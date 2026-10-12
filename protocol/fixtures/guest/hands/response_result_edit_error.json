@@ -1,0 +1,18 @@
+{
+  "type": "result",
+  "call_id": "toolu_01G",
+  "result": {
+    "is_error": true,
+    "content": [
+      {
+        "type": "text",
+        "text": "Found 2 matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance."
+      }
+    ],
+    "detail": {
+      "tool": "Edit",
+      "replacements": 0,
+      "changed_since_read": false
+    }
+  }
+}

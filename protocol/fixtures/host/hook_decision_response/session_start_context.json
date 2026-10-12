@@ -1,0 +1,8 @@
+{
+  "output": {
+    "hookSpecificOutput": {
+      "hookEventName": "SessionStart",
+      "additionalContext": "Repository CLAUDE.md (read from the sandbox):\n..."
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "type": "listeners_add",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "listeners": [
+    {
+      "id": 1,
+      "transport": "udp",
+      "addr": "172.16.0.1:53",
+      "purpose": "dns"
+    },
+    {
+      "id": 2,
+      "transport": "tcp",
+      "addr": "172.16.0.1:53",
+      "purpose": "dns"
+    },
+    {
+      "id": 3,
+      "transport": "tcp",
+      "addr": "172.16.0.1:80",
+      "purpose": "http_transparent"
+    },
+    {
+      "id": 4,
+      "transport": "tcp",
+      "addr": "172.16.0.1:443",
+      "purpose": "https_transparent"
+    },
+    {
+      "id": 5,
+      "transport": "tcp",
+      "addr": "172.16.0.1:3128",
+      "purpose": "explicit",
+      "agent": "agt_01jb7n0w1e",
+      "slot": 0
+    },
+    {
+      "id": 6,
+      "transport": "tcp",
+      "addr": "172.16.0.1:20000",
+      "purpose": "tcp_exception",
+      "rule": "db.example.com:5432"
+    }
+  ]
+}

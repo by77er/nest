@@ -1,0 +1,8 @@
+{
+  "cmd": "cmd_01jb7q0006",
+  "issued_ms": 1760270400000,
+  "type": "sandbox_checkpoint",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "reason": "archive"
+}

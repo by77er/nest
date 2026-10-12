@@ -1,0 +1,21 @@
+{
+  "cmd": "cmd_01jb7q0014",
+  "issued_ms": 1760270400000,
+  "type": "commit_result",
+  "request": "req_01jb7r1x2y",
+  "sandbox": "sbx_01jb7m2a4c",
+  "outcome": {
+    "status": "committed",
+    "generation": {
+      "id": "gen_01jb7p8r3n",
+      "sandbox": "sbx_01jb7m2a4c",
+      "parent": "gen_01jb7p1k2m",
+      "epoch": 4,
+      "kind": "checkpoint",
+      "disk_manifest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "mem_manifest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "reason": "suspend",
+      "created_ms": 1760270400000
+    }
+  }
+}

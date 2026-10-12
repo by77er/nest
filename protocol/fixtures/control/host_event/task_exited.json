@@ -1,0 +1,17 @@
+{
+  "ts_ms": 1760270460000,
+  "type": "task_exited",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "agent": "agt_01jb7n0w1e",
+  "task": {
+    "task_id": "bg_7f3a",
+    "description": "vite dev server",
+    "status": "exited",
+    "exit_code": 0,
+    "output_path": "/run/nest/agents/agt_01jb7n0w1e/tasks/bg_7f3a.out",
+    "output_bytes": 2048,
+    "started_ms": 1760270400000,
+    "ended_ms": 1760270460000
+  }
+}

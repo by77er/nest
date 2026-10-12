@@ -1,0 +1,8 @@
+{
+  "type": "rejected",
+  "error": {
+    "code": "connect_refused",
+    "message": "nothing listening on 127.0.0.1:5174 or 172.16.0.2:5174",
+    "retryable": true
+  }
+}

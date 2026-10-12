@@ -1,0 +1,15 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 320,
+  "ts_ms": 1760270460000,
+  "type": "task_exited",
+  "task": {
+    "task_id": "bg_7f3a",
+    "status": "killed",
+    "output_path": "/run/nest/agents/agt_01jb7n0w1e/tasks/bg_7f3a.out",
+    "output_bytes": 512,
+    "started_ms": 1760270400000,
+    "ended_ms": 1760270460000
+  }
+}

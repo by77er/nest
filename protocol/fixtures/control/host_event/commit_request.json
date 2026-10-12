@@ -1,0 +1,12 @@
+{
+  "ts_ms": 1760270400000,
+  "type": "commit_request",
+  "request": "req_01jb7r1x2y",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "parent": "gen_01jb7p1k2m",
+  "kind": "checkpoint",
+  "disk_manifest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "mem_manifest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "reason": "suspend"
+}

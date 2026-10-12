@@ -1,0 +1,8 @@
+{
+  "type": "error",
+  "error": {
+    "code": "invalid_message",
+    "message": "listeners_add declared 6 listeners but carried 5 fds",
+    "retryable": false
+  }
+}

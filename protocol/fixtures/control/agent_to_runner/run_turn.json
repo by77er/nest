@@ -1,0 +1,9 @@
+{
+  "type": "run_turn",
+  "seq": 10,
+  "turn": "trn_01jb7t0b",
+  "input": {
+    "kind": "user",
+    "text": "Add a dark mode toggle to the settings page and open a PR."
+  }
+}

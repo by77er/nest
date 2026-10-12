@@ -1,0 +1,30 @@
+{
+  "type": "events",
+  "seq": 55,
+  "events": [
+    {
+      "agent": "agt_01jb7n0w1e",
+      "epoch": 4,
+      "seq": 301,
+      "ts_ms": 1760270400000,
+      "turn": "trn_01jb7t0a",
+      "type": "tool_call",
+      "call_id": "toolu_01AbC",
+      "name": "mcp__nest__Bash",
+      "input": {
+        "command": "npm test"
+      }
+    },
+    {
+      "agent": "agt_01jb7n0w1e",
+      "epoch": 4,
+      "seq": 302,
+      "ts_ms": 1760270404100,
+      "turn": "trn_01jb7t0a",
+      "type": "tool_result",
+      "call_id": "toolu_01AbC",
+      "is_error": false,
+      "summary": "42 passing"
+    }
+  ]
+}

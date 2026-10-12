@@ -1,0 +1,14 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 302,
+  "ts_ms": 1760270400002,
+  "turn": "trn_01jb7t0a",
+  "type": "tool_call",
+  "call_id": "toolu_01AbC",
+  "name": "mcp__nest__Bash",
+  "input": {
+    "command": "npm test",
+    "timeout": 120000
+  }
+}

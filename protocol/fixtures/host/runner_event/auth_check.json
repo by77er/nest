@@ -1,0 +1,7 @@
+{
+  "type": "auth_check",
+  "agent": "agt_01jb7n0w1e",
+  "auth_method": "oauth_token",
+  "api_key_source": "none",
+  "ok": true
+}

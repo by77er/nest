@@ -1,0 +1,8 @@
+{
+  "output": {
+    "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "allow"
+    }
+  }
+}

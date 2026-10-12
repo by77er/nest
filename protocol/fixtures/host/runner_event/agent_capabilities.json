@@ -1,0 +1,8 @@
+{
+  "type": "agent_capabilities",
+  "agent": "agt_01jb7n0w1e",
+  "capabilities": [
+    "interrupt_receipt_v1",
+    "interrupt_cancel_queued_v1"
+  ]
+}

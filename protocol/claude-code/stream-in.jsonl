@@ -1,0 +1,3 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Implement the retry policy described in docs/retry.md."}]}, "parent_tool_use_id": null}
+{"type": "control_request", "request_id": "req_1", "request": {"subtype": "interrupt"}}
+{"type": "control_request", "request_id": "req_2", "request": {"subtype": "interrupt", "cancel_queued": true}}

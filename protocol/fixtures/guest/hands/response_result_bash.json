@@ -1,0 +1,23 @@
+{
+  "type": "result",
+  "call_id": "toolu_01A",
+  "result": {
+    "is_error": false,
+    "content": [
+      {
+        "type": "text",
+        "text": " \u2713 src/main.test.ts (12 tests) 41ms\n\n Test Files  1 passed (1)\n      Tests  12 passed (12)\n"
+      }
+    ],
+    "detail": {
+      "tool": "Bash",
+      "exit_code": 0,
+      "interrupted": false,
+      "output_path": "/run/nest/agents/agt_01JB8Z3K7Q2M/calls/toolu_01A.out",
+      "output_bytes": 96,
+      "truncated": false,
+      "cwd": "/workspace",
+      "duration_ms": 2310
+    }
+  }
+}

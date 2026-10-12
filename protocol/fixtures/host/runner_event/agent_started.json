@@ -1,0 +1,11 @@
+{
+  "type": "agent_started",
+  "agent": "agt_01jb7n0w1e",
+  "pid": 6161,
+  "session": "ses_0b6c7f6e-8f4c-4a7b-9a51-2f1d3c4b5a69",
+  "claude_version": "2.1.296",
+  "capabilities": [
+    "interrupt_receipt_v1",
+    "interrupt_cancel_queued_v1"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "type": "tool_result",
+  "seq": 14,
+  "call": "cal_trn01jb7t0a-3",
+  "outcome": {
+    "status": "pending",
+    "ask": "ask_01jb7w5x",
+    "message": "Question posted to the captain. End your turn; the answer arrives as your next input."
+  }
+}

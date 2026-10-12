@@ -1,0 +1,8 @@
+{
+  "type": "error",
+  "error": {
+    "code": "stale_epoch",
+    "message": "runner reported epoch 3; sandbox is at epoch 4",
+    "retryable": false
+  }
+}

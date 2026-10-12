@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "call_id": "toolu_01A",
+  "error": {
+    "code": "stale_epoch",
+    "message": "request epoch 6 is older than sandbox epoch 7",
+    "retryable": false
+  }
+}

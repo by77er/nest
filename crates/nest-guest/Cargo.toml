@@ -1,0 +1,33 @@
+[package]
+name = "nest-guest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nest-guest"
+path = "src/main.rs"
+
+[dependencies]
+nest-protocol = { path = "../nest-protocol" }
+anyhow = "1"
+base64 = "0.22"
+globset = "0.4"
+libc = "0.2"
+nix = { version = "0.31", features = ["fs", "hostname", "ioctl", "process", "signal", "term", "time", "user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-vsock = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

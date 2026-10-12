@@ -1,0 +1,11 @@
+{
+  "host": "hst_01jb7k3x9q",
+  "host_token": "nht_eyJhbGciOiJFZERTQSJ9.eyJob3N0IjoiaHN0XzAxIn0.c2ln",
+  "host_token_expires_ms": 1760274000000,
+  "fleet_ws_url": "wss://nest.example.dev/v1/fleet",
+  "proxy_ca": {
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ0...\n-----END CERTIFICATE-----\n",
+    "chain_pem": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ0...\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBjTCCATOgAwIBAgIUR1...\n-----END CERTIFICATE-----\n",
+    "expires_ms": 1760875200000
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "command": {
+    "command": "expose",
+    "port": 5173,
+    "exposed": true
+  }
+}

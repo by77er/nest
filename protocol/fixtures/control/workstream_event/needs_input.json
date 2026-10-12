@@ -1,0 +1,10 @@
+{
+  "workstream": "ws_01jb7j8r2t",
+  "ts_ms": 1760270400000,
+  "agent": "agt_01jb7n0w1e",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "type": "needs_input",
+  "ask": "ask_01jb7w5x",
+  "question": "Allow egress to api.openai.com?"
+}

@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "agent": "agt_01HZX3M7W4",
+  "ts_ms": 1760266813000,
+  "input": {
+    "session_id": "0b6c7f6e-8f4c-4a7b-9a51-2f1d3c4b5a69",
+    "transcript_path": "/var/lib/nest/agents/agt_01HZX3M7W4/projects/-var-lib-nest-empty/0b6c7f6e-8f4c-4a7b-9a51-2f1d3c4b5a69.jsonl",
+    "cwd": "/var/lib/nest/empty",
+    "permission_mode": "dontAsk",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission",
+    "notification_type": "permission_prompt"
+  },
+  "truncated": false
+}

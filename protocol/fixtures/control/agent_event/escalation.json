@@ -1,0 +1,13 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 311,
+  "ts_ms": 1760270400100,
+  "turn": "trn_01jb7t0a",
+  "type": "escalation",
+  "call": "cal_trn_01jb7t0a-3",
+  "tool": "mcp__nest__Bash",
+  "input": {
+    "command": "git push --force origin main"
+  }
+}

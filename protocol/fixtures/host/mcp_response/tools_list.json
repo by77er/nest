@@ -1,0 +1,30 @@
+{
+  "type": "tools_list",
+  "id": 1,
+  "tools": [
+    {
+      "name": "notify",
+      "description": "Send a message to your captain or the user.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "enum": [
+              "captain",
+              "user"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "to",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

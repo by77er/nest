@@ -1,0 +1,6 @@
+{
+  "type": "hello_ack",
+  "protocol_version": 1,
+  "durable_bytes": 262144,
+  "last_seq": 54
+}

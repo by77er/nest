@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/nest-protocol",
+  "crates/nestd",
+  "crates/nest-proxy",
+  "crates/nest-guest",
+  "crates/nest-runner",
+  "crates/nest-cli",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "UNLICENSED"
+publish = false

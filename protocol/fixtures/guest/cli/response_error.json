@@ -1,0 +1,10 @@
+{
+  "result": {
+    "status": "error",
+    "error": {
+      "code": "bad_request",
+      "message": "port 22 cannot be exposed",
+      "retryable": false
+    }
+  }
+}

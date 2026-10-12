@@ -1,0 +1,18 @@
+{
+  "type": "ports",
+  "listening": [
+    {
+      "port": 5173,
+      "proto": "tcp",
+      "bind": "loopback",
+      "pid": 412,
+      "process": "node"
+    },
+    {
+      "port": 8000,
+      "proto": "tcp6",
+      "bind": "any"
+    }
+  ],
+  "ts_ms": 1760270401234
+}

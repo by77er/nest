@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nest-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "FLEET", "class_name": "FleetDO" },
+      { "name": "SANDBOX", "class_name": "SandboxDO" },
+      { "name": "AGENT", "class_name": "AgentDO" },
+      { "name": "WORKSTREAM", "class_name": "WorkstreamDO" },
+      { "name": "BROKER", "class_name": "BrokerDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["FleetDO", "SandboxDO", "AgentDO", "WorkstreamDO", "BrokerDO"] }
+  ],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "nest-control" }],
+  "vars": {
+    "PUBLIC_BASE_URL": "http://127.0.0.1:8787",
+    "PREVIEW_DOMAIN": "preview.nest.localhost",
+    "ASK_SYNC_WINDOW_MS": "120000",
+    "HOST_TOKEN_TTL_MS": "3600000",
+    "PROXY_CA_TTL_MS": "604800000"
+  }
+  // Secrets (wrangler secret put / .dev.vars): ADMIN_TOKEN, HOST_TOKEN_SECRET,
+  // ROOT_CA_CERT_PEM, ROOT_CA_KEY_PEM (PKCS#8, ECDSA P-256), AWS_IDENTITY_CERT_PEM,
+  // AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION.
+}

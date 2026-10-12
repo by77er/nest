@@ -1,0 +1,5 @@
+# Copy to .dev.vars for `npm run dev`. Never commit real values.
+ADMIN_TOKEN=dev-admin-token
+HOST_TOKEN_SECRET=dev-host-token-secret-change-me-0123456789
+# Mint and persist a development root CA in FleetDO (fetch it from GET /v1/admin/root-ca).
+ALLOW_DEV_CA=1

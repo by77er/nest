@@ -1,0 +1,5 @@
+{
+  "type": "resync_ack",
+  "sandboxes": 1,
+  "listeners": 6
+}

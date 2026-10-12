@@ -1,0 +1,10 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 308,
+  "ts_ms": 1760270400008,
+  "turn": "trn_01jb7t0a",
+  "type": "state_changed",
+  "state": "waiting_permission",
+  "detail": "mcp__nest__Bash(git push origin main)"
+}

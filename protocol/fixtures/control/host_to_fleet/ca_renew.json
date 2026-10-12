@@ -1,0 +1,4 @@
+{
+  "type": "ca_renew",
+  "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nMIHzMIGbAgEAMDkxNzA1BgNV...\n-----END CERTIFICATE REQUEST-----\n"
+}

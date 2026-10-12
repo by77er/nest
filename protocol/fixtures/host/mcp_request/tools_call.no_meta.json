@@ -1,0 +1,9 @@
+{
+  "type": "tools_call",
+  "id": 3,
+  "name": "notify",
+  "arguments": {
+    "to": "captain",
+    "message": "done"
+  }
+}

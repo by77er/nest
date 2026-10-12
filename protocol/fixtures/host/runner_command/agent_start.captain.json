@@ -1,0 +1,18 @@
+{
+  "type": "agent_start",
+  "start": {
+    "agent": "agt_01jb7n5c0p",
+    "role": "captain",
+    "workstream": "ws_01jb7j8r2t",
+    "launch": {
+      "builtin_tools": [],
+      "system_prompt": {
+        "mode": "replace",
+        "text": "You are a nest captain..."
+      }
+    },
+    "oauth_token": "sk-ant-oat01-REDACTED-EXAMPLE2",
+    "session_ws_url": "wss://nest.example.dev/v1/agents/agt_01jb7n5c0p/session"
+  },
+  "config_dir": "/var/lib/nest/agents/agt_01jb7n5c0p"
+}

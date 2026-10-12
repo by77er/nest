@@ -1,0 +1,20 @@
+{
+  "type": "result",
+  "call_id": "toolu_01E",
+  "result": {
+    "is_error": false,
+    "content": [
+      {
+        "type": "image",
+        "media_type": "image/png",
+        "data_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      }
+    ],
+    "detail": {
+      "tool": "Read",
+      "file_kind": "image",
+      "total_lines": 0,
+      "partial": false
+    }
+  }
+}

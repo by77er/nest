@@ -1,0 +1,6 @@
+{
+  "type": "agent_stop",
+  "agent": "agt_01jb7n0w1e",
+  "mode": "graceful",
+  "reason": "idle"
+}

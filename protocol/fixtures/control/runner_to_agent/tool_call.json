@@ -1,0 +1,14 @@
+{
+  "type": "tool_call",
+  "seq": 56,
+  "call": "cal_trn01jb7t0a-3",
+  "turn": "trn_01jb7t0a",
+  "name": "ask",
+  "arguments": {
+    "question": "Allow egress to api.openai.com for the eval script?",
+    "options": [
+      "allow 2h",
+      "deny"
+    ]
+  }
+}

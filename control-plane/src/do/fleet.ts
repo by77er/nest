@@ -1,0 +1,840 @@
+// FleetDO: one per cell. Host enrollment, the fleet WebSocket (docs/interfaces/control-host/fleet/),
+// leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
+import { DurableObject } from "cloudflare:workers";
+import { num, type Env } from "../env";
+import { isSecretRef } from "./broker";
+import { signIntermediate, generateDevRoot, type RootCa } from "../lib/ca";
+import { AwsEc2, isDead, type Ec2 } from "../lib/ec2";
+import type { InstanceIdentity } from "../lib/aws-identity";
+import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
+import { issueHostToken } from "../lib/tokens";
+import { errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
+import {
+  type Capacity, type CommandBody, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
+  type EnrollResponse, type FleetToHost, type HostEvent, HostToFleet, type LeaseClaim, type CaCertificate, type SandboxReport,
+} from "../protocol/control";
+import {
+  type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, type HostRole, PROTOCOL_VERSION, type Resources,
+} from "../protocol/model";
+
+type HostStatus = "active" | "draining" | "expired" | "stonith_pending" | "dead";
+
+interface HostRow {
+  host: string;
+  role: HostRole;
+  instance_id: string | null;
+  status: HostStatus;
+  last_rx: number | null;
+  token_exp: number;
+  capacity: string | null;
+  [key: string]: SqlStorageValue;
+}
+
+interface LeaseRow {
+  sandbox: string;
+  host: string;
+  epoch: number;
+  expired: number;
+  [key: string]: SqlStorageValue;
+}
+
+interface Attachment {
+  host: string;
+  helloed: boolean;
+}
+
+export interface PlaceRequest {
+  sandbox: string;
+  workstream: string;
+  epoch: number;
+  image: string;
+  resources: Resources;
+  policy: EgressPolicy;
+  from?: GenerationRecord;
+  excludeHost?: string;
+}
+
+/** An instance this control plane launched, with what it may enroll as. */
+export interface LaunchedInstance {
+  instance_id: string;
+  role?: HostRole;
+  account_id?: string;
+  region?: string;
+}
+
+/** Command purposes FleetDO itself needs to react to when the result arrives. */
+type Purpose = "stonith_fence" | null;
+
+const TOKEN_ROTATE_BEFORE_MS = 10 * 60_000;
+const COMMAND_RETENTION_MS = 24 * 3_600_000;
+const ENROLL_TOKEN_RETENTION_MS = 7 * 86_400_000;
+const ALARM_TICK = "tick";
+
+export class FleetDO extends DurableObject<Env> {
+  private readonly sql: SqlStorage;
+  private readonly rel: ReliableChannels;
+  private readonly deadlines: Deadlines;
+  /** Per-host serialization of inbound reliable messages (hello and event batches). */
+  private readonly inbound = new Map<string, SerialQueue>();
+  /** Override for tests; `undefined` derives a client from the AWS_* secrets. */
+  ec2Override: Ec2 | null | undefined = undefined;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS hosts (host TEXT PRIMARY KEY, cell TEXT NOT NULL, role TEXT NOT NULL,
+      instance_id TEXT, status TEXT NOT NULL, last_rx INTEGER, token_exp INTEGER NOT NULL, enrolled_ms INTEGER NOT NULL,
+      capacity TEXT, nestd_instance TEXT)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS enroll_tokens (hash TEXT PRIMARY KEY, role TEXT NOT NULL,
+      created_ms INTEGER NOT NULL, used_ms INTEGER, host TEXT)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS launched (instance_id TEXT PRIMARY KEY, launched_ms INTEGER NOT NULL,
+      host TEXT, role TEXT, account_id TEXT, region TEXT)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS leases (sandbox TEXT PRIMARY KEY, host TEXT NOT NULL,
+      epoch INTEGER NOT NULL, expired INTEGER NOT NULL DEFAULT 0)`);
+    // Command bodies hold BrokerDO secret references, never secret values (resolved only when sent).
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS commands (cmd TEXT PRIMARY KEY, host TEXT NOT NULL, type TEXT NOT NULL,
+      sandbox TEXT, agent TEXT, epoch INTEGER, purpose TEXT, body TEXT NOT NULL, issued_ms INTEGER NOT NULL,
+      result TEXT, result_ms INTEGER)`);
+    this.sql.exec("CREATE INDEX IF NOT EXISTS commands_host_result ON commands (host, result)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS host_agents (agent TEXT PRIMARY KEY, host TEXT NOT NULL, cmd TEXT NOT NULL)");
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS reassign_queue (sandbox TEXT PRIMARY KEY, host TEXT NOT NULL,
+      epoch INTEGER NOT NULL, host_dead INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`);
+    this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    this.rel = new ReliableChannels(this.sql);
+    this.deadlines = new Deadlines(this.sql, ctx.storage);
+  }
+
+  private queue(host: string): SerialQueue {
+    let q = this.inbound.get(host);
+    if (!q) this.inbound.set(host, (q = new SerialQueue()));
+    return q;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Enrollment
+  // ---------------------------------------------------------------------------------------------
+
+  async mintEnrollmentToken(role: HostRole): Promise<string> {
+    const token = `net_${newId("")}${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
+    this.sql.exec("INSERT INTO enroll_tokens (hash, role, created_ms) VALUES (?, ?, ?)", hex(await sha256(token)), role, Date.now());
+    return token;
+  }
+
+  /**
+   * Records an instance this control plane launched (RunInstances); only those may enroll via AWS
+   * identity, as the recorded role, from the recorded account and region (when given).
+   */
+  async registerLaunched(l: LaunchedInstance): Promise<void> {
+    this.sql.exec(
+      `INSERT INTO launched (instance_id, launched_ms, role, account_id, region) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(instance_id) DO UPDATE SET role = excluded.role, account_id = excluded.account_id, region = excluded.region
+       WHERE launched.host IS NULL`,
+      l.instance_id, Date.now(), l.role ?? null, l.account_id ?? null, l.region ?? null,
+    );
+  }
+
+  /**
+   * `identity` is set when the Worker verified an AWS identity document; otherwise the proof must be
+   * an enrollment token. The CSR is validated (signed) before the one-time proof is consumed.
+   */
+  async enroll(req: EnrollRequest, cell: string, identity: InstanceIdentity | null): Promise<EnrollResponse> {
+    const proxyCa = await this.signProxyCa(req.proxy_ca_csr_pem);
+    const hash = req.proof.type === "enrollment_token" ? hex(await sha256(req.proof.token)) : "";
+    // Everything below is synchronous: the proof is checked and consumed atomically.
+    const now = Date.now();
+    const host = newId("hst_");
+    let instanceId: string | null = null;
+    if (req.proof.type === "enrollment_token") {
+      const row = this.sql
+        .exec<{ role: string; used_ms: number | null }>("SELECT role, used_ms FROM enroll_tokens WHERE hash = ?", hash)
+        .toArray()[0];
+      if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "unknown enrollment token", 401);
+      if (row.used_ms !== null) throw new NestError(ErrorCodes.FORBIDDEN, "enrollment token already used", 409);
+      if (row.role !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, "enrollment token minted for another role", 401);
+      this.sql.exec("UPDATE enroll_tokens SET used_ms = ?, host = ? WHERE hash = ?", now, host, hash);
+    } else {
+      if (!identity) throw new NestError(ErrorCodes.UNAUTHORIZED, "unverified identity document", 401);
+      const row = this.sql
+        .exec<{ host: string | null; role: string | null; account_id: string | null; region: string | null }>(
+          "SELECT host, role, account_id, region FROM launched WHERE instance_id = ?", identity.instanceId)
+        .toArray()[0];
+      if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance was not launched by this control plane (in this cell)", 401);
+      if (row.host) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
+      if (row.role && row.role !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, `instance was launched as ${row.role}`, 401);
+      if (row.account_id && row.account_id !== identity.accountId) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS account", 401);
+      if (row.region && row.region !== identity.region) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS region", 401);
+      this.sql.exec("UPDATE launched SET host = ? WHERE instance_id = ?", host, identity.instanceId);
+      instanceId = identity.instanceId;
+    }
+
+    const tokenExp = now + num(this.env.HOST_TOKEN_TTL_MS, 3_600_000);
+    this.sql.exec(
+      `INSERT INTO hosts (host, cell, role, instance_id, status, last_rx, token_exp, enrolled_ms)
+       VALUES (?, ?, ?, ?, 'active', NULL, ?, ?)`,
+      host, cell, req.role, instanceId, tokenExp, now,
+    );
+    const hostToken = await issueHostToken(this.env.HOST_TOKEN_SECRET, { host, cell, role: req.role, exp: tokenExp });
+    return {
+      host,
+      host_token: hostToken,
+      host_token_expires_ms: tokenExp,
+      fleet_ws_url: `${this.env.PUBLIC_BASE_URL.replace(/^http/, "ws")}/v1/fleet`,
+      proxy_ca: proxyCa,
+    };
+  }
+
+  private async rootCa(): Promise<RootCa> {
+    if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KEY_PEM) {
+      return { certPem: this.env.ROOT_CA_CERT_PEM, keyPem: this.env.ROOT_CA_KEY_PEM };
+    }
+    if (this.env.ALLOW_DEV_CA !== "1") {
+      throw new NestError(ErrorCodes.INTERNAL, "root CA not configured (ROOT_CA_CERT_PEM / ROOT_CA_KEY_PEM)", 500);
+    }
+    const stored = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'dev_root_ca'").toArray()[0];
+    if (stored) return JSON.parse(stored.value) as RootCa;
+    const root = await generateDevRoot();
+    const raced = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'dev_root_ca'").toArray()[0];
+    if (raced) return JSON.parse(raced.value) as RootCa;
+    console.warn("FleetDO: generated a development root CA (ALLOW_DEV_CA=1)");
+    this.sql.exec("INSERT INTO kv (key, value) VALUES ('dev_root_ca', ?)", JSON.stringify(root));
+    return root;
+  }
+
+  /** Root certificate to bake into sandbox images. */
+  async rootCertificatePem(): Promise<string> {
+    return (await this.rootCa()).certPem;
+  }
+
+  private async signProxyCa(csrPem: string): Promise<CaCertificate> {
+    return signIntermediate(await this.rootCa(), csrPem, num(this.env.PROXY_CA_TTL_MS, 7 * 86_400_000));
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Fleet WebSocket
+  // ---------------------------------------------------------------------------------------------
+
+  override async fetch(request: Request): Promise<Response> {
+    const host = request.headers.get("x-nest-host");
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket" || !host) {
+      return new Response("expected websocket upgrade", { status: 400 });
+    }
+    const row = this.host(host);
+    if (!row || row.status === "dead") return new Response("unknown or dead host", { status: 401 });
+    // Older connections are superseded only once this one presents a valid hello.
+    const pair = new WebSocketPair();
+    const server = pair[1];
+    this.ctx.acceptWebSocket(server, [host]);
+    server.serializeAttachment({ host, helloed: false } satisfies Attachment);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  override async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
+    const att = ws.deserializeAttachment() as Attachment;
+    let parsed: HostToFleet;
+    try {
+      const r = HostToFleet.safeParse(JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw)));
+      if (!r.success) throw new Error(r.error.message);
+      parsed = r.data;
+    } catch (e) {
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.INVALID_MESSAGE, String(e instanceof Error ? e.message : e)) });
+      return;
+    }
+    if (!att.helloed && parsed.type !== "hello") {
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.INVALID_MESSAGE, "first frame must be hello") });
+      ws.close(4400, "expected hello");
+      return;
+    }
+    switch (parsed.type) {
+      case "hello":
+        return this.queue(att.host).run(() => this.onHello(ws, att, parsed));
+      case "heartbeat":
+        return this.onHeartbeat(ws, att.host, parsed.sent_ms, parsed.leases);
+      case "events":
+        return this.queue(att.host).run(() => this.onEvents(ws, att.host, parsed.seq, parsed.events));
+      case "ack":
+        this.rel.ack(att.host, parsed.up_to);
+        return;
+      case "ca_renew": {
+        try {
+          this.send(ws, { type: "proxy_ca", ...(await this.signProxyCa(parsed.csr_pem)) });
+        } catch (e) {
+          this.send(ws, { type: "error", error: (asNestError(e) ?? new NestError(ErrorCodes.INTERNAL, "CA signing failed")).body() });
+        }
+        return;
+      }
+    }
+  }
+
+  override async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+    try {
+      ws.close(code === 1005 ? 1000 : code, "closing");
+    } catch {
+      // already closed
+    }
+  }
+
+  private send(ws: WebSocket, msg: FleetToHost): void {
+    try {
+      ws.send(JSON.stringify(msg));
+    } catch {
+      // The socket died; reliable messages are resent after the next hello.
+    }
+  }
+
+  /** Send messages after replacing BrokerDO secret references with current values. */
+  private async sendResolved(ws: WebSocket, msgs: unknown[]): Promise<void> {
+    const refs = new Set<string>();
+    const collect = (v: unknown): void => {
+      if (isSecretRef(v)) refs.add(v);
+      else if (Array.isArray(v)) v.forEach(collect);
+      else if (v && typeof v === "object") Object.values(v).forEach(collect);
+    };
+    msgs.forEach(collect);
+    let values: Record<string, string | null> = {};
+    if (refs.size) {
+      try {
+        values = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs([...refs]);
+      } catch (e) {
+        console.error("FleetDO: resolving secret references failed; not sending", e);
+        return; // stays queued; resent after the next hello
+      }
+    }
+    const replace = (v: unknown): unknown => {
+      if (isSecretRef(v)) {
+        const value = values[v];
+        if (value === null || value === undefined) console.warn(`FleetDO: secret ${v.slice(v.indexOf(":") + 1)} is missing or expired`);
+        return value ?? "";
+      }
+      if (Array.isArray(v)) return v.map(replace);
+      if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, replace(x)]));
+      return v;
+    };
+    for (const m of msgs) this.send(ws, replace(m) as FleetToHost);
+  }
+
+  private socketFor(host: string): WebSocket | undefined {
+    return this.ctx.getWebSockets(host).find((ws) => (ws.deserializeAttachment() as Attachment).helloed);
+  }
+
+  private async onHello(ws: WebSocket, att: Attachment, hello: Extract<HostToFleet, { type: "hello" }>): Promise<void> {
+    if (hello.protocol_version !== PROTOCOL_VERSION) {
+      this.send(ws, {
+        type: "error",
+        error: errorBody(ErrorCodes.UNSUPPORTED_PROTOCOL_VERSION, `server speaks ${PROTOCOL_VERSION}`),
+      });
+      ws.close(4426, "unsupported protocol version");
+      return;
+    }
+    const prior = this.host(att.host);
+    if (hello.host !== att.host || !prior || prior.status === "dead") {
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.UNAUTHORIZED, "hello.host does not match token, or host is dead") });
+      ws.close(4401, "unauthorized");
+      return;
+    }
+    for (const old of this.ctx.getWebSockets(att.host)) {
+      if (old === ws) continue;
+      // Never pick a superseded socket for sending, even while its close is in flight.
+      old.serializeAttachment({ host: att.host, helloed: false } satisfies Attachment);
+      old.close(4000, "superseded by a new connection");
+    }
+    const now = Date.now();
+    // A new nestd process (new instance_id): both seq lineages restart. Its unacked commands fail
+    // (retryably) or are reconciled from the report below.
+    const lastInstance = prior.nestd_instance as string | null;
+    const newProcess = lastInstance !== null && lastInstance !== hello.instance_id;
+    if (newProcess) this.rel.reset(att.host);
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ? WHERE host = ?",
+      now, JSON.stringify(hello.capacity), hello.instance_id, att.host);
+    ws.serializeAttachment({ host: att.host, helloed: true } satisfies Attachment);
+
+    this.send(ws, {
+      type: "hello_ack",
+      protocol_version: PROTOCOL_VERSION,
+      server_ms: now,
+      ...(this.rel.lastIn(att.host) !== undefined ? { last_event_seq: this.rel.lastIn(att.host) } : {}),
+      lease: DEFAULT_LEASE_TIMING,
+      host_token_expires_ms: prior.token_exp,
+    });
+    if (prior.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, att.host);
+
+    // Resend unacked commands the host hasn't processed.
+    if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
+    await this.sendResolved(ws, this.rel.pendingAfter(att.host, hello.last_command_seq));
+
+    if (prior.status === "expired" || prior.status === "stonith_pending") {
+      this.sql.exec("UPDATE hosts SET status = 'active' WHERE host = ?", att.host);
+    }
+    await this.reconcileSandboxes(att.host, hello.sandboxes);
+    const reported = new Map(hello.sandboxes.map((s) => [s.sandbox, s]));
+    if (newProcess) await this.failPendingCommands(att.host, "host process restarted before running this command", reported);
+    await this.reconcileAgents(att.host, hello.agents);
+    // A host whose leases we expired came back: it must fence them before we reassign (STONITH by fence).
+    await this.ensureStonithFence(att.host);
+    await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
+  }
+
+  /** Fence what we don't honor; take the reported state of what we do (e.g. after a nestd restart). */
+  private async reconcileSandboxes(host: string, sandboxes: SandboxReport[]): Promise<void> {
+    const fence: string[] = [];
+    for (const s of sandboxes) {
+      const lease = this.lease(s.sandbox);
+      const honored = lease && lease.host === host && lease.epoch === s.epoch && !lease.expired;
+      if (!honored) {
+        if (s.state !== "fenced" && s.state !== "destroyed") fence.push(s.sandbox);
+        continue;
+      }
+      try {
+        await this.sandbox(s.sandbox).reportState(host, s.epoch, s.state, null, "reported in hello");
+      } catch (e) {
+        console.error(`FleetDO: reconciling ${s.sandbox} failed`, e);
+      }
+    }
+    if (fence.length) await this.issueCommands(host, [{ type: "fence", sandboxes: fence, reason: "reconcile" }]);
+  }
+
+  /** Brains the host doesn't report (after its agent_start completed) are gone. */
+  private async reconcileAgents(host: string, agents: Extract<HostToFleet, { type: "hello" }>["agents"]): Promise<void> {
+    const reported = new Set(agents.map((a) => a.agent));
+    for (const a of agents) {
+      try {
+        await this.agentStub(a.agent).hostReport(host, a.state);
+      } catch (e) {
+        console.error(`FleetDO: reconciling ${a.agent} failed`, e);
+      }
+    }
+    const known = this.sql
+      .exec<{ agent: string; c_cmd: string | null; result: string | null }>(
+        `SELECT h.agent, c.cmd AS c_cmd, c.result FROM host_agents h LEFT JOIN commands c ON c.cmd = h.cmd WHERE h.host = ?`, host)
+      .toArray();
+    for (const k of known) {
+      if (reported.has(k.agent)) continue;
+      // Only once its agent_start completed (or the command aged out); a pending start isn't running yet.
+      if (k.c_cmd !== null && k.result === null) continue;
+      this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", k.agent, host);
+      try {
+        await this.agentStub(k.agent).onExited(host, "not running after host reconnect");
+      } catch (e) {
+        console.error(`FleetDO: marking ${k.agent} exited failed`, e);
+      }
+    }
+  }
+
+  private async onHeartbeat(ws: WebSocket, host: string, sentMs: number, claims: LeaseClaim[]): Promise<void> {
+    const now = Date.now();
+    this.sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ? AND status IN ('active', 'draining')", now, host);
+    const revoked = claims.filter((c) => {
+      const lease = this.lease(c.sandbox);
+      return !lease || lease.host !== host || lease.epoch !== c.epoch || lease.expired === 1;
+    });
+    this.send(ws, { type: "heartbeat_ack", sent_ms: sentMs, server_ms: now, revoked });
+    if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
+  }
+
+  /**
+   * Strictly in order: the next batch is processed and acked; a duplicate is re-acked; a gap or a
+   * failure closes the connection so the host reconnects and resends from `last_event_seq`.
+   */
+  private async onEvents(ws: WebSocket, host: string, seq: number, events: HostEvent[]): Promise<void> {
+    const verdict = this.rel.classify(host, seq);
+    if (verdict === "duplicate") {
+      this.send(ws, { type: "ack", up_to: this.rel.lastIn(host)! });
+      return;
+    }
+    if (verdict === "gap") {
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.INVALID_MESSAGE, `event batch ${seq} out of order; expected ${this.rel.lastIn(host)! + 1}`, true) });
+      ws.close(4409, "out-of-order event batch; reconnect and resend");
+      return;
+    }
+    try {
+      for (const ev of events) await this.handleEvent(host, ev);
+    } catch (e) {
+      console.error("FleetDO: event batch failed", e);
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.INTERNAL, "event processing failed; reconnect and resend", true) });
+      ws.close(4500, "event processing failed; reconnect and resend");
+      return;
+    }
+    this.rel.markProcessed(host, seq);
+    this.send(ws, { type: "ack", up_to: seq });
+  }
+
+  /** True when `host` holds the live lease for `sandbox` (at `epoch`, when given). */
+  private holds(host: string, sandbox: string | undefined, epoch?: number): boolean {
+    if (!sandbox) return false;
+    const lease = this.lease(sandbox);
+    return !!lease && lease.host === host && !lease.expired && (epoch === undefined || lease.epoch === epoch);
+  }
+
+  private async handleEvent(host: string, ev: HostEvent): Promise<void> {
+    switch (ev.type) {
+      case "command_result":
+        return this.onCommandResult(host, ev.cmd, ev.outcome);
+      case "sandbox_state":
+        await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.suspend_mode ?? null, ev.detail ?? null);
+        return;
+      case "commit_request":
+        return this.onCommitRequest(host, ev);
+      case "workstream": {
+        // Host-originated workstream events must be about a sandbox this host holds.
+        if (!this.holds(host, ev.event.sandbox, ev.event.epoch)) {
+          console.warn(`FleetDO: dropping ${ev.event.type} from ${host}: not the lease holder of ${ev.event.sandbox ?? "(no sandbox)"}`);
+          return;
+        }
+        await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(ev.event.workstream)).ingest(ev.event);
+        return;
+      }
+      case "egress_audit": {
+        const body = ev.records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+        await this.env.BUCKET.put(`audit/${host}/${ev.ts_ms}-${newId("")}.jsonl`, body);
+        return;
+      }
+      case "capacity":
+        this.sql.exec("UPDATE hosts SET capacity = ? WHERE host = ?", JSON.stringify(ev.capacity), host);
+        return;
+      case "spot_notice":
+        this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host);
+        return;
+      case "agent_exited":
+        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", ev.agent, host);
+        await this.agentStub(ev.agent).onExited(host, ev.reason);
+        return;
+      case "guest_cli":
+        if (!this.holds(host, ev.sandbox, ev.epoch)) {
+          await this.issueCommands(host, [{
+            type: "guest_cli_result", request: ev.request,
+            result: { status: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "this host does not hold the sandbox's lease") },
+          }]);
+          return;
+        }
+        // `ask` may wait up to 120 s: don't hold the event batch (and its ack) for it.
+        this.ctx.waitUntil(this.relayGuestCli(host, ev));
+        return;
+      case "task_exited":
+        if (!this.holds(host, ev.sandbox, ev.epoch)) return;
+        await this.agentStub(ev.agent).onTaskExited(ev.sandbox, ev.epoch, ev.task);
+        return;
+    }
+  }
+
+  /** Run a guest `nest` CLI command on the attributed agent and answer with `guest_cli_result`. */
+  private async relayGuestCli(host: string, ev: Extract<HostEvent, { type: "guest_cli" }>): Promise<void> {
+    let result: CliResult;
+    try {
+      if (!ev.agent) {
+        result = { status: "error", error: errorBody(ErrorCodes.INVALID_MESSAGE, "nest CLI call has no NEST_AGENT_ID") };
+      } else {
+        result = await this.agentStub(ev.agent).guestCli(ev.sandbox, ev.epoch, ev.command);
+      }
+    } catch (e) {
+      const ne = asNestError(e);
+      result = { status: "error", error: ne ? ne.body() : errorBody(ErrorCodes.INTERNAL, "nest CLI relay failed", true) };
+    }
+    await this.issueCommands(host, [{ type: "guest_cli_result", request: ev.request, result }]);
+  }
+
+  /**
+   * Fail every command still awaiting a result on `host` (retryable). A `sandbox_create` the new
+   * process reports running anyway is completed instead.
+   */
+  private async failPendingCommands(host: string, message: string, reported = new Map<string, SandboxReport>()): Promise<void> {
+    const pending = this.sql
+      .exec<{ cmd: string; type: string; sandbox: string | null; epoch: number | null }>(
+        "SELECT cmd, type, sandbox, epoch FROM commands WHERE host = ? AND result IS NULL ORDER BY issued_ms", host)
+      .toArray();
+    for (const c of pending) {
+      const r = c.sandbox ? reported.get(c.sandbox) : undefined;
+      const done = c.type === "sandbox_create" && r && r.epoch === c.epoch;
+      await this.onCommandResult(host, c.cmd, done ? { status: "ok" } : { status: "error", error: errorBody(ErrorCodes.INTERNAL, message, true) });
+    }
+  }
+
+  private async onCommandResult(host: string, cmd: string, outcome: Extract<HostEvent, { type: "command_result" }>["outcome"]) {
+    const row = this.sql
+      .exec<{ type: string; sandbox: string | null; agent: string | null; epoch: number | null; purpose: string | null; body: string; result: string | null; host: string }>(
+        "SELECT type, sandbox, agent, epoch, purpose, body, result, host FROM commands WHERE cmd = ?", cmd)
+      .toArray()[0];
+    if (!row || row.host !== host || row.result !== null) return; // unknown, foreign, or a redelivered result
+    this.sql.exec("UPDATE commands SET result = ?, result_ms = ? WHERE cmd = ?", JSON.stringify(outcome), Date.now(), cmd);
+
+    if (row.purpose === "stonith_fence") {
+      const body = JSON.parse(row.body) as Extract<CommandBody, { type: "fence" }>;
+      if (outcome.status === "ok") await this.queueReassign(host, body.sandboxes, false);
+      else await this.ensureStonithFence(host); // re-issue: leases stay expired until a fence succeeds
+      return;
+    }
+    if (row.type === "agent_stop" && outcome.status === "ok" && row.agent) {
+      this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", row.agent, host);
+    }
+    if (outcome.status === "error") {
+      if (row.sandbox && row.epoch !== null) await this.sandbox(row.sandbox).commandFailed(host, row.type, row.epoch, outcome.error);
+      if (row.agent && row.type === "agent_start") {
+        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND cmd = ?", row.agent, cmd);
+        await this.agentStub(row.agent).startFailed(host, outcome.error);
+      }
+    }
+  }
+
+  private async onCommitRequest(host: string, ev: CommitRequestEvent): Promise<void> {
+    const outcome = await this.sandbox(ev.sandbox).commit(host, ev);
+    await this.issueCommands(host, [{ type: "commit_result", request: ev.request, sandbox: ev.sandbox, outcome }]);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Commands
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Queue commands for a host: persisted, delivered reliably in order, each with exactly one result.
+   * Secret values must arrive as BrokerDO references; they are resolved only when sent.
+   */
+  async issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): Promise<string[]> {
+    const now = Date.now();
+    const commands = bodies.map((body) => ({ cmd: newId("cmd_"), issued_ms: now, ...body }));
+    for (const c of commands) {
+      const sandbox = "sandbox" in c ? c.sandbox : c.type === "sandbox_fork" ? c.child : null;
+      const epoch = "epoch" in c ? c.epoch : c.type === "sandbox_fork" ? c.child_epoch : null;
+      const agent = "agent" in c ? c.agent : null;
+      this.sql.exec(
+        `INSERT INTO commands (cmd, host, type, sandbox, agent, epoch, purpose, body, issued_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        c.cmd, host, c.type, sandbox, agent, epoch, purpose, JSON.stringify(c), now,
+      );
+      if (c.type === "agent_start") {
+        this.sql.exec("INSERT INTO host_agents (agent, host, cmd) VALUES (?, ?, ?) ON CONFLICT(agent) DO UPDATE SET host = excluded.host, cmd = excluded.cmd",
+          c.agent, host, c.cmd);
+      }
+    }
+    const msg = this.rel.push(host, (seq) => ({ type: "commands" as const, seq, commands }));
+    const ws = this.socketFor(host);
+    if (ws) await this.sendResolved(ws, [msg]);
+    return commands.map((c) => c.cmd);
+  }
+
+  /** Result of a command, once the host reported it. */
+  async commandResult(cmd: string): Promise<unknown> {
+    const row = this.sql.exec<{ result: string | null }>("SELECT result FROM commands WHERE cmd = ?", cmd).toArray()[0];
+    return row?.result ? (JSON.parse(row.result) as unknown) : null;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Placement and leases
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Choose a host, record the lease and send `sandbox_create`. `null` when no capacity. Refuses a
+   * sandbox that already holds a lease: a lease is only ever granted to one host at a time.
+   */
+  async place(req: PlaceRequest): Promise<string | null> {
+    const existing = this.lease(req.sandbox);
+    if (existing) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `sandbox ${req.sandbox} already holds a lease (epoch ${existing.epoch} on ${existing.host})`, 409);
+    }
+    const candidates = this.sql
+      .exec<HostRow>("SELECT * FROM hosts WHERE role = 'burst' AND status = 'active'")
+      .toArray()
+      .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host));
+    if (!candidates.length) return null;
+    const load = (h: string) => this.leasesOf(h).length;
+    const warm = (h: HostRow) => {
+      if (!req.from || !h.capacity) return false;
+      return (JSON.parse(h.capacity) as Capacity).warm.includes(req.from.id);
+    };
+    candidates.sort((a, b) => Number(warm(b)) - Number(warm(a)) || load(a.host) - load(b.host));
+    const host = candidates[0]!.host;
+    this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired) VALUES (?, ?, ?, 0)", req.sandbox, host, req.epoch);
+    await this.issueCommands(host, [{
+      type: "sandbox_create",
+      sandbox: req.sandbox,
+      workstream: req.workstream,
+      epoch: req.epoch,
+      image: req.image,
+      resources: req.resources,
+      policy: req.policy,
+      ...(req.from ? { from: req.from } : {}),
+    }]);
+    return host;
+  }
+
+  /** Drop a sandbox's lease (destroyed, or about to be re-placed after a failed create). */
+  async releaseLease(sandbox: string, epoch?: number): Promise<void> {
+    if (epoch === undefined) this.sql.exec("DELETE FROM leases WHERE sandbox = ?", sandbox);
+    else this.sql.exec("DELETE FROM leases WHERE sandbox = ? AND epoch = ?", sandbox, epoch);
+  }
+
+  async leaseOf(sandbox: string): Promise<{ host: string; epoch: number; expired: boolean } | null> {
+    const l = this.lease(sandbox);
+    return l ? { host: l.host, epoch: l.epoch, expired: l.expired === 1 } : null;
+  }
+
+  /** A connected, active controller host for captains. */
+  async controllerHost(): Promise<string | null> {
+    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE role = 'controller' AND status = 'active'").toArray();
+    return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
+  }
+
+  async hostStatus(host: string): Promise<{ status: HostStatus; connected: boolean; last_rx: number | null } | null> {
+    const h = this.host(host);
+    return h ? { status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx } : null;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Lease expiry, STONITH, token rotation
+  // ---------------------------------------------------------------------------------------------
+
+  override async alarm(): Promise<void> {
+    await this.deadlines.runDue(Date.now(), async (key) => {
+      if (key === ALARM_TICK) await this.tick();
+    });
+  }
+
+  private async tick(): Promise<void> {
+    const now = Date.now();
+    const expiry = DEFAULT_LEASE_TIMING.cp_expiry_ms;
+    for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status IN ('active', 'draining')").toArray()) {
+      if (h.last_rx !== null && now - h.last_rx >= expiry && this.leasesOf(h.host).some((l) => !l.expired)) await this.expireHost(h.host);
+    }
+    for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'stonith_pending'").toArray()) {
+      await this.pollStonith(h);
+    }
+    for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status IN ('active', 'draining')").toArray()) {
+      const ws = this.socketFor(h.host);
+      if (ws) await this.ensureStonithFence(h.host);
+      if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
+    }
+    await this.processReassign();
+    this.sql.exec("DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?", now - COMMAND_RETENTION_MS);
+    this.sql.exec("DELETE FROM enroll_tokens WHERE used_ms IS NOT NULL AND used_ms < ?", now - ENROLL_TOKEN_RETENTION_MS);
+    const busy = this.sql.exec("SELECT 1 FROM hosts WHERE status IN ('active', 'draining', 'stonith_pending')").toArray().length
+      || this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length;
+    if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
+  }
+
+  private async rotateToken(ws: WebSocket, host: string): Promise<void> {
+    const h = this.host(host);
+    if (!h) return;
+    const exp = Date.now() + num(this.env.HOST_TOKEN_TTL_MS, 3_600_000);
+    const token = await issueHostToken(this.env.HOST_TOKEN_SECRET, { host, cell: h.cell, role: h.role, exp });
+    this.sql.exec("UPDATE hosts SET token_exp = ? WHERE host = ?", exp, host);
+    this.send(ws, { type: "host_token", token, expires_ms: exp });
+  }
+
+  private ec2(): Ec2 | null {
+    if (this.ec2Override !== undefined) return this.ec2Override;
+    const { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, AWS_REGION: region } = this.env;
+    return id && secret && region ? new AwsEc2(id, secret, region) : null;
+  }
+
+  /** CP-side lease expiry: no sandbox on this host may run anywhere else until STONITH is confirmed. */
+  private async expireHost(host: string): Promise<void> {
+    this.sql.exec("UPDATE leases SET expired = 1 WHERE host = ?", host);
+    this.sql.exec("UPDATE hosts SET status = 'stonith_pending' WHERE host = ?", host);
+    for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "lease expired");
+    const row = this.host(host)!;
+    const ec2 = this.ec2();
+    if (row.instance_id && ec2) {
+      try {
+        await ec2.terminate(row.instance_id);
+      } catch (e) {
+        console.error("FleetDO: TerminateInstances failed; will retry", e);
+      }
+      await this.pollStonith(row);
+    }
+    // Without an instance id or EC2 access, STONITH waits for the host to reconnect and fence, or for
+    // an operator to confirm (`confirmHostDead`). Never double-run.
+  }
+
+  private async pollStonith(h: HostRow): Promise<void> {
+    const ec2 = this.ec2();
+    if (!h.instance_id || !ec2) return;
+    try {
+      const state = await ec2.state(h.instance_id);
+      if (isDead(state)) await this.confirmHostDead(h.host);
+      else if (state === "running" || state === "pending" || state === "stopping" || state === "stopped") {
+        await ec2.terminate(h.instance_id);
+      }
+    } catch (e) {
+      console.error("FleetDO: STONITH poll failed; will retry", e);
+    }
+  }
+
+  /**
+   * A reachable host with expired leases must fence them before they are reassigned. Re-issued on
+   * every hello, every tick and after a failed fence until one succeeds.
+   */
+  private async ensureStonithFence(host: string): Promise<void> {
+    const queued = new Set(this.sql.exec<{ sandbox: string }>("SELECT sandbox FROM reassign_queue").toArray().map((r) => r.sandbox));
+    const expired = this.leasesOf(host).filter((l) => l.expired && !queued.has(l.sandbox)).map((l) => l.sandbox);
+    if (!expired.length) return;
+    const covered = new Set<string>();
+    for (const r of this.sql.exec<{ body: string }>(
+      "SELECT body FROM commands WHERE host = ? AND purpose = 'stonith_fence' AND result IS NULL", host).toArray()) {
+      for (const s of (JSON.parse(r.body) as { sandboxes: string[] }).sandboxes) covered.add(s);
+    }
+    const missing = expired.filter((s) => !covered.has(s));
+    if (missing.length) await this.issueCommands(host, [{ type: "fence", sandboxes: missing, reason: "lease expired" }], "stonith_fence");
+  }
+
+  /** STONITH confirmed (EC2 says terminated, or an operator confirmed): reassign every lease. */
+  async confirmHostDead(host: string): Promise<void> {
+    const h = this.host(host);
+    if (!h) return;
+    if (h.status !== "dead") {
+      this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", host);
+      for (const ws of this.ctx.getWebSockets(host)) ws.close(4410, "host declared dead");
+    }
+    await this.queueReassign(host, this.leasesOf(host).map((l) => l.sandbox), true);
+  }
+
+  /** Queue leases for reassignment and work the queue; failures are retried from the alarm. */
+  private async queueReassign(host: string, sandboxes: string[], hostDead: boolean): Promise<void> {
+    for (const sandbox of sandboxes) {
+      const lease = this.lease(sandbox);
+      if (!lease || lease.host !== host) continue;
+      this.sql.exec("INSERT OR IGNORE INTO reassign_queue (sandbox, host, epoch, host_dead) VALUES (?, ?, ?, ?)",
+        sandbox, host, lease.epoch, hostDead ? 1 : 0);
+    }
+    await this.processReassign();
+  }
+
+  /** Idempotent per sandbox: drop the old lease, then have SandboxDO grant a new one elsewhere. */
+  private async processReassign(): Promise<void> {
+    const rows = this.sql
+      .exec<{ sandbox: string; host: string; epoch: number; host_dead: number }>("SELECT sandbox, host, epoch, host_dead FROM reassign_queue")
+      .toArray();
+    for (const r of rows) {
+      try {
+        const lease = this.lease(r.sandbox);
+        if (lease && lease.host === r.host && lease.epoch === r.epoch) this.sql.exec("DELETE FROM leases WHERE sandbox = ?", r.sandbox);
+        await this.sandbox(r.sandbox).leaseLost(r.host, r.epoch, r.host_dead === 1);
+        this.sql.exec("DELETE FROM reassign_queue WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
+      } catch (e) {
+        this.sql.exec("UPDATE reassign_queue SET attempts = attempts + 1 WHERE sandbox = ?", r.sandbox);
+        console.error(`FleetDO: reassigning ${r.sandbox} failed; will retry`, e);
+      }
+    }
+    if (this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length && !this.deadlines.has(ALARM_TICK)) {
+      await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+
+  private host(host: string): (HostRow & { cell: string; nestd_instance: string | null }) | undefined {
+    return this.sql.exec<HostRow & { cell: string; nestd_instance: string | null }>("SELECT * FROM hosts WHERE host = ?", host).toArray()[0];
+  }
+
+  private lease(sandbox: string): LeaseRow | undefined {
+    return this.sql.exec<LeaseRow>("SELECT * FROM leases WHERE sandbox = ?", sandbox).toArray()[0];
+  }
+
+  private leasesOf(host: string): LeaseRow[] {
+    return this.sql.exec<LeaseRow>("SELECT * FROM leases WHERE host = ?", host).toArray();
+  }
+
+  private sandbox(id: string) {
+    return this.env.SANDBOX.get(this.env.SANDBOX.idFromName(id));
+  }
+
+  private agentStub(id: string) {
+    return this.env.AGENT.get(this.env.AGENT.idFromName(id));
+  }
+}

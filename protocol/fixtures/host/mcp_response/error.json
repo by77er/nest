@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "id": 2,
+  "error": {
+    "code": "hands_unbound",
+    "message": "this agent has no sandbox bound",
+    "retryable": false
+  }
+}

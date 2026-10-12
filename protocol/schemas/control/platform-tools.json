@@ -1,0 +1,685 @@
+[
+  {
+    "name": "notify",
+    "description": "Send a short message to your captain, to the user (via Discord), or to another agent's inbox. Does not wait for a reply.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string",
+          "description": "Recipient: 'captain', 'user', or an agent id (agt_...)."
+        },
+        "message": {
+          "type": "string",
+          "description": "Message text."
+        },
+        "urgency": {
+          "type": "string",
+          "description": "normal or high (high may @-mention the user).",
+          "enum": [
+            "normal",
+            "high"
+          ]
+        }
+      },
+      "required": [
+        "to",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker",
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "emit",
+    "description": "Emit a structured workstream event (progress, blocked, pr_opened, completed, failed). Decision events wake your captain.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "event": {
+          "type": "string",
+          "description": "Event type.",
+          "enum": [
+            "progress",
+            "blocked",
+            "pr_opened",
+            "completed",
+            "failed"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "description": "Human-readable summary."
+        },
+        "url": {
+          "type": "string",
+          "description": "Related URL, e.g. the PR."
+        },
+        "title": {
+          "type": "string",
+          "description": "PR title (pr_opened)."
+        }
+      },
+      "required": [
+        "event",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "ask",
+    "description": "Ask your captain or the user a question. Answers within ~2 minutes are returned directly; otherwise the call returns 'pending', you should end your turn, and the answer arrives as your next input.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string",
+          "description": "The question."
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Suggested answers."
+        },
+        "to": {
+          "type": "string",
+          "description": "captain (default) or user.",
+          "enum": [
+            "captain",
+            "user"
+          ]
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker",
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "spawn_agent",
+    "description": "Start a new worker agent in a workstream, optionally bound to a sandbox.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "workstream": {
+          "type": "string",
+          "description": "Workstream id (ws_...)."
+        },
+        "task": {
+          "type": "string",
+          "description": "Initial instructions."
+        },
+        "sandbox": {
+          "type": "string",
+          "description": "Sandbox to bind hands to (sbx_...); omit to create one."
+        },
+        "fork_session_of": {
+          "type": "string",
+          "description": "Fork the conversation of this agent (agt_...)."
+        }
+      },
+      "required": [
+        "workstream",
+        "task"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "fork_sandbox",
+    "description": "Fork a sandbox (copy-on-write). disk_only (default) is cheap; live also copies running processes.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "string",
+          "description": "Sandbox to fork (sbx_...)."
+        },
+        "mode": {
+          "type": "string",
+          "description": "Fork mode.",
+          "enum": [
+            "disk_only",
+            "live"
+          ]
+        },
+        "read_only": {
+          "type": "boolean",
+          "description": "Child is for inspection; egress limited to base policy."
+        }
+      },
+      "required": [
+        "sandbox"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker",
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "attach",
+    "description": "Bind (or with sandbox omitted, unbind) a worker agent's hands to a sandbox in the same workstream.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "description": "Agent id (agt_...)."
+        },
+        "sandbox": {
+          "type": "string",
+          "description": "Sandbox id (sbx_...)."
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "read_transcript",
+    "description": "Read an agent's normalized transcript without waking anything.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "description": "Agent id (agt_...)."
+        },
+        "since_seq": {
+          "type": "integer",
+          "description": "Return entries after this 1-based entry number (a line of the session JSONL)."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max entries (default 200)."
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker",
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "checkpoint",
+    "description": "Commit the bound sandbox's disk now (e.g. before a risky step).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "note": {
+          "type": "string",
+          "description": "Why."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "expose_port",
+    "description": "Expose a port of the bound sandbox as a preview URL (behind Access by default).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "description": "Guest port.",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "share": {
+          "type": "boolean",
+          "description": "Also mint an expiring public share link (operator-only; refused for agents)."
+        },
+        "host_header": {
+          "type": "string",
+          "description": "Host header sent to the server.",
+          "enum": [
+            "localhost",
+            "preserve"
+          ]
+        }
+      },
+      "required": [
+        "port"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "brokered",
+    "description": "Run a brokered action (e.g. github.create_pr, email.send, http.request) executed outside the sandbox with secrets the sandbox never sees. Available actions depend on your grants; tools/list may also expose them as dedicated tools.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "Action name, e.g. github.create_pr."
+        },
+        "args": {
+          "type": "object",
+          "description": "Action arguments."
+        }
+      },
+      "required": [
+        "action",
+        "args"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "worker",
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "spawn_workstream",
+    "description": "Create a workstream with a goal/spec and budget, and start its first worker.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "goal": {
+          "type": "string",
+          "description": "One-line goal."
+        },
+        "spec": {
+          "type": "string",
+          "description": "Full spec for the first worker."
+        },
+        "repo": {
+          "type": "string",
+          "description": "Repository URL, if any."
+        },
+        "budget_turns": {
+          "type": "integer",
+          "description": "Turn budget."
+        },
+        "image": {
+          "type": "string",
+          "description": "Sandbox image (default nest-base)."
+        }
+      },
+      "required": [
+        "goal",
+        "spec"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "send",
+    "description": "Send a message to a workstream's agents (or one agent). interrupt=true interrupts the current turn.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "workstream": {
+          "type": "string",
+          "description": "Workstream id."
+        },
+        "agent": {
+          "type": "string",
+          "description": "Specific agent (optional)."
+        },
+        "message": {
+          "type": "string",
+          "description": "Message."
+        },
+        "interrupt": {
+          "type": "boolean",
+          "description": "Interrupt the current turn first."
+        }
+      },
+      "required": [
+        "workstream",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "list_workstreams",
+    "description": "List workstreams in your scope with their state.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "description": "Filter.",
+          "enum": [
+            "active",
+            "parked",
+            "done",
+            "all"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "get_status",
+    "description": "Detailed status of a workstream: agents, sandboxes, recent events, open asks, budget.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "workstream": {
+          "type": "string",
+          "description": "Workstream id."
+        }
+      },
+      "required": [
+        "workstream"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "wait_events",
+    "description": "Wait up to timeout_ms (max 120000) for workstream events matching the filter. Prefer ending your turn: you are woken on decision events.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "workstreams": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Workstream ids (default: all in scope)."
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Event types."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "description": "Max wait.",
+          "maximum": 120000
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "approve",
+    "description": "Approve a pending request (ask or approval-gated action).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "string",
+          "description": "ask_... or approval id."
+        },
+        "answer": {
+          "type": "string",
+          "description": "Answer text / chosen option."
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "deny",
+    "description": "Deny a pending request.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "string",
+          "description": "ask_... or approval id."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why."
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "merge",
+    "description": "Mark a workstream's result as accepted (e.g. merge its PR via brokered action) and wind it down.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "workstream": {
+          "type": "string",
+          "description": "Workstream id."
+        },
+        "note": {
+          "type": "string",
+          "description": "Note."
+        }
+      },
+      "required": [
+        "workstream"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": true
+  },
+  {
+    "name": "kill",
+    "description": "Stop a workstream: stop its agents and archive its sandboxes.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "workstream": {
+          "type": "string",
+          "description": "Workstream id."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why."
+        }
+      },
+      "required": [
+        "workstream",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "delegate",
+    "description": "Have a read-only worker inspect something (code, a sandbox, a repo) in an ephemeral fork and report back. Use this instead of reading code yourself.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task": {
+          "type": "string",
+          "description": "What to find out."
+        },
+        "sandbox": {
+          "type": "string",
+          "description": "Sandbox to inspect (forked, never modified)."
+        },
+        "repo": {
+          "type": "string",
+          "description": "Repository to clone if no sandbox."
+        },
+        "mode": {
+          "type": "string",
+          "description": "Fork mode.",
+          "enum": [
+            "disk_only",
+            "live"
+          ]
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "memory_read",
+    "description": "Read a key from your durable memory (notes per workstream).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Key."
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "memory_write",
+    "description": "Write a key in your durable memory.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Key."
+        },
+        "value": {
+          "type": "string",
+          "description": "Value (markdown)."
+        }
+      },
+      "required": [
+        "key",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  },
+  {
+    "name": "notify_user",
+    "description": "Message the user on Discord. urgency high @-mentions them.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string",
+          "description": "Message."
+        },
+        "urgency": {
+          "type": "string",
+          "description": "normal or high.",
+          "enum": [
+            "normal",
+            "high"
+          ]
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "roles": [
+      "captain"
+    ],
+    "requires_approval": false
+  }
+]

@@ -1,0 +1,6 @@
+{
+  "type": "hello_ack",
+  "protocol_version": 1,
+  "host_id": "hst_01jb7h0st1",
+  "host_role": "burst"
+}

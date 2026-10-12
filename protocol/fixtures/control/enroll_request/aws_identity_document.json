@@ -1,0 +1,11 @@
+{
+  "protocol_version": 1,
+  "role": "burst",
+  "cell": "aws-us-east-1",
+  "proof": {
+    "type": "aws_identity_document",
+    "document_b64": "eyJpbnN0YW5jZUlkIjoiaS0wYWJjMTIzIn0=",
+    "pkcs7_b64": "MIAGCSqGSIb3DQEHAqCAMIACAQEx..."
+  },
+  "proxy_ca_csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nMIHzMIGbAgEAMDkxNzA1BgNV...\n-----END CERTIFICATE REQUEST-----\n"
+}

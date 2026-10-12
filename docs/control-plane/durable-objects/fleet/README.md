@@ -1,0 +1,27 @@
+# FleetDO
+
+One per cell: hosts, enrollment, leases, placement, STONITH and command delivery.
+
+- **Enrollment:**
+  - **One-time enrollment token** minted by the operator for a role.
+  - **AWS signed identity document**, accepted only for an instance this control plane recorded as launched in this cell, as the recorded role, from the recorded account and region, and only once.
+  - **Order:** the CSR for nest-proxy's intermediate CA is validated before the proof is consumed, so a bad CSR doesn't burn a token.
+  - **Host tokens** are short-lived and rotated over the fleet channel. A host that was disconnected past expiry can still open the fleet channel for 24 h, and gets a fresh token right after hello.
+- **Fleet channel:** nestd connects here and heartbeats every 5 s, which renews the leases of every sandbox on the host. See [../../../sandbox/fencing/](../../../sandbox/fencing/).
+- **Hello reconciliation:**
+  - **Sandboxes:** reported sandboxes we don't honor are fenced, and the reported state of honored ones is adopted. `head`/`dirty` are informational.
+  - **Agents:** a brain whose `agent_start` completed but that the host no longer reports is marked detached. Reported ones keep the reported state.
+  - **New nestd process:** a new `instance_id` resets both seq lineages. Unfinished commands then fail retryably, except a `sandbox_create` the host reports running, which completes.
+- **Commands:** persisted, delivered in order, exactly one result each.
+- **Leases:**
+  - **One lease, one host:** placement refuses a sandbox that already holds a lease, and a lease is never overwritten.
+  - **Expiry:** a host silent for 30 s has its leases expired.
+- **STONITH:**
+  - **EC2:** terminates the old instance (signed with `aws4fetch`) and waits until it's `shutting-down`/`terminated`.
+  - **Without EC2:** waits for the host to reconnect and fence. The fence is re-issued on every hello, every tick and after a failure, until one succeeds.
+  - **Operator:** can confirm a host dead.
+  - **Reassignment:** an idempotent per-sandbox queue that the alarm retries, so one failure can't strand the others.
+- **Placement order:** a host with the snapshot warm, then the least loaded connected burst host.
+- **Not built:**
+  - **The autoscaler** (`RunInstances` plus recording the launch). See [../../../compute/autoscaling/](../../../compute/autoscaling/).
+  - **Command batching:** one frame per `issueCommands` call.

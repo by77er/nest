@@ -1,0 +1,102 @@
+{
+  "cmd": "cmd_01jb7q0002",
+  "issued_ms": 1760270400000,
+  "type": "sandbox_create",
+  "sandbox": "sbx_01jb7m9z8d",
+  "workstream": "ws_01jb7j8r2t",
+  "epoch": 1,
+  "image": "nest-base-2026.10",
+  "resources": {
+    "vcpus": 2,
+    "memory_mib": 2048,
+    "disk_gib": 10
+  },
+  "policy": {
+    "version": 7,
+    "allow": [
+      {
+        "host": "registry.npmjs.org",
+        "ports": [
+          443
+        ],
+        "layer": "base"
+      },
+      {
+        "host": "github.com",
+        "ports": [
+          443
+        ],
+        "layer": "base"
+      },
+      {
+        "host": "*.githubusercontent.com",
+        "ports": [
+          443
+        ],
+        "layer": "base"
+      },
+      {
+        "host": "api.stripe.com",
+        "ports": [
+          443
+        ],
+        "layer": "workstream"
+      },
+      {
+        "host": "example.com",
+        "ports": [
+          80,
+          443
+        ],
+        "layer": "sandbox",
+        "expires_ms": 1760277600000
+      }
+    ],
+    "passthrough": [
+      "pinned.example.net"
+    ],
+    "inject": [
+      {
+        "name": "github",
+        "hosts": [
+          "github.com",
+          "api.github.com",
+          "*.githubusercontent.com"
+        ],
+        "placeholder": "nest-ph-github-7f3a",
+        "locations": [
+          {
+            "type": "authorization_bearer"
+          },
+          {
+            "type": "authorization_basic_password"
+          }
+        ]
+      },
+      {
+        "name": "stripe",
+        "hosts": [
+          "api.stripe.com"
+        ],
+        "placeholder": "nest-ph-stripe-19c2",
+        "locations": [
+          {
+            "type": "header",
+            "name": "Stripe-Key"
+          }
+        ]
+      }
+    ],
+    "tcp": [
+      {
+        "host": "db.example.com",
+        "port": 5432
+      }
+    ],
+    "limits": {
+      "max_connections": 256,
+      "bandwidth_mbps": 200,
+      "max_inspected_body_bytes": 536870912
+    }
+  }
+}

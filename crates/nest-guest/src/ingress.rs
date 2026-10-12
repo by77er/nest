@@ -1,0 +1,311 @@
+//! Ingress (port 10000): raw TCP splice to an in-guest port, or a framed PTY.
+
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::io;
+use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::process::ExitStatusExt;
+use std::sync::Arc;
+use std::time::Duration;
+
+use nest_protocol::guest::frame::Kind;
+use nest_protocol::guest::{IngressRequest, IngressResponse, PtyControl, error_code};
+use nest_protocol::model::AgentId;
+use nix::pty::{Winsize, openpty};
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncWriteExt, ReadHalf};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tracing::debug;
+
+use crate::exec::agent_env;
+use crate::framed::{FramedReader, err, parse_json, write_data, write_json};
+use crate::state::Guest;
+use crate::transport::Conn;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub async fn serve(guest: Arc<Guest>, conn: Conn) {
+    let mut reader = FramedReader::new(conn);
+    let req: IngressRequest = match reader.next().await {
+        Ok(Some(f)) => match parse_json(&f) {
+            Ok(r) => r,
+            Err(e) => {
+                let (mut conn, _) = reader.into_parts();
+                let _ = write_json(&mut conn, &IngressResponse::Rejected { error: e }).await;
+                return;
+            }
+        },
+        _ => return,
+    };
+    match req {
+        IngressRequest::Tcp { port } => tcp(reader, port).await,
+        IngressRequest::Pty { agent_id, cols, rows, command, cwd, env } => {
+            let (conn, rest) = reader.into_parts();
+            if let Err(e) = pty(&guest, conn, rest, agent_id, cols, rows, command, cwd, env).await {
+                debug!(error = %e, "pty session ended with error");
+            }
+        }
+    }
+}
+
+async fn tcp(reader: FramedReader<Conn>, port: u16) {
+    let mut target = None;
+    for addr in [SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([172, 16, 0, 2], port)), SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))] {
+        if let Ok(Ok(s)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            target = Some((s, addr));
+            break;
+        }
+    }
+    let (mut conn, rest) = reader.into_parts();
+    let Some((mut stream, addr)) = target else {
+        let _ = write_json(
+            &mut conn,
+            &IngressResponse::Rejected {
+                error: err(error_code::CONNECT_REFUSED, format!("nothing is listening on port {port}"), true),
+            },
+        )
+        .await;
+        return;
+    };
+    let accepted = IngressResponse::Accepted { connected: Some(addr.to_string()), pid: None };
+    if write_json(&mut conn, &accepted).await.is_err() {
+        return;
+    }
+    if !rest.is_empty() && stream.write_all(&rest).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut conn, &mut stream).await;
+}
+
+/// Master side of a PTY as an async fd.
+struct Master(AsyncFd<OwnedFd>);
+
+impl Master {
+    fn new(fd: OwnedFd) -> io::Result<Self> {
+        let raw = fd.as_raw_fd();
+        // SAFETY: valid fd we own.
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        Ok(Master(AsyncFd::new(fd)?))
+    }
+
+    async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let mut guard = self.0.readable().await?;
+            match guard.try_io(|fd| {
+                // SAFETY: buf is valid for writes of buf.len() bytes.
+                let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+            }) {
+                Ok(Ok(n)) => return Ok(n),
+                // EIO: the slave side is gone (child exited).
+                Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => return Ok(0),
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    async fn write_all(&self, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let mut guard = self.0.writable().await?;
+            match guard.try_io(|fd| {
+                // SAFETY: data is valid for reads.
+                let n = unsafe { libc::write(fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+                if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+            }) {
+                Ok(Ok(n)) => data = &data[n..],
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
+        Ok(())
+    }
+
+    fn raw(&self) -> RawFd {
+        self.0.get_ref().as_raw_fd()
+    }
+}
+
+fn set_winsize(fd: RawFd, cols: u16, rows: u16) {
+    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCSWINSZ with a valid winsize pointer.
+    unsafe {
+        libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
+    }
+}
+
+fn signal_by_name(name: &str) -> Option<Signal> {
+    let n = name.trim_start_matches("SIG");
+    format!("SIG{n}").parse().ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pty(
+    guest: &Arc<Guest>,
+    conn: Conn,
+    rest: Vec<u8>,
+    agent_id: Option<AgentId>,
+    cols: u16,
+    rows: u16,
+    command: Option<Vec<String>>,
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
+) -> io::Result<()> {
+    let (rd, mut wr) = tokio::io::split(conn);
+    // Agent context, if any.
+    let ctx = match &agent_id {
+        Some(a) => {
+            let inner = guest.inner.lock().unwrap();
+            inner.agents.get(a).map(|rt| (agent_env(&rt.slot, guest.config.run_as), Some(rt.cwd.clone())))
+        }
+        None => Some((crate::exec::base_env(guest.config.run_as), None)),
+    };
+    let Some((mut envs, agent_cwd)) = ctx else {
+        let a = agent_id.as_ref().map(|a| a.0.clone()).unwrap_or_default();
+        let e = err(error_code::UNKNOWN_AGENT, format!("agent {a} is not attached"), false);
+        return write_json(&mut wr, &IngressResponse::Rejected { error: e }).await;
+    };
+    if !envs.iter().any(|(k, _)| k == "TERM") {
+        envs.push(("TERM".into(), "xterm-256color".into()));
+    }
+    for (k, v) in env {
+        envs.retain(|(ek, _)| *ek != k);
+        envs.push((k, v));
+    }
+    let argv = command.filter(|c| !c.is_empty()).unwrap_or_else(|| {
+        let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/bash".into());
+        vec![shell, "-l".into()]
+    });
+    let dir = cwd
+        .or(agent_cwd)
+        .or_else(|| std::env::var("HOME").ok())
+        .filter(|d| std::path::Path::new(d).is_dir())
+        .unwrap_or_else(|| "/".into());
+    let cgroup = agent_id.as_ref().and_then(|a| guest.cgroups.leaf(&a.0, "pty", &crate::state::random_hex(4)));
+
+    let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let pair = openpty(&ws, None).map_err(io::Error::from)?;
+    let slave_fd = pair.slave.as_raw_fd();
+    let procs = cgroup.map(|p| CString::new(p.join("cgroup.procs").into_os_string().into_encoded_bytes()).unwrap());
+    let run_as = guest.config.run_as;
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(&dir).env_clear().envs(envs);
+    // SAFETY: async-signal-safe calls only.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for target in 0..3 {
+                if libc::dup2(slave_fd, target) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if let Some(p) = &procs {
+                let fd = libc::open(p.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd >= 0 {
+                    libc::write(fd, b"0".as_ptr().cast(), 1);
+                    libc::close(fd);
+                }
+            }
+            if let Some((uid, gid)) = run_as
+                && (libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0) {
+                    return Err(io::Error::last_os_error());
+                }
+            Ok(())
+        });
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let e = err(error_code::INTERNAL, format!("could not start {}: {e}", argv[0]), false);
+            return write_json(&mut wr, &IngressResponse::Rejected { error: e }).await;
+        }
+    };
+    drop(pair.slave);
+    let pid = child.id().unwrap_or(0);
+    let master = Arc::new(Master::new(pair.master)?);
+    write_json(&mut wr, &IngressResponse::Accepted { connected: None, pid: Some(pid) }).await?;
+
+    // Host → PTY.
+    let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
+    let input = {
+        let master = master.clone();
+        tokio::spawn(async move { host_to_pty(rd, rest, master, pid).await; let _ = hangup_tx.send(()).await; })
+    };
+
+    // PTY → host, until the shell exits (EIO) or the host hangs up.
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut hung_up = false;
+    loop {
+        tokio::select! {
+            r = master.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => if write_data(&mut wr, &buf[..n]).await.is_err() { hung_up = true; break; },
+            },
+            _ = hangup_rx.recv() => { hung_up = true; break; }
+        }
+    }
+    if hung_up {
+        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGHUP);
+        input.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        return Ok(());
+    }
+    let status = child.wait().await?;
+    input.abort();
+    let exit = PtyControl::Exit { code: status.code(), signal: status.signal() };
+    write_json(&mut wr, &exit).await?;
+    wr.shutdown().await
+}
+
+async fn host_to_pty(rd: ReadHalf<Conn>, rest: Vec<u8>, master: Arc<Master>, pid: u32) {
+    let mut reader = FramedReader::new(rd);
+    // Bytes already buffered past the request frame are framed data too.
+    let mut pre = nest_protocol::guest::frame::Decoder::new();
+    pre.push(&rest);
+    let mut pending = std::collections::VecDeque::new();
+    while let Ok(Some(f)) = pre.next_frame() {
+        pending.push_back(f);
+    }
+    loop {
+        let f = match pending.pop_front() {
+            Some(f) => f,
+            None => match reader.next().await {
+                Ok(Some(f)) => f,
+                _ => return,
+            },
+        };
+        match f.kind {
+            Kind::Data => {
+                if master.write_all(&f.payload).await.is_err() {
+                    return;
+                }
+            }
+            Kind::Json => match parse_json::<PtyControl>(&f) {
+                Ok(PtyControl::Resize { cols, rows }) => set_winsize(master.raw(), cols, rows),
+                Ok(PtyControl::Signal { signal }) => {
+                    if let Some(sig) = signal_by_name(&signal) {
+                        // Foreground process group of the terminal, else the session leader's group.
+                        // SAFETY: tcgetpgrp on a valid fd.
+                        let fg = unsafe { libc::tcgetpgrp(master.raw()) };
+                        let pg = if fg > 0 { fg } else { pid as i32 };
+                        let _ = killpg(Pid::from_raw(pg), sig);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+}
+

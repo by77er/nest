@@ -1,0 +1,9 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 300,
+  "ts_ms": 1760270400000,
+  "turn": "trn_01jb7t0a",
+  "type": "turn_started",
+  "input_kind": "user"
+}

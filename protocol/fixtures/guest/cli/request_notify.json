@@ -1,0 +1,9 @@
+{
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "command": {
+    "command": "notify",
+    "to": "user",
+    "message": "deploy preview ready on port 5173",
+    "urgency": "high"
+  }
+}

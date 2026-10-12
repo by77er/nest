@@ -1,0 +1,12 @@
+{
+  "protocol_version": 1,
+  "call_id": "toolu_01C",
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "epoch": 7,
+  "op": {
+    "tool": "TaskOutput",
+    "task_id": "bg_7f3a",
+    "block": true,
+    "timeout": 30000
+  }
+}

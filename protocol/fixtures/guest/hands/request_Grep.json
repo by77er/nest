@@ -1,0 +1,17 @@
+{
+  "protocol_version": 1,
+  "call_id": "toolu_01I",
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "epoch": 7,
+  "op": {
+    "tool": "Grep",
+    "pattern": "TODO\\(",
+    "path": "/workspace/src",
+    "glob": "*.ts",
+    "output_mode": "content",
+    "-n": true,
+    "-C": 2,
+    "-i": false,
+    "head_limit": 50
+  }
+}

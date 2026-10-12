@@ -1,0 +1,26 @@
+{
+  "name": "nest-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local --persist-to .wrangler/state",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.0",
+    "@cloudflare/workers-types": "5.20261012.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "wrangler": "4.149.0"
+  },
+  "dependencies": {
+    "@peculiar/x509": "2.1.0",
+    "aws4fetch": "1.0.20",
+    "reflect-metadata": "0.2.2",
+    "zod": "4.6.6"
+  }
+}

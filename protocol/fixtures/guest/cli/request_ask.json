@@ -1,0 +1,12 @@
+{
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "command": {
+    "command": "ask",
+    "question": "Bump major version of react-router?",
+    "options": [
+      "yes",
+      "no"
+    ],
+    "wait_s": 60
+  }
+}

@@ -1,0 +1,259 @@
+{
+  "$comment": "Hands tools served by nest-mcp as mcp__nest__<name>. Inputs are forwarded verbatim as HandsRequest.op (plus \"tool\": <name>). Spec: docs/interfaces/host-guest/.",
+  "server": "nest",
+  "tools": [
+    {
+      "name": "Bash",
+      "description": "Executes a bash command in the sandbox and returns its combined stdout/stderr.\n\n- Each command runs in a new process. The working directory carries over between calls (a `cd` persists); exported environment variables do not.\n- Quote paths that contain spaces. Prefer absolute paths.\n- `timeout` is in milliseconds: default 120000 (2 minutes), maximum 600000 (10 minutes). A foreground command that reaches its timeout is moved to the background instead of being killed (unless it starts with `sleep`); the result gives its task ID and output file.\n- Set `run_in_background: true` for long-running processes such as dev servers or watch builds. The result returns immediately with a task ID and the path of an output file; read it with Read or poll with TaskOutput, and stop it with TaskStop. Background commands run for at most `timeout` ms (default 30 minutes, maximum 2 hours).\n- Output longer than ~30000 characters is saved to a file in the sandbox; the result contains the file path and a preview of the first 2000 characters. Failed commands show a head-and-tail excerpt instead.\n- Use Read, Edit, Write, Glob and Grep instead of cat/sed/echo/find/grep where they fit.\n- Network access goes through the sandbox's egress policy; a request denied by policy fails with HTTP 403 and an explanation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The command to execute"
+          },
+          "timeout": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional timeout in milliseconds (foreground max 600000; background max 7200000)"
+          },
+          "description": {
+            "type": "string",
+            "description": "Clear, concise description of what this command does in 5-10 words, in active voice"
+          },
+          "run_in_background": {
+            "type": "boolean",
+            "description": "Set to true to run this command in the background. Use TaskOutput or Read on the output file to read the output later."
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "TaskOutput",
+      "description": "Retrieves output and status of a background task started with Bash `run_in_background` (or moved to the background at its timeout). Returns the task status, exit code if finished, and the most recent output (the full output is in the task's output file; Read it for everything). Set `block: true` to wait up to `timeout` ms for the task to finish.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "The ID of the background task"
+          },
+          "block": {
+            "type": "boolean",
+            "description": "Wait for the task to finish before returning"
+          },
+          "timeout": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum time to wait in milliseconds when block is true (default 30000, max 600000)"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "TaskStop",
+      "description": "Stops a running background task by ID. Its process tree is killed; the output file is kept.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "The ID of the background task to stop"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Read",
+      "description": "Reads a file from the sandbox filesystem.\n\n- `file_path` must be absolute.\n- By default reads up to 2000 lines from the start of the file. Use `offset` (1-based line number) and `limit` to read a range; read large files in pages.\n- Output uses `cat -n` format: line number, a tab, then the line. Lines longer than 2000 characters are truncated.\n- A whole-file read over 256 KB, or a range over the output limit, returns an error asking for a smaller range or a Grep search.\n- Images (PNG, JPEG, GIF, WebP) are returned as images you can see. PDFs: pass `pages` (e.g. \"1-5\", max 20 pages) for documents over 10 pages. Jupyter notebooks return all cells with outputs.\n- Reads only files, not directories; list directories with `ls` via Bash.\n- Reading a file is required before editing or overwriting it with Edit or Write.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "The absolute path to the file to read"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The line number to start reading from"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The number of lines to read"
+          },
+          "pages": {
+            "type": "string",
+            "description": "Page range for PDF files, e.g. \"1-5\" (max 20 pages per request)"
+          }
+        },
+        "required": [
+          "file_path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Write",
+      "description": "Writes a file to the sandbox filesystem, creating parent directories as needed and overwriting any existing file.\n\n- `file_path` must be absolute.\n- An existing file must have been read with Read first in this session; otherwise the write fails.\n- Prefer Edit for partial changes to existing files.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "The absolute path to the file to write"
+          },
+          "content": {
+            "type": "string",
+            "description": "The content to write to the file"
+          }
+        },
+        "required": [
+          "file_path",
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Edit",
+      "description": "Performs exact string replacement in a file.\n\n- You must Read the file before editing it.\n- `old_string` must match the file exactly, including whitespace and indentation (do not include the line-number prefix from Read output).\n- The edit fails if `old_string` is not found, or appears more than once and `replace_all` is false; add surrounding context to make it unique, or set `replace_all` to replace every occurrence.\n- If the file changed on disk since you read it, the edit still applies when `old_string` matches the current content exactly once; the result says so, and you should re-read before edits that depend on surrounding content.\n- Only valid UTF-8 (or UTF-16LE with BOM) files can be edited.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "The absolute path to the file to modify"
+          },
+          "old_string": {
+            "type": "string",
+            "description": "The text to replace"
+          },
+          "new_string": {
+            "type": "string",
+            "description": "The text to replace it with (must be different from old_string)"
+          },
+          "replace_all": {
+            "type": "boolean",
+            "description": "Replace all occurrences of old_string (default false)"
+          }
+        },
+        "required": [
+          "file_path",
+          "old_string",
+          "new_string"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Glob",
+      "description": "Fast file pattern matching in the sandbox.\n\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\".\n- Returns matching file paths sorted by modification time (newest first), at most 100; a truncation note appears when the cap is hit.\n- Does not respect .gitignore.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "The glob pattern to match files against"
+          },
+          "path": {
+            "type": "string",
+            "description": "The directory to search in. Defaults to the current working directory."
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Grep",
+      "description": "A search tool built on ripgrep, run in the sandbox.\n\n- Full regex syntax (ripgrep, not POSIX grep): literal braces need escaping, e.g. `interface\\{\\}`.\n- Filter files with `glob` (e.g. \"**/*.tsx\") or `type` (e.g. \"py\", \"rust\").\n- `output_mode`: \"files_with_matches\" (default, paths only), \"content\" (matching lines; supports -n, -A, -B, -C), \"count\" (matches per file plus a total).\n- Patterns match within single lines unless `multiline` is true.\n- Respects .gitignore; pass a path directly to search an ignored file.\n- `head_limit` limits entries returned (default 250); `offset` skips entries for paging.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "The regular expression pattern to search for in file contents"
+          },
+          "path": {
+            "type": "string",
+            "description": "File or directory to search in. Defaults to the current working directory."
+          },
+          "glob": {
+            "type": "string",
+            "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\")"
+          },
+          "type": {
+            "type": "string",
+            "description": "File type to search (rg --type), e.g. js, py, rust, go"
+          },
+          "output_mode": {
+            "type": "string",
+            "enum": [
+              "content",
+              "files_with_matches",
+              "count"
+            ],
+            "description": "Output mode (default files_with_matches)"
+          },
+          "-i": {
+            "type": "boolean",
+            "description": "Case insensitive search"
+          },
+          "-n": {
+            "type": "boolean",
+            "description": "Show line numbers in output (content mode)"
+          },
+          "-A": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Lines to show after each match (content mode)"
+          },
+          "-B": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Lines to show before each match (content mode)"
+          },
+          "-C": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Lines to show before and after each match (content mode)"
+          },
+          "multiline": {
+            "type": "boolean",
+            "description": "Enable multiline mode where . matches newlines and patterns can span lines"
+          },
+          "head_limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Limit output to the first N entries (default 250)"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Skip the first N entries before applying head_limit"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

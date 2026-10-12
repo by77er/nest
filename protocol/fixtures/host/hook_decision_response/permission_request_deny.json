@@ -1,0 +1,12 @@
+{
+  "output": {
+    "hookSpecificOutput": {
+      "hookEventName": "PermissionRequest",
+      "decision": {
+        "behavior": "deny",
+        "message": "not permitted by policy",
+        "interrupt": false
+      }
+    }
+  }
+}

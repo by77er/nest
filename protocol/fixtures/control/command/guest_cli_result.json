@@ -1,0 +1,10 @@
+{
+  "cmd": "cmd_01jb7q0031",
+  "issued_ms": 1760270400500,
+  "type": "guest_cli_result",
+  "request": "req_01jb7r9c1d",
+  "result": {
+    "status": "pending",
+    "question_id": "ask_01jb7s2k"
+  }
+}

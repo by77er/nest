@@ -1,0 +1,23 @@
+[package]
+name = "nest-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+nest-protocol = { path = "../nest-protocol" }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+anyhow = "1.0.104"
+futures-util = "0.3.34"
+nest-runner = { path = "../nest-runner" }
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-tungstenite = "0.30.0"
+
+[[bin]]
+name = "nest"
+path = "src/main.rs"

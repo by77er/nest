@@ -1,0 +1,10 @@
+{
+  "type": "tools_call",
+  "id": 2,
+  "name": "Bash",
+  "arguments": {
+    "command": "cargo test",
+    "timeout": 600000
+  },
+  "tool_use_id": "toolu_01AbC"
+}

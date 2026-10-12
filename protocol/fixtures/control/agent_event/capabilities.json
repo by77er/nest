@@ -1,0 +1,11 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 2,
+  "ts_ms": 1760270399000,
+  "type": "capabilities",
+  "capabilities": [
+    "interrupt_receipt_v1",
+    "interrupt_cancel_queued_v1"
+  ]
+}

@@ -1,0 +1,30 @@
+//! nestd: the privileged per-host daemon (`docs/compute/nestd/`).
+
+use std::path::PathBuf;
+
+use anyhow::Context;
+use clap::Parser;
+use nestd::config::Config;
+
+#[derive(Parser)]
+#[command(version, about = "nest host daemon")]
+struct Args {
+    /// Path to the JSON config file.
+    #[arg(long, default_value = "/etc/nest/nestd.json")]
+    config: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+    let args = Args::parse();
+    let text = std::fs::read_to_string(&args.config).with_context(|| format!("read {}", args.config.display()))?;
+    let cfg: Config = serde_json::from_str(&text).with_context(|| format!("parse {}", args.config.display()))?;
+    let enrolled = nestd::enroll::enroll(&cfg).await.context("enrollment")?;
+    tracing::info!(host = %enrolled.host, fleet = %enrolled.fleet_ws_url, "enrolled");
+    let host = nestd::host::Host::start(cfg, enrolled, None).await?;
+    tracing::info!(host = %host.inner.host_id(), "nestd running");
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutting down");
+    Ok(())
+}

@@ -1,0 +1,18 @@
+{
+  "type": "tools_call",
+  "id": 2,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "test result: ok. 12 passed"
+      },
+      {
+        "type": "image",
+        "data": "iVBORw0KGgo=",
+        "mimeType": "image/png"
+      }
+    ],
+    "isError": false
+  }
+}

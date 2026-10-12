@@ -1,0 +1,13 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 306,
+  "ts_ms": 1760270400006,
+  "turn": "trn_01jb7t0a",
+  "type": "error",
+  "error": {
+    "code": "internal",
+    "message": "claude exited with status 1",
+    "retryable": true
+  }
+}

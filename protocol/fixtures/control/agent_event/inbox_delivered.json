@@ -1,0 +1,8 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 9,
+  "ts_ms": 1760270412000,
+  "type": "inbox_delivered",
+  "message": "msg_01jb7v2c"
+}

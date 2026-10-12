@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "nest": {
+      "type": "stdio",
+      "command": "/usr/lib/nest/nest",
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "NEST_AGENT_ID": "agt_EXAMPLE",
+        "NEST_MCP_SOCK": "/run/nest/runner/mcp.sock"
+      },
+      "timeout": 900000,
+      "alwaysLoad": true
+    }
+  }
+}

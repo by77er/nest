@@ -1,0 +1,14 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 307,
+  "ts_ms": 1760270400007,
+  "turn": "trn_01jb7t0a",
+  "type": "usage",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 20,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  }
+}

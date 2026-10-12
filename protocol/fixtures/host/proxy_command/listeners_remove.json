@@ -1,0 +1,8 @@
+{
+  "type": "listeners_remove",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "listener_ids": [
+    5
+  ]
+}

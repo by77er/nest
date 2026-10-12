@@ -1,0 +1,11 @@
+{
+  "type": "inbox",
+  "seq": 11,
+  "message": {
+    "id": "msg_01jb7v4",
+    "from": "captain:agt_01jb7n5c0p",
+    "text": "Stop the refactor; the API changed upstream. Rebase on main first.",
+    "interrupt": true,
+    "ts_ms": 1760270400000
+  }
+}

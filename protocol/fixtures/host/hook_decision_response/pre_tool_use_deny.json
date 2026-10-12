@@ -1,0 +1,9 @@
+{
+  "output": {
+    "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "deny",
+      "permissionDecisionReason": "force push needs approval; request esc_3 sent to your captain. You will be told the answer."
+    }
+  }
+}

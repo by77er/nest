@@ -1,0 +1,11 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 303,
+  "ts_ms": 1760270400003,
+  "turn": "trn_01jb7t0a",
+  "type": "tool_result",
+  "call_id": "toolu_01AbC",
+  "is_error": false,
+  "summary": "42 passing"
+}

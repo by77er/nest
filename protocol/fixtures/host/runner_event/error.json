@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "agent": "agt_01jb7n0w1e",
+  "error": {
+    "code": "internal",
+    "message": "spawn claude: No such file or directory",
+    "retryable": false
+  }
+}

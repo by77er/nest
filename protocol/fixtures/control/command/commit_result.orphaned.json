@@ -1,0 +1,20 @@
+{
+  "cmd": "cmd_01jb7q0016",
+  "issued_ms": 1760270400000,
+  "type": "commit_result",
+  "request": "req_01jb7r1x30",
+  "sandbox": "sbx_01jb7m2a4c",
+  "outcome": {
+    "status": "orphaned",
+    "generation": {
+      "id": "gen_01jb7s0o9p",
+      "sandbox": "sbx_01jb7m2a4c",
+      "parent": "gen_01jb7p1k2m",
+      "epoch": 3,
+      "kind": "disk_only",
+      "disk_manifest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "reason": "salvage",
+      "created_ms": 1760270400000
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "id": 5,
+  "type": "prepare_snapshot",
+  "drop_caches": true,
+  "fsfreeze": [
+    "/workspace"
+  ]
+}

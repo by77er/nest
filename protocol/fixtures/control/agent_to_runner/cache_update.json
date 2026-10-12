@@ -1,0 +1,24 @@
+{
+  "type": "cache_update",
+  "seq": 13,
+  "cache": {
+    "version": 5,
+    "rules": [
+      {
+        "pattern": "mcp__nest__Bash(git push --force*)",
+        "decision": "deny",
+        "reason": "force push not granted"
+      },
+      {
+        "pattern": "mcp__nest__*",
+        "decision": "allow"
+      },
+      {
+        "pattern": "brokered",
+        "decision": "ask"
+      }
+    ],
+    "inbox": [],
+    "max_stop_continuations": 5
+  }
+}

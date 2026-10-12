@@ -1,0 +1,12 @@
+{
+  "protocol_version": 1,
+  "call_id": "toolu_01E",
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "epoch": 7,
+  "op": {
+    "tool": "Read",
+    "file_path": "/workspace/src/main.ts",
+    "offset": 120,
+    "limit": 80
+  }
+}

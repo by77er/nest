@@ -1,0 +1,10 @@
+{
+  "agent": "agt_01jb7n0w1e",
+  "epoch": 4,
+  "seq": 305,
+  "ts_ms": 1760270400005,
+  "turn": "trn_01jb7t0a",
+  "type": "rate_limited",
+  "retry_after_ms": 900000,
+  "detail": "api_retry: rate_limit (subscription 5-hour window)"
+}

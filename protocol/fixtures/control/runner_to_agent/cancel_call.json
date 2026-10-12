@@ -1,0 +1,6 @@
+{
+  "type": "cancel_call",
+  "seq": 57,
+  "call": "cal_trn01jb7t0a-3",
+  "reason": "timed out after 150 s in the runner; returned outcome_unknown to the model"
+}

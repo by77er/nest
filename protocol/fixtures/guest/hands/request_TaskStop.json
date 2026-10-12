@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "call_id": "toolu_01D",
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "epoch": 7,
+  "op": {
+    "tool": "TaskStop",
+    "task_id": "bg_7f3a"
+  }
+}

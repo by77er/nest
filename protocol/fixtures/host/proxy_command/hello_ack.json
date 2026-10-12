@@ -1,0 +1,6 @@
+{
+  "type": "hello_ack",
+  "protocol_version": 1,
+  "host_id": "hst_01jb7h0st1",
+  "nestd_boot_id": "b7c1e2d4-0f3a-4c5e-9b8d-7a6f5e4d3c2b"
+}

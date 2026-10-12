@@ -1,0 +1,13 @@
+{
+  "id": 2,
+  "type": "agent_attach",
+  "slot": {
+    "agent_id": "agt_01JB8Z3K7Q2M",
+    "proxy_port": 3129,
+    "cwd": "/workspace",
+    "env": {
+      "CI": "1"
+    },
+    "memory_max_bytes": 4294967296
+  }
+}

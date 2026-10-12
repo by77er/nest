@@ -1,0 +1,12 @@
+{
+  "protocol_version": 1,
+  "call_id": "toolu_01B",
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "epoch": 7,
+  "op": {
+    "tool": "Bash",
+    "command": "npm run dev",
+    "description": "Start vite dev server",
+    "run_in_background": true
+  }
+}

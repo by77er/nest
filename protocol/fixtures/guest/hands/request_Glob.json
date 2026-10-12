@@ -1,0 +1,11 @@
+{
+  "protocol_version": 1,
+  "call_id": "toolu_01H",
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "epoch": 7,
+  "op": {
+    "tool": "Glob",
+    "pattern": "src/**/*.ts",
+    "path": "/workspace"
+  }
+}

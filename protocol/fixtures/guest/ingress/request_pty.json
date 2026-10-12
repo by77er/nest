@@ -1,0 +1,14 @@
+{
+  "mode": "pty",
+  "agent_id": "agt_01JB8Z3K7Q2M",
+  "cols": 120,
+  "rows": 40,
+  "command": [
+    "/bin/bash",
+    "-l"
+  ],
+  "cwd": "/workspace",
+  "env": {
+    "TERM": "xterm-256color"
+  }
+}
