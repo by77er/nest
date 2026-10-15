@@ -1,6 +1,6 @@
 # Platform tools
 
-> **Current contract.** The `Roles` column and the captain-only tools are what's implemented. The design replaces them with grant-filtered tools and channels; see [Planned: role-free model](../../README.md#planned-role-free-model) and [agents/tools/](../../../agents/tools/).
+> **Implemented contract.** For the designed catalog, see [agents/tools/](../../../agents/tools/) and [pending contract changes](../../README.md#pending-contract-changes).
 
 **Canonical catalog:** `protocol/schemas/control/platform-tools.json`, a list of `ToolDef{name, description, input_schema, roles, requires_approval}`. Every input schema is an object schema with `additionalProperties: false`. The **control plane's tool registry** and nest-mcp's `tools/list` both come from this file. Hands tools (`Bash`, `Read`, …) are defined by the [host ↔ guest](../../host-guest/) boundary and aren't part of it.
 

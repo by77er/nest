@@ -7,7 +7,7 @@ Hosts, grouped into **cells**. A cell is compute plus its object store in one pr
 | Role | Runs | Lifecycle |
 |---|---|---|
 | **[Controller](controller/)** | Brains without hands (agent runner), Discord gateway. **No sandboxes.** | Always on, small, stateless, any provider |
-| **Burst** | **Every sandbox** (Firecracker) plus their workers' brains (agent runner, outside the VMs) | Spot, scales to zero |
+| **Burst** | **Every sandbox** (Firecracker) plus the brains of agents attached to them (agent runner, outside the VMs) | Spot, scales to zero |
 
 ## Choice of provider
 

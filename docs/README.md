@@ -2,7 +2,7 @@
 
 A personal platform that combines sandboxes with durable agents. Long-lived Claude Code agents run on my own subscription. Their brains run on hosts, and their hands work in isolated VMs on commodity cloud compute. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. Every component exists, and each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. **The code still encodes roles and workstreams** (see [Migration](#migration-to-the-role-free-model)).
+**Status:** early implementation. Every component exists, and each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. Channels, grants and spawn specs are designed but not built (see `control-plane/README.md`).
 
 ## Goals
 
@@ -40,16 +40,6 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `e2e/` | Local end-to-end harness |
 
 UFFD memory snapshots and the ublk lazy disk are designed but not built.
-
-### Migration to the role-free model
-
-The design moved to role-free agents, grants and channels. The code hasn't yet:
-- `AgentRole` (`worker`/`captain`) drives placement, tool filtering, launch defaults and the per-role setup token.
-- WorkstreamDO, `WorkstreamEvent` and the workstream scoping of `notify`/`ask` are still the coordination path. ChannelDO doesn't exist.
-- The tool catalog is role-filtered, and has neither channel tools nor `grant`/`revoke`.
-- Egress policy has a `workstream` layer, and injection secrets have workstream-scoped names.
-
-The contract changes are listed in [interfaces/](interfaces/#planned-role-free-model).
 
 ## Primitives
 
@@ -148,14 +138,14 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
   - whether `system/init` arrives before the first user message
   - the stdin user-message shape without `session_id`
   - the `_meta` key carrying the tool-use id on MCP `tools/call`
-  - that `--restricted` honors the worker's built-in tool list
+  - that `--restricted` honors the `--tools` built-in list
   - that `notifications/cancelled` reaches MCP on interrupt
   - the `claude auth status` JSON
   - that `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` keeps `NEST_*`
   - the transcript path encoding
 
   See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
-- **Role-free model:**
+- **Agents, grants and channels:**
   - **Revocation:** whether revoking a grant also revokes the grants passed on from it. See [agents/tools/](agents/tools/).
   - **Owner removal:** whether an owner's resources are stopped with it or passed to its owner. See [agents/](agents/).
   - **Sandbox programs:** which channel tools the in-sandbox `nest` CLI may use, and with whose grants. See [agents/tools/](agents/tools/).

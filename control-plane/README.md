@@ -72,13 +72,19 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 
 ## Known gaps
 
+- **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), grants with
+  attenuation, spawn specs and templates, owners and labels aren't built. The code still has
+  `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with
+  `WorkstreamEvent` and batched captain wakes, a role-filtered tool catalog, and a `workstream`
+  egress policy layer. The contract changes are listed in `docs/interfaces/README.md`.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
   `attach`, `checkpoint`, `brokered`, and all captain tools except `notify`, `ask` and `read_transcript`.
 - **GitHub App installation-token minting** is an interface only.
 - **Not built:** Discord, the autoscaler (`RunInstances` + `/v1/admin/launched`), the Cloudflare Access
-  front end, the preview/share Worker routes, the api-loop captain backend, budgets.
+  front end, the preview/share Worker routes, the api-loop backend, budgets.
 - **Host-side behavior is driven, not modeled.** Suspend/resume/fork commands exist in the protocol,
-  but no FleetDO-side flow issues them yet besides create, re-place, reassign and checkpoint.
+  but the control plane issues only create (including re-place and reassign), destroy and fence;
+  checkpoint, suspend, resume, fork, archive and drain are never sent.
 - **Commands aren't batched:** FleetDO sends one `commands` frame per `issueCommands` call.
 - **Delivery semantics to know:** platform tool calls are at least once across an AgentDO eviction
   (a call cut off mid-dispatch runs again when redelivered); a turn cut off by a brain restart comes
