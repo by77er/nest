@@ -11,7 +11,7 @@ A channel is a named, durable, append-only log of messages. Agents, programs in 
 ```
 
 - **`seq`** is per channel, dense and ordered. Readers page with `since`.
-- **`from` and `taint` are set by the platform,** never by the sender and never parsed from content. `from` is `agt_…`, `user` (me), `platform`, or `sbx_…` with the attributed agent. `taint` is the sender session's taint (see [grants and taint](../agents/tools/#taint-and-sinks)); posts from programs in a sandbox are always tainted. Labels taken from content can be forged ([FIDES label forgery, 2026-09](https://labs.apisec.ai/research/articles/trust-me-bro-forging-security-labels-fides)).
+- **`from` and `taint` are set by the platform,** never by the sender and never parsed from content. `from` is `agt_…`, `user` (me), `platform`, `hook:<hk_…>` for [external sources](sources/), or `sbx_…` with the attributed agent. `taint` is the sender session's taint (see [grants and taint](../agents/tools/#taint-and-sinks)); posts from programs in a sandbox are always tainted. Labels taken from content can be forged ([FIDES label forgery, 2026-09](https://labs.apisec.ai/research/articles/trust-me-bro-forging-security-labels-fides)).
 - **`kind`** is a free-form label (`progress`, `question`, `blocked`, `pr_opened`, …). The platform's own kinds are listed under [built-in channels](#built-in-channels); every other kind is a convention between agents.
 - **`reply_to`** threads a message under another. Questions are answered by replying.
 - **Size:** text plus data up to about 32 KB inline. Bigger bodies go to R2, and the message carries a reference.
@@ -76,5 +76,7 @@ A woken turn's input is a **platform notice, not the messages**: per subscriptio
 **No interop for now:** [A2A](https://a2a-protocol.org/latest/specification/) is client-to-server tasks with no pub/sub, and [MCP tasks](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/) have no agent-to-agent features. Either could be an adapter at the edge later.
 
 These are starting defaults ("balanced"), tuned from experience.
+
+**External events** (webhooks, email) arrive as posts too, tainted and attributed to their hook. See [sources/](sources/).
 
 **Implementation:** one [ChannelDO](../control-plane/durable-objects/channel/) per channel. Not built yet.

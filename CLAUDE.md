@@ -16,11 +16,11 @@ The docs are **hierarchical**. Each directory's `README.md` summarizes that subs
 
 ```
 docs/
-  control-plane/   Cloudflare Workers + Durable Objects (fleet, sandbox, agent, channel, broker), API (Discord bot), activator
+  control-plane/   Cloudflare Workers + Durable Objects (fleet, sandbox, agent, channel, hook, broker), API (Discord bot), activator
   compute/         cells, controller/burst hosts, nestd, autoscaling, provisioning
   sandbox/         drivers, state (memory, disk, object store), fencing, networking (egress, ingress), guest agent (hands server)
   agents/          backends (pluggable), capabilities (pluggable tool bundles), runner (Claude Code on the host), hands (RPC tools), sessions, state tracking, tools and grants
-  channels/        named durable logs: post, read, subscribe (inboxes, events, questions, memory)
+  channels/        named durable logs: post, read, subscribe (inboxes, events, questions, memory); external sources (webhooks, email)
   orchestration/   patterns, not code: captain and worker templates, workstream conventions; quota-aware scheduling
   security/        model access, identity (credential injection, OIDC), credentials inventory
   data/            what lives in DO SQLite, R2 and S3

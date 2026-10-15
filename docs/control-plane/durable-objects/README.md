@@ -8,6 +8,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [sandbox/](sandbox/) | Epoch and placement, generation head, attachments, idle state, policy, ports |
 | [agent/](agent/) | Turn queue, deliveries, session stream, state, spec and grants, tool relay |
 | [channel/](channel/) | Message log, subscriptions and cursors, fan-out |
+| [hook/](hook/) | One webhook: verification (through BrokerDO), mapping, dedup, posting to its channel |
 | [broker/](broker/) | Claude setup tokens, injected secrets, GitHub App (interface only) |
 
 ## Conventions

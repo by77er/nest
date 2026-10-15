@@ -25,9 +25,10 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **Sandboxes** carry `owner` and `labels`; sandbox commands carry no grouping field.
 - **Platform events** are posts to `<sbx>/events` and `<agt>/events`: `ChannelMessage{seq, ts_ms, from, kind?, text, data?, reply_to?, key?, mentions?}`, with kinds such as `port_opened`, `egress_denied`, `egress_alert` and `orphaned_work`.
 - **`EgressPolicy` layers** are `base`, `sandbox` and `grant`.
-- **The platform tool catalog** is filtered by grants and has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`), `message`, `agent_spawn`, `adopt`, `list`, `wake_at`/`wake_cancel`, and `grant`/`revoke`, plus each `mcp` or `api` capability's tools (`<capability>_<tool>`, `<capability>_request`). See [agents/tools/](../agents/tools/).
+- **The platform tool catalog** is filtered by grants and has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`), `message`, `agent_spawn`, `adopt`, `list`, `wake_at`/`wake_cancel`, `hook_create`/`hook_delete`, and `grant`/`revoke`, plus each `mcp` or `api` capability's tools (`<capability>_<tool>`, `<capability>_request`). See [agents/tools/](../agents/tools/).
 - **Guest CLI:** `nest post`, `nest read`, `nest expose`.
-- **IDs:** `chn_` (channel) and `tpl_` (template).
+- **IDs:** `chn_` (channel), `tpl_` (template) and `hk_` (hook).
+- **Webhook route:** `POST /v1/hooks/<hk_…>` on the Worker (see [sources](../channels/sources/)).
 - **Channel messages** carry `taint`, set by the platform.
 - **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit.
 - **Hands journal:** guest → nestd → AgentDO intent and outcome events keyed by `(agent, epoch, tool_use_id)`.

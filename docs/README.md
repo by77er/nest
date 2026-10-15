@@ -61,7 +61,7 @@ Captains, workstreams and teams are patterns built from these. See [orchestratio
 ```
 patterns        captains · workstreams (templates + conventions) · quota scheduling  orchestration/
 agents          backends · runner · hands · sessions · state tracking · tools          agents/
-channels        logs · subscriptions · wakes                                           channels/
+channels        logs · subscriptions · wakes · external sources (webhooks, email)      channels/
 sandbox         drivers · state · fencing · networking · guest agent                   sandbox/
 compute         cells · controller/burst hosts · nestd · autoscaling                   compute/
 control plane   Cloudflare Workers + Durable Objects · API · activator                 control-plane/
@@ -93,6 +93,7 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | Attach | Bind an agent's hands to a sandbox |
 | Fork | Copy-on-write copy of a sandbox (disk only, or live with memory) |
 | Channel | A named, durable, append-only message log. Inboxes, platform events, questions, shared state and memory are all channels. |
+| Hook | A verified webhook (or email address) that turns each external event into a tainted post on a channel |
 | Subscription | An agent's wake rule on a channel: a filter plus how matches are delivered |
 | Grant | Permission for a principal to do an action on a resource. Passed on only by someone who holds it. |
 | Owner | Whoever created a resource. Holds every grant on it. |
@@ -132,6 +133,7 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | The memory key index injected at session start is capped at 200 keys, newest first; agents tidy memory as they go, plus a weekly consolidation wake | [agents/](agents/) |
 | Agents schedule their own wakes with `wake_at` (once or repeating), a capability backed by AgentDO alarms | [agents/capabilities/](agents/capabilities/) |
 | MCP servers are remote only; a local server runs as a sandbox service exposed through ingress | [agents/capabilities/](agents/capabilities/) |
+| External events (webhooks, email) become tainted channel posts through verified hooks; polling is an agent's job, not a platform source | [channels/sources/](channels/sources/) |
 | An agent with memory resumes if its last turn was under an hour ago or its session is under ~50k tokens, otherwise starts fresh from memory | [agents/](agents/) |
 | Channel message bodies older than 7 days move to R2; the index and keyed view stay in SQLite | [channels/](channels/) |
 | Egress policy is per sandbox (forks inherit); no shared policy objects | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/) |
