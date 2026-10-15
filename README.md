@@ -37,4 +37,4 @@ cd control-plane && npm install && npm test
 e2e/run.sh
 ```
 
-CI runs these on every pull request. How nest ships and maintains itself: [operations](docs/operations/README.md).
+CI runs these on every pull request; [dev/](dev/README.md) covers CI, deploys and repo settings.

@@ -29,7 +29,7 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **Guest CLI:** `nest post`, `nest read`, `nest expose`.
 - **IDs:** `chn_` (channel), `tpl_` (template) and `hk_` (hook) are added; `ws_` goes.
 - **Webhook route:** `POST /v1/hooks/<hk_…>` on the Worker (see [sources](../channels/sources/)). Hook maps produce keys, and subscription filters take `keys` prefixes.
-- **Metrics:** hosts send a `metrics` frame on the fleet channel every 60 s; `GET /v1/health` makes one round trip to each DO class (see [operations/](../operations/)).
+- **Metrics:** hosts send a `metrics` frame on the fleet channel every 60 s; `GET /v1/health` makes one round trip to each DO class (see [metrics](../control-plane/metrics/) and [upgrades](../control-plane/#upgrades)).
 - **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit.
 - **Hands journal:** guest → nestd → AgentDO intent and outcome events keyed by `(agent, epoch, tool_use_id)`.
 - **`GenerationRecord`** gains `restore_abi` and `session{offset, last_tool_use}`.

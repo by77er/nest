@@ -3,7 +3,7 @@
 | Credential | Stored | Seen by | Notes |
 |---|---|---|---|
 | Claude setup token (subscription OAuth, 1 year, model requests only) | BrokerDO | Claude Code process env on hosts, **never a VM** | Separate named tokens per template, e.g. captains vs workers (to verify that they're independent and revocable) |
-| GitHub App private key | BrokerDO | Control plane | Mints installation tokens per binding (1 hour, narrowed to the binding's repos and permissions); see [operations/github/](../../operations/github/) |
+| GitHub App private key | BrokerDO | Control plane | Mints installation tokens per binding (1 hour, narrowed to the binding's repos and permissions); see [BrokerDO](../../control-plane/durable-objects/broker/) |
 | GitHub installation tokens | nest-proxy memory | Proxy only | Injected by placeholder |
 | Other injected secrets | BrokerDO → nest-proxy memory | Proxy only | Per host and grant |
 | Brokered-action secrets (email, …) | BrokerDO | Never a VM | Executed outside the VM |
@@ -17,5 +17,4 @@
 | Webhook secrets (`hook:<hk_…>`) | BrokerDO | Control plane only | BrokerDO verifies signatures itself; brokered actions send the secret straight to the provider |
 | MCP server and API credentials (`cap:<name>`) | BrokerDO | Control plane only | One per `mcp` or `api` capability; attached per call |
 | api-loop API key (future) | BrokerDO | Control plane only | |
-| Cloudflare deploy token and account ID | GitHub environment `production` | `deploy.yml` and `rollback.yml` on `main` only | Agents never hold them; see [operations/deploy/](../../operations/deploy/) |
-| Cloudflare Analytics read tokens | BrokerDO (`cap:metrics`) and the `production` environment | Control plane; the deploy health window | Account Analytics Read only |
+| Cloudflare Analytics read token | BrokerDO (`cap:metrics`) | Control plane only | Account Analytics Read only; see [metrics](../../control-plane/metrics/) |

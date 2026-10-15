@@ -1,6 +1,6 @@
 # Metrics
 
-**Decided: runtime metrics go to [Workers Analytics Engine](https://developers.cloudflare.com/analytics/analytics-engine/),** written by the Worker and every DO, and read with SQL. It's on the same platform as the control plane, needs no new service or credential on hosts, and bills only for points written and queries run. Not built.
+**Decided: nest's runtime metrics go to [Workers Analytics Engine](https://developers.cloudflare.com/analytics/analytics-engine/),** written by the Worker and every DO, and read with SQL. It's on the same platform as the control plane, needs no new service or credential on hosts, and bills only for points written and queries run. Not built.
 
 ## Writing
 
@@ -32,5 +32,5 @@ One dataset, `nest_metrics`, bound to the Worker (and so to every DO). Each even
 ## Reading
 
 - **The `metrics` [capability](../../agents/capabilities/)** gives `metrics_query(sql)`. The control plane runs the query against the SQL API (`POST …/accounts/<id>/analytics_engine/sql`) with a token that has only Account Analytics Read, stored in BrokerDO as `cap:metrics`. It's a builtin rather than an `api` capability because the SQL API takes `POST`, which `mode: ro` refuses. Results don't taint (see above).
-- **The deploy health window** runs the same queries with the same kind of token from the `production` environment (see [deploy/](../deploy/)).
-- **No dashboards or platform alerting.** Noticing a trend is a judgment, so a [monitor agent](../../orchestration/repo-maintenance/) polls with `wake_at` and reports what matters, the same rule as [polling](../../channels/sources/#other-sources).
+- **Deploy checks** can run the same queries with their own read token.
+- **No dashboards or platform alerting.** Noticing a trend is a judgment, so a [monitor agent](../../orchestration/#example-structures) with the `metrics` capability polls with `wake_at` and reports what matters, the same rule as [polling](../../channels/sources/#other-sources).

@@ -30,3 +30,12 @@
 No secrets go in user-data. A host outside AWS (e.g. the controller host on a VPS) enrolls once with a one-time token I mint myself.
 
 **Instance metadata service (IMDS):** require IMDSv2 with hop limit 1. nest-proxy blocks link-local and private ranges for sandboxes, so a guest can never reach IMDS or the instance role's credentials.
+
+## Upgrades
+
+Hosts are replaced, never updated in place. Not built; it needs the autoscaler.
+
+- **Versions:** host binaries (nestd, nest-proxy, the runner, `nest`, the guest agent) and images are built per release into the cell's bucket.
+- **Rollout:** FleetDO holds a desired host version per cell. New hosts boot it, and old hosts are [drained](../autoscaling/) and terminated one at a time. The controller host is replaced the same way; its brains move after 30 s, like a lost host's.
+- **Rollback:** set the desired version back and replace again.
+- **Guests:** cold boots use the new rootfs. Memory snapshots keep their guest agent and restore only on hosts with a matching [restore ABI](../../sandbox/state/memory/#restore-abi), so the hands protocol stays compatible one version back.

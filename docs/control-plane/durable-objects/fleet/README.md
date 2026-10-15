@@ -25,5 +25,6 @@ One per cell: hosts, enrollment, leases, placement, STONITH and command delivery
 - **Placement packs:** among hosts whose free hugepages and vCPUs fit the sandbox, prefer one with its snapshot warm and a matching restore ABI, then the one with the fewest free hugepages that still fit, then fewest free vCPUs. Packing lets idle hosts empty out and scale to zero; spreading keeps every host partly full. An undersized hugepage pool makes Firecracker fail with SIGBUS, so hugepages are reserved, never overcommitted.
 - **Not built:**
   - **The autoscaler** (`RunInstances` plus recording the launch). See [../../../compute/autoscaling/](../../../compute/autoscaling/).
+  - **The desired host version** per cell, which drives [host upgrades](../../../compute/provisioning/#upgrades).
   - **Command batching:** one frame per `issueCommands` call.
   - **Packing:** placement is least-loaded by lease count (warm snapshots first); hugepage-aware packing and the restore-ABI match aren't built.
