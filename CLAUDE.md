@@ -22,10 +22,11 @@ docs/
   sandbox/         drivers, state (memory, disk, object store), fencing, networking (egress, ingress), guest agent (hands server)
   agents/          backends (pluggable), capabilities (pluggable tool bundles), runner (Claude Code on the host), hands (RPC tools), sessions, state tracking, tools and grants
   channels/        named durable logs: post, read, subscribe (inboxes, events, questions, memory); external sources (webhooks, email)
-  orchestration/   patterns, not code: the captain template, workstream conventions, example structures; quota-aware scheduling
+  orchestration/   patterns, not code: the captain template, workstream conventions, repo maintenance, example structures; quota-aware scheduling
   security/        model access, identity (credential injection, OIDC), credentials inventory
   data/            what lives in DO SQLite, R2 and S3
   interfaces/      boundary contracts (wire protocols, tool schemas); fixtures in protocol/fixtures/ are the source of truth
+  operations/      how nest ships itself: CI, deploy and rollback, metrics, GitHub (App, branch protection, CODEOWNERS)
   setup/           everything needed to bring nest up: accounts, credentials, where they go, what each unlocks
 ```
 

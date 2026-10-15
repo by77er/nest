@@ -9,7 +9,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [agent/](agent/) | Turn queue, deliveries, scheduled wakes, session stream, state, spec, grants, taint and budget, hands journal, tool relay |
 | [channel/](channel/) | Message log, subscriptions and cursors, fan-out |
 | [hook/](hook/) | One webhook: verification (through BrokerDO), mapping, dedup, posting to its channel |
-| [broker/](broker/) | Claude setup tokens, injected secrets, hook secrets, capability credentials, GitHub App (interface only) |
+| [broker/](broker/) | Claude setup tokens, injected secrets, hook secrets, capability credentials, GitHub App token minting |
 
 ## Conventions
 

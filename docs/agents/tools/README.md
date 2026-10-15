@@ -10,7 +10,8 @@
 | **Sandboxes** | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | Control plane |
 | **Authority** | `grant`, `revoke` | Control plane |
 | **Hooks** | `hook_create`, `hook_delete` (external events into a channel; see [sources](../../channels/sources/)) | HookDO |
-| **Brokered actions** | `github.create_pr`, `github.create_webhook`, `email.send`, `http.request(profile)` | Control plane, with secrets that never reach a sandbox |
+| **Brokered actions** | `github.create_pr`, `github.review_check`, `github.review_comment`, `github.comment`, `github.create_issue`, `github.dispatch_workflow`, `github.create_webhook`, `email.send`, `http.request(profile)` | Control plane, with secrets that never reach a sandbox |
+| **Metrics** | `metrics_query` (see [operations/metrics/](../../operations/metrics/)) | Control plane → Analytics Engine |
 
 **Messaging and memory are channel operations.** Messaging an agent is `message` (a `post` to its inbox, through the [messaging capability](../capabilities/#messaging)); notifying me is `post` to `user`. An event is a `post` with a `kind`. Asking is `post` with `await_reply_s`. Waiting for events is `subscribe`, or `read` with a wait. Memory is a private channel read by key.
 

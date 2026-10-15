@@ -82,7 +82,8 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   by free hugepages. The contract changes are listed in `docs/interfaces/README.md`.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
   `attach`, `checkpoint`, `brokered`, and all captain tools except `notify`, `ask` and `read_transcript`.
-- **GitHub App installation-token minting** is an interface only.
+- **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.
+- **Operations** (`docs/operations/`): no Analytics Engine metrics, `metrics_query`, `deploy.yml` or `rollback.yml`; `/v1/health` doesn't reach the DOs yet.
 - **Not built:** Discord, the autoscaler (`RunInstances` + `/v1/admin/launched`), the Cloudflare Access
   front end, the preview/share Worker routes, the api-loop backend, budgets.
 - **Host-side behavior is driven, not modeled.** Suspend/resume/fork commands exist in the protocol,

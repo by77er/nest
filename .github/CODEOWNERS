@@ -1,0 +1,41 @@
+# Changes to these paths need the owner's review before they merge; everything
+# else can merge on green CI plus the reviewer agent's `nest/review` check.
+# They are the paths whose changes could weaken nest's guardrails or the gates
+# on this repo. See docs/operations/github/.
+
+# The gates themselves: CI, deploys, this file, repo-level agent instructions.
+/.github/                                   @by77er
+/CLAUDE.md                                  @by77er
+/.claude/                                   @by77er
+/scripts/                                   @by77er
+
+# Dependencies (supply chain).
+/Cargo.toml                                 @by77er
+/Cargo.lock                                 @by77er
+/crates/*/Cargo.toml                        @by77er
+/control-plane/package.json                 @by77er
+/control-plane/package-lock.json            @by77er
+
+# Control plane: deploy config (bindings, DO migrations), API auth, secrets,
+# host identity, the root CA, EC2 access, and the authority checks (grants,
+# taint) once they land in src/authz/.
+/control-plane/wrangler.jsonc               @by77er
+/control-plane/src/index.ts                 @by77er
+/control-plane/src/do/broker.ts             @by77er
+/control-plane/src/lib/tokens.ts            @by77er
+/control-plane/src/lib/ca.ts                @by77er
+/control-plane/src/lib/aws-identity.ts      @by77er
+/control-plane/src/lib/ec2.ts               @by77er
+/control-plane/src/authz/                   @by77er
+
+# Hosts: egress enforcement, Claude Code launch hygiene, sandbox isolation.
+/crates/nest-proxy/                         @by77er
+/crates/nest-runner/                        @by77er
+/crates/nest-protocol/src/host.rs           @by77er
+/crates/nestd/src/net.rs                    @by77er
+/crates/nestd/src/driver/                   @by77er
+/protocol/claude-code/                      @by77er
+
+# The security design these paths implement.
+/docs/security/                             @by77er
+/docs/operations/                           @by77er

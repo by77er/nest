@@ -18,9 +18,11 @@
 | Triage in front of an expensive agent | A cheap agent subscribed to a busy channel, posting only what matters to the other's inbox |
 | Monitor | A long-lived agent with memory, subscribed to the channels or events it watches (CI hooks, a sandbox's ports), or polling a feed with `wake_at`, posting to `user` or a captain when something needs attention |
 | Personal assistant | A long-lived agent with memory, bridged to Discord, that answers me and spawns ephemeral workers for tasks |
+| Repo maintenance | A maintainer spawning a worker per task and a clean-context reviewer per PR, merging through the repo's own gates, with a monitor watching what ships. nest maintains itself this way |
 
 ## Components
 
 - [captains/](captains/): the `captain` template, and the conventions in its prompt
 - [workstreams/](workstreams/): a convention for grouping work under a label
+- [repo-maintenance/](repo-maintenance/): agents that propose, review and merge changes to a repo and watch what ships
 - [scheduling/](scheduling/): subscription quota as a resource. This one is platform mechanism.
