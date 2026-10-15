@@ -25,7 +25,7 @@ When a daily limit is exceeded, operations **fail** until 00:00 UTC, so hosts mu
 
 ## Components
 
-- [durable-objects/](durable-objects/): one DO per entity (fleet, sandbox, agent, workstream, broker)
+- [durable-objects/](durable-objects/): one DO per entity (fleet, sandbox, agent, channel, broker)
 - [api/](api/): HTTP API, dashboard, auth, triggers, user surfaces
 - [activator/](activator/): turns "X is needed" into "X is running"
 

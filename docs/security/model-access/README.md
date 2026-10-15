@@ -17,6 +17,6 @@
 - The token never enters a VM.
 - Usage stays within ordinary personal use; the [scheduler](../../orchestration/scheduling/) caps concurrency.
 
-**Platform-owned API usage:** only the future [api-loop captain backend](../../orchestration/captains/backends/api-loop/), with a key the control plane holds.
+**Platform-owned API usage:** only the future [api-loop backend](../../agents/backends/api-loop/), with a key the control plane holds.
 
 Sources: [Claude Code legal and compliance](https://code.claude.com/docs/en/legal-and-compliance), [authentication](https://code.claude.com/docs/en/authentication)

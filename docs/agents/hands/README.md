@@ -15,7 +15,7 @@ MCP tools that act on the agent's bound sandbox. `nest mcp` (a stdio shim Claude
 - **Everything runs as the sandbox user.** Bash, Grep and helpers (pdftotext, vips, convert) are spawned as that uid with the agent's environment (`HOME`, `USER`, `LOGNAME`, `SHELL` from passwd, plus `NEST_AGENT_ID` and `HTTP(S)_PROXY`). Read/Write/Edit/Glob run inside the guest agent with the user's **filesystem identity** (per-thread `setfsuid`/`setfsgid`), so permission checks and new files' ownership are the user's, not root's.
 - **Per-agent exec context:** every call carries the agent ID. The guest runs processes in that agent's cgroup (for accounting and `cgroup.kill` on interrupt).
 - **Cancellation:** an MCP cancel or a hard interrupt kills the call's process tree; in-process file tools return `[Interrupted]` and are abandoned after 2 minutes at most.
-- **Unbound agents** (captains, or agents that are detached) get a clear error.
+- **Agents without hands** (never bound, or detached) get a clear error.
 - **Schemas and descriptions are copied closely** from Claude Code's built-ins to keep them familiar to the model. Tools appear as `mcp__nest__<Name>`.
 - **Fidelity risk:** the built-ins are heavily tuned. **Spike:** run the same tasks with native tools (Claude Code inside a VM) and with hands over RPC, and compare success rate, number of turns and token use.
 - **Rejected alternative:** native tools redirected with `CLAUDE_CODE_SHELL_PREFIX` plus a filesystem mount. The prefix also wraps hooks and MCP server startup, the command it receives includes setup that refers to local files, Firecracker has no virtiofs, and pointing the working directory at the repo would let the repo's config load on the host.

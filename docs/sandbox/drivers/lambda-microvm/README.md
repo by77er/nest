@@ -16,6 +16,6 @@ AWS launched Lambda MicroVMs in June 2026. Each is a Firecracker VM per session,
 - **Egress can't be enforced outside the guest** without an always-on VPC proxy.
 - Snapshot and fork control is limited.
 
-**Not planned.** It was considered for captains, but captains have no machine now (see [captains](../../../orchestration/captains/)).
+**Not planned.** It was considered for agents without hands, but those need no machine (see [backends](../../../agents/backends/)).
 
 Sources: [AWS blog](https://aws.amazon.com/blogs/aws/run-isolated-sandboxes-with-full-lifecycle-control-aws-lambda-introduces-microvms/), [Lambda pricing](https://aws.amazon.com/lambda/pricing/)

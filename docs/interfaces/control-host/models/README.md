@@ -1,5 +1,7 @@
 # Shared models (`nest_protocol::model`)
 
+> **Current contract.** `WorkstreamEvent`, `AgentRole` and the `workstream` policy layer are implemented and planned to go; see [Planned: role-free model](../../README.md#planned-role-free-model).
+
 | Model | Shape (JSON) | Notes |
 |---|---|---|
 | IDs | `hst_`, `sbx_`, `agt_`, `ws_`, `gen_`, `ses_`, plus `trn_` (turn), `cal_` (tool call), `cmd_`, `req_`, `ask_`, `msg_` | Opaque prefixed strings |

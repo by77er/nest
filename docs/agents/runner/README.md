@@ -1,10 +1,10 @@
 # Agent runner
 
 A Rust component on every host that runs brains:
-- **On burst hosts,** for the workers whose sandboxes live there. RPC to their hands is local vsock.
-- **On the controller host,** for captains, which have no hands.
+- **On burst hosts,** for agents whose sandboxes live there. RPC to their hands is local vsock.
+- **On the controller host,** for agents without hands.
 
-## Invocation (worker)
+## Invocation (agent with hands)
 
 The canonical command line, environment and managed settings are in [../../interfaces/host-internal/runner-claude/](../../interfaces/host-internal/runner-claude/) (built by `nest_protocol::host::claude`). In short:
 
@@ -20,12 +20,12 @@ claude -p --input-format stream-json --output-format stream-json --verbose \
   (--session-id <uuid> | --resume <session file> [--fork-session])
 ```
 
-The system prompt text comes from the control plane (`LaunchConfig.system_prompt`) and is written into the agent's config dir; nothing captain- or worker-specific lives on the host.
+The system prompt text comes from the control plane (`LaunchConfig.system_prompt`) and is written into the agent's config dir; nothing template-specific lives on the host.
 
 - **`--tools`** keeps only the built-ins that don't touch the host's files or run commands there: the task list, subagents, and WebSearch/WebFetch (which send traffic from the host through its egress allowlist). The exact list is checked against Claude Code's tools reference. Every file and shell operation goes through [hands](../hands/).
 - **`--restricted`** loads only managed settings and `--settings`, and refuses `bypassPermissions`.
 - **The working directory is an empty host directory,** so a repo's `.claude/settings.json` hooks and `.mcp.json` can never load. If they did, they would run *on the host*. The repo's CLAUDE.md is passed in as text by our `SessionStart` hook, read through hands.
-- **System prompt:** `--append-system-prompt-file` keeps Claude Code's coding prompt and adds the control plane's worker text, which explains that the hands tools work like the built-ins. Captains use `--system-prompt-file` and `--tools ""` instead.
+- **System prompt:** `--append-system-prompt-file` keeps Claude Code's coding prompt and adds the spawn spec's text, which explains that the hands tools work like the built-ins. A spec with `system_prompt.mode: replace` and no built-ins (the `captain` template, for example) gets `--system-prompt-file` and `--tools ""` instead.
 - **Host-side built-ins are refused** (`Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, …) at start, and a brain whose `system/init` reports one is killed.
 - **Never use `--bare`** (it ignores OAuth) or **`--safe-mode`** (it stops MCP servers from loading).
 

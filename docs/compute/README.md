@@ -6,7 +6,7 @@ Hosts, grouped into **cells**. A cell is compute plus its object store in one pr
 
 | Role | Runs | Lifecycle |
 |---|---|---|
-| **[Controller](controller/)** | Captain brains (agent runner), Discord gateway. **No sandboxes.** | Always on, small, stateless, any provider |
+| **[Controller](controller/)** | Brains without hands (agent runner), Discord gateway. **No sandboxes.** | Always on, small, stateless, any provider |
 | **Burst** | **Every sandbox** (Firecracker) plus their workers' brains (agent runner, outside the VMs) | Spot, scales to zero |
 
 ## Choice of provider
@@ -37,7 +37,7 @@ Approximate prices, us-east-1, 2026:
 
 ## Components
 
-- [controller/](controller/): the always-on, stateless captain host
+- [controller/](controller/): the always-on, stateless host for brains without hands
 - [nestd/](nestd/): the per-host daemon on burst hosts
 - [autoscaling/](autoscaling/): spot capacity, scale-to-zero, interruptions
 - [provisioning/](provisioning/): images, launch template, IAM, network

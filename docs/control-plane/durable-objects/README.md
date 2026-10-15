@@ -6,8 +6,8 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 |---|---|
 | [fleet/](fleet/) | Hosts, enrollment, leases, placement, STONITH, command delivery |
 | [sandbox/](sandbox/) | Epoch and placement, generation head, attachments, idle state, policy, ports |
-| [agent/](agent/) | Turn queue, inbox, session stream, state, grants, tool relay |
-| [workstream/](workstream/) | Goal, event fan-in, captain wake |
+| [agent/](agent/) | Turn queue, deliveries, session stream, state, spec and grants, tool relay |
+| [channel/](channel/) | Message log, subscriptions and cursors, fan-out |
 | [broker/](broker/) | Claude setup tokens, injected secrets, GitHub App (interface only) |
 
 ## Conventions
@@ -19,4 +19,4 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 - **No lost updates across awaits.** A DO's input gate opens while it awaits R2 or another DO, so state is never saved from a copy loaded before an await: mutations load, apply and save synchronously. Inbound WebSocket messages are processed one at a time per channel.
 - **Timers are alarms,** several deadlines multiplexed onto one. A deadline is removed only after its handler succeeds; a failing handler is retried.
 - **Hosts connect over hibernatable WebSockets:** one control connection per host to FleetDO, plus one per active agent to its AgentDO. A new connection supersedes the old one only after a valid hello.
-- **Bounded growth:** finished commands, tool calls, asks, turns and workstream events are pruned.
+- **Bounded growth:** finished commands, tool calls, asks and turns are pruned; channel messages follow their channel's retention.

@@ -6,7 +6,7 @@ The authority for one sandbox.
 - Epoch and current host; the epoch→host history (which host held which epoch)
 - Head generation and the generation chain (including orphaned salvage generations)
 - Attached agents, the idle refcount
-- Policy layers: base, workstream (allow, passthrough, injection bindings, TCP exceptions), sandbox (temporary grants)
+- Policy layers: base (image), sandbox (allow, passthrough, injection bindings, TCP exceptions; set by whoever holds `egress_policy` on it, and inherited by forks), temporary grants
 - Exposed ports
 
 **Placement:**

@@ -18,6 +18,17 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 - **Versioning:** every connection starts with a hello that carries `protocol_version`. Unknown fields are ignored and unknown message types are rejected with an error.
 - **Anything from a host or guest** that changes state carries `(sandbox, epoch)` and is rejected when the epoch is stale.
 
+## Planned: role-free model
+
+The design moved to role-free agents, grants and channels ([agents/](../agents/), [channels/](../channels/)). The contract below still has the implemented shapes; these change with the code:
+- **`AgentRole`** and `AgentStart.role` go. The launch config already carries what the role implied (prompt mode, built-in tools); placement follows `hands`.
+- **Workstream fields** (`sandbox_create.workstream`, `sandbox_fork.child_workstream`, `agent_start.workstream`) are replaced by `owner` and `labels`.
+- **`WorkstreamEvent`** and the fleet `workstream` host event become platform posts to `<sbx>/events` and `<agt>/events`: `ChannelMessage{seq, ts_ms, from, kind?, text, data?, reply_to?, key?, mentions?}`. The kinds keep their names.
+- **`EgressPolicy` layers** `base`/`workstream`/`sandbox` become `base`/`sandbox`/`grant`.
+- **The platform tool catalog** is role-filtered today. It becomes grant-filtered, and channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`) plus `grant`/`revoke` replace `notify`, `emit`, `ask` and the captain-only tools.
+- **Guest CLI:** `nest notify --to captain` becomes `nest post <channel>`.
+- **IDs:** `ws_` goes; `chn_` (channel) and `tpl_` (template) arrive.
+
 ## Contract changelog
 
 **2026-10-12** (from the implementation change requests):

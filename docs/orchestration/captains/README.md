@@ -1,48 +1,42 @@
-# Captains
+# Captains (pattern)
 
-A captain is a long-lived assistant that manages workstreams, receives their events and escalates to me. **It has no machine:** all of its state, tools and policy live in the control plane. The model inference behind it is a pluggable **backend**.
+A captain is a long-lived agent without hands that manages other agents and escalates to me. **It isn't a platform concept:** it's an agent spawned from the `captain` template, and everything that makes it a captain is in that template's prompt and grants.
 
-```
-                 ┌──────────────── control plane (authoritative) ─────────────────┐
- events/inbox ──►│ AgentDO (role: captain)                                        │
-                 │   turn queue · inbox · memory · grants · state · transcript    │
-                 │   tool registry (schemas + handlers) · prompt · input format   │
-                 │                 │ CaptainBackend.runTurn()                      │
-                 └─────────────────┼──────────────────────────────────────────────┘
-                     ┌─────────────┴──────────────┐
-          claude-code backend (now)        api-loop backend (later, pure Cloudflare)
-          controller host, subscription    Messages API loop inside the DO, API key
-```
+## The `captain` template
 
-## Design rules (keep the captain re-implementable on Cloudflare)
-
-1. **Captain logic lives only in the control plane:** tool schemas and handlers, the system prompt, how event batches become turn input, memory, grants. The controller host has **no captain logic**. It's a dumb runner plus an MCP bridge.
-2. **One tool registry.** Tools are defined once in TypeScript. The `claude-code` backend exposes them through a generic MCP bridge that fetches `tools/list` from the DO and forwards `tools/call` to it. The `api-loop` backend passes the same schemas to the Messages API. Either way, the handlers run in the DO.
-3. **One prompt, kept in the control plane.** AgentDO sends the captain prompt in `AgentStart.launch`. The runner writes it to `<config_dir>/nest-system-prompt.md` for `--system-prompt-file`; the api-loop backend would use it as `system`.
-4. **Continuity comes from memory, not the backend's conversation history.** Each wake's input includes a DO-generated digest (workstream states, open questions, notes). A backend's own session (a Claude Code JSONL file or Messages API history) is only a cache. Switching backends starts a fresh session from the digest; we never translate one history format into the other.
-5. **Canonical events.** Each backend maps its output to one event schema: `turn_started`, `assistant_text`, `tool_call`, `tool_result`, `turn_completed`, `rate_limited`, `error`, `usage`. Transcripts, state tracking, Discord and the scheduler only consume canonical events.
-6. **Backend concerns stay inside backends:** context management (Claude Code autocompact vs API compaction), thinking and effort, credentials, quota vs budget. These surface only as canonical events.
-
-## Tools
-
-```
-spawn_workstream(spec, budget)  send(ws, msg)  list_workstreams()  get_status(ws)
-read_transcript(ws, since)  wait_events(filter)  approve/deny(req)  merge(ws)/kill(ws)
-delegate(task, ws?)  memory_read/memory_write(key)  notify_user(msg, urgency)
+```yaml
+launch:
+  system_prompt: {mode: replace, text: <captain prompt, stored in the control plane>}
+  builtin_tools: []                  # optionally WebSearch
+hands: null
+backend: claude-code                 # api-loop later
+grants:                              # all on resources it owns, with limits
+  - agent_spawn{max: 8}, sandbox_create{max: 4}, sandbox_fork, sandbox_destroy, attach, agent_stop
+  - channel_create, post, read, subscribe, list, read_transcript, grant, egress_policy
+  - post on user
+subscriptions: [{channel: <own>/inbox}]   # it adds the rest itself
+escalate_to: user
+priority: high
+credential: claude_oauth_token:captain   # revocable separately from workers
 ```
 
-**`delegate`** replaces any need for captains to read code or attach to sandboxes. It spawns a worker (a brain with hands) bound to an **ephemeral read-only fork**. The worker does the reading and reports back. **Captains never attach to sandboxes.**
+## Conventions in its prompt
 
-## Waking
-
-WorkstreamDO batches events. **Only decision events wake a captain:** `needs_input`, `blocked`, `completed`, `failed`, `pr_opened`, `budget_exceeded`, `orphaned_work`, `egress_alert`. Progress events go into the digest it reads on its next wake. Workstream output is untrusted, so it goes into user-role content and never into system instructions.
+- **Workstreams:** for each one, it creates a channel, sandboxes and workers labeled `workstream=<name>`, and subscribes to their `events` with a decision filter (`question`, `blocked`, `completed`, `failed`, `pr_opened`, `orphaned_work`, `egress_alert`) and a batch window. Progress stays in the channel for its next read. See [../workstreams/](../workstreams/).
+- **Inspection (`delegate`):** it never attaches to sandboxes. It spawns a read-only worker on a read-only fork and reads its report.
+- **Continuity:** a private memory channel, read by key at each wake. The Claude Code session is a cache, so a fresh session or a backend switch loses nothing.
+- **Escalation:** it answers its workers' questions itself when it holds the grant they ask for, and posts to `user` otherwise.
+- **Untrusted input:** everything its workers post is data, not instructions. Channel messages reach it as user-role content.
 
 ## Safeguards
 
-- A captain's only actions are `nest` tool calls, gated by grants and approvals.
-- Captains can use a separate setup token from workers (a per-role override in BrokerDO: `claude_oauth_token:captain`), so the two can be revoked independently.
-- The scheduler reserves subscription headroom for captains.
+- A captain acts only through tool calls bounded by its grants, and its grants are bounded by mine.
+- Its workers get only grants it holds; the `worker` template keeps management grants away from agents with hands.
+- It can use a separate setup token from workers (`credential` above).
+- `priority: high` reserves subscription headroom for it.
 
-## Backends
+## Open questions
 
-- [backends/](backends/): the interface, plus `claude-code` (current) and `api-loop` (future)
+- **`delegate`:** keep it a pattern (spawn plus read the report), or add a tool for it if models do it poorly.
+
+Its backend is per agent. See [../../agents/backends/](../../agents/backends/).
