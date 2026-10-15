@@ -6,7 +6,7 @@
 |---|---|---|
 | **[Hands](../hands/)** | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | In the bound sandbox, over vsock RPC |
 | **Channels** | `channel_create`, `post` (optionally awaiting a reply), `read` (optionally waiting up to 120 s), `subscribe`, `unsubscribe` | ChannelDO. See [../../channels/](../../channels/) |
-| **Agents** | `agent_spawn`, `agent_stop`, `attach`, `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
+| **Agents** | `agent_spawn`, `agent_stop`, `attach`, `adopt` (take ownership of a parked resource), `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
 | **Sandboxes** | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | Control plane |
 | **Authority** | `grant`, `revoke` | Control plane |
 | **Brokered actions** | `github.create_pr`, `email.send`, `http.request(profile)` | Control plane, with secrets that never reach a sandbox |
@@ -35,7 +35,7 @@ An agent that reads untrusted content, holds private data and can send data out 
 - **Ways back to clean:**
   - A fresh session starts clean, unless it then reads tainted content.
   - **Quarantined reports:** a spawn spec can declare a `report_schema` of enums, numbers and ids. A child's final report that validates against it reaches the spawner untainted, even from a tainted child. This is the dual-LLM / map-reduce pattern from [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837) (2025-06), and how a captain stays clean while its workers read code.
-- **Template defaults:** widening egress and granting sinks are `approve`. Brokered actions already scoped by their binding (e.g. `github.create_pr` to the binding's repos) are `allow`. Management grants stay off agents with hands.
+- **Template defaults ("balanced", tuned from experience):** widening egress and granting sinks are `approve`. Brokered actions already scoped by their binding (e.g. `github.create_pr` to the binding's repos) are `allow`. Management grants stay off agents with hands.
 
 **Brokered action pipeline:** check the grant and taint → rate limit → scan arguments for secrets → approval gate → read current external state → run with a natural idempotency key (e.g. `(repo, head_sha)` for a PR) → write to the journal.
 

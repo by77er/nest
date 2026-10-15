@@ -120,7 +120,12 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | No agent roles. Placement follows hands; an agent without hands needs no machine. The brain backend is pluggable (`claude-code` now, `api-loop` inside the control plane later). | [agents/](agents/) |
 | Captains and workstreams are patterns (templates plus conventions), not code | [orchestration/](orchestration/) |
 | Coordination is one primitive: channels. Inboxes, platform events, questions, shared state and memory are channels. | [channels/](channels/) |
-| Authority is grants, attenuated from me and revoked down the chain; there's no built-in scoping unit. Inspecting without hands means spawning a read-only agent on a read-only fork. | [agents/tools/](agents/tools/) |
+| Authority is grants, attenuated from me and revoked down the chain; there's no built-in scoping unit | [agents/tools/](agents/tools/) |
+| When an agent is removed, what it owns is parked (stopped, archived, read-only), adoptable, and destroyed after 30 days | [agents/](agents/) |
+| Inspection without hands is a pure pattern: no `delegate` tool or reader template | [orchestration/captains/](orchestration/captains/) |
+| A wake resumes the session while it's cheap, otherwise starts fresh from memory | [agents/](agents/) |
+| Egress policy is per sandbox (forks inherit); no shared policy objects | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/) |
+| Guardrails start "balanced": 60 subscription-started turns an hour per agent, a 50-delivery backlog, 30-day retention, approval for egress widening and granting sinks | [channels/](channels/) |
 | Taint is tracked per session by the platform; sink calls (egress widening, external brokered actions, granting sinks) from a tainted session need approval from me or an untainted holder | [agents/tools/](agents/tools/) |
 | A woken turn gets a platform notice; other agents' message bodies reach a model only as `read` results | [channels/](channels/) |
 | Budgets (depth, concurrency, spawns, turns, quota share) shrink like grants and are enforced per owner subtree | [orchestration/scheduling/](orchestration/scheduling/) |
@@ -155,14 +160,9 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 
   See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
 - **Agents, grants and channels:**
-  - **Owner removal:** whether an owner's resources are stopped with it or passed to its owner. See [agents/](agents/).
-  - **Wake limits:** the per-agent cap on subscription-started turns, and loop detection. See [channels/](channels/).
-  - **Channel retention:** the defaults, and whether long-lived channels need compaction to R2. See [channels/](channels/).
+  - **Channel compaction:** whether long-lived channels need compaction to R2. See [channels/](channels/).
   - **Quota share:** how to measure it while individual-plan windows are unpublished. See [orchestration/scheduling/](orchestration/scheduling/).
-  - **Resume or fresh:** the cost threshold between resuming a long session and starting fresh from memory. See [agents/](agents/).
-  - **Approval load:** whether approvals on tainted sinks are too frequent in practice. See [orchestration/captains/](orchestration/captains/).
-  - **Shared egress policies:** per-sandbox policy only, or named policies shared by many sandboxes. See [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/).
-  - **`delegate`:** a tool, or just a pattern. See [orchestration/captains/](orchestration/captains/).
+  - **Resume or fresh:** the threshold value, measured in the first spike. See [agents/](agents/).
 
 ## First spike
 
