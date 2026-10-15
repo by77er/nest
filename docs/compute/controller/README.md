@@ -3,6 +3,7 @@
 A small, always-on, **stateless** host. It runs no sandboxes.
 
 **What it runs:**
+- **nestd** without sandbox networking: the fleet channel, the host's lease, and commands to the runner.
 - **The agent runner, for agents without hands** (captains, for example). See [claude-code backend](../../agents/backends/claude-code/).
 - **nest-mcp:** platform tools proxied to AgentDO.
 - **Discord Gateway client:** free-form messages.
