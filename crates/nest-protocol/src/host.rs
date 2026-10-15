@@ -855,11 +855,46 @@ pub mod claude {
     }
 
     /// Where the runner materializes a resumed session before `--resume <path>`: Claude Code's
-    /// project directory for the process cwd (normally [`paths::EMPTY_CWD`]; `/` → `-`).
-    /// UNVERIFIED encoding; the runner always tails the `transcript_path` reported by the
-    /// `SessionStart` hook and rebases if it differs.
+    /// project directory for the process cwd (normally [`paths::EMPTY_CWD`]). The runner still
+    /// tails the `transcript_path` reported by the `SessionStart` hook and rebases if it differs.
     pub fn transcript_path(config_dir: &str, cwd: &str, claude_uuid: &str) -> String {
-        format!("{config_dir}/projects/{}/{claude_uuid}.jsonl", cwd.replace('/', "-"))
+        format!("{config_dir}/projects/{}/{claude_uuid}.jsonl", project_dir(cwd))
+    }
+
+    /// Longest project directory name Claude Code uses before shortening it with a hash.
+    const MAX_PROJECT_DIR: usize = 200;
+
+    /// Claude Code's project directory name for `cwd`: every UTF-16 unit that isn't an ASCII letter
+    /// or digit becomes `-`; a name over [`MAX_PROJECT_DIR`] is cut there and suffixed with `-` and
+    /// the base-36 absolute value of the cwd's Java-style string hash. Observed on Claude Code
+    /// 2.1.300 (`e2e/claude-verify`, probe 8); the exact cut-off and non-ASCII handling are inferred.
+    pub fn project_dir(cwd: &str) -> String {
+        let name: String = cwd
+            .encode_utf16()
+            .map(|u| match char::from_u32(u32::from(u)) {
+                Some(c) if c.is_ascii_alphanumeric() => c,
+                _ => '-',
+            })
+            .collect();
+        if name.len() <= MAX_PROJECT_DIR {
+            return name;
+        }
+        let hash = cwd.encode_utf16().fold(0i32, |h, u| h.wrapping_mul(31).wrapping_add(i32::from(u)));
+        format!("{}-{}", &name[..MAX_PROJECT_DIR], base36(i64::from(hash).unsigned_abs()))
+    }
+
+    fn base36(mut n: u64) -> String {
+        const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut out = Vec::new();
+        loop {
+            out.push(DIGITS[(n % 36) as usize]);
+            n /= 36;
+            if n == 0 {
+                break;
+            }
+        }
+        out.reverse();
+        String::from_utf8(out).expect("ascii")
     }
 
     /// Exact argv (without the program). `config_dir` holds [`PROMPT_FILE`] and
@@ -1226,6 +1261,21 @@ mod tests {
         .map(String::from)
         .to_vec();
         assert_eq!(args, expected);
+    }
+
+    /// Samples observed on Claude Code 2.1.300 by `e2e/claude-verify` (probe 8).
+    #[test]
+    fn project_dir_matches_claude_code() {
+        assert_eq!(claude::project_dir("/tmp/nest-cv-hg5x5c20/baseline/cwd.nest_probe"), "-tmp-nest-cv-hg5x5c20-baseline-cwd-nest-probe");
+        let seg = "/seg.dir_0123456789-abcdefghij";
+        let long = format!("/tmp/nest-cv-hg5x5c20/long{}", seg.repeat(8));
+        let expected = format!(
+            "-tmp-nest-cv-hg5x5c20-long{}-seg-dir-0123456789-abcd-6rxg1j",
+            "-seg-dir-0123456789-abcdefghij".repeat(5)
+        );
+        assert_eq!(long.len(), 266);
+        assert_eq!(claude::project_dir(&long), expected);
+        assert_eq!(expected.len(), 207);
     }
 
     #[test]
