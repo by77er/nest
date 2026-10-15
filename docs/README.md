@@ -2,7 +2,7 @@
 
 A personal platform that combines sandboxes with durable agents. Long-lived Claude Code agents run on my own subscription. Their brains run on hosts, and their hands work in isolated VMs on commodity cloud compute. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. Every component exists, and each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. Channels, grants and spawn specs are designed but not built (see `control-plane/README.md`).
+**Status:** early implementation. Every component exists, and each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. Channels, grants and spawn specs are designed but not built (see `control-plane/README.md`). Everything needed to bring nest up (accounts, credentials, where they go) is in [setup/](setup/).
 
 ## Goals
 
@@ -68,7 +68,7 @@ cross-cutting   security (authority, model access, identity, credentials) · dat
 contracts       boundary interfaces (wire protocols, tool schemas)                     interfaces/
 ```
 
-See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/) and [interfaces/](interfaces/).
+See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [interfaces/](interfaces/) and [setup/](setup/).
 
 ```
  you / webhooks / email ──► Cloudflare: Worker API + Durable Objects (control plane, R2)
