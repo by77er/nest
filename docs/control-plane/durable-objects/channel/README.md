@@ -2,7 +2,7 @@
 
 The authority for one [channel](../../../channels/): its log, subscriptions and their cursors.
 
-- **Storage:** message index and inline bodies in SQLite. Bodies over about 32 KB go to R2 (`channels/<channel>/<seq>`). Retention is enforced by an alarm.
+- **Storage:** message index, keyed view and recent bodies in SQLite. Bodies over about 32 KB, and every body older than 7 days, go to R2 (`channels/<channel>/<seq>`); reads fetch them transparently. Retention and tiering run from the alarm.
 - **Post:**
   1. Check the poster's grant (AgentDO already checked it; ChannelDO checks the channel's own grant list again).
   2. Assign `seq`, store, update the keyed index.

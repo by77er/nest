@@ -123,12 +123,13 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | Authority is grants, attenuated from me and revoked down the chain; there's no built-in scoping unit | [agents/tools/](agents/tools/) |
 | When an agent is removed, what it owns is parked (stopped, archived, read-only), adoptable, and destroyed after 30 days | [agents/](agents/) |
 | Inspection without hands is a pure pattern: no `delegate` tool or reader template | [orchestration/captains/](orchestration/captains/) |
-| A wake resumes the session while it's cheap, otherwise starts fresh from memory | [agents/](agents/) |
+| A wake resumes the session if the last turn was under an hour ago or the session is under ~50k tokens, otherwise starts fresh from memory | [agents/](agents/) |
+| Channel message bodies older than 7 days move to R2; the index and keyed view stay in SQLite | [channels/](channels/) |
 | Egress policy is per sandbox (forks inherit); no shared policy objects | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/) |
 | Guardrails start "balanced": 60 subscription-started turns an hour per agent, a 50-delivery backlog, 30-day retention, approval for egress widening and granting sinks | [channels/](channels/) |
 | Taint is tracked per session by the platform; sink calls (egress widening, external brokered actions, granting sinks) from a tainted session need approval from me or an untainted holder | [agents/tools/](agents/tools/) |
 | A woken turn gets a platform notice; other agents' message bodies reach a model only as `read` results | [channels/](channels/) |
-| Budgets (depth, concurrency, spawns, turns, quota share) shrink like grants and are enforced per owner subtree | [orchestration/scheduling/](orchestration/scheduling/) |
+| Budgets (depth, concurrency, spawns, turns) shrink like grants and are enforced per owner subtree; quota is divided by priority and the concurrency cap, not by estimated shares | [orchestration/scheduling/](orchestration/scheduling/) |
 | Hands calls are journaled (intent, outcome); after a crash, in-flight calls are reported as unknown, never retried | [agents/hands/](agents/hands/) |
 | Memory snapshots carry a restore ABI and restore only on matching hosts; the burst fleet is the 8i family; placement packs | [sandbox/state/memory/](sandbox/state/memory/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
@@ -159,10 +160,6 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
   - that a `SessionStart` hook fires after compaction (to re-inject the memory index)
 
   See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
-- **Agents, grants and channels:**
-  - **Channel compaction:** whether long-lived channels need compaction to R2. See [channels/](channels/).
-  - **Quota share:** how to measure it while individual-plan windows are unpublished. See [orchestration/scheduling/](orchestration/scheduling/).
-  - **Resume or fresh:** the threshold value, measured in the first spike. See [agents/](agents/).
 
 ## First spike
 
@@ -175,7 +172,7 @@ On a c8id with nested virtualization and a hugepage pool:
 6. ublk lazy-disk throughput.
 7. Epoch-flip commit latency under write load.
 8. Forced-partition test: self-fence, then STONITH, then restore.
-9. **First real Claude Code run** through the runner (the verification list above).
+9. **First real Claude Code run** through the runner (the verification list above). It needs no KVM, so it runs in the cloud dev environment through the e2e harness, with the token as `NEST_CLAUDE_OAUTH_TOKEN`.
 10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM) and with RPC hands; compare success rate, turns and tokens.
 11. **Nested overhead:** CPU and I/O on a nested 8i instance against the same work on `.metal`.
 12. **Resume or fresh:** turn cost and quality when resuming a long session after the cache expired, against a fresh session seeded from memory.

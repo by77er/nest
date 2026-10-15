@@ -28,7 +28,7 @@ launch:        {system_prompt, builtin_tools, model, effort}   # becomes Claude 
 backend:       claude-code         # or api-loop (later; agents without hands only)
 hands:         {sandbox, cwd?}     # or null
 grants:        [...]               # must be a subset of the spawner's
-budget:        {depth, concurrent, spawns, turns_per_day, quota_share}   # at most what the spawner has left
+budget:        {depth, concurrent, spawns, turns_per_day}   # at most what the spawner has left
 subscriptions: [{channel, filter, delivery, batch_ms}]
 report_schema: {...}               # optional: a final report that matches it reaches the spawner untainted
 escalate_to:   <channel>           # default: the spawner's inbox
@@ -45,7 +45,7 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 
 ## Continuity
 
-- **Each wake picks resume or fresh.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the transcript is small. Otherwise it starts a fresh session, seeded with its memory index and the wake envelope. A fresh session also clears [taint](tools/#taint-and-sinks). The threshold is to be measured.
+- **Each wake picks resume or fresh.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the session is small. The starting rule: **resume if the last turn was under an hour ago or the session is under about 50k tokens**; otherwise start a fresh session, seeded with its memory index and the wake envelope. A fresh session also clears [taint](tools/#taint-and-sinks). The first spike measures whether the rule is right.
 - **One memory system:** memory is a private keyed channel. Claude Code's own auto memory is off (it's local to one host), and a `SessionStart` hook injects the memory key index at startup and after compaction.
 - **The session file is a cache** of a format Claude Code doesn't stabilize; the durable state is the R2 copy plus memory. See [sessions/](sessions/).
 
@@ -64,10 +64,6 @@ When an agent is removed for good, **what it owns is parked, then expires**:
 - Everything parked is labeled `orphaned_from=<agent>`, and a notice goes to the removed agent's owner (or to me).
 - **Adoption:** that owner, or I, can `adopt` a parked resource and become its owner; grants on it are then issued from the adopter. The removed agent's own grants have already ended with it (see [tools/](tools/)).
 - **Expiry:** whatever nobody adopts is destroyed after 30 days. Nothing is lost by accident, and nothing leaks forever.
-
-## Open questions
-
-- **Resume or fresh:** the threshold value, measured in the first spike.
 
 ## Components
 
