@@ -7,7 +7,7 @@ The authority for one agent (conversation).
   - Retryable start failures are retried 3 times.
   - Exits and host reports count only from the host the agent is assigned to.
   - When the sandbox moves, the agent follows it.
-  - **Waking:** a brain that isn't running (it went idle, exited or lost its host) starts again whenever work is waiting: a new turn, or the turn it was in the middle of. It resumes or starts fresh from memory, whichever is cheaper (see [continuity](../../../agents/#continuity)). A start with no host available retries every 30 s, and brain starts per cell are capped so a broadcast can't start every brain at once.
+  - **Waking:** a brain that isn't running (it went idle, exited or lost its host) starts again whenever work is waiting: a new turn, a due [scheduled wake](../../../agents/capabilities/#schedules) (an alarm here), or the turn it was in the middle of. It resumes or starts fresh from memory, whichever is cheaper (see [continuity](../../../agents/#continuity)). A start with no host available retries every 30 s, and brain starts per cell are capped so a broadcast can't start every brain at once.
   - **Crash-loop guard:** an exit other than `stopped` or `auth_failed` restarts the brain at once if work is waiting. After 3 such restarts without a completed turn, the agent is `errored` and only new input retries.
   - **Agents without hands** on a controller host that goes silent start again on another one. See [FleetDO](../fleet/).
 - **Session socket:**

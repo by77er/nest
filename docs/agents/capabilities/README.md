@@ -45,7 +45,7 @@ prompt: The issue tracker: read freely; comment only when asked.
 - **Results are untrusted:** every result from an `mcp` or `api` tool sets [taint](../tools/#taint-and-sinks), like web results.
 - **`ro` means no state changes, not no leaks:** requests go only to the configured base URL and path prefixes, so data can reach only that API's operator.
 - **Attenuation:** a spawner can pass on a narrower version of a capability (fewer tools, `ro` instead of `rw`, fewer paths), never a wider one.
-- **Hosts never run third-party MCP servers:** brains reach these tools only through `nest mcp` → AgentDO → the server. Tools appear to Claude Code as `mcp__nest__<capability>_<tool>`, and the allowlist keeps a large server from flooding the context.
+- **MCP servers are remote only.** Hosts never run third-party MCP servers, and neither do guest agents: brains reach these tools only through `nest mcp` → AgentDO → the server. A server that has to run locally (a browser, a database client) runs as a service in a sandbox and is exposed through [ingress](../../sandbox/networking/ingress/) as an `mcp{url}` endpoint. Tools appear to Claude Code as `mcp__nest__<capability>_<tool>`, and the allowlist keeps a large server from flooding the context.
 
 ## Built-in capabilities
 
@@ -54,11 +54,12 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `hands{sandbox}` | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | `attach` on that sandbox |
 | `messaging{peers}` | `message` | `post` on the peers' inboxes |
 | `channels` | `channel_create`, `post`, `read`, `subscribe`, `unsubscribe` | its own channels; others by extra grants |
-| `memory` | `post` and `read` on its private keyed channel | that channel; the key index is injected at session start. **Only for long-lived agents** (see [continuity](../#continuity)) |
+| `memory` | `post` and `read` on its private keyed channel | that channel; the key index (at most 200 keys) is injected at session start, and a weekly wake asks for consolidation. **Only for long-lived agents** (see [continuity](../#continuity)) |
 | `spawning{budget}` | `agent_spawn`, `agent_stop`, `adopt`, `list` | spawning within the budget |
 | `sandboxes` | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | its own sandboxes |
 | `authority` | `grant`, `revoke` | granting what it holds; sink grants are `approve` when tainted |
 | `transcripts` | `read_transcript` | agents it owns |
+| `schedules` | `wake_at(at \| every, note)` → id, `wake_cancel(id)` | waking itself, within its turn budget |
 | `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
 
@@ -66,9 +67,9 @@ prompt: The issue tracker: read freely; comment only when asked.
 
 ```yaml
 worker:    [hands, messaging{peers: label:workstream}, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
-captain:   [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory]
-monitor:   [channels, messaging{peers: tree}, memory, web]          # long-lived: watches channels or the web
-assistant: [channels, messaging{peers: tree}, spawning{budget}, memory, web]  # long-lived: talks to me through `user`
+captain:   [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory, schedules]
+monitor:   [channels, messaging{peers: tree}, memory, schedules, web]          # long-lived: watches channels or the web
+assistant: [channels, messaging{peers: tree}, spawning{budget}, memory, schedules, web]  # long-lived: talks to me through `user`
 ```
 
 ## Messaging
@@ -79,6 +80,11 @@ assistant: [channels, messaging{peers: tree}, spawning{budget}, memory, web]  # 
 - **Labels set reach,** so the spawner sets them at spawn time, and changing an agent's labels needs a grant on it.
 - **Injection spread is a group, not a tree:** a tainted agent can reach its whole group. Every message carries the sender's taint, wake envelopes carry no bodies, and loop guards and rate limits bound the traffic.
 
-## Open questions
+## Schedules
 
-- **MCP servers inside a sandbox:** a stdio server (a browser, a database client) could run in the agent's sandbox, with the guest agent bridging its tools like hands. That keeps third-party code off hosts; it isn't designed yet.
+`wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
+
+- **Durable:** wakes are AgentDO alarms, so they survive restarts and moves, and cost nothing while waiting.
+- **A due wake is a wake envelope** carrying the note, and it starts a brain like any other wake (see [continuity](../#continuity)).
+- **Taint travels:** a wake carries the taint of the session that set it, so an injected note can't launder itself into a clean fresh session.
+- **Bounded:** scheduled wakes count against the agent's turn budget and the per-agent wake cap.
