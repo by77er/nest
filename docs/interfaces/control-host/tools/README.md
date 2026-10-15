@@ -16,7 +16,9 @@
 | `checkpoint` | worker | Commit the bound sandbox now |
 | `expose_port` | worker | Preview URL, optionally with a share link |
 | `brokered` | worker, captain | `{action, args}`, run outside the sandbox. The available actions depend on grants, and AgentDO's `tools_list` may also expose them as dedicated tools (e.g. `github_create_pr`) |
-| `spawn_workstream`, `send`, `list_workstreams`, `get_status`, `wait_events` (≤120 s), `approve`, `deny`, `merge` (approval), `kill`, `delegate`, `memory_read`, `memory_write`, `notify_user` | captain | See [orchestration/captains](../../../orchestration/captains/) |
+| `spawn_workstream`, `send`, `list_workstreams`, `get_status`, `wait_events` (≤120 s), `approve`, `deny`, `merge` (approval), `kill`, `delegate`, `memory_read`, `memory_write`, `notify_user` | captain | Return `not_implemented`; the design replaces them with capability tools ([pending contract changes](../../README.md#pending-contract-changes)) |
+
+Only `notify`, `emit`, `ask`, `read_transcript` and `expose_port` run; the rest return `not_implemented`.
 
 **Grants:**
 - AgentDO filters `tools_list` by role and grants, and checks every `tool_call` again.

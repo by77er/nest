@@ -17,7 +17,7 @@ What I provide, where it goes, and what each piece unlocks, in the order testing
 | Monthly spend cap | $25 | Becomes an AWS Budgets alarm. Testing costs a few dollars. |
 | Dedicated AWS account | Yes | Keeps the blast radius of broad testing credentials to nest. |
 | Separate Claude token for captains | Optional | Needed only to verify that two setup tokens can be revoked independently. |
-| Domain on Cloudflare | Not yet | Needed only for previews and share links (`*.preview.<domain>`), not for testing. |
+| Domain on Cloudflare | Not yet | Needed only for previews (`*.preview.<domain>`), share links (`*.share.<domain>`) and email hooks, not for testing. |
 
 ## Stage 1: real Claude Code (no cloud, no KVM)
 
@@ -70,7 +70,7 @@ The provisioning key creates the narrow credentials nest actually runs with:
 |---|---|---|
 | **Discord bot:** an application with a bot, on a private server | Approvals, escalations and chat ([discord](../control-plane/api/discord/)) | `DISCORD_APPLICATION_ID`, `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID` |
 | **GitHub App:** permissions Contents (read/write), Pull requests (read/write) and Metadata (read), installed on chosen repos | Credential injection for `git push` and PRs ([injection](../sandbox/networking/egress/injection/)) | `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY` (the PEM) |
-| **A domain on Cloudflare,** plus a Zero Trust team for Access | Previews, share links, and Access in front of the API and dashboard ([ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN`; the API token gains Zone DNS and Workers Routes edit for that zone |
+| **A domain on Cloudflare,** plus a Zero Trust team for Access | Previews, share links, email hooks, and Access in front of the API and dashboard ([ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN`; the API token gains Zone DNS and Workers Routes edit for that zone |
 
 **Webhooks need nothing extra:** hooks live at `https://<control plane>/v1/hooks/<hk_…>`, and each provider is wired through a brokered action or by pasting a URL and a one-time secret (see [sources](../channels/sources/)).
 

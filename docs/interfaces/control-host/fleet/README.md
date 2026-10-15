@@ -1,5 +1,8 @@
 # Fleet channel (host ↔ FleetDO)
 
+> **Implemented contract.** Workstream fields, `role` and `WorkstreamEvent` go; see [pending contract changes](../../README.md#pending-contract-changes).
+
+
 One WebSocket per host. It carries lifecycle, leases, commands and host-level events. Per-agent traffic goes over the [session channel](../session/).
 
 ## Messages

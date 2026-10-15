@@ -1,5 +1,8 @@
 # Control plane ↔ host
 
+> **Implemented contract.** It still has roles and WorkstreamDO; see [pending contract changes](../README.md#pending-contract-changes).
+
+
 How hosts (nestd and the agent runner) talk to the Cloudflare control plane. Rust types: `nest_protocol::control` (messages) and `nest_protocol::model` (shared models). Fixtures: `protocol/fixtures/control/<type>/<variant>[.<case>].json`. The Rust tests round-trip every fixture and fail if any message variant lacks one; the control plane's TypeScript tests must do the same.
 
 | Transport | Endpoint | Direction of connect | Spec |

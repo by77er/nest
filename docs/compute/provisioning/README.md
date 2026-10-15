@@ -20,7 +20,7 @@
 - **Host instance role:** S3 access scoped to the cell's bucket.
 - **Control-plane IAM user:** `RunInstances` with our launch template only; `Terminate` and `Stop` only on instances tagged `nest=true`; `Describe*`.
 
-**Controller host image:** Claude Code, the agent runner, nest-mcp and the Discord gateway client. No hypervisor, no hugepages, no S3 access.
+**Controller host image:** nestd, Claude Code, the agent runner and the `nest` binary, bubblewrap and the Discord gateway client. No hypervisor, no hugepages, no S3 access.
 
 **Host authentication:**
 1. An AWS host presents its **signed instance identity document** (from IMDS).

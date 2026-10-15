@@ -3,8 +3,8 @@
 The per-host daemon. It's trusted, but it's fenced.
 
 - **Brains:** hosts the [agent runner](../../agents/runner/) for agents whose sandboxes are here. Hands RPC goes over local vsock.
-- **Sandboxes:** runs them through [drivers](../../sandbox/drivers/), and sets up each one's netns (tap0, nft, **listening sockets handed to nest-proxy**), ublk daemon and UFFD handler. See [../../sandbox/networking/egress/steering/](../../sandbox/networking/egress/steering/).
-- **Privilege split:** nestd is the only privileged component. nest-proxy, the preview router and the agent runner run unprivileged.
+- **Sandboxes:** runs them through [drivers](../../sandbox/drivers/), and sets up each one's netns (tap0, nft, **listening sockets handed to nest-proxy**), and (planned) its ublk daemon and UFFD handler. See [../../sandbox/networking/egress/steering/](../../sandbox/networking/egress/steering/).
+- **Privilege split:** nestd is the only privileged component. nest-proxy, the preview router (planned) and the agent runner run unprivileged.
 - **Control plane connections:**
   - one control WebSocket to FleetDO, with a 5 s heartbeat that acts as the lease
   - one WebSocket per active agent to its AgentDO, carrying session streams (from the runner)
@@ -28,4 +28,4 @@ The per-host daemon. It's trusted, but it's fenced.
 - **Spot interruptions** (planned): poll instance metadata for the 2-minute notice, then run a prioritized checkpoint and commit.
 - **Process supervision** (planned): VMs in systemd scopes with `BindsTo=nestd`, and `WatchdogSec` on nestd, so if nestd dies its VMs die with it.
 - **Credentials:** S3 access comes from the instance role. nestd has no R2 credentials; it reads R2 only through Worker-signed URLs from DOs.
-- **Runs alongside** [nest-proxy](../../sandbox/networking/egress/) and cloudflared plus the preview router ([ingress](../../sandbox/networking/ingress/), which uses vsock).
+- **Runs alongside** [nest-proxy](../../sandbox/networking/egress/) and cloudflared plus the preview router (planned; [ingress](../../sandbox/networking/ingress/), which uses vsock).

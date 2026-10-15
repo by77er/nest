@@ -37,7 +37,7 @@ A **rebalance recommendation** can arrive with the notice rather than before it,
 
 ## Volumes
 
-- **Durable:** `/workspace` and `$HOME` (which contains harness session files).
+- **Durable:** `/workspace` and `$HOME`.
 - **Local only, never written back:** `/scratch`, package caches, build output. This removes most of the write churn.
 
 ## Components

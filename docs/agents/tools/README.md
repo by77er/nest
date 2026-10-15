@@ -1,6 +1,6 @@
 # Tools
 
-`nest-mcp` runs on the host next to each brain. An agent's tools come from its [capabilities](../capabilities/), and every call is checked against its grants; there are no role-specific tools.
+`nest mcp` runs on the host next to each brain. An agent's tools come from its [capabilities](../capabilities/), and every call is checked against its grants; there are no role-specific tools.
 
 | Group | Tools | Executes |
 |---|---|---|
@@ -23,18 +23,18 @@ A grant is `(principal, action, resource, limits?, expires?, parent)`. A resourc
 - **Ownership:** creating a resource gives its creator every grant on it.
 - **Budgets shrink like grants:** see [spawning](../#spawning). An agent over budget is parked and escalates.
 - **Checked twice:** AgentDO filters `tools_list` by grants, then checks every `tool_call` again.
-- **Approval:** `requires_approval` actions always post a `question` to the agent's escalation channel first.
+- **Approval:** a sink call from a tainted session under `when_tainted: approve` first posts a `question` to the agent's escalation channel (see [taint and sinks](#taint-and-sinks)).
 
 ## Taint and sinks
 
 An agent that reads untrusted content, holds private data and can send data out can be made to leak it: the [lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/) (2025-06), also framed as the [Agents Rule of Two](https://ai.meta.com/blog/practical-ai-agent-security/) (2025-10). Model robustness helps but isn't a boundary: adaptive attacks broke 12 published defenses at over 90% ([2025-10](https://arxiv.org/abs/2510.09023)). So nest tracks what each session has read, the way [CaMeL](https://arxiv.org/abs/2503.18813) and [FIDES](https://arxiv.org/abs/2505.23643) label data, but per session, which is cheap:
 
-- **Taint is one bit per session, kept by AgentDO and set only by the platform.** It's set by hands output, `WebFetch`/`WebSearch` results, `read_transcript`, and reading a tainted message or memory entry. It lasts for the session (a `--resume` keeps it).
+- **Taint is one bit per session, kept by AgentDO and set only by the platform.** It's set by hands output, `WebFetch`/`WebSearch` results, `mcp` and `api` capability results, `read_transcript`, a tainted wake, and reading a tainted message or memory entry. It lasts for the session (a `--resume` keeps it).
 - **It propagates:** a spawned agent starts with its spawner's taint, and every post carries its sender's taint.
-- **Sinks** are the actions that can send data out or widen authority: widening an egress policy, external brokered actions, and granting a sink action. Each sink grant carries `when_tainted: approve | allow` (default `approve`), and attenuation can only tighten it.
+- **Sinks** are the actions that can send data out or widen authority: widening an egress policy, external brokered actions, `mcp` tools not marked read-only, `api` capabilities with `mode: rw`, and granting a sink action. Each sink grant carries `when_tainted: approve | allow` (default `approve`), and attenuation can only tighten it.
 - **A sink call from a tainted session** with `approve` posts a question to the escalation channel. Only I or an untainted holder of that grant can approve it.
 - **Ways back to clean:**
-  - A fresh session starts clean, unless it then reads tainted content.
+  - A fresh session starts untainted unless the wake that starts it carries taint, or it then reads tainted content.
   - **Quarantined reports:** a spawn spec can declare a `report_schema` of enums, numbers and ids. A child's final report that validates against it reaches the spawner untainted, even from a tainted child. This is the dual-LLM / map-reduce pattern from [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837) (2025-06), and how a captain stays clean while its workers read code.
 - **Template defaults ("balanced", tuned from experience):** widening egress and granting sinks are `approve`. Brokered actions already scoped by their binding (e.g. `github.create_pr` to the binding's repos) are `allow`. Management grants stay off agents with hands.
 
@@ -42,8 +42,8 @@ An agent that reads untrusted content, holds private data and can send data out 
 
 - **Identity:** the runner knows which agent each MCP process belongs to and authenticates to the control plane with its host token. Stale epochs are rejected.
 - **Never block on a human:** `post` with `await_reply_s` and approvals wait at most about 2 minutes. After that they return `pending`, the turn ends, and the reply arrives as a later turn.
-- **Inbound messages** arrive as wake envelopes, with bodies only through `read` (see [channels](../../channels/#the-wake-envelope)). A post flagged `interrupt` interrupts the current turn if the poster holds `interrupt` on the agent.
+- **Inbound messages** arrive as wake envelopes, with bodies only through `read`; messages from me arrive inline (see [channels](../../channels/#the-wake-envelope)). A post flagged `interrupt` interrupts the current turn if the poster holds `interrupt` on the agent.
 
 ## The `nest` CLI inside sandboxes
 
-Scripts and programs running in a sandbox can call `nest post`, `nest read` and `nest expose` through the guest agent over vsock. Their posts are **always tainted**, and they can reach only the channels named in the sandbox's spec. `NEST_AGENT_ID`, set on every hands exec, attributes a post. It isn't a secret, because identity inside a sandbox is attribution only. Everything else needs a brain.
+Scripts and programs running in a sandbox can call `nest post`, `nest read` and `nest expose` through the guest agent over vsock. Their posts are **always tainted**, and they can reach only the channels the sandbox was created with (`sandbox_create{channels}`; by default just its own `events`). `NEST_AGENT_ID`, set on every hands exec, attributes a post. It isn't a secret, because identity inside a sandbox is attribution only. Everything else needs a brain.

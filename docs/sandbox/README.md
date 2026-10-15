@@ -8,7 +8,7 @@
 - **Attach** agents (bind their [hands](../agents/hands/)) or humans (terminal). They share files, services and ports, and conflicts are accepted, like two people on one machine.
 - **Fork.** This is the *only* isolation primitive. A fork is an independent copy of the work, whatever kind of work it is.
 - **Suspend and resume. Archive.**
-- **Link:** an opt-in path through the proxy so one sandbox can reach a port in another.
+- **Link** (not designed yet): an opt-in path through the proxy so one sandbox can reach a port in another.
 
 ## Lifecycle
 

@@ -12,7 +12,7 @@ turn for agent A → AgentDO → SandboxDO:
 
 **External events:** a webhook posts to a channel, and a subscriber's wake starts its brain, which resumes its sandbox if it has one. Nothing runs between events. See [sources](../../channels/sources/).
 
-**Brains:** a turn for an agent whose brain isn't running (it went idle, crashed or lost its host) starts one with `--resume`. See [AgentDO](../durable-objects/agent/).
+**Brains:** a turn for an agent whose brain isn't running (it went idle, crashed or lost its host) starts one, resumed or fresh per the [continuity](../../agents/#continuity) rule. See [AgentDO](../durable-objects/agent/).
 
 **Previews:** a request to `<port>-<sandbox>.preview.<domain>` for a suspended sandbox is **held** at the Worker or preview router while the sandbox resumes. Waiting doesn't use CPU time.
 
@@ -24,4 +24,4 @@ turn for agent A → AgentDO → SandboxDO:
 | Memory snapshot in page cache | near-instant |
 | Host cold start | 45–90 s |
 
-**To reduce cold starts:** use an idle grace period, and optionally keep a stopped warm worker. See [../../compute/autoscaling/](../../compute/autoscaling/).
+**To reduce cold starts:** use an idle grace period, and optionally keep a stopped warm host. See [../../compute/autoscaling/](../../compute/autoscaling/).

@@ -6,15 +6,17 @@ The agent's brain is an [agent runner](../../runner/) Claude Code process. The r
 - **Without hands** (e.g. the `captain` template): on a controller host, usually with no built-in tools and a replaced prompt:
 
 ```bash
-CLAUDE_CONFIG_DIR=/var/lib/nest/agents/<agent-id> \
+cd /var/lib/nest/empty && CLAUDE_CONFIG_DIR=/var/lib/nest/agents/<agent-id> \
 claude -p --input-format stream-json --output-format stream-json --verbose \
   --restricted --tools "" \
-  --strict-mcp-config --mcp-config <runner-generated: nest platform tools, proxied to the agent's AgentDO> \
-  --permission-mode dontAsk --allowedTools "mcp__nest__*" \
+  --strict-mcp-config --mcp-config <config_dir>/nest-mcp.json \
+  --permission-mode dontAsk --permission-prompts none --allowedTools "mcp__nest__*" \
   --disable-slash-commands \
-  --system-prompt-file <config_dir>/nest-system-prompt.md   # from the spawn spec \
-  --resume <session>
+  --system-prompt-file <config_dir>/nest-system-prompt.md \
+  (--session-id <uuid> | --resume <session file>)
 ```
+
+The prompt file holds the spawn spec's prompt; the MCP config points `nest mcp` at the agent's AgentDO.
 
 - **`--tools ""`** removes every built-in. `--tools "WebSearch"` brings back only web search.
 - **`--system-prompt-file`** (`system_prompt.mode: replace`) swaps the coding prompt for the template's prompt, which is the same text an `api-loop` backend would use as `system`.

@@ -223,6 +223,8 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 
 ## CLI relay
 
+> **Implemented contract.** The design replaces `notify`/`emit`/`ask` with `nest post`/`nest read`; see [pending contract changes](../README.md#pending-contract-changes).
+
 Programs in the sandbox run the `nest` binary, which connects to `/run/nest/guest.sock` (same framing) and sends one `CliRequest{agent_id?, command}`.
 - `agent_id` comes from `NEST_AGENT_ID` when set (**attribution only**).
 - The guest answers `whoami` locally. Everything else is relayed as a control `cli` request.

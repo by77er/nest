@@ -1,6 +1,6 @@
 # BrokerDO
 
-The only place secret values are stored. See [../../../security/credentials/](../../../security/credentials/).
+The only DO that stores secret values. Platform keys (the root CA key, AWS credentials, the host-token and admin secrets) are Worker secrets. See [../../../security/credentials/](../../../security/credentials/).
 
 - **References, not values:** other DOs ask BrokerDO for a reference (`$nest-secret:<name>`) and pass that around. FleetDO resolves references when it sends a command to a host. Missing or expired secrets resolve to empty and are logged.
 - **Claude setup tokens:** `claude_oauth_token`, plus named ones (`claude_oauth_token:<name>`, e.g. `:captain`) that a spawn spec's `credential` picks. They end up only in the Claude Code process environment on the host.

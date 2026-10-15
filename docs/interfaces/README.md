@@ -22,15 +22,14 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 
 The design in [agents/](../agents/) and [channels/](../channels/) needs these contract changes; the specs below and the fixtures describe what's implemented until they land:
 - **Agents** carry `owner`, `labels` and a spawn spec (with `capabilities`) instead of a role. Placement follows `hands`. Capability definitions are control-plane data, not contract.
-- **Sandboxes** carry `owner` and `labels`; sandbox commands carry no grouping field.
-- **Platform events** are posts to `<sbx>/events` and `<agt>/events`: `ChannelMessage{seq, ts_ms, from, kind?, text, data?, reply_to?, key?, mentions?}`, with kinds such as `port_opened`, `egress_denied`, `egress_alert` and `orphaned_work`.
+- **Sandboxes** carry `owner`, `labels` and the channels their programs may post to; sandbox commands carry no grouping field. Every `workstream` field goes; grouping is labels.
+- **Platform events** are posts to `<sbx>/events` and `<agt>/events`: `ChannelMessage{seq, ts_ms, from, taint, kind?, text, data?, reply_to?, key?, mentions?}`, with kinds such as `port_opened`, `egress_denied`, `egress_alert` and `orphaned_work`.
 - **`EgressPolicy` layers** are `base`, `sandbox` and `grant`.
-- **The platform tool catalog** is filtered by grants and has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`), `message`, `agent_spawn`, `adopt`, `list`, `wake_at`/`wake_cancel`, `hook_create`/`hook_delete`, and `grant`/`revoke`, plus each `mcp` or `api` capability's tools (`<capability>_<tool>`, `<capability>_request`). See [agents/tools/](../agents/tools/).
+- **The platform tool catalog** is filtered by grants. It has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`, `message`), the agent tools (`agent_spawn`, `agent_stop`, `attach`, `adopt`, `list`, `read_transcript`, `wake_at`/`wake_cancel`), the sandbox tools (`sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy`), `hook_create`/`hook_delete`, `grant`/`revoke`, brokered actions, and each `mcp` or `api` capability's tools (`<capability>_<tool>`, `<capability>_request`). `notify`, `emit`, `ask`, `spawn_agent`, `fork_sandbox` and the captain-only tools go. `ToolDef` drops `roles` and `requires_approval`; sinks and `when_tainted` come from grants. See [agents/tools/](../agents/tools/).
 - **Guest CLI:** `nest post`, `nest read`, `nest expose`.
-- **IDs:** `chn_` (channel), `tpl_` (template) and `hk_` (hook).
+- **IDs:** `chn_` (channel), `tpl_` (template) and `hk_` (hook) are added; `ws_` goes.
 - **Webhook route:** `POST /v1/hooks/<hk_…>` on the Worker (see [sources](../channels/sources/)).
-- **Channel messages** carry `taint`, set by the platform.
 - **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit.
 - **Hands journal:** guest → nestd → AgentDO intent and outcome events keyed by `(agent, epoch, tool_use_id)`.
 - **`GenerationRecord`** gains `restore_abi` and `session{offset, last_tool_use}`.
-- **Claude Code invocation** (`runner-claude`): `--system-prompt-snapshot off`, `--max-turns` and `--max-budget-usd` from the budget, no `TodoWrite` or `Agent` in `--tools`, `DISABLE_UPDATES=1`, `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` (after verification), auto memory off, and `PreToolUse` answering `defer` for approvals.
+- **Claude Code invocation** (`runner-claude`): `--system-prompt-snapshot off`, `--max-turns` and `--max-budget-usd` from the budget, no `TodoWrite` or `Agent` in `--tools`, `DISABLE_UPDATES=1`, `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` (after verification), auto memory off, and `PreToolUse` answering `defer` for approvals. `SessionStart` also returns the memory key index and the recovery context, from the AgentCache.

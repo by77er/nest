@@ -12,8 +12,8 @@
 ```
 host                                                 sandbox VM
 agent-runner → claude (no local exec/FS tools)       guest agent (hands server)
-   │ nest-mcp: hands ─────────── RPC over vsock ───►  exec · fs · pty
-   │ nest-mcp: platform ─► AgentDO ─► channels · agents · sandboxes
+   │ nest mcp: hands ─────────── RPC over vsock ───►  exec · fs · pty
+   │ nest mcp: platform ─► AgentDO ─► channels · agents · sandboxes
    └ subscription token: process env only (never in a VM)
 ```
 
@@ -49,7 +49,7 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 
 - **Memory is for long-lived agents only.** Monitors, personal assistants and captains, which live for weeks and wake many times, get the `memory` capability. Ephemeral agents (task workers, readers) get none: they finish in one session or a few, their transcript carries them, and their results reach their spawner through its subscription to their `events`. Memory that nobody needs is context to load, taint to carry and state to tidy.
 - **Agents without memory always resume** their session, since there's nothing else to restart from.
-- **Agents with memory pick resume or fresh at each wake.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the session is small. The starting rule: **resume if the last turn was under an hour ago or the session is under about 50k tokens**; otherwise start a fresh session, seeded with its memory index and the wake envelope. A fresh session also clears [taint](tools/#taint-and-sinks). The first spike measures whether the rule is right.
+- **Agents with memory pick resume or fresh at each wake.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the session is small. The starting rule: **resume if the last turn was under an hour ago or the session is under about 50k tokens**; otherwise start a fresh session, seeded with its memory index and the wake envelope. A fresh session starts untainted unless the wake that starts it carries [taint](tools/#taint-and-sinks) or it then reads tainted content. A turn cut off by a crash always resumes, since its context is in the transcript. The first spike measures whether the rule is right.
 - **One memory system:** memory is a private keyed channel. Claude Code's own auto memory is off for every agent (it's local to one host).
 - **The key index is bounded:** for agents with memory, a `SessionStart` hook injects at most 200 keys, most recently written first, plus a count of the rest, at startup and after compaction. The agent lists more with `read(keys_only, prefix)`. Claude Code's own memory index loads 200 lines the same way ([memory](https://code.claude.com/docs/en/memory)).
 - **Upkeep:** the template asks the agent to update and prune memory as it goes, and the `memory` capability schedules a weekly wake asking it to consolidate.

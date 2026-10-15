@@ -26,7 +26,7 @@ Before granting a new epoch, FleetDO terminates the old instance through the clo
 ## 4. External side effects
 
 - Every event, tool call and brokered action carries `(sandbox, epoch)`, and stale ones are rejected.
-- Brokered actions use an idempotency key of `(agent, epoch, call_id)`.
+- Brokered actions carry `(agent, epoch, call_id)`, rejected when stale, and use a natural idempotency key for the external effect (e.g. `(repo, head_sha)`).
 - A `PreToolUse` gate blocks, for example, `git push` from a stale epoch.
 - Pushes use `--force-with-lease` (a template convention).
 

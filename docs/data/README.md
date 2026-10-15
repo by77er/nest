@@ -8,5 +8,5 @@
 | R2 | Session segments (native Claude Code session files), large and older (7+ days) channel message bodies, audit log, UI artifacts (diffs, screenshots), exported journals | DOs, UI, agents, me | DO bindings only |
 | S3, per cell (Express One Zone for hot data) | Disk chunks, memory pages, generation manifests | Hosts | Instance role |
 
-- **Cross-cloud traffic is small text in one direction only:** transcripts from AWS to Cloudflare. No bulk data crosses.
+- **Cross-cloud traffic is small text:** transcripts from AWS to Cloudflare, and session files back from R2 when a brain starts on a new host. No bulk data crosses.
 - **R2 is the one global store for the control plane.** Each cell has its own S3-compatible store. See [../sandbox/state/object-store/](../sandbox/state/object-store/).
