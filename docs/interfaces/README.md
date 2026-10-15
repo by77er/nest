@@ -28,7 +28,8 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **The platform tool catalog** is filtered by grants. It has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`, `message`), the agent tools (`agent_spawn`, `agent_stop`, `attach`, `adopt`, `list`, `read_transcript`, `wake_at`/`wake_cancel`), the sandbox tools (`sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy`), `hook_create`/`hook_delete`, `grant`/`revoke`, brokered actions, and each `mcp` or `api` capability's tools (`<capability>_<tool>`, `<capability>_request`). `notify`, `emit`, `ask`, `spawn_agent`, `fork_sandbox` and the captain-only tools go. `ToolDef` drops `roles` and `requires_approval`; sinks and `when_tainted` come from grants. See [agents/tools/](../agents/tools/).
 - **Guest CLI:** `nest post`, `nest read`, `nest expose`.
 - **IDs:** `chn_` (channel), `tpl_` (template) and `hk_` (hook) are added; `ws_` goes.
-- **Webhook route:** `POST /v1/hooks/<hk_…>` on the Worker (see [sources](../channels/sources/)).
+- **Webhook route:** `POST /v1/hooks/<hk_…>` on the Worker (see [sources](../channels/sources/)). Hook maps produce keys, and subscription filters take `keys` prefixes.
+- **Metrics:** hosts send a `metrics` frame on the fleet channel every 60 s; `GET /v1/health` makes one round trip to each DO class (see [operations/](../operations/)).
 - **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit.
 - **Hands journal:** guest → nestd → AgentDO intent and outcome events keyed by `(agent, epoch, tool_use_id)`.
 - **`GenerationRecord`** gains `restore_abi` and `session{offset, last_tool_use}`.

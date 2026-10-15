@@ -36,3 +36,5 @@ cargo test --workspace
 cd control-plane && npm install && npm test
 e2e/run.sh
 ```
+
+CI runs these on every pull request. How nest ships and maintains itself: [operations](docs/operations/README.md).

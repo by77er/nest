@@ -38,7 +38,7 @@ Agents create any other channel (`ws/auth`, `team/review`). Names are hierarchic
 ## Subscriptions
 
 `subscribe(channel, filter?, delivery, batch_ms?, once?)` registers a wake rule for an agent:
-- **Filter:** `kinds`, `from`, `mentions_me`, `reply_to`. An empty filter matches everything.
+- **Filter:** `kinds`, `from`, `keys` (key prefixes, e.g. a hook's `ref/<branch>`), `mentions_me`, `reply_to`. An empty filter matches everything.
 - **Delivery:**
   - `turn`: when the agent is idle, matches start its next turn; mid-turn, a notice joins the inbox stream (stdin, or the `Stop` hook).
   - `none`: only a cursor, for later reads.

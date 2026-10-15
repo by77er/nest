@@ -2,7 +2,7 @@
 
 A personal platform that combines sandboxes with durable agents. Long-lived Claude Code agents run on my own subscription. Their brains run on hosts, and their hands work in isolated VMs on commodity cloud compute. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. Designed but not built: the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes), the Discord bot, the autoscaler and the preview router; `control-plane/README.md` lists the gaps.
+**Status:** early implementation. CI (`.github/workflows/ci.yml`) runs the Rust, control-plane, end-to-end and doc-link checks on every PR. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. Designed but not built: the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes), the Discord bot, the autoscaler and the preview router; `control-plane/README.md` lists the gaps.
 
 **Start with [architecture/](architecture/)** for how the pieces fit and how a turn flows. Everything needed to bring nest up (accounts, credentials, where they go) is in [setup/](setup/).
 
@@ -40,6 +40,8 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `crates/nest-cli` | `nest` binary: `nest hook`, `nest mcp`, in-sandbox commands |
 | `protocol/` | Fixtures, tool catalogs, Claude Code reference artifacts |
 | `e2e/` | Local end-to-end harness |
+| `.github/` | CI workflow and `CODEOWNERS` |
+| `scripts/` | Repo checks (doc links) |
 
 UFFD memory snapshots, the ublk lazy disk, the S3 object store and spot-notice handling are designed but not built (see `crates/nestd/README.md`).
 
@@ -69,9 +71,10 @@ compute         cells · controller/burst hosts · nestd · autoscaling · provi
 control plane   Cloudflare Workers + Durable Objects · API · activator                 control-plane/
 cross-cutting   security (authority, model access, identity, credentials) · data      security/  data/
 contracts       boundary interfaces (wire protocols, tool schemas)                     interfaces/
+operations      CI · deploy and rollback · metrics · GitHub (how nest ships itself)    operations/
 ```
 
-See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [interfaces/](interfaces/) and [setup/](setup/).
+See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [interfaces/](interfaces/), [operations/](operations/) and [setup/](setup/).
 
 ## Glossary
 
@@ -146,6 +149,12 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Ingress (previews, terminals, port-forwards) goes over vsock through the guest agent | [sandbox/networking/ingress/](sandbox/networking/ingress/) |
 | Reliable channels deliver strictly in order: a gap or a processing failure closes the socket and the sender resends. Each peer process has an `instance_id`; a new one resets the lineage. | [interfaces/control-host/](interfaces/control-host/) |
 | A fence is terminal for its epoch, applied on arrival, and never waits on the proxy link | [sandbox/fencing/](sandbox/fencing/) |
+| nest maintains its own repo through the repo-maintenance pattern (maintainer, workers, clean-context reviewers, monitor) | [orchestration/repo-maintenance/](orchestration/repo-maintenance/) |
+| The gates on nest's own changes are GitHub's and Cloudflare's (branch protection, `CODEOWNERS`, environment-scoped deploy secrets, rollback in Actions), never nest's | [operations/](operations/) |
+| PRs that pass CI and the reviewer's `nest/review` check auto-merge; `CODEOWNERS` paths also need me | [operations/github/](operations/github/) |
+| GitHub access is one GitHub App; BrokerDO mints installation tokens narrowed per binding (`github:dev`, `github:review`, `github:ops`) | [operations/github/](operations/github/) |
+| Merges deploy the control plane to production at 100%, then a 10-minute health window rolls back on regression and pauses deploys; schema changes are expand-only | [operations/deploy/](operations/deploy/) |
+| Runtime metrics go to Workers Analytics Engine (numbers, enums and ids only), read through the `metrics` capability | [operations/metrics/](operations/metrics/) |
 
 ## Open questions and watch items
 
@@ -164,6 +173,8 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
   `e2e/claude-verify` runs these. Already observed on 2.1.300 without a token: `system/init` arrives only after the first user message, the env scrub keeps `NEST_*` but needs bubblewrap, and the transcript path rule (implemented in `claude::project_dir`). See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
 
 - **Verify:** that Amazon Linux 2023 ships ublk, which the lazy disk needs. See [compute/provisioning/](compute/provisioning/).
+- **Verify:** that classic branch protection enforces on a private personal repo with GitHub Pro, and that code-owner review is required with zero required approvals. See [operations/github/](operations/github/).
+- **Open:** taint is one bit, so it can't tell sandbox output from outside content; auto-merge relies on keeping outside content from this repo's workers. Recording a taint source would let PRs from sessions that read the web wait for me. See [operations/](operations/#open-questions).
 - **Not designed yet:** the sandbox-to-sandbox **link** (an opt-in path through the proxy). See [sandbox/](sandbox/).
 
 ## First spike

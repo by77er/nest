@@ -100,3 +100,7 @@ Hosts hold only caches: page cache, NVMe chunk caches, local session files. See 
 | External input | Webhooks, web pages, other agents' posts | Tainted; its content reaches models only as tool results |
 
 See [security/](../security/).
+
+## Shipping nest itself
+
+nest's own agents maintain this repo: workers open PRs, clean-context reviewers check them, and PRs merge through GitHub's gates. Merges deploy through GitHub Actions with a health window and automatic rollback. A monitor agent reads runtime metrics from Workers Analytics Engine. The gates that protect nest's guardrails are GitHub's and Cloudflare's, so agents can't loosen them by changing nest. See [operations/](../operations/) and [repo maintenance](../orchestration/repo-maintenance/).
