@@ -1,6 +1,6 @@
 # Capabilities
 
-A capability is a **named, pluggable bundle**: the tools an agent gets, the grants those tools need, and a short prompt section on using them. Spawn specs and templates list capabilities, and the platform expands them into the agent's tool list, its grants (attenuated against the spawner's) and its system prompt. Messaging, channels, spawning and memory are all capabilities, so a template is a composition, not code.
+A capability is a **named, pluggable bundle**: the tools an agent gets, the grants those tools need, and a short prompt section on using them. Its tools come from the platform, from an **MCP server**, or from an **API** with read-only or read-write access, and they all reach the agent the same way: as tools. Spawn specs and templates list capabilities, and the platform expands them into the agent's tool list, its grants (attenuated against the spawner's) and its system prompt. Messaging, channels, spawning and memory are all capabilities, so a template is a composition, not code.
 
 **Why:** grants say what's allowed, not what an agent is equipped and told to do. A bundle keeps the three together, so turning messaging on is one line, and the same unit plugs into any template. It's the shape of Claude Code's plugins and skills: tools plus instructions.
 
@@ -15,10 +15,37 @@ prompt:  |                                  # added to the system prompt
   To reach a peer, use `message`. …
 ```
 
-- **Data, not code:** capabilities are stored in the control plane and edited by me, like templates. Composing existing tools into a capability is data; a new tool needs code (the tool registry).
+- **Data, not code:** capabilities are stored in the control plane and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
 - **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
+
+## Sources
+
+Every capability's tools run in the control plane or behind it, so credentials stay in BrokerDO, calls go through one pipeline, and both backends (`claude-code`, `api-loop`) get the same tools.
+
+| Source | Tools it surfaces | Credentials | Sinks |
+|---|---|---|---|
+| `builtin` | Platform tools from the registry (below) | None | Per tool |
+| `mcp{url, tools?}` | A remote MCP server's tools ([Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)), listed by the control plane and filtered by an allowlist | OAuth or a bearer token in BrokerDO; the control plane is the MCP client | A tool is a sink unless the server marks it `readOnlyHint` ([tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)) and the capability doesn't override it |
+| `api{base_url, mode, paths?, auth}` | One tool, `<capability>_request(method, path, query?, body?)` | In BrokerDO; the control plane attaches it to each request | `mode: ro` allows only `GET` and `HEAD` and isn't a sink; `mode: rw` is |
+
+```yaml
+capability: github_ro
+source: api{base_url: https://api.github.com, mode: ro, paths: [/repos/me/], auth: cap:github_ro}
+prompt: Read-only GitHub REST access to my repos, through `github_ro_request`.
+
+capability: tracker
+source: mcp{url: https://mcp.example.com/mcp, auth: cap:tracker, tools: [list_issues, get_issue, create_comment]}
+sinks: {create_comment: approve}
+prompt: The issue tracker: read freely; comment only when asked.
+```
+
+- **Same pipeline as brokered actions:** every call checks the grant and taint, rate-limits, scans arguments for secrets, gets approval if it's a sink from a tainted session, and is journaled.
+- **Results are untrusted:** every result from an `mcp` or `api` tool sets [taint](../tools/#taint-and-sinks), like web results.
+- **`ro` means no state changes, not no leaks:** requests go only to the configured base URL and path prefixes, so data can reach only that API's operator.
+- **Attenuation:** a spawner can pass on a narrower version of a capability (fewer tools, `ro` instead of `rw`, fewer paths), never a wider one.
+- **Hosts never run third-party MCP servers:** brains reach these tools only through `nest mcp` → AgentDO → the server. Tools appear to Claude Code as `mcp__nest__<capability>_<tool>`, and the allowlist keeps a large server from flooding the context.
 
 ## Built-in capabilities
 
@@ -35,10 +62,10 @@ prompt:  |                                  # added to the system prompt
 | `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
 
-**Templates compose them.** For example:
+**Templates compose them,** with any `mcp` or `api` capability alongside. For example:
 
 ```yaml
-worker:  [hands, messaging{peers: label:workstream}, memory, web, brokered{actions: [github.create_pr]}]
+worker:  [hands, messaging{peers: label:workstream}, memory, web, github_ro, brokered{actions: [github.create_pr]}]
 captain: [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory]
 ```
 
@@ -49,3 +76,7 @@ captain: [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authori
 - **Default reach is the label group.** With `peers: label:<key>`, an agent can message its owner and every agent with the same value of `<key>` (e.g. everyone with `workstream=auth`). The template picks the key. `tree` (owner and children) and `any` (every agent it knows the id of) are the alternatives.
 - **Labels set reach,** so the spawner sets them at spawn time, and changing an agent's labels needs a grant on it.
 - **Injection spread is a group, not a tree:** a tainted agent can reach its whole group. Every message carries the sender's taint, wake envelopes carry no bodies, and loop guards and rate limits bound the traffic.
+
+## Open questions
+
+- **MCP servers inside a sandbox:** a stdio server (a browser, a database client) could run in the agent's sandbox, with the guest agent bridging its tools like hands. That keeps third-party code off hosts; it isn't designed yet.
