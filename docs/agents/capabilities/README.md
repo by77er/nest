@@ -54,7 +54,7 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `hands{sandbox}` | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | `attach` on that sandbox |
 | `messaging{peers}` | `message` | `post` on the peers' inboxes |
 | `channels` | `channel_create`, `post`, `read`, `subscribe`, `unsubscribe` | its own channels; others by extra grants |
-| `memory` | `post` and `read` on its private keyed channel | that channel; the key index is injected at session start |
+| `memory` | `post` and `read` on its private keyed channel | that channel; the key index is injected at session start. **Only for long-lived agents** (see [continuity](../#continuity)) |
 | `spawning{budget}` | `agent_spawn`, `agent_stop`, `adopt`, `list` | spawning within the budget |
 | `sandboxes` | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | its own sandboxes |
 | `authority` | `grant`, `revoke` | granting what it holds; sink grants are `approve` when tainted |
@@ -65,8 +65,10 @@ prompt: The issue tracker: read freely; comment only when asked.
 **Templates compose them,** with any `mcp` or `api` capability alongside. For example:
 
 ```yaml
-worker:  [hands, messaging{peers: label:workstream}, memory, web, github_ro, brokered{actions: [github.create_pr]}]
-captain: [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory]
+worker:    [hands, messaging{peers: label:workstream}, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
+captain:   [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory]
+monitor:   [channels, messaging{peers: tree}, memory, web]          # long-lived: watches channels or the web
+assistant: [channels, messaging{peers: tree}, spawning{budget}, memory, web]  # long-lived: talks to me through `user`
 ```
 
 ## Messaging

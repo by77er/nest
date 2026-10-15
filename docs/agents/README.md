@@ -28,7 +28,7 @@ template:      worker              # optional; the fields below override it
 launch:        {system_prompt, builtin_tools, model, effort}   # becomes Claude Code flags
 backend:       claude-code         # or api-loop (later; agents without hands only)
 hands:         {sandbox, cwd?}     # or null
-capabilities:  [messaging{peers: label:workstream}, memory, ...]   # see capabilities/
+capabilities:  [messaging{peers: label:workstream}, web, ...]   # see capabilities/
 grants:        [...]               # extra grants; everything must be a subset of the spawner's
 budget:        {depth, concurrent, spawns, turns_per_day}   # at most what the spawner has left
 subscriptions: [{channel, filter, delivery, batch_ms}]
@@ -47,8 +47,10 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 
 ## Continuity
 
-- **Each wake picks resume or fresh.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the session is small. The starting rule: **resume if the last turn was under an hour ago or the session is under about 50k tokens**; otherwise start a fresh session, seeded with its memory index and the wake envelope. A fresh session also clears [taint](tools/#taint-and-sinks). The first spike measures whether the rule is right.
-- **One memory system:** memory is a private keyed channel. Claude Code's own auto memory is off (it's local to one host), and a `SessionStart` hook injects the memory key index at startup and after compaction.
+- **Memory is for long-lived agents only.** Monitors, personal assistants and captains, which live for weeks and wake many times, get the `memory` capability. Ephemeral agents (task workers, readers) get none: they finish in one session or a few, their transcript carries them, and their results reach their spawner through its subscription to their `events`. Memory that nobody needs is context to load, taint to carry and state to tidy.
+- **Agents without memory always resume** their session, since there's nothing else to restart from.
+- **Agents with memory pick resume or fresh at each wake.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the session is small. The starting rule: **resume if the last turn was under an hour ago or the session is under about 50k tokens**; otherwise start a fresh session, seeded with its memory index and the wake envelope. A fresh session also clears [taint](tools/#taint-and-sinks). The first spike measures whether the rule is right.
+- **One memory system:** memory is a private keyed channel. Claude Code's own auto memory is off for every agent (it's local to one host), and for agents with memory a `SessionStart` hook injects the memory key index at startup and after compaction.
 - **The session file is a cache** of a format Claude Code doesn't stabilize; the durable state is the R2 copy plus memory. See [sessions/](sessions/).
 
 ## Attach, share, fork
@@ -66,6 +68,10 @@ When an agent is removed for good, **what it owns is parked, then expires**:
 - Everything parked is labeled `orphaned_from=<agent>`, and a notice goes to the removed agent's owner (or to me).
 - **Adoption:** that owner, or I, can `adopt` a parked resource and become its owner; grants on it are then issued from the adopter. The removed agent's own grants have already ended with it (see [tools/](tools/)).
 - **Expiry:** whatever nobody adopts is destroyed after 30 days. Nothing is lost by accident, and nothing leaks forever.
+
+## Open questions
+
+- **Memory upkeep:** a size limit on the injected key index, and whether long-lived agents consolidate their memory themselves (a prompt convention) or on a schedule (a periodic tidying turn).
 
 ## Components
 
