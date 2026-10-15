@@ -18,10 +18,11 @@ nest runs many long-lived Claude Code agents at once. Each agent's brain is an u
 
 ## Status
 
-Early implementation. Every component exists and is tested locally, but nothing has run on real hardware yet. Channels, grants and spawn specs are designed but not built.
+Early implementation. The runtime (control plane, host daemon, egress proxy, guest agent, agent runner) exists and is tested locally, but nothing has run on real hardware yet. The coordination layer (channels, hooks, grants, capabilities, scheduled wakes) is designed but not built.
 
 ## Learn more
 
+- [Architecture](docs/architecture/README.md): how the pieces fit, and a turn end to end
 - [Design docs](docs/README.md): goals, principles, primitives, decisions and open questions
 - [Setup](docs/setup/README.md): accounts and credentials needed to bring it up
 - [End-to-end harness](e2e/README.md): running the real components together locally

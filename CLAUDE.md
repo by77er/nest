@@ -10,12 +10,13 @@ A personal platform that combines sandboxes with durable agents. Claude Code bra
 
 ## Design docs
 
-Start at [docs/README.md](docs/README.md): it has the goals, principles, layer map, glossary, settled decisions, open questions and the first spike.
+Start at [docs/README.md](docs/README.md): it has the goals, principles, layer map, glossary, settled decisions, open questions and the first spike. [docs/architecture/](docs/architecture/README.md) explains the system end to end.
 
 The docs are **hierarchical**. Each directory's `README.md` summarizes that subsystem and links down to a subdirectory for each subcomponent, recursively:
 
 ```
 docs/
+  architecture/    the system end to end: components, a turn's flow, failures, state, trust boundaries
   control-plane/   Cloudflare Workers + Durable Objects (fleet, sandbox, agent, channel, hook, broker), API (Discord bot), activator
   compute/         cells, controller/burst hosts, nestd, autoscaling, provisioning
   sandbox/         drivers, state (memory, disk, object store), fencing, networking (egress, ingress), guest agent (hands server)
