@@ -59,6 +59,7 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `sandboxes` | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | its own sandboxes |
 | `authority` | `grant`, `revoke` | granting what it holds; sink grants are `approve` when tainted |
 | `transcripts` | `read_transcript` | agents it owns |
+| `hooks` | `hook_create(channel, verify, filter?, map?)` → URL, `hook_delete`, `list` | hooks posting to channels it can post to; it never sees their secrets (see [sources](../../channels/sources/)) |
 | `schedules` | `wake_at(at \| every, note)` → id, `wake_cancel(id)` | waking itself, within its turn budget |
 | `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
@@ -67,8 +68,8 @@ prompt: The issue tracker: read freely; comment only when asked.
 
 ```yaml
 worker:    [hands, messaging{peers: label:workstream}, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
-captain:   [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory, schedules]
-monitor:   [channels, messaging{peers: tree}, memory, schedules, web]          # long-lived: watches channels or the web
+captain:   [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory, schedules, hooks]
+monitor:   [channels, messaging{peers: tree}, memory, schedules, hooks, web]   # long-lived: watches hooks, channels or the web
 assistant: [channels, messaging{peers: tree}, spawning{budget}, memory, schedules, web]  # long-lived: talks to me through `user`
 ```
 

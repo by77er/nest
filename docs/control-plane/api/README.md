@@ -1,7 +1,7 @@
 # API and surfaces
 
 - **Worker HTTP API and a static dashboard,** with my access gated by Cloudflare Access.
-- **Triggers:** webhooks (e.g. GitHub), Email Routing to an Email Worker, and schedules implemented as DO alarms.
+- **External events:** webhooks at `POST /v1/hooks/<hk_…>` and Email Routing to an Email Worker, both turned into channel posts (see [sources](../../channels/sources/)). Agents schedule their own wakes with `wake_at`.
 - **Live views:** live tails and agents' waiting `read`s follow channels (ChannelDO), including each agent's and sandbox's `events`.
 - **Approvals and escalations** go through the **[Discord bot](discord/)**, and can also be answered in the dashboard.
 - **`nest` CLI on my machine:** `attach` (a terminal over WebSocket → nestd → vsock), `logs -f`, `port-forward` (TCP over WebSocket), `diff <a> <b>`.

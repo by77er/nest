@@ -72,8 +72,8 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 
 ## Known gaps
 
-- **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), grants with
-  attenuation, spawn specs and templates, owners and labels aren't built. The code still has
+- **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
+  with attenuation, spawn specs, templates and capabilities, owners and labels aren't built. The code still has
   `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with
   `WorkstreamEvent` and batched captain wakes, a role-filtered tool catalog, and a `workstream`
   egress policy layer. Taint and sinks, budgets, wake envelopes and the hands journal aren't built either.

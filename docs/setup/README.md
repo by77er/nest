@@ -72,6 +72,8 @@ The provisioning key creates the narrow credentials nest actually runs with:
 | **GitHub App:** permissions Contents (read/write), Pull requests (read/write) and Metadata (read), installed on chosen repos | Credential injection for `git push` and PRs ([injection](../sandbox/networking/egress/injection/)) | `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY` (the PEM) |
 | **A domain on Cloudflare,** plus a Zero Trust team for Access | Previews, share links, and Access in front of the API and dashboard ([ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN`; the API token gains Zone DNS and Workers Routes edit for that zone |
 
+**Webhooks need nothing extra:** hooks live at `https://<control plane>/v1/hooks/<hk_…>`, and each provider is wired through a brokered action or by pasting a URL and a one-time secret (see [sources](../channels/sources/)).
+
 ## Generated, not provided
 
 The setup agent creates these itself, so none are needed from me:

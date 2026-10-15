@@ -10,6 +10,8 @@ turn for agent A → AgentDO → SandboxDO:
   no capacity           → stays unplaced; its alarm retries placement every 30 s (the autoscaler that would launch a host isn't built)
 ```
 
+**External events:** a webhook posts to a channel, and a subscriber's wake starts its brain, which resumes its sandbox if it has one. Nothing runs between events. See [sources](../../channels/sources/).
+
 **Brains:** a turn for an agent whose brain isn't running (it went idle, crashed or lost its host) starts one with `--resume`. See [AgentDO](../durable-objects/agent/).
 
 **Previews:** a request to `<port>-<sandbox>.preview.<domain>` for a suspended sandbox is **held** at the Worker or preview router while the sandbox resumes. Waiting doesn't use CPU time.
