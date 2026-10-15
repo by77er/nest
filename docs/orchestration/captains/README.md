@@ -29,7 +29,7 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 - **A reviewer with a clean context** checks finished work. Agents grade their own work too kindly ([Anthropic, 2026-03](https://www.anthropic.com/engineering/harness-design-long-running-apps)), and missing verification is the largest failure class in [MAST](https://arxiv.org/abs/2503.13657).
 - **Every spawn prompt says when the work counts as done,** since not knowing when to stop is a top failure mode (MAST).
 - **Workstreams:** for each one, it creates a channel, sandboxes and workers labeled `workstream=<name>`, and subscribes to their `events` with a decision filter (`question`, `blocked`, `completed`, `failed`, `pr_opened`, `orphaned_work`, `egress_alert`) and a batch window. See [../workstreams/](../workstreams/).
-- **Staying clean:** a captain that reads worker output becomes [tainted](../../agents/tools/#taint-and-sinks), and its sink calls then need my approval. So it reads wake envelopes and **quarantined reports** (a `report_schema` of enums, numbers and ids), and when it needs details it spawns a read-only reader on a read-only fork (`delegate`) instead of reading code itself.
+- **Staying clean:** a captain that reads worker output becomes [tainted](../../agents/tools/#taint-and-sinks), and its sink calls then need my approval. It can stay clean on wake envelopes and **quarantined reports** (a `report_schema` of enums, numbers and ids). How it gets details beyond those is its own call: nothing ships for it, though read-only forks and report schemas exist.
 - **Continuity:** a private memory channel, read by key at each wake. The Claude Code session is a cache, so a fresh session or a backend switch loses nothing.
 - **Escalation:** it answers its workers' questions itself when it holds the grant they ask for and is untainted, and posts to `user` otherwise.
 
@@ -39,10 +39,5 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 - Its workers get only grants and budget it holds; the `worker` template keeps management grants away from agents with hands.
 - It can use a separate setup token from workers (`credential` above).
 - `priority: high` reserves subscription headroom for it.
-
-## Open questions
-
-- **`delegate`:** keep it a pattern (spawn plus a schema'd report), or add a tool for it if models do it poorly.
-- **Approval load:** whether `approve` on tainted sinks generates too many questions in practice, and which sinks can safely be `allow`.
 
 Its backend is per agent. See [../../agents/backends/](../../agents/backends/).

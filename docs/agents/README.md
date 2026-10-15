@@ -55,12 +55,19 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 - **Several agents in one sandbox** are several RPC clients. They share files, services and ports, and conflicts are accepted. No worktrees, port blocks or per-agent uids.
 - **Isolation comes from forking the sandbox.**
 - **Per-agent grants provide attribution and prevent accidents.** Within one sandbox, they aren't a security boundary.
-- **Inspecting without hands:** spawn a read-only agent on a read-only fork and read its report (the `delegate` pattern).
+- **Inspecting without hands** is left to agents. The platform offers read-only forks and report schemas, and no `delegate` tool or reader template, so how to inspect is the model's call.
+
+## Removal
+
+When an agent is removed for good, **what it owns is parked, then expires**:
+- Owned agents stop with their state kept; owned sandboxes suspend and are archived to S3; owned channels become read-only. Parked resources cost almost nothing (see [scale to zero](../compute/autoscaling/)).
+- Everything parked is labeled `orphaned_from=<agent>`, and a notice goes to the removed agent's owner (or to me).
+- **Adoption:** that owner, or I, can `adopt` a parked resource and become its owner; grants on it are then issued from the adopter. The removed agent's own grants have already ended with it (see [tools/](tools/)).
+- **Expiry:** whatever nobody adopts is destroyed after 30 days. Nothing is lost by accident, and nothing leaks forever.
 
 ## Open questions
 
-- **Owner removal:** when an owner is stopped for good, whether what it owns is stopped with it or passed to the owner's owner. (The grants it issued end with it; see [tools/](tools/).)
-- **Resume or fresh:** the cost threshold between resuming a long session and starting fresh from memory.
+- **Resume or fresh:** the threshold value, measured in the first spike.
 
 ## Components
 

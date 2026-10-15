@@ -12,7 +12,7 @@ A captain running workstream `auth` typically creates:
 **Stopping a workstream** means listing what it owns with that label, then stopping the agents and destroying the sandboxes.
 
 **The captain decides between attach and fork; the platform imposes neither:**
-- **Same sandbox:** a reviewer watching an implementer, a tester hitting a live dev server, or me pairing with an agent. (Captains inspect through `delegate`, never by attaching.)
+- **Same sandbox:** a reviewer watching an implementer, a tester hitting a live dev server, or me pairing with an agent. (A captain that attaches reads untrusted content and becomes tainted.)
 - **Fork:** independent attempts, risky experiments, or anything that might be thrown away.
 
 Any other grouping works the same way, since labels are free-form.

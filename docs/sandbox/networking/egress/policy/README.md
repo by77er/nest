@@ -29,6 +29,4 @@ limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
   Allowed traffic isn't aggregated; it's bounded by the connection limit.
 - **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `connection_limit`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors.
 
-## Open questions
-
-- **Shared policies:** policy is per sandbox (an owner updates each of its sandboxes, and forks inherit). Named policies shared by many sandboxes would make one edit apply to all, at the cost of another object.
+**Policy is per sandbox:** forks inherit it, and an owner updates each of its sandboxes itself. There are no shared policy objects: the blast radius of an edit is one sandbox, and a loop over sandboxes is the agent's job.

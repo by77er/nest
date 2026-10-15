@@ -65,7 +65,7 @@ A woken turn's input is a **platform notice, not the messages**: per subscriptio
 
 - **An agent's own posts never wake it.**
 - **Repeats are dropped:** a sender's message identical to its previous one on the same channel (same text and data) within a minute isn't stored.
-- **Rate limits** per poster per channel, and a per-agent cap on turns started by subscriptions. A loop (A wakes B wakes A) hits a wall, not a bill.
+- **Rate limits** per poster per channel, and a per-agent cap of **60 subscription-started turns an hour**. A loop (A wakes B wakes A) hits a wall, not a bill.
 - **Bounded backlog:** at most 50 deliveries wait per agent; the oldest is dropped with a notice. Claude Code's own cross-session messaging uses the same guards ([docs](https://code.claude.com/docs/en/cross-session-messaging)).
 - **Idempotent posts:** `post(idem_key?)` returns the existing `seq` for a repeated key, so a retried post after an eviction lands once.
 - **Retention:** set per channel. The default is 30 days; a keyed message is kept while it's the newest for its key.
@@ -74,9 +74,10 @@ A woken turn's input is a **platform notice, not the messages**: per subscriptio
 
 **No interop for now:** [A2A](https://a2a-protocol.org/latest/specification/) is client-to-server tasks with no pub/sub, and [MCP tasks](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/) have no agent-to-agent features. Either could be an adapter at the edge later.
 
+These are starting defaults ("balanced"), tuned from experience.
+
 ## Open questions
 
-- **Wake limits:** default numbers for the rate limits and the wake-rate cap.
-- **Retention:** the defaults, and whether long-lived channels need compaction to R2.
+- **Compaction:** whether long-lived channels need compaction to R2.
 
 **Implementation:** one [ChannelDO](../control-plane/durable-objects/channel/) per channel. Not built yet.
