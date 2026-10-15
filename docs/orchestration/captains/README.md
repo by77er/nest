@@ -10,12 +10,15 @@ launch:
   builtin_tools: []                  # optionally WebSearch
 hands: null
 backend: claude-code                 # api-loop later
-grants:                              # on resources it owns
-  - agent_spawn, sandbox_create, sandbox_fork, sandbox_destroy, attach, agent_stop
-  - channel_create, post, read, subscribe, list, read_transcript
-  - grant, egress_policy             # sinks: when_tainted = approve
-  - post on user
-budget: {depth: 2, concurrent: <the brain concurrency cap>, spawns: 20/day}
+capabilities:                        # on resources it owns; see agents/capabilities/
+  - channels
+  - messaging{peers: tree}           # its workers, and its own owner
+  - spawning{budget: {depth: 2, concurrent: <the brain concurrency cap>, spawns: 20/day}}
+  - sandboxes                        # egress_policy is a sink: approve when tainted
+  - authority                        # granting sinks: approve when tainted
+  - transcripts
+  - memory
+grants: [post on user]
 subscriptions: [{channel: <own>/inbox}]   # it adds the rest itself
 escalate_to: user
 priority: high
@@ -36,7 +39,7 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 ## Safeguards
 
 - A captain acts only through tool calls bounded by its grants, its budget and its taint; all three are bounded by mine.
-- Its workers get only grants and budget it holds; the `worker` template keeps management grants away from agents with hands.
+- Its workers get only grants and budget it holds; the `worker` template gives agents with hands no management capabilities (no `spawning`, `sandboxes` or `authority`).
 - It can use a separate setup token from workers (`credential` above).
 - `priority: high` reserves subscription headroom for it.
 
