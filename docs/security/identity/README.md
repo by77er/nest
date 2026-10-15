@@ -16,4 +16,4 @@ Sandboxes only ever see **placeholders**. nest-proxy substitutes real credential
 
 ## OIDC tokens (deferred)
 
-`nest token --audience X` (through the guest agent and vsock) would return a short-lived JWT signed by the control plane. Its claims are sandbox, workstream, agent and **epoch**, and the Worker would publish the public keys (JWKS). It's for services that verify identity themselves and issue their own short-lived credentials (AWS `AssumeRoleWithWebIdentity`, GCP, Vault). **Deferred** until a workstream needs cloud deploy access. Placeholder injection covers token-based APIs.
+`nest token --audience X` (through the guest agent and vsock) would return a short-lived JWT signed by the control plane. Its claims are sandbox, agent, labels and **epoch**, and the Worker would publish the public keys (JWKS). It's for services that verify identity themselves and issue their own short-lived credentials (AWS `AssumeRoleWithWebIdentity`, GCP, Vault). **Deferred** until a workstream needs cloud deploy access. Placeholder injection covers token-based APIs.

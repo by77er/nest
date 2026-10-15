@@ -18,7 +18,7 @@ turn for agent A → AgentDO → SandboxDO:
 
 | Situation | Latency |
 |---|---|
-| Captain turn (`claude-code` backend on the controller host) | ~1–2 s (process start plus `--resume`) |
+| Turn for an agent without hands (`claude-code` backend on the controller host) | ~1–2 s (process start plus `--resume`) |
 | Memory snapshot in page cache | near-instant |
 | Host cold start | 45–90 s |
 

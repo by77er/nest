@@ -1,9 +1,18 @@
-# Workstreams
+# Workstreams (pattern)
 
-A workstream has a goal, a spec, a branch and a budget. It owns a set of agents and sandboxes. Its authority is [WorkstreamDO](../../control-plane/durable-objects/workstream/).
+A workstream is a **convention**, not a platform object: a goal plus the resources an agent sets up for it. The platform never sees a workstream, only labels.
 
-**Normalized events:** `started`, `progress`, `needs_input`, `blocked`, `pr_opened`, `completed`, `failed`, `budget_exceeded`, `quota_parked`, `orphaned_work`, `egress_denied`, `egress_alert`, `port_opened`, `port_exposed`. They carry `(sandbox, epoch)` when they come from a sandbox. The authoritative list is `WorkstreamEventKind` in `crates/nest-protocol/src/model.rs`.
+A captain running workstream `auth` typically creates:
+- a channel `ws/auth` holding the goal, the spec and the task board (keyed messages), plus progress;
+- sandboxes and workers labeled `workstream=auth`, owned by the captain;
+- subscriptions from itself to those workers' and sandboxes' `events` (decision kinds only, batched);
+- an egress policy on those sandboxes;
+- a budget, carried by the grant limits it gives its workers.
+
+**Stopping a workstream** means listing what it owns with that label, then stopping the agents and destroying the sandboxes.
 
 **The captain decides between attach and fork; the platform imposes neither:**
 - **Same sandbox:** a reviewer watching an implementer, a tester hitting a live dev server, or me pairing with an agent. (Captains inspect through `delegate`, never by attaching.)
 - **Fork:** independent attempts, risky experiments, or anything that might be thrown away.
+
+Any other grouping works the same way, since labels are free-form.

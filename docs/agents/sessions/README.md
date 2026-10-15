@@ -11,7 +11,7 @@ claude writes $CLAUDE_CONFIG_DIR/projects/…/<session>.jsonl (path from Session
 ```
 
 - **Stored raw,** because it's exactly what `--resume` needs. When a brain moves to another host, the runner rebuilds the file from R2 (through Worker-signed URLs) and passes its path to `--resume`.
-- **Normalized on read** for the UI, `nest logs` and captains' `read_transcript`. Reads never wake anything.
+- **Normalized on read** for the UI, `nest logs` and agents' `read_transcript`. Reads never wake anything.
 - **Rewrites:** if the file shrinks or its inode changes (e.g. from `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC` trimming after compaction), it's re-uploaded as a new base segment.
 - **Fenced** by `(agent, epoch)`. Segments from a stale host go to the orphan branch.
 - **Why not rebuild resume files from captured API traffic?** Claude Code's JSONL is an internal, versioned format with data the API traffic doesn't carry (uuid chains, structured tool results, compaction boundaries, subagent sidechains). Rebuilding it would break on Claude Code updates, and the native file is already trustworthy.

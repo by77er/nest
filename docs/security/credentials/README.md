@@ -2,8 +2,8 @@
 
 | Credential | Stored | Seen by | Notes |
 |---|---|---|---|
-| Claude setup token (subscription OAuth, 1 year, model requests only) | BrokerDO | Claude Code process env on hosts, **never a VM** | Separate tokens for captains and workers (to verify that they're independent and revocable) |
-| GitHub App private key | BrokerDO | Control plane | Mints installation tokens per workstream (1 hour, scoped) |
+| Claude setup token (subscription OAuth, 1 year, model requests only) | BrokerDO | Claude Code process env on hosts, **never a VM** | Separate named tokens per template, e.g. captains vs workers (to verify that they're independent and revocable) |
+| GitHub App private key | BrokerDO | Control plane | Mints installation tokens per binding (1 hour, scoped) |
 | GitHub installation tokens | nest-proxy memory | Proxy only | Injected by placeholder |
 | Other injected secrets | BrokerDO → nest-proxy memory | Proxy only | Per host and grant |
 | Brokered-action secrets (email, …) | Control plane | Never a VM | Executed outside the VM |
@@ -15,4 +15,4 @@
 | AWS: host role | Instance profile | nestd | S3 for its cell only |
 | AWS: control plane | Worker secret | FleetDO | Launch template only; terminate/stop only instances tagged `nest=true` |
 | R2 | DO bindings | Control plane | Hosts use Worker-signed URLs only (no R2 S3 credentials exist) |
-| api-loop captain API key (future) | BrokerDO | Control plane only | |
+| api-loop API key (future) | BrokerDO | Control plane only | |

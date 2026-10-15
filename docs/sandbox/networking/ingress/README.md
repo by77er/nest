@@ -11,7 +11,7 @@ browser ─► Cloudflare Access ─► Worker (<port>-<sandbox>.preview.<domain
 
 - **Loopback-bound dev servers work,** because the guest agent connects from inside the guest. The preview router needs only file permission on the vsock socket: no privileges, no `setns`.
 - **Routing in the Worker:** it looks up the sandbox's current host in SandboxDO and proxies to that host's single tunnel hostname, protected by an Access service token. WebSockets (hot module reload) pass through. Previews follow a sandbox when it moves, and **a request to a suspended sandbox wakes it**.
-- **Exposure is opt-in per port:** `nest expose 3000` in the sandbox, or the `expose_port` tool. The guest agent watches `/proc/net/tcp` and reports newly opened ports as events, so the UI and captains can offer a preview link.
+- **Exposure is opt-in per port:** `nest expose 3000` in the sandbox, or the `expose_port` tool. The guest agent watches `/proc/net/tcp` and reports newly opened ports as events, so the UI and subscribed agents can offer a preview link.
 - **Auth:**
   - `*.preview.<domain>` sits behind Access, so only me.
   - `*.share.<domain>` has no Access; the Worker checks a signed, expiring token for one specific `{sandbox, port}`.

@@ -28,11 +28,11 @@ Before granting a new epoch, FleetDO terminates the old instance through the clo
 - Every event, tool call and brokered action carries `(sandbox, epoch)`, and stale ones are rejected.
 - Brokered actions use an idempotency key of `(agent, epoch, call_id)`.
 - A `PreToolUse` gate blocks, for example, `git push` from a stale epoch.
-- Workstream pushes use `--force-with-lease`.
+- Pushes use `--force-with-lease` (a template convention).
 
 ## 5. Salvage
 
-If a host that was fenced off comes back with uncommitted work, it commits that work as a **sibling branch** off its last parent. The captain gets an `orphaned_work` event. No agent work is silently lost.
+If a host that was fenced off comes back with uncommitted work, it commits that work as a **sibling branch** off its last parent. An `orphaned_work` message is posted to the sandbox's `events` channel. No agent work is silently lost.
 
 The same happens when a newer epoch of a sandbox is created on a host that still has an older, dirty incarnation: the old work is salvaged before the new one reuses the disk. A commit rejected for a stale epoch fences the sandbox and offers its work as salvage too. Salvage holds the sandbox lock only while chunking, never while waiting for the control plane.
 

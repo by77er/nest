@@ -26,4 +26,4 @@
 
 Before each snapshot, the guest agent runs `drop_caches`. Because the guest kernel uses `init_on_free=1`, freed pages are zero. zstd then compresses them to nearly nothing. Keep guests at 2–4 GB.
 
-Captains don't use sandboxes, so they never need memory snapshots.
+Agents without hands have no sandbox, so they never need memory snapshots.
