@@ -129,6 +129,9 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | When an agent is removed, what it owns is parked (stopped, archived, read-only), adoptable, and destroyed after 30 days | [agents/](agents/) |
 | Inspection without hands is a pure pattern: no `delegate` tool or reader template | [orchestration/captains/](orchestration/captains/) |
 | Memory is a capability for long-lived agents only (monitors, personal assistants, captains); ephemeral agents have none and always resume | [agents/](agents/) |
+| The memory key index injected at session start is capped at 200 keys, newest first; agents tidy memory as they go, plus a weekly consolidation wake | [agents/](agents/) |
+| Agents schedule their own wakes with `wake_at` (once or repeating), a capability backed by AgentDO alarms | [agents/capabilities/](agents/capabilities/) |
+| MCP servers are remote only; a local server runs as a sandbox service exposed through ingress | [agents/capabilities/](agents/capabilities/) |
 | An agent with memory resumes if its last turn was under an hour ago or its session is under ~50k tokens, otherwise starts fresh from memory | [agents/](agents/) |
 | Channel message bodies older than 7 days move to R2; the index and keyed view stay in SQLite | [channels/](channels/) |
 | Egress policy is per sandbox (forks inherit); no shared policy objects | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/) |
@@ -164,8 +167,6 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
   - that a `SessionStart` hook fires after compaction (to re-inject the memory index)
 
   `e2e/claude-verify` runs these. Already observed on 2.1.300 without a token: `system/init` arrives only after the first user message, the env scrub keeps `NEST_*` but needs bubblewrap, and the transcript path rule (now in `claude::project_dir`). See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
-- **Memory upkeep:** a size limit on the injected key index, and how long-lived agents consolidate memory. See [agents/](agents/).
-- **MCP servers inside a sandbox:** running stdio servers in the agent's sandbox, bridged by the guest agent. See [agents/capabilities/](agents/capabilities/).
 
 ## First spike
 

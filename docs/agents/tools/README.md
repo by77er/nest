@@ -6,7 +6,7 @@
 |---|---|---|
 | **[Hands](../hands/)** | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | In the bound sandbox, over vsock RPC |
 | **Channels** | `channel_create`, `post` (optionally awaiting a reply), `read` (optionally waiting up to 120 s), `subscribe`, `unsubscribe`, `message` (post to an agent's inbox) | ChannelDO. See [../../channels/](../../channels/) |
-| **Agents** | `agent_spawn`, `agent_stop`, `attach`, `adopt` (take ownership of a parked resource), `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
+| **Agents** | `agent_spawn`, `agent_stop`, `attach`, `adopt` (take ownership of a parked resource), `wake_at` and `wake_cancel` (scheduled wakes on itself), `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
 | **Sandboxes** | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | Control plane |
 | **Authority** | `grant`, `revoke` | Control plane |
 | **Brokered actions** | `github.create_pr`, `email.send`, `http.request(profile)` | Control plane, with secrets that never reach a sandbox |
