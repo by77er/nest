@@ -17,7 +17,7 @@ The docs are **hierarchical**. Each directory's `README.md` summarizes that subs
 ```
 docs/
   architecture/    the system end to end: components, a turn's flow, failures, state, trust boundaries
-  control-plane/   Cloudflare Workers + Durable Objects (fleet, sandbox, agent, channel, hook, broker), API (Discord bot), activator
+  control-plane/   Cloudflare Workers + Durable Objects (fleet, sandbox, agent, channel, hook, broker), API (Discord bot), activator, metrics, upgrades
   compute/         cells, controller/burst hosts, nestd, autoscaling, provisioning
   sandbox/         drivers, state (memory, disk, object store), fencing, networking (egress, ingress), guest agent (hands server)
   agents/          backends (pluggable), capabilities (pluggable tool bundles), runner (Claude Code on the host), hands (RPC tools), sessions, state tracking, tools and grants
@@ -26,7 +26,6 @@ docs/
   security/        model access, identity (credential injection, OIDC), credentials inventory
   data/            what lives in DO SQLite, R2 and S3
   interfaces/      boundary contracts (wire protocols, tool schemas); fixtures in protocol/fixtures/ are the source of truth
-  operations/      how nest ships itself: CI, deploy and rollback, metrics, GitHub (App, branch protection, CODEOWNERS)
   setup/           everything needed to bring nest up: accounts, credentials, where they go, what each unlocks
 ```
 
@@ -43,3 +42,4 @@ docs/
 - Record open questions in the doc that owns them and also in the list in `docs/README.md`.
 - Link sources for external facts (pricing, limits, terms). Mark unverified claims as unverified.
 - A new subcomponent gets its own directory with a `README.md`, linked from its parent.
+- **Developing this repo is not platform design.** CI, deploys, repo settings and using nest to maintain this repo live in `dev/`, outside `docs/`. The design docs stay generic: building nest with nest is incidental.

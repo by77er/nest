@@ -64,26 +64,13 @@ The provisioning key creates the narrow credentials nest actually runs with:
 
 **Prefer not to hand over an admin key?** The setup agent can write a CloudFormation template instead. Deploying it from the console creates the same resources, plus a narrower deploy key to provide in its place.
 
-## Stage 4: self-maintenance
-
-**Unlocks:** nest maintaining this repo (see [operations/](../operations/)). The GitHub steps can be done now; CI and `CODEOWNERS` are already in the repo.
-
-| What | How | Where it goes |
-|---|---|---|
-| **GitHub Pro** | github.com → Settings → Billing and plans, or move the repo to a Team organization. Branch protection on a private repo needs it. | — |
-| **Repo settings** | Settings → General: allow auto-merge, squash merging only, automatically delete head branches. Settings → Actions → General: workflow permissions read-only, and Actions may not create or approve pull requests. | — |
-| **Branch protection on `main`** | Settings → Branches → add a classic branch protection rule, as in [operations/github/](../operations/github/#repo-settings). The checks show up for selection once CI has run on a PR. Add `nest/review` at hand-over; until then I merge with my own review. | — |
-| **The GitHub App** | Settings → Developer settings → GitHub Apps → New: the permissions and events in [operations/github/](../operations/github/#the-app), "Only on this account", webhook inactive until the control plane is up. Generate a private key, then install the App on `by77er/nest` only. | Cloud environment: `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY` (the PEM) |
-| **An analytics read token** | Cloudflare → My Profile → API Tokens → Create Custom Token: Account → Account Analytics → Read | Cloud environment: `CLOUDFLARE_ANALYTICS_TOKEN` (the setup agent stores it as `cap:metrics`) |
-| **Environment `production`** | Settings → Environments → New environment; deployment branches: `main` only. Add three environment secrets: a **second** Edit Cloudflare Workers token (so GitHub's copy can be revoked on its own), the account ID, and an analytics read token. | GitHub environment secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ANALYTICS_TOKEN` |
-
-**Then, in a new session, the setup agent checks the gates as the App** (PRs I author prove nothing, since I can bypass): it opens two throwaway PRs and confirms that GitHub reports one outside the `CODEOWNERS` paths mergeable on green CI, and one under `.github/` blocked on code-owner review. If the rule shows as not enforced, the plan doesn't cover it.
-
 ## Later (not needed to start testing)
 
 | What | Needed for | Environment variables |
 |---|---|---|
 | **Discord bot:** an application with a bot, on a private server | Approvals, escalations and chat ([discord](../control-plane/api/discord/)) | `DISCORD_APPLICATION_ID`, `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID` |
+| **GitHub App:** the repository permissions its agents need (at least Contents and Pull requests: read and write), installed on chosen repos; generate a private key | Credential injection for `git push`, and `github.*` brokered actions ([BrokerDO](../control-plane/durable-objects/broker/)) | `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY` (the PEM) |
+| **An analytics read token:** a custom Cloudflare API token with Account → Account Analytics → Read | The `metrics` capability ([metrics](../control-plane/metrics/)) | `CLOUDFLARE_ANALYTICS_TOKEN` |
 | **A domain on Cloudflare,** plus a Zero Trust team for Access | Previews, share links, email hooks, and Access in front of the API and dashboard ([ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN`; the API token gains Zone DNS and Workers Routes edit for that zone |
 
 **Webhooks need nothing extra:** hooks live at `https://<control plane>/v1/hooks/<hk_…>`, and each provider is wired through a brokered action or by pasting a URL and a one-time secret (see [sources](../channels/sources/)).
@@ -109,7 +96,7 @@ The setup agent creates these itself, so none are needed from me:
 ## Cleanup
 
 - **Claude:** revoke the setup token(s). Where tokens are revoked isn't in the public docs (unverified); stage 1 checks it.
-- **Cloudflare:** delete the API tokens (including GitHub's copies); `wrangler delete` removes the Worker.
-- **GitHub:** delete the App (its key goes with it) and the `production` environment.
+- **Cloudflare:** delete the API tokens; `wrangler delete` removes the Worker.
+- **GitHub:** delete the App; its key goes with it.
 - **AWS:** terminate every instance tagged `nest=true`, delete the stacks or resources, and deactivate the `nest-provisioner` key. Closing a dedicated account removes everything.
 - **Environment settings:** remove the variables.

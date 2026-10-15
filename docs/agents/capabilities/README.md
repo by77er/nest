@@ -63,14 +63,14 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `schedules` | `wake_at(at \| every, note)` → id, `wake_cancel(id)` | waking itself, within its turn budget |
 | `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
-| `metrics` | `metrics_query(sql)` over nest's own [runtime metrics](../../operations/metrics/) | reading them; results hold only numbers, enums and ids, so they don't taint |
+| `metrics` | `metrics_query(sql)` over nest's own [runtime metrics](../../control-plane/metrics/) | reading them; results hold only numbers, enums and ids, so they don't taint |
 
 **Templates compose them,** with any `mcp` or `api` capability alongside. For example:
 
 ```yaml
 worker:    [hands, messaging{peers: label:workstream}, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
 captain:   [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory, schedules, hooks]
-monitor:   [channels, messaging{peers: tree}, memory, schedules, hooks, web]   # long-lived: watches hooks, channels or the web (nest's own monitor swaps web for metrics)
+monitor:   [channels, messaging{peers: tree}, memory, schedules, hooks, web]   # long-lived: watches hooks, channels or the web; add `metrics` to watch nest itself
 assistant: [channels, messaging{peers: tree}, spawning{budget}, memory, schedules, web]  # long-lived: talks to me through `user`
 ```
 

@@ -1,4 +1,4 @@
-# The checks every change to main must pass. See docs/operations/ci/.
+# The checks every change to main must pass. See dev/ci.md.
 name: ci
 
 on:

@@ -1,7 +1,7 @@
 # Changes to these paths need the owner's review before they merge; everything
 # else can merge on green CI plus the reviewer agent's `nest/review` check.
 # They are the paths whose changes could weaken nest's guardrails or the gates
-# on this repo. See docs/operations/github/.
+# on this repo. See dev/github.md.
 
 # The gates themselves: CI, deploys, this file, repo-level agent instructions.
 /.github/                                   @by77er
@@ -36,6 +36,6 @@
 /crates/nestd/src/driver/                   @by77er
 /protocol/claude-code/                      @by77er
 
-# The security design these paths implement.
+# The security design these paths implement, and this repo's own pipeline.
 /docs/security/                             @by77er
-/docs/operations/                           @by77er
+/dev/                                       @by77er
