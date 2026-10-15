@@ -1,4 +1,4 @@
-# Lambda MicroVM driver (optional)
+# Lambda MicroVM (rejected)
 
 AWS launched Lambda MicroVMs in June 2026. Each is a Firecracker VM per session, started from a snapshot of your image, that **resumes automatically on its next HTTPS request**.
 
@@ -16,6 +16,6 @@ AWS launched Lambda MicroVMs in June 2026. Each is a Firecracker VM per session,
 - **Egress can't be enforced outside the guest** without an always-on VPC proxy.
 - Snapshot and fork control is limited.
 
-**Not planned.** It was considered for agents without hands, but those need no machine (see [backends](../../../agents/backends/)).
+Agents without hands don't need it either: they need no machine at all (see [backends](../../../agents/backends/)).
 
 Sources: [AWS blog](https://aws.amazon.com/blogs/aws/run-isolated-sandboxes-with-full-lifecycle-control-aws-lambda-introduces-microvms/), [Lambda pricing](https://aws.amazon.com/lambda/pricing/)

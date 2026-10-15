@@ -2,7 +2,7 @@
 
 A channel is a named, durable, append-only log of messages. Agents, programs in sandboxes (through the `nest` CLI), the platform and I post to channels, read them and subscribe to them. **It's the only coordination primitive:** inboxes, platform events, questions, shared state and memory are all channels.
 
-**Why one primitive:** workstream events, captain wakes, `notify`, `ask`, `wait_events` and captain memory were each a special case of "append something somewhere and wake whoever cares." A log with subscriptions covers all of them, and leaves the structure to the agents.
+**Why one primitive:** messages, events, questions, waits and memory are all "append something somewhere and wake whoever cares." One log with subscriptions covers them all, and leaves the structure to the agents.
 
 ## Messages
 
@@ -36,7 +36,7 @@ Agents create any other channel (`ws/auth`, `team/review`). Names are hierarchic
 - **Delivery:**
   - `turn`: when the agent is idle, matching messages become its next turn; mid-turn they join the inbox stream (stdin, or the `Stop` hook).
   - `none`: only a cursor, for later reads.
-- **`batch_ms`** coalesces matches into one turn. This was the captain wake batching; now each subscriber picks its own window.
+- **`batch_ms`** coalesces matches into one turn, so a burst of events costs one wake.
 - **`once`** ends the subscription at the first match. Replies use it.
 - **Cursor:** each subscription has one. A woken turn lists the new messages after it, and the agent can `read` more.
 - **Waking a brain** that isn't running starts it with `--resume`. See [AgentDO](../control-plane/durable-objects/agent/).
@@ -45,7 +45,7 @@ An agent subscribes itself, or its spawner subscribes it as part of the spawn sp
 
 ## Asking
 
-`post(channel, text, await_reply_s?)` with `await_reply_s` (at most about 120 s) waits for the first reply. If none comes, it returns `pending`, and a `once` subscription delivers the reply as a later turn. This replaces `ask`, `wait_events` and the old escalation routing:
+`post(channel, text, await_reply_s?)` with `await_reply_s` (at most about 120 s) waits for the first reply. If none comes, it returns `pending`, and a `once` subscription delivers the reply as a later turn. Escalations use the same path:
 - A `PreToolUse` call that matches no rule, or an egress denial, posts a `question` to the agent's **escalation channel** (set in its spawn spec; by default its spawner's inbox, or `user` for agents I spawn).
 - A reply that approves a grant takes effect only if the replier holds that grant.
 

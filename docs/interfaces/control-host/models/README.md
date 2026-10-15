@@ -1,6 +1,6 @@
 # Shared models (`nest_protocol::model`)
 
-> **Current contract.** `WorkstreamEvent`, `AgentRole` and the `workstream` policy layer are implemented and planned to go; see [Planned: role-free model](../../README.md#planned-role-free-model).
+> **Implemented contract.** See [pending contract changes](../../README.md#pending-contract-changes).
 
 | Model | Shape (JSON) | Notes |
 |---|---|---|

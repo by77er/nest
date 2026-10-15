@@ -14,4 +14,4 @@ The authority for one [channel](../../../channels/): its log, subscriptions and 
 - **Built-in channels** (`<agt>/inbox`, `<agt>/events`, `<sbx>/events`, `user`) are ordinary ChannelDOs, created with the agent or sandbox and owned by it.
 - **Cost:** idle channels hold no WebSocket and no alarm, so they cost only storage.
 
-Replaces WorkstreamDO (event fan-in, batched captain wakes, the user-notification queue). **Not built.**
+**Not built.**
