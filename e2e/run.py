@@ -2,11 +2,14 @@
 """nest local end-to-end harness. See e2e/README.md.
 
 Runs the real control plane (wrangler dev --local) and the real host components (nest-proxy, nestd
-with the `process` driver running nest-guest, nest-runner with a FAKE claude) inside an
-unprivileged user namespace, then drives a scenario through the admin API and checks the results.
-The real `claude` binary is never invoked.
+with the `process` driver running nest-guest, nest-runner) inside an unprivileged user namespace,
+then drives a scenario through the admin API and checks the results.
+
+NEST_E2E_CLAUDE=fake (default): brains are e2e/fake_claude.py running a scripted scenario; the real
+`claude` binary is never invoked. NEST_E2E_CLAUDE=real: brains are the real `claude` with the token
+from NEST_CLAUDE_OAUTH_TOKEN, given a short natural-language turn that uses the hands tools.
 """
-import json, os, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request
+import json, os, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 E2E = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(E2E)
@@ -16,6 +19,14 @@ PORT = int(os.environ.get("NEST_E2E_PORT", "18787"))
 BASE = f"http://127.0.0.1:{PORT}"
 ADMIN = "e2e-admin-token"
 FENCE_BUDGET_S = float(os.environ.get("NEST_E2E_FENCE_BUDGET_S", "30"))
+MODE = os.environ.get("NEST_E2E_CLAUDE", "fake")
+REAL = MODE == "real"
+# Popped so no subprocess inherits it (nest-guest is the sandbox): the token reaches Claude Code only
+# through the control plane's `claude_oauth_token` secret and the runner's explicit env.
+TOKEN = os.environ.pop("NEST_CLAUDE_OAUTH_TOKEN", "").strip() if REAL else ""
+REAL_MODEL = os.environ.get("NEST_CLAUDE_MODEL", "haiku")
+REAL_TURN_TIMEOUT_S = float(os.environ.get("NEST_E2E_REAL_TURN_TIMEOUT_S", "300"))
+REAL_ENV = {}  # extra env for inner.sh in real mode (set by prepare_real)
 
 PROCS = {}
 RESULTS = []  # (name, ok, detail)
@@ -165,7 +176,7 @@ def configure_host():
     assert st == 200 and "BEGIN CERTIFICATE" in ca, (st, ca)
     with open(os.path.join(WORK, "root-ca.pem"), "w") as f:
         f.write(ca)
-    st, r = api("PUT", "/v1/admin/secrets/claude_oauth_token", {"value": "fake-e2e-oauth-token-not-real"})
+    st, r = api("PUT", "/v1/admin/secrets/claude_oauth_token", {"value": TOKEN if REAL else "fake-e2e-oauth-token-not-real"})
     assert st == 200, (st, r)
     guest = [os.path.join(BIN, "nest-guest"), "--state-dir", os.path.join(WORK, "guest-state"),
              "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none", "--port-poll-ms", "500"]
@@ -176,7 +187,7 @@ def configure_host():
         "driver": {"type": "process", "guest_command": guest},
         "network": {"type": "netns", "persist_dir": os.path.join(WORK, "netns")},
         "flush_interval_ms": 500,
-        "versions": {"nest_proxy": "e2e", "agent_runner": "e2e", "claude_code": "fake"},
+        "versions": {"nest_proxy": "e2e", "agent_runner": "e2e", "claude_code": REAL_ENV.get("version", "real") if REAL else "fake"},
     }
     with open(os.path.join(WORK, "nestd.json"), "w") as f:
         json.dump(cfg, f, indent=2)
@@ -185,6 +196,8 @@ def configure_host():
 def start_inner():
     log("starting nest-proxy, nestd, nest-runner inside `unshare --user --map-root-user --mount`")
     env = dict(os.environ, WORK=WORK, BIN=BIN, E2E=E2E)
+    if REAL:
+        env.update({k: v for k, v in REAL_ENV.items() if k.startswith("NEST_E2E_")})
     logf = open(os.path.join(WORK, "logs", "inner.log"), "w")
     PROCS["inner"] = subprocess.Popen(
         ["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private", "bash", os.path.join(E2E, "inner.sh")],
@@ -210,6 +223,145 @@ def stop_inner():
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+    if REAL:  # never pgrep for `claude`: that would match the Claude Code running this harness
+        for pid in real_brains():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+# ---------------------------------------------------------------------------------- real-Claude mode
+def real_brains():
+    """Real Claude Code brains of this run: their argv names a config dir under WORK."""
+    marker = f"--mcp-config\0{os.path.join(WORK, 'state', 'agents')}/"
+    out = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/cmdline", "rb") as f:
+                    if marker in f.read().decode(errors="replace"):
+                        out.append(int(d))
+            except OSError:
+                pass
+    return out
+
+
+def cv_harness():
+    """e2e/claude-verify/harness.py: bubblewrap lookup, nest's managed settings, token redaction."""
+    d = os.path.join(E2E, "claude-verify")
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import harness
+    return harness
+
+
+def prepare_real():
+    """Managed settings for the inner mount namespace (hooks → the built `nest`; bubblewrap for the
+    subprocess env scrub), an empty cwd outside the repo (no CLAUDE.md above it), and the binary."""
+    harness = cv_harness()
+    claude = os.path.abspath(os.environ.get("NEST_CLAUDE_BIN") or shutil.which("claude") or "")
+    v = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=30,
+                       env={"PATH": harness.CHILD_PATH, "HOME": WORK, "CLAUDE_CONFIG_DIR": os.path.join(WORK, "claude-version")})
+    bwrap, source = harness.find_bwrap(os.path.join(WORK, "tools", "bubblewrap"))
+    settings = harness.managed_settings(lambda c: c.replace("/usr/lib/nest/nest", f"{BIN}/nest"), bwrap=bwrap)
+    d = os.path.join(WORK, "claude-code")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "managed-settings.json"), "w") as f:
+        json.dump(settings, f, indent=2)
+    cwd = os.path.join("/tmp", f"nest-e2e-cwd-{uuid.uuid4().hex[:12]}")
+    os.makedirs(cwd)
+    REAL_ENV.update(NEST_E2E_CLAUDE_BIN=claude, NEST_E2E_MANAGED_SETTINGS_DIR=d, NEST_E2E_RUNNER_CWD=cwd,
+                    version=(v.stdout.split() or ["unknown"])[0])
+    log(f"real Claude Code {REAL_ENV['version']} ({claude}), model {REAL_MODEL}; bubblewrap: {bwrap or source}")
+
+
+def finish_real():
+    """Same-length redaction of the token everywhere under WORK (logs, wrangler state), and cleanup."""
+    r = cv_harness().Redactor(TOKEN)
+    changed = r.scrub_tree(WORK)
+    log(f"redacted the OAuth token from {len(changed)} file(s) under {WORK}"
+        + (f" (skipped {len(r.skipped)} file(s) over 64 MB: {', '.join(os.path.basename(p) for p in r.skipped)})" if r.skipped else ""))
+    if REAL_ENV.get("NEST_E2E_RUNNER_CWD"):
+        shutil.rmtree(REAL_ENV["NEST_E2E_RUNNER_CWD"], ignore_errors=True)
+
+
+REAL_LAUNCH = {  # control-plane DEFAULT_WORKER_LAUNCH, plus a cheap model
+    "model": REAL_MODEL, "builtin_tools": ["TodoWrite", "Task", "WebSearch"],
+    "system_prompt": {"mode": "append", "text": "You work in a remote sandbox through the mcp__nest__* tools; they behave like Claude Code's built-ins."},
+}
+REAL_CONTENT = "hello from nest e2e\nedited line\n"
+
+
+def real_prompt(f):
+    return ("This is an automated end-to-end test of the hands tools. Use only mcp__nest__ tools and do these steps in order:\n"
+            "1. Run `pwd` with mcp__nest__Bash.\n"
+            f"2. Create the file {f} with mcp__nest__Write. Its content must be two lines, \"hello from nest e2e\" and \"second line\", each followed by a newline.\n"
+            f"3. Read {f} with mcp__nest__Read.\n"
+            f"4. With mcp__nest__Edit, replace \"second line\" with \"edited line\" in {f}.\n"
+            f"5. Read {f} again with mcp__nest__Read.\n"
+            "Then reply with exactly: scenario done")
+
+
+def nest_tool_uses(text):
+    return [n for n in transcript_tool_uses(text) if n.startswith("mcp__nest__")]
+
+
+def transcript_tool_uses(text):
+    names = []
+    for line in text.splitlines():
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        content = (o.get("message") or {}).get("content") if isinstance(o, dict) else None
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                names.append(b.get("name", ""))
+    return names
+
+
+def run_real_turn(agid):
+    f = os.path.join(WORK, "files", "hello.txt")
+    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": real_prompt(f)})
+    check("turn enqueued", st == 201, json.dumps(t))
+    t0 = time.time()
+
+    def finished():
+        st, turns = api("GET", f"/v1/agents/{agid}/turns")
+        return turns if st == 200 and turns and all(x.get("status") in ("done", "interrupted") for x in turns) else None
+    try:
+        wait_for(finished, REAL_TURN_TIMEOUT_S, 2.0, "the real Claude Code turn to finish")
+        check("real claude: turn finished", True, f"{time.time() - t0:.0f}s")
+    except TimeoutError as e:
+        check("real claude: turn finished", False, f"{e}"[:300] + f"; runner log: {os.path.join(WORK, 'logs', 'runner.log')}")
+    p = in_userns(["cat", f])
+    check("real claude: file in the sandbox has the expected content", p.stdout.rstrip("\n") == REAL_CONTENT.rstrip("\n"),
+          repr(p.stdout or p.stderr)[:200])
+
+    def transcript_has_tools():
+        st, tr = api("GET", f"/v1/agents/{agid}/transcript", raw=True)
+        return tr if st == 200 and nest_tool_uses(tr) else None
+    try:
+        tr = wait_for(transcript_has_tools, 45, 1.0, "mcp__nest__ tool uses in the transcript")  # an idle agent flushes every 30 s
+    except TimeoutError:
+        tr = ""
+    names = transcript_tool_uses(tr)
+    nest_tools = sorted({n for n in names if n.startswith("mcp__nest__")})
+    check("real claude: transcript has mcp__nest__ tool uses", nest_tools, f"{len(names)} tool uses: {', '.join(nest_tools) or 'none'}")
+    host = sorted({n for n in names if not n.startswith("mcp__")} & {"Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "NotebookEdit"})
+    check("real claude: no host-side built-in tool uses", not host, ", ".join(host) or "none")
+    guests = children_named(os.path.join(BIN, "nest-guest"))
+    leaked = [g for g in guests if TOKEN.encode() in read_bytes(f"/proc/{g}/environ")]
+    check("real claude: the OAuth token is not in the sandbox's environment", guests and not leaked, f"guests={guests} leaked={leaked}")
+
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
 
 
 # ---------------------------------------------------------------------------------- scenario
@@ -279,37 +431,44 @@ def run_scenario():
     netns = os.path.join(WORK, "netns", f"ns-{sbxid}")
     wait_for(lambda: os.path.exists(netns), 20, 0.2, "sandbox netns")
 
-    st, ag = api("POST", "/v1/agents", {"role": "worker", "workstream": wsid, "sandbox": sbxid, "cell": "local"})
+    body = {"role": "worker", "workstream": wsid, "sandbox": sbxid, "cell": "local"}
+    if REAL:
+        body["launch"] = REAL_LAUNCH
+    st, ag = api("POST", "/v1/agents", body)
     check("agent created + started", st == 201, json.dumps(ag)[:300])
     agid = ag.get("agent") or ag.get("id")
 
-    spath, nsteps = scenario(os.path.join(WORK, "files"))
-    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {spath}"})
-    check("turn enqueued", st == 201, json.dumps(t))
+    if REAL:
+        run_real_turn(agid)
+        skip("scripted hands, egress, notify and audit checks", "fake mode only: they need scripted tool calls; real mode checks hands through a natural-language turn")
+    else:
+        spath, nsteps = scenario(os.path.join(WORK, "files"))
+        st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {spath}"})
+        check("turn enqueued", st == 201, json.dumps(t))
 
-    try:
-        wait_for(lambda: len(results_by_label()) >= nsteps or None, 120, 0.5, "scenario tool results")
-    except TimeoutError as e:
-        check("all tool results returned to fake claude", False, f"{len(results_by_label())}/{nsteps}: {e}")
-    res = results_by_label()
-    text = lambda k: (res.get(k) or {}).get("text") or ""
-    check("Bash pwd", res.get("pwd") and not res["pwd"]["is_error"], text("pwd").strip()[:200])
-    check("Bash cwd persists across calls", f"cwd={WORK}/files" in text("persist"), text("persist").strip()[:200])
-    check("Bash exported vars do NOT persist (matches Claude Code; host-guest spec)", "var=persisted" not in text("persist"), text("persist").strip()[:200])
-    check("exec env (NEST_AGENT_ID, HTTPS_PROXY)", agid in text("env") and "172.16.0.1:" in text("env"), text("env").strip()[:200])
-    check("allowed host via proxy → 200", text("allowed").strip().endswith("200"), text("allowed").strip()[:200])
-    check("denied host → 403 inside the tunnel", "http=403" in text("denied"), text("denied").strip().replace("\n", " | ")[:200])
-    check("denied host → readable JSON reason", "egress_denied" in text("denied"), text("denied").strip().replace("\n", " | ")[:300])
-    inj = text("inject")
-    check("credential injection: upstream saw the real secret (scrubbed on the way back)",
-          "http=200" in inj and INJECT_PLACEHOLDER not in inj and INJECT_SECRET not in inj and ("*" * len(INJECT_SECRET)) in inj,
-          inj.strip().replace("\n", " | ")[:300])
-    check("direct egress blocked (no route)", " rc=0" not in text("direct"), text("direct").strip()[:200])
-    check("Write", res.get("write") and not res["write"]["is_error"], text("write").strip()[:200])
-    check("Read", "hello from nest e2e" in text("read"), text("read").strip()[:200])
-    check("Edit", res.get("edit") and not res["edit"]["is_error"], text("edit").strip()[:200])
-    check("Read after Edit", "edited line" in text("reread"), text("reread").strip()[:200])
-    check("platform tool notify", res.get("notify") and not res["notify"]["is_error"], text("notify").strip()[:300])
+        try:
+            wait_for(lambda: len(results_by_label()) >= nsteps or None, 120, 0.5, "scenario tool results")
+        except TimeoutError as e:
+            check("all tool results returned to fake claude", False, f"{len(results_by_label())}/{nsteps}: {e}")
+        res = results_by_label()
+        text = lambda k: (res.get(k) or {}).get("text") or ""
+        check("Bash pwd", res.get("pwd") and not res["pwd"]["is_error"], text("pwd").strip()[:200])
+        check("Bash cwd persists across calls", f"cwd={WORK}/files" in text("persist"), text("persist").strip()[:200])
+        check("Bash exported vars do NOT persist (matches Claude Code; host-guest spec)", "var=persisted" not in text("persist"), text("persist").strip()[:200])
+        check("exec env (NEST_AGENT_ID, HTTPS_PROXY)", agid in text("env") and "172.16.0.1:" in text("env"), text("env").strip()[:200])
+        check("allowed host via proxy → 200", text("allowed").strip().endswith("200"), text("allowed").strip()[:200])
+        check("denied host → 403 inside the tunnel", "http=403" in text("denied"), text("denied").strip().replace("\n", " | ")[:200])
+        check("denied host → readable JSON reason", "egress_denied" in text("denied"), text("denied").strip().replace("\n", " | ")[:300])
+        inj = text("inject")
+        check("credential injection: upstream saw the real secret (scrubbed on the way back)",
+              "http=200" in inj and INJECT_PLACEHOLDER not in inj and INJECT_SECRET not in inj and ("*" * len(INJECT_SECRET)) in inj,
+              inj.strip().replace("\n", " | ")[:300])
+        check("direct egress blocked (no route)", " rc=0" not in text("direct"), text("direct").strip()[:200])
+        check("Write", res.get("write") and not res["write"]["is_error"], text("write").strip()[:200])
+        check("Read", "hello from nest e2e" in text("read"), text("read").strip()[:200])
+        check("Edit", res.get("edit") and not res["edit"]["is_error"], text("edit").strip()[:200])
+        check("Read after Edit", "edited line" in text("reread"), text("reread").strip()[:200])
+        check("platform tool notify", res.get("notify") and not res["notify"]["is_error"], text("notify").strip()[:300])
 
     # Direct connect from inside the sandbox netns (outside the guest's own tools).
     p = in_userns(["bash", "-c", "ip route; timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' && echo CONNECTED || echo BLOCKED"], netns=netns)
@@ -321,6 +480,8 @@ def run_scenario():
     # Session transcript in R2 (via the admin API), agent turns/events.
     def transcript_ok():
         st, tr = api("GET", f"/v1/agents/{agid}/transcript", raw=True)
+        if REAL:  # tool uses are checked by run_real_turn; here only that durable bytes reached R2
+            return tr if st == 200 and tr.strip() else None
         return tr if st == 200 and "tool_use" in tr and "scenario done" in tr else None
     try:
         tr = wait_for(transcript_ok, 45, 1.0, "transcript segments in R2")  # an idle agent flushes every 30 s
@@ -334,6 +495,8 @@ def run_scenario():
     st, evs = api("GET", f"/v1/workstreams/{wsid}/events")
     evs_s = json.dumps(evs)
     check("workstream events visible", st == 200, evs_s[:300])
+    if REAL:
+        return {"workstream": wsid, "sandbox": sbxid, "agent": agid, "netns": netns}
     st, notes = api("GET", f"/v1/workstreams/{wsid}/notifications")
     check("notify reached the user-notification queue", st == 200 and "hello from the e2e fake claude" in json.dumps(notes), json.dumps(notes)[:300])
 
@@ -354,7 +517,7 @@ def run_scenario():
 
 
 def run_fencing(ids):
-    brains = children_named(os.path.join(E2E, "fake_claude.py"))
+    brains = real_brains() if REAL else children_named(os.path.join(E2E, "fake_claude.py"))
     guests = children_named(os.path.join(BIN, "nest-guest"))
     check("pre-fence: brain + guest alive", brains and guests, f"brains={brains} guests={guests}")
     log("stopping the control plane to cut heartbeats")
@@ -380,10 +543,21 @@ def run_fencing(ids):
 
 
 def main():
+    if MODE not in ("fake", "real"):
+        log(f"NEST_E2E_CLAUDE must be `fake` or `real`, not {MODE!r}")
+        sys.exit(2)
+    if REAL and not TOKEN:
+        log("SKIP: NEST_E2E_CLAUDE=real needs the owner's Claude token in NEST_CLAUDE_OAUTH_TOKEN; nothing was run")
+        sys.exit(2)
+    if REAL and not (os.environ.get("NEST_CLAUDE_BIN") or shutil.which("claude")):
+        log("SKIP: NEST_E2E_CLAUDE=real needs `claude` on PATH or NEST_CLAUDE_BIN; nothing was run")
+        sys.exit(2)
     started = time.time()
     try:
         build()
         prepare_work()
+        if REAL:
+            prepare_real()
         start_control_plane()
         configure_host()
         start_inner()
@@ -408,6 +582,8 @@ def main():
             log(f"  failed: {n}")
         with open(os.path.join(WORK, "summary.json"), "w") as f:
             json.dump([{"check": n, "ok": ok, "detail": d} for n, ok, d in RESULTS], f, indent=2)
+        if REAL:
+            finish_real()
     sys.exit(1 if any(ok is False for _, ok, _ in RESULTS) else 0)
 
 
