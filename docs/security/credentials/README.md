@@ -6,8 +6,7 @@
 | GitHub App private key | BrokerDO | Control plane | Mints installation tokens per binding (1 hour, scoped) |
 | GitHub installation tokens | nest-proxy memory | Proxy only | Injected by placeholder |
 | Other injected secrets | BrokerDO → nest-proxy memory | Proxy only | Per host and grant |
-| Brokered-action secrets (email, …) | Control plane | Never a VM | Executed outside the VM |
-| Remote MCP OAuth tokens | Control plane | Never a VM | |
+| Brokered-action secrets (email, …) | BrokerDO | Never a VM | Executed outside the VM |
 | Proxy root CA key | Worker secret | Control plane | Signs per-host intermediates at enrollment; the root certificate is in the image |
 | Per-host intermediate CA (~7 days) | nest-proxy memory | Proxy | Signs leaf certificates on the fly |
 | OIDC signing key (deferred) | Worker secret | Control plane | JWKS published |

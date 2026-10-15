@@ -16,7 +16,7 @@
 | Swarm | N workers on forks of one sandbox, claiming tasks on a shared board (a channel read by key, with compare-and-set claims). Without an oracle splitting the work, swarms pile onto the same problem ([Anthropic's C compiler, 2026-02](https://www.anthropic.com/engineering/building-c-compiler)) |
 | Me pairing with an agent | Its inbox (from Discord), and `nest attach` to its sandbox |
 | Triage in front of an expensive agent | A cheap agent subscribed to a busy channel, posting only what matters to the other's inbox |
-| Monitor | A long-lived agent with memory, subscribed to the channels or events it watches (CI, a sandbox's ports, a feed), posting to `user` or a captain when something needs attention |
+| Monitor | A long-lived agent with memory, subscribed to the channels or events it watches (CI hooks, a sandbox's ports), or polling a feed with `wake_at`, posting to `user` or a captain when something needs attention |
 | Personal assistant | A long-lived agent with memory, bridged to Discord, that answers me and spawns ephemeral workers for tasks |
 
 ## Components

@@ -11,7 +11,7 @@ ingress:        vsock only (Firecracker's host-side unix socket → guest agent)
 - **Egress:** the only reachable addresses are nest-proxy's listeners on `172.16.0.1`, which nestd binds inside the netns and hands to the unprivileged proxy. See [egress/](egress/).
 - **Ingress:** previews, terminals and port-forwards all arrive over **vsock** through the guest agent. Loopback-bound servers work, and nothing needs network access into the netns. See [ingress/](ingress/).
 - **Snapshots restore unchanged** on any host or into any fork. nestd rebuilds the host side (netns, tap0, nft, listeners) before Firecracker starts.
-- **Sandboxes can't reach each other.** With identical addresses and no routes, it's structurally impossible. An explicit **link** goes through the proxy.
+- **Sandboxes can't reach each other.** With identical addresses and no routes, it's structurally impossible. An explicit **link** would go through the proxy (not designed yet).
 - **Control and identity go over vsock.**
 - **TCP connections drop on suspend or move.** Clients retry. Brains are unaffected, because they run on the host.
 - The guest is IPv4-only. The proxy chooses the upstream address family.

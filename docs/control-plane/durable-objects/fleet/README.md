@@ -16,7 +16,7 @@ One per cell: hosts, enrollment, leases, placement, STONITH and command delivery
 - **Leases:**
   - **One lease, one host:** placement refuses a sandbox that already holds a lease, and a lease is never overwritten.
   - **Expiry:** a host silent for 30 s has its leases expired.
-  - **Controller hosts** hold no leases. One silent for 30 s is marked `expired`, and its agents (none of which have hands) start on another controller host without STONITH: nothing on it can run twice, its runner killed the brains when its lease lapsed at 20 s, and only an agent's assigned host may attach its session. Its next `hello` makes it active again.
+  - **Controller hosts** hold no sandbox leases. One silent for 30 s is marked `expired`, and its agents (none of which have hands) start on another controller host without STONITH: nothing on it can run twice, its runner killed the brains when its lease lapsed at 20 s, and only an agent's assigned host may attach its session. Its next `hello` makes it active again.
 - **STONITH:**
   - **EC2:** terminates the old instance (signed with `aws4fetch`) and waits until it's `shutting-down`/`terminated`.
   - **Without EC2:** waits for the host to reconnect and fence. The fence is re-issued on every hello, every tick and after a failure, until one succeeds.
@@ -26,3 +26,4 @@ One per cell: hosts, enrollment, leases, placement, STONITH and command delivery
 - **Not built:**
   - **The autoscaler** (`RunInstances` plus recording the launch). See [../../../compute/autoscaling/](../../../compute/autoscaling/).
   - **Command batching:** one frame per `issueCommands` call.
+  - **Packing:** placement is least-loaded by lease count (warm snapshots first); hugepage-aware packing and the restore-ABI match aren't built.

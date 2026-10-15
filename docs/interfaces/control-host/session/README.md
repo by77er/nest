@@ -1,5 +1,8 @@
 # Session channel (agent runner ↔ AgentDO)
 
+> **Implemented contract.** In the design, `segment_ack` follows the SQLite commit and there are no roles; see [pending contract changes](../../README.md#pending-contract-changes).
+
+
 One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello includes the agent's epoch: the bound sandbox's epoch for workers, `0` for captains.
 
 ## Messages

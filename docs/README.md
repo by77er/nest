@@ -2,7 +2,7 @@
 
 A personal platform that combines sandboxes with durable agents. Long-lived Claude Code agents run on my own subscription. Their brains run on hosts, and their hands work in isolated VMs on commodity cloud compute. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. Every component exists, and each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. The coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes) is designed but not built; `control-plane/README.md` lists the gaps.
+**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. Nothing has run on real hardware yet: there's no KVM here, so Firecracker is untested. Designed but not built: the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes), the Discord bot, the autoscaler and the preview router; `control-plane/README.md` lists the gaps.
 
 **Start with [architecture/](architecture/)** for how the pieces fit and how a turn flows. Everything needed to bring nest up (accounts, credentials, where they go) is in [setup/](setup/).
 
@@ -41,7 +41,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `protocol/` | Fixtures, tool catalogs, Claude Code reference artifacts |
 | `e2e/` | Local end-to-end harness |
 
-UFFD memory snapshots and the ublk lazy disk are designed but not built.
+UFFD memory snapshots, the ublk lazy disk, the S3 object store and spot-notice handling are designed but not built (see `crates/nestd/README.md`).
 
 ## Primitives
 
@@ -62,10 +62,10 @@ Captains, workstreams and teams are patterns built from these. See [orchestratio
 
 ```
 patterns        captains · workstreams (templates + conventions) · quota scheduling  orchestration/
-agents          backends · runner · hands · sessions · state tracking · tools          agents/
+agents          backends · capabilities · runner · hands · sessions · state tracking · tools  agents/
 channels        logs · subscriptions · wakes · external sources (webhooks, email)      channels/
 sandbox         drivers · state · fencing · networking · guest agent                   sandbox/
-compute         cells · controller/burst hosts · nestd · autoscaling                   compute/
+compute         cells · controller/burst hosts · nestd · autoscaling · provisioning    compute/
 control plane   Cloudflare Workers + Durable Objects · API · activator                 control-plane/
 cross-cutting   security (authority, model access, identity, credentials) · data      security/  data/
 contracts       boundary interfaces (wire protocols, tool schemas)                     interfaces/
@@ -88,14 +88,14 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Subscription | An agent's wake rule on a channel: a filter plus how matches are delivered |
 | Grant | Permission for a principal to do an action on a resource. Passed on only by someone who holds it. |
 | Owner | Whoever created a resource. Holds every grant on it. |
-| Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, other agents' tainted posts) |
+| Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, MCP and API results, transcripts, tainted posts) |
 | Sink | An action that can send data out or widen authority; from a tainted session it needs approval |
 | Capability | A pluggable bundle of tools, the grants they need and prompt instructions, listed in spawn specs |
 | Template | A named spawn spec (prompt, capabilities, grants, subscriptions, backend), stored as data |
 | Generation | Immutable manifest of a sandbox's disk (and optionally memory) chunks |
 | Epoch | Fencing token. It increments each time a sandbox's lease is granted. |
 | Cell | A unit of compute plus its object store (e.g. AWS us-east-1 with S3) |
-| Controller host | A small, always-on, stateless host: brains without hands, and the Discord gateway. No sandboxes. |
+| Controller host | A small, always-on, stateless host: nestd (no sandboxes), brains without hands, and the Discord gateway |
 | Burst host | A spot VM with nested virtualization running Firecracker sandboxes (all sandboxes live here) |
 | Captain | A pattern, not a platform concept: an agent without hands, spawned from the `captain` template, that manages other agents and escalates to me |
 | Workstream | A pattern, not a platform concept: a goal plus the channel, sandboxes and agents set up for it, grouped by a label |
@@ -128,12 +128,14 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | An agent with memory resumes if its last turn was under an hour ago or its session is under ~50k tokens, otherwise starts fresh from memory | [agents/](agents/) |
 | Channel message bodies older than 7 days move to R2; the index and keyed view stay in SQLite | [channels/](channels/) |
 | Egress policy is per sandbox (forks inherit); no shared policy objects | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/) |
-| Guardrails start "balanced": 60 subscription-started turns an hour per agent, a 50-delivery backlog, 30-day retention, approval for egress widening and granting sinks | [channels/](channels/) |
-| Taint is tracked per session by the platform; sink calls (egress widening, external brokered actions, granting sinks) from a tainted session need approval from me or an untainted holder | [agents/tools/](agents/tools/) |
+| Guardrails start "balanced": 60 subscription-started or scheduled turns an hour per agent, a 50-delivery backlog, 30-day retention | [channels/](channels/) |
+| Taint is tracked per session by the platform; sink calls (egress widening, external brokered actions, MCP tools not marked read-only, `rw` APIs, granting sinks) from a tainted session need approval from me or an untainted holder | [agents/tools/](agents/tools/) |
 | A woken turn gets a platform notice; other agents' message bodies reach a model only as `read` results | [channels/](channels/) |
 | Budgets (depth, concurrency, spawns, turns) shrink like grants and are enforced per owner subtree; quota is divided by priority and the concurrency cap, not by estimated shares | [orchestration/scheduling/](orchestration/scheduling/) |
 | Hands calls are journaled (intent, outcome); after a crash, in-flight calls are reported as unknown, never retried | [agents/hands/](agents/hands/) |
-| Memory snapshots carry a restore ABI and restore only on matching hosts; the burst fleet is the 8i family; placement packs | [sandbox/state/memory/](sandbox/state/memory/) |
+| Memory snapshots carry a restore ABI and restore only on matching hosts | [sandbox/state/memory/](sandbox/state/memory/) |
+| The AWS burst fleet is the 8i family only | [compute/](compute/) |
+| Placement packs by free hugepages | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
 | The harness runs on the host; hands are RPC into the sandbox; no credentials in VMs | [agents/](agents/) |
 | I reach agents through a Discord bot that bridges Discord channels and threads to nest channels | [control-plane/api/discord/](control-plane/api/discord/) |
@@ -159,7 +161,10 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
   - `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` and `PreToolUse` `defer` under stream-json input
   - that a `SessionStart` hook fires after compaction (to re-inject the memory index)
 
-  `e2e/claude-verify` runs these. Already observed on 2.1.300 without a token: `system/init` arrives only after the first user message, the env scrub keeps `NEST_*` but needs bubblewrap, and the transcript path rule (now in `claude::project_dir`). See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
+  `e2e/claude-verify` runs these. Already observed on 2.1.300 without a token: `system/init` arrives only after the first user message, the env scrub keeps `NEST_*` but needs bubblewrap, and the transcript path rule (implemented in `claude::project_dir`). See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
+
+- **Verify:** that Amazon Linux 2023 ships ublk, which the lazy disk needs. See [compute/provisioning/](compute/provisioning/).
+- **Not designed yet:** the sandbox-to-sandbox **link** (an opt-in path through the proxy). See [sandbox/](sandbox/).
 
 ## First spike
 

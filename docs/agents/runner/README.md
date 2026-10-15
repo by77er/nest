@@ -6,7 +6,7 @@ A Rust component on every host that runs brains:
 
 ## Invocation (agent with hands)
 
-The canonical command line, environment and managed settings are in [../../interfaces/host-internal/runner-claude/](../../interfaces/host-internal/runner-claude/) (built by `nest_protocol::host::claude`). In short:
+The canonical command line, environment and managed settings are in [../../interfaces/host-internal/runner-claude/](../../interfaces/host-internal/runner-claude/) (built by `nest_protocol::host::claude`). In short (the flags under [pending contract changes](../../interfaces/README.md#pending-contract-changes) aren't built yet):
 
 ```bash
 cd /var/lib/nest/empty && CLAUDE_CONFIG_DIR=/var/lib/nest/agents/<id> \
@@ -50,7 +50,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 - **Running:** one long-lived process per active agent. Messages written to stdin during a turn are queued; stdin has its own writer task, so a kill never waits on it.
 - **Turn tracking:** each user message (turn or inbox) is counted against `result`s; if a `result` leaves messages outstanding and Claude Code shows no further activity for 10 s, they were merged into that turn.
 - **Interrupt:** the stream-json control message (check for `interrupt_receipt_v1`). Fallback: SIGINT to the Claude Code pid only, then SIGKILL of its process group.
-- **Idle:** after a grace period, close stdin so the process exits. A turn or inbox message arriving while it exits restarts Claude Code with `--resume` and is replayed; after that, the next turn starts a new brain with `--resume`.
+- **Idle:** after 120 s idle (configurable), close stdin so the process exits. A turn or inbox message arriving while it exits restarts Claude Code with `--resume` and is replayed; after that, the next turn starts a new brain as AgentDO's `agent_start` says (resumed or fresh).
 - **Exit:** the last stdout lines are processed before the exit is handled; the session channel keeps flushing (and reconnecting) for up to 30 s until AgentDO has acked every event and the session bytes are durable.
 - **Unattended runs:** `--permission-prompts none` makes Claude Code deny without prompting and tell the model not to retry ([headless](https://code.claude.com/docs/en/headless)). Escalation comes from our own `PreToolUse` hook: a call no rule allows is held with `defer`, which ends the process; once approved, the brain resumes and the same call runs ([hooks](https://code.claude.com/docs/en/hooks)). `defer` handles one tool call per turn and works only under `-p`; to verify with stream-json in the spike.
 - **Stream parsing:** `system/init` arrives only after the first user message, with `SessionStart` hook lines before it, so the runner writes the first turn without waiting for it.

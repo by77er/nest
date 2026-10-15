@@ -16,5 +16,5 @@ The Worker answers an interaction within Discord's 3-second window by deferring,
 - **Bridges:** a Discord channel or thread can be bridged to a nest channel (`/bridge <channel>`). The `user` channel is always bridged. Posts in a bridged nest channel appear in Discord; the control plane posts through the REST API and batches to stay under rate limits.
 - **A message I type** in a bridged Discord channel or thread becomes a post from `user`. Typed in an agent's inbox bridge, it wakes that agent.
 - **Questions** (`kind: question`) become messages with buttons. Each button's `custom_id` carries an opaque message reference; my click or modal answer is posted as the reply.
-- **Urgency:** a post's `urgency` decides whether the message @-mentions me or just posts silently.
-- **What gets bridged is up to agents and me:** a captain typically bridges one Discord thread per workstream channel it creates.
+- **Mentions:** a post that mentions me (`mentions: [user]`) or is a `question` @-mentions me; anything else posts silently.
+- **What gets bridged is up to me** (`/bridge`); an agent can ask me to bridge a channel, e.g. a captain for each workstream channel.

@@ -7,7 +7,7 @@ The authority for one agent (conversation).
   - Retryable start failures are retried 3 times.
   - Exits and host reports count only from the host the agent is assigned to.
   - When the sandbox moves, the agent follows it.
-  - **Waking:** a brain that isn't running (it went idle, exited or lost its host) starts again whenever work is waiting: a new turn, a due [scheduled wake](../../../agents/capabilities/#schedules) (an alarm here), or the turn it was in the middle of. It resumes or starts fresh from memory, whichever is cheaper (see [continuity](../../../agents/#continuity)). A start with no host available retries every 30 s, and brain starts per cell are capped so a broadcast can't start every brain at once.
+  - **Waking:** a brain that isn't running (it went idle, exited or lost its host) starts again whenever work is waiting: a new turn, a due [scheduled wake](../../../agents/capabilities/#schedules) (an alarm here), or the turn it was in the middle of. It resumes; an agent with memory starts fresh from it instead when its last turn was over an hour ago and its session is over ~50k tokens. A turn cut off by a crash always resumes. See [continuity](../../../agents/#continuity). A start with no host available retries every 30 s, and brain starts per cell are capped so a broadcast can't start every brain at once.
   - **Crash-loop guard:** an exit other than `stopped` or `auth_failed` restarts the brain at once if work is waiting. After 3 such restarts without a completed turn, the agent is `errored` and only new input retries.
   - **Agents without hands** on a controller host that goes silent start again on another one. See [FleetDO](../fleet/).
 - **Session socket:**
@@ -34,9 +34,11 @@ The authority for one agent (conversation).
   - **Grants:** each call needs a grant held by this agent; `grant` and spawn specs are checked for attenuation (a subset of this agent's grants).
   - **`read_transcript`:** pages by entry, where an entry is a 1-based line of the session JSONL. `since_seq` is the last entry seen, the default limit is 200 (max 500, about 256 KiB), and reads stream segment by segment.
 - **Spec:** grants, the list of its subscriptions, escalation channel, priority, labels, owner, and rules for the runner's local hook answers.
-- **Taint:** one bit for the current session, set from runner events (hands results, web tools) and from reads of tainted content, and checked on every sink call. See [taint and sinks](../../../agents/tools/#taint-and-sinks).
+- **Taint:** one bit for the current session, set from runner events (hands results, web tools), from `mcp` and `api` capability results, from tainted wakes and from reads of tainted content, and checked on every sink call. See [taint and sinks](../../../agents/tools/#taint-and-sinks).
 - **Budget:** tracked against its owner's subtree. An agent over budget is parked, and the overrun posts a question to its escalation channel.
 - **Hands journal:** intent and outcome events per hands call, used to build the recovery context.
 - **Backend:** for `api-loop` agents (later), the DO runs the model loop itself. See [../../../agents/backends/](../../../agents/backends/).
+
+**Not built:** deliveries from ChannelDO, scheduled wakes, the resume-or-fresh choice, the per-cell start cap, the spec (capabilities, grants, subscriptions, owner, labels), taint, budgets and the hands journal. Session bytes are acked after the R2 put and flushed every 5 s, and the code still keys agents by role and workstream. See `control-plane/README.md`.
 
 **Cost:** an AgentDO is billed for duration only while it's active. Hibernatable sockets and alarm-based timers let an idle one hibernate; pending `setTimeout`s, RPCs and fetches keep it active (and billed) for up to 15 minutes each ([changelog](https://developers.cloudflare.com/changelog/product/durable-objects/)). Even an AgentDO that never hibernates (about 10.8k GB-s/day at 128 MB) costs roughly $4/month beyond Workers Paid's included 400k GB-s/month ([pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)).

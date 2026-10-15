@@ -1,5 +1,8 @@
 # runner ↔ Claude Code
 
+> **Implemented contract.** The design drops `Agent` and `TodoWrite` from `--tools` and adds `--system-prompt-snapshot off`, the budget flags and `DISABLE_UPDATES=1`; see [pending contract changes](../../README.md#pending-contract-changes).
+
+
 Unmodified Claude Code, documented flags only. Reference artifacts in `protocol/claude-code/`; builders in `nest_protocol::host::claude` (golden-tested).
 
 ## Command line

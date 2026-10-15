@@ -22,6 +22,7 @@ Keyed messages form a key-value view: shared state (a spec, a task board, claims
 - `read(latest_by_key, prefix?, keys_only?)` returns the newest message per key.
 - `post(key, if_seq?)` is a compare-and-set: it fails if the key's newest `seq` isn't `if_seq`. Two agents claiming the same task can't both win.
 - A keyed post with no text removes the key from the view.
+- **Keys are short identifiers** (`[a-z0-9/_.-]`, at most 64 characters), so a key index can't carry instructions; the index marks keys whose newest entry is tainted.
 
 ## Built-in channels
 
@@ -58,7 +59,7 @@ A woken turn's input is a **platform notice, not the messages**: per subscriptio
 ## Asking
 
 `post(channel, text, await_reply_s?)` with `await_reply_s` (at most about 120 s) waits for the first reply. If none comes, it returns `pending`, and a `once` subscription delivers the reply as a later turn. Escalations use the same path:
-- A `PreToolUse` call that matches no rule, a sink call from a tainted session, or an egress denial posts a `question` to the agent's **escalation channel** (set in its spawn spec; by default its spawner's inbox, or `user` for agents I spawn).
+- A `PreToolUse` call that matches no rule, or a sink call from a tainted session, posts a `question` to the agent's **escalation channel** (set in its spawn spec; by default its spawner's inbox, or `user` for agents I spawn). After an egress denial, the agent asks the same way.
 - A reply that approves a grant or a sink call counts only if the replier holds that grant and its own session is untainted.
 
 ## Limits and loop guards

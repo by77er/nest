@@ -5,7 +5,7 @@ A small, always-on, **stateless** host. It runs no sandboxes.
 **What it runs:**
 - **nestd** without sandbox networking: the fleet channel, the host's lease, and commands to the runner.
 - **The agent runner, for agents without hands** (captains, for example). See [claude-code backend](../../agents/backends/claude-code/).
-- **nest-mcp:** platform tools proxied to AgentDO.
+- **`nest mcp`:** platform tools proxied to AgentDO.
 - **Discord Gateway client:** free-form messages.
 
 **Size:** about 2 vCPU / 4 GB. No KVM, no hugepages, no S3 access. An AWS `t4g.medium` (~$25/mo) or any cheap VPS (ARM is fine).

@@ -6,8 +6,9 @@ The authority for one sandbox.
 - Epoch and current host; the epoch→host history (which host held which epoch)
 - Head generation and the generation chain (including orphaned salvage generations)
 - Attached agents, the idle refcount
-- Policy layers: base (image), sandbox (allow, passthrough, injection bindings, TCP exceptions; set by whoever holds `egress_policy` on it, and inherited by forks), temporary grants
+- Policy layers: base (image), sandbox (allow, passthrough, injection bindings, TCP exceptions; set by whoever holds `egress_policy` on it, and inherited by forks), temporary grants. Built: the middle layer is still the `workstream` layer, set by the operator API ([pending contract changes](../../../interfaces/README.md#pending-contract-changes)).
 - Exposed ports
+- The channels programs inside it may post to (`sandbox_create{channels}`; by default its own `events`)
 
 **Placement:**
 - **Every placement attempt grants a new epoch.** Creation places at epoch 1.
@@ -27,7 +28,7 @@ The authority for one sandbox.
 - A **salvage** commit from an older epoch becomes an orphaned sibling generation (raising `orphaned_work`), but only from the host that held that epoch.
 
 **Policy:**
-- **Changes:** set by the operator (`PUT /v1/sandboxes/<id>/policy`) or a temporary grant, and pushed live as `policy_update`.
+- **Changes:** set by the operator (`PUT /v1/sandboxes/<id>/policy`), by a holder of `egress_policy` on it, or by a temporary grant, and pushed live as `policy_update`.
 - **Injection secrets:** pushed as BrokerDO references, resolved only when FleetDO sends them.
 
 **Ports:**
