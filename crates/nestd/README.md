@@ -44,7 +44,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 
 ## Tests
 
-`cargo test -p nestd` runs everything **unprivileged**: no root, no KVM.
+`cargo test -p nestd` runs everything **unprivileged**: no root, no KVM. The netns tests need unprivileged user namespaces, `ip` (iproute2) and `nft` (nftables).
 
 - **Unit tests:**
   - config parsing, rate limiter, vsock emulator handshake

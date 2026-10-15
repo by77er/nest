@@ -323,7 +323,7 @@ def run_scenario():
         st, tr = api("GET", f"/v1/agents/{agid}/transcript", raw=True)
         return tr if st == 200 and "tool_use" in tr and "scenario done" in tr else None
     try:
-        tr = wait_for(transcript_ok, 30, 1.0, "transcript segments in R2")
+        tr = wait_for(transcript_ok, 45, 1.0, "transcript segments in R2")  # an idle agent flushes every 30 s
         check("session transcript stored (R2 via read API)", True, f"{len(tr)} bytes")
     except TimeoutError as e:
         check("session transcript stored (R2 via read API)", False, str(e)[:300])

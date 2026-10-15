@@ -11,10 +11,13 @@ describe("egress policy layers", () => {
     const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     expect(create.policy.version).toBe(1);
 
+    // The 100 ms grant may well have lapsed by the time the response arrives on a loaded machine:
+    // check the expiry against when it was granted, not against now.
+    const granted = Date.now();
     const policy = await adminJson(`/v1/sandboxes/${sbx.sandbox}/grants`, { body: { host: "api.openai.com", ttl_ms: 100, ports: [443] } });
     const grant = policy.allow.find((r: any) => r.host === "api.openai.com");
     expect(grant).toMatchObject({ layer: "sandbox", ports: [443] });
-    expect(grant.expires_ms).toBeGreaterThan(Date.now());
+    expect(grant.expires_ms).toBeGreaterThanOrEqual(granted + 100);
     const [update] = await nextCommands(h.ws, (c) => c.type === "policy_update");
     expect(update).toMatchObject({ sandbox: sbx.sandbox, epoch: 1, policy: { version: 2 } });
 

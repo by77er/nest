@@ -31,6 +31,14 @@ const SIGNED_URL_TTL_MS = 15 * 60_000;
 const WORKING_STATES: AgentState[] = ["working", "compacting", "waiting_permission", "waiting_input"];
 const MAX_START_ATTEMPTS = 3;
 const START_RETRY_MS = 5_000;
+/** States with no brain running, which waiting work starts one from (see `wake()`). */
+const WAKE_STATES: AgentState[] = ["detached", "errored"];
+/** A wake that found no host (or failed transiently) retries this often. */
+const WAKE_RETRY_MS = 30_000;
+/** Exits that restart the brain at once when work is waiting (not `stopped`, not `auth_failed`). */
+const RESTART_ON_EXIT = ["idle", "crashed", "fenced", "not running after host reconnect"];
+/** Restarts after an exit without a turn completing in between, before giving up (`errored`). */
+const MAX_EXIT_RESTARTS = 3;
 const RETENTION_MS = 7 * 86_400_000;
 const PRUNE_EVERY_MS = 3_600_000;
 /** read_transcript: entries per call by default / at most, and a response size cap. */
@@ -84,6 +92,8 @@ export interface AgentInfo {
   /** Runner process (session `hello.instance_id`); a change starts a new channel lineage. */
   runner_instance: string | null;
   start_attempts: number;
+  /** Restarts after an exit since the last completed turn (crash-loop guard). */
+  exit_restarts?: number;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
   capabilities?: string[];
 }
@@ -122,6 +132,8 @@ export class AgentDO extends DurableObject<Env> {
   private readonly rel: ReliableChannels;
   private readonly deadlines: Deadlines;
   private readonly inbound = new SerialQueue();
+  /** A `wake()` is starting a brain (its awaits open the input gate). */
+  private waking = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -257,6 +269,9 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no host available for this agent", 503, true);
     const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).oauthTokenRef(info.role);
+    // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
+    // resume from up to a flush interval ago.
+    await this.flush();
     const fresh = this.load();
     const resume = fresh.session ? await this.sessionResume(fresh) : undefined;
     const body: Omit<AgentStart, "type"> = {
@@ -310,6 +325,67 @@ export class AgentDO extends DurableObject<Env> {
     });
     if (info.hands && info.role === "worker") await this.sandboxStub(info.hands.sandbox).agentActivity(info.agent, false);
     console.log(`agent ${info.agent}: brain exited (${reason})`);
+    // Work that arrived while it was exiting, or the turn it died in, brings it straight back.
+    if (RESTART_ON_EXIT.includes(reason)) await this.wake(reason !== "idle");
+  }
+
+  /**
+   * The host running this brain went silent past its lease. Only controller hosts get here: captains
+   * have no sandbox to follow. Their brains fenced themselves when the host's lease lapsed, so another
+   * one can start elsewhere.
+   */
+  async onHostLost(host: string): Promise<void> {
+    if (!this.exists() || this.load().host !== host) return;
+    this.update((i) => {
+      i.host = null;
+      i.state = "detached";
+    });
+    for (const ws of this.ctx.getWebSockets("session")) {
+      const a = ws.deserializeAttachment() as Attachment;
+      if (a.host !== host) continue;
+      ws.serializeAttachment({ ...a, helloed: false, stale: true });
+      ws.close(4409, "host lost");
+    }
+    await this.wake(true);
+  }
+
+  /**
+   * Start a brain for waiting work (a queued turn, or the turn it was in the middle of) when it has
+   * none: it went idle, exited or lost its host (`detached`), or gave up (`errored`). Never throws:
+   * callers are queuing work, which stays queued. A retryable failure (no host yet) retries from the
+   * alarm. `afterExit` counts towards the crash-loop guard; new input always gets a fresh try.
+   */
+  private async wake(afterExit = false): Promise<void> {
+    if (this.waking) return;
+    const info = this.load();
+    if (!WAKE_STATES.includes(info.state) || this.socket()) return;
+    const queued = this.sql.exec("SELECT 1 FROM turns WHERE status = 'queued' LIMIT 1").toArray().length > 0;
+    if (!info.current_turn && !queued) return;
+    if (afterExit && (info.exit_restarts ?? 0) >= MAX_EXIT_RESTARTS) {
+      this.update((i) => {
+        i.state = "errored";
+      });
+      console.warn(`agent ${info.agent}: exited ${MAX_EXIT_RESTARTS} times without completing a turn; waiting for new input`);
+      return;
+    }
+    this.waking = true;
+    try {
+      this.update((i) => {
+        i.start_attempts = 0;
+        if (afterExit) i.exit_restarts = (i.exit_restarts ?? 0) + 1;
+      });
+      await this.start();
+    } catch (e) {
+      console.warn(`agent ${info.agent}: wake failed`, e);
+      // A failure after start() claimed the agent must not leave it `starting` with nothing running.
+      this.update((i) => {
+        if (i.state === "starting") i.state = "detached";
+      });
+      // Anything but a NestError is infrastructure (e.g. a Durable Object call): try again later.
+      if (asNestError(e)?.retryable ?? true) await this.deadlines.set("wake", Date.now() + WAKE_RETRY_MS, true);
+    } finally {
+      this.waking = false;
+    }
   }
 
   /** The host reported this brain in its hello (e.g. after a nestd restart). */
@@ -340,6 +416,8 @@ export class AgentDO extends DurableObject<Env> {
       this.update((i) => {
         i.state = "errored";
       });
+      // Waiting work retries from the alarm instead of stranding the agent.
+      await this.deadlines.set("wake", Date.now() + WAKE_RETRY_MS, true);
       throw e;
     }
   }
@@ -753,6 +831,7 @@ export class AgentDO extends DurableObject<Env> {
             this.sql.exec("UPDATE inbox SET status = 'consumed' WHERE status = 'delivered'");
             i.current_turn = null;
             i.state = "idle";
+            i.exit_restarts = 0;
           }
           break;
         default:
@@ -792,6 +871,7 @@ export class AgentDO extends DurableObject<Env> {
     const ord = (this.sql.exec<{ m: number | null }>("SELECT MAX(ord) AS m FROM turns").toArray()[0]?.m ?? 0) + 1;
     this.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES (?, ?, ?, 'queued', ?)", turn, ord, JSON.stringify(input), Date.now());
     await this.pump();
+    await this.wake();
     return turn;
   }
 
@@ -1188,6 +1268,8 @@ export class AgentDO extends DurableObject<Env> {
       } else if (key === "restart") {
         const info = this.load();
         if (info.state === "starting" && info.host && !this.socket()) await this.start();
+      } else if (key === "wake") {
+        await this.wake();
       } else if (key === "prune") {
         this.prune();
         await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
