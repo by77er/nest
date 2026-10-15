@@ -95,6 +95,13 @@ export class SerialQueue {
 
 /** Multiplexes several named deadlines onto a Durable Object's single alarm. */
 export class Deadlines {
+  /**
+   * Keys whose handler `runDue` is running, with the `at` being run. That row is about to be deleted,
+   * so it must not make `keepEarlier` swallow a re-arm (from the handler itself, or from anything that
+   * runs while it awaits).
+   */
+  private readonly running = new Map<string, number>();
+
   constructor(
     private readonly sql: SqlStorage,
     private readonly storage: DurableObjectStorage,
@@ -105,7 +112,7 @@ export class Deadlines {
   async set(key: string, at: number, keepEarlier = false): Promise<void> {
     if (keepEarlier) {
       const cur = this.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = ?", key).toArray()[0];
-      if (cur && cur.at <= at) return;
+      if (cur && cur.at <= at && this.running.get(key) !== cur.at) return;
     }
     this.sql.exec("INSERT INTO deadlines (key, at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at", key, at);
     await this.reschedule();
@@ -127,12 +134,15 @@ export class Deadlines {
   async runDue(now: number, handler: (key: string) => Promise<void>, retryMs = 5_000): Promise<void> {
     const due = this.sql.exec<{ key: string; at: number }>("SELECT key, at FROM deadlines WHERE at <= ? ORDER BY at", now).toArray();
     for (const { key, at } of due) {
+      this.running.set(key, at);
       try {
         await handler(key);
         this.sql.exec("DELETE FROM deadlines WHERE key = ? AND at = ?", key, at);
       } catch (e) {
         console.error(`deadline ${key} failed; retrying`, e);
         this.sql.exec("UPDATE deadlines SET at = ? WHERE key = ? AND at = ?", Date.now() + retryMs, key, at);
+      } finally {
+        this.running.delete(key);
       }
     }
     await this.reschedule();

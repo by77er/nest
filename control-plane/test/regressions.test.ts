@@ -458,6 +458,129 @@ describe("#20 deadlines survive a failing handler", () => {
   });
 });
 
+describe("#21 a deadline re-armed while it runs isn't dropped", () => {
+  it("keeps a keepEarlier re-arm made by the key's own handler", async () => {
+    const s = await setup();
+    await runInDurableObject(agentStub(s.agent), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("x", 1);
+      await d.runDue(Date.now(), async () => {
+        await d.set("x", Date.now() + 60_000, true);
+      });
+      expect(d.has("x")).toBe(true);
+    });
+  });
+
+  it("an unplaced sandbox keeps retrying while there is no capacity", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const s1 = await adminJson("/v1/sandboxes", { body: { workstream: await workstream(), cell } }, 201);
+    await sandboxStub(s1.sandbox).reportState(a.host, 1, "running", null, null);
+    a.ws.close();
+    await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const retryNow = async () => {
+      await runInDurableObject(sandboxStub(s1.sandbox), (_i, st) => {
+        st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'");
+      });
+      await runDurableObjectAlarm(sandboxStub(s1.sandbox));
+    };
+    await retryNow(); // still no capacity
+    expect(await sandboxStub(s1.sandbox).info()).toMatchObject({ host: null });
+    const b = await connectHost(cell);
+    await retryNow();
+    expect((await sandboxStub(s1.sandbox).info()).host).toBe(b.host);
+  });
+});
+
+describe("#22 a detached agent with waiting work gets a brain", () => {
+  const exited = (s: { host: { ws: Ws } }, agent: string, reason: string) =>
+    sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent, reason }]);
+  const isStart = (agent: string) => (c: any) => c.type === "agent_start" && c.agent === agent;
+
+  it("a turn for a brain that idled out starts it again", async () => {
+    const s = await setup();
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    ws.close();
+    const seq = exited(s, s.agent, "idle");
+    await s.host.ws.next("ack", (m) => m.up_to === seq);
+    expect((await agentStub(s.agent).info()).state).toBe("detached");
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "wake up" } }, 201);
+    const [start] = await nextCommands(s.host.ws, isStart(s.agent));
+    expect(start).toMatchObject({ hands: { sandbox: s.sandbox, epoch: 1 } });
+  });
+
+  it("a brain that dies mid-turn restarts; after repeated crashes only new input retries", async () => {
+    const s = await setup();
+    let r = await runner(s.agent, s.host.host, s.host.host_token, "rin_c0");
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
+    await r.ws.next("run_turn");
+    for (let i = 1; i <= 3; i++) {
+      r.ws.close();
+      const seq = exited(s, s.agent, "crashed");
+      await s.host.ws.next("ack", (m) => m.up_to === seq);
+      await nextCommands(s.host.ws, isStart(s.agent));
+      r = await runner(s.agent, s.host.host, s.host.host_token, `rin_c${i}`);
+      await r.ws.next("run_turn", (m) => m.input.kind === "recovery");
+    }
+    r.ws.close();
+    const seq = exited(s, s.agent, "crashed");
+    await s.host.ws.next("ack", (m) => m.up_to === seq);
+    expect((await agentStub(s.agent).info()).state).toBe("errored");
+    expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStart(s.agent)))).toBe(true);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "try again" } }, 201);
+    await nextCommands(s.host.ws, isStart(s.agent));
+  });
+
+  it("a restarted brain resumes from every byte received, not only what was flushed", async () => {
+    const s = await setup();
+    const r = await runner(s.agent, s.host.host, s.host.host_token);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
+    await r.ws.next("run_turn");
+    r.ws.send(seg(0, "l1\nl2\n"));
+    for (let i = 0; i < 100 && (await agentStub(s.agent).info()).received_bytes < 6; i++) await sleep(10);
+    expect(await agentStub(s.agent).info()).toMatchObject({ received_bytes: 6, durable_bytes: 0 });
+    r.ws.close();
+    const seq = exited(s, s.agent, "crashed");
+    await s.host.ws.next("ack", (m) => m.up_to === seq);
+    const [start] = await nextCommands(s.host.ws, isStart(s.agent));
+    expect(start.resume).toMatchObject({ session: SESSION, total_bytes: 6 });
+  });
+
+  it("a stopped brain isn't restarted by its exit", async () => {
+    const s = await setup();
+    const r = await runner(s.agent, s.host.host, s.host.host_token);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
+    await r.ws.next("run_turn");
+    r.ws.close();
+    const seq = exited(s, s.agent, "stopped");
+    await s.host.ws.next("ack", (m) => m.up_to === seq);
+    expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStart(s.agent)))).toBe(true);
+  });
+});
+
+describe("#23 captains move off a silent controller host", () => {
+  it("a captain mid-turn restarts on another controller host", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-regress" } });
+    const a = await connectHost(cell, "controller");
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: await workstream(), cell } }, 201)).agent as string;
+    await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
+    const r = await runner(captain, a.host, a.host_token, "rin_cap", 0);
+    await adminJson(`/v1/agents/${captain}/turns`, { body: { text: "plan" } }, 201);
+    await r.ws.next("run_turn");
+    const b = await connectHost(cell, "controller");
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, a.host);
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+    });
+    await runDurableObjectAlarm(fleetStub(cell));
+    await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === captain);
+    expect((await agentStub(captain).info()).host).toBe(b.host);
+    await sleep(50);
+    expect(r.ws.closed?.code).toBe(4409);
+  });
+});
+
 describe("docs #13 guest CLI mapping", () => {
   it("maps urgency low, validates emit events, defaults the summary, and unexposes", async () => {
     const s = await setup({ captain: true });

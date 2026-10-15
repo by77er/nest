@@ -7,6 +7,9 @@ The authority for one agent (conversation).
   - Retryable start failures are retried 3 times.
   - Exits and host reports count only from the host the agent is assigned to.
   - When the sandbox moves, the agent follows it.
+  - **Waking:** a brain that isn't running (it went idle, exited or lost its host) starts again with `--resume` whenever work is waiting: a new turn, or the turn it was in the middle of. A start with no host available retries every 30 s.
+  - **Crash-loop guard:** an exit other than `stopped` or `auth_failed` restarts the brain at once if work is waiting. After 3 such restarts without a completed turn, the agent is `errored` and only new input retries.
+  - **Captains** on a controller host that goes silent start again on another one. See [FleetDO](../fleet/).
 - **Session socket:**
   - Only the assigned host, in the agent's cell, while that host is live, may attach.
   - A new socket supersedes the old one only after a valid hello.

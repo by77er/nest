@@ -690,7 +690,9 @@ export class FleetDO extends DurableObject<Env> {
     const now = Date.now();
     const expiry = DEFAULT_LEASE_TIMING.cp_expiry_ms;
     for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status IN ('active', 'draining')").toArray()) {
-      if (h.last_rx !== null && now - h.last_rx >= expiry && this.leasesOf(h.host).some((l) => !l.expired)) await this.expireHost(h.host);
+      if (h.last_rx === null || now - h.last_rx < expiry) continue;
+      if (this.leasesOf(h.host).some((l) => !l.expired)) await this.expireHost(h.host);
+      else if (h.role === "controller") await this.expireController(h.host);
     }
     for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'stonith_pending'").toArray()) {
       await this.pollStonith(h);
@@ -740,6 +742,26 @@ export class FleetDO extends DurableObject<Env> {
     }
     // Without an instance id or EC2 access, STONITH waits for the host to reconnect and fence, or for
     // an operator to confirm (`confirmHostDead`). Never double-run.
+  }
+
+  /**
+   * A silent controller host: it holds no sandboxes, so nothing can run twice and no STONITH is needed.
+   * Its runner killed its brains when the host lease lapsed (20 s, before this 30 s expiry), and only
+   * an agent's assigned host may attach its session, so its captains start again on another controller
+   * host (or on this one once it reconnects; `hello` makes it active again).
+   */
+  private async expireController(host: string): Promise<void> {
+    this.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", host);
+    for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "lease expired");
+    const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray();
+    this.sql.exec("DELETE FROM host_agents WHERE host = ?", host);
+    for (const { agent } of agents) {
+      try {
+        await this.agentStub(agent).onHostLost(host);
+      } catch (e) {
+        console.error(`FleetDO: moving ${agent} off ${host} failed`, e);
+      }
+    }
   }
 
   private async pollStonith(h: HostRow): Promise<void> {

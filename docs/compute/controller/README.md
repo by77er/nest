@@ -17,6 +17,7 @@ A small, always-on, **stateless** host. It runs no sandboxes.
 **If it goes down:**
 - Captain turns queue in the DOs.
 - Discord buttons and slash commands keep working, because they're served by the Worker.
-- FleetDO starts a replacement anywhere.
+- After 30 s of silence, FleetDO restarts its captains on another connected controller host, or on this one once it reconnects. See [FleetDO](../../control-plane/durable-objects/fleet/).
+- Launching a replacement host needs the autoscaler, which isn't built.
 
 If captains move to the [api-loop backend](../../orchestration/captains/backends/api-loop/), the controller host is needed only for the Discord Gateway, and it can be removed entirely if Discord switches to interactions-only.
