@@ -17,7 +17,7 @@ cd /var/lib/nest/empty && exec claude -p --input-format stream-json --output-for
   (--session-id <uuid> | --resume <transcript path> [--fork-session])
 ```
 
-Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended worker built-ins: `Agent, TaskCreate, TaskGet, TaskUpdate, TaskList, TodoWrite, WebSearch, WebFetch` (**unverified** under `--restricted`; the runner logs `system/init.tools`).
+Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended worker built-ins: `Agent, TaskCreate, TaskGet, TaskUpdate, TaskList, TodoWrite, WebSearch, WebFetch`. **Observed on 2.1.300** (`e2e/claude-verify`, before a successful model turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools and `WebSearch`; `TodoWrite` and `WebFetch` are missing even when named. The runner logs `system/init.tools`.
 
 **Host-side built-ins are refused:** a `launch.builtin_tools` naming `Bash`, `BashOutput`, `KillShell`, `KillBash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`, `Grep`, `LS`, `PowerShell` or `Monitor` fails the start, and if `system/init.tools` reports one the brain is killed (`--restricted` re-enables tools named individually in `--tools`).
 
@@ -27,7 +27,12 @@ Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended
 
 `PATH`, `HOME=<config_dir>`, `LANG=C.UTF-8`, `TZ=UTC`, `TMPDIR=/tmp` (private), `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` (hooks and MCP never see the token), `CLAUDE_CODE_MCP_ALLOWLIST_ENV=1`, `DISABLE_AUTOUPDATER=1`, `NEST_AGENT_ID`, `NEST_HOOK_DGRAM`, `NEST_HOOK_SOCK`, `NEST_HOOK_SPOOL`. Built by `claude::env(agent, config_dir, oauth_token, &RunnerSockets)`; the MCP config by `claude::mcp_config(agent, &RunnerSockets)` and the transcript path by `claude::transcript_path(config_dir, cwd, uuid)`. `paths::RunnerSockets::default()` is the production layout; tests and dev runs override it. **No `ANTHROPIC_*`, no proxy variables** (brains aren't proxied).
 
-**Unverified:** that the scrub keeps `NEST_*` variables (their names don't look like credentials).
+**Observed on 2.1.300:**
+- The scrub keeps `NEST_*` for hooks and the MCP server; it strips the token and `CLAUDE_CONFIG_DIR` from hooks.
+- **The scrub needs bubblewrap on Linux:** with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` and no `bwrap`, Claude Code won't start, not even `claude auth status`. Hosts install `bubblewrap`, or managed settings set `sandbox.bwrapPath`.
+- **The scrub forces `--permission-mode default`** (instead of `dontAsk`, with a warning on stderr). Whether nest's allow rules and hooks still behave the same is to be verified with a real token.
+- **`system/init` arrives only after the first user message.** Before it, stdout carries only the `SessionStart` hook lines, so the runner never waits for `system/init` before writing the first turn.
+- **Transcript path:** every character that isn't an ASCII letter or digit becomes `-`, and a name over 200 characters is cut and suffixed with a hash (`claude::project_dir`).
 
 ## Managed settings
 

@@ -35,7 +35,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 ## Auth
 
 - **Token:** `claude setup-token` is the same browser OAuth as `/login` and produces a one-year token that can only make model requests. I run it once; the token is stored in BrokerDO and handed to each process as `CLAUDE_CODE_OAUTH_TOKEN`.
-- **Clean environment:** the runner builds the process environment explicitly (the token, `CLAUDE_CONFIG_DIR`, and nothing inherited). That stops any `ANTHROPIC_*` variable from taking over: `CLAUDE_CODE_OAUTH_TOKEN` ranks below `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` and `apiKeyHelper` ([authentication](https://code.claude.com/docs/en/authentication)). `NEST_*` values for `nest mcp` go in the MCP config's `env` block, since whether the subprocess environment scrub keeps them is undocumented.
+- **Clean environment:** the runner builds the process environment explicitly (the token, `CLAUDE_CONFIG_DIR`, and nothing inherited). That stops any `ANTHROPIC_*` variable from taking over: `CLAUDE_CODE_OAUTH_TOKEN` ranks below `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` and `apiKeyHelper` ([authentication](https://code.claude.com/docs/en/authentication)). The subprocess environment scrub (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`) keeps `NEST_*` and strips the token from hooks and MCP servers; on Linux it needs bubblewrap, so hosts install it (see [runner-claude](../../interfaces/host-internal/runner-claude/)).
 - **Managed settings** set `forceLoginMethod: "claudeai"` and `allowedProviders: ["anthropic"]`, so Claude Code refuses to start with an API key or a custom endpoint. (To verify in the spike: that `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod`.)
 - **Startup check:** the runner confirms `claude auth status` reports `authMethod: "oauth_token"`. This also catches `--bare` becoming the default for `-p`.
 - **Compliance:**
@@ -53,7 +53,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 - **Idle:** after a grace period, close stdin so the process exits. A turn or inbox message arriving while it exits restarts Claude Code with `--resume` and is replayed; after that, the next turn starts a new brain with `--resume`.
 - **Exit:** the last stdout lines are processed before the exit is handled; the session channel keeps flushing (and reconnecting) for up to 30 s until AgentDO has acked every event and the session bytes are durable.
 - **Unattended runs:** `--permission-prompts none` makes Claude Code deny without prompting and tell the model not to retry ([headless](https://code.claude.com/docs/en/headless)). Escalation comes from our own `PreToolUse` hook: a call no rule allows is held with `defer`, which ends the process; once approved, the brain resumes and the same call runs ([hooks](https://code.claude.com/docs/en/hooks)). `defer` handles one tool call per turn and works only under `-p`; to verify with stream-json in the spike.
-- **Stream parsing:** hook events can precede `system/init`, so the parser accepts them.
+- **Stream parsing:** `system/init` arrives only after the first user message, with `SessionStart` hook lines before it, so the runner writes the first turn without waiting for it.
 
 ## Process hygiene
 

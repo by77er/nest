@@ -15,4 +15,5 @@
 | AWS: host role | Instance profile | nestd | S3 for its cell only |
 | AWS: control plane | Worker secret | FleetDO | Launch template only; terminate/stop only instances tagged `nest=true` |
 | R2 | DO bindings | Control plane | Hosts use Worker-signed URLs only (no R2 S3 credentials exist) |
+| MCP server and API credentials (`cap:<name>`) | BrokerDO | Control plane only | One per `mcp` or `api` capability; attached per call |
 | api-loop API key (future) | BrokerDO | Control plane only | |

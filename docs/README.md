@@ -123,6 +123,7 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | Captains and workstreams are patterns (templates plus conventions), not code | [orchestration/](orchestration/) |
 | Agent features are pluggable capabilities: named bundles of tools, grants and prompt, composed by templates | [agents/capabilities/](agents/capabilities/) |
 | Agents message each other through the messaging capability; by default an agent reaches its owner and its label group | [agents/capabilities/](agents/capabilities/) |
+| Remote MCP servers and HTTP APIs (`ro` or `rw`) plug in as capabilities, as data: the control plane calls them with credentials from BrokerDO and surfaces them as tools | [agents/capabilities/](agents/capabilities/) |
 | Coordination is one primitive: channels. Inboxes, platform events, questions, shared state and memory are channels. | [channels/](channels/) |
 | Authority is grants, attenuated from me and revoked down the chain; there's no built-in scoping unit | [agents/tools/](agents/tools/) |
 | When an agent is removed, what it owns is parked (stopped, archived, read-only), adoptable, and destroyed after 30 days | [agents/](agents/) |
@@ -151,19 +152,18 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 
 - **Watch:** `--bare` may become the default for `claude -p`, which would break subscription auth. The mitigation is the `authMethod` startup check. See [agents/runner/](agents/runner/).
 - **Verify:** that `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod: "claudeai"`, and that separate setup tokens can be revoked independently. See [agents/runner/](agents/runner/).
-- **Verify against the real Claude Code binary** (never run here; the tests use a fake):
-  - whether `system/init` arrives before the first user message (documented as the first event after hook events)
+- **Verify against the real Claude Code binary** (these need a real token):
   - the stdin user-message shape without `session_id`
   - the `_meta` key carrying the tool-use id on MCP `tools/call` (undocumented; `PreToolUse` input has `tool_use_id` to correlate instead)
-  - that `--restricted` honors the `--tools` built-in list (documented)
+  - that `--restricted` honors the `--tools` built-in list (`TodoWrite` and `WebFetch` were missing before a successful turn; re-check with a real one)
   - that `notifications/cancelled` reaches MCP on interrupt
   - the `claude auth status` JSON (`authMethod` and `configDirectory` are documented)
-  - that `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` keeps `NEST_*`
-  - the transcript path encoding (non-alphanumerics become `-`; the hashing of paths over 200 characters is undocumented)
+  - whether nest's allow rules and hooks behave the same under the `default` permission mode the env scrub forces
   - `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` and `PreToolUse` `defer` under stream-json input
   - that a `SessionStart` hook fires after compaction (to re-inject the memory index)
 
-  See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
+  `e2e/claude-verify` runs these. Already observed on 2.1.300 without a token: `system/init` arrives only after the first user message, the env scrub keeps `NEST_*` but needs bubblewrap, and the transcript path rule (now in `claude::project_dir`). See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
+- **MCP servers inside a sandbox:** running stdio servers in the agent's sandbox, bridged by the guest agent. See [agents/capabilities/](agents/capabilities/).
 
 ## First spike
 

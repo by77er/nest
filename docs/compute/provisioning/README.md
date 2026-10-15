@@ -3,6 +3,7 @@
 **Burst host image (built with Packer):**
 - Amazon Linux 2023 with kernel 6.18 (or 6.1), the host kernels Firecracker supports on 8i ([README](https://github.com/firecracker-microvm/firecracker/blob/main/README.md)); Ubuntu 24.04's 6.8 isn't one of them. Hugetlb needs 5.18+ and ublk needs 6.0+; whether AL2023 ships ublk is unverified.
 - Firecracker 1.17 or later.
+- `bubblewrap`: Claude Code needs it for the subprocess environment scrub nest relies on (see [runner-claude](../../interfaces/host-internal/runner-claude/)). The controller host image installs it too.
 - Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, **Claude Code + the agent runner** (brains for local sandboxes).
 
 **Launch template:**
