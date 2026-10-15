@@ -1,17 +1,17 @@
 # Tools
 
-`nest-mcp` runs on the host next to each brain. **Every tool is open to any agent holding the grant for it;** there are no role-specific tools.
+`nest-mcp` runs on the host next to each brain. An agent's tools come from its [capabilities](../capabilities/), and every call is checked against its grants; there are no role-specific tools.
 
 | Group | Tools | Executes |
 |---|---|---|
 | **[Hands](../hands/)** | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | In the bound sandbox, over vsock RPC |
-| **Channels** | `channel_create`, `post` (optionally awaiting a reply), `read` (optionally waiting up to 120 s), `subscribe`, `unsubscribe` | ChannelDO. See [../../channels/](../../channels/) |
+| **Channels** | `channel_create`, `post` (optionally awaiting a reply), `read` (optionally waiting up to 120 s), `subscribe`, `unsubscribe`, `message` (post to an agent's inbox) | ChannelDO. See [../../channels/](../../channels/) |
 | **Agents** | `agent_spawn`, `agent_stop`, `attach`, `adopt` (take ownership of a parked resource), `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
 | **Sandboxes** | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | Control plane |
 | **Authority** | `grant`, `revoke` | Control plane |
 | **Brokered actions** | `github.create_pr`, `email.send`, `http.request(profile)` | Control plane, with secrets that never reach a sandbox |
 
-**Messaging and memory are channel operations.** Notifying someone is `post` to their inbox or to `user`. An event is a `post` with a `kind`. Asking is `post` with `await_reply_s`. Waiting for events is `subscribe`, or `read` with a wait. Memory is a private channel read by key.
+**Messaging and memory are channel operations.** Messaging an agent is `message` (a `post` to its inbox, through the [messaging capability](../capabilities/#messaging)); notifying me is `post` to `user`. An event is a `post` with a `kind`. Asking is `post` with `await_reply_s`. Waiting for events is `subscribe`, or `read` with a wait. Memory is a private channel read by key.
 
 ## Grants
 

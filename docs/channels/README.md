@@ -27,7 +27,7 @@ Keyed messages form a key-value view: shared state (a spec, a task board, claims
 
 | Channel | Posted by | Contents |
 |---|---|---|
-| `<agt_…>/inbox` | Whoever holds `post` on it (its owner, at least) | Messages to the agent. The agent is always subscribed. The platform also posts its background task exits here. |
+| `<agt_…>/inbox` | Whoever holds `post` on it: its owner, and peers through the [messaging capability](../agents/capabilities/#messaging) (by default, agents sharing its group label) | Messages to the agent. The agent is always subscribed. The platform also posts its background task exits here. |
 | `<agt_…>/events` | Platform | State changes, escalations, and `turn_completed` / `exit` carrying the final text (up to 2 KB) and usage. **The spawner is subscribed by default,** so results come back without being asked for. |
 | `<sbx_…>/events` | Platform | State changes, ports opened and exposed, egress denials and alerts, orphaned work, rollback notices |
 | `user` | Whoever holds `post` on it | Messages to me. The [Discord bot](../control-plane/api/discord/) bridges it. |

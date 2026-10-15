@@ -51,7 +51,8 @@ UFFD memory snapshots and the ublk lazy disk are designed but not built.
 
 - **Operations:** create, **attach** (bind an agent's hands to a sandbox), **fork** (copy a sandbox; the only isolation primitive), **spawn** (an agent creates an agent), **post / read / subscribe**, **grant / revoke**.
 - **On every resource:** an **owner** (the agent that created it, or me) and **labels** (free-form key/values).
-- **Templates:** named spawn specs, stored as data. `captain` and `worker` are templates.
+- **Capabilities:** pluggable bundles of tools, grants and prompt instructions (messaging, channels, spawning, memory, …).
+- **Templates:** named spawn specs, mostly a list of capabilities, stored as data. `captain` and `worker` are templates.
 
 Captains, workstreams and teams are patterns built from these. See [orchestration/](orchestration/).
 
@@ -97,7 +98,8 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | Owner | Whoever created a resource. Holds every grant on it. |
 | Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, other agents' tainted posts) |
 | Sink | An action that can send data out or widen authority; from a tainted session it needs approval |
-| Template | A named spawn spec (prompt, tools, grants, subscriptions, backend), stored as data |
+| Capability | A pluggable bundle of tools, the grants they need and prompt instructions, listed in spawn specs |
+| Template | A named spawn spec (prompt, capabilities, grants, subscriptions, backend), stored as data |
 | Generation | Immutable manifest of a sandbox's disk (and optionally memory) chunks |
 | Epoch | Fencing token. It increments each time a sandbox's lease is granted. |
 | Cell | A unit of compute plus its object store (e.g. AWS us-east-1 with S3) |
@@ -119,6 +121,8 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | Hosts authenticate with signed instance identity documents; guests can't reach IMDS | [compute/provisioning/](compute/provisioning/) |
 | No agent roles. Placement follows hands; an agent without hands needs no machine. The brain backend is pluggable (`claude-code` now, `api-loop` inside the control plane later). | [agents/](agents/) |
 | Captains and workstreams are patterns (templates plus conventions), not code | [orchestration/](orchestration/) |
+| Agent features are pluggable capabilities: named bundles of tools, grants and prompt, composed by templates | [agents/capabilities/](agents/capabilities/) |
+| Agents message each other through the messaging capability; by default an agent reaches its owner and its label group | [agents/capabilities/](agents/capabilities/) |
 | Coordination is one primitive: channels. Inboxes, platform events, questions, shared state and memory are channels. | [channels/](channels/) |
 | Authority is grants, attenuated from me and revoked down the chain; there's no built-in scoping unit | [agents/tools/](agents/tools/) |
 | When an agent is removed, what it owns is parked (stopped, archived, read-only), adoptable, and destroyed after 30 days | [agents/](agents/) |

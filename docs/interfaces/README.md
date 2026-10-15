@@ -21,11 +21,11 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 ## Pending contract changes
 
 The design in [agents/](../agents/) and [channels/](../channels/) needs these contract changes; the specs below and the fixtures describe what's implemented until they land:
-- **Agents** carry `owner`, `labels` and a spawn spec instead of a role. Placement follows `hands`.
+- **Agents** carry `owner`, `labels` and a spawn spec (with `capabilities`) instead of a role. Placement follows `hands`. Capability definitions are control-plane data, not contract.
 - **Sandboxes** carry `owner` and `labels`; sandbox commands carry no grouping field.
 - **Platform events** are posts to `<sbx>/events` and `<agt>/events`: `ChannelMessage{seq, ts_ms, from, kind?, text, data?, reply_to?, key?, mentions?}`, with kinds such as `port_opened`, `egress_denied`, `egress_alert` and `orphaned_work`.
 - **`EgressPolicy` layers** are `base`, `sandbox` and `grant`.
-- **The platform tool catalog** is filtered by grants and has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`), `agent_spawn`, `adopt`, `list`, and `grant`/`revoke`. See [agents/tools/](../agents/tools/).
+- **The platform tool catalog** is filtered by grants and has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`), `message`, `agent_spawn`, `adopt`, `list`, and `grant`/`revoke`. See [agents/tools/](../agents/tools/).
 - **Guest CLI:** `nest post`, `nest read`, `nest expose`.
 - **IDs:** `chn_` (channel) and `tpl_` (template).
 - **Channel messages** carry `taint`, set by the platform.
