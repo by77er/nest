@@ -30,8 +30,8 @@ The runner owns the Claude Code process, so it sees the **stream-json output** d
 
 | Hook | Answered from |
 |---|---|
-| `PreToolUse` policy gate | Grant and policy cache in the runner, pushed down from AgentDO |
-| `PermissionRequest` | Same cache. Escalation returns `pending` and goes through the async `ask()` |
+| `PreToolUse` policy gate | Grant and policy cache in the runner, pushed down from AgentDO. A call no rule allows is held with `defer` and escalated as a question; it runs once approved (see [runner](../runner/#lifecycle)) |
+| `PermissionRequest` | Same cache |
 | `Stop` | **Local inbox mirror:** queued messages come back as `decision: "block"`, at most `max_stop_continuations` per stop chain (`stop_hook_active: false` starts a new chain) |
 
 Sync hooks are answered only for a peer process descending from the declared agent's Claude Code; others get the fail-safe fallback.

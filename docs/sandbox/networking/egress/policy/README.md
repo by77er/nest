@@ -17,6 +17,7 @@ limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
 ```
 
 - **Agents can ask for more access.** A denial comes back as a 403 with a readable reason. The agent posts a question to its escalation channel; whoever holds `egress_policy` on the sandbox (its owner, a captain, or me in Discord) can approve, and the rule is added live, optionally with an expiry.
+- **Inspected hosts can carry method and path rules** (e.g. `GET` only, or `/repos/me/*`), since the proxy already decrypts them. Vercel's sandbox firewall offers the same matchers ([docs](https://vercel.com/docs/vercel-sandbox/concepts/firewall)); its plain allow rules match SNI only, while nest-proxy also requires Host to equal SNI.
 - **TCP exceptions** each get their own listener port. The proxy connects only to IPs its own resolver returned for that host, and passes the bytes through uninspected. There's no raw ssh by default.
 - **Bandwidth** is shaped on the tap device. The other limits are enforced in the proxy.
 - **Audit:** every connection or request is logged with sandbox, agent (if known), entry point (`via`), SNI/host, method, path (no query string), status, bytes, the decision, and the *name* of any binding used (never its value). Records are batched through nestd to the control plane and written to R2. Denials and alerts are also posted to the sandbox's `events` channel.

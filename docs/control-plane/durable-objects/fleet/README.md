@@ -22,7 +22,7 @@ One per cell: hosts, enrollment, leases, placement, STONITH and command delivery
   - **Without EC2:** waits for the host to reconnect and fence. The fence is re-issued on every hello, every tick and after a failure, until one succeeds.
   - **Operator:** can confirm a host dead.
   - **Reassignment:** an idempotent per-sandbox queue that the alarm retries, so one failure can't strand the others.
-- **Placement order:** a host with the snapshot warm, then the least loaded connected burst host.
+- **Placement packs:** among hosts whose free hugepages and vCPUs fit the sandbox, prefer one with its snapshot warm and a matching restore ABI, then the one with the fewest free hugepages that still fit, then fewest free vCPUs. Packing lets idle hosts empty out and scale to zero; spreading keeps every host partly full. An undersized hugepage pool makes Firecracker fail with SIGBUS, so hugepages are reserved, never overcommitted.
 - **Not built:**
   - **The autoscaler** (`RunInstances` plus recording the launch). See [../../../compute/autoscaling/](../../../compute/autoscaling/).
   - **Command batching:** one frame per `issueCommands` call.

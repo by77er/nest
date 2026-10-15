@@ -1,6 +1,6 @@
 # Captains (pattern)
 
-A captain is a long-lived agent without hands that manages other agents and escalates to me. **It isn't a platform concept:** it's an agent spawned from the `captain` template, and everything that makes it a captain is in that template's prompt and grants.
+A captain is a long-lived agent without hands that manages other agents and escalates to me. **It isn't a platform concept:** it's an agent spawned from the `captain` template, and everything that makes it a captain is in that template's prompt, grants and budget.
 
 ## The `captain` template
 
@@ -10,10 +10,12 @@ launch:
   builtin_tools: []                  # optionally WebSearch
 hands: null
 backend: claude-code                 # api-loop later
-grants:                              # all on resources it owns, with limits
-  - agent_spawn{max: 8}, sandbox_create{max: 4}, sandbox_fork, sandbox_destroy, attach, agent_stop
-  - channel_create, post, read, subscribe, list, read_transcript, grant, egress_policy
+grants:                              # on resources it owns
+  - agent_spawn, sandbox_create, sandbox_fork, sandbox_destroy, attach, agent_stop
+  - channel_create, post, read, subscribe, list, read_transcript
+  - grant, egress_policy             # sinks: when_tainted = approve
   - post on user
+budget: {depth: 2, concurrent: <the brain concurrency cap>, spawns: 20/day}
 subscriptions: [{channel: <own>/inbox}]   # it adds the rest itself
 escalate_to: user
 priority: high
@@ -22,21 +24,25 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 
 ## Conventions in its prompt
 
-- **Workstreams:** for each one, it creates a channel, sandboxes and workers labeled `workstream=<name>`, and subscribes to their `events` with a decision filter (`question`, `blocked`, `completed`, `failed`, `pr_opened`, `orphaned_work`, `egress_alert`) and a batch window. Progress stays in the channel for its next read. See [../workstreams/](../workstreams/).
-- **Inspection (`delegate`):** it never attaches to sandboxes. It spawns a read-only worker on a read-only fork and reads its report.
+- **One agent first.** Multi-agent setups win on parallel, read-heavy work and lose on sequential work: one study measured +81% on parallelizable tasks and −39% to −70% on sequential ones ([2025-12](https://arxiv.org/abs/2512.08296)), and Anthropic calls its multi-agent research design a poor fit for most coding ([2025-06](https://www.anthropic.com/engineering/multi-agent-research-system)). The captain spawns more agents only for independent, mostly read-only work.
+- **One writer per sandbox.** Parallel writers still fail; what works is single-threaded writes plus forks ([Cognition, 2026-04](https://cognition.com/blog/multi-agents-working)).
+- **A reviewer with a clean context** checks finished work. Agents grade their own work too kindly ([Anthropic, 2026-03](https://www.anthropic.com/engineering/harness-design-long-running-apps)), and missing verification is the largest failure class in [MAST](https://arxiv.org/abs/2503.13657).
+- **Every spawn prompt says when the work counts as done,** since not knowing when to stop is a top failure mode (MAST).
+- **Workstreams:** for each one, it creates a channel, sandboxes and workers labeled `workstream=<name>`, and subscribes to their `events` with a decision filter (`question`, `blocked`, `completed`, `failed`, `pr_opened`, `orphaned_work`, `egress_alert`) and a batch window. See [../workstreams/](../workstreams/).
+- **Staying clean:** a captain that reads worker output becomes [tainted](../../agents/tools/#taint-and-sinks), and its sink calls then need my approval. So it reads wake envelopes and **quarantined reports** (a `report_schema` of enums, numbers and ids), and when it needs details it spawns a read-only reader on a read-only fork (`delegate`) instead of reading code itself.
 - **Continuity:** a private memory channel, read by key at each wake. The Claude Code session is a cache, so a fresh session or a backend switch loses nothing.
-- **Escalation:** it answers its workers' questions itself when it holds the grant they ask for, and posts to `user` otherwise.
-- **Untrusted input:** everything its workers post is data, not instructions. Channel messages reach it as user-role content.
+- **Escalation:** it answers its workers' questions itself when it holds the grant they ask for and is untainted, and posts to `user` otherwise.
 
 ## Safeguards
 
-- A captain acts only through tool calls bounded by its grants, and its grants are bounded by mine.
-- Its workers get only grants it holds; the `worker` template keeps management grants away from agents with hands.
+- A captain acts only through tool calls bounded by its grants, its budget and its taint; all three are bounded by mine.
+- Its workers get only grants and budget it holds; the `worker` template keeps management grants away from agents with hands.
 - It can use a separate setup token from workers (`credential` above).
 - `priority: high` reserves subscription headroom for it.
 
 ## Open questions
 
-- **`delegate`:** keep it a pattern (spawn plus read the report), or add a tool for it if models do it poorly.
+- **`delegate`:** keep it a pattern (spawn plus a schema'd report), or add a tool for it if models do it poorly.
+- **Approval load:** whether `approve` on tainted sinks generates too many questions in practice, and which sinks can safely be `allow`.
 
 Its backend is per agent. See [../../agents/backends/](../../agents/backends/).

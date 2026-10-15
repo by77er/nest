@@ -76,7 +76,10 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   attenuation, spawn specs and templates, owners and labels aren't built. The code still has
   `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with
   `WorkstreamEvent` and batched captain wakes, a role-filtered tool catalog, and a `workstream`
-  egress policy layer. The contract changes are listed in `docs/interfaces/README.md`.
+  egress policy layer. Taint and sinks, budgets, wake envelopes and the hands journal aren't built either.
+  Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
+  commit and flushes at turn boundaries. Placement is least-loaded by lease count, where the design packs
+  by free hugepages. The contract changes are listed in `docs/interfaces/README.md`.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
   `attach`, `checkpoint`, `brokered`, and all captain tools except `notify`, `ask` and `read_transcript`.
 - **GitHub App installation-token minting** is an interface only.

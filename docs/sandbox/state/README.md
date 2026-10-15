@@ -5,7 +5,7 @@
 A sandbox's state is a chain of immutable generations. Each generation is a manifest of content-addressed chunks.
 
 ```
-gen    { id, parent, epoch, disk_manifest, mem_manifest?, kind: disk-only | checkpoint, at }
+gen    { id, parent, epoch, disk_manifest, mem_manifest?, restore_abi?, session: {offset, last_tool_use}?, kind: disk-only | checkpoint, at }
 chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 ```
 
@@ -25,12 +25,15 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 A memory snapshot is valid **only when it belongs to the head generation**. Restoring older memory over a newer disk corrupts the filesystem.
 - **Head is a checkpoint:** do a memory restore (the fast path).
 - **Head is disk-only** (after a crash): cold-boot with the newest disk and run `--resume`. Running processes are lost; at most 60 s of file changes are lost.
+- **Rollback notice:** each generation records the session position it covers (`session`). After a disk-only restore, the agent's recovery context says the workspace went back to that point and which tool calls after it may be undone, so the model checks (e.g. `git status`) instead of trusting its transcript.
 
 ## Spot notice (2 minutes)
 
-1. Order sandboxes by how recently they were active.
-2. For each: pause, write a full memory snapshot to NVMe, flip the disk epoch, upload with zstd compression, commit.
-3. Anything that doesn't finish falls back to its last disk-only generation.
+1. **Flip the disk epoch of every sandbox first** (milliseconds each), so none loses more than the notice's worth of file changes.
+2. Then, in order of recent activity: pause, write a full memory snapshot to NVMe (`sync_snapshot_files=false`), upload with zstd compression, commit.
+3. Anything that doesn't finish falls back to its disk-only generation.
+
+A **rebalance recommendation** can arrive with the notice rather than before it, so it's polled every 5 s and means: stop placing on the host and flush idle sandboxes, not a full drain ([AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/rebalance-recommendations.html)).
 
 ## Volumes
 

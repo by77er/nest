@@ -28,3 +28,8 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **The platform tool catalog** is filtered by grants and has the channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`), `agent_spawn`, `list`, and `grant`/`revoke`. See [agents/tools/](../agents/tools/).
 - **Guest CLI:** `nest post`, `nest read`, `nest expose`.
 - **IDs:** `chn_` (channel) and `tpl_` (template).
+- **Channel messages** carry `taint`, set by the platform.
+- **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit.
+- **Hands journal:** guest → nestd → AgentDO intent and outcome events keyed by `(agent, epoch, tool_use_id)`.
+- **`GenerationRecord`** gains `restore_abi` and `session{offset, last_tool_use}`.
+- **Claude Code invocation** (`runner-claude`): `--system-prompt-snapshot off`, `--max-turns` and `--max-budget-usd` from the budget, no `TodoWrite` or `Agent` in `--tools`, `DISABLE_UPDATES=1`, `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` (after verification), auto memory off, and `PreToolUse` answering `defer` for approvals.

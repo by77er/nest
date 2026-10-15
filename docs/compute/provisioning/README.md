@@ -1,11 +1,12 @@
 # Provisioning
 
 **Burst host image (built with Packer):**
-- Ubuntu 24.04 (kernel 6.8). Hugetlb needs 5.18+ and ublk needs 6.0+.
+- Amazon Linux 2023 with kernel 6.18 (or 6.1), the host kernels Firecracker supports on 8i ([README](https://github.com/firecracker-microvm/firecracker/blob/main/README.md)); Ubuntu 24.04's 6.8 isn't one of them. Hugetlb needs 5.18+ and ublk needs 6.0+; whether AL2023 ships ublk is unverified.
+- Firecracker 1.17 or later.
 - Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, **Claude Code + the agent runner** (brains for local sandboxes).
 
 **Launch template:**
-- Nested virtualization enabled, restricted to supported families.
+- Nested virtualization enabled, restricted to the 8i family.
 - Prefer `d` variants for local NVMe.
 - Reserve a `vm.nr_hugepages` pool at boot. The remaining memory is for the host and the snapshot page cache.
 

@@ -11,6 +11,7 @@ github:
 ```
 
 - **Substitution** happens only when the placeholder is present, and only for the binding's own hosts.
+- **Processors:** a binding's `where` covers bearer and basic credentials now. Request-signing processors (AWS SigV4, OAuth2 client credentials, HMAC) come later, as in Fly's [Tokenizer](https://github.com/superfly/tokenizer).
 - **A placeholder sent to any other host is blocked** and raises an `egress_alert`, since it's a likely exfiltration attempt or a misconfiguration.
 - **Fenced:** after the sandbox's lease or epoch expires, bindings stop substituting.
 - **Defaults in the image:**
