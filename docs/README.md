@@ -16,7 +16,7 @@ A personal platform that combines sandboxes with durable agents. Long-lived Clau
 
 1. **Mechanism, not policy.** Primitives make no assumptions about the work inside them: no git, no worktrees, no port conventions, no roles, no workstreams.
 2. **Structure is the model's job** ([the bitter lesson](http://www.incompleteideas.net/IncIdeas/BitterLesson.html)). The platform provides general primitives and hard limits. How agents organize, delegate and coordinate lives in prompts and tool calls, so it improves as models do and changes without a release.
-3. **Authority is grants, and grants only shrink.** Every action needs a grant, and an agent can pass on only grants it holds. I hold the root.
+3. **Authority is grants, and grants only shrink.** Every action needs a grant, and an agent can pass on only grants it holds. A session that has read untrusted content needs approval for actions that send data out. I hold the root.
 4. **The sandbox is the trust boundary.** Everything inside one sandbox shares a trust domain.
 5. **Decisions on the agent's hot path are local; everything else is async.** Hooks never wait on the network.
 6. **Each piece of data lives next to its main reader.** Metadata lives in Durable Objects, bookkeeping in R2 and sandbox bytes in S3.
@@ -95,6 +95,8 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | Subscription | An agent's wake rule on a channel: a filter plus how matches are delivered |
 | Grant | Permission for a principal to do an action on a resource. Passed on only by someone who holds it. |
 | Owner | Whoever created a resource. Holds every grant on it. |
+| Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, other agents' tainted posts) |
+| Sink | An action that can send data out or widen authority; from a tainted session it needs approval |
 | Template | A named spawn spec (prompt, tools, grants, subscriptions, backend), stored as data |
 | Generation | Immutable manifest of a sandbox's disk (and optionally memory) chunks |
 | Epoch | Fencing token. It increments each time a sandbox's lease is granted. |
@@ -118,7 +120,12 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 | No agent roles. Placement follows hands; an agent without hands needs no machine. The brain backend is pluggable (`claude-code` now, `api-loop` inside the control plane later). | [agents/](agents/) |
 | Captains and workstreams are patterns (templates plus conventions), not code | [orchestration/](orchestration/) |
 | Coordination is one primitive: channels. Inboxes, platform events, questions, shared state and memory are channels. | [channels/](channels/) |
-| Authority is grants, attenuated from me; there's no built-in scoping unit. Inspecting without hands means spawning a read-only agent on a read-only fork. | [agents/tools/](agents/tools/) |
+| Authority is grants, attenuated from me and revoked down the chain; there's no built-in scoping unit. Inspecting without hands means spawning a read-only agent on a read-only fork. | [agents/tools/](agents/tools/) |
+| Taint is tracked per session by the platform; sink calls (egress widening, external brokered actions, granting sinks) from a tainted session need approval from me or an untainted holder | [agents/tools/](agents/tools/) |
+| A woken turn gets a platform notice; other agents' message bodies reach a model only as `read` results | [channels/](channels/) |
+| Budgets (depth, concurrency, spawns, turns, quota share) shrink like grants and are enforced per owner subtree | [orchestration/scheduling/](orchestration/scheduling/) |
+| Hands calls are journaled (intent, outcome); after a crash, in-flight calls are reported as unknown, never retried | [agents/hands/](agents/hands/) |
+| Memory snapshots carry a restore ABI and restore only on matching hosts; the burst fleet is the 8i family; placement packs | [sandbox/state/memory/](sandbox/state/memory/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
 | The harness runs on the host; hands are RPC into the sandbox; no credentials in VMs | [agents/](agents/) |
 | I reach agents through a Discord bot that bridges Discord channels and threads to nest channels | [control-plane/api/discord/](control-plane/api/discord/) |
@@ -135,23 +142,25 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 - **Watch:** `--bare` may become the default for `claude -p`, which would break subscription auth. The mitigation is the `authMethod` startup check. See [agents/runner/](agents/runner/).
 - **Verify:** that `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod: "claudeai"`, and that separate setup tokens can be revoked independently. See [agents/runner/](agents/runner/).
 - **Verify against the real Claude Code binary** (never run here; the tests use a fake):
-  - whether `system/init` arrives before the first user message
+  - whether `system/init` arrives before the first user message (documented as the first event after hook events)
   - the stdin user-message shape without `session_id`
-  - the `_meta` key carrying the tool-use id on MCP `tools/call`
-  - that `--restricted` honors the `--tools` built-in list
+  - the `_meta` key carrying the tool-use id on MCP `tools/call` (undocumented; `PreToolUse` input has `tool_use_id` to correlate instead)
+  - that `--restricted` honors the `--tools` built-in list (documented)
   - that `notifications/cancelled` reaches MCP on interrupt
-  - the `claude auth status` JSON
+  - the `claude auth status` JSON (`authMethod` and `configDirectory` are documented)
   - that `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` keeps `NEST_*`
-  - the transcript path encoding
+  - the transcript path encoding (non-alphanumerics become `-`; the hashing of paths over 200 characters is undocumented)
+  - `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` and `PreToolUse` `defer` under stream-json input
+  - that a `SessionStart` hook fires after compaction (to re-inject the memory index)
 
   See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
 - **Agents, grants and channels:**
-  - **Revocation:** whether revoking a grant also revokes the grants passed on from it. See [agents/tools/](agents/tools/).
   - **Owner removal:** whether an owner's resources are stopped with it or passed to its owner. See [agents/](agents/).
-  - **Sandbox programs:** which channel tools the in-sandbox `nest` CLI may use, and with whose grants. See [agents/tools/](agents/tools/).
   - **Wake limits:** the per-agent cap on subscription-started turns, and loop detection. See [channels/](channels/).
   - **Channel retention:** the defaults, and whether long-lived channels need compaction to R2. See [channels/](channels/).
-  - **Budgets:** quota and cost budgets per agent or per owner subtree, and how spawning splits them. See [orchestration/scheduling/](orchestration/scheduling/).
+  - **Quota share:** how to measure it while individual-plan windows are unpublished. See [orchestration/scheduling/](orchestration/scheduling/).
+  - **Resume or fresh:** the cost threshold between resuming a long session and starting fresh from memory. See [agents/](agents/).
+  - **Approval load:** whether approvals on tainted sinks are too frequent in practice. See [orchestration/captains/](orchestration/captains/).
   - **Shared egress policies:** per-sandbox policy only, or named policies shared by many sandboxes. See [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/).
   - **`delegate`:** a tool, or just a pattern. See [orchestration/captains/](orchestration/captains/).
 
@@ -160,7 +169,7 @@ See [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/)
 On a c8id with nested virtualization and a hugepage pool:
 1. Cold boot until the guest agent is ready.
 2. Disk-only resume through `claude --resume`.
-3. Hugepage UFFD resume from page cache, NVMe and S3.
+3. Hugepage UFFD resume from page cache, NVMe and S3 Express (no public benchmark of 2 MB UFFD restores exists).
 4. Time to write a full snapshot at 2 and 4 GB.
 5. A dev server's first response after resume.
 6. ublk lazy-disk throughput.
@@ -168,3 +177,5 @@ On a c8id with nested virtualization and a hugepage pool:
 8. Forced-partition test: self-fence, then STONITH, then restore.
 9. **First real Claude Code run** through the runner (the verification list above).
 10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM) and with RPC hands; compare success rate, turns and tokens.
+11. **Nested overhead:** CPU and I/O on a nested 8i instance against the same work on `.metal`.
+12. **Resume or fresh:** turn cost and quality when resuming a long session after the cache expired, against a fresh session seeded from memory.

@@ -13,7 +13,7 @@
 ## Lifecycle
 
 ```
-running ⇄ suspended (on host H; disk-only or with memory) → archived (S3 only) → restore on any host in the cell
+running ⇄ suspended (on host H; disk-only or with memory) → archived (S3 only) → restore in the cell: disk on any host, memory only on a host with the same restore ABI
 ```
 
 ## Fork
@@ -24,9 +24,9 @@ running ⇄ suspended (on host H; disk-only or with memory) → archived (S3 onl
 | Live | Pause, write a full memory snapshot, resume the parent; the child restores from the same chunks | 1–2 s pause for 2–4 GB |
 | Same host | The child reads the parent's snapshot from page cache | Near-instant |
 
-After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock, and sets a new machine-id and hostname. Forking an agent's conversation is a separate step (`--fork-session`).
+After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock (VMClock where the guest kernel supports it), and sets a new machine-id and hostname. Firecracker calls resuming one snapshot more than once insecure, so a live fork treats userspace RNG state and other process state as duplicated. Forking an agent's conversation is a separate step (`--fork-session`).
 
-**Sizing:** hugetlbfs memory can't be ballooned and hotplug isn't assumed. Size the sandbox for the agents it will hold; if it gets crowded, fork instead of growing it.
+**Sizing:** hugetlbfs memory can't be ballooned in the traditional way, and hotplug isn't assumed. Size the sandbox for the agents it will hold; if it gets crowded, fork instead of growing it.
 
 ## Components
 

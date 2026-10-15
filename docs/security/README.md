@@ -1,6 +1,6 @@
 # Security
 
-**Threat model:** the adversary is **one of my own agents after a prompt injection**, not me. Injected instructions act through hands, which run inside a sandbox, and through platform tools, which are bounded by the agent's grants. Channels carry untrusted content between agents: a compromised agent can post only where it holds grants, and readers get its messages as data, never instructions.
+**Threat model:** the adversary is **one of my own agents after a prompt injection**, not me. Injected instructions act through hands, which run inside a sandbox, and through platform tools, which are bounded by the agent's grants. Channels carry untrusted content between agents, and injections spread from agent to agent. A compromised agent can post only where it holds grants, its posts carry its taint, and readers get message bodies only as tool results. Model robustness lowers the odds but isn't a boundary; grants, taint and sinks are.
 
 ## Trust boundaries
 
@@ -17,7 +17,7 @@
 - Credentials stay outside VMs: [identity/](identity/)
 - Egress allowlist, credential injection, secret scan, no raw ssh: [../sandbox/networking/egress/](../sandbox/networking/egress/)
 - The harness runs on the host, with a clean environment, restricted mode and managed settings: [../agents/runner/](../agents/runner/)
-- Grants, attenuated from me (an agent passes on only what it holds), brokered actions and approval gates: [../agents/tools/](../agents/tools/)
+- Grants, attenuated from me (an agent passes on only what it holds), taint tracking with approval on sinks, brokered actions and approval gates: [../agents/tools/](../agents/tools/)
 - Epoch fencing of side effects: [../sandbox/fencing/](../sandbox/fencing/)
 
 ## Components

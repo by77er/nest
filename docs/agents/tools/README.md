@@ -15,26 +15,34 @@
 
 ## Grants
 
-A grant is `(principal, action, resource, limits?, expires?)`. A resource is an id, a label selector (`sandbox{workstream=auth}`), or `own` (whatever the principal owns, now or later).
+A grant is `(principal, action, resource, limits?, expires?, parent)`. A resource is an id, a label selector (`sandbox{workstream=auth}`), or `own` (whatever the principal owns, now or later).
 
 - **Attenuation:** an agent can grant, or put in a spawn spec, only grants it holds, with equal or tighter limits. I hold the root, so authority flows down from me and only shrinks.
+- **The chain is the revocation list:** each grant records its `parent` and is valid only while every ancestor is. Limits intersect down the chain. Revoking a grant revokes everything derived from it, and the grants an agent issued end when it's removed. Every call is checked online against one store, so no signed tokens are needed; attenuable tokens ([Biscuit](https://doc.biscuitsec.org/reference/specifications), the [IETF attenuating agent tokens draft](https://www.ietf.org/archive/id/draft-niyikiza-oauth-attenuating-agent-tokens-01.html)) solve offline and cross-domain checks, which nest doesn't have.
 - **Ownership:** creating a resource gives its creator every grant on it.
-- **Limits ride on grants:** e.g. `agent_spawn{max: 5}`, `sandbox_create{max: 3, memory_mb ≤ 4096}`.
+- **Budgets shrink like grants:** see [spawning](../#spawning). An agent over budget is parked and escalates.
 - **Checked twice:** AgentDO filters `tools_list` by grants, then checks every `tool_call` again.
 - **Approval:** `requires_approval` actions always post a `question` to the agent's escalation channel first.
-- **Template defaults, not platform rules:** the default templates keep management grants (`agent_spawn`, `grant`, `attach`) away from agents with hands, because those read untrusted content.
 
-**Brokered action pipeline:** check the grant → rate limit → scan arguments for secrets → approval gate → run with idempotency key `(agent, epoch, call_id)` → write to the journal.
+## Taint and sinks
+
+An agent that reads untrusted content, holds private data and can send data out can be made to leak it: the [lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/) (2025-06), also framed as the [Agents Rule of Two](https://ai.meta.com/blog/practical-ai-agent-security/) (2025-10). Model robustness helps but isn't a boundary: adaptive attacks broke 12 published defenses at over 90% ([2025-10](https://arxiv.org/abs/2510.09023)). So nest tracks what each session has read, the way [CaMeL](https://arxiv.org/abs/2503.18813) and [FIDES](https://arxiv.org/abs/2505.23643) label data, but per session, which is cheap:
+
+- **Taint is one bit per session, kept by AgentDO and set only by the platform.** It's set by hands output, `WebFetch`/`WebSearch` results, `read_transcript`, and reading a tainted message or memory entry. It lasts for the session (a `--resume` keeps it).
+- **It propagates:** a spawned agent starts with its spawner's taint, and every post carries its sender's taint.
+- **Sinks** are the actions that can send data out or widen authority: widening an egress policy, external brokered actions, and granting a sink action. Each sink grant carries `when_tainted: approve | allow` (default `approve`), and attenuation can only tighten it.
+- **A sink call from a tainted session** with `approve` posts a question to the escalation channel. Only I or an untainted holder of that grant can approve it.
+- **Ways back to clean:**
+  - A fresh session starts clean, unless it then reads tainted content.
+  - **Quarantined reports:** a spawn spec can declare a `report_schema` of enums, numbers and ids. A child's final report that validates against it reaches the spawner untainted, even from a tainted child. This is the dual-LLM / map-reduce pattern from [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837) (2025-06), and how a captain stays clean while its workers read code.
+- **Template defaults:** widening egress and granting sinks are `approve`. Brokered actions already scoped by their binding (e.g. `github.create_pr` to the binding's repos) are `allow`. Management grants stay off agents with hands.
+
+**Brokered action pipeline:** check the grant and taint → rate limit → scan arguments for secrets → approval gate → read current external state → run with a natural idempotency key (e.g. `(repo, head_sha)` for a PR) → write to the journal.
 
 - **Identity:** the runner knows which agent each MCP process belongs to and authenticates to the control plane with its host token. Stale epochs are rejected.
 - **Never block on a human:** `post` with `await_reply_s` and approvals wait at most about 2 minutes. After that they return `pending`, the turn ends, and the reply arrives as a later turn.
-- **Inbound messages** are delivered from the agent's subscriptions: mid-turn through stdin or the `Stop` hook inbox, otherwise as the next turn. A post flagged `interrupt` interrupts the current turn if the poster holds `interrupt` on the agent.
+- **Inbound messages** arrive as wake envelopes, with bodies only through `read` (see [channels](../../channels/#the-wake-envelope)). A post flagged `interrupt` interrupts the current turn if the poster holds `interrupt` on the agent.
 
 ## The `nest` CLI inside sandboxes
 
-Scripts and programs running in a sandbox can call `nest post`, `nest read` and `nest expose` through the guest agent over vsock. `NEST_AGENT_ID`, set on every hands exec, attributes the call, and it runs with that agent's grants. It isn't a secret, because identity inside a sandbox is attribution only. `spawn`, `attach`, `grant` and policy changes need a brain, so the CLI never offers them.
-
-## Open questions
-
-- **Revocation:** whether revoking a grant also revokes the grants passed on from it. That needs each grant to record where it came from.
-- **Sandbox programs:** whether in-sandbox programs act with the attributed agent's grants (as above), or with a smaller grant set of the sandbox's own.
+Scripts and programs running in a sandbox can call `nest post`, `nest read` and `nest expose` through the guest agent over vsock. Their posts are **always tainted**, and they can reach only the channels named in the sandbox's spec. `NEST_AGENT_ID`, set on every hands exec, attributes a post. It isn't a secret, because identity inside a sandbox is attribution only. Everything else needs a brain.

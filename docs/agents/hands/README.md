@@ -19,3 +19,10 @@ MCP tools that act on the agent's bound sandbox. `nest mcp` (a stdio shim Claude
 - **Schemas and descriptions are copied closely** from Claude Code's built-ins to keep them familiar to the model. Tools appear as `mcp__nest__<Name>`.
 - **Fidelity risk:** the built-ins are heavily tuned. **Spike:** run the same tasks with native tools (Claude Code inside a VM) and with hands over RPC, and compare success rate, number of turns and token use.
 - **Rejected alternative:** native tools redirected with `CLAUDE_CODE_SHELL_PREFIX` plus a filesystem mount. The prefix also wraps hooks and MCP server startup, the command it receives includes setup that refers to local files, Firecracker has no virtiofs, and pointing the working directory at the repo would let the repo's config load on the host.
+
+## Journal
+
+A hands call that was in flight when its brain died has an unknown outcome. Durable-execution systems record that as a first-class state instead of guessing ([an example, 2026-03](https://urandom.io/blog/2026-03-29-exactly-once-is-a-fantasy-agent-systems-need-idempotent-tools)), and so does nest:
+- The guest records **intent** before running a call and **outcome** after, keyed by `(agent, epoch, tool_use_id)`, and streams both to AgentDO as events.
+- After a restart, calls with an intent and no outcome are reported as **unknown** in the recovery context, so the model checks (e.g. `git status`, the remote branch) before re-running.
+- Calls aren't retried by the platform. Irreversible external actions (publishing, deploying, opening PRs) should go through [brokered actions](../tools/), which read the current state and use natural idempotency keys.

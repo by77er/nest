@@ -28,7 +28,9 @@ launch:        {system_prompt, builtin_tools, model, effort}   # becomes Claude 
 backend:       claude-code         # or api-loop (later; agents without hands only)
 hands:         {sandbox, cwd?}     # or null
 grants:        [...]               # must be a subset of the spawner's
+budget:        {depth, concurrent, spawns, turns_per_day, quota_share}   # at most what the spawner has left
 subscriptions: [{channel, filter, delivery, batch_ms}]
+report_schema: {...}               # optional: a final report that matches it reaches the spawner untainted
 escalate_to:   <channel>           # default: the spawner's inbox
 priority:      normal              # or high; see quota scheduling
 labels:        {workstream: auth}
@@ -37,8 +39,15 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 
 - **Templates** are named specs stored in the control plane and edited by me. `captain` and `worker` are just the two I start with. See [../orchestration/](../orchestration/).
 - **Placement follows hands:** an agent with hands runs on its sandbox's host, where hands RPC is local vsock. One without hands runs on a controller host, or, with `api-loop`, nowhere.
-- **Ownership:** the spawner owns the new agent and holds every grant on it: post to its inbox, stop it, attach it, read its transcript.
+- **Ownership:** the spawner owns the new agent and holds every grant on it: post to its inbox, stop it, attach it, read its transcript. It's subscribed to the new agent's `events` by default, so the agent's final text comes back when it finishes.
+- **Budgets shrink like grants:** a child's budget is carved from its spawner's remaining budget and enforced per owner subtree. That bounds spawn depth, fan-out and quota, the runaway modes seen in practice ([Anthropic's research system](https://www.anthropic.com/engineering/multi-agent-research-system) once spawned 50 subagents for a simple query). An agent over budget is parked and escalates.
 - **Fencing:** an agent with hands presents its sandbox's epoch; one without hands presents 0 and is fenced by its host's lease.
+
+## Continuity
+
+- **Each wake picks resume or fresh.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the transcript is small. Otherwise it starts a fresh session, seeded with its memory index and the wake envelope. A fresh session also clears [taint](tools/#taint-and-sinks). The threshold is to be measured.
+- **One memory system:** memory is a private keyed channel. Claude Code's own auto memory is off (it's local to one host), and a `SessionStart` hook injects the memory key index at startup and after compaction.
+- **The session file is a cache** of a format Claude Code doesn't stabilize; the durable state is the R2 copy plus memory. See [sessions/](sessions/).
 
 ## Attach, share, fork
 
@@ -50,7 +59,8 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 
 ## Open questions
 
-- **Owner removal:** when an owner is stopped for good, whether what it owns is stopped with it or passed to the owner's owner.
+- **Owner removal:** when an owner is stopped for good, whether what it owns is stopped with it or passed to the owner's owner. (The grants it issued end with it; see [tools/](tools/).)
+- **Resume or fresh:** the cost threshold between resuming a long session and starting fresh from memory.
 
 ## Components
 
