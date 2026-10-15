@@ -69,15 +69,12 @@ A woken turn's input is a **platform notice, not the messages**: per subscriptio
 - **Bounded backlog:** at most 50 deliveries wait per agent; the oldest is dropped with a notice. Claude Code's own cross-session messaging uses the same guards ([docs](https://code.claude.com/docs/en/cross-session-messaging)).
 - **Idempotent posts:** `post(idem_key?)` returns the existing `seq` for a repeated key, so a retried post after an eviction lands once.
 - **Retention:** set per channel. The default is 30 days; a keyed message is kept while it's the newest for its key.
+- **Tiering:** message bodies older than 7 days move to R2. The index and the keyed view stay in SQLite, and reads fetch old bodies transparently, so a channel's DO storage stays bounded however long it lives.
 - **Delivery:** at least once, in order per subscription. AgentDO deduplicates with a per-subscription high-water `seq`.
 - **Posting** needs `post` on the channel and **reading** needs `read`; a channel's owner holds both and can grant them.
 
 **No interop for now:** [A2A](https://a2a-protocol.org/latest/specification/) is client-to-server tasks with no pub/sub, and [MCP tasks](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/) have no agent-to-agent features. Either could be an adapter at the edge later.
 
 These are starting defaults ("balanced"), tuned from experience.
-
-## Open questions
-
-- **Compaction:** whether long-lived channels need compaction to R2.
 
 **Implementation:** one [ChannelDO](../control-plane/durable-objects/channel/) per channel. Not built yet.
