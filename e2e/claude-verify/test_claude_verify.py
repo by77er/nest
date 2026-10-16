@@ -194,7 +194,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_transcript_encodings_and_hash_guess(self):
         self.assertEqual(h.encode_documented("/a/b.c_d"), "-a-b-c-d")
-        self.assertEqual(h.encode_nest("/a/b.c_d"), "-a-b.c_d")
+        self.assertEqual(h.encode_nest("/a/b.c_d"), "-a-b-c-d")
         cwd = "/tmp/" + "x.y_" * 60
         hsh = 0
         for ch in cwd:
@@ -203,6 +203,8 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(h.identify_suffix(cwd, "-" + h.to_base36(hsh)), "java_hashcode_abs_base36")
         self.assertEqual(h.identify_suffix(cwd, "-" + hashlib.sha256(cwd.encode()).hexdigest()[:8]), "sha256_hex")
         self.assertIsNone(h.identify_suffix(cwd, "-zzzzzzzz"))
+        # The observed sample from e2e/claude-verify (a 266-character cwd), mirrored by `claude::project_dir`.
+        self.assertEqual(h.encode_nest(cwd), h.encode_documented(cwd)[:200] + "-" + h.to_base36(hsh))
 
     def test_redactor(self):
         r = h.Redactor("sk-ant-oat01-secret")

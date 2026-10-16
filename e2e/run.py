@@ -23,7 +23,8 @@ MODE = os.environ.get("NEST_E2E_CLAUDE", "fake")
 REAL = MODE == "real"
 # Popped so no subprocess inherits it (nest-guest is the sandbox): the token reaches Claude Code only
 # through the control plane's `claude_oauth_token` secret and the runner's explicit env.
-TOKEN = os.environ.pop("NEST_CLAUDE_OAUTH_TOKEN", "").strip() if REAL else ""
+# A token has no whitespace; `claude setup-token` wraps it, so a copied line break is dropped.
+TOKEN = "".join(os.environ.pop("NEST_CLAUDE_OAUTH_TOKEN", "").split()) if REAL else ""
 REAL_MODEL = os.environ.get("NEST_CLAUDE_MODEL", "haiku")
 REAL_TURN_TIMEOUT_S = float(os.environ.get("NEST_E2E_REAL_TURN_TIMEOUT_S", "300"))
 REAL_ENV = {}  # extra env for inner.sh in real mode (set by prepare_real)

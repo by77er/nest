@@ -181,8 +181,19 @@ def encode_documented(cwd):
 
 
 def encode_nest(cwd):
-    """`claude::transcript_path`'s rule: `/` becomes `-`."""
-    return cwd.replace("/", "-")
+    """`claude::project_dir` (crates/nest-protocol/src/host.rs): every UTF-16 unit that isn't an ASCII
+    letter or digit becomes `-`; past 200 units the name keeps its first 200 and gains `-` plus the
+    base-36 absolute value of the cwd's Java `hashCode`."""
+    raw = cwd.encode("utf-16-le")
+    units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    name = "".join(chr(u) if u < 128 and chr(u).isalnum() else "-" for u in units)
+    if len(name) <= 200:
+        return name
+    h = 0
+    for u in units:
+        h = (31 * h + u) & 0xFFFFFFFF
+    signed = h - (1 << 32) if h >= (1 << 31) else h
+    return f"{name[:200]}-{to_base36(abs(signed))}"
 
 
 def common_prefix_len(a, b):

@@ -564,7 +564,7 @@ def probe_transcript_path(ctx, n, key, title):
                  "long cwd follows the same rule" if long["matches_documented_rule"] else
                  f"long cwd ({long['cwd_len']} chars) → {long['encoded_len']}-char directory: first {long.get('common_prefix_with_rule')} chars follow the rule, "
                  f"then {long.get('rest_after_prefix')!r} (hash: {long.get('hash_guess') or 'unidentified'})")
-    nest_note = "" if short["matches_nest_formula"] else " `claude::transcript_path` (only `/` → `-`) differs for this cwd; it agrees for /var/lib/nest/empty."
+    nest_note = "" if short["matches_nest_formula"] else " `claude::project_dir` differs for this cwd."
     if short["matches_documented_rule"]:
         return h.result(n, key, title, PASS, f"Non-alphanumerics become '-' ({short['encoded_dir']}); {long_note}.{nest_note}", ev)
     return h.result(n, key, title, FAIL, f"Observed {short['observed']}, expected {short['documented_rule']}; {long_note}.", ev)

@@ -37,7 +37,8 @@ def main(argv):
             print(f"{n:>2}  {key:<18} {title}")
         return 0
     # Popped so nothing but Claude Code (given it explicitly as CLAUDE_CODE_OAUTH_TOKEN) inherits it.
-    token = os.environ.pop(h.TOKEN_ENV, "").strip()
+    # A token has no whitespace; `claude setup-token` wraps it, so a copied line break is dropped.
+    token = "".join(os.environ.pop(h.TOKEN_ENV, "").split())
     if not token:
         return skip(f"{h.TOKEN_ENV} is not set. Put the owner's `claude setup-token` token in it to run the probes; nothing was run.")
     claude = os.environ.get("NEST_CLAUDE_BIN") or shutil.which("claude")
