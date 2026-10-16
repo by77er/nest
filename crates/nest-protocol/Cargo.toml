@@ -14,3 +14,6 @@ strum = { version = "0.28", features = ["derive"] }
 [target.'cfg(unix)'.dependencies]
 # host-internal: SCM_RIGHTS fd passing helpers (host.rs)
 nix = { version = "0.31", features = ["socket", "uio"] }
+
+[lints]
+workspace = true

@@ -34,7 +34,7 @@ One App, owned by me and installed only on `by77er/nest`.
 | Setting | Value |
 |---|---|
 | Plan | **GitHub Pro** (or a Team organization): branch protection on a private repo needs it. Users report rulesets not enforcing on personal private repos even on Pro (unverified), so use classic branch protection |
-| Branch protection on `main` | Require a pull request, 0 approvals, review from Code Owners. Required checks: `rust`, `control-plane`, `e2e`, `docs` (from GitHub Actions) and `nest/review` (pinned to the App as its source, so a same-named check from anything else doesn't count). Not "up to date before merging": PR CI already runs on the merge with `main`, and deploys wait for CI on `main`. No force pushes or deletions. Administrators (me) may bypass |
+| Branch protection on `main` | Require a pull request, 0 approvals, review from Code Owners. Required checks: `ci-ok` (from GitHub Actions; it aggregates every CI job) and `nest/review` (pinned to the App as its source, so a same-named check from anything else doesn't count). Not "up to date before merging": PR CI already runs on the merge with `main`, and deploys wait for CI on `main`. No force pushes or deletions. Administrators (me) may bypass |
 | Merging | Allow auto-merge; squash only; delete head branches |
 | Actions | Workflow permissions read-only; Actions may not create or approve pull requests |
 | Environment `production` | Deployment branches: `main` only. Secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ANALYTICS_TOKEN` |
@@ -46,7 +46,7 @@ One App, owned by me and installed only on `by77er/nest`.
 
 - **Low-risk** means no `CODEOWNERS` path changed. Such a PR merges when CI and `nest/review` pass.
 - **`CODEOWNERS` paths** need my approval as well:
-  - the gates: `.github/`, `scripts/`, `CLAUDE.md`, `.claude/`;
+  - the gates: `.github/`, `scripts/`, `CLAUDE.md`, `.claude/`, and the toolchain, lint, dependency and secret-scanning configs;
   - dependency manifests and lockfiles;
   - deploy config and DO migrations;
   - API auth, BrokerDO, host identity, the root CA and EC2 access;

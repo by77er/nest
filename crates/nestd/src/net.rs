@@ -205,28 +205,46 @@ fn run_nft(rules: &str) -> io::Result<()> {
 
 /// Test support: run the calling test inside a fresh user + network namespace by re-executing
 /// the test binary under `unshare`. Returns `true` when already inside (run the test body),
-/// `false` after the child ran (the caller returns). Panics if the child test failed; returns
-/// `false` with a message if user namespaces are unavailable.
+/// `false` after the child ran (the caller returns). Panics if the child test failed, or if the
+/// child didn't run `test_name` at all (a renamed test makes `--exact` match nothing, which
+/// libtest reports as success). Without `unshare` it prints a `NEST-TEST-SKIP:` line and returns
+/// `false`, unless `NEST_CI_REQUIRE_USERNS` is set, when it panics: CI never skips silently.
 #[doc(hidden)]
 pub fn reexec_in_userns(test_name: &str) -> bool {
     const MARK: &str = "NESTD_IN_USERNS";
-    if std::env::var_os(MARK).is_some() {
+    if let Some(ack) = std::env::var_os(MARK) {
         // A fresh network namespace starts with loopback down.
-        let _ = Command::new("ip").args(["link", "set", "lo", "up"]).status();
+        let up = Command::new("ip").args(["link", "set", "lo", "up"]).status();
+        assert!(matches!(up, Ok(s) if s.success()), "{test_name}: `ip link set lo up` failed: {up:?}");
+        std::fs::write(&ack, test_name).expect("write the re-exec acknowledgement");
         return true;
     }
     let exe = std::env::current_exe().expect("current_exe");
+    let ack = std::env::temp_dir().join(format!("nestd-userns-{}-{}", std::process::id(), test_name.replace(':', "_")));
+    let _ = std::fs::remove_file(&ack);
     let status = Command::new("unshare")
         .args(["--user", "--map-root-user", "--net", "--mount", "--"])
         .arg(exe)
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env(MARK, "1")
+        .env(MARK, &ack)
         .status();
     match status {
-        Ok(s) if s.success() => false,
+        Ok(s) if s.success() => {
+            let ran = std::fs::read_to_string(&ack).ok();
+            let _ = std::fs::remove_file(&ack);
+            assert_eq!(
+                ran.as_deref(),
+                Some(test_name),
+                "{test_name}: the re-executed test binary didn't run this test (renamed, or the name passed is wrong)"
+            );
+            false
+        }
         Ok(s) => panic!("{test_name} failed inside user namespace: {s}"),
+        Err(e) if std::env::var_os("NEST_CI_REQUIRE_USERNS").is_some() => {
+            panic!("{test_name}: cannot run unshare ({e}), and NEST_CI_REQUIRE_USERNS forbids skipping")
+        }
         Err(e) => {
-            eprintln!("skipping {test_name}: cannot run unshare: {e}");
+            eprintln!("NEST-TEST-SKIP: {test_name}: cannot run unshare: {e}");
             false
         }
     }

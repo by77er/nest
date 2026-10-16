@@ -1,0 +1,35 @@
+# Secret scanning (CI job `secrets`). Default rules, plus nest's own token formats, plus narrow
+# allowlists: each entry names exact files and exact example values, never a whole directory.
+
+title = "nest"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "claude-setup-token"
+description = "Claude Code setup token (subscription OAuth)"
+regex = '''sk-ant-oat01-[A-Za-z0-9_\-]{40,}'''
+keywords = ["sk-ant-oat01-"]
+
+[[rules]]
+id = "nest-host-token"
+description = "nest host token"
+regex = '''nht_[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{40,}'''
+keywords = ["nht_"]
+
+# Rule-scoped (`targetRules`), because a global allowlist skips matching paths outright and would
+# ignore `condition = "AND"`.
+[[allowlists]]
+targetRules = ["github-app-token", "stripe-access-token", "generic-api-key"]
+description = "Example credentials in wire-protocol fixtures: GitHub's documented example token, a Stripe test-key shape, and unsigned host tokens"
+condition = "AND"
+paths = ['''^protocol/fixtures/(control|host)/''']
+regexes = ['''^ghs_16C7e42F292c6912E7710c838347Ae178B4a$''', '''^rk_test_51Hx+$''', '''^nht_eyJhbGciOiJFZERTQSJ9\.[A-Za-z0-9_\-]+\.c2ln$''']
+
+[[allowlists]]
+targetRules = ["generic-api-key", "curl-auth-header"]
+description = "Fake tokens in tests and the local dev admin token in docs"
+condition = "AND"
+paths = ['''^e2e/claude-verify/test_claude_verify\.py$''', '''^crates/nest-runner/tests/lifecycle\.rs$''', '''^control-plane/README\.md$''']
+regexes = ['''^tok-123456789$''', '''^tok-0123456789abcdef$''', '''^dev-admin-token$''']

@@ -44,7 +44,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 
 ## Tests
 
-`cargo test -p nestd` runs everything **unprivileged**: no root, no KVM. The netns tests need unprivileged user namespaces, `ip` (iproute2) and `nft` (nftables).
+`cargo test -p nestd` runs everything **unprivileged**: no root, no KVM. The netns tests need unprivileged user namespaces, `ip` (iproute2) and `nft` (nftables). They re-execute themselves under `unshare`, and the child must acknowledge that it ran the named test, so a renamed test fails instead of matching nothing. Without `unshare` they skip with a `NEST-TEST-SKIP:` line; CI sets `NEST_CI_REQUIRE_USERNS=1`, which turns a skip into a failure.
 
 - **Unit tests:**
   - config parsing, rate limiter, vsock emulator handshake
