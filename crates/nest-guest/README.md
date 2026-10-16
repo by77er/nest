@@ -23,6 +23,6 @@ nest-guest [--listen vsock|unix:<dir>] [--state-dir /run/nest] [--cgroup-root /s
 
 **Not exercised here (needs root / a VM):** the uid drop and the per-thread `setfsuid` identity switch, cgroup v2 kill and `memory.max`, the real vsock path and its CID check, `fsfreeze`, PDF and image helpers (poppler/vips not installed).
 
-**Known gaps:** the `agent_root: none` package-install helper; image downscaling only via external `vips`/`convert`.
+**Known gaps:** the `agent_root: none` package-install helper; image downscaling only via external `vips`/`convert`. Protocol version 2 ([host-guest](../../docs/interfaces/host-guest/)) isn't built: the version range and capabilities, `flush`, call records and `call_status`, pidfd exits, admission caps, terminal reattach, the change ledger and log-site counts.
 
 **Tests:** `cargo test -p nest-guest`. The integration tests run the guest over the unix emulation and drive every channel with real frames.

@@ -82,7 +82,7 @@ The setup agent creates these itself, so none are needed from me:
 - **Control-plane secrets:** the operator tokens (`observe`, `approve`, `admin`; the Worker keeps only their SHA-256 hashes, and I get the tokens), `HOST_TOKEN_SECRET`, `REVOCATION_COUNTER`, and the root certificate from stage 3, all random or freshly generated (see [API](../control-plane/api/)). Built: one `ADMIN_TOKEN`, and the root key as `ROOT_CA_KEY_PEM` until KMS signing lands.
 - **`AWS_IDENTITY_CERT_PEM`:** AWS's public certificate for verifying instance identity documents, from AWS's docs.
 - **Cloud resources:** the R2 bucket `nest-control`, the cell's S3 bucket with its gateway endpoint, the security group, the launch template, and the IAM pieces and KMS key above.
-- **Images:** the guest kernel and root filesystem, and the burst-host bootstrap (Amazon Linux 2023, kernel 6.18, Firecracker 1.17+; see [provisioning](../compute/provisioning/)).
+- **Images:** the guest kernel and root filesystem, and the burst-host bootstrap (Amazon Linux 2023, kernel 6.18, Firecracker from the 1.17 line pinned by digest; see [provisioning](../compute/provisioning/)).
 - **Enrollment tokens** for hosts outside AWS.
 
 ## Cost while testing

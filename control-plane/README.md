@@ -84,6 +84,8 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   `attach`, `checkpoint`, `brokered`, and all captain tools except `notify`, `ask` and `read_transcript`.
 - **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`; `/v1/health` doesn't reach the DOs yet.
+- **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the root CA key is `ROOT_CA_KEY_PEM`, not a KMS key, and the CSR shape isn't enforced; BrokerDO has no issuance audit.
+- **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, retention, the staged pause/suspend policy and restore-ABI sets aren't built.
 - **Not built:** Discord, the autoscaler (`RunInstances` + `/v1/admin/launched`), the Cloudflare Access
   front end, the preview/share Worker routes, the api-loop backend, budgets.
 - **Host-side behavior is driven, not modeled.** Suspend/resume/fork commands exist in the protocol,

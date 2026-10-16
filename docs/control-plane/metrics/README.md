@@ -27,7 +27,7 @@ One dataset, `nest_metrics`, bound to the Worker (and so to every DO). Each even
 | AgentDO | Turns (queued → started latency, duration, outcome, tokens and cost from the stream's `result`), brain starts (resume or fresh), crash restarts, rate limits, wake latency, tool calls by group and outcome, approvals |
 | ChannelDO | Posts, deliveries, loop-guard drops, backlog depth |
 | HookDO | Deliveries, verification failures, dedup hits |
-| Hosts (via FleetDO) | CPU, memory, free hugepages, VM count, proxy allows and denies, hands-call latency p50 and p99, session tail lag |
+| Hosts (via FleetDO) | CPU, memory, free hugepages, VM count, proxy allows and denies, hands-call latency p50 and p99, session tail lag, guest agents' WARN and ERROR counts by log site ([diagnostics](../../sandbox/guest-agent/#diagnostics)) |
 
 ## Reading
 

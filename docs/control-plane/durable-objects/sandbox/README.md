@@ -67,7 +67,7 @@ The authority for one sandbox.
 
 ## Policy
 
-- **Changes:** set by the operator (`PUT /v1/sandboxes/<id>/policy`), by a holder of `egress_policy` on it, or by a temporary grant, and pushed live as `policy_update`.
+- **Changes:** set by the operator (`PUT /v1/sandboxes/<id>/policy`), by a holder of `egress_policy` on it, or by a temporary grant, and pushed live as `policy_update`, with its version and sha256, and with its injection secrets in the same push. The VM starts or resumes only after nest-proxy acknowledges that exact policy ([policy changes](../../../sandbox/networking/egress/policy/#changes)).
 - **Injection secrets:** pushed as BrokerDO references, resolved only when FleetDO sends them.
 
 ## Ports

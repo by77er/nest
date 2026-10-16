@@ -3,7 +3,7 @@
 The per-host daemon. It's trusted, but it's fenced.
 
 - **Brains:** hosts the [agent runner](../../agents/runner/) for agents whose sandboxes are here. Hands RPC goes over local vsock.
-- **Sandboxes:** runs them through [drivers](../../sandbox/drivers/), and sets up each one's netns (tap0, nft, **listening sockets handed to nest-proxy**), and (planned) its ublk daemon and UFFD handler. See [../../sandbox/networking/egress/steering/](../../sandbox/networking/egress/steering/).
+- **Sandboxes:** runs them through [drivers](../../sandbox/drivers/), and sets up each one's netns (tap0, nft, **listening sockets handed to nest-proxy**), and (planned) its ublk daemon and UFFD handler. It starts or resumes a VM only after nest-proxy acknowledges the sandbox's policy ([policy changes](../../sandbox/networking/egress/policy/#changes)), and it installs the root-namespace rule that rejects nest-proxy's non-public egress ([kernel backstop](../../sandbox/networking/egress/steering/#kernel-backstop)). See [../../sandbox/networking/egress/steering/](../../sandbox/networking/egress/steering/).
 - **Privilege split:** nestd is the only privileged component. nest-proxy, the preview router (planned) and the agent runner run unprivileged.
 - **Control plane connections:**
   - one control WebSocket to FleetDO, with a 5 s heartbeat that acts as the lease

@@ -44,7 +44,7 @@ Brains live outside the VMs, on hosts, and act inside them only through RPC. Not
 | **AgentDO** | Cloudflare, one per agent | Spawn spec (capabilities, grants, budget), turn queue, session stream, taint, scheduled wakes, tool relay | [agent/](../control-plane/durable-objects/agent/) |
 | **ChannelDO** | Cloudflare, one per channel | Message log, keyed view, subscriptions, fan-out | [channel/](../control-plane/durable-objects/channel/) |
 | **HookDO** | Cloudflare, one per webhook | Verification (through BrokerDO), mapping, dedup, posting | [hook/](../control-plane/durable-objects/hook/) |
-| **BrokerDO** | Cloudflare, one | The only DO that stores secret values: setup tokens, injection secrets, hook and capability credentials. Platform keys (root CA, AWS, host-token and admin secrets) are Worker secrets | [broker/](../control-plane/durable-objects/broker/) |
+| **BrokerDO** | Cloudflare, one | The only DO that stores secret values: setup tokens, injection secrets, hook and capability credentials. Platform keys (AWS, the host-token secret, operator-token hashes, the revocation counter) are Worker secrets; the proxy root CA key is in AWS KMS | [broker/](../control-plane/durable-objects/broker/) |
 | **nestd** | Burst hosts (and the controller host, without sandboxes) | Runs sandboxes, builds their network namespaces, holds the host's lease and self-fences, commits sandbox state to S3 | [compute/nestd/](../compute/nestd/) |
 | **nest-proxy** | Burst hosts | All sandbox egress: allowlist, TLS inspection, credential injection by placeholder, audit | [egress/](../sandbox/networking/egress/) |
 | **Agent runner** | Every host | Starts and drives unmodified Claude Code, tails its session, answers hooks locally, bridges MCP | [agents/runner/](../agents/runner/) |
@@ -61,15 +61,15 @@ Brains live outside the VMs, on hosts, and act inside them only through RPC. Not
 5. **Hands.** `mcp__nest__Bash` goes Claude Code → `nest mcp` → runner → vsock → guest agent, which runs it as the sandbox user and journals intent and outcome. Results come back the same way.
 6. **Platform tools.** `post`, `agent_spawn`, `wake_at`, brokered actions and MCP or API capability tools go runner → AgentDO. AgentDO checks the grant and the session's [taint](../agents/tools/#taint-and-sinks); a sink called from a tainted session first becomes a question for me or an untainted holder.
 7. **Egress.** Processes in the VM reach the network only through nest-proxy. It allows listed hosts and injects credentials into requests that carry a placeholder, so the sandbox never holds a secret.
-8. **Durability.** The runner tails the session file to AgentDO, which acks once the bytes are in SQLite and flushes them to R2 at 1 MiB, at turn end, after 30 s idle and before any start. nestd commits the sandbox disk at turn ends (at most every 10 s), every 60 s while dirty, and on suspend. Chunks go to S3, and the head moves by compare-and-set in SandboxDO.
-9. **After.** `turn_completed` is posted to the agent's `events`, which its spawner subscribes to. An idle brain exits after 120 s, a sandbox with no agent mid-turn can suspend, and an idle host is drained and terminated.
+8. **Durability.** The runner tails the session file to AgentDO, which acks once the bytes are in SQLite and flushes them to R2 at 1 MiB, at turn end, after 30 s idle and before any start. nestd commits the sandbox disk at turn ends (at most every 10 s), every 60 s while dirty, and on pause and suspend, each time after the guest agent's `syncfs`. Chunks go to S3, and the head moves by compare-and-set in SandboxDO.
+9. **After.** `turn_completed` is posted to the agent's `events`, which its spawner subscribes to. An idle brain exits after 120 s. A sandbox with no agent mid-turn, no live ingress and no hold pauses after 1 minute and suspends after 10 more. An idle host is drained and terminated.
 
 ## When things fail
 
 | Failure | What happens |
 |---|---|
-| Brain crash | AgentDO restarts it with `--resume`; the recovery context lists hands calls with unknown outcomes. Three crashes without a completed turn, and it waits for new input |
-| Host loss | Heartbeats stop. The host self-fences at 20 s (pauses VMs, kills brains); at 30 s FleetDO expires its leases and terminates the instance (STONITH), then each sandbox is re-placed under a new epoch from its last committed generation and its agents follow. A rollback notice tells each agent what may be undone |
+| Brain crash | AgentDO restarts it with `--resume`; the recovery context gives each in-flight hands call's outcome from the guest's call records (unknown only if the guest lost them) and the files changed since. Three crashes without a completed turn, and it waits for new input |
+| Host loss | Heartbeats stop. The host self-fences at 20 s (pauses VMs, kills brains); at 30 s FleetDO expires its leases and terminates the instance (STONITH), then each sandbox records its loss and is claimed again under a new epoch, restoring from its last committed generation, and its agents follow. A rollback notice tells each agent what may be undone |
 | Controller host loss | After 30 s its agents start on another controller host; nothing to fence |
 | Spot notice | Every sandbox's disk is cut first, then memory snapshots in order of recent activity, within the 2-minute warning |
 | Control-plane restart or deploy | Hosts reconnect with jittered backoff; reliable channels resend in order from the last ack |
