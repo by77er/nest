@@ -1,17 +1,18 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
-import type { Ec2, InstanceState } from "../src/lib/ec2";
+import { CapacityError, type Ec2, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
+import type { AwsCellConfig } from "../src/lib/cells";
 import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
 
 async function workstream(goal = "test") {
   return adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal } }, 201);
 }
 
-async function createSandbox(cell: string) {
+async function createSandbox(cell: string, status = 201) {
   const ws = await workstream();
   const info = await adminJson<{ sandbox: string; epoch: number; host: string; workstream: string }>(
-    `/v1/sandboxes`, { body: { workstream: ws.workstream, cell } }, 201);
+    `/v1/sandboxes`, { body: { workstream: ws.workstream, cell } }, status);
   return info;
 }
 
@@ -197,20 +198,29 @@ describe("commit compare-and-set", () => {
   });
 });
 
-describe("lease expiry and STONITH", () => {
-  class MockEc2 implements Ec2 {
-    terminated: string[] = [];
-    states: (InstanceState | null)[];
-    constructor(...states: (InstanceState | null)[]) {
-      this.states = states;
-    }
-    async terminate(id: string) {
-      this.terminated.push(id);
-    }
-    async state() {
-      return this.states.length > 1 ? this.states.shift()! : this.states[0]!;
-    }
+class MockEc2 implements Ec2 {
+  terminated: string[] = [];
+  launched: LaunchSpec[] = [];
+  /** Instance types that fail with no capacity. */
+  noCapacity = new Set<string>();
+  states: (InstanceState | null)[];
+  constructor(...states: (InstanceState | null)[]) {
+    this.states = states;
   }
+  async launch(spec: LaunchSpec) {
+    if (this.noCapacity.has(`${spec.instanceType}/${spec.spot ? "spot" : "od"}`)) throw new CapacityError("InsufficientInstanceCapacity");
+    this.launched.push(spec);
+    return `i-0${this.launched.length.toString(16).padStart(8, "0")}`;
+  }
+  async terminate(id: string) {
+    this.terminated.push(id);
+  }
+  async state() {
+    return this.states.length > 1 ? this.states.shift()! : this.states[0]!;
+  }
+}
+
+describe("lease expiry and STONITH", () => {
 
   it("terminates the silent host, confirms, then reassigns with epoch + 1 from head", async () => {
     const cell = uniqueCell();
@@ -301,5 +311,114 @@ describe("lease expiry and STONITH", () => {
     const rotated = await h.ws.next("host_token");
     expect(rotated.token).toMatch(/^nht_/);
     expect(rotated.expires_ms).toBeGreaterThan(Date.now() + 30 * 60_000);
+  });
+});
+
+describe("autoscaling", () => {
+  const config: AwsCellConfig = {
+    region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a", "subnet-0b"],
+    instance_types: ["c8i-flex.large", "c8i.large"], spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+  };
+
+  /** Run FleetDO's tick now, `ms` in the future as far as the idle and enroll clocks are concerned. */
+  async function tickAt(cell: string, ec2: MockEc2, shiftMs = 0) {
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO, state) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = config;
+      state.storage.sql.exec("UPDATE hosts SET idle_since = idle_since - ? WHERE idle_since IS NOT NULL", shiftMs);
+      state.storage.sql.exec("UPDATE launched SET launched_ms = launched_ms - ?", shiftMs);
+      state.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+    });
+    await runDurableObjectAlarm(fleetStub(cell));
+  }
+
+  async function autoscaled(cell: string, ec2: MockEc2) {
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = config;
+    });
+  }
+
+  /** Enroll as the launched instance (what the Worker does after verifying its identity document). */
+  async function enrollLaunched(cell: string, instanceId: string) {
+    return runInDurableObject(fleetStub(cell), async (inst: FleetDO) => {
+      const { csrPem } = await import("./helpers");
+      return inst.enroll({ role: "burst", proof: { type: "aws_identity_document", document_b64: "", pkcs7_b64: "" }, proxy_ca_csr_pem: await csrPem() } as never,
+        cell, { instanceId, accountId: "123456789012", region: "us-east-1" } as never);
+    });
+  }
+
+  it("launches one host when a sandbox can't be placed, places on it, and scales back to zero", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running", "terminated");
+    ec2.noCapacity.add("c8i-flex.large/spot");
+    await autoscaled(cell, ec2);
+
+    const sbx = await createSandbox(cell, 202);
+    expect(sbx.host).toBeNull();
+    // c8i-flex had no spot capacity; the next type launched, on spot, from the launch template.
+    expect(ec2.launched).toHaveLength(1);
+    expect(ec2.launched[0]).toMatchObject({ launchTemplateId: "lt-0abc", instanceType: "c8i.large", spot: true });
+    // A second unplaceable sandbox waits for the pending launch instead of launching another.
+    await createSandbox(cell, 202);
+    expect(ec2.launched).toHaveLength(1);
+
+    // The instance enrolls (only as a burst host of this cell, from the launch record) and connects.
+    const enrolled = await enrollLaunched(cell, "i-000000001");
+    const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
+    ws.send(hostHello(enrolled.host, cell));
+    await ws.next("hello_ack");
+    expect(await sandboxStub(sbx.sandbox).retryPlacement()).toBe(enrolled.host);
+
+    // Busy: never retired, however long.
+    await tickAt(cell, ec2, 3_600_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+
+    // Destroying its sandboxes makes it idle; it's retired only after the grace.
+    await adminJson(`/v1/sandboxes/${sbx.sandbox}`, { method: "DELETE" });
+    const view = (await fleetStub(cell).fleetView()) as { hosts: { leases: number }[] };
+    for (const l of view.hosts) expect(l.leases).toBe(0);
+    await tickAt(cell, ec2);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+    await tickAt(cell, ec2, 30_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+    await tickAt(cell, ec2, 31_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("dead");
+    expect(ec2.terminated).toEqual(["i-000000001"]);
+    // The next tick sees it terminated and stops (the alarm isn't re-armed for it).
+    await tickAt(cell, ec2);
+    const after = (await fleetStub(cell).fleetView()) as { launches: unknown[] };
+    expect(after.launches).toEqual([expect.objectContaining({ instance_id: "i-000000001", reason: "idle", ended_ms: expect.any(Number) })]);
+    ws.close();
+  });
+
+  it("terminates a launch that never enrolls, then launches again on demand", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("terminated");
+    await autoscaled(cell, ec2);
+    const sbx = await createSandbox(cell, 202);
+    expect(ec2.launched).toHaveLength(1);
+    await tickAt(cell, ec2, 601_000);
+    expect(ec2.terminated).toEqual([]); // state was already terminated; just recorded
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches[0]).toMatchObject({ reason: "enroll_timeout", ended_ms: expect.any(Number) });
+    await autoscaled(cell, ec2);
+    await sandboxStub(sbx.sandbox).retryPlacement();
+    expect(ec2.launched).toHaveLength(2);
+  });
+
+  it("does nothing in a cell without AWS settings, and never retires hosts it didn't launch", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = null;
+    });
+    const sbx = await createSandbox(cell, 202);
+    expect(sbx.host).toBeNull();
+    expect(ec2.launched).toHaveLength(0);
+    const h = await connectHost(cell); // enrolled with a token: no instance id
+    await tickAt(cell, ec2, 3_600_000);
+    await tickAt(cell, ec2, 3_600_000);
+    expect((await fleetStub(cell).hostStatus(h.host))!.status).toBe("active");
   });
 });

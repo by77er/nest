@@ -63,7 +63,7 @@ The provisioning key creates the narrow credentials nest actually runs with:
 - the hosts' instance role (S3 access to the cell's bucket only);
 - **the proxy root CA key:** a KMS key (`ECC_NIST_P256`, sign and verify), which never leaves KMS. The setup agent self-signs the root certificate through KMS `Sign` and stores it as `ROOT_CA_CERT_PEM`; the image bakes it in ([tls](../sandbox/networking/egress/tls/)).
 
-**The cell's resources** (VPC with public subnets and an S3 gateway endpoint, security group, bucket, host role, launch template, the control plane's IAM user) are one CloudFormation stack, [deploy/aws/cell.yaml](../../deploy/aws/cell.yaml), named `nest-<cell>`. It creates no instances; the KMS key is separate, and its ARN is passed back in as `RootCaKeyArn`.
+**The cell's resources** (VPC with public subnets and an S3 gateway endpoint, security group, bucket, host role, launch template, the control plane's IAM user) are one [inframe](https://github.com/by77er/inframe) stack per cell in [deploy/](../../deploy/), with OpenTofu state in a versioned S3 bucket. It creates no instances: FleetDO launches them.
 
 **Prefer not to hand over an admin key?** The setup agent can write a CloudFormation template instead. Deploying it from the console creates the same resources, plus a narrower deploy key to provide in its place.
 

@@ -4,7 +4,8 @@ import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
 import { isSecretRef } from "./broker";
 import { signIntermediate, generateDevRoot, type RootCa } from "../lib/ca";
-import { AwsEc2, isDead, type Ec2 } from "../lib/ec2";
+import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
+import { awsCell, type AwsCellConfig } from "../lib/cells";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
@@ -52,6 +53,8 @@ export interface PlaceRequest {
   policy: EgressPolicy;
   from?: GenerationRecord;
   excludeHost?: string;
+  /** The cell this FleetDO serves; lets it launch a burst host when none can take the sandbox. */
+  cell?: string;
 }
 
 /** An instance this control plane launched, with what it may enroll as. */
@@ -78,6 +81,10 @@ export class FleetDO extends DurableObject<Env> {
   private readonly inbound = new Map<string, SerialQueue>();
   /** Override for tests; `undefined` derives a client from the AWS_* secrets. */
   ec2Override: Ec2 | null | undefined = undefined;
+  /** Override for tests; `undefined` reads the cell's entry in `AWS_CELLS`. */
+  cellConfigOverride: AwsCellConfig | null | undefined = undefined;
+  /** A launch is in flight (RunInstances awaits); placements meanwhile don't launch another. */
+  private launching = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -100,8 +107,18 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS reassign_queue (sandbox TEXT PRIMARY KEY, host TEXT NOT NULL,
       epoch INTEGER NOT NULL, host_dead INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    // Autoscaling: when a launched instance stopped counting (`reason`) and when EC2 confirmed it gone.
+    this.addColumn("launched", "cell", "TEXT");
+    this.addColumn("launched", "reason", "TEXT");
+    this.addColumn("launched", "ended_ms", "INTEGER");
+    this.addColumn("hosts", "idle_since", "INTEGER");
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
+  }
+
+  private addColumn(table: string, column: string, type: string): void {
+    const cols = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
+    if (!cols.some((c) => c.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 
   private queue(host: string): SerialQueue {
@@ -138,6 +155,7 @@ export class FleetDO extends DurableObject<Env> {
    * an enrollment token. The CSR is validated (signed) before the one-time proof is consumed.
    */
   async enroll(req: EnrollRequest, cell: string, identity: InstanceIdentity | null): Promise<EnrollResponse> {
+    this.rememberCell(cell);
     const proxyCa = await this.signProxyCa(req.proxy_ca_csr_pem);
     const hash = req.proof.type === "enrollment_token" ? hex(await sha256(req.proof.token)) : "";
     // Everything below is synchronous: the proof is checked and consumed atomically.
@@ -628,11 +646,16 @@ export class FleetDO extends DurableObject<Env> {
     if (existing) {
       throw new NestError(ErrorCodes.FORBIDDEN, `sandbox ${req.sandbox} already holds a lease (epoch ${existing.epoch} on ${existing.host})`, 409);
     }
+    if (req.cell) this.rememberCell(req.cell);
     const candidates = this.sql
       .exec<HostRow>("SELECT * FROM hosts WHERE role = 'burst' AND status = 'active'")
       .toArray()
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host));
-    if (!candidates.length) return null;
+    if (!candidates.length) {
+      // SandboxDO retries placement on its own alarm; by then the new host may have enrolled.
+      await this.scaleUp();
+      return null;
+    }
     const load = (h: string) => this.leasesOf(h).length;
     const warm = (h: HostRow) => {
       if (!req.from || !h.capacity) return false;
@@ -703,10 +726,12 @@ export class FleetDO extends DurableObject<Env> {
       if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
     }
     await this.processReassign();
+    await this.scaleDown(now);
     this.sql.exec("DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?", now - COMMAND_RETENTION_MS);
     this.sql.exec("DELETE FROM enroll_tokens WHERE used_ms IS NOT NULL AND used_ms < ?", now - ENROLL_TOKEN_RETENTION_MS);
     const busy = this.sql.exec("SELECT 1 FROM hosts WHERE status IN ('active', 'draining', 'stonith_pending')").toArray().length
-      || this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length;
+      || this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length
+      || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND (host IS NULL OR reason IS NOT NULL)").toArray().length;
     if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
 
@@ -721,8 +746,126 @@ export class FleetDO extends DurableObject<Env> {
 
   private ec2(): Ec2 | null {
     if (this.ec2Override !== undefined) return this.ec2Override;
-    const { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret, AWS_REGION: region } = this.env;
+    const { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret } = this.env;
+    const region = this.cellConfig()?.region ?? this.env.AWS_REGION;
     return id && secret && region ? new AwsEc2(id, secret, region) : null;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Autoscaling (docs/compute/autoscaling/): launch on demand, retire idle hosts, scale to zero
+  // ---------------------------------------------------------------------------------------------
+
+  private rememberCell(cell: string): void {
+    this.sql.exec("INSERT OR IGNORE INTO kv (key, value) VALUES ('cell', ?)", cell);
+  }
+
+  private cellConfig(): AwsCellConfig | null {
+    if (this.cellConfigOverride !== undefined) return this.cellConfigOverride;
+    const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value;
+    return cell ? awsCell(this.env.AWS_CELLS, cell) : null;
+  }
+
+  /**
+   * No connected burst host could take a sandbox: launch one, unless a launch is already on its way
+   * or the cell is at its host cap. Tries each instance type on spot (rotating zones), then the first
+   * type on demand. The instance may enroll only as a burst host of this cell, from this region.
+   */
+  private async scaleUp(): Promise<void> {
+    const cfg = this.cellConfig();
+    const ec2 = this.ec2();
+    if (!cfg || !ec2 || this.launching) return;
+    const pending = this.sql.exec("SELECT 1 FROM launched WHERE host IS NULL AND reason IS NULL").toArray().length;
+    if (pending) return;
+    const live = this.sql
+      .exec("SELECT 1 FROM hosts WHERE role = 'burst' AND status IN ('active', 'draining', 'stonith_pending')")
+      .toArray().length;
+    if (live >= cfg.max_hosts) return;
+    const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value ?? null;
+    const now = Date.now();
+    const zone = (i: number) => cfg.subnet_ids[(Math.floor(now / 1000) + i) % cfg.subnet_ids.length]!;
+    const attempts = [
+      ...(cfg.spot ? cfg.instance_types.map((t, i) => ({ type: t, subnet: zone(i), spot: true })) : []),
+      { type: cfg.instance_types[0]!, subnet: zone(0), spot: false },
+    ];
+    this.launching = true;
+    try {
+      for (const [i, a] of attempts.entries()) {
+        try {
+          const id = await ec2.launch({
+            launchTemplateId: cfg.launch_template_id, instanceType: a.type, subnetId: a.subnet, spot: a.spot,
+            clientToken: `${cell ?? "cell"}-${now}-${i}`,
+          });
+          this.sql.exec(
+            "INSERT INTO launched (instance_id, launched_ms, role, region, cell) VALUES (?, ?, 'burst', ?, ?)",
+            id, Date.now(), cfg.region, cell,
+          );
+          console.log(`FleetDO: launched ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
+          if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+          return;
+        } catch (e) {
+          if (!(e instanceof CapacityError)) {
+            console.error("FleetDO: launch failed", e);
+            return;
+          }
+          console.warn(`FleetDO: no capacity for ${a.type} (${a.spot ? "spot" : "on-demand"}): ${e.message}`);
+        }
+      }
+    } finally {
+      this.launching = false;
+    }
+  }
+
+  /**
+   * Retire what the cell no longer needs: a launched instance that never enrolled, and a burst host
+   * we launched that has held no sandbox and no agent for the idle grace. Retiring marks the host
+   * dead first, so nothing is placed on it while TerminateInstances is in flight.
+   */
+  private async scaleDown(now: number): Promise<void> {
+    const cfg = this.cellConfig();
+    if (!cfg) return;
+    for (const r of this.sql.exec<{ instance_id: string }>(
+      "SELECT instance_id FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
+      now - cfg.enroll_timeout_ms).toArray()) {
+      this.sql.exec("UPDATE launched SET reason = 'enroll_timeout' WHERE instance_id = ?", r.instance_id);
+      console.warn(`FleetDO: ${r.instance_id} never enrolled; terminating`);
+    }
+    for (const h of this.sql.exec<HostRow & { idle_since: number | null }>(
+      "SELECT * FROM hosts WHERE role = 'burst' AND status = 'active' AND instance_id IS NOT NULL").toArray()) {
+      const busy = this.leasesOf(h.host).length > 0
+        || this.sql.exec("SELECT 1 FROM host_agents WHERE host = ?", h.host).toArray().length > 0;
+      if (busy) {
+        if (h.idle_since !== null) this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", h.host);
+      } else if (h.idle_since === null) {
+        this.sql.exec("UPDATE hosts SET idle_since = ? WHERE host = ?", now, h.host);
+      } else if (now - h.idle_since >= cfg.idle_grace_ms) {
+        this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", h.host);
+        this.sql.exec("UPDATE launched SET reason = 'idle' WHERE instance_id = ?", h.instance_id);
+        for (const ws of this.ctx.getWebSockets(h.host)) ws.close(4410, "idle: retired");
+        console.log(`FleetDO: retiring idle host ${h.host} (${h.instance_id})`);
+      }
+    }
+    const ec2 = this.ec2();
+    if (!ec2) return;
+    for (const r of this.sql.exec<{ instance_id: string }>(
+      "SELECT instance_id FROM launched WHERE reason IS NOT NULL AND ended_ms IS NULL").toArray()) {
+      try {
+        const state = await ec2.state(r.instance_id);
+        if (isDead(state)) this.sql.exec("UPDATE launched SET ended_ms = ? WHERE instance_id = ?", Date.now(), r.instance_id);
+        else await ec2.terminate(r.instance_id);
+      } catch (e) {
+        console.error(`FleetDO: terminating ${r.instance_id} failed; will retry`, e);
+      }
+    }
+  }
+
+  /** Operator view: hosts with their lease counts, and launched instances with their outcome. */
+  async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[] }> {
+    return {
+      hosts: this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since,
+        (SELECT COUNT(*) FROM leases l WHERE l.host = h.host) AS leases FROM hosts h ORDER BY h.enrolled_ms`).toArray()
+        .map((h) => ({ ...h, connected: !!this.socketFor(h.host as string) })),
+      launches: this.sql.exec("SELECT instance_id, launched_ms, host, reason, ended_ms FROM launched ORDER BY launched_ms").toArray(),
+    };
   }
 
   /** CP-side lease expiry: no sandbox on this host may run anywhere else until STONITH is confirmed. */

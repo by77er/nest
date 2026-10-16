@@ -1,0 +1,25 @@
+name = "nest-infra"
+version = "0.1.0"
+defaultTargets = ["Cell"]
+
+[[require]]
+name = "inframe"
+git = "https://github.com/by77er/inframe"
+rev = "a68f89ce683be8fd0f548da4fb74442142a55fac"
+subDir = "lean"
+
+[[require]]
+name = "generated-aws"
+path = ".generated/aws"
+
+[[lean_lib]]
+name = "Cell"
+globs = ["Cell.+"]
+
+[[lean_exe]]
+name = "cell-use1"
+root = "Cell.Use1"
+
+[[lean_exe]]
+name = "cell-test"
+root = "Cell.Test"

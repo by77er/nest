@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SKIP = {".git", "node_modules", "target", ".work", ".wrangler", ".ruff_cache"}
+SKIP = {".git", "node_modules", "target", ".work", ".wrangler", ".ruff_cache", ".inframe", ".lake", ".generated"}
 LINK = re.compile(r"(?<!!)\[[^\]]*\]\(([^)\s]+)\)")
 FENCE = re.compile(r"^\s*(```|~~~)")
 HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*#*\s*$")
