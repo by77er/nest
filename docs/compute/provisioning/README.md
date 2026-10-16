@@ -2,7 +2,7 @@
 
 **Burst host image (built with Packer):**
 - Amazon Linux 2023 with kernel 6.18 (or 6.1), the host kernels Firecracker supports on 8i ([README](https://github.com/firecracker-microvm/firecracker/blob/main/README.md)); Ubuntu 24.04's 6.8 isn't one of them. Hugetlb needs 5.18+ and ublk needs 6.0+; whether AL2023 ships ublk is unverified.
-- Firecracker 1.17 or later.
+- Firecracker from the 1.17 line, pinned by binary digest, patch level included ([driver](../../sandbox/drivers/firecracker/)).
 - `bubblewrap`: Claude Code needs it for the subprocess environment scrub nest relies on (see [runner-claude](../../interfaces/host-internal/runner-claude/)). The controller host image installs it too.
 - Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, **Claude Code + the agent runner** (brains for local sandboxes).
 
@@ -38,4 +38,6 @@ Hosts are replaced, never updated in place. Not built; it needs the autoscaler.
 - **Versions:** host binaries (nestd, nest-proxy, the runner, `nest`, the guest agent) and images are built per release into the cell's bucket.
 - **Rollout:** FleetDO holds a desired host version per cell. New hosts boot it, and old hosts are [drained](../autoscaling/) and terminated one at a time. The controller host is replaced the same way; its brains move after 30 s, like a lost host's.
 - **Rollback:** set the desired version back and replace again.
-- **Guests:** cold boots use the new rootfs. Memory snapshots keep their guest agent and restore only on hosts with a matching [restore ABI](../../sandbox/state/memory/#restore-abi), so the hands protocol stays compatible one version back.
+- **Restore ABI:** each release records the [restore ABIs](../../sandbox/state/memory/#restore-abi) its hosts create and load. A release that changes nestd, the proxy, the runner or the guest agent keeps the ABI; one that changes Firecracker, the host or guest kernel, the CPU template or the VM profile changes it.
+- **ABI-changing upgrades** leave dormant memory generations unloadable on the new hosts. They resume disk-only, with "process state lost" in the rollback notice, and no old hosts are kept for them ([restore ABI](../../sandbox/state/memory/#restore-abi)). The rollout's drains skip memory snapshots no new host could load, and rolling back makes generations still at head loadable again.
+- **Guests:** cold boots use the new rootfs. Memory generations keep their guest agent, and the host accepts a range of guest protocol versions ([host-guest](../../interfaces/host-guest/)), so the guest agent isn't part of the ABI.

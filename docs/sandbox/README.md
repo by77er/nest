@@ -4,16 +4,18 @@
 
 ## Operations
 
-- **Create** from an image.
+- **Create** from an image: restore its [base generation](state/memory/#base-generations) on a host that loads it, else cold-boot.
 - **Attach** agents (bind their [hands](../agents/hands/)) or humans (terminal). They share files, services and ports, and conflicts are accepted, like two people on one machine.
 - **Fork.** This is the *only* isolation primitive. A fork is an independent copy of the work, whatever kind of work it is.
-- **Suspend and resume. Archive.**
+- **Pause, suspend and resume. Archive.** When each happens is SandboxDO's [idle rule](../control-plane/durable-objects/sandbox/#activity-and-idle).
 - **Link** (not designed yet): an opt-in path through the proxy so one sandbox can reach a port in another.
 
 ## Lifecycle
 
 ```
-running ⇄ suspended (on host H; disk-only or with memory) → archived (S3 only) → restore in the cell: disk on any host, memory only on a host with the same restore ABI
+running ⇄ paused (on host H, hugepages kept)
+running, paused → suspended (on H; disk-only or with memory) → running
+suspended → archived (S3 only) → restore in the cell: disk on any host, memory only on a host that loads its restore ABI
 ```
 
 ## Fork
@@ -31,7 +33,7 @@ After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock (V
 ## Components
 
 - [drivers/](drivers/): Firecracker (primary), gVisor, Lambda MicroVM
-- [state/](state/): generations, memory, disk, object store
-- [fencing/](fencing/): leases, epochs, STONITH, salvage
+- [state/](state/): generations, restore sources, retention, memory (restore ABI, base generations), disk, object store and GC
+- [fencing/](fencing/): leases, epochs, STONITH, loss records, salvage
 - [networking/](networking/): identical internal network identity, egress, ingress
 - [guest-agent/](guest-agent/): the daemon inside each VM

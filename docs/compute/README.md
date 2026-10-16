@@ -13,7 +13,7 @@ Hosts, grouped into **cells**. A cell is compute plus its object store in one pr
 
 - **DigitalOcean and most cheap VMs don't expose `/dev/kvm`.** That rules out Firecracker there, leaving gVisor as the only option.
 - **AWS has supported nested virtualization since February 16, 2026,** launched on C8i, M8i and R8i ([what's new](https://aws.amazon.com/about-aws/whats-new/2026/02/amazon-ec2-nested-virtualization-on-virtual)); the user guide now also lists the 7i families, I7i/I7ie and X8i. The only `d` (local NVMe) variants are C8id, M8id and R8id. It costs nothing extra and is enabled with `--cpu-options NestedVirtualization=enabled`.
-- **The AWS burst fleet is the 8i family only** (C8i, M8i, R8i, with their `d` and flex variants): memory snapshots restore only on the same CPU family (see [restore ABI](../sandbox/state/memory/#restore-abi)), and Firecracker supports 8i hosts.
+- **The AWS burst fleet is the 8i family only** (C8i, M8i, R8i, with their `d` and flex variants): memory snapshots restore only on the same CPU model (see [restore ABI](../sandbox/state/memory/#restore-abi)), and Firecracker supports 8i hosts. That every 8i variant has the same CPU model, so the fleet shares one ABI, is unverified.
 - **GCP:** Intel series and N4D only. GCP quotes 10% or more overhead.
 - **Cost:**
   - On-demand AWS costs about 1.5× DigitalOcean.

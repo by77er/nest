@@ -36,7 +36,7 @@ A deploy restarts every DO and drops every socket (above). Cloudflare can roll a
 - **Deploy at 100%, not gradually.** With DOs, a gradual deployment pins each object to one version until the next deployment, so old and new objects would talk to each other for the whole rollout ([docs](https://developers.cloudflare.com/workers/versions-and-deployments/gradual-deployments/with-durable-objects/)).
 - **Host reconnection is a free canary:** every host connected before a deploy should reconnect and renew its leases within about 2 minutes, even with no other traffic.
 
-Hosts upgrade by replacement; see [provisioning](../compute/provisioning/#upgrades).
+Hosts upgrade by replacement; one that changes the [restore ABI](../sandbox/state/memory/#restore-abi) resumes dormant memory generations disk-only. See [provisioning](../compute/provisioning/#upgrades).
 
 ## Components
 
