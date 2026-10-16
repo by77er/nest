@@ -200,7 +200,7 @@ On a c8id with nested virtualization and a hugepage pool:
 6. ublk lazy-disk throughput.
 7. Commit latency under write load, including the guest flush and the epoch flip.
 8. Forced-partition test: self-fence, then STONITH, then restore.
-9. **First real Claude Code run** through the runner (the verification list above). It needs no KVM, so it runs in the cloud dev environment through the e2e harness, with the token as `NEST_CLAUDE_OAUTH_TOKEN`.
+9. **First real Claude Code run** through the runner (the verification list above). It needs no KVM, so it runs in the cloud dev environment through the e2e harness, with the token as `NEST_CLAUDE_OAUTH_TOKEN`. **Done** (2026-10-16, Claude Code 2.1.301, `NEST_E2E_CLAUDE=real e2e/run.sh`): a real turn ran entirely through `mcp__nest__` hands (Bash, Write, Read, Edit), with no host-side built-ins and the token absent from the sandbox. All 21 checks passed, including self-fencing 20 s after the control plane was cut.
 10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM) and with RPC hands; compare success rate, turns and tokens. The same eval gates every upgrade of the pinned Claude Code version ([runner](agents/runner/)).
 11. **Nested overhead:** CPU and I/O on a nested 8i instance against the same work on `.metal`.
 12. **Resume or fresh:** turn cost and quality when resuming a long session after the cache expired, against a fresh session seeded from memory.
