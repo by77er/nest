@@ -9,13 +9,15 @@
 | Sandbox VM | Hard isolation (Firecracker; gVisor only in cells without KVM). **Holds no credentials,** only placeholders. Anything that needs isolation gets its own sandbox. |
 | Agents within one sandbox | One shared trust domain. Grants give attribution only. |
 | Brain (Claude Code process on a host) | Holds the subscription token in its process environment. It has no local exec or file tools, and repo config can't load. A prompt injection can only act through `nest` tools and the web built-ins (host-allowlisted, tainting). |
-| Hosts (nestd, proxy, runner) | Trusted, but fenced by lease and STONITH. No R2 credentials. |
-| Control plane | Authoritative. No S3 credentials; EC2 permissions scoped. |
+| Hosts (nestd, proxy, runner) | Trusted, but fenced by lease and STONITH. S3 for their whole cell through the instance role; no R2 credentials. nest-proxy can't reach IMDS or other non-public addresses (kernel rule on its uid). |
+| Control plane | Authoritative. No S3 credentials; AWS permissions scoped to EC2 and to KMS `Sign` with the proxy root key. Operator access is by scoped token. |
 
 ## Defense layers
 
 - Credentials stay outside VMs: [identity/](identity/)
-- Egress allowlist, credential injection, reflected-secret masking, no raw ssh: [../sandbox/networking/egress/](../sandbox/networking/egress/)
+- Egress allowlist, hard deny of non-public addresses (in the proxy and the kernel), request sanitizing, live policy re-checks, scoped credential injection, reflected-secret masking, no raw ssh: [../sandbox/networking/egress/](../sandbox/networking/egress/)
+- Short-lived CA chain under a KMS root, since guests check no revocation: [../sandbox/networking/egress/tls/](../sandbox/networking/egress/tls/)
+- Every credential issuance, push and refusal is audited by BrokerDO: [../control-plane/durable-objects/broker/](../control-plane/durable-objects/broker/)
 - The harness runs on the host, with a clean environment, restricted mode and managed settings: [../agents/runner/](../agents/runner/)
 - Grants, attenuated from me (an agent passes on only what it holds), taint tracking with approval on sinks, brokered actions and approval gates: [../agents/tools/](../agents/tools/)
 - Epoch fencing of side effects: [../sandbox/fencing/](../sandbox/fencing/)
