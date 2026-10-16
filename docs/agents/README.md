@@ -75,7 +75,7 @@ When an agent is removed for good, **what it owns is parked, then expires**:
 
 - [backends/](backends/): `claude-code` (current) and `api-loop` (future), chosen per agent
 - [capabilities/](capabilities/): pluggable bundles of tools, grants and prompt (messaging, channels, spawning, memory, …)
-- [runner/](runner/): starts and drives Claude Code, keeps its environment clean, handles auth and placement
+- [runner/](runner/): starts and drives Claude Code at a pinned version, keeps its environment clean, handles auth and placement
 - [hands/](hands/): MCP tools modeled on Claude Code's built-ins, executed in the sandbox over RPC
 - [sessions/](sessions/): the native session file, tailed on the host and stored in R2
 - [state-tracking/](state-tracking/): hooks and the stream, an async pipeline, and synchronous decisions answered locally

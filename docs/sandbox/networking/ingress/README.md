@@ -17,7 +17,7 @@ browser ─► Cloudflare Access ─► Worker (<port>-<sandbox>.preview.<domain
   - `*.share.<domain>` has no Access; the Worker checks a signed, expiring token for one specific `{sandbox, port}`.
 - **Host header:** dev servers often reject unfamiliar `Host` values (DNS-rebinding protection). The router sends `Host: localhost:<port>` and passes the original as `X-Forwarded-Host`, configurable per exposed port.
 - **Over the same vsock channel:**
-  - **Terminal attach:** a PTY, over WebSocket → nestd → vsock.
+  - **Terminal attach:** a PTY, over WebSocket → nestd → vsock. A dropped connection detaches it for 60 s ([guest agent](../../guest-agent/#terminals)), and the client reattaches with the terminal id, its byte offset and a reattach token. **The token never goes in a URL:** Cloudflare logs the request URI with its query string ([`ClientRequestURI`](https://developers.cloudflare.com/logs/reference/log-fields/zone/http_requests/#clientrequesturi)), so it travels in the first WebSocket message.
   - **`nest port-forward <sandbox> <port>`:** raw TCP over the same authenticated WebSocket.
 - **Fencing:** a stale host's router refuses connections, and the Worker routes only to the host holding the current lease.
 - **cloudflared** dials Cloudflare outbound on port 7844: QUIC, falling back to HTTP/2 over TCP. No inbound ports.

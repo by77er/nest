@@ -1,6 +1,6 @@
 # claude-code backend
 
-The agent's brain is an [agent runner](../../runner/) Claude Code process. The runner's auth, environment, lifecycle and hygiene rules all apply. The command line comes from the spawn spec's launch config; nothing about it depends on what the agent is for.
+The agent's brain is an [agent runner](../../runner/) Claude Code process. The runner's pinned Claude Code baseline and its auth, environment, lifecycle and hygiene rules all apply. The command line comes from the spawn spec's launch config; nothing about it depends on what the agent is for.
 
 - **With hands:** on the sandbox's host. Built-in tools are limited to ones that don't touch the host, and Claude Code's coding prompt is kept (`--append-system-prompt-file`). See the [runner](../../runner/).
 - **Without hands** (e.g. the `captain` template): on a controller host, usually with no built-in tools and a replaced prompt:

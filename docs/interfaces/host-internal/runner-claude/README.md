@@ -1,6 +1,6 @@
 # runner ↔ Claude Code
 
-> **Implemented contract.** The design drops `Agent` and `TodoWrite` from `--tools` and adds `--system-prompt-snapshot off`, the budget flags and `DISABLE_UPDATES=1`; see [pending contract changes](../../README.md#pending-contract-changes).
+> **Implemented contract.** The design drops `Agent` and `TodoWrite` from `--tools`, adds `--system-prompt-snapshot off`, the budget flags and `DISABLE_UPDATES=1`, and checks a [pinned version](#version); see [pending contract changes](../../README.md#pending-contract-changes).
 
 
 Unmodified Claude Code, documented flags only. Reference artifacts in `protocol/claude-code/`; builders in `nest_protocol::host::claude` (golden-tested).
@@ -25,6 +25,10 @@ Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended
 **Host-side built-ins are refused:** a `launch.builtin_tools` naming `Bash`, `BashOutput`, `KillShell`, `KillBash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`, `Grep`, `LS`, `PowerShell` or `Monitor` fails the start, and if `system/init.tools` reports one the brain is killed (`--restricted` re-enables tools named individually in `--tools`).
 
 **Process:** Claude Code runs in its own process group (with `nest mcp` and hooks). SIGINT goes to the Claude Code pid only; SIGKILL to the group. Startup subprocesses (`auth status`, `--version`) run in the empty cwd with timeouts and are killed if abandoned.
+
+## Version
+
+**Designed:** the host release pins one Claude Code version and the SHA-256 of its binary. Before spawning, the runner checks `claude --version` against the version and hashes the binary it will exec; a mismatch refuses the start with `claude_version` ([nestd-runner](../nestd-runner/)). `DISABLE_UPDATES=1` and `DISABLE_AUTOUPDATER=1` keep the binary from changing underneath. A new pin needs the `e2e/claude-verify` probes, the hands fidelity eval and resuming the previous baseline's sessions to pass ([runner](../../../agents/runner/)). Observations below name the version they were made on.
 
 ## Environment (complete; nothing inherited)
 

@@ -2,6 +2,8 @@
 
 How host components (nestd, the agent runner's hands bridge, the preview router) talk to the **guest agent** inside a sandbox VM. Rust types: `nest_protocol::guest`. Fixtures: `protocol/fixtures/guest/`. MCP tool schemas: `protocol/schemas/guest/hands-tools.json`.
 
+> **Implemented contract (version 1), plus version 2 (designed).** Items marked **v2** aren't built; they're listed under [pending contract changes](../README.md#pending-contract-changes) until they land. Design: [guest agent](../../sandbox/guest-agent/), [hands](../../agents/hands/).
+
 ## Transport
 
 Firecracker virtio-vsock in **hybrid mode**. The guest has CID **3** and the host CID 2. Every connection is **host-initiated**:
@@ -52,9 +54,10 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 | `configure` | host → guest | request | `sandbox_id`, `epoch`, `hostname`, complete `agents[]` set. Sent after every hello and on change. |
 | `agent_attach` / `agent_detach` | host → guest | request | Add or remove one `AgentSlot`. `kill_processes` → `cgroup.kill` the agent subtree. |
 | `resume` | host → guest | request | After a memory restore: `wall_clock_ms`, `entropy_b64` (64 bytes), optional `fork` identity. Reply `resume_done{clock_step_ms}`. |
-| `prepare_snapshot` | host → guest | request | `sync`; `drop_caches` → `echo 3 > /proc/sys/vm/drop_caches`; `fsfreeze` listed mounts. Reply `ok`. |
+| `flush` (v2) | host → guest | request | `syncfs` every filesystem. Reply `ok`, or `error{sync_failed}` on a writeback error. Precedes every commit, pause and suspend ([flush before commit](../../sandbox/state/disk/#flush-before-commit)). |
+| `prepare_snapshot` | host → guest | request | `sync` (v2: the `flush` above, stopping on `sync_failed`); `drop_caches` → `echo 3 > /proc/sys/vm/drop_caches`; `fsfreeze` listed mounts. Reply `ok`. |
 | `thaw` | host → guest | request | `fsfreeze -u` everything frozen. Idempotent. |
-| `health` | host → guest | request | Reply `health_report` (load, memory, disks, per-agent cgroup usage). |
+| `health` | host → guest | request | Reply `health_report` (load, memory, disks, per-agent cgroup usage). v2 (`diagnostics`): `drain_log_sites: true` adds `log_sites[{level, site, count}]` and `log_sites_dropped`, the guest agent's WARN/ERROR counts since the last drain, by site (module and line), never text. Only nestd's periodic probe drains. |
 | `ports` | guest → host | event | **Full** set of listening TCP sockets. Sent after `configure` and on change (polled every 1 s, debounced). |
 | `task_exited` | guest → host | event | A background task ended (exit, kill, time limit). |
 | `cli` | guest → host | request | A `nest` CLI command from inside the sandbox. Host replies `cli_result`. |
@@ -62,7 +65,7 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 
 **Rules:**
 - **Startup order:** the guest must send `hello` before anything else. The host must send `configure` before any hands call is accepted. Until then, hands and ingress-PTY return `error{code: "busy", retryable: true}`.
-- **Version mismatch:** if `protocol_version` differs, the host replies `error{unsupported_version}` and closes.
+- **Versions:** a v1 host requires an equal `protocol_version`; v2 accepts a [range](#versions-v2). Outside it, the host replies `error{unsupported_version}` and closes.
 - **Fencing:** the guest stores `epoch` from the last `configure` and **rejects hands calls with a different epoch** (`stale_epoch`). nestd only ever raises the epoch, and the guest enforces it: a `configure` with a **lower** epoch is rejected with `error{stale_epoch}` and changes nothing.
 - **Reconnects:** if the control connection drops (vsock resets on every snapshot restore), the host reconnects. The guest sends a new `hello`. `boot_id` is the kernel boot id (`/proc/sys/kernel/random/boot_id`; it survives a memory restore and changes on reboot) and `instance_id` is random per guest-agent process:
 
@@ -72,6 +75,36 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
   | same `boot_id`, new `instance_id` | the guest agent restarted | `configure` |
   | new `boot_id` | reboot (cold boot) | `configure` |
 - **Guest-side buffering:** `ports` and `task_exited` events produced while disconnected are buffered: latest `ports` only, and up to 1000 `task_exited`. They're flushed after the next `configure`.
+
+### Versions (v2)
+
+A memory snapshot keeps the guest agent it was taken with ([guest agent](../../sandbox/guest-agent/#versions)), so the host serves a range of guest versions.
+
+- **Range:** nestd accepts a hello whose `protocol_version` is in `[MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION]` (`nest_protocol::guest`; 1 and 2). Outside it, nestd replies `error{unsupported_version}`, closes, and fails the sandbox's start or resume with that code at once, never by a readiness timeout.
+- **Paused restores:** the check runs on `hello`, which a paused VM doesn't send. nestd never resumes a VM only to read it.
+- **The host speaks the guest's version.** nestd passes the guest's `protocol_version` and `capabilities` to the runner with each hands binding. Every `HandsRequest` carries the guest's version, and a guest refuses any other (`unsupported_version`).
+- **Capabilities gate features,** not version numbers. The host sends a request only if the guest advertised it, and otherwise answers its own caller `unsupported`. A v2 guest answers a request `type`, `tool` or ingress `mode` it doesn't know with `error{unsupported, executed: false}` (on control, with `reply_to`), never a close or silence. A v1 guest replies `bad_request` without `reply_to`, so the host never relies on it.
+
+| Capability | Since | Feature |
+|---|---|---|
+| `pty`, `cgroup_v2`, `pdf`, `fsfreeze` | 1 | PTYs, cgroup kills, PDF pages, `fsfreeze` |
+| `flush` | 2 | the `flush` request |
+| `call_status` | 2 | [call lookup](#refusals-and-call-records-v2) |
+| `modified_files` | 2 | the change ledger in `call_status` |
+| `heartbeat` | 2 | [heartbeats](#admission-and-liveness-v2) on hands calls |
+| `pty_reattach` | 2 | [terminal reattach](#ingress-port-10000) |
+| `diagnostics` | 2 | log-site counts in `health_report` |
+
+**Legacy stays until `min_supported` passes it.** Each compatibility path is marked in code with the version that retires it:
+
+| Kept for v1 guests | Host behavior | Retired when `min_supported` reaches |
+|---|---|---|
+| Hands `error` frames without `executed` | Treated as possibly executed: never retried | 2 |
+| `HandsDetail::Bash` without `exit` | `exit` derived from `exit_code` and `signal` | 2 |
+| No `flush` | `prepare_snapshot{}` (a plain `sync`, which reports no writeback error) stands in for it | 2 |
+| CLI `notify`, `emit`, `ask` | Relayed to the control plane as `guest_cli` events | 2 |
+
+**Release gate:** each release resumes a retained memory snapshot taken with the previous release's guest on the new host and runs every hands tool once (needs KVM). Without KVM, the host's decoders keep passing the fixtures of every version from `min_supported` up.
 
 ### Resume and fork
 
@@ -89,27 +122,54 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 | Aspect | Value |
 |---|---|
 | User | The sandbox's normal user (uid 1000). Never root, unless `agent_root: shared` is baked into the image. Processes (Bash, tasks, PTYs, Grep, PDF/image helpers) `setuid` to it; Read/Write/Edit/Glob run in the guest agent with its **filesystem identity** (per-thread `setfsuid`/`setfsgid`/groups), so permission checks and ownership of created files and directories are the user's. |
-| cgroup (v2) | `/sys/fs/cgroup/nest/agents/<agent_id>/` (with `memory.max` from the slot), containing `calls/<call_id>/` for each foreground call, `tasks/<task_id>/` for each background task, `pty/<n>/` for each terminal |
+| cgroup | `/sys/fs/cgroup/nest/agents/<agent_id>/` (unified hierarchy, with `memory.max` from the slot), containing `calls/<call_id>/` for each foreground call, `tasks/<task_id>/` for each background task, `pty/<n>/` for each terminal. Children join their leaf before exec; v2: a failed placement refuses the call. |
+| OOM (v2) | The guest agent runs at `oom_score_adj` −1000; each child is reset to 0 before exec, and a failure refuses the call. |
 | Environment | Image base env, then the user's `HOME`/`USER`/`LOGNAME`/`SHELL` (from passwd), then slot `env`, then `NEST_AGENT_ID=<agent_id>`, `HTTP_PROXY`/`HTTPS_PROXY`/`http_proxy`/`https_proxy=http://172.16.0.1:<proxy_port>`, `NO_PROXY=localhost,127.0.0.1,::1` |
-| Files | `/run/nest/agents/<agent_id>/` (tmpfs), holding `calls/<call_id>.out` and `tasks/<task_id>.out` (combined output) and `cwd` (persisted Bash working directory). **Retention:** the newest 64 call outputs (≤256 MB) and the newest 32 finished tasks are kept per agent; older ones are deleted (finished tasks are also forgotten, so their IDs become `unknown_task`). |
+| Files | `/run/nest/agents/<agent_id>/` (tmpfs), holding `calls/<call_id>.out` and `tasks/<task_id>.out` (combined output), `cwd` (persisted Bash working directory) and, v2, `calls/<call_id>.json` ([call records](#refusals-and-call-records-v2)). **Retention:** the newest 64 call outputs (≤256 MB) and the newest 32 finished tasks are kept per agent; older ones are deleted (finished tasks are also forgotten, so their IDs become `unknown_task`). |
 
 **Interrupt:**
 - A cancelled call → `cgroup.kill` on `calls/<call_id>`. **Background tasks survive** interrupts, matching Claude Code.
+- **A hangup is a cancel,** whatever caused it, a runner restart included: hands calls get no detach grace (v2 terminals do).
 - `agent_detach{kill_processes: true}` → `cgroup.kill` on the whole agent subtree, and the agent's output directory is deleted.
 
 ## Hands RPC (port 1025)
 
 ```
 host → guest   HandsRequest {protocol_version, call_id, agent_id, epoch, op: {tool, ...input}}
-guest → host   [started]  then  result{call_id, result{is_error, content[], detail}}  |  error{call_id, error}
+               v2, read-only instead:  {"type":"call_status", ...}
+guest → host   [started]  then  result{call_id, result{is_error, content[], detail}}  |  error{call_id?, error, executed?, retry_after_ms?}
+               v2: heartbeat{call_id} after each 10 s without another frame
 host → guest   (optional, any time)  {"type":"cancel"}   — or just close the connection
 ```
 
-- **Input format:** `op` is the **MCP tool input, verbatim**, plus `"tool": "<Name>"`. The runner never translates fields.
+- **Input format:** `op` is the **MCP tool input, verbatim**, plus `"tool": "<Name>"`. The runner never translates fields. The guest ignores fields it doesn't know; a field `hands-tools.json` lists as rejected for its tool (one that would change the call's meaning) is refused by the runner with `unsupported` before any connection (v2).
 - **`content`** maps 1:1 to MCP `CallToolResult.content` (`text`; `image` → `{"type":"image","data":…,"mimeType":…}`). `is_error` maps to MCP `isError`.
 - **`detail`** is structured data for the runner, state tracking and the UI. It's **never shown to the model**.
-- **`error`** frames mean the call wasn't executed (bad request, stale epoch, unknown agent). The runner returns them to the model as an MCP tool error whose text includes the code.
+- **`error`** frames mean the call wasn't executed (bad request, stale epoch, unknown agent). The runner returns them to the model as an MCP tool error whose text includes the code. v2: they carry `executed`, and the runner retries proven non-executions (below).
 - **On cancel,** the guest kills the call's cgroup and, if the connection is still open, sends `result` with `detail.interrupted = true` and the partial output.
+
+### Refusals and call records (v2)
+
+- **`executed: false`** proves the call never reached its point of no return, so nothing ran and it's safe to retry. Every refusal before that point carries it: `duplicate_call`, `unsupported_version`, `unsupported`, `stale_epoch`, `unknown_agent`, `bad_request`, `busy`, and a failed cgroup or OOM-score setup. `retry_after_ms` hints when a retryable refusal may succeed. `call_id` is absent when the request frame was never read (frame memory).
+- **Order of checks:** a `call_id` that already has a record or a live reservation for this agent is refused first (`duplicate_call`), so the answer can't depend on state that changed since. Then version, epoch, agent, admission, input, and preparation (cgroup, output file, read records). Only then is the record written and the effect started.
+- **Runner retries:** a retryable `executed: false` refusal is retried on a new connection with the same `call_id` for up to 30 s, waiting `retry_after_ms` (default 1 s) between tries. A frame without `executed` (v1) is never retried.
+- **Call records:** `calls/<call_id>.json` = `{call_id, epoch, tool, started_ms, ledger_pos?, outcome?: {is_error, exit?, interrupted?: cancel|hangup, output_path?, output_bytes?}}`, written at the point of no return and again at the end. The newest 1,024 per agent are kept, beyond output retention. They survive epoch changes and guest-agent restarts, not reboots. A restarted guest agent kills the cgroups of calls without an outcome; those stay unknown.
+- **`call_status`** (capability `call_status`), on a port-1025 connection instead of a `HandsRequest`:
+
+  ```
+  host → guest   {"type":"call_status", protocol_version, agent_id, epoch, calls: [{epoch, call_id}]}
+  guest → host   call_status{calls: [{epoch, call_id, state, record?, modified?}]}
+  ```
+  `epoch` must be current; the calls may be from any epoch. `state` is `finished`, `running`, `not_started` (no record, and the records cover that epoch: they start at the first epoch configured since boot) or `unknown` (a record without an outcome, or an epoch the records don't cover). `modified` (capability `modified_files`) is `{paths[], overflowed}`: what the [change ledger](../../sandbox/guest-agent/#change-ledger) saw modified since the call's `ledger_pos`.
+
+### Admission and liveness (v2)
+
+Design: [guest agent](../../sandbox/guest-agent/#admission).
+- **First frame within 5 s** of `CONNECT`, or the guest closes the connection.
+- **Frame memory:** the receiver reads a frame's length, then charges it to a budget of 1/16 of guest memory (16–64 MiB) before reading the payload. A frame that doesn't fit waits up to 2 s, then gets `error{busy, executed: false}` without a `call_id`.
+- **Caps:** once the request is read, 16 hands calls per agent and 64 in total; 256 connections on the CLI socket. Over a cap, a call waits up to 2 s (64 waiters at most), then gets `error{busy, executed: false, retry_after_ms: 1000}`.
+- **Reserved:** the control connection is separate, and `TaskStop` and `call_status` skip the caps. After its request, a hands connection accepts only `cancel` frames, so a cancel never waits for admission or memory.
+- **Heartbeats** (capability `heartbeat`): `heartbeat{call_id}` after each 10 s without another frame. With them, the runner fails a call after 30 s without a frame; with any guest, at the tool's own deadline (Bash and TaskOutput `timeout`, 120 s for the rest) plus 15 s, SPACE's stall grace ([ecw_process.rs](https://github.com/perplexityai/space/blob/main/crates/libs/data/plane/server/src/ecw_process.rs)). It closes the connection, which cancels the call, and returns `outcome_unknown`.
 
 ### Tools
 
@@ -120,6 +180,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
   - Runs `bash -c` in a **new process per call**, in the agent's persisted cwd.
   - A trailing `cd` **persists**: the guest captures `$PWD` at exit through an extra fd and stores it in `/run/nest/agents/<id>/cwd`. Exported variables don't persist.
   - stdin is `/dev/null`. stdout and stderr are combined, in order, into `calls/<call_id>.out`.
+  - v2: the call ends when the main process exits, seen through a pidfd. Output drains for up to 1 s (`POLLHUP` on a duplicate of the pipe's read end tells a descendant holding it from a reader that's behind), then the call's cgroup is killed, so `cmd &` can't hang the call.
   - If the persisted cwd no longer exists, the command runs in the slot's `cwd` (or `/` if that's gone too) and the output starts with a `nest: working directory … does not exist; running in …` line.
 - **Timeout** in ms: default 120 000, max 600 000 (larger values are clamped).
   - On timeout the command is **moved to the background**, not killed (unless it starts with `sleep`, in which case it's killed). From then on it runs under the background default time limit (1 800 000 ms), like a `run_in_background` task without a `timeout`. The result text is `Command did not complete within its <N>s timeout and was moved to the background` plus the task ID and output path. Any cwd change made by a moved command doesn't persist, and the result says `Session cwd remains <dir>…`.
@@ -131,6 +192,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
   - **Empty successful output** is returned as the text `(no output)`, so MCP never gets an empty text block.
   - **Failure:** a head-and-tail excerpt of up to 10 000 characters, with no path.
   - **What counts as success:** exit code 0, or exit code 1 from `grep`, `rg`, `egrep`, `fgrep`, `find`, `diff`, `test`, `[`, `git diff` and `git grep`. Anything else is `is_error: true`, and the text ends with `Exit code <n>`.
+  - v2: `detail.exit` is `exited{code}`, `signaled{signal}`, `timed_out` or `unknown`, and `<n>` is the code, 128+signal, or 124 for a timeout.
   - Output files are capped at 64 MiB (truncated beyond that). A command whose output passes 5 GB is killed. For the inline text the guest reads at most the first and last 512 KiB of the file; a larger output is reported by its byte size.
 
 **`TaskOutput {task_id, block?, timeout?}`**
@@ -162,6 +224,8 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 
 **`Write {file_path, content}`**
 - Creates parent directories and writes the file **in place** (truncate + write, following symlinks and keeping hard links, owner, mode, ACLs and xattrs), like Claude Code's own Write. Not atomic.
+- v2: **atomic when safe.** If the target (after following symlinks) is new, or a regular file the writing user owns with one link and no ACL, the content goes to a temporary file in the same directory, which gets the target's mode, group and xattrs and is renamed over it: readers see the old or the new content, never a partial file. A directory that refuses the temporary file, or a failed rename (e.g. a bind mount), falls back to in place.
+- Neither path fsyncs. Durability comes from the commit's `flush` ([flush before commit](../../sandbox/state/disk/#flush-before-commit)).
 - If the file **exists and this agent hasn't fully read it** → `is_error`: `File has not been read yet. Read it first before writing to it.`
 - If it **changed since that read** (size differs, or same size with a different mtime and different content; an mtime-only change such as `touch` doesn't count) → `is_error`: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.`
 - Non-regular files → `is_error`.
@@ -177,7 +241,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 - **Staleness:** if the file changed since the agent read it (mtime, size or hash differ), the edit **still applies** when `old_string` matches the *current* content exactly once (or `replace_all`). The text then adds `Note: the file had changed since you last read it; re-read before edits that depend on surrounding content.` and `detail.changed_since_read = true`.
 - **Encoding:** non-UTF-8 files (except UTF-16LE with a BOM) → `is_error` suggesting a shell edit.
 - **Size:** files over 16 MiB → `is_error` suggesting a shell edit.
-- **Write and result:** in-place write, as for Write. The record is updated, and the result text is a short confirmation plus a ±4-line snippet with line numbers.
+- **Write and result:** written as for Write. The record is updated, and the result text is a short confirmation plus a ±4-line snippet with line numbers.
 
 **`Glob {pattern, path?}`**
 - `path` defaults to the agent's cwd. Doesn't respect `.gitignore`.
@@ -211,10 +275,17 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 
 **`{"mode":"pty", agent_id?, cols, rows, command?, cwd?, env?}`**
 - Spawns a PTY, in `pty/<n>` under the agent's cgroup if `agent_id` is set, with the agent's env.
-- Replies `accepted{pid}`. Then `DATA` frames carry terminal bytes both ways.
+- Replies `accepted{pid}` (v2 with `pty_reattach`: `accepted{pid, terminal_id, attach_token}`). Then `DATA` frames carry terminal bytes both ways.
 - Host → guest JSON: `resize{cols, rows}`, `signal{signal}` (names such as `INT`, `TERM`, `HUP`).
 - Guest → host: `exit{code|signal}`, then the guest closes.
-- **A dropped connection SIGHUPs the PTY session.**
+- **A dropped connection SIGHUPs the PTY session.** v2: it detaches instead. The terminal runs on for 60 s with its output in scrollback (at most 4 MiB per terminal; 1/32 of guest memory, clamped to 16–64 MiB, for all), then gets SIGHUP. An exited terminal's scrollback and exit status are kept 60 s.
+
+**`{"mode":"pty_attach", terminal_id, attach_token, offset, observe?}`** (v2, `pty_reattach`)
+- Replies `accepted{pid, terminal_id, attach_token, offset}` with a new token and the offset of the first byte replayed, which is later than requested if those bytes were dropped. Then scrollback from there, then live output, as above.
+- `offset` counts terminal output bytes since the terminal started.
+- **One attached reader:** a new attach replaces the previous connection, and only it applies backpressure. `observe: true` attaches read-only: an observer that falls behind skips ahead instead of stalling the process.
+- An unknown or expired terminal, or a wrong token → `rejected{unknown_terminal}`.
+- `attach_token` is 128 random bits, rotated on every attach. It travels only in frames and message bodies, never in a URL ([ingress](../../sandbox/networking/ingress/)).
 
 ### Ports and exposure
 
@@ -245,13 +316,17 @@ nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a flee
 | Code | Where |
 |---|---|
 | `bad_request` | Malformed frame or message, relative path, invalid parameter |
-| `unsupported_version` | Hello or hands `protocol_version` mismatch |
+| `unsupported_version` | Hello outside the host's range (v1: not equal); a hands `protocol_version` other than the guest's |
+| `unsupported` (v2) | A request type, tool, ingress mode or rejected input field the receiver doesn't support; the host gives it for a capability the guest didn't advertise |
+| `duplicate_call` (v2) | A `call_id` with a record or a live reservation for this agent; checked first |
 | `stale_epoch` | Hands epoch ≠ configured epoch |
 | `unknown_agent` | Agent not in the slot set |
 | `unknown_task` | TaskOutput / TaskStop |
-| `busy` (retryable) | Before `configure`, or during `prepare_snapshot` freeze |
+| `busy` (retryable) | Before `configure`, during `prepare_snapshot` freeze, or (v2) over an admission cap or the frame-memory budget |
+| `sync_failed` (v2) | `flush` or `prepare_snapshot` hit a writeback error |
 | `not_found`, `is_directory`, `not_read`, `not_utf8`, `old_string_not_found`, `old_string_ambiguous`, `too_large` | Code names for tool-level failures. The model sees them as `is_error` text, and `error` frames use them only when the call couldn't run at all. |
 | `connect_refused` (retryable) | Ingress TCP |
+| `unknown_terminal` (v2) | Ingress `pty_attach` |
 | `internal` | Anything else |
 
 ## Sequences
@@ -265,6 +340,15 @@ runner                              guest
   │ (user interrupts the turn)        │
   │ {"type":"cancel"} ─────────────►  │ cgroup.kill calls/toolu_01A
   │ ◄── result{is_error, interrupted} │ close
+```
+
+**Brain restart with a call in flight (v2)**
+```
+runner (new brain for agt_a)        guest
+  │ CONNECT 1025 / OK                 │
+  │ call_status{epoch: 8, calls: [{epoch: 7, call_id: toolu_01A}]} ──► │ read calls/toolu_01A.json
+  │ ◄── call_status{state: finished, record{exit: exited{0}, output_path}, modified{paths, overflowed: false}}
+  runner ─► AgentDO: journal outcome; the recovery context says "exited 0, output at …"
 ```
 
 **Background task**
@@ -296,7 +380,9 @@ guest ─► ports{…}   (re-announced)
   - `tools/call` → open a port-1025 connection to the bound sandbox's vsock socket, then send `HandsRequest{op: input + tool}`.
   - MCP cancellation, or an interrupted turn → `cancel` or close.
   - `call_id` = the MCP request ID or tool-use ID, which must be unique per agent.
+  - v2: stamp the guest's version; retry `executed: false` refusals; fail silent calls; look up in-flight calls with `call_status` at brain start.
 - **nestd:** owns the port-1024 connection, `configure`, `resume`, `prepare_snapshot` and `thaw`. It relays `cli` requests and `ports`/`task_exited` events to the control plane. Epoch and slots come from SandboxDO.
+  - v2: checks the version range, passes the guest's version and capabilities to the runner, sends `flush` before every commit, and drains log-site counts into its metrics.
 - **Preview router / nestd terminals:** use port 10000. The `Host` rewrite happens in the router.
 - **Control plane:**
   - `ports` → nestd emits a `port_opened` workstream event for each newly listening port (closed ports aren't reported).
