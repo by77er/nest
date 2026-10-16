@@ -1,6 +1,6 @@
 # FleetDO
 
-One per cell: hosts, enrollment, leases, placement, STONITH and command delivery.
+One per cell: hosts, enrollment, leases, placement, drains, STONITH, base generations and command delivery.
 
 - **Enrollment:**
   - **One-time enrollment token** minted by the operator for a role.
@@ -9,7 +9,7 @@ One per cell: hosts, enrollment, leases, placement, STONITH and command delivery
   - **Host tokens** are short-lived and rotated over the fleet channel. A host that was disconnected past expiry can still open the fleet channel for 24 h, and gets a fresh token right after hello.
 - **Fleet channel:** nestd connects here and heartbeats every 5 s, which renews the leases of every sandbox on the host. See [../../../sandbox/fencing/](../../../sandbox/fencing/).
 - **Hello reconciliation:**
-  - **Sandboxes:** reported sandboxes we don't honor are fenced, and the reported state of honored ones is adopted. `head`/`dirty` are informational.
+  - **Sandboxes:** reported sandboxes we don't honor, including any below SandboxDO's current epoch, are fenced, salvaged if dirty and destroyed; the reported state of honored ones is adopted as evidence. `head`/`dirty` are informational.
   - **Agents:** a brain whose `agent_start` completed but that the host no longer reports is marked detached. Reported ones keep the reported state.
   - **New nestd process:** a new `instance_id` resets both seq lineages. Unfinished commands then fail retryably, except a `sandbox_create` the host reports running, which completes.
 - **Commands:** persisted, delivered in order, exactly one result each.
@@ -22,9 +22,18 @@ One per cell: hosts, enrollment, leases, placement, STONITH and command delivery
   - **Without EC2:** waits for the host to reconnect and fence. The fence is re-issued on every hello, every tick and after a failure, until one succeeds.
   - **Operator:** can confirm a host dead.
   - **Reassignment:** an idempotent per-sandbox queue that the alarm retries, so one failure can't strand the others.
-- **Placement packs:** among hosts whose free hugepages and vCPUs fit the sandbox, prefer one with its snapshot warm and a matching restore ABI, then the one with the fewest free hugepages that still fit, then fewest free vCPUs. Packing lets idle hosts empty out and scale to zero; spreading keeps every host partly full. An undersized hugepage pool makes Firecracker fail with SIGBUS, so hugepages are reserved, never overcommitted.
+- **Restore ABIs:** each host advertises the [restore ABIs](../../../sandbox/state/memory/#restore-abi) it can create and load (in `hello` and `capacity`), and each host release records the ones its hosts will have, so FleetDO knows whether launching a host would help. A memory generation is placed only on a host that loads its ABI; if none with room does and the desired host version wouldn't either, the sandbox boots disk-only.
+- **Placement** grants a lease at the epoch of a SandboxDO [claim](../sandbox/#placement), only once every older epoch's lease is gone. It packs: among hosts whose free hugepages and vCPUs fit the sandbox, prefer one with its snapshot warm and a loading restore ABI, then the one with the fewest free hugepages that still fit, then fewest free vCPUs. Packing lets idle hosts empty out and scale to zero; spreading keeps every host partly full. An undersized hugepage pool makes Firecracker fail with SIGBUS, so hugepages are reserved, never overcommitted; paused sandboxes keep theirs. Disk I/O isn't packed; each sandbox's drive is rate-limited instead ([I/O limits](../../../sandbox/state/disk/#io-limits)).
+- **Drains** ([modes](../../../compute/autoscaling/)): a draining host gets no new placements, and its resident sandboxes become `evacuating`. **FleetDO terminates a drained host only when, for every resident sandbox:**
+  - SandboxDO's head is the host's last committed generation for it (exact ids, through [`isRestoreSource`](../../../sandbox/state/#restore-sources));
+  - that head is `ready`, verified when it was committed;
+  - the host's pending-upload list is empty. The list is all-or-nothing: an answer the host can't complete is an error, never a short list, because a short list looks the same as a complete one.
+
+  A spot notice doesn't wait for the gate: the instance goes anyway, and whatever didn't commit is recorded as a loss.
+- **Base generations:** an index of `(image digest, restore ABI) → generation` for the cell, with a per-digest backoff for failed preparation ([base generations](../../../sandbox/state/memory/#base-generations)). Each is a GC root until its image is retired.
 - **Not built:**
   - **The autoscaler** (`RunInstances` plus recording the launch). See [../../../compute/autoscaling/](../../../compute/autoscaling/).
   - **The desired host version** per cell, which drives [host upgrades](../../../compute/provisioning/#upgrades).
   - **Command batching:** one frame per `issueCommands` call.
   - **Packing:** placement is least-loaded by lease count (warm snapshots first); hugepage-aware packing and the restore-ABI match aren't built.
+  - **Drains, the drain gate and base generations.**
