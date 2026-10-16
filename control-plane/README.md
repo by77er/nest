@@ -37,7 +37,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    per-role overrides are `claude_oauth_token:worker` and `claude_oauth_token:captain`.
 5. Create work (all admin endpoints use `Authorization: Bearer $ADMIN_TOKEN`):
    - `POST /v1/workstreams {goal}`
-   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected burst host. `policy` is the
+   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected burst host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
@@ -50,6 +50,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
      `{lines, next_seq, more}`)
    - `POST /v1/admin/hosts/<id>/confirm-dead`: manual STONITH
+   - `GET /v1/admin/fleet?cell=<cell>`: hosts (status, leases, idle since) and launched instances (outcome)
    - `POST /v1/admin/launched {instance_id, role, account_id?, region?, cell}`: record an instance we
      launched so it may enroll with its AWS identity document (as that role, from that account and region)
    - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<workstream>`)
@@ -66,6 +67,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `PUBLIC_BASE_URL`, `PREVIEW_DOMAIN`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
 | `WAKE_BATCH_MS` | Captain wake batching window; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
+| `AWS_CELLS` | Autoscaled cells: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?}` (`src/lib/cells.ts`). A cell without an entry is never scaled |
 
 Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its resend queue) carry
 `$nest-secret:<name>` references, resolved when the command is sent to a host.

@@ -198,6 +198,7 @@ export class SandboxDO extends DurableObject<Env> {
       host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
         workstream: before.workstream,
+        cell: before.cell,
         epoch,
         image: before.image,
         resources: before.resources,

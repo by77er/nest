@@ -1,0 +1,33 @@
+# nest's cloud infrastructure as an inframe project (https://github.com/by77er/inframe): Lean stacks
+# rendered to OpenTofu. One stack per cell. See README.md.
+
+[lean]
+directory = "lean"
+main = "cell-use1"
+core = { git = "https://github.com/by77er/inframe", rev = "a68f89ce683be8fd0f548da4fb74442142a55fac", subdir = "lean" }
+
+# The provider schema is trimmed to the resource types nest uses (aws-schema.json, from
+# `inframe provider inspect`), so the generated bindings build in seconds.
+[providers.aws]
+source = "hashicorp/aws"
+version = "6.69.1"
+module_root = "Aws"
+
+[workspace]
+directory = ".inframe"
+graph_directory = ".inframe/graphs"
+
+[stacks.use1]
+frontend = "lean"
+main = "cell-use1"
+test = "cell-test"
+
+[stacks.use1.backend]
+type = "s3"
+
+[stacks.use1.backend.config]
+bucket = "nest-tfstate-589531222691"
+key = "cells/use1.tfstate"
+region = "us-east-1"
+use_lockfile = true
+encrypt = true

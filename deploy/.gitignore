@@ -1,0 +1,4 @@
+.inframe/
+lean/.lake/
+lean/.generated/
+*.plan

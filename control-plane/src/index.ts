@@ -135,6 +135,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "GET" && (p = m(/^\/v1\/admin\/hosts\/(hst_[A-Za-z0-9]+)$/))) {
     return json(await fleet(env, cell).hostStatus(p[1]!));
   }
+  if (req.method === "GET" && path === "/v1/admin/fleet") return json(await fleet(env, cell).fleetView());
   if (req.method === "GET" && path === "/v1/admin/root-ca") {
     return new Response(await fleet(env, cell).rootCertificatePem(), { headers: { "content-type": "application/x-pem-file" } });
   }
@@ -175,7 +176,8 @@ async function route(req: Request, env: Env): Promise<Response> {
       ...(r.image ? { image: r.image } : {}), ...(r.resources ? { resources: r.resources } : {}),
       ...(r.policy ? { workstreamPolicy: r.policy } : {}),
     });
-    return json(info, info.host ? 201 : 503);
+    // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
+    return json(info, info.host ? 201 : 202);
   }
   if ((p = m(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)\/ports(?:\/(\d+))?$/))) {
     const s = sandbox(env, p[1]!);

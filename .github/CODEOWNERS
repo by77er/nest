@@ -42,4 +42,7 @@
 
 # The security design these paths implement, and this repo's own pipeline.
 /docs/security/                             @by77er
+
+# Cloud infrastructure: IAM, network exposure and what the control plane may launch.
+/deploy/                                    @by77er
 /dev/                                       @by77er

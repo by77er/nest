@@ -27,6 +27,8 @@ export interface Env {
   AWS_ACCESS_KEY_ID?: string;
   AWS_SECRET_ACCESS_KEY?: string;
   AWS_REGION?: string;
+  /** Autoscaled cells: JSON object of cell → `AwsCellConfig` (`src/lib/cells.ts`). */
+  AWS_CELLS?: string;
 
   PUBLIC_BASE_URL: string;
   PREVIEW_DOMAIN: string;
