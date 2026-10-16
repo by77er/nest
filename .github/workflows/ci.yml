@@ -1,4 +1,6 @@
-# The checks every change to main must pass. See dev/ci.md.
+# The checks every change to main must pass. See dev/ci.md. Branch protection requires only
+# `ci-ok`, so adding a job here never needs a settings change.
+# Actions are pinned by commit; the comment names the release.
 name: ci
 
 on:
@@ -17,22 +19,26 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Tests that need user namespaces fail instead of skipping (see crates/nestd/README.md).
+  NEST_CI_REQUIRE_USERNS: "1"
 
 jobs:
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - name: Toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
       # nestd's netns tests need iproute2, nftables and unprivileged user namespaces.
       - name: Host tools
@@ -53,8 +59,10 @@ jobs:
       run:
         working-directory: control-plane
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -67,21 +75,23 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
-      - name: Toolchain
-        run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: control-plane/package-lock.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target/e2e
-          key: e2e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: e2e-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: e2e-${{ runner.os }}-
       - name: Host tools
         run: |
@@ -99,7 +109,7 @@ jobs:
         run: e2e/run.sh
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs
           path: |
@@ -107,9 +117,65 @@ jobs:
             e2e/.work/summary.json
           retention-days: 7
 
-  docs:
+  # Repo guards: doc links, source fences for the CLAUDE.md invariants, and tests proving each
+  # guard can fail.
+  guards:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: python3 -I scripts/check-doc-links.py
+      - run: python3 -I scripts/check-fences.py
+      - run: python3 -m unittest discover -s scripts/tests
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_DENY: 0.20.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY }}-${{ hashFiles('rust-toolchain.toml') }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo install --locked "cargo-deny@$CARGO_DENY"
+      - run: cargo deny --locked check
+
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GITLEAKS: v8.30.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # Built from source; the Go checksum database verifies the module.
+      - run: GOBIN="$RUNNER_TEMP/bin" go install "github.com/zricethezav/gitleaks/v8@$GITLEAKS"
+      - run: '"$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner -c .gitleaks.toml .'
+
+  ci-ok:
+    if: always()
+    needs: [rust, control-plane, e2e, guards, deny, secrets]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 -I -c '
+          import json, os, sys
+          bad = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items() if v["result"] != "success"}
+          print(bad or "all jobs passed")
+          sys.exit(1 if bad else 0)'

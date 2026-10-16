@@ -3,3 +3,4 @@ node_modules/
 .wrangler/
 *.log
 .dev.vars
+__pycache__/

@@ -1,0 +1,6 @@
+# Pinned so a new stable release's lints can't break `clippy -D warnings` on an unrelated PR.
+# Bump deliberately, in its own PR.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

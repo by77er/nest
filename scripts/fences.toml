@@ -1,0 +1,67 @@
+# Source fences: patterns that may appear only in the places listed, so the invariants in
+# CLAUDE.md fail a check instead of resting on prose. Checked by scripts/check-fences.py, with
+# tests in scripts/tests/ proving each fence can fail. Loosening an `allow` list is invisible to
+# the check itself, which is why this file needs the owner's review (CODEOWNERS covers scripts/).
+#
+# `files`: globs the fence scans. `allow`: globs where a match is fine; an entry whose files exist
+# but no longer match is stale and fails, so the list only shrinks as code moves. `example`: a
+# line the fence must reject outside `allow`, which the tests plant to prove it can fail.
+
+[[fence]]
+name = "subscription-token"
+example = 'env.insert("CLAUDE_CODE_OAUTH_TOKEN", token);'
+why = "The subscription token never enters a VM: only the control plane's secret handling, the host relay to the runner, and the runner's launch of Claude Code may name it."
+patterns = ['CLAUDE_CODE_OAUTH_TOKEN', '(?i)claude_oauth_token', '(?i)\boauth_?token\b']
+files = ["crates/**", "control-plane/src/**", "protocol/**"]
+allow = [
+  "control-plane/src/do/broker.ts",          # stores it
+  "control-plane/src/do/agent.ts",           # passes its reference in agent_start
+  "control-plane/src/protocol/control.ts",   # the agent_start schema
+  "crates/nest-protocol/src/control.rs",     # the agent_start type (a redacting Secret)
+  "crates/nest-protocol/src/host.rs",        # Claude Code's environment, built on the host
+  "crates/nestd/src/runner_link.rs",         # relays agent_start to the runner
+  "crates/nestd/tests/**",
+  "crates/nest-runner/**",
+  "crates/nest-cli/tests/**",
+  "protocol/fixtures/**",
+]
+
+[[fence]]
+name = "guest-holds-no-credentials"
+example = 'let api_key = read_key();'
+why = "The guest agent runs inside the VM and holds no credentials; it never names a token or key."
+patterns = ['(?i)oauth', '(?i)api[_-]?key', '(?i)anthropic', '(?i)setup[_-]token']
+files = ["crates/nest-guest/**"]
+allow = []
+
+[[fence]]
+name = "claude-launch"
+example = 'let child = Command::new("claude").spawn();'
+why = "Claude Code runs unmodified with documented flags only, launched by the runner alone."
+patterns = ['\bclaude_bin\b', 'Command::new\(\s*"claude"']
+files = ["crates/**"]
+allow = ["crates/nest-runner/**", "crates/nest-cli/tests/**"]
+
+[[fence]]
+name = "no-permission-bypass"
+example = 'args.push("--dangerously-skip-permissions");'
+why = "Claude Code never runs with permission checks bypassed."
+patterns = ['dangerously-skip-permissions', '"bypassPermissions"']
+files = ["crates/**", "control-plane/src/**", "protocol/**", "e2e/**"]
+allow = []
+
+[[fence]]
+name = "tls-interception"
+example = 'let acceptor = TlsAcceptor::from(cfg);'
+why = "Only nest-proxy terminates TLS for interception; nothing else, and nothing on the brain's path, decrypts traffic."
+patterns = ['ServerConfig::builder', '\bTlsAcceptor\b']
+files = ["crates/**"]
+allow = ["crates/nest-proxy/**"]
+
+[[fence]]
+name = "metrics-vocabulary"
+example = 'env.METRICS.writeDataPoint({ blobs: [path] });'
+why = "Metrics are written through one module whose blobs and indexes are closed vocabularies (numbers, enums and ids only)."
+patterns = ['\bwriteDataPoints?\b']
+files = ["control-plane/src/**"]
+allow = ["control-plane/src/lib/metrics.ts"]

@@ -2,13 +2,18 @@
 
 How this repo is built, tested and shipped, and how nest's own agents will maintain it. **This is about the project, not the platform.** Running nest on its own repo is one use of the [repo maintenance](../docs/orchestration/repo-maintenance/) pattern, so it lives here, outside `docs/`.
 
-> Built: CI (`.github/workflows/ci.yml`) and `.github/CODEOWNERS`. The rest is a plan.
+> Built:
+> - CI (`.github/workflows/ci.yml`) and `.github/CODEOWNERS`;
+> - the repo guards (`scripts/`);
+> - the agent skills (`.claude/skills/`).
+>
+> The rest is a plan.
 
 ## Pipeline
 
 ```
 worker ── push + github.create_pr{auto_merge} ──► PR
-PR ── ci.yml: rust · control-plane · e2e · docs ──┐
+PR ── ci.yml (ci-ok) ──────────────────────────────┐
 PR ── reviewer: nest/review check ────────────────┤──► GitHub auto-merge (squash) ──► main
 PR ── me, only if CODEOWNERS paths changed ───────┘
 main ── ci.yml green ──► deploy.yml (environment production): wrangler deploy ─► smoke ─► 10-min health window
@@ -41,10 +46,12 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | [deploy.md](deploy.md) | `deploy.yml`, the health window, `rollback.yml` |
 | [github.md](github.md) | The App's permissions and bindings for this repo, branch protection, merge policy |
 | [setup.md](setup.md) | What I set up on GitHub and Cloudflare for all of the above |
+| [practices.md](practices.md) | Guards, test rules, evidence tiers, review and supply chain: what keeps agent-written changes safe |
+| [review-lessons.md](review-lessons.md) | Standalone lessons from real findings, checked on every review |
 
 ## Path to self-maintenance
 
-1. **CI and `CODEOWNERS`.** Done.
+1. **CI, `CODEOWNERS`, guards and agent skills.** Done.
 2. **Merge this branch into `main`.** `main` still holds only the initial commit.
 3. **Me:** the GitHub and Cloudflare steps in [setup.md](setup.md), and stages 1–3 of the [platform setup](../docs/setup/) (a Claude token, the control plane on Cloudflare, one controller host and one burst host).
 4. **Build the minimum platform slice,** in this order. Each step is a PR through the gates above, with me as reviewer until step 5:

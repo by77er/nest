@@ -21,3 +21,6 @@ tokio-tungstenite = "0.30.0"
 [[bin]]
 name = "nest"
 path = "src/main.rs"
+
+[lints]
+workspace = true

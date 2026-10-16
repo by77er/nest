@@ -1,0 +1,4 @@
+disallowed-methods = [
+  { path = "std::env::set_var", reason = "process-global and racy across threads (tests run in parallel); pass configuration explicitly or set it on the child Command" },
+  { path = "std::env::remove_var", reason = "process-global and racy across threads; set the environment on the child Command instead" },
+]
