@@ -37,7 +37,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 
 - **Token:** `claude setup-token` is the same browser OAuth as `/login` and produces a one-year token that can only make model requests. I run it once; the token is stored in BrokerDO and handed to each process as `CLAUDE_CODE_OAUTH_TOKEN`.
 - **Clean environment:** the runner builds the process environment explicitly (the token, `CLAUDE_CONFIG_DIR`, and nothing inherited). That stops any `ANTHROPIC_*` variable from taking over: `CLAUDE_CODE_OAUTH_TOKEN` ranks below `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` and `apiKeyHelper` ([authentication](https://code.claude.com/docs/en/authentication)). The subprocess environment scrub (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`) keeps `NEST_*` and strips the token from hooks and MCP servers; on Linux it needs bubblewrap, so hosts install it (see [runner-claude](../../interfaces/host-internal/runner-claude/)).
-- **Managed settings** set `forceLoginMethod: "claudeai"` and `allowedProviders: ["anthropic"]`, so Claude Code refuses to start with an API key or a custom endpoint. (To verify in the spike: that `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod`.)
+- **Managed settings** set `forceLoginMethod: "claudeai"` and `allowedProviders: ["anthropic"]`, so Claude Code refuses to start with an API key or a custom endpoint. A setup token passed as `CLAUDE_CODE_OAUTH_TOKEN` is accepted under it (checked on 2.1.301 with `e2e/claude-verify`).
 - **Startup check:** the runner confirms `claude auth status` reports `authMethod: "oauth_token"`. This also catches `--bare` becoming the default for `-p`.
 - **Compliance:**
   - The binary is unmodified.
