@@ -20,7 +20,7 @@ cd /var/lib/nest/empty && exec claude -p --input-format stream-json --output-for
   (--session-id <uuid> | --resume <transcript path> [--fork-session])
 ```
 
-Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended worker built-ins: `Agent, TaskCreate, TaskGet, TaskUpdate, TaskList, TodoWrite, WebSearch, WebFetch`. **Observed on 2.1.300** (`e2e/claude-verify`, before a successful model turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools and `WebSearch`; `TodoWrite` and `WebFetch` are missing even when named. The runner logs `system/init.tools`.
+Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended worker built-ins: `Agent, TaskCreate, TaskGet, TaskUpdate, TaskList, TodoWrite, WebSearch, WebFetch`. **Observed on 2.1.301** (`e2e/claude-verify`, with a real turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools, `WebSearch` and `WebFetch`; `TodoWrite` is missing even when named, which is why the designed invocation leaves it out. A captain's `--tools ""` gives no built-ins. The runner logs `system/init.tools`.
 
 **Host-side built-ins are refused:** a `launch.builtin_tools` naming `Bash`, `BashOutput`, `KillShell`, `KillBash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`, `Grep`, `LS`, `PowerShell` or `Monitor` fails the start, and if `system/init.tools` reports one the brain is killed (`--restricted` re-enables tools named individually in `--tools`).
 
@@ -51,7 +51,7 @@ Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended
   "hooks": { "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "/usr/lib/nest/nest hook --sync", "timeout": 10, "onFailure": "block"}]}], "…": "see file" } }
 ```
 
-`onFailure` requires Claude Code ≥ 2.1.295. **Unverified:** that `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod: "claudeai"` (spike).
+`onFailure` requires Claude Code ≥ 2.1.295. **Checked on 2.1.301:** `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod: "claudeai"`, `claude auth status` reports `authMethod: "oauth_token"` and the `configDirectory`, and `system/init.apiKeySource` is `"none"`.
 
 ## Auth check (before any turn)
 
@@ -77,7 +77,13 @@ Otherwise the runner kills the agent and reports `auth_check{ok:false}`. This al
 | `result` | turn end: `subtype`, `is_error`, `stop_reason`, `usage`, `total_cost_usd` |
 | `control_response` | interrupt receipt (`still_queued`) |
 
-Shapes checked against `@anthropic-ai/claude-agent-sdk` 0.3.296 type definitions. The `user` input shape omits `session_id` (**unverified**).
+Shapes checked against `@anthropic-ai/claude-agent-sdk` 0.3.296 type definitions. The `user` input shape omits `session_id`; a turn sent that way completes (checked on 2.1.301).
+
+**Also checked on 2.1.301** (`e2e/claude-verify`):
+- **Permissions:** under the `default` permission mode the env scrub forces, nest's allow rules and `PreToolUse` hooks let `mcp__nest__*` calls run without prompts.
+- **Resume:** with `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, `--resume` after a SIGKILL mid tool call continues the turn without input.
+- **`defer`:** a `defer` answer ends the run with `stop_reason: "tool_deferred"`, and `--resume` fires `PreToolUse` again for the same `tool_use_id`.
+- **Compaction:** `SessionStart` fires with `source: "compact"` after `/compact`, which needs slash commands enabled.
 
 ## Sources
 

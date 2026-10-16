@@ -176,18 +176,9 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 ## Open questions and watch items
 
 - **Watch:** `--bare` may become the default for `claude -p`, which would break subscription auth. The mitigation is the `authMethod` startup check. See [agents/runner/](agents/runner/).
-- **Verify:** that `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod: "claudeai"`, and that separate setup tokens can be revoked independently. See [agents/runner/](agents/runner/).
-- **Verify against the real Claude Code binary** (these need a real token):
-  - the stdin user-message shape without `session_id`
-  - the `_meta` key carrying the tool-use id on MCP `tools/call` (undocumented; `PreToolUse` input has `tool_use_id` to correlate instead)
-  - that `--restricted` honors the `--tools` built-in list (`TodoWrite` and `WebFetch` were missing before a successful turn; re-check with a real one)
-  - that `notifications/cancelled` reaches MCP on interrupt
-  - the `claude auth status` JSON (`authMethod` and `configDirectory` are documented)
-  - whether nest's allow rules and hooks behave the same under the `default` permission mode the env scrub forces
-  - `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` and `PreToolUse` `defer` under stream-json input
-  - that a `SessionStart` hook fires after compaction (to re-inject the memory index)
-
-  `e2e/claude-verify` runs these. Already observed on 2.1.300 without a token: `system/init` arrives only after the first user message, the env scrub keeps `NEST_*` but needs bubblewrap, and the transcript path rule (implemented in `claude::project_dir`). See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
+- **Verify:** that separate setup tokens can be revoked independently. See [agents/runner/](agents/runner/).
+- **Verify:** that `SessionStart` fires after an automatic compaction under `--disable-slash-commands`. `e2e/claude-verify` could trigger compaction only with `/compact`, which needs slash commands. See [agents/](agents/#continuity).
+- **Checked against the real binary** (Claude Code 2.1.301, `e2e/claude-verify` with a real token, 2026-10-16): the token works under `forceLoginMethod: "claudeai"`, and the stdin shape, the MCP tool-use id, cancellation, the env scrub, the transcript path, interrupted-turn resume, `defer` and `SessionStart` after `/compact` all behave as nest assumes. Two don't: `system/init` arrives only after the first user message, and `--restricted` drops `TodoWrite` even when it's named. The designs already account for both. Details: [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
 
 - **Verify:** that Amazon Linux 2023 ships ublk, which the lazy disk needs. See [compute/provisioning/](compute/provisioning/).
 - **Verify:** that every 8i variant reports the same CPU model (it's part of the restore ABI); that Firecracker's writes pass through the host page cache before ublk; and whether S3 Inventory and lifecycle rules work on S3 Express One Zone directory buckets. See [sandbox/state/](sandbox/state/).
