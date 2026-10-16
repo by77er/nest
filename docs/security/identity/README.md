@@ -12,7 +12,7 @@
 
 ## Outbound credentials
 
-Sandboxes only ever see **placeholders**. nest-proxy substitutes real credentials, and GitHub goes through a GitHub App. See [../../sandbox/networking/egress/injection/](../../sandbox/networking/egress/injection/).
+Sandboxes only ever see **placeholders**. nest-proxy substitutes real credentials, only on each binding's exact hosts (and methods and path prefix, when set), and GitHub goes through a GitHub App. See [../../sandbox/networking/egress/injection/](../../sandbox/networking/egress/injection/).
 
 ## OIDC tokens (deferred)
 

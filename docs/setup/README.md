@@ -36,7 +36,7 @@ Not `CLAUDE_CODE_OAUTH_TOKEN`: that name could change how the session's own Clau
 
 ## Stage 2: the control plane on Cloudflare
 
-**Unlocks:** a deployed control plane that real hosts can enroll with.
+**Unlocks:** a deployed control plane. Hosts can enroll once stage 3 has created the proxy root CA key.
 
 | What | How | Environment variable |
 |---|---|---|
@@ -59,8 +59,9 @@ Not `CLAUDE_CODE_OAUTH_TOKEN`: that name could change how the session's own Clau
 | A budget alarm | Billing → Budgets → a monthly cost budget at the spend cap, emailing me | — |
 
 The provisioning key creates the narrow credentials nest actually runs with:
-- the control plane's IAM user (`RunInstances` with the launch template only; terminate and stop only instances tagged `nest=true`);
-- the hosts' instance role (S3 access to the cell's bucket only).
+- the control plane's IAM user (`RunInstances` with the launch template only; terminate and stop only instances tagged `nest=true`; `kms:Sign` on the proxy root CA key only);
+- the hosts' instance role (S3 access to the cell's bucket only);
+- **the proxy root CA key:** a KMS key (`ECC_NIST_P256`, sign and verify), which never leaves KMS. The setup agent self-signs the root certificate through KMS `Sign` and stores it as `ROOT_CA_CERT_PEM`; the image bakes it in ([tls](../sandbox/networking/egress/tls/)).
 
 **Prefer not to hand over an admin key?** The setup agent can write a CloudFormation template instead. Deploying it from the console creates the same resources, plus a narrower deploy key to provide in its place.
 
@@ -78,9 +79,9 @@ The provisioning key creates the narrow credentials nest actually runs with:
 ## Generated, not provided
 
 The setup agent creates these itself, so none are needed from me:
-- **Control-plane secrets:** `ADMIN_TOKEN`, `HOST_TOKEN_SECRET`, and the proxy root CA (`ROOT_CA_CERT_PEM`, `ROOT_CA_KEY_PEM`), all random or freshly generated.
+- **Control-plane secrets:** the operator tokens (`observe`, `approve`, `admin`; the Worker keeps only their SHA-256 hashes, and I get the tokens), `HOST_TOKEN_SECRET`, `REVOCATION_COUNTER`, and the root certificate from stage 3, all random or freshly generated (see [API](../control-plane/api/)). Built: one `ADMIN_TOKEN`, and the root key as `ROOT_CA_KEY_PEM` until KMS signing lands.
 - **`AWS_IDENTITY_CERT_PEM`:** AWS's public certificate for verifying instance identity documents, from AWS's docs.
-- **Cloud resources:** the R2 bucket `nest-control`, the cell's S3 bucket with its gateway endpoint, the security group, the launch template and the IAM pieces above.
+- **Cloud resources:** the R2 bucket `nest-control`, the cell's S3 bucket with its gateway endpoint, the security group, the launch template, and the IAM pieces and KMS key above.
 - **Images:** the guest kernel and root filesystem, and the burst-host bootstrap (Amazon Linux 2023, kernel 6.18, Firecracker 1.17+; see [provisioning](../compute/provisioning/)).
 - **Enrollment tokens** for hosts outside AWS.
 
@@ -91,6 +92,7 @@ The setup agent creates these itself, so none are needed from me:
 - **AWS:**
   - a c8i.large spot host is about $0.03/hour, plus about $0.005/hour for its public IPv4;
   - S3 is cents;
+  - the KMS root key is $1/month, plus $0.15 per 10,000 `Sign` calls (one per host enrollment or renewal; not in the free tier, [pricing](https://aws.amazon.com/kms/pricing/));
   - an idle cell costs nothing once its hosts terminate.
 
 ## Cleanup
@@ -98,5 +100,5 @@ The setup agent creates these itself, so none are needed from me:
 - **Claude:** revoke the setup token(s). Where tokens are revoked isn't in the public docs (unverified); stage 1 checks it.
 - **Cloudflare:** delete the API tokens; `wrangler delete` removes the Worker.
 - **GitHub:** delete the App; its key goes with it.
-- **AWS:** terminate every instance tagged `nest=true`, delete the stacks or resources, and deactivate the `nest-provisioner` key. Closing a dedicated account removes everything.
+- **AWS:** terminate every instance tagged `nest=true`, delete the stacks or resources, schedule the root CA key's deletion in KMS, and deactivate the `nest-provisioner` key. Closing a dedicated account removes everything.
 - **Environment settings:** remove the variables.
