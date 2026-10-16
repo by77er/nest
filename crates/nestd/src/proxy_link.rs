@@ -526,10 +526,15 @@ pub(crate) mod tests {
 
     impl FakeProxy {
         pub fn connect(path: &Path) -> FakeProxy {
+            FakeProxy::try_connect(path).unwrap()
+        }
+        /// Like `connect`, but returns the hello's send error: a link that refuses this proxy
+        /// may close the socket before the hello is written.
+        pub fn try_connect(path: &Path) -> io::Result<FakeProxy> {
             let fd = socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::SOCK_CLOEXEC, None).unwrap();
             connect(fd.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
-            fdpass::send(fd.as_fd(), &ProxyEvent::Hello { protocol_version: PROTOCOL_VERSION, proxy_version: "test".into(), pid: 1 }, &[]).unwrap();
-            FakeProxy { fd }
+            fdpass::send(fd.as_fd(), &ProxyEvent::Hello { protocol_version: PROTOCOL_VERSION, proxy_version: "test".into(), pid: 1 }, &[])?;
+            Ok(FakeProxy { fd })
         }
         pub fn recv(&self) -> (ProxyCommand, Vec<OwnedFd>) {
             set_timeout(&self.fd, sockopt::ReceiveTimeout, Some(Duration::from_secs(5))).unwrap();
@@ -726,11 +731,20 @@ pub(crate) mod tests {
         let p1 = FakeProxy::connect(&path);
         assert!(matches!(p1.recv().0, ProxyCommand::HelloAck { .. }));
         let _ = p1.resync();
-        let p2 = FakeProxy::connect(&path);
-        let mut buf = vec![];
-        set_timeout(&p2.fd, sockopt::ReceiveTimeout, Some(Duration::from_secs(5))).unwrap();
-        let r = fdpass::recv::<ProxyCommand>(p2.fd.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY);
-        assert!(matches!(r, Ok(None) | Err(_)), "second proxy must be refused: {r:?}");
+        // The link closes a second proxy at once, which can land before its hello is sent: a
+        // failed send is a refusal too. Otherwise it must read EOF or an error, never a command.
+        match FakeProxy::try_connect(&path) {
+            Err(e) => assert!(
+                matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset),
+                "unexpected hello error: {e}"
+            ),
+            Ok(p2) => {
+                let mut buf = vec![];
+                set_timeout(&p2.fd, sockopt::ReceiveTimeout, Some(Duration::from_secs(5))).unwrap();
+                let r = fdpass::recv::<ProxyCommand>(p2.fd.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY);
+                assert!(matches!(r, Ok(None) | Err(_)), "second proxy must be refused: {r:?}");
+            }
+        }
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o660);
     }
