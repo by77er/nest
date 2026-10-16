@@ -32,5 +32,27 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **Metrics:** hosts send a `metrics` frame on the fleet channel every 60 s; `GET /v1/health` makes one round trip to each DO class (see [metrics](../control-plane/metrics/) and [upgrades](../control-plane/#upgrades)).
 - **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit.
 - **Hands journal:** guest → nestd → AgentDO intent and outcome events keyed by `(agent, epoch, tool_use_id)`.
-- **`GenerationRecord`** gains `restore_abi` and `session{offset, last_tool_use}`.
+- **`GenerationRecord`** gains `restore_abi` (a `sha256:` reference), `reason`, `state` and `session{offset, last_tool_use}`.
+- **Guest protocol version 2** ([host-guest](host-guest/)):
+  - the version range and capabilities;
+  - `flush`, with the error `sync_failed`;
+  - hands `error{call_id?, executed, retry_after_ms}`, with the codes `unsupported`, `duplicate_call` and `unknown_terminal`;
+  - `call_status`, the `heartbeat` frame, `detail.exit` and `calls/<id>.json`;
+  - `pty_attach`, and `terminal_id` and `attach_token` on `accepted`;
+  - `health{drain_log_sites}` and the ready report;
+  - the CLI's `hold{duration_s}` → `{granted_s}`.
+- **nestd ↔ runner:** a `guest{protocol_version, capabilities}` field on `agent_start.hands` and `agent_bind`, and the `claude_version` error. **runner ↔ Claude Code:** the version and SHA-256 check.
+- **nestd ↔ proxy:** `sandbox_upsert{policy, sha256, secrets}`, `secrets_set{version, sha256, secrets}` and a `policy_ack{sandbox, epoch, version, sha256, outcome}` event. New reasons: `dns_non_public`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `injection_out_of_scope` and `injection_upgrade`.
+- **`InjectionBinding`** gains `methods?`, `path_prefix?` and `wildcard?`; header names are checked against the reserved names.
+- **Fleet:**
+  - **Policy:** `policy_update` carries the policy's sha256 and its secrets, and `secrets_update` names the policy version and sha256.
+  - **Placement:** `hello` and `capacity` carry `restore_abis{create, load}`; `sandbox_create` carries the claim's `attempt`; `sandbox_state` reports the guest's hello and ready as evidence.
+  - **Pause and suspend:** a `sandbox_pause` command. Pause and suspend carry `wake_seq` and add the outcomes `superseded` and `busy`; a commit can fail with `guest_flush_failed`.
+  - **Drain:** `drain{mode: gentle|forced}`, and an all-or-nothing `pending_uploads` report with each sandbox's last committed generation.
+  - **Sandboxes:** ingress-guard `activity` events; `base_prepare` and `from: base`; drive rate limits in `resources`.
+  - **CLI and metrics:** `guest_cli` carries `hold`; the metrics frame carries guest log-site counts.
+  - **Agents:** `AgentStart.in_flight_hands`, and journal outcomes from the runner.
+- **Enrollment:** a fixed-shape CSR, and `proxy_ca` is pathLen 0.
+- **Operator API:** scoped tokens, never accepted in URLs; the revocation counter goes into share links, terminal sessions and host tokens.
+- **Channels:** a loss-record kind on `<sbx>/events`. **Tool schema:** a per-tool list of rejected fields in `hands-tools.json`.
 - **Claude Code invocation** (`runner-claude`): `--system-prompt-snapshot off`, `--max-turns` and `--max-budget-usd` from the budget, no `TodoWrite` or `Agent` in `--tools`, `DISABLE_UPDATES=1`, `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` (after verification), auto memory off, and `PreToolUse` answering `defer` for approvals. `SessionStart` also returns the memory key index and the recovery context, from the AgentCache.

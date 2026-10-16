@@ -95,7 +95,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Capability | A pluggable bundle of tools, the grants they need and prompt instructions, listed in spawn specs |
 | Template | A named spawn spec (prompt, capabilities, grants, subscriptions, backend), stored as data |
 | Generation | Immutable manifest of a sandbox's disk (and optionally memory) chunks |
-| Epoch | Fencing token. It increments each time a sandbox's lease is granted. |
+| Epoch | Fencing token. A new one is issued with each placement claim, and only a host holding the newest epoch's lease may act for the sandbox. |
 | Cell | A unit of compute plus its object store (e.g. AWS us-east-1 with S3) |
 | Controller host | A small, always-on, stateless host: nestd (no sandboxes), brains without hands, and the Discord gateway |
 | Burst host | A spot VM with nested virtualization running Firecracker sandboxes (all sandboxes live here) |
@@ -134,8 +134,21 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Taint is tracked per session by the platform; sink calls (egress widening, external brokered actions, MCP tools not marked read-only, `rw` APIs, granting sinks) from a tainted session need approval from me or an untainted holder | [agents/tools/](agents/tools/) |
 | A woken turn gets a platform notice; other agents' message bodies reach a model only as `read` results | [channels/](channels/) |
 | Budgets (depth, concurrency, spawns, turns) shrink like grants and are enforced per owner subtree; quota is divided by priority and the concurrency cap, not by estimated shares | [orchestration/scheduling/](orchestration/scheduling/) |
-| Hands calls are journaled (intent, outcome); after a crash, in-flight calls are reported as unknown, never retried | [agents/hands/](agents/hands/) |
-| Memory snapshots carry a restore ABI and restore only on matching hosts | [sandbox/state/memory/](sandbox/state/memory/) |
+| Hands calls are journaled, with intent written at the point of no return. A refusal before it says `executed: false` and the runner retries it; duplicate call ids are refused. After a crash, outcomes come from the guest's call records, and a call that may have run is never retried | [agents/hands/](agents/hands/) |
+| A hands call ends with its main process (pidfd, 1 s drain, cgroup kill), and a hangup cancels it. Write and Edit replace atomically when safe, otherwise in place | [agents/hands/](agents/hands/) |
+| The host accepts guest protocol versions in `[min_supported, current]`, gating features on capabilities, so a protocol bump doesn't strand memory snapshots | [sandbox/guest-agent/](sandbox/guest-agent/#versions) |
+| Terminals survive a dropped connection for 60 s and reattach by offset; attach tokens never go in URLs | [sandbox/guest-agent/](sandbox/guest-agent/#terminals) |
+| The runner pins one Claude Code version (version and SHA-256); upgrades are gated on `claude-verify`, the hands fidelity eval and resume | [agents/runner/](agents/runner/) |
+| The restore ABI is a SHA-256 over a canonical, versioned descriptor, never inferred from version strings. Hosts advertise the ABIs they can create and load, and an ABI-changing upgrade resumes dormant memory generations disk-only | [sandbox/state/memory/](sandbox/state/memory/#restore-abi) |
+| Firecracker is pinned by binary digest, and memory restore is qualified per (Firecracker, kernel) pair before hosts create memory generations | [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/) |
+| New sandboxes restore a base memory generation per (image, ABI), falling back to cold boot; no warm pools | [sandbox/state/memory/](sandbox/state/memory/#base-generations) |
+| Placement is a fenced claim in SandboxDO: the epoch is issued at claim, completion is one compare-and-set checked against host evidence, an epoch is never retried, and every loss is recorded | [control-plane/durable-objects/sandbox/](control-plane/durable-objects/sandbox/#placement) |
+| One `isRestoreSource` predicate decides resume, the drain gate and GC; deleting a generation is one-way | [sandbox/state/](sandbox/state/#restore-sources) |
+| Turn-end generations are always kept; periodic ones thin by tier | [sandbox/state/](sandbox/state/#retention) |
+| Drains are gentle (consolidation) or forced (spot notices); a host terminates only after it reports, all or nothing, that its uploads are done | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
+| A sandbox pauses, then suspends, only with no agent mid-turn, no live ingress and no hold (`nest hold`) | [control-plane/durable-objects/sandbox/](control-plane/durable-objects/sandbox/#activity-and-idle) |
+| Every commit, pause and suspend requires a guest `syncfs` | [sandbox/state/disk/](sandbox/state/disk/#flush-before-commit) |
+| Per-sandbox disk I/O is limited (10,000 ops/s, 100 MiB/s, 30 s burst) | [sandbox/state/disk/](sandbox/state/disk/#io-limits) |
 | The AWS burst fleet is the 8i family only | [compute/](compute/) |
 | Placement packs by free hugepages | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
@@ -144,6 +157,13 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | No platform API-key proxy; apps bring their own keys | [security/model-access/](security/model-access/) |
 | One session artifact: the native session file, tailed on the host. No proxy decrypts OAuth traffic. | [agents/sessions/](agents/sessions/) |
 | Sandbox credentials are injected at the proxy by placeholder; GitHub through a GitHub App; OIDC deferred | [security/identity/](security/identity/) |
+| Credential bindings name exact hosts (wildcards opt-in), optional methods and whole-segment path prefixes, and allow no upgrade after a substitution | [sandbox/networking/egress/injection/](sandbox/networking/egress/injection/) |
+| Inspected requests have CDN routing overrides stripped and smuggling-shaped framing rejected | [sandbox/networking/egress/inspection/](sandbox/networking/egress/inspection/) |
+| Non-public destinations are hard-denied ahead of any policy, by nest-proxy and by a kernel rule on its uid; denied guest traffic is rejected, not dropped | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/#hard-deny) |
+| A policy change re-checks open connections, and a VM boots only after nest-proxy acknowledges its exact policy | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/#changes) |
+| The proxy root CA key is a non-exportable AWS KMS key; hosts send fixed-shape CSRs for intermediates (pathLen 0, about 7 days); leaves last at most 24 h | [sandbox/networking/egress/tls/](sandbox/networking/egress/tls/) |
+| Operator tokens are scoped, stored hashed and sent only in headers; one revocation counter invalidates every minted session | [control-plane/api/](control-plane/api/) |
+| BrokerDO audits every credential mint, push and refusal; S3 access stays a cell-wide host role | [security/credentials/](security/credentials/) |
 | The netns has no uplink: nestd binds nest-proxy's listeners inside it and passes them over; the proxy is unprivileged | [sandbox/networking/egress/](sandbox/networking/egress/) |
 | Ingress (previews, terminals, port-forwards) goes over vsock through the guest agent | [sandbox/networking/ingress/](sandbox/networking/ingress/) |
 | Reliable channels deliver strictly in order: a gap or a processing failure closes the socket and the sender resends. Each peer process has an `instance_id`; a new one resets the lineage. | [interfaces/control-host/](interfaces/control-host/) |
@@ -170,21 +190,26 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
   `e2e/claude-verify` runs these. Already observed on 2.1.300 without a token: `system/init` arrives only after the first user message, the env scrub keeps `NEST_*` but needs bubblewrap, and the transcript path rule (implemented in `claude::project_dir`). See [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
 
 - **Verify:** that Amazon Linux 2023 ships ublk, which the lazy disk needs. See [compute/provisioning/](compute/provisioning/).
+- **Verify:** that every 8i variant reports the same CPU model (it's part of the restore ABI); that Firecracker's writes pass through the host page cache before ublk; and whether S3 Inventory and lifecycle rules work on S3 Express One Zone directory buckets. See [sandbox/state/](sandbox/state/).
+- **Open:** turn-end generations are always kept, so a long-lived sandbox's history grows without bound; it may need a cap. See [sandbox/state/](sandbox/state/#retention).
+- **Open:** per-sandbox I/O limits don't make a dense host fair when many sandboxes spend their burst at once. See [sandbox/state/disk/](sandbox/state/disk/#io-limits).
+- **Open:** upgrading the guest agent in place by re-exec, which needs a task registry rebuildable from tmpfs. See [sandbox/guest-agent/](sandbox/guest-agent/#versions).
+- **Open:** resolving upstream names with a DNS client instead of getaddrinfo, so TTL and CNAME caps can apply. Which origins honor `X-Forwarded-Host` and similar overrides is unverified (nest strips them regardless). See [sandbox/networking/egress/dns/](sandbox/networking/egress/dns/).
 - **Open:** taint is one bit, so it can't tell sandbox output from outside content; auto-merging agents' PRs relies on keeping outside content from the repo's workers. Recording a taint source would let PRs from sessions that read the web wait for me. See [repo maintenance](orchestration/repo-maintenance/#why-auto-merge-is-safe-enough).
 - **Not designed yet:** the sandbox-to-sandbox **link** (an opt-in path through the proxy). See [sandbox/](sandbox/).
 
 ## First spike
 
 On a c8id with nested virtualization and a hugepage pool:
-1. Cold boot until the guest agent is ready.
+1. Cold boot until the guest agent is ready, against a restore from a base memory generation.
 2. Disk-only resume through `claude --resume`.
-3. Hugepage UFFD resume from page cache, NVMe and S3 Express (no public benchmark of 2 MB UFFD restores exists).
+3. Hugepage UFFD resume from page cache, NVMe and S3 Express (no public benchmark of 2 MB UFFD restores exists). This also qualifies the pinned (Firecracker, guest kernel) pair for memory restore; until it passes, hosts create no memory generations ([restore ABI](sandbox/state/memory/#restore-abi)).
 4. Time to write a full snapshot at 2 and 4 GB.
 5. A dev server's first response after resume.
 6. ublk lazy-disk throughput.
-7. Epoch-flip commit latency under write load.
+7. Commit latency under write load, including the guest flush and the epoch flip.
 8. Forced-partition test: self-fence, then STONITH, then restore.
 9. **First real Claude Code run** through the runner (the verification list above). It needs no KVM, so it runs in the cloud dev environment through the e2e harness, with the token as `NEST_CLAUDE_OAUTH_TOKEN`.
-10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM) and with RPC hands; compare success rate, turns and tokens.
+10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM) and with RPC hands; compare success rate, turns and tokens. The same eval gates every upgrade of the pinned Claude Code version ([runner](agents/runner/)).
 11. **Nested overhead:** CPU and I/O on a nested 8i instance against the same work on `.metal`.
 12. **Resume or fresh:** turn cost and quality when resuming a long session after the cache expired, against a fresh session seeded from memory.

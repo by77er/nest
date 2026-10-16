@@ -77,3 +77,4 @@ CARGO_TARGET_DIR=target/nest-proxy cargo test -p nest-proxy
 - **Bandwidth shaping** lives on the tap device (nestd), not here. Limits enforced here: connection count and inspected request body size.
 - **The upstream resolver** is the host's (getaddrinfo). A dedicated upstream DNS server isn't configurable yet.
 - No **metrics** endpoint. No h2c or HTTP/3 (UDP is blocked by design).
+- **Behind the design** ([egress](../../docs/sandbox/networking/egress/)): routing-override stripping and smuggling checks ([inspection](../../docs/sandbox/networking/egress/inspection/)), policy versions with re-checks of open connections and the `policy_ack`, the hard-deny list, binding `methods`/`path_prefix` and the no-upgrade rule, DNS answer hygiene, and the per-sandbox handshake and leaf-signing limits aren't built.

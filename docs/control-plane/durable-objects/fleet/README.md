@@ -5,7 +5,7 @@ One per cell: hosts, enrollment, leases, placement, drains, STONITH, base genera
 - **Enrollment:**
   - **One-time enrollment token** minted by the operator for a role.
   - **AWS signed identity document**, accepted only for an instance this control plane recorded as launched in this cell, as the recorded role, from the recorded account and region, and only once.
-  - **Order:** the CSR for nest-proxy's intermediate CA is validated before the proof is consumed, so a bad CSR doesn't burn a token.
+  - **Order:** the CSR for nest-proxy's intermediate CA is validated before the proof is consumed, so a bad CSR doesn't burn a token. Only the fixed CSR shape is accepted, and the intermediate is signed with the KMS-held root ([TLS](../../../sandbox/networking/egress/tls/)).
   - **Host tokens** are short-lived and rotated over the fleet channel. A host that was disconnected past expiry can still open the fleet channel for 24 h, and gets a fresh token right after hello.
 - **Fleet channel:** nestd connects here and heartbeats every 5 s, which renews the leases of every sandbox on the host. See [../../../sandbox/fencing/](../../../sandbox/fencing/).
 - **Hello reconciliation:**

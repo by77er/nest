@@ -4,7 +4,7 @@ MCP tools that act on the agent's bound sandbox. `nest mcp` (a stdio shim Claude
 
 | Tool | Modeled on | Semantics |
 |---|---|---|
-| `Bash` | Bash | Per-agent **cwd persists** across calls (exported variables don't: each call is a fresh `bash -c`). Timeouts (default 2 min, max 10), `run_in_background`, output truncation like the built-in. If the cwd disappeared, the command runs in the slot's cwd (or `/`) and the output starts with a `nest:` warning. |
+| `Bash` | Bash | Per-agent **cwd persists** across calls (exported variables don't: each call is a fresh `bash -c`). Timeouts (default 2 min, max 10), `run_in_background` (a running background task holds the sandbox awake; [idle rule](../../control-plane/durable-objects/sandbox/#activity-and-idle)), output truncation like the built-in. If the cwd disappeared, the command runs in the slot's cwd (or `/`) and the output starts with a `nest:` warning. |
 | `TaskOutput` / `TaskStop` | Background shell tools | Poll (optionally blocking) or kill background jobs |
 | `Read` | Read | Line-numbered output, `offset`/`limit`, images as MCP image content, PDFs (`pages`), notebooks. **Regular files only** (FIFOs, sockets and devices are refused; use Bash). Whole-file reads are capped at 256 KB; `offset`/`limit` reads stream and stop counting lines after 1 GiB. |
 | `Write` | Write | **Must read before overwriting**, and **rejected if the file changed since the read** (size or content; an mtime-only change such as `touch` is fine). |
