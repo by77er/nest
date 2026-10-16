@@ -19,7 +19,7 @@ The runner owns the Claude Code process, so it sees the **stream-json output** d
 | Process exit / `SessionEnd` | `detached` |
 | `rate_limit_event` (stream) | parsed but **not used yet** |
 
-**`stalled`:** `working` with no events for N minutes. Check whether a hands exec is still running and using CPU in the agent's sandbox cgroup: if it is, it's a long tool call.
+**`stalled`:** `working` with no events for N minutes. A hands call that's still running keeps sending [heartbeats](../hands/), so check whether it's using CPU in its cgroup (`calls/<call_id>`): if it is, it's a long tool call.
 
 ## Async pipeline
 

@@ -26,7 +26,8 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 - **`--restricted`** (Claude Code 2.1.248+) removes command and code tools and WebFetch unless `--tools` names them, confines file tools to the working directories, loads only managed settings and `--settings`, and refuses `bypassPermissions` ([CLI reference](https://code.claude.com/docs/en/cli-reference)).
 - **`--system-prompt-snapshot off`:** a resumed session otherwise keeps its first request's system prompt until compaction, so template edits wouldn't reach it ([sessions](https://code.claude.com/docs/en/sessions)).
 - **Budget backstop:** the spawn spec's budget also becomes `--max-turns` and `--max-budget-usd` (a client-side estimate). The control plane's budget is the real limit.
-- **Version pinned:** a minimum version checked with `claude --version` at start, and updates off (`DISABLE_UPDATES=1`). The session JSONL is an internal format that "changes between versions" ([sessions](https://code.claude.com/docs/en/sessions)), so resume is tested on every upgrade.
+- **Pinned baseline:** each host release pins one Claude Code version, by version number and the binary's SHA-256, as the supported baseline. The runner checks both at start and refuses anything else, and updates are off (`DISABLE_UPDATES=1`).
+- **Upgrades are gated:** a new baseline is adopted only when the `e2e/claude-verify` probes, the [hands fidelity eval](../../README.md#first-spike) (first-spike item 10) and resuming sessions written by the previous baseline all pass. The session JSONL is an internal format that "changes between versions" ([sessions](https://code.claude.com/docs/en/sessions)).
 - **The working directory is an empty host directory,** so a repo's `.claude/settings.json` hooks and `.mcp.json` can never load. If they did, they would run *on the host*. The repo's CLAUDE.md is passed in as text by our `SessionStart` hook, read through hands.
 - **System prompt:** `--append-system-prompt-file` keeps Claude Code's coding prompt and adds the spawn spec's text, which explains that the hands tools work like the built-ins. A spec with `system_prompt.mode: replace` and no built-ins (the `captain` template, for example) gets `--system-prompt-file` and `--tools ""` instead.
 - **Host-side built-ins are refused** (`Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, …) at start, and a brain whose `system/init` reports one is killed.
@@ -46,7 +47,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 
 ## Lifecycle
 
-- **Start registers first,** then runs the slow steps (session rebuild, `auth status`, `--version`) with timeouts; a fence, stop or lease lapse during startup cancels it. A duplicate `agent_start` never touches the live brain. Starting needs a valid lease.
+- **Start registers first,** then runs the slow steps (session rebuild, `auth status`, the baseline check, the [lookup of in-flight hands calls](../hands/#journal)) with timeouts; a fence, stop or lease lapse during startup cancels it. A duplicate `agent_start` never touches the live brain. Starting needs a valid lease.
 - **Running:** one long-lived process per active agent. Messages written to stdin during a turn are queued; stdin has its own writer task, so a kill never waits on it.
 - **Turn tracking:** each user message (turn or inbox) is counted against `result`s; if a `result` leaves messages outstanding and Claude Code shows no further activity for 10 s, they were merged into that turn.
 - **Interrupt:** the stream-json control message (check for `interrupt_receipt_v1`). Fallback: SIGINT to the Claude Code pid only, then SIGKILL of its process group.

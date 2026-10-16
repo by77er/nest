@@ -25,5 +25,6 @@ claude writes $CLAUDE_CONFIG_DIR/projects/…/<session>.jsonl, plus subagents/ a
 
 - **Claude Code's own interrupted-turn handling first:** on resume, a cut-off tool call is shown to the model as interrupted, with an instruction to check whether it took effect before re-running it ([sessions](https://code.claude.com/docs/en/sessions)). `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` continues the turn automatically ([env vars](https://code.claude.com/docs/en/env-vars)); whether it works under stream-json input is to be verified. The platform's own `recovery` turn is the fallback.
 - **Recovery context:** a `SessionStart` hook adds what the model can't know:
-  - **In-flight hands calls,** from the [hands journal](../hands/#journal), each marked done, failed or unknown.
+  - **In-flight hands calls,** from the [hands journal](../hands/#journal). Each is looked up in the guest's call records at brain start, so it reads as finished (exit status, output path), killed by the hangup (output so far), not started, or, only when the guest lost its records, unknown.
+  - **What changed since:** for each call that didn't finish cleanly, the files modified after its intent, from the guest's [change ledger](../../sandbox/guest-agent/#change-ledger), marked incomplete when the ledger overflowed or doesn't reach back that far.
   - **A workspace rollback:** each sandbox generation records the session offset and last `tool_use` uuid it covers. After a disk-only restore, the notice says which calls after that point may be undone (see [sandbox state](../../sandbox/state/)).

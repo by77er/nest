@@ -31,6 +31,10 @@
 - **Prompt and MCP config** are written into `config_dir` (`nest-system-prompt.md`, `nest-mcp.json`) before spawning.
 - **Hands** go directly from the runner to the guest: connect `vsock_uds_path`, `CONNECT 1025\n` (`guest::PORT_HANDS`), one `HandsRequest` per call. nestd configures the guest's agent slots (`guest::Configure`/`AgentAttach`) before `agent_start`/`agent_bind`.
 
+**Designed** ([pending contract changes](../../README.md#pending-contract-changes)):
+- **Guest version:** `agent_start.hands` and `agent_bind` carry `guest: {protocol_version, capabilities}` from the guest's latest `hello`, and nestd re-sends `agent_bind` when a new hello changes them. The runner stamps that version on every `HandsRequest` and uses only the advertised features ([host-guest](../../host-guest/#versions-v2)).
+- **Start steps:** the `claude --version` step becomes the [baseline check](../runner-claude/#version) (version and SHA-256). A new step looks up the hands calls `start.in_flight_hands` lists (`call_status`, ≤10 s) and sends the results to AgentDO as journal outcomes before Claude Code starts ([hands journal](../../../agents/hands/#journal)).
+
 ## Error codes
 
 Reported in `RunnerEvent::Error` (to nestd) or in an `AgentEventBody::Error` (on the session channel). Codes outside `model::error_codes` are runner-local:
@@ -42,9 +46,10 @@ Reported in `RunnerEvent::Error` (to nestd) or in an `AgentEventBody::Error` (on
 | `forbidden_tool` | `RunnerEvent::Error` | `launch.builtin_tools`, or `system/init.tools`, includes a local exec/file built-in (Bash, Read, Write, Edit, Glob, Grep, NotebookEdit…). The start is refused, or the brain is killed. |
 | `invalid_message` | `RunnerEvent::Error` | An undecodable `RunnerCommand` from nestd. It's skipped; the connection stays up. |
 | `agent_start_failed` | `RunnerEvent::Error` | A startup step failed or timed out (materialize, auth check, spawn). Retryable. |
+| `claude_version` (designed) | `RunnerEvent::Error` | Claude Code isn't the pinned baseline (version or SHA-256). The start is refused (`agent_exited{crashed}`). Not retryable. |
 | `agent_stopping` | `AgentEventBody::Error` | A turn or inbox message arrived after a stop; it isn't delivered. |
 | `stdin` | `AgentEventBody::Error` | Writing to Claude Code's stdin failed. Retryable. |
-| `outcome_unknown` | MCP tool result | A platform call timed out in the runner. The runner sends `cancel_call`; the model is told the call may or may not have taken effect. |
+| `outcome_unknown` | MCP tool result | A platform call timed out in the runner (the runner sends `cancel_call`), or (designed) a hands call went silent. The model is told the call may or may not have taken effect. |
 
 ## Agent start → turn → sync hook → idle exit
 
