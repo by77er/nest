@@ -35,6 +35,8 @@ pub fn proxy_ca_csr(cell: &str) -> anyhow::Result<(Secret, String)> {
 
 /// IMDSv2: session token, then the identity document and its RSA-2048 signature (`rsa2048`: the
 /// CMS/PKCS#7 form the Worker verifies; the legacy `pkcs7` endpoint is DSA and not accepted).
+/// `rsa2048` is already base64 (line-wrapped, possibly PEM-armored): it is sent as-is, joined,
+/// never encoded again.
 pub async fn aws_identity_proof(http: &reqwest::Client, imds_url: &str) -> anyhow::Result<EnrollmentProof> {
     let token = http
         .put(format!("{imds_url}/latest/api/token"))
@@ -50,8 +52,10 @@ pub async fn aws_identity_proof(http: &reqwest::Client, imds_url: &str) -> anyho
     };
     let document = get("document").await?.error_for_status()?.text().await?;
     let pkcs7 = get("rsa2048").await?.error_for_status()?.text().await?;
-    let b64 = base64::engine::general_purpose::STANDARD;
-    Ok(EnrollmentProof::AwsIdentityDocument { document_b64: b64.encode(document), pkcs7_b64: b64.encode(pkcs7.trim()) })
+    let pkcs7_b64: String =
+        pkcs7.lines().filter(|l| !l.starts_with("-----")).flat_map(|l| l.chars().filter(|c| !c.is_whitespace())).collect();
+    base64::engine::general_purpose::STANDARD.decode(&pkcs7_b64).context("IMDS rsa2048 signature is not base64")?;
+    Ok(EnrollmentProof::AwsIdentityDocument { document_b64: base64::engine::general_purpose::STANDARD.encode(document), pkcs7_b64 })
 }
 
 pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
@@ -131,7 +135,8 @@ mod tests {
                         assert!(head.to_ascii_lowercase().contains("x-aws-ec2-metadata-token: imds-token"));
                         "{\"instanceId\":\"i-0abc\"}".to_string()
                     } else if line.contains("/instance-identity/rsa2048") {
-                        "MIIrsa2048".to_string()
+                        // As IMDS serves it: base64 of the DER SignedData, wrapped at 64 columns.
+                        RSA2048_IMDS.to_string()
                     } else if line.starts_with("POST /v1/hosts/enroll") {
                         *seen.lock().unwrap() = Some(serde_json::from_str(body).unwrap());
                         serde_json::json!({
@@ -149,6 +154,9 @@ mod tests {
         });
         (url, seen)
     }
+
+    /// The start of a real CMS SignedData (`30 80 06 09 2a 86 48 86 f7 0d 01 07 02 …`), as IMDS wraps it.
+    const RSA2048_IMDS: &str = "MIAGCSqGSIb3DQEHAqCAMIACAQExDzANBglghkgBZQMEAgEFADCABgkqhkiG9w0B\nBwGggCSABIIB\n";
 
     #[tokio::test]
     async fn enrolls_with_aws_identity_document_and_csr() {
@@ -170,9 +178,11 @@ mod tests {
         assert_eq!(body["proof"]["type"], "aws_identity_document");
         let doc = base64::engine::general_purpose::STANDARD.decode(body["proof"]["document_b64"].as_str().unwrap()).unwrap();
         assert_eq!(doc, b"{\"instanceId\":\"i-0abc\"}");
-        // The rsa2048 signature (not the legacy DSA pkcs7) is what gets sent.
+        // The rsa2048 signature (not the legacy DSA pkcs7) is sent once-encoded: it decodes to the
+        // DER SignedData itself (the Worker parses exactly this), not to IMDS's base64 text.
         let sig = base64::engine::general_purpose::STANDARD.decode(body["proof"]["pkcs7_b64"].as_str().unwrap()).unwrap();
-        assert_eq!(sig, b"MIIrsa2048");
+        assert_eq!(&sig[..4], &[0x30, 0x80, 0x06, 0x09]);
+        assert_eq!(body["proof"]["pkcs7_b64"], RSA2048_IMDS.replace('\n', ""));
         assert!(body["proxy_ca_csr_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE REQUEST"));
     }
 }
