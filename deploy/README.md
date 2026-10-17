@@ -24,6 +24,7 @@ inframe plan --stack use1 -- -out=use1.plan
 inframe apply --stack use1 -- use1.plan
 ```
 
+- **Spot drill:** `aws fis start-experiment --experiment-template-id $(inframe output --stack use1 | jq -r .spot_drill_template_id.value)` sends a real two-minute interruption notice to one running nest spot host. Its role can interrupt only `nest=true` instances (proved in `Cell.Test`).
 - **Once per account:** the EC2 Spot service-linked role (`aws iam create-service-linked-role --aws-service-name spot.amazonaws.com`); without it, spot launches fail with `AuthFailure.ServiceLinkedRoleCreationNotPermitted`.
 - **State** lives in the versioned bucket `nest-tfstate-<account>`, created once by hand (versioning on, public access blocked), with S3-native locking.
 - **The provider pins the account** (`allowed_account_ids`), so credentials for another account fail before any change.
