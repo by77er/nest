@@ -81,8 +81,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 
 - **ublk lazy disk and the copy-on-write epoch flip.** Checkpoints currently pause the VM while chunking.
 - **UFFD memory restore.** Restores from `checkpoint` generations cold-boot from the disk.
-- **The S3 `ObjectStore`.**
-- **Spot interruption handling** (IMDS polling, `spot_notice`).
+- **Garbage collection** of the object store, and the 12 h chunk-reuse rule it depends on. (Built: the S3 `ObjectStore` with parallel transfers, retries, multipart and a capped cache; spot notices from IMDS; resuming with saved host credentials after a restart.)
 - **The preview router.** `port_expose` is recorded only. Nothing on the host uses ingress port 10000 yet: no terminal attach, no `nest port-forward`.
 - **Live forks.** They're disk-only.
 - **Firecracker itself has never run** here (no `/dev/kvm` access): the driver's API calls are unit-tested only.

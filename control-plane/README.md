@@ -87,12 +87,13 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 - **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`; `/v1/health` doesn't reach the DOs yet.
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the root CA key is `ROOT_CA_KEY_PEM`, not a KMS key, and the CSR shape isn't enforced; BrokerDO has no issuance audit.
-- **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, retention, the staged pause/suspend policy and restore-ABI sets aren't built.
-- **Not built:** Discord, the autoscaler (`RunInstances` + `/v1/admin/launched`), the Cloudflare Access
+- **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
+- **Built:** the autoscaler (`AWS_CELLS`: `RunInstances` from the cell's launch template, idle retirement, enroll timeouts).
+- **Not built:** Discord, the Cloudflare Access
   front end, the preview/share Worker routes, the api-loop backend, budgets.
-- **Host-side behavior is driven, not modeled.** Suspend/resume/fork commands exist in the protocol,
-  but the control plane issues only create (including re-place and reassign), destroy and fence;
-  checkpoint, suspend, resume, fork, archive and drain are never sent.
+- **Host-side behavior is driven, not modeled.** The control plane issues create (including re-place
+  and reassign), destroy, fence, suspend (idle and spot drains) and resume (lazy wake); checkpoint,
+  fork, archive and drain are never sent.
 - **Commands aren't batched:** FleetDO sends one `commands` frame per `issueCommands` call.
 - **Delivery semantics to know:** platform tool calls are at least once across an AgentDO eviction
   (a call cut off mid-dispatch runs again when redelivered); a turn cut off by a brain restart comes
