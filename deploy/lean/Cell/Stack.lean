@@ -21,7 +21,8 @@ import Aws.Resource.IamRole
 import Aws.Resource.IamRolePolicy
 import Aws.Resource.IamInstanceProfile
 import Aws.Resource.IamUser
-import Aws.Resource.IamUserPolicy
+import Aws.Resource.IamPolicy
+import Aws.Resource.IamUserPolicyAttachment
 import Aws.Resource.LaunchTemplate
 import Cell.Iam
 
@@ -186,8 +187,10 @@ def cell (spec : CellSpec) : Infra Unit := do
   -- The control plane (FleetDO). Its access key is created out of band and kept as a Worker secret.
   let cp ← IamUser.create "control_plane" { name := lit s!"nest-{spec.name}-control-plane" }
   let templateArn : Input String := template.arn
-  let _ ← IamUserPolicy.create "control_plane_fleet"
-    { name := "fleet", user := cp.name, policy := document (controlPlaneStatements spec templateArn hostRole.arn) }
+  -- A managed policy: the document is over IAM's 2,048-byte limit for inline user policies.
+  let fleet ← IamPolicy.create "control_plane_fleet"
+    { name := lit s!"nest-{spec.name}-fleet", policy := document (controlPlaneStatements spec templateArn hostRole.arn) }
+  let _ ← IamUserPolicyAttachment.create "control_plane_fleet" { user := cp.name, policyArn := fleet.arn }
 
   output "bucket" bucket.id
   output "launch_template_id" template.id
