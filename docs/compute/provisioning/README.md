@@ -27,7 +27,9 @@
 2. FleetDO verifies AWS's signature and checks that **it launched that instance ID** (and account and region) and hasn't enrolled it already.
 3. FleetDO issues a short-lived host token, which rotates over the control WebSocket.
 
-No secrets go in user-data. A host outside AWS (e.g. the controller host on a VPS) enrolls once with a one-time token I mint myself.
+No secrets go in user-data.
+
+**Re-enrollment is open:** an instance may enroll once, and nestd keeps its host token only in memory, so a nestd that restarts on an AWS host can't rejoin; the host sits idle until the autoscaler retires it. Seen on EC2 when nestd panicked after enrolling. Options: persist the host token (root-only, rotated) and reconnect with it, or allow re-enrollment by the same instance while its host isn't dead. A host outside AWS (e.g. the controller host on a VPS) enrolls once with a one-time token I mint myself.
 
 **Instance metadata service (IMDS):** require IMDSv2 with hop limit 1. nest-proxy blocks link-local and private ranges for sandboxes, so a guest can never reach IMDS or the instance role's credentials. A kernel rule on nest-proxy's uid rejects non-public destinations too, so a proxy bug can't reach them either ([kernel backstop](../../sandbox/networking/egress/steering/#kernel-backstop)).
 
