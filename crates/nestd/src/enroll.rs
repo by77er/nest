@@ -93,6 +93,11 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
                 proxy_ca: None,
             });
         }
+        _ if resumable(cfg).is_some() => {
+            let e = resumable(cfg).expect("checked");
+            tracing::info!(host = %e.host, "resuming with saved host credentials");
+            return Ok(e);
+        }
         EnrollmentConfig::TokenFile { path } => {
             let token = std::fs::read_to_string(path).with_context(|| format!("read enrollment token {}", path.display()))?;
             EnrollmentProof::EnrollmentToken { token: token.trim().to_string() }
@@ -108,13 +113,30 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
         bail!("enrollment rejected: {status} {}", resp.text().await.unwrap_or_default());
     }
     let r: EnrollResponse = resp.json().await.context("enrollment response")?;
-    Ok(Enrolled {
+    // The fleet channel carries every command: never let an enrollment answer point it elsewhere.
+    if url_host(&r.fleet_ws_url) != url_host(&cfg.control_url) {
+        bail!("enrollment returned fleet_ws_url {} on a different host than {}", r.fleet_ws_url, cfg.control_url);
+    }
+    let e = Enrolled {
         host: r.host,
         host_token: Secret(r.host_token),
         host_token_expires_ms: r.host_token_expires_ms,
         fleet_ws_url: r.fleet_ws_url,
         proxy_ca: Some((r.proxy_ca, key)),
-    })
+    };
+    // Without these a restarted nestd couldn't rejoin: AWS instances enroll once.
+    crate::credentials::save(&cfg.credentials_path(), &cfg.control_url, &cfg.cell, &e).context("save host credentials")?;
+    Ok(e)
+}
+
+fn resumable(cfg: &Config) -> Option<Enrolled> {
+    crate::credentials::load(&cfg.credentials_path(), &cfg.control_url, &cfg.cell, crate::util::now_ms())
+}
+
+/// The authority (host and port) of a URL, lowercased.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or_default().to_ascii_lowercase()
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -131,14 +153,21 @@ mod tests {
 
     /// Tiny HTTP server: IMDSv2 endpoints + `POST /v1/hosts/enroll` (records the body).
     async fn mock_server() -> (String, Arc<Mutex<Option<serde_json::Value>>>) {
+        mock_server_with(None).await
+    }
+
+    /// `fleet_ws_url` defaults to this server's own address (as a real control plane answers).
+    async fn mock_server_with(fleet_ws_url: Option<&str>) -> (String, Arc<Mutex<Option<serde_json::Value>>>) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
+        let fleet = fleet_ws_url.map_or_else(|| format!("{}/v1/fleet", url.replace("http://", "ws://")), str::to_string);
         let seen = Arc::new(Mutex::new(None));
         let seen2 = seen.clone();
         tokio::spawn(async move {
             loop {
                 let (mut s, _) = l.accept().await.unwrap();
                 let seen = seen2.clone();
+                let fleet = fleet.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     let mut n = 0;
@@ -166,8 +195,8 @@ mod tests {
                     } else if line.starts_with("POST /v1/hosts/enroll") {
                         *seen.lock().unwrap() = Some(serde_json::from_str(body).unwrap());
                         serde_json::json!({
-                            "host": "hst_new", "host_token": "tok", "host_token_expires_ms": 123,
-                            "fleet_ws_url": "wss://cp/v1/fleet",
+                            "host": "hst_new", "host_token": "tok", "host_token_expires_ms": 4_102_444_800_000i64,
+                            "fleet_ws_url": fleet,
                             "proxy_ca": {"cert_pem": "CERT", "chain_pem": "CHAIN", "expires_ms": 456}
                         }).to_string()
                     } else {
@@ -184,6 +213,41 @@ mod tests {
     /// The start of a real CMS SignedData (`30 80 06 09 2a 86 48 86 f7 0d 01 07 02 …`), as IMDS wraps it.
     const RSA2048_IMDS: &str = "MIAGCSqGSIb3DQEHAqCAMIACAQExDzANBglghkgBZQMEAgEFADCABgkqhkiG9w0B\nBwGggCSABIIB\n";
 
+    fn aws_config(url: &str, state_dir: &std::path::Path) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "role": "burst", "cell": "aws-us-east-1", "control_url": url,
+            "enrollment": {"type": "aws_imds", "imds_url": url},
+            "driver": {"type": "process", "guest_command": ["x"]},
+            "state_dir": state_dir,
+        }))
+        .unwrap()
+    }
+
+    /// A restarted nestd rejoins with its saved credentials instead of enrolling again (an AWS
+    /// instance may enroll only once).
+    #[tokio::test]
+    async fn a_restart_resumes_with_saved_credentials() {
+        let (url, seen) = mock_server().await;
+        let state = tempfile::tempdir().unwrap();
+        let cfg = aws_config(&url, state.path());
+        let first = enroll(&cfg).await.unwrap();
+        assert!(seen.lock().unwrap().take().is_some(), "the first start enrolls");
+        let again = enroll(&cfg).await.unwrap();
+        assert!(seen.lock().unwrap().is_none(), "a restart must not enroll again");
+        assert_eq!((again.host.0.as_str(), again.host_token.expose()), (first.host.0.as_str(), first.host_token.expose()));
+        assert_eq!(again.proxy_ca.unwrap().1.expose(), first.proxy_ca.unwrap().1.expose());
+    }
+
+    /// An enrollment answer can't point the command channel at another host.
+    #[tokio::test]
+    async fn refuses_a_fleet_url_on_another_host() {
+        let (url, _) = mock_server_with(Some("wss://elsewhere.example/v1/fleet")).await;
+        let state = tempfile::tempdir().unwrap();
+        let err = enroll(&aws_config(&url, state.path())).await.unwrap_err();
+        assert!(err.to_string().contains("different host"), "{err:#}");
+        assert!(!state.path().join("host-credentials.json").exists());
+    }
+
     #[tokio::test]
     async fn reads_the_spot_interruption_deadline() {
         let (url, _) = mock_server().await;
@@ -194,16 +258,12 @@ mod tests {
     #[tokio::test]
     async fn enrolls_with_aws_identity_document_and_csr() {
         let (url, seen) = mock_server().await;
-        let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "aws-us-east-1", "control_url": url,
-            "enrollment": {"type": "aws_imds", "imds_url": url},
-            "driver": {"type": "process", "guest_command": ["x"]},
-        }))
-        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let cfg = aws_config(&url, state.path());
         assert!(matches!(cfg.driver, DriverConfig::Process { .. }));
         let e = enroll(&cfg).await.unwrap();
         assert_eq!(e.host.0, "hst_new");
-        assert_eq!(e.fleet_ws_url, "wss://cp/v1/fleet");
+        assert_eq!(e.fleet_ws_url, format!("{}/v1/fleet", url.replace("http://", "ws://")));
         let (ca, key) = e.proxy_ca.unwrap();
         assert_eq!(ca.cert_pem, "CERT");
         assert!(key.0.contains("PRIVATE KEY"));

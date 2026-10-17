@@ -390,11 +390,35 @@ export class FleetDO extends DurableObject<Env> {
     }
     await this.reconcileSandboxes(att.host, hello.sandboxes);
     const reported = new Map(hello.sandboxes.map((s) => [s.sandbox, s]));
-    if (newProcess) await this.failPendingCommands(att.host, "host process restarted before running this command", reported);
+    if (newProcess) {
+      // What the old process never answered, captured before re-placement issues anything new.
+      const pending = new Set(this.sql.exec<{ cmd: string }>("SELECT cmd FROM commands WHERE host = ? AND result IS NULL", att.host).toArray().map((r) => r.cmd));
+      await this.dropUnreported(att.host, reported);
+      await this.failPendingCommands(att.host, "host process restarted before running this command", reported, pending);
+    }
     await this.reconcileAgents(att.host, hello.agents);
     // A host whose leases we expired came back: it must fence them before we reassign (STONITH by fence).
     await this.ensureStonithFence(att.host);
     await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
+  }
+
+  /**
+   * A new nestd process on this host (a restart) reported its sandboxes; one we leased to the host
+   * that it doesn't report is gone with the old process, so it can't run twice. A suspended one is
+   * evicted (it wakes lazily); any other is placed again from its head.
+   */
+  private async dropUnreported(host: string, reported: Map<string, SandboxReport>): Promise<void> {
+    const gone = this.leasesOf(host).filter((l) => !l.expired && !reported.has(l.sandbox));
+    if (!gone.length) return;
+    // Their unanswered commands died with the old process; close them without the retries a
+    // failure would trigger (the sandbox is placed again below, under a new epoch).
+    const closed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, "sandbox lost with the old host process", false) });
+    for (const l of gone) {
+      this.sql.exec("UPDATE commands SET result = ?, result_ms = ? WHERE host = ? AND sandbox = ? AND result IS NULL", closed, Date.now(), host, l.sandbox);
+    }
+    console.warn(`FleetDO: ${host} restarted without ${gone.map((l) => l.sandbox).join(", ")}`);
+    await this.evict(host, gone.filter((l) => l.state === "suspended").map((l) => l.sandbox));
+    await this.queueReassign(host, gone.filter((l) => l.state !== "suspended").map((l) => l.sandbox), false);
   }
 
   /** Fence what we don't honor; take the reported state of what we do (e.g. after a nestd restart). */
@@ -564,11 +588,12 @@ export class FleetDO extends DurableObject<Env> {
    * Fail every command still awaiting a result on `host` (retryable). A `sandbox_create` the new
    * process reports running anyway is completed instead.
    */
-  private async failPendingCommands(host: string, message: string, reported = new Map<string, SandboxReport>()): Promise<void> {
+  private async failPendingCommands(host: string, message: string, reported = new Map<string, SandboxReport>(), only?: Set<string>): Promise<void> {
     const pending = this.sql
       .exec<{ cmd: string; type: string; sandbox: string | null; epoch: number | null }>(
         "SELECT cmd, type, sandbox, epoch FROM commands WHERE host = ? AND result IS NULL ORDER BY issued_ms", host)
-      .toArray();
+      .toArray()
+      .filter((c) => !only || only.has(c.cmd));
     for (const c of pending) {
       const r = c.sandbox ? reported.get(c.sandbox) : undefined;
       const done = c.type === "sandbox_create" && r && r.epoch === c.epoch;
