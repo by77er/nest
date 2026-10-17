@@ -187,7 +187,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Open:** upgrading the guest agent in place by re-exec, which needs a task registry rebuildable from tmpfs. See [sandbox/guest-agent/](sandbox/guest-agent/#versions).
 - **Open:** resolving upstream names with a DNS client instead of getaddrinfo, so TTL and CNAME caps can apply. Which origins honor `X-Forwarded-Host` and similar overrides is unverified (nest strips them regardless). See [sandbox/networking/egress/dns/](sandbox/networking/egress/dns/).
 - **Open:** taint is one bit, so it can't tell sandbox output from outside content; auto-merging agents' PRs relies on keeping outside content from the repo's workers. Recording a taint source would let PRs from sessions that read the web wait for me. See [repo maintenance](orchestration/repo-maintenance/#why-auto-merge-is-safe-enough).
-- **Verify:** whether `--resume` continues a Task-tool subagent that was mid-run when the brain died, or the parent re-runs it. See [agents/sessions/](agents/sessions/#after-a-crash).
+- **Open:** Claude Code 2.1.301 names the Task tool `Agent`, and the default worker rules escalate it, so a default worker's subagents wait for approval although its launch enables them. Allowing `Agent` by default is a security call. See [agents/sessions/](agents/sessions/#after-a-crash).
 - **Not designed yet:** the sandbox-to-sandbox **link** (an opt-in path through the proxy). See [sandbox/](sandbox/).
 
 ## First spike
