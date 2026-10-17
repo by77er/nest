@@ -1323,6 +1323,14 @@ mod tests {
         assert!(keys.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(!keys.iter().any(|k| k.starts_with("ANTHROPIC_")), "no ANTHROPIC_* may be set");
         assert!(!keys.contains(&"HTTPS_PROXY"), "brains are not proxied");
+        // AgentDO's recovery turn is the one way an interrupted turn continues; Claude Code's own
+        // auto-continue would run it a second time.
+        assert!(!keys.contains(&"CLAUDE_CODE_RESUME_INTERRUPTED_TURN"));
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/claude-code/managed-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(settings.get("env").and_then(|e| e.get("CLAUDE_CODE_RESUME_INTERRUPTED_TURN")).is_none());
     }
 
     #[test]

@@ -274,16 +274,20 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (req.method === "GET" && !p[2]) return json(await a.info());
     if (req.method === "GET" && p[2] === "/turns") return json(await a.turns());
     if (req.method === "GET" && p[2] === "/transcript" && url.searchParams.has("since")) {
-      return json(await a.readTranscript(num(url.searchParams.get("since") ?? undefined, 0), num(url.searchParams.get("limit") ?? undefined, 200)));
+      const base = url.searchParams.get("base");
+      return json(await a.readTranscript(num(url.searchParams.get("since") ?? undefined, 0), num(url.searchParams.get("limit") ?? undefined, 200),
+        base === null ? undefined : num(base, 0)));
     }
     if (req.method === "GET" && p[2] === "/transcript") return new Response(await a.transcript(), { headers: { "content-type": "application/x-ndjson" } });
     if (req.method === "POST" && p[2] === "/turns") {
-      const r = await body(req, z.object({ text: z.string(), kind: z.enum(["user", "recovery"]).default("user") }));
-      return json({ turn: await a.enqueueTurn({ kind: r.kind, text: r.text }) }, 201);
+      const r = await body(req, z.object({ text: z.string(), kind: z.enum(["user", "recovery"]).default("user"), request_id: RequestIdField }));
+      return json({ turn: await a.enqueueTurn({ kind: r.kind, text: r.text }, requestId(req, r.request_id)) }, 201);
     }
     if (req.method === "POST" && p[2] === "/inbox") {
-      const r = await body(req, z.object({ text: z.string(), from: z.string().default("user"), interrupt: z.boolean().default(false) }));
-      return json({ message: await a.postInbox(r.from, r.text, r.interrupt) }, 201);
+      const r = await body(req, z.object({
+        text: z.string(), from: z.string().default("user"), interrupt: z.boolean().default(false), request_id: RequestIdField,
+      }));
+      return json({ message: await a.postInbox(r.from, r.text, r.interrupt, requestId(req, r.request_id)) }, 201);
     }
     if (req.method === "POST" && p[2] === "/interrupt") {
       await a.interrupt();
@@ -306,6 +310,15 @@ async function route(req: Request, env: Env): Promise<Response> {
   }
 
   throw new NestError(ErrorCodes.INVALID_MESSAGE, `no route for ${req.method} ${path}`, 404);
+}
+
+/** A client's id for a submission (body `request_id` or `Idempotency-Key`): a retry with it is applied once. */
+const RequestIdField = z.string().min(1).max(128).optional();
+function requestId(req: Request, fromBody: string | undefined): string | undefined {
+  const header = req.headers.get("idempotency-key") ?? undefined;
+  const id = fromBody ?? header;
+  if (id !== undefined && (id.length === 0 || id.length > 128)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "request id must be 1-128 characters");
+  return id === undefined ? undefined : `api/${id}`;
 }
 
 export default {

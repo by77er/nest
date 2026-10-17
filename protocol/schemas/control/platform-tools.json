@@ -219,6 +219,10 @@
           "type": "integer",
           "description": "Return entries after this 1-based entry number (a line of the session JSONL)."
         },
+        "base": {
+          "type": "integer",
+          "description": "The base a previous call returned with since_seq. If the transcript was rewritten since, the reply starts again from entry 1 and says reset."
+        },
         "limit": {
           "type": "integer",
           "description": "Max entries (default 200)."

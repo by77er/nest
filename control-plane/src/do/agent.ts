@@ -17,7 +17,7 @@ import {
   type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
-  type AgentEvent, type AgentRole, type AgentState, type CliCommand, type CliResult, ErrorCodes, PROTOCOL_VERSION,
+  type AgentEvent, type AgentRole, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
   type TaskInfo, type WorkstreamEvent,
 } from "../protocol/model";
 
@@ -46,6 +46,9 @@ const TRANSCRIPT_DEFAULT_LIMIT = 200;
 const TRANSCRIPT_MAX_LIMIT = 500;
 const TRANSCRIPT_MAX_BYTES = 256 * 1024;
 const EMIT_EVENTS = ["progress", "blocked", "pr_opened", "completed", "failed"] as const;
+/** Separates a recovery turn's notes from the original turn's text. */
+const RECOVERY_MARK = "\nThe turn was:\n";
+const iso = (ms: number) => new Date(ms).toISOString();
 
 export const DEFAULT_RULES: ToolRule[] = [{ pattern: "mcp__nest__*", decision: "allow" }];
 export const DEFAULT_WORKER_LAUNCH: LaunchConfig = {
@@ -96,6 +99,10 @@ export interface AgentInfo {
   exit_restarts?: number;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
   capabilities?: string[];
+  /** When the transcript was last made durable (a recovery turn says where it ends). */
+  durable_ms?: number;
+  /** When the bound sandbox last moved to a new lease (it was restored from its head). */
+  hands_moved_ms?: number;
 }
 
 export interface CreateAgent {
@@ -125,6 +132,10 @@ export interface TranscriptPage {
   /** Entry number (1-based JSONL line) of the last line returned, or `since_seq` if none. */
   next_seq: number;
   more: boolean;
+  /** The transcript base the entry numbers belong to. A rewrite (compaction trim, new session) starts a new one. */
+  base: number;
+  /** The caller's cursor was for another base: this page starts again from entry 1. */
+  reset?: boolean;
 }
 
 export class AgentDO extends DurableObject<Env> {
@@ -154,6 +165,12 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS seg_buffer (base INTEGER NOT NULL, offset INTEGER NOT NULL, data BLOB NOT NULL,
       PRIMARY KEY (base, offset))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
+    // Idempotent admission: a retried submission with the same request id gets the same turn / message.
+    this.addColumn("turns", "request_id", "TEXT");
+    this.addColumn("turns", "started_ms", "INTEGER");
+    this.addColumn("inbox", "request_id", "TEXT");
+    this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS turns_request ON turns (request_id) WHERE request_id IS NOT NULL");
+    this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS inbox_request ON inbox (request_id) WHERE request_id IS NOT NULL");
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
   }
@@ -161,6 +178,11 @@ export class AgentDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------------------------------
+
+  private addColumn(table: string, column: string, type: string): void {
+    const cols = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
+    if (!cols.some((c) => c.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
 
   private load(): AgentInfo {
     const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0];
@@ -406,6 +428,7 @@ export class AgentDO extends DurableObject<Env> {
       i.hands = { sandbox, epoch };
       i.host = null;
       i.start_attempts = 0;
+      i.hands_moved_ms = Date.now();
     });
     for (const ws of this.ctx.getWebSockets("session")) {
       ws.serializeAttachment({ ...(ws.deserializeAttachment() as Attachment), helloed: false, stale: true });
@@ -617,7 +640,7 @@ export class AgentDO extends DurableObject<Env> {
       if (i.state === "starting" || i.state === "detached" || i.state === "errored") i.state = "ready";
     });
     this.sql.exec("DELETE FROM seg_buffer WHERE base < ?", info.recv_base);
-    if (recovered) this.requeueAsRecovery(recovered);
+    if (recovered) await this.requeueAsRecovery(recovered);
 
     this.send(ws, {
       type: "hello_ack",
@@ -631,18 +654,43 @@ export class AgentDO extends DurableObject<Env> {
     await this.pump();
   }
 
-  /** A turn whose brain restarted mid-turn comes back first, as a recovery turn. */
-  private requeueAsRecovery(turn: string): void {
-    const row = this.sql.exec<{ input: string }>("SELECT input FROM turns WHERE turn = ?", turn).toArray()[0];
+  /**
+   * A turn whose brain restarted mid-turn comes back first, as a recovery turn: the one way an
+   * interrupted turn continues (the runner never sets `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`, so the two
+   * can't both continue it). It says what the model can't know from its transcript: where the durable
+   * transcript ends (actions after that may have taken effect without appearing in it), and whether the
+   * sandbox was restored from a saved generation meanwhile (changes after that are gone).
+   */
+  private async requeueAsRecovery(turn: string): Promise<void> {
+    const row = this.sql.exec<{ input: string; started_ms: number | null; created_ms: number }>(
+      "SELECT input, started_ms, created_ms FROM turns WHERE turn = ?", turn).toArray()[0];
     this.sql.exec("UPDATE turns SET status = 'interrupted' WHERE turn = ?", turn);
     if (!row) return;
     const orig = JSON.parse(row.input) as TurnInput;
+    // A recovery turn that is itself interrupted keeps the original turn's text.
+    const mark = orig.kind === "recovery" ? orig.text.indexOf(RECOVERY_MARK) : -1;
+    const original = mark >= 0 ? orig.text.slice(mark + RECOVERY_MARK.length) : orig.text;
+    const info = this.load();
+    const notes = ["Your session restarted while you were working on a turn."];
+    if (info.durable_ms) {
+      notes.push(`Your saved transcript ends at ${iso(info.durable_ms)}. Anything you did after that may be missing from it but may still have taken effect: check the workspace (e.g. git status) before redoing work.`);
+    }
+    const started = row.started_ms ?? row.created_ms;
+    if (info.hands && (info.hands_moved_ms ?? 0) >= started) {
+      let head: GenerationRecord | null = null;
+      try {
+        head = await this.sandboxStub(info.hands.sandbox).headGeneration();
+      } catch (e) {
+        console.warn(`agent ${info.agent}: reading the sandbox head failed`, e);
+      }
+      notes.push(head
+        ? `Your sandbox moved to another machine and was restored from its state saved at ${iso(head.created_ms)}${head.kind === "disk_only" ? "; running processes stopped" : ""}. File changes after that were lost.`
+        : "Your sandbox moved to another machine; it may have lost recent file changes and running processes.");
+    }
+    notes.push("If the turn isn't finished, continue it.");
     const ord = (this.sql.exec<{ m: number | null }>("SELECT MIN(ord) AS m FROM turns").toArray()[0]?.m ?? 0) - 1;
     this.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES (?, ?, ?, 'queued', ?)",
-      newId("trn_"), ord, JSON.stringify({
-        kind: "recovery",
-        text: `Your session restarted while you were working on a turn. If it isn't finished, continue it. The turn was:\n${orig.text}`,
-      } satisfies TurnInput), Date.now());
+      newId("trn_"), ord, JSON.stringify({ kind: "recovery", text: `${notes.join(" ")}${RECOVERY_MARK}${original}` } satisfies TurnInput), Date.now());
   }
 
   // --- session segments ---------------------------------------------------------------------------
@@ -722,6 +770,7 @@ export class AgentDO extends DurableObject<Env> {
     const after = this.update((i) => {
       if (i.recv_base !== base) return; // a newer stream started meanwhile; this one is superseded
       i.recv_durable = Math.max(i.recv_durable, start + bytes.length);
+      i.durable_ms = Date.now();
       if (i.base_gen === base) {
         i.durable_bytes = i.recv_durable;
       } else if (i.recv_durable >= i.received_bytes) {
@@ -759,8 +808,13 @@ export class AgentDO extends DurableObject<Env> {
    * Entries (1-based JSONL lines of the committed base) after `since`, streamed segment by segment:
    * never more than `limit` entries or about 256 KiB.
    */
-  async readTranscript(since = 0, limit = TRANSCRIPT_DEFAULT_LIMIT): Promise<TranscriptPage> {
+  async readTranscript(since = 0, limit = TRANSCRIPT_DEFAULT_LIMIT, base?: number): Promise<TranscriptPage> {
     const info = this.load();
+    // A cursor from another base would skip or repeat entries: start the new base from the top.
+    const reset = base !== undefined && base !== info.base_gen && since > 0;
+    if (reset) since = 0;
+    const page = (lines: string[], next_seq: number, more: boolean): TranscriptPage =>
+      ({ lines, next_seq, more, base: info.base_gen, ...(reset ? { reset } : {}) });
     const max = Math.max(1, Math.min(limit, TRANSCRIPT_MAX_LIMIT));
     const rows = this.sql
       .exec<{ key: string }>("SELECT key FROM segments WHERE base = ? AND offset < ? ORDER BY offset", info.base_gen, info.durable_bytes)
@@ -783,10 +837,10 @@ export class AgentDO extends DurableObject<Env> {
       if (!obj) continue;
       const parts = (carry + decoder.decode(new Uint8Array(await obj.arrayBuffer()), { stream: true })).split("\n");
       carry = parts.pop() ?? "";
-      for (const p of parts) if (take(p)) return { lines, next_seq: n, more: true };
+      for (const p of parts) if (take(p)) return page(lines, n, true);
     }
     take(carry + decoder.decode());
-    return { lines, next_seq: lines.length ? n : since, more: false };
+    return page(lines, lines.length ? n : since, false);
   }
 
   // --- events ---------------------------------------------------------------------------------------
@@ -868,10 +922,16 @@ export class AgentDO extends DurableObject<Env> {
   // Turns, inbox, interrupt, caches
   // ---------------------------------------------------------------------------------------------
 
-  async enqueueTurn(input: TurnInput): Promise<string> {
+  /** Queue a turn. A retried submission with the same `requestId` gets the same turn, queued once. */
+  async enqueueTurn(input: TurnInput, requestId?: string): Promise<string> {
+    if (requestId) {
+      const prior = this.sql.exec<{ turn: string }>("SELECT turn FROM turns WHERE request_id = ?", requestId).toArray()[0];
+      if (prior) return prior.turn;
+    }
     const turn = newId("trn_");
     const ord = (this.sql.exec<{ m: number | null }>("SELECT MAX(ord) AS m FROM turns").toArray()[0]?.m ?? 0) + 1;
-    this.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES (?, ?, ?, 'queued', ?)", turn, ord, JSON.stringify(input), Date.now());
+    this.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, 'queued', ?, ?)",
+      turn, ord, JSON.stringify(input), Date.now(), requestId ?? null);
     await this.pump();
     await this.wake();
     return turn;
@@ -885,7 +945,7 @@ export class AgentDO extends DurableObject<Env> {
       .toArray()[0];
     if (!next) return;
     // Synchronous from the check above: no other pump can claim a turn in between.
-    this.sql.exec("UPDATE turns SET status = 'active' WHERE turn = ?", next.turn);
+    this.sql.exec("UPDATE turns SET status = 'active', started_ms = ? WHERE turn = ?", Date.now(), next.turn);
     const info = this.update((i) => {
       i.current_turn = next.turn;
       i.state = "working";
@@ -906,18 +966,23 @@ export class AgentDO extends DurableObject<Env> {
    * Mid-turn: delivered over stdin (and mirrored for the Stop hook). Between turns: becomes the next
    * `inbox` turn. `interrupt` interrupts the running turn first.
    */
-  async postInbox(from: string, text: string, interrupt = false): Promise<string> {
+  /** A retried post with the same `requestId` gets the same message, delivered once. */
+  async postInbox(from: string, text: string, interrupt = false, requestId?: string): Promise<string> {
+    if (requestId) {
+      const prior = this.sql.exec<{ id: string }>("SELECT id FROM inbox WHERE request_id = ?", requestId).toArray()[0];
+      if (prior) return prior.id;
+    }
     const info = this.load();
     const message: InboxMessage = { id: newId("msg_"), from, text, interrupt, ts_ms: Date.now() };
     if (info.current_turn) {
-      this.sql.exec("INSERT INTO inbox (id, message, turn, status, created_ms) VALUES (?, ?, ?, 'delivered', ?)",
-        message.id, JSON.stringify(message), info.current_turn, Date.now());
+      this.sql.exec("INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, 'delivered', ?, ?)",
+        message.id, JSON.stringify(message), info.current_turn, Date.now(), requestId ?? null);
       this.pushReliable((seq) => ({ type: "inbox", seq, message }));
       this.pushCache();
     } else {
-      this.sql.exec("INSERT INTO inbox (id, message, turn, status, created_ms) VALUES (?, ?, NULL, 'consumed', ?)",
-        message.id, JSON.stringify(message), Date.now());
-      await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` });
+      this.sql.exec("INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, NULL, 'consumed', ?, ?)",
+        message.id, JSON.stringify(message), Date.now(), requestId ?? null);
+      await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`);
     }
     return message.id;
   }
@@ -958,7 +1023,8 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * In order with the runner's other reliable messages. The call's seq is marked processed only after
    * the call ran (or is waiting for an ask), so a call cut short by an eviction is redelivered and run
-   * again: platform tools are at-least-once across evictions, exactly-once otherwise.
+   * again. Every write a tool makes to another object carries the key `<agent>/<epoch>/<call>`, which
+   * the target applies once, so a re-run repeats no side effect.
    */
   private async onToolCall(ws: WebSocket, att: Attachment, call: Extract<RunnerToAgent, { type: "tool_call" }>): Promise<void> {
     if (att.stale) {
@@ -1050,13 +1116,15 @@ export class AgentDO extends DurableObject<Env> {
     }
     const a = validateArgs(def.input_schema, args);
     const text = (t: string): ToolOutcome => ({ status: "ok", content: [{ type: "text", text: t }] });
+    // Idempotency key for this call's writes to other objects (see onToolCall).
+    const key = `${info.agent}/${epoch}/${call}`;
 
     switch (name) {
       case "notify": {
         const to = String(a.to);
         const message = String(a.message);
         if (to === "user") {
-          await this.workstream(info.workstream).notifyUser(message, a.urgency === "high" ? "high" : "normal");
+          await this.workstream(info.workstream).notifyUser(message, a.urgency === "high" ? "high" : "normal", key);
         } else {
           const wsCaptain = (await this.workstream(info.workstream).info()).captain;
           const target = to === "captain" ? info.captain ?? wsCaptain : to;
@@ -1067,7 +1135,7 @@ export class AgentDO extends DurableObject<Env> {
             const other = await stub.info();
             if (other.workstream !== info.workstream) throw new NestError(ErrorCodes.FORBIDDEN, `${target} is in another workstream`, 403);
           }
-          await stub.postInbox(`${info.role}:${info.agent}`, message);
+          await stub.postInbox(`${info.role}:${info.agent}`, message, false, key);
         }
         return text(`Delivered to ${to}.`);
       }
@@ -1089,7 +1157,7 @@ export class AgentDO extends DurableObject<Env> {
             break;
           default: throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown event ${String(a.event)}`);
         }
-        await this.workstream(info.workstream).ingest(event);
+        await this.workstream(info.workstream).ingest(event, key);
         return text(`Recorded ${event.type}.`);
       }
       case "ask": {
@@ -1103,20 +1171,21 @@ export class AgentDO extends DurableObject<Env> {
         const target = String(a.agent);
         const since = typeof a.since_seq === "number" ? Math.max(0, a.since_seq) : 0;
         const limit = typeof a.limit === "number" ? a.limit : TRANSCRIPT_DEFAULT_LIMIT;
+        const base = typeof a.base === "number" ? a.base : undefined;
         let page: TranscriptPage;
         if (target === info.agent) {
-          page = await this.readTranscript(since, limit);
+          page = await this.readTranscript(since, limit, base);
         } else {
           const stub = this.env.AGENT.get(this.env.AGENT.idFromName(target));
           const other = await stub.info();
           if (other.workstream !== info.workstream) throw new NestError(ErrorCodes.FORBIDDEN, "transcript is in another workstream", 403);
-          page = await stub.readTranscript(since, limit);
+          page = await stub.readTranscript(since, limit, base);
         }
         return {
           status: "ok",
           content: [
             { type: "text", text: page.lines.join("\n") },
-            { type: "json", value: { entries: page.lines.length, next_seq: page.next_seq, more: page.more } },
+            { type: "json", value: { entries: page.lines.length, next_seq: page.next_seq, more: page.more, base: page.base, ...(page.reset ? { reset: true } : {}) } },
           ],
         };
       }
@@ -1143,18 +1212,21 @@ export class AgentDO extends DurableObject<Env> {
   private async postAsk(
     info: AgentInfo, call: string, epoch: number, question: string, status: "sync" | "cli" | "async", to: "captain" | "user",
   ): Promise<string> {
+    // Re-run for the same call (after an eviction): the question is already out.
+    const prior = this.sql.exec<{ ask: string }>("SELECT ask FROM asks WHERE call = ? AND epoch = ?", call, epoch).toArray()[0];
+    if (prior) return prior.ask;
     const ask = newId("ask_");
     const deadline = Date.now() + num(this.env.ASK_SYNC_WINDOW_MS, 120_000);
     this.sql.exec("INSERT INTO asks (ask, call, epoch, question, status, deadline, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
       ask, call, epoch, question, status, deadline, Date.now());
     if (status === "sync") await this.deadlines.set(`ask:${ask}`, deadline);
     if (to === "user") {
-      await this.workstream(info.workstream).notifyUser(`[${ask}] ${info.agent} asks: ${question}`, "high");
+      await this.workstream(info.workstream).notifyUser(`[${ask}] ${info.agent} asks: ${question}`, "high", `${info.agent}/${ask}`);
     } else {
       await this.workstream(info.workstream).ingest({
         workstream: info.workstream, ts_ms: Date.now(), agent: info.agent, type: "needs_input", ask, question,
         ...(info.hands ? { sandbox: info.hands.sandbox, epoch: info.hands.epoch } : {}),
-      });
+      }, `${info.agent}/${ask}`);
     }
     return ask;
   }
