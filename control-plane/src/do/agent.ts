@@ -51,6 +51,8 @@ const RECOVERY_MARK = "\nThe turn was:\n";
 const iso = (ms: number) => new Date(ms).toISOString();
 
 export const DEFAULT_RULES: ToolRule[] = [{ pattern: "mcp__nest__*", decision: "allow" }];
+/** Workers' launch enables subagents (Claude Code's `Agent` tool, `Task` before 2.1); they run without an approval. */
+export const DEFAULT_WORKER_RULES: ToolRule[] = [...DEFAULT_RULES, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }];
 export const DEFAULT_WORKER_LAUNCH: LaunchConfig = {
   builtin_tools: ["TodoWrite", "Task", "WebSearch"],
   system_prompt: {
@@ -231,7 +233,7 @@ export class AgentDO extends DurableObject<Env> {
       hands,
       launch: req.launch ?? (req.role === "captain" ? DEFAULT_CAPTAIN_LAUNCH : DEFAULT_WORKER_LAUNCH),
       grants: req.grants ?? null,
-      rules: req.rules ?? DEFAULT_RULES,
+      rules: req.rules ?? (req.role === "worker" ? DEFAULT_WORKER_RULES : DEFAULT_RULES),
       host: null,
       session: null,
       state: "detached",

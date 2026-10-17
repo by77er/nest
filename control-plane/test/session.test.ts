@@ -55,7 +55,10 @@ describe("session channel", () => {
     const { ws, ack } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     expect(ack).toMatchObject({ durable_bytes: 0 });
     const cache = await ws.next("cache_update");
-    expect(cache.cache.rules).toEqual([{ pattern: "mcp__nest__*", decision: "allow" }]);
+    // A worker's default rules let its subagents run (Claude Code's `Agent` tool) without an approval.
+    expect(cache.cache.rules).toEqual([
+      { pattern: "mcp__nest__*", decision: "allow" }, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" },
+    ]);
 
     const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "first" } }, 201)).turn;
     const t2 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "second" } }, 201)).turn;
