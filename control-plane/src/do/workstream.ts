@@ -16,6 +16,9 @@ const DIGEST_PROGRESS = 5;
 const EVENT_RETENTION = 5_000;
 const NOTIFICATION_RETENTION = 1_000;
 
+/** Idempotency keys are kept a week, as long as a call's outcome. */
+const APPLIED_RETENTION_MS = 7 * 86_400_000;
+
 export class WorkstreamDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
 
@@ -27,6 +30,16 @@ export class WorkstreamDO extends DurableObject<Env> {
       type TEXT NOT NULL, decision INTEGER NOT NULL, body TEXT NOT NULL, woke INTEGER NOT NULL DEFAULT 0)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS user_notifications (id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts_ms INTEGER NOT NULL, urgency TEXT NOT NULL, text TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)`);
+    // Idempotency keys of writes already applied (a platform tool re-run after an eviction).
+    this.sql.exec("CREATE TABLE IF NOT EXISTS applied (key TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL)");
+  }
+
+  /** True the first time `key` is seen; a write with a key it has seen is skipped. */
+  private firstTime(key: string | undefined): boolean {
+    if (!key) return true;
+    if (this.sql.exec("INSERT OR IGNORE INTO applied (key, ts_ms) VALUES (?, ?)", key, Date.now()).rowsWritten === 0) return false;
+    this.sql.exec("DELETE FROM applied WHERE ts_ms < ?", Date.now() - APPLIED_RETENTION_MS);
+    return true;
   }
 
   private info_(): WorkstreamInfo | undefined {
@@ -59,8 +72,9 @@ export class WorkstreamDO extends DurableObject<Env> {
     this.save(info);
   }
 
-  /** Record an event; decision events schedule a (batched) captain wake. */
-  async ingest(event: WorkstreamEvent): Promise<void> {
+  /** Record an event; decision events schedule a (batched) captain wake. At most once per `key`. */
+  async ingest(event: WorkstreamEvent, key?: string): Promise<void> {
+    if (!this.firstTime(key)) return;
     const decision = isDecisionEvent(event);
     this.sql.exec("INSERT INTO events (ts_ms, type, decision, body) VALUES (?, ?, ?, ?)",
       event.ts_ms, event.type, decision ? 1 : 0, JSON.stringify(event));
@@ -79,7 +93,8 @@ export class WorkstreamDO extends DurableObject<Env> {
       .reverse();
   }
 
-  async notifyUser(text: string, urgency: "normal" | "high" = "normal"): Promise<void> {
+  async notifyUser(text: string, urgency: "normal" | "high" = "normal", key?: string): Promise<void> {
+    if (!this.firstTime(key)) return;
     // Delivered by the Discord integration (out of scope here); kept as a durable queue.
     this.sql.exec("INSERT INTO user_notifications (ts_ms, urgency, text) VALUES (?, ?, ?)", Date.now(), urgency, text);
     this.sql.exec("DELETE FROM user_notifications WHERE id <= (SELECT MAX(id) FROM user_notifications) - ?", NOTIFICATION_RETENTION);

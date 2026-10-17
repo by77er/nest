@@ -422,9 +422,18 @@ describe("#17/#14 read_transcript pages by entry", () => {
     ws.send(toolCall(1, "cal_r-1", "read_transcript", { agent: s.agent, since_seq: 1, limit: 2 }));
     const r = await ws.next("tool_result", (m) => m.call === "cal_r-1");
     expect(r.outcome.content[0].text).toBe("l2\nl3");
-    expect(r.outcome.content[1].value).toEqual({ entries: 2, next_seq: 3, more: true });
-    const page = await adminJson(`/v1/agents/${s.agent}/transcript?since=3`);
-    expect(page).toEqual({ lines: ["l4"], next_seq: 4, more: false });
+    expect(r.outcome.content[1].value).toEqual({ entries: 2, next_seq: 3, more: true, base: 0 });
+    const page = await adminJson(`/v1/agents/${s.agent}/transcript?since=3&base=0`);
+    expect(page).toEqual({ lines: ["l4"], next_seq: 4, more: false, base: 0 });
+
+    // The file is rewritten (e.g. trimmed after compaction): an old cursor would skip entries, so a
+    // reader holding one starts the new base from the top, told so.
+    ws.send(seg(0, "n1\nn2\n", true));
+    await sleep(30);
+    await agentStub(s.agent).flush();
+    const after = await adminJson(`/v1/agents/${s.agent}/transcript?since=4&base=0`);
+    expect(after).toEqual({ lines: ["n1", "n2"], next_seq: 2, more: false, base: 1, reset: true });
+    expect(await adminJson(`/v1/agents/${s.agent}/transcript?since=1&base=1`)).toEqual({ lines: ["n2"], next_seq: 2, more: false, base: 1 });
   });
 });
 
@@ -616,5 +625,105 @@ describe("docs #8 hello.agents reconciliation", () => {
     await third.next("hello_ack");
     await sleep(50);
     expect((await agentStub(s.agent).info()).state).toBe("idle");
+  });
+});
+
+describe("#24 a platform tool re-run after an eviction repeats no side effect", () => {
+  it("notify, emit and ask each apply once when a call is dispatched again", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    const calls: [string, string, unknown][] = [
+      ["cal_i-1", "notify", { to: "captain", message: "hello once" }],
+      ["cal_i-2", "notify", { to: "user", message: "user once" }],
+      ["cal_i-3", "emit", { event: "progress", summary: "progress once" }],
+    ];
+    let seq = 0;
+    for (const [call, name, args] of calls) {
+      ws.send(toolCall(++seq, call, name, args));
+      expect((await ws.next("tool_result", (m) => m.call === call)).outcome.status).toBe("ok");
+    }
+    ws.send(toolCall(++seq, "cal_i-4", "ask", { question: "which way?", to: "user" }));
+    await sleep(50);
+    // An eviction mid-dispatch leaves each call without an outcome; the runner redelivers them.
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("UPDATE tool_calls SET status = 'dispatching', outcome = NULL");
+    });
+    for (const [call, name, args] of calls) {
+      ws.send(toolCall(++seq, call, name, args));
+      expect((await ws.next("tool_result", (m) => m.call === call)).outcome.status).toBe("ok");
+    }
+    ws.send(toolCall(++seq, "cal_i-4", "ask", { question: "which way?", to: "user" }));
+    await ws.next("ack", (m) => m.up_to === seq);
+
+    const inbox = await runInDurableObject(agentStub(s.captain!), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ input: string }>("SELECT input FROM turns").toArray().filter((r) => r.input.includes("hello once")).length);
+    expect(inbox).toBe(1);
+    const wsStub = env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream));
+    expect((await wsStub.events()).filter((e) => e.type === "progress").length).toBe(1);
+    const notes = await wsStub.userNotifications();
+    expect(notes.filter((n) => n.text === "user once").length).toBe(1);
+    expect(notes.filter((n) => n.text.includes("which way?")).length).toBe(1);
+    const asks = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM asks").toArray().length);
+    expect(asks).toBe(1);
+  });
+});
+
+describe("#25 retried submissions are applied once", () => {
+  it("a turn or inbox post with the same request id (body or Idempotency-Key) is queued once", async () => {
+    const s = await setup({ start: false });
+    const post = (path: string, body: unknown, key?: string) => SELF.fetch(`http://cp.test/v1/agents/${s.agent}/${path}`, {
+      method: "POST", body: JSON.stringify(body),
+      headers: { authorization: "Bearer test-admin-token", "content-type": "application/json", ...(key ? { "idempotency-key": key } : {}) },
+    }).then((r) => r.json<any>());
+    const t1 = await post("turns", { text: "do it", request_id: "r-1" });
+    const t2 = await post("turns", { text: "do it", request_id: "r-1" });
+    const t3 = await post("turns", { text: "do it" }, "r-2");
+    const t4 = await post("turns", { text: "do it" }, "r-2");
+    expect(t1.turn).toBe(t2.turn);
+    expect(t3.turn).toBe(t4.turn);
+    expect(t3.turn).not.toBe(t1.turn);
+    const m1 = await post("inbox", { text: "fyi", request_id: "r-3" });
+    const m2 = await post("inbox", { text: "fyi", request_id: "r-3" });
+    expect(m1.message).toBe(m2.message);
+    const turns = await agentStub(s.agent).turns();
+    expect(turns.map((t) => t.input.text)).toEqual(["do it", "do it", "Message from user: fyi"]);
+  });
+});
+
+describe("#26 a recovery turn says what the transcript can't", () => {
+  it("names where the saved transcript ends and the sandbox state it was restored from, and survives a second restart", async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, "rin_one");
+    const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "refactor the parser" } }, 201)).turn;
+    await r1.ws.next("run_turn", (m) => m.turn === t1);
+    r1.ws.send(seg(0, '{"type":"user"}\n'));
+    await sleep(30);
+    await agentStub(s.agent).flush();
+    const durable = (await agentStub(s.agent).info()).durable_ms!;
+    // The sandbox commits a generation, then moves (restored from that head) while the turn runs.
+    sendEvents(s.host.ws, [{
+      ts_ms: Date.now(), type: "commit_request", request: "req_rec", sandbox: s.sandbox, epoch: 1, kind: "disk_only",
+      disk_manifest: manifest("e"), reason: "timer",
+    }]);
+    await nextCommands(s.host.ws, (c) => c.type === "commit_result" && c.request === "req_rec");
+    const head = (await env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)).headGeneration())!;
+    await agentStub(s.agent).onSandboxMoved(s.sandbox, 1, s.host.host);
+    r1.ws.close();
+
+    const r2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_two");
+    const rec = await r2.ws.next("run_turn");
+    expect(rec.input.kind).toBe("recovery");
+    expect(rec.input.text).toContain(`saved transcript ends at ${new Date(durable).toISOString()}`);
+    expect(rec.input.text).toContain(`restored from its state saved at ${new Date(head.created_ms).toISOString()}; running processes stopped`);
+    expect(rec.input.text.endsWith("The turn was:\nrefactor the parser")).toBe(true);
+    r2.ws.close();
+
+    // Interrupted again: the next recovery turn still carries the original text, once.
+    const r3 = await runner(s.agent, s.host.host, s.host.host_token, "rin_three");
+    const rec2 = await r3.ws.next("run_turn");
+    expect(rec2.input.kind).toBe("recovery");
+    expect(rec2.input.text.split("refactor the parser").length).toBe(2);
+    // That recovery turn started after the move: no restore note this time.
+    expect(rec2.input.text).not.toContain("restored from");
   });
 });

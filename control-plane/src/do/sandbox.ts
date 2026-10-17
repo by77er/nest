@@ -416,6 +416,12 @@ export class SandboxDO extends DurableObject<Env> {
 
   // --- generations ----------------------------------------------------------------------------------
 
+  /** The head generation, if any (an agent's recovery context compares it with its transcript). */
+  async headGeneration(): Promise<GenerationRecord | null> {
+    const head = this.get<SandboxInfo>("info")?.head;
+    return (head && this.generation(head)) || null;
+  }
+
   private generation(id: string): GenerationRecord | undefined {
     const row = this.sql.exec<{ record: string }>("SELECT record FROM generations WHERE id = ?", id).toArray()[0];
     return row ? (JSON.parse(row.record) as GenerationRecord) : undefined;
