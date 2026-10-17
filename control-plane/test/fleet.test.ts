@@ -93,7 +93,8 @@ describe("fleet channel", () => {
     // Issued while the host is offline; the restarted process never sees it.
     const [ckpt] = await fleetStub(cell).issueCommands(h.host, [{ type: "sandbox_checkpoint", sandbox: sbx.sandbox, epoch: 1, reason: "checkpoint" }]);
     const ws2 = await Ws.connect("/v1/fleet", h.host_token);
-    ws2.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    // It reports the sandbox (so it isn't re-placed): this test is about the lineages.
+    ws2.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002", sandboxes: [{ sandbox: sbx.sandbox, epoch: 1, state: "running", dirty: false }] }));
     const ack = await ws2.next("hello_ack");
     expect(ack.last_event_seq).toBeUndefined(); // the event lineage restarted
     expect(await ws2.none("commands", 150, (m) => m.seq <= first.seq + 1)).toBe(true);
@@ -475,8 +476,8 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await nextCommands(a.ws, (c) => c.type === "sandbox_create");
     state(a.ws, sbx.sandbox, 1, "running");
     const head = await commitHead(a.ws, sbx.sandbox, 1, "req_life1");
-    state(a.ws, sbx.sandbox, 1, "suspended");
-    await a.ws.next("ack", (m) => m.up_to >= 1002);
+    const suspendedSeq = state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= suspendedSeq);
 
     // Suspended sandboxes don't keep the host up: idle → retired after the grace, sandbox evicted.
     const tick = async (shift: number) => {
@@ -567,5 +568,32 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await a.ws.next("ack");
     await createSandbox(cell, 202);
     expect(ec2.launched).toHaveLength(1);
+  });
+});
+
+describe("nestd restarts", () => {
+  it("leases a restarted nestd doesn't report are dropped: running ones re-placed from head, suspended ones evicted", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const running = await createSandbox(cell);
+    const parked = await createSandbox(cell);
+    await nextCommands(h.ws, (c) => c.type === "sandbox_create" && c.sandbox === parked.sandbox);
+    sendEvents(h.ws, [{ ts_ms: Date.now(), type: "commit_request", request: "req_rs1", sandbox: running.sandbox, epoch: 1, kind: "disk_only", disk_manifest: manifest("d"), reason: "timer" }]);
+    const head = (await nextCommands(h.ws, (c) => c.type === "commit_result")).find((c) => c.type === "commit_result").outcome.generation;
+    sendEvents(h.ws, [
+      { ts_ms: Date.now(), type: "sandbox_state", sandbox: running.sandbox, epoch: 1, state: "running" },
+      { ts_ms: Date.now(), type: "sandbox_state", sandbox: parked.sandbox, epoch: 1, state: "suspended" },
+    ]);
+    await h.ws.next("ack", (m) => m.up_to >= 1002);
+    h.ws.close();
+
+    // The new process (saved credentials, new instance_id) comes back with nothing.
+    const ws2 = await Ws.connect("/v1/fleet", h.host_token);
+    ws2.send(hostHello(h.host, cell, { instance_id: "nestdrestart0001", sandboxes: [] }));
+    await ws2.next("hello_ack");
+    const [recreate] = await nextCommands(ws2, (c) => c.type === "sandbox_create");
+    expect(recreate).toMatchObject({ sandbox: running.sandbox, epoch: 2, from: { id: head.id } });
+    expect(await sandboxStub(parked.sandbox).info()).toMatchObject({ host: null, state: "suspended", epoch: 1 });
+    expect(await fleetStub(cell).leaseOf(parked.sandbox)).toBeNull();
   });
 });

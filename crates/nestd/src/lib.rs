@@ -1,6 +1,7 @@
 //! nestd: the privileged per-host daemon. See `docs/compute/nestd/` and `crates/nestd/README.md`.
 
 pub mod config;
+pub mod credentials;
 pub mod driver;
 pub mod enroll;
 pub mod fleet;

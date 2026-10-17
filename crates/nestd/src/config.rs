@@ -197,6 +197,10 @@ impl Config {
     pub fn agents_dir(&self) -> PathBuf {
         self.state_dir.join("agents")
     }
+    /// Saved host credentials (see `credentials.rs`).
+    pub fn credentials_path(&self) -> PathBuf {
+        self.state_dir.join("host-credentials.json")
+    }
     pub fn store_dir(&self) -> PathBuf {
         self.state_dir.join("store").join(&self.cell)
     }

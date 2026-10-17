@@ -67,6 +67,8 @@ Wants=network-online.target nest-proxy.service
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=RUST_LOG=info
+# /run is empty after a reboot; nestd resumes with the credentials saved under /var/lib/nest.
+ExecStartPre=/bin/mkdir -p /run/nest/netns /run/nest/runner
 ExecStart=/opt/nest/bin/nestd --config /etc/nest/nestd.json
 Restart=always
 RestartSec=5
@@ -91,6 +93,7 @@ Environment=NEST_RUNNER_MCP_SOCK=/run/nest/runner/mcp.sock
 Environment=NEST_RUNNER_CLAUDE_BIN=$CLAUDE_BIN
 Environment=NEST_RUNNER_NEST_BIN=/usr/lib/nest/nest
 Environment=NEST_RUNNER_CWD=/var/lib/nest/runner/cwd
+ExecStartPre=/bin/mkdir -p /run/nest/runner
 ExecStartPre=/bin/sh -c 'for i in \$(seq 60); do [ -S /run/nest/runner.sock ] && exit 0; sleep 1; done; exit 1'
 ExecStart=/opt/nest/bin/nest-runner
 Restart=always

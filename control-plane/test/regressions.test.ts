@@ -351,8 +351,9 @@ describe("#13 a nestd restart doesn't fail live sandboxes", () => {
     const restarted = await Ws.connect("/v1/fleet", h.host_token);
     restarted.send(hostHello(h.host, cell, { instance_id: "nestd-restarted", sandboxes: [{ sandbox: s1.sandbox, epoch: 1, state: "running", dirty: false }] }));
     await restarted.next("hello_ack");
+    // The unreported one is gone with the old process: placed again under a new epoch.
     const [again] = await nextCommands(restarted, (c) => c.type === "sandbox_create");
-    expect(again).toMatchObject({ sandbox: s2.sandbox, epoch: 1 });
+    expect(again).toMatchObject({ sandbox: s2.sandbox, epoch: 2 });
     await sleep(50);
     expect((await sandboxStub(s1.sandbox).info()).state).toBe("running");
     expect((await sandboxStub(s2.sandbox).info()).state).not.toBe("failed");

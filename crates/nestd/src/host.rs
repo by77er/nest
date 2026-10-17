@@ -233,7 +233,7 @@ impl Host {
         let store: Arc<dyn ObjectStore> = match &cfg.storage {
             StorageConfig::Local => Arc::new(cache),
             StorageConfig::S3 { bucket, region, prefix, imds_url, parallelism, cache_max_gib } => {
-                let options = S3Options { parallelism: *parallelism, cache_max_bytes: cache_max_gib << 30 };
+                let options = S3Options { parallelism: *parallelism, cache_max_bytes: cache_max_gib << 30, ..S3Options::default() };
                 Arc::new(S3Store::new(bucket, region, prefix, None, CredentialSource::Imds(imds_url.clone()), cache, options)?)
             }
         };
@@ -504,7 +504,10 @@ impl Inner {
                     }
                 }
             }
-            FleetNotice::HostToken { token, expires_ms } => self.runner.host_token(Secret(token), expires_ms),
+            FleetNotice::HostToken { token, expires_ms } => {
+                crate::credentials::update_token(&self.cfg.credentials_path(), &token, expires_ms);
+                self.runner.host_token(Secret(token), expires_ms)
+            }
             FleetNotice::ProxyCa(ca) => {
                 // A renewal answer is for the pending key; otherwise it re-issues the current one.
                 let key = {
@@ -519,6 +522,7 @@ impl Inner {
                 match key {
                     Some(key_pem) => {
                         tracing::info!(expires_ms = ca.expires_ms, "installing proxy intermediate CA");
+                        crate::credentials::update_proxy_ca(&self.cfg.credentials_path(), &ca, key_pem.expose());
                         self.proxy.apply(ProxyOp::CaInstall { ca, key_pem });
                     }
                     None => tracing::warn!("received proxy CA without a local key"),
