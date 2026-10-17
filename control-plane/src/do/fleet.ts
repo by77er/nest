@@ -36,6 +36,8 @@ interface LeaseRow {
   host: string;
   epoch: number;
   expired: number;
+  /** Last state the holder reported (`suspended` leases don't keep a host busy). */
+  state: string | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -112,6 +114,10 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("launched", "reason", "TEXT");
     this.addColumn("launched", "ended_ms", "INTEGER");
     this.addColumn("hosts", "idle_since", "INTEGER");
+    this.addColumn("leases", "state", "TEXT");
+    // Suspended sandboxes leaving a host that is going away; SandboxDO is told, with retries.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS evictions (sandbox TEXT NOT NULL, host TEXT NOT NULL, epoch INTEGER NOT NULL,
+      PRIMARY KEY (sandbox, host, epoch))`);
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
   }
@@ -401,6 +407,7 @@ export class FleetDO extends DurableObject<Env> {
         if (s.state !== "fenced" && s.state !== "destroyed") fence.push(s.sandbox);
         continue;
       }
+      this.sql.exec("UPDATE leases SET state = ? WHERE sandbox = ? AND host = ? AND epoch = ?", s.state, s.sandbox, host, s.epoch);
       try {
         await this.sandbox(s.sandbox).reportState(host, s.epoch, s.state, null, "reported in hello");
       } catch (e) {
@@ -487,7 +494,12 @@ export class FleetDO extends DurableObject<Env> {
       case "command_result":
         return this.onCommandResult(host, ev.cmd, ev.outcome);
       case "sandbox_state":
+        if (this.holds(host, ev.sandbox, ev.epoch)) {
+          this.sql.exec("UPDATE leases SET state = ? WHERE sandbox = ? AND host = ?", ev.state, ev.sandbox, host);
+        }
         await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.suspend_mode ?? null, ev.detail ?? null);
+        // A draining host's sandboxes leave as soon as they're safely suspended.
+        if (ev.state === "suspended" && this.host(host)?.status === "draining") await this.evict(host, [ev.sandbox]);
         return;
       case "commit_request":
         return this.onCommitRequest(host, ev);
@@ -509,8 +521,7 @@ export class FleetDO extends DurableObject<Env> {
         this.sql.exec("UPDATE hosts SET capacity = ? WHERE host = ?", JSON.stringify(ev.capacity), host);
         return;
       case "spot_notice":
-        this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host);
-        return;
+        return this.drain(host, ev.deadline_ms);
       case "agent_exited":
         this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", ev.agent, host);
         await this.agentStub(ev.agent).onExited(host, ev.reason);
@@ -731,7 +742,8 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM enroll_tokens WHERE used_ms IS NOT NULL AND used_ms < ?", now - ENROLL_TOKEN_RETENTION_MS);
     const busy = this.sql.exec("SELECT 1 FROM hosts WHERE status IN ('active', 'draining', 'stonith_pending')").toArray().length
       || this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length
-      || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND (host IS NULL OR reason IS NOT NULL)").toArray().length;
+      || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND (host IS NULL OR reason IS NOT NULL)").toArray().length
+      || this.sql.exec("SELECT 1 FROM evictions").toArray().length;
     if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
 
@@ -777,7 +789,7 @@ export class FleetDO extends DurableObject<Env> {
     const pending = this.sql.exec("SELECT 1 FROM launched WHERE host IS NULL AND reason IS NULL").toArray().length;
     if (pending) return;
     const live = this.sql
-      .exec("SELECT 1 FROM hosts WHERE role = 'burst' AND status IN ('active', 'draining', 'stonith_pending')")
+      .exec("SELECT 1 FROM hosts WHERE role = 'burst' AND status IN ('active', 'stonith_pending')")
       .toArray().length;
     if (live >= cfg.max_hosts) return;
     const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value ?? null;
@@ -831,7 +843,8 @@ export class FleetDO extends DurableObject<Env> {
     }
     for (const h of this.sql.exec<HostRow & { idle_since: number | null }>(
       "SELECT * FROM hosts WHERE role = 'burst' AND status = 'active' AND instance_id IS NOT NULL").toArray()) {
-      const busy = this.leasesOf(h.host).length > 0
+      // Suspended sandboxes are safe in the object store: they don't keep a host up.
+      const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended")
         || this.sql.exec("SELECT 1 FROM host_agents WHERE host = ?", h.host).toArray().length > 0;
       if (busy) {
         if (h.idle_since !== null) this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", h.host);
@@ -839,11 +852,22 @@ export class FleetDO extends DurableObject<Env> {
         this.sql.exec("UPDATE hosts SET idle_since = ? WHERE host = ?", now, h.host);
       } else if (now - h.idle_since >= cfg.idle_grace_ms) {
         this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", h.host);
-        this.sql.exec("UPDATE launched SET reason = 'idle' WHERE instance_id = ?", h.instance_id);
+        this.endInstance(h.instance_id!, "idle");
         for (const ws of this.ctx.getWebSockets(h.host)) ws.close(4410, "idle: retired");
         console.log(`FleetDO: retiring idle host ${h.host} (${h.instance_id})`);
+        await this.evict(h.host, this.leasesOf(h.host).map((l) => l.sandbox));
       }
     }
+    // A draining host whose sandboxes have all left goes now rather than at its deadline.
+    for (const h of this.sql.exec<HostRow>(
+      "SELECT * FROM hosts WHERE role = 'burst' AND status = 'draining' AND instance_id IS NOT NULL").toArray()) {
+      if (this.leasesOf(h.host).length) continue;
+      this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", h.host);
+      this.endInstance(h.instance_id!, "drained");
+      for (const ws of this.ctx.getWebSockets(h.host)) ws.close(4410, "drained");
+      console.log(`FleetDO: drained ${h.host} (${h.instance_id})`);
+    }
+    await this.processEvictions();
     const ec2 = this.ec2();
     if (!ec2) return;
     for (const r of this.sql.exec<{ instance_id: string }>(
@@ -854,6 +878,58 @@ export class FleetDO extends DurableObject<Env> {
         else await ec2.terminate(r.instance_id);
       } catch (e) {
         console.error(`FleetDO: terminating ${r.instance_id} failed; will retry`, e);
+      }
+    }
+  }
+
+  /**
+   * Forced drain (spot notice): no new placements; suspended sandboxes leave now, the rest are
+   * suspended to the object store and leave as they report `suspended`. SandboxDO re-places a
+   * sandbox whose agents are mid-turn at once; the others wait until something needs them.
+   */
+  private async drain(host: string, deadlineMs: number): Promise<void> {
+    this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host);
+    console.warn(`FleetDO: ${host} draining (spot interruption at ${new Date(deadlineMs).toISOString()})`);
+    const leases = this.leasesOf(host).filter((l) => !l.expired);
+    await this.evict(host, leases.filter((l) => l.state === "suspended").map((l) => l.sandbox));
+    const running = leases.filter((l) => l.state !== "suspended");
+    if (running.length) {
+      await this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
+    }
+    if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+  }
+
+  /**
+   * Take suspended sandboxes off a host that is going away: their head is in the object store, so
+   * the lease is dropped and SandboxDO forgets the host (retried from the alarm until it answers).
+   * The host fences what it still has when its next heartbeat's leases are revoked.
+   */
+  private async evict(host: string, sandboxes: string[]): Promise<void> {
+    for (const sandbox of sandboxes) {
+      const lease = this.lease(sandbox);
+      if (!lease || lease.host !== host) continue;
+      this.sql.exec("DELETE FROM leases WHERE sandbox = ? AND host = ?", sandbox, host);
+      this.sql.exec("INSERT OR IGNORE INTO evictions (sandbox, host, epoch) VALUES (?, ?, ?)", sandbox, host, lease.epoch);
+    }
+    await this.processEvictions();
+  }
+
+  /** Mark an instance for termination (retried from the alarm until EC2 reports it gone). */
+  private endInstance(instanceId: string, reason: string): void {
+    this.sql.exec(
+      `INSERT INTO launched (instance_id, launched_ms, role, reason) VALUES (?, ?, 'burst', ?)
+       ON CONFLICT(instance_id) DO UPDATE SET reason = COALESCE(launched.reason, excluded.reason)`,
+      instanceId, Date.now(), reason,
+    );
+  }
+
+  private async processEvictions(): Promise<void> {
+    for (const e of this.sql.exec<{ sandbox: string; host: string; epoch: number }>("SELECT * FROM evictions").toArray()) {
+      try {
+        await this.sandbox(e.sandbox).evicted(e.host, e.epoch);
+        this.sql.exec("DELETE FROM evictions WHERE sandbox = ? AND host = ? AND epoch = ?", e.sandbox, e.host, e.epoch);
+      } catch (err) {
+        console.error(`FleetDO: evicting ${e.sandbox} from ${e.host} failed; will retry`, err);
       }
     }
   }

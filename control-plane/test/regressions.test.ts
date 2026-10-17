@@ -160,13 +160,14 @@ describe("#4 reassignment can't strand leases", () => {
     await sandboxStub(s1.sandbox).reportState(a.host, 1, "running", null, null);
     a.ws.close();
     await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
-    expect(await sandboxStub(s1.sandbox).info()).toMatchObject({ host: null, epoch: 2 });
+    // No host could take it, so no epoch was spent: the dead host's lease (epoch 1) is still the last one.
+    expect(await sandboxStub(s1.sandbox).info()).toMatchObject({ host: null, epoch: 1 });
     const b = await connectHost(cell);
     await runInDurableObject(sandboxStub(s1.sandbox), (_i, st) => {
       st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'");
     });
     await runDurableObjectAlarm(sandboxStub(s1.sandbox));
-    expect(await sandboxStub(s1.sandbox).info()).toMatchObject({ host: b.host, epoch: 3 });
+    expect(await sandboxStub(s1.sandbox).info()).toMatchObject({ host: b.host, epoch: 2 });
   });
 });
 

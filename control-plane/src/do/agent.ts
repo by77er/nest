@@ -263,7 +263,9 @@ export class AgentDO extends DurableObject<Env> {
     let host: string | null;
     if (info.role === "worker") {
       if (!info.hands) throw new NestError(ErrorCodes.NOT_BOUND, "worker has no hands binding", 409);
-      host = hostHint ?? (await this.sandboxStub(info.hands.sandbox).info()).host;
+      // Lazy start: a suspended sandbox resumes, an unplaced one is placed (maybe on a new host).
+      // Without a host yet this fails retryably; the placement then moves the agent onto it.
+      host = hostHint ?? (await this.sandboxStub(info.hands.sandbox).wake()).host;
     } else {
       host = await this.fleet(info.cell).controllerHost();
     }

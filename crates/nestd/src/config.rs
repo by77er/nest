@@ -34,6 +34,26 @@ pub struct Config {
     /// Who may connect to nestd's proxy and runner sockets.
     #[serde(default)]
     pub sockets: SocketsConfig,
+    /// Where generations (disk and memory chunks, manifests) go.
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StorageConfig {
+    /// A directory on this host (`<state_dir>/store/<cell>`): development and tests.
+    #[default]
+    Local,
+    /// The cell's S3 bucket, through the instance role; `<state_dir>/store/<cell>` is its cache.
+    S3 {
+        bucket: String,
+        region: String,
+        #[serde(default = "default_s3_prefix")]
+        prefix: String,
+        #[serde(default = "default_imds_url")]
+        imds_url: String,
+    },
 }
 
 /// Access control for the host-local control sockets (`proxy.sock`, `runner.sock`). Whoever
@@ -186,6 +206,9 @@ fn default_commit_timeout_ms() -> u64 {
 fn default_imds_url() -> String {
     "http://169.254.169.254".into()
 }
+fn default_s3_prefix() -> String {
+    "store/".into()
+}
 fn default_boot_args() -> String {
     "console=ttyS0 reboot=k panic=1 pci=off init_on_free=1".into()
 }
@@ -213,5 +236,8 @@ mod tests {
         assert_eq!(cfg.run_dir, PathBuf::from("/run/nest"));
         assert!(matches!(cfg.enrollment, EnrollmentConfig::AwsImds { ref imds_url } if imds_url == "http://169.254.169.254"));
         assert_eq!(cfg.proxy_sock(), PathBuf::from("/run/nest/proxy.sock"));
+        assert!(matches!(cfg.storage, StorageConfig::Local));
+        let s3: StorageConfig = serde_json::from_value(serde_json::json!({"type": "s3", "bucket": "b", "region": "us-east-1"})).unwrap();
+        assert!(matches!(s3, StorageConfig::S3 { ref prefix, .. } if prefix == "store/"));
     }
 }

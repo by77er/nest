@@ -58,6 +58,30 @@ pub async fn aws_identity_proof(http: &reqwest::Client, imds_url: &str) -> anyho
     Ok(EnrollmentProof::AwsIdentityDocument { document_b64: base64::engine::general_purpose::STANDARD.encode(document), pkcs7_b64 })
 }
 
+/// The spot interruption deadline (Unix ms) once EC2 has scheduled one, from IMDSv2
+/// `spot/instance-action` (404 until then). Rebalance recommendations are not notices.
+pub async fn spot_deadline(http: &reqwest::Client, imds_url: &str) -> anyhow::Result<Option<i64>> {
+    let token = http
+        .put(format!("{imds_url}/latest/api/token"))
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "60")
+        .send()
+        .await
+        .context("IMDSv2 token")?
+        .error_for_status()?
+        .text()
+        .await?;
+    let res = http.get(format!("{imds_url}/latest/meta-data/spot/instance-action")).header("X-aws-ec2-metadata-token", token).send().await?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    #[derive(serde::Deserialize)]
+    struct Action {
+        time: String,
+    }
+    let a: Action = res.error_for_status()?.json().await.context("spot/instance-action")?;
+    Ok(Some(crate::util::parse_rfc3339_utc_ms(&a.time).with_context(|| format!("bad spot action time {}", a.time))?))
+}
+
 pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
     let proof = match &cfg.enrollment {
         EnrollmentConfig::Static { host, host_token, fleet_ws_url } => {
@@ -137,6 +161,8 @@ mod tests {
                     } else if line.contains("/instance-identity/rsa2048") {
                         // As IMDS serves it: base64 of the DER SignedData, wrapped at 64 columns.
                         RSA2048_IMDS.to_string()
+                    } else if line.contains("/meta-data/spot/instance-action") {
+                        r#"{"action": "terminate", "time": "2026-10-17T04:20:00Z"}"#.to_string()
                     } else if line.starts_with("POST /v1/hosts/enroll") {
                         *seen.lock().unwrap() = Some(serde_json::from_str(body).unwrap());
                         serde_json::json!({
@@ -157,6 +183,13 @@ mod tests {
 
     /// The start of a real CMS SignedData (`30 80 06 09 2a 86 48 86 f7 0d 01 07 02 …`), as IMDS wraps it.
     const RSA2048_IMDS: &str = "MIAGCSqGSIb3DQEHAqCAMIACAQExDzANBglghkgBZQMEAgEFADCABgkqhkiG9w0B\nBwGggCSABIIB\n";
+
+    #[tokio::test]
+    async fn reads_the_spot_interruption_deadline() {
+        let (url, _) = mock_server().await;
+        let deadline = spot_deadline(&http_client().unwrap(), &url).await.unwrap();
+        assert_eq!(deadline, crate::util::parse_rfc3339_utc_ms("2026-10-17T04:20:00Z"));
+    }
 
     #[tokio::test]
     async fn enrolls_with_aws_identity_document_and_csr() {

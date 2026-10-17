@@ -10,6 +10,7 @@ pub mod limits;
 pub mod net;
 pub mod proxy_link;
 pub mod runner_link;
+pub mod s3;
 pub mod storage;
 pub mod util;
 pub mod vsock;
