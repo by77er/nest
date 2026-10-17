@@ -6,7 +6,7 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "../env";
+import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { b64url, NestError, newId } from "../lib/util";
 import type { CommandBody, CommitOutcome, CommitRequestEvent } from "../protocol/control";
@@ -70,6 +70,11 @@ export interface CreateSandbox {
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
 const PLACING_STALE_MS = 60_000;
 const PLACE_RETRY_MS = 30_000;
+/**
+ * Idle (no agent working) this long → suspend to the object store. The design pauses at 1 min and
+ * suspends after 10 min paused; pausing isn't in the host contract yet, so this is both tiers.
+ */
+const DEFAULT_SUSPEND_IDLE_MS = 11 * 60_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const HISTORY_MAX = 50;
 
@@ -194,6 +199,7 @@ export class SandboxDO extends DurableObject<Env> {
     });
     const from = before.head ? this.generation(before.head) : undefined;
     let host: string | null = null;
+    let noCapacity = false;
     try {
       host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
@@ -206,11 +212,15 @@ export class SandboxDO extends DurableObject<Env> {
         ...(from ? { from } : {}),
         ...(excludeHost ? { excludeHost } : {}),
       });
+      noCapacity = host === null;
     } finally {
       this.update((i) => {
         if (i.placing !== epoch) return;
         i.placing = null;
         i.placing_ms = null;
+        // FleetDO answered that no host could take it, so no lease exists under this epoch: the
+        // next attempt reuses it. (After an exception a lease may exist; the epoch stays spent.)
+        if (noCapacity && i.epoch === epoch) i.epoch = before.epoch;
         if (host) {
           i.host = host;
           i.state = from ? "restoring" : "creating";
@@ -223,6 +233,7 @@ export class SandboxDO extends DurableObject<Env> {
       await this.deadlines.clear("place");
       await this.pushSecrets();
       await this.notifyAgentsMoved(host);
+      await this.armIdle();
     } else {
       await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
     }
@@ -256,6 +267,58 @@ export class SandboxDO extends DurableObject<Env> {
     this.update((i) => {
       i.state = state;
     });
+    await this.armIdle();
+  }
+
+  /**
+   * Lazy start: what an agent (or anything else) calls when it needs the sandbox now. A sandbox
+   * suspended on its host resumes there; one with no host (evicted, or never placed) is placed from
+   * its head, launching a host if the cell autoscales. Returns the host, or `null` while none can
+   * take it yet (the caller retries).
+   */
+  async wake(): Promise<{ host: string | null; state: SandboxState }> {
+    const info = this.info_();
+    if (info.state === "destroyed" || info.state === "archived") {
+      throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
+    }
+    if (info.host) {
+      if (info.state === "suspended") {
+        await this.command([{ type: "sandbox_resume", sandbox: info.sandbox, epoch: info.epoch }]);
+      }
+      return { host: info.host, state: info.state };
+    }
+    if (info.placing !== null) return { host: null, state: info.state };
+    const host = await this.placeCurrentEpoch();
+    return { host, state: this.info_().state };
+  }
+
+  /**
+   * FleetDO took this suspended sandbox off a host that is going away; its head is in the object
+   * store. It stays suspended with no host until something wakes it, unless an agent is mid-turn on
+   * it (a spot drain), in which case it's placed elsewhere now.
+   */
+  async evicted(host: string, epoch: number): Promise<void> {
+    const cur = this.get<SandboxInfo>("info") ? this.info_() : undefined;
+    if (!cur || cur.host !== host || cur.epoch !== epoch) return;
+    const info = this.update((i) => {
+      i.host = null;
+      i.state = "suspended";
+    });
+    await this.deadlines.clear("idle");
+    if (info.working.length) await this.placeCurrentEpoch(host);
+    else await this.notifyAgentsMoved(null);
+  }
+
+  /** Start (or clear) the idle countdown: running, placed, and no agent working. */
+  private async armIdle(): Promise<void> {
+    const info = this.info_();
+    if (info.host && info.state === "running" && info.working.length === 0) {
+      if (!this.deadlines.has("idle")) {
+        await this.deadlines.set("idle", Date.now() + num(this.env.SANDBOX_SUSPEND_IDLE_MS, DEFAULT_SUSPEND_IDLE_MS));
+      }
+    } else {
+      await this.deadlines.clear("idle");
+    }
   }
 
   /**
@@ -467,7 +530,14 @@ export class SandboxDO extends DurableObject<Env> {
         if (expired) await this.policyChanged(false);
       } else if (key === "place") {
         const info = this.info_();
-        if (info.host === null && info.placing === null && ACTIVE_STATES.includes(info.state)) await this.placeCurrentEpoch();
+        // A suspended sandbox with nobody working stays unplaced until something wakes it.
+        const wanted = info.state !== "suspended" || info.working.length > 0;
+        if (info.host === null && info.placing === null && ACTIVE_STATES.includes(info.state) && wanted) await this.placeCurrentEpoch();
+      } else if (key === "idle") {
+        const info = this.info_();
+        if (info.host && info.state === "running" && info.working.length === 0) {
+          await this.command([{ type: "sandbox_suspend", sandbox: info.sandbox, epoch: info.epoch, mode: "disk_only" }]);
+        }
       }
     });
   }
@@ -510,6 +580,7 @@ export class SandboxDO extends DurableObject<Env> {
       i.attached = i.attached.filter((a) => a !== agent);
       i.working = i.working.filter((a) => a !== agent);
     });
+    await this.armIdle();
   }
 
   /** Agent activity feeds the idle refcount: the sandbox may suspend only when nobody is working. */
@@ -518,6 +589,7 @@ export class SandboxDO extends DurableObject<Env> {
       i.working = i.working.filter((a) => a !== agent);
       if (working && i.attached.includes(agent)) i.working.push(agent);
     });
+    await this.armIdle();
     return { idle: info.working.length === 0 };
   }
 

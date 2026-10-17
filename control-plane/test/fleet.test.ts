@@ -422,3 +422,150 @@ describe("autoscaling", () => {
     expect((await fleetStub(cell).hostStatus(h.host))!.status).toBe("active");
   });
 });
+
+describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () => {
+  const state = (ws: Ws, sandbox: string, epoch: number, s: string) =>
+    sendEvents(ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox, epoch, state: s }]);
+
+  /** A committed head, so a move has something to restore from. */
+  async function commitHead(ws: Ws, sandbox: string, epoch: number, request: string) {
+    sendEvents(ws, [{ ts_ms: Date.now(), type: "commit_request", request, sandbox, epoch, kind: "disk_only", disk_manifest: manifest("c"), reason: "suspend" }]);
+    return (await nextCommands(ws, (c) => c.type === "commit_result")).find((c) => c.type === "commit_result").outcome.generation;
+  }
+
+  async function runAlarm(stub: DurableObjectStub, key: string) {
+    await runInDurableObject(stub, (_i, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = ?", key);
+    });
+    await runDurableObjectAlarm(stub);
+  }
+
+  it("suspends a running sandbox once nobody has worked on it for the idle period", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "running");
+    await a.ws.next("ack");
+    // An agent at work holds it awake; when it goes idle, the countdown starts.
+    await sandboxStub(sbx.sandbox).attachAgent("agt_lifecycle00000000000000000");
+    await sandboxStub(sbx.sandbox).agentActivity("agt_lifecycle00000000000000000", true);
+    await runAlarm(sandboxStub(sbx.sandbox), "idle");
+    await sandboxStub(sbx.sandbox).agentActivity("agt_lifecycle00000000000000000", false);
+    await runAlarm(sandboxStub(sbx.sandbox), "idle");
+    const [suspend] = await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    expect(suspend).toMatchObject({ sandbox: sbx.sandbox, epoch: 1, mode: "disk_only" });
+  });
+
+  it("a host retired with only suspended sandboxes evicts them; waking places them from head elsewhere", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running", "terminated");
+    const config: AwsCellConfig = {
+      region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"],
+      spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+    };
+    const fleet = fleetStub(cell);
+    const a = await connectHost(cell);
+    await runInDurableObject(fleet, (inst: FleetDO, st) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = config;
+      st.storage.sql.exec("UPDATE hosts SET instance_id = 'i-0hostA' WHERE host = ?", a.host);
+    });
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "running");
+    const head = await commitHead(a.ws, sbx.sandbox, 1, "req_life1");
+    state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= 1002);
+
+    // Suspended sandboxes don't keep the host up: idle → retired after the grace, sandbox evicted.
+    const tick = async (shift: number) => {
+      await runInDurableObject(fleet, (inst: FleetDO, st) => {
+        inst.ec2Override = ec2;
+        inst.cellConfigOverride = config;
+        st.storage.sql.exec("UPDATE hosts SET idle_since = idle_since - ? WHERE idle_since IS NOT NULL", shift);
+        st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+      });
+      await runDurableObjectAlarm(fleet);
+    };
+    await tick(0);
+    await tick(61_000);
+    expect((await fleet.hostStatus(a.host))!.status).toBe("dead");
+    expect(ec2.terminated).toContain("i-0hostA");
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ host: null, state: "suspended", epoch: 1, head: head.id });
+    expect(await fleet.leaseOf(sbx.sandbox)).toBeNull();
+
+    // Nothing places it until something needs it: its own retry alarm leaves it alone.
+    const b = await connectHost(cell);
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('place', 0)");
+    });
+    await runDurableObjectAlarm(sandboxStub(sbx.sandbox));
+    expect((await sandboxStub(sbx.sandbox).info()).host).toBeNull();
+
+    // Lazy start: waking places it from head on the connected host, under the next epoch.
+    expect((await sandboxStub(sbx.sandbox).wake()).host).toBe(b.host);
+    const [create] = await nextCommands(b.ws, (c) => c.type === "sandbox_create");
+    expect(create).toMatchObject({ sandbox: sbx.sandbox, epoch: 2, from: { id: head.id } });
+  });
+
+  it("waking a sandbox suspended on a live host resumes it there", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack");
+    expect((await sandboxStub(sbx.sandbox).wake()).host).toBe(a.host);
+    const [resume] = await nextCommands(a.ws, (c) => c.type === "sandbox_resume");
+    expect(resume).toMatchObject({ sandbox: sbx.sandbox, epoch: 1 });
+  });
+
+  it("a spot notice drains: running sandboxes suspend; a busy one moves at once, an idle one waits", async () => {
+    const cell = uniqueCell();
+    const fleet = fleetStub(cell);
+    const a = await connectHost(cell);
+    const busy = await createSandbox(cell);
+    const idle = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create" && c.sandbox === idle.sandbox);
+    state(a.ws, busy.sandbox, 1, "running");
+    state(a.ws, idle.sandbox, 1, "running");
+    await a.ws.next("ack", (m) => m.up_to >= 1002);
+    await sandboxStub(busy.sandbox).attachAgent("agt_spotbusy0000000000000000000");
+    await sandboxStub(busy.sandbox).agentActivity("agt_spotbusy0000000000000000000", true);
+    const b = await connectHost(cell);
+
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    const cmds = await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    expect(cmds.filter((c) => c.type === "sandbox_suspend").map((c) => c.sandbox).sort()).toEqual([busy.sandbox, idle.sandbox].sort());
+    expect((await fleet.hostStatus(a.host))!.status).toBe("draining");
+
+    // Each leaves as it reports suspended; only the busy one is placed again right away.
+    const head = await commitHead(a.ws, busy.sandbox, 1, "req_spot1");
+    state(a.ws, busy.sandbox, 1, "suspended");
+    const idleSeq = state(a.ws, idle.sandbox, 1, "suspended");
+    const [recreate] = await nextCommands(b.ws, (c) => c.type === "sandbox_create");
+    await a.ws.next("ack", (m) => m.up_to >= idleSeq);
+    expect(recreate).toMatchObject({ sandbox: busy.sandbox, epoch: 2, from: { id: head.id } });
+    expect(await sandboxStub(busy.sandbox).info()).toMatchObject({ host: b.host, state: "restoring" });
+    expect(await sandboxStub(idle.sandbox).info()).toMatchObject({ host: null, state: "suspended" });
+  });
+
+  it("a draining host doesn't count toward the cell's host cap", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    const config: AwsCellConfig = {
+      region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"],
+      spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+    };
+    const a = await connectHost(cell);
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = config;
+    });
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await a.ws.next("ack");
+    await createSandbox(cell, 202);
+    expect(ec2.launched).toHaveLength(1);
+  });
+});

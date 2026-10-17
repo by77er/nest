@@ -1234,6 +1234,7 @@ dependencies = [
  "rand",
  "rcgen",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "socket2",

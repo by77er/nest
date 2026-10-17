@@ -37,6 +37,8 @@ export interface Env {
   PROXY_CA_TTL_MS: string;
   /** Comma-separated list of valid cells; when set, others are refused (no stray FleetDOs). */
   CELLS?: string;
+  /** A placed, running sandbox with no agent working is suspended after this long (default 11 min). */
+  SANDBOX_SUSPEND_IDLE_MS?: string;
   /** Captain wake batching window. */
   WAKE_BATCH_MS?: string;
 }

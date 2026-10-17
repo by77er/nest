@@ -38,7 +38,8 @@ use nest_protocol::model::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::config::{Config, DriverConfig, NetworkConfig};
+use crate::config::{Config, DriverConfig, NetworkConfig, StorageConfig};
+use crate::s3::{CredentialSource, S3Store};
 use crate::driver::{Driver, Pauser, Vm, VmSpec};
 use crate::enroll::Enrolled;
 use crate::fleet::{self, FleetInput, FleetNotice, FleetParams, FleetReporter};
@@ -226,7 +227,13 @@ impl Host {
                 DriverConfig::Firecracker(fc) => Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone() }),
             },
         };
-        let store: Arc<dyn ObjectStore> = Arc::new(storage::LocalFsStore::new(cfg.store_dir())?);
+        let cache = storage::LocalFsStore::new(cfg.store_dir())?;
+        let store: Arc<dyn ObjectStore> = match &cfg.storage {
+            StorageConfig::Local => Arc::new(cache),
+            StorageConfig::S3 { bucket, region, prefix, imds_url } => {
+                Arc::new(S3Store::new(bucket, region, prefix, None, CredentialSource::Imds(imds_url.clone()), cache)?)
+            }
+        };
         // Random per nestd process: the fleet hello's `instance_id` and the proxy's `nestd_boot_id`.
         let instance_id = crate::util::random_hex(8);
 
@@ -347,6 +354,11 @@ impl Host {
         {
             let inner = inner.clone();
             tokio::spawn(async move { inner.lease_watchdog(lease_rx).await });
+        }
+        // Spot interruption notices (AWS hosts): FleetDO drains the host before the deadline.
+        if let crate::config::EnrollmentConfig::AwsImds { imds_url } = &inner.cfg.enrollment {
+            let (inner, url) = (inner.clone(), imds_url.clone());
+            tokio::spawn(async move { inner.spot_watch(url).await });
         }
         // Housekeeping: proxy CA renewal and capacity reports.
         {
@@ -799,6 +811,26 @@ impl Inner {
     }
 
     /// Periodic: renew the proxy intermediate CA before it expires; report capacity changes.
+    /// Poll IMDS for a spot interruption every 5 s and report it once.
+    async fn spot_watch(self: Arc<Self>, imds_url: String) {
+        let http = match reqwest::Client::builder().timeout(Duration::from_secs(2)).build() {
+            Ok(h) => h,
+            Err(e) => return tracing::error!("spot watch disabled: {e}"),
+        };
+        loop {
+            match crate::enroll::spot_deadline(&http, &imds_url).await {
+                Ok(Some(deadline_ms)) => {
+                    tracing::warn!(deadline_ms, "spot interruption notice: draining");
+                    self.emit(HostEventBody::SpotNotice { deadline_ms });
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!("spot watch: {e:#}"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
     async fn housekeeping(self: Arc<Self>) {
         let mut last_capacity: Option<(Capacity, Instant)> = None;
         loop {
