@@ -95,6 +95,21 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "GET" && path === "/v1/health") return json({ ok: true, protocol_version: PROTOCOL_VERSION });
   if (req.method === "POST" && path === "/v1/hosts/enroll") return enroll(req, env);
 
+  // Host-authenticated HTTP: object-store GC (a burst host runs it; FleetDO says when and from what).
+  if (req.method === "POST" && (path === "/v1/hosts/gc/claim" || path === "/v1/hosts/gc/report")) {
+    const token = bearer(req);
+    if (!token) throw new NestError(ErrorCodes.UNAUTHORIZED, "host token required", 401);
+    const claims = await verifyHostToken(env.HOST_TOKEN_SECRET, token);
+    const f = fleet(env, checkCell(env, claims.cell));
+    if (path === "/v1/hosts/gc/claim") {
+      const c = await f.gcClaim(claims.host);
+      return c ? json(c) : new Response(null, { status: 204 });
+    }
+    const r = await body(req, z.object({ run: z.string().startsWith("gc_"), report: z.record(z.string(), z.unknown()) }));
+    await f.gcReport(claims.host, r.run, r.report);
+    return json({ ok: true });
+  }
+
   // Host-authenticated WebSockets.
   if (path === "/v1/fleet" || (p = m(/^\/v1\/agents\/(agt_[A-Za-z0-9-]+)\/session$/))) {
     if (!isUpgrade(req)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "expected a WebSocket upgrade", 426);
@@ -147,6 +162,15 @@ async function route(req: Request, env: Env): Promise<Response> {
     return json(await fleet(env, cell).hostStatus(p[1]!));
   }
   if (req.method === "GET" && path === "/v1/admin/fleet") return json(await fleet(env, cell).fleetView());
+  if (req.method === "GET" && path === "/v1/admin/gc") return json(await fleet(env, cell).gcStatus());
+  if (req.method === "POST" && path === "/v1/admin/gc/run") {
+    await fleet(env, cell).gcRequest();
+    return json({ ok: true, note: "the next burst host to check in runs it (dry run until one completes)" });
+  }
+  if (req.method === "POST" && path === "/v1/admin/gc/register") {
+    const r = await body(req, z.object({ sandboxes: z.array(z.string().startsWith("sbx_")) }));
+    return json({ live: await fleet(env, cell).registerSandboxes(r.sandboxes) });
+  }
   if (req.method === "GET" && path === "/v1/admin/root-ca") {
     return new Response(await fleet(env, cell).rootCertificatePem(), { headers: { "content-type": "application/x-pem-file" } });
   }

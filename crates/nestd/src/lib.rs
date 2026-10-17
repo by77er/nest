@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod driver;
 pub mod enroll;
 pub mod fleet;
+pub mod gc;
 pub mod guest;
 pub mod host;
 pub mod limits;

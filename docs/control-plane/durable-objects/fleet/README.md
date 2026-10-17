@@ -31,8 +31,8 @@ One per cell: hosts, enrollment, leases, placement, drains, STONITH, base genera
 
   A spot notice doesn't wait for the gate: the instance goes anyway, and whatever didn't commit is recorded as a loss.
 - **Base generations:** an index of `(image digest, restore ABI) → generation` for the cell, with a per-digest backoff for failed preparation ([base generations](../../../sandbox/state/memory/#base-generations)). Each is a GC root until its image is retired.
+- **Object-store GC:** the cell's sandbox registry, the GC schedule and the roots snapshot. A burst host runs the pass ([GC](../../../sandbox/state/object-store/#garbage-collection)).
 - **Not built:**
-  - **The autoscaler** (`RunInstances` plus recording the launch). See [../../../compute/autoscaling/](../../../compute/autoscaling/).
   - **The desired host version** per cell, which drives [host upgrades](../../../compute/provisioning/#upgrades).
   - **Command batching:** one frame per `issueCommands` call.
   - **Packing:** placement is least-loaded by lease count (warm snapshots first); hugepage-aware packing and the restore-ABI match aren't built.
