@@ -24,6 +24,7 @@ import Aws.Resource.IamUser
 import Aws.Resource.IamPolicy
 import Aws.Resource.IamUserPolicyAttachment
 import Aws.Resource.LaunchTemplate
+import Aws.Resource.FisExperimentTemplate
 import Cell.Iam
 
 /-!
@@ -90,6 +91,14 @@ def controlPlaneStatements (spec : CellSpec) (template hostRole : Input String) 
   , { sid := "PassHostRole", actions := ["iam:PassRole"], resources := [hostRole]
       conditions := [{ op := "StringEquals", entries := [("iam:PassedToService", ["ec2.amazonaws.com"])] }] }
   , { sid := "StonithNestOnly", actions := ["ec2:TerminateInstances", "ec2:StopInstances"], resources := [ec2 "instance/*"]
+      conditions := [{ op := "StringEquals", entries := [("aws:ResourceTag/nest", ["true"])] }] }
+  , { sid := "Describe", actions := ["ec2:DescribeInstances"], resources := [lit "*"] } ]
+
+/-- AWS Fault Injection Service, for spot interruption drills: it may interrupt nest's spot
+instances only. -/
+def fisStatements (spec : CellSpec) : List Statement :=
+  [ { sid := "InterruptNestSpotOnly", actions := ["ec2:SendSpotInstanceInterruptions"]
+      resources := [lit s!"arn:aws:ec2:{spec.region}:{spec.accountId}:instance/*"]
       conditions := [{ op := "StringEquals", entries := [("aws:ResourceTag/nest", ["true"])] }] }
   , { sid := "Describe", actions := ["ec2:DescribeInstances"], resources := [lit "*"] } ]
 
@@ -192,11 +201,29 @@ def cell (spec : CellSpec) : Infra Unit := do
     { name := lit s!"nest-{spec.name}-fleet", policy := document (controlPlaneStatements spec templateArn hostRole.arn) }
   let _ ← IamUserPolicyAttachment.create "control_plane_fleet" { user := cp.name, policyArn := fleet.arn }
 
+  -- Spot interruption drill: `aws fis start-experiment --experiment-template-id <output>` sends a
+  -- real two-minute notice to one running nest spot instance.
+  let fisRole ← IamRole.create "fis"
+    { name := lit s!"nest-{spec.name}-fis"
+      assumeRolePolicy := "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"fis.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}" }
+  let _ ← IamRolePolicy.create "fis_interrupt" { name := "interrupt-nest-spot", role := fisRole.id, policy := document (fisStatements spec) }
+  let drill ← FisExperimentTemplate.create "spot_interruption"
+    { description := lit s!"nest {spec.name}: interrupt one running nest spot host (2 min notice)"
+      roleArn := fisRole.arn
+      stopCondition := [{ source := "none" }]
+      target := [{ name := "nest-spot", resourceType := "aws:ec2:spot-instance", selectionMode := "COUNT(1)"
+                   resourceTag := [{ key := "nest", value := "true" }]
+                   filter := [{ path := "State.Name", values := array [lit "running"] }] }]
+      action := [{ name := "interrupt", actionId := "aws:ec2:send-spot-instance-interruptions"
+                   parameter := [{ key := "durationBeforeInterruption", value := "PT2M" }]
+                   target := some { key := "SpotInstances", value := "nest-spot" } }] }
+
   output "bucket" bucket.id
   output "launch_template_id" template.id
   output "subnet_ids" (array [subnetA.id, subnetB.id, subnetC.id])
   output "security_group_id" sg.id
   output "s3_endpoint_id" s3.id
   output "control_plane_user" cp.name
+  output "spot_drill_template_id" drill.id
 
 end Cell
