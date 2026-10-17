@@ -53,6 +53,12 @@ pub enum StorageConfig {
         prefix: String,
         #[serde(default = "default_imds_url")]
         imds_url: String,
+        /// Concurrent chunk transfers per commit or restore.
+        #[serde(default = "default_s3_parallelism")]
+        parallelism: usize,
+        /// Cap on the local chunk cache (least recently used chunks go first).
+        #[serde(default = "default_s3_cache_gib")]
+        cache_max_gib: u64,
     },
 }
 
@@ -103,7 +109,12 @@ pub enum EnrollmentConfig {
 pub enum DriverConfig {
     /// Local development: runs the guest agent as a child process; vsock is emulated with unix
     /// sockets (see `docs/interfaces/host-guest/`).
-    Process { guest_command: Vec<String> },
+    Process {
+        guest_command: Vec<String>,
+        /// Run the guest with its disk image loop-mounted at `/workspace` (root only).
+        #[serde(default)]
+        mount_disk: bool,
+    },
     Firecracker(FirecrackerConfig),
 }
 
@@ -205,6 +216,12 @@ fn default_commit_timeout_ms() -> u64 {
 }
 fn default_imds_url() -> String {
     "http://169.254.169.254".into()
+}
+fn default_s3_parallelism() -> usize {
+    16
+}
+fn default_s3_cache_gib() -> u64 {
+    8
 }
 fn default_s3_prefix() -> String {
     "store/".into()

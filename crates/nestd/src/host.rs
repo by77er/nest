@@ -39,7 +39,7 @@ use nest_protocol::model::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Config, DriverConfig, NetworkConfig, StorageConfig};
-use crate::s3::{CredentialSource, S3Store};
+use crate::s3::{CredentialSource, S3Options, S3Store};
 use crate::driver::{Driver, Pauser, Vm, VmSpec};
 use crate::enroll::Enrolled;
 use crate::fleet::{self, FleetInput, FleetNotice, FleetParams, FleetReporter};
@@ -223,15 +223,18 @@ impl Host {
         let driver: Arc<dyn Driver> = match driver {
             Some(d) => d,
             None => match &cfg.driver {
-                DriverConfig::Process { guest_command } => Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone() }),
+                DriverConfig::Process { guest_command, mount_disk } => {
+                    Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk })
+                }
                 DriverConfig::Firecracker(fc) => Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone() }),
             },
         };
         let cache = storage::LocalFsStore::new(cfg.store_dir())?;
         let store: Arc<dyn ObjectStore> = match &cfg.storage {
             StorageConfig::Local => Arc::new(cache),
-            StorageConfig::S3 { bucket, region, prefix, imds_url } => {
-                Arc::new(S3Store::new(bucket, region, prefix, None, CredentialSource::Imds(imds_url.clone()), cache)?)
+            StorageConfig::S3 { bucket, region, prefix, imds_url, parallelism, cache_max_gib } => {
+                let options = S3Options { parallelism: *parallelism, cache_max_bytes: cache_max_gib << 30 };
+                Arc::new(S3Store::new(bucket, region, prefix, None, CredentialSource::Imds(imds_url.clone()), cache, options)?)
             }
         };
         // Random per nestd process: the fleet hello's `instance_id` and the proxy's `nestd_boot_id`.
