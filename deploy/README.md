@@ -5,7 +5,7 @@ nest's cells as an [inframe](https://github.com/by77er/inframe) project: Lean st
 | Path | What |
 |---|---|
 | `inframe.toml` | The project: the Lean package, the pinned AWS provider, and each stack's S3 state backend |
-| `aws-schema.json` | The AWS provider schema (6.69.1), trimmed to the resource types nest uses, so bindings build in seconds |
+| `aws-schema.json` | The AWS provider schema (6.69.1), trimmed to the resource types nest uses (123 KB instead of 24 MB) and without the provider's `endpoints` block |
 | `lean/Cell/Stack.lean` | A cell: VPC with public subnets and an S3 gateway endpoint, egress-only security group, versioned bucket, host role, launch template, the control plane's IAM user |
 | `lean/Cell/Iam.lean` | IAM policies as data, rendered to JSON |
 | `lean/Cell/Test.lean` | Theorems about what the control plane and hosts may do, for every cell; policies over the `use1` graph (no ingress, egress allow-list, IMDSv2) |
@@ -31,4 +31,5 @@ inframe apply --stack use1 -- use1.plan
 - **The provider pins the account** (`allowed_account_ids`), so credentials for another account fail before any change.
 - **Every resource is tagged** `nest=true` and `nest:cell=<cell>` through the provider's default tags.
 - **The bucket can't be destroyed** by the stack (`prevent_destroy`): sandbox state lives there.
-- **The provider's `endpoints` block is trimmed** from the schema: its 300+ fields exceed what one Lean structure can hold.
+- **The provider's `endpoints` block is trimmed** from the schema: its 326 fields exceed Lean's limit on constructor fields.
+- **Adding a resource type:** copy its entry unchanged from `inframe provider inspect --source hashicorp/aws --version 6.69.1 --output <file>` into `aws-schema.json`. The trim is only for size: since inframe `ea3880b` the full schema generates in under a second, and Lake compiles only the modules a stack imports.

@@ -4,10 +4,11 @@
 [lean]
 directory = "lean"
 main = "cell-use1"
-core = { git = "https://github.com/by77er/inframe", rev = "a68f89ce683be8fd0f548da4fb74442142a55fac", subdir = "lean" }
+core = { git = "https://github.com/by77er/inframe", rev = "ea3880b268cdbd43addaaa92e3b3c7176204f1b9", subdir = "lean" }
 
 # The provider schema is trimmed to the resource types nest uses (aws-schema.json, from
-# `inframe provider inspect`), so the generated bindings build in seconds.
+# `inframe provider inspect`) to keep it small, and drops the provider's `endpoints` block,
+# which Lean can't compile. See README.md.
 [providers.aws]
 source = "hashicorp/aws"
 version = "6.69.1"
