@@ -4,9 +4,14 @@
 //!
 //! The child starts inside the sandbox netns (when networking is enabled), so its egress hits the
 //! same nft rules and proxy listeners a VM would. Pause/resume are SIGSTOP/SIGCONT.
+//!
+//! With `mount_disk` (root only), the disk image is formatted ext4 on first use and the guest
+//! runs in a private mount namespace with it loop-mounted at `/workspace`, so what an agent writes
+//! there is in the image that commits upload and restores bring back, as with a VM's disk.
 
 use std::io;
-use std::path::PathBuf;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,6 +24,37 @@ use crate::vsock::Emulator;
 pub struct ProcessDriver {
     /// Guest agent command; `--listen unix:<dir>` is appended.
     pub guest_command: Vec<String>,
+    /// Loop-mount the disk image at `/workspace` in the guest's own mount namespace.
+    pub mount_disk: bool,
+}
+
+/// Where the image is mounted inside the guest's mount namespace.
+pub const WORKSPACE: &str = "/workspace";
+
+/// Whether `path` holds an ext2/3/4 filesystem (superblock magic `0xEF53` at byte 1080).
+fn has_ext4(path: &Path) -> io::Result<bool> {
+    let f = std::fs::File::open(path)?;
+    let mut magic = [0u8; 2];
+    match f.read_exact_at(&mut magic, 1080) {
+        Ok(()) => Ok(magic == [0x53, 0xEF]),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Format a fresh (all-holes) image; a restored one already has its filesystem.
+fn ensure_ext4(path: &Path) -> io::Result<()> {
+    if has_ext4(path)? {
+        return Ok(());
+    }
+    let out = std::process::Command::new("mkfs.ext4")
+        .args(["-F", "-q", "-m", "0", "-E", "lazy_itable_init=1,lazy_journal_init=1,nodiscard"])
+        .arg(path)
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!("mkfs.ext4: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -31,12 +67,13 @@ impl Driver for ProcessDriver {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "process driver: empty guest_command"));
         }
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), spec, child: None, emulator: None }))
+        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), mount_disk: self.mount_disk, spec, child: None, emulator: None }))
     }
 }
 
 pub struct ProcessVm {
     cmd: Vec<String>,
+    mount_disk: bool,
     spec: VmSpec,
     child: Option<std::process::Child>,
     emulator: Option<Emulator>,
@@ -78,9 +115,24 @@ impl Vm for ProcessVm {
         let guest_dir = self.guest_dir();
         std::fs::create_dir_all(&guest_dir)?;
         self.emulator = Some(Emulator::start(&self.vsock_uds_path(), &guest_dir)?);
-        let mut cmd = std::process::Command::new(&self.cmd[0]);
-        cmd.args(&self.cmd[1..])
-            .arg("--listen")
+        let mut cmd = if self.mount_disk {
+            let disk = self.spec.disk_path.clone();
+            tokio::task::spawn_blocking(move || ensure_ext4(&disk)).await.map_err(io::Error::other)??;
+            std::fs::create_dir_all(WORKSPACE)?;
+            // unshare execs in place and sh execs the guest, so the child's pid is the guest's
+            // (pause and stop signal it directly). The mount dies with the namespace.
+            let mut c = std::process::Command::new("unshare");
+            c.args(["--mount", "--propagation", "private", "--", "/bin/sh", "-c", r#"mount -o loop "$1" "$2" && shift 2 && exec "$@""#, "nest-mount"])
+                .arg(&self.spec.disk_path)
+                .arg(WORKSPACE)
+                .args(&self.cmd);
+            c
+        } else {
+            let mut c = std::process::Command::new(&self.cmd[0]);
+            c.args(&self.cmd[1..]);
+            c
+        };
+        cmd.arg("--listen")
             .arg(format!("unix:{}", guest_dir.display()))
             .env("NEST_DISK_IMAGE", &self.spec.disk_path)
             .stdin(std::process::Stdio::null());
@@ -117,5 +169,69 @@ impl Drop for ProcessVm {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh image is formatted once; a formatted (e.g. restored) one is left alone.
+    #[test]
+    fn formats_a_fresh_image_once() {
+        if std::process::Command::new("mkfs.ext4").arg("-V").output().is_err() {
+            eprintln!("skipping: no mkfs.ext4");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        crate::storage::create_sparse(&img, 256 << 20).unwrap();
+        assert!(!has_ext4(&img).unwrap());
+        ensure_ext4(&img).unwrap();
+        assert!(has_ext4(&img).unwrap());
+        let before = std::fs::read(&img).unwrap();
+        ensure_ext4(&img).unwrap();
+        assert_eq!(before, std::fs::read(&img).unwrap(), "an existing filesystem is never reformatted");
+    }
+
+    /// What the guest writes under /workspace and syncs is in the image file itself (what a commit
+    /// chunks), read from outside the guest's mount namespace while it still runs.
+    #[tokio::test]
+    async fn guest_writes_land_in_the_disk_image() {
+        let probe = std::process::Command::new("unshare").args(["--mount", "true"]).status();
+        if !nix::unistd::geteuid().is_root() || !probe.is_ok_and(|s| s.success()) || std::process::Command::new("debugfs").arg("-V").output().is_err() {
+            eprintln!("skipping: needs root, mount namespaces and debugfs");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        crate::storage::create_sparse(&img, 256 << 20).unwrap();
+        let driver = ProcessDriver {
+            guest_command: vec!["/bin/sh".into(), "-c".into(), "echo state-that-moves > /workspace/marker && sync && exec sleep 30".into()],
+            mount_disk: true,
+        };
+        let spec = VmSpec {
+            sandbox: nest_protocol::model::SandboxId("sbx_mounttest".into()),
+            epoch: nest_protocol::model::Epoch(1),
+            image: "test".into(),
+            resources: nest_protocol::model::Resources { vcpus: 1, memory_mib: 128, disk_gib: 1 },
+            vm_dir: dir.path().join("vm"),
+            disk_path: img.clone(),
+            netns: None,
+        };
+        let mut vm = driver.create(spec).await.unwrap();
+        vm.start().await.unwrap();
+        let mut found = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let out = std::process::Command::new("debugfs").args(["-R", "cat /marker"]).arg(&img).output().unwrap();
+            found = String::from_utf8_lossy(&out.stdout).to_string();
+            if found.contains("state-that-moves") {
+                break;
+            }
+        }
+        vm.stop().await.unwrap();
+        assert!(found.contains("state-that-moves"), "image holds: {found:?}");
+        assert!(!std::path::Path::new("/workspace/marker").exists(), "the mount is private to the guest");
     }
 }

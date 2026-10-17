@@ -15,7 +15,7 @@ CONTROL_URL="@CONTROL_URL@"
 CLAUDE_VERSION="2.1.301"
 export HOME=/root
 
-dnf install -y -q nftables iproute util-linux bubblewrap
+dnf install -y -q nftables iproute util-linux bubblewrap e2fsprogs
 
 install -d -m 0755 /opt/nest/bin /usr/lib/nest /etc/nest /etc/claude-code /var/lib/nest /run/nest /var/lib/nest/runner/cwd /run/nest/runner
 aws s3 cp --region "$REGION" --recursive --only-show-errors "s3://$BUCKET/releases/current/" /opt/nest/release/
@@ -36,7 +36,7 @@ cat >/etc/nest/nestd.json <<EOF
   "control_url": "$CONTROL_URL",
   "enrollment": {"type": "aws_imds"},
   "driver": {"type": "process", "guest_command": ["/opt/nest/bin/nest-guest", "--state-dir", "/var/lib/nest/guest",
-    "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none"]},
+    "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none"], "mount_disk": true},
   "network": {"type": "netns", "persist_dir": "/run/nest/netns"},
   "storage": {"type": "s3", "bucket": "$BUCKET", "region": "$REGION"},
   "versions": {"nest_proxy": "$(cat /opt/nest/release/VERSION)", "agent_runner": "$(cat /opt/nest/release/VERSION)", "claude_code": "$CLAUDE_VERSION"}

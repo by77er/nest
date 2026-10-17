@@ -5,8 +5,11 @@
 //! chunks become `null` entries that are never stored.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 
 use nest_protocol::model::{Manifest, ManifestHash, ManifestKind};
@@ -17,6 +20,10 @@ pub const DISK_CHUNK: u32 = 4 << 20;
 pub const MEMORY_CHUNK: u32 = 2 << 20;
 
 pub trait ObjectStore: Send + Sync {
+    /// How many chunk transfers [`commit_file`] and [`restore_file`] run at once.
+    fn parallelism(&self) -> usize {
+        1
+    }
     fn has_chunk(&self, hex: &str) -> io::Result<bool>;
     fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()>;
     fn get_chunk(&self, hex: &str) -> io::Result<Vec<u8>>;
@@ -32,6 +39,10 @@ pub struct LocalFsStore {
 }
 
 impl LocalFsStore {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(root.join("chunks"))?;
@@ -102,7 +113,8 @@ fn next_data(file: &File, pos: u64) -> io::Result<Option<u64>> {
 }
 
 /// Chunk `path` into `store` and write its manifest. Returns the manifest and its hash.
-/// Unchanged chunks already present in the store are not rewritten (content addressing).
+/// Unchanged chunks already present in the store are not rewritten (content addressing). The file
+/// is read sequentially; hashing and uploads run on `store.parallelism()` threads.
 pub fn commit_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind) -> io::Result<(Manifest, ManifestHash)> {
     let chunk_size = match kind {
         ManifestKind::Disk => DISK_CHUNK,
@@ -111,26 +123,56 @@ pub fn commit_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind) -> 
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
     let n = size.div_ceil(chunk_size) as usize;
-    let mut chunks: Vec<Option<String>> = vec![None; n];
-    let mut buf = vec![0u8; chunk_size as usize];
-    let mut pos = 0u64;
-    while pos < size {
-        let Some(data) = next_data(&file, pos)? else { break };
-        let idx = data / chunk_size;
-        let start = idx * chunk_size;
-        let len = chunk_size.min(size - start) as usize;
-        file.seek(SeekFrom::Start(start))?;
-        file.read_exact(&mut buf[..len])?;
-        let bytes = &buf[..len];
-        if bytes.iter().any(|&b| b != 0) {
-            let hex = blake3::hash(bytes).to_hex().to_string();
-            if !store.has_chunk(&hex)? {
-                store.put_chunk(&hex, bytes)?;
-            }
-            chunks[idx as usize] = Some(format!("blake3:{hex}"));
+    let chunks: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; n]);
+    let failed: Mutex<Option<io::Error>> = Mutex::new(None);
+    let workers = store.parallelism().max(1);
+    // Bounded: at most ~2 chunks per worker are read ahead of the uploads.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(workers * 2);
+    let rx = Mutex::new(rx);
+    std::thread::scope(|scope| -> io::Result<()> {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let Ok((idx, bytes)) = rx.lock().expect("rx").recv() else { return };
+                    let hex = blake3::hash(&bytes).to_hex().to_string();
+                    let r = store.has_chunk(&hex).and_then(|has| if has { Ok(()) } else { store.put_chunk(&hex, &bytes) });
+                    match r {
+                        Ok(()) => chunks.lock().expect("chunks")[idx] = Some(format!("blake3:{hex}")),
+                        Err(e) => {
+                            failed.lock().expect("failed").get_or_insert(e);
+                            return;
+                        }
+                    }
+                }
+            });
         }
-        pos = start + chunk_size;
+        let mut pos = 0u64;
+        let read = (|| -> io::Result<()> {
+            while pos < size {
+                if failed.lock().expect("failed").is_some() {
+                    break;
+                }
+                let Some(data) = next_data(&file, pos)? else { break };
+                let idx = data / chunk_size;
+                let start = idx * chunk_size;
+                let len = chunk_size.min(size - start) as usize;
+                let mut buf = vec![0u8; len];
+                file.seek(SeekFrom::Start(start))?;
+                file.read_exact(&mut buf)?;
+                if buf.iter().any(|&b| b != 0) && tx.send((idx as usize, buf)).is_err() {
+                    break; // every worker stopped on an error
+                }
+                pos = start + chunk_size;
+            }
+            Ok(())
+        })();
+        drop(tx);
+        read
+    })?;
+    if let Some(e) = failed.into_inner().expect("failed") {
+        return Err(e);
     }
+    let chunks = chunks.into_inner().expect("chunks");
     let manifest = Manifest { format: 1, kind, chunk_size: chunk_size as u32, size_bytes: size, chunks, prefetch: vec![] };
     let bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
     let hex = blake3::hash(&bytes).to_hex().to_string();
@@ -151,20 +193,36 @@ pub fn restore_file(store: &dyn ObjectStore, manifest_hash: &ManifestHash, dest:
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(dest)?;
+    let f = OpenOptions::new().create(true).write(true).truncate(true).open(dest)?;
     f.set_len(manifest.size_bytes)?;
-    for (i, c) in manifest.chunks.iter().enumerate() {
-        if let Some(c) = c {
-            let hex = hex_of(c)?;
-            let data = store.get_chunk(hex)?;
-            verify(hex, &data)?;
-            let offset = i as u64 * chunk_size;
-            if data.len() as u64 > chunk_size || offset + data.len() as u64 > manifest.size_bytes {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("chunk {i} exceeds the manifest bounds")));
-            }
-            f.seek(SeekFrom::Start(offset))?;
-            f.write_all(&data)?;
+    // Every chunk name is checked before any download.
+    let todo: Vec<(usize, &str)> =
+        manifest.chunks.iter().enumerate().filter_map(|(i, c)| c.as_deref().map(|c| hex_of(c).map(|h| (i, h)))).collect::<io::Result<_>>()?;
+    let next = AtomicUsize::new(0);
+    let failed: Mutex<Option<io::Error>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..store.parallelism().max(1).min(todo.len().max(1)) {
+            scope.spawn(|| {
+                while failed.lock().expect("failed").is_none() {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(i, hex)) = todo.get(k) else { return };
+                    let offset = i as u64 * chunk_size;
+                    let r = store.get_chunk(hex).and_then(|data| {
+                        verify(hex, &data)?;
+                        if data.len() as u64 > chunk_size || offset + data.len() as u64 > manifest.size_bytes {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("chunk {i} exceeds the manifest bounds")));
+                        }
+                        f.write_all_at(&data, offset)
+                    });
+                    if let Err(e) = r {
+                        failed.lock().expect("failed").get_or_insert(e);
+                    }
+                }
+            });
         }
+    });
+    if let Some(e) = failed.into_inner().expect("failed") {
+        return Err(e);
     }
     f.sync_all()?;
     Ok(manifest)
@@ -181,6 +239,8 @@ pub fn create_sparse(path: &Path, bytes: u64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
