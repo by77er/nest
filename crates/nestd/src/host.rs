@@ -66,6 +66,9 @@ const CA_RENEW_BEFORE_MS: i64 = 48 * 3600 * 1000;
 const CA_RENEW_RETRY: Duration = Duration::from_secs(600);
 /// How often capacity is re-evaluated (emitted when it changed, or every 10 minutes).
 const CAPACITY_EVERY: Duration = Duration::from_secs(30);
+/// GC: first offer a few minutes after start, then hourly.
+const GC_FIRST_CHECK: Duration = Duration::from_secs(180);
+const GC_CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Coalescing window for guest port reports.
 const PORTS_COALESCE: Duration = Duration::from_millis(500);
 /// Bound on the (sandbox, host, port) dedup map for egress denials.
@@ -144,6 +147,10 @@ pub struct Inner {
     host_id: HostId,
     driver: Arc<dyn Driver>,
     store: Arc<dyn ObjectStore>,
+    /// The same store when it's S3: burst hosts run its GC.
+    s3: Option<Arc<S3Store>>,
+    /// The current host token (rotated over the fleet channel), for HTTP calls to the control plane.
+    host_token: Mutex<Secret>,
     proxy: ProxyLink,
     runner: RunnerLink,
     fleet: mpsc::UnboundedSender<FleetInput>,
@@ -230,11 +237,12 @@ impl Host {
             },
         };
         let cache = storage::LocalFsStore::new(cfg.store_dir())?;
-        let store: Arc<dyn ObjectStore> = match &cfg.storage {
-            StorageConfig::Local => Arc::new(cache),
+        let (store, s3): (Arc<dyn ObjectStore>, Option<Arc<S3Store>>) = match &cfg.storage {
+            StorageConfig::Local => (Arc::new(cache), None),
             StorageConfig::S3 { bucket, region, prefix, imds_url, parallelism, cache_max_gib } => {
                 let options = S3Options { parallelism: *parallelism, cache_max_bytes: cache_max_gib << 30, ..S3Options::default() };
-                Arc::new(S3Store::new(bucket, region, prefix, None, CredentialSource::Imds(imds_url.clone()), cache, options)?)
+                let s3 = Arc::new(S3Store::new(bucket, region, prefix, None, CredentialSource::Imds(imds_url.clone()), cache, options)?);
+                (s3.clone(), Some(s3))
             }
         };
         // Random per nestd process: the fleet hello's `instance_id` and the proxy's `nestd_boot_id`.
@@ -260,6 +268,8 @@ impl Host {
             host_id: enrolled.host.clone(),
             driver,
             store,
+            s3,
+            host_token: Mutex::new(enrolled.host_token.clone()),
             proxy,
             runner,
             fleet: fleet_tx,
@@ -362,6 +372,11 @@ impl Host {
         if let crate::config::EnrollmentConfig::AwsImds { imds_url } = &inner.cfg.enrollment {
             let (inner, url) = (inner.clone(), imds_url.clone());
             tokio::spawn(async move { inner.spot_watch(url).await });
+        }
+        // Object-store GC: burst hosts offer to run it; the control plane says when.
+        if inner.cfg.role == nest_protocol::model::HostRole::Burst && inner.s3.is_some() {
+            let inner = inner.clone();
+            tokio::spawn(async move { inner.gc_loop().await });
         }
         // Housekeeping: proxy CA renewal and capacity reports.
         {
@@ -506,6 +521,7 @@ impl Inner {
             }
             FleetNotice::HostToken { token, expires_ms } => {
                 crate::credentials::update_token(&self.cfg.credentials_path(), &token, expires_ms);
+                *self.host_token.lock().expect("host token") = Secret(token.clone());
                 self.runner.host_token(Secret(token), expires_ms)
             }
             FleetNotice::ProxyCa(ca) => {
@@ -815,6 +831,44 @@ impl Inner {
                 Err(e) => tracing::warn!(sandbox = %id, code = %e.code, "salvage commit failed"),
             }
         })
+    }
+
+    /// Ask the control plane whether a GC pass is due, soon after start and then hourly (hosts
+    /// come and go; whichever is up when one is due runs it), and run it.
+    async fn gc_loop(self: Arc<Self>) {
+        let http = match reqwest::Client::builder().timeout(Duration::from_secs(60)).build() {
+            Ok(h) => h,
+            Err(e) => return tracing::error!("GC disabled: {e}"),
+        };
+        tokio::time::sleep(GC_FIRST_CHECK).await;
+        loop {
+            if let Err(e) = self.gc_once(&http).await {
+                tracing::warn!("GC: {e:#}");
+            }
+            tokio::time::sleep(GC_CHECK_EVERY).await;
+        }
+    }
+
+    async fn gc_once(&self, http: &reqwest::Client) -> anyhow::Result<()> {
+        let base = self.cfg.control_url.trim_end_matches('/');
+        let token = || self.host_token.lock().expect("host token").0.clone();
+        let res = http.post(format!("{base}/v1/hosts/gc/claim")).bearer_auth(token()).send().await?;
+        if res.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        let claim: crate::gc::Claim = res.error_for_status()?.json().await?;
+        let Some(s3) = self.s3.clone() else { return Ok(()) };
+        tracing::info!(run = %claim.run, dry_run = claim.dry_run, roots = claim.roots.len(), "GC pass starting");
+        let c = claim.clone();
+        let report = tokio::task::spawn_blocking(move || crate::gc::run(&s3, &c, &|| now_ms())).await?;
+        tracing::info!(run = %claim.run, ?report, "GC pass done");
+        http.post(format!("{base}/v1/hosts/gc/report"))
+            .bearer_auth(token())
+            .json(&serde_json::json!({ "run": claim.run, "report": report }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Periodic: renew the proxy intermediate CA before it expires; report capacity changes.

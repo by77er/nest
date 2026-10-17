@@ -6,6 +6,7 @@
 //! before they expire). The store's methods are synchronous (callers run them on blocking
 //! threads), so each request blocks on the runtime that created the store.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +16,7 @@ use ring::{digest, hmac};
 use serde::Deserialize;
 
 use crate::storage::{LocalFsStore, ObjectStore};
-use crate::util::{amz_date, parse_rfc3339_utc_ms};
+use crate::util::{amz_date, parse_http_date_ms, parse_rfc3339_utc_ms};
 
 /// Refresh role credentials this long before they expire.
 const REFRESH_BEFORE_MS: i64 = 5 * 60_000;
@@ -44,13 +45,30 @@ impl Default for S3Options {
     }
 }
 
+/// A commit reuses an object only if it was last uploaded under this long ago, and uploads it again
+/// otherwise: GC deletes only objects unmarked for 24 h, so whatever a new generation needs is
+/// always inside that grace (`docs/sandbox/state/object-store/#garbage-collection`).
+pub const REUSE_MS: i64 = 12 * 3_600_000;
+
 /// Parts of one multipart upload in flight at once.
 const PART_PARALLELISM: usize = 4;
 
-/// A successful response: its body and `ETag` header.
+/// A successful response: its body and `ETag` and `Last-Modified` headers.
 struct Reply {
     body: Vec<u8>,
     etag: Option<String>,
+    last_modified_ms: Option<i64>,
+}
+
+/// One version of an object, from ListObjectVersions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectVersion {
+    /// Relative to the store's prefix (`chunks/<hex>`, `manifests/<hex>`).
+    pub key: String,
+    pub version_id: String,
+    pub last_modified_ms: i64,
+    pub size: u64,
+    pub delete_marker: bool,
 }
 
 /// What a failed attempt means for the next one.
@@ -94,6 +112,9 @@ pub struct S3Store {
     /// Bytes of cached chunks (an estimate between trims), and one trim at a time.
     cache_bytes: AtomicU64,
     trimming: Mutex<()>,
+    /// When each object this process uploaded or checked was last uploaded (Unix ms), for the
+    /// reuse rule. Entries older than [`REUSE_MS`] are re-checked.
+    uploaded: Mutex<HashMap<String, i64>>,
 }
 
 impl S3Store {
@@ -131,6 +152,7 @@ impl S3Store {
             cache,
             options,
             trimming: Mutex::new(()),
+            uploaded: Mutex::new(HashMap::new()),
         })
     }
 
@@ -209,9 +231,14 @@ impl S3Store {
     /// failures, and re-signed with fresh credentials if they were refused as expired. `Ok(None)`
     /// for 404. `query` is `(name, value)` pairs, unencoded.
     fn request(&self, method: reqwest::Method, key: &str, query: &[(&str, &str)], body: Option<&[u8]>) -> io::Result<Option<Reply>> {
+        self.request_path(method, &format!("{}{key}", self.prefix), query, body)
+    }
+
+    /// [`Self::request`] for a path in the bucket (`""` is the bucket itself), not under the prefix.
+    fn request_path(&self, method: reqwest::Method, path: &str, query: &[(&str, &str)], body: Option<&[u8]>) -> io::Result<Option<Reply>> {
         let mut attempt = 0;
         loop {
-            let err = match self.attempt(&method, key, query, body) {
+            let err = match self.attempt(&method, path, query, body) {
                 Ok(r) => return Ok(r),
                 Err(Failure::Fatal(e)) => return Err(e),
                 Err(Failure::Refresh(e)) => {
@@ -224,15 +251,14 @@ impl S3Store {
             if attempt >= ATTEMPTS {
                 return Err(err);
             }
-            tracing::debug!(attempt, "S3 {method} {key}: {err}; retrying");
+            tracing::debug!(attempt, "S3 {method} /{path}: {err}; retrying");
             backoff(attempt - 1);
         }
     }
 
-    fn attempt(&self, method: &reqwest::Method, key: &str, query: &[(&str, &str)], body: Option<&[u8]>) -> Result<Option<Reply>, Failure> {
+    fn attempt(&self, method: &reqwest::Method, path: &str, query: &[(&str, &str)], body: Option<&[u8]>) -> Result<Option<Reply>, Failure> {
         // `credentials` already retried on its own.
         let creds = self.credentials().map_err(Failure::Fatal)?;
-        let path = format!("{}{key}", self.prefix);
         let canonical_query = canonical_query(query);
         let url = if canonical_query.is_empty() { format!("{}/{path}", self.base) } else { format!("{}/{path}?{canonical_query}", self.base) };
         let canonical_uri = format!("{}/{path}", self.base).split_once(&self.host).map_or_else(|| format!("/{path}"), |(_, p)| p.to_string());
@@ -257,10 +283,12 @@ impl S3Store {
             if status == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            let etag = res.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let header = |name: &str| res.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+            let etag = header("etag");
+            let last_modified_ms = header("last-modified").as_deref().and_then(parse_http_date_ms);
             let bytes = res.bytes().await.map_err(|e| Failure::Retry(io::Error::other(e)))?;
             if status.is_success() {
-                return Ok(Some(Reply { body: bytes.to_vec(), etag }));
+                return Ok(Some(Reply { body: bytes.to_vec(), etag, last_modified_ms }));
             }
             let text = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).to_string();
             let err = io::Error::other(format!("S3 {method} {path}: {status} {text}"));
@@ -276,8 +304,79 @@ impl S3Store {
         })
     }
 
-    fn exists(&self, key: &str) -> io::Result<bool> {
-        Ok(self.request(reqwest::Method::HEAD, key, &[], None)?.is_some())
+    /// Whether `key` is in S3 and was last uploaded under [`REUSE_MS`] ago, so a commit may
+    /// reuse it. The local cache doesn't count: it says nothing about the object's age.
+    fn recent(&self, key: &str) -> io::Result<bool> {
+        let now = now_ms();
+        if self.uploaded.lock().unwrap().get(key).is_some_and(|t| now - t < REUSE_MS) {
+            return Ok(true);
+        }
+        let Some(r) = self.request(reqwest::Method::HEAD, key, &[], None)? else { return Ok(false) };
+        // No usable Last-Modified: treat it as old and upload again.
+        let Some(t) = r.last_modified_ms else { return Ok(false) };
+        if now - t >= REUSE_MS {
+            return Ok(false);
+        }
+        self.uploaded.lock().unwrap().insert(key.into(), t);
+        Ok(true)
+    }
+
+    /// Tests: upload `key` and treat it as just uploaded.
+    #[cfg(test)]
+    pub(crate) fn put_young(&self, key: String, data: &[u8]) {
+        self.put(&key, data).unwrap();
+        self.uploaded_now(&key);
+    }
+
+    fn uploaded_now(&self, key: &str) {
+        let mut u = self.uploaded.lock().unwrap();
+        let now = now_ms();
+        // Bounded by what a host commits in 12 h; drop what no longer counts.
+        if u.len() > 100_000 {
+            u.retain(|_, t| now - *t < REUSE_MS);
+        }
+        u.insert(key.into(), now);
+    }
+
+    /// Every version of every object under `<prefix><sub>`, oldest pages first. ListObjectVersions
+    /// returns up to 1,000 per request.
+    pub fn list_versions(&self, sub: &str) -> io::Result<Vec<ObjectVersion>> {
+        let prefix = format!("{}{sub}", self.prefix);
+        let (mut key_marker, mut version_marker) = (None::<String>, None::<String>);
+        let mut out = Vec::new();
+        loop {
+            let mut q: Vec<(&str, &str)> = vec![("versions", ""), ("prefix", &prefix)];
+            if let Some(k) = &key_marker {
+                q.push(("key-marker", k));
+            }
+            if let Some(v) = &version_marker {
+                q.push(("version-id-marker", v));
+            }
+            let r = self.request_path(reqwest::Method::GET, "", &q, None)?.ok_or_else(|| io::Error::other("list versions: bucket not found"))?;
+            let page = parse_versions(&r.body, &self.prefix)?;
+            out.extend(page.versions);
+            if !page.truncated {
+                return Ok(out);
+            }
+            if page.next_key.is_none() {
+                return Err(io::Error::other("list versions: truncated without a next marker"));
+            }
+            (key_marker, version_marker) = (page.next_key, page.next_version);
+        }
+    }
+
+    /// Delete exactly this version: a newer upload of the same key is untouched.
+    pub fn delete_version(&self, key: &str, version_id: &str) -> io::Result<()> {
+        self.request(reqwest::Method::DELETE, key, &[("versionId", version_id)], None).map(|_| ())
+    }
+
+    /// A manifest, fetched and checked against its hash (never trusting the cache).
+    pub fn manifest_verified(&self, hex: &str) -> io::Result<Vec<u8>> {
+        let d = self.get_manifest(hex)?;
+        if blake3::hash(&d).to_hex().as_str() != hex {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("manifest {hex} does not match its hash")));
+        }
+        Ok(d)
     }
 
     fn get(&self, key: &str) -> io::Result<Vec<u8>> {
@@ -371,11 +470,12 @@ impl ObjectStore for S3Store {
         self.options.parallelism
     }
     fn has_chunk(&self, hex: &str) -> io::Result<bool> {
-        // The cache only ever holds objects known to be in S3.
-        Ok(self.cache.has_chunk(hex)? || self.exists(&format!("chunks/{hex}"))?)
+        self.recent(&format!("chunks/{hex}"))
     }
     fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()> {
-        self.put(&format!("chunks/{hex}"), data)?;
+        let key = format!("chunks/{hex}");
+        self.put(&key, data)?;
+        self.uploaded_now(&key);
         self.cache.put_chunk(hex, data)?;
         self.cached(data.len());
         Ok(())
@@ -394,11 +494,13 @@ impl ObjectStore for S3Store {
         Ok(d)
     }
     fn put_manifest(&self, hex: &str, data: &[u8]) -> io::Result<()> {
-        // Content-addressed: a manifest already cached is already in S3.
-        if self.cache.get_manifest(hex).is_ok() {
+        // Shared by forks and reused like chunks.
+        let key = format!("manifests/{hex}");
+        if self.recent(&key)? {
             return Ok(());
         }
-        self.put(&format!("manifests/{hex}"), data)?;
+        self.put(&key, data)?;
+        self.uploaded_now(&key);
         self.cache.put_manifest(hex, data)
     }
     fn get_manifest(&self, hex: &str) -> io::Result<Vec<u8>> {
@@ -460,6 +562,51 @@ fn xml_value(body: &[u8], tag: &str) -> Option<String> {
     let start = text.find(&format!("<{tag}>"))? + tag.len() + 2;
     let end = text[start..].find(&format!("</{tag}>"))? + start;
     Some(text[start..end].to_string())
+}
+
+struct VersionsPage {
+    versions: Vec<ObjectVersion>,
+    truncated: bool,
+    next_key: Option<String>,
+    next_version: Option<String>,
+}
+
+/// A ListVersionsResult: its `<Version>` and `<DeleteMarker>` entries, keys made relative to
+/// `prefix`. An entry missing a field is an error, not skipped: the sweep must see everything.
+fn parse_versions(body: &[u8], prefix: &str) -> io::Result<VersionsPage> {
+    let text = String::from_utf8_lossy(body);
+    if !text.contains("<ListVersionsResult") {
+        return Err(io::Error::other(format!("list versions: unexpected reply {}", &text[..text.len().min(300)])));
+    }
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("list versions: {what}"));
+    let mut versions = Vec::new();
+    let mut rest: &str = &text;
+    loop {
+        let v = rest.find("<Version>").map(|i| (i, "Version"));
+        let d = rest.find("<DeleteMarker>").map(|i| (i, "DeleteMarker"));
+        let Some((start, tag)) = [v, d].into_iter().flatten().min() else { break };
+        let close = format!("</{tag}>");
+        let end = rest[start..].find(&close).ok_or_else(|| bad("unterminated entry"))? + start;
+        let entry = &rest.as_bytes()[start..end];
+        let key = xml_unescape(&xml_value(entry, "Key").ok_or_else(|| bad("entry without Key"))?);
+        let key = key.strip_prefix(prefix).ok_or_else(|| bad(&format!("{key} is outside {prefix}")))?.to_string();
+        let version_id = xml_value(entry, "VersionId").ok_or_else(|| bad("entry without VersionId"))?;
+        let last_modified_ms =
+            xml_value(entry, "LastModified").as_deref().and_then(parse_rfc3339_utc_ms).ok_or_else(|| bad("entry without LastModified"))?;
+        let size = if tag == "Version" { xml_value(entry, "Size").and_then(|s| s.parse().ok()).ok_or_else(|| bad("version without Size"))? } else { 0 };
+        versions.push(ObjectVersion { key, version_id, last_modified_ms, size, delete_marker: tag == "DeleteMarker" });
+        rest = &rest[end + close.len()..];
+    }
+    Ok(VersionsPage {
+        versions,
+        truncated: xml_value(body, "IsTruncated").as_deref() == Some("true"),
+        next_key: xml_value(body, "NextKeyMarker").map(|k| xml_unescape(&k)),
+        next_version: xml_value(body, "NextVersionIdMarker"),
+    })
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
 fn xml_escape(s: &str) -> String {
@@ -532,7 +679,7 @@ async fn imds_credentials(http: &reqwest::Client, imds_url: &str) -> anyhow::Res
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -573,11 +720,24 @@ mod tests {
     /// Multipart uploads in progress: upload id → part number → bytes.
     type Uploads = Arc<Mutex<HashMap<String, HashMap<u32, Vec<u8>>>>>;
 
+    /// One stored version: id, Last-Modified (Unix ms), bytes.
+    #[derive(Clone)]
+    pub(crate) struct FakeVersion {
+        pub id: String,
+        pub modified_ms: i64,
+        pub data: Vec<u8>,
+    }
+
+    /// A versioned bucket (newest version last) like the cell's, plus ListObjectVersions paged
+    /// `page` entries at a time and exact deletes by version id.
     #[derive(Clone, Default)]
-    struct Fake {
-        url: String,
-        objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-        calls: Arc<Mutex<HashMap<String, usize>>>,
+    pub(crate) struct Fake {
+        pub url: String,
+        /// The latest version of each object.
+        pub objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        pub versions: Arc<Mutex<HashMap<String, Vec<FakeVersion>>>>,
+        pub page: Arc<AtomicU64>,
+        pub calls: Arc<Mutex<HashMap<String, usize>>>,
         inflight: Arc<AtomicU64>,
         max_inflight: Arc<AtomicU64>,
         fail_next: Arc<AtomicU64>,
@@ -587,7 +747,87 @@ mod tests {
         reject_part: Arc<AtomicU64>,
     }
 
-    async fn fake_s3() -> Fake {
+    impl Fake {
+        /// Make every version of `path` (`/cell/store/...`) look `ms` older.
+        pub fn age(&self, path: &str, ms: i64) {
+            for v in self.versions.lock().unwrap().get_mut(path).into_iter().flatten() {
+                v.modified_ms -= ms;
+            }
+        }
+        pub fn age_all(&self, ms: i64) {
+            let paths: Vec<String> = self.versions.lock().unwrap().keys().cloned().collect();
+            for p in paths {
+                self.age(&p, ms);
+            }
+        }
+        fn store(&self, path: &str, data: Vec<u8>) {
+            let mut vs = self.versions.lock().unwrap();
+            let n = vs.values().map(Vec::len).sum::<usize>();
+            vs.entry(path.into()).or_default().push(FakeVersion { id: format!("v{n}"), modified_ms: now_ms(), data: data.clone() });
+            self.objects.lock().unwrap().insert(path.into(), data);
+        }
+        fn delete_version(&self, path: &str, id: &str) {
+            let mut vs = self.versions.lock().unwrap();
+            let Some(list) = vs.get_mut(path) else { return };
+            list.retain(|v| v.id != id);
+            match list.last() {
+                Some(v) => {
+                    self.objects.lock().unwrap().insert(path.into(), v.data.clone());
+                }
+                None => {
+                    vs.remove(path);
+                    self.objects.lock().unwrap().remove(path);
+                }
+            }
+        }
+        fn list(&self, prefix: &str, key_marker: Option<&str>, version_marker: Option<&str>) -> String {
+            let vs = self.versions.lock().unwrap();
+            // Keys in order, each key's versions newest first.
+            let mut all: Vec<(String, FakeVersion, bool)> = Vec::new();
+            let mut keys: Vec<&String> = vs.keys().filter(|k| k.strip_prefix("/cell/").is_some_and(|k| k.starts_with(prefix))).collect();
+            keys.sort();
+            for k in keys {
+                for (i, v) in vs[k].iter().rev().enumerate() {
+                    all.push((k.strip_prefix("/cell/").unwrap().to_string(), v.clone(), i == 0));
+                }
+            }
+            let start = match (key_marker, version_marker) {
+                (Some(k), Some(v)) => all.iter().position(|(key, ver, _)| key == k && ver.id == v).map_or(0, |i| i + 1),
+                _ => 0,
+            };
+            let page = match self.page.load(Ordering::SeqCst) {
+                0 => 1000,
+                n => n as usize,
+            };
+            let entries = &all[start.min(all.len())..(start + page).min(all.len())];
+            let truncated = start + page < all.len();
+            let mut xml = String::from("<?xml version=\"1.0\"?><ListVersionsResult><Name>cell</Name>");
+            xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+            if let (true, Some((k, v, _))) = (truncated, entries.last()) {
+                xml.push_str(&format!("<NextKeyMarker>{k}</NextKeyMarker><NextVersionIdMarker>{}</NextVersionIdMarker>", v.id));
+            }
+            for (k, v, latest) in entries {
+                let d = amz_date(v.modified_ms / 1000);
+                let lm = format!("{}-{}-{}T{}:{}:{}.{:03}Z", &d[0..4], &d[4..6], &d[6..8], &d[9..11], &d[11..13], &d[13..15], v.modified_ms % 1000);
+                xml.push_str(&format!(
+                    "<Version><Key>{k}</Key><VersionId>{}</VersionId><IsLatest>{latest}</IsLatest><LastModified>{lm}</LastModified><Size>{}</Size></Version>",
+                    v.id,
+                    v.data.len()
+                ));
+            }
+            xml + "</ListVersionsResult>"
+        }
+    }
+
+    /// An HTTP date for `ms` (the weekday is a placeholder: the parser ignores it).
+    fn http_date(ms: i64) -> String {
+        let d = amz_date(ms / 1000); // 20130524T000000Z
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let mo: usize = d[4..6].parse().unwrap();
+        format!("Mon, {} {} {} {}:{}:{} GMT", &d[6..8], MONTHS[mo - 1], &d[0..4], &d[9..11], &d[11..13], &d[13..15])
+    }
+
+    pub(crate) async fn fake_s3() -> Fake {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fake = Fake { url: format!("http://{}", listener.local_addr().unwrap()), ..Default::default() };
         let f = fake.clone();
@@ -633,6 +873,7 @@ mod tests {
                         assert!(lower.contains(&format!("x-amz-content-sha256: {sha}")), "payload hash mismatch");
                         let throttled = f.fail_next.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
                         let mut etag = None;
+                        let mut last_modified = None;
                         let (status, out) = if throttled {
                             ("503 Slow Down", b"<Error><Code>SlowDown</Code></Error>".to_vec())
                         } else if method == "POST" && param("uploads").is_some() {
@@ -663,17 +904,28 @@ mod tests {
                                     assert!(part.contains(&format!("<ETag>&quot;etag-{}&quot;</ETag>", i + 1)), "wrong ETag: {part}");
                                     whole.extend(up.remove(&(i as u32 + 1)).unwrap());
                                 }
-                                f.objects.lock().unwrap().insert(path, whole);
+                                f.store(&path, whole);
                                 ("200 OK", b"<CompleteMultipartUploadResult></CompleteMultipartUploadResult>".to_vec())
                             }
+                        } else if method == "GET" && path == "/cell/" && param("versions").is_some() {
+                            let decode = |v: String| v.replace("%2F", "/");
+                            let prefix = param("prefix").map(decode).unwrap_or_default();
+                            let km = param("key-marker").map(decode);
+                            ("200 OK", f.list(&prefix, km.as_deref(), param("version-id-marker").as_deref()).into_bytes())
+                        } else if let (true, Some(id)) = (method == "DELETE", param("versionId")) {
+                            f.delete_version(&path, &id);
+                            ("204 No Content", Vec::new())
                         } else {
                             match method.as_str() {
                                 "PUT" => {
-                                    f.objects.lock().unwrap().insert(path, body);
+                                    f.store(&path, body);
                                     ("200 OK", Vec::new())
                                 }
-                                _ => match f.objects.lock().unwrap().get(&path) {
-                                    Some(d) => ("200 OK", if method == "HEAD" { Vec::new() } else { d.clone() }),
+                                _ => match f.versions.lock().unwrap().get(&path).and_then(|v| v.last()) {
+                                    Some(v) => {
+                                        last_modified = Some(http_date(v.modified_ms));
+                                        ("200 OK", if method == "HEAD" { Vec::new() } else { v.data.clone() })
+                                    }
                                     None => ("404 Not Found", Vec::new()),
                                 },
                             }
@@ -681,7 +933,8 @@ mod tests {
                         f.inflight.fetch_sub(1, Ordering::SeqCst);
                         let len = if method == "HEAD" { 0 } else { out.len() };
                         let etag = etag.map(|e| format!("ETag: {e}\r\n")).unwrap_or_default();
-                        let resp = format!("HTTP/1.1 {status}\r\n{etag}Content-Length: {len}\r\n\r\n");
+                        let lm = last_modified.map(|d| format!("Last-Modified: {d}\r\n")).unwrap_or_default();
+                        let resp = format!("HTTP/1.1 {status}\r\n{etag}{lm}Content-Length: {len}\r\n\r\n");
                         s.write_all(resp.as_bytes()).await.unwrap();
                         if method != "HEAD" {
                             s.write_all(&out).await.unwrap();
@@ -693,17 +946,17 @@ mod tests {
         fake
     }
 
-    fn store_with(endpoint: &str, cache: &std::path::Path, options: S3Options) -> S3Store {
+    pub(crate) fn store_with(endpoint: &str, cache: &std::path::Path, options: S3Options) -> S3Store {
         let creds = Credentials { access_key_id: "AKID".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_ms: None };
         S3Store::new("cell", "us-east-1", "store/", Some(endpoint), CredentialSource::Static(creds), LocalFsStore::new(cache).unwrap(), options).unwrap()
     }
 
-    fn store(endpoint: &str, cache: &std::path::Path) -> S3Store {
+    pub(crate) fn store(endpoint: &str, cache: &std::path::Path) -> S3Store {
         store_with(endpoint, cache, S3Options::default())
     }
 
     /// An image with `n` distinct non-zero 4 MiB chunks (and holes between them).
-    fn image(path: &std::path::Path, n: u64) {
+    pub(crate) fn image(path: &std::path::Path, n: u64) {
         use std::io::{Seek, SeekFrom, Write};
         storage::create_sparse(path, 2 * n * u64::from(storage::DISK_CHUNK)).unwrap();
         let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
@@ -879,9 +1132,9 @@ mod tests {
     /// Against real S3 (`cargo test -p nestd real_s3 -- --ignored`): needs `NEST_S3_TEST_BUCKET`,
     /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN` if temporary), and
     /// optionally `NEST_S3_TEST_CA`, a PEM to trust as well (a TLS-inspecting proxy's).
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
-    async fn real_s3_single_and_multipart() {
+    /// A store on the real bucket in `NEST_S3_TEST_BUCKET` (env credentials; `NEST_S3_TEST_CA`
+    /// adds a trusted root), under a fresh `test/<random>/` prefix.
+    pub(crate) fn real_store() -> (S3Store, String, String) {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let bucket = std::env::var("NEST_S3_TEST_BUCKET").expect("NEST_S3_TEST_BUCKET");
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
@@ -897,19 +1150,26 @@ mod tests {
                 http = http.add_root_certificate(cert);
             }
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
         let prefix = format!("test/{}/", crate::util::random_hex(6));
-        let s = S3Store::new(&bucket, &region, &prefix, None, CredentialSource::Static(creds), LocalFsStore::new(dir.path()).unwrap(), S3Options::default())
+        let s = S3Store::new(&bucket, &region, &prefix, None, CredentialSource::Static(creds), LocalFsStore::new(dir).unwrap(), S3Options::default())
             .unwrap()
             .with_http(http.build().unwrap());
+        (s, bucket, prefix)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn real_s3_single_and_multipart() {
+        let (s, bucket, prefix) = real_store();
         let big: Vec<u8> = (0..(21u32 << 20)).map(|i| (i % 253) as u8).collect();
         tokio::task::spawn_blocking(move || {
             s.put("small", b"hello").unwrap();
             assert_eq!(s.get("small").unwrap(), b"hello");
             s.put("big", &big).unwrap();
             assert_eq!(s.get("big").unwrap(), big);
-            assert!(s.exists("big").unwrap());
-            assert!(!s.exists("absent").unwrap());
+            assert!(s.recent("big").unwrap());
+            assert!(!s.recent("absent").unwrap());
         })
         .await
         .unwrap();

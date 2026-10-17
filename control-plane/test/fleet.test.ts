@@ -1,4 +1,4 @@
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import { CapacityError, type Ec2, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
@@ -595,5 +595,67 @@ describe("nestd restarts", () => {
     expect(recreate).toMatchObject({ sandbox: running.sandbox, epoch: 2, from: { id: head.id } });
     expect(await sandboxStub(parked.sandbox).info()).toMatchObject({ host: null, state: "suspended", epoch: 1 });
     expect(await fleetStub(cell).leaseOf(parked.sandbox)).toBeNull();
+  });
+});
+
+describe("object-store GC", () => {
+  const claim = (token: string) => SELF.fetch("http://cp.test/v1/hosts/gc/claim", { method: "POST", headers: { authorization: `Bearer ${token}` } });
+  const report = (token: string, run: string, rep: Record<string, unknown>) => SELF.fetch("http://cp.test/v1/hosts/gc/report", {
+    method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ run, report: rep }) });
+
+  it("hands one burst host the live sandboxes' generations as roots, dry run first, then daily", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const keep = await createSandbox(cell);
+    const gone = await createSandbox(cell);
+    await nextCommands(h.ws, (c) => c.type === "sandbox_create" && c.sandbox === gone.sandbox);
+    const commit = (sandbox: string, m: string, request: string) => sendEvents(h.ws, [{
+      ts_ms: Date.now(), type: "commit_request", request, sandbox, epoch: 1, kind: "disk_only", disk_manifest: manifest(m), reason: "turn_end" }]);
+    commit(keep.sandbox, "a", "req_k");
+    await nextCommands(h.ws, (c) => c.type === "commit_result" && c.request === "req_k");
+    commit(gone.sandbox, "b", "req_g");
+    await nextCommands(h.ws, (c) => c.type === "commit_result" && c.request === "req_g");
+    await adminJson(`/v1/sandboxes/${gone.sandbox}`, { method: "DELETE" }, 200);
+
+    // Without a token: refused. A controller host never runs it.
+    expect((await SELF.fetch("http://cp.test/v1/hosts/gc/claim", { method: "POST" })).status).toBe(401);
+    const ctl = await connectHost(cell, "controller");
+    expect((await claim(ctl.host_token)).status).toBe(204);
+
+    const r1 = await claim(h.host_token);
+    expect(r1.status).toBe(200);
+    const c1 = await r1.json<any>();
+    expect(c1).toMatchObject({ dry_run: true, roots: [manifest("a")], grace_ms: 86_400_000 });
+    expect(c1.deadline_ms - c1.marked_ms).toBe(12 * 3_600_000);
+    // One run at a time.
+    expect((await claim(h.host_token)).status).toBe(204);
+    expect((await report(h.host_token, c1.run, { would_delete: 3 })).status).toBe(200);
+    // Not due again for a day, unless an operator asks; the next one is for real.
+    expect((await claim(h.host_token)).status).toBe(204);
+    await adminJson(`/v1/admin/gc/run?cell=${cell}`, { body: {} }, 200);
+    const c2 = await (await claim(h.host_token)).json<any>();
+    expect(c2.dry_run).toBe(false);
+    const status = await adminJson<any>(`/v1/admin/gc?cell=${cell}`, {}, 200);
+    expect(status.sandboxes).toBe(1);
+    expect(status.runs[1]).toMatchObject({ run: c1.run, dry_run: 1, report: { would_delete: 3 } });
+  });
+
+  it("abandons a run that outlives its window and backfills registrations", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const c1 = await (await claim(h.host_token)).json<any>();
+    await runInDurableObject(fleetStub(cell), (_i: FleetDO, state) => {
+      state.storage.sql.exec("UPDATE gc_runs SET marked_ms = ? WHERE run = ?", Date.now() - 13 * 3_600_000, c1.run);
+      state.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('gc_requested', '1')");
+    });
+    const c2 = await (await claim(h.host_token)).json<any>();
+    // The abandoned dry run proves nothing: still dry.
+    expect(c2).toMatchObject({ dry_run: true });
+    expect(c2.run).not.toBe(c1.run);
+    // A late report for the abandoned run is ignored.
+    await report(h.host_token, c1.run, { deleted: 1 });
+    const runs = (await adminJson<any>(`/v1/admin/gc?cell=${cell}`, {}, 200)).runs;
+    expect(runs.find((r: any) => r.run === c1.run).report).toEqual({ abandoned: true });
+    expect((await adminJson<any>(`/v1/admin/gc/register?cell=${cell}`, { body: { sandboxes: ["sbx_old1", "sbx_old2"] } }, 200)).live).toBe(2);
   });
 });

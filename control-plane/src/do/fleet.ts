@@ -74,6 +74,25 @@ const TOKEN_ROTATE_BEFORE_MS = 10 * 60_000;
 const COMMAND_RETENTION_MS = 24 * 3_600_000;
 const ENROLL_TOKEN_RETENTION_MS = 7 * 86_400_000;
 const ALARM_TICK = "tick";
+/** GC: one run a day; a pass deletes only within 12 h of its mark; unmarked objects go after 24 h. */
+const GC_INTERVAL_MS = 24 * 3_600_000;
+const GC_WINDOW_MS = 12 * 3_600_000;
+const GC_GRACE_MS = 24 * 3_600_000;
+const GC_MAX_DELETES = 10_000;
+/** Bump when the marking rules change: the next run is then a dry run again. */
+const GC_MARK_VERSION = 1;
+
+/** What a host needs to run one GC pass. */
+export interface GcClaim {
+  run: string;
+  marked_ms: number;
+  dry_run: boolean;
+  /** Manifest hashes (`blake3:<hex>`) to mark from. */
+  roots: string[];
+  grace_ms: number;
+  deadline_ms: number;
+  max_deletes: number;
+}
 
 export class FleetDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -115,6 +134,13 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("launched", "ended_ms", "INTEGER");
     this.addColumn("hosts", "idle_since", "INTEGER");
     this.addColumn("leases", "state", "TEXT");
+    // Object-store GC: the cell's sandboxes (their generations are the roots) and the runs.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS sandboxes (sandbox TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL,
+      destroyed_ms INTEGER)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS gc_runs (run TEXT PRIMARY KEY, host TEXT NOT NULL, marked_ms INTEGER NOT NULL,
+      dry_run INTEGER NOT NULL, mark_version INTEGER NOT NULL, roots INTEGER NOT NULL, finished_ms INTEGER, report TEXT)`);
+    // Sandboxes that held a lease before the registry existed.
+    this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) SELECT sandbox, ? FROM leases", Date.now());
     // Suspended sandboxes leaving a host that is going away; SandboxDO is told, with retries.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS evictions (sandbox TEXT NOT NULL, host TEXT NOT NULL, epoch INTEGER NOT NULL,
       PRIMARY KEY (sandbox, host, epoch))`);
@@ -683,6 +709,7 @@ export class FleetDO extends DurableObject<Env> {
       throw new NestError(ErrorCodes.FORBIDDEN, `sandbox ${req.sandbox} already holds a lease (epoch ${existing.epoch} on ${existing.host})`, 409);
     }
     if (req.cell) this.rememberCell(req.cell);
+    this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     const candidates = this.sql
       .exec<HostRow>("SELECT * FROM hosts WHERE role = 'burst' AND status = 'active'")
       .toArray()
@@ -957,6 +984,83 @@ export class FleetDO extends DurableObject<Env> {
         console.error(`FleetDO: evicting ${e.sandbox} from ${e.host} failed; will retry`, err);
       }
     }
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Object-store GC (docs/sandbox/state/object-store/#garbage-collection). Hosts hold the S3
+  // credentials, so a burst host runs it; FleetDO decides when, and supplies the roots.
+  // -------------------------------------------------------------------------------------------
+
+  /** A sandbox was destroyed: its generations stop being roots. */
+  async sandboxDestroyed(sandbox: string): Promise<void> {
+    this.sql.exec("INSERT INTO sandboxes (sandbox, registered_ms, destroyed_ms) VALUES (?, ?, ?) ON CONFLICT(sandbox) DO UPDATE SET destroyed_ms = excluded.destroyed_ms",
+      sandbox, Date.now(), Date.now());
+  }
+
+  /** Operator: register sandboxes created before the registry existed, so GC keeps their data. */
+  async registerSandboxes(sandboxes: string[]): Promise<number> {
+    for (const s of sandboxes) this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", s, Date.now());
+    return this.sql.exec("SELECT 1 FROM sandboxes WHERE destroyed_ms IS NULL").toArray().length;
+  }
+
+  /** Operator: make the next claim start a run now (it still follows the dry-run rule). */
+  async gcRequest(): Promise<void> {
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('gc_requested', '1')");
+  }
+
+  /**
+   * A burst host offers to run GC. Due once a day (or when requested), one run at a time; a run
+   * that hasn't reported within its 12 h window is abandoned. The roots are snapshotted now: the
+   * host must finish deleting within 12 h of this mark. The first run, and the first after the
+   * marking rules change, is a dry run.
+   */
+  async gcClaim(host: string): Promise<GcClaim | null> {
+    const h = this.host(host);
+    if (!h || h.role !== "burst" || h.status !== "active") return null;
+    const now = Date.now();
+    this.sql.exec("UPDATE gc_runs SET finished_ms = ?, report = '{\"abandoned\":true}' WHERE finished_ms IS NULL AND marked_ms < ?", now, now - GC_WINDOW_MS);
+    if (this.sql.exec("SELECT 1 FROM gc_runs WHERE finished_ms IS NULL").toArray().length) return null;
+    const last = this.sql.exec<{ marked_ms: number }>("SELECT MAX(marked_ms) AS marked_ms FROM gc_runs").toArray()[0]?.marked_ms ?? 0;
+    const requested = this.sql.exec("SELECT 1 FROM kv WHERE key = 'gc_requested'").toArray().length > 0;
+    if (!requested && now - last < GC_INTERVAL_MS) return null;
+    // Dry unless a completed (not abandoned) run of this marking version has already reported.
+    const proven = this.sql.exec(
+      "SELECT 1 FROM gc_runs WHERE mark_version = ? AND finished_ms IS NOT NULL AND report NOT LIKE '%\"abandoned\"%' AND report NOT LIKE '%\"error\"%'",
+      GC_MARK_VERSION).toArray().length > 0;
+    // Take the run before collecting roots: the calls below let another claim in.
+    const run = newId("gc_");
+    this.sql.exec("DELETE FROM kv WHERE key = 'gc_requested'");
+    this.sql.exec("INSERT INTO gc_runs (run, host, marked_ms, dry_run, mark_version, roots) VALUES (?, ?, ?, ?, ?, 0)",
+      run, host, now, proven ? 0 : 1, GC_MARK_VERSION);
+    const live = this.sql.exec<{ sandbox: string }>("SELECT sandbox FROM sandboxes WHERE destroyed_ms IS NULL").toArray();
+    const roots = new Set<string>();
+    try {
+      for (const { sandbox } of live) for (const m of await this.sandbox(sandbox).gcRoots()) roots.add(m);
+    } catch (e) {
+      // A root we can't read means we can't mark: no run.
+      this.sql.exec("UPDATE gc_runs SET finished_ms = ?, report = ? WHERE run = ?", Date.now(),
+        JSON.stringify({ error: `collecting roots: ${String(e)}` }), run);
+      return null;
+    }
+    this.sql.exec("UPDATE gc_runs SET roots = ? WHERE run = ?", roots.size, run);
+    return {
+      run, marked_ms: now, dry_run: !proven, roots: [...roots], grace_ms: GC_GRACE_MS, deadline_ms: now + GC_WINDOW_MS,
+      max_deletes: GC_MAX_DELETES,
+    };
+  }
+
+  async gcReport(host: string, run: string, report: Record<string, unknown>): Promise<void> {
+    this.sql.exec("UPDATE gc_runs SET finished_ms = ?, report = ? WHERE run = ? AND host = ? AND finished_ms IS NULL",
+      Date.now(), JSON.stringify(report), run, host);
+  }
+
+  async gcStatus(): Promise<{ sandboxes: number; runs: Record<string, unknown>[] }> {
+    return {
+      sandboxes: this.sql.exec("SELECT 1 FROM sandboxes WHERE destroyed_ms IS NULL").toArray().length,
+      runs: this.sql.exec<{ report: string | null } & Record<string, SqlStorageValue>>(
+        "SELECT * FROM gc_runs ORDER BY marked_ms DESC LIMIT 10").toArray()
+        .map((r) => ({ ...r, report: r.report ? JSON.parse(r.report) as unknown : null })),
+    };
   }
 
   /** Operator view: hosts with their lease counts, and launched instances with their outcome. */

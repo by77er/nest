@@ -10,6 +10,7 @@ How hosts (nestd and the agent runner) talk to the Cloudflare control plane. Rus
 | Enrollment | `POST /v1/hosts/enroll` (HTTPS) | host → Worker | [enrollment/](enrollment/) |
 | Fleet channel | `wss://…/v1/fleet` (one per host) | host → FleetDO | [fleet/](fleet/) |
 | Session channel | `wss://…/v1/agents/<agent>/session` (one per active agent) | agent runner → AgentDO | [session/](session/) |
+| Object-store GC | `POST /v1/hosts/gc/claim` and `/v1/hosts/gc/report` (HTTPS, host token) | burst host → FleetDO | [GC](../../sandbox/state/object-store/#garbage-collection) |
 
 Also: [tools/](tools/) (the platform tool catalog and call semantics) and [models/](models/) (policy, events, generations, states).
 

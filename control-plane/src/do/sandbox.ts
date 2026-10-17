@@ -379,6 +379,21 @@ export class SandboxDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * The manifests this sandbox needs kept: every generation it records (retention isn't built, so
+   * all of them). GC marks from these.
+   */
+  async gcRoots(): Promise<string[]> {
+    if (!this.get<SandboxInfo>("info") || this.info_().state === "destroyed") return [];
+    const roots = new Set<string>();
+    for (const { record } of this.sql.exec<{ record: string }>("SELECT record FROM generations").toArray()) {
+      const g = JSON.parse(record) as GenerationRecord;
+      roots.add(g.disk_manifest);
+      if (g.mem_manifest) roots.add(g.mem_manifest);
+    }
+    return [...roots];
+  }
+
   async destroy(): Promise<void> {
     const info = this.info_();
     if (info.host) await this.command([{ type: "sandbox_destroy", sandbox: info.sandbox, epoch: info.epoch }]);
@@ -389,6 +404,8 @@ export class SandboxDO extends DurableObject<Env> {
     });
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
+    // Its generations stop being GC roots.
+    await this.fleet(info.cell).sandboxDestroyed(info.sandbox);
   }
 
   private async command(bodies: CommandBody[]): Promise<void> {

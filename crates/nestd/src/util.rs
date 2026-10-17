@@ -86,12 +86,33 @@ pub fn parse_rfc3339_utc_ms(s: &str) -> Option<i64> {
     Some((days * 86_400 + h * 3600 + mi * 60 + sec) * 1000 + frac_ms)
 }
 
+/// An HTTP date (`Wed, 21 Oct 2015 07:28:00 GMT`, IMF-fixdate: what S3 sends) as Unix ms.
+pub fn parse_http_date_ms(s: &str) -> Option<i64> {
+    let mut f = s.split_whitespace();
+    let (_, d, mo, y, hms, tz) = (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+    if tz != "GMT" || f.next().is_some() {
+        return None;
+    }
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mo = MONTHS.iter().position(|m| *m == mo)? as u32 + 1;
+    let iso = format!("{y:0>4}-{mo:02}-{d:0>2}T{hms}Z");
+    parse_rfc3339_utc_ms(&iso)
+}
+
 pub fn error(code: &str, message: impl Into<String>, retryable: bool) -> ErrorBody {
     ErrorBody { code: code.into(), message: message.into(), retryable }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_http_dates() {
+        use super::*;
+        assert_eq!(parse_http_date_ms("Wed, 21 Oct 2015 07:28:00 GMT"), parse_rfc3339_utc_ms("2015-10-21T07:28:00Z"));
+        assert!(parse_http_date_ms("Wed, 21 Oct 2015 07:28:00 PST").is_none());
+        assert!(parse_http_date_ms("garbage").is_none());
+    }
+
     #[test]
     fn utc_formatting_and_parsing_round_trip() {
         assert_eq!(super::amz_date(1_369_353_600), "20130524T000000Z");
