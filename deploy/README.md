@@ -24,6 +24,7 @@ inframe plan --stack use1 -- -out=use1.plan
 inframe apply --stack use1 -- use1.plan
 ```
 
+- **Once per account:** the EC2 Spot service-linked role (`aws iam create-service-linked-role --aws-service-name spot.amazonaws.com`); without it, spot launches fail with `AuthFailure.ServiceLinkedRoleCreationNotPermitted`.
 - **State** lives in the versioned bucket `nest-tfstate-<account>`, created once by hand (versioning on, public access blocked), with S3-native locking.
 - **The provider pins the account** (`allowed_account_ids`), so credentials for another account fail before any change.
 - **Every resource is tagged** `nest=true` and `nest:cell=<cell>` through the provider's default tags.

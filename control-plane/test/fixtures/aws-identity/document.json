@@ -1,0 +1,12 @@
+{
+  "accountId" : "123456789012",
+  "architecture" : "x86_64",
+  "availabilityZone" : "us-east-1a",
+  "imageId" : "ami-0ed59cbb87dfa8dba",
+  "instanceId" : "i-0123456789abcdef0",
+  "instanceType" : "c8i-flex.large",
+  "pendingTime" : "2026-10-17T04:04:14Z",
+  "privateIp" : "10.42.2.98",
+  "region" : "us-east-1",
+  "version" : "2017-09-30"
+}
