@@ -44,6 +44,46 @@ function derSet(items: Uint8Array[]): Uint8Array {
   return out;
 }
 
+/**
+ * The contents of a BER OCTET STRING: primitive (`04`), or constructed (`24`, definite or indefinite
+ * length) with its primitive chunks concatenated in order.
+ */
+export function octetStringContents(der: Uint8Array): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  const read = (at: number): number => {
+    const tag = der[at];
+    if (tag !== 0x04 && tag !== 0x24) throw bad("eContent is not an OCTET STRING");
+    let p = at + 1;
+    const first = der[p++];
+    if (first === undefined) throw bad("truncated eContent");
+    let len = -1;
+    if (first < 0x80) len = first;
+    else if (first > 0x80) {
+      len = 0;
+      for (let n = first & 0x7f; n > 0; n--) len = len * 256 + (der[p++] ?? 0);
+    } else if (tag === 0x04) throw bad("indefinite-length primitive OCTET STRING");
+    if (tag === 0x04) {
+      if (p + len > der.length) throw bad("truncated eContent");
+      chunks.push(der.subarray(p, p + len));
+      return p + len;
+    }
+    const end = len >= 0 ? p + len : -1;
+    while (end >= 0 ? p < end : !(der[p] === 0 && der[p + 1] === 0)) {
+      if (p >= der.length) throw bad("truncated eContent");
+      p = read(p);
+    }
+    return end >= 0 ? end : p + 2;
+  };
+  read(0);
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
 /** CMS SignedData with an RSA PKCS#1 v1.5 / SHA-256 signer, checked against one configured certificate. */
 export class CmsRsaIdentityVerifier implements IdentityVerifier {
   constructor(private readonly certPem: string) {}
@@ -66,8 +106,18 @@ export class CmsRsaIdentityVerifier implements IdentityVerifier {
     if (![OID_RSA, OID_SHA256_RSA].includes(signer.signatureAlgorithm.algorithm)) throw bad("signature must be RSA");
 
     // The signed content is either embedded (rsa2048 form) or detached (then it's the document).
-    const embedded = signed.encapContentInfo.eContent?.single?.buffer ?? signed.encapContentInfo.eContent?.any;
-    const content = embedded ? new Uint8Array(embedded) : document;
+    // IMDS embeds it as BER: a constructed, indefinite-length OCTET STRING, which the parser hands
+    // back raw (`any`), header included; `octetStringContents` joins its chunks.
+    const eContent = signed.encapContentInfo.eContent;
+    let content = document;
+    let embedded = false;
+    if (eContent?.single) {
+      content = new Uint8Array(eContent.single.buffer);
+      embedded = true;
+    } else if (eContent?.any) {
+      content = octetStringContents(new Uint8Array(eContent.any));
+      embedded = true;
+    }
     if (embedded && !timingSafeEqual(content, document)) throw bad("document does not match signed content");
 
     let signedBytes: Uint8Array;

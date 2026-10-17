@@ -8,7 +8,7 @@ import { AlgorithmIdentifier } from "@peculiar/asn1-x509";
 import * as x509 from "@peculiar/x509";
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { CmsRsaIdentityVerifier } from "../src/lib/aws-identity";
+import { CmsRsaIdentityVerifier, octetStringContents } from "../src/lib/aws-identity";
 import { verifyHostToken } from "../src/lib/tokens";
 import { bytesToB64 } from "../src/lib/util";
 import { BASE, adminJson, csrPem, enrollHost, hostHello, uniqueCell, Ws } from "./helpers";
@@ -83,7 +83,25 @@ function derLength(n: number): number[] {
   return [0x80 | bytes.length, ...bytes];
 }
 
+import realShapeDocument from "./fixtures/aws-identity/document.json?raw";
+import realShapeRsa2048 from "./fixtures/aws-identity/rsa2048.b64?raw";
+import realShapeSigner from "./fixtures/aws-identity/signer.pem?raw";
+
 describe("AWS identity document verification", () => {
+  it("joins a BER OCTET STRING's chunks: primitive, definite and indefinite constructed", () => {
+    const b = (...x: number[]) => new Uint8Array(x);
+    expect(octetStringContents(b(0x04, 2, 0x61, 0x62))).toEqual(b(0x61, 0x62));
+    expect(octetStringContents(b(0x24, 0x80, 0x04, 1, 0x61, 0x04, 2, 0x62, 0x63, 0, 0))).toEqual(b(0x61, 0x62, 0x63));
+    expect(octetStringContents(b(0x24, 7, 0x04, 1, 0x61, 0x24, 2, 0x04, 0))).toEqual(b(0x61));
+    expect(() => octetStringContents(b(0x24, 0x80, 0x04, 5, 0x61))).toThrow(/truncated/);
+  });
+
+  it("accepts IMDS's rsa2048 shape: BER, indefinite lengths, the document in a constructed OCTET STRING", async () => {
+    const doc = new TextEncoder().encode(realShapeDocument);
+    const id = await new CmsRsaIdentityVerifier(realShapeSigner).verify(bytesToB64(doc), realShapeRsa2048.replace(/\s+/g, ""));
+    expect(id).toEqual({ instanceId: "i-0123456789abcdef0", accountId: "123456789012", region: "us-east-1" });
+  });
+
   const doc = new TextEncoder().encode(JSON.stringify({ instanceId: "i-0abc123", accountId: "123456789012", region: "us-east-1" }));
 
   it("accepts a valid rsa2048 PKCS#7 signature", async () => {
