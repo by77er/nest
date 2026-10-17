@@ -4,7 +4,7 @@ import { z } from "zod";
 import { num, type Env } from "./env";
 import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identity";
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
-import { errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
+import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { AgentRole, ErrorCodes, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
@@ -68,6 +68,17 @@ async function enroll(req: Request, env: Env): Promise<Response> {
     throw new NestError(ErrorCodes.UNSUPPORTED_PROTOCOL_VERSION, `server speaks ${PROTOCOL_VERSION}`);
   }
   let identity: InstanceIdentity | null = null;
+  try {
+    return await enrollWith(r, env, identity);
+  } catch (e) {
+    // The refusal reaches only the host; log it so an operator can see why a host doesn't join.
+    const err = asNestError(e);
+    console.warn(`enroll refused (${r.proof.type}, cell ${r.cell}): ${err ? `${err.code}: ${err.message}` : String(e)}`);
+    throw e;
+  }
+}
+
+async function enrollWith(r: z.infer<typeof EnrollRequest>, env: Env, identity: InstanceIdentity | null): Promise<Response> {
   if (r.proof.type === "aws_identity_document") {
     if (!env.AWS_IDENTITY_CERT_PEM) throw new NestError(ErrorCodes.UNAUTHORIZED, "AWS identity enrollment is not configured", 401);
     identity = await new CmsRsaIdentityVerifier(env.AWS_IDENTITY_CERT_PEM).verify(r.proof.document_b64, r.proof.pkcs7_b64);
