@@ -17,6 +17,10 @@
     { "tag": "v1", "new_sqlite_classes": ["FleetDO", "SandboxDO", "AgentDO", "WorkstreamDO", "BrokerDO"] }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "nest-control" }],
+  // Production hostname (a Workers Custom Domain on the bitcru.sh zone; Cloudflare issues its certificate).
+  // Deploys set PUBLIC_BASE_URL=https://nest.bitcru.sh, AWS_CELLS and the rest with --var; the vars below
+  // are for `wrangler dev`.
+  "routes": [{ "pattern": "nest.bitcru.sh", "custom_domain": true }],
   "vars": {
     "PUBLIC_BASE_URL": "http://127.0.0.1:8787",
     "PREVIEW_DOMAIN": "preview.nest.localhost",
