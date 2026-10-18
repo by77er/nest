@@ -25,6 +25,8 @@ import Aws.Resource.IamPolicy
 import Aws.Resource.IamUserPolicyAttachment
 import Aws.Resource.LaunchTemplate
 import Aws.Resource.FisExperimentTemplate
+import Aws.Resource.KmsKey
+import Aws.Resource.KmsAlias
 import Cell.Iam
 
 /-!
@@ -72,8 +74,8 @@ def hostStatements (spec : CellSpec) : List Statement :=
       resources := [lit s!"arn:aws:s3:::{bucketName spec}/*"] } ]
 
 /-- The control plane's permissions (FleetDO): launch only from the cell's template, only 8i;
-stop and terminate only instances tagged `nest=true`; describe. -/
-def controlPlaneStatements (spec : CellSpec) (template hostRole : Input String) : List Statement :=
+stop and terminate only instances tagged `nest=true`; describe; sign with the proxy root CA key. -/
+def controlPlaneStatements (spec : CellSpec) (template hostRole rootKey : Input String) : List Statement :=
   let fromTemplate : Condition := { op := "ArnLike", entries := [("ec2:LaunchTemplate", [template])] }
   let ec2 (kind : String) : Input String := lit s!"arn:aws:ec2:{spec.region}:{spec.accountId}:{kind}"
   [ { sid := "LaunchFromTemplateOnly", actions := ["ec2:RunInstances"], resources := [template]
@@ -92,7 +94,8 @@ def controlPlaneStatements (spec : CellSpec) (template hostRole : Input String) 
       conditions := [{ op := "StringEquals", entries := [("iam:PassedToService", ["ec2.amazonaws.com"])] }] }
   , { sid := "StonithNestOnly", actions := ["ec2:TerminateInstances", "ec2:StopInstances"], resources := [ec2 "instance/*"]
       conditions := [{ op := "StringEquals", entries := [("aws:ResourceTag/nest", ["true"])] }] }
-  , { sid := "Describe", actions := ["ec2:DescribeInstances"], resources := [lit "*"] } ]
+  , { sid := "Describe", actions := ["ec2:DescribeInstances"], resources := [lit "*"] }
+  , { sid := "SignWithProxyRootOnly", actions := ["kms:Sign", "kms:GetPublicKey"], resources := [rootKey] } ]
 
 /-- AWS Fault Injection Service, for spot interruption drills: it may interrupt nest's spot
 instances only. -/
@@ -193,12 +196,20 @@ def cell (spec : CellSpec) : Infra Unit := do
       userData := some (unsafeCall "base64encode" [unsafeArgument (lit (bootstrap spec))] : Input String)
       updateDefaultVersion := true }
 
+  -- The proxy root CA: a non-exportable P-256 signing key. FleetDO signs each host's intermediate
+  -- with it through KMS `Sign`; the private key never leaves KMS.
+  let rootKey ← KmsKey.createWith "proxy_root"
+    { description := lit s!"nest {spec.name}: proxy root CA (signs per-host intermediates)"
+      customerMasterKeySpec := "ECC_NIST_P256", keyUsage := "SIGN_VERIFY", deletionWindowInDays := 30 }
+    (resourceOptions |>.preventDestroy true)
+  let _ ← KmsAlias.create "proxy_root" { name := lit s!"alias/nest-{spec.name}-proxy-root", targetKeyId := rootKey.keyId }
+
   -- The control plane (FleetDO). Its access key is created out of band and kept as a Worker secret.
   let cp ← IamUser.create "control_plane" { name := lit s!"nest-{spec.name}-control-plane" }
   let templateArn : Input String := template.arn
   -- A managed policy: the document is over IAM's 2,048-byte limit for inline user policies.
   let fleet ← IamPolicy.create "control_plane_fleet"
-    { name := lit s!"nest-{spec.name}-fleet", policy := document (controlPlaneStatements spec templateArn hostRole.arn) }
+    { name := lit s!"nest-{spec.name}-fleet", policy := document (controlPlaneStatements spec templateArn hostRole.arn rootKey.arn) }
   let _ ← IamUserPolicyAttachment.create "control_plane_fleet" { user := cp.name, policyArn := fleet.arn }
 
   -- Spot interruption drill: `aws fis start-experiment --experiment-template-id <output>` sends a
@@ -225,5 +236,6 @@ def cell (spec : CellSpec) : Infra Unit := do
   output "s3_endpoint_id" s3.id
   output "control_plane_user" cp.name
   output "spot_drill_template_id" drill.id
+  output "proxy_root_key_arn" rootKey.arn
 
 end Cell

@@ -1198,7 +1198,12 @@ impl Inner {
         if let NetworkConfig::Netns { persist_dir } = &self.cfg.network {
             let persist = persist_dir.as_ref().map(|d| d.join(format!("ns-{}", sbx.id.0)));
             let ns = Arc::new(Netns::create(persist.as_deref()).context("create netns")?);
-            ns.configure().context("configure netns")?;
+            // A jailed Firecracker runs as the jail's user, which must be able to attach to the tap.
+            let tap_owner = match &self.cfg.driver {
+                DriverConfig::Firecracker(fc) if fc.jailer_bin.is_some() => fc.jailer.as_ref().map(|j| (j.uid, j.gid)),
+                _ => None,
+            };
+            ns.configure(tap_owner).context("configure netns")?;
             let std_listeners: [(Transport, u16, ListenerPurpose); 4] = [
                 (Transport::Udp, 53, ListenerPurpose::Dns),
                 (Transport::Tcp, 53, ListenerPurpose::Dns),

@@ -12,4 +12,4 @@ for name in SANDBOX_SUSPEND_IDLE_MS; do
 done
 npx wrangler deploy --message "$(git rev-parse --short HEAD) ${1:-manual}" \
   --var "PUBLIC_BASE_URL:$(var PUBLIC_BASE_URL)" --var PREVIEW_DOMAIN:preview.nest.bitcru.sh --var CELLS:use1 \
-  --var "AWS_CELLS:$(var AWS_CELLS)" "${optional[@]}"
+  --var "AWS_CELLS:$(var AWS_CELLS)" --var "ROOT_CA_KMS_KEY_ID:$(var ROOT_CA_KMS_KEY_ID)" "${optional[@]}"

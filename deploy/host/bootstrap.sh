@@ -15,7 +15,7 @@ CONTROL_URL="@CONTROL_URL@"
 CLAUDE_VERSION="2.1.301"
 export HOME=/root
 
-dnf install -y -q nftables iproute util-linux bubblewrap e2fsprogs
+dnf install -y -q nftables iproute util-linux bubblewrap e2fsprogs zstd
 
 install -d -m 0755 /opt/nest/bin /usr/lib/nest /etc/nest /etc/claude-code /var/lib/nest /run/nest /var/lib/nest/runner/cwd /run/nest/runner
 aws s3 cp --region "$REGION" --recursive --only-show-errors "s3://$BUCKET/releases/current/" /opt/nest/release/
@@ -24,6 +24,28 @@ install -m 0755 /opt/nest/release/{nestd,nest-proxy,nest-guest,nest-runner,nest}
 # The managed settings' hooks run /usr/lib/nest/nest.
 install -m 0755 /opt/nest/release/nest /usr/lib/nest/nest
 install -m 0644 /opt/nest/release/managed-settings.json /etc/claude-code/managed-settings.json
+
+# Sandboxes run in Firecracker when the instance has KVM (nested virtualization, set in the launch
+# template); otherwise in the process driver, so a host never comes up unusable.
+if [ -e /dev/kvm ] && [ -f /opt/nest/release/firecracker ]; then
+  install -m 0755 /opt/nest/release/{firecracker,jailer} /opt/nest/bin/
+  # The jailer hard-links the kernel and each disk into its chroot: same filesystem as /srv/jailer.
+  install -d -m 0755 /var/lib/nest/images /var/lib/nest/kernel /srv/jailer
+  install -m 0644 /opt/nest/release/vmlinux /var/lib/nest/kernel/vmlinux
+  zstd -q -d -f /opt/nest/release/nest-base.ext4.zst -o "/var/lib/nest/images/nest-base:latest.ext4"
+  rm -f /opt/nest/release/nest-base.ext4.zst
+  id -u nest-fc >/dev/null 2>&1 || useradd --system --uid 900 --user-group --no-create-home --shell /sbin/nologin nest-fc
+  # Guest memory is backed by 2 MiB hugepages, reserved up front (half the host's memory, so the
+  # brain, nestd and the proxy keep the rest).
+  echo $(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 2 / 2048 )) > /proc/sys/vm/nr_hugepages
+  DRIVER='{"type": "firecracker", "firecracker_bin": "/opt/nest/bin/firecracker", "jailer_bin": "/opt/nest/bin/jailer",
+    "jailer": {"uid": 900, "gid": 900, "chroot_base_dir": "/srv/jailer"},
+    "kernel_image": "/var/lib/nest/kernel/vmlinux", "images_dir": "/var/lib/nest/images", "huge_pages": true}'
+else
+  echo "no /dev/kvm (or no firecracker in the release): using the process driver"
+  DRIVER='{"type": "process", "guest_command": ["/opt/nest/bin/nest-guest", "--state-dir", "/var/lib/nest/guest",
+    "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none"], "mount_disk": true}'
+fi
 
 # Claude Code, pinned (the installer checks the release's checksum).
 curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
@@ -35,8 +57,7 @@ cat >/etc/nest/nestd.json <<EOF
   "cell": "$CELL",
   "control_url": "$CONTROL_URL",
   "enrollment": {"type": "aws_imds"},
-  "driver": {"type": "process", "guest_command": ["/opt/nest/bin/nest-guest", "--state-dir", "/var/lib/nest/guest",
-    "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none"], "mount_disk": true},
+  "driver": $DRIVER,
   "network": {"type": "netns", "persist_dir": "/run/nest/netns"},
   "storage": {"type": "s3", "bucket": "$BUCKET", "region": "$REGION"},
   "versions": {"nest_proxy": "$(cat /opt/nest/release/VERSION)", "agent_runner": "$(cat /opt/nest/release/VERSION)", "claude_code": "$CLAUDE_VERSION"}

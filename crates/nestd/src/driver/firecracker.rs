@@ -62,6 +62,9 @@ impl Driver for FirecrackerDriver {
 #[derive(Clone, Debug)]
 pub struct Jail {
     pub cfg: JailerConfig,
+    /// The jailer's `--id`: the sandbox id with `_` as `-` (the jailer takes alphanumerics and
+    /// `-` only, at most 64).
+    pub id: String,
     /// `<chroot_base>/<firecracker binary name>/<sandbox>/root`
     pub root: PathBuf,
 }
@@ -69,7 +72,8 @@ pub struct Jail {
 impl Jail {
     pub fn new(fc: &FirecrackerConfig, cfg: &JailerConfig, spec: &VmSpec) -> Jail {
         let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
-        Jail { cfg: cfg.clone(), root: cfg.chroot_base_dir.join(exe).join(&spec.sandbox.0).join("root") }
+        let id = spec.sandbox.0.replace('_', "-");
+        Jail { cfg: cfg.clone(), root: cfg.chroot_base_dir.join(exe).join(&id).join("root"), id }
     }
 
     /// Hard-link the kernel and disk into the jail root, owned by the jail uid/gid.
@@ -134,10 +138,10 @@ impl FirecrackerVm {
 }
 
 /// The jailer command line (pure, unit-tested).
-pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, sandbox: &str, netns: &Path, api_sock: &Path) -> Vec<String> {
+pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: &Path) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--id".into(),
-        sandbox.into(),
+        jail.id.clone(),
         "--exec-file".into(),
         fc.firecracker_bin.display().to_string(),
         "--uid".into(),
@@ -215,7 +219,7 @@ impl Vm for FirecrackerVm {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the jailer needs a persisted netns (network.persist_dir)"))?;
                 jail.populate(&self.cfg, &self.spec)?;
                 let mut c = std::process::Command::new(jailer);
-                c.args(jailer_args(&self.cfg, jail, &self.spec.sandbox.0, ns_path, &paths.api_sock));
+                c.args(jailer_args(&self.cfg, jail, ns_path, &paths.api_sock));
                 c
             }
             _ => {
@@ -233,8 +237,8 @@ impl Vm for FirecrackerVm {
             _ => cmd.spawn()?,
         };
         self.child = Some(child);
-        // Wait for the API socket.
-        for _ in 0..100 {
+        // Wait for the API socket (the jailer first copies Firecracker into the chroot).
+        for _ in 0..500 {
             if self.api_sock().exists() {
                 break;
             }
@@ -264,7 +268,25 @@ impl Vm for FirecrackerVm {
             let _ = c.kill();
             let _ = tokio::task::spawn_blocking(move || c.wait()).await;
         }
+        if let Some(j) = &self.jail {
+            j.remove()?;
+        }
         Ok(())
+    }
+}
+
+impl Jail {
+    /// Remove this VM's jail directory (its hard links to the kernel and disk, the sockets and the
+    /// device nodes the jailer made) once Firecracker has exited. Only ever under the chroot base.
+    fn remove(&self) -> io::Result<()> {
+        let dir = self.root.parent().filter(|d| d.starts_with(&self.cfg.chroot_base_dir) && d.ends_with(&self.id));
+        match dir {
+            Some(d) => match std::fs::remove_dir_all(d) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+            None => Err(io::Error::other(format!("refusing to remove {}: not a jail directory", self.root.display()))),
+        }
     }
 }
 
@@ -273,6 +295,9 @@ impl Drop for FirecrackerVm {
         if let Some(c) = &mut self.child {
             let _ = c.kill();
             let _ = c.wait();
+            if let Some(j) = &self.jail {
+                let _ = j.remove();
+            }
         }
     }
 }
@@ -363,10 +388,12 @@ mod tests {
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
         let vm = driver.create(s.clone()).await.unwrap();
-        assert_eq!(vm.vsock_uds_path(), PathBuf::from("/srv/jailer/firecracker/sbx_1/root/vsock.sock"));
+        // The jailer rejects `_` in ids (alphanumerics and `-` only): the jail is named sbx-1.
+        assert_eq!(vm.vsock_uds_path(), PathBuf::from("/srv/jailer/firecracker/sbx-1/root/vsock.sock"));
         let jail = Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s);
-        let args = jailer_args(&fc, &jail, "sbx_1", Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"));
+        let args = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"));
         let joined = args.join(" ");
+        assert!(joined.starts_with("--id sbx-1 "), "{joined}");
         assert!(joined.contains("--uid 900 --gid 900 --chroot-base-dir /srv/jailer --netns /run/netns/ns-sbx_1 -- --api-sock /api.sock"), "{joined}");
         let paths = FcPaths { api_sock: "/api.sock".into(), kernel: "/vmlinux".into(), disk: "/disk.img".into(), vsock: "/vsock.sock".into() };
         let reqs = boot_requests(&fc, &s, &paths);
@@ -375,6 +402,26 @@ mod tests {
         // A jailer without uid/gid/chroot settings is a configuration error.
         fc.jailer = None;
         assert!(FirecrackerDriver { cfg: fc }.create(s).await.is_err());
+    }
+
+    /// Stopping a jailed VM removes its jail directory, and only that.
+    #[test]
+    fn jail_removal_stays_inside_the_chroot_base() {
+        let base = tempfile::tempdir().unwrap();
+        let mut fc = cfg();
+        let jc = JailerConfig { uid: 0, gid: 0, chroot_base_dir: base.path().into() };
+        fc.jailer = Some(jc.clone());
+        let jail = Jail::new(&fc, &jc, &spec());
+        std::fs::create_dir_all(jail.root.join("dev")).unwrap();
+        std::fs::write(jail.root.join("disk.img"), b"x").unwrap();
+        let sibling = base.path().join("firecracker").join("sbx-2");
+        std::fs::create_dir_all(&sibling).unwrap();
+        jail.remove().unwrap();
+        assert!(!jail.root.parent().unwrap().exists());
+        assert!(sibling.exists());
+        jail.remove().unwrap(); // idempotent
+        let outside = Jail { root: "/tmp/elsewhere/sbx-1/root".into(), ..jail };
+        assert!(outside.remove().is_err());
     }
 
     #[tokio::test]

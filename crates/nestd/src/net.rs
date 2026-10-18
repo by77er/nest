@@ -93,9 +93,10 @@ impl Netns {
         })
     }
 
-    /// Create `tap0` (172.16.0.1/30) and install the nft ruleset.
-    pub fn configure(&self) -> io::Result<()> {
-        self.configure_with(LinkSetup::Tap)
+    /// Create `tap0` (172.16.0.1/30) and install the nft ruleset. `owner` (uid, gid) is who may
+    /// attach to the tap: the jailer's unprivileged user, when Firecracker runs jailed.
+    pub fn configure(&self, owner: Option<(u32, u32)>) -> io::Result<()> {
+        self.configure_with(LinkSetup::Tap { owner })
     }
 
     /// Like [`configure`](Self::configure), with the link supplied by a test (a veth peer named
@@ -103,8 +104,12 @@ impl Netns {
     pub fn configure_with(&self, link: LinkSetup) -> io::Result<()> {
         self.run(|| {
             run_cmd("ip", &["link", "set", "lo", "up"])?;
-            if let LinkSetup::Tap = link {
-                run_cmd("ip", &["tuntap", "add", TAP_NAME, "mode", "tap"])?;
+            if let LinkSetup::Tap { owner } = link {
+                let mut args = vec!["tuntap".to_string(), "add".into(), TAP_NAME.into(), "mode".into(), "tap".into()];
+                if let Some((uid, gid)) = owner {
+                    args.extend(["user".into(), uid.to_string(), "group".into(), gid.to_string()]);
+                }
+                run_cmd("ip", &args.iter().map(String::as_str).collect::<Vec<_>>())?;
             }
             run_cmd("ip", &["addr", "add", &format!("{GATEWAY_IP}/30"), "dev", TAP_NAME])?;
             run_cmd("ip", &["link", "set", TAP_NAME, "up"])?;
@@ -129,8 +134,8 @@ impl Drop for Netns {
 }
 
 pub enum LinkSetup {
-    /// Production: create a tap device for Firecracker.
-    Tap,
+    /// Production: create a tap device for Firecracker, attachable by `owner` if set.
+    Tap { owner: Option<(u32, u32)> },
     /// Tests: an interface named `tap0` already exists in the namespace.
     Existing,
 }
