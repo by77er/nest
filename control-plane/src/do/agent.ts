@@ -911,8 +911,10 @@ export class AgentDO extends DurableObject<Env> {
       const question = `Allow ${ev.tool}? (request ${ev.call}) input: ${input.length > 500 ? `${input.slice(0, 500)}…` : input}`;
       await this.postAsk(info, ev.call, ev.epoch, question, "async", "captain");
     }
-    const wasWorking = WORKING_STATES.includes(before.state);
-    const isWorking = WORKING_STATES.includes(info.state);
+    // A turn in progress is work whatever state it reports (SessionStart says `ready` mid-turn):
+    // the sandbox hears "not working" only when no turn is running.
+    const wasWorking = WORKING_STATES.includes(before.state) || before.current_turn !== null;
+    const isWorking = WORKING_STATES.includes(info.state) || info.current_turn !== null;
     if (info.hands && wasWorking !== isWorking) await this.sandboxStub(info.hands.sandbox).agentActivity(info.agent, isWorking);
     if (completed) {
       this.pushCache();
