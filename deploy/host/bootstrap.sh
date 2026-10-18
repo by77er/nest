@@ -36,8 +36,9 @@ if [ -e /dev/kvm ] && [ -f /opt/nest/release/firecracker ]; then
   rm -f /opt/nest/release/nest-base.ext4.zst
   id -u nest-fc >/dev/null 2>&1 || useradd --system --uid 900 --user-group --no-create-home --shell /sbin/nologin nest-fc
   # Guest memory is backed by 2 MiB hugepages, reserved up front (half the host's memory, so the
-  # brain, nestd and the proxy keep the rest).
-  echo $(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 2 / 2048 )) > /proc/sys/vm/nr_hugepages
+  # brain, nestd and the proxy keep the rest). sysctl.d, so a reboot reserves them again.
+  echo "vm.nr_hugepages = $(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 2 / 2048 ))" > /etc/sysctl.d/90-nest-hugepages.conf
+  sysctl -q -p /etc/sysctl.d/90-nest-hugepages.conf
   DRIVER='{"type": "firecracker", "firecracker_bin": "/opt/nest/bin/firecracker", "jailer_bin": "/opt/nest/bin/jailer",
     "jailer": {"uid": 900, "gid": 900, "chroot_base_dir": "/srv/jailer"},
     "kernel_image": "/var/lib/nest/kernel/vmlinux", "images_dir": "/var/lib/nest/images", "huge_pages": true}'
