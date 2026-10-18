@@ -40,10 +40,12 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `crates/nest-cli` | `nest` binary: `nest hook`, `nest mcp`, in-sandbox commands |
 | `protocol/` | Fixtures, tool catalogs, Claude Code reference artifacts |
 | `e2e/` | Local end-to-end harness |
+| `deploy/` | Cells as an inframe stack (OpenTofu); the burst-host bootstrap |
+| `images/` | The Firecracker guest image (kernel and `nest-base` rootfs) and its EC2 builder |
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
 
-UFFD memory snapshots, the ublk lazy disk, the S3 object store and spot-notice handling are designed but not built (see `crates/nestd/README.md`).
+UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`).
 
 ## Primitives
 
