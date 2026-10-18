@@ -184,6 +184,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 
 - **Verify:** that Amazon Linux 2023 ships ublk, which the lazy disk needs. See [compute/provisioning/](compute/provisioning/).
 - **Verify:** that every 8i variant reports the same CPU model (it's part of the restore ABI); that Firecracker's writes pass through the host page cache before ublk; and whether S3 Inventory and lifecycle rules work on S3 Express One Zone directory buckets. See [sandbox/state/](sandbox/state/).
+- **Open:** guest `init_on_free=1` (for compressible memory snapshots) stalled 1-vCPU guest boots past a minute on a nested 8i host, so it's off until snapshots exist; whether nested hosts can afford it then is unmeasured. See [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/).
 - **Open:** turn-end generations are always kept, so a long-lived sandbox's history grows without bound; it may need a cap. See [sandbox/state/](sandbox/state/#retention).
 - **Open:** per-sandbox I/O limits don't make a dense host fair when many sandboxes spend their burst at once. See [sandbox/state/disk/](sandbox/state/disk/#io-limits).
 - **Open:** upgrading the guest agent in place by re-exec, which needs a task registry rebuildable from tmpfs. See [sandbox/guest-agent/](sandbox/guest-agent/#versions).
