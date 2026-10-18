@@ -17,7 +17,9 @@ ln -sf /proc/self/fd /dev/fd
 mount -o remount,rw /
 
 # nestd extends the image file to the sandbox's disk size; the filesystem follows (online).
-resize2fs /dev/vda >/dev/null 2>&1 || log "resize2fs failed"
+# resize2fs decides "mounted" from /etc/mtab, which the stripped rootfs lacks.
+ln -sf /proc/self/mounts /etc/mtab
+out=$(resize2fs /dev/vda 2>&1) || log "resize2fs failed: $out"
 
 ip link set lo up
 ip addr add 172.16.0.2/30 dev eth0

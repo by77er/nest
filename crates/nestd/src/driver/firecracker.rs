@@ -63,7 +63,8 @@ impl Driver for FirecrackerDriver {
 pub struct Jail {
     pub cfg: JailerConfig,
     /// The jailer's `--id`: the sandbox id with `_` as `-` (the jailer takes alphanumerics and
-    /// `-` only, at most 64).
+    /// `-` only, at most 64), plus a suffix unique to this VM, so a retry or the next epoch never
+    /// shares a jail with one that's still being torn down.
     pub id: String,
     /// `<chroot_base>/<firecracker binary name>/<sandbox>/root`
     pub root: PathBuf,
@@ -72,7 +73,7 @@ pub struct Jail {
 impl Jail {
     pub fn new(fc: &FirecrackerConfig, cfg: &JailerConfig, spec: &VmSpec) -> Jail {
         let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
-        let id = spec.sandbox.0.replace('_', "-");
+        let id = format!("{}-{}", spec.sandbox.0.replace('_', "-"), crate::util::random_hex(4));
         Jail { cfg: cfg.clone(), root: cfg.chroot_base_dir.join(exe).join(&id).join("root"), id }
     }
 
@@ -275,6 +276,21 @@ impl Vm for FirecrackerVm {
     }
 }
 
+/// Remove every jail under `chroot_base` (at nestd start: VMs don't outlive nestd, since systemd
+/// stops its whole cgroup, so any jail left is from a crash or a reboot).
+pub fn remove_stale_jails(fc: &FirecrackerConfig, jail: &JailerConfig) -> io::Result<usize> {
+    let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
+    let dir = jail.chroot_base_dir.join(exe);
+    let mut n = 0;
+    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with("sbx-") {
+            std::fs::remove_dir_all(e.path())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 impl Jail {
     /// Remove this VM's jail directory (its hard links to the kernel and disk, the sockets and the
     /// device nodes the jailer made) once Firecracker has exited. Only ever under the chroot base.
@@ -416,12 +432,16 @@ mod tests {
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
         let vm = driver.create(s.clone()).await.unwrap();
-        // The jailer rejects `_` in ids (alphanumerics and `-` only): the jail is named sbx-1.
-        assert_eq!(vm.vsock_uds_path(), PathBuf::from("/srv/jailer/firecracker/sbx-1/root/vsock.sock"));
+        // The jailer rejects `_` in ids (alphanumerics and `-` only): the jail is sbx-1-<suffix>,
+        // unique per VM.
+        let uds = vm.vsock_uds_path().display().to_string();
+        assert!(uds.starts_with("/srv/jailer/firecracker/sbx-1-") && uds.ends_with("/root/vsock.sock"), "{uds}");
         let jail = Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s);
+        assert_ne!(jail.id, Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s).id);
+        assert!(jail.id.len() <= 64 && jail.id.chars().all(|c| c == '-' || c.is_ascii_alphanumeric()), "{}", jail.id);
         let args = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"));
         let joined = args.join(" ");
-        assert!(joined.starts_with("--id sbx-1 "), "{joined}");
+        assert!(joined.starts_with(&format!("--id {} ", jail.id)), "{joined}");
         assert!(joined.contains("--uid 900 --gid 900 --chroot-base-dir /srv/jailer --netns /run/netns/ns-sbx_1 -- --api-sock /api.sock"), "{joined}");
         let paths = FcPaths { api_sock: "/api.sock".into(), kernel: "/vmlinux".into(), disk: "/disk.img".into(), vsock: "/vsock.sock".into() };
         let reqs = boot_requests(&fc, &s, &paths);
@@ -442,14 +462,20 @@ mod tests {
         let jail = Jail::new(&fc, &jc, &spec());
         std::fs::create_dir_all(jail.root.join("dev")).unwrap();
         std::fs::write(jail.root.join("disk.img"), b"x").unwrap();
-        let sibling = base.path().join("firecracker").join("sbx-2");
+        let sibling = base.path().join("firecracker").join("sbx-2-abcd");
         std::fs::create_dir_all(&sibling).unwrap();
         jail.remove().unwrap();
         assert!(!jail.root.parent().unwrap().exists());
         assert!(sibling.exists());
         jail.remove().unwrap(); // idempotent
-        let outside = Jail { root: "/tmp/elsewhere/sbx-1/root".into(), ..jail };
+        let id = jail.id.clone();
+        let outside = Jail { root: format!("/tmp/elsewhere/{id}/root").into(), ..jail };
         assert!(outside.remove().is_err());
+        // At start, nestd clears what a crash left (only jails, nothing else in the base).
+        std::fs::write(base.path().join("firecracker").join("keep.txt"), b"").unwrap();
+        assert_eq!(remove_stale_jails(&fc, &jc).unwrap(), 1);
+        assert!(!sibling.exists());
+        assert!(base.path().join("firecracker").join("keep.txt").exists());
     }
 
     #[tokio::test]

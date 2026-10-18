@@ -233,7 +233,16 @@ impl Host {
                 DriverConfig::Process { guest_command, mount_disk } => {
                     Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk })
                 }
-                DriverConfig::Firecracker(fc) => Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone() }),
+                DriverConfig::Firecracker(fc) => {
+                    if let (Some(_), Some(j)) = (&fc.jailer_bin, &fc.jailer) {
+                        match crate::driver::firecracker::remove_stale_jails(fc, j) {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(n, "removed jails left by a crash or reboot"),
+                            Err(e) => tracing::warn!("removing stale jails: {e}"),
+                        }
+                    }
+                    Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone() })
+                }
             },
         };
         let cache = storage::LocalFsStore::new(cfg.store_dir())?;
