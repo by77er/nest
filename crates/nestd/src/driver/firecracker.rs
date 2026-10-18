@@ -316,18 +316,46 @@ impl ApiClient {
             body.len()
         );
         s.write_all(req.as_bytes()).await?;
-        let mut resp = Vec::new();
-        tokio::time::timeout(Duration::from_secs(30), s.read_to_end(&mut resp))
+        // Firecracker keeps the connection open after it answers, `Connection: close` or not: read
+        // one response (headers, then `Content-Length` bytes), never to EOF.
+        let (status, resp_body) = tokio::time::timeout(Duration::from_secs(30), read_response(&mut s))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "firecracker API timed out"))??;
-        let text = String::from_utf8_lossy(&resp).into_owned();
-        let status: u16 = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let resp_body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("firecracker {method} {path}: API timed out")))??;
         if !(200..300).contains(&status) {
             return Err(io::Error::other(format!("firecracker {method} {path}: {status} {resp_body}")));
         }
         Ok(resp_body)
     }
+}
+
+/// One HTTP/1.1 response: its status and body. The body is `Content-Length` bytes (none if absent).
+async fn read_response(s: &mut UnixStream) -> io::Result<(u16, String)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = s.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "firecracker closed the API connection mid-response"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let status: u16 = head.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse().ok()))
+        .unwrap_or(0);
+    while buf.len() < head_end + len {
+        let n = s.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "firecracker closed the API connection mid-body"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok((status, String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned()))
 }
 
 #[cfg(test)]
@@ -429,18 +457,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("fc.sock");
         let l = UnixListener::bind(&sock).unwrap();
+        // Like Firecracker, the server answers and keeps the connection open (it closes only when
+        // the test ends): a client that reads to EOF hangs here.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            let (mut s, _) = l.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = s.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-            req
+            let mut reqs = vec![];
+            let replies: [&[u8]; 3] = [
+                b"HTTP/1.1 204 No Content\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\ncontent-length: 14\r\n\r\n{\"state\":\"Ok\"}",
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\n{\"fault_message\":\"no\"}",
+            ];
+            let mut held = vec![];
+            for reply in replies {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap();
+                reqs.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                s.write_all(reply).await.unwrap();
+                held.push(s);
+            }
+            let _ = done_rx.await;
+            reqs
         });
         let c = ApiClient { sock };
-        c.call("PATCH", "/vm", Some(&json!({"state": "Paused"}))).await.unwrap();
-        let req = server.await.unwrap();
-        assert!(req.starts_with("PATCH /vm HTTP/1.1\r\n"));
-        assert!(req.ends_with("{\"state\":\"Paused\"}"));
+        let t = Duration::from_secs(5);
+        tokio::time::timeout(t, c.call("PATCH", "/vm", Some(&json!({"state": "Paused"})))).await.unwrap().unwrap();
+        assert_eq!(tokio::time::timeout(t, c.call("GET", "/vm", None)).await.unwrap().unwrap(), "{\"state\":\"Ok\"}");
+        let err = tokio::time::timeout(t, c.call("PUT", "/actions", None)).await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("400 {\"fault_message\":\"no\"}"), "{err}");
+        done_tx.send(()).unwrap();
+        let reqs = server.await.unwrap();
+        assert!(reqs[0].starts_with("PATCH /vm HTTP/1.1\r\n"));
+        assert!(reqs[0].ends_with("{\"state\":\"Paused\"}"));
     }
 }
