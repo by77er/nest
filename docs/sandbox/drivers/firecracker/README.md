@@ -13,4 +13,11 @@
 - **Drives** keep the default `Unsafe` cache mode, so a guest flush stops at the host page cache; nestd `fsync`s the ublk device before each cut ([disk](../../state/disk/#flush-before-commit)).
 - **Rate limiter** on every drive: 10,000 ops/s and 100 MiB/s with a 30 s burst by default ([I/O limits](../../state/disk/#io-limits)).
 
+**Built and verified** (EC2 `c8i-flex.large`, nested virtualization, Firecracker 1.17.0, 2026-10-18): a 1-vCPU, 1 GiB guest boots from `nest-base` in seconds; a real Claude Code turn ran its tools in it; egress went through nest-proxy (allowed 200, denied 403); the disk committed at turn end, and after a host reboot the sandbox restored on epoch 2 with the file intact.
+- **Jailer:** each VM runs as uid 900 in its own jail (`<sandbox>-<random>`: the jailer accepts only alphanumerics and `-`, and a retry must never share a jail being torn down); nestd removes a stopped VM's jail and, at start, any a crash left. The tap is owned by the jail's user.
+- **Hugepages:** half of host memory, reserved through `/etc/sysctl.d` so a reboot keeps the pool.
+- **Disk:** a fresh sandbox's disk is a copy of `nest-base`, extended to its size and grown offline by nestd before boot (the guest can't resize its own root).
+- **Guest image:** `images/guest/` builds it from Firecracker's CI 6.18 kernel and Ubuntu 24.04 rootfs on a disposable EC2 builder; init brings up `eth0` on the sandbox network and runs nest-guest on vsock.
+- **Not built:** memory snapshots (UFFD), ublk, the rate limiter.
+
 Sources: [hugepages.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/hugepages.md), [network-for-clones.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/network-for-clones.md)
