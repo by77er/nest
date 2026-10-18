@@ -458,6 +458,32 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(suspend).toMatchObject({ sandbox: sbx.sandbox, epoch: 1, mode: "disk_only" });
   });
 
+  it("commits the disk when a turn ends, and a turn ending within 10 s gets its commit when the interval is up", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "running");
+    await a.ws.next("ack");
+    const stub = sandboxStub(sbx.sandbox);
+    const agent = "agt_turnend000000000000000000";
+    await stub.attachAgent(agent);
+    await stub.agentActivity(agent, true);
+    await stub.agentActivity(agent, false);
+    const [first] = await nextCommands(a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(first).toMatchObject({ sandbox: sbx.sandbox, epoch: 1, reason: "turn_end" });
+    // A second turn right away: no commit yet (rate limit), but one is due, not dropped.
+    await stub.agentActivity(agent, true);
+    await stub.agentActivity(agent, false);
+    expect(await a.ws.none("commands", 300)).toBe(true);
+    await runInDurableObject(stub, (_i, st) => {
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'turn_checkpoint_ms'", JSON.stringify(Date.now() - 11_000));
+    });
+    await runAlarm(stub, "turn_checkpoint");
+    const [second] = await nextCommands(a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(second).toMatchObject({ reason: "turn_end", epoch: 1 });
+  });
+
   it("a host retired with only suspended sandboxes evicts them; waking places them from head elsewhere", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running", "terminated");
