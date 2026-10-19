@@ -6,10 +6,11 @@ nest's cells as an [inframe](https://github.com/by77er/inframe) project: Lean st
 |---|---|
 | `inframe.toml` | The project: the Lean package, the pinned AWS provider, and each stack's S3 state backend |
 | `aws-schema.json` | The AWS provider schema (6.69.1), trimmed to the resource types nest uses, so bindings build in seconds |
-| `lean/Cell/Stack.lean` | A cell: VPC with public subnets and an S3 gateway endpoint, egress-only security group, versioned bucket, host role, launch template, the control plane's IAM user |
+| `lean/Cell/Stack.lean` | A cell: VPC with public subnets and an S3 gateway endpoint, egress-only security group, versioned bucket, host role, launch template, the host-image pipeline (EC2 Image Builder), the control plane's IAM user |
 | `lean/Cell/Iam.lean` | IAM policies as data, rendered to JSON |
 | `lean/Cell/Test.lean` | Theorems about what the control plane and hosts may do, for every cell; policies over the `use1` graph (no ingress, egress allow-list, IMDSv2) |
-| `host/bootstrap.sh` | Burst-host user-data: installs the host binaries from the cell's bucket and starts nestd (no secrets) |
+| `host/install.sh` | Installs a host's software (packages, the release, Claude Code, systemd units): baked into the host AMI, and rerun at boot to catch up |
+| `host/bootstrap.sh` | Burst-host user-data: runs `install.sh`, writes the per-host config and starts nestd (no secrets) |
 
 ## Use
 
@@ -24,7 +25,8 @@ inframe plan --stack use1 -- -out=use1.plan
 inframe apply --stack use1 -- use1.plan
 ```
 
-- **`include_str` isn't tracked by Lake:** after editing `host/bootstrap.sh`, delete `lean/.lake/build/{lib/lean,ir}/Cell/Stack.*` (Lake hashes contents, so `touch` doesn't help) or the plan shows no change.
+- **`include_str` isn't tracked by Lake:** after editing `host/bootstrap.sh` or `host/install.sh`, delete `lean/.lake/build/{lib/lean,ir}/Cell/Stack.*` (Lake hashes contents, so `touch` doesn't help) or the plan shows no change.
+- **Host AMI:** `aws imagebuilder start-image-pipeline-execution --image-pipeline-arn $(inframe output --stack use1 | jq -r .host_image_pipeline.value)` bakes `releases/current/` into a new AMI (about 15 minutes). Its ID lands in `/imagebuilder/nest-<cell>/host-ami`, which the launch template resolves at each launch; the parameter starts at stock AL2023. Rebuild after publishing a release: hosts on an older AMI still work, but download the difference at boot.
 - **Spot drill:** `aws fis start-experiment --experiment-template-id $(inframe output --stack use1 | jq -r .spot_drill_template_id.value)` sends a real two-minute interruption notice to one running nest spot host. Its role can interrupt only `nest=true` instances (proved in `Cell.Test`).
 - **Once per account:** the EC2 Spot service-linked role (`aws iam create-service-linked-role --aws-service-name spot.amazonaws.com`); without it, spot launches fail with `AuthFailure.ServiceLinkedRoleCreationNotPermitted`.
 - **State** lives in the versioned bucket `nest-tfstate-<account>`, created once by hand (versioning on, public access blocked), with S3-native locking.

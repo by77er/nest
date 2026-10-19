@@ -40,7 +40,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `crates/nest-cli` | `nest` binary: `nest hook`, `nest mcp`, in-sandbox commands |
 | `protocol/` | Fixtures, tool catalogs, Claude Code reference artifacts |
 | `e2e/` | Local end-to-end harness |
-| `deploy/` | Cells as an inframe stack (OpenTofu); the burst-host bootstrap |
+| `deploy/` | Cells as an inframe stack (OpenTofu): network, bucket, IAM, the host-image pipeline; the burst-host install and bootstrap |
 | `images/` | The Firecracker guest image (kernel and `nest-base` rootfs) and its EC2 builder |
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
@@ -186,6 +186,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Verify:** that every 8i variant reports the same CPU model (it's part of the restore ABI); that Firecracker's writes pass through the host page cache before ublk; and whether S3 Inventory and lifecycle rules work on S3 Express One Zone directory buckets. See [sandbox/state/](sandbox/state/).
 - **Not built:** the 60 s dirty-disk timer and the 256 MB dirty threshold. Disks commit at turn end, suspend, drain and spot notice only; a timer needs dirty tracking and a cut that doesn't pause the VM for the whole chunking pass (ublk). See [sandbox/state/](sandbox/state/#writeback-cadence).
 - **Watch:** a host terminated outside FleetDO kept new sandboxes waiting about 10 minutes before a replacement launched. See [compute/autoscaling/](compute/autoscaling/).
+- **Not built:** pruning old host AMIs and their snapshots. Each build adds one (a few GB of snapshot, cents a month); an Image Builder lifecycle policy would keep the last few. See [compute/provisioning/](compute/provisioning/).
 - **Open:** guest `init_on_free=1` (for compressible memory snapshots) stalled 1-vCPU guest boots past a minute on a nested 8i host, so it's off until snapshots exist; whether nested hosts can afford it then is unmeasured. See [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/).
 - **Open:** turn-end generations are always kept, so a long-lived sandbox's history grows without bound; it may need a cap. See [sandbox/state/](sandbox/state/#retention).
 - **Open:** per-sandbox I/O limits don't make a dense host fair when many sandboxes spend their burst at once. See [sandbox/state/disk/](sandbox/state/disk/#io-limits).

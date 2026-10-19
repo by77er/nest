@@ -1,10 +1,18 @@
 # Provisioning
 
-**Burst host image (built with Packer):**
+**Burst host image (EC2 Image Builder):**
 - Amazon Linux 2023 with kernel 6.18 (or 6.1), the host kernels Firecracker supports on 8i ([README](https://github.com/firecracker-microvm/firecracker/blob/main/README.md)); Ubuntu 24.04's 6.8 isn't one of them. Hugetlb needs 5.18+ and ublk needs 6.0+; whether AL2023 ships ublk is unverified.
 - Firecracker from the 1.17 line, pinned by binary digest, patch level included ([driver](../../sandbox/drivers/firecracker/)).
 - `bubblewrap`: Claude Code needs it for the subprocess environment scrub nest relies on (see [runner-claude](../../interfaces/host-internal/runner-claude/)). The controller host image installs it too.
 - Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, **Claude Code + the agent runner** (brains for local sandboxes). The image carries the runner's pinned Claude Code version, checked by SHA-256 ([runner](../../agents/runner/)).
+- **Built by the cell's Image Builder pipeline,** managed in the cell stack: AWS-native, no build host of ours. One install script runs in two places:
+  - at build time, baked into the AMI;
+  - at every boot, where it only fills what the AMI lacks.
+
+  Booting a stale AMI, or stock AL2023, therefore still works. It is only slower.
+- **Builds run on demand.** The pipeline writes the new AMI's ID to an SSM parameter, and the launch template resolves that parameter at each launch (`resolve:ssm:`). A new image therefore needs no stack change.
+- **The builder runs in the cell's subnet.** Its role can only read the release, and it is not tagged `nest=true`, so STONITH can't reach it.
+- **Not built:** pruning old AMIs and their snapshots (an Image Builder lifecycle policy); gVisor and cloudflared.
 
 **Launch template:**
 - Nested virtualization enabled, restricted to the 8i family.
