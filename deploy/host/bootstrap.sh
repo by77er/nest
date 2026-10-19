@@ -22,6 +22,8 @@ install -d -m 0755 /run/nest /run/nest/runner
 # Sandboxes run in Firecracker when the instance has KVM (nested virtualization, set in the launch
 # template); otherwise in the process driver, so a host never comes up unusable.
 if [ -e /dev/kvm ] && [ -x /opt/nest/bin/firecracker ]; then
+  BASE=/var/lib/nest/images/nest-base:latest.ext4
+  [ -f "$BASE" ] || { zstd -q -d -f /var/lib/nest/images/nest-base.ext4.zst -o "$BASE.tmp" && mv "$BASE.tmp" "$BASE"; }
   # Guest memory is backed by 2 MiB hugepages, reserved up front (half the host's memory, so the
   # brain, nestd and the proxy keep the rest). sysctl.d, so a reboot reserves them again.
   echo "vm.nr_hugepages = $(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 2 / 2048 ))" > /etc/sysctl.d/90-nest-hugepages.conf

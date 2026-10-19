@@ -35,7 +35,11 @@ else
     # The jailer hard-links the kernel and each disk into its chroot: same filesystem as /srv/jailer.
     install -d -m 0755 /var/lib/nest/images /var/lib/nest/kernel /srv/jailer
     install -m 0644 "$STAGE/vmlinux" /var/lib/nest/kernel/vmlinux
-    zstd -q -d -f "$STAGE/nest-base.ext4.zst" -o "/var/lib/nest/images/nest-base:latest.ext4"
+    # Compressed: bootstrap expands it on each host's first boot. Blocks baked into an AMI load
+    # lazily from its snapshot on first read, and sandbox disks are reflinked copies of the base,
+    # so a baked expanded image made every first commit crawl (it timed out on EC2).
+    install -m 0644 "$STAGE/nest-base.ext4.zst" /var/lib/nest/images/nest-base.ext4.zst
+    rm -f "/var/lib/nest/images/nest-base:latest.ext4"
   fi
   install -d -m 0755 /opt/nest/release
   install -m 0644 "$STAGE/VERSION" /opt/nest/release/VERSION

@@ -10,6 +10,7 @@
   - at every boot, where it only fills what the AMI lacks.
 
   Booting a stale AMI, or stock AL2023, therefore still works. It is only slower.
+- **The guest image is baked compressed and expanded on first boot.** EBS loads an AMI's blocks from its snapshot on first read. Sandbox disks are reflinked copies of the base image (XFS), so with a baked, expanded base every first commit read cold blocks: on EC2 the first turn-end commit hit its 60 s timeout.
 - **Builds run on demand.** The pipeline writes the new AMI's ID to an SSM parameter, and the launch template resolves that parameter at each launch (`resolve:ssm:`). A new image therefore needs no stack change.
 - **The builder runs in the cell's subnet.** Its role can only read the release, and it is not tagged `nest=true`, so STONITH can't reach it.
 - **Not built:** pruning old AMIs and their snapshots (an Image Builder lifecycle policy); gVisor and cloudflared.
