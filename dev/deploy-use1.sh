@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deploys nest-control-plane for the use1 cell by hand, until deploy.yml exists (dev/deploy.md).
+# Deploys nest-control-plane for the use1 cell: run by deploy.yml, or by hand (dev/deploy.md).
 # Worker secrets persist across versions; `--var`s don't, so every deploy passes them again. They
 # live in SSM next to the secrets (/nest/control-plane/vars/*). Needs CLOUDFLARE_* and AWS_* in env.
 set -euo pipefail

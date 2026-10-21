@@ -7,6 +7,7 @@
 | `rust` | `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | iproute2, nftables and unprivileged user namespaces for nestd's netns tests |
 | `control-plane` | `npm ci`, `npm run typecheck`, `npm test` (vitest in workerd) | Node 22 |
 | `e2e` | The `claude-verify` harness tests (with a stub, never the real binary), then `e2e/run.sh` with the fake brain | The above, plus outbound access to `registry.npmjs.org` and `httpbin.org`; logs are uploaded on failure |
+| `infra` | `inframe test --stack use1`: the cell stack's IAM theorems and graph policies, with no AWS credentials (plans run only in [deploy.yml](deploy.md)) | elan and the inframe CLI (`scripts/infra-tools.sh`, pinned) |
 | `guards` | Doc links (`scripts/check-doc-links.py`), source fences (`scripts/check-fences.py`), and the guards' own tests (`scripts/tests/`) | Python 3.11+ |
 | `deny` | `cargo deny check` (`deny.toml`): RustSec advisories, licenses, wildcards, unknown sources | cargo-deny, built from crates.io and cached |
 | `secrets` | gitleaks over the full history (`.gitleaks.toml`): default rules plus nest's token formats | gitleaks, built from source and verified by Go's checksum database |
