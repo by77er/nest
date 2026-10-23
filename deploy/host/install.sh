@@ -9,6 +9,10 @@ set -euo pipefail
 BUCKET="@BUCKET@"
 REGION="@REGION@"
 CLAUDE_VERSION="2.1.301"
+# cloudflared: the host's Cloudflare Tunnel, run by nestd when enrollment hands it a tunnel token.
+# A GitHub release binary, pinned by version and checksum (never committed to the repo).
+CLOUDFLARED_VERSION="2026.10.3"
+CLOUDFLARED_SHA256="053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0"
 PACKAGES="nftables iproute util-linux bubblewrap e2fsprogs zstd"
 export HOME=/root
 
@@ -46,6 +50,8 @@ else
   install -m 0644 "$STAGE/SHA256SUMS" /opt/nest/release.sha256sums
 fi
 id -u nest-fc >/dev/null 2>&1 || useradd --system --uid 900 --user-group --no-create-home --shell /sbin/nologin nest-fc
+# cloudflared runs as its own user, not as nestd (root).
+id -u nest-cf >/dev/null 2>&1 || useradd --system --uid 901 --user-group --no-create-home --shell /sbin/nologin nest-cf
 
 # Claude Code, pinned (the installer checks the release's checksum).
 CLAUDE_BIN=/root/.local/bin/claude
@@ -53,6 +59,14 @@ if [ "$("$CLAUDE_BIN" --version 2>/dev/null | awk '{print $1}')" != "$CLAUDE_VER
   curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
 fi
 echo "$CLAUDE_VERSION" > /etc/nest/claude-version
+
+# cloudflared, pinned: skipped when the installed binary already has the pinned checksum.
+CLOUDFLARED_BIN=/opt/nest/bin/cloudflared
+if ! echo "$CLOUDFLARED_SHA256  $CLOUDFLARED_BIN" | sha256sum -c --quiet --status 2>/dev/null; then
+  curl -fsSL -o "$STAGE/cloudflared" "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64"
+  echo "$CLOUDFLARED_SHA256  $STAGE/cloudflared" | sha256sum -c --quiet
+  install -m 0755 "$STAGE/cloudflared" "$CLOUDFLARED_BIN"
+fi
 
 # Until logs ship elsewhere, the services also write to the serial console (`aws ec2 get-console-output`).
 cat >/etc/systemd/system/nest-proxy.service <<'EOF'

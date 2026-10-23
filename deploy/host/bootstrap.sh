@@ -47,6 +47,8 @@ cat >/etc/nest/nestd.json <<EOF
   "driver": $DRIVER,
   "network": {"type": "netns", "persist_dir": "/run/nest/netns"},
   "gateway_url": "ws://127.0.0.1:18790",
+  "cloudflared_bin": "/opt/nest/bin/cloudflared",
+  "cloudflared_user": "nest-cf",
   "storage": {"type": "s3", "bucket": "$BUCKET", "region": "$REGION"},
   "versions": {"nest_proxy": "$VERSION", "agent_runner": "$VERSION", "claude_code": "$(cat /etc/nest/claude-version)"}
 }

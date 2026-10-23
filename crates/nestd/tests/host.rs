@@ -484,7 +484,7 @@ async fn host_lifecycle_commit_and_self_fence() {
         "gateway_url": "ws://127.0.0.1:18790",
     }))
     .unwrap();
-    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let run_dir = dir.path().join("run");
     let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
@@ -731,7 +731,7 @@ fn netns_listeners_handed_to_proxy() {
             "flush_interval_ms": 20,
         }))
         .unwrap();
-        let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
+        let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
         let ns_slot = Arc::new(Mutex::new(None));
         let _host = Host::start(cfg, enrolled, Some(Arc::new(NetnsCapture(ns_slot.clone())))).await.unwrap();
         let received = fake_proxy_keeping_fds(dir.path().join("run/proxy.sock"));
@@ -821,12 +821,151 @@ async fn start_host_with(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
         "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
     }))
     .unwrap();
-    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca };
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
     let host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
     Started { _host: host, _dir: dir, fleet, _runner: runner, proxy }
+}
+
+/// Whether `pid` is still a live process (a zombie counts as dead: it has been killed).
+fn alive(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(s) => !s.lines().any(|l| l.starts_with("State:") && l.contains('Z')),
+        Err(_) => false,
+    }
+}
+
+/// nestd's cloudflared log lines for the whole test binary (a process has one global subscriber;
+/// tests tell their own lines apart by their temp paths).
+fn cloudflared_logs() -> Arc<Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let b = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("nestd::cloudflared=info"))
+            .with_writer(move || Sink(b.clone()))
+            .with_ansi(false)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(sub);
+        buf
+    })
+    .clone()
+}
+
+fn tunnel_config(dir: &Path, fleet_url: &str, bin: &Path, user: Option<String>) -> Config {
+    serde_json::from_value(serde_json::json!({
+        "role": "burst", "cell": "test-cell",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet_url},
+        "run_dir": dir.join("run"), "state_dir": dir.join("state"),
+        "driver": {"type": "process", "guest_command": ["unused"]},
+        "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
+        "gateway_url": "ws://127.0.0.1:18790", "cloudflared_bin": bin, "cloudflared_user": user,
+    }))
+    .unwrap()
+}
+
+fn tunnel_enrolled(fleet_url: &str) -> Enrolled {
+    Enrolled {
+        host: HostId("hst_t".into()),
+        host_token: nest_protocol::host::Secret("tok".into()),
+        host_token_expires_ms: i64::MAX,
+        fleet_ws_url: fleet_url.into(),
+        proxy_ca: None,
+        tunnel_token: Some(nest_protocol::host::Secret("tunnel-token".into())),
+        gateway_url: Some("wss://hst_t-gw-nest.example.dev".into()),
+    }
+}
+
+/// With a cloudflared binary and user configured and a tunnel token from enrollment, the host runs
+/// the tunnel as its child; the fleet hello still carries the configured `gateway_url`, not the
+/// control plane's; and shutting the host down sends the child SIGTERM, after which it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let log = dir.path().join("cloudflared.log");
+    let bin = dir.path().join("cloudflared");
+    std::fs::write(&bin, format!("#!/bin/sh\necho pid=$$ >> {l}\ntrap 'echo term >> {l}; exit 0' TERM\nwhile :; do sleep 0.1; done\n", l = log.display())).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The configured user: the test's own, the only one an unprivileged test can switch to.
+    let me = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
+    let cfg = tunnel_config(dir.path(), &fleet.url, &bin, Some(me));
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
+    let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
+    let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
+    wait_until("cloudflared spawned", || log.exists()).await;
+    let pid: i32 = std::fs::read_to_string(&log).unwrap().trim().strip_prefix("pid=").unwrap().parse().unwrap();
+    assert!(alive(pid));
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    assert_eq!(fleet.log.lock().unwrap().hellos[0].gateway_url.as_deref(), Some("ws://127.0.0.1:18790"), "the hello keeps nestd's configured URL");
+    host.shutdown().await;
+    assert!(!alive(pid));
+    assert!(std::fs::read_to_string(&log).unwrap().ends_with("\nterm\n"), "the child saw SIGTERM before it died");
+}
+
+/// A configured binary that is missing does not stop the host: it enrolls and says hello, and the
+/// failed start is logged on every retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_cloudflared_binary_is_logged_and_does_not_stop_the_host() {
+    let logs = cloudflared_logs();
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let bin = dir.path().join("no-such-cloudflared");
+    let cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
+    let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
+    let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    let mine = || {
+        let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        text.lines().filter(|l| l.contains("cloudflared failed to start") && l.contains(&bin.display().to_string())).count()
+    };
+    // The second attempt comes after the 1 s minimum backoff.
+    wait_until("the failed start to be logged twice", || mine() >= 2).await;
+    host.shutdown().await;
+}
+
+/// cloudflared is started last: a `Host::start` that fails after deciding to run it (here on an
+/// unusable `run_dir`) leaves no child behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_start_leaves_no_tunnel_child() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let log = dir.path().join("cloudflared.log");
+    let bin = dir.path().join("cloudflared");
+    std::fs::write(&bin, format!("#!/bin/sh\necho pid=$$ >> {}\nexit 0\n", log.display())).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
+    cfg.run_dir = "/proc/no-such-dir/run".into();
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.err().unwrap();
+    assert!(!err.to_string().contains("cloudflared"), "the failure is elsewhere: {err:#}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!log.exists(), "cloudflared was started although the host did not");
+}
+
+/// A `cloudflared_user` that does not exist is a configuration error: the host does not start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_cloudflared_user_fails_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let cfg = tunnel_config(dir.path(), &fleet.url, Path::new("/opt/nest/bin/cloudflared"), Some("no-such-user-nest".into()));
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.err().unwrap();
+    assert!(err.to_string().contains("no-such-user-nest"), "{err}");
 }
 
 fn create(id: &str, sandbox: &str) -> Command {
@@ -859,7 +998,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
         "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
     }))
     .unwrap();
-    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let latch = Arc::new(AttachLatch::default());
     let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), fail_next_start: Arc::default() }))).await.unwrap();
@@ -907,7 +1046,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
         "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
     }))
     .unwrap();
-    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let fail = Arc::new(AtomicBool::new(true));
     let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: fail.clone() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;

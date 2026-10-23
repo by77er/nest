@@ -21,6 +21,13 @@ pub struct Enrolled {
     pub fleet_ws_url: String,
     /// Proxy intermediate CA and its private key (absent for static/dev credentials).
     pub proxy_ca: Option<(CaCertificate, Secret)>,
+    /// The host's Cloudflare Tunnel token, when the control plane created a tunnel for it; nestd
+    /// runs cloudflared with it (`cloudflared.rs`). Kept in memory and in the credentials file.
+    pub tunnel_token: Option<Secret>,
+    /// What the control plane will tell clients for this host's gateway (`wss://…` behind the
+    /// tunnel). Informational here: the control plane is the authority, and nestd's own hello
+    /// carries its configured `gateway_url` as the fallback.
+    pub gateway_url: Option<String>,
 }
 
 /// Generate the proxy CA key pair and a CSR for it. Returns `(key_pem, csr_pem)`.
@@ -91,6 +98,8 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
                 host_token_expires_ms: i64::MAX,
                 fleet_ws_url: fleet_ws_url.clone(),
                 proxy_ca: None,
+                tunnel_token: None,
+                gateway_url: None,
             });
         }
         _ if resumable(cfg).is_some() => {
@@ -123,6 +132,8 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
         host_token_expires_ms: r.host_token_expires_ms,
         fleet_ws_url: r.fleet_ws_url,
         proxy_ca: Some((r.proxy_ca, key)),
+        tunnel_token: r.tunnel_token,
+        gateway_url: r.gateway_url,
     };
     // Without these a restarted nestd couldn't rejoin: AWS instances enroll once.
     crate::credentials::save(&cfg.credentials_path(), &cfg.control_url, &cfg.cell, &e).context("save host credentials")?;
@@ -197,7 +208,8 @@ mod tests {
                         serde_json::json!({
                             "host": "hst_new", "host_token": "tok", "host_token_expires_ms": 4_102_444_800_000i64,
                             "fleet_ws_url": fleet,
-                            "proxy_ca": {"cert_pem": "CERT", "chain_pem": "CHAIN", "expires_ms": 456}
+                            "proxy_ca": {"cert_pem": "CERT", "chain_pem": "CHAIN", "expires_ms": 456},
+                            "tunnel_token": "tunnel-token-value", "gateway_url": "wss://new-gw-nest.example.dev"
                         }).to_string()
                     } else {
                         String::new()
@@ -236,6 +248,9 @@ mod tests {
         assert!(seen.lock().unwrap().is_none(), "a restart must not enroll again");
         assert_eq!((again.host.0.as_str(), again.host_token.expose()), (first.host.0.as_str(), first.host_token.expose()));
         assert_eq!(again.proxy_ca.unwrap().1.expose(), first.proxy_ca.unwrap().1.expose());
+        // The tunnel token survives the restart too: cloudflared comes back without re-enrolling.
+        assert_eq!(again.tunnel_token.as_ref().map(Secret::expose), Some("tunnel-token-value"));
+        assert_eq!(again.gateway_url.as_deref(), Some("wss://new-gw-nest.example.dev"));
     }
 
     /// An enrollment answer can't point the command channel at another host.
@@ -267,6 +282,8 @@ mod tests {
         let (ca, key) = e.proxy_ca.unwrap();
         assert_eq!(ca.cert_pem, "CERT");
         assert!(key.0.contains("PRIVATE KEY"));
+        assert_eq!(e.tunnel_token.as_ref().map(Secret::expose), Some("tunnel-token-value"));
+        assert_eq!(e.gateway_url.as_deref(), Some("wss://new-gw-nest.example.dev"));
         let body = seen.lock().unwrap().clone().unwrap();
         assert_eq!(body["proof"]["type"], "aws_identity_document");
         let doc = base64::engine::general_purpose::STANDARD.decode(body["proof"]["document_b64"].as_str().unwrap()).unwrap();

@@ -34,6 +34,11 @@ struct Saved {
     proxy_ca: Option<CaCertificate>,
     #[serde(default)]
     proxy_ca_key: Option<String>,
+    /// The host's Cloudflare Tunnel token (absent in files written before tunnels existed).
+    #[serde(default)]
+    tunnel_token: Option<String>,
+    #[serde(default)]
+    gateway_url: Option<String>,
 }
 
 fn read(path: &Path) -> Option<Saved> {
@@ -65,6 +70,8 @@ pub fn load(path: &Path, control_url: &str, cell: &str, now_ms: TimestampMs) -> 
         host_token_expires_ms: s.host_token_expires_ms,
         fleet_ws_url: s.fleet_ws_url,
         proxy_ca: s.proxy_ca.zip(s.proxy_ca_key.map(Secret)),
+        tunnel_token: s.tunnel_token.map(Secret),
+        gateway_url: s.gateway_url,
     })
 }
 
@@ -81,6 +88,8 @@ pub fn save(path: &Path, control_url: &str, cell: &str, e: &Enrolled) -> anyhow:
             fleet_ws_url: e.fleet_ws_url.clone(),
             proxy_ca: e.proxy_ca.as_ref().map(|(c, _)| c.clone()),
             proxy_ca_key: e.proxy_ca.as_ref().map(|(_, k)| k.expose().into()),
+            tunnel_token: e.tunnel_token.as_ref().map(|t| t.expose().into()),
+            gateway_url: e.gateway_url.clone(),
         },
     )
 }
@@ -120,7 +129,28 @@ mod tests {
             host_token_expires_ms: exp,
             fleet_ws_url: "wss://cp/v1/fleet".into(),
             proxy_ca: Some((CaCertificate { cert_pem: "CERT".into(), chain_pem: "CHAIN".into(), expires_ms: 9 }, Secret("KEY".into()))),
+            tunnel_token: Some(Secret("TUNNEL".into())),
+            gateway_url: Some("wss://saved-gw-nest.example.dev".into()),
         }
+    }
+
+    /// The tunnel token is kept with the host token, and a file from before tunnels existed loads.
+    #[test]
+    fn keeps_the_tunnel_token_and_loads_files_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("host-credentials.json");
+        save(&p, "https://cp", "use1", &enrolled(1_000_000)).unwrap();
+        let e = load(&p, "https://cp", "use1", 0).unwrap();
+        assert_eq!(e.tunnel_token.as_ref().map(Secret::expose), Some("TUNNEL"));
+        assert_eq!(e.gateway_url.as_deref(), Some("wss://saved-gw-nest.example.dev"));
+        // A file written by a nestd that knew nothing of tunnels.
+        std::fs::write(&p, serde_json::json!({
+            "control_url": "https://cp", "cell": "use1", "host": "hst_old", "host_token": "tok", "host_token_expires_ms": 1_000_000,
+            "fleet_ws_url": "wss://cp/v1/fleet"
+        }).to_string()).unwrap();
+        let e = load(&p, "https://cp", "use1", 0).unwrap();
+        assert_eq!(e.host.0, "hst_old");
+        assert!(e.tunnel_token.is_none() && e.gateway_url.is_none());
     }
 
     #[test]

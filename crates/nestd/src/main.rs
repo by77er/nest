@@ -24,10 +24,16 @@ async fn main() -> anyhow::Result<()> {
     let text = std::fs::read_to_string(&args.config).with_context(|| format!("read {}", args.config.display()))?;
     let cfg: Config = serde_json::from_str(&text).with_context(|| format!("parse {}", args.config.display()))?;
     let enrolled = nestd::enroll::enroll(&cfg).await.context("enrollment")?;
-    tracing::info!(host = %enrolled.host, fleet = %enrolled.fleet_ws_url, "enrolled");
+    tracing::info!(host = %enrolled.host, fleet = %enrolled.fleet_ws_url, tunnel_url = enrolled.gateway_url.as_deref().unwrap_or("-"), tunnel = enrolled.tunnel_token.is_some(), "enrolled");
     let host = nestd::host::Host::start(cfg, enrolled, None).await?;
     tracing::info!(host = %host.inner.host_id(), "nestd running");
-    tokio::signal::ctrl_c().await?;
+    // systemd stops nestd with SIGTERM; the terminal with SIGINT. Either way the children go too.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r?,
+        _ = term.recv() => {}
+    }
     tracing::info!("shutting down");
+    host.shutdown().await;
     Ok(())
 }

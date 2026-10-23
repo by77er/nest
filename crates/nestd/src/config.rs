@@ -38,6 +38,14 @@ pub struct Config {
     /// the fleet hello. `None` on a host that runs no sandboxes.
     #[serde(default)]
     pub gateway_url: Option<String>,
+    /// The cloudflared binary. With it and a tunnel token from enrollment, nestd runs the host's
+    /// Cloudflare Tunnel as a child (`cloudflared.rs`); without it, no tunnel.
+    #[serde(default)]
+    pub cloudflared_bin: Option<PathBuf>,
+    /// Run cloudflared as this system user (`nest-cf` on real hosts), not as nestd. Unset, the
+    /// child keeps nestd's own user (the harness). A name that does not exist fails startup.
+    #[serde(default)]
+    pub cloudflared_user: Option<String>,
     /// Where generations (disk and memory chunks, manifests) go.
     #[serde(default)]
     pub storage: StorageConfig,

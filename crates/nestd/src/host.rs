@@ -197,6 +197,18 @@ struct CaState {
 /// Running nestd instance.
 pub struct Host {
     pub inner: Arc<Inner>,
+    /// The tunnel's supervisor (`cloudflared.rs`), when this host has one. Dropping it terminates
+    /// cloudflared in the background; [`Host::shutdown`] waits for that.
+    cloudflared: Option<crate::cloudflared::Supervisor>,
+}
+
+impl Host {
+    /// Stop what must not outlive nestd: cloudflared gets SIGTERM, then SIGKILL after 5 s.
+    pub async fn shutdown(mut self) {
+        if let Some(s) = self.cloudflared.take() {
+            s.stop().await;
+        }
+    }
 }
 
 impl FleetReporter for Inner {
@@ -235,6 +247,13 @@ fn holds_lease(s: SandboxState) -> bool {
 impl Host {
     /// Start every subsystem. `driver` overrides the configured driver (tests).
     pub async fn start(cfg: Config, enrolled: Enrolled, driver: Option<Arc<dyn Driver>>) -> anyhow::Result<Host> {
+        // The host's tunnel, when the control plane gave it one and cloudflared is installed.
+        // Decided here, started last, so a failure below leaves no child behind.
+        let tunnel = crate::cloudflared::plan(&cfg, &enrolled)?;
+        if let crate::cloudflared::Plan::Run(t) = &tunnel {
+            let user = t.user.map(|(uid, _)| uid.as_raw());
+            tracing::info!(bin = %t.bin.display(), ?user, tunnel_url = enrolled.gateway_url.as_deref().unwrap_or("-"), "this host runs a tunnel");
+        }
         std::fs::create_dir_all(&cfg.run_dir).with_context(|| format!("create {}", cfg.run_dir.display()))?;
         std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("create {}", cfg.state_dir.display()))?;
         std::fs::create_dir_all(cfg.agents_dir())?;
@@ -416,7 +435,8 @@ impl Host {
             let inner = inner.clone();
             tokio::spawn(async move { inner.housekeeping().await });
         }
-        Ok(Host { inner })
+        let cloudflared = crate::cloudflared::spawn(tunnel);
+        Ok(Host { inner, cloudflared })
     }
 }
 
