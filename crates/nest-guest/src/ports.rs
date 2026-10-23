@@ -10,9 +10,12 @@ use crate::state::{Guest, now_ms};
 const TCP_LISTEN: &str = "0A";
 
 /// Current listening sockets, sorted by (port, proto, bind).
+///
+/// The socket table is read before the fd tables: a socket that is already `LISTEN` has had its
+/// fd since `socket()`, so the owner scan that follows finds it. The other order reports a socket
+/// that started listening between the two reads with no pid, then again with one a poll later.
 pub fn scan() -> Vec<ListeningPort> {
-    let inodes = socket_owners();
-    let mut out = Vec::new();
+    let mut listening = Vec::new();
     for (file, proto) in [("/proc/net/tcp", PortProto::Tcp), ("/proc/net/tcp6", PortProto::Tcp6)] {
         let Ok(text) = std::fs::read_to_string(file) else { continue };
         for line in text.lines().skip(1) {
@@ -22,15 +25,14 @@ pub fn scan() -> Vec<ListeningPort> {
             }
             let Some((addr, port)) = cols[1].split_once(':') else { continue };
             let Ok(port) = u16::from_str_radix(port, 16) else { continue };
-            let owner = cols[9].parse::<u64>().ok().and_then(|i| inodes.get(&i));
-            out.push(ListeningPort {
-                port,
-                proto,
-                bind: bind_label(addr),
-                pid: owner.map(|o| o.0),
-                process: owner.map(|o| o.1.clone()),
-            });
+            listening.push((port, proto, bind_label(addr), cols[9].parse::<u64>().ok()));
         }
+    }
+    let inodes = socket_owners();
+    let mut out = Vec::new();
+    for (port, proto, bind, inode) in listening {
+        let owner = inode.and_then(|i| inodes.get(&i));
+        out.push(ListeningPort { port, proto, bind, pid: owner.map(|o| o.0), process: owner.map(|o| o.1.clone()) });
     }
     out.sort_by(|a, b| (a.port, a.proto as u8, &a.bind).cmp(&(b.port, b.proto as u8, &b.bind)));
     out.dedup();
