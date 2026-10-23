@@ -65,6 +65,17 @@ pub struct EnrollResponse {
     pub host_token_expires_ms: TimestampMs,
     pub fleet_ws_url: String,
     pub proxy_ca: CaCertificate,
+    /// The host's Cloudflare Tunnel token, when the control plane created a tunnel for it (a
+    /// sandbox host in a cell with a zone): nestd runs cloudflared with it, in memory and in its
+    /// credentials file, never on a command line. Absent on the harness and on hosts that run
+    /// no sandboxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_token: Option<crate::model::Secret>,
+    /// The URL clients will be told for this host's gateway (`wss://<host>-gw-nest.<zone>` behind
+    /// the tunnel). The control plane is the authority; the host's own `hello.gateway_url` counts
+    /// only when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_url: Option<String>,
 }
 
 /// Per-host intermediate CA certificate (≈7 days), signed by the root key held in the control

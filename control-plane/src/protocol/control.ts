@@ -46,6 +46,10 @@ export const EnrollResponse = z.object({
   host_token_expires_ms: TimestampMs,
   fleet_ws_url: z.string(),
   proxy_ca: CaCertificate,
+  /** The host's Cloudflare Tunnel token when the control plane created one for it; never on a command line. */
+  tunnel_token: z.string().optional(),
+  /** What clients will be told for this host's gateway; the control plane is the authority. */
+  gateway_url: z.string().optional(),
 });
 export type EnrollResponse = z.output<typeof EnrollResponse>;
 
