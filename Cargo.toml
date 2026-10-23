@@ -7,6 +7,8 @@ members = [
   "crates/nest-guest",
   "crates/nest-runner",
   "crates/nest-cli",
+  "crates/nest-gateway",
+  "crates/nest-hands-client",
 ]
 
 [workspace.package]

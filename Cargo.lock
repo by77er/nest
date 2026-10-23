@@ -1135,6 +1135,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nest-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "futures-util",
+ "nest-protocol",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "nest-guest"
 version = "0.1.0"
 dependencies = [
@@ -1157,9 +1177,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nest-hands-client"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "nest-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "nest-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "nix",
  "serde",
  "serde_json",

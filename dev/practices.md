@@ -7,6 +7,7 @@ What makes this repo safe for agents to change and to review. The checks are the
 - **Source fences** (`scripts/fences.toml`, checked by `scripts/check-fences.py`) turn `CLAUDE.md`'s invariants from prose into checks. Each fence lists patterns that may appear only in the files it allows:
   - the subscription token's names;
   - the guest's credential-free code;
+  - the gateway's and the hands client's credential-free code;
   - Claude Code's launch, and permission bypass;
   - TLS interception;
   - metrics writes.
