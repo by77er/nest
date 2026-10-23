@@ -153,6 +153,7 @@ impl State {
         let mut g = self.write();
         g.sandboxes.remove(sandbox);
         close_matching(&mut g, |c| &c.sandbox == sandbox, close_code::MOVED);
+        tracing::info!(sandbox = %sandbox.0, "sandbox removed");
     }
 
     /// nestd is gone (or the process is stopping): forget every sandbox and cut every
