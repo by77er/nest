@@ -13,7 +13,7 @@
 **Not built yet:** the pause, deploy classification, the metrics health window, `rollback.yml`, and guest image rebuilds. Rebuild the guest image by hand (`images/guest/build-on-ec2.sh`) when `nest-guest` changes.
 
 **Credentials:**
-- **AWS:** the cell stack's `nest-<cell>-deploy` role, assumed over GitHub OIDC. Its trust policy accepts only `repo:by77er/nest:environment:production`. Applying the stack manages IAM, so the role is administrator-equivalent; the trust policy is what limits it. The first apply of a cell runs by hand with the provisioner key: it creates the role that later applies assume.
+- **AWS:** the cell stack's `nest-<cell>-deploy` role, assumed over GitHub OIDC. Its trust policy accepts only `repo:by77er@39721110/nest@1416068100:environment:production`: GitHub's immutable subject format for repositories created after 2026-07-15 carries the owner and repository ids, and `GET /repos/by77er/nest/actions/oidc/customization/sub` confirms it for this repo ([OIDC reference](https://docs.github.com/en/actions/reference/security/oidc)). Applying the stack manages IAM, so the role is administrator-equivalent; the trust policy is what limits it. The first apply of a cell runs by hand with the provisioner key: it creates the role that later applies assume.
 - **Cloudflare:** `CLOUDFLARE_API_TOKEN` (Workers edit) and `CLOUDFLARE_ACCOUNT_ID` are secrets on the `production` environment.
 - Pull requests get neither.
 
