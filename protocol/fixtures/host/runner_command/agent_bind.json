@@ -1,9 +1,0 @@
-{
-  "type": "agent_bind",
-  "agent": "agt_01jb7n0w1e",
-  "hands": {
-    "sandbox": "sbx_01jb7m9f0k",
-    "epoch": 1,
-    "vsock_uds_path": "/srv/jailer/firecracker/sbx_01jb7m9f0k/root/v.sock"
-  }
-}

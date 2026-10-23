@@ -1,0 +1,6 @@
+{
+  "type": "hello",
+  "protocol_version": 1,
+  "instance_id": "9b1d4e7f2c3a5068",
+  "listen": "127.0.0.1:18790"
+}

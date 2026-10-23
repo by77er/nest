@@ -1,0 +1,15 @@
+{
+  "type": "sandbox_upsert",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "vsock_uds_path": "/srv/jailer/firecracker/sbx_01jb7m2a4c/root/v.sock",
+  "guest": {
+    "protocol_version": 1,
+    "capabilities": [
+      "pty",
+      "cgroup_v2",
+      "pdf",
+      "fsfreeze"
+    ]
+  }
+}

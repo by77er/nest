@@ -24,8 +24,19 @@
       "fork": false
     },
     "hands": {
+      "url": "wss://01jb7k3x9q-gw-nest.example.dev",
       "sandbox": "sbx_01jb7m2a4c",
-      "epoch": 4
+      "epoch": 4,
+      "binding": "nbd_eyJ2IjoxLCJraWQiOiJrMSIsInNhbmRib3giOiJzYnhfMDFqYjdtMmE0YyIsImVwb2NoIjo0LCJjbGllbnQiOiJhZ3RfMDFqYjduMHcxZSIsInNjb3BlIjoiaGFuZHMiLCJleHBfbXMiOjE3NjAyNzQwMDAwMDB9.c2lnbmF0dXJlLWJ5dGVz",
+      "guest": {
+        "protocol_version": 1,
+        "capabilities": [
+          "pty",
+          "cgroup_v2",
+          "pdf",
+          "fsfreeze"
+        ]
+      }
     },
     "launch": {
       "model": "opus",
@@ -43,10 +54,5 @@
     "oauth_token": "sk-ant-oat01-REDACTED-EXAMPLE",
     "session_ws_url": "wss://nest.example.dev/v1/agents/agt_01jb7n0w1e/session"
   },
-  "config_dir": "/var/lib/nest/agents/agt_01jb7n0w1e",
-  "hands": {
-    "sandbox": "sbx_01jb7m2a4c",
-    "epoch": 4,
-    "vsock_uds_path": "/srv/jailer/firecracker/sbx_01jb7m2a4c/root/v.sock"
-  }
+  "config_dir": "/var/lib/nest/agents/agt_01jb7n0w1e"
 }

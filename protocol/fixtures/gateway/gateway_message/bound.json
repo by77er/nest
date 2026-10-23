@@ -1,0 +1,12 @@
+{
+  "type": "bound",
+  "guest": {
+    "protocol_version": 1,
+    "capabilities": [
+      "pty",
+      "cgroup_v2",
+      "pdf",
+      "fsfreeze"
+    ]
+  }
+}

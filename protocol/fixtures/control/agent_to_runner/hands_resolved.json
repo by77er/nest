@@ -1,0 +1,19 @@
+{
+  "type": "hands_resolved",
+  "request": "req_01jb7r5c3k",
+  "hands": {
+    "url": "wss://01jb7k3x9q-gw-nest.example.dev",
+    "sandbox": "sbx_01jb7m2a4c",
+    "epoch": 4,
+    "binding": "nbd_eyJ2IjoxLCJraWQiOiJrMSIsInNhbmRib3giOiJzYnhfMDFqYjdtMmE0YyIsImVwb2NoIjo0LCJjbGllbnQiOiJhZ3RfMDFqYjduMHcxZSIsInNjb3BlIjoiaGFuZHMiLCJleHBfbXMiOjE3NjAyNzQwMDAwMDB9.c2lnbmF0dXJlLWJ5dGVz",
+    "guest": {
+      "protocol_version": 1,
+      "capabilities": [
+        "pty",
+        "cgroup_v2",
+        "pdf",
+        "fsfreeze"
+      ]
+    }
+  }
+}

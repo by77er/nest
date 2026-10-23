@@ -68,6 +68,17 @@ export type SandboxReport = z.output<typeof SandboxReport>;
 export const HandsBinding = z.object({ sandbox: SandboxId, epoch: Epoch, cwd: z.string().optional() });
 export type HandsBinding = z.output<typeof HandsBinding>;
 
+/** The guest's protocol version and capabilities, as nestd reported them (docs/interfaces/gateway/). */
+export const GuestInfo = z.object({ protocol_version: z.number().int(), capabilities: z.array(z.string()).default([]) });
+export type GuestInfo = z.output<typeof GuestInfo>;
+
+/**
+ * Everything a client needs to reach one sandbox's hands: the gateway URL, the binding token and
+ * the guest version. Issued by SandboxDO; the runner receives it in `agent_start` and `hands_resolved`.
+ */
+export const HandsTarget = z.object({ url: z.string(), sandbox: SandboxId, epoch: Epoch, binding: z.string(), guest: GuestInfo });
+export type HandsTarget = z.output<typeof HandsTarget>;
+
 export const AgentReport = z.object({ agent: AgentId, state: AgentState, hands: HandsBinding.optional() });
 
 export const LeaseClaim = z.object({ sandbox: SandboxId, epoch: Epoch });
@@ -91,6 +102,8 @@ export const HostHello = z.object({
   role: HostRole,
   cell: z.string(),
   versions: ComponentVersions,
+  /** `ws://` or `wss://` base URL of this host's sandbox gateway; absent on a host without sandboxes. */
+  gateway_url: z.string().optional(),
   last_command_seq: Seq.optional(),
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
@@ -164,7 +177,7 @@ const AgentStartFields = {
   role: AgentRole,
   workstream: WorkstreamId,
   resume: SessionResume.optional(),
-  hands: HandsBinding.optional(),
+  hands: HandsTarget.optional(),
   launch: LaunchConfig,
   oauth_token: z.string(),
   session_ws_url: z.string(),
@@ -191,7 +204,8 @@ export const CommandBodyVariants = [
   z.object({ type: z.literal("commit_result"), request: RequestId, sandbox: SandboxId, outcome: CommitOutcome }),
   z.object({ type: z.literal("guest_cli_result"), request: RequestId, result: CliResult }),
   z.object({ type: z.literal("agent_start"), ...AgentStartFields }),
-  z.object({ type: z.literal("agent_bind"), agent: AgentId, hands: HandsBinding.optional() }),
+  z.object({ type: z.literal("agent_attach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, cwd: z.string().optional() }),
+  z.object({ type: z.literal("agent_detach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, kill_processes: z.boolean().default(false) }),
   z.object({ type: z.literal("agent_stop"), agent: AgentId, reason: z.string() }),
   z.object({ type: z.literal("fence"), sandboxes: z.array(SandboxId), reason: z.string() }),
   z.object({ type: z.literal("drain"), reason: z.string(), deadline_ms: TimestampMs }),
@@ -244,7 +258,7 @@ export const HostEventVariants = [
   z.object({ ...hostEventBase, type: z.literal("command_result"), cmd: CommandId, outcome: CommandOutcome }),
   z.object({
     ...hostEventBase, type: z.literal("sandbox_state"), sandbox: SandboxId, epoch: Epoch, state: SandboxState,
-    suspend_mode: SuspendMode.optional(), detail: z.string().optional(),
+    suspend_mode: SuspendMode.optional(), detail: z.string().optional(), guest: GuestInfo.optional(),
   }),
   z.object({
     ...hostEventBase, type: z.literal("commit_request"), request: RequestId, sandbox: SandboxId, epoch: Epoch,
@@ -287,6 +301,8 @@ export const FleetToHostVariants = [
   z.object({ type: z.literal("commands"), seq: Seq, commands: z.array(Command) }),
   z.object({ type: z.literal("ack"), up_to: Seq }),
   z.object({ type: z.literal("host_token"), token: z.string(), expires_ms: TimestampMs }),
+  /** The cell's binding verification key for the sandbox gateway (ECDSA P-256, uncompressed point, base64url). */
+  z.object({ type: z.literal("binding_key"), kid: z.string(), public_key: z.string() }),
   CaCertificate.extend({ type: z.literal("proxy_ca") }),
   z.object({ type: z.literal("error"), error: ErrorBody }),
 ] as const;
@@ -320,6 +336,8 @@ export const RunnerToAgentVariants = [
   z.object({ type: z.literal("events"), seq: Seq, events: z.array(AgentEvent) }),
   ToolCall.extend({ type: z.literal("tool_call") }),
   z.object({ type: z.literal("tools_list_request"), request: RequestId }),
+  /** The runner's binding aged out or a gateway refused it: ask for the sandbox's current placement. */
+  z.object({ type: z.literal("hands_resolve"), request: RequestId }),
   /** The runner abandoned a platform call (timed out locally); never run it if it hasn't started. */
   z.object({ type: z.literal("cancel_call"), seq: Seq, call: CallId, reason: z.string() }),
   z.object({ type: z.literal("ack"), up_to: Seq }),
@@ -383,6 +401,8 @@ export const AgentToRunnerVariants = [
   z.object({ type: z.literal("cache_update"), seq: Seq, cache: AgentCache }),
   z.object({ type: z.literal("tool_result"), seq: Seq, call: CallId, outcome: ToolOutcome }),
   z.object({ type: z.literal("tools_list"), request: RequestId, tools: z.array(ToolDef) }),
+  /** Answer to `hands_resolve`; `hands` absent when the agent has no hands now. */
+  z.object({ type: z.literal("hands_resolved"), request: RequestId, hands: HandsTarget.optional() }),
   z.object({ type: z.literal("ack"), up_to: Seq }),
   z.object({ type: z.literal("error"), error: ErrorBody }),
 ] as const;

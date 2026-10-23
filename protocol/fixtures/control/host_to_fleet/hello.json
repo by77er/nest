@@ -11,6 +11,7 @@
     "agent_runner": "0.1.0",
     "claude_code": "2.1.296"
   },
+  "gateway_url": "wss://01jb7k3x9q-gw-nest.example.dev",
   "last_command_seq": 41,
   "sandboxes": [
     {
