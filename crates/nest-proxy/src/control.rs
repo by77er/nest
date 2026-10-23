@@ -60,7 +60,9 @@ fn connect_nestd(path: &Path) -> io::Result<OwnedFd> {
 /// Serve one nestd connection until EOF or error. All state lives in the `Session` and dies
 /// with it.
 pub async fn serve(upstream: Arc<Upstream>, fd: OwnedFd) -> Result<()> {
-    let fd = Arc::new(AsyncFd::new(fd).context("register control socket")?);
+    // SAFETY: the AsyncFd takes ownership of `fd`, an `OwnedFd`: the descriptor stays open and
+    // refers to the same socket until the AsyncFd drops it (RUSTSEC-2026-0386).
+    let fd = Arc::new(unsafe { AsyncFd::register(fd) }.map_err(io::Error::from).context("register control socket")?);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<ProxyEvent>();
     let (audit_tx, audit_rx) = mpsc::channel(4096);
     let session = Session::new(upstream, ev_tx.clone(), audit_tx);

@@ -92,7 +92,9 @@ impl Master {
             let flags = libc::fcntl(raw, libc::F_GETFL);
             libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        Ok(Master(AsyncFd::new(fd)?))
+        // SAFETY: the AsyncFd takes ownership of `fd`, an `OwnedFd`: the descriptor stays open and
+        // refers to the same PTY master until the AsyncFd drops it (RUSTSEC-2026-0386).
+        Ok(Master(unsafe { AsyncFd::register(fd) }.map_err(io::Error::from)?))
     }
 
     async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
