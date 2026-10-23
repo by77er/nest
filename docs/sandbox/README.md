@@ -4,7 +4,7 @@
 
 ## Operations
 
-- **Create** from an image: restore its [base generation](state/memory/#base-generations) on a host that loads it, else cold-boot.
+- **Create** from an image: cold-boot it. Today the one image is `nest-base` ([firecracker](drivers/firecracker/)); restoring a [base generation](state/memory/#base-generations) instead is designed, not built.
 - **Attach** agents (bind their [hands](../agents/hands/)) or humans (terminal). They share files, services and ports, and conflicts are accepted, like two people on one machine.
 - **Fork.** This is the *only* isolation primitive. A fork is an independent copy of the work, whatever kind of work it is.
 - **Pause, suspend and resume. Archive.** When each happens is SandboxDO's [idle rule](../control-plane/durable-objects/sandbox/#activity-and-idle).
@@ -23,8 +23,10 @@ suspended → archived (S3 only) → restore in the cell: disk on any host, memo
 | Type | How | Cost |
 |---|---|---|
 | Disk-only (default) | Epoch-flip commit; the child's head is the same disk manifest; copy-on-write chunks | Writing a manifest plus a ~1 s cold boot |
-| Live | Pause, write a full memory snapshot, resume the parent; the child restores from the same chunks | 1–2 s pause for 2–4 GB |
-| Same host | The child reads the parent's snapshot from page cache | Near-instant |
+| Live (designed, not built) | Pause, write a full memory snapshot, resume the parent; the child restores from the same chunks | 1–2 s pause for 2–4 GB |
+| Same host (designed, not built) | The child reads the parent's snapshot from page cache | Near-instant |
+
+**Built:** disk-only forks, which restore on any host in the cell. Live and same-host forks wait with [memory snapshots](state/memory/).
 
 After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock (VMClock where the guest kernel supports it), and sets a new machine-id and hostname. Firecracker calls resuming one snapshot more than once insecure, so a live fork treats userspace RNG state and other process state as duplicated. Forking an agent's conversation is a separate step (`--fork-session`).
 

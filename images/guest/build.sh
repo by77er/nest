@@ -63,7 +63,7 @@ mkdir -p "$R/var/cache/apt/archives/partial" "$R/var/lib/apt/lists/partial" "$R/
   "$R/var/lib/dpkg/updates" "$R/var/lib/dpkg/info" "$R/var/cache/debconf"
 cp -L /etc/resolv.conf "$R/etc/resolv.conf"
 chroot "$R" env DEBIAN_FRONTEND=noninteractive \
-  bash -c 'apt-get update -q && apt-get install -y -q --no-install-recommends git openssh-client less jq unzip xz-utils make build-essential && apt-get clean && rm -rf /var/lib/apt/lists/*'
+  bash -c 'apt-get update -q && apt-get install -y -q --no-install-recommends git openssh-client less jq unzip xz-utils make build-essential python3 python3-venv python3-pip && apt-get clean && rm -rf /var/lib/apt/lists/*'
 umount -R "$R/dev" "$R/proc" "$R/tmp"
 chmod 1777 "$R/tmp"
 

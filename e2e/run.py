@@ -292,15 +292,20 @@ REAL_LAUNCH = {  # control-plane DEFAULT_WORKER_LAUNCH, plus a cheap model
     "system_prompt": {"mode": "append", "text": "You work in a remote sandbox through the mcp__nest__* tools; they behave like Claude Code's built-ins."},
 }
 REAL_CONTENT = "hello from nest e2e\nedited line\n"
+FIB_N = 90
+FIB_EXPECTED = "2880067194370816120"  # F(90), the oracle; the program in the sandbox computes it iteratively
+FIB_PY = "a, b = 0, 1\n" f"for _ in range({FIB_N}):\n" "    a, b = b, a + b\n" "print(a)\n"
 
 
-def real_prompt(f):
+def real_prompt(f, fib):
     return ("This is an automated end-to-end test of the hands tools. Use only mcp__nest__ tools and do these steps in order:\n"
             "1. Run `pwd` with mcp__nest__Bash.\n"
             f"2. Create the file {f} with mcp__nest__Write. Its content must be two lines, \"hello from nest e2e\" and \"second line\", each followed by a newline.\n"
             f"3. Read {f} with mcp__nest__Read.\n"
             f"4. With mcp__nest__Edit, replace \"second line\" with \"edited line\" in {f}.\n"
             f"5. Read {f} again with mcp__nest__Read.\n"
+            f"6. With mcp__nest__Write, create {fib} containing a Python 3 program that computes the {FIB_N}th Fibonacci number (F(1) = F(2) = 1) and prints only that number.\n"
+            f"7. Run it with mcp__nest__Bash as `python3 {fib}`.\n"
             "Then reply with exactly: scenario done")
 
 
@@ -324,7 +329,8 @@ def transcript_tool_uses(text):
 
 def run_real_turn(agid):
     f = os.path.join(WORK, "files", "hello.txt")
-    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": real_prompt(f)})
+    fib = os.path.join(WORK, "files", "fib.py")
+    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": real_prompt(f, fib)})
     check("turn enqueued", st == 201, json.dumps(t))
     t0 = time.time()
 
@@ -339,6 +345,8 @@ def run_real_turn(agid):
     p = in_userns(["cat", f])
     check("real claude: file in the sandbox has the expected content", p.stdout.rstrip("\n") == REAL_CONTENT.rstrip("\n"),
           repr(p.stdout or p.stderr)[:200])
+    p = in_userns(["python3", fib])
+    check("real claude: the Python program it wrote runs and prints F(90)", p.stdout.strip() == FIB_EXPECTED, repr(p.stdout or p.stderr)[:200])
 
     def transcript_has_tools():
         st, tr = api("GET", f"/v1/agents/{agid}/transcript", raw=True)
@@ -390,6 +398,8 @@ def scenario(sbx_dir):
         ("read", "Read", {"file_path": f}),
         ("edit", "Edit", {"file_path": f, "old_string": "second line", "new_string": "edited line"}),
         ("reread", "Read", {"file_path": f}),
+        ("pyscript", "Write", {"file_path": os.path.join(WORK, "files", "fib.py"), "content": FIB_PY}),
+        ("pyrun", "Bash", {"command": f"python3 {os.path.join(WORK, 'files', 'fib.py')}"}),
         ("notify", "notify", {"to": "user", "message": "hello from the e2e fake claude"}),
     ]
     path = os.path.join(WORK, "scenario.json")
@@ -469,6 +479,8 @@ def run_scenario():
         check("Read", "hello from nest e2e" in text("read"), text("read").strip()[:200])
         check("Edit", res.get("edit") and not res["edit"]["is_error"], text("edit").strip()[:200])
         check("Read after Edit", "edited line" in text("reread"), text("reread").strip()[:200])
+        check("Write a Python program", res.get("pyscript") and not res["pyscript"]["is_error"], text("pyscript").strip()[:200])
+        check("Bash runs it: python3 prints F(90)", text("pyrun").strip() == FIB_EXPECTED, text("pyrun").strip()[:200])
         check("platform tool notify", res.get("notify") and not res["notify"]["is_error"], text("notify").strip()[:300])
 
     # Direct connect from inside the sandbox netns (outside the guest's own tools).

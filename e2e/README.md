@@ -85,9 +85,10 @@ python3 -m unittest discover -s e2e/claude-verify   # probe-harness tests, no to
 
 ### `NEST_E2E_CLAUDE=real`: the harness with a real brain
 
-The runner starts the real `claude`; the token becomes the control plane's `claude_oauth_token` secret instead of the fake value, and the worker gets the default launch config with `NEST_CLAUDE_MODEL`. The turn is a short natural-language request to run `pwd`, write a file, read it, edit it and read it again with the `mcp__nest__` tools. Checks that tolerate model variation replace the scripted ones:
+The runner starts the real `claude`; the token becomes the control plane's `claude_oauth_token` secret instead of the fake value, and the worker gets the default launch config with `NEST_CLAUDE_MODEL`. The turn is a short natural-language request to run `pwd`, write a file, read it, edit it and read it again, then write a Python program that computes F(90) and run it, all with the `mcp__nest__` tools: the sandbox has to do real work, not only move bytes. Checks that tolerate model variation replace the scripted ones:
 - the turn finishes (`done`)
 - the file in the sandbox has the expected content
+- the Python program it wrote runs and prints F(90)
 - the transcript has `mcp__nest__` tool uses and no host-side built-ins
 
 Startup, netns, control-plane state and fencing checks run as in fake mode; the scripted hands, egress, `notify` and audit checks are skipped. Quota: one turn with about six tool calls.

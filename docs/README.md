@@ -45,7 +45,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
 
-UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`).
+UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`); memory snapshots are deferred by decision until cold boot proves too slow ([memory](sandbox/state/memory/)).
 
 ## Primitives
 
@@ -143,7 +143,9 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | The runner pins one Claude Code version (version and SHA-256); upgrades are gated on `claude-verify`, the hands fidelity eval and resume | [agents/runner/](agents/runner/) |
 | The restore ABI is a SHA-256 over a canonical, versioned descriptor, never inferred from version strings. Hosts advertise the ABIs they can create and load, and an ABI-changing upgrade resumes dormant memory generations disk-only | [sandbox/state/memory/](sandbox/state/memory/#restore-abi) |
 | Firecracker is pinned by binary digest, and memory restore is qualified per (Firecracker, kernel) pair before hosts create memory generations | [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/) |
-| New sandboxes restore a base memory generation per (image, ABI), falling back to cold boot; no warm pools | [sandbox/state/memory/](sandbox/state/memory/#base-generations) |
+| New sandboxes restore a base memory generation per (image, ABI), falling back to cold boot; no warm pools (designed; today every create cold-boots) | [sandbox/state/memory/](sandbox/state/memory/#base-generations) |
+| Sandboxes cold-boot from their disk generation, and forks are disk-only, so they land on any host in the cell. Memory snapshots (hugepages plus UFFD, S3-backed) wait for a measured need; a same-host File-backend restore is rejected | [sandbox/state/memory/](sandbox/state/memory/) |
+| The guest kernel is Firecracker's prebuilt 6.18 longterm CI build, pinned by digest and never self-built; the image is Firecracker's Ubuntu 24.04 rootfs plus apt packages (`nest-base`, with python3) | [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/) |
 | Placement is a fenced claim in SandboxDO: the epoch is issued at claim, completion is one compare-and-set checked against host evidence, an epoch is never retried, and every loss is recorded | [control-plane/durable-objects/sandbox/](control-plane/durable-objects/sandbox/#placement) |
 | One `isRestoreSource` predicate decides resume, the drain gate and GC; deleting a generation is one-way | [sandbox/state/](sandbox/state/#restore-sources) |
 | Turn-end generations are always kept; periodic ones thin by tier | [sandbox/state/](sandbox/state/#retention) |
