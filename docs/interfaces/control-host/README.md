@@ -42,4 +42,4 @@ Captain/UI        WorkstreamDO/AgentDO        FleetDO                 host (nest
    │                    │                        │ commands[commit_result committed] ──►│                   │
 ```
 
-In the design, `sandbox_create` goes to a sandbox host and `agent_start` to a brain host chosen by capacity, with `hands = {hostname, binding, guest}` for the sandbox's gateway ([gateway](../gateway/)); the runner's hands calls then cross the network to that host. The sequence above is the implemented contract, where both commands go to one host.
+`agent_start` names the sandbox and its epoch only; the runner fetches the gateway target over its session channel and its hands calls cross the network to the sandbox's host ([gateway](../gateway/)). In the design `agent_start` goes to a brain host chosen by capacity; the sequence above is the implemented placement, where both commands go to one host.
