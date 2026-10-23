@@ -23,6 +23,7 @@ import Aws.Resource.IamInstanceProfile
 import Aws.Resource.IamUser
 import Aws.Resource.IamPolicy
 import Aws.Resource.IamUserPolicyAttachment
+import Aws.Resource.IamOpenidConnectProvider
 import Aws.Resource.LaunchTemplate
 import Aws.Resource.FisExperimentTemplate
 import Aws.Resource.KmsKey
@@ -39,8 +40,8 @@ import Cell.Iam
 /-!
 One nest cell on AWS (docs/compute/provisioning/): public subnets with no NAT and an S3 gateway
 endpoint, an egress-only host security group, the cell's bucket, the burst hosts' role and launch
-template, the host-image pipeline, and the control plane's IAM user. It creates no instances:
-FleetDO launches them.
+template, the host-image pipeline, the control plane's IAM user, and the deploy role GitHub Actions
+assumes over OIDC. It creates no instances: FleetDO launches them.
 -/
 
 open Inframe
@@ -59,6 +60,9 @@ structure CellSpec where
   controlUrl : String
   /-- Instance-type patterns the control plane may launch: the 8i family only. -/
   instanceTypes : List String := ["c8i*.*", "m8i*.*", "r8i*.*"]
+  /-- The GitHub repository and environment that may assume the deploy role (dev/deploy.md). -/
+  deployRepo : String := "by77er/nest"
+  deployEnvironment : String := "production"
 
 /-- Outbound from burst hosts: HTTPS, plus cloudflared's 7844 over TCP and UDP. Nothing inbound. -/
 def hostEgress : List (String × Nat) := [("tcp", 443), ("tcp", 7844), ("udp", 7844)]
@@ -317,6 +321,22 @@ def cell (spec : CellSpec) : Infra Unit := do
                    parameter := [{ key := "durationBeforeInterruption", value := "PT2M" }]
                    target := some { key := "SpotInstances", value := "nest-spot" } }] }
 
+  -- Deploys (dev/deploy.md): GitHub Actions assumes this role over OIDC, only from the repo's
+  -- `production` environment, which only `main` may deploy from. Applying the stack manages IAM,
+  -- so the role is administrator-equivalent; the trust policy is what limits it. The first apply
+  -- of a cell runs by hand with the provisioner key: it creates the role later applies assume.
+  let github ← IamOpenidConnectProvider.create "github"
+    { url := "https://token.actions.githubusercontent.com", clientIdList := array [lit "sts.amazonaws.com"] }
+  let deployRole ← IamRole.create "deploy"
+    { name := lit s!"nest-{spec.name}-deploy"
+      assumeRolePolicy := "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\""
+        ++ github.arn ++ "\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{"
+        ++ "\"token.actions.githubusercontent.com:aud\":\"sts.amazonaws.com\","
+        ++ "\"token.actions.githubusercontent.com:sub\":\"repo:" ++ lit spec.deployRepo ++ ":environment:"
+        ++ lit spec.deployEnvironment ++ "\"}}}]}" }
+  let _ ← IamRolePolicyAttachment.create "deploy_admin"
+    { role := deployRole.name, policyArn := "arn:aws:iam::aws:policy/AdministratorAccess" }
+
   output "bucket" bucket.id
   output "launch_template_id" template.id
   output "subnet_ids" (array [subnetA.id, subnetB.id, subnetC.id])
@@ -326,5 +346,6 @@ def cell (spec : CellSpec) : Infra Unit := do
   output "spot_drill_template_id" drill.id
   output "proxy_root_key_arn" rootKey.arn
   output "host_image_pipeline" pipeline.arn
+  output "deploy_role_arn" deployRole.arn
 
 end Cell

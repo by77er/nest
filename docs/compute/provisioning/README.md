@@ -28,6 +28,7 @@
 **IAM:**
 - **Host instance role:** S3 access scoped to the cell's bucket.
 - **Control-plane IAM user:** `RunInstances` with our launch template only; `Terminate` and `Stop` only on instances tagged `nest=true`; `Describe*`; `kms:Sign` on the proxy root CA key only ([TLS](../../sandbox/networking/egress/tls/)).
+- **Deploy role** (`nest-<cell>-deploy`): assumed from GitHub Actions over OIDC, only by the repo's `production` environment; administrator-equivalent, because applying the stack manages IAM ([deploys](../../../dev/deploy.md)).
 
 **Controller host image:** nestd, Claude Code, the agent runner and the `nest` binary, bubblewrap and the Discord gateway client. No hypervisor, no hugepages, no S3 access.
 
