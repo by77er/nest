@@ -96,7 +96,11 @@ export class CloudflareHttp implements CloudflareApi {
     const timer = setTimeout(() => ctrl.abort(), CALL_TIMEOUT_MS);
     let res: Response;
     try {
-      res = await this.fetchFn(`${this.base}${path}`, {
+      // Never `this.fetchFn(...)`: the global fetch called as a method of this object gets the
+      // wrong `this` and workerd throws "Illegal invocation" (a fake fetch does not, which is why
+      // only the live Worker saw it; `the default fetch works under workerd` is the test).
+      const fetchFn = this.fetchFn;
+      res = await fetchFn(`${this.base}${path}`, {
         method,
         headers: { authorization: `Bearer ${this.cfg.token}`, "content-type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
