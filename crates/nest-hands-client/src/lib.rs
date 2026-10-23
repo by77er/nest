@@ -185,6 +185,9 @@ impl std::fmt::Display for TransportError {
             TransportError::Io(e) => write!(f, "{:?}: {e}", e.kind()),
             TransportError::Dns(m) => write!(f, "dns: {m}"),
             TransportError::Tls(m) => write!(f, "tls: {m}"),
+            TransportError::Http(s @ (302 | 401 | 403)) => {
+                write!(f, "http {s} instead of an upgrade: Cloudflare Access refused the edge credential")
+            }
             TransportError::Http(s) => write!(f, "http {s} instead of an upgrade"),
             TransportError::Url(m) => write!(f, "url: {m}"),
             TransportError::ClosedBeforeBound {
