@@ -6,7 +6,7 @@ nest's cells as an [inframe](https://github.com/by77er/inframe) project: Lean st
 |---|---|
 | `inframe.toml` | The project: the Lean package, the pinned AWS provider, and each stack's S3 state backend |
 | `aws-schema.json` | The AWS provider schema (6.69.1), trimmed to the resource types nest uses, so bindings build in seconds |
-| `lean/Cell/Stack.lean` | A cell: VPC with public subnets and an S3 gateway endpoint, egress-only security group, versioned bucket, host role, launch template, the host-image pipeline (EC2 Image Builder), the control plane's IAM user |
+| `lean/Cell/Stack.lean` | A cell: VPC with public subnets and an S3 gateway endpoint, egress-only security group, versioned bucket, host role, launch template, the host-image pipeline (EC2 Image Builder), the control plane's IAM user, the deploy role GitHub Actions assumes over OIDC |
 | `lean/Cell/Iam.lean` | IAM policies as data, rendered to JSON |
 | `lean/Cell/Test.lean` | Theorems about what the control plane and hosts may do, for every cell; policies over the `use1` graph (no ingress, egress allow-list, IMDSv2) |
 | `host/install.sh` | Installs a host's software (packages, the release, Claude Code, systemd units): baked into the host AMI, and rerun at boot to catch up |
