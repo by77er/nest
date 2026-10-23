@@ -1182,12 +1182,14 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "nest-protocol",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -1237,7 +1239,10 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "futures-util",
+ "nest-gateway",
+ "nest-hands-client",
  "nest-protocol",
+ "nest-runner",
  "nix",
  "reqwest",
  "rustls",
