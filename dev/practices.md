@@ -34,9 +34,9 @@ What each kind of run can prove (the `nest-validation` skill). Claims in PRs and
 | Tier | Proves | Doesn't prove |
 |---|---|---|
 | Unit and integration tests | Logic; wire formats against `protocol/fixtures/` | Real processes, namespaces or VMs |
-| `e2e/run.sh` (process driver) | The real components together on one machine: hands through the gateway's WebSocket-to-vsock path (emulated vsock), bindings minted by the control plane and refused when tampered or fenced, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code, the tunnel and Cloudflare Access, a brain and a sandbox on different machines |
+| `e2e/run.sh` (process driver) | The real components together on one machine: hands through the gateway's WebSocket-to-vsock path (emulated vsock), bindings minted by the control plane and refused when tampered or fenced, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code, the tunnel and Cloudflare Access (nothing leaves the machine), a brain and a sandbox on different hosts |
 | `e2e/claude-verify`, `NEST_E2E_CLAUDE=real` | Real Claude Code's behaviour under nest's flags | Firecracker, scale |
-| The [first spike](../docs/README.md#first-spike) on AWS | Firecracker, snapshots and restore, fencing under partition, the seam (a brain reaching a sandbox through the gateway and the tunnel) | — |
+| The [first spike](../docs/README.md#first-spike) on AWS | Firecracker, snapshots and restore, fencing under partition, the seam (a brain on a cell host reaching its own sandbox out through Cloudflare's edge and Access and back down the tunnel into the gateway, shown by the gateway's log of connections arriving through cloudflared) | — |
 
 ## Review
 

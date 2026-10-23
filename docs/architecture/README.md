@@ -63,7 +63,7 @@ Three things cross between the systems, and nothing else:
 2. **The hands data plane on the gateway:** one WebSocket per call to the host's tunnel hostname, the binding first, then the host-guest hands frames verbatim. Cancel is a close. Terminals (`/pty`) and ingress (`/ingress/<port>`) are the same kind of connection. A person's `nest` CLI is a client like any brain.
 3. **The sandbox's events** on `<sbx>/events`: ports, task exits, egress denials, loss records.
 
-The contract is in [interfaces/gateway/](../interfaces/gateway/). Any runner can drive any sandbox: a brain host in the cell, one elsewhere, a laptop, or (later) the `api-loop` inside AgentDO.
+The contract is in [interfaces/gateway/](../interfaces/gateway/). Any runner can drive any sandbox: a brain host in the cell, one in another cell, or (later) the `api-loop` inside AgentDO.
 
 ## A turn, end to end
 
