@@ -1,5 +1,7 @@
 # Memory snapshots
 
+**Decided (2026-10-22): designed, not built, and not next.** Sandboxes cold-boot from their disk generation, and forks are disk-only, so a fork or a resume lands on any host in the cell straight from S3. Memory snapshots buy warm process state (a dev server answering right after resume, spike item 5) and a faster create; the first use cases need neither, and a `nest-base` guest boots in seconds. This section is built when a measurement says cold boot is too slow, not before. **Rejected:** a same-host restore through Firecracker's File backend: 4 KB pages, and it ties a fork to its parent's host.
+
 **2 MB hugepages plus UFFD.** Firecracker requires UFFD for hugetlbfs, and 2 MB pages mean 512× fewer faults, so the per-fault cost of UFFD stops mattering. A 400 MB working set is about 200 faults: by estimate (unverified; no public benchmark of 2 MB UFFD restores exists), tens of milliseconds from page cache and a few hundred from NVMe. The first spike measures it.
 
 **Why not 4 KB pages:**

@@ -17,7 +17,7 @@
 - **Jailer:** each VM runs as uid 900 in its own jail (`<sandbox>-<random>`: the jailer accepts only alphanumerics and `-`, and a retry must never share a jail being torn down); nestd removes a stopped VM's jail and, at start, any a crash left. The tap is owned by the jail's user.
 - **Hugepages:** half of host memory, reserved through `/etc/sysctl.d` so a reboot keeps the pool.
 - **Disk:** a fresh sandbox's disk is a copy of `nest-base`, extended to its size and grown offline by nestd before boot (the guest can't resize its own root).
-- **Guest image:** `images/guest/` builds it from Firecracker's CI 6.18 kernel and Ubuntu 24.04 rootfs on a disposable EC2 builder; init brings up `eth0` on the sandbox network and runs nest-guest on vsock.
-- **Not built:** memory snapshots (UFFD), ublk, the rate limiter.
+- **Guest image** (`images/guest/`; **decided 2026-10-22**): the kernel is Firecracker's **prebuilt** CI build from the **6.18 longterm line** (`vmlinux-6.18.54`, pinned by SHA-256), never one nest builds itself. Firecracker supports 6.18 guests from 1.16.1 with a minimum end of support of 2028-06-01, while 6.1's minimum ended 2026-09-02 ([kernel policy](https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md)); 6.18 is also kernel.org's current longterm line. The rootfs is Firecracker's Ubuntu 24.04 CI squashfs plus apt packages (git, build tools, python3). `nest-base` is the only image, built on a disposable EC2 builder; init brings up `eth0` on the sandbox network and runs nest-guest on vsock. Sandboxes **cold-boot** it: memory snapshots wait for a measured need ([memory](../../state/memory/)).
+- **Not built:** memory snapshots (UFFD; deferred by decision), ublk, the rate limiter.
 
 Sources: [hugepages.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/hugepages.md), [network-for-clones.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/network-for-clones.md)
