@@ -6,7 +6,7 @@ import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identit
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
-import { AgentRole, ErrorCodes, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
+import { AgentRole, ErrorCodes, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
@@ -162,6 +162,8 @@ async function route(req: Request, env: Env): Promise<Response> {
     return json(await fleet(env, cell).hostStatus(p[1]!));
   }
   if (req.method === "GET" && path === "/v1/admin/fleet") return json(await fleet(env, cell).fleetView());
+  // The daily tunnel sweep, now (after a Cloudflare outage, or to see what the account holds).
+  if (req.method === "POST" && path === "/v1/admin/tunnels/sweep") return json(await fleet(env, cell).tunnelSweep());
   if (req.method === "GET" && path === "/v1/admin/gc") return json(await fleet(env, cell).gcStatus());
   if (req.method === "POST" && path === "/v1/admin/gc/run") {
     await fleet(env, cell).gcRequest();
@@ -307,7 +309,23 @@ async function route(req: Request, env: Env): Promise<Response> {
       await a.interrupt();
       return json({ ok: true });
     }
-    if (req.method === "POST" && p[2] === "/start") return json(await a.start());
+    if (req.method === "POST" && p[2] === "/start") {
+      // An optional host: a brain on a chosen enrolled host (hands still reach the sandbox's gateway).
+      const text = await req.text();
+      let r: { host?: string } = {};
+      if (text.trim()) {
+        let raw: unknown;
+        try {
+          raw = JSON.parse(text);
+        } catch {
+          throw new NestError(ErrorCodes.INVALID_MESSAGE, "body must be JSON");
+        }
+        const parsed = z.object({ host: HostId.optional() }).safeParse(raw);
+        if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, parsed.error.message);
+        r = parsed.data;
+      }
+      return json(await a.start(r.host));
+    }
 
     if (req.method === "POST" && p[2] === "/stop") {
       await a.stop("requested");

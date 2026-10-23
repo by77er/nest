@@ -30,5 +30,7 @@
   }
   // Secrets (wrangler secret put / .dev.vars): ADMIN_TOKEN, HOST_TOKEN_SECRET,
   // ROOT_CA_CERT_PEM, ROOT_CA_KEY_PEM (PKCS#8, ECDSA P-256), AWS_IDENTITY_CERT_PEM,
-  // AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION.
+  // AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, CLOUDFLARE_TUNNEL_API_TOKEN.
+  // Deploys also set NEST_DOMAIN and CLOUDFLARE_ACCOUNT_ID (vars); without them no host gets a tunnel,
+  // which is what `wrangler dev` and the harness want.
 }

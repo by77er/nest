@@ -6,6 +6,10 @@ import { isSecretRef } from "./broker";
 import { createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
 import { AwsKms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
+import {
+  CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName, tunnelPrefix,
+  type CloudflareApi,
+} from "../lib/cloudflare";
 import { awsCell, type AwsCellConfig } from "../lib/cells";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
@@ -32,6 +36,10 @@ interface HostRow {
   capacity: string | null;
   /** Where clients reach this host's sandbox gateway, from its hello (null: none advertised). */
   gateway_url: string | null;
+  /** The host's Cloudflare Tunnel and DNS record (docs/sandbox/gateway/, Addressing); null without a zone. */
+  tunnel_id: string | null;
+  tunnel_hostname: string | null;
+  dns_record_id: string | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -78,6 +86,11 @@ const TOKEN_ROTATE_BEFORE_MS = 10 * 60_000;
 const COMMAND_RETENTION_MS = 24 * 3_600_000;
 const ENROLL_TOKEN_RETENTION_MS = 7 * 86_400_000;
 const ALARM_TICK = "tick";
+/** The daily pass that deletes tunnels and records whose host is gone (docs/sandbox/gateway/). */
+const ALARM_TUNNEL_SWEEP = "tunnel_sweep";
+const TUNNEL_SWEEP_INTERVAL_MS = 24 * 3_600_000;
+/** How long a tunnel this cell created may go without a hosts row (an enrollment still in flight). */
+const TUNNEL_INTENT_GRACE_MS = 3_600_000;
 /** GC: one run a day; a pass deletes only within 12 h of its mark; unmarked objects go after 24 h. */
 const GC_INTERVAL_MS = 24 * 3_600_000;
 const GC_WINDOW_MS = 12 * 3_600_000;
@@ -108,6 +121,8 @@ export class FleetDO extends DurableObject<Env> {
   ec2Override: Ec2 | null | undefined = undefined;
   /** Override for tests; `undefined` reads the cell's entry in `AWS_CELLS`. */
   cellConfigOverride: AwsCellConfig | null | undefined = undefined;
+  /** Override for tests: a fake Cloudflare API and the domain; `null` = no tunnels; `undefined` reads the env. */
+  cloudflareOverride: { api: CloudflareApi; domain: string } | null | undefined = undefined;
   /** A launch is in flight (RunInstances awaits); placements meanwhile don't launch another. */
   private launching = false;
 
@@ -132,6 +147,9 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS reassign_queue (sandbox TEXT PRIMARY KEY, host TEXT NOT NULL,
       epoch INTEGER NOT NULL, host_dead INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    // Every host this cell created a tunnel for, written before the first Cloudflare call: what the
+    // sweep may delete. Rows are never removed (one per sandbox host ever enrolled).
+    this.sql.exec("CREATE TABLE IF NOT EXISTS tunnels_created (host TEXT PRIMARY KEY, created_ms INTEGER NOT NULL)");
     // Autoscaling: when a launched instance stopped counting (`reason`) and when EC2 confirmed it gone.
     this.addColumn("launched", "cell", "TEXT");
     this.addColumn("launched", "reason", "TEXT");
@@ -139,6 +157,9 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("hosts", "idle_since", "INTEGER");
     // The seam: where clients reach a host's sandbox gateway (docs/sandbox/gateway/).
     this.addColumn("hosts", "gateway_url", "TEXT");
+    this.addColumn("hosts", "tunnel_id", "TEXT");
+    this.addColumn("hosts", "tunnel_hostname", "TEXT");
+    this.addColumn("hosts", "dns_record_id", "TEXT");
     this.addColumn("leases", "state", "TEXT");
     // Object-store GC: the cell's sandboxes (their generations are the roots) and the runs.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS sandboxes (sandbox TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL,
@@ -196,10 +217,22 @@ export class FleetDO extends DurableObject<Env> {
     this.rememberCell(cell);
     const proxyCa = await this.signProxyCa(req.proxy_ca_csr_pem);
     const hash = req.proof.type === "enrollment_token" ? hex(await sha256(req.proof.token)) : "";
-    // Everything below is synchronous: the proof is checked and consumed atomically.
-    const now = Date.now();
     const host = newId("hst_");
-    let instanceId: string | null = null;
+    // The proof is checked twice: once here, so an unauthenticated caller costs no Cloudflare call,
+    // and once more when it is consumed atomically with the row. A failure in between fails the
+    // enrollment (the host retries with the same proof) and the tunnel just created is deleted.
+    this.checkProof(req, identity, hash);
+    const tunnel = req.role === "burst" ? await this.createTunnel(host) : null;
+    try {
+      return await this.enrollRecord(req, cell, identity, hash, host, proxyCa, tunnel);
+    } catch (e) {
+      if (tunnel) this.ctx.waitUntil(this.deleteTunnelAssets(host, tunnel.id, tunnel.record, "enrollment refused"));
+      throw e;
+    }
+  }
+
+  /** Synchronous: throws unless the proof is valid and unused; `consume` marks it used by `host`. */
+  private checkProof(req: EnrollRequest, identity: InstanceIdentity | null, hash: string, consume?: { host: string; now: number }): string | null {
     if (req.proof.type === "enrollment_token") {
       const row = this.sql
         .exec<{ role: string; used_ms: number | null }>("SELECT role, used_ms FROM enroll_tokens WHERE hash = ?", hash)
@@ -207,27 +240,35 @@ export class FleetDO extends DurableObject<Env> {
       if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "unknown enrollment token", 401);
       if (row.used_ms !== null) throw new NestError(ErrorCodes.FORBIDDEN, "enrollment token already used", 409);
       if (row.role !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, "enrollment token minted for another role", 401);
-      this.sql.exec("UPDATE enroll_tokens SET used_ms = ?, host = ? WHERE hash = ?", now, host, hash);
-    } else {
-      if (!identity) throw new NestError(ErrorCodes.UNAUTHORIZED, "unverified identity document", 401);
-      const row = this.sql
-        .exec<{ host: string | null; role: string | null; account_id: string | null; region: string | null }>(
-          "SELECT host, role, account_id, region FROM launched WHERE instance_id = ?", identity.instanceId)
-        .toArray()[0];
-      if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance was not launched by this control plane (in this cell)", 401);
-      if (row.host) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
-      if (row.role && row.role !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, `instance was launched as ${row.role}`, 401);
-      if (row.account_id && row.account_id !== identity.accountId) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS account", 401);
-      if (row.region && row.region !== identity.region) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS region", 401);
-      this.sql.exec("UPDATE launched SET host = ? WHERE instance_id = ?", host, identity.instanceId);
-      instanceId = identity.instanceId;
+      if (consume) this.sql.exec("UPDATE enroll_tokens SET used_ms = ?, host = ? WHERE hash = ?", consume.now, consume.host, hash);
+      return null;
     }
+    if (!identity) throw new NestError(ErrorCodes.UNAUTHORIZED, "unverified identity document", 401);
+    const row = this.sql
+      .exec<{ host: string | null; role: string | null; account_id: string | null; region: string | null }>(
+        "SELECT host, role, account_id, region FROM launched WHERE instance_id = ?", identity.instanceId)
+      .toArray()[0];
+    if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance was not launched by this control plane (in this cell)", 401);
+    if (row.host) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
+    if (row.role && row.role !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, `instance was launched as ${row.role}`, 401);
+    if (row.account_id && row.account_id !== identity.accountId) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS account", 401);
+    if (row.region && row.region !== identity.region) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS region", 401);
+    if (consume) this.sql.exec("UPDATE launched SET host = ? WHERE instance_id = ?", consume.host, identity.instanceId);
+    return identity.instanceId;
+  }
 
+  private async enrollRecord(
+    req: EnrollRequest, cell: string, identity: InstanceIdentity | null, hash: string, host: string, proxyCa: EnrollResponse["proxy_ca"],
+    tunnel: { id: string; token: string; hostname: string; record: string } | null,
+  ): Promise<EnrollResponse> {
+    // Everything up to the INSERT is synchronous: the proof is checked and consumed atomically.
+    const now = Date.now();
+    const instanceId = this.checkProof(req, identity, hash, { host, now });
     const tokenExp = now + num(this.env.HOST_TOKEN_TTL_MS, 3_600_000);
     this.sql.exec(
-      `INSERT INTO hosts (host, cell, role, instance_id, status, last_rx, token_exp, enrolled_ms)
-       VALUES (?, ?, ?, ?, 'active', NULL, ?, ?)`,
-      host, cell, req.role, instanceId, tokenExp, now,
+      `INSERT INTO hosts (host, cell, role, instance_id, status, last_rx, token_exp, enrolled_ms, tunnel_id, tunnel_hostname, dns_record_id)
+       VALUES (?, ?, ?, ?, 'active', NULL, ?, ?, ?, ?, ?)`,
+      host, cell, req.role, instanceId, tokenExp, now, tunnel?.id ?? null, tunnel?.hostname ?? null, tunnel?.record ?? null,
     );
     const hostToken = await issueHostToken(this.env.HOST_TOKEN_SECRET, { host, cell, role: req.role, exp: tokenExp });
     return {
@@ -236,7 +277,149 @@ export class FleetDO extends DurableObject<Env> {
       host_token_expires_ms: tokenExp,
       fleet_ws_url: `${this.env.PUBLIC_BASE_URL.replace(/^http/, "ws")}/v1/fleet`,
       proxy_ca: proxyCa,
+      ...(tunnel ? { tunnel_token: tunnel.token, gateway_url: `wss://${tunnel.hostname}` } : {}),
     };
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Tunnels (docs/sandbox/gateway/, Addressing): one tunnel and one proxied record per sandbox host.
+  // The account is shared (other cells, other deployments, hand-made tunnels), so this cell deletes
+  // only what `tunnels_created` says it made, and only once the host is dead or never enrolled.
+
+  private cloudflare(): { api: CloudflareApi; label: string; zone: string } | null {
+    if (this.cloudflareOverride === null) return null;
+    if (this.cloudflareOverride) return { api: this.cloudflareOverride.api, ...splitDomain(this.cloudflareOverride.domain) };
+    const cfg = tunnelConfig(this.env);
+    return cfg ? { api: new CloudflareHttp(cfg), ...splitDomain(cfg.domain) } : null;
+  }
+
+  /** The zone's id, looked up once and kept in kv. */
+  private async zoneId(cf: { api: CloudflareApi; zone: string }): Promise<string> {
+    const key = `zone_id:${cf.zone}`;
+    const cached = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray()[0]?.value;
+    if (cached) return cached;
+    const id = await cf.api.zoneId(cf.zone);
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", key, id);
+    return id;
+  }
+
+  /** Create the host's tunnel, its ingress to the gateway, and its record; undo on a later failure. */
+  private async createTunnel(host: string): Promise<{ id: string; token: string; hostname: string; record: string } | null> {
+    const cf = this.cloudflare();
+    if (!cf) return null;
+    // Before the first call: the sweep is armed and the host is on record as one this cell made a
+    // tunnel for, so whatever a failure or a reset leaves behind is accounted for and swept.
+    await this.deadlines.set(ALARM_TUNNEL_SWEEP, Date.now() + TUNNEL_SWEEP_INTERVAL_MS, true);
+    this.sql.exec("INSERT OR REPLACE INTO tunnels_created (host, created_ms) VALUES (?, ?)", host, Date.now());
+    const hostname = gatewayHostname(cf.label, cf.zone, host);
+    const zone = await this.zoneId(cf);
+    const t = await cf.api.createTunnel(tunnelName(cf.label, host));
+    try {
+      await cf.api.configureIngress(t.id, hostname);
+      const r = await cf.api.createRecord(zone, hostname, t.id, `nest ${host}`);
+      return { id: t.id, token: t.token, hostname, record: r.id };
+    } catch (e) {
+      await cf.api.deleteTunnel(t.id).catch((err: unknown) => console.error(`FleetDO: tunnel ${t.id} for ${host} leaked after a failed enrollment; the sweep deletes it`, err));
+      throw e;
+    }
+  }
+
+  /** Delete a host's record and tunnel. Never awaited on a fence or STONITH path; failures go to the sweep. */
+  private async deleteTunnelAssets(host: string, tunnelId: string | null, recordId: string | null, why: string): Promise<boolean> {
+    const cf = this.cloudflare();
+    if (!cf) return true;
+    let ok = true;
+    if (recordId) {
+      try {
+        await cf.api.deleteRecord(await this.zoneId(cf), recordId);
+        this.sql.exec("UPDATE hosts SET dns_record_id = NULL WHERE host = ?", host);
+      } catch (e) {
+        ok = false;
+        console.error(`FleetDO: deleting the record of ${host} (${why}) failed; the sweep retries`, e);
+      }
+    }
+    if (tunnelId) {
+      try {
+        await cf.api.deleteTunnel(tunnelId);
+        this.sql.exec("UPDATE hosts SET tunnel_id = NULL, tunnel_hostname = NULL WHERE host = ?", host);
+      } catch (e) {
+        ok = false;
+        console.error(`FleetDO: deleting the tunnel of ${host} (${why}) failed; the sweep retries`, e);
+      }
+    }
+    return ok;
+  }
+
+  /** A host is gone: release its tunnel and record without holding up the caller. */
+  private releaseTunnel(host: string, why: string): void {
+    const h = this.host(host);
+    if (!h || (!h.tunnel_id && !h.dns_record_id)) return;
+    this.ctx.waitUntil(this.deleteTunnelAssets(host, h.tunnel_id, h.dns_record_id, why));
+  }
+
+  /**
+   * The daily pass. Retries the deletes a dead host's row still owes; then, among the tunnels with
+   * nest's name prefix and the records with nest's hostname suffix that Cloudflare lists, deletes
+   * those this cell created (`tunnels_created`) for a host that is dead, or that never got a row
+   * within the grace (an enrollment that failed after the tunnel existed). A nest-shaped name this
+   * cell cannot account for (another cell or deployment on the same account, a hand-made tunnel)
+   * is counted and logged, never deleted. An operator runs it with `POST /v1/admin/tunnels/sweep`.
+   */
+  async tunnelSweep(): Promise<{ tunnels: number; records: number; retried: number; failed: number; unknown: number }> {
+    const cf = this.cloudflare();
+    const counts = { tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0 };
+    if (!cf) return counts;
+    const now = Date.now();
+    for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'dead' AND (tunnel_id IS NOT NULL OR dns_record_id IS NOT NULL)").toArray()) {
+      counts.retried++;
+      if (!(await this.deleteTunnelAssets(h.host, h.tunnel_id, h.dns_record_id, "sweep retry"))) counts.failed++;
+    }
+    const unknown: string[] = [];
+    const disposable = (host: string | null, name: string): boolean => {
+      const created = host ? this.sql.exec<{ created_ms: number }>("SELECT created_ms FROM tunnels_created WHERE host = ?", host).toArray()[0] : undefined;
+      if (!host || !created) {
+        unknown.push(name);
+        return false;
+      }
+      const h = this.host(host);
+      return h ? h.status === "dead" : now - created.created_ms > TUNNEL_INTENT_GRACE_MS;
+    };
+    // Each pass fails on its own: a refused list call must not cost the other pass a day.
+    try {
+      const zone = await this.zoneId(cf);
+      for (const r of await cf.api.listRecords(zone, hostnameSuffix(cf.label, cf.zone))) {
+        if (!disposable(hostOfHostname(cf.label, cf.zone, r.name), r.name)) continue;
+        try {
+          await cf.api.deleteRecord(zone, r.id);
+          counts.records++;
+        } catch (e) {
+          counts.failed++;
+          console.error(`FleetDO: sweep could not delete record ${r.name}`, e);
+        }
+      }
+    } catch (e) {
+      counts.failed++;
+      console.error("FleetDO: sweep could not list the zone's records", e);
+    }
+    try {
+      for (const t of await cf.api.listTunnels(tunnelPrefix(cf.label))) {
+        if (!disposable(hostOfTunnelName(cf.label, t.name), t.name)) continue;
+        try {
+          await cf.api.deleteTunnel(t.id);
+          counts.tunnels++;
+        } catch (e) {
+          counts.failed++;
+          console.error(`FleetDO: sweep could not delete tunnel ${t.name}`, e);
+        }
+      }
+    } catch (e) {
+      counts.failed++;
+      console.error("FleetDO: sweep could not list the account's tunnels", e);
+    }
+    counts.unknown = unknown.length;
+    if (unknown.length) console.warn(`FleetDO: sweep left ${unknown.length} nest-named tunnels/records this cell did not create: ${unknown.slice(0, 20).join(", ")}`);
+    console.log(`FleetDO: tunnel sweep: ${counts.tunnels} tunnels, ${counts.records} records, ${counts.retried} retried, ${counts.failed} failed, ${counts.unknown} unknown`);
+    return counts;
   }
 
   private kms(): AwsKms {
@@ -810,6 +993,13 @@ export class FleetDO extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === ALARM_TICK) await this.tick();
+      if (key === ALARM_TUNNEL_SWEEP) {
+        try {
+          await this.tunnelSweep();
+        } finally {
+          await this.deadlines.set(ALARM_TUNNEL_SWEEP, Date.now() + TUNNEL_SWEEP_INTERVAL_MS);
+        }
+      }
     });
   }
 
@@ -857,9 +1047,16 @@ export class FleetDO extends DurableObject<Env> {
     }
   }
 
-  /** The URL clients reach `host`'s sandbox gateway at, as the host advertised it. */
-  async hostGatewayUrl(host: string): Promise<string | null> {
-    return this.host(host)?.gateway_url ?? null;
+  /**
+   * Where clients reach `host`'s sandbox gateway: its tunnel when it has one (the control plane is
+   * the authority), else what its hello advertised. `tunnel` says whether Cloudflare Access fronts it.
+   */
+  async hostGatewayUrl(host: string): Promise<{ url: string; tunnel: boolean } | null> {
+    const h = this.host(host);
+    // A dead host serves nothing; its sandboxes are being reassigned.
+    if (!h || h.status === "dead") return null;
+    if (h.tunnel_hostname) return { url: `wss://${h.tunnel_hostname}`, tunnel: true };
+    return h.gateway_url ? { url: h.gateway_url, tunnel: false } : null;
   }
 
   private async rotateToken(ws: WebSocket, host: string): Promise<void> {
@@ -968,6 +1165,7 @@ export class FleetDO extends DurableObject<Env> {
       } else if (now - h.idle_since >= cfg.idle_grace_ms) {
         this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", h.host);
         this.endInstance(h.instance_id!, "idle");
+        this.releaseTunnel(h.host, "idle");
         for (const ws of this.ctx.getWebSockets(h.host)) ws.close(4410, "idle: retired");
         console.log(`FleetDO: retiring idle host ${h.host} (${h.instance_id})`);
         await this.evict(h.host, this.leasesOf(h.host).map((l) => l.sandbox));
@@ -979,6 +1177,7 @@ export class FleetDO extends DurableObject<Env> {
       if (this.leasesOf(h.host).length) continue;
       this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", h.host);
       this.endInstance(h.instance_id!, "drained");
+      this.releaseTunnel(h.host, "drained");
       for (const ws of this.ctx.getWebSockets(h.host)) ws.close(4410, "drained");
       console.log(`FleetDO: drained ${h.host} (${h.instance_id})`);
     }
@@ -1129,7 +1328,7 @@ export class FleetDO extends DurableObject<Env> {
   /** Operator view: hosts with their lease counts, and launched instances with their outcome. */
   async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[] }> {
     return {
-      hosts: this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since,
+      hosts: this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since, h.tunnel_hostname,
         (SELECT COUNT(*) FROM leases l WHERE l.host = h.host) AS leases FROM hosts h ORDER BY h.enrolled_ms`).toArray()
         .map((h) => ({ ...h, connected: !!this.socketFor(h.host as string) })),
       launches: this.sql.exec("SELECT instance_id, launched_ms, host, reason, ended_ms FROM launched ORDER BY launched_ms").toArray(),
@@ -1213,6 +1412,7 @@ export class FleetDO extends DurableObject<Env> {
     if (h.status !== "dead") {
       this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", host);
       for (const ws of this.ctx.getWebSockets(host)) ws.close(4410, "host declared dead");
+      this.releaseTunnel(host, "dead");
     }
     await this.queueReassign(host, this.leasesOf(host).map((l) => l.sandbox), true);
   }

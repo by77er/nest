@@ -778,12 +778,17 @@ export class SandboxDO extends DurableObject<Env> {
     // so a target minted during a resume would only ever be refused as `moved`.
     if (info.state !== "running") throw notReady(`sandbox is ${info.state}`);
     if (info.attach_pending.includes(agent)) throw notReady(`${agent}'s slot is not configured yet`);
-    const url = await this.fleet(info.cell).hostGatewayUrl(info.host);
+    const gateway = await this.fleet(info.cell).hostGatewayUrl(info.host);
     // The host may advertise one on its next hello (a restart, an upgrade): not an error, not yet.
-    if (!url) throw notReady(`host ${info.host} advertises no gateway yet`);
-    const binding = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).signBinding(info.cell, {
+    if (!gateway) throw notReady(`host ${info.host} advertises no gateway yet`);
+    const url = gateway.url;
+    const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    const binding = await broker.signBinding(info.cell, {
       sandbox: info.sandbox, epoch: info.epoch, client: agent, scope: "hands", exp_ms: Date.now() + BINDING_LIFETIME_MS,
     });
+    // Only a tunnel has the Access edge in front of it; a gateway reached directly (the harness, a
+    // host's own address) would receive the service token and front nothing, so it never travels.
+    const edge = gateway.tunnel ? await broker.accessServiceToken() : null;
     // Across the awaits the sandbox may have moved, or the agent been detached: never hand out a
     // token the gateway would refuse, or one for an agent that is no longer attached.
     const fresh = this.info_();
@@ -791,7 +796,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (fresh.epoch !== info.epoch || fresh.host !== info.host || fresh.attach_pending.includes(agent)) {
       throw notReady("sandbox moved while resolving");
     }
-    return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest ?? DEFAULT_GUEST };
+    return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest ?? DEFAULT_GUEST, ...(edge ? { edge } : {}) };
   }
 
   /** Agent activity feeds the idle refcount: the sandbox may suspend only when nobody is working. */
