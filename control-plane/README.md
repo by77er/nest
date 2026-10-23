@@ -56,7 +56,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/admin/tunnels/sweep?cell=<cell>`: run the daily tunnel sweep now; returns what it deleted, retried,
      failed and left alone (`unknown`: nest-named tunnels and records this cell did not create)
    - `PUT /v1/admin/secrets/access:gateway {"value": "{\"client_id\":...,\"client_secret\":...}"}`: the Cloudflare
-     Access service token `resolve` hands out as `edge` on every `wss://` target
+     Access service token `resolve` hands out as `edge` on every target that points at a host's connected tunnel
    - `GET /v1/admin/fleet?cell=<cell>`: hosts (status, leases, idle since) and launched instances (outcome)
    - `POST /v1/admin/launched {instance_id, role, account_id?, region?, cell}`: record an instance we
      launched so it may enroll with its AWS identity document (as that role, from that account and region)
@@ -90,8 +90,16 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   is in, AgentDO answers `hands_resolve` on the session channel, and `POST /v1/sandboxes/:id/resolve` serves a
   person or a test harness. Per-host tunnels: FleetDO creates one at a sandbox host's enrollment (`tunnel_id`,
   `tunnel_hostname`, `dns_record_id` on the host's row; the tunnel token goes to the host and is kept nowhere
-  else), is the authority for the gateway URL, deletes the tunnel and record on every path that marks a host dead,
-  and a daily `tunnel_sweep` alarm deletes leaks. The account is shared (other cells, other deployments, tunnels
+  else), is the authority for the name but advertises `wss://<tunnel_hostname>` only while the host reports its
+  tunnel `connected` (`hello.tunnel` and the `tunnel_state` event, kept in `tunnel_state`): `connecting` makes
+  `resolve` answer `sandbox_not_ready` (the runner retries), and `none` (an old nestd, no cloudflared) falls back
+  to the hello URL with an error logged, which works while every brain starts on its sandbox's host. A tunnel
+  target without `access:gateway` is refused (500, not retryable) rather than minted for the edge to reject.
+  FleetDO deletes the tunnel and record on every path that marks a host dead, and a daily `tunnel_sweep` alarm
+  deletes leaks. A proof (enrollment token or instance identity) already used by a host that never said hello
+  enrolls again (that host dies and its tunnel goes): a lost enrollment answer does not brick the instance. A
+  Cloudflare 401/403 at enrollment (the API token revoked or short of a permission) enrolls the host without a
+  tunnel and logs it, so a bad token does not burn instances through the enroll timeout. The account is shared (other cells, other deployments, tunnels
   made by hand), so the sweep deletes only tunnels and records this cell recorded in `tunnels_created` before its
   first Cloudflare call, for a host that is dead or never got a row within an hour; every other nest-shaped name
   is counted as `unknown` and logged. `resolve` carries the Access service token only when the host has a tunnel,

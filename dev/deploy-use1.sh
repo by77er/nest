@@ -22,7 +22,7 @@ for name in PUBLIC_BASE_URL CLOUDFLARE_ACCOUNT_ID AWS_CELLS ROOT_CA_KMS_KEY_ID; 
 done
 # The tunnel API token (Account: Cloudflare One Connector: cloudflared: Edit; Zone: DNS: Edit) is a Worker
 # secret, written here from the deploy environment when present; secrets persist across versions, so it
-# can be absent. The Worker must exist (one deploy) before a secret can be put.
+# can be absent.
 if [ -n "${CLOUDFLARE_TUNNEL_API_TOKEN:-}" ]; then
   printf '%s' "$CLOUDFLARE_TUNNEL_API_TOKEN" | npx wrangler secret put CLOUDFLARE_TUNNEL_API_TOKEN
 fi

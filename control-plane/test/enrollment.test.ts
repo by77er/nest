@@ -152,9 +152,16 @@ describe("enrollment", () => {
         body: JSON.stringify({ protocol_version: 1, role, cell, proof: { type: "enrollment_token", token: t }, proxy_ca_csr_pem: await csrPem() }),
       });
     expect((await post(token, "controller")).status).toBe(401);
-    expect((await post(token)).status).toBe(200);
+    const first = await post(token);
+    expect(first.status).toBe(200);
+    // Spent once the host connects (before that, a retry of a lost answer: test/tunnel.test.ts).
+    const { host, host_token } = (await first.json()) as { host: string; host_token: string };
+    const ws = await Ws.connect("/v1/fleet", host_token);
+    ws.send(hostHello(host, cell));
+    await ws.next("hello_ack");
     expect((await post(token)).status).toBe(409);
     expect((await post("net_bogus")).status).toBe(401);
+    ws.close();
   });
 
   it("AWS hosts must have been launched by us and enroll once", async () => {
@@ -169,8 +176,14 @@ describe("enrollment", () => {
     const enroll = () => Promise.resolve().then(() => fleet.enroll(req, cell, identity));
     await expect(enroll()).rejects.toThrow(/not launched/);
     await fleet.registerLaunched({ instance_id: "i-0launched" });
-    expect((await fleet.enroll(req, cell, identity)).host).toMatch(/^hst_/);
+    const enrolled = await fleet.enroll(req, cell, identity);
+    expect(enrolled.host).toMatch(/^hst_/);
+    // Once connected; until then a retry of a lost answer enrolls again (test/tunnel.test.ts).
+    const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
+    ws.send(hostHello(enrolled.host, cell));
+    await ws.next("hello_ack");
     await expect(enroll()).rejects.toThrow(/already enrolled/);
+    ws.close();
   });
 
   it("an AWS enrollment over HTTP without a configured certificate is unauthorized", async () => {

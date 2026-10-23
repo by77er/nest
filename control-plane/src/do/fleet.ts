@@ -7,8 +7,8 @@ import { createRootCertificate, generateDevRoot, kmsRoot, localRoot, signInterme
 import { AwsKms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
 import {
-  CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName, tunnelPrefix,
-  type CloudflareApi,
+  CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
+  tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
 import { awsCell, type AwsCellConfig } from "../lib/cells";
 import type { InstanceIdentity } from "../lib/aws-identity";
@@ -18,12 +18,24 @@ import { errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/ut
 import {
   type Capacity, type CommandBody, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
   type EnrollResponse, type FleetToHost, type HostEvent, HostToFleet, type LeaseClaim, type CaCertificate, type SandboxReport,
+  type TunnelState,
 } from "../protocol/control";
 import {
   type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, type HostRole, PROTOCOL_VERSION, type Resources,
 } from "../protocol/model";
 
 type HostStatus = "active" | "draining" | "expired" | "stonith_pending" | "dead";
+
+/**
+ * Where a host's sandbox gateway is reached (`hostGatewayUrl`): through its tunnel (Cloudflare
+ * Access in front, so targets carry the service token), not yet (the tunnel is connecting), or
+ * directly at the URL its hello advertised (`tunnel` names the hostname a tunnel host is not
+ * serving, for the log).
+ */
+export type HostGateway =
+  | { kind: "tunnel"; url: string }
+  | { kind: "connecting" }
+  | { kind: "direct"; url: string; tunnel: string | null };
 
 interface HostRow {
   host: string;
@@ -40,6 +52,8 @@ interface HostRow {
   tunnel_id: string | null;
   tunnel_hostname: string | null;
   dns_record_id: string | null;
+  /** What the host last said about its tunnel (`TunnelState`); null before its first hello (= `none`). */
+  tunnel_state: string | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -160,6 +174,7 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("hosts", "tunnel_id", "TEXT");
     this.addColumn("hosts", "tunnel_hostname", "TEXT");
     this.addColumn("hosts", "dns_record_id", "TEXT");
+    this.addColumn("hosts", "tunnel_state", "TEXT");
     this.addColumn("leases", "state", "TEXT");
     // Object-store GC: the cell's sandboxes (their generations are the roots) and the runs.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS sandboxes (sandbox TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL,
@@ -235,12 +250,15 @@ export class FleetDO extends DurableObject<Env> {
   private checkProof(req: EnrollRequest, identity: InstanceIdentity | null, hash: string, consume?: { host: string; now: number }): string | null {
     if (req.proof.type === "enrollment_token") {
       const row = this.sql
-        .exec<{ role: string; used_ms: number | null }>("SELECT role, used_ms FROM enroll_tokens WHERE hash = ?", hash)
+        .exec<{ role: string; used_ms: number | null; host: string | null }>("SELECT role, used_ms, host FROM enroll_tokens WHERE hash = ?", hash)
         .toArray()[0];
       if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "unknown enrollment token", 401);
-      if (row.used_ms !== null) throw new NestError(ErrorCodes.FORBIDDEN, "enrollment token already used", 409);
+      if (row.used_ms !== null && !this.neverConnected(row.host)) throw new NestError(ErrorCodes.FORBIDDEN, "enrollment token already used", 409);
       if (row.role !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, "enrollment token minted for another role", 401);
-      if (consume) this.sql.exec("UPDATE enroll_tokens SET used_ms = ?, host = ? WHERE hash = ?", consume.now, consume.host, hash);
+      if (consume) {
+        if (row.host) this.retireNeverConnected(row.host, consume.host);
+        this.sql.exec("UPDATE enroll_tokens SET used_ms = ?, host = ? WHERE hash = ?", consume.now, consume.host, hash);
+      }
       return null;
     }
     if (!identity) throw new NestError(ErrorCodes.UNAUTHORIZED, "unverified identity document", 401);
@@ -249,12 +267,37 @@ export class FleetDO extends DurableObject<Env> {
         "SELECT host, role, account_id, region FROM launched WHERE instance_id = ?", identity.instanceId)
       .toArray()[0];
     if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance was not launched by this control plane (in this cell)", 401);
-    if (row.host) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
+    if (row.host && !this.neverConnected(row.host)) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
     if (row.role && row.role !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, `instance was launched as ${row.role}`, 401);
     if (row.account_id && row.account_id !== identity.accountId) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS account", 401);
     if (row.region && row.region !== identity.region) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS region", 401);
-    if (consume) this.sql.exec("UPDATE launched SET host = ? WHERE instance_id = ?", consume.host, identity.instanceId);
+    if (consume) {
+      if (row.host) this.retireNeverConnected(row.host, consume.host);
+      this.sql.exec("UPDATE launched SET host = ? WHERE instance_id = ?", consume.host, identity.instanceId);
+    }
     return identity.instanceId;
+  }
+
+  /**
+   * A proof already used by a host that never said hello may be used again: the enrollment answer
+   * was lost (nestd timed out while the tunnel was being made, or was killed before it saved its
+   * credentials), so nobody holds that host's token and nestd is retrying with the same proof. A
+   * host that connected keeps its proof: a second enrollment from a connected instance is a replay.
+   */
+  private neverConnected(host: string | null): boolean {
+    const h = host ? this.host(host) : undefined;
+    return !!h && h.status === "active" && h.last_rx === null;
+  }
+
+  /** The prior, never-connected holder of a proof gives way to `successor`: dead, tunnel released. */
+  private retireNeverConnected(host: string, successor: string): void {
+    if (!this.neverConnected(host)) return;
+    this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", host);
+    for (const ws of this.ctx.getWebSockets(host)) ws.close(4410, "re-enrolled before connecting");
+    this.releaseTunnel(host, "re-enrolled before connecting");
+    const leases = this.leasesOf(host).map((l) => l.sandbox);
+    if (leases.length) this.ctx.waitUntil(this.queueReassign(host, leases, true));
+    console.warn(`FleetDO: ${host} never connected; its proof enrolls again as ${successor}`);
   }
 
   private async enrollRecord(
@@ -312,8 +355,22 @@ export class FleetDO extends DurableObject<Env> {
     await this.deadlines.set(ALARM_TUNNEL_SWEEP, Date.now() + TUNNEL_SWEEP_INTERVAL_MS, true);
     this.sql.exec("INSERT OR REPLACE INTO tunnels_created (host, created_ms) VALUES (?, ?)", host, Date.now());
     const hostname = gatewayHostname(cf.label, cf.zone, host);
-    const zone = await this.zoneId(cf);
-    const t = await cf.api.createTunnel(tunnelName(cf.label, host));
+    let zone: string;
+    let t: { id: string; token: string };
+    try {
+      zone = await this.zoneId(cf);
+      t = await cf.api.createTunnel(tunnelName(cf.label, host));
+    } catch (e) {
+      // A revoked token (or one short of a permission) would fail every enrollment until an
+      // operator acts, and a host that cannot enroll restarts nestd until the enroll timeout
+      // terminates and relaunches it: an instance-burning loop. The host enrolls without a tunnel
+      // instead (reachable directly, as the harness is) and the fleet view shows no hostname.
+      if (e instanceof CloudflareError && e.unauthorized) {
+        console.error(`FleetDO: Cloudflare refuses the tunnel API token (HTTP ${e.httpStatus}); ${host} enrolls without a tunnel: ${e.message}`);
+        return null;
+      }
+      throw e;
+    }
     try {
       await cf.api.configureIngress(t.id, hostname);
       const r = await cf.api.createRecord(zone, hostname, t.id, `nest ${host}`);
@@ -607,6 +664,7 @@ export class FleetDO extends DurableObject<Env> {
     if (newProcess) this.rel.reset(att.host);
     this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ? WHERE host = ?",
       now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, att.host);
+    this.setTunnelState(att.host, hello.tunnel ?? "none", prior as HostRow);
     ws.serializeAttachment({ host: att.host, helloed: true } satisfies Attachment);
 
     this.send(ws, {
@@ -789,6 +847,9 @@ export class FleetDO extends DurableObject<Env> {
       }
       case "capacity":
         this.sql.exec("UPDATE hosts SET capacity = ? WHERE host = ?", JSON.stringify(ev.capacity), host);
+        return;
+      case "tunnel_state":
+        this.setTunnelState(host, ev.state, this.host(host));
         return;
       case "spot_notice":
         return this.drain(host, ev.deadline_ms);
@@ -1047,16 +1108,35 @@ export class FleetDO extends DurableObject<Env> {
     }
   }
 
+  /** What the host last reported about its tunnel; `none` until it says otherwise. */
+  private setTunnelState(host: string, state: TunnelState, prior: Pick<HostRow, "tunnel_state" | "tunnel_hostname"> | undefined): void {
+    const was = (prior?.tunnel_state ?? "none") as TunnelState;
+    this.sql.exec("UPDATE hosts SET tunnel_state = ? WHERE host = ?", state, host);
+    if (was === state) return;
+    if (state === "none" && prior?.tunnel_hostname) {
+      console.warn(`FleetDO: ${host} has the tunnel ${prior.tunnel_hostname} but runs none (an old nestd, or no cloudflared on the host): its gateway is reached directly`);
+    } else {
+      console.log(`FleetDO: ${host} tunnel ${was} → ${state}`);
+    }
+  }
+
   /**
-   * Where clients reach `host`'s sandbox gateway: its tunnel when it has one (the control plane is
-   * the authority), else what its hello advertised. `tunnel` says whether Cloudflare Access fronts it.
+   * Where clients reach `host`'s sandbox gateway. The control plane is the authority for the name,
+   * but only the host knows whether its tunnel is served: `tunnel` (Cloudflare Access in front)
+   * needs the hostname FleetDO recorded at enrollment and the host's `connected`; `connecting` is
+   * a tunnel host whose cloudflared has no ready connection yet (the caller waits); `direct` is the
+   * URL the host's hello advertised, which is also where a tunnel host that reports `none` is
+   * reached (an old nestd, or no binary), since every brain still starts on its sandbox's host.
    */
-  async hostGatewayUrl(host: string): Promise<{ url: string; tunnel: boolean } | null> {
+  async hostGatewayUrl(host: string): Promise<HostGateway | null> {
     const h = this.host(host);
     // A dead host serves nothing; its sandboxes are being reassigned.
     if (!h || h.status === "dead") return null;
-    if (h.tunnel_hostname) return { url: `wss://${h.tunnel_hostname}`, tunnel: true };
-    return h.gateway_url ? { url: h.gateway_url, tunnel: false } : null;
+    if (h.tunnel_hostname) {
+      if (h.tunnel_state === "connected") return { kind: "tunnel", url: `wss://${h.tunnel_hostname}` };
+      if (h.tunnel_state === "connecting") return { kind: "connecting" };
+    }
+    return h.gateway_url ? { kind: "direct", url: h.gateway_url, tunnel: h.tunnel_hostname } : null;
   }
 
   private async rotateToken(ws: WebSocket, host: string): Promise<void> {
@@ -1328,7 +1408,7 @@ export class FleetDO extends DurableObject<Env> {
   /** Operator view: hosts with their lease counts, and launched instances with their outcome. */
   async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[] }> {
     return {
-      hosts: this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since, h.tunnel_hostname,
+      hosts: this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since, h.tunnel_hostname, h.tunnel_state,
         (SELECT COUNT(*) FROM leases l WHERE l.host = h.host) AS leases FROM hosts h ORDER BY h.enrolled_ms`).toArray()
         .map((h) => ({ ...h, connected: !!this.socketFor(h.host as string) })),
       launches: this.sql.exec("SELECT instance_id, launched_ms, host, reason, ended_ms FROM launched ORDER BY launched_ms").toArray(),

@@ -781,6 +781,12 @@ export class SandboxDO extends DurableObject<Env> {
     const gateway = await this.fleet(info.cell).hostGatewayUrl(info.host);
     // The host may advertise one on its next hello (a restart, an upgrade): not an error, not yet.
     if (!gateway) throw notReady(`host ${info.host} advertises no gateway yet`);
+    // Its cloudflared has no ready connection yet (the host just started, or the tunnel is
+    // reconnecting): a target now would only fail at the edge. The runner retries.
+    if (gateway.kind === "connecting") throw notReady(`host ${info.host}'s tunnel is connecting`);
+    if (gateway.kind === "direct" && gateway.tunnel) {
+      console.error(`SandboxDO: host ${info.host} has the tunnel ${gateway.tunnel} but reports none; ${info.sandbox} is reached directly at ${gateway.url}`);
+    }
     const url = gateway.url;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const binding = await broker.signBinding(info.cell, {
@@ -788,7 +794,12 @@ export class SandboxDO extends DurableObject<Env> {
     });
     // Only a tunnel has the Access edge in front of it; a gateway reached directly (the harness, a
     // host's own address) would receive the service token and front nothing, so it never travels.
-    const edge = gateway.tunnel ? await broker.accessServiceToken() : null;
+    // And a tunnel target without it would be refused at the edge on every call: not retryable,
+    // an operator stores the token (docs/setup/).
+    const edge = gateway.kind === "tunnel" ? await broker.accessServiceToken() : null;
+    if (gateway.kind === "tunnel" && !edge) {
+      throw new NestError(ErrorCodes.INTERNAL, "access:gateway is not stored; a tunnel target cannot be used without it", 500, false);
+    }
     // Across the awaits the sandbox may have moved, or the agent been detached: never hand out a
     // token the gateway would refuse, or one for an agent that is no longer attached.
     const fresh = this.info_();

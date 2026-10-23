@@ -6,7 +6,9 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
-import type { CloudflareApi } from "../src/lib/cloudflare";
+import { CloudflareError, type CloudflareApi } from "../src/lib/cloudflare";
+import { CapacityError, type Ec2, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
+import type { AwsCellConfig } from "../src/lib/cells";
 import { NestError } from "../src/lib/util";
 import { ErrorCodes } from "../src/protocol/model";
 import type { HandsTarget } from "../src/protocol/gateway";
@@ -37,10 +39,12 @@ class FakeCloudflare implements CloudflareApi {
   undeletable = new Set<string>();
   /** Record ids whose deletion fails. */
   undeletableRecords = new Set<string>();
+  /** `createTunnel` fails with this HTTP status (401/403: the token is revoked). */
+  refuseTunnelWith: number | null = null;
   private n = 0;
   /** What the HTTP client throws for a refused call (test/cloudflare.test.ts proves that shape). */
-  private refuse(what: string): never {
-    throw new NestError(ErrorCodes.INTERNAL, `cloudflare: ${what}`, 502, true);
+  private refuse(what: string, status = 502): never {
+    throw new CloudflareError(`cloudflare: ${what}`, status, status === 429 || status >= 500);
   }
 
   seedTunnel(name: string): string {
@@ -68,6 +72,7 @@ class FakeCloudflare implements CloudflareApi {
   }
   async createTunnel(name: string): Promise<{ id: string; token: string }> {
     this.calls.push(`createTunnel ${name}`);
+    if (this.refuseTunnelWith !== null) this.refuse(`HTTP ${this.refuseTunnelWith} (10000: Authentication error)`, this.refuseTunnelWith);
     const id = `tun-${++this.n}`;
     this.tunnels.set(id, { name, ingress: null });
     return { id, token: `eyJ-tunnel-token-${id}` };
@@ -153,22 +158,33 @@ async function enrollRaw(cell: string, token: string): Promise<Response> {
   });
 }
 
+/** Enroll as a launched instance (what the Worker does after verifying its identity document). */
+async function enrollLaunched(cell: string, instanceId: string) {
+  return runInDurableObject(fleetStub(cell), async (inst: FleetDO) =>
+    inst.enroll({ role: "burst", proof: { type: "aws_identity_document", document_b64: "", pkcs7_b64: "" }, proxy_ca_csr_pem: await csrPem() } as never,
+      cell, { instanceId, accountId: "123456789012", region: "us-east-1" } as never));
+}
+
 const sweep = (cell: string) => adminJson<{ tunnels: number; records: number; retried: number; failed: number; unknown: number }>(
   `/v1/admin/tunnels/sweep?cell=${cell}`, { body: {} });
 
+/** Enroll and connect a host whose hello carries `extra` (a `gateway_url`, a `tunnel` state). */
+async function connectHostWith(cell: string, extra: Record<string, unknown>) {
+  const enrolled = await enrollHost(cell, "burst");
+  const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
+  ws.send(hostHello(enrolled.host, cell, extra));
+  const ack = await ws.next("hello_ack");
+  const keys = (await ws.next("binding_key")).keys as { kid: string; public_key: string }[];
+  return { ...enrolled, ws, ack, keys };
+}
+
+const ACCESS = { client_id: "abc.access", client_secret: "shh-service-secret" };
+const storeAccessToken = () => adminJson("/v1/admin/secrets/access:gateway", { method: "PUT", body: { value: JSON.stringify(ACCESS) } });
+
 /** A sandbox with a worker attached and running on a connected host, ready for `resolve`. */
-async function attached(cell: string, gatewayUrl?: string) {
+async function attached(cell: string, hello: Record<string, unknown> = {}) {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-tunnel" } });
-  let host: Awaited<ReturnType<typeof connectHost>>;
-  if (gatewayUrl === undefined) host = await connectHost(cell);
-  else {
-    const enrolled = await enrollHost(cell, "burst");
-    const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
-    ws.send(hostHello(enrolled.host, cell, { gateway_url: gatewayUrl }));
-    const ack = await ws.next("hello_ack");
-    const keys = (await ws.next("binding_key")).keys as { kid: string; public_key: string }[];
-    host = { ...enrolled, ws, ack, keys };
-  }
+  const host = Object.keys(hello).length ? await connectHostWith(cell, hello) : await connectHost(cell);
   const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "tunnel" } }, 201);
   const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "sandbox_create");
@@ -268,37 +284,205 @@ describe("enrollment creates the host's tunnel", () => {
 });
 
 describe("resolve through the tunnel", () => {
-  it("targets the tunnel hostname, not the host's loopback hello, and carries the Access token", async () => {
+  it("targets the tunnel hostname once the host reports it connected, and carries the Access token", async () => {
     const cell = uniqueCell();
     await withCloudflare(cell);
-    const s = await attached(cell);
-    const t1 = await sandboxStub(s.sandbox).resolve(s.agent);
-    expect(t1.url).toBe(`wss://${hostnameOf(s.host.host)}`);
-    expect(t1.edge, "no Access token stored yet").toBeUndefined();
-    await adminJson("/v1/admin/secrets/access:gateway", {
-      method: "PUT", body: { value: JSON.stringify({ client_id: "abc.access", client_secret: "shh-service-secret" }) },
-    });
+    const s = await attached(cell, { tunnel: "connected" });
+    // A tunnel target without the Access credential would be refused at the edge on every call:
+    // refused here instead, for an operator, not retried by the runner.
+    const refused = await sandboxStub(s.sandbox).resolve(s.agent).then(() => null, (e: unknown) => e as Error);
+    expect(refused?.message, "no Access token stored yet").toMatch(/access:gateway is not stored/);
+    expect(refused?.message).toMatch(/^nest:internal:500:0:/);
+    await storeAccessToken();
     const t2 = await sandboxStub(s.sandbox).resolve(s.agent);
-    expect(t2.edge).toEqual({ client_id: "abc.access", client_secret: "shh-service-secret" });
+    expect(t2.url).toBe(`wss://${hostnameOf(s.host.host)}`);
+    expect(t2.edge).toEqual(ACCESS);
     const viaApi = await adminJson<HandsTarget>(`/v1/sandboxes/${s.sandbox}/resolve`, { body: { client: s.agent } });
     expect(viaApi.url).toBe(t2.url);
     expect(viaApi.edge).toEqual(t2.edge);
   });
 
+  it("the tunnel is advertised only while the host reports it connected; connecting waits, none falls back to the hello URL", async () => {
+    const cell = uniqueCell();
+    await withCloudflare(cell);
+    await storeAccessToken();
+    // An old nestd, or one without cloudflared: the hello says nothing about a tunnel. The host's
+    // own URL still works, since every brain starts on its sandbox's host; never with the edge token.
+    const s = await attached(cell);
+    const t0 = await sandboxStub(s.sandbox).resolve(s.agent);
+    expect(t0.url).toBe("ws://127.0.0.1:18790");
+    expect(t0.edge).toBeUndefined();
+    expect(await fleetStub(cell).hostGatewayUrl(s.host.host)).toEqual({ kind: "direct", url: "ws://127.0.0.1:18790", tunnel: hostnameOf(s.host.host) });
+    // cloudflared is up but has no ready connection: nothing answers at the hostname yet.
+    let seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "tunnel_state", state: "connecting" }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    expect(await fleetStub(cell).hostGatewayUrl(s.host.host)).toEqual({ kind: "connecting" });
+    const waiting = await sandboxStub(s.sandbox).resolve(s.agent).then(() => null, (e: unknown) => e as NestError);
+    expect(waiting?.code).toBe(ErrorCodes.SANDBOX_NOT_READY);
+    expect(waiting?.retryable).toBe(true);
+    // Ready: the tunnel, with the edge credential.
+    seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "tunnel_state", state: "connected" }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    const t1 = await sandboxStub(s.sandbox).resolve(s.agent);
+    expect(t1.url).toBe(`wss://${hostnameOf(s.host.host)}`);
+    expect(t1.edge).toEqual(ACCESS);
+    const view = (await fleetStub(cell).fleetView()) as { hosts: { host: string; tunnel_state: string | null }[] };
+    expect(view.hosts.find((h) => h.host === s.host.host)?.tunnel_state).toBe("connected");
+    // The connection dropped: back to waiting, not to a target the edge would answer 5xx.
+    seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "tunnel_state", state: "connecting" }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    expect(await fleetStub(cell).hostGatewayUrl(s.host.host)).toEqual({ kind: "connecting" });
+  });
+
   it("a host without a tunnel never gets the Access token, whatever scheme its hello advertises", async () => {
-    await adminJson("/v1/admin/secrets/access:gateway", {
-      method: "PUT", body: { value: JSON.stringify({ client_id: "abc.access", client_secret: "shh-service-secret" }) },
-    });
+    await storeAccessToken();
     // The harness: a loopback gateway.
     const plain = await attached(uniqueCell());
     const t1 = await sandboxStub(plain.sandbox).resolve(plain.agent);
     expect(t1.url).toBe("ws://127.0.0.1:18790");
     expect(t1.edge).toBeUndefined();
     // A host with its own TLS in front of the gateway: no Access edge, so no secret to send it.
-    const direct = await attached(uniqueCell(), "wss://gw.direct.example.net");
+    const direct = await attached(uniqueCell(), { gateway_url: "wss://gw.direct.example.net" });
     const t2 = await sandboxStub(direct.sandbox).resolve(direct.agent);
     expect(t2.url).toBe("wss://gw.direct.example.net");
     expect(t2.edge).toBeUndefined();
+    // Even a host that claims a connected tunnel it was never given.
+    const claims = await attached(uniqueCell(), { tunnel: "connected" });
+    const t3 = await sandboxStub(claims.sandbox).resolve(claims.agent);
+    expect(t3.url).toBe("ws://127.0.0.1:18790");
+    expect(t3.edge).toBeUndefined();
+  });
+});
+
+describe("enrollment again before the host ever connected", () => {
+  it("an enrollment token used by a host that never said hello enrolls again: the first host dies with its tunnel; after hello it is 409", async () => {
+    const cell = uniqueCell();
+    const cf = await withCloudflare(cell);
+    const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "burst", cell } });
+    const first = (await (await enrollRaw(cell, token)).json()) as { host: string };
+    const [firstTunnel] = cf.tunnelNamed(`nest-${label(first.host)}`)!;
+    // nestd never saved the answer (it timed out, or was killed): it retries with the same token.
+    const res = await enrollRaw(cell, token);
+    expect(res.status).toBe(200);
+    const second = (await res.json()) as { host: string; host_token: string; tunnel_token: string; gateway_url: string };
+    expect(second.host).not.toBe(first.host);
+    expect(second.gateway_url).toBe(`wss://${hostnameOf(second.host)}`);
+    expect(await hostRow(cell, first.host)).toMatchObject({ status: "dead" });
+    await until(() => !cf.tunnels.has(firstTunnel) && !cf.recordNamed(hostnameOf(first.host)), "the first host's assets to go");
+    expect(cf.tunnelNamed(`nest-${label(second.host)}`), "the second host has its own tunnel").toBeDefined();
+    // Once the host connects, the token is spent: a third enrollment would be a replay.
+    const ws = await Ws.connect("/v1/fleet", second.host_token);
+    ws.send(hostHello(second.host, cell));
+    await ws.next("hello_ack");
+    expect((await enrollRaw(cell, token)).status).toBe(409);
+    expect(await hostRow(cell, second.host)).toMatchObject({ status: "active" });
+    ws.close();
+  });
+
+  it("an AWS instance that never connected enrolls again with its identity; a connected one is a replay", async () => {
+    const cell = uniqueCell();
+    const cf = await withCloudflare(cell);
+    await adminJson("/v1/admin/launched", { body: { instance_id: "i-0reenroll", role: "burst", cell } });
+    const first = await enrollLaunched(cell, "i-0reenroll");
+    const [firstTunnel] = cf.tunnelNamed(`nest-${label(first.host)}`)!;
+    const second = await enrollLaunched(cell, "i-0reenroll");
+    expect(second.host).not.toBe(first.host);
+    expect(await hostRow(cell, first.host)).toMatchObject({ status: "dead" });
+    await until(() => !cf.tunnels.has(firstTunnel), "the first host's tunnel to go");
+    const ws = await Ws.connect("/v1/fleet", second.host_token);
+    ws.send(hostHello(second.host, cell));
+    await ws.next("hello_ack");
+    await expect(enrollLaunched(cell, "i-0reenroll")).rejects.toThrow(/already enrolled/);
+    ws.close();
+  });
+});
+
+describe("a revoked tunnel API token", () => {
+  it("enrolls the host without a tunnel instead of failing every enrollment, and the sweep has nothing to delete", async () => {
+    const cell = uniqueCell();
+    const cf = await withCloudflare(cell);
+    cf.refuseTunnelWith = 403;
+    const res = await enrollRaw(cell, (await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "burst", cell } })).token);
+    expect(res.status).toBe(200);
+    const h = (await res.json()) as Record<string, unknown>;
+    expect(h.tunnel_token).toBeUndefined();
+    expect(h.gateway_url).toBeUndefined();
+    expect(await hostRow(cell, h.host as string)).toMatchObject({ tunnel_id: null, tunnel_hostname: null, dns_record_id: null });
+    expect(cf.tunnels.size).toBe(0);
+    expect(await sweep(cell)).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0 });
+    // An outage is different: the enrollment fails and the host retries.
+    cf.refuseTunnelWith = 503;
+    expect((await enrollRaw(cell, (await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "burst", cell } })).token)).status).toBe(502);
+  });
+});
+
+describe("retirement releases the tunnel", () => {
+  const config: AwsCellConfig = {
+    region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
+    max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+  };
+  class MockEc2 implements Ec2 {
+    terminated: string[] = [];
+    launched: LaunchSpec[] = [];
+    async launch(spec: LaunchSpec) {
+      if (spec.instanceType === "none") throw new CapacityError("InsufficientInstanceCapacity");
+      this.launched.push(spec);
+      return `i-0${this.launched.length.toString(16).padStart(8, "0")}`;
+    }
+    async terminate(id: string) {
+      this.terminated.push(id);
+    }
+    async state(): Promise<InstanceState> {
+      return "terminated";
+    }
+  }
+  /** Run FleetDO's tick now, `shiftMs` in the future as far as the idle clock is concerned. */
+  async function tickAt(cell: string, ec2: MockEc2, shiftMs = 0) {
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO, st) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = config;
+      st.storage.sql.exec("UPDATE hosts SET idle_since = idle_since - ? WHERE idle_since IS NOT NULL", shiftMs);
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+    });
+    await runDurableObjectAlarm(fleetStub(cell));
+  }
+  /** A launched instance, enrolled (with a tunnel) and connected. */
+  async function launchedHost(cell: string, instanceId: string) {
+    await adminJson("/v1/admin/launched", { body: { instance_id: instanceId, role: "burst", cell } });
+    const enrolled = await enrollLaunched(cell, instanceId);
+    const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
+    ws.send(hostHello(enrolled.host, cell, { tunnel: "connected" }));
+    await ws.next("hello_ack");
+    return { ...enrolled, ws };
+  }
+
+  it("an idle host retired after the grace loses its tunnel and record", async () => {
+    const cell = uniqueCell();
+    const cf = await withCloudflare(cell);
+    const ec2 = new MockEc2();
+    const h = await launchedHost(cell, "i-0idle0001");
+    const [tunnelId] = cf.tunnelNamed(`nest-${label(h.host)}`)!;
+    await tickAt(cell, ec2);
+    expect((await fleetStub(cell).hostStatus(h.host))!.status).toBe("active");
+    await tickAt(cell, ec2, 61_000);
+    expect((await fleetStub(cell).hostStatus(h.host))!.status).toBe("dead");
+    await until(() => !cf.tunnels.has(tunnelId) && !cf.recordNamed(hostnameOf(h.host)), "the idle host's assets to go");
+    expect(await hostRow(cell, h.host)).toMatchObject({ tunnel_id: null, tunnel_hostname: null, dns_record_id: null });
+  });
+
+  it("a drained host (spot notice, no sandboxes left) loses its tunnel and record", async () => {
+    const cell = uniqueCell();
+    const cf = await withCloudflare(cell);
+    const ec2 = new MockEc2();
+    const h = await launchedHost(cell, "i-0drain001");
+    const [tunnelId] = cf.tunnelNamed(`nest-${label(h.host)}`)!;
+    const seq = sendEvents(h.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await h.ws.next("ack", (m) => m.up_to >= seq);
+    expect((await fleetStub(cell).hostStatus(h.host))!.status).toBe("draining");
+    await tickAt(cell, ec2);
+    expect((await fleetStub(cell).hostStatus(h.host))!.status).toBe("dead");
+    await until(() => !cf.tunnels.has(tunnelId) && !cf.recordNamed(hostnameOf(h.host)), "the drained host's assets to go");
+    expect(await hostRow(cell, h.host)).toMatchObject({ tunnel_id: null, tunnel_hostname: null, dns_record_id: null });
   });
 });
 

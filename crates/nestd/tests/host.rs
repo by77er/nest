@@ -866,13 +866,17 @@ fn cloudflared_logs() -> Arc<Mutex<Vec<u8>>> {
 }
 
 fn tunnel_config(dir: &Path, fleet_url: &str, bin: &Path, user: Option<String>) -> Config {
+    tunnel_config_with_metrics(dir, fleet_url, bin, user, "127.0.0.1:1")
+}
+
+fn tunnel_config_with_metrics(dir: &Path, fleet_url: &str, bin: &Path, user: Option<String>, metrics: &str) -> Config {
     serde_json::from_value(serde_json::json!({
         "role": "burst", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet_url},
         "run_dir": dir.join("run"), "state_dir": dir.join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
         "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
-        "gateway_url": "ws://127.0.0.1:18790", "cloudflared_bin": bin, "cloudflared_user": user,
+        "gateway_url": "ws://127.0.0.1:18790", "cloudflared_bin": bin, "cloudflared_user": user, "cloudflared_metrics": metrics,
     }))
     .unwrap()
 }
@@ -889,29 +893,57 @@ fn tunnel_enrolled(fleet_url: &str) -> Enrolled {
     }
 }
 
+/// A loopback stand-in for cloudflared's metrics server: `/ready` is 503 until `ready` is set.
+async fn fake_metrics() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let r = ready.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else { return };
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).await;
+            let (status, body) = if r.load(std::sync::atomic::Ordering::SeqCst) { ("200 OK", "{\"status\":200}") } else { ("503 Service Unavailable", "{\"status\":503}") };
+            let _ = s.write_all(format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+            let _ = s.shutdown().await;
+        }
+    });
+    (addr, ready)
+}
+
 /// With a cloudflared binary and user configured and a tunnel token from enrollment, the host runs
-/// the tunnel as its child; the fleet hello still carries the configured `gateway_url`, not the
-/// control plane's; and shutting the host down sends the child SIGTERM, after which it is gone.
+/// the tunnel as its child, told where to serve its metrics; the fleet hello still carries the
+/// configured `gateway_url`, not the control plane's, and reports the tunnel as `connecting` until
+/// `/ready` answers 200, which goes out as a `tunnel_state` event; shutting the host down sends
+/// the child SIGTERM, after which it is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
+    let (metrics, ready) = fake_metrics().await;
     let log = dir.path().join("cloudflared.log");
     let bin = dir.path().join("cloudflared");
-    std::fs::write(&bin, format!("#!/bin/sh\necho pid=$$ >> {l}\ntrap 'echo term >> {l}; exit 0' TERM\nwhile :; do sleep 0.1; done\n", l = log.display())).unwrap();
+    std::fs::write(&bin, format!("#!/bin/sh\necho pid=$$ >> {l}\nwhile [ $# -gt 0 ]; do [ \"$1\" = --metrics ] && echo metrics=$2 >> {l}; shift; done\ntrap 'echo term >> {l}; exit 0' TERM\nwhile :; do sleep 0.1; done\n", l = log.display())).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     // The configured user: the test's own, the only one an unprivileged test can switch to.
     let me = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
-    let cfg = tunnel_config(dir.path(), &fleet.url, &bin, Some(me));
+    let cfg = tunnel_config_with_metrics(dir.path(), &fleet.url, &bin, Some(me), &metrics);
     let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("cloudflared spawned", || log.exists()).await;
-    let pid: i32 = std::fs::read_to_string(&log).unwrap().trim().strip_prefix("pid=").unwrap().parse().unwrap();
+    let pid: i32 = std::fs::read_to_string(&log).unwrap().lines().next().unwrap().strip_prefix("pid=").unwrap().parse().unwrap();
     assert!(alive(pid));
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
-    assert_eq!(fleet.log.lock().unwrap().hellos[0].gateway_url.as_deref(), Some("ws://127.0.0.1:18790"), "the hello keeps nestd's configured URL");
+    let hello = fleet.log.lock().unwrap().hellos[0].clone();
+    assert_eq!(hello.gateway_url.as_deref(), Some("ws://127.0.0.1:18790"), "the hello keeps nestd's configured URL");
+    assert_eq!(hello.tunnel, TunnelState::Connecting, "planned but not served yet");
+    assert!(std::fs::read_to_string(&log).unwrap().contains(&format!("metrics={metrics}\n")), "cloudflared is told where to serve /ready");
+    assert!(!fleet.log.lock().unwrap().events.iter().any(|e| matches!(e.body, HostEventBody::TunnelState { .. })), "no change yet");
+    ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    fleet.wait_event("tunnel connected", |b| matches!(b, HostEventBody::TunnelState { state: TunnelState::Connected })).await;
     host.shutdown().await;
     assert!(!alive(pid));
     assert!(std::fs::read_to_string(&log).unwrap().ends_with("\nterm\n"), "the child saw SIGTERM before it died");

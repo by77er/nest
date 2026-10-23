@@ -73,6 +73,17 @@ export interface CloudflareApi {
 
 type ApiEnvelope<T> = { success?: boolean; errors?: { code?: number; message?: string }[]; result: T };
 
+/** A Cloudflare call that failed. `status` is the HTTP status (0: no response), so a caller can tell a revoked token (401/403) from an outage. */
+export class CloudflareError extends NestError {
+  constructor(message: string, readonly httpStatus: number, retryable: boolean) {
+    super(ErrorCodes.INTERNAL, message, 502, retryable);
+  }
+  /** The token is revoked, expired or lacks a permission: no retry will help until an operator acts. */
+  get unauthorized(): boolean {
+    return this.httpStatus === 401 || this.httpStatus === 403;
+  }
+}
+
 export class CloudflareHttp implements CloudflareApi {
   constructor(private readonly cfg: TunnelConfig, private readonly fetchFn: typeof fetch = fetch, private readonly base = API_BASE) {}
 
@@ -92,7 +103,7 @@ export class CloudflareHttp implements CloudflareApi {
         signal: ctrl.signal,
       });
     } catch (e) {
-      throw new NestError(ErrorCodes.INTERNAL, `cloudflare ${method} ${path}: ${e instanceof Error ? e.message : String(e)}`, 502, true);
+      throw new CloudflareError(`cloudflare ${method} ${path}: ${e instanceof Error ? e.message : String(e)}`, 0, true);
     } finally {
       clearTimeout(timer);
     }
@@ -107,7 +118,7 @@ export class CloudflareHttp implements CloudflareApi {
     // parsed envelope that does not say `success: false` is a success.
     if (!res.ok || !env || env.success === false) {
       const messages = (env?.errors ?? []).map((e) => (e.code ? `${e.code}: ${e.message ?? ""}` : e.message ?? "")).join("; ");
-      throw new NestError(ErrorCodes.INTERNAL, `cloudflare ${method} ${path}: HTTP ${res.status}${messages ? ` (${messages})` : ""}`, 502,
+      throw new CloudflareError(`cloudflare ${method} ${path}: HTTP ${res.status}${messages ? ` (${messages})` : ""}`, res.status,
         !!opts.retryable || res.status === 429 || res.status >= 500);
     }
     return env.result;

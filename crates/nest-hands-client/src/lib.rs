@@ -25,9 +25,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 
 /// Request header names for a Cloudflare Access service token ([`HandsTarget::edge`]).
 pub const EDGE_CLIENT_ID_HEADER: &str = "CF-Access-Client-Id";
@@ -135,6 +133,8 @@ pub enum Phase {
 pub enum TransportError {
     /// The TCP connect or the socket failed.
     Io(io::Error),
+    /// The target's hostname did not resolve (the control plane deletes a dead host's record).
+    Dns(String),
     /// The TLS handshake failed (certificate, protocol).
     Tls(String),
     /// The server answered the upgrade with an HTTP status instead of switching protocols.
@@ -147,20 +147,35 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// Nothing answered at the target's address (refused, reset, unreachable): the runner treats
-    /// this like `moved` and resolves again rather than retrying the same target.
+    /// Nothing usable answered where the target points: the runner treats this like `moved` and
+    /// resolves again rather than retrying the same target. True for a refused, reset or
+    /// unreachable connect; a hostname that does not resolve (FleetDO deletes a dead host's
+    /// record); and an HTTP answer from in front of the gateway: a 5xx is Cloudflare's edge with
+    /// no connector or origin behind the hostname (502, 503, 530: the host is gone or its tunnel
+    /// is reconnecting), and 401 or 403 is Cloudflare Access refusing the `edge` credential,
+    /// which a fresh `resolve` carries anew after a rotation. 404 and 501 are the gateway itself
+    /// answering (an unknown or not yet served route; the edge never says 501) and stay final,
+    /// as does every other status.
     pub fn is_unreachable(&self) -> bool {
-        matches!(
-            self,
-            TransportError::Io(e) if matches!(
+        match self {
+            TransportError::Io(e) => matches!(
                 e.kind(),
                 io::ErrorKind::ConnectionRefused
                     | io::ErrorKind::ConnectionReset
                     | io::ErrorKind::NotConnected
                     | io::ErrorKind::HostUnreachable
                     | io::ErrorKind::NetworkUnreachable
-            )
-        )
+            ),
+            TransportError::Dns(_) => true,
+            TransportError::Http(s) => (*s >= 500 && *s != 501) || matches!(*s, 401 | 403),
+            TransportError::Tls(_) | TransportError::Url(_) | TransportError::ClosedBeforeBound { .. } => false,
+        }
+    }
+
+    /// An HTTP 5xx from in front of the gateway: worth a short pause before resolving again,
+    /// since a tunnel that is reconnecting answers this way for a few seconds.
+    pub fn is_edge_outage(&self) -> bool {
+        matches!(self, TransportError::Http(s) if *s >= 500 && *s != 501)
     }
 }
 
@@ -168,6 +183,7 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransportError::Io(e) => write!(f, "{:?}: {e}", e.kind()),
+            TransportError::Dns(m) => write!(f, "dns: {m}"),
             TransportError::Tls(m) => write!(f, "tls: {m}"),
             TransportError::Http(s) => write!(f, "http {s} instead of an upgrade"),
             TransportError::Url(m) => write!(f, "url: {m}"),
@@ -366,14 +382,28 @@ pub async fn open(target: &HandsTarget, opts: &OpenOptions) -> Result<HandsConn,
         req.headers_mut().insert(EDGE_CLIENT_SECRET_HEADER, secret);
     }
     tracing::debug!(url = %url, sandbox = %target.sandbox.0, epoch = target.epoch.0, "opening hands connection");
+    let host = req.uri().host().unwrap_or("").to_string();
+    let port = req.uri().port_u16().unwrap_or(if scheme == "wss" { 443 } else { 80 });
     let connector = (scheme == "wss").then(tls_connector);
-    let (mut ws, _) = tokio::time::timeout(
-        opts.connect_timeout,
-        connect_async_tls_with_config(req, Some(ws_config()), false, connector),
-    )
+    let (mut ws, _) = tokio::time::timeout(opts.connect_timeout, async {
+        // Resolve and connect here so a hostname that no longer exists is its own error (not
+        // an io error of no particular kind); TLS still verifies and names the hostname.
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| OpenError::Transport(TransportError::Dns(format!("{host}: {e}"))))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(OpenError::Transport(TransportError::Dns(format!("{host}: no addresses"))));
+        }
+        let stream = TcpStream::connect(addrs.as_slice())
+            .await
+            .map_err(|e| OpenError::Transport(TransportError::Io(e)))?;
+        client_async_tls_with_config(req, stream, Some(ws_config()), connector)
+            .await
+            .map_err(transport)
+    })
     .await
-    .map_err(|_| OpenError::Timeout(Phase::Connect))?
-    .map_err(transport)?;
+    .map_err(|_| OpenError::Timeout(Phase::Connect))??;
     let bind = ClientMessage::Bind {
         binding: target.binding.expose().to_string(),
         protocol_version: target.guest.protocol_version,

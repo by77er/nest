@@ -46,6 +46,10 @@ pub struct Config {
     /// child keeps nestd's own user (the harness). A name that does not exist fails startup.
     #[serde(default)]
     pub cloudflared_user: Option<String>,
+    /// Where cloudflared serves its metrics and `/ready` (nestd polls it to report the tunnel's
+    /// state). Default `127.0.0.1:18791`, next to the gateway's 18790; tests point it at a fake.
+    #[serde(default)]
+    pub cloudflared_metrics: Option<String>,
     /// Where generations (disk and memory chunks, manifests) go.
     #[serde(default)]
     pub storage: StorageConfig,

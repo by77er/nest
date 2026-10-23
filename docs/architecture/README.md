@@ -7,7 +7,7 @@ nest is two systems with one seam between them:
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
-> This is the design. **Not built:** the gateway, bindings, tunnels, brain hosts and the agent epoch (today the runner calls the guest over vsock on the sandbox's host, FleetDO has `burst` and `controller` host roles, and AgentDO starts captains on a `controller` host), and the coordination layer (ChannelDO, HookDO, grants, taint, capabilities, `wake_at`); the code still has roles and WorkstreamDO. `control-plane/README.md` lists the gaps.
+> This is the design. **Built:** the gateway, bindings and per-host tunnels (unverified on AWS: spike item 13 in [docs/README.md](../README.md#first-spike)). **Not built:** brain hosts and the agent epoch (today every brain starts on its sandbox's host and reaches the guest only through its gateway, FleetDO has `burst` and `controller` host roles, and AgentDO starts captains on a `controller` host), and the coordination layer (ChannelDO, HookDO, grants, taint, capabilities, `wake_at`); the code still has roles and WorkstreamDO. `control-plane/README.md` lists the gaps.
 
 ## At a glance
 

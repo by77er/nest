@@ -2,24 +2,34 @@
 //!
 //! The control plane creates one tunnel per sandbox host at enrollment and hands nestd the tunnel
 //! token, which is saved next to the host token (`credentials.rs`) whether or not cloudflared is
-//! installed. With a configured binary, nestd runs `cloudflared --no-autoupdate tunnel run` as a
-//! child whose environment is cleared down to `PATH`, `HOME` and the token in `TUNNEL_TOKEN` (which
-//! cloudflared reads). The token is never on a command line, where `/proc/<pid>/cmdline` is
+//! installed. With a configured binary, nestd runs `cloudflared --no-autoupdate tunnel --metrics
+//! 127.0.0.1:18791 run` as a child whose environment is cleared down to `PATH`, `HOME` and the
+//! token in `TUNNEL_TOKEN` (which cloudflared reads). The token is never on a command line, where `/proc/<pid>/cmdline` is
 //! world-readable; `/proc/<pid>/environ` is readable only by the child's user and root, like the
 //! credentials file. The child runs as `cloudflared_user` when configured: a different user from
 //! nestd. Its output goes to nestd's log at info. It is restarted with a backoff whenever it exits
 //! (a revoked token makes it exit at once, so that loop warns every 30 s), and at shutdown it gets
 //! SIGTERM, then SIGKILL after 5 s. A token without a binary is logged every minute: the control
 //! plane already advertises a tunnel URL for this host that nothing serves.
+//!
+//! Whether the tunnel actually serves is reported, not assumed: cloudflared's metrics server
+//! answers `GET /ready` with 200 while it holds a connection to Cloudflare's edge and 503 before
+//! (cloudflared's `metrics/readiness.go`; checked against 2026.10.3). nestd polls it, every 2 s
+//! until ready and every 10 s after, and publishes `TunnelState` on a watch channel: `connecting`
+//! from the moment a tunnel is planned, `connected` on a 200, back to `connecting` on anything
+//! else. The fleet hello carries the current state and every change goes out as a `tunnel_state`
+//! event, so the control plane advertises the tunnel hostname only while it is served.
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use nest_protocol::control::TunnelState;
 use nest_protocol::model::Secret;
 use nix::unistd::{Gid, Uid};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -33,6 +43,13 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const STOP_GRACE: Duration = Duration::from_secs(5);
 /// How often a token without a binary is logged.
 pub const NAG_INTERVAL: Duration = Duration::from_secs(60);
+/// Where cloudflared serves `/ready` unless `cloudflared_metrics` says otherwise.
+pub const METRICS_ADDR: &str = "127.0.0.1:18791";
+/// Readiness polling: every [`PROBE_FAST`] until the tunnel is connected, every [`PROBE_SLOW`]
+/// after; each request gets [`PROBE_TIMEOUT`].
+pub const PROBE_FAST: Duration = Duration::from_secs(2);
+pub const PROBE_SLOW: Duration = Duration::from_secs(10);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Longer output lines are cut here and the rest of the line dropped.
 const MAX_LINE: u64 = 64 * 1024;
 /// A pipe that keeps failing to read is gone; stop after this many consecutive errors.
@@ -47,6 +64,8 @@ pub struct Tunnel {
     pub user: Option<(Uid, Gid)>,
     /// The child's `HOME`: a directory nestd creates, in which cloudflared finds no config file.
     pub home: PathBuf,
+    /// The metrics address cloudflared is told to listen on (`--metrics`), polled for `/ready`.
+    pub metrics: String,
 }
 
 /// Delays, injectable for tests.
@@ -56,11 +75,20 @@ pub struct Timing {
     pub backoff_max: Duration,
     pub stop_grace: Duration,
     pub nag_interval: Duration,
+    pub probe_fast: Duration,
+    pub probe_slow: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { backoff_min: BACKOFF_MIN, backoff_max: BACKOFF_MAX, stop_grace: STOP_GRACE, nag_interval: NAG_INTERVAL }
+        Self {
+            backoff_min: BACKOFF_MIN,
+            backoff_max: BACKOFF_MAX,
+            stop_grace: STOP_GRACE,
+            nag_interval: NAG_INTERVAL,
+            probe_fast: PROBE_FAST,
+            probe_slow: PROBE_SLOW,
+        }
     }
 }
 
@@ -85,7 +113,18 @@ pub fn plan(cfg: &Config, enrolled: &Enrolled) -> anyhow::Result<Plan> {
         }
         None => None,
     };
-    Ok(Plan::Run(Tunnel { bin, token, user, home: cfg.state_dir.join("cloudflared") }))
+    let metrics = cfg.cloudflared_metrics.clone().unwrap_or_else(|| METRICS_ADDR.to_string());
+    Ok(Plan::Run(Tunnel { bin, token, user, home: cfg.state_dir.join("cloudflared"), metrics }))
+}
+
+/// The state channel for a plan, at its initial value: `connecting` for a tunnel about to run
+/// (the control plane must not advertise it before `/ready` says so), `none` otherwise. The
+/// sender goes to [`spawn`]; the receiver feeds the fleet hello and the `tunnel_state` events.
+pub fn channel(plan: &Plan) -> (watch::Sender<TunnelState>, watch::Receiver<TunnelState>) {
+    watch::channel(match plan {
+        Plan::Run(_) => TunnelState::Connecting,
+        Plan::TokenWithoutBinary | Plan::Nothing => TunnelState::None,
+    })
 }
 
 /// The running supervisor. [`Supervisor::stop`] shuts the child down gracefully. Dropping it
@@ -110,19 +149,54 @@ impl Drop for Supervisor {
     }
 }
 
-/// Start the plan in the background: `None` when there is nothing to do.
-pub fn spawn(plan: Plan) -> Option<Supervisor> {
-    spawn_with(plan, Timing::default())
+/// Start the plan in the background: `None` when there is nothing to do. `state` is the sender
+/// from [`channel`]; a running tunnel's readiness is published on it.
+pub fn spawn(plan: Plan, state: watch::Sender<TunnelState>) -> Option<Supervisor> {
+    spawn_with(plan, Timing::default(), state)
 }
 
-pub fn spawn_with(plan: Plan, timing: Timing) -> Option<Supervisor> {
+pub fn spawn_with(plan: Plan, timing: Timing, state: watch::Sender<TunnelState>) -> Option<Supervisor> {
     let stop = CancellationToken::new();
     let task = match plan {
         Plan::Nothing => return None,
         Plan::TokenWithoutBinary => tokio::spawn(nag(timing.nag_interval, stop.clone())),
-        Plan::Run(tunnel) => tokio::spawn(supervise(tunnel, timing, stop.clone())),
+        Plan::Run(tunnel) => {
+            tokio::spawn(probe(format!("http://{}/ready", tunnel.metrics), timing, state, stop.clone()));
+            tokio::spawn(supervise(tunnel, timing, stop.clone()))
+        }
     };
     Some(Supervisor { stop, task })
+}
+
+/// Poll `/ready` and publish the tunnel's state until stopped. The first request goes out at
+/// once; a request that fails or times out counts as not ready (cloudflared is restarting).
+async fn probe(url: String, timing: Timing, state: watch::Sender<TunnelState>, stop: CancellationToken) {
+    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("tunnel readiness probe cannot start: {e}");
+            return;
+        }
+    };
+    loop {
+        let ready = match client.get(&url).send().await {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
+        };
+        let next = if ready { TunnelState::Connected } else { TunnelState::Connecting };
+        if *state.borrow() != next {
+            match next {
+                TunnelState::Connected => tracing::info!("tunnel connected: cloudflared reports a ready connection"),
+                _ => tracing::warn!("tunnel not ready: cloudflared reports no connection to Cloudflare"),
+            }
+            state.send_replace(next);
+        }
+        let interval = if ready { timing.probe_slow } else { timing.probe_fast };
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = stop.cancelled() => return,
+        }
+    }
 }
 
 async fn nag(interval: Duration, stop: CancellationToken) {
@@ -177,7 +251,7 @@ fn start(t: &Tunnel) -> std::io::Result<Child> {
     std::fs::create_dir_all(&t.home)?;
     let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
     let mut cmd = Command::new(&t.bin);
-    cmd.args(["--no-autoupdate", "tunnel", "run"])
+    cmd.args(["--no-autoupdate", "tunnel", "--metrics", &t.metrics, "run"])
         .env_clear()
         .env("PATH", path)
         .env("HOME", &t.home)
@@ -330,7 +404,7 @@ mod tests {
             self.dir.path().join(name)
         }
         fn tunnel(&self, token: &str) -> Tunnel {
-            Tunnel { bin: self.path("cloudflared"), token: Secret(token.into()), user: None, home: self.path("home") }
+            Tunnel { bin: self.path("cloudflared"), token: Secret(token.into()), user: None, home: self.path("home"), metrics: "127.0.0.1:1".into() }
         }
         fn text(&self) -> String {
             std::fs::read_to_string(&self.log).unwrap_or_default()
@@ -376,8 +450,44 @@ mod tests {
         raw.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
     }
 
+    /// A state sender nobody reads.
+    fn sender() -> watch::Sender<TunnelState> {
+        watch::channel(TunnelState::Connecting).0
+    }
+
+    /// A loopback HTTP server for `/ready`: answers 503 until `ready` is set, 200 after.
+    async fn fake_metrics() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+        use tokio::io::AsyncWriteExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = ready.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let (status, body) = if r.load(std::sync::atomic::Ordering::SeqCst) {
+                    ("200 OK", "{\"status\":200,\"readyConnections\":1}")
+                } else {
+                    ("503 Service Unavailable", "{\"status\":503,\"readyConnections\":0}")
+                };
+                let _ = s.write_all(format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (addr, ready)
+    }
+
     fn timing(min_ms: u64, max_ms: u64) -> Timing {
-        Timing { backoff_min: Duration::from_millis(min_ms), backoff_max: Duration::from_millis(max_ms), stop_grace: Duration::from_millis(300), nag_interval: Duration::from_millis(50) }
+        Timing {
+            backoff_min: Duration::from_millis(min_ms),
+            backoff_max: Duration::from_millis(max_ms),
+            stop_grace: Duration::from_millis(300),
+            nag_interval: Duration::from_millis(50),
+            probe_fast: Duration::from_millis(50),
+            probe_slow: Duration::from_millis(50),
+        }
     }
 
     /// The child stays up until SIGTERM, which it records.
@@ -413,13 +523,13 @@ mod tests {
     async fn child_gets_only_token_path_and_home_restarts_after_an_exit_and_gets_sigterm_on_stop() {
         let fake = Fake::new(|log| format!("if [ \"$n\" = 1 ]; then exit 0; fi\n{}", trap_term_and_wait(log)));
         let token = "tok-secret-value";
-        let sup = spawn_with(Plan::Run(fake.tunnel(token)), timing(100, 400)).unwrap();
+        let sup = spawn_with(Plan::Run(fake.tunnel(token)), timing(100, 400), sender()).unwrap();
         // The first run exited at once; the second is the restart, still running.
         let spawns = fake.wait_spawns(2).await;
         let pid = spawns[1].pid;
         assert!(alive(pid));
         let argv = proc_strings(pid, "cmdline");
-        assert_eq!(argv[2..], ["--no-autoupdate", "tunnel", "run"], "{argv:?}");
+        assert_eq!(argv[2..], ["--no-autoupdate", "tunnel", "--metrics", "127.0.0.1:1", "run"], "{argv:?}");
         assert!(argv.iter().all(|a| !a.contains(token)), "{argv:?}");
         let mut env = proc_strings(pid, "environ");
         env.sort();
@@ -440,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn backoff_doubles_to_the_cap_and_resets_after_a_long_run() {
         let fake = Fake::new(|_| "if [ \"$n\" = 5 ]; then sleep 0.7; fi\nexit 0".into());
-        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(150, 600)).unwrap();
+        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(150, 600), sender()).unwrap();
         let s = fake.wait_spawns(7).await;
         drop(sup);
         let gap = |i: usize| s[i].at - s[i - 1].at;
@@ -467,7 +577,7 @@ mod tests {
             let marker = Path::new(log).with_file_name("marker");
             format!("printf 'bad \\377\\376 bytes\\n'\nhead -c 300000 /dev/zero | tr '\\0' a\necho\necho after-the-long-line\ntouch {}\n{}", marker.display(), trap_term_and_wait(log))
         });
-        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(100, 400)).unwrap();
+        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(100, 400), sender()).unwrap();
         wait_for("the child to get past its output", || fake.path("marker").exists()).await;
         wait_for("the last line to be forwarded", || logs.count("after-the-long-line") == 1).await;
         let text = logs.text();
@@ -483,7 +593,7 @@ mod tests {
         let logs = Logs::default();
         let _guard = logs.install();
         let fake = Fake::new(|_| "exit 3".into());
-        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(50, 400)).unwrap();
+        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(50, 400), sender()).unwrap();
         fake.wait_spawns(2).await;
         drop(sup);
         let text = logs.text();
@@ -496,8 +606,8 @@ mod tests {
         let logs = Logs::default();
         let _guard = logs.install();
         let dir = tempfile::tempdir().unwrap();
-        let tunnel = Tunnel { bin: dir.path().join("absent"), token: Secret("t".into()), user: None, home: dir.path().join("home") };
-        let sup = spawn_with(Plan::Run(tunnel), timing(50, 400)).unwrap();
+        let tunnel = Tunnel { bin: dir.path().join("absent"), token: Secret("t".into()), user: None, home: dir.path().join("home"), metrics: "127.0.0.1:1".into() };
+        let sup = spawn_with(Plan::Run(tunnel), timing(50, 400), sender()).unwrap();
         wait_for("two failed starts", || logs.count("cloudflared failed to start") >= 2).await;
         drop(sup);
         assert!(logs.text().contains(&dir.path().join("absent").display().to_string()));
@@ -509,7 +619,7 @@ mod tests {
         let logs = Logs::default();
         let _guard = logs.install();
         let fake = Fake::new(|_| "trap '' TERM\nwhile :; do sleep 0.1; done".into());
-        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(100, 400)).unwrap();
+        let sup = spawn_with(Plan::Run(fake.tunnel("t")), timing(100, 400), sender()).unwrap();
         let pid = fake.wait_spawns(1).await[0].pid;
         let t0 = Instant::now();
         sup.stop().await;
@@ -528,7 +638,7 @@ mod tests {
         assert_eq!(planned.user, Some((me.uid, me.gid)));
         let fake = Fake::new(|log| format!("id -u >> {log}\nexit 0"));
         let tunnel = Tunnel { user: planned.user, ..fake.tunnel("t") };
-        let sup = spawn_with(Plan::Run(tunnel), timing(100, 400)).unwrap();
+        let sup = spawn_with(Plan::Run(tunnel), timing(100, 400), sender()).unwrap();
         fake.wait_spawns(1).await;
         wait_for("the child's uid", || fake.text().contains(&format!("\n{}\n", me.uid.as_raw()))).await;
         drop(sup);
@@ -543,14 +653,46 @@ mod tests {
         assert!(matches!(plan(&config(serde_json::json!({})), &enrolled(None)).unwrap(), Plan::Nothing));
         assert!(matches!(plan(&config(serde_json::json!({"cloudflared_bin": "/x"})), &enrolled(None)).unwrap(), Plan::Nothing));
         let Plan::Run(t) = plan(&config(serde_json::json!({"cloudflared_bin": "/x"})), &enrolled(Some("tok"))).unwrap() else { panic!("not planned to run") };
-        assert_eq!((t.bin.as_path(), t.token.expose(), t.user, t.home.as_path()), (Path::new("/x"), "tok", None, Path::new("/var/lib/nest-test/cloudflared")));
+        assert_eq!((t.bin.as_path(), t.token.expose(), t.user, t.home.as_path(), t.metrics.as_str()), (Path::new("/x"), "tok", None, Path::new("/var/lib/nest-test/cloudflared"), METRICS_ADDR));
+        let Plan::Run(t) = plan(&config(serde_json::json!({"cloudflared_bin": "/x", "cloudflared_metrics": "127.0.0.1:4"})), &enrolled(Some("tok"))).unwrap() else { panic!("not planned to run") };
+        assert_eq!(t.metrics, "127.0.0.1:4");
         let err = plan(&config(serde_json::json!({"cloudflared_bin": "/x", "cloudflared_user": "no-such-user-nest"})), &enrolled(Some("tok"))).err().unwrap();
         assert!(err.to_string().contains("no-such-user-nest"), "{err}");
-        assert!(spawn_with(Plan::Nothing, timing(50, 400)).is_none());
+        assert!(spawn_with(Plan::Nothing, timing(50, 400), sender()).is_none());
         let p = plan(&config(serde_json::json!({})), &enrolled(Some("tok"))).unwrap();
         assert!(matches!(p, Plan::TokenWithoutBinary));
-        let sup = spawn_with(p, timing(50, 400)).unwrap();
+        let (tx, rx) = channel(&p);
+        assert_eq!(*rx.borrow(), TunnelState::None, "a token without a binary serves nothing");
+        let sup = spawn_with(p, timing(50, 400), tx).unwrap();
         wait_for("the warning to repeat", || logs.count("no cloudflared_bin is configured") >= 2).await;
+        sup.stop().await;
+    }
+
+    /// The state follows `/ready`: `connecting` from the plan, `connected` once the metrics
+    /// server answers 200, `connecting` again when it stops, and `connecting` while nothing
+    /// listens at the address at all (cloudflared restarting). Polled at the test's 50 ms.
+    #[tokio::test]
+    async fn state_follows_the_ready_endpoint() {
+        let (addr, ready) = fake_metrics().await;
+        let fake = Fake::new(trap_term_and_wait);
+        let tunnel = Tunnel { metrics: addr, ..fake.tunnel("t") };
+        let p = Plan::Run(tunnel);
+        let (tx, rx) = channel(&p);
+        assert_eq!(*rx.borrow(), TunnelState::Connecting, "planned, not yet served");
+        let sup = spawn_with(p, timing(100, 400), tx).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(*rx.borrow(), TunnelState::Connecting, "503 is not ready");
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_for("connected", || *rx.borrow() == TunnelState::Connected).await;
+        ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        wait_for("connecting again", || *rx.borrow() == TunnelState::Connecting).await;
+        sup.stop().await;
+        // A plan whose metrics address has no listener stays `connecting`.
+        let p = Plan::Run(fake.tunnel("t"));
+        let (tx, rx) = channel(&p);
+        let sup = spawn_with(p, timing(100, 400), tx).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(*rx.borrow(), TunnelState::Connecting);
         sup.stop().await;
     }
 }

@@ -250,6 +250,7 @@ impl Host {
         // The host's tunnel, when the control plane gave it one and cloudflared is installed.
         // Decided here, started last, so a failure below leaves no child behind.
         let tunnel = crate::cloudflared::plan(&cfg, &enrolled)?;
+        let (tunnel_tx, tunnel_rx) = crate::cloudflared::channel(&tunnel);
         if let crate::cloudflared::Plan::Run(t) = &tunnel {
             let user = t.user.map(|(uid, _)| uid.as_raw());
             tracing::info!(bin = %t.bin.display(), ?user, tunnel_url = enrolled.gateway_url.as_deref().unwrap_or("-"), "this host runs a tunnel");
@@ -346,6 +347,7 @@ impl Host {
                 role: inner.cfg.role,
                 cell: inner.cfg.cell.clone(),
                 gateway_url: inner.cfg.gateway_url.clone(),
+                tunnel: tunnel_rx.clone(),
                 versions: ComponentVersions {
                     nestd: env!("CARGO_PKG_VERSION").into(),
                     nest_proxy: inner.cfg.versions.nest_proxy.clone(),
@@ -435,7 +437,19 @@ impl Host {
             let inner = inner.clone();
             tokio::spawn(async move { inner.housekeeping().await });
         }
-        let cloudflared = crate::cloudflared::spawn(tunnel);
+        // Every change of the tunnel's state goes to the control plane as an event (the hello
+        // carries the state at connect time).
+        {
+            let inner = inner.clone();
+            let mut rx = tunnel_rx;
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let state = *rx.borrow_and_update();
+                    inner.emit(HostEventBody::TunnelState { state });
+                }
+            });
+        }
+        let cloudflared = crate::cloudflared::spawn(tunnel, tunnel_tx);
         Ok(Host { inner, cloudflared })
     }
 }

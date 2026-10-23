@@ -37,6 +37,9 @@ pub struct Budgets {
     pub busy: Duration,
     /// The longest single sleep, whatever a `retry_after_ms` hint says.
     pub max_sleep: Duration,
+    /// The pause before resolving again after an HTTP 5xx from in front of the gateway (a
+    /// tunnel that is reconnecting answers 530 for a few seconds); at most `max_sleep`.
+    pub edge_pause: Duration,
     pub open: OpenOptions,
 }
 
@@ -47,6 +50,7 @@ impl Default for Budgets {
             not_ready: Duration::from_secs(60),
             busy: Duration::from_secs(30),
             max_sleep: Duration::from_secs(10),
+            edge_pause: Duration::from_secs(2),
             open: OpenOptions::default(),
         }
     }
@@ -124,6 +128,9 @@ pub async fn call_with(
                 if !re_resolved && needs_resolve(&e) {
                     tracing::info!(agent = %agent.id, sandbox = %target.sandbox, "hands target refused ({e}); resolving again");
                     re_resolved = true;
+                    if edge_outage(&e) && sleep_or_cancel(budgets.edge_pause.min(budgets.max_sleep), &mut cancel).await {
+                        return ToolCallResult::error("interrupted");
+                    }
                     continue;
                 }
                 return ToolCallResult::error(format!("hands unavailable: {e}"));
@@ -194,8 +201,9 @@ fn unknown_outcome(why: &str) -> ToolCallResult {
 }
 
 /// A refusal that a fresh target may cure: the binding is stale, expired or for a rotated key,
-/// the sandbox moved, or nothing answers where the target points (refused, reset, or a host
-/// that never completes the upgrade).
+/// the sandbox moved, or nothing usable answers where the target points (refused, reset, a
+/// hostname that no longer resolves, an edge with no connector behind the hostname or one that
+/// refused the credential, or a host that never completes the upgrade).
 fn needs_resolve(e: &OpenError) -> bool {
     match e {
         OpenError::Refused(r) => r.resolve_again() || r.code == RefusalCode::Unauthorized,
@@ -203,6 +211,11 @@ fn needs_resolve(e: &OpenError) -> bool {
         OpenError::Timeout(Phase::Connect) => true,
         OpenError::Timeout(Phase::Bind) | OpenError::Protocol(_) => false,
     }
+}
+
+/// An HTTP 5xx from in front of the gateway: the next resolve waits `Budgets::edge_pause` first.
+fn edge_outage(e: &OpenError) -> bool {
+    matches!(e, OpenError::Transport(t) if t.is_edge_outage())
 }
 
 /// How long to actually sleep for a `wait` hint: at most `max`, at most what is left of
@@ -406,8 +419,35 @@ mod tests {
             not_ready: Duration::from_millis(600),
             busy: Duration::from_millis(600),
             max_sleep: Duration::from_millis(100),
+            edge_pause: Duration::from_millis(50),
             open: OpenOptions { connect_timeout: Duration::from_millis(300), bind_timeout: Duration::from_secs(5) },
         }
+    }
+
+    /// A plain HTTP server answering every request with `status` and no upgrade: Cloudflare's
+    /// edge in front of a tunnel hostname with no connector behind it.
+    async fn http_status_server(status: u16) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let reply = format!("HTTP/1.1 {status} Edge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        url
     }
 
     async fn gateway_with_guest() -> (TestGateway, FakeGuest) {
@@ -688,6 +728,49 @@ mod tests {
         assert!(text_of(&r).contains("hands refused"), "{r:?}");
         assert!(guest.requests().await.is_empty(), "nothing reached the guest");
         assert!(agent.hands_target().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_edge_5xx_pauses_then_resolves_again_once_and_a_403_resolves_again_at_once() {
+        // The first target's hostname has no connector behind it (a dead host's tunnel, or one
+        // reconnecting): Cloudflare answers 530. The fresh target is the live gateway.
+        let (gw, guest) = gateway_with_guest().await;
+        let mut gone = gw.target(SBX, 4, AGENT);
+        gone.url = http_status_server(530).await;
+        let (agent, resolves) = agent_with_resolver(vec![target(gone), target(gw.target(SBX, 4, AGENT))]);
+        let (_tx, rx) = oneshot::channel();
+        let mut budgets = quick();
+        budgets.edge_pause = Duration::from_millis(80);
+        let started = Instant::now();
+        let r = call_with(&agent, "c1".into(), bash("echo hi"), rx, &budgets).await;
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(*resolves.lock().unwrap(), 2, "a 5xx from the edge resolves again once");
+        assert!(started.elapsed() >= Duration::from_millis(80), "the re-resolve waits the edge pause first");
+        assert_eq!(guest.requests().await.len(), 1);
+
+        // Access refusing the credential: resolve again (a rotated token rides on the fresh
+        // target) without the pause.
+        let mut refused = gw.target(SBX, 4, AGENT);
+        refused.url = http_status_server(403).await;
+        let (agent, resolves) = agent_with_resolver(vec![target(refused), target(gw.target(SBX, 4, AGENT))]);
+        let (_tx, rx) = oneshot::channel();
+        let mut budgets = quick();
+        budgets.edge_pause = Duration::from_secs(5);
+        let started = Instant::now();
+        let r = call_with(&agent, "c2".into(), bash("echo hi"), rx, &budgets).await;
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(*resolves.lock().unwrap(), 2, "an Access refusal resolves again once");
+        assert!(started.elapsed() < Duration::from_secs(5), "no pause for a refused credential");
+
+        // The gateway's own 404 (an unknown route) is final: one resolve, an error result.
+        let mut wrong = gw.target(SBX, 4, AGENT);
+        wrong.url = http_status_server(404).await;
+        let (agent, resolves) = agent_with_resolver(vec![target(wrong), target(gw.target(SBX, 4, AGENT))]);
+        let (_tx, rx) = oneshot::channel();
+        let r = call_with(&agent, "c3".into(), bash("echo hi"), rx, &quick()).await;
+        assert!(r.is_error, "{r:?}");
+        assert!(text_of(&r).contains("http 404"), "{r:?}");
+        assert_eq!(*resolves.lock().unwrap(), 1, "a 404 is the gateway's answer, not a stale target");
     }
 
     #[tokio::test]
