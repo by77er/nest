@@ -9,16 +9,18 @@ Boundaries between the processes on one host. Rust types: `nest_protocol::host`.
 | `nest hook` → runner | unix `SOCK_DGRAM` (async) / `SOCK_STREAM` frame (sync) | [runner-hooks/](runner-hooks/) |
 | `nest mcp` ↔ runner | unix `SOCK_STREAM`, length-prefixed JSON | [runner-mcp/](runner-mcp/) |
 | runner ↔ Claude Code | argv, env, managed settings, stream-json on stdio | [runner-claude/](runner-claude/) |
+| nestd ↔ gateway (designed) | unix `SOCK_STREAM`, length-prefixed JSON: the binding verification key, revocations, the VMs' vsock socket paths | [gateway](../../sandbox/gateway/) |
 
 ## Who talks to the control plane
 
 | Process | Control-plane connections | Holds |
 |---|---|---|
 | **nestd** (privileged) | enrollment, **fleet channel** (FleetDO) | host token, proxy CA key, leases, fencing authority |
-| **agent runner** (unprivileged) | one **session channel** per active agent (AgentDO), per `docs/interfaces/control-host/session/` | host token (memory, pushed by nestd), OAuth tokens (memory) |
-| **nest-proxy** (unprivileged) | none | injection secrets, CA key (memory, pushed by nestd) |
+| **agent runner** (unprivileged, brain hosts) | one **session channel** per active agent (AgentDO), per `docs/interfaces/control-host/session/` | host token (memory, pushed by nestd), OAuth tokens (memory), each agent's binding and gateway hostname (memory, from AgentDO) |
+| **nest-proxy** (unprivileged, sandbox hosts) | none | injection secrets, CA key (memory, pushed by nestd) |
+| **gateway** (unprivileged, sandbox hosts; designed) | none: it serves connections arriving through the host's tunnel | the binding verification key and revocations (memory, pushed by nestd) |
 
-**Decision: the runner owns its session channels; nestd does not relay them.** Session bytes are the largest traffic on a host, and turns, inbox, caches and platform tool calls are per-agent AgentDO concerns. Relaying them through nestd would add a hop and per-agent logic to the privileged daemon for no security gain. Fencing stays with nestd: it mirrors the lease to the runner (`lease_update`), kills brains on `fence`, and the runner kills everything if the nestd socket closes. AgentDO independently rejects stale epochs. The runner authenticates with the host token nestd hands it (memory only, rotated). Claude Code processes never see it.
+**Decision: the runner owns its session channels; nestd does not relay them.** Session bytes are the largest traffic on a host, and turns, inbox, caches and platform tool calls are per-agent AgentDO concerns. Relaying them through nestd would add a hop and per-agent logic to the privileged daemon for no security gain. Fencing stays with nestd: on a brain host it mirrors the lease to the runner (`lease_update`), kills brains on `fence` or when the lease lapses, and the runner kills everything if the nestd socket closes; AgentDO fences brains by the agent epoch and rejects stale ones. A sandbox host runs no brains, so its epoch reaches a brain only inside its binding, which the gateway and the guest check. The runner authenticates with the host token nestd hands it (memory only, rotated). Claude Code processes never see it.
 
 ## Sockets
 
@@ -29,6 +31,7 @@ Boundaries between the processes on one host. Rust types: `nest_protocol::host`.
 | `/run/nest/runner/hook.dgram` | `SOCK_DGRAM` | runner | `0660 nest-runner:nest-agents` |
 | `/run/nest/runner/hook.sock` | `SOCK_STREAM` | runner | `0660 nest-runner:nest-agents` |
 | `/run/nest/runner/mcp.sock` | `SOCK_STREAM` | runner | `0660 nest-runner:nest-agents` |
+| `/run/nest/gateway.sock` (designed) | `SOCK_STREAM` | nestd | `0660 root:nest-gateway` |
 
 **Planned:** Claude Code processes run as per-agent `DynamicUser`s in the `nest-agents` group (supplementary), so `nest hook` and `nest mcp` can reach the runner's sockets and nothing else. **Today** brains run as the runner's user in their own process group; the sync-hook and MCP sockets are bound to the brain's process tree with `SO_PEERCRED` (see [runner-hooks/](runner-hooks/)).
 

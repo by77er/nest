@@ -53,7 +53,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 
 1. **CI, `CODEOWNERS`, guards and agent skills.** Done.
 2. **Merge this branch into `main`.** `main` still holds only the initial commit.
-3. **Me:** the GitHub and Cloudflare steps in [setup.md](setup.md), and stages 1–3 of the [platform setup](../docs/setup/) (a Claude token, the control plane on Cloudflare, one controller host and one burst host).
+3. **Me:** the GitHub and Cloudflare steps in [setup.md](setup.md), and stages 1–3 of the [platform setup](../docs/setup/) (a Claude token, the control plane on Cloudflare, one sandbox host and one brain host).
 4. **Build the minimum platform slice,** in this order. Each step is a PR through the gates above, with me as reviewer until step 5:
    1. ChannelDO with posts, reads, subscriptions and wakes; the `user` channel through the API.
    2. Spawn specs, templates, capabilities and grants (taint included), replacing roles and WorkstreamDO.

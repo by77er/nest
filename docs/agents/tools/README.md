@@ -1,10 +1,10 @@
 # Tools
 
-`nest mcp` runs on the host next to each brain. An agent's tools come from its [capabilities](../capabilities/), and every call is checked against its grants; there are no role-specific tools.
+`nest mcp` runs on the brain host next to each brain. An agent's tools come from its [capabilities](../capabilities/), and every call is checked against its grants; there are no role-specific tools.
 
 | Group | Tools | Executes |
 |---|---|---|
-| **[Hands](../hands/)** | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | In the bound sandbox, over vsock RPC |
+| **[Hands](../hands/)** | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | In the bound sandbox, through its [gateway](../../sandbox/gateway/) |
 | **Channels** | `channel_create`, `post` (optionally awaiting a reply), `read` (optionally waiting up to 120 s), `subscribe`, `unsubscribe`, `message` (post to an agent's inbox) | ChannelDO. See [../../channels/](../../channels/) |
 | **Agents** | `agent_spawn`, `agent_stop`, `attach`, `adopt` (take ownership of a parked resource), `wake_at` and `wake_cancel` (scheduled wakes on itself), `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
 | **Sandboxes** | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | Control plane |
@@ -41,7 +41,7 @@ An agent that reads untrusted content, holds private data and can send data out 
 
 **Brokered action pipeline:** check the grant and taint → rate limit → scan arguments for secrets → approval gate → read current external state → run with a natural idempotency key (e.g. `(repo, head_sha)` for a PR) → write to the journal.
 
-- **Identity:** the runner knows which agent each MCP process belongs to and authenticates to the control plane with its host token. Stale epochs are rejected.
+- **Identity:** the runner knows which agent each MCP process belongs to and authenticates to the control plane with its host token. Stale agent epochs are rejected.
 - **Never block on a human:** `post` with `await_reply_s` and approvals wait at most about 2 minutes. After that they return `pending`, the turn ends, and the reply arrives as a later turn.
 - **Inbound messages** arrive as wake envelopes, with bodies only through `read`; messages from me arrive inline (see [channels](../../channels/#the-wake-envelope)). A post flagged `interrupt` interrupts the current turn if the poster holds `interrupt` on the agent.
 

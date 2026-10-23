@@ -8,11 +8,11 @@
 
 | `type` | Purpose |
 |---|---|
-| `hello_ack` | `host_id`, `host_role` (`burst` \| `controller`). The runner starts with no agents; nestd re-issues `agent_start` for agents that should run |
+| `hello_ack` | `host_id`, `host_role` (`burst` \| `controller`; designed: `host_kind: brain`, since the runner runs only on brain hosts). The runner starts with no agents; nestd re-issues `agent_start` for agents that should run |
 | `host_token` | Bearer for session-channel upgrades; sent after `hello_ack` and on rotation. Memory only |
 | `lease_update` | Every heartbeat. If it lapses, **or the socket closes**, the runner kills every brain (SIGKILL to its process group) |
 | `agent_start` | `{start: control::AgentStart, config_dir, hands?: {sandbox, epoch, vsock_uds_path}}`. Refused without a valid lease mirror (`error{no_lease}` + `agent_exited{fenced}`) or when `launch.builtin_tools` names a host-side tool (`error{forbidden_tool}` + `agent_exited{crashed}`) |
-| `agent_bind` | Rebind/unbind hands (next hands call) |
+| `agent_bind` | Rebind/unbind hands (next hands call). Designed: goes; AgentDO rebinds over the session channel |
 | `agent_stop` | `mode: graceful` (close stdin, finish turn; a brain still starting is killed) \| `kill` |
 | `fence` | Kill listed brains (empty = all) now, including ones still starting |
 | `ping` | Health |
@@ -29,11 +29,11 @@
 
 - **Session IDs:** `SessionId` = `ses_<Claude session UUID>` (`host::claude::session_id`). New sessions: the runner picks the UUID and passes `--session-id`. Resumes: the runner downloads `start.resume.segments` (Worker-signed URLs, `base` resets) into `claude::transcript_path(config_dir, cwd, uuid)` and passes `--resume <path>` (`--fork-session` if `fork`).
 - **Prompt and MCP config** are written into `config_dir` (`nest-system-prompt.md`, `nest-mcp.json`) before spawning.
-- **Hands** go directly from the runner to the guest: connect `vsock_uds_path`, `CONNECT 1025\n` (`guest::PORT_HANDS`), one `HandsRequest` per call. nestd configures the guest's agent slots (`guest::Configure`/`AgentAttach`) before `agent_start`/`agent_bind`.
+- **Hands (implemented contract):** the runner connects `vsock_uds_path`, `CONNECT 1025\n` (`guest::PORT_HANDS`), one `HandsRequest` per call, and nestd configures the guest's agent slots (`guest::Configure`/`AgentAttach`) before `agent_start`/`agent_bind`. The design has no `hands` field on this boundary at all (below).
 
 **Designed** ([pending contract changes](../../README.md#pending-contract-changes)):
-- **Guest version:** `agent_start.hands` and `agent_bind` carry `guest: {protocol_version, capabilities}` from the guest's latest `hello`, and nestd re-sends `agent_bind` when a new hello changes them. The runner stamps that version on every `HandsRequest` and uses only the advertised features ([host-guest](../../host-guest/#versions-v2)).
-- **Start steps:** the `claude --version` step becomes the [baseline check](../runner-claude/#version) (version and SHA-256). A new step looks up the hands calls `start.in_flight_hands` lists (`call_status`, ≤10 s) and sends the results to AgentDO as journal outcomes before Claude Code starts ([hands journal](../../../agents/hands/#journal)).
+- **Hands setup:** `agent_start` carries no `hands` field and `agent_bind` goes. nestd relays `control::AgentStart` unchanged, and for an agent with hands it carries `{hostname, binding, guest{protocol_version, capabilities}}` from AgentDO, which called SandboxDO's `attach` and `resolve`. The runner's hands client opens one WebSocket per call to the sandbox's gateway with that binding ([gateway](../../gateway/)), stamps the guest's version on every `HandsRequest`, uses only the advertised features ([host-guest](../../host-guest/#versions-v2)), and renews or re-resolves with `hands_resolve` on its session channel. nestd carries nothing about guests, sandboxes or hands to the runner.
+- **Start steps:** the `claude --version` step becomes the [baseline check](../runner-claude/#version) (version and SHA-256). A new step looks up the hands calls AgentDO lists as in flight (`call_status` through the gateway, ≤10 s) and reports their outcomes to AgentDO as canonical events before Claude Code starts ([hands journal](../../../agents/hands/#journal)).
 
 ## Error codes
 
@@ -72,7 +72,7 @@ nestd            runner                         claude (stdio)          nest hoo
  │                │                                │ PreToolUse ──► nest hook --sync
  │                │◄──────────────── HookDecisionRequest ───────────────────│
  │                │ match AgentCache.rules (~1 ms) ─ HookDecisionResponse ─►│ prints JSON
- │                │                                │ mcp__nest__Bash → nest mcp → runner → guest RPC
+ │                │                                │ mcp__nest__Bash → nest mcp → runner → hands client → gateway → guest RPC
  │                │◄── result ─────────────────────│ Stop ──► nest hook --sync (inbox mirror)
  │                │ tail transcript → segment ──────────────────────────────────────────────►│
  │                │ idle grace → close stdin → exit │
@@ -84,7 +84,8 @@ nestd            runner                         claude (stdio)          nest hoo
 ```
 AgentDO ── interrupt{seq} ──► runner ── {"type":"control_request","request_id":"r7","request":{"subtype":"interrupt"}} ──► claude
 runner ◄── {"type":"control_response","response":{"subtype":"success","request_id":"r7","response":{"still_queued":[]}}}
-in-flight hands calls: nest mcp gets notifications/cancelled → bridge `cancel{id}` → runner sends HandsCancel / closes the vsock connection → guest cgroup.kill
+in-flight hands calls: nest mcp gets notifications/cancelled → bridge `cancel{id}` → runner sends `cancel` / closes the call's WebSocket → the gateway closes the vsock side → guest cgroup.kill
+  (implemented: the runner closes the vsock connection itself)
 fallback (no interrupt capability, or not honored within interrupt_grace): SIGINT to the Claude Code pid only
   (its process group also holds `nest mcp` and hooks), then SIGKILL of the group after another grace
 hard kill (wedged): AgentStop{kill} or Fence → SIGKILL of the process group (no per-agent cgroup yet)

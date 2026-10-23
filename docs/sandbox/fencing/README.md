@@ -11,12 +11,12 @@ SandboxDO issues a new epoch with every [placement claim](../../control-plane/du
 - **Heartbeat** every 5 s.
 - **The host** treats its lease as expired **20 s after it *sent*** the renewal.
 - **The DO** waits **30 s** before treating it as expired. The gap absorbs clock drift, and both sides measure durations, not timestamps.
-- **On local expiry,** nestd pauses the VMs, drops their proxy listeners and netns, and stops every agent runner process (brain) on the host. The deadline is also checked on `CLOCK_BOOTTIME`, so a host that was suspended notices the lapse when it wakes.
+- **On local expiry,** nestd pauses the VMs and drops their proxy listeners and netns. Sandbox hosts run no brains; a brain host whose lease lapses kills its brains the same way, and AgentDO restarts them elsewhere under a new agent epoch once its own 30 s expiry passes ([runner](../../agents/runner/)). The deadline is also checked on `CLOCK_BOOTTIME`, so a host that was suspended notices the lapse when it wakes.
 - **Fencing is authoritative and never waits:**
   - **Immediate:** a `fence` command (or a revoked lease) takes effect when it arrives, not behind slow commands. The command result is still reported in order.
   - **Terminal per epoch:** an in-flight create, resume or suspend that finishes after a fence can't move the sandbox back to `running`. Long operations re-check for a fence after every await.
   - **Proxy:** nest-proxy refuses to re-add an epoch it dropped for fencing.
-  - **Without the sandbox lock:** vCPUs are frozen through a pause handle that doesn't need it, egress is dropped through a proxy link that never blocks, and brains are fenced through the runner.
+  - **Without the sandbox lock:** vCPUs are frozen through a pause handle that doesn't need it, and egress is dropped through a proxy link that never blocks. Bindings die with the epoch: the [gateway](../gateway/) and the guest refuse hands calls for any other, so no brain needs to be told.
 - **If nestd crashes,** its VMs should die with it (systemd `BindsTo` plus a watchdog; planned, not implemented yet).
 - **Heartbeats are evidence, not authority.** They renew leases, and their silence lets FleetDO expire them; they never move a sandbox's placement. Only a claim and its epoch do.
 
@@ -28,9 +28,9 @@ Every STONITH records each sandbox's loss explicitly ("work since generation G a
 
 ## 4. External side effects
 
-- Every event, tool call and brokered action carries `(sandbox, epoch)`, and stale ones are rejected.
+- Every sandbox event and commit carries `(sandbox, epoch)`, every hands call carries the sandbox epoch inside its binding, and platform tool calls carry the agent epoch; stale ones are rejected.
 - Brokered actions carry `(agent, epoch, call_id)`, rejected when stale, and use a natural idempotency key for the external effect (e.g. `(repo, head_sha)`).
-- A `PreToolUse` gate blocks, for example, `git push` from a stale epoch.
+- A `PreToolUse` gate blocks, for example, `git push` from a stale sandbox epoch; the runner knows the epoch from its binding.
 - Pushes use `--force-with-lease` (a template convention).
 
 ## 5. Salvage
@@ -47,6 +47,6 @@ The same happens when a newer epoch of a sandbox is created on a host that still
 t=0    last heartbeat
 t=20s  host self-fences (if alive)
 t=30s  DO lease expires → terminate the instance → confirmed → loss recorded ("work since G at T")
-t≈35s  new claim, epoch+1 → place on another host → lazy restore of head (disk-only → cold boot + --resume)
+t≈35s  new claim, epoch+1 → place on another host → lazy restore of head (disk-only → cold boot); the brain, on its brain host, re-resolves its binding and is told what was lost
        → completion CAS once the host reports the VM running, guest hello and agent ready
 ```

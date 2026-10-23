@@ -4,9 +4,9 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 
 | DO | Owns |
 |---|---|
-| [fleet/](fleet/) | Hosts, enrollment, leases, placement, drains, STONITH, base generations, command delivery |
-| [sandbox/](sandbox/) | Placement claims and epochs, the generation chain (pins, retention, losses), attachments, activity and holds, policy, ports |
-| [agent/](agent/) | Turn queue, deliveries, scheduled wakes, session stream, state, spec, grants, taint and budget, hands journal, tool relay |
+| [fleet/](fleet/) | Hosts of both kinds, enrollment and tunnels, leases, sandbox placement, drains, STONITH, desired versions, the binding verification key, base generations, command delivery |
+| [sandbox/](sandbox/) | Placement claims and epochs, the generation chain (pins, retention, losses), attachments and bindings (`attach`, `resolve`, `detach`), activity and holds, policy, ports |
+| [agent/](agent/) | Turn queue, deliveries, scheduled wakes, brain placement and the agent epoch, hands setup through SandboxDO, session stream, state, spec, grants, taint and budget, tool relay |
 | [channel/](channel/) | Message log, subscriptions and cursors, fan-out |
 | [hook/](hook/) | One webhook: verification (through BrokerDO), mapping, dedup, posting to its channel |
 | [broker/](broker/) | Claude setup tokens, injected secrets, hook secrets, capability credentials, GitHub App token minting |
@@ -20,5 +20,5 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 - **No lost updates across awaits.** A DO's input gate opens while it awaits R2 or another DO, so state is never saved from a copy loaded before an await: mutations load, apply and save synchronously. Inbound WebSocket messages are processed one at a time per channel.
 - **Timers are alarms,** several deadlines multiplexed onto one. A deadline is removed only after its handler succeeds; a failing handler is retried.
 - **Repair loops:** every transient state carries an alarm deadline, and when it fires the DO re-derives the state from durable facts. An unreachable peer means defer, never destroy.
-- **Hosts connect over hibernatable WebSockets:** one control connection per host to FleetDO, plus one per active agent to its AgentDO. A new connection supersedes the old one only after a valid hello.
+- **Hosts connect over hibernatable WebSockets:** one control connection per host to FleetDO, plus one per active agent from a brain host's runner to its AgentDO. Hands bytes never pass through a DO: they go from the brain to the sandbox host's gateway. A new connection supersedes the old one only after a valid hello.
 - **Bounded growth:** finished commands, tool calls, reply waits and turns are pruned; channel messages follow their channel's retention.

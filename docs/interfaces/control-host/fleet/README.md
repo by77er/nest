@@ -3,7 +3,9 @@
 > **Implemented contract.** Workstream fields, `role` and `WorkstreamEvent` go; see [pending contract changes](../../README.md#pending-contract-changes).
 
 
-One WebSocket per host. It carries lifecycle, leases, commands and host-level events. Per-agent traffic goes over the [session channel](../session/).
+One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycle, leases, commands and host-level events. Per-agent traffic goes over the [session channel](../session/).
+
+> **Designed:** `hello` carries `kind: brain | sandbox`; a brain host reports brain capacity and receives only `agent_start`, `agent_stop` and `fence`; FleetDO holds three desired versions per cell (brain host, sandbox host, guest image); sandbox hosts receive the binding verification key and revocations the way they receive policy secrets. See [pending contract changes](../../README.md#pending-contract-changes) and the [gateway](../../gateway/).
 
 ## Messages
 
@@ -48,13 +50,13 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `sandbox_destroy` | sandbox, epoch | Stop and delete local state. Chunks are left for GC. |
 | `policy_update` | sandbox, epoch, policy | Applied live by nest-proxy. Ignored if `policy.version` isn't newer. |
 | `secrets_update` | sandbox, epoch, secrets | Injection secret values, held in proxy memory only |
-| `port_expose` / `port_unexpose` | sandbox, epoch, port, `host_header{mode}` | Preview router mapping |
+| `port_expose` / `port_unexpose` | sandbox, epoch, port, `host_header{mode}` | The gateway's preview mapping |
 | `commit_result` | request, sandbox, outcome | Answer to `commit_request` (see the CAS sequence below) |
 | `guest_cli_result` | request, result (`guest::CliResult`) | Answer to a `guest_cli` event; nestd relays it to the guest's pending `cli` request. Like `commit_result`, hosts resolve it **on arrival**, not in command order |
-| `agent_start` | agent, role, workstream, `resume?`, `hands?`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. |
-| `agent_bind` | agent, `hands?` | Rebind or unbind hands. Takes effect at the next tool call. |
+| `agent_start` | agent, role, workstream, `resume?`, `hands?`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. Designed: sent to a brain host, with `hands = {hostname, binding, guest{protocol_version, capabilities}}` for the sandbox's [gateway](../../gateway/) |
+| `agent_bind` | agent, `hands?` | Rebind or unbind hands. Takes effect at the next tool call. Designed: goes; AgentDO rebinds over the session channel |
 | `agent_stop` | agent, reason | End the turn cleanly if possible, then stop the process |
-| `fence` | sandboxes, reason | Stop bound brains, pause VMs, drop listeners and netns |
+| `fence` | sandboxes, reason | Pause VMs, drop listeners and netns; on a brain host, kill the listed brains |
 | `drain` | reason, deadline_ms | Commit or suspend everything by the deadline, then exit |
 
 ## Host events (`HostEvent{ts_ms, type, …}`)

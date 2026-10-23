@@ -2,18 +2,22 @@
 
 Hosts, grouped into **cells**. A cell is compute plus its object store in one provider and region, such as AWS us-east-1 with S3. The control plane is global; sandbox state belongs to one cell.
 
-## Host roles
+## Host kinds
 
-| Role | Runs | Lifecycle |
+Two kinds, placed and scaled independently. A brain never runs on a sandbox host, a sandbox host never holds the subscription token, and a brain reaches a sandbox only through its [gateway](../sandbox/gateway/), so the two kinds share nothing but the cell.
+
+| Kind | Runs | Lifecycle |
 |---|---|---|
-| **[Controller](controller/)** | nestd (no sandboxes), brains without hands (agent runner), Discord gateway. **No sandboxes.** | Always on, small, stateless, any provider |
-| **Burst** | **Every sandbox** (Firecracker) plus the brains of agents attached to them (agent runner, outside the VMs) | Spot, scales to zero |
+| **Sandbox host** (`kind: sandbox`; the `burst` role in code) | **Every sandbox** (Firecracker), nestd, nest-proxy, cloudflared and the gateway. No brains. | Spot with nested virtualization, scales to zero |
+| **[Brain host](brain-hosts/)** (`kind: brain`) | nestd (enrollment, lease, runner supervision), the agent runner with one Claude Code process per active agent, `nest mcp`, and the Discord gateway client when FleetDO places it here. No sandboxes, no KVM, no S3 access. | The cheapest instance class that runs Claude Code, spot or on-demand; idle for 30 min, then terminated; scales to zero |
+
+**Not built:** brain hosts. The code has `burst` and `controller` host roles, and `control-plane/README.md` lists the gaps.
 
 ## Choice of provider
 
-- **DigitalOcean and most cheap VMs don't expose `/dev/kvm`.** That rules out Firecracker there, leaving gVisor as the only option.
+- **DigitalOcean and most cheap VMs don't expose `/dev/kvm`.** That rules out Firecracker there, leaving gVisor as the only option for sandboxes. Brain hosts need no KVM, so any provider can run them.
 - **AWS has supported nested virtualization since February 16, 2026,** launched on C8i, M8i and R8i ([what's new](https://aws.amazon.com/about-aws/whats-new/2026/02/amazon-ec2-nested-virtualization-on-virtual)); the user guide now also lists the 7i families, I7i/I7ie and X8i. The only `d` (local NVMe) variants are C8id, M8id and R8id. It costs nothing extra and is enabled with `--cpu-options NestedVirtualization=enabled`.
-- **The AWS burst fleet is the 8i family only** (C8i, M8i, R8i, with their `d` and flex variants): memory snapshots restore only on the same CPU model (see [restore ABI](../sandbox/state/memory/#restore-abi)), and Firecracker supports 8i hosts. That every 8i variant has the same CPU model, so the fleet shares one ABI, is unverified.
+- **The AWS sandbox fleet is the 8i family only** (C8i, M8i, R8i, with their `d` and flex variants): memory snapshots restore only on the same CPU model (see [restore ABI](../sandbox/state/memory/#restore-abi)), and Firecracker supports 8i hosts. That every 8i variant has the same CPU model, so the fleet shares one ABI, is unverified.
 - **GCP:** Intel series and N4D only. GCP quotes 10% or more overhead.
 - **Cost:**
   - On-demand AWS costs about 1.5× DigitalOcean.
@@ -25,8 +29,9 @@ Approximate prices, us-east-1, 2026:
 
 | Option | Price |
 |---|---|
-| c8i.large on-demand | $0.094/hr |
-| c8i.large spot | ~$0.033/hr |
+| c8i.large on-demand (sandbox host) | $0.094/hr |
+| c8i.large spot (sandbox host) | ~$0.033/hr |
+| t4g.medium on-demand (brain-host class, 2 vCPU / 4 GB, ARM) | ~$25/mo |
 | DigitalOcean CPU-optimized, 2 vCPU / 4 GB | $42/mo |
 | Lambda MicroVM, 2 vCPU / 4 GB | ~$0.25/hr |
 
@@ -38,9 +43,9 @@ Approximate prices, us-east-1, 2026:
 
 ## Components
 
-- [controller/](controller/): the always-on, stateless host for brains without hands
-- [nestd/](nestd/): the per-host daemon (sandboxes on burst hosts; the lease and runner commands on the controller host)
-- [autoscaling/](autoscaling/): spot capacity, scale-to-zero, interruptions
-- [provisioning/](provisioning/): images, launch template, IAM, network
+- [brain-hosts/](brain-hosts/): the hosts that run brains: cheap, stateless, no KVM, placed without regard to where sandboxes are
+- [nestd/](nestd/): the per-host daemon on both kinds (sandboxes, the gateway and cloudflared on sandbox hosts; runner supervision on brain hosts)
+- [autoscaling/](autoscaling/): spot capacity, scale-to-zero, interruptions, both kinds
+- [provisioning/](provisioning/): images, launch templates, IAM, network, host rollout
 
 Sources: [EC2 nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html), [GCP nested virtualization](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/overview), [DO pricing](https://www.digitalocean.com/pricing/droplets)

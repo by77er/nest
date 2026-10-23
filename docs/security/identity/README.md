@@ -10,6 +10,10 @@
 - **Forks get a new identity automatically:** a new sandbox ID and a new epoch.
 - Within a sandbox, `NEST_AGENT_ID` attributes calls to agents. It isn't a secret.
 
+## Client identity at the gateway
+
+A brain, a person's `nest` CLI or any other client reaches a sandbox only through its host's [gateway](../../sandbox/gateway/), and the gateway admits a connection only with a **binding**: a token SandboxDO signs at `attach` naming the sandbox, its epoch, the client, a scope (`hands`, `pty` or `ingress`) and an expiry of about an hour. `resolve` renews it; `detach` and any epoch bump void it. The gateway verifies the signature with the cell's binding key and pins `(sandbox, epoch)` on every frame, and the guest checks the epoch again. In front of the gateway, the host's tunnel hostname sits behind a Cloudflare Access service token that the control plane and brain hosts hold and a sandbox never does. A brain's own fencing token is its **agent epoch**, issued by AgentDO at each start and carried by platform tool calls and brokered actions ([AgentDO](../../control-plane/durable-objects/agent/)).
+
 ## Outbound credentials
 
 Sandboxes only ever see **placeholders**. nest-proxy substitutes real credentials, only on each binding's exact hosts (and methods and path prefix, when set), and GitHub goes through a GitHub App. See [../../sandbox/networking/egress/injection/](../../sandbox/networking/egress/injection/).

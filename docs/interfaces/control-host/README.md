@@ -10,13 +10,13 @@ How hosts (nestd and the agent runner) talk to the Cloudflare control plane. Rus
 | Enrollment | `POST /v1/hosts/enroll` (HTTPS) | host → Worker | [enrollment/](enrollment/) |
 | Fleet channel | `wss://…/v1/fleet` (one per host) | host → FleetDO | [fleet/](fleet/) |
 | Session channel | `wss://…/v1/agents/<agent>/session` (one per active agent) | agent runner → AgentDO | [session/](session/) |
-| Object-store GC | `POST /v1/hosts/gc/claim` and `/v1/hosts/gc/report` (HTTPS, host token) | burst host → FleetDO | [GC](../../sandbox/state/object-store/#garbage-collection) |
+| Object-store GC | `POST /v1/hosts/gc/claim` and `/v1/hosts/gc/report` (HTTPS, host token) | sandbox host → FleetDO | [GC](../../sandbox/state/object-store/#garbage-collection) |
 
 Also: [tools/](tools/) (the platform tool catalog and call semantics) and [models/](models/) (policy, events, generations, states).
 
 ## Common rules
 
-- **Hosts always dial out.** WebSocket upgrades carry `Authorization: Bearer <host_token>`. The first frame is a hello carrying `protocol_version` (currently `1`, `model::PROTOCOL_VERSION`). A version mismatch gets `error{unsupported_protocol_version}` and the socket closes.
+- **Hosts always dial out,** sandbox hosts and brain hosts alike. WebSocket upgrades carry `Authorization: Bearer <host_token>`. The first frame is a hello carrying `protocol_version` (currently `1`, `model::PROTOCOL_VERSION`). A version mismatch gets `error{unsupported_protocol_version}` and the socket closes.
 - **Reliable messages** carry a per-direction `seq` (starting at 1, never reused for a connection lineage) and are acknowledged with a **cumulative** `ack{up_to}`. The sender keeps unacknowledged messages and resends them after reconnect, starting after the `last_*_seq` the peer reported in its hello or hello-ack. Receivers deduplicate by `seq`. Delivery is **at least once, in order**.
 - **Unreliable messages:** `heartbeat` and its ack (a missed heartbeat is just a missed renewal), `segment` (ordered and deduplicated by byte offset instead), and `tools_list_request` / `tools_list` (retried by the caller).
 - **Batching:** hosts flush `events` every 1–2 s, or sooner when a batch reaches 100 entries. FleetDO batches `commands` the same way.
@@ -41,3 +41,5 @@ Captain/UI        WorkstreamDO/AgentDO        FleetDO                 host (nest
    │                    │                        │── CAS ───────────────────────────────┼──────────────────►│
    │                    │                        │ commands[commit_result committed] ──►│                   │
 ```
+
+In the design, `sandbox_create` goes to a sandbox host and `agent_start` to a brain host chosen by capacity, with `hands = {hostname, binding, guest}` for the sandbox's gateway ([gateway](../gateway/)); the runner's hands calls then cross the network to that host. The sequence above is the implemented contract, where both commands go to one host.

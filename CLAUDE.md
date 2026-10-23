@@ -1,6 +1,6 @@
 # nest
 
-A personal platform that combines sandboxes with durable agents. Claude Code brains run on hosts using my subscription; their hands work through RPC in Firecracker sandboxes on spot compute; a Cloudflare control plane holds the state; agents coordinate through channels, and structures like captains and workstreams are templates and conventions, not code.
+A personal platform built as two systems with one seam between them. The **sandbox system** runs machines: Firecracker microVMs on spot sandbox hosts in cells, reached only through each host's gateway. The **agent system** runs loops: durable agents whose brains are unmodified Claude Code processes on brain hosts, using my subscription (or, later, a Messages API loop inside the control plane), acting on sandboxes only over the network. A Cloudflare control plane holds the state; agents coordinate through channels, and structures like captains and workstreams are templates and conventions, not code.
 
 **Status:** early implementation. See the repo map in `docs/README.md`. Test with `cargo test --workspace`, `cd control-plane && npm test`, and `e2e/run.sh`.
 
@@ -18,14 +18,14 @@ The docs are **hierarchical**. Each directory's `README.md` summarizes that subs
 docs/
   architecture/    the system end to end: components, a turn's flow, failures, state, trust boundaries
   control-plane/   Cloudflare Workers + Durable Objects (fleet, sandbox, agent, channel, hook, broker), API (Discord bot), activator, metrics, upgrades
-  compute/         cells, controller/burst hosts, nestd, autoscaling, provisioning
-  sandbox/         drivers, state (memory, disk, object store), fencing, networking (egress, ingress), guest agent (hands server)
-  agents/          backends (pluggable), capabilities (pluggable tool bundles), runner (Claude Code on the host), hands (RPC tools), sessions, state tracking, tools and grants
+  compute/         cells, sandbox hosts, brain hosts, nestd, autoscaling, provisioning
+  sandbox/         drivers, state (memory, disk, object store), fencing, networking (egress, ingress), the gateway (the one network door into a sandbox), guest agent (hands server)
+  agents/          backends (pluggable), capabilities (pluggable tool bundles), runner (Claude Code on a brain host), hands (RPC tools through the gateway), sessions, state tracking, tools and grants
   channels/        named durable logs: post, read, subscribe (inboxes, events, questions, memory); external sources (webhooks, email)
   orchestration/   patterns, not code: the captain template, workstream conventions, repo maintenance, example structures; quota-aware scheduling
   security/        model access, identity (credential injection, OIDC), credentials inventory
   data/            what lives in DO SQLite, R2 and S3
-  interfaces/      boundary contracts (wire protocols, tool schemas); fixtures in protocol/fixtures/ are the source of truth
+  interfaces/      boundary contracts (wire protocols, the gateway contract, tool schemas); fixtures in protocol/fixtures/ are the source of truth
   setup/           everything needed to bring nest up: accounts, credentials, where they go, what each unlocks
 ```
 
@@ -35,7 +35,8 @@ docs/
   - The subscription token never enters a VM.
   - Claude Code runs unmodified, with documented flags only.
   - No proxy decrypts OAuth traffic.
-- **Agent logic belongs only in the control plane:** tool handlers, prompts and templates. Hosts are dumb runners, so any agent without hands (a captain, for example) can move to a pure-Cloudflare backend. See `docs/agents/backends/`.
+- **Agent logic belongs only in the control plane:** tool handlers, prompts and templates. Hosts are dumb runners, so any agent can move to a pure-Cloudflare backend. See `docs/agents/backends/`.
+- **Where an agent loop runs and where its sandbox runs are unrelated and opaque to each other.** A runner reaches a sandbox only through the seam (the SandboxDO control API, the gateway's hands data plane, and the sandbox's events on channels), by hostname and binding, never by sharing a host with it. See `docs/architecture/` and `docs/sandbox/gateway/`.
 - **No roles or workstreams in the platform.** Captains, workstreams and other structures are templates and conventions built from primitives (sandbox, agent, channel) and grants. See `docs/orchestration/`.
 - Keep the docs succinct: decisions plus brief rationale, not narrative.
 - Record a decision in the lowest-level doc that owns it, and update the summaries above it if they change.

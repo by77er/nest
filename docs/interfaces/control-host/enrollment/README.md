@@ -4,13 +4,13 @@
 
 | Field | Meaning |
 |---|---|
-| `role` | `burst` or `controller` |
+| `role` | `burst` or `controller` (designed: `kind`, `sandbox` or `brain`) |
 | `cell` | e.g. `aws-us-east-1`. Determines the object store and placement |
 | `proof.type = aws_identity_document` | The IMDSv2 instance identity document and its **`rsa2048` signature** (`/latest/dynamic/instance-identity/rsa2048`: RSA-2048 / SHA-256 CMS, with or without PEM armor), both base64. The signature goes in `pkcs7_b64`; the DSA `/pkcs7` signature isn't accepted. FleetDO checks the AWS signature, that **it launched this instance ID** (matching account and region), and that the instance hasn't enrolled before |
 | `proof.type = enrollment_token` | A single-use token I mint, for hosts outside AWS |
 | `proxy_ca_csr_pem` | CSR for nest-proxy's per-host intermediate CA. The private key is generated on the host and never leaves it |
 
-The response contains: `host` (id), `host_token` (a short-lived bearer token, about 1 h), `fleet_ws_url`, and `proxy_ca` (the intermediate certificate, about 7 days, plus the chain up to the root baked into the image).
+The response contains: `host` (id), `host_token` (a short-lived bearer token, about 1 h), `fleet_ws_url`, and `proxy_ca` (the intermediate certificate, about 7 days, plus the chain up to the root baked into the image). Designed: a sandbox host's response also carries `tunnel_token`, for the Cloudflare Tunnel and DNS record the Worker created for this host before answering ([gateway](../../../sandbox/gateway/)); a brain host enrolls the same way and gets none.
 
 **Errors:** `401 unauthorized` (bad proof), `409 forbidden` (instance already enrolled), `400 invalid_message`.
 

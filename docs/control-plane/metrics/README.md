@@ -22,12 +22,13 @@ One dataset, `nest_metrics`, bound to the Worker (and so to every DO). Each even
 | Source | Metrics |
 |---|---|
 | Worker | Requests by route and status, latency, exceptions |
-| FleetDO | Host connects, reconnect time after a deploy, lease renewals (late, missed), expiries, STONITH, placement attempts and failures |
+| FleetDO | Host connects by kind, reconnect time after a deploy, lease renewals (late, missed), expiries, STONITH, placement attempts and failures, the host version mix during a rollout |
 | SandboxDO | Commits (latency, bytes), restores (time, from cache or S3), forks, fences |
 | AgentDO | Turns (queued → started latency, duration, outcome, tokens and cost from the stream's `result`), brain starts (resume or fresh), crash restarts, rate limits, wake latency, tool calls by group and outcome, approvals |
 | ChannelDO | Posts, deliveries, loop-guard drops, backlog depth |
 | HookDO | Deliveries, verification failures, dedup hits |
-| Hosts (via FleetDO) | CPU, memory, free hugepages, VM count, proxy allows and denies, hands-call latency p50 and p99, session tail lag, guest agents' WARN and ERROR counts by log site ([diagnostics](../../sandbox/guest-agent/#diagnostics)) |
+| Sandbox hosts (via FleetDO) | CPU, memory, free hugepages, VM count, proxy allows and denies, gateway connections by route and outcome (refused bindings, stale epochs), hands-call latency p50 and p99 at the gateway, guest agents' WARN and ERROR counts by log site ([diagnostics](../../sandbox/guest-agent/#diagnostics)) |
+| Brain hosts (via FleetDO) | CPU, memory, brains running, hands-call round trip p50 and p99 as the runner sees it, session tail lag |
 
 ## Reading
 

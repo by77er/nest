@@ -1,8 +1,8 @@
 # nest
 
-A personal platform that combines sandboxes with durable agents. Long-lived Claude Code agents run on my own subscription. Their brains run on hosts, and their hands work in isolated VMs on commodity cloud compute. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
+A personal platform built as two systems with one seam: a **sandbox system** that runs isolated VMs on commodity cloud compute, and an **agent system** that runs long-lived Claude Code agents on my own subscription. Brains run on brain hosts (or, later, inside the control plane) and act on sandboxes only over the network, through each sandbox host's gateway; neither system knows where the other runs. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales burst hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Sandboxes run in Firecracker on nested-virtualization hosts (jailed, hugepages, the proxy root CA in KMS): a real Claude Code turn ran in a VM, its disk was committed at turn end, and after a host reboot the sandbox came back with the file (EC2, 2026-10-18; see [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/)). Hosts without `/dev/kvm` fall back to the process driver. Designed but not built: the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes), the Discord bot and the preview router; `control-plane/README.md` lists the gaps.
+**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales sandbox hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Sandboxes run in Firecracker on nested-virtualization hosts (jailed, hugepages, the proxy root CA in KMS): a real Claude Code turn ran in a VM, its disk was committed at turn end, and after a host reboot the sandbox came back with the file (EC2, 2026-10-18; see [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/)). Hosts without `/dev/kvm` fall back to the process driver. Designed but not built: the seam between the two systems (the [gateway](sandbox/gateway/), bindings, tunnels, [brain hosts](compute/brain-hosts/) and the agent epoch; today the runner calls the guest over vsock on the sandbox's host), the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes) and the Discord bot; `control-plane/README.md` lists the gaps.
 
 **Start with [architecture/](architecture/)** for how the pieces fit and how a turn flows. Everything needed to bring nest up (accounts, credentials, where they go) is in [setup/](setup/).
 
@@ -23,7 +23,7 @@ A personal platform that combines sandboxes with durable agents. Long-lived Clau
 5. **Decisions on the agent's hot path are local; everything else is async.** Hooks never wait on the network.
 6. **Each piece of data lives next to its main reader.** Metadata lives in Durable Objects, bookkeeping in R2 and sandbox bytes in S3.
 7. **One writer per entity, fenced by epochs.** Each entity has a single Durable Object, and stale writers are rejected.
-8. **Claude Code runs unmodified, outside the VMs.** The subscription token never enters a sandbox. Agents act on sandboxes only through RPC hands.
+8. **Claude Code runs unmodified, on brain hosts that never share a machine with a sandbox.** The subscription token never enters a sandbox or a sandbox host. Agents act on sandboxes only through RPC hands, over the network, through the gateway.
 
 ## Implementation
 
@@ -37,10 +37,11 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `crates/nest-proxy` | Egress proxy |
 | `crates/nest-guest` | Guest agent (hands server) |
 | `crates/nest-runner` | Agent runner |
+| `crates/nest-gateway`, `crates/nest-hands-client` | Planned: the sandbox gateway and the hands client ([gateway](sandbox/gateway/)) |
 | `crates/nest-cli` | `nest` binary: `nest hook`, `nest mcp`, in-sandbox commands |
 | `protocol/` | Fixtures, tool catalogs, Claude Code reference artifacts |
 | `e2e/` | Local end-to-end harness |
-| `deploy/` | Cells as an inframe stack (OpenTofu): network, bucket, IAM, the host-image pipeline; the burst-host install and bootstrap |
+| `deploy/` | Cells as an inframe stack (OpenTofu): network, bucket, IAM, the host-image pipeline; the sandbox-host install and bootstrap |
 | `images/` | The Firecracker guest image (kernel and `nest-base` rootfs) and its EC2 builder |
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
@@ -68,11 +69,11 @@ Captains, workstreams and teams are patterns built from these. See [orchestratio
 patterns        captains · workstreams (templates + conventions) · quota scheduling  orchestration/
 agents          backends · capabilities · runner · hands · sessions · state tracking · tools  agents/
 channels        logs · subscriptions · wakes · external sources (webhooks, email)      channels/
-sandbox         drivers · state · fencing · networking · guest agent                   sandbox/
-compute         cells · controller/burst hosts · nestd · autoscaling · provisioning    compute/
+sandbox         drivers · state · fencing · networking · gateway · guest agent         sandbox/
+compute         cells · sandbox hosts · brain hosts · nestd · autoscaling · provisioning  compute/
 control plane   Cloudflare Workers + Durable Objects · API · activator                 control-plane/
 cross-cutting   security (authority, model access, identity, credentials) · data      security/  data/
-contracts       boundary interfaces (wire protocols, tool schemas)                     interfaces/
+contracts       boundary interfaces (wire protocols, the gateway contract, tool schemas) interfaces/
 ```
 
 See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [interfaces/](interfaces/) and [setup/](setup/).
@@ -82,9 +83,12 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Term | Meaning |
 |---|---|
 | Sandbox | A VM: volumes, processes, network. Holds 0..N attached agents. |
-| Agent | A brain (Claude Code on a host, on my subscription) plus optional hands, grants and subscriptions. There are no agent roles. |
-| Agent runner | Host component that starts, drives and tails Claude Code processes |
-| Hands | `nest` MCP tools modeled on Claude Code's built-ins, executed in a sandbox by the guest agent |
+| Agent | A brain (Claude Code on a brain host, on my subscription; later, a Messages API loop inside AgentDO) plus optional hands, grants and subscriptions. There are no agent roles. |
+| Agent runner | Brain-host component that starts, drives and tails Claude Code processes, and carries their hands calls to a sandbox's gateway |
+| Hands | `nest` MCP tools modeled on Claude Code's built-ins, executed in a sandbox by the guest agent, reached through the sandbox host's gateway |
+| Gateway | The one network door into a sandbox: an unprivileged process per sandbox host, behind the host's Cloudflare Tunnel, that checks a binding and forwards hands, terminal and ingress connections to the guest over vsock |
+| Binding | A signed token from SandboxDO's `attach`: sandbox, epoch, client, scope and expiry. The gateway admits a connection only with one; an epoch bump voids it |
+| Agent epoch | Fencing token for a brain, issued by AgentDO at each brain start; platform tool calls and brokered actions carry it |
 | Attach | Bind an agent's hands to a sandbox |
 | Fork | Copy-on-write copy of a sandbox (disk only, or live with memory) |
 | Channel | A named, durable, append-only message log. Inboxes, platform events, questions, shared state and memory are all channels. |
@@ -99,14 +103,14 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Generation | Immutable manifest of a sandbox's disk (and optionally memory) chunks |
 | Epoch | Fencing token. A new one is issued with each placement claim, and only a host holding the newest epoch's lease may act for the sandbox. |
 | Cell | A unit of compute plus its object store (e.g. AWS us-east-1 with S3) |
-| Controller host | A small, always-on, stateless host: nestd (no sandboxes), brains without hands, and the Discord gateway |
-| Burst host | A spot VM with nested virtualization running Firecracker sandboxes (all sandboxes live here) |
+| Sandbox host | A spot VM with nested virtualization running Firecracker sandboxes, nestd, nest-proxy, cloudflared and the gateway. Every sandbox lives here; no brain does. The `burst` role in code. |
+| Brain host | A cheap host with no KVM running nestd, the agent runner and Claude Code processes. Every brain lives here; no sandbox does. Scales to zero. |
 | Captain | A pattern, not a platform concept: an agent without hands, spawned from the `captain` template, that manages other agents and escalates to me |
 | Workstream | A pattern, not a platform concept: a goal plus the channel, sandboxes and agents set up for it, grouped by a label |
 | nestd | Per-host daemon |
 | nest-proxy | Per-host egress proxy |
 | Guest agent | Hands server inside each sandbox VM. Holds no credentials. |
-| `nest mcp` / `nest` | `nest mcp`: the host-side stdio MCP bridge that Claude Code spawns. `nest`: the CLI used for hooks and inside sandboxes. |
+| `nest mcp` / `nest` | `nest mcp`: the stdio MCP bridge that Claude Code spawns on a brain host. `nest`: the CLI used for hooks, for a person's terminal and port-forward through the gateway, and inside sandboxes. |
 
 ## Settled decisions
 
@@ -115,7 +119,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Rust on the host side (nestd, nest-proxy, guest agent, UFFD/ublk, CLI); TypeScript for the control plane | this file |
 | Workers Paid ($5/mo) | [control-plane/](control-plane/) |
 | Hosts authenticate with signed instance identity documents; guests can't reach IMDS | [compute/provisioning/](compute/provisioning/) |
-| No agent roles. Placement follows hands; an agent without hands needs no machine. The brain backend is pluggable (`claude-code` now, `api-loop` inside the control plane later). | [agents/](agents/) |
+| No agent roles. Where a brain runs and where its sandbox runs are unrelated: brains run on brain hosts (later, inside AgentDO) and reach a sandbox only through the gateway; an agent without hands needs no sandbox. The brain backend is pluggable (`claude-code`, and `api-loop` inside the control plane later). | [agents/](agents/) |
 | Captains and workstreams are patterns (templates plus conventions), not code | [orchestration/](orchestration/) |
 | Agent features are pluggable capabilities: named bundles of tools, grants and prompt, composed by templates | [agents/capabilities/](agents/capabilities/) |
 | Agents message each other through the messaging capability; by default an agent reaches its owner and its label group | [agents/capabilities/](agents/capabilities/) |
@@ -156,7 +160,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | The AWS burst fleet is the 8i family only | [compute/](compute/) |
 | Placement packs by free hugepages | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
-| The harness runs on the host; hands are RPC into the sandbox; no credentials in VMs | [agents/](agents/) |
+| The harness runs on brain hosts; hands are RPC into the sandbox through the gateway; no credentials in VMs or on sandbox hosts | [agents/](agents/) |
 | I reach agents through a Discord bot that bridges Discord channels and threads to nest channels | [control-plane/api/discord/](control-plane/api/discord/) |
 | No platform API-key proxy; apps bring their own keys | [security/model-access/](security/model-access/) |
 | One session artifact: the native session file, tailed on the host. No proxy decrypts OAuth traffic. | [agents/sessions/](agents/sessions/) |
@@ -169,13 +173,20 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Operator tokens are scoped, stored hashed and sent only in headers; one revocation counter invalidates every minted session | [control-plane/api/](control-plane/api/) |
 | BrokerDO audits every credential mint, push and refusal; S3 access stays a cell-wide host role | [security/credentials/](security/credentials/) |
 | The netns has no uplink: nestd binds nest-proxy's listeners inside it and passes them over; the proxy is unprivileged | [sandbox/networking/egress/](sandbox/networking/egress/) |
-| Ingress (previews, terminals, port-forwards) goes over vsock through the guest agent | [sandbox/networking/ingress/](sandbox/networking/ingress/) |
+| Ingress (previews, terminals, port-forwards) goes through the gateway and over vsock through the guest agent | [sandbox/networking/ingress/](sandbox/networking/ingress/) |
 | Reliable channels deliver strictly in order: a gap or a processing failure closes the socket and the sender resends. Each peer process has an `instance_id`; a new one resets the lineage. | [interfaces/control-host/](interfaces/control-host/) |
 | A fence is terminal for its epoch, applied on arrival, and never waits on the proxy link | [sandbox/fencing/](sandbox/fencing/) |
 | Repo maintenance is a pattern: a maintainer, a worker per task, a clean-context reviewer per PR and a monitor, merging through the repo's own GitHub gates (required checks, the review check pinned to the App, `CODEOWNERS`) | [orchestration/repo-maintenance/](orchestration/repo-maintenance/) |
 | GitHub access is a GitHub App; BrokerDO mints installation tokens narrowed per binding | [control-plane/durable-objects/broker/](control-plane/durable-objects/broker/) |
-| Control-plane upgrades: expand-only schemas, wire formats compatible one version back, deploys at 100%, DO class changes one-way. Hosts upgrade by replacement | [control-plane/](control-plane/#upgrades) |
+| Control-plane upgrades: expand-only schemas, wire formats compatible one version back, deploys at 100%, DO class changes one-way. Hosts upgrade by replacement, brain hosts before sandbox hosts | [control-plane/](control-plane/#upgrades) |
 | Runtime metrics go to Workers Analytics Engine (numbers, enums and ids only), read through the `metrics` capability | [control-plane/metrics/](control-plane/metrics/) |
+| nest is two systems with one seam: the sandbox system (hosts, VMs, state, fencing, egress, the gateway) and the agent system (agents, runners, channels). Only three protocols cross it: the SandboxDO control API, the gateway's hands data plane, and the sandbox's events on channels. Co-location is never assumed; there is one hands path, and it goes over the network | [architecture/](architecture/), [sandbox/gateway/](sandbox/gateway/) |
+| Sandbox hosts accept no inbound connections: each runs cloudflared, and the gateway sits behind the host's tunnel hostname with an Access service token at the edge, a binding at the gateway and the epoch check in the guest. Tunnel-only to start; a VPC endpoint only if a measurement asks for one | [sandbox/gateway/](sandbox/gateway/) |
+| A brain has its own epoch, issued by AgentDO at each start; platform tool calls and brokered actions carry it, and hands calls carry the sandbox epoch inside the binding | [control-plane/durable-objects/agent/](control-plane/durable-objects/agent/) |
+| Hands journal records stay in the guest; after a crash the runner asks `call_status` through the gateway, and nestd relays nothing about agents | [agents/hands/](agents/hands/) |
+| Every brain runs on a brain host: the cheapest instance class that runs Claude Code, no KVM, idle 30 min then terminated. An agent without hands is a brain like any other, and the Discord gateway client is a singleton placed on one brain host; no host kind is reserved for brains without sandboxes | [compute/brain-hosts/](compute/brain-hosts/) |
+| A release rolls out control plane, then brain hosts, then sandbox hosts, one canary and a probe gate each; FleetDO holds three desired versions per cell (brain host, sandbox host, guest image), and rollback sets a version back | [compute/provisioning/](compute/provisioning/#upgrades) |
+| `api-loop` can hold hands through the gateway (a Durable Object opens one WebSocket per call) and is deferred until the API credits are picked up | [agents/backends/api-loop/](agents/backends/api-loop/) |
 
 ## Open questions and watch items
 
@@ -197,6 +208,9 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Open:** resolving upstream names with a DNS client instead of getaddrinfo, so TTL and CNAME caps can apply. Which origins honor `X-Forwarded-Host` and similar overrides is unverified (nest strips them regardless). See [sandbox/networking/egress/dns/](sandbox/networking/egress/dns/).
 - **Open:** taint is one bit, so it can't tell sandbox output from outside content; auto-merging agents' PRs relies on keeping outside content from the repo's workers. Recording a taint source would let PRs from sessions that read the web wait for me. See [repo maintenance](orchestration/repo-maintenance/#why-auto-merge-is-safe-enough).
 - **Not designed yet:** the sandbox-to-sandbox **link** (an opt-in path through the proxy). See [sandbox/](sandbox/).
+- **Measure:** the edge round trip a hands call pays over the tunnel, in the remote-brain arm of the fidelity eval (spike item 10). A VPC endpoint for same-cell brain hosts waits on this number. See [sandbox/gateway/](sandbox/gateway/).
+- **Measure:** a worker's wall time inside hands calls per turn, before `api-loop` ships: a Durable Object is billed while an outbound WebSocket is open. See [agents/backends/api-loop/](agents/backends/api-loop/).
+- **Needed for the tunnel (step 2 of the seam):** a domain on Cloudflare for the per-host hostnames, a Cloudflare API token with Tunnel Edit and DNS Edit as a Worker secret, and an Access service token. See [setup/](setup/).
 
 ## First spike
 
@@ -210,6 +224,7 @@ On a c8id with nested virtualization and a hugepage pool:
 7. Commit latency under write load, including the guest flush and the epoch flip.
 8. Forced-partition test: self-fence, then STONITH, then restore.
 9. **First real Claude Code run** through the runner (the verification list above). It needs no KVM, so it runs in the cloud dev environment through the e2e harness, with the token as `NEST_CLAUDE_OAUTH_TOKEN`. **Done** (2026-10-16, Claude Code 2.1.301, `NEST_E2E_CLAUDE=real e2e/run.sh`): a real turn ran entirely through `mcp__nest__` hands (Bash, Write, Read, Edit), with no host-side built-ins and the token absent from the sandbox. All 21 checks passed, including self-fencing 20 s after the control plane was cut.
-10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM) and with RPC hands; compare success rate, turns and tokens. The same eval gates every upgrade of the pinned Claude Code version ([runner](agents/runner/)).
+10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM), with RPC hands from a brain on the same machine, and with hands from a remote brain through the gateway and the tunnel; compare success rate, turns and tokens, and record the per-call round trip of the remote arm. The same eval gates every upgrade of the pinned Claude Code version ([runner](agents/runner/)).
 11. **Nested overhead:** CPU and I/O on a nested 8i instance against the same work on `.metal`.
 12. **Resume or fresh:** turn cost and quality when resuming a long session after the cache expired, against a fresh session seeded from memory.
+13. **The seam:** a brain on a laptop drives a sandbox in the `use1` cell through the gateway and the host's tunnel, running the real Claude Code Python task (F(90)); then the same with the brain on a brain host in the cell. The first proves the contract, the second the fleet ([gateway](sandbox/gateway/), [brain hosts](compute/brain-hosts/)).

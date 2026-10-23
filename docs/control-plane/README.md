@@ -19,7 +19,7 @@ When a daily limit is exceeded, operations **fail** until 00:00 UTC, so hosts mu
 
 ## Rules
 
-- **No bulk bytes.** Transcripts pass through the control plane and are stored in R2. Sandbox state never comes through it. See [../data/](../data/).
+- **No bulk bytes.** Transcripts pass through the control plane and are stored in R2. Sandbox state never comes through it, and neither do hands calls: a brain talks to a sandbox host's [gateway](../sandbox/gateway/) directly, and the control plane only issues the binding and resolves the hostname. See [../data/](../data/).
 - **No S3 credentials.** The only AWS credential is a scoped IAM user for EC2. See [../compute/provisioning/](../compute/provisioning/).
 - **Durability means DO storage plus alarms.** Not Workflows or Queues: on Paid their retention is fine (30 days and 14 days), but a long-lived opaque process (Claude Code) doesn't fit a step function, and either would be a second authority next to the entity's DO ([Workflows limits](https://developers.cloudflare.com/workflows/reference/limits/), [Queues limits](https://developers.cloudflare.com/queues/platform/limits/)). Queues stay an option for channel fan-out at scale.
 - **Point-in-time recovery:** DO SQLite can be restored to any point in the last 30 days ([SQLite API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)). Each DO takes a bookmark before migrating its own schema, so a bad migration can be undone object by object.
@@ -36,7 +36,7 @@ A deploy restarts every DO and drops every socket (above). Cloudflare can roll a
 - **Deploy at 100%, not gradually.** With DOs, a gradual deployment pins each object to one version until the next deployment, so old and new objects would talk to each other for the whole rollout ([docs](https://developers.cloudflare.com/workers/versions-and-deployments/gradual-deployments/with-durable-objects/)).
 - **Host reconnection is a free canary:** every host connected before a deploy should reconnect and renew its leases within about 2 minutes, even with no other traffic.
 
-Hosts upgrade by replacement; one that changes the [restore ABI](../sandbox/state/memory/#restore-abi) resumes dormant memory generations disk-only. See [provisioning](../compute/provisioning/#upgrades).
+Hosts upgrade by replacement, brain hosts before sandbox hosts, each kind behind a canary and a probe; a sandbox-host release that changes the [restore ABI](../sandbox/state/memory/#restore-abi) resumes dormant memory generations disk-only. See [provisioning](../compute/provisioning/#upgrades).
 
 ## Components
 

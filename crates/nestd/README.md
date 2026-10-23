@@ -1,6 +1,6 @@
 # nestd
 
-The privileged per-host daemon (`docs/compute/nestd/`). It speaks the fleet channel to FleetDO and owns sandboxes, network namespaces, the nest-proxy listener handoff, the guest control connection, leases and fencing.
+The privileged per-host daemon (`docs/compute/nestd/`). It speaks the fleet channel to FleetDO and owns sandboxes, network namespaces, the nest-proxy listener handoff, the guest control connection, leases and fencing; with `role: controller` it runs no sandboxes and only supervises the runner (the design's brain host, `docs/compute/brain-hosts/`).
 
 ```
 cargo build -p nestd
@@ -18,7 +18,7 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
 | `limits` | Per-sandbox token buckets for guest- and proxy-originated events |
 | `net` | Netns with no uplink: `unshare(CLONE_NEWNET)` in a helper thread, tap0 plus the nft ruleset, listeners bound inside the namespace via `setns` on a fresh thread |
 | `proxy_link` | nestd ↔ nest-proxy over SEQPACKET + `SCM_RIGHTS`. A state mirror plus sequence-tagged ops gives a full resync on every reconnect with nothing lost or duplicated. `apply` never blocks: queued ops carry duplicated fds, and sends have a timeout. Also: ping watchdog, resync count check, refusal of fenced epochs, socket access control |
-| `runner_link` | nestd ↔ agent runner. Keeps the desired set of brains and re-issues `agent_start` on reconnect. Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
+| `runner_link` | nestd ↔ agent runner. Keeps the desired set of brains and re-issues `agent_start` on reconnect, with the sandbox's vsock path for hands (the design routes hands through the gateway instead, `docs/sandbox/gateway/`). Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
 | `guest` | Guest control connection (vsock 1024): hello, configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
 | `vsock` | Hybrid-vsock `CONNECT` client and the unix-socket emulator (test transport) |
 | `driver` | `Driver`/`Vm`/`Pauser` traits; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (2M hugepages, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths |
@@ -82,9 +82,9 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 - **ublk lazy disk and the copy-on-write epoch flip.** Checkpoints currently pause the VM while chunking.
 - **UFFD memory restore.** Restores from `checkpoint` generations cold-boot from the disk.
 - **Garbage collection** of the object store, and the 12 h chunk-reuse rule it depends on. (Built: the S3 `ObjectStore` with parallel transfers, retries, multipart and a capped cache; spot notices from IMDS; resuming with saved host credentials after a restart.)
-- **The preview router.** `port_expose` is recorded only. Nothing on the host uses ingress port 10000 yet: no terminal attach, no `nest port-forward`.
+- **The gateway** (`docs/sandbox/gateway/`), cloudflared and `gateway.sock`. `port_expose` is recorded only; nothing on the host uses ingress port 10000 yet: no terminal attach, no `nest port-forward`; hands reach the guest from the runner over vsock on the same host.
 - **Live forks.** They're disk-only.
-- **Firecracker** runs on EC2 burst hosts with nested virtualization and is verified there end to end ([driver](../../docs/sandbox/drivers/firecracker/)); this dev environment has no `/dev/kvm`, so locally the driver is unit-tested only.
+- **Firecracker** runs on EC2 sandbox hosts (the `burst` role) with nested virtualization and is verified there end to end ([driver](../../docs/sandbox/drivers/firecracker/)); this dev environment has no `/dev/kvm`, so locally the driver is unit-tested only.
 - **Jailer path untested against a real jailer.** The chroot hard-links require the disk and kernel on the same filesystem as the chroot base.
 - **systemd supervision** (`BindsTo=nestd` scopes for VMs, `WatchdogSec`) and **per-agent `DynamicUser` ownership** of config dirs.
 - **`capacity.warm`**, `drain` ending with nestd exiting, and the control `health` probe to the guest.
