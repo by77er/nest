@@ -74,11 +74,15 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 
 ## Known gaps
 
-- **The two-system split** (`docs/architecture/`): the sandbox gateway, bindings (`attach`/`resolve`/`detach`),
-  `hands_resolve`, the agent epoch, host kinds with brain placement by capacity, per-host tunnels and the three
-  desired versions aren't built. The code has `burst` and `controller` host roles (`HostRole`),
-  `FleetDO.controllerHost()` starts captains on a `controller` host, other brains start on the sandbox's host,
-  and `agent_start.hands` carries the sandbox's vsock path for the runner to call the guest directly.
+- **The two-system split** (`docs/architecture/`): the control plane's side of the seam is built: BrokerDO holds
+  the per-cell binding signing key (`binding_key:<cell>`, a P-256 private JWK; `signBinding`, `bindingPublicKeys`),
+  FleetDO sends `binding_key` after every hello and records each host's `gateway_url`, SandboxDO configures agent
+  slots with `agent_attach`/`agent_detach` and answers `resolve` with a `HandsTarget` only once the slot's result
+  is in, AgentDO answers `hands_resolve` on the session channel, and `POST /v1/sandboxes/:id/resolve` serves a
+  person or a test harness. Not built: the agent epoch, host kinds with brain placement by capacity, per-host
+  tunnels, key rotation and the three desired versions. The code has `burst` and `controller` host roles
+  (`HostRole`), `FleetDO.controllerHost()` starts captains on a `controller` host, other brains start on the
+  sandbox's host, and `agent_start.hands` carries the sandbox id and epoch only (the runner fetches its target).
 - **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
   with attenuation, spawn specs, templates and capabilities, owners and labels aren't built. The code still has
   `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with

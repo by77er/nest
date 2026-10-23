@@ -23,12 +23,15 @@ type HostStatus = "active" | "draining" | "expired" | "stonith_pending" | "dead"
 
 interface HostRow {
   host: string;
+  cell: string;
   role: HostRole;
   instance_id: string | null;
   status: HostStatus;
   last_rx: number | null;
   token_exp: number;
   capacity: string | null;
+  /** Where clients reach this host's sandbox gateway, from its hello (null: none advertised). */
+  gateway_url: string | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -134,6 +137,8 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("launched", "reason", "TEXT");
     this.addColumn("launched", "ended_ms", "INTEGER");
     this.addColumn("hosts", "idle_since", "INTEGER");
+    // The seam: where clients reach a host's sandbox gateway (docs/sandbox/gateway/).
+    this.addColumn("hosts", "gateway_url", "TEXT");
     this.addColumn("leases", "state", "TEXT");
     // Object-store GC: the cell's sandboxes (their generations are the roots) and the runs.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS sandboxes (sandbox TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL,
@@ -417,8 +422,8 @@ export class FleetDO extends DurableObject<Env> {
     const lastInstance = prior.nestd_instance as string | null;
     const newProcess = lastInstance !== null && lastInstance !== hello.instance_id;
     if (newProcess) this.rel.reset(att.host);
-    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ? WHERE host = ?",
-      now, JSON.stringify(hello.capacity), hello.instance_id, att.host);
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ? WHERE host = ?",
+      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, att.host);
     ws.serializeAttachment({ host: att.host, helloed: true } satisfies Attachment);
 
     this.send(ws, {
@@ -430,6 +435,7 @@ export class FleetDO extends DurableObject<Env> {
       host_token_expires_ms: prior.token_exp,
     });
     if (prior.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, att.host);
+    await this.sendBindingKeys(ws, prior.cell);
 
     // Resend unacked commands the host hasn't processed.
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
@@ -483,7 +489,7 @@ export class FleetDO extends DurableObject<Env> {
       }
       this.sql.exec("UPDATE leases SET state = ? WHERE sandbox = ? AND host = ? AND epoch = ?", s.state, s.sandbox, host, s.epoch);
       try {
-        await this.sandbox(s.sandbox).reportState(host, s.epoch, s.state, null, "reported in hello");
+        await this.sandbox(s.sandbox).reportState(host, s.epoch, s.state, null, "reported in hello", s.guest ?? null);
       } catch (e) {
         console.error(`FleetDO: reconciling ${s.sandbox} failed`, e);
       }
@@ -571,7 +577,7 @@ export class FleetDO extends DurableObject<Env> {
         if (this.holds(host, ev.sandbox, ev.epoch)) {
           this.sql.exec("UPDATE leases SET state = ? WHERE sandbox = ? AND host = ?", ev.state, ev.sandbox, host);
         }
-        await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.suspend_mode ?? null, ev.detail ?? null);
+        await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.suspend_mode ?? null, ev.detail ?? null, ev.guest ?? null);
         // A draining host's sandboxes leave as soon as they're safely suspended.
         if (ev.state === "suspended" && this.host(host)?.status === "draining") await this.evict(host, [ev.sandbox]);
         return;
@@ -667,6 +673,10 @@ export class FleetDO extends DurableObject<Env> {
     }
     if (row.type === "agent_stop" && outcome.status === "ok" && row.agent) {
       this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", row.agent, host);
+    }
+    // The sandbox side of `attach`: SandboxDO hands out no binding for an agent until its slot exists.
+    if (row.type === "agent_attach" && row.sandbox && row.epoch !== null && row.agent) {
+      await this.sandbox(row.sandbox).attachResult(host, row.epoch, row.agent, cmd, outcome);
     }
     if (outcome.status === "error") {
       if (row.sandbox && row.epoch !== null) await this.sandbox(row.sandbox).commandFailed(host, row.type, row.epoch, outcome.error);
@@ -821,6 +831,24 @@ export class FleetDO extends DurableObject<Env> {
       || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND (host IS NULL OR reason IS NOT NULL)").toArray().length
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length;
     if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
+  }
+
+  /**
+   * The cell's binding verification keys, for the host's sandbox gateway (docs/sandbox/gateway/).
+   * Sent after every hello: the gateway verifies bindings with them and holds nothing else.
+   */
+  private async sendBindingKeys(ws: WebSocket, cell: string): Promise<void> {
+    try {
+      const keys = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).bindingPublicKeys(cell);
+      this.send(ws, { type: "binding_key", keys });
+    } catch (e) {
+      console.error("FleetDO: binding keys unavailable; the host's gateway refuses bindings until the next hello", e);
+    }
+  }
+
+  /** The URL clients reach `host`'s sandbox gateway at, as the host advertised it. */
+  async hostGatewayUrl(host: string): Promise<string | null> {
+    return this.host(host)?.gateway_url ?? null;
   }
 
   private async rotateToken(ws: WebSocket, host: string): Promise<void> {

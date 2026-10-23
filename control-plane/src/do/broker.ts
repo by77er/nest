@@ -2,8 +2,13 @@
 // leave the control plane except inside agent_start (Claude setup token) and secrets_update (proxy memory).
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { NestError } from "../lib/util";
+import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
+import { b64url, NestError } from "../lib/util";
+import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
 import { type AgentRole, ErrorCodes, type InjectionSecret } from "../protocol/model";
+
+/** The per-cell binding signing key, stored as a secret named `binding_key:<cell>`. */
+type StoredBindingKey = { kid: string; public_key: string; private_jwk: JsonWebKey };
 
 /** Mints short-lived GitHub App installation tokens per workstream. Not implemented yet. */
 export interface GitHubAppMinter {
@@ -21,6 +26,8 @@ export class NotImplementedGitHubAppMinter implements GitHubAppMinter {
 export class BrokerDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   github: GitHubAppMinter = new NotImplementedGitHubAppMinter();
+  /** Imported signing keys by kid (memory only; rebuilt from the stored JWK after an eviction). */
+  private readonly bindingSigners = new Map<string, Promise<CryptoKey>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -75,6 +82,46 @@ export class BrokerDO extends DurableObject<Env> {
       if (s) out.push({ binding, value: secretRef(name), ...(s.expires_ms !== null ? { expires_ms: s.expires_ms } : {}) });
     }
     return out;
+  }
+
+  // --- binding keys (docs/interfaces/gateway/) --------------------------------------------------
+
+  /**
+   * The cell's binding signing key, generated on first use. The private JWK rests here and nowhere
+   * else; hosts get only the public point (`bindingPublicKeys`), and SandboxDO gets signed tokens.
+   */
+  private async bindingKey(cell: string): Promise<StoredBindingKey> {
+    const name = `binding_key:${cell}`;
+    const row = this.secret(name);
+    if (row) return JSON.parse(row.value) as StoredBindingKey;
+    const pair = await generateBindingKey();
+    // Another caller may have generated one across the await: the first stored key wins.
+    const again = this.secret(name);
+    if (again) return JSON.parse(again.value) as StoredBindingKey;
+    const stored: StoredBindingKey = { kid: pair.kid, public_key: b64url(pair.publicKey), private_jwk: pair.privateJwk };
+    await this.putSecret(name, JSON.stringify(stored));
+    return stored;
+  }
+
+  /** Every key a gateway in `cell` must accept (one today; the list is what a rotation extends). */
+  async bindingPublicKeys(cell: string): Promise<BindingKey[]> {
+    const k = await this.bindingKey(cell);
+    return [{ kid: k.kid, public_key: k.public_key }];
+  }
+
+  /** Sign a binding for `cell` with its current key; `v` and `kid` are filled in here. */
+  async signBinding(cell: string, claims: Omit<BindingClaims, "v" | "kid">): Promise<string> {
+    const k = await this.bindingKey(cell);
+    let signer = this.bindingSigners.get(k.kid);
+    if (!signer) {
+      // A rejected import must not poison the cell: the next call imports again.
+      signer = importPrivateJwk(k.private_jwk).catch((e: unknown) => {
+        this.bindingSigners.delete(k.kid);
+        throw e;
+      });
+      this.bindingSigners.set(k.kid, signer);
+    }
+    return signBindingToken(await signer, { v: BINDING_VERSION, kid: k.kid, ...claims });
   }
 
   /** Resolve references to current values; missing or expired secrets resolve to `null`. */
