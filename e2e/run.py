@@ -321,7 +321,10 @@ def nest_tool_uses(text):
 
 
 def transcript_tool_uses(text):
-    names = []
+    """Each tool call once, by its `tool_use` id: Claude Code 2.1.309's transcript also carries
+    `api-request-blob` lines that replay earlier assistant content, so counting blocks on every line
+    counted each call again (12 for 8 gateway connections)."""
+    names, seen = [], set()
     for line in text.splitlines():
         try:
             o = json.loads(line)
@@ -330,6 +333,10 @@ def transcript_tool_uses(text):
         content = (o.get("message") or {}).get("content") if isinstance(o, dict) else None
         for b in content if isinstance(content, list) else []:
             if isinstance(b, dict) and b.get("type") == "tool_use":
+                key = b.get("id") or (len(seen), b.get("name"))
+                if key in seen:
+                    continue
+                seen.add(key)
                 names.append(b.get("name", ""))
     return names
 
