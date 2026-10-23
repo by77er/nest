@@ -1,5 +1,5 @@
 //! The `nest mcp` bridge server: `tools/list` = hands tools (when bound) + AgentDO's platform
-//! tools; `tools/call` routes hands → guest RPC, everything else → AgentDO relay.
+//! tools; `tools/call` routes hands → the sandbox's gateway, everything else → AgentDO relay.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -127,10 +127,10 @@ async fn call(
     cancel: oneshot::Receiver<()>,
 ) -> McpBridgeResponse {
     if HANDS_TOOLS.contains(&name) {
-        let Some(binding) = agent.inner.lock().unwrap().hands.clone() else {
+        if agent.inner.lock().unwrap().hands.is_none() {
             let e = ErrorBody { code: error_codes::NOT_BOUND.into(), message: "this agent has no sandbox bound (no hands)".into(), retryable: false };
             return McpBridgeResponse::Error { id: Some(id), error: e };
-        };
+        }
         let op = match hands::op_from_mcp(name, &arguments) {
             Ok(op) => op,
             Err(msg) => return McpBridgeResponse::ToolsCall { id, result: ToolCallResult::error(msg) },
@@ -149,7 +149,7 @@ async fn call(
         // The guest call id is Claude Code's tool_use id when `nest mcp` found one in the
         // request's `_meta` (UNVERIFIED that Claude Code sends it); otherwise a generated id.
         let call_id = tool_use_id.unwrap_or_else(|| format!("hc_{}", &key[..12]));
-        let result = hands::call(&binding.vsock_uds_path, &agent.id, binding.epoch, call_id, op, merged_rx).await;
+        let result = hands::call(agent, call_id, op, merged_rx).await;
         agent.hands_inflight.lock().unwrap().remove(&key);
         McpBridgeResponse::ToolsCall { id, result }
     } else {

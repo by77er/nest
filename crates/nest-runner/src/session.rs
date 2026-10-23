@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::runtime::{Agent, AgentCmd, Outbound, Runtime};
+use crate::runtime::{Agent, AgentCmd, HandsResolveOutcome, Outbound, Runtime};
 use crate::tailer::Tailer;
 
 /// Flush an event batch early at this size.
@@ -56,6 +56,8 @@ struct State {
     batch: Vec<AgentEvent>,
     /// Session bytes AgentDO reported durable.
     durable: u64,
+    /// `hands_resolve` requests made while disconnected, sent right after the next `hello_ack`.
+    resolves: Vec<model::RequestId>,
     /// Set by `Close`: give up at this instant.
     close_deadline: Option<tokio::time::Instant>,
 }
@@ -90,7 +92,15 @@ impl State {
 
 impl Session {
     pub async fn run(mut self, mut out: mpsc::UnboundedReceiver<Outbound>) {
-        let mut st = State { next_seq: 1, unacked: VecDeque::new(), last_in: 0, batch: Vec::new(), durable: 0, close_deadline: None };
+        let mut st = State {
+            next_seq: 1,
+            unacked: VecDeque::new(),
+            last_in: 0,
+            batch: Vec::new(),
+            durable: 0,
+            resolves: Vec::new(),
+            close_deadline: None,
+        };
         let mut backoff = Duration::from_millis(100);
         loop {
             match self.connect_once(&mut st, &mut out).await {
@@ -130,6 +140,7 @@ impl Session {
             Outbound::AbandonCall(call) => {
                 st.abandon(&call);
             }
+            Outbound::HandsResolve(req) => st.resolves.push(req),
             Outbound::ToolsListRequest(_) | Outbound::Reconnect => {}
             Outbound::SetTranscript(p) => self.tailer.set_path(p),
             Outbound::SetSession(s) => self.session = Some(s),
@@ -204,6 +215,9 @@ impl Session {
         for (_, m) in &st.unacked {
             tx.send(text(m)?).await?;
         }
+        for request in std::mem::take(&mut st.resolves) {
+            tx.send(text(&RunnerToAgent::HandsResolve { request })?).await?;
+        }
         if let Some(o) = self.opened.take() {
             let _ = o.send(());
         }
@@ -260,6 +274,7 @@ impl Session {
                             tx.send(text(&m)?).await?;
                         }
                         Outbound::ToolsListRequest(request) => tx.send(text(&RunnerToAgent::ToolsListRequest { request })?).await?,
+                        Outbound::HandsResolve(request) => tx.send(text(&RunnerToAgent::HandsResolve { request })?).await?,
                         Outbound::SetTranscript(p) => self.tailer.set_path(p),
                         Outbound::SetSession(s) => self.session = Some(s),
                         Outbound::Reconnect => {
@@ -304,6 +319,9 @@ impl Session {
             AgentToRunner::CacheUpdate { cache, .. } => a.set_cache(cache),
             AgentToRunner::ToolResult { call, outcome, .. } => a.resolve_call(&call, outcome),
             AgentToRunner::ToolsList { request, tools } => a.resolve_tools(&request, tools),
+            AgentToRunner::HandsResolved { request, hands, error, retry_after_ms } => {
+                a.resolve_hands(&request, HandsResolveOutcome::from_wire(hands, error, retry_after_ms));
+            }
             AgentToRunner::Ack { up_to } => st.unacked.retain(|(s, _)| *s > up_to.0),
             AgentToRunner::SegmentAck { durable_bytes, .. } => st.durable = st.durable.max(durable_bytes),
             AgentToRunner::HelloAck { .. } => {}
@@ -416,7 +434,15 @@ mod tests {
     fn abandoning_a_call_keeps_the_seq_lineage_contiguous() {
         let call = model::CallId("cal_t1-1".into());
         let tc = |seq| RunnerToAgent::ToolCall(ToolCall { seq: Seq(seq), call: call.clone(), turn: None, name: "notify".into(), arguments: serde_json::json!({}) });
-        let mut st = State { next_seq: 3, unacked: VecDeque::from([(1, tc(1)), (2, tc(2))]), last_in: 0, batch: Vec::new(), durable: 0, close_deadline: None };
+        let mut st = State {
+            next_seq: 3,
+            unacked: VecDeque::from([(1, tc(1)), (2, tc(2))]),
+            last_in: 0,
+            batch: Vec::new(),
+            durable: 0,
+            resolves: Vec::new(),
+            close_deadline: None,
+        };
         st.unacked[1].1 = RunnerToAgent::Events { seq: Seq(2), events: vec![] };
         let fresh = st.abandon(&call);
         // The unacked copy became a cancel at the same seq; a fresh cancel follows at the next seq.
@@ -426,5 +452,86 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3]);
         assert_eq!(st.next_seq, 4);
         assert!(!st.unacked.iter().any(|(_, m)| matches!(m, RunnerToAgent::ToolCall(_))));
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::runtime::HandsResolveOutcome;
+    use nest_protocol::control::HandsBinding;
+    use nest_protocol::gateway::{GuestInfo, HandsTarget};
+    use nest_protocol::model::{AgentId, AgentRole, Epoch, SandboxId, Secret};
+    use tokio::net::TcpListener;
+
+    /// A `hands_resolve` made while the session channel is still down (no host token yet) is
+    /// queued and sent after `hello_ack`, and its answer reaches the waiter.
+    #[tokio::test]
+    async fn a_resolve_made_while_disconnected_is_sent_after_hello_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/agents/agt_q/session", listener.local_addr().unwrap());
+        let target = HandsTarget {
+            url: "ws://127.0.0.1:1".into(),
+            sandbox: SandboxId("sbx_q".into()),
+            epoch: Epoch(3),
+            binding: Secret("nbd_x.y".into()),
+            guest: GuestInfo { protocol_version: 1, capabilities: vec![] },
+            edge: None,
+        };
+        let t2 = target.clone();
+        // AgentDO: hello → hello_ack, then answers the one hands_resolve it receives.
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let (mut wtx, mut wrx) = ws.split();
+            let mut saw_resolve = false;
+            while let Some(Ok(m)) = wrx.next().await {
+                let Message::Text(t) = m else { continue };
+                match serde_json::from_str::<RunnerToAgent>(&t).unwrap() {
+                    RunnerToAgent::Hello(_) => {
+                        let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                        wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
+                    }
+                    RunnerToAgent::HandsResolve { request } => {
+                        saw_resolve = true;
+                        let m = AgentToRunner::HandsResolved { request, hands: Some(t2.clone()), error: None, retry_after_ms: None };
+                        wtx.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await.unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            saw_resolve
+        });
+        let rt = Runtime::new(Config { batch_interval: Duration::from_millis(50), tail_interval: Duration::from_millis(50), ..Config::default() });
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, orx) = mpsc::unbounded_channel();
+        let agent = Agent::new(
+            AgentId("agt_q".into()),
+            AgentRole::Worker,
+            Epoch(3),
+            std::env::temp_dir(),
+            Some(HandsBinding { sandbox: SandboxId("sbx_q".into()), epoch: Epoch(3) }),
+            None,
+            vec![],
+            0,
+            ctx,
+            otx,
+        );
+        let transcript = std::env::temp_dir().join(format!("nest-session-test-{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
+        // Nothing is connected yet: there is no host token. The request waits in the channel.
+        let waiter = {
+            let a = agent.clone();
+            tokio::spawn(async move { a.resolve_hands_target(Duration::from_secs(10)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rt.host_token.send_replace(Some(Secret("tok".into())));
+        match waiter.await.unwrap() {
+            Ok(HandsResolveOutcome::Target(t)) => assert_eq!(t, target),
+            other => panic!("{other:?}"),
+        }
+        assert!(server.await.unwrap(), "AgentDO received the queued hands_resolve");
     }
 }

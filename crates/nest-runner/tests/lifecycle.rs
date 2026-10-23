@@ -58,7 +58,7 @@ fn start_cmd(dir: &Path, agent: &str, tools: &[&str]) -> RunnerCommand {
         oauth_token: "tok-0123456789abcdef".into(),
         session_ws_url: "ws://127.0.0.1:1/x".into(),
     };
-    RunnerCommand::AgentStart(Box::new(AgentStart { start: s, config_dir: dir.join(agent).display().to_string(), hands: None }))
+    RunnerCommand::AgentStart(Box::new(AgentStart { start: s, config_dir: dir.join(agent).display().to_string() }))
 }
 
 fn pids(dir: &Path) -> Vec<i32> {

@@ -114,3 +114,102 @@ fn bash(text: &str, is_error: bool, interrupted: bool) -> HandsResult {
         },
     }
 }
+
+/// A real gateway in-process (feature `test-support`), fed directly instead of by nestd, with a
+/// local signer standing in for the control plane. Tests of the hands path put a [`FakeGuest`]
+/// behind it.
+#[cfg(feature = "test-support")]
+pub mod gateway {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use nest_gateway::State;
+    use nest_gateway::testing::Signer;
+    use nest_protocol::gateway::{BINDING_VERSION, BindingClaims, BindingScope, GuestInfo, HandsTarget};
+    use nest_protocol::model::{Epoch, SandboxId, Secret};
+
+    pub struct TestGateway {
+        /// `ws://127.0.0.1:<port>`, what a `HandsTarget.url` holds.
+        pub url: String,
+        pub state: Arc<State>,
+        pub signer: Signer,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestGateway {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl TestGateway {
+        pub async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let state = State::new();
+            let signer = Signer::generate();
+            state.set_key(&signer.kid(), &signer.public_key());
+            let st = state.clone();
+            let task = tokio::spawn(async move {
+                let _ = nest_gateway::serve(listener, st).await;
+            });
+            Self { url, state, signer, task }
+        }
+
+        /// A sandbox whose guest is up (version 1), with these clients attached.
+        pub fn add_sandbox(&self, sandbox: &str, epoch: u64, vsock_uds_path: &str, clients: &[&str]) {
+            Self::configure(&self.state, sandbox, epoch, vsock_uds_path, clients);
+        }
+
+        /// A sandbox still booting: no guest info, so binds get `busy` until [`Self::configure`].
+        pub fn add_sandbox_booting(&self, sandbox: &str, epoch: u64, vsock_uds_path: &str, clients: &[&str]) {
+            self.state.upsert_sandbox(
+                SandboxId(sandbox.into()),
+                Epoch(epoch),
+                PathBuf::from(vsock_uds_path),
+                clients.iter().map(|c| c.to_string()).collect::<BTreeSet<_>>(),
+                None,
+            );
+        }
+
+        pub fn configure(state: &State, sandbox: &str, epoch: u64, vsock_uds_path: &str, clients: &[&str]) {
+            state.upsert_sandbox(
+                SandboxId(sandbox.into()),
+                Epoch(epoch),
+                PathBuf::from(vsock_uds_path),
+                clients.iter().map(|c| c.to_string()).collect::<BTreeSet<_>>(),
+                Some(GuestInfo { protocol_version: nest_protocol::guest::PROTOCOL_VERSION, capabilities: vec![] }),
+            );
+        }
+
+        /// A target with a binding this gateway accepts (for the sandbox at `epoch`, if that is
+        /// its current epoch) — what AgentDO's `hands_resolved` would carry.
+        pub fn target(&self, sandbox: &str, epoch: u64, client: &str) -> HandsTarget {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+            self.target_with_exp(sandbox, epoch, client, now + 3_600_000)
+        }
+
+        /// A target whose binding expires at `exp_ms` (in the past: the gateway refuses it as
+        /// `unauthorized`, like a binding that aged out).
+        pub fn target_with_exp(&self, sandbox: &str, epoch: u64, client: &str, exp_ms: i64) -> HandsTarget {
+            let claims = BindingClaims {
+                v: BINDING_VERSION,
+                kid: self.signer.kid(),
+                sandbox: SandboxId(sandbox.into()),
+                epoch: Epoch(epoch),
+                client: client.into(),
+                scope: BindingScope::Hands,
+                exp_ms,
+            };
+            HandsTarget {
+                url: self.url.clone(),
+                sandbox: SandboxId(sandbox.into()),
+                epoch: Epoch(epoch),
+                binding: Secret(self.signer.sign(&claims)),
+                guest: GuestInfo { protocol_version: nest_protocol::guest::PROTOCOL_VERSION, capabilities: vec![] },
+                edge: None,
+            }
+        }
+    }
+}

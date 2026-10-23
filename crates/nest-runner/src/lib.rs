@@ -8,8 +8,8 @@
 //! | nestd `runner.sock` | lifecycle (we connect): [`supervisor`] |
 //! | `hook.dgram` / `hook.sock` | async tracking / sync decisions (we serve): [`hooks`] |
 //! | `mcp.sock` | `nest mcp` bridge (we serve): [`mcp`] |
-//! | AgentDO WebSocket | one per active agent: [`session`] |
-//! | guest vsock `:1025` | hands RPC per tool call: [`hands`] |
+//! | AgentDO WebSocket | one per active agent (turns, events, platform tools, `hands_resolve`): [`session`] |
+//! | the sandbox's gateway (WebSocket, via `nest-hands-client`) | hands RPC per tool call, with the target from AgentDO's `hands_resolve`: [`hands`] |
 
 pub mod agent;
 pub mod config;
