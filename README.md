@@ -2,7 +2,7 @@
 
 Durable Claude Code agents with isolated hands, on your own subscription.
 
-nest runs many long-lived Claude Code agents at once. Each agent's brain is an unmodified Claude Code process on a host; its hands (shell and file tools) work over RPC inside its own Firecracker microVM on cheap spot compute. A Cloudflare control plane holds the state, so agents survive losing their host, can wait days for an event at near-zero cost, and the whole system scales to zero when idle.
+nest runs many long-lived Claude Code agents at once. Each agent's brain is an unmodified Claude Code process on a brain host; its hands (shell and file tools) work over the network inside its own Firecracker microVM on a cheap spot sandbox host, through that host's gateway. The two never share a machine. A Cloudflare control plane holds the state, so agents survive losing their host, can wait days for an event at near-zero cost, and the whole system scales to zero when idle.
 
 ## What it does
 
@@ -18,7 +18,7 @@ nest runs many long-lived Claude Code agents at once. Each agent's brain is an u
 
 ## Status
 
-Early implementation. The runtime (control plane, host daemon, egress proxy, guest agent, agent runner) exists and is tested locally, but nothing has run on real hardware yet. The coordination layer (channels, hooks, grants, capabilities, scheduled wakes) is designed but not built.
+Early implementation. The runtime (control plane, host daemon, egress proxy, guest agent, agent runner) exists, is tested locally, and has run on EC2 with Firecracker. The split into a sandbox system and an agent system (the gateway, bindings, brain hosts, tunnels) and the coordination layer (channels, hooks, grants, capabilities, scheduled wakes) are designed but not built.
 
 ## Learn more
 

@@ -1,6 +1,6 @@
 # State tracking
 
-The runner owns the Claude Code process, so it sees the **stream-json output** directly: tool use, results, per-turn `result` messages (with usage and cost), and `api_retry` events. **Hooks**, which run on the host, add the decision points and the states the stream doesn't show.
+The runner owns the Claude Code process, so it sees the **stream-json output** directly: tool use, results, per-turn `result` messages (with usage and cost), and `api_retry` events. **Hooks**, which run on the brain host, add the decision points and the states the stream doesn't show.
 
 ## State machine
 
@@ -36,4 +36,4 @@ The runner owns the Claude Code process, so it sees the **stream-json output** d
 
 Sync hooks are answered only for a peer process descending from the declared agent's Claude Code; others get the fail-safe fallback.
 
-**Configuration:** hooks live in **managed settings** on the host, and repo settings never load (see [runner](../runner/)).
+**Configuration:** hooks live in **managed settings** on the brain host, and repo settings never load (see [runner](../runner/)).

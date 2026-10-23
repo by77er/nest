@@ -3,7 +3,7 @@
 > **Implemented contract.** In the design, `segment_ack` follows the SQLite commit and there are no roles; see [pending contract changes](../../README.md#pending-contract-changes).
 
 
-One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello includes the agent's epoch: the bound sandbox's epoch for workers, `0` for captains.
+One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello includes the agent's epoch: the bound sandbox's epoch for workers, `0` for captains (designed: the agent epoch AgentDO issues per brain start, for every agent; the sandbox epoch travels inside the agent's binding, [gateway](../../gateway/)).
 
 ## Messages
 
@@ -17,6 +17,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `tool_call` | seq | A platform tool call relayed from nest-mcp: `call`, `turn?`, `name`, `arguments` |
 | `tools_list_request` | no | nest-mcp `tools/list` |
 | `cancel_call` | seq | `call`, `reason`. The runner abandoned a platform call (it timed out locally and the model was told `outcome_unknown`). An unacked `tool_call` is replaced in place by a `cancel_call` with the same seq, and a fresh one is always sent too. AgentDO marks the call done with `outcome_unknown` without running it (a later `tool_call` with that id gets that outcome), stops a pending `ask`'s sync wait (its answer then arrives as a turn), and sends no `tool_result`. Idempotent. |
+| `hands_resolve` | seq | Designed. Ask for the sandbox's current gateway hostname, a renewed binding and the guest's version, at start, before the binding expires, and after a refused connection, `moved` or `stale_epoch`; AgentDO calls SandboxDO's `resolve` ([gateway](../../gateway/)) |
 | `ack` | — | Cumulative ack of reliable `AgentToRunner` messages |
 
 **AgentDO → runner (`AgentToRunner`)**
@@ -31,6 +32,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `cache_update` | seq | `AgentCache{version, rules, inbox, max_stop_continuations}` for answering hooks locally |
 | `tool_result` | seq | `outcome: ok{content} \| error{error} \| pending{ask, message}` |
 | `tools_list` | no | `ToolDef[]` (MCP `tools/list` plus nest metadata) |
+| `hands_resolved` | seq | Designed. `{hostname, epoch, binding, guest{protocol_version, capabilities}}`, or `error{not_bound}` for an agent without a sandbox |
 | `ack` / `error` | — | |
 
 ## Session stream and acks

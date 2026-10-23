@@ -1,6 +1,6 @@
 # Captains (pattern)
 
-A captain is a long-lived agent without hands that manages other agents and escalates to me. **It isn't a platform concept:** it's an agent spawned from the `captain` template, and everything that makes it a captain is in that template's prompt, grants and budget.
+A captain is a long-lived agent without hands, a brain on a [brain host](../../compute/brain-hosts/) with no sandbox, that manages other agents and escalates to me. **It isn't a platform concept:** it's an agent spawned from the `captain` template, and everything that makes it a captain is in that template's prompt, grants and budget.
 
 ## The `captain` template
 
@@ -9,7 +9,7 @@ launch:
   system_prompt: {mode: replace, text: <captain prompt, stored in the control plane>}
   builtin_tools: []                  # web access comes from the `web` capability
 hands: null
-backend: claude-code                 # api-loop later
+backend: claude-code                 # api-loop once it lands (deferred)
 capabilities:                        # on resources it owns; see agents/capabilities/
   - channels
   - messaging{peers: tree}           # its workers, and its own owner

@@ -1,6 +1,6 @@
 # End-to-end harness
 
-`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built.
+`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built. One machine plays both host kinds: the runner here reaches the guest over the vsock emulator directly. **Not built:** the [gateway](../docs/sandbox/gateway/) and the hands client, after which the harness runs the fake brain against a gateway on localhost and the brain and the sandbox can be on different machines.
 
 ```
 wrangler dev --local (control plane, :18787)          ← outside any namespace

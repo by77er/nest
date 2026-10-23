@@ -3,10 +3,14 @@
 One per cell: hosts, enrollment, leases, placement, drains, STONITH, base generations and command delivery.
 
 - **Enrollment:**
-  - **One-time enrollment token** minted by the operator for a role.
+  - **One-time enrollment token** minted by the operator for a host kind.
   - **AWS signed identity document**, accepted only for an instance this control plane recorded as launched in this cell, as the recorded role, from the recorded account and region, and only once.
   - **Order:** the CSR for nest-proxy's intermediate CA is validated before the proof is consumed, so a bad CSR doesn't burn a token. Only the fixed CSR shape is accepted, and the intermediate is signed with the KMS-held root ([TLS](../../../sandbox/networking/egress/tls/)).
   - **Host tokens** are short-lived and rotated over the fleet channel. A host that was disconnected past expiry can still open the fleet channel for 24 h, and gets a fresh token right after hello.
+  - **Tunnels:** a sandbox host's enrollment also creates its Cloudflare Tunnel and DNS record through the Cloudflare API and returns the tunnel token with the host token; a brain host gets none. FleetDO deletes the tunnel and record when it terminates the host (a drain or STONITH), and a daily sweep removes records whose host is gone ([gateway](../../../sandbox/gateway/), [provisioning](../../../compute/provisioning/)).
+- **Host kinds:** `sandbox` and `brain`. A sandbox host reports hugepages, vCPUs and restore ABIs and holds sandbox leases; a brain host reports brain capacity and nothing else. Sandbox placement never looks at brain hosts, and AgentDO's brain placement never looks at where a sandbox is ([brain hosts](../../../compute/brain-hosts/)).
+- **Bindings and tunnels for the seam:** FleetDO holds the cell's binding verification key and pushes it to every sandbox host over the fleet channel, the way it pushes policy secrets; SandboxDO signs bindings with it, and FleetDO relays each revocation to the host's gateway. `resolve` answers carry the host's tunnel hostname. The Access service token that fronts the hostnames lives in BrokerDO ([gateway](../../../sandbox/gateway/)).
+- **Desired versions:** three per cell: the brain-host version, the sandbox-host version and the guest image. Setting one starts that kind's [rollout](../../../compute/provisioning/#upgrades): one canary host, its probe, then gentle drains of the old hosts.
 - **Fleet channel:** nestd connects here and heartbeats every 5 s, which renews the leases of every sandbox on the host. See [../../../sandbox/fencing/](../../../sandbox/fencing/).
 - **Hello reconciliation:**
   - **Sandboxes:** reported sandboxes we don't honor, including any below SandboxDO's current epoch, are fenced, salvaged if dirty and destroyed; the reported state of honored ones is adopted as evidence. `head`/`dirty` are informational.
@@ -16,7 +20,7 @@ One per cell: hosts, enrollment, leases, placement, drains, STONITH, base genera
 - **Leases:**
   - **One lease, one host:** placement refuses a sandbox that already holds a lease, and a lease is never overwritten.
   - **Expiry:** a host silent for 30 s has its leases expired.
-  - **Controller hosts** hold no sandbox leases. One silent for 30 s is marked `expired`, and its agents (none of which have hands) start on another controller host without STONITH: nothing on it can run twice, its runner killed the brains when its lease lapsed at 20 s, and only an agent's assigned host may attach its session. Its next `hello` makes it active again.
+  - **Brain hosts** hold no sandbox leases. One silent for 30 s is marked `expired`; AgentDO expires the agent epoch of every brain on it and starts each on another brain host, without STONITH: nothing on it can run twice, its runner killed the brains when its lease lapsed at 20 s, and only an agent's assigned host may attach its session. Its next `hello` makes it active again.
 - **STONITH:**
   - **EC2:** terminates the old instance (signed with `aws4fetch`) and waits until it's `shutting-down`/`terminated`.
   - **Without EC2:** waits for the host to reconnect and fence. The fence is re-issued on every hello, every tick and after a failure, until one succeeds.
@@ -31,9 +35,10 @@ One per cell: hosts, enrollment, leases, placement, drains, STONITH, base genera
 
   A spot notice doesn't wait for the gate: the instance goes anyway, and whatever didn't commit is recorded as a loss.
 - **Base generations:** an index of `(image digest, restore ABI) → generation` for the cell, with a per-digest backoff for failed preparation ([base generations](../../../sandbox/state/memory/#base-generations)). Each is a GC root until its image is retired.
-- **Object-store GC:** the cell's sandbox registry, the GC schedule and the roots snapshot. A burst host runs the pass ([GC](../../../sandbox/state/object-store/#garbage-collection)).
+- **Object-store GC:** the cell's sandbox registry, the GC schedule and the roots snapshot. A sandbox host runs the pass ([GC](../../../sandbox/state/object-store/#garbage-collection)).
 - **Not built:**
-  - **The desired host version** per cell, which drives [host upgrades](../../../compute/provisioning/#upgrades).
+  - **Host kinds, bindings and tunnels.** The code has `burst` and `controller` host roles, `controllerHost()` picks a `controller` host for captains, and nothing signs bindings or creates tunnels.
+  - **The desired versions** per cell, which drive [host upgrades](../../../compute/provisioning/#upgrades).
   - **Command batching:** one frame per `issueCommands` call.
   - **Packing:** placement is least-loaded by lease count (warm snapshots first); hugepage-aware packing and the restore-ABI match aren't built.
   - **Drains, the drain gate and base generations.**

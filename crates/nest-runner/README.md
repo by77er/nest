@@ -1,6 +1,6 @@
 # nest-runner
 
-The agent runner: runs unmodified Claude Code brains on a host, outside every VM. Design:
+The agent runner: runs unmodified Claude Code brains on a host, outside every VM; the design places it on brain hosts only (`docs/compute/brain-hosts/`). Design:
 `docs/agents/runner/`. Contracts: `docs/interfaces/host-internal/` (nestd-runner, runner-hooks,
 runner-mcp, runner-claude) and `docs/interfaces/control-host/session/`.
 
@@ -12,7 +12,7 @@ runner-mcp, runner-claude) and `docs/interfaces/control-host/session/`.
 | `tailer` | Native session JSONL → whole-line segments by byte offset; base reset on shrink/inode change; same-length secret redaction |
 | `hooks` | `hook.dgram` (tracking → state events), `hook.sock` (peer-bound to the brain's process tree; PreToolUse/PermissionRequest rules, Stop inbox mirror with a per-chain loop guard, SessionStart transcript rebase limited to `<config_dir>/projects/` + CLAUDE.md via hands), spool drain |
 | `mcp` | `mcp.sock` bridge for `nest mcp` (peer-bound): hands tools (when bound) + AgentDO's platform tools; hands → guest RPC, rest → session relay; cancellation |
-| `hands` | Guest hands RPC client (vsock UDS `CONNECT 1025`, one connection per call, `cancel` then hangup) |
+| `hands` | Guest hands RPC client (vsock UDS `CONNECT 1025`, one connection per call, `cancel` then hangup). The designed hands client speaks the [gateway contract](../../docs/interfaces/gateway/) (one WebSocket per call to the sandbox's gateway, binding first) and isn't built |
 | `rules` | Permission-rule matching (`Tool`, `Tool(glob)`, `mcp__nest__*`) |
 | `stream` | stream-json → canonical `AgentEvent`s |
 
@@ -44,6 +44,7 @@ kill with a full stdin, lease/forbidden-tool refusal, abandoned platform calls) 
 - **Hook datagrams aren't peer-checked** (tracking only); sync hooks and the MCP bridge are.
 - **`rate_limit_event`** from the stream is parsed but not mapped to events (rate limits are still
   reported from `system/api_retry` and `StopFailure`).
+- **Hands reach the guest over local vsock only** (`agent_start.hands.vsock_uds_path`), which ties the brain to the sandbox's host. The gateway client, bindings and `hands_resolve` from `docs/agents/runner/` aren't built.
 - **Permission rules** are accident prevention: Bash prefix globs are easy to sidestep.
 - The guest hands `call_id` uses Claude Code's `tool_use` id from MCP `_meta` when present
   (unverified that Claude Code sends it), else a generated `hc_…`.

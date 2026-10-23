@@ -37,7 +37,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    per-role overrides are `claude_oauth_token:worker` and `claude_oauth_token:captain`.
 5. Create work (all admin endpoints use `Authorization: Bearer $ADMIN_TOKEN`):
    - `POST /v1/workstreams {goal}`
-   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected burst host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
+   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (the `burst` role; 201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
@@ -74,6 +74,11 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 
 ## Known gaps
 
+- **The two-system split** (`docs/architecture/`): the sandbox gateway, bindings (`attach`/`resolve`/`detach`),
+  `hands_resolve`, the agent epoch, host kinds with brain placement by capacity, per-host tunnels and the three
+  desired versions aren't built. The code has `burst` and `controller` host roles (`HostRole`),
+  `FleetDO.controllerHost()` starts captains on a `controller` host, other brains start on the sandbox's host,
+  and `agent_start.hands` carries the sandbox's vsock path for the runner to call the guest directly.
 - **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
   with attenuation, spawn specs, templates and capabilities, owners and labels aren't built. The code still has
   `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with
@@ -90,7 +95,7 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 - **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
 - **Built:** the autoscaler (`AWS_CELLS`: `RunInstances` from the cell's launch template, idle retirement, enroll timeouts).
 - **Not built:** Discord, the Cloudflare Access
-  front end, the preview/share Worker routes, the api-loop backend, budgets.
+  front end, the preview/share Worker routes, the api-loop backend (deferred), budgets.
 - **Host-side behavior is driven, not modeled.** The control plane issues create (including re-place
   and reassign), destroy, fence, suspend (idle and spot drains) and resume (lazy wake); checkpoint,
   fork, archive and drain are never sent.

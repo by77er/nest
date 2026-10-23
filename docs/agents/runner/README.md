@@ -1,8 +1,6 @@
 # Agent runner
 
-A Rust component on every host that runs brains:
-- **On burst hosts,** for agents whose sandboxes live there. RPC to their hands is local vsock.
-- **On the controller host,** for agents without hands.
+A Rust component on every [brain host](../../compute/brain-hosts/) that runs brains, with or without hands. It never runs on a sandbox host. Hands reach the sandbox through the runner's **hands client**: one WebSocket per call to the sandbox's [gateway](../../sandbox/gateway/) over that host's tunnel, with the binding as the first frame ([gateway contract](../../interfaces/gateway/)).
 
 ## Invocation (agent with hands)
 
@@ -33,6 +31,16 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 - **Host-side built-ins are refused** (`Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, …) at start, and a brain whose `system/init` reports one is killed.
 - **Never use `--bare`** (it ignores OAuth) or **`--safe-mode`** (it stops MCP servers from loading).
 
+## Hands
+
+- **Binding and address come from AgentDO:** `agent_start` carries `{hostname, binding, guest{protocol_version, capabilities}}`, which AgentDO obtained from SandboxDO's `attach` and `resolve`. The runner never talks to SandboxDO, and never to nestd about hands.
+- **One WebSocket per call** to `wss://<hostname>/hands`: the binding first, then the host-guest hands frames verbatim, `op` being the MCP tool input plus `tool`. Cancel is a close. `call_status` uses the same kind of connection.
+- **Renewal and moves:** the runner renews the binding before it expires (about an hour) with a `hands_resolve` request on its session channel, which AgentDO answers from SandboxDO. A refused connection, `moved` or `stale_epoch` triggers the same request, and the next call goes to the new hostname and epoch. A brain survives its sandbox moving: the tool result says the sandbox moved and what was lost.
+- **Liveness:** the guest heartbeats a call silent for 10 s; 30 s without any frame, or the tool's deadline plus 15 s, fails the call with an unknown outcome ([hands](../hands/)). A dropped connection cancels the call in the guest, so long work belongs in background tasks.
+- **Versions:** every `HandsRequest` carries the guest's `protocol_version` from `resolve`, and the runner uses only the capabilities it advertised.
+
+**Not built:** the hands client, bindings and `hands_resolve`. Today the runner opens the guest's vsock socket on the host it shares with the sandbox (`agent_start.hands.vsock_uds_path`).
+
 ## Auth
 
 - **Token:** `claude setup-token` is the same browser OAuth as `/login` and produces a one-year token that can only make model requests. I run it once; the token is stored in BrokerDO and handed to each process as `CLAUDE_CODE_OAUTH_TOKEN`.
@@ -61,7 +69,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 
 - **Planned, not built:** each agent as a systemd unit (`DynamicUser`, `ProtectSystem=strict`, a private `/tmp`, write access only to its `CLAUDE_CONFIG_DIR`). Today every brain runs as the runner's user in its own process group, so brains on one host can read each other's environment (and OAuth token) through `/proc`; only host code execution could exploit that.
 - **Hook and MCP peers are bound to brains:** the sync hook socket and the `nest mcp` bridge accept an agent id only from a process descending from that agent's Claude Code (`SO_PEERCRED` + `/proc` ancestry). The tailer only follows session files under the agent's `<config_dir>/projects/`.
-- Egress is limited to Anthropic's hosts (every host Claude Code contacts, per its network config docs), the control plane, and WebFetch through the host allowlist. Nothing is decrypted.
-- On self-fence, nestd stops every runner process on the host.
+- A brain host's egress is limited to Anthropic's hosts (every host Claude Code contacts, per its network config docs), the control plane, the gateway hostnames, and WebFetch through the host allowlist. Nothing is decrypted.
+- When the brain host's lease lapses (20 s), nestd stops every runner process on the host. AgentDO expires the agent epoch at 30 s and starts the brain again on another brain host with `--resume`.
 
-**Placement:** a brain runs on the host of its sandbox, so the host's lease and epoch cover both. If the two are ever split across hosts, agents will need their own epoch.
+**Epochs:** AgentDO issues an agent epoch per brain start, and platform tool calls and brokered actions carry it; the sandbox epoch travels inside the binding on every hands call. Where a brain runs and where its sandbox runs are unrelated: the brain host's lease fences the brain, and the sandbox host's lease and epoch fence the sandbox.

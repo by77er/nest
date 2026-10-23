@@ -30,6 +30,7 @@ It runs when `ci.yml` succeeds on a push to `main` (`workflow_run`), and on `wor
    - DO exceptions per class;
    - host reconnection: every host connected before the deploy reconnects and renews its leases within 2 minutes;
    - agent turn failures and brain crash restarts;
+   - gateway refusals (`stale_epoch`, unknown bindings) and hands calls reported unknown;
    - reliable-channel resends.
 6. **On regression:** `wrangler rollback <previous> --message "auto-rollback: <reason>"`, mark the deployment failed, and pause deploys. A one-way deploy is only marked failed and paused.
 7. **Either way,** GitHub's `deployment_status` webhook reaches the maintainer and the monitor as a channel post.
@@ -40,4 +41,10 @@ It runs when `ci.yml` succeeds on a push to `main` (`workflow_run`), and on `wor
 
 ## Hosts
 
-When host rollout is built (see [upgrades](../docs/compute/provisioning/#upgrades)), CI on `main` builds the host binaries and images into the cell's bucket, versioned by commit, and `deploy.yml` sets the cell's desired version after the control plane is healthy. The same health window applies, per host version, and rollback sets the version back.
+Host rollout follows the platform's [upgrade rules](../docs/compute/provisioning/#upgrades): hosts are replaced, never updated in place, and the two host kinds roll one after the other. When it is built, CI on `main` builds the host binaries and the guest image into the cell's bucket, versioned by commit, and `deploy.yml` sets the cell's desired versions after the control plane is healthy, in this order:
+
+1. **Brain hosts.** Set the desired brain-host version. FleetDO launches one canary host; the gate is a probe turn: a real Claude Code turn running the Python task against a probe sandbox through its gateway. Then the old brain hosts drain gently (no new brains, running brains exit at idle, forced after 30 min; AgentDO restarts the brains elsewhere with `--resume`). No sandbox is touched.
+2. **Sandbox hosts.** Set the desired sandbox-host version and, when it changed, the guest image version. One canary host boots a probe sandbox, a hands call round-trips through its gateway and a commit lands; then the old hosts drain gently as the [autoscaler](../docs/compute/autoscaling/) does, forced after 30 min. Brains survive their sandbox moving.
+3. **Done** when no host of either kind reports the old version in its `hello`.
+
+The same 10-minute health window applies per host version, with the probe as its gate. `rollback.yml` sets a desired version back, and the same replacement rolls the old version forward again. A release that changes the gateway protocol's `min_supported` or (once memory snapshots exist) the restore ABI is one-way and ships alone, like a Durable Object class change.

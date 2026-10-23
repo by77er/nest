@@ -33,9 +33,9 @@ What each kind of run can prove (the `nest-validation` skill). Claims in PRs and
 | Tier | Proves | Doesn't prove |
 |---|---|---|
 | Unit and integration tests | Logic; wire formats against `protocol/fixtures/` | Real processes, namespaces or VMs |
-| `e2e/run.sh` (process driver) | The real components together: hands over emulated vsock, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code |
+| `e2e/run.sh` (process driver) | The real components together on one machine: hands over emulated vsock, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code, the gateway and the tunnel (a brain and a sandbox on different machines) |
 | `e2e/claude-verify`, `NEST_E2E_CLAUDE=real` | Real Claude Code's behaviour under nest's flags | Firecracker, scale |
-| The [first spike](../docs/README.md#first-spike) on AWS | Firecracker, snapshots and restore, fencing under partition | — |
+| The [first spike](../docs/README.md#first-spike) on AWS | Firecracker, snapshots and restore, fencing under partition, the seam (a brain reaching a sandbox through the gateway and the tunnel) | — |
 
 ## Review
 

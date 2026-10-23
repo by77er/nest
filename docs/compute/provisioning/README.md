@@ -1,10 +1,11 @@
 # Provisioning
 
-**Burst host image (EC2 Image Builder):**
+Two host images, one per [host kind](../). Neither contains a secret ([identity](../../security/identity/)).
+
+**Sandbox host image (EC2 Image Builder):**
 - Amazon Linux 2023 with kernel 6.18 (or 6.1), the host kernels Firecracker supports on 8i ([README](https://github.com/firecracker-microvm/firecracker/blob/main/README.md)); Ubuntu 24.04's 6.8 isn't one of them. Hugetlb needs 5.18+ and ublk needs 6.0+; whether AL2023 ships ublk is unverified.
 - Firecracker from the 1.17 line, pinned by binary digest, patch level included ([driver](../../sandbox/drivers/firecracker/)).
-- `bubblewrap`: Claude Code needs it for the subprocess environment scrub nest relies on (see [runner-claude](../../interfaces/host-internal/runner-claude/)). The controller host image installs it too.
-- Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, **Claude Code + the agent runner** (brains for local sandboxes). The image carries the runner's pinned Claude Code version, checked by SHA-256 ([runner](../../agents/runner/)).
+- Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, the [gateway](../../sandbox/gateway/), and the guest kernel and `nest-base` image. No Claude Code, no agent runner, no bubblewrap: nothing on a sandbox host runs a brain.
 - **Built by the cell's Image Builder pipeline,** managed in the cell stack: AWS-native, no build host of ours. One install script runs in two places:
   - at build time, baked into the AMI;
   - at every boot, where it only fills what the AMI lacks.
@@ -15,41 +16,56 @@
 - **The builder runs in the cell's subnet.** Its role can only read the release, and it is not tagged `nest=true`, so STONITH can't reach it.
 - **Not built:** pruning old AMIs and their snapshots (an Image Builder lifecycle policy); gVisor and cloudflared.
 
-**Launch template:**
-- Nested virtualization enabled, restricted to the 8i family.
-- Prefer `d` variants for local NVMe.
-- Reserve a `vm.nr_hugepages` pool at boot. The remaining memory is for the host and the snapshot page cache.
+**Brain host image:** nestd, Claude Code, the agent runner and the `nest` binary, `bubblewrap` (Claude Code needs it for the subprocess environment scrub nest relies on; see [runner-claude](../../interfaces/host-internal/runner-claude/)) and the Discord gateway client. The image carries the runner's pinned Claude Code version, checked by SHA-256 ([runner](../../agents/runner/)). No hypervisor, no hugepages, no S3 access, no cloudflared. Built by the same pipeline from an ARM-capable AL2023 base, for the cheapest class that runs Claude Code ([brain hosts](../brain-hosts/)). **Not built.**
+
+**Launch templates,** one per host kind:
+- **Sandbox hosts:** nested virtualization enabled, restricted to the 8i family. Prefer `d` variants for local NVMe. Reserve a `vm.nr_hugepages` pool at boot; the remaining memory is for the host and the snapshot page cache.
+- **Brain hosts:** the brain-host AMI, the cheapest class that runs Claude Code (`t4g.medium`-class), no hugepages, no nested virtualization. **Not built.**
 
 **Network:**
 - Public subnet with public IPv4, no NAT.
 - **S3 gateway endpoint.** It's free, and it lets the bucket policy require `aws:SourceVpce`.
-- Security group: outbound 443, plus 7844 TCP and UDP for cloudflared. No inbound rules.
+- Security group: outbound 443, plus 7844 TCP and UDP for cloudflared on sandbox hosts. No inbound rules on either kind: brains reach sandboxes through each sandbox host's tunnel, and hosts dial the control plane out ([gateway](../../sandbox/gateway/)).
 
 **IAM:**
-- **Host instance role:** S3 access scoped to the cell's bucket.
+- **Sandbox host instance role:** S3 access scoped to the cell's bucket.
+- **Brain host instance role:** nothing. A brain host holds no S3 access; enrollment needs only IMDS, which is local.
 - **Control-plane IAM user:** `RunInstances` with our launch template only; `Terminate` and `Stop` only on instances tagged `nest=true`; `Describe*`; `kms:Sign` on the proxy root CA key only ([TLS](../../sandbox/networking/egress/tls/)).
 - **Deploy role** (`nest-<cell>-deploy`): assumed from GitHub Actions over OIDC, only by the repo's `production` environment; administrator-equivalent, because applying the stack manages IAM ([deploys](../../../dev/deploy.md)).
-
-**Controller host image:** nestd, Claude Code, the agent runner and the `nest` binary, bubblewrap and the Discord gateway client. No hypervisor, no hugepages, no S3 access.
 
 **Host authentication:**
 1. An AWS host presents its **signed instance identity document** (from IMDS).
 2. FleetDO verifies AWS's signature and checks that **it launched that instance ID** (and account and region) and hasn't enrolled it already.
 3. FleetDO issues a short-lived host token, which rotates over the control WebSocket.
+4. For a sandbox host, the Worker also creates the host's Cloudflare Tunnel and its DNS record through the Cloudflare API ([remote tunnel API](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel-api/); an API token with Account: Cloudflare Tunnel: Edit and Zone: DNS: Edit, a Worker secret) and returns the tunnel token with the host token. nestd starts cloudflared with it. A brain host gets none ([gateway](../../sandbox/gateway/)). FleetDO deletes the tunnel and record when it terminates the host.
 
 No secrets go in user-data.
 
-**Restarts resume, they don't re-enroll:** an instance enrolls once (its identity document is never replayable), so nestd keeps what enrollment gave it (host id, host token, fleet URL, proxy intermediate) root-only in `<state_dir>/host-credentials.json`, rewritten on every token rotation and CA renewal. A restarted nestd reconnects with it while the token is less than 23 h past expiry (the fleet channel's grace is 24 h; it rotates the token at hello); after that the host is replaced. The control plane treats leases a new nestd process doesn't report as gone with the old one: suspended sandboxes are evicted, the rest placed again from head. Verified on EC2 by rebooting a host: the same host reconnected 20 s later with no new enrollment and took new work. A host down longer than the 30 s lease expiry while holding leases is fenced by STONITH as before. A host outside AWS (e.g. the controller host on a VPS) enrolls once with a one-time token I mint myself.
+**Restarts resume, they don't re-enroll:** an instance enrolls once (its identity document is never replayable), so nestd keeps what enrollment gave it (host id, host token, fleet URL, proxy intermediate) root-only in `<state_dir>/host-credentials.json`, rewritten on every token rotation and CA renewal. A restarted nestd reconnects with it while the token is less than 23 h past expiry (the fleet channel's grace is 24 h; it rotates the token at hello); after that the host is replaced. The control plane treats leases a new nestd process doesn't report as gone with the old one: suspended sandboxes are evicted, the rest placed again from head. Verified on EC2 by rebooting a host: the same host reconnected 20 s later with no new enrollment and took new work. A host down longer than the 30 s lease expiry while holding leases is fenced by STONITH as before. A host outside AWS (a brain host on a VPS, for example) enrolls once with a one-time token I mint myself.
 
 **Instance metadata service (IMDS):** require IMDSv2 with hop limit 1. nest-proxy blocks link-local and private ranges for sandboxes, so a guest can never reach IMDS or the instance role's credentials. A kernel rule on nest-proxy's uid rejects non-public destinations too, so a proxy bug can't reach them either ([kernel backstop](../../sandbox/networking/egress/steering/#kernel-backstop)).
 
 ## Upgrades
 
-Hosts are replaced, never updated in place. Not built; it needs the autoscaler.
+Hosts are replaced, never updated in place. The two host kinds roll separately, brain hosts before sandbox hosts, and the [gateway protocol](../../interfaces/gateway/) lets a brain host and a sandbox host be one release apart in either direction. Not built; it needs the autoscaler.
 
-- **Versions:** host binaries (nestd, nest-proxy, the runner, `nest`, the guest agent) and images are built per release into the cell's bucket.
-- **Rollout:** FleetDO holds a desired host version per cell. New hosts boot it, and old hosts are [drained](../autoscaling/) and terminated one at a time. The controller host is replaced the same way; its brains move after 30 s, like a lost host's.
-- **Rollback:** set the desired version back and replace again.
-- **Restore ABI:** each release records the [restore ABIs](../../sandbox/state/memory/#restore-abi) its hosts create and load. A release that changes nestd, the proxy, the runner or the guest agent keeps the ABI; one that changes Firecracker, the host or guest kernel, the CPU template or the VM profile changes it.
-- **ABI-changing upgrades** leave dormant memory generations unloadable on the new hosts. They resume disk-only, with "process state lost" in the rollback notice, and no old hosts are kept for them ([restore ABI](../../sandbox/state/memory/#restore-abi)). The rollout's drains skip memory snapshots no new host could load, and rolling back makes generations still at head loadable again.
-- **Guests:** cold boots use the new rootfs. Memory generations keep their guest agent, and the host accepts a range of guest protocol versions ([host-guest](../../interfaces/host-guest/)), so the guest agent isn't part of the ABI.
+- **Versions:** host binaries (nestd, nest-proxy, the gateway, the runner, the hands client, `nest`, the guest agent) and images are built per release into the cell's bucket, versioned by commit. FleetDO holds **three desired versions per cell:** the brain-host version, the sandbox-host version and the guest image.
+- **One release, in order,** each stage gated before the next ([deploys](../../../dev/deploy.md)):
+  1. **Control plane:** deploy at 100%, then the 10-minute health window; host reconnection is the free canary. Rollback is `wrangler rollback`, except across a Durable Object class change, which is one-way and ships alone ([control plane](../../control-plane/#upgrades)).
+  2. **Brain hosts:** set the desired brain-host version. One canary host launches, enrolls and runs a **probe turn**: a real Claude Code turn with the Python task against a probe sandbox through the gateway. Then the old brain hosts [drain gently](../autoscaling/): no new brains are placed, running brains finish their turn and exit at idle (120 s), and after 30 min the drain is forced: the brains are killed and AgentDO starts them elsewhere with `--resume`, exactly like a brain-host loss. No sandbox is touched.
+  3. **Sandbox hosts:** set the desired sandbox-host version. One canary host launches, cold-boots a **probe sandbox**, a hands call round-trips through its gateway and a commit lands. Then the old hosts drain gently: residents suspend at their next idle point, forced after 30 min, one host at a time. A brain whose sandbox moves keeps running; its next hands call re-resolves and sees the new epoch.
+  4. **Done** when no host reports the old version in its `hello`. FleetDO's [metrics](../../control-plane/metrics/) show the version mix throughout, so a stuck drain is visible.
+- **Rollback:** set the desired version back; the same replacement rolls the old version forward again. A canary that fails its probe never gets a second host.
+- **What rides with which kind:**
+
+  | Change | Kind | Gate | One-way when |
+  |---|---|---|---|
+  | nestd, nest-proxy, the gateway, cloudflared, Firecracker, the host kernel | Sandbox host | The probe sandbox | The restore ABI changes, once memory snapshots exist |
+  | The guest image `nest-base` (guest agent, rootfs, packages) | Sandbox host, as the image version | The probe sandbox. Cold boots use the new image, so a sandbox picks it up at its next cold boot; the host serves a range of guest versions ([host-guest](../../interfaces/host-guest/)), so old and new guests coexist | Raising the guest `min_supported`; harmless with disk-only restores |
+  | The agent runner, the hands client, `nest mcp`, the Discord gateway client | Brain host | The probe turn | Raising the gateway protocol's `min_supported` |
+  | The Claude Code baseline (version and SHA-256) | Brain host | The existing gate: `claude-verify` probes, the hands fidelity eval, resuming sessions written by the previous baseline ([runner](../../agents/runner/)) | Rolling back may leave sessions the newer binary wrote unreadable; those agents start fresh from memory |
+  | Worker and Durable Objects | Cloudflare | The health window | A Durable Object class change |
+
+- **Compatibility:** the control plane and hosts may differ by one version, with additive optional fields only ([control plane](../../control-plane/#upgrades)). A brain host and a sandbox host may differ by one release through the gateway protocol's `[min_supported, current]` range with capabilities; the release gate runs the previous release's hands client against the new gateway and the previous release's gateway against the new client, from the fixtures at `min_supported` up. The runner and Claude Code are pinned to each other exactly.
+- **Restore ABI:** each release records the [restore ABIs](../../sandbox/state/memory/#restore-abi) its sandbox hosts create and load. A release that changes nestd, the proxy, the gateway or the guest agent keeps the ABI; one that changes Firecracker, the host or guest kernel, the CPU template or the VM profile changes it. **ABI-changing upgrades** leave dormant memory generations unloadable on the new hosts: they resume disk-only, with "process state lost" in the rollback notice, and no old hosts are kept for them. The rollout's drains skip memory snapshots no new host could load, and rolling back makes generations still at head loadable again. Dormant while cold boot is the only restore ([memory](../../sandbox/state/memory/)).
+- **Scale to zero makes many rollouts free:** a cell with no hosts running takes the new version at its next launch. The canary still launches one host of each kind, so a release is never first exercised by real work.

@@ -1,6 +1,6 @@
 # Host ↔ guest (vsock)
 
-How host components (nestd, the agent runner's hands bridge, the preview router) talk to the **guest agent** inside a sandbox VM. Rust types: `nest_protocol::guest`. Fixtures: `protocol/fixtures/guest/`. MCP tool schemas: `protocol/schemas/guest/hands-tools.json`.
+How the host side (nestd and the [gateway](../../sandbox/gateway/)) talks to the **guest agent** inside a sandbox VM. Clients elsewhere (brains, terminals, browsers) reach these ports only through the gateway ([gateway contract](../gateway/)). Rust types: `nest_protocol::guest`. Fixtures: `protocol/fixtures/guest/`. MCP tool schemas: `protocol/schemas/guest/hands-tools.json`.
 
 > **Implemented contract (version 1), plus version 2 (designed).** Items marked **v2** aren't built; they're listed under [pending contract changes](../README.md#pending-contract-changes) until they land. Design: [guest agent](../../sandbox/guest-agent/), [hands](../../agents/hands/).
 
@@ -17,8 +17,8 @@ The guest agent listens on `AF_VSOCK` ports and **accepts only peer CID 2 (the h
 | Port | Channel | Lifetime | Opened by |
 |---|---|---|---|
 | **1024** | Control: `ControlFrame` both ways | one persistent connection | nestd |
-| **1025** | Hands RPC: `HandsRequest` → `HandsResponse`s | **one connection per tool call** | agent runner (on behalf of `nest mcp`) |
-| **10000** | Ingress: `IngressRequest` → `IngressResponse`, then raw TCP or framed PTY | one connection per stream | preview router, nestd (terminal / port-forward) |
+| **1025** | Hands RPC: `HandsRequest` → `HandsResponse`s | **one connection per tool call** | the gateway, for each client call (the runner's hands client, AgentDO, a `call_status` lookup) |
+| **10000** | Ingress: `IngressRequest` → `IngressResponse`, then raw TCP or framed PTY | one connection per stream | the gateway (previews, terminals, port-forwards) |
 
 **Test transport (no KVM):** an emulator that accepts on one unix socket, speaks the same handshake, and dispatches each connection to the guest agent's handler for that port. The guest agent takes a `--listen unix:<dir>` option to listen on `<dir>/<port>.sock` instead of vsock, and the emulator bridges `CONNECT <port>` to it. Host code is identical in both modes, because it always talks to "a unix socket that speaks CONNECT". The helpers in `guest::handshake` implement both sides.
 
@@ -82,7 +82,7 @@ A memory snapshot keeps the guest agent it was taken with ([guest agent](../../s
 
 - **Range:** nestd accepts a hello whose `protocol_version` is in `[MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION]` (`nest_protocol::guest`; 1 and 2). Outside it, nestd replies `error{unsupported_version}`, closes, and fails the sandbox's start or resume with that code at once, never by a readiness timeout.
 - **Paused restores:** the check runs on `hello`, which a paused VM doesn't send. nestd never resumes a VM only to read it.
-- **The host speaks the guest's version.** nestd passes the guest's `protocol_version` and `capabilities` to the runner with each hands binding. Every `HandsRequest` carries the guest's version, and a guest refuses any other (`unsupported_version`).
+- **The host speaks the guest's version.** nestd passes the guest's `protocol_version` and `capabilities` to the gateway, and SandboxDO's `resolve` reports them to each client ([gateway](../gateway/)). Every `HandsRequest` carries the guest's version, and a guest refuses any other (`unsupported_version`).
 - **Capabilities gate features,** not version numbers. The host sends a request only if the guest advertised it, and otherwise answers its own caller `unsupported`. A v2 guest answers a request `type`, `tool` or ingress `mode` it doesn't know with `error{unsupported, executed: false}` (on control, with `reply_to`), never a close or silence. A v1 guest replies `bad_request` without `reply_to`, so the host never relies on it.
 
 | Capability | Since | Feature |
@@ -271,7 +271,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 - The guest connects to `127.0.0.1:P`, then `172.16.0.2:P`, then `[::1]:P` (2 s timeout each).
 - **Success:** replies `accepted{connected}`, then splices bytes until both sides close.
 - **Failure:** `rejected{connect_refused, retryable: true}`.
-- **No HTTP awareness.** The preview router does the `Host` rewrite before bytes enter the stream.
+- **No HTTP awareness.** The gateway does the `Host` rewrite before bytes enter the stream.
 
 **`{"mode":"pty", agent_id?, cols, rows, command?, cwd?, env?}`**
 - Spawns a PTY, in `pty/<n>` under the agent's cgroup if `agent_id` is set, with the agent's env.
@@ -331,7 +331,7 @@ nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a flee
 
 ## Sequences
 
-**Hands call with cancel**
+**Hands call with cancel** (the client's frames, piped by the gateway)
 ```
 runner                              guest
   │ CONNECT 1025 / OK                 │
@@ -344,11 +344,11 @@ runner                              guest
 
 **Brain restart with a call in flight (v2)**
 ```
-runner (new brain for agt_a)        guest
+runner (new brain for agt_a, through the gateway)   guest
   │ CONNECT 1025 / OK                 │
   │ call_status{epoch: 8, calls: [{epoch: 7, call_id: toolu_01A}]} ──► │ read calls/toolu_01A.json
   │ ◄── call_status{state: finished, record{exit: exited{0}, output_path}, modified{paths, overflowed: false}}
-  runner ─► AgentDO: journal outcome; the recovery context says "exited 0, output at …"
+  runner ─► AgentDO: the outcome, as a canonical event; the recovery context says "exited 0, output at …"
 ```
 
 **Background task**
@@ -360,8 +360,8 @@ runner: TaskOutput{block:false} ──►   guest: ◄── result{status line 
 
 **Ingress connect (preview)**
 ```
-router: CONNECT 10000 / OK; {"mode":"tcp","port":5173} ─► guest: dial 127.0.0.1:5173 ✓
-router ◄─ accepted{connected:"127.0.0.1:5173"}            both switch to raw bytes ⇄
+gateway: CONNECT 10000 / OK; {"mode":"tcp","port":5173} ─► guest: dial 127.0.0.1:5173 ✓
+gateway ◄─ accepted{connected:"127.0.0.1:5173"}            both switch to raw bytes ⇄
 ```
 
 **Resume after a memory restore (with fork)**
@@ -376,14 +376,14 @@ guest ─► ports{…}   (re-announced)
 
 ## What other boundaries must adopt
 
-- **Runner (host-internal):** serve `hands-tools.json` verbatim as the `nest` MCP server's hands tools.
-  - `tools/call` → open a port-1025 connection to the bound sandbox's vsock socket, then send `HandsRequest{op: input + tool}`.
+- **Runner (hands client, [gateway](../gateway/)):** serve `hands-tools.json` verbatim as the `nest` MCP server's hands tools.
+  - `tools/call` → one WebSocket to the sandbox gateway's `/hands` route with the agent's binding, which the gateway turns into a port-1025 connection, then send `HandsRequest{op: input + tool}`.
   - MCP cancellation, or an interrupted turn → `cancel` or close.
   - `call_id` = the MCP request ID or tool-use ID, which must be unique per agent.
-  - v2: stamp the guest's version; retry `executed: false` refusals; fail silent calls; look up in-flight calls with `call_status` at brain start.
+  - v2: stamp the guest's version (from `resolve`); retry `executed: false` refusals; fail silent calls; look up in-flight calls with `call_status` at brain start.
 - **nestd:** owns the port-1024 connection, `configure`, `resume`, `prepare_snapshot` and `thaw`. It relays `cli` requests and `ports`/`task_exited` events to the control plane. Epoch and slots come from SandboxDO.
-  - v2: checks the version range, passes the guest's version and capabilities to the runner, sends `flush` before every commit, and drains log-site counts into its metrics.
-- **Preview router / nestd terminals:** use port 10000. The `Host` rewrite happens in the router.
+  - v2: checks the version range, passes the guest's version and capabilities to the gateway (and, through SandboxDO, to `resolve`), sends `flush` before every commit, and drains log-site counts into its metrics.
+- **Gateway:** owns every port-1025 and port-10000 connection, one per client call or stream, and does the `Host` rewrite for previews.
 - **Control plane:**
   - `ports` → nestd emits a `port_opened` workstream event for each newly listening port (closed ports aren't reported).
   - CLI `notify`/`emit`/`ask`/`expose` map onto the platform tools of the same names.

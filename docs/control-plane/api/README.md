@@ -4,7 +4,7 @@
 - **External events:** webhooks at `POST /v1/hooks/<hk_…>` and Email Routing to an Email Worker, both turned into channel posts (see [sources](../../channels/sources/)). Agents schedule their own wakes with `wake_at`.
 - **Live views:** live tails and agents' waiting `read`s follow channels (ChannelDO), including each agent's and sandbox's `events`.
 - **Approvals and escalations** go through the **[Discord bot](discord/)**, and can also be answered in the dashboard.
-- **`nest` CLI on my machine:** `attach` (a terminal over WebSocket → nestd → vsock), `logs -f`, `port-forward` (TCP over WebSocket), `diff <a> <b>`.
+- **`nest` CLI on my machine:** `login` (the Access service token, and a binding per sandbox from SandboxDO's `attach`), `attach` (a terminal: a WebSocket to the sandbox host's [gateway](../../sandbox/gateway/), then vsock), `logs -f`, `port-forward` (TCP over the same path), `diff <a> <b>`. The CLI reaches a sandbox the way a brain does, by hostname and binding.
 - **Host authentication:**
   - A signed instance identity document (or a one-time enrollment token) is exchanged for a rotating host token. See [../../compute/provisioning/](../../compute/provisioning/).
   - The fleet channel accepts a token up to 24 h past expiry, so a reconnecting host can get a fresh one. The session channel accepts no grace period.

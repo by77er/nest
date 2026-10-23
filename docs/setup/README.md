@@ -13,11 +13,12 @@ What I provide, where it goes, and what each piece unlocks, in the order testing
 
 | Decision | Default | Why it matters |
 |---|---|---|
-| AWS region | `us-east-1` | It hosts the first cell: the burst hosts and the cell's S3 bucket. It must offer C8i instances. |
+| AWS region | `us-east-1` | It hosts the first cell: the sandbox hosts, the brain hosts and the cell's S3 bucket. It must offer C8i instances. |
 | Monthly spend cap | $25 | Becomes an AWS Budgets alarm. Testing costs a few dollars. |
 | Dedicated AWS account | Yes | Keeps the blast radius of broad testing credentials to nest. |
 | Separate Claude token for captains | Optional | Needed only to verify that two setup tokens can be revoked independently. |
-| Domain on Cloudflare | Not yet | Needed only for previews (`*.preview.<domain>`), share links (`*.share.<domain>`) and email hooks, not for testing. |
+| Domain on Cloudflare | Not yet | Needed for the tunnel path (one hostname per sandbox host, which is how brains reach hands), previews (`*.preview.<domain>`), share links (`*.share.<domain>`) and email hooks. Not for the local harness. |
+| Brain-host instance class | The cheapest ARM class that runs Claude Code (`t4g.medium`-class) | Brains need no KVM; the class sets the cost of keeping a warm host for 30 min after its last brain. |
 
 ## Stage 1: real Claude Code (no cloud, no KVM)
 
@@ -46,7 +47,7 @@ Not `CLAUDE_CODE_OAUTH_TOKEN`: that name could change how the session's own Clau
 
 `wrangler` reads both variables directly. The control plane deploys to `nest-control-plane.<subdomain>.workers.dev` until there's a domain.
 
-## Stage 3: burst hosts on AWS
+## Stage 3: sandbox hosts on AWS
 
 **Unlocks:** real Firecracker sandboxes, and spike items 1–8, 11 and 12.
 
@@ -67,6 +68,12 @@ The provisioning key creates the narrow credentials nest actually runs with:
 
 **Prefer not to hand over an admin key?** The setup agent can write a CloudFormation template instead. Deploying it from the console creates the same resources, plus a narrower deploy key to provide in its place.
 
+## Stage 4: brain hosts
+
+**Unlocks:** brains off the laptop and off the sandbox hosts: spike item 13's second half, and every agent running unattended.
+
+Nothing new to provide. Brain hosts live in the same account and cell, launched by FleetDO from a second launch template (no KVM, no hugepages, no S3 access; the class from the decisions above). They get the Claude Code baseline and the setup token from BrokerDO, like any host. The tunnel below is what lets them reach sandboxes, so stage 4 needs the domain and the tunnel credentials from the table below first.
+
 ## Later (not needed to start testing)
 
 | What | Needed for | Environment variables |
@@ -74,7 +81,9 @@ The provisioning key creates the narrow credentials nest actually runs with:
 | **Discord bot:** an application with a bot, on a private server | Approvals, escalations and chat ([discord](../control-plane/api/discord/)) | `DISCORD_APPLICATION_ID`, `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID` |
 | **GitHub App:** the repository permissions its agents need (at least Contents and Pull requests: read and write), installed on chosen repos; generate a private key | Credential injection for `git push`, and `github.*` brokered actions ([BrokerDO](../control-plane/durable-objects/broker/)) | `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY` (the PEM) |
 | **An analytics read token:** a custom Cloudflare API token with Account → Account Analytics → Read | The `metrics` capability ([metrics](../control-plane/metrics/)) | `CLOUDFLARE_ANALYTICS_TOKEN` |
-| **A domain on Cloudflare,** plus a Zero Trust team for Access | Previews, share links, email hooks, and Access in front of the API and dashboard ([ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN`; the API token gains Zone DNS and Workers Routes edit for that zone |
+| **A domain on Cloudflare,** plus a Zero Trust team for Access | The tunnel path to every sandbox host (hands, terminals, previews), share links, email hooks, and Access in front of the API and dashboard ([gateway](../sandbox/gateway/), [ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN`; the API token gains Zone DNS and Workers Routes edit for that zone |
+| **A tunnel token:** a custom Cloudflare API token with Account → Cloudflare Tunnel → Edit and Zone → DNS → Edit for that zone | The Worker creates one tunnel and one DNS record per sandbox host at enrollment and deletes them at termination ([gateway](../sandbox/gateway/), [remote tunnel API](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel-api/)) | `CLOUDFLARE_TUNNEL_API_TOKEN` (a Worker secret) |
+| **An Access service token:** Zero Trust → Access → Service Auth → create one, and an Access application covering the per-host hostnames that accepts it | The edge check on every gateway hostname; held by the Worker, AgentDO and brain hosts through BrokerDO, by a laptop through `nest` login, never by a sandbox ([gateway](../sandbox/gateway/)) | `NEST_ACCESS_CLIENT_ID`, `NEST_ACCESS_CLIENT_SECRET` |
 
 **Webhooks need nothing extra:** hooks live at `https://<control plane>/v1/hooks/<hk_…>`, and each provider is wired through a brokered action or by pasting a URL and a one-time secret (see [sources](../channels/sources/)).
 
@@ -83,8 +92,9 @@ The provisioning key creates the narrow credentials nest actually runs with:
 The setup agent creates these itself, so none are needed from me:
 - **Control-plane secrets:** the operator tokens (`observe`, `approve`, `admin`; the Worker keeps only their SHA-256 hashes, and I get the tokens), `HOST_TOKEN_SECRET`, `REVOCATION_COUNTER`, and the root certificate from stage 3, all random or freshly generated (see [API](../control-plane/api/)). Built: one `ADMIN_TOKEN`; the root key is in KMS and the root certificate is self-signed through it (`POST /v1/admin/root-ca/kms`).
 - **`AWS_IDENTITY_CERT_PEM`:** AWS's public certificate for verifying instance identity documents, from AWS's docs.
-- **Cloud resources:** the R2 bucket `nest-control`, the cell's S3 bucket with its gateway endpoint, the security group, the launch template, and the IAM pieces and KMS key above.
-- **Images:** the guest kernel and root filesystem, the burst-host AMI from the cell's Image Builder pipeline, and its bootstrap (Amazon Linux 2023, kernel 6.18, Firecracker from the 1.17 line pinned by digest; see [provisioning](../compute/provisioning/)).
+- **Cloud resources:** the R2 bucket `nest-control`, the cell's S3 bucket with its gateway endpoint, the security group, the launch templates (sandbox hosts and brain hosts), the IAM pieces and KMS key above, and, per sandbox host, its tunnel and DNS record.
+- **The binding key:** the per-cell key SandboxDO signs bindings with, generated by FleetDO and pushed to each sandbox host's gateway ([gateway](../sandbox/gateway/)).
+- **Images:** the guest kernel and root filesystem, the sandbox-host AMI from the cell's Image Builder pipeline, and its bootstrap (Amazon Linux 2023, kernel 6.18, Firecracker from the 1.17 line pinned by digest), and the brain-host AMI (no Firecracker; the pinned Claude Code baseline); see [provisioning](../compute/provisioning/).
 - **Enrollment tokens** for hosts outside AWS.
 
 ## Cost while testing
@@ -92,7 +102,8 @@ The setup agent creates these itself, so none are needed from me:
 - **Claude:** subscription quota only.
 - **Cloudflare:** $5/month for Workers Paid; usage stays inside what's included.
 - **AWS:**
-  - a c8i.large spot host is about $0.03/hour, plus about $0.005/hour for its public IPv4;
+  - a c8i.large spot sandbox host is about $0.03/hour, plus about $0.005/hour for its public IPv4;
+  - a `t4g.medium`-class brain host is about $25/month on demand, less on spot, and it terminates 30 min after its last brain ([brain hosts](../compute/brain-hosts/));
   - S3 is cents;
   - the KMS root key is $1/month, plus $0.15 per 10,000 `Sign` calls (one per host enrollment or renewal; not in the free tier, [pricing](https://aws.amazon.com/kms/pricing/));
   - an idle cell costs nothing once its hosts terminate.

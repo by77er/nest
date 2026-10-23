@@ -5,7 +5,7 @@
 ## Operations
 
 - **Create** from an image: cold-boot it. Today the one image is `nest-base` ([firecracker](drivers/firecracker/)); restoring a [base generation](state/memory/#base-generations) instead is designed, not built.
-- **Attach** agents (bind their [hands](../agents/hands/)) or humans (terminal). They share files, services and ports, and conflicts are accepted, like two people on one machine.
+- **Attach** agents (bind their [hands](../agents/hands/)) or humans (terminal): `attach` configures the client's slot in the guest and issues a signed binding, which the client presents to the [gateway](gateway/) from wherever it runs. They share files, services and ports, and conflicts are accepted, like two people on one machine.
 - **Fork.** This is the *only* isolation primitive. A fork is an independent copy of the work, whatever kind of work it is.
 - **Pause, suspend and resume. Archive.** When each happens is SandboxDO's [idle rule](../control-plane/durable-objects/sandbox/#activity-and-idle).
 - **Link** (not designed yet): an opt-in path through the proxy so one sandbox can reach a port in another.
@@ -38,4 +38,5 @@ After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock (V
 - [state/](state/): generations, restore sources, retention, memory (restore ABI, base generations), disk, object store and GC
 - [fencing/](fencing/): leases, epochs, STONITH, loss records, salvage
 - [networking/](networking/): identical internal network identity, egress, ingress
+- [gateway/](gateway/): the only network door into a sandbox: hands, terminals and previews behind the host's tunnel
 - [guest-agent/](guest-agent/): the daemon inside each VM
