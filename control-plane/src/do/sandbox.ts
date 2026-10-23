@@ -774,6 +774,9 @@ export class SandboxDO extends DurableObject<Env> {
       info = this.info_();
     }
     if (!info.host || info.placing !== null) throw notReady("sandbox is not placed yet");
+    // nestd forgets a suspended sandbox's gateway entry and re-adds it before it reports `running`,
+    // so a target minted during a resume would only ever be refused as `moved`.
+    if (info.state !== "running") throw notReady(`sandbox is ${info.state}`);
     if (info.attach_pending.includes(agent)) throw notReady(`${agent}'s slot is not configured yet`);
     const url = await this.fleet(info.cell).hostGatewayUrl(info.host);
     // The host may advertise one on its next hello (a restart, an upgrade): not an error, not yet.

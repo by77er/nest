@@ -35,6 +35,21 @@ pub const MAX_PRE_BIND: usize = 256;
 /// Pause after a failed accept (fd exhaustion and the like) before accepting again.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
+/// How long [`shutdown`] waits for the connection tasks to deliver their close frames.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Cut every connection (close code 4409) and wait, up to [`SHUTDOWN_GRACE`], until each
+/// connection task has sent its close frame and unregistered, so clients see a close rather
+/// than a reset when the process exits. Returns the connections still open at the cap.
+pub async fn shutdown(state: &State) -> usize {
+    state.clear();
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    while state.open_connections() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    state.open_connections()
+}
+
 /// Accept connections forever. An accept error is logged and retried after [`ACCEPT_RETRY`].
 pub async fn serve(listener: TcpListener, state: Arc<State>) -> std::io::Result<()> {
     let pre_bind = Arc::new(Semaphore::new(MAX_PRE_BIND));

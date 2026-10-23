@@ -1328,13 +1328,12 @@ impl Inner {
     /// Stop the VM and drop network state; forget the sandbox locally.
     async fn teardown(self: &Arc<Self>, id: &SandboxId, reason: DropReason) {
         let epoch = self.summary.lock().expect("summary").get(id).map(|s| s.epoch);
-        match epoch {
-            Some(epoch) => {
-                self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason });
-                self.gateway.remove(id, epoch);
-            }
-            None => self.gateway.forget(id),
+        if let Some(epoch) = epoch {
+            self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason });
         }
+        // No tombstone here: a failed create is retried at the same epoch, and a destroy, archive
+        // or move ends the sandbox's time here without fencing it. Only a fence tombstones.
+        self.gateway.forget(id);
         self.pausers.lock().expect("pausers").remove(id);
         self.latest_ports.lock().expect("ports").remove(id);
         self.cli_inflight.lock().expect("cli").remove(id);

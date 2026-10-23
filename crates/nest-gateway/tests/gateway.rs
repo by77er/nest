@@ -520,6 +520,22 @@ async fn one_epoch_bump_cuts_every_connection_of_the_sandbox() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn shutdown_delivers_4409_to_a_bound_client_before_returning() {
+    let signer = Signer::generate();
+    let guest = FakeGuest::start().await;
+    let state = ready_state(&signer, &guest);
+    let addr = start_server(state.clone()).await;
+    let mut ws = bound_ws(&addr, &signer).await;
+    let (left, code) = tokio::join!(
+        tokio::time::timeout(nest_gateway::server::SHUTDOWN_GRACE + Duration::from_secs(1), nest_gateway::shutdown(&state)),
+        close_code(&mut ws),
+    );
+    assert_eq!(code, Some(close_code::MOVED), "the client sees the documented close, not a reset");
+    assert_eq!(left.expect("shutdown returns within its cap"), 0, "every connection task finished before shutdown returned");
+    assert_eq!(state.open_connections(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_client_close_is_answered_with_a_close_frame() {
     let signer = Signer::generate();
     let guest = FakeGuest::start().await;

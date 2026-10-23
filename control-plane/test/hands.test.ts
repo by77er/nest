@@ -46,6 +46,8 @@ async function setup() {
   await nextCommands(host.ws, (c) => c.type === "sandbox_create");
   const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, start: false } }, 201);
   const [attach] = await nextCommands(host.ws, (c) => c.type === "agent_attach" && c.agent === worker.agent);
+  // nestd reports `running` once the guest is up, before any attach result; resolve needs it.
+  await running(host.ws, sbx.sandbox, 1);
   const pub = b64urlToBytes(host.keys[0]!.public_key);
   return { cell, host, workstream, sandbox: sbx.sandbox as string, agent: worker.agent as string, attach, pub };
 }
@@ -115,6 +117,7 @@ describe("attach and resolve", () => {
     await nextCommands(s.host.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
     const [again] = await nextCommands(s.host.ws, (c) => c.type === "agent_attach" && c.epoch === 2);
     expect(again).toMatchObject({ sandbox: s.sandbox, agent: s.agent });
+    await running(s.host.ws, s.sandbox, 2);
     await expect(Promise.resolve().then(() => sandboxStub(s.sandbox).resolve(s.agent))).rejects.toThrow(/sandbox_not_ready/);
     await okResult(s.host.ws, again.cmd);
     const second = await sandboxStub(s.sandbox).resolve(s.agent);
@@ -159,6 +162,35 @@ describe("attach and resolve", () => {
     expect((await verified(s.pub, await sandboxStub(s.sandbox).resolve(other.agent))).client).toBe(other.agent);
   });
 
+  it("a resolve on a suspended sandbox is not ready until it reports running", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.attach.cmd);
+    await running(s.host.ws, s.sandbox, 1, "suspended");
+    // resolve wakes the sandbox (a resume to the host) but never mints while the resume is in flight:
+    // nestd forgets the gateway entry on suspend and re-adds it only before it reports `running`.
+    await rejects(sandboxStub(s.sandbox).resolve(s.agent)).toThrow(/sandbox_not_ready/);
+    const [resume] = await nextCommands(s.host.ws, (c) => c.type === "sandbox_resume");
+    await okResult(s.host.ws, resume.cmd);
+    await rejects(sandboxStub(s.sandbox).resolve(s.agent)).toThrow(/sandbox_not_ready/);
+    await running(s.host.ws, s.sandbox, 1, "running");
+    expect((await verified(s.pub, await sandboxStub(s.sandbox).resolve(s.agent))).epoch).toBe(1);
+  });
+
+  it("a host that missed its binding keys gets them on its next heartbeat", async () => {
+    const s = await setup();
+    // The keys went out after hello_ack. Forget that they did (what a FleetDO restart does), and the
+    // next heartbeat carries them again; one that has them gets none.
+    await runInDurableObject(fleetStub(s.cell), (inst) => {
+      (inst as unknown as { keysSent: Set<string> }).keysSent.clear();
+    });
+    s.host.ws.send({ type: "heartbeat", sent_ms: 1, leases: [] });
+    const again = await s.host.ws.next("binding_key");
+    expect(again.keys).toEqual(s.host.keys);
+    s.host.ws.send({ type: "heartbeat", sent_ms: 2, leases: [] });
+    await s.host.ws.next("heartbeat_ack");
+    expect(await s.host.ws.none("binding_key", 200)).toBe(true);
+  });
+
   it("a repeat attach of a confirmed agent sends nothing and keeps the slot confirmed", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.attach.cmd);
@@ -176,6 +208,7 @@ describe("attach and resolve", () => {
     await sandboxStub(s.sandbox).wake();
     const [again] = await nextCommands(s.host.ws, (c) => c.type === "agent_attach" && c.epoch === 2);
     expect((await sandboxStub(s.sandbox).info()).attach_pending).toEqual([s.agent]);
+    await running(s.host.ws, s.sandbox, 2);
     await okResult(s.host.ws, again.cmd);
     expect((await verified(s.pub, await sandboxStub(s.sandbox).resolve(s.agent))).epoch).toBe(2);
   });

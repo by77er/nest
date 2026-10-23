@@ -18,5 +18,5 @@ pub mod testing;
 pub mod verify;
 
 pub use link::link;
-pub use server::serve;
+pub use server::{serve, shutdown};
 pub use state::State;

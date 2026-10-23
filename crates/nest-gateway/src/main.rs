@@ -32,9 +32,12 @@ fn main() -> anyhow::Result<()> {
             r = nest_gateway::serve(listener, Arc::clone(&state)) => r.map_err(anyhow::Error::from),
             _ = nest_gateway::link(args.nestd_sock, listen, Arc::clone(&state)) => Ok(()),
             _ = term.recv() => {
-                // Cut every call before the process goes, so clients see a close, not a reset.
+                // Cut every call and let the close frames go out before the process does.
                 tracing::info!("SIGTERM: closing every connection");
-                state.clear();
+                let left = nest_gateway::shutdown(&state).await;
+                if left > 0 {
+                    tracing::warn!(left, "connections still open at the shutdown cap");
+                }
                 Ok(())
             }
         }

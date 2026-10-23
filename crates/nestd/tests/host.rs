@@ -53,6 +53,8 @@ struct AttachLatch {
 struct FakeDriver {
     seen: Seen,
     latch: Option<Arc<AttachLatch>>,
+    /// The next VM start fails (a create that fails, to be retried at the same epoch).
+    fail_next_start: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -62,7 +64,7 @@ impl Driver for FakeDriver {
     }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: self.seen.clone(), latch: self.latch.clone(), emu: None, guest: None }))
+        Ok(Box::new(FakeVm { spec, seen: self.seen.clone(), latch: self.latch.clone(), fail_next_start: self.fail_next_start.clone(), emu: None, guest: None }))
     }
 }
 
@@ -70,6 +72,7 @@ struct FakeVm {
     spec: VmSpec,
     seen: Seen,
     latch: Option<Arc<AttachLatch>>,
+    fail_next_start: Arc<AtomicBool>,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
 }
@@ -83,6 +86,9 @@ impl Vm for FakeVm {
         self.spec.disk_path.clone()
     }
     async fn start(&mut self) -> std::io::Result<()> {
+        if self.fail_next_start.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("fake VM failed to start"));
+        }
         // A slow boot, to race commands and fences against it.
         if self.spec.sandbox.0.starts_with("sbx_slow") {
             tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -481,7 +487,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let run_dir = dir.path().join("run");
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
     let runner = fake_runner(&run_dir.join("runner.sock")).await;
     let proxy = fake_proxy(run_dir.join("proxy.sock"));
     let gw = fake_gateway(&run_dir.join("gateway.sock")).await;
@@ -673,7 +679,7 @@ impl Driver for NetnsCapture {
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         *self.0.lock().unwrap() = spec.netns.clone();
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, emu: None, guest: None }))
+        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), emu: None, guest: None }))
     }
 }
 
@@ -816,7 +822,7 @@ async fn start_host_with(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
     }))
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca };
-    let host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None }))).await.unwrap();
+    let host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
@@ -856,7 +862,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let latch = Arc::new(AttachLatch::default());
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()) }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), fail_next_start: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
@@ -883,6 +889,49 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
     tokio::time::sleep(Duration::from_millis(300)).await;
     let last = gw.got.lock().unwrap().iter().rev().find(|c| matches!(c, GatewayCommand::SandboxUpsert { sandbox, .. } | GatewayCommand::SandboxRemove { sandbox } if sandbox == &sbx)).cloned();
     assert!(matches!(last, Some(GatewayCommand::SandboxRemove { .. })), "a fenced sandbox was re-added to the gateway: {last:?}");
+    assert!(gw.errors.lock().unwrap().is_empty());
+}
+
+/// Integrated review: a `sandbox_create` that fails is retried by SandboxDO at the SAME epoch. The
+/// failed attempt's teardown must leave no tombstone, so the retried create reaches the gateway
+/// (entry present at epoch 1, with its vsock socket and the guest's version: bindable).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "role": "burst", "cell": "test-cell",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+        "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+        "driver": {"type": "process", "guest_command": ["unused"]},
+        "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
+    }))
+    .unwrap();
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
+    let fail = Arc::new(AtomicBool::new(true));
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: fail.clone() }))).await.unwrap();
+    let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
+    let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
+    let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+
+    let sbx = SandboxId("sbx_1".into());
+    fleet.commands.send(vec![create("cmd_create_1", "sbx_1")]).unwrap();
+    assert!(matches!(fleet.result("cmd_create_1").await, CommandOutcome::Error { .. }), "the first create fails");
+    fleet.wait_event("failed", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Failed, .. })).await;
+    assert!(!fail.load(Ordering::SeqCst));
+
+    // SandboxDO retries at the same epoch.
+    fleet.commands.send(vec![create("cmd_create_2", "sbx_1")]).unwrap();
+    assert!(matches!(fleet.result("cmd_create_2").await, CommandOutcome::Ok { .. }), "the retried create succeeds");
+    fleet.wait_event("running", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Running, epoch: Epoch(1), .. })).await;
+    wait_until("gateway upsert after the retry", || {
+        matches!(
+            gw.got.lock().unwrap().iter().rev().find(|c| matches!(c, GatewayCommand::SandboxUpsert { sandbox, .. } | GatewayCommand::SandboxRemove { sandbox } if sandbox == &sbx)),
+            Some(GatewayCommand::SandboxUpsert { epoch: Epoch(1), vsock_uds_path, guest: Some(_), .. }) if vsock_uds_path.ends_with("vsock.sock")
+        )
+    })
+    .await;
     assert!(gw.errors.lock().unwrap().is_empty());
 }
 

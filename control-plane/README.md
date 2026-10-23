@@ -75,6 +75,7 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 ## Known gaps
 
 - **The two-system split** (`docs/architecture/`): the control plane's side of the seam is built: BrokerDO holds
+- Agent removal isn't built, so `SandboxDO.detach` has no caller yet: a stopped agent keeps its slot, proxy port and gateway client entry, and revocation by detach is exercised only by tests.
   the per-cell binding signing key (`binding_key:<cell>`, a P-256 private JWK; `signBinding`, `bindingPublicKeys`),
   FleetDO sends `binding_key` after every hello and records each host's `gateway_url`, SandboxDO configures agent
   slots with `agent_attach`/`agent_detach` and answers `resolve` with a `HandsTarget` only once the slot's result

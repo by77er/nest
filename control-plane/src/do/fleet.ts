@@ -435,7 +435,8 @@ export class FleetDO extends DurableObject<Env> {
       host_token_expires_ms: prior.token_exp,
     });
     if (prior.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, att.host);
-    await this.sendBindingKeys(ws, prior.cell);
+    this.keysSent.delete(att.host);
+    await this.sendBindingKeys(ws, prior.cell, att.host);
 
     // Resend unacked commands the host hasn't processed.
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
@@ -532,6 +533,12 @@ export class FleetDO extends DurableObject<Env> {
       return !lease || lease.host !== host || lease.epoch !== c.epoch || lease.expired === 1;
     });
     this.send(ws, { type: "heartbeat_ack", sent_ms: sentMs, server_ms: now, revoked });
+    // A host that missed its keys (BrokerDO was unavailable at hello, or this object restarted)
+    // refuses every binding as unknown_key until it has them: resend on the next heartbeat.
+    if (!this.keysSent.has(host)) {
+      const row = this.sql.exec<{ cell: string }>("SELECT cell FROM hosts WHERE host = ?", host).toArray()[0];
+      if (row) await this.sendBindingKeys(ws, row.cell, host);
+    }
     if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
 
@@ -837,12 +844,16 @@ export class FleetDO extends DurableObject<Env> {
    * The cell's binding verification keys, for the host's sandbox gateway (docs/sandbox/gateway/).
    * Sent after every hello: the gateway verifies bindings with them and holds nothing else.
    */
-  private async sendBindingKeys(ws: WebSocket, cell: string): Promise<void> {
+  /** Hosts that have the cell's binding keys since their last hello; in memory only, so a restart resends once. */
+  private readonly keysSent = new Set<string>();
+
+  private async sendBindingKeys(ws: WebSocket, cell: string, host: string): Promise<void> {
     try {
       const keys = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).bindingPublicKeys(cell);
       this.send(ws, { type: "binding_key", keys });
+      this.keysSent.add(host);
     } catch (e) {
-      console.error("FleetDO: binding keys unavailable; the host's gateway refuses bindings until the next hello", e);
+      console.error("FleetDO: binding keys unavailable; the host's gateway refuses bindings until the next heartbeat", e);
     }
   }
 

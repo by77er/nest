@@ -166,24 +166,31 @@ pub async fn call_with(
             Ok(Some(HandsResponse::Result { result, .. })) => break to_mcp(result),
             Ok(Some(HandsResponse::Error { error, .. })) => break error_result(&error),
             Ok(None) if cancelled => break ToolCallResult::error("interrupted"),
-            Ok(None) => break ToolCallResult::error("hands connection closed before a result"),
+            // The request was sent: a close or a broken connection before the result (a guest
+            // EOF, a gateway restart) leaves the command possibly run.
+            Ok(None) => break unknown_outcome("the connection closed before a result arrived"),
             Err(RecvError::Closed(c)) if c.is_moved() => {
                 agent.drop_target_if(generation);
-                break ToolCallResult::error(format!(
-                    "{OUTCOME_UNKNOWN}: the sandbox left its host while the call ran; the call may or may not have \
-                     taken effect. Check before retrying anything with side effects. ({c})"
-                ));
+                break unknown_outcome(&format!("the sandbox left its host while the call ran ({c})"));
             }
             Err(RecvError::Closed(c)) if c.is_unauthorized() => {
                 agent.drop_target_if(generation);
                 break ToolCallResult::error(format!("hands refused: {c}"));
             }
             Err(e) if cancelled => break ToolCallResult::error(format!("interrupted ({e})")),
-            Err(e) => break ToolCallResult::error(format!("hands connection lost: {e}")),
+            Err(e) => break unknown_outcome(&format!("the connection failed before a result arrived ({e})")),
         }
     };
     tokio::spawn(conn.close());
     outcome
+}
+
+/// After the request frame went out, losing the connection says nothing about the command.
+fn unknown_outcome(why: &str) -> ToolCallResult {
+    ToolCallResult::error(format!(
+        "{OUTCOME_UNKNOWN}: {why}; the call may or may not have taken effect. Check before retrying anything with side \
+         effects."
+    ))
 }
 
 /// A refusal that a fresh target may cure: the binding is stale, expired or for a rotated key,
@@ -651,6 +658,20 @@ mod tests {
         assert!(r.is_error);
         assert!(text_of(&r).contains(OUTCOME_UNKNOWN), "{r:?}");
         assert!(agent.hands_target().is_none(), "the target is dropped so the next call resolves again");
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_after_the_request_is_an_unknown_outcome() {
+        let (gw, guest) = gateway_with_guest().await;
+        let (agent, _) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
+        let (_tx, rx) = oneshot::channel();
+        // The fake guest hangs up right after reading this request; the gateway then closes
+        // the WebSocket, with no result ever sent.
+        let r = call(&agent, "c1".into(), bash("hangup"), rx).await;
+        assert!(r.is_error);
+        assert!(text_of(&r).contains(OUTCOME_UNKNOWN), "{r:?}");
+        assert_eq!(guest.requests().await.len(), 1, "the request did reach the guest");
+        assert!(agent.hands_target().is_some(), "a dropped connection is not a refused target");
     }
 
     #[tokio::test]

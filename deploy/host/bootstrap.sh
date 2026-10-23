@@ -46,9 +46,10 @@ cat >/etc/nest/nestd.json <<EOF
   "enrollment": {"type": "aws_imds"},
   "driver": $DRIVER,
   "network": {"type": "netns", "persist_dir": "/run/nest/netns"},
+  "gateway_url": "ws://127.0.0.1:18790",
   "storage": {"type": "s3", "bucket": "$BUCKET", "region": "$REGION"},
   "versions": {"nest_proxy": "$VERSION", "agent_runner": "$VERSION", "claude_code": "$(cat /etc/nest/claude-version)"}
 }
 EOF
 
-systemctl enable --now nest-proxy.service nestd.service nest-runner.service
+systemctl enable --now nest-proxy.service nestd.service nest-gateway.service nest-runner.service

@@ -22,7 +22,7 @@ RUST_LOG=debug   # tracing filter
 
 ## Behavior worth knowing
 
-- **Fail closed:** with nestd gone there are no sandboxes, so every bind is `moved` and every open call is cut with 4409 (the public keys stay, so a bind after a link loss is `moved`, not `unknown_key`). During a resync an unknown sandbox is `busy`, not `moved`. SIGTERM cuts every call the same way before the process exits.
+- **Fail closed:** with nestd gone there are no sandboxes, so every bind is `moved` and every open call is cut with 4409 (the public keys stay, so a bind after a link loss is `moved`, not `unknown_key`). During a resync an unknown sandbox is `busy`, not `moved`. SIGTERM cuts every call the same way and waits up to 2 s for the close frames to go out before the process exits.
 - **Nothing is forwarded before the checks pass:** a refused bind never opens the guest's port, and a first frame whose agent, epoch or version differs from the binding closes the connection before the guest sees a byte. A connection is registered against its sandbox and epoch, under the same lock that re-checks both, before the guest's port is opened, so a sandbox that leaves between the check and the first frame is refused or cut, never piped.
 - **Bounded before authentication:** the upgrade and the `bind` share one 5 s deadline from the accept, at most 256 connections sit before `bound` at once (each may hold a 16 MiB message), and every write toward a client has a 2 s bound, so a client that stops reading cannot pin a task, its registration or the guest connection.
 - **One frame per message:** `len == message_len - 4` with a known kind, or the connection closes with 4400; a message over 16 MiB is refused by the WebSocket layer.
