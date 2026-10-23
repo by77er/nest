@@ -1,5 +1,9 @@
 {
   "type": "binding_key",
-  "kid": "k1",
-  "public_key": "BLQqxZ4m8Z5X0hJ2mJxQy0cbdFOMqTT3Dqt0c7mD1oJ0W2hYxU1g6l6z7bJyQ4OwqQfMzQ6PqkG2f7J4oY2Wn6g"
+  "keys": [
+    {
+      "kid": "787edc692db579fe",
+      "public_key": "BG-PmQ8OWaATxpZ0Ts5grKyueVGB0kuKekJw7OcETAsJeHvUm5lVzu_QPOUBssOZOnZAy9dmzf1Kg0N08F05fQs"
+    }
+  ]
 }

@@ -8,5 +8,6 @@
       "pdf",
       "fsfreeze"
     ]
-  }
+  },
+  "gateway_version": 1
 }

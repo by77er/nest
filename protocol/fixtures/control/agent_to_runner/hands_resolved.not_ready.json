@@ -1,0 +1,10 @@
+{
+  "type": "hands_resolved",
+  "request": "req_01jb7r5c3k",
+  "error": {
+    "code": "sandbox_not_ready",
+    "message": "sandbox is being placed",
+    "retryable": true
+  },
+  "retry_after_ms": 2000
+}

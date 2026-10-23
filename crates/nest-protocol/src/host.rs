@@ -509,36 +509,46 @@ pub mod runner {
 /// forwarded raw; outputs use Claude Code's camelCase field names.
 
 /// nestd ↔ sandbox gateway (`paths::GATEWAY_SOCK`, length-prefixed JSON). nestd is the source of
-/// truth: after every `hello` it resends the key and every sandbox, and a gateway that loses
-/// the socket refuses every binding until it reconnects (the gateway's self-fence).
+/// truth: after every `hello` it resends the keys and every sandbox, then `resync_done`. A
+/// gateway that loses the socket closes every open connection (`close_code::MOVED`) and refuses
+/// every binding (`moved`) until it reconnects: the gateway's self-fence. nestd pings every 5 s
+/// and drops a peer silent for 15 s.
 pub mod gateway_link {
     use super::*;
-    use crate::gateway::GuestInfo;
+    use crate::gateway::{BindingKey, GuestInfo};
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
     #[strum_discriminants(name(GatewayCommandKind), derive(strum::EnumIter, strum::IntoStaticStr))]
     #[strum_discriminants(strum(serialize_all = "snake_case"))]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum GatewayCommand {
-        /// Reply to [`GatewayEvent::Hello`]; a full resync (`key_update`, then one
-        /// `sandbox_upsert` per sandbox) follows on every (re)connection.
+        /// Reply to [`GatewayEvent::Hello`]; a full resync (`key_update`, one `sandbox_upsert`
+        /// per sandbox, then `resync_done`) follows on every (re)connection.
         HelloAck { protocol_version: u32, host_id: HostId },
-        /// The cell's binding verification key: ECDSA P-256, the uncompressed SEC1 point,
-        /// base64url without padding. A binding whose `kid` is not the current one is refused.
-        KeyUpdate { kid: String, public_key: String },
+        /// Every binding verification key still valid (see [`BindingKey`]); replaces the set.
+        KeyUpdate { keys: Vec<BindingKey> },
         /// A sandbox this host runs: its current epoch, the host-side vsock unix socket the
-        /// gateway connects to (`CONNECT <port>`), and the guest's version once its hello
-        /// arrived (`None` until then: bindings get `busy`). A newer epoch replaces the old
-        /// one, which revokes every binding that named it.
+        /// gateway connects to (`CONNECT <port>`), the clients attached to it (agent ids with a
+        /// configured slot; a binding whose client is not listed is `unauthorized`, which is how
+        /// `detach` revokes), and the guest's version once its hello arrived (`None` until the
+        /// guest is configured: bindings get `busy`). A newer epoch replaces the old one, which
+        /// revokes every binding that named it. Exposed ports and their `Host` mode come with
+        /// the ingress routes, which are not served yet.
         SandboxUpsert {
             sandbox: SandboxId,
             epoch: Epoch,
             vsock_uds_path: String,
+            #[serde(default)]
+            clients: Vec<String>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             guest: Option<GuestInfo>,
         },
-        /// The sandbox left this host (destroyed, evicted, fenced): bindings get `moved`.
+        /// The sandbox left this host (destroyed, evicted, fenced): open connections close with
+        /// `close_code::MOVED` and bindings get `moved`.
         SandboxRemove { sandbox: SandboxId },
+        /// Ends the resync that follows `hello_ack`: entries not re-sent since `hello` are
+        /// dropped, and unknown sandboxes answer `moved` instead of `busy` from here on.
+        ResyncDone,
         Ping,
     }
 
@@ -548,7 +558,8 @@ pub mod gateway_link {
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum GatewayEvent {
         /// First frame. `instance_id` is random per gateway process; `listen` is the address it
-        /// accepts WebSockets on (what nestd reports as the host's gateway, behind the tunnel).
+        /// accepts WebSockets on, for nestd's logs and health. The URL clients use comes from
+        /// nestd's configuration (`gateway_url` in its fleet hello), not from here.
         Hello { protocol_version: u32, instance_id: String, listen: String },
         Pong,
         Error { error: ErrorBody },

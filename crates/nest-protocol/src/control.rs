@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::gateway::{GuestInfo, HandsTarget};
+use crate::gateway::{BindingKey, GuestInfo, HandsTarget};
 use crate::model::{
     AgentEvent, AgentId, AgentRole, AgentState, AskId, CallId, CommandId, CommitReason, Epoch,
     ErrorBody, EgressPolicy, ForkMode, GenerationId, GenerationKind, GenerationRecord, HostId,
@@ -141,14 +141,16 @@ pub struct SandboxReport {
     /// Uncommitted local writes exist (salvage candidate if the epoch turns out stale).
     #[serde(default)]
     pub dirty: bool,
+    /// The guest's version and capabilities for a `running` sandbox (nestd caches the last
+    /// guest hello, so a resumed sandbox reports it too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<GuestInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentReport {
     pub agent: AgentId,
     pub state: AgentState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hands: Option<HandsBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,9 +192,9 @@ pub enum FleetToHost {
     Ack { up_to: Seq },
     /// Rotated bearer token; use for all new connections and reconnects.
     HostToken { token: String, expires_ms: TimestampMs },
-    /// The cell's binding verification key (ECDSA P-256, uncompressed SEC1 point, base64url),
-    /// for the sandbox gateway. Sent after `hello_ack` and whenever it rotates.
-    BindingKey { kid: String, public_key: String },
+    /// Every binding verification key still valid, for the sandbox gateway (replaces the set).
+    /// Sent after `hello_ack` and on every rotation.
+    BindingKey { keys: Vec<BindingKey> },
     /// Renewed proxy intermediate (answer to `CaRenew`).
     ProxyCa(CaCertificate),
     /// Fatal or per-frame error. `unsupported_protocol_version` / `unauthorized` close the socket.
@@ -285,7 +287,10 @@ pub enum CommandBody {
     /// Start a brain (agent runner). The runner then opens the session channel to AgentDO.
     AgentStart(AgentStart),
     /// Configure an agent's slot in a sandbox's guest (cwd, proxy port, cgroup): the sandbox
-    /// side of `attach`. Goes to the sandbox's host; the brain may run anywhere.
+    /// side of `attach`. Goes to the sandbox's host; the brain may run anywhere. Idempotent: an
+    /// existing slot is replaced. `cwd` defaults to [`DEFAULT_CWD`]. Its `command_result` is what
+    /// SandboxDO waits for before it hands out a binding, so a first hands call never beats the
+    /// slot.
     AgentAttach {
         sandbox: SandboxId,
         epoch: Epoch,
@@ -293,7 +298,8 @@ pub enum CommandBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
-    /// Remove the slot; with `kill_processes`, kill the agent's whole cgroup first.
+    /// Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's whole
+    /// cgroup first. The gateway then refuses the agent's bindings (`unauthorized`).
     AgentDetach { sandbox: SandboxId, epoch: Epoch, agent: AgentId, #[serde(default)] kill_processes: bool },
     /// Stop the brain process (end the current turn cleanly if possible).
     AgentStop { agent: AgentId, reason: String },
@@ -329,22 +335,16 @@ pub enum CommitOutcome {
     },
 }
 
+/// The sandbox an agent's hands act in, by id and epoch only: no address, no token. The runner
+/// fetches the target (`HandsTarget`) with `hands_resolve` over its own session channel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandsBinding {
     pub sandbox: SandboxId,
     pub epoch: Epoch,
-    /// Initial working directory inside the sandbox (absolute). `None` = `/workspace`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
 }
 
-impl HandsBinding {
-    pub const DEFAULT_CWD: &'static str = "/workspace";
-
-    pub fn cwd_or_default(&self) -> &str {
-        self.cwd.as_deref().unwrap_or(Self::DEFAULT_CWD)
-    }
-}
+/// Default working directory of an agent's slot (`agent_attach.cwd`).
+pub const DEFAULT_CWD: &str = "/workspace";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStart {
@@ -354,10 +354,11 @@ pub struct AgentStart {
     /// Existing session to resume; `None` starts a fresh conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<SessionResume>,
-    /// The sandbox this agent's hands act in, as the hands client needs it: the gateway URL,
-    /// the binding and the guest version. `None` for an agent without hands.
+    /// The sandbox this agent's hands act in, if any. Only the ids: the gateway URL and the
+    /// binding never pass through FleetDO or nestd; the runner asks AgentDO for them
+    /// (`hands_resolve`) before its first hands call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hands: Option<HandsTarget>,
+    pub hands: Option<HandsBinding>,
     pub launch: LaunchConfig,
     /// `claude setup-token` OAuth token. Goes only into the Claude Code process environment
     /// (`CLAUDE_CODE_OAUTH_TOKEN`); never logged, never written to disk, never sent to a VM.
@@ -429,8 +430,10 @@ pub enum HostEventBody {
         suspend_mode: Option<SuspendMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
-        /// The guest's protocol version and capabilities, reported with `running` once its hello
-        /// arrived; SandboxDO hands them to clients in bindings (`resolve`).
+        /// The guest's protocol version and capabilities. Every `running` carries it (nestd
+        /// caches the last guest hello, so a resume reports it without a new hello); a repeated
+        /// `running` with a different `guest` is an update, not a transition. SandboxDO hands it
+        /// to clients in `resolve`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guest: Option<GuestInfo>,
     },
@@ -636,12 +639,18 @@ pub enum AgentToRunner {
     CacheUpdate { seq: Seq, cache: AgentCache },
     ToolResult { seq: Seq, call: CallId, outcome: ToolOutcome },
     ToolsList { request: RequestId, tools: Vec<ToolDef> },
-    /// Answer to `hands_resolve`: a fresh binding and the sandbox's current gateway, or `None`
-    /// when the agent has no hands now (detached, or the sandbox is gone).
+    /// Answer to `hands_resolve`. Exactly one of `hands` and `error` is present: `hands` is a
+    /// fresh binding and the sandbox's current gateway; `error` is `not_bound` (the agent has no
+    /// hands: tell the model), `sandbox_not_ready` with `retry_after_ms` (placing, waking:
+    /// wait and ask again), or another `ErrorBody` the runner surfaces as an MCP error.
     HandsResolved {
         request: RequestId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hands: Option<HandsTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorBody>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
     },
     Ack { up_to: Seq },
     Error { error: ErrorBody },

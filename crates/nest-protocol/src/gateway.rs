@@ -7,10 +7,20 @@
 //! `bound`, every binary message is exactly one host-guest frame (`crate::guest::frame`), piped
 //! verbatim to the guest's vsock port, so the hands contract itself lives in `crate::guest`.
 //! Closing the WebSocket closes the vsock side: a hangup is a cancel.
+//!
+//! Framing rule: a binary message holds exactly one frame, `len:u32be kind:u8 payload` with
+//! `len == message_len - 4` and a known `kind`; the gateway rejects anything else (close code
+//! [`close_code::PROTOCOL`]) so a message can never smuggle a second frame past the checks on the
+//! first. The first client frame after `bound` must be a JSON frame whose `agent_id`, `epoch` and
+//! `protocol_version`, where present, equal the binding's client and epoch and the bound guest
+//! version; on a mismatch the gateway closes with [`close_code::UNAUTHORIZED`] before forwarding
+//! anything, so `executed: false` stays true. Later client frames (`cancel`) pass through.
+//! After `bound` the gateway sends no text frames: refusals are close codes, and every other
+//! error is the guest's own frame. A text frame from the client after `bound` is a protocol error.
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Epoch, ErrorBody, SandboxId, TimestampMs};
+use crate::model::{Epoch, ErrorBody, SandboxId, Secret, TimestampMs};
 
 /// Version of this boundary (the `bind` handshake and framing), independent of the guest version
 /// the frames inside carry. The gateway serves `[MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION]`.
@@ -23,8 +33,9 @@ pub const ROUTE_HANDS: &str = "/hands";
 pub const ROUTE_PTY: &str = "/pty";
 pub const ROUTE_INGRESS_PREFIX: &str = "/ingress/";
 
-/// Everything a client needs to reach one sandbox's hands. Issued by SandboxDO (`attach`,
-/// `resolve`); the runner receives it inside `agent_start` and in `hands_resolved`.
+/// Everything a client needs to reach one sandbox's hands. Issued by SandboxDO (`resolve`) and
+/// carried to the runner only over the session channel (`hands_resolved`), never through
+/// FleetDO, nestd or any command at rest: a bearer token travels AgentDO → runner, nowhere else.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandsTarget {
     /// `ws://` or `wss://` base URL of the sandbox host's gateway (no path).
@@ -32,11 +43,34 @@ pub struct HandsTarget {
     pub sandbox: SandboxId,
     /// The sandbox epoch the binding names; every `HandsRequest` carries it too.
     pub epoch: Epoch,
-    /// The binding token (`nbd_…`), sent as the first message. Never put in a URL.
-    pub binding: String,
-    /// The guest's protocol version and capabilities, as nestd reported them; the client speaks
-    /// that version and uses only advertised features.
+    /// The binding token (`nbd_…`), sent as the first message. Never in a URL, never logged
+    /// (`Secret` redacts `Debug`); held in memory only.
+    pub binding: Secret,
+    /// The guest's protocol version and capabilities as SandboxDO last heard them. Advisory: the
+    /// gateway's `bound.guest` is authoritative, and the client uses that for capabilities.
     pub guest: GuestInfo,
+    /// Credentials for the edge in front of the gateway (a Cloudflare Access service token),
+    /// absent on a plain `ws://` gateway. Sent as request headers on the upgrade, never in a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<EdgeAuth>,
+}
+
+/// A Cloudflare Access service token: `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeAuth {
+    pub client_id: String,
+    pub client_secret: Secret,
+}
+
+/// One binding verification key. The control plane lists every key still valid (the previous
+/// one stays listed for at least a binding lifetime after a rotation), so a rotation never
+/// refuses outstanding bindings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingKey {
+    /// First 16 hex characters of SHA-256 over the raw public key bytes.
+    pub kid: String,
+    /// ECDSA P-256 public key: the uncompressed SEC1 point (65 bytes), base64url, no padding.
+    pub public_key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +119,8 @@ pub struct ParsedBinding {
     pub signature: Vec<u8>,
 }
 
+/// `Prefix`, `Shape`, `Base64` and `Claims` are refused as `unauthorized`; `Version` (claims
+/// format newer or older than this gateway knows) as `unsupported_version`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BindingParseError {
     Prefix,
@@ -167,9 +203,13 @@ pub enum ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayMessage {
     /// The binding was accepted and the guest's port is connected; guest frames follow.
-    Bound { guest: GuestInfo },
-    /// The connection is refused; the gateway closes right after. `executed` is always false
-    /// here: nothing reached the guest. Codes: [`error_code`].
+    /// `gateway_version` is the version this gateway chose (the highest it serves that is not
+    /// above the client's), so a newer client can step down; `guest` is authoritative.
+    Bound { guest: GuestInfo, gateway_version: u32 },
+    /// The connection is refused; the gateway closes right after. `executed` is false here by
+    /// construction: the gateway never executes anything, and nothing has reached the guest.
+    /// (Host-guest v1 treats a *missing* `executed` as "possibly executed"; here the field is
+    /// always present.) Codes: [`error_code`].
     Error {
         error: ErrorBody,
         #[serde(default)]
@@ -179,20 +219,46 @@ pub enum GatewayMessage {
     },
 }
 
+/// Refusal codes, in the order the gateway checks them: `bad_request` (shape, route, no `bind`
+/// within 5 s) → `unsupported_version` (gateway version out of range, claims format version) →
+/// `unknown_key` → `unauthorized` (signature, expiry, scope, client not attached) → `moved`
+/// (sandbox unknown here) → `stale_epoch` (binding epoch older than the sandbox's) → `busy`
+/// (binding epoch newer than this gateway's table, guest not configured, resync in progress,
+/// vsock connect failed) → `unsupported_version` again if `bind.protocol_version` is not the
+/// guest's. Only `busy` is retryable with the same binding; `stale_epoch`, `moved` and
+/// `unknown_key` mean "resolve again"; `unauthorized` and `bad_request` are final.
 pub mod error_code {
-    /// Bad signature, unknown key, expired binding, wrong scope, or a frame whose agent or epoch
-    /// differs from the binding's.
+    /// Bad signature, expired binding, wrong scope, a client that is not attached to the
+    /// sandbox, or a first frame whose agent or epoch differs from the binding's. Never says which.
     pub const UNAUTHORIZED: &str = "unauthorized";
-    /// The binding names an epoch that is not the sandbox's current one on this host; re-resolve.
+    /// The binding's `kid` is none of the keys this gateway holds: rotated away, or forged with
+    /// a key this cell never had. Not retryable with the same binding; resolve again.
+    pub const UNKNOWN_KEY: &str = "unknown_key";
+    /// The binding names an epoch older than the sandbox's current one on this host. Not
+    /// retryable: the same binding can never succeed; resolve again.
     pub const STALE_EPOCH: &str = "stale_epoch";
-    /// The sandbox is not on this host; re-resolve.
+    /// The sandbox is not on this host (or this gateway has lost nestd). Resolve again.
     pub const MOVED: &str = "moved";
-    /// The client's guest or gateway version is outside what this gateway serves.
+    /// The client's gateway version is outside the served range, the claims format is unknown,
+    /// or `bind.protocol_version` is not the guest's version (then `message` names it).
     pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
-    /// The guest is not ready (before `configure`, or during a freeze); retryable.
+    /// Not yet: the binding's epoch is newer than this gateway's table (a placement that nestd
+    /// has not pushed yet), the guest has not been configured, a resync is in progress, or the
+    /// vsock connect failed. Retryable with the same binding after `retry_after_ms`.
     pub const BUSY: &str = "busy";
-    /// The first message was not a well-formed `bind`, or the route is unknown.
+    /// The first message was not a well-formed `bind` text frame, or the route is unknown.
     pub const BAD_REQUEST: &str = "bad_request";
+}
+
+/// WebSocket close codes the gateway uses after `bound`, when text frames are no longer allowed.
+pub mod close_code {
+    /// A message that is not exactly one well-formed frame, or a text frame after `bound`.
+    pub const PROTOCOL: u16 = 4400;
+    /// The first frame's agent, epoch or version differs from the binding's. Nothing was forwarded.
+    pub const UNAUTHORIZED: u16 = 4401;
+    /// The sandbox left this host mid-call (fence, eviction, nestd link lost). The call may have
+    /// run; the client treats the outcome as unknown.
+    pub const MOVED: u16 = 4409;
 }
 
 #[cfg(test)]
@@ -253,6 +319,19 @@ mod tests {
     fn claims_and_target_fixtures() {
         round_trip_dir::<BindingClaims>("binding_claims");
         round_trip_dir::<HandsTarget>("hands_target");
+    }
+
+    #[test]
+    fn signed_fixture_parses_to_its_claims() {
+        let f: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixtures_dir().join("binding_token/signed.json")).unwrap(),
+        )
+        .unwrap();
+        let parsed = parse_binding(f["token"].as_str().unwrap()).unwrap();
+        let claims: BindingClaims = serde_json::from_value(f["claims"].clone()).unwrap();
+        assert_eq!(parsed.claims, claims);
+        assert_eq!(parsed.claims.kid, f["kid"].as_str().unwrap());
+        assert_eq!(parsed.signature.len(), 64, "fixed-size r‖s signature");
     }
 
     fn claims() -> BindingClaims {
