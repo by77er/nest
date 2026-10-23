@@ -455,8 +455,9 @@ pub mod runner {
     pub struct AgentStart {
         /// As received from FleetDO (`CommandBody::AgentStart`), including `oauth_token`,
         /// `session_ws_url`, `resume` (Worker-signed segment URLs the runner downloads) and
-        /// `hands` (the gateway URL, binding and guest version the hands client uses). nestd
-        /// adds nothing about hands: the runner never touches a vsock socket.
+        /// `hands` (the sandbox's id and epoch only; the runner fetches the gateway target over
+        /// its session channel). nestd adds nothing about hands: the runner never touches a
+        /// vsock socket.
         pub start: crate::control::AgentStart,
         /// `CLAUDE_CONFIG_DIR`, normally `<AGENTS_DIR>/<agent>`; created by nestd, owned by the
         /// agent's unit user.
@@ -505,9 +506,6 @@ pub mod runner {
 /// [`HookDatagram`]; sync (decision) hooks send one [`HookDecisionRequest`] frame and print the
 /// [`HookOutput`] from the response to stdout. `nest hook` always exits 0.
 ///
-/// Claude Code's hook input/output JSON is an external format: inputs are snake_case and are
-/// forwarded raw; outputs use Claude Code's camelCase field names.
-
 /// nestd ↔ sandbox gateway (`paths::GATEWAY_SOCK`, length-prefixed JSON). nestd is the source of
 /// truth: after every `hello` it resends the keys and every sandbox, then `resync_done`. A
 /// gateway that loses the socket closes every open connection (`close_code::MOVED`) and refuses
@@ -566,6 +564,8 @@ pub mod gateway_link {
     }
 }
 
+/// Claude Code's hook input/output JSON is an external format: inputs are snake_case and are
+/// forwarded raw; outputs use Claude Code's camelCase field names.
 pub mod hook {
     use super::*;
 
