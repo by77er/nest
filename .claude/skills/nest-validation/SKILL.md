@@ -11,7 +11,7 @@ description: Use before claiming that a nest change works, is safe, or is verifi
    - repo guards: `python3 -I scripts/check-doc-links.py`, `python3 -I scripts/check-fences.py`, and `python3 -m unittest discover -s scripts/tests`.
 2. **Run `e2e/run.sh`** when a change crosses components (runner, nestd, proxy, guest, control plane).
 3. **Name the evidence tier in every claim.** The tiers and what each can't prove are in `dev/practices.md#evidence-tiers`. Never:
-   - claim Firecracker, snapshot, real-vsock, gateway or tunnel behaviour from the process driver;
+   - claim Firecracker, snapshot, real-vsock, tunnel or Access behaviour from the process driver (it does prove the gateway's WebSocket-to-vsock path on one host, not across machines);
    - claim real Claude Code behaviour from `fake_claude.py`.
 4. **For a fix or an invariant, mutation-check it:** break the code, watch the owning test fail, restore. Say what you mutated.
 5. **A skipped test is not a pass.** Look for `NEST-TEST-SKIP:` lines, and say which tests skipped and why.

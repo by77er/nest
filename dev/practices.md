@@ -7,6 +7,7 @@ What makes this repo safe for agents to change and to review. The checks are the
 - **Source fences** (`scripts/fences.toml`, checked by `scripts/check-fences.py`) turn `CLAUDE.md`'s invariants from prose into checks. Each fence lists patterns that may appear only in the files it allows:
   - the subscription token's names;
   - the guest's credential-free code;
+  - the gateway's and the hands client's credential-free code;
   - Claude Code's launch, and permission bypass;
   - TLS interception;
   - metrics writes.
@@ -33,7 +34,7 @@ What each kind of run can prove (the `nest-validation` skill). Claims in PRs and
 | Tier | Proves | Doesn't prove |
 |---|---|---|
 | Unit and integration tests | Logic; wire formats against `protocol/fixtures/` | Real processes, namespaces or VMs |
-| `e2e/run.sh` (process driver) | The real components together on one machine: hands over emulated vsock, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code, the gateway and the tunnel (a brain and a sandbox on different machines) |
+| `e2e/run.sh` (process driver) | The real components together on one machine: hands through the gateway's WebSocket-to-vsock path (emulated vsock), bindings minted by the control plane and refused when tampered or fenced, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code, the tunnel and Cloudflare Access, a brain and a sandbox on different machines |
 | `e2e/claude-verify`, `NEST_E2E_CLAUDE=real` | Real Claude Code's behaviour under nest's flags | Firecracker, scale |
 | The [first spike](../docs/README.md#first-spike) on AWS | Firecracker, snapshots and restore, fencing under partition, the seam (a brain reaching a sandbox through the gateway and the tunnel) | — |
 

@@ -9,7 +9,10 @@ publish.workspace = true
 anyhow = "1.0.104"
 base64 = "0.23.1"
 futures-util = "0.3.34"
+nest-hands-client = { path = "../nest-hands-client" }
 nest-protocol = { path = "../nest-protocol" }
+# test-support only: an in-process gateway for this crate's tests and nest-cli's e2e tests
+nest-gateway = { path = "../nest-gateway", optional = true }
 nix = { version = "0.31.3", features = ["signal", "process"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
@@ -22,7 +25,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 tokio-util = "0.7"
 
+[features]
+# `test_support::gateway`: a real gateway in-process, for tests of the hands path. Never on in
+# a production build: the runner must not carry the gateway's code or its verification key.
+test-support = ["dep:nest-gateway"]
+
 [dev-dependencies]
+nest-runner = { path = ".", features = ["test-support"] }
 tempfile = "3"
 
 [lints]

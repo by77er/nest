@@ -1,0 +1,9 @@
+{
+  "cmd": "cmd_01jb7q0019",
+  "issued_ms": 1760270400000,
+  "type": "agent_detach",
+  "sandbox": "sbx_01jb7m2a4c",
+  "epoch": 4,
+  "agent": "agt_01jb7n0w1e",
+  "kill_processes": true
+}

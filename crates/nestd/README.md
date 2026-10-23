@@ -1,6 +1,6 @@
 # nestd
 
-The privileged per-host daemon (`docs/compute/nestd/`). It speaks the fleet channel to FleetDO and owns sandboxes, network namespaces, the nest-proxy listener handoff, the guest control connection, leases and fencing; with `role: controller` it runs no sandboxes and only supervises the runner (the design's brain host, `docs/compute/brain-hosts/`).
+The privileged per-host daemon (`docs/compute/nestd/`). It speaks the fleet channel to FleetDO and owns sandboxes, network namespaces, the nest-proxy listener handoff, the sandbox gateway's view of the host (keys, sandboxes, clients, guest versions), the guest control connection, leases and fencing; with `role: controller` it runs no sandboxes and only supervises the runner (the design's brain host, `docs/compute/brain-hosts/`). It carries nothing about hands to the runner: a brain reaches a guest through the gateway with a binding from AgentDO.
 
 ```
 cargo build -p nestd
@@ -18,8 +18,9 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
 | `limits` | Per-sandbox token buckets for guest- and proxy-originated events |
 | `net` | Netns with no uplink: `unshare(CLONE_NEWNET)` in a helper thread, tap0 plus the nft ruleset, listeners bound inside the namespace via `setns` on a fresh thread |
 | `proxy_link` | nestd ↔ nest-proxy over SEQPACKET + `SCM_RIGHTS`. A state mirror plus sequence-tagged ops gives a full resync on every reconnect with nothing lost or duplicated. `apply` never blocks: queued ops carry duplicated fds, and sends have a timeout. Also: ping watchdog, resync count check, refusal of fenced epochs, socket access control |
-| `runner_link` | nestd ↔ agent runner. Keeps the desired set of brains and re-issues `agent_start` on reconnect, with the sandbox's vsock path for hands (the design routes hands through the gateway instead, `docs/sandbox/gateway/`). Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
-| `guest` | Guest control connection (vsock 1024): hello, configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
+| `runner_link` | nestd ↔ agent runner, lifecycle only. Keeps the desired set of brains and re-issues `agent_start` on reconnect (the sandbox's id and epoch, never a socket path or a binding). Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
+| `gateway_link` | nestd ↔ sandbox gateway (`gateway.sock`). A mirror of the binding verification keys and, per sandbox, the epoch, the vsock socket, the attached clients and the guest's version; replayed in full on every (re)connection and closed with `resync_done`, then deltas on attach, detach, boot, resume, the guest's hello, fence and teardown. Ping every 5 s, a silent gateway is dropped after 15 s. Socket access control, one gateway at a time |
+| `guest` | Guest control connection (vsock 1024): hello (the guest's version and capabilities are kept and reported with `running`), configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
 | `vsock` | Hybrid-vsock `CONNECT` client and the unix-socket emulator (test transport) |
 | `driver` | `Driver`/`Vm`/`Pauser` traits; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (2M hugepages, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths |
 | `storage` | Content-addressed chunks and manifests. Hole-aware disk chunking (`SEEK_DATA`), `LocalFsStore` backend. On restore, chunk names and every chunk's and manifest's hash are verified |
@@ -34,11 +35,12 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
   "enrollment": {"type": "aws_imds"},
   "driver": {"type": "process", "guest_command": ["/usr/lib/nest/nest-guest"]},
   "network": {"type": "netns", "persist_dir": "/run/netns"},
-  "sockets": {"gid": 990, "proxy_uids": [991], "runner_uids": [992]}
+  "sockets": {"gid": 990, "proxy_uids": [991], "runner_uids": [992], "gateway_uids": [993]},
+  "gateway_url": "wss://01jb7k3x9q-gw-nest.example.dev"
 }
 ```
 
-`sockets`: who may connect to `proxy.sock`/`runner.sock`. Empty lists allow only nestd's own euid and root. With the Firecracker driver in production, also set `"jailer_bin"` and `"jailer": {"uid": …, "gid": …, "chroot_base_dir": "/srv/jailer"}`. Without the jailer, Firecracker runs with nestd's privileges, which is for development only and is logged as a warning.
+`sockets`: who may connect to `proxy.sock`/`runner.sock`/`gateway.sock`. Empty lists allow only nestd's own euid and root. `gateway_url`: where clients reach this host's sandbox gateway, reported in the fleet hello (the e2e harness uses `ws://127.0.0.1:18790`); omit it on a host that runs no sandboxes. With the Firecracker driver in production, also set `"jailer_bin"` and `"jailer": {"uid": …, "gid": …, "chroot_base_dir": "/srv/jailer"}`. Without the jailer, Firecracker runs with nestd's privileges, which is for development only and is logged as a warning.
 
 Development without a control plane: `"enrollment": {"type": "static", "host": "hst_dev", "host_token": "…", "fleet_ws_url": "ws://…"}`.
 
@@ -57,6 +59,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
     - **a second concurrent proxy is refused**, socket mode 0660
     - **fenced epochs can't be re-added**
   - runner link: replay on reconnect; **stale fenced exits after a replay are dropped**; a second concurrent runner is refused
+  - gateway link: the replay (keys, sandboxes, `resync_done`) on connect and reconnect; deltas sent once, identical upserts not resent; **a second concurrent gateway is refused**; **a silent gateway is dropped after the pong timeout** (the test waits the real 15 s)
   - guest control:
     - configure/attach and reconnect with `resume`
     - **CLI and task frames during the resume handshake are routed**
@@ -65,7 +68,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 - **`net::tests::netns_redirect_reaches_listener`** re-executes itself under `unshare --user --map-root-user --net`. The traffic from a "guest" netns to an arbitrary IP on `:443` is redirected to the gateway listener, and `:22` is dropped.
 - **`tests/host.rs`** uses a mock FleetDO that accepts reconnects and can simulate a partition, a fake driver whose guest sits behind the vsock emulator, and fake runner and proxy:
   - `host_lifecycle_commit_and_self_fence`:
-    - create, agent start with hands, guest CLI relay, task exit, port events
+    - create (`running` carries the guest's version), agent start (ids only to the runner, no guest slot), `agent_attach`/`agent_detach` (guest slot, the gateway's client set, idempotent re-attach, a stale epoch refused, detaching twice is `ok`), the gateway link's replay and the binding keys FleetDO pushes, guest CLI relay, task exit, port events
     - checkpoint compare-and-set
     - stale epoch rejection, and that a redelivered command isn't re-executed
     - self-fence about 500 ms into a partition (proxy drop, **a single runner fence**)

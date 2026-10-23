@@ -1,8 +1,6 @@
 # Hands
 
-MCP tools that act on the agent's bound sandbox. `nest mcp` (a stdio shim Claude Code spawns on the brain host) forwards them to the agent runner, whose hands client opens one WebSocket per call to the sandbox's [gateway](../../sandbox/gateway/), which forwards it over vsock to the [guest agent](../../sandbox/guest-agent/). Every call carries the binding SandboxDO issued at `attach` (sandbox, epoch, client, scope), checked by the gateway and again by the guest. The exact schemas are in `protocol/schemas/guest/hands-tools.json`; the wire semantics are in [../../interfaces/gateway/](../../interfaces/gateway/) and [../../interfaces/host-guest/](../../interfaces/host-guest/).
-
-**Not built:** the gateway and the hands client. Today the runner opens the guest's vsock port directly, on the host it shares with the sandbox.
+MCP tools that act on the agent's bound sandbox. `nest mcp` (a stdio shim Claude Code spawns on the brain host) forwards them to the agent runner, whose hands client (`crates/nest-hands-client`) opens one WebSocket per call to the sandbox's [gateway](../../sandbox/gateway/), which forwards it over vsock to the [guest agent](../../sandbox/guest-agent/). Every call carries the binding SandboxDO minted at `resolve` (sandbox, epoch, client, scope), checked by the gateway and again by the guest. The exact schemas are in `protocol/schemas/guest/hands-tools.json`; the wire semantics are in [../../interfaces/gateway/](../../interfaces/gateway/) and [../../interfaces/host-guest/](../../interfaces/host-guest/). **Built**, and proven on the e2e harness with the gateway on loopback; the runner holds no vsock path.
 
 | Tool | Modeled on | Semantics |
 |---|---|---|

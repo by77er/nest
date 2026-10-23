@@ -1,0 +1,10 @@
+{
+  "type": "error",
+  "error": {
+    "code": "busy",
+    "message": "guest not configured yet",
+    "retryable": true
+  },
+  "executed": false,
+  "retry_after_ms": 500
+}

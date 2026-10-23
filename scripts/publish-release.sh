@@ -13,13 +13,13 @@ BUCKET=$1 VERSION=$2
 REGION=${AWS_REGION:-us-east-1}
 CURRENT="s3://$BUCKET/releases/current"
 TARGET=x86_64-unknown-linux-musl
-BINS=(nestd nest-guest nest-proxy nest-runner nest)
+BINS=(nestd nest-guest nest-proxy nest-gateway nest-runner nest)
 CARRIED=(firecracker jailer vmlinux nest-base.ext4.zst)
 
 # Static binaries: hosts run Amazon Linux 2023, whose glibc is older than the runner's.
 rustup target add "$TARGET" >&2
 CC_x86_64_unknown_linux_musl=musl-gcc cargo build --locked --release --target "$TARGET" \
-  -p nestd -p nest-guest -p nest-proxy -p nest-runner -p nest-cli >&2
+  -p nestd -p nest-guest -p nest-proxy -p nest-gateway -p nest-runner -p nest-cli >&2
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT

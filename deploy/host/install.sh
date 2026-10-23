@@ -26,7 +26,7 @@ if cmp -s "$STAGE/SHA256SUMS" /opt/nest/release.sha256sums; then
 else
   aws s3 cp --region "$REGION" --recursive --only-show-errors "s3://$BUCKET/releases/current/" "$STAGE/"
   (cd "$STAGE" && sha256sum -c --quiet SHA256SUMS)
-  install -m 0755 "$STAGE"/{nestd,nest-proxy,nest-guest,nest-runner,nest} /opt/nest/bin/
+  install -m 0755 "$STAGE"/{nestd,nest-proxy,nest-gateway,nest-guest,nest-runner,nest} /opt/nest/bin/
   # The managed settings' hooks run /usr/lib/nest/nest.
   install -m 0755 "$STAGE/nest" /usr/lib/nest/nest
   install -m 0644 "$STAGE/managed-settings.json" /etc/claude-code/managed-settings.json
@@ -84,6 +84,26 @@ ExecStartPre=/bin/mkdir -p /run/nest/netns /run/nest/runner
 ExecStart=/opt/nest/bin/nestd --config /etc/nest/nestd.json
 Restart=always
 RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# The sandbox gateway: the only way hands reach a guest. It connects to nestd's gateway socket and
+# listens on loopback; in this step every brain runs on its sandbox's host, so loopback is the
+# gateway URL nestd advertises (the tunnel hostname replaces it when cloudflared lands).
+cat >/etc/systemd/system/nest-gateway.service <<'EOF'
+[Unit]
+Description=nest sandbox gateway (hands over WebSocket to the guests' vsock ports)
+After=nestd.service
+Wants=nestd.service
+[Service]
+StandardOutput=journal+console
+StandardError=journal+console
+Environment=RUST_LOG=info
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S /run/nest/gateway.sock ] && exit 0; sleep 1; done; exit 1'
+ExecStart=/opt/nest/bin/nest-gateway --listen 127.0.0.1:18790 --nestd-sock /run/nest/gateway.sock
+Restart=always
+RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF

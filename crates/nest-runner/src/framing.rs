@@ -1,6 +1,8 @@
 //! Async helpers for the two frame formats the runner speaks:
 //! - host-internal frames (`nest_protocol::host::frame`): `[u32 BE len][JSON]`;
-//! - guest frames (`nest_protocol::guest::frame`): `[u32 BE len][u8 kind][payload]`.
+//! - guest frames (`nest_protocol::guest::frame`): `[u32 BE len][u8 kind][payload]`, which the
+//!   runner itself no longer reads from a socket (hands go through `nest-hands-client`); the
+//!   helpers serve the test double in `test_support`.
 
 use std::io;
 
@@ -72,31 +74,6 @@ pub async fn read_guest<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unknown frame kind {}", body[0])))?;
     body.remove(0);
     Ok(Frame { kind, payload: body })
-}
-
-/// Client side of the Firecracker hybrid-vsock handshake on an already connected unix stream:
-/// write `CONNECT <port>\n`, read `OK <n>\n`. Returns the stream (buffered reader drained of
-/// exactly the handshake line).
-pub async fn vsock_connect(path: &str, port: u32) -> io::Result<tokio::net::UnixStream> {
-    let mut stream = tokio::net::UnixStream::connect(path).await?;
-    stream.write_all(nest_protocol::guest::handshake::connect_line(port).as_bytes()).await?;
-    // Read the reply byte by byte so no frame bytes are consumed into a buffer we'd drop.
-    let mut line = Vec::with_capacity(16);
-    loop {
-        let mut b = [0u8; 1];
-        let n = stream.read(&mut b).await?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "vsock handshake: connection closed"));
-        }
-        line.push(b[0]);
-        if b[0] == b'\n' || line.len() > 64 {
-            break;
-        }
-    }
-    let line = String::from_utf8_lossy(&line);
-    nest_protocol::guest::handshake::parse_ok_line(&line)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("vsock handshake: unexpected reply {line:?}")))?;
-    Ok(stream)
 }
 
 /// Read newline-delimited lines (used for Claude Code stdout).

@@ -17,6 +17,11 @@ WORK = os.environ.get("NEST_E2E_WORK", os.path.join(E2E, ".work"))
 BIN = os.path.join(ROOT, "target", "e2e", "release")
 PORT = int(os.environ.get("NEST_E2E_PORT", "18787"))
 BASE = f"http://127.0.0.1:{PORT}"
+GW_PORT = int(os.environ.get("NEST_E2E_GATEWAY_PORT", "18790"))
+GW_URL = f"ws://127.0.0.1:{GW_PORT}"
+# The hands tools the scripted scenario and the real prompt use. Every one of these is a gateway
+# connection; the guest's full list is longer, and drift here only undercounts (a weaker check).
+HANDS_TOOLS = {"Bash", "Read", "Write", "Edit", "Glob", "Grep", "TaskOutput", "TaskStop"}
 ADMIN = "e2e-admin-token"
 FENCE_BUDGET_S = float(os.environ.get("NEST_E2E_FENCE_BUDGET_S", "30"))
 MODE = os.environ.get("NEST_E2E_CLAUDE", "fake")
@@ -131,7 +136,7 @@ def build():
     log("building release binaries (CARGO_TARGET_DIR=target/e2e)")
     env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(ROOT, "target", "e2e"))
     subprocess.run(["cargo", "build", "--release", "-q", "-p", "nestd", "-p", "nest-proxy", "-p", "nest-guest",
-                    "-p", "nest-runner", "-p", "nest-cli"], cwd=ROOT, env=env, check=True)
+                    "-p", "nest-gateway", "-p", "nest-runner", "-p", "nest-cli"], cwd=ROOT, env=env, check=True)
     if not os.path.exists(os.path.join(ROOT, "control-plane", "node_modules")):
         subprocess.run(["npm", "install", "--silent"], cwd=os.path.join(ROOT, "control-plane"), check=True)
 
@@ -187,6 +192,7 @@ def configure_host():
         "run_dir": os.path.join(WORK, "run"), "state_dir": os.path.join(WORK, "state"),
         "driver": {"type": "process", "guest_command": guest},
         "network": {"type": "netns", "persist_dir": os.path.join(WORK, "netns")},
+        "gateway_url": GW_URL,
         "flush_interval_ms": 500,
         "versions": {"nest_proxy": "e2e", "agent_runner": "e2e", "claude_code": REAL_ENV.get("version", "real") if REAL else "fake"},
     }
@@ -195,8 +201,8 @@ def configure_host():
 
 
 def start_inner():
-    log("starting nest-proxy, nestd, nest-runner inside `unshare --user --map-root-user --mount`")
-    env = dict(os.environ, WORK=WORK, BIN=BIN, E2E=E2E)
+    log("starting nest-proxy, nestd, nest-gateway, nest-runner inside `unshare --user --map-root-user --mount`")
+    env = dict(os.environ, WORK=WORK, BIN=BIN, E2E=E2E, NEST_E2E_GATEWAY_PORT=str(GW_PORT))
     if REAL:
         env.update({k: v for k, v in REAL_ENV.items() if k.startswith("NEST_E2E_")})
     logf = open(os.path.join(WORK, "logs", "inner.log"), "w")
@@ -218,7 +224,8 @@ def stop_inner():
             except ProcessLookupError:
                 pass
     # Guests/brains may have been re-parented; sweep anything under WORK.
-    for pat in [os.path.join(BIN, "nest-guest"), os.path.join(E2E, "fake_claude.py"), os.path.join(BIN, "nest") + " mcp"]:
+    for pat in [os.path.join(BIN, "nest-guest"), os.path.join(BIN, "nest-gateway"), os.path.join(E2E, "fake_claude.py"),
+                os.path.join(BIN, "nest") + " mcp"]:
         for pid in children_named(pat):
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -363,6 +370,10 @@ def run_real_turn(agid):
     guests = children_named(os.path.join(BIN, "nest-guest"))
     leaked = [g for g in guests if TOKEN.encode() in read_bytes(f"/proc/{g}/environ")]
     check("real claude: the OAuth token is not in the sandbox's environment", guests and not leaked, f"guests={guests} leaked={leaked}")
+    gateways = children_named(os.path.join(BIN, "nest-gateway"))
+    leaked = [g for g in gateways if TOKEN.encode() in read_bytes(f"/proc/{g}/environ") + read_bytes(f"/proc/{g}/cmdline")]
+    check("real claude: the OAuth token is not in the gateway's environment", gateways and not leaked, f"gateways={gateways} leaked={leaked}")
+    return sum(1 for n in names if n.startswith("mcp__nest__") and n[len("mcp__nest__"):] in HANDS_TOOLS)
 
 
 def read_bytes(path):
@@ -406,7 +417,7 @@ def scenario(sbx_dir):
     with open(path, "w") as fh:
         json.dump({"results": os.path.join(WORK, "results.jsonl"),
                    "steps": [{"label": l, "tool": t, "args": a} for l, t, a in steps]}, fh, indent=2)
-    return path, len(steps)
+    return path, len(steps), sum(1 for _, tool, _ in steps if tool in HANDS_TOOLS)
 
 
 def results_by_label():
@@ -450,10 +461,10 @@ def run_scenario():
     agid = ag.get("agent") or ag.get("id")
 
     if REAL:
-        run_real_turn(agid)
+        nhands = run_real_turn(agid)
         skip("scripted hands, egress, notify and audit checks", "fake mode only: they need scripted tool calls; real mode checks hands through a natural-language turn")
     else:
-        spath, nsteps = scenario(os.path.join(WORK, "files"))
+        spath, nsteps, nhands = scenario(os.path.join(WORK, "files"))
         st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {spath}"})
         check("turn enqueued", st == 201, json.dumps(t))
 
@@ -490,6 +501,26 @@ def run_scenario():
     p = in_userns(["bash", "-c", "timeout 5 bash -c 'exec 3<>/dev/tcp/172.16.0.1/443' && echo OPEN || echo CLOSED"], netns=netns)
     check("netns: proxy listener reachable on 172.16.0.1:443", "OPEN" in p.stdout, (p.stdout + p.stderr).strip()[:200])
 
+    # The seam: every hands call went through the gateway, and the gateway refuses what it must.
+    bound = len(re.findall(r"\bbound\b.*sandbox=", gateway_log()))
+    check("hands calls went through the gateway", bound >= nhands, f"{bound} bound connections for {nhands} hands calls")
+    st, target = api("POST", f"/v1/sandboxes/{sbxid}/resolve", {"client": agid})
+    ok = check("operator resolve returns a target",
+               isinstance(target, dict) and st == 200 and target.get("url") == GW_URL and str(target.get("binding") or "").startswith("nbd_")
+               and isinstance((target.get("guest") or {}).get("protocol_version"), int),
+               json.dumps({k: v for k, v in target.items() if k != "binding"})[:200] if isinstance(target, dict) else str(target)[:200])
+    if ok:
+        r = gateway_probe(target["url"], target["binding"], target["guest"]["protocol_version"])
+        check("gateway admits a valid binding (bound)", (r.get("message") or {}).get("type") == "bound", json.dumps(r)[:200])
+        tampered = tamper_signature(target["binding"])
+        r = gateway_probe(target["url"], tampered, target["guest"]["protocol_version"])
+        m = r.get("message") or {}
+        check("gateway refuses a tampered binding (unauthorized, nothing executed)",
+              m.get("type") == "error" and m.get("error", {}).get("code") == "unauthorized" and m.get("executed") is False, json.dumps(r)[:200])
+        ids_target = target
+    else:
+        ids_target = None
+
     # Session transcript in R2 (via the admin API), agent turns/events.
     def transcript_ok():
         st, tr = api("GET", f"/v1/agents/{agid}/transcript", raw=True)
@@ -509,7 +540,7 @@ def run_scenario():
     evs_s = json.dumps(evs)
     check("workstream events visible", st == 200, evs_s[:300])
     if REAL:
-        return {"workstream": wsid, "sandbox": sbxid, "agent": agid, "netns": netns}
+        return {"workstream": wsid, "sandbox": sbxid, "agent": agid, "netns": netns, "target": ids_target}
     st, notes = api("GET", f"/v1/workstreams/{wsid}/notifications")
     check("notify reached the user-notification queue", st == 200 and "hello from the e2e fake claude" in json.dumps(notes), json.dumps(notes)[:300])
 
@@ -526,7 +557,30 @@ def run_scenario():
     except TimeoutError as e:
         check("egress audit: allowed + denied records", False, str(e)[:200])
 
-    return {"workstream": wsid, "sandbox": sbxid, "agent": agid, "netns": netns}
+    return {"workstream": wsid, "sandbox": sbxid, "agent": agid, "netns": netns, "target": ids_target}
+
+
+def gateway_log():
+    """The gateway's log without tracing's ANSI colour codes, which sit between a field's name and its value."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", read(os.path.join(WORK, "logs", "gateway.log")))
+
+
+def gateway_probe(url, binding, version):
+    """Open /hands on the gateway as a brain would and return the first reply (see gateway_probe.mjs)."""
+    p = subprocess.run(["node", os.path.join(E2E, "gateway_probe.mjs"), url, binding, str(version)], capture_output=True, text=True, timeout=30)
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        return {"error": (p.stdout + p.stderr).strip()[:200]}
+
+
+def tamper_signature(binding):
+    """Flip one character of the signature segment: the claims stay intact, the signature no longer verifies."""
+    if "." not in binding:
+        return binding + ".AA"
+    head, sig = binding.rsplit(".", 1)
+    c = "A" if sig[0] != "A" else "B"
+    return f"{head}.{c}{sig[1:]}"
 
 
 def run_fencing(ids):
@@ -553,6 +607,16 @@ def run_fencing(ids):
     check("proxy listeners dropped / netns removed",
           p is None or "CLOSED" in p.stdout,
           "netns removed" if p is None else (p.stdout + p.stderr).strip()[:200])
+    if ids.get("target"):
+        t = ids["target"]
+        r = gateway_probe(t["url"], t["binding"], t["guest"]["protocol_version"])
+        m = r.get("message") or {}
+        gl = gateway_log()
+        removed = f"sandbox removed sandbox={ids['sandbox']}" in gl
+        link_lost = bool(re.search(r"nestd link (lost|closed)", gl))
+        check("gateway refuses the fenced sandbox's binding (moved, because nestd removed it)",
+              m.get("type") == "error" and m.get("error", {}).get("code") == "moved" and removed and not link_lost,
+              f"{json.dumps(r)[:140]} removed={removed} link_lost={link_lost}")
 
 
 def main():
@@ -579,6 +643,11 @@ def main():
             check("nestd enrolled + fleet connected", True)
         except TimeoutError as e:
             check("nestd enrolled + fleet connected", False, str(e))
+        try:
+            wait_for(lambda: ("nest-gateway listening" in gateway_log() and "resync done" in gateway_log()) or None, 30, 0.5, "gateway up and synced")
+            check("gateway listening + synced with nestd", True)
+        except TimeoutError as e:
+            check("gateway listening + synced with nestd", False, str(e))
         ids = run_scenario()
         run_fencing(ids)
         skip("transparent :443 interception", "the process driver runs the guest inside the netns itself (no tap0 peer), so nft's tap0 redirect never applies; covered by nestd's netns_redirect_reaches_listener test")

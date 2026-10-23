@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "error": {
+    "code": "stale_epoch",
+    "message": "binding names epoch 3; the sandbox is at epoch 4",
+    "retryable": false
+  },
+  "executed": false
+}

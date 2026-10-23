@@ -11,6 +11,7 @@
     "agent_runner": "0.1.0",
     "claude_code": "2.1.296"
   },
+  "gateway_url": "wss://01jb7k3x9q-gw-nest.example.dev",
   "last_command_seq": 41,
   "sandboxes": [
     {
@@ -18,7 +19,16 @@
       "epoch": 4,
       "state": "running",
       "head": "gen_01jb7p1k2m",
-      "dirty": true
+      "dirty": true,
+      "guest": {
+        "protocol_version": 1,
+        "capabilities": [
+          "pty",
+          "cgroup_v2",
+          "pdf",
+          "fsfreeze"
+        ]
+      }
     },
     {
       "sandbox": "sbx_01jb7m9z8d",
@@ -31,11 +41,7 @@
   "agents": [
     {
       "agent": "agt_01jb7n0w1e",
-      "state": "working",
-      "hands": {
-        "sandbox": "sbx_01jb7m2a4c",
-        "epoch": 4
-      }
+      "state": "working"
     }
   ],
   "capacity": {

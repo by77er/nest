@@ -1,6 +1,6 @@
 //! End-to-end: the real runner (in-process) + the real `nest` binary (hooks, MCP) + a fake
-//! `claude` (tests/fake_claude.py) + fake nestd + mock AgentDO WebSocket + fake guest.
-//! No real Claude Code and no credentials are ever used.
+//! `claude` (tests/fake_claude.py) + fake nestd + mock AgentDO WebSocket + a real gateway
+//! in-process + fake guest behind it. No real Claude Code and no credentials are ever used.
 #![allow(clippy::result_large_err)] // tungstenite handshake callback signature
 
 use std::os::unix::fs::PermissionsExt;
@@ -15,13 +15,15 @@ use nest_protocol::control::{
     SystemPrompt, ToolContent, ToolDef, ToolOutcome, ToolRule, TurnInput,
 };
 use nest_protocol::host::claude;
-use nest_protocol::host::runner::{AgentStart, ExitReason, LocalHands, RunnerCommand, RunnerEvent};
+use nest_protocol::gateway::HandsTarget;
+use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerCommand, RunnerEvent};
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
     AgentEventBody, AgentId, AgentRole, Epoch, HostId, HostRole, MessageId, SandboxId, Seq, SessionId, TurnId, TurnInputKind,
     WorkstreamId,
 };
 use nest_runner::test_support::FakeGuest;
+use nest_runner::test_support::gateway::TestGateway;
 use nest_runner::{Config, Runtime};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, UnixListener};
@@ -101,6 +103,7 @@ impl FakeNestd {
 struct DoLog {
     authorization: Vec<String>,
     hellos: Vec<control::RunnerHello>,
+    resolves: usize,
     events: Vec<nest_protocol::model::AgentEvent>,
     tool_calls: Vec<control::ToolCall>,
     segments: Vec<(u64, bool, Vec<u8>)>,
@@ -110,6 +113,8 @@ struct MockDo {
     url: String,
     log: Arc<Mutex<DoLog>>,
     to_runner: Arc<Mutex<Option<mpsc::UnboundedSender<AgentToRunner>>>>,
+    /// What `hands_resolve` is answered with (set once the gateway exists).
+    hands: Arc<Mutex<Option<HandsTarget>>>,
     seq: std::sync::atomic::AtomicU64,
 }
 
@@ -119,10 +124,11 @@ impl MockDo {
         let url = format!("ws://{}/v1/agents/agt_e2e/session", listener.local_addr().unwrap());
         let log: Arc<Mutex<DoLog>> = Default::default();
         let to_runner: Arc<Mutex<Option<mpsc::UnboundedSender<AgentToRunner>>>> = Default::default();
-        let (log2, tr2) = (log.clone(), to_runner.clone());
+        let hands: Arc<Mutex<Option<HandsTarget>>> = Default::default();
+        let (log2, tr2, hands2) = (log.clone(), to_runner.clone(), hands.clone());
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let (log, tr) = (log2.clone(), tr2.clone());
+                let (log, tr, hands) = (log2.clone(), tr2.clone(), hands2.clone());
                 tokio::spawn(async move {
                     let auth = Arc::new(std::sync::Mutex::new(String::new()));
                     let a2 = auth.clone();
@@ -174,6 +180,16 @@ impl MockDo {
                             RunnerToAgent::ToolsListRequest { request } => {
                                 let _ = tx.send(AgentToRunner::ToolsList { request, tools: vec![notify_tool()] });
                             }
+                            RunnerToAgent::HandsResolve { request } => {
+                                l.resolves += 1;
+                                let hands = hands.lock().await.clone();
+                                let error = hands.is_none().then(|| nest_protocol::model::ErrorBody {
+                                    code: "not_bound".into(),
+                                    message: "no sandbox in this test".into(),
+                                    retryable: false,
+                                });
+                                let _ = tx.send(AgentToRunner::HandsResolved { request, hands, error, retry_after_ms: None });
+                            }
                             RunnerToAgent::CancelCall { seq, .. } => {
                                 let _ = tx.send(AgentToRunner::Ack { up_to: seq });
                             }
@@ -183,7 +199,7 @@ impl MockDo {
                 });
             }
         });
-        Arc::new(Self { url, log, to_runner, seq: std::sync::atomic::AtomicU64::new(0) })
+        Arc::new(Self { url, log, to_runner, hands, seq: std::sync::atomic::AtomicU64::new(0) })
     }
 
     async fn send(&self, f: impl FnOnce(Seq) -> AgentToRunner) {
@@ -243,6 +259,7 @@ struct Harness {
     nestd: Arc<FakeNestd>,
     agentdo: Arc<MockDo>,
     guest: FakeGuest,
+    _gateway: TestGateway,
     runner: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
@@ -284,7 +301,13 @@ impl Harness {
         nestd.send(RunnerCommand::HelloAck { protocol_version: 1, host_id: HostId("hst_test".into()), host_role: HostRole::Burst });
         nestd.send(RunnerCommand::HostToken { token: Secret("host-token-abc".into()), expires_ms: now_ms() + 3_600_000 });
         nestd.send(RunnerCommand::LeaseUpdate { valid_until_ms: now_ms() + 600_000 });
-        Self { dir, nestd, agentdo: MockDo::start().await, guest: FakeGuest::start().await, runner }
+        let agentdo = MockDo::start().await;
+        let guest = FakeGuest::start().await;
+        // The sandbox lives behind a real gateway; AgentDO's `hands_resolved` names it.
+        let gateway = TestGateway::start().await;
+        gateway.add_sandbox("sbx_e2e", 7, &guest.path, &[AGENT]);
+        *agentdo.hands.lock().await = Some(gateway.target("sbx_e2e", 7, AGENT));
+        Self { dir, nestd, agentdo, guest, _gateway: gateway, runner }
     }
 
     fn config_dir(&self) -> PathBuf {
@@ -297,7 +320,7 @@ impl Harness {
             role: AgentRole::Worker,
             workstream: WorkstreamId("ws_e2e".into()),
             resume,
-            hands: Some(HandsBinding { sandbox: SandboxId("sbx_e2e".into()), epoch: Epoch(7), cwd: None }),
+            hands: Some(HandsBinding { sandbox: SandboxId("sbx_e2e".into()), epoch: Epoch(7) }),
             launch: LaunchConfig {
                 model: None,
                 effort: Some("high".into()),
@@ -310,7 +333,6 @@ impl Harness {
         self.nestd.send(RunnerCommand::AgentStart(Box::new(AgentStart {
             start,
             config_dir: self.config_dir().to_string_lossy().into_owned(),
-            hands: Some(LocalHands { sandbox: SandboxId("sbx_e2e".into()), epoch: Epoch(7), vsock_uds_path: self.guest.path.clone() }),
         })));
     }
 
@@ -420,6 +442,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
         })
         .collect();
     assert!(cmds[0].contains("CLAUDE.md"), "{cmds:?}");
+    assert_eq!(h.agentdo.log.lock().await.resolves, 1, "one hands_resolve serves the hook read and both turn steps");
     assert!(cmds.iter().any(|c| c == "echo PLATFORM hello"), "{cmds:?}");
     assert!(cmds.iter().any(|c| c.starts_with("echo New messages arrived")), "{cmds:?}");
     assert!(reqs.iter().all(|r| r.epoch == Epoch(7) && r.agent_id.0 == AGENT));

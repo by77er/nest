@@ -5,7 +5,7 @@
 
 One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycle, leases, commands and host-level events. Per-agent traffic goes over the [session channel](../session/).
 
-> **Designed:** `hello` carries `kind: brain | sandbox`; a brain host reports brain capacity and receives only `agent_start`, `agent_stop` and `fence`; FleetDO holds three desired versions per cell (brain host, sandbox host, guest image); sandbox hosts receive the binding verification key and revocations the way they receive policy secrets. See [pending contract changes](../../README.md#pending-contract-changes) and the [gateway](../../gateway/).
+> **Designed:** `hello` carries `kind: brain | sandbox`; a brain host reports brain capacity and receives only `agent_start`, `agent_stop` and `fence`; FleetDO holds three desired versions per cell (brain host, sandbox host, guest image). See [pending contract changes](../../README.md#pending-contract-changes). **Built:** `gateway_url` in `hello`, `guest` in sandbox reports, `binding_key` after `hello_ack`, and the `agent_attach`/`agent_detach` commands ([gateway](../../gateway/)).
 
 ## Messages
 
@@ -13,7 +13,7 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `last_command_seq`, and **a full report** of local sandboxes (epoch, state, head, dirty), agents (state, hands) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
+| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `gateway_url?` (where clients reach this host's sandbox gateway, from nestd's configuration), `last_command_seq`, and **a full report** of local sandboxes (epoch, state, head, dirty, and `guest{protocol_version, capabilities}` for a running one), agents (state) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
 | `heartbeat` | no | Every 5 s: `sent_ms` and `leases[(sandbox, epoch)]`. **Renews every listed lease.** |
 | `events` | seq | A batch of `HostEvent`s (below) |
 | `ack` | — | Cumulative ack of `commands` |
@@ -28,6 +28,7 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 | `commands` | seq | A batch of `Command{cmd, issued_ms, type, …}`, applied **in order** |
 | `ack` | — | Cumulative ack of `events` |
 | `host_token` | no | Rotated bearer token |
+| `binding_key` | no | `keys[{kid, public_key}]`: every binding verification key still valid for the cell (ECDSA P-256, the uncompressed point, base64url); sent after `hello_ack` and on rotation; nestd forwards it to the gateway ([gateway](../../gateway/)) |
 | `proxy_ca` | no | Renewed intermediate |
 | `error` | — | `ErrorBody`. `unauthorized` and `unsupported_protocol_version` close the socket |
 
@@ -53,8 +54,9 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `port_expose` / `port_unexpose` | sandbox, epoch, port, `host_header{mode}` | The gateway's preview mapping |
 | `commit_result` | request, sandbox, outcome | Answer to `commit_request` (see the CAS sequence below) |
 | `guest_cli_result` | request, result (`guest::CliResult`) | Answer to a `guest_cli` event; nestd relays it to the guest's pending `cli` request. Like `commit_result`, hosts resolve it **on arrival**, not in command order |
-| `agent_start` | agent, role, workstream, `resume?`, `hands?`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. Designed: sent to a brain host, with `hands = {hostname, binding, guest{protocol_version, capabilities}}` for the sandbox's [gateway](../../gateway/) |
-| `agent_bind` | agent, `hands?` | Rebind or unbind hands. Takes effect at the next tool call. Designed: goes; AgentDO rebinds over the session channel |
+| `agent_start` | agent, role, workstream, `resume?`, `hands?{sandbox, epoch}`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. `hands` names the sandbox and epoch only; the runner fetches the gateway target over its session channel. Designed: sent to a brain host chosen by capacity |
+| `agent_attach` | sandbox, epoch, agent, `cwd?` | Configure the agent's slot in the guest (cwd, proxy port, cgroup) on the sandbox's host; idempotent (an existing slot is replaced), `cwd` defaults to `/workspace`. SandboxDO waits for its `ok` before it hands out a binding. Stale epoch → `stale_epoch` |
+| `agent_detach` | sandbox, epoch, agent, `kill_processes` | Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's cgroup first. The gateway then refuses the agent's bindings |
 | `agent_stop` | agent, reason | End the turn cleanly if possible, then stop the process |
 | `fence` | sandboxes, reason | Pause VMs, drop listeners and netns; on a brain host, kill the listed brains |
 | `drain` | reason, deadline_ms | Commit or suspend everything by the deadline, then exit |
@@ -64,7 +66,7 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `type` | Purpose |
 |---|---|
 | `command_result` | `outcome: {status: ok, detail?}` or `{status: error, error}` |
-| `sandbox_state` | Every transition (`model::SandboxState`), with `suspend_mode?` and `detail?` |
+| `sandbox_state` | Every transition (`model::SandboxState`), with `suspend_mode?`, `detail?` and, for `running`, `guest{protocol_version, capabilities}` (nestd caches the guest's hello, so a resume reports it too; a repeated `running` with a new `guest` is an update) |
 | `commit_request` | Chunks and manifest are already uploaded. Asks for a CAS with `request`, epoch, parent, kind, manifests, reason (`salvage` marks the commit as orphaned work) |
 | `workstream` | A host-originated `WorkstreamEvent` (`port_opened`, `port_exposed`, `egress_denied`, `egress_alert`) |
 | `egress_audit` | Batches of `EgressAuditRecord` (no secret values, no query strings), written to R2. `via?` names the nest-proxy entry point: `dns http_transparent https_transparent explicit tcp_exception`; `reason` values are listed in [nestd-proxy](../../host-internal/nestd-proxy/). `count?` marks an aggregated record (how many requests it stands for), used for nest-proxy's per-window suppression summaries |

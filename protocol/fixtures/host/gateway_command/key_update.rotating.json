@@ -1,0 +1,13 @@
+{
+  "type": "key_update",
+  "keys": [
+    {
+      "kid": "787edc692db579fe",
+      "public_key": "BG-PmQ8OWaATxpZ0Ts5grKyueVGB0kuKekJw7OcETAsJeHvUm5lVzu_QPOUBssOZOnZAy9dmzf1Kg0N08F05fQs"
+    },
+    {
+      "kid": "0123456789abcdef",
+      "public_key": "BIcpRc8pdOMQ22P8f3_tFgzXz6v2a7wBDpr9sQ4KyU3Ri_LCyrdbqaj3SyGLSWfn1y4uuRzkqdsgCS2w3VcPaC0"
+    }
+  ]
+}

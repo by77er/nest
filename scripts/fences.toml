@@ -27,6 +27,14 @@ allow = [
 ]
 
 [[fence]]
+name = "gateway-holds-no-token"
+example = 'let token = std::env::var("CLAUDE_CODE_OAUTH_TOKEN");'
+why = "The gateway and the hands client sit on the hands path between a brain and a sandbox; neither may ever name a model credential, so a compromised sandbox host or gateway can't reach one."
+patterns = ['CLAUDE_CODE_OAUTH_TOKEN', '(?i)oauth', '(?i)api[_-]?key', '(?i)setup[_-]token']
+files = ["crates/nest-gateway/**", "crates/nest-hands-client/**"]
+allow = []
+
+[[fence]]
 name = "guest-holds-no-credentials"
 example = 'let api_key = read_key();'
 why = "The guest agent runs inside the VM and holds no credentials; it never names a token or key."

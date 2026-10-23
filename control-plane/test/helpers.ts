@@ -117,6 +117,9 @@ export class Ws {
   }
 }
 
+/** What a test host advertises as its sandbox gateway (the e2e harness uses the same address). */
+export const GATEWAY_URL = "ws://127.0.0.1:18790";
+
 export function hostHello(host: string, cell: string, extra: Partial<Record<string, unknown>> = {}) {
   return {
     type: "hello",
@@ -126,6 +129,7 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
     role: "burst",
     cell,
     versions: { nestd: "0.1.0", nest_proxy: "0.1.0", agent_runner: "0.1.0", claude_code: "2.1.296" },
+    gateway_url: GATEWAY_URL,
     sandboxes: [],
     agents: [],
     capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, sandboxes: 0, agents: 0, warm: [] },
@@ -133,13 +137,14 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
   };
 }
 
-/** Enroll a host and connect its fleet channel (hello acknowledged). */
+/** Enroll a host and connect its fleet channel (hello acknowledged, the cell's binding keys received). */
 export async function connectHost(cell: string, role: "burst" | "controller" = "burst") {
   const enrolled = await enrollHost(cell, role);
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
   ws.send(hostHello(enrolled.host, cell, { role }));
   const ack = await ws.next("hello_ack");
-  return { ...enrolled, ws, ack };
+  const keys = (await ws.next("binding_key")).keys as { kid: string; public_key: string }[];
+  return { ...enrolled, ws, ack, keys };
 }
 
 /** Wait for the next `commands` batch, ack it, and return its commands. */

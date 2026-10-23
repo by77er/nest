@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::gateway::{BindingKey, GuestInfo, HandsTarget};
 use crate::model::{
     AgentEvent, AgentId, AgentRole, AgentState, AskId, CallId, CommandId, CommitReason, Epoch,
     ErrorBody, EgressPolicy, ForkMode, GenerationId, GenerationKind, GenerationRecord, HostId,
@@ -109,6 +110,10 @@ pub struct HostHello {
     pub role: HostRole,
     pub cell: String,
     pub versions: ComponentVersions,
+    /// Where clients reach this host's sandbox gateway: a `ws://` or `wss://` base URL (the
+    /// host's tunnel hostname on a real host). Absent on a host that runs no sandboxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_url: Option<String>,
     /// Highest `FleetToHost::Commands.seq` this host fully processed (reconnect resume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_command_seq: Option<Seq>,
@@ -136,14 +141,16 @@ pub struct SandboxReport {
     /// Uncommitted local writes exist (salvage candidate if the epoch turns out stale).
     #[serde(default)]
     pub dirty: bool,
+    /// The guest's version and capabilities for a `running` sandbox (nestd caches the last
+    /// guest hello, so a resumed sandbox reports it too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<GuestInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentReport {
     pub agent: AgentId,
     pub state: AgentState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hands: Option<HandsBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +192,9 @@ pub enum FleetToHost {
     Ack { up_to: Seq },
     /// Rotated bearer token; use for all new connections and reconnects.
     HostToken { token: String, expires_ms: TimestampMs },
+    /// Every binding verification key still valid, for the sandbox gateway (replaces the set).
+    /// Sent after `hello_ack` and on every rotation.
+    BindingKey { keys: Vec<BindingKey> },
     /// Renewed proxy intermediate (answer to `CaRenew`).
     ProxyCa(CaCertificate),
     /// Fatal or per-frame error. `unsupported_protocol_version` / `unauthorized` close the socket.
@@ -276,8 +286,21 @@ pub enum CommandBody {
     GuestCliResult { request: RequestId, result: crate::guest::CliResult },
     /// Start a brain (agent runner). The runner then opens the session channel to AgentDO.
     AgentStart(AgentStart),
-    /// Rebind (or unbind with `None`) an agent's hands. Takes effect at the next tool call.
-    AgentBind { agent: AgentId, #[serde(default, skip_serializing_if = "Option::is_none")] hands: Option<HandsBinding> },
+    /// Configure an agent's slot in a sandbox's guest (cwd, proxy port, cgroup): the sandbox
+    /// side of `attach`. Goes to the sandbox's host; the brain may run anywhere. Idempotent: an
+    /// existing slot is replaced. `cwd` defaults to [`DEFAULT_CWD`]. Its `command_result` is what
+    /// SandboxDO waits for before it hands out a binding, so a first hands call never beats the
+    /// slot.
+    AgentAttach {
+        sandbox: SandboxId,
+        epoch: Epoch,
+        agent: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's whole
+    /// cgroup first. The gateway then refuses the agent's bindings (`unauthorized`).
+    AgentDetach { sandbox: SandboxId, epoch: Epoch, agent: AgentId, #[serde(default)] kill_processes: bool },
     /// Stop the brain process (end the current turn cleanly if possible).
     AgentStop { agent: AgentId, reason: String },
     /// Fence immediately: stop brains bound to these sandboxes, pause VMs, drop listeners/netns.
@@ -312,22 +335,16 @@ pub enum CommitOutcome {
     },
 }
 
+/// The sandbox an agent's hands act in, by id and epoch only: no address, no token. The runner
+/// fetches the target (`HandsTarget`) with `hands_resolve` over its own session channel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandsBinding {
     pub sandbox: SandboxId,
     pub epoch: Epoch,
-    /// Initial working directory inside the sandbox (absolute). `None` = `/workspace`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
 }
 
-impl HandsBinding {
-    pub const DEFAULT_CWD: &'static str = "/workspace";
-
-    pub fn cwd_or_default(&self) -> &str {
-        self.cwd.as_deref().unwrap_or(Self::DEFAULT_CWD)
-    }
-}
+/// Default working directory of an agent's slot (`agent_attach.cwd`).
+pub const DEFAULT_CWD: &str = "/workspace";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStart {
@@ -337,6 +354,9 @@ pub struct AgentStart {
     /// Existing session to resume; `None` starts a fresh conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<SessionResume>,
+    /// The sandbox this agent's hands act in, if any. Only the ids: the gateway URL and the
+    /// binding never pass through FleetDO or nestd; the runner asks AgentDO for them
+    /// (`hands_resolve`) before its first hands call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hands: Option<HandsBinding>,
     pub launch: LaunchConfig,
@@ -410,6 +430,12 @@ pub enum HostEventBody {
         suspend_mode: Option<SuspendMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// The guest's protocol version and capabilities. Every `running` carries it (nestd
+        /// caches the last guest hello, so a resume reports it without a new hello); a repeated
+        /// `running` with a different `guest` is an update, not a transition. SandboxDO hands it
+        /// to clients in `resolve`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest: Option<GuestInfo>,
     },
     /// Chunks are already uploaded; asks SandboxDO to compare-and-set head. Answered by
     /// `CommandBody::CommitResult`.
@@ -543,6 +569,9 @@ pub enum RunnerToAgent {
     ToolCall(ToolCall),
     /// nest-mcp asks for the current platform tool list (captain backends use the DO registry).
     ToolsListRequest { request: RequestId },
+    /// The runner's binding aged out or a gateway refused it (`stale_epoch`, `moved`, a refused
+    /// connection): ask AgentDO for the sandbox's current placement. Answered by `hands_resolved`.
+    HandsResolve { request: RequestId },
     /// The runner abandoned a platform tool call (it timed out locally and returned
     /// `outcome_unknown` to the model). Reliable. AgentDO marks the call cancelled: if it hasn't
     /// started it never runs, a pending `ask` is withdrawn, and a late result is discarded.
@@ -610,6 +639,19 @@ pub enum AgentToRunner {
     CacheUpdate { seq: Seq, cache: AgentCache },
     ToolResult { seq: Seq, call: CallId, outcome: ToolOutcome },
     ToolsList { request: RequestId, tools: Vec<ToolDef> },
+    /// Answer to `hands_resolve`. Exactly one of `hands` and `error` is present: `hands` is a
+    /// fresh binding and the sandbox's current gateway; `error` is `not_bound` (the agent has no
+    /// hands: tell the model), `sandbox_not_ready` with `retry_after_ms` (placing, waking:
+    /// wait and ask again), or another `ErrorBody` the runner surfaces as an MCP error.
+    HandsResolved {
+        request: RequestId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hands: Option<HandsTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorBody>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
     Ack { up_to: Seq },
     Error { error: ErrorBody },
 }
@@ -750,11 +792,13 @@ mod tests {
             FleetToHost::Commands { .. } => "commands",
             FleetToHost::Ack { .. } => "ack",
             FleetToHost::HostToken { .. } => "host_token",
+            FleetToHost::BindingKey { .. } => "binding_key",
             FleetToHost::ProxyCa(_) => "proxy_ca",
             FleetToHost::Error { .. } => "error",
         }
     }
-    const FLEET_TO_HOST: &[&str] = &["hello_ack", "heartbeat_ack", "commands", "ack", "host_token", "proxy_ca", "error"];
+    const FLEET_TO_HOST: &[&str] =
+        &["hello_ack", "heartbeat_ack", "commands", "ack", "host_token", "binding_key", "proxy_ca", "error"];
 
     fn command(c: &Command) -> &'static str {
         match &c.body {
@@ -772,7 +816,8 @@ mod tests {
             CommandBody::CommitResult { .. } => "commit_result",
             CommandBody::GuestCliResult { .. } => "guest_cli_result",
             CommandBody::AgentStart(_) => "agent_start",
-            CommandBody::AgentBind { .. } => "agent_bind",
+            CommandBody::AgentAttach { .. } => "agent_attach",
+            CommandBody::AgentDetach { .. } => "agent_detach",
             CommandBody::AgentStop { .. } => "agent_stop",
             CommandBody::Fence { .. } => "fence",
             CommandBody::Drain { .. } => "drain",
@@ -781,7 +826,8 @@ mod tests {
     const COMMANDS: &[&str] = &[
         "sandbox_create", "sandbox_suspend", "sandbox_resume", "sandbox_archive", "sandbox_checkpoint",
         "sandbox_fork", "sandbox_destroy", "policy_update", "secrets_update", "port_expose", "port_unexpose",
-        "commit_result", "guest_cli_result", "agent_start", "agent_bind", "agent_stop", "fence", "drain",
+        "commit_result", "guest_cli_result", "agent_start", "agent_attach", "agent_detach", "agent_stop", "fence",
+        "drain",
     ];
 
     fn host_event(e: &HostEvent) -> &'static str {
@@ -810,11 +856,13 @@ mod tests {
             RunnerToAgent::Events { .. } => "events",
             RunnerToAgent::ToolCall(_) => "tool_call",
             RunnerToAgent::ToolsListRequest { .. } => "tools_list_request",
+            RunnerToAgent::HandsResolve { .. } => "hands_resolve",
             RunnerToAgent::CancelCall { .. } => "cancel_call",
             RunnerToAgent::Ack { .. } => "ack",
         }
     }
-    const RUNNER_TO_AGENT: &[&str] = &["hello", "segment", "events", "tool_call", "tools_list_request", "cancel_call", "ack"];
+    const RUNNER_TO_AGENT: &[&str] =
+        &["hello", "segment", "events", "tool_call", "tools_list_request", "hands_resolve", "cancel_call", "ack"];
 
     fn agent_to_runner(m: &AgentToRunner) -> &'static str {
         match m {
@@ -826,13 +874,14 @@ mod tests {
             AgentToRunner::CacheUpdate { .. } => "cache_update",
             AgentToRunner::ToolResult { .. } => "tool_result",
             AgentToRunner::ToolsList { .. } => "tools_list",
+            AgentToRunner::HandsResolved { .. } => "hands_resolved",
             AgentToRunner::Ack { .. } => "ack",
             AgentToRunner::Error { .. } => "error",
         }
     }
     const AGENT_TO_RUNNER: &[&str] = &[
         "hello_ack", "segment_ack", "run_turn", "inbox", "interrupt", "cache_update", "tool_result",
-        "tools_list", "ack", "error",
+        "tools_list", "hands_resolved", "ack", "error",
     ];
 
     fn agent_event(e: &crate::model::AgentEvent) -> &'static str {

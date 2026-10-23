@@ -449,7 +449,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     state(a.ws, sbx.sandbox, 1, "running");
     await a.ws.next("ack");
     // An agent at work holds it awake; when it goes idle, the countdown starts.
-    await sandboxStub(sbx.sandbox).attachAgent("agt_lifecycle00000000000000000");
+    await sandboxStub(sbx.sandbox).attach("agt_lifecycle00000000000000000");
     await sandboxStub(sbx.sandbox).agentActivity("agt_lifecycle00000000000000000", true);
     await runAlarm(sandboxStub(sbx.sandbox), "idle");
     await sandboxStub(sbx.sandbox).agentActivity("agt_lifecycle00000000000000000", false);
@@ -467,7 +467,8 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await a.ws.next("ack");
     const stub = sandboxStub(sbx.sandbox);
     const agent = "agt_turnend000000000000000000";
-    await stub.attachAgent(agent);
+    await stub.attach(agent);
+    await nextCommands(a.ws, (c) => c.type === "agent_attach"); // the slot, not a commit
     await stub.agentActivity(agent, true);
     await stub.agentActivity(agent, false);
     const [first] = await nextCommands(a.ws, (c) => c.type === "sandbox_checkpoint");
@@ -558,7 +559,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     state(a.ws, busy.sandbox, 1, "running");
     state(a.ws, idle.sandbox, 1, "running");
     await a.ws.next("ack", (m) => m.up_to >= 1002);
-    await sandboxStub(busy.sandbox).attachAgent("agt_spotbusy0000000000000000000");
+    await sandboxStub(busy.sandbox).attach("agt_spotbusy0000000000000000000");
     await sandboxStub(busy.sandbox).agentActivity("agt_spotbusy0000000000000000000", true);
     const b = await connectHost(cell);
 
