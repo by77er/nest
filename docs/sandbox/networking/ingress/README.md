@@ -16,6 +16,7 @@ browser ─► Cloudflare Access ─► Worker (<port>-<sandbox>.preview.<domain
 - **Auth:**
   - `*.preview.<domain>` sits behind Access, so only me.
   - `*.share.<domain>` has no Access; the Worker checks a signed, expiring token for one specific `{sandbox, port}`.
+  - `<domain>` is the nest domain, and the sandbox hosts' own hostnames sit beside these as `h-<host>.<domain>` with no Worker route; the full table, with the certificate that covers them, is in [setup](../../../setup/#hostnames).
 - **Host header:** dev servers often reject unfamiliar `Host` values (DNS-rebinding protection). The router sends `Host: localhost:<port>` and passes the original as `X-Forwarded-Host`, configurable per exposed port.
 - **Over the same vsock channel:**
   - **Terminal attach:** a PTY, over WebSocket → the gateway's `/pty` route → vsock, with a `pty` binding. A dropped connection detaches it for 60 s ([guest agent](../../guest-agent/#terminals)), and the client reattaches with the terminal id, its byte offset and a reattach token. **The token never goes in a URL:** Cloudflare logs the request URI with its query string ([`ClientRequestURI`](https://developers.cloudflare.com/logs/reference/log-fields/zone/http_requests/#clientrequesturi)), so it travels in the first WebSocket message.

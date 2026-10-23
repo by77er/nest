@@ -17,8 +17,21 @@ What I provide, where it goes, and what each piece unlocks, in the order testing
 | Monthly spend cap | $25 | Becomes an AWS Budgets alarm. Testing costs a few dollars. |
 | Dedicated AWS account | Yes | Keeps the blast radius of broad testing credentials to nest. |
 | Separate Claude token for captains | Optional | Needed only to verify that two setup tokens can be revoked independently. |
-| Domain on Cloudflare | Not yet | Needed for the tunnel path (one hostname per sandbox host, which is how brains reach hands), previews (`*.preview.<domain>`), share links (`*.share.<domain>`) and email hooks. Not for the local harness. |
+| Domain on Cloudflare | `nest.bitcru.sh`, a first-level subdomain of the `bitcru.sh` zone | Every nest hostname is one label under it ([hostnames](#hostnames)): the tunnel path (one hostname per sandbox host, which is how brains reach hands), previews, share links and email hooks. Not for the local harness. |
 | Brain-host instance class | The cheapest ARM class that runs Claude Code (`t4g.medium`-class) | Brains need no KVM; the class sets the cost of keeping a warm host for 30 min after its last brain. |
+
+## Hostnames
+
+Every nest hostname is one label under `nest.bitcru.sh`, so one wildcard certificate covers all of them and a new host's hostname works the moment its record exists.
+
+| Hostname | What | TLS and routing | Access |
+|---|---|---|---|
+| `nest.bitcru.sh` | The control plane Worker: API, dashboard, webhooks, Discord interactions | The Worker's custom domain (`control-plane/wrangler.jsonc`); Universal SSL covers it | Operator tokens; Access in front of the dashboard |
+| `h-<host>.nest.bitcru.sh` | One per sandbox host: the tunnel to its [gateway](../sandbox/gateway/) (hands, terminals, ingress). `<host>` is the host id without its `hst_` prefix | A proxied CNAME to `<tunnel-id>.cfargotunnel.com`, created by the Worker at enrollment and deleted at termination. **No Worker route**, so a fetch from a Durable Object never re-enters the Worker | An Access application on `*.nest.bitcru.sh` whose policy accepts the service token |
+| `<port>-<sandbox>.preview.nest.bitcru.sh` | Previews ([ingress](../sandbox/networking/ingress/)) | Worker route `*.preview.nest.bitcru.sh/*` | An Access application on `*.preview.nest.bitcru.sh` whose policy is me |
+| `<token>.share.nest.bitcru.sh` | Share links | Worker route `*.share.nest.bitcru.sh/*` | None; the Worker checks the signed token |
+
+**Certificates.** Universal SSL covers the zone apex and first-level subdomains only, so it covers `nest.bitcru.sh` and nothing below it ([Universal SSL](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/)). The rest needs Advanced Certificate Manager, a paid add-on on every plan (the price is in the dashboard, not the docs), and one advanced certificate listing `bitcru.sh` (the apex must be on it), `nest.bitcru.sh`, `*.nest.bitcru.sh`, `*.preview.nest.bitcru.sh` and `*.share.nest.bitcru.sh`: a wildcard covers one level, and a certificate holds up to 50 hosts ([advanced certificates](https://developers.cloudflare.com/ssl/edge-certificates/advanced-certificate-manager/)). Whether an Access application on `*.nest.bitcru.sh` also matches the deeper preview hostnames is unverified; step 2 of the seam checks it and orders the policies accordingly.
 
 ## Stage 1: real Claude Code (no cloud, no KVM)
 
@@ -45,7 +58,7 @@ Not `CLAUDE_CODE_OAUTH_TOKEN`: that name could change how the session's own Clau
 | Account ID | Dashboard → Workers & Pages → the right-hand sidebar | `CLOUDFLARE_ACCOUNT_ID` |
 | API token | Dashboard → My Profile → API Tokens → Create Token → the **Edit Cloudflare Workers** template, limited to this account. It covers Workers scripts (including Durable Objects), R2 and logs. | `CLOUDFLARE_API_TOKEN` |
 
-`wrangler` reads both variables directly. The control plane deploys to `nest-control-plane.<subdomain>.workers.dev` until there's a domain.
+`wrangler` reads both variables directly. The control plane deploys to `nest.bitcru.sh`, the Worker's custom domain in `control-plane/wrangler.jsonc`.
 
 ## Stage 3: sandbox hosts on AWS
 
@@ -81,8 +94,8 @@ Nothing new to provide. Brain hosts live in the same account and cell, launched 
 | **Discord bot:** an application with a bot, on a private server | Approvals, escalations and chat ([discord](../control-plane/api/discord/)) | `DISCORD_APPLICATION_ID`, `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID` |
 | **GitHub App:** the repository permissions its agents need (at least Contents and Pull requests: read and write), installed on chosen repos; generate a private key | Credential injection for `git push`, and `github.*` brokered actions ([BrokerDO](../control-plane/durable-objects/broker/)) | `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY` (the PEM) |
 | **An analytics read token:** a custom Cloudflare API token with Account → Account Analytics → Read | The `metrics` capability ([metrics](../control-plane/metrics/)) | `CLOUDFLARE_ANALYTICS_TOKEN` |
-| **A domain on Cloudflare,** plus a Zero Trust team for Access | The tunnel path to every sandbox host (hands, terminals, previews), share links, email hooks, and Access in front of the API and dashboard ([gateway](../sandbox/gateway/), [ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN`; the API token gains Zone DNS and Workers Routes edit for that zone |
-| **A tunnel token:** a custom Cloudflare API token with Account → Cloudflare Tunnel → Edit and Zone → DNS → Edit for that zone | The Worker creates one tunnel and one DNS record per sandbox host at enrollment and deletes them at termination ([gateway](../sandbox/gateway/), [remote tunnel API](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel-api/)) | `CLOUDFLARE_TUNNEL_API_TOKEN` (a Worker secret) |
+| **The `bitcru.sh` zone on Cloudflare** with Advanced Certificate Manager and the advanced certificate above, plus a Zero Trust team for Access | The tunnel path to every sandbox host (hands, terminals, previews), share links, email hooks, and Access in front of the API and dashboard ([hostnames](#hostnames), [gateway](../sandbox/gateway/), [ingress](../sandbox/networking/ingress/)) | `NEST_DOMAIN=nest.bitcru.sh`; the API token gains Zone DNS and Workers Routes edit for that zone |
+| **A tunnel token:** a custom Cloudflare API token with Account → Cloudflare Tunnel → Edit and Zone → DNS → Edit for the `bitcru.sh` zone | The Worker creates one tunnel and one DNS record per sandbox host at enrollment and deletes them at termination ([gateway](../sandbox/gateway/), [remote tunnel API](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel-api/)) | `CLOUDFLARE_TUNNEL_API_TOKEN` (a Worker secret) |
 | **An Access service token:** Zero Trust → Access → Service Auth → create one, and an Access application covering the per-host hostnames that accepts it | The edge check on every gateway hostname; held by the Worker, AgentDO and brain hosts through BrokerDO, by a laptop through `nest` login, never by a sandbox ([gateway](../sandbox/gateway/)) | `NEST_ACCESS_CLIENT_ID`, `NEST_ACCESS_CLIENT_SECRET` |
 
 **Webhooks need nothing extra:** hooks live at `https://<control plane>/v1/hooks/<hk_…>`, and each provider is wired through a brokered action or by pasting a URL and a one-time secret (see [sources](../channels/sources/)).
