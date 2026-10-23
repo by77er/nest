@@ -60,8 +60,10 @@ structure CellSpec where
   controlUrl : String
   /-- Instance-type patterns the control plane may launch: the 8i family only. -/
   instanceTypes : List String := ["c8i*.*", "m8i*.*", "r8i*.*"]
-  /-- The GitHub repository and environment that may assume the deploy role (dev/deploy.md). -/
-  deployRepo : String := "by77er/nest"
+  /-- The GitHub repository that may assume the deploy role (dev/deploy.md), in GitHub's immutable
+  OIDC subject form `OWNER@OWNER-ID/REPO@REPO-ID`: repositories created after 2026-07-15 put the
+  owner and repository ids in the `sub` claim, and they can't be removed. -/
+  deployRepo : String := "by77er@39721110/nest@1416068100"
   deployEnvironment : String := "production"
 
 /-- Outbound from burst hosts: HTTPS, plus cloudflared's 7844 over TCP and UDP. Nothing inbound. -/
