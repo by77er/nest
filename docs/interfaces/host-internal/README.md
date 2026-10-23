@@ -31,7 +31,7 @@ Boundaries between the processes on one host. Rust types: `nest_protocol::host`.
 | `/run/nest/runner/hook.dgram` | `SOCK_DGRAM` | runner | `0660 nest-runner:nest-agents` |
 | `/run/nest/runner/hook.sock` | `SOCK_STREAM` | runner | `0660 nest-runner:nest-agents` |
 | `/run/nest/runner/mcp.sock` | `SOCK_STREAM` | runner | `0660 nest-runner:nest-agents` |
-| `/run/nest/gateway.sock` | `SOCK_STREAM` | nestd | `0660 root:nest-gateway` (the host unit and group are not written yet; the e2e runs everything as one user) |
+| `/run/nest/gateway.sock` | `SOCK_STREAM` | nestd | `0660 root:nest-gateway` (the group is not created yet: the host unit runs the gateway as root; the e2e runs everything as one user) |
 
 **Planned:** Claude Code processes run as per-agent `DynamicUser`s in the `nest-agents` group (supplementary), so `nest hook` and `nest mcp` can reach the runner's sockets and nothing else. **Today** brains run as the runner's user in their own process group; the sync-hook and MCP sockets are bound to the brain's process tree with `SO_PEERCRED` (see [runner-hooks/](runner-hooks/)).
 

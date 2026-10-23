@@ -14,12 +14,12 @@
 
 **Credentials:**
 - **AWS:** the cell stack's `nest-<cell>-deploy` role, assumed over GitHub OIDC. Its trust policy accepts only `repo:by77er@39721110/nest@1416068100:environment:production`: GitHub's immutable subject format for repositories created after 2026-07-15 carries the owner and repository ids, and `GET /repos/by77er/nest/actions/oidc/customization/sub` confirms it for this repo ([OIDC reference](https://docs.github.com/en/actions/reference/security/oidc)). Applying the stack manages IAM, so the role is administrator-equivalent; the trust policy is what limits it. The first apply of a cell runs by hand with the provisioner key: it creates the role that later applies assume.
-- **Cloudflare:** `CLOUDFLARE_API_TOKEN` (Workers edit) and `CLOUDFLARE_ACCOUNT_ID` are secrets on the `production` environment.
+- **Cloudflare:** `CLOUDFLARE_API_TOKEN` (Workers edit) and `CLOUDFLARE_ACCOUNT_ID` are secrets on the `production` environment, and so is `CLOUDFLARE_TUNNEL_API_TOKEN` (Account: Cloudflare One Connector: cloudflared → Edit, Zone: DNS → Edit on the nest zone): `dev/deploy-use1.sh` writes it to the Worker with `wrangler secret put` whenever the deploy environment carries it, so the Worker can create and delete each sandbox host's tunnel and DNS record ([gateway](../docs/sandbox/gateway/)). The Worker's non-secret vars for the tunnel come from the script too: `NEST_DOMAIN` (`nest.bitcru.sh`, a literal) and `CLOUDFLARE_ACCOUNT_ID` from the SSM parameter `/nest/control-plane/vars/CLOUDFLARE_ACCOUNT_ID`, created once by hand like the other parameters.
 - Pull requests get neither.
 
 ## `deploy.yml`
 
-It runs when `ci.yml` succeeds on a push to `main` (`workflow_run`), and on `workflow_dispatch` by me. Its job uses the GitHub environment `production`, which only `main` may deploy from and which holds `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_ANALYTICS_TOKEN`. Deploys are serialized (`concurrency: production`, never cancelled).
+It runs when `ci.yml` succeeds on a push to `main` (`workflow_run`), and on `workflow_dispatch` by me. Its job uses the GitHub environment `production`, which only `main` may deploy from and which holds `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ANALYTICS_TOKEN` and `CLOUDFLARE_TUNNEL_API_TOKEN`. Deploys are serialized (`concurrency: production`, never cancelled).
 
 1. **Check the pause.** If the last production deployment was rolled back, an automatic run stops; a `workflow_dispatch` run clears the pause. The state is GitHub's own deployment statuses, so nothing else stores it.
 2. **Classify.** Diff `wrangler.jsonc` against the deployed version. A Durable Object class change or a removed binding makes this a **one-way deploy**, since Cloudflare won't roll back across one.

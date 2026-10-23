@@ -33,3 +33,10 @@ description = "Fake tokens in tests and the local dev admin token in docs"
 condition = "AND"
 paths = ['''^e2e/claude-verify/test_claude_verify\.py$''', '''^crates/nest-runner/tests/lifecycle\.rs$''', '''^control-plane/README\.md$''']
 regexes = ['''^tok-123456789$''', '''^tok-0123456789abcdef$''', '''^dev-admin-token$''']
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = "The example tunnel token in the enrollment-response fixture: base64 of {a, t, s} with s = REDACTED-EXAMPLE, not a Cloudflare secret"
+condition = "AND"
+paths = ['''^protocol/fixtures/control/enroll_response/enroll_response\.tunnel\.json$''']
+regexes = ['''^eyJhIjoiOGRiZWM2MTQ4MzAwNDgzODAxZDcyMTg4OWEyZjQ3NDkiLCJ0IjoiYzE3NDRmOGItZmFhMS00OGE0LTllNWMtMDJhYzkyMTQ2N2ZhIiwicyI6IlJFREFDVEVELUVYQU1QTEUifQ$''']

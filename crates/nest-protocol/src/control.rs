@@ -65,6 +65,17 @@ pub struct EnrollResponse {
     pub host_token_expires_ms: TimestampMs,
     pub fleet_ws_url: String,
     pub proxy_ca: CaCertificate,
+    /// The host's Cloudflare Tunnel token, when the control plane created a tunnel for it (a
+    /// sandbox host in a cell with a zone): nestd runs cloudflared with it, in memory and in its
+    /// credentials file, never on a command line. Absent on the harness and on hosts that run
+    /// no sandboxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_token: Option<crate::model::Secret>,
+    /// The URL clients will be told for this host's gateway (`wss://<host>-gw-nest.<zone>` behind
+    /// the tunnel). The control plane is the authority; the host's own `hello.gateway_url` counts
+    /// only when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_url: Option<String>,
 }
 
 /// Per-host intermediate CA certificate (≈7 days), signed by the root key held in the control
@@ -99,6 +110,27 @@ pub enum HostToFleet {
     CaRenew { csr_pem: String },
 }
 
+/// Whether the host's Cloudflare Tunnel serves its gateway hostname: `none` (no tunnel runs: no
+/// token, no binary, or a nestd that predates the field), `connecting` (cloudflared runs but
+/// reports no ready connection to Cloudflare yet) or `connected` (it does). Reported in the hello
+/// and as a `tunnel_state` event on every change; the control plane advertises the tunnel
+/// hostname only while `connected` (docs/sandbox/gateway/, Addressing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelState {
+    #[default]
+    None,
+    Connecting,
+    Connected,
+}
+
+impl TunnelState {
+    /// `none` is the wire default and is left out when serializing.
+    pub fn is_none(&self) -> bool {
+        *self == TunnelState::None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostHello {
     pub protocol_version: u32,
@@ -114,6 +146,10 @@ pub struct HostHello {
     /// host's tunnel hostname on a real host). Absent on a host that runs no sandboxes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_url: Option<String>,
+    /// The tunnel's state at connect time; changes follow as `tunnel_state` events. Absent
+    /// (an older nestd, or a host without a tunnel) means `none`.
+    #[serde(default, skip_serializing_if = "TunnelState::is_none")]
+    pub tunnel: TunnelState,
     /// Highest `FleetToHost::Commands.seq` this host fully processed (reconnect resume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_command_seq: Option<Seq>,
@@ -469,6 +505,8 @@ pub enum HostEventBody {
     TaskExited { sandbox: SandboxId, epoch: Epoch, agent: AgentId, task: crate::guest::TaskInfo },
     EgressAudit { records: Vec<EgressAuditRecord> },
     Capacity { capacity: Capacity },
+    /// The host's tunnel changed state (see [`TunnelState`]).
+    TunnelState { state: TunnelState },
     /// Spot interruption notice (IMDS): the host is draining by `deadline_ms`.
     SpotNotice { deadline_ms: TimestampMs },
     /// Brain process ended (crash, stop, or idle exit). Lifecycle only; turns/state go over the
@@ -838,6 +876,7 @@ mod tests {
             HostEventBody::Workstream { .. } => "workstream",
             HostEventBody::EgressAudit { .. } => "egress_audit",
             HostEventBody::Capacity { .. } => "capacity",
+            HostEventBody::TunnelState { .. } => "tunnel_state",
             HostEventBody::SpotNotice { .. } => "spot_notice",
             HostEventBody::AgentExited { .. } => "agent_exited",
             HostEventBody::GuestCli { .. } => "guest_cli",
@@ -846,6 +885,7 @@ mod tests {
     }
     const HOST_EVENTS: &[&str] = &[
         "command_result", "sandbox_state", "commit_request", "workstream", "egress_audit", "capacity",
+        "tunnel_state",
         "spot_notice", "agent_exited", "guest_cli", "task_exited",
     ];
 

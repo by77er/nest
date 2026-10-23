@@ -46,6 +46,10 @@ export const EnrollResponse = z.object({
   host_token_expires_ms: TimestampMs,
   fleet_ws_url: z.string(),
   proxy_ca: CaCertificate,
+  /** The host's Cloudflare Tunnel token when the control plane created one for it; never on a command line. */
+  tunnel_token: z.string().optional(),
+  /** What clients will be told for this host's gateway; the control plane is the authority. */
+  gateway_url: z.string().optional(),
 });
 export type EnrollResponse = z.output<typeof EnrollResponse>;
 
@@ -89,6 +93,14 @@ export const Capacity = z.object({
 });
 export type Capacity = z.output<typeof Capacity>;
 
+/**
+ * What the host says about its Cloudflare Tunnel: `none` (no token, no cloudflared binary, or a
+ * nestd that predates the field), `connecting` (cloudflared runs but reports no ready connection
+ * on its `/ready` endpoint) or `connected`. FleetDO advertises the tunnel hostname only on `connected`.
+ */
+export const TunnelState = z.enum(["none", "connecting", "connected"]);
+export type TunnelState = z.output<typeof TunnelState>;
+
 export const HostHello = z.object({
   protocol_version: z.number().int(),
   host: HostId,
@@ -99,6 +111,8 @@ export const HostHello = z.object({
   versions: ComponentVersions,
   /** `ws://` or `wss://` base URL of this host's sandbox gateway; absent on a host without sandboxes. */
   gateway_url: z.string().optional(),
+  /** Absent from a nestd that predates the field: `none`. */
+  tunnel: TunnelState.optional(),
   last_command_seq: Seq.optional(),
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
@@ -263,6 +277,8 @@ export const HostEventVariants = [
   z.object({ ...hostEventBase, type: z.literal("workstream"), event: WorkstreamEvent }),
   z.object({ ...hostEventBase, type: z.literal("egress_audit"), records: z.array(EgressAuditRecord) }),
   z.object({ ...hostEventBase, type: z.literal("capacity"), capacity: Capacity }),
+  /** Sent on every change of the host's tunnel state. */
+  z.object({ ...hostEventBase, type: z.literal("tunnel_state"), state: TunnelState }),
   z.object({ ...hostEventBase, type: z.literal("spot_notice"), deadline_ms: TimestampMs }),
   z.object({
     ...hostEventBase, type: z.literal("agent_exited"), agent: AgentId, exit_code: z.number().int().optional(),

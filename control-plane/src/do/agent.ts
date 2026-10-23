@@ -287,13 +287,22 @@ export class AgentDO extends DurableObject<Env> {
   async start(hostHint?: string): Promise<{ host: string; cmd: string }> {
     const info = this.load();
     let host: string | null;
+    if (hostHint) {
+      // An operator's choice (a brain on a chosen host, for a test): an active, connected host of
+      // this cell, like `controllerHost` picks. Hands still go through the sandbox's gateway.
+      const st = await this.fleet(info.cell).hostStatus(hostHint);
+      if (!st || st.status !== "active" || !st.connected) {
+        throw new NestError(ErrorCodes.FORBIDDEN, `${hostHint} is not an active, connected host in ${info.cell}`, 409);
+      }
+      if (info.role === "worker" && info.hands) await this.sandboxStub(info.hands.sandbox).wake();
+    }
     if (info.role === "worker") {
       if (!info.hands) throw new NestError(ErrorCodes.NOT_BOUND, "worker has no hands binding", 409);
       // Lazy start: a suspended sandbox resumes, an unplaced one is placed (maybe on a new host).
       // Without a host yet this fails retryably; the placement then moves the agent onto it.
       host = hostHint ?? (await this.sandboxStub(info.hands.sandbox).wake()).host;
     } else {
-      host = await this.fleet(info.cell).controllerHost();
+      host = hostHint ?? (await this.fleet(info.cell).controllerHost());
     }
     if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no host available for this agent", 503, true);
     const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).oauthTokenRef(info.role);

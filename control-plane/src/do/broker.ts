@@ -103,6 +103,23 @@ export class BrokerDO extends DurableObject<Env> {
     return stored;
   }
 
+  /**
+   * The Cloudflare Access service token in front of the gateways, stored under `access:gateway` as
+   * the JSON `{"client_id", "client_secret"}` through the admin secrets route. `null` until it is.
+   */
+  async accessServiceToken(): Promise<{ client_id: string; client_secret: string } | null> {
+    const s = this.secret("access:gateway");
+    if (!s) return null;
+    try {
+      const v = JSON.parse(s.value) as { client_id?: unknown; client_secret?: unknown };
+      if (typeof v.client_id === "string" && typeof v.client_secret === "string") return { client_id: v.client_id, client_secret: v.client_secret };
+    } catch {
+      // not JSON: reported below
+    }
+    console.error("BrokerDO: access:gateway is not {client_id, client_secret} JSON; targets carry no edge credential");
+    return null;
+  }
+
   /** Every key a gateway in `cell` must accept (one today; the list is what a rotation extends). */
   async bindingPublicKeys(cell: string): Promise<BindingKey[]> {
     const k = await this.bindingKey(cell);

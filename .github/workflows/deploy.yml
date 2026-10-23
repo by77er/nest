@@ -99,6 +99,8 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Written to the Worker as a secret by the script (tunnels and DNS records per sandbox host).
+          CLOUDFLARE_TUNNEL_API_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_API_TOKEN }}
         run: dev/deploy-use1.sh "deploy.yml run ${{ github.run_id }}"
       - name: Smoke
         id: smoke

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::control::{
     AgentReport, CaCertificate, Capacity, Command, ComponentVersions, FleetToHost, HelloAck, HostEvent, HostEventBody, HostHello,
-    HostToFleet, LeaseClaim, LeaseTiming, SandboxReport,
+    HostToFleet, LeaseClaim, LeaseTiming, SandboxReport, TunnelState,
 };
 use nest_protocol::model::{ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Seq, TimestampMs};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -72,6 +72,8 @@ pub struct FleetParams {
     pub cell: String,
     /// Reported in the hello: where clients reach this host's sandbox gateway.
     pub gateway_url: Option<String>,
+    /// The tunnel's state, reported in the hello (changes go out as `tunnel_state` events).
+    pub tunnel: tokio::sync::watch::Receiver<TunnelState>,
     pub versions: ComponentVersions,
     /// Random per nestd process; FleetDO resets both seq lineages when it changes.
     pub instance_id: String,
@@ -247,6 +249,7 @@ impl State {
             cell: self.params.cell.clone(),
             versions: self.params.versions.clone(),
             gateway_url: self.params.gateway_url.clone(),
+            tunnel: *self.params.tunnel.borrow(),
             last_command_seq: self.last_command_seq,
             sandboxes,
             agents,

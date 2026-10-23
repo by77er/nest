@@ -5,7 +5,7 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 | Boundary | Spec | Rust module |
 |---|---|---|
 | Control plane ↔ host (WebSocket), shared models, platform tools | [control-host/](control-host/) | `control`, `model` |
-| Brain ↔ sandbox gateway (WebSocket; through the host's tunnel once it lands): bindings, `resolve`, hands (PTY and ingress designed) | [gateway/](gateway/) | `gateway` |
+| Brain ↔ sandbox gateway (WebSocket; through the host's tunnel on a real host): bindings, `resolve`, hands (PTY and ingress designed) | [gateway/](gateway/) | `gateway` |
 | Host ↔ guest agent (vsock), hands tools; nestd and the gateway are the host side | [host-guest/](host-guest/) | `guest` |
 | Host-internal: nestd ↔ nest-proxy (fd passing), nestd ↔ runner, nestd ↔ gateway, runner ↔ `nest hook` / Claude Code | [host-internal/](host-internal/) | `host` |
 
@@ -55,7 +55,7 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
   - **Sandboxes:** ingress-guard `activity` events; `base_prepare` and `from: base`; drive rate limits in `resources`.
   - **CLI and metrics:** `guest_cli` carries `hold`; the metrics frame carries guest log-site counts.
   - **Agents:** `agent_start` goes to a brain host chosen by capacity; platform tool calls and brokered actions carry the agent epoch. (Its `hands` field is the sandbox's id and epoch only: built.)
-- **Enrollment:** a fixed-shape CSR, and `proxy_ca` is pathLen 0. A sandbox host's response carries its `tunnel_token`; a brain host's carries none.
+- **Enrollment:** a fixed-shape CSR, and `proxy_ca` is pathLen 0. (A sandbox host's response carrying `tunnel_token` and `gateway_url`, a brain host's neither: built.)
 - **Operator API:** scoped tokens, never accepted in URLs; the revocation counter goes into share links, terminal sessions and host tokens.
 - **Channels:** a loss-record kind on `<sbx>/events`. **Tool schema:** a per-tool list of rejected fields in `hands-tools.json`.
 - **Claude Code invocation** (`runner-claude`): `--system-prompt-snapshot off`, `--max-turns` and `--max-budget-usd` from the budget, no `TodoWrite` or `Agent` in `--tools`, `DISABLE_UPDATES=1`, `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, auto memory off, and `PreToolUse` answering `defer` for approvals. `SessionStart` also returns the memory key index and the recovery context, from the AgentCache.

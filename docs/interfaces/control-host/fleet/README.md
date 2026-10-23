@@ -13,7 +13,7 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `gateway_url?` (where clients reach this host's sandbox gateway, from nestd's configuration), `last_command_seq`, and **a full report** of local sandboxes (epoch, state, head, dirty, and `guest{protocol_version, capabilities}` for a running one), agents (state) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
+| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `gateway_url?` (where clients reach this host's sandbox gateway, from nestd's configuration), `tunnel` (`none` | `connecting` | `connected`; absent from a nestd that predates it, read as `none`), `last_command_seq`, and **a full report** of local sandboxes (epoch, state, head, dirty, and `guest{protocol_version, capabilities}` for a running one), agents (state) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
 | `heartbeat` | no | Every 5 s: `sent_ms` and `leases[(sandbox, epoch)]`. **Renews every listed lease.** |
 | `events` | seq | A batch of `HostEvent`s (below) |
 | `ack` | — | Cumulative ack of `commands` |
@@ -71,6 +71,7 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `workstream` | A host-originated `WorkstreamEvent` (`port_opened`, `port_exposed`, `egress_denied`, `egress_alert`) |
 | `egress_audit` | Batches of `EgressAuditRecord` (no secret values, no query strings), written to R2. `via?` names the nest-proxy entry point: `dns http_transparent https_transparent explicit tcp_exception`; `reason` values are listed in [nestd-proxy](../../host-internal/nestd-proxy/). `count?` marks an aggregated record (how many requests it stands for), used for nest-proxy's per-window suppression summaries |
 | `capacity` | Free vCPU, memory and hugepages, counts, warm generations |
+| `tunnel_state` | `state`: the host's tunnel changed to `none`, `connecting` or `connected` (from cloudflared's `/ready`); FleetDO advertises the tunnel hostname only while `connected` |
 | `spot_notice` | IMDS interruption notice; the host is draining |
 | `agent_exited` | Brain process exit (lifecycle only) |
 | `guest_cli` | `request, sandbox, epoch, agent?, command` (`guest::CliCommand`): a `nest notify/emit/ask/expose` run by a program in the sandbox, attributed by `NEST_AGENT_ID`. FleetDO runs it on the agent's AgentDO as the platform tool of the same name (`expose` → `expose_port`) **without holding the event batch** (an `ask` waits ≤ 120 s, then returns `pending`), and answers with a `guest_cli_result` command. nestd gives up after `wait_s` + 15 s (`ask`) or 30 s (others) |

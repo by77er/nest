@@ -422,7 +422,7 @@ async fn an_out_of_range_gateway_version_in_bound_is_a_protocol_error() {
 }
 
 #[tokio::test]
-async fn connect_refused_is_unreachable_and_a_dns_failure_is_not() {
+async fn connect_refused_and_an_unresolvable_hostname_are_unreachable() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", l.local_addr().unwrap());
     drop(l);
@@ -436,13 +436,14 @@ async fn connect_refused_is_unreachable_and_a_dns_failure_is_not() {
         }
         other => panic!("expected Transport, got {other:?}"),
     }
-    // `.invalid` never resolves; a resolver that stalls instead of failing makes this a connect
-    // timeout, which is also not "unreachable".
+    // `.invalid` never resolves: the record of a dead host, as the runner sees it once FleetDO
+    // deleted it. A resolver that stalls instead of failing makes this a connect timeout, which
+    // the runner also resolves again on.
     match open(&target("ws://nonexistent.invalid:1", None), &opts()).await {
-        Err(OpenError::Transport(t)) => assert!(
-            !t.is_unreachable(),
-            "a DNS failure is not a refused connect: {t}"
-        ),
+        Err(OpenError::Transport(t)) => {
+            assert!(matches!(&t, TransportError::Dns(_)), "{t}");
+            assert!(t.is_unreachable(), "a hostname that does not resolve: {t}");
+        }
         Err(OpenError::Timeout(Phase::Connect)) => {}
         other => panic!("expected Transport, got {other:?}"),
     }
@@ -451,6 +452,65 @@ async fn connect_refused_is_unreachable_and_a_dns_failure_is_not() {
         matches!(&r, Err(OpenError::Transport(TransportError::Url(_)))),
         "{r:?}"
     );
+}
+
+/// A plain HTTP server that answers every request with `status` and no upgrade: Cloudflare's
+/// edge in front of a hostname with no connector (530, 502, 503), Access refusing the service
+/// token (403), or the gateway itself for an unknown route (404).
+async fn http_status_server(status: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let reply =
+                    format!("HTTP/1.1 {status} Edge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn an_edge_5xx_or_an_access_refusal_is_unreachable_and_a_404_is_not() {
+    for status in [530u16, 503, 502, 403, 401] {
+        let url = http_status_server(status).await;
+        match open(&target(&url, None), &opts()).await {
+            Err(OpenError::Transport(t)) => {
+                assert!(matches!(&t, TransportError::Http(s) if *s == status), "{status}: {t}");
+                assert!(t.is_unreachable(), "{status} from in front of the gateway: {t}");
+            }
+            other => panic!("{status}: expected Transport(Http), got {other:?}"),
+        }
+    }
+    // Only a 5xx is worth a pause before the next resolve; a refused credential is not.
+    assert!(TransportError::Http(530).is_edge_outage());
+    assert!(!TransportError::Http(403).is_edge_outage());
+    for status in [404u16, 501, 400] {
+        let url = http_status_server(status).await;
+        match open(&target(&url, None), &opts()).await {
+            Err(OpenError::Transport(t)) => {
+                assert!(matches!(&t, TransportError::Http(s) if *s == status), "{status}: {t}");
+                assert!(!t.is_unreachable(), "{status} is the gateway's own answer: {t}");
+                assert!(!t.is_edge_outage());
+            }
+            other => panic!("{status}: expected Transport(Http), got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
