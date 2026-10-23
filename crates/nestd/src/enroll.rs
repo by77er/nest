@@ -116,7 +116,10 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
     let (key, csr) = proxy_ca_csr(&cfg.cell)?;
     let req = EnrollRequest { protocol_version: PROTOCOL_VERSION, role: cfg.role, cell: cfg.cell.clone(), proof, proxy_ca_csr_pem: csr };
     let url = format!("{}/v1/hosts/enroll", cfg.control_url.trim_end_matches('/'));
-    let resp = http_client()?.post(&url).json(&req).send().await.with_context(|| format!("POST {url}"))?;
+    // The control plane may create the host's tunnel before answering: up to four Cloudflare calls
+    // of 10 s each, plus the CA signature (docs/interfaces/control-host/enrollment/). A timeout
+    // here while the control plane finishes would consume the proof with no host to give it to.
+    let resp = http_client()?.post(&url).json(&req).timeout(ENROLL_TIMEOUT).send().await.with_context(|| format!("POST {url}"))?;
     let status = resp.status();
     if !status.is_success() {
         bail!("enrollment rejected: {status} {}", resp.text().await.unwrap_or_default());
@@ -149,6 +152,9 @@ fn url_host(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     rest.split(['/', '?', '#']).next().unwrap_or_default().to_ascii_lowercase()
 }
+
+/// The enrollment request's own budget; IMDS and spot queries keep the client's 10 s.
+const ENROLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?)

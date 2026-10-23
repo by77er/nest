@@ -32,4 +32,4 @@ The hosts that run brains: small, stateless, and never the machine a sandbox run
 
 **If one goes down:** turns for its agents queue; Discord buttons and slash commands keep working, because the Worker serves them; the brains start elsewhere after 30 s, and the Discord gateway client is placed again.
 
-**Not built:** brain hosts. The code has `burst` and `controller` host roles, FleetDO's `controllerHost()` picks a `controller` host for captains, and the runner reaches the guest over vsock on the sandbox's host; `control-plane/README.md` lists the gaps.
+**Not built:** brain hosts. The code has `burst` and `controller` host roles, FleetDO's `controllerHost()` picks a `controller` host for captains, and brains still start on the sandbox's host, reaching the guest only through its gateway; `control-plane/README.md` lists the gaps.

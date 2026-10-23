@@ -103,8 +103,8 @@ WantedBy=multi-user.target
 EOF
 
 # The sandbox gateway: the only way hands reach a guest. It connects to nestd's gateway socket and
-# listens on loopback; in this step every brain runs on its sandbox's host, so loopback is the
-# gateway URL nestd advertises (the tunnel hostname replaces it when cloudflared lands).
+# listens on loopback, where cloudflared forwards the host's tunnel hostname; the loopback URL nestd
+# advertises in its hello counts only for a host without a tunnel.
 cat >/etc/systemd/system/nest-gateway.service <<'EOF'
 [Unit]
 Description=nest sandbox gateway (hands over WebSocket to the guests' vsock ports)

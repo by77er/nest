@@ -44,7 +44,7 @@ kill with a full stdin, lease/forbidden-tool refusal, abandoned platform calls) 
 - **Hook datagrams aren't peer-checked** (tracking only); sync hooks and the MCP bridge are.
 - **`rate_limit_event`** from the stream is parsed but not mapped to events (rate limits are still
   reported from `system/api_retry` and `StopFailure`).
-- **The runner holds no vsock path and no binding of its own:** `agent_start.hands` names the sandbox and epoch only, and every target is fetched from AgentDO. The edge credential (`HandsTarget.edge`) rides along to the client untouched; the tunnel step decides how it is minted.
+- **The runner holds no vsock path and no binding of its own:** `agent_start.hands` names the sandbox and epoch only, and every target is fetched from AgentDO. The edge credential (`HandsTarget.edge`, the Access service token from BrokerDO, present only for a host with a tunnel) rides along to the client untouched.
 - **Permission rules** are accident prevention: Bash prefix globs are easy to sidestep.
 - The guest hands `call_id` uses Claude Code's `tool_use` id from MCP `_meta` when present
   (unverified that Claude Code sends it), else a generated `hc_…`.

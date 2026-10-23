@@ -79,7 +79,7 @@ type Ws = WebSocketStream<TcpStream>;
 async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::OwnedSemaphorePermit) -> anyhow::Result<()> {
     // Upgrade and bind share one deadline, counted from the accept.
     let deadline = tokio::time::Instant::now() + BIND_TIMEOUT;
-    let Some((mut ws, bind)) = upgrade_and_bind(stream, deadline).await else { return Ok(()) };
+    let Some((mut ws, bind, via)) = upgrade_and_bind(stream, deadline).await else { return Ok(()) };
     let Some(ClientMessage::Bind { binding, protocol_version, gateway_version }) = bind else {
         refuse(&mut ws, &Refusal::new(error_code::BAD_REQUEST, "expected a bind message")).await;
         return Ok(());
@@ -87,7 +87,7 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
     let accepted = match check_bind(&state, &binding, protocol_version, gateway_version, now_ms()) {
         Ok(a) => a,
         Err(r) => {
-            tracing::info!(code = r.code, "bind refused");
+            tracing::info!(code = r.code, via, "bind refused");
             refuse(&mut ws, &r).await;
             return Ok(());
         }
@@ -125,7 +125,7 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
     if send(&mut ws, Message::text(serde_json::to_string(&bound)?)).await.is_err() {
         return Ok(());
     }
-    tracing::info!(sandbox = %sandbox.0, client = %client, "bound");
+    tracing::info!(sandbox = %sandbox.0, client = %client, via, "bound");
 
     // The pipe.
     let (mut guest_rd, mut guest_wr) = guest.into_split();
@@ -222,12 +222,21 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
     Ok(())
 }
 
+/// Where a connection came in from, for the log: `edge` when the upgrade request carries
+/// Cloudflare's `cf-ray` header (it arrived through the host's tunnel, past Access), `direct`
+/// otherwise (loopback on the harness, or a client on the host). A log fact only: the binding
+/// is the admission check, and a direct client can set the header itself.
+pub fn via_of(req: &Request) -> &'static str {
+    if req.headers().contains_key("cf-ray") { "edge" } else { "direct" }
+}
+
 /// The upgrade, then the first text message, both before `deadline`. Pings, pongs and raw
-/// frames before `bind` are skipped. `Some((ws, None))` (a binary message, a non-bind text, or
-/// the deadline after the upgrade) is answered as `bad_request` by the caller; a closed or
+/// frames before `bind` are skipped. `Some((ws, None, _))` (a binary message, a non-bind text,
+/// or the deadline after the upgrade) is answered as `bad_request` by the caller; a closed or
 /// broken socket, or no upgrade before the deadline, is `None`.
-async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> Option<(Ws, Option<ClientMessage>)> {
+async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> Option<(Ws, Option<ClientMessage>, &'static str)> {
     let mut route = String::new();
+    let mut via = "direct";
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME_LEN as usize + 4))
         .max_frame_size(Some(MAX_FRAME_LEN as usize + 4));
@@ -235,6 +244,7 @@ async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> 
     #[allow(clippy::result_large_err)]
     let callback = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
         route = req.uri().path().to_string();
+        via = via_of(req);
         if route == ROUTE_HANDS {
             return Ok(resp);
         }
@@ -258,11 +268,11 @@ async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> 
     };
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => return Some((ws, serde_json::from_str::<ClientMessage>(&text).ok())),
+            Ok(Some(Ok(Message::Text(text)))) => return Some((ws, serde_json::from_str::<ClientMessage>(&text).ok(), via)),
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => continue,
-            Ok(Some(Ok(Message::Binary(_)))) => return Some((ws, None)),
+            Ok(Some(Ok(Message::Binary(_)))) => return Some((ws, None, via)),
             Ok(Some(Ok(Message::Close(_))) | Some(Err(_)) | None) => return None,
-            Err(_) => return Some((ws, None)),
+            Err(_) => return Some((ws, None, via)),
         }
     }
 }
@@ -331,4 +341,20 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn via_is_edge_only_with_a_cf_ray_header() {
+        let direct = Request::builder().uri("/hands").body(()).unwrap();
+        assert_eq!(via_of(&direct), "direct");
+        let edge = Request::builder().uri("/hands").header("cf-ray", "8a1b2c3d4e5f-IAD").body(()).unwrap();
+        assert_eq!(via_of(&edge), "edge");
+        // Cloudflare sets `cf-connecting-ip` too; alone it is not the edge (the host's own clients could).
+        let other = Request::builder().uri("/hands").header("cf-connecting-ip", "203.0.113.9").body(()).unwrap();
+        assert_eq!(via_of(&other), "direct");
+    }
 }

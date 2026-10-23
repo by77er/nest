@@ -45,7 +45,7 @@ export interface Env {
   WAKE_BATCH_MS?: string;
   /** The nest domain, `<label>.<zone>` (e.g. `nest.bitcru.sh`): sandbox hosts get `<host>-gw-<label>.<zone>`. Unset: no tunnels. */
   NEST_DOMAIN?: string;
-  /** The Cloudflare account that holds the tunnels (a var) and a token with Cloudflare Tunnel Edit + DNS Edit on the zone (a secret). */
+  /** The Cloudflare account that holds the tunnels (a var) and a token with Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit (a secret). */
   CLOUDFLARE_ACCOUNT_ID?: string;
   CLOUDFLARE_TUNNEL_API_TOKEN?: string;
 }
