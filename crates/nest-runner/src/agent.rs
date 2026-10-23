@@ -79,7 +79,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let hands = start.hands.clone();
+        let hands = start.start.hands.clone();
         let epoch = hands.as_ref().map(|h| h.epoch).unwrap_or(Epoch(0));
         let secrets = vec![start.start.oauth_token.expose().to_owned()];
         let agent = Agent::new(
@@ -105,8 +105,8 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(existing) => {
-                    tracing::warn!(agent = %id, "agent_start for a brain that is already running; rebinding its hands only");
-                    existing.bind(start.hands.clone());
+                    tracing::warn!(agent = %id, "agent_start for a brain that is already running; updating its hands only");
+                    existing.set_hands(start.start.hands.clone());
                     rt.report(RunnerEvent::Error {
                         agent: Some(id),
                         error: ErrorBody { code: "already_running".into(), message: "brain already running".into(), retryable: false },
@@ -277,6 +277,9 @@ async fn run(
         inner.session = session_id.clone();
         inner.transcript = Some(transcript.clone());
     }
+    // Hands: ask AgentDO where the sandbox is while the slow steps run (the request waits for
+    // the session channel), so the SessionStart hook and the first tool call find the target.
+    crate::hands::prefetch_target(agent.clone());
 
     let launch = Launch { launch: s.start.launch.clone(), config_dir: s.config_dir.clone(), env: process_env(&rt, &s) };
 

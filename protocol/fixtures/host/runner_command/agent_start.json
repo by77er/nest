@@ -43,10 +43,5 @@
     "oauth_token": "sk-ant-oat01-REDACTED-EXAMPLE",
     "session_ws_url": "wss://nest.example.dev/v1/agents/agt_01jb7n0w1e/session"
   },
-  "config_dir": "/var/lib/nest/agents/agt_01jb7n0w1e",
-  "hands": {
-    "sandbox": "sbx_01jb7m2a4c",
-    "epoch": 4,
-    "vsock_uds_path": "/srv/jailer/firecracker/sbx_01jb7m2a4c/root/v.sock"
-  }
+  "config_dir": "/var/lib/nest/agents/agt_01jb7n0w1e"
 }

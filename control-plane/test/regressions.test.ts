@@ -145,7 +145,7 @@ describe("#4 reassignment can't strand leases", () => {
     const s1 = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
     const s2 = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
     for (const s of [s1, s2]) await sandboxStub(s.sandbox).reportState(a.host, 1, "running", null, null);
-    await sandboxStub(s1.sandbox).attachAgent("agt_doesnotexist0000000000000");
+    await sandboxStub(s1.sandbox).attach("agt_doesnotexist0000000000000");
     const b = await connectHost(cell);
     a.ws.close();
     await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
@@ -621,7 +621,7 @@ describe("docs #8 hello.agents reconciliation", () => {
     expect((await agentStub(s.agent).info()).state).toBe("detached");
 
     const third = await Ws.connect("/v1/fleet", s.host.host_token);
-    third.send(hostHello(s.host.host, s.cell, { agents: [{ agent: s.agent, state: "idle", hands: { sandbox: s.sandbox, epoch: 1 } }] }));
+    third.send(hostHello(s.host.host, s.cell, { agents: [{ agent: s.agent, state: "idle" }] }));
     await third.next("hello_ack");
     await sleep(50);
     expect((await agentStub(s.agent).info()).state).toBe("idle");

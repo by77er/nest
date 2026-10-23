@@ -1,8 +1,10 @@
 //! nestd side of the nestd ↔ agent runner protocol (`docs/interfaces/host-internal/nestd-runner/`).
 //!
-//! Lifecycle only. nestd keeps the *desired* set of brains; on every runner (re)connection it
+//! Lifecycle only: nestd keeps the *desired* set of brains and on every runner (re)connection
 //! re-issues `agent_start` for each of them (the runner starts with no agents and kills every
-//! brain when the nestd socket closes or the lease lapses).
+//! brain when the nestd socket closes or the lease lapses). Nothing about hands crosses this
+//! link: the runner reaches a sandbox's guest through the gateway with a binding it gets from
+//! AgentDO, and the guest slot is configured by `agent_attach` from SandboxDO.
 //!
 //! Replay vs. stale exits: a runner that lost its nestd connection may still deliver
 //! `agent_exited{fenced}` for brains it killed *before* the reconnect. Those must not cancel the
@@ -20,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeSet;
 
-use nest_protocol::host::runner::{AgentStart, ExitReason, LocalHands, RunnerCommand, RunnerEvent, StopMode};
+use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerCommand, RunnerEvent, StopMode};
 use nest_protocol::host::{PROTOCOL_VERSION, Secret};
 use nest_protocol::model::{AgentId, HostId, HostRole, TimestampMs};
 use tokio::net::UnixListener;
@@ -102,13 +104,6 @@ impl RunnerLink {
         let agent = start.start.agent.clone();
         self.state.lock().expect("runner state").desired.insert(agent, start.clone());
         self.send(RunnerCommand::AgentStart(Box::new(start)));
-    }
-
-    pub fn agent_bind(&self, agent: &AgentId, hands: Option<LocalHands>) {
-        if let Some(s) = self.state.lock().expect("runner state").desired.get_mut(agent) {
-            s.hands = hands.clone();
-        }
-        self.send(RunnerCommand::AgentBind { agent: agent.clone(), hands });
     }
 
     pub fn agent_stop(&self, agent: &AgentId, mode: StopMode, reason: &str) {
@@ -270,7 +265,7 @@ mod tests {
         let (ntx, mut nrx) = mpsc::unbounded_channel();
         let link = RunnerLink::start(&path, HostId("hst_1".into()), HostRole::Burst, crate::proxy_link::Access::default(), ntx).unwrap();
         link.host_token(Secret("t1".into()), 99);
-        link.agent_start(AgentStart { start: cp_start("agt_a"), config_dir: "/tmp/a".into(), hands: None });
+        link.agent_start(AgentStart { start: cp_start("agt_a"), config_dir: "/tmp/a".into() });
 
         let connect = || async {
             let s = UnixStream::connect(&path).await.unwrap();
@@ -290,7 +285,7 @@ mod tests {
         f.send(bytes::Bytes::from(serde_json::to_vec(&ev).unwrap())).await.unwrap();
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentExited { .. }))));
         link.forget(&AgentId("agt_a".into()));
-        link.agent_start(AgentStart { start: cp_start("agt_b"), config_dir: "/tmp/b".into(), hands: None });
+        link.agent_start(AgentStart { start: cp_start("agt_b"), config_dir: "/tmp/b".into() });
         assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_b"));
 
         // Reconnect: only agt_b is replayed.
@@ -314,7 +309,7 @@ mod tests {
         let path = dir.path().join("runner.sock");
         let (ntx, mut nrx) = mpsc::unbounded_channel();
         let link = RunnerLink::start(&path, HostId("hst_1".into()), HostRole::Burst, crate::proxy_link::Access::default(), ntx).unwrap();
-        link.agent_start(AgentStart { start: cp_start("agt_a"), config_dir: "/tmp/a".into(), hands: None });
+        link.agent_start(AgentStart { start: cp_start("agt_a"), config_dir: "/tmp/a".into() });
         let s = UnixStream::connect(&path).await.unwrap();
         let mut f = Framed::new(s, LengthDelimitedCodec::new());
         let hello = RunnerEvent::Hello { protocol_version: PROTOCOL_VERSION, runner_version: "t".into(), pid: 7 };

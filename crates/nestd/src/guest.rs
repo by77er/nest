@@ -23,8 +23,9 @@ use crate::vsock;
 /// What the guest tells nestd.
 #[derive(Debug)]
 pub enum GuestEvent {
-    /// Configured and ready for hands calls. `resumed`: same `boot_id` and `instance_id` as before (memory restore).
-    Ready { resumed: bool },
+    /// Configured and ready for hands calls. `resumed`: same `boot_id` and `instance_id` as before
+    /// (memory restore). `guest`: the version and capabilities from this connection's hello.
+    Ready { resumed: bool, guest: nest_protocol::gateway::GuestInfo },
     Disconnected,
     Ports(Vec<nest_protocol::guest::ListeningPort>),
     TaskExited { agent_id: AgentId, task: nest_protocol::guest::TaskInfo },
@@ -53,6 +54,8 @@ pub struct GuestCtl {
     /// Resume to send after the next `hello` (set before restoring a memory snapshot).
     pending_resume: Arc<Mutex<Option<Option<ForkIdentity>>>>,
     stop: Arc<tokio::sync::Notify>,
+    /// The guest's version and capabilities from the last hello (what `resolve` hands clients).
+    guest: Arc<Mutex<Option<nest_protocol::gateway::GuestInfo>>>,
 }
 
 impl GuestCtl {
@@ -60,7 +63,7 @@ impl GuestCtl {
         let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots: vec![] }));
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = watch::channel(false);
-        let ctl = GuestCtl { cfg, reqs: tx, ready: ready_rx, pending_resume: Arc::new(Mutex::new(None)), stop: Arc::new(tokio::sync::Notify::new()) };
+        let ctl = GuestCtl { cfg, reqs: tx, ready: ready_rx, pending_resume: Arc::new(Mutex::new(None)), stop: Arc::new(tokio::sync::Notify::new()), guest: Arc::new(Mutex::new(None)) };
         let task = Task { uds, ctl: ctl.clone(), events, ready: ready_tx, sandbox, last_identity: None };
         tokio::spawn(task.run(rx));
         ctl
@@ -78,6 +81,11 @@ impl GuestCtl {
 
     pub fn is_ready(&self) -> bool {
         *self.ready.borrow()
+    }
+
+    /// The guest's version and capabilities from its last hello, if one arrived.
+    pub fn guest(&self) -> Option<nest_protocol::gateway::GuestInfo> {
+        self.guest.lock().expect("guest info").clone()
     }
 
     pub fn slots(&self) -> Vec<AgentSlot> {
@@ -203,7 +211,7 @@ impl Task {
 
         // 1. hello
         let hello = read_frame(&mut stream, &mut dec, &mut buf).await?;
-        let ControlBody::Hello { protocol_version, boot_id, instance_id, .. } = hello.body else {
+        let ControlBody::Hello { protocol_version, boot_id, instance_id, capabilities, .. } = hello.body else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "first guest frame was not hello"));
         };
         if protocol_version != PROTOCOL_VERSION {
@@ -238,8 +246,10 @@ impl Task {
                 other => tracing::warn!(?other, "unexpected resume reply"),
             }
         }
+        let guest = nest_protocol::gateway::GuestInfo { protocol_version, capabilities };
+        *self.ctl.guest.lock().expect("guest info") = Some(guest.clone());
         self.ready.send_replace(true);
-        let _ = self.events.send((self.sandbox.clone(), GuestEvent::Ready { resumed }));
+        let _ = self.events.send((self.sandbox.clone(), GuestEvent::Ready { resumed, guest }));
 
         // 3. steady state
         loop {
@@ -431,7 +441,7 @@ pub(crate) mod tests {
         let (etx, mut erx) = mpsc::unbounded_channel();
         let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), etx);
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
-        assert!(matches!(erx.recv().await, Some((_, GuestEvent::Ready { resumed: false }))));
+        assert!(matches!(erx.recv().await, Some((_, GuestEvent::Ready { resumed: false, guest })) if guest.protocol_version == PROTOCOL_VERSION));
         assert!(matches!(erx.recv().await, Some((_, GuestEvent::Ports(p))) if p[0].port == 5173));
 
         let slot = AgentSlot { agent_id: AgentId("agt_1".into()), proxy_port: 3128, cwd: "/workspace".into(), env: Default::default(), memory_max_bytes: None };
@@ -445,7 +455,7 @@ pub(crate) mod tests {
         let fake2 = FakeGuest::start(&guest_dir, "boot-1");
         loop {
             match erx.recv().await.unwrap().1 {
-                GuestEvent::Ready { resumed } => { assert!(resumed); break; }
+                GuestEvent::Ready { resumed, .. } => { assert!(resumed); break; }
                 _ => continue,
             }
         }

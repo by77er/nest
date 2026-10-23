@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::control::{AgentCache, InboxMessage, ToolDef, ToolOutcome, TurnInput};
+use nest_protocol::control::{AgentCache, HandsBinding, InboxMessage, ToolDef, ToolOutcome, TurnInput};
+use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
-use nest_protocol::host::runner::{ExitReason, LocalHands, RunnerEvent, StopMode};
+use nest_protocol::host::runner::{ExitReason, RunnerEvent, StopMode};
 use nest_protocol::model::{
     AgentEvent, AgentEventBody, AgentId, AgentRole, CallId, Epoch, ErrorBody, HostId, MessageId, RequestId,
     SessionId, TimestampMs, TurnId,
@@ -141,6 +142,18 @@ impl Runtime {
     }
 }
 
+/// Removes a `hands_resolve` request from the pending map when its waiter goes away.
+struct PendingResolve<'a> {
+    agent: &'a Agent,
+    req: RequestId,
+}
+
+impl Drop for PendingResolve<'_> {
+    fn drop(&mut self) {
+        self.agent.pending_resolves.lock().unwrap().remove(&self.req);
+    }
+}
+
 /// Parent pid from `/proc/<pid>/stat` (the field after the `)` that ends the command name).
 fn parent_pid(pid: i32) -> Option<i32> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -169,6 +182,9 @@ pub enum Outbound {
     Event(AgentEvent),
     ToolCall { call: CallId, turn: Option<TurnId>, name: String, arguments: Value },
     ToolsListRequest(RequestId),
+    /// Ask AgentDO where the agent's hands are now (`hands_resolve`); answered through
+    /// [`Agent::resolve_hands`].
+    HandsResolve(RequestId),
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
     SetSession(SessionId),
@@ -180,10 +196,51 @@ pub enum Outbound {
     Close,
 }
 
+/// What AgentDO answered to `hands_resolve`.
+#[derive(Debug)]
+pub enum HandsResolveOutcome {
+    Target(HandsTarget),
+    Error { error: ErrorBody, retry_after_ms: Option<u64> },
+}
+
+impl HandsResolveOutcome {
+    /// From a `hands_resolved` frame: exactly one of `hands` and `error`; neither is a protocol
+    /// error the caller surfaces as `invalid_message`.
+    pub fn from_wire(hands: Option<HandsTarget>, error: Option<ErrorBody>, retry_after_ms: Option<u64>) -> Self {
+        match (hands, error) {
+            (Some(t), _) => HandsResolveOutcome::Target(t),
+            (None, Some(error)) => HandsResolveOutcome::Error { error, retry_after_ms },
+            (None, None) => HandsResolveOutcome::Error {
+                error: ErrorBody {
+                    code: nest_protocol::model::error_codes::INVALID_MESSAGE.into(),
+                    message: "hands_resolved carried neither hands nor error".into(),
+                    retryable: false,
+                },
+                retry_after_ms: None,
+            },
+        }
+    }
+}
+
+/// AgentDO did not answer `hands_resolve` in time (or the session channel was down).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveTimeout;
+
 /// Mutable per-agent state shared with hooks and the MCP bridge.
 #[derive(Debug, Default)]
 pub struct AgentInner {
-    pub hands: Option<LocalHands>,
+    /// The sandbox this agent's hands act in (ids only, from `agent_start`); `None` = no hands.
+    /// Its `epoch` is the session channel's epoch for this brain and is updated only by a new
+    /// `agent_start`; a target fetched later may name a newer sandbox epoch (the sandbox moved
+    /// while the brain stayed), and hands calls use the target's epoch, not this one. Making
+    /// the brain's own epoch independent of the sandbox's is step 3 of the seam.
+    pub hands: Option<HandsBinding>,
+    /// The gateway target for those hands, fetched from AgentDO (`hands_resolve`) and dropped
+    /// whenever a gateway refuses it, so the next call asks again.
+    pub target: Option<HandsTarget>,
+    /// Bumped on every [`Agent::set_hands_target`], so a call that saw an old target drops only
+    /// that one ([`Agent::drop_target_if`]) and never a fresher target another call stored.
+    pub target_gen: u64,
     pub cache: Option<AgentCache>,
     /// Inbox messages already delivered (stdin or `Stop`).
     pub delivered: HashSet<MessageId>,
@@ -215,6 +272,10 @@ pub struct Agent {
     out: mpsc::UnboundedSender<Outbound>,
     pub pending_calls: Mutex<HashMap<CallId, oneshot::Sender<ToolOutcome>>>,
     pub pending_lists: Mutex<HashMap<RequestId, oneshot::Sender<Vec<ToolDef>>>>,
+    pub pending_resolves: Mutex<HashMap<RequestId, oneshot::Sender<HandsResolveOutcome>>>,
+    /// Held while one caller resolves the target, so N parallel first calls send one
+    /// `hands_resolve` and the rest find the cached target.
+    pub resolve_gate: tokio::sync::Mutex<()>,
     pub tools_changed: broadcast::Sender<()>,
     /// In-flight hands calls (bridge-scoped key → cancel), cancelled on hard interrupt.
     pub hands_inflight: Mutex<HashMap<String, oneshot::Sender<()>>>,
@@ -231,7 +292,7 @@ impl Agent {
         role: AgentRole,
         epoch: Epoch,
         config_dir: PathBuf,
-        hands: Option<LocalHands>,
+        hands: Option<HandsBinding>,
         session: Option<SessionId>,
         secrets: Vec<String>,
         conn_gen: u64,
@@ -252,6 +313,8 @@ impl Agent {
             out,
             pending_calls: Mutex::new(HashMap::new()),
             pending_lists: Mutex::new(HashMap::new()),
+            pending_resolves: Mutex::new(HashMap::new()),
+            resolve_gate: tokio::sync::Mutex::new(()),
             tools_changed: broadcast::channel(8).0,
             hands_inflight: Mutex::new(HashMap::new()),
             event_seq: AtomicU64::new(0),
@@ -307,17 +370,73 @@ impl Agent {
         self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch(), seq, ts_ms: now_ms(), turn, body }));
     }
 
-    /// Rebind hands. A new epoch re-handshakes the session channel; MCP clients are told the
-    /// tool list changed.
-    pub fn bind(&self, hands: Option<LocalHands>) {
+    /// Set the hands ids (a duplicate `agent_start` for a live brain). A changed binding drops
+    /// the cached target; a new epoch re-handshakes the session channel; MCP clients are told
+    /// the tool list changed.
+    pub fn set_hands(&self, hands: Option<HandsBinding>) {
         let new_epoch = hands.as_ref().map(|h| h.epoch);
-        self.inner.lock().unwrap().hands = hands;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.hands != hands {
+                inner.target = None;
+            }
+            inner.hands = hands;
+        }
         if let Some(e) = new_epoch
             && self.epoch.swap(e.0, Ordering::SeqCst) != e.0
         {
             self.send_out(Outbound::Reconnect);
         }
         let _ = self.tools_changed.send(());
+    }
+
+    /// The cached gateway target with its generation, if a `hands_resolve` has answered since
+    /// the last refusal.
+    pub fn hands_target(&self) -> Option<(HandsTarget, u64)> {
+        let inner = self.inner.lock().unwrap();
+        inner.target.clone().map(|t| (t, inner.target_gen))
+    }
+
+    /// Cache a target; returns its generation.
+    pub fn set_hands_target(&self, target: HandsTarget) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.target_gen += 1;
+        inner.target = Some(target);
+        inner.target_gen
+    }
+
+    /// Forget the target a call was using (a gateway refused it, or the sandbox moved mid-call),
+    /// unless another call has stored a fresher one since.
+    pub fn drop_target_if(&self, generation: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.target_gen == generation {
+            inner.target = None;
+        }
+    }
+
+    /// One `hands_resolve` round trip over the session channel. Dropping the future (a caller's
+    /// timeout, a cancelled call) forgets the request, so a late answer is ignored.
+    pub async fn resolve_hands_target(&self, timeout: Duration) -> Result<HandsResolveOutcome, ResolveTimeout> {
+        let req = RequestId(format!("req_{}", uuid::Uuid::new_v4().simple()));
+        let (tx, rx) = oneshot::channel();
+        self.pending_resolves.lock().unwrap().insert(req.clone(), tx);
+        let _guard = PendingResolve { agent: self, req: req.clone() };
+        self.send_out(Outbound::HandsResolve(req));
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            _ => Err(ResolveTimeout),
+        }
+    }
+
+    /// `hands_resolved` arrived on the session channel. An id nobody waits for (the caller gave
+    /// up, or a duplicate answer) is logged and ignored.
+    pub fn resolve_hands(&self, req: &RequestId, outcome: HandsResolveOutcome) {
+        match self.pending_resolves.lock().unwrap().remove(req) {
+            Some(tx) => {
+                let _ = tx.send(outcome);
+            }
+            None => tracing::debug!(agent = %self.id, request = %req.0, "hands_resolved for a request nobody awaits"),
+        }
     }
 
     /// Apply a cache update unless it's older than what we have.

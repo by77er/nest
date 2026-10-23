@@ -29,6 +29,8 @@ pub mod paths {
     pub const PROXY_SOCK: &str = "/run/nest/proxy.sock";
     /// nestd listens (`SOCK_STREAM`, `0660 root:nest-runner`); the agent runner connects.
     pub const RUNNER_SOCK: &str = "/run/nest/runner.sock";
+    /// nestd listens (`SOCK_STREAM`, `0660 root:nest-gateway`); the sandbox gateway connects.
+    pub const GATEWAY_SOCK: &str = "/run/nest/gateway.sock";
     /// Runner-owned directory for the hook and MCP sockets (`nest-runner:nest-agents 0750`).
     pub const RUNNER_DIR: &str = "/run/nest/runner";
     /// Runner binds (`SOCK_DGRAM`): async tracking hooks.
@@ -397,12 +399,6 @@ pub mod runner {
         LeaseUpdate { valid_until_ms: TimestampMs },
         /// Start (or resume) a brain.
         AgentStart(Box<AgentStart>),
-        /// Rebind (or unbind) hands; takes effect at the next hands call.
-        AgentBind {
-            agent: AgentId,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            hands: Option<LocalHands>,
-        },
         AgentStop { agent: AgentId, mode: StopMode, reason: String },
         /// Kill these brains now (empty = all). The runner then reports
         /// `AgentExited { reason: fenced }` and closes their session channels.
@@ -458,23 +454,14 @@ pub mod runner {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AgentStart {
         /// As received from FleetDO (`CommandBody::AgentStart`), including `oauth_token`,
-        /// `session_ws_url` and `resume` (Worker-signed segment URLs the runner downloads).
+        /// `session_ws_url`, `resume` (Worker-signed segment URLs the runner downloads) and
+        /// `hands` (the sandbox's id and epoch only; the runner fetches the gateway target over
+        /// its session channel). nestd adds nothing about hands: the runner never touches a
+        /// vsock socket.
         pub start: crate::control::AgentStart,
         /// `CLAUDE_CONFIG_DIR`, normally `<AGENTS_DIR>/<agent>`; created by nestd, owned by the
         /// agent's unit user.
         pub config_dir: String,
-        /// Present iff `start.hands` is.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub hands: Option<LocalHands>,
-    }
-
-    /// Where hands RPC for an agent goes on this host.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct LocalHands {
-        pub sandbox: SandboxId,
-        pub epoch: Epoch,
-        /// Firecracker's host-side vsock unix socket; connect, then `CONNECT <guest::PORT_HANDS>\n`.
-        pub vsock_uds_path: String,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +506,64 @@ pub mod runner {
 /// [`HookDatagram`]; sync (decision) hooks send one [`HookDecisionRequest`] frame and print the
 /// [`HookOutput`] from the response to stdout. `nest hook` always exits 0.
 ///
+/// nestd ↔ sandbox gateway (`paths::GATEWAY_SOCK`, length-prefixed JSON). nestd is the source of
+/// truth: after every `hello` it resends the keys and every sandbox, then `resync_done`. A
+/// gateway that loses the socket closes every open connection (`close_code::MOVED`) and refuses
+/// every binding (`moved`) until it reconnects: the gateway's self-fence. nestd pings every 5 s
+/// and drops a peer silent for 15 s.
+pub mod gateway_link {
+    use super::*;
+    use crate::gateway::{BindingKey, GuestInfo};
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
+    #[strum_discriminants(name(GatewayCommandKind), derive(strum::EnumIter, strum::IntoStaticStr))]
+    #[strum_discriminants(strum(serialize_all = "snake_case"))]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum GatewayCommand {
+        /// Reply to [`GatewayEvent::Hello`]; a full resync (`key_update`, one `sandbox_upsert`
+        /// per sandbox, then `resync_done`) follows on every (re)connection.
+        HelloAck { protocol_version: u32, host_id: HostId },
+        /// Every binding verification key still valid (see [`BindingKey`]); replaces the set.
+        KeyUpdate { keys: Vec<BindingKey> },
+        /// A sandbox this host runs: its current epoch, the host-side vsock unix socket the
+        /// gateway connects to (`CONNECT <port>`), the clients attached to it (agent ids with a
+        /// configured slot; a binding whose client is not listed is `unauthorized`, which is how
+        /// `detach` revokes), and the guest's version once its hello arrived (`None` until the
+        /// guest is configured: bindings get `busy`). A newer epoch replaces the old one, which
+        /// revokes every binding that named it. Exposed ports and their `Host` mode come with
+        /// the ingress routes, which are not served yet.
+        SandboxUpsert {
+            sandbox: SandboxId,
+            epoch: Epoch,
+            vsock_uds_path: String,
+            #[serde(default)]
+            clients: Vec<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            guest: Option<GuestInfo>,
+        },
+        /// The sandbox left this host (destroyed, evicted, fenced): open connections close with
+        /// `close_code::MOVED` and bindings get `moved`.
+        SandboxRemove { sandbox: SandboxId },
+        /// Ends the resync that follows `hello_ack`: entries not re-sent since `hello` are
+        /// dropped, and unknown sandboxes answer `moved` instead of `busy` from here on.
+        ResyncDone,
+        Ping,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
+    #[strum_discriminants(name(GatewayEventKind), derive(strum::EnumIter, strum::IntoStaticStr))]
+    #[strum_discriminants(strum(serialize_all = "snake_case"))]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum GatewayEvent {
+        /// First frame. `instance_id` is random per gateway process; `listen` is the address it
+        /// accepts WebSockets on, for nestd's logs and health. The URL clients use comes from
+        /// nestd's configuration (`gateway_url` in its fleet hello), not from here.
+        Hello { protocol_version: u32, instance_id: String, listen: String },
+        Pong,
+        Error { error: ErrorBody },
+    }
+}
+
 /// Claude Code's hook input/output JSON is an external format: inputs are snake_case and are
 /// forwarded raw; outputs use Claude Code's camelCase field names.
 pub mod hook {
@@ -1183,6 +1228,14 @@ mod tests {
         assert_covered::<mcp::McpBridgeRequestKind>("mcp_request", &seen);
         let seen = round_trip_dir::<mcp::McpBridgeResponse>("mcp_response");
         assert_covered::<mcp::McpBridgeResponseKind>("mcp_response", &seen);
+    }
+
+    #[test]
+    fn gateway_link_fixtures() {
+        let seen = round_trip_dir::<gateway_link::GatewayCommand>("gateway_command");
+        assert_covered::<gateway_link::GatewayCommandKind>("gateway_command", &seen);
+        let seen = round_trip_dir::<gateway_link::GatewayEvent>("gateway_event");
+        assert_covered::<gateway_link::GatewayEventKind>("gateway_event", &seen);
     }
 
     #[test]

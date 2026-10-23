@@ -33,13 +33,13 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 
 ## Hands
 
-- **Binding and address come from AgentDO:** `agent_start` carries `{hostname, binding, guest{protocol_version, capabilities}}`, which AgentDO obtained from SandboxDO's `attach` and `resolve`. The runner never talks to SandboxDO, and never to nestd about hands.
-- **One WebSocket per call** to `wss://<hostname>/hands`: the binding first, then the host-guest hands frames verbatim, `op` being the MCP tool input plus `tool`. Cancel is a close. `call_status` uses the same kind of connection.
-- **Renewal and moves:** the runner renews the binding before it expires (about an hour) with a `hands_resolve` request on its session channel, which AgentDO answers from SandboxDO. A refused connection, `moved` or `stale_epoch` triggers the same request, and the next call goes to the new hostname and epoch. A brain survives its sandbox moving: the tool result says the sandbox moved and what was lost.
-- **Liveness:** the guest heartbeats a call silent for 10 s; 30 s without any frame, or the tool's deadline plus 15 s, fails the call with an unknown outcome ([hands](../hands/)). A dropped connection cancels the call in the guest, so long work belongs in background tasks.
-- **Versions:** every `HandsRequest` carries the guest's `protocol_version` from `resolve`, and the runner uses only the capabilities it advertised.
+- **The target comes from AgentDO, lazily.** `agent_start` names the sandbox and its epoch only. Before its first hands call after a brain start, the runner sends `hands_resolve` on its session channel (10 s per round trip) and caches the `HandsTarget` (gateway URL, binding, guest version) AgentDO obtained from SandboxDO's `resolve`. `sandbox_not_ready` is waited out per `retry_after_ms` (2 s by default) for up to 60 s; `not_bound` is the MCP `not_bound` error. The runner never talks to SandboxDO, and never to nestd about hands.
+- **One WebSocket per call** (`crates/nest-hands-client`) to `<url>/hands`: `bind` first, then the host-guest hands frames verbatim, `op` being the MCP tool input plus `tool`, every `HandsRequest` stamped with the guest version `bound` reported. Cancel sends `cancel`, waits 5 s for the final frame, then hangs up. `call_status` uses the same kind of connection.
+- **Refusals and moves:** `stale_epoch`, `moved`, `unknown_key` or an unreachable gateway drops the cached target, resolves again once and retries the call once; a second refusal is the error. `busy` is retried per `retry_after_ms` (500 ms by default) for up to 30 s. A 4409 close mid-call (the sandbox left the host) makes the call `outcome_unknown` and drops the target, so the next call resolves afresh. A brain survives its sandbox moving: the recovery turn says what was lost.
+- **The SessionStart read** of the repo's CLAUDE.md goes through the same path.
+- **Tests** run a real `nest-gateway` on loopback behind the fake guest (the crate's `test-support` feature, a dev-dependency only, so no production build carries the gateway).
 
-**Not built:** the hands client, bindings and `hands_resolve`. Today the runner opens the guest's vsock socket on the host it shares with the sandbox (`agent_start.hands.vsock_uds_path`).
+**Not built:** the guest's heartbeat on a call silent for 10 s and the runner's 30 s no-frame rule (a wedged guest holds a call until the tool's own deadline), `executed` on guest errors (v2), and `call_status` lookups at start.
 
 ## Auth
 

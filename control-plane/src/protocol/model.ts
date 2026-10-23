@@ -45,6 +45,8 @@ export const ErrorCodes = {
   CAPACITY_EXHAUSTED: "capacity_exhausted",
   RATE_LIMITED: "rate_limited",
   NOT_BOUND: "not_bound",
+  /** `resolve` can't hand out a binding yet (unplaced, placing, or the slot isn't configured): ask again. */
+  SANDBOX_NOT_READY: "sandbox_not_ready",
   INTERNAL: "internal",
   /** The operation exists in the contract but has no implementation yet (passed through as a tool error). */
   NOT_IMPLEMENTED: "not_implemented",

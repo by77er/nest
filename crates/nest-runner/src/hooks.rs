@@ -212,7 +212,9 @@ async fn session_start(rt: &Runtime, agent: &Arc<Agent>, input: &Value) -> HookO
             None => tracing::warn!(agent = %agent.id, path = p, "ignoring a transcript_path outside the agent's config dir"),
         }
     }
-    let Some(binding) = agent.inner.lock().unwrap().hands.clone() else { return HookOutput::default() };
+    if agent.inner.lock().unwrap().hands.is_none() {
+        return HookOutput::default();
+    }
     let op = match hands::op_from_mcp(
         "Bash",
         &json!({"command": "cat CLAUDE.md 2>/dev/null || true", "timeout": 5000, "description": "nest: read CLAUDE.md"}),
@@ -221,8 +223,14 @@ async fn session_start(rt: &Runtime, agent: &Arc<Agent>, input: &Value) -> HookO
         Err(_) => return HookOutput::default(),
     };
     let (_tx, rx) = oneshot::channel();
-    let call = hands::call(&binding.vsock_uds_path, &agent.id, binding.epoch, format!("ss-{}", uuid::Uuid::new_v4().simple()), op, rx);
-    let result = match tokio::time::timeout(rt.cfg.session_start_read_timeout, call).await {
+    let call = hands::call(agent, format!("ss-{}", uuid::Uuid::new_v4().simple()), op, rx);
+    // With a target cached the read itself is bounded; without one the call first waits for
+    // AgentDO (the sandbox may still be placing), which takes as long as the resolve budget.
+    let limit = match agent.hands_target() {
+        Some(_) => rt.cfg.session_start_read_timeout,
+        None => rt.cfg.session_start_read_timeout.max(hands::Budgets::default().not_ready),
+    };
+    let result = match tokio::time::timeout(limit, call).await {
         Ok(r) if !r.is_error => r,
         _ => return HookOutput::default(),
     };
@@ -389,5 +397,64 @@ mod tests {
         a.set_cache(c);
         // A new stop chain (not caused by our block) may continue again.
         assert_eq!(decide(&rt, &req(json!({"hook_event_name": "Stop", "stop_hook_active": false}))).await.decision, Some(TopLevelDecision::Block));
+    }
+}
+
+#[cfg(test)]
+mod session_start_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::hands::SANDBOX_NOT_READY;
+    use crate::runtime::{AgentCmd, HandsResolveOutcome, Outbound};
+    use crate::test_support::FakeGuest;
+    use crate::test_support::gateway::TestGateway;
+    use nest_protocol::control::HandsBinding;
+    use nest_protocol::model::{AgentId, AgentRole, Epoch, ErrorBody, SandboxId};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    /// The SessionStart read on a sandbox that becomes ready 2 s after the brain starts: the
+    /// hook's own read timeout (500 ms here) does not cut the wait for the target.
+    #[tokio::test]
+    async fn session_start_reads_claude_md_once_the_sandbox_is_ready() {
+        let gw = TestGateway::start().await;
+        let guest = FakeGuest::start().await;
+        gw.add_sandbox("sbx_s", 2, &guest.path, &["agt_s"]);
+        let rt = Runtime::new(Config { session_start_read_timeout: Duration::from_millis(500), ..Config::default() });
+        let (ctx, _crx) = mpsc::unbounded_channel::<AgentCmd>();
+        let (otx, mut orx) = mpsc::unbounded_channel::<Outbound>();
+        let agent = Agent::new(
+            AgentId("agt_s".into()),
+            AgentRole::Worker,
+            Epoch(2),
+            std::env::temp_dir(),
+            Some(HandsBinding { sandbox: SandboxId("sbx_s".into()), epoch: Epoch(2) }),
+            None,
+            vec![],
+            0,
+            ctx,
+            otx,
+        );
+        // AgentDO: not ready for the first 2 s, then the target.
+        let (a2, ready_at) = (agent.clone(), Instant::now() + Duration::from_secs(2));
+        let target = gw.target("sbx_s", 2, "agt_s");
+        tokio::spawn(async move {
+            while let Some(o) = orx.recv().await {
+                if let Outbound::HandsResolve(req) = o {
+                    let outcome = if Instant::now() < ready_at {
+                        HandsResolveOutcome::Error {
+                            error: ErrorBody { code: SANDBOX_NOT_READY.into(), message: "placing".into(), retryable: true },
+                            retry_after_ms: Some(200),
+                        }
+                    } else {
+                        HandsResolveOutcome::Target(target.clone())
+                    };
+                    a2.resolve_hands(&req, outcome);
+                }
+            }
+        });
+        let out = session_start(&rt, &agent, &json!({"transcript_path": "/nope"})).await;
+        let ctx = out.hook_specific_output.map(|o| format!("{o:?}")).unwrap_or_default();
+        assert!(ctx.contains("Project rules"), "CLAUDE.md was read through hands: {ctx}");
     }
 }

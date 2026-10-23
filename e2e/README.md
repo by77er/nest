@@ -1,14 +1,15 @@
 # End-to-end harness
 
-`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built. One machine plays both host kinds: the runner here reaches the guest over the vsock emulator directly. **Not built:** the [gateway](../docs/sandbox/gateway/) and the hands client, after which the harness runs the fake brain against a gateway on localhost and the brain and the sandbox can be on different machines.
+`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built. One machine plays both host kinds, but the runner reaches the guest only the way a brain on another machine would: through the sandbox [gateway](../docs/sandbox/gateway/) on a loopback port, with a binding the control plane minted. What the harness cannot show is the tunnel, Cloudflare Access, and a brain and a sandbox on different machines.
 
 ```
 wrangler dev --local (control plane, :18787)          ← outside any namespace
 unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
-  ├─ nest-proxy   (unprivileged; listeners handed over by nestd)
-  ├─ nestd        (enrolls with a one-time token; `process` driver; creates one netns per sandbox)
+  ├─ nest-proxy    (unprivileged; listeners handed over by nestd)
+  ├─ nestd         (enrolls with a one-time token; `process` driver; creates one netns per sandbox; advertises gateway_url)
   │    └─ nest-guest   (in the sandbox netns, behind the unix-socket vsock emulator)
-  └─ nest-runner  (brains = e2e/fake_claude.py, or real `claude`; hands through the real `nest mcp` bridge)
+  ├─ nest-gateway  (ws://127.0.0.1:18790; fed by nestd over gateway.sock; forwards hands calls to the guest's vsock port)
+  └─ nest-runner   (brains = e2e/fake_claude.py, or real `claude`; hands through the real `nest mcp` bridge and the hands client)
 ```
 
 **By default the real `claude` binary is never invoked.** `fake_claude.py`, adapted from `crates/nest-cli/tests/fake_claude.py`, speaks stream-json, runs hooks through `nest hook`, and drives `nest mcp`. A turn whose text is `E2E <scenario.json>` runs scripted tool calls and appends each result to a JSONL file immediately. The real binary is used only by [real-Claude mode](#real-claude-code) and `claude-verify/`.
@@ -16,7 +17,7 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
 ## What it checks
 
 1. **Startup:** enrollment and fleet connection; a sandbox is placed on the host; a worker agent is created and its brain starts.
-2. **Hands, through MCP → runner → vsock emulator → nest-guest:**
+2. **Hands, through MCP → runner → hands client → gateway → vsock emulator → nest-guest:**
    - `Bash`: `pwd`; cwd persists across calls; exported variables don't (Claude Code's semantics); the exec env carries `NEST_AGENT_ID` and `HTTPS_PROXY`
    - `Write`, `Read`, `Edit`, `Read`
 3. **Egress, through the real nest-proxy:**
@@ -25,12 +26,13 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
    - **credential injection:** the sandbox policy (set through `POST /v1/sandboxes {policy}`) binds a placeholder to `httpbin.org`, and the secret is stored with `PUT /v1/admin/secrets/inject:httpbin`. `curl -H 'Authorization: Bearer <placeholder>' https://httpbin.org/headers` returns 200. The echoed header is masked to the **secret's** length (not the placeholder's), so the upstream got the real secret and the proxy scrubbed it on the way back.
    - a direct connection with no proxy fails (no route)
    - from inside the sandbox netns: no route out, and the proxy listener on `172.16.0.1:443` is reachable
-4. **Platform tool:** `notify` reaches the workstream's user-notification queue.
-5. **Control plane state:**
+4. **The seam:** the gateway's log shows at least as many bound connections as the scripted hands calls (the SessionStart CLAUDE.md read adds one), counted before the probes below run; the gateway was listening and had synced with nestd before the scenario; `POST /v1/sandboxes/<sbx>/resolve` returns a target whose URL is the advertised `gateway_url` and whose binding the gateway admits (`bound`, probed by `gateway_probe.mjs` with Node's WebSocket client); the same binding with one character of its signature flipped is refused `unauthorized` with `executed: false`; after the self-fence the still-valid binding is refused `moved`, and the log shows nestd removed the sandbox rather than the gateway losing its nestd link.
+5. **Platform tool:** `notify` reaches the workstream's user-notification queue.
+6. **Control plane state:**
    - the session transcript is in R2 (read through `GET /v1/agents/<id>/transcript`)
    - the turn is `done`; workstream events are visible
    - the egress audit (allowed and denied records) is in R2 under `audit/…`
-6. **Fencing:** the control plane is stopped. nestd self-fences within about 20 s; runner brains are killed; the guest is paused (SIGSTOP); proxy listeners are dropped.
+7. **Fencing:** the control plane is stopped. nestd self-fences within about 20 s; runner brains are killed; the guest is paused (SIGSTOP); proxy listeners are dropped; the gateway refuses the sandbox's still-valid binding as `moved`.
 
 **Skipped, with the reason printed:**
 - **Transparent `:443` interception.** The process driver runs the guest in the netns itself, with no tap0 peer, so nft's tap0 redirect can't apply. nestd's `netns_redirect_reaches_listener` test covers it.
@@ -41,10 +43,11 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
 e2e/run.sh            # builds with CARGO_TARGET_DIR=target/e2e (release), runs, cleans up
 ```
 
-- **Requirements:** cargo, node/npm (`control-plane/node_modules` is installed if missing), `unshare`/`nsenter` with unprivileged user namespaces, curl, and internet access for `registry.npmjs.org` and `httpbin.org`.
+- **Requirements:** cargo, Node 22 or newer with npm (the gateway probe uses Node's global WebSocket client; `control-plane/node_modules` is installed if missing), `unshare`/`nsenter` with unprivileged user namespaces, curl, and internet access for `registry.npmjs.org` and `httpbin.org`.
 - **Outputs:** each run starts from a fresh `e2e/.work/` (git-ignored). It holds logs in `logs/`, `summary.json`, the wrangler state, and the scenario files.
 - **Env:**
   - `NEST_E2E_PORT` (default 18787)
+  - `NEST_E2E_GATEWAY_PORT` (default 18790)
   - `NEST_E2E_WORK` (work dir)
   - `NEST_E2E_FENCE_BUDGET_S` (default 30)
   - `NEST_E2E_CLAUDE` (`fake`, the default, or `real`; see below)
@@ -90,6 +93,7 @@ The runner starts the real `claude`; the token becomes the control plane's `clau
 - the file in the sandbox has the expected content
 - the Python program it wrote runs and prints F(90)
 - the transcript has `mcp__nest__` tool uses and no host-side built-ins
+- the OAuth token is in neither the guest's nor the gateway's environment or command line
 
 Startup, netns, control-plane state and fencing checks run as in fake mode; the scripted hands, egress, `notify` and audit checks are skipped. Quota: one turn with about six tool calls.
 

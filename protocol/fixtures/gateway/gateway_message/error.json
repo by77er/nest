@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "error": {
+    "code": "unauthorized",
+    "message": "binding signature does not verify",
+    "retryable": false
+  },
+  "executed": false
+}

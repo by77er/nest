@@ -35,6 +35,8 @@ const START_RETRY_MS = 5_000;
 const WAKE_STATES: AgentState[] = ["detached", "errored"];
 /** A wake that found no host (or failed transiently) retries this often. */
 const WAKE_RETRY_MS = 30_000;
+/** `hands_resolved{error}` hint when the sandbox isn't ready: how long the runner waits before asking again. */
+const HANDS_RETRY_MS = 2_000;
 /** Exits that restart the brain at once when work is waiting (not `stopped`, not `auth_failed`). */
 const RESTART_ON_EXIT = ["idle", "crashed", "fenced", "not running after host reconnect"];
 /** Restarts after an exit without a turn completing in between, before giving up (`errored`). */
@@ -220,7 +222,7 @@ export class AgentDO extends DurableObject<Env> {
     if (this.exists()) return this.load();
     let hands: AgentInfo["hands"] = null;
     if (req.role === "worker" && req.sandbox) {
-      const sbx = await this.sandboxStub(req.sandbox).attachAgent(req.agent);
+      const sbx = await this.sandboxStub(req.sandbox).attach(req.agent);
       hands = { sandbox: req.sandbox, epoch: sbx.epoch };
     }
     if (this.exists()) return this.load();
@@ -449,6 +451,24 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * The runner's binding aged out or a gateway refused it: a fresh target from SandboxDO, or the
+   * reason there is none now. The target travels only here, AgentDO to runner; never through a
+   * host command (docs/interfaces/gateway/).
+   */
+  private async resolveHands(request: string): Promise<AgentToRunner> {
+    const info = this.load();
+    if (!info.hands) return { type: "hands_resolved", request, error: errorBody(ErrorCodes.NOT_BOUND, "agent has no hands") };
+    try {
+      const hands = await this.sandboxStub(info.hands.sandbox).resolve(info.agent);
+      return { type: "hands_resolved", request, hands };
+    } catch (e) {
+      const ne = asNestError(e);
+      const error = ne ? ne.body() : errorBody(ErrorCodes.INTERNAL, "resolving hands failed", true);
+      return { type: "hands_resolved", request, error, ...(error.retryable ? { retry_after_ms: HANDS_RETRY_MS } : {}) };
+    }
+  }
+
   /** Segments for `claude --resume`: signed GET URLs for the committed base, in offset order. */
   private async sessionResume(info: AgentInfo) {
     if (!info.session || info.durable_bytes === 0) return undefined;
@@ -517,6 +537,16 @@ export class AgentDO extends DurableObject<Env> {
     if (msg.type === "tools_list_request") {
       const info = this.load();
       this.send(ws, { type: "tools_list", request: msg.request, tools: toolsFor(info.role, info.grants ?? undefined) });
+      return;
+    }
+    if (msg.type === "hands_resolve") {
+      // Only the current runner process at the current epoch gets a target: a superseded or stale
+      // brain must never hold a binding for the new epoch.
+      if (!this.current(pre)) {
+        this.send(ws, { type: "hands_resolved", request: msg.request, error: errorBody(ErrorCodes.STALE_EPOCH, "not the current runner process or epoch") });
+        return;
+      }
+      this.send(ws, await this.resolveHands(msg.request));
       return;
     }
     // Everything else is processed strictly one at a time, in arrival order.

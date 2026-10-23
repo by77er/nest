@@ -13,7 +13,7 @@ serde_json = "1.0.154"
 [dev-dependencies]
 anyhow = "1.0.104"
 futures-util = "0.3.34"
-nest-runner = { path = "../nest-runner" }
+nest-runner = { path = "../nest-runner", features = ["test-support"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["full"] }
 tokio-tungstenite = "0.30.0"

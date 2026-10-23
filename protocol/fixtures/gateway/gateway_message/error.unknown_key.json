@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "error": {
+    "code": "unknown_key",
+    "message": "no key with kid 0123456789abcdef",
+    "retryable": false
+  },
+  "executed": false
+}

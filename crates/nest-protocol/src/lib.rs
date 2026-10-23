@@ -2,6 +2,7 @@
 //! `docs/interfaces/`; JSON fixtures in `protocol/fixtures/` are the cross-language source of truth.
 
 pub mod control; // control plane <-> host (WebSocket)       docs/interfaces/control-host/
+pub mod gateway; // brain <-> sandbox gateway (WebSocket)     docs/interfaces/gateway/
 pub mod guest; // host <-> guest agent (vsock)              docs/interfaces/host-guest/
 pub mod host; // host-internal: nestd <-> proxy/runner/hook docs/interfaces/host-internal/
 pub mod model; // shared data models: events, policy, generations, ids

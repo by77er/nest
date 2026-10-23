@@ -52,6 +52,8 @@ pub enum FleetNotice {
     Revoked(Vec<LeaseClaim>),
     HostToken { token: String, expires_ms: TimestampMs },
     ProxyCa(CaCertificate),
+    /// Every binding verification key still valid, for the sandbox gateway.
+    BindingKey(Vec<nest_protocol::gateway::BindingKey>),
     Error(ErrorBody),
 }
 
@@ -68,6 +70,8 @@ pub struct FleetParams {
     pub host: HostId,
     pub role: HostRole,
     pub cell: String,
+    /// Reported in the hello: where clients reach this host's sandbox gateway.
+    pub gateway_url: Option<String>,
     pub versions: ComponentVersions,
     /// Random per nestd process; FleetDO resets both seq lineages when it changes.
     pub instance_id: String,
@@ -242,6 +246,7 @@ impl State {
             role: self.params.role,
             cell: self.params.cell.clone(),
             versions: self.params.versions.clone(),
+            gateway_url: self.params.gateway_url.clone(),
             last_command_seq: self.last_command_seq,
             sandboxes,
             agents,
@@ -400,6 +405,9 @@ impl State {
             }
             FleetToHost::ProxyCa(ca) => {
                 let _ = self.notices.send(FleetNotice::ProxyCa(ca));
+            }
+            FleetToHost::BindingKey { keys } => {
+                let _ = self.notices.send(FleetNotice::BindingKey(keys));
             }
             FleetToHost::Error { error } => {
                 let fatal = error.code == nest_protocol::model::error_codes::UNAUTHORIZED

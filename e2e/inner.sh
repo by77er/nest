@@ -3,7 +3,7 @@
 # shared, so nest-proxy reaches the internet and nestd reaches the local control plane on 127.0.0.1;
 # nestd creates the per-sandbox netns (owned by this user namespace) itself.
 set -euo pipefail
-: "${WORK:?}" "${BIN:?}" "${E2E:?}"
+: "${WORK:?}" "${BIN:?}" "${E2E:?}" "${NEST_E2E_GATEWAY_PORT:?}"
 mkdir -p "$WORK/logs"
 trap 'kill $(jobs -p) 2>/dev/null; wait' EXIT TERM INT
 
@@ -29,6 +29,18 @@ echo $! >"$WORK/proxy.pid"
 
 RUST_LOG=info,nestd=debug "$BIN/nestd" --config "$WORK/nestd.json" >"$WORK/logs/nestd.log" 2>&1 &
 echo $! >"$WORK/nestd.pid"
+
+# The sandbox gateway: the only way the runner's hands reach the guest. It connects to nestd's
+# gateway socket and listens on loopback; the runner learns its URL from the control plane.
+for _ in $(seq 100); do [ -S "$WORK/run/gateway.sock" ] && break; sleep 0.1; done
+RUST_LOG=info,nest_gateway=debug "$BIN/nest-gateway" --listen "127.0.0.1:$NEST_E2E_GATEWAY_PORT" \
+    --nestd-sock "$WORK/run/gateway.sock" >"$WORK/logs/gateway.log" 2>&1 &
+echo $! >"$WORK/gateway.pid"
+for _ in $(seq 100); do
+    kill -0 "$(cat "$WORK/gateway.pid")" 2>/dev/null || { echo "nest-gateway died (port $NEST_E2E_GATEWAY_PORT taken?)" >&2; exit 1; }
+    timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$NEST_E2E_GATEWAY_PORT" 2>/dev/null && break
+    sleep 0.1
+done
 
 # Wait for nestd's runner socket before starting the runner.
 for _ in $(seq 100); do [ -S "$WORK/run/runner.sock" ] && break; sleep 0.1; done

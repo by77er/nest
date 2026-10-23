@@ -1,0 +1,9 @@
+{
+  "type": "hands_resolved",
+  "request": "req_01jb7r5c3k",
+  "error": {
+    "code": "not_bound",
+    "message": "agent has no hands",
+    "retryable": false
+  }
+}

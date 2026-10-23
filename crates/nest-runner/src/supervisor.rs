@@ -89,10 +89,6 @@ pub fn handle(rt: &Arc<Runtime>, cmd: RunnerCommand) {
         }
         RunnerCommand::LeaseUpdate { valid_until_ms } => *rt.lease.lock().unwrap() = Some(valid_until_ms),
         RunnerCommand::AgentStart(start) => agent::start(rt.clone(), *start),
-        RunnerCommand::AgentBind { agent, hands } => match rt.agent(&agent) {
-            Some(a) => a.bind(hands),
-            None => tracing::warn!(%agent, "agent_bind for unknown agent"),
-        },
         RunnerCommand::AgentStop { agent, mode, reason } => {
             tracing::info!(%agent, ?mode, %reason, "agent_stop");
             if let Some(a) = rt.agent(&agent) {

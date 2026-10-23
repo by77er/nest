@@ -26,8 +26,7 @@
   },
   "hands": {
     "sandbox": "sbx_01jb7m2a4c",
-    "epoch": 4,
-    "cwd": "/workspace/site"
+    "epoch": 4
   },
   "launch": {
     "model": "opus",
