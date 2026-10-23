@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   CloudflareHttp, gatewayHostname, HOST_ID_BODY, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
 } from "../src/lib/cloudflare";
-import { newId } from "../src/lib/util";
+import { NestError, newId } from "../src/lib/util";
 
 const cfg = { token: "cf-secret-token", accountId: "acc123", domain: "nest.bitcru.sh" };
 type Rec = { method: string; url: string; body: unknown; auth: string | null };
@@ -170,5 +170,19 @@ describe("errors", () => {
     expect(err).toMatchObject({ status: 502, retryable: true, message: /fetch failed/ });
     expect(err.message).not.toContain(cfg.token);
     expect(r.calls[0]!.url).not.toContain(cfg.token);
+  });
+});
+
+describe("the default fetch under workerd", () => {
+  it("the default fetch works under workerd (no incorrect `this`: Illegal invocation)", async () => {
+    // Every other test injects a fake fetch, which binds nothing; the live Worker calls the
+    // platform's fetch, which throws "Illegal invocation" when invoked as a method of another
+    // object, before any network. Nothing listens at the discard port, so a fetch that was
+    // invoked correctly fails on the connection instead, and the client reports that as retryable.
+    const api = new CloudflareHttp({ token: "t", accountId: "acc", domain: "nest.bitcru.sh" }, undefined, "http://127.0.0.1:9/v4");
+    const err = await api.zoneId("bitcru.sh").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NestError);
+    expect((err as Error).message).not.toMatch(/Illegal invocation/);
+    expect((err as Error).message).toMatch(/cloudflare GET \/zones\?name=bitcru\.sh: /);
   });
 });

@@ -9,3 +9,4 @@ Short, standalone lessons from real findings in this repo. The reviewer agent ch
 5. **Match the real tool's encoding, not a guess.** Claude Code's transcript directory rule (non-alphanumerics to `-`, a hash suffix past 200 characters) was observed, then implemented with the observed samples as tests.
 6. **Retries must not stop after the first failure.** A placement retry and a start retry each fired once and gave up silently. Every retry path has a test that fails twice.
 7. **Advisories arrive in dependencies you didn't change.** Run `cargo deny check` before claiming a TLS or crypto change is safe; a patch release can carry the fix.
+8. **A fake collaborator hides binding errors.** `this.fetchFn(...)` with the global `fetch` as the default threw "Illegal invocation" in the live Worker while every test, which injected a fake, passed. One test per injected global runs the default against the platform (`fetchMock`), not a fake.
