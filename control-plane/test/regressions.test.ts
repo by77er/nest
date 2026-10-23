@@ -727,3 +727,25 @@ describe("#26 a recovery turn says what the transcript can't", () => {
     expect(rec2.input.text).not.toContain("restored from");
   });
 });
+
+describe("#27 a turn is work until it completes", () => {
+  it("SessionStart's mid-turn `ready` neither ends the sandbox's work nor commits early; the turn's end does", async () => {
+    const s = await setup();
+    const seqh = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: s.sandbox, epoch: 1, state: "running" }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seqh);
+    const r = await runner(s.agent, s.host.host, s.host.host_token);
+    const t = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "write a file" } }, 201)).turn;
+    await r.ws.next("run_turn", (m) => m.turn === t);
+    const ev = (seq: number, body: Record<string, unknown>) => ({ agent: s.agent, epoch: 1, seq, ts_ms: Date.now(), turn: t, ...body });
+    r.ws.send({ type: "events", seq: 1, events: [ev(1, { type: "turn_started", input_kind: "user" }), ev(2, { type: "state_changed", state: "ready" })] });
+    await r.ws.next("ack", (m) => m.up_to === 1);
+    expect((await sandboxStub(s.sandbox).info()).working).toEqual([s.agent]);
+    expect(await s.host.ws.none("commands", 300, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_checkpoint"))).toBe(true);
+
+    r.ws.send({ type: "events", seq: 2, events: [ev(3, { type: "turn_completed", stop_reason: "end_turn" })] });
+    await r.ws.next("ack", (m) => m.up_to === 2);
+    expect((await sandboxStub(s.sandbox).info()).working).toEqual([]);
+    const [cp] = await nextCommands(s.host.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(cp).toMatchObject({ sandbox: s.sandbox, reason: "turn_end" });
+  });
+});

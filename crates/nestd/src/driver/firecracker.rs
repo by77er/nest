@@ -62,6 +62,10 @@ impl Driver for FirecrackerDriver {
 #[derive(Clone, Debug)]
 pub struct Jail {
     pub cfg: JailerConfig,
+    /// The jailer's `--id`: the sandbox id with `_` as `-` (the jailer takes alphanumerics and
+    /// `-` only, at most 64), plus a suffix unique to this VM, so a retry or the next epoch never
+    /// shares a jail with one that's still being torn down.
+    pub id: String,
     /// `<chroot_base>/<firecracker binary name>/<sandbox>/root`
     pub root: PathBuf,
 }
@@ -69,7 +73,8 @@ pub struct Jail {
 impl Jail {
     pub fn new(fc: &FirecrackerConfig, cfg: &JailerConfig, spec: &VmSpec) -> Jail {
         let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
-        Jail { cfg: cfg.clone(), root: cfg.chroot_base_dir.join(exe).join(&spec.sandbox.0).join("root") }
+        let id = format!("{}-{}", spec.sandbox.0.replace('_', "-"), crate::util::random_hex(4));
+        Jail { cfg: cfg.clone(), root: cfg.chroot_base_dir.join(exe).join(&id).join("root"), id }
     }
 
     /// Hard-link the kernel and disk into the jail root, owned by the jail uid/gid.
@@ -134,10 +139,10 @@ impl FirecrackerVm {
 }
 
 /// The jailer command line (pure, unit-tested).
-pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, sandbox: &str, netns: &Path, api_sock: &Path) -> Vec<String> {
+pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: &Path) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--id".into(),
-        sandbox.into(),
+        jail.id.clone(),
         "--exec-file".into(),
         fc.firecracker_bin.display().to_string(),
         "--uid".into(),
@@ -215,7 +220,7 @@ impl Vm for FirecrackerVm {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the jailer needs a persisted netns (network.persist_dir)"))?;
                 jail.populate(&self.cfg, &self.spec)?;
                 let mut c = std::process::Command::new(jailer);
-                c.args(jailer_args(&self.cfg, jail, &self.spec.sandbox.0, ns_path, &paths.api_sock));
+                c.args(jailer_args(&self.cfg, jail, ns_path, &paths.api_sock));
                 c
             }
             _ => {
@@ -233,8 +238,8 @@ impl Vm for FirecrackerVm {
             _ => cmd.spawn()?,
         };
         self.child = Some(child);
-        // Wait for the API socket.
-        for _ in 0..100 {
+        // Wait for the API socket (the jailer first copies Firecracker into the chroot).
+        for _ in 0..500 {
             if self.api_sock().exists() {
                 break;
             }
@@ -264,7 +269,40 @@ impl Vm for FirecrackerVm {
             let _ = c.kill();
             let _ = tokio::task::spawn_blocking(move || c.wait()).await;
         }
+        if let Some(j) = &self.jail {
+            j.remove()?;
+        }
         Ok(())
+    }
+}
+
+/// Remove every jail under `chroot_base` (at nestd start: VMs don't outlive nestd, since systemd
+/// stops its whole cgroup, so any jail left is from a crash or a reboot).
+pub fn remove_stale_jails(fc: &FirecrackerConfig, jail: &JailerConfig) -> io::Result<usize> {
+    let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
+    let dir = jail.chroot_base_dir.join(exe);
+    let mut n = 0;
+    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with("sbx-") {
+            std::fs::remove_dir_all(e.path())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+impl Jail {
+    /// Remove this VM's jail directory (its hard links to the kernel and disk, the sockets and the
+    /// device nodes the jailer made) once Firecracker has exited. Only ever under the chroot base.
+    fn remove(&self) -> io::Result<()> {
+        let dir = self.root.parent().filter(|d| d.starts_with(&self.cfg.chroot_base_dir) && d.ends_with(&self.id));
+        match dir {
+            Some(d) => match std::fs::remove_dir_all(d) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+            None => Err(io::Error::other(format!("refusing to remove {}: not a jail directory", self.root.display()))),
+        }
     }
 }
 
@@ -273,6 +311,9 @@ impl Drop for FirecrackerVm {
         if let Some(c) = &mut self.child {
             let _ = c.kill();
             let _ = c.wait();
+            if let Some(j) = &self.jail {
+                let _ = j.remove();
+            }
         }
     }
 }
@@ -291,18 +332,46 @@ impl ApiClient {
             body.len()
         );
         s.write_all(req.as_bytes()).await?;
-        let mut resp = Vec::new();
-        tokio::time::timeout(Duration::from_secs(30), s.read_to_end(&mut resp))
+        // Firecracker keeps the connection open after it answers, `Connection: close` or not: read
+        // one response (headers, then `Content-Length` bytes), never to EOF.
+        let (status, resp_body) = tokio::time::timeout(Duration::from_secs(30), read_response(&mut s))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "firecracker API timed out"))??;
-        let text = String::from_utf8_lossy(&resp).into_owned();
-        let status: u16 = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let resp_body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("firecracker {method} {path}: API timed out")))??;
         if !(200..300).contains(&status) {
             return Err(io::Error::other(format!("firecracker {method} {path}: {status} {resp_body}")));
         }
         Ok(resp_body)
     }
+}
+
+/// One HTTP/1.1 response: its status and body. The body is `Content-Length` bytes (none if absent).
+async fn read_response(s: &mut UnixStream) -> io::Result<(u16, String)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = s.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "firecracker closed the API connection mid-response"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let status: u16 = head.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse().ok()))
+        .unwrap_or(0);
+    while buf.len() < head_end + len {
+        let n = s.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "firecracker closed the API connection mid-body"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok((status, String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned()))
 }
 
 #[cfg(test)]
@@ -363,10 +432,16 @@ mod tests {
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
         let vm = driver.create(s.clone()).await.unwrap();
-        assert_eq!(vm.vsock_uds_path(), PathBuf::from("/srv/jailer/firecracker/sbx_1/root/vsock.sock"));
+        // The jailer rejects `_` in ids (alphanumerics and `-` only): the jail is sbx-1-<suffix>,
+        // unique per VM.
+        let uds = vm.vsock_uds_path().display().to_string();
+        assert!(uds.starts_with("/srv/jailer/firecracker/sbx-1-") && uds.ends_with("/root/vsock.sock"), "{uds}");
         let jail = Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s);
-        let args = jailer_args(&fc, &jail, "sbx_1", Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"));
+        assert_ne!(jail.id, Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s).id);
+        assert!(jail.id.len() <= 64 && jail.id.chars().all(|c| c == '-' || c.is_ascii_alphanumeric()), "{}", jail.id);
+        let args = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"));
         let joined = args.join(" ");
+        assert!(joined.starts_with(&format!("--id {} ", jail.id)), "{joined}");
         assert!(joined.contains("--uid 900 --gid 900 --chroot-base-dir /srv/jailer --netns /run/netns/ns-sbx_1 -- --api-sock /api.sock"), "{joined}");
         let paths = FcPaths { api_sock: "/api.sock".into(), kernel: "/vmlinux".into(), disk: "/disk.img".into(), vsock: "/vsock.sock".into() };
         let reqs = boot_requests(&fc, &s, &paths);
@@ -377,23 +452,68 @@ mod tests {
         assert!(FirecrackerDriver { cfg: fc }.create(s).await.is_err());
     }
 
+    /// Stopping a jailed VM removes its jail directory, and only that.
+    #[test]
+    fn jail_removal_stays_inside_the_chroot_base() {
+        let base = tempfile::tempdir().unwrap();
+        let mut fc = cfg();
+        let jc = JailerConfig { uid: 0, gid: 0, chroot_base_dir: base.path().into() };
+        fc.jailer = Some(jc.clone());
+        let jail = Jail::new(&fc, &jc, &spec());
+        std::fs::create_dir_all(jail.root.join("dev")).unwrap();
+        std::fs::write(jail.root.join("disk.img"), b"x").unwrap();
+        let sibling = base.path().join("firecracker").join("sbx-2-abcd");
+        std::fs::create_dir_all(&sibling).unwrap();
+        jail.remove().unwrap();
+        assert!(!jail.root.parent().unwrap().exists());
+        assert!(sibling.exists());
+        jail.remove().unwrap(); // idempotent
+        let id = jail.id.clone();
+        let outside = Jail { root: format!("/tmp/elsewhere/{id}/root").into(), ..jail };
+        assert!(outside.remove().is_err());
+        // At start, nestd clears what a crash left (only jails, nothing else in the base).
+        std::fs::write(base.path().join("firecracker").join("keep.txt"), b"").unwrap();
+        assert_eq!(remove_stale_jails(&fc, &jc).unwrap(), 1);
+        assert!(!sibling.exists());
+        assert!(base.path().join("firecracker").join("keep.txt").exists());
+    }
+
     #[tokio::test]
     async fn api_client_speaks_http_over_uds() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("fc.sock");
         let l = UnixListener::bind(&sock).unwrap();
+        // Like Firecracker, the server answers and keeps the connection open (it closes only when
+        // the test ends): a client that reads to EOF hangs here.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            let (mut s, _) = l.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = s.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await.unwrap();
-            req
+            let mut reqs = vec![];
+            let replies: [&[u8]; 3] = [
+                b"HTTP/1.1 204 No Content\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\ncontent-length: 14\r\n\r\n{\"state\":\"Ok\"}",
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\n{\"fault_message\":\"no\"}",
+            ];
+            let mut held = vec![];
+            for reply in replies {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap();
+                reqs.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                s.write_all(reply).await.unwrap();
+                held.push(s);
+            }
+            let _ = done_rx.await;
+            reqs
         });
         let c = ApiClient { sock };
-        c.call("PATCH", "/vm", Some(&json!({"state": "Paused"}))).await.unwrap();
-        let req = server.await.unwrap();
-        assert!(req.starts_with("PATCH /vm HTTP/1.1\r\n"));
-        assert!(req.ends_with("{\"state\":\"Paused\"}"));
+        let t = Duration::from_secs(5);
+        tokio::time::timeout(t, c.call("PATCH", "/vm", Some(&json!({"state": "Paused"})))).await.unwrap().unwrap();
+        assert_eq!(tokio::time::timeout(t, c.call("GET", "/vm", None)).await.unwrap().unwrap(), "{\"state\":\"Ok\"}");
+        let err = tokio::time::timeout(t, c.call("PUT", "/actions", None)).await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("400 {\"fault_message\":\"no\"}"), "{err}");
+        done_tx.send(()).unwrap();
+        let reqs = server.await.unwrap();
+        assert!(reqs[0].starts_with("PATCH /vm HTTP/1.1\r\n"));
+        assert!(reqs[0].ends_with("{\"state\":\"Paused\"}"));
     }
 }

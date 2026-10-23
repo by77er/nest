@@ -61,7 +61,7 @@ Not `CLAUDE_CODE_OAUTH_TOKEN`: that name could change how the session's own Clau
 The provisioning key creates the narrow credentials nest actually runs with:
 - the control plane's IAM user (`RunInstances` with the launch template only; terminate and stop only instances tagged `nest=true`; `kms:Sign` on the proxy root CA key only);
 - the hosts' instance role (S3 access to the cell's bucket only);
-- **the proxy root CA key:** a KMS key (`ECC_NIST_P256`, sign and verify), which never leaves KMS. The setup agent self-signs the root certificate through KMS `Sign` and stores it as `ROOT_CA_CERT_PEM`; the image bakes it in ([tls](../sandbox/networking/egress/tls/)).
+- **the proxy root CA key:** a KMS key (`ECC_NIST_P256`, sign and verify), which never leaves KMS. The cell stack creates it; the setup agent self-signs the root certificate through KMS `Sign` (`POST /v1/admin/root-ca/kms`) and stores it as `ROOT_CA_CERT_PEM`; the guest image bakes it in ([tls](../sandbox/networking/egress/tls/)).
 
 **The cell's resources** (VPC with public subnets and an S3 gateway endpoint, security group, bucket, host role, launch template, the control plane's IAM user) are one [inframe](https://github.com/by77er/inframe) stack per cell in [deploy/](../../deploy/), with OpenTofu state in a versioned S3 bucket. It creates no instances: FleetDO launches them.
 
@@ -81,10 +81,10 @@ The provisioning key creates the narrow credentials nest actually runs with:
 ## Generated, not provided
 
 The setup agent creates these itself, so none are needed from me:
-- **Control-plane secrets:** the operator tokens (`observe`, `approve`, `admin`; the Worker keeps only their SHA-256 hashes, and I get the tokens), `HOST_TOKEN_SECRET`, `REVOCATION_COUNTER`, and the root certificate from stage 3, all random or freshly generated (see [API](../control-plane/api/)). Built: one `ADMIN_TOKEN`, and the root key as `ROOT_CA_KEY_PEM` until KMS signing lands.
+- **Control-plane secrets:** the operator tokens (`observe`, `approve`, `admin`; the Worker keeps only their SHA-256 hashes, and I get the tokens), `HOST_TOKEN_SECRET`, `REVOCATION_COUNTER`, and the root certificate from stage 3, all random or freshly generated (see [API](../control-plane/api/)). Built: one `ADMIN_TOKEN`; the root key is in KMS and the root certificate is self-signed through it (`POST /v1/admin/root-ca/kms`).
 - **`AWS_IDENTITY_CERT_PEM`:** AWS's public certificate for verifying instance identity documents, from AWS's docs.
 - **Cloud resources:** the R2 bucket `nest-control`, the cell's S3 bucket with its gateway endpoint, the security group, the launch template, and the IAM pieces and KMS key above.
-- **Images:** the guest kernel and root filesystem, and the burst-host bootstrap (Amazon Linux 2023, kernel 6.18, Firecracker from the 1.17 line pinned by digest; see [provisioning](../compute/provisioning/)).
+- **Images:** the guest kernel and root filesystem, the burst-host AMI from the cell's Image Builder pipeline, and its bootstrap (Amazon Linux 2023, kernel 6.18, Firecracker from the 1.17 line pinned by digest; see [provisioning](../compute/provisioning/)).
 - **Enrollment tokens** for hosts outside AWS.
 
 ## Cost while testing

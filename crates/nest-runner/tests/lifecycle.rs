@@ -80,8 +80,10 @@ async fn events(rt: &Runtime, wait: Duration) -> Vec<RunnerEvent> {
     out
 }
 
+/// Polls `f` for up to 15 s. The bound is a margin, not a timing claim: a GitHub runner has
+/// taken more than 5 s to start the fake brain (a Python process) under load.
 async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..100 {
+    for _ in 0..300 {
         if f() {
             return;
         }

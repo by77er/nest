@@ -1,6 +1,21 @@
 # Deploy
 
-**Decided: merges deploy to production automatically, and a health window rolls back on regression.** Nothing deploys from a branch, and agents never hold deploy credentials. The workflows follow the platform's [upgrade rules](../docs/control-plane/#upgrades). Not built.
+**Decided: merges deploy to production automatically, and a health window rolls back on regression.** Nothing deploys from a branch, and agents never hold deploy credentials. The workflows follow the platform's [upgrade rules](../docs/control-plane/#upgrades).
+
+**Built (`deploy.yml`, first cut):** after `ci.yml` passes on a push to `main`, or by `workflow_dispatch`, three jobs run in order. All three use the `production` environment and the cell's deploy role over OIDC.
+1. **`infra`:** `inframe test` and `plan` (the plan's summary goes in the run summary), then `apply` for `use1`.
+2. **`worker`:** `dev/deploy-use1.sh`, then `GET /v1/health` for up to two minutes. If the health check fails, `wrangler rollback` returns to the previous version.
+3. **`release`:** `scripts/publish-release.sh` builds the host binaries (static, musl) into `releases/current/`.
+   - Firecracker, the jailer, the guest kernel and the guest image carry over from the current release.
+   - If no file changes, nothing is published.
+   - When it does publish, a host AMI build starts.
+
+**Not built yet:** the pause, deploy classification, the metrics health window, `rollback.yml`, and guest image rebuilds. Rebuild the guest image by hand (`images/guest/build-on-ec2.sh`) when `nest-guest` changes.
+
+**Credentials:**
+- **AWS:** the cell stack's `nest-<cell>-deploy` role, assumed over GitHub OIDC. Its trust policy accepts only `repo:by77er/nest:environment:production`. Applying the stack manages IAM, so the role is administrator-equivalent; the trust policy is what limits it.
+- **Cloudflare:** `CLOUDFLARE_API_TOKEN` (Workers edit) and `CLOUDFLARE_ACCOUNT_ID` are secrets on the `production` environment.
+- Pull requests get neither.
 
 ## `deploy.yml`
 

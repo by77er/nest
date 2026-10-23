@@ -230,8 +230,11 @@ fn default_s3_cache_gib() -> u64 {
 fn default_s3_prefix() -> String {
     "store/".into()
 }
+/// No `init_on_free=1` until memory snapshots exist (its purpose): on a nested 8i host it makes a
+/// 1-vCPU guest zero all of its memory at boot, which stalled boots past a minute (soft lockups in
+/// `pgdatinit`, 2026-10-18).
 fn default_boot_args() -> String {
-    "console=ttyS0 reboot=k panic=1 pci=off init_on_free=1".into()
+    "console=ttyS0 reboot=k panic=1 pci=off".into()
 }
 fn default_true() -> bool {
     true

@@ -322,15 +322,20 @@ impl Writer {
     }
 
     fn run(mut self, rx: mpsc::Receiver<WriterMsg>) {
+        // Pings go out on schedule whatever else is sent: lease updates alone arrive more often than
+        // every PING_INTERVAL, and a quiet-time-only ping would never be sent under them.
+        let mut next_ping = Instant::now() + PING_INTERVAL;
         loop {
-            let msg = match rx.recv_timeout(PING_INTERVAL) {
-                Ok(m) => m,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.health_check();
-                    continue;
-                }
+            let msg = match rx.recv_timeout(next_ping.saturating_duration_since(Instant::now())) {
+                Ok(m) => Some(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            if Instant::now() >= next_ping {
+                self.health_check();
+                next_ping = Instant::now() + PING_INTERVAL;
+            }
+            let Some(msg) = msg else { continue };
             match msg {
                 WriterMsg::NewConn(fd) => {
                     if self.conn.is_some() {
@@ -693,6 +698,39 @@ pub(crate) mod tests {
         while let Ok(n) = nrx.try_recv() {
             assert!(!matches!(n, ProxyNotice::Disconnected), "link dropped");
         }
+    }
+
+    /// Pings keep going out while other commands stream (lease updates come every few seconds),
+    /// so a healthy proxy is never dropped for "no pong".
+    #[test]
+    fn pings_go_out_under_steady_traffic() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _g = rt.enter();
+        let (link, path, _nrx) = start_link(dir.path());
+        let p = FakeProxy::connect(&path);
+        let _ = p.recv();
+        let _ = p.resync();
+        let l2 = link.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stop.clone();
+        // One lease update a second: busier than real heartbeats.
+        let feeder = std::thread::spawn(move || {
+            let mut v = 1;
+            while !s2.load(Ordering::Relaxed) {
+                l2.apply(ProxyOp::Lease { valid_until_ms: v });
+                v += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let deadline = Instant::now() + PING_INTERVAL + Duration::from_secs(2);
+        let mut pinged = false;
+        while Instant::now() < deadline && !pinged {
+            pinged = matches!(p.recv().0, ProxyCommand::Ping { .. });
+        }
+        stop.store(true, Ordering::Relaxed);
+        feeder.join().unwrap();
+        assert!(pinged, "no ping within {:?} while lease updates streamed", PING_INTERVAL + Duration::from_secs(2));
     }
 
     /// Review #11/#17: a resync_ack with counts that differ from the snapshot closes the

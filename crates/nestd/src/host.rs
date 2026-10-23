@@ -233,7 +233,16 @@ impl Host {
                 DriverConfig::Process { guest_command, mount_disk } => {
                     Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk })
                 }
-                DriverConfig::Firecracker(fc) => Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone() }),
+                DriverConfig::Firecracker(fc) => {
+                    if let (Some(_), Some(j)) = (&fc.jailer_bin, &fc.jailer) {
+                        match crate::driver::firecracker::remove_stale_jails(fc, j) {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(n, "removed jails left by a crash or reboot"),
+                            Err(e) => tracing::warn!("removing stale jails: {e}"),
+                        }
+                    }
+                    Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone() })
+                }
             },
         };
         let cache = storage::LocalFsStore::new(cfg.store_dir())?;
@@ -1145,6 +1154,10 @@ impl Inner {
                     let f = std::fs::OpenOptions::new().write(true).open(&disk)?;
                     if f.metadata()?.len() < disk_gib << 30 {
                         f.set_len(disk_gib << 30)?;
+                        drop(f);
+                        // Grow the filesystem with the file, offline, before the guest mounts it (the
+                        // guest can't resize its own root: it isn't /dev/vda to resize2fs).
+                        grow_filesystem(&disk)?;
                     }
                 }
                 _ => storage::create_sparse(&disk, disk_gib << 30).context("create sparse disk")?,
@@ -1198,7 +1211,12 @@ impl Inner {
         if let NetworkConfig::Netns { persist_dir } = &self.cfg.network {
             let persist = persist_dir.as_ref().map(|d| d.join(format!("ns-{}", sbx.id.0)));
             let ns = Arc::new(Netns::create(persist.as_deref()).context("create netns")?);
-            ns.configure().context("configure netns")?;
+            // A jailed Firecracker runs as the jail's user, which must be able to attach to the tap.
+            let tap_owner = match &self.cfg.driver {
+                DriverConfig::Firecracker(fc) if fc.jailer_bin.is_some() => fc.jailer.as_ref().map(|j| (j.uid, j.gid)),
+                _ => None,
+            };
+            ns.configure(tap_owner).context("configure netns")?;
             let std_listeners: [(Transport, u16, ListenerPurpose); 4] = [
                 (Transport::Udp, 53, ListenerPurpose::Dns),
                 (Transport::Tcp, 53, ListenerPurpose::Dns),
@@ -1770,3 +1788,38 @@ fn command_kind(b: &CommandBody) -> &'static str {
     }
 }
 
+
+/// Grow the ext4 filesystem in a freshly copied base image to fill its (just extended) file. The
+/// image is new from `mkfs`, so the check resize2fs wants first is skipped (`-f`).
+fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
+    let out = std::process::Command::new("resize2fs").arg("-f").arg(disk).output().context("run resize2fs")?;
+    anyhow::ensure!(out.status.success(), "resize2fs {}: {}", disk.display(), String::from_utf8_lossy(&out.stderr).trim());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A base image extended to a sandbox's disk size gets a filesystem that fills it.
+    #[test]
+    fn grows_a_copied_base_image_to_its_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::File::create(&img).unwrap().set_len(64 << 20).unwrap();
+        let ok = std::process::Command::new("mkfs.ext4").args(["-q", "-F"]).arg(&img).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            eprintln!("NEST-TEST-SKIP: mkfs.ext4 unavailable");
+            return;
+        }
+        let blocks = || {
+            let out = std::process::Command::new("dumpe2fs").arg("-h").arg(&img).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let line = text.lines().find(|l| l.starts_with("Block count:")).unwrap().to_string();
+            line.split_whitespace().last().unwrap().parse::<u64>().unwrap()
+        };
+        let before = blocks();
+        std::fs::OpenOptions::new().write(true).open(&img).unwrap().set_len(256 << 20).unwrap();
+        super::grow_filesystem(&img).unwrap();
+        let after = blocks();
+        assert!(after >= before * 3, "{before} -> {after} blocks");
+    }
+}

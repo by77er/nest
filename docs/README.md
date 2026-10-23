@@ -2,7 +2,7 @@
 
 A personal platform that combines sandboxes with durable agents. Long-lived Claude Code agents run on my own subscription. Their brains run on hosts, and their hands work in isolated VMs on commodity cloud compute. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales burst hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Hosts run sandboxes with the process driver (no VM isolation) until the Firecracker image exists; Firecracker is still untested. Designed but not built: the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes), the Discord bot and the preview router; `control-plane/README.md` lists the gaps.
+**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales burst hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Sandboxes run in Firecracker on nested-virtualization hosts (jailed, hugepages, the proxy root CA in KMS): a real Claude Code turn ran in a VM, its disk was committed at turn end, and after a host reboot the sandbox came back with the file (EC2, 2026-10-18; see [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/)). Hosts without `/dev/kvm` fall back to the process driver. Designed but not built: the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes), the Discord bot and the preview router; `control-plane/README.md` lists the gaps.
 
 **Start with [architecture/](architecture/)** for how the pieces fit and how a turn flows. Everything needed to bring nest up (accounts, credentials, where they go) is in [setup/](setup/).
 
@@ -40,10 +40,12 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `crates/nest-cli` | `nest` binary: `nest hook`, `nest mcp`, in-sandbox commands |
 | `protocol/` | Fixtures, tool catalogs, Claude Code reference artifacts |
 | `e2e/` | Local end-to-end harness |
+| `deploy/` | Cells as an inframe stack (OpenTofu): network, bucket, IAM, the host-image pipeline; the burst-host install and bootstrap |
+| `images/` | The Firecracker guest image (kernel and `nest-base` rootfs) and its EC2 builder |
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
 
-UFFD memory snapshots, the ublk lazy disk, the S3 object store and spot-notice handling are designed but not built (see `crates/nestd/README.md`).
+UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`).
 
 ## Primitives
 
@@ -182,6 +184,11 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 
 - **Verify:** that Amazon Linux 2023 ships ublk, which the lazy disk needs. See [compute/provisioning/](compute/provisioning/).
 - **Verify:** that every 8i variant reports the same CPU model (it's part of the restore ABI); that Firecracker's writes pass through the host page cache before ublk; and whether S3 Inventory and lifecycle rules work on S3 Express One Zone directory buckets. See [sandbox/state/](sandbox/state/).
+- **Not built:** the 60 s dirty-disk timer and the 256 MB dirty threshold. Disks commit at turn end, suspend, drain and spot notice only; a timer needs dirty tracking and a cut that doesn't pause the VM for the whole chunking pass (ublk). See [sandbox/state/](sandbox/state/#writeback-cadence).
+- **Watch:** a host terminated outside FleetDO kept new sandboxes waiting about 10 minutes before a replacement launched. See [compute/autoscaling/](compute/autoscaling/).
+- **Not built:** pruning old host AMIs and their snapshots. Each build adds one (a few GB of snapshot, cents a month); an Image Builder lifecycle policy would keep the last few. See [compute/provisioning/](compute/provisioning/).
+- **Not built:** retrying a failed turn-end commit. One that times out leaves the head where it was, with nothing surfaced until the next turn ends (seen on EC2 with a cold-snapshot AMI). See [sandbox/state/](sandbox/state/).
+- **Open:** guest `init_on_free=1` (for compressible memory snapshots) stalled 1-vCPU guest boots past a minute on a nested 8i host, so it's off until snapshots exist; whether nested hosts can afford it then is unmeasured. See [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/).
 - **Open:** turn-end generations are always kept, so a long-lived sandbox's history grows without bound; it may need a cap. See [sandbox/state/](sandbox/state/#retention).
 - **Open:** per-sandbox I/O limits don't make a dense host fair when many sandboxes spend their burst at once. See [sandbox/state/disk/](sandbox/state/disk/#io-limits).
 - **Open:** upgrading the guest agent in place by re-exec, which needs a task registry rebuildable from tmpfs. See [sandbox/guest-agent/](sandbox/guest-agent/#versions).

@@ -1,0 +1,33 @@
+#!/bin/bash
+# PID 1 of a nest sandbox VM (installed as /sbin/init). It mounts the kernel filesystems, grows the
+# root filesystem to the disk nestd sized, brings up eth0 on the sandbox network (no uplink: the
+# gateway is nest-proxy's netns), and keeps nest-guest running. bash reaps orphans as PID 1.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+log() { echo "nest-init: $*" >/dev/console; }
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm /run /tmp
+mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs -o mode=0755 tmpfs /run
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
+ln -sf /proc/self/fd /dev/fd
+mount -o remount,rw /
+
+# nestd sizes the filesystem to the sandbox's disk before boot. Tools expect /etc/mtab.
+ln -sf /proc/self/mounts /etc/mtab
+
+ip link set lo up
+ip addr add 172.16.0.2/30 dev eth0
+ip link set eth0 up
+ip route add default via 172.16.0.1
+
+mkdir -p /workspace && chown 1000:1000 /workspace
+log "up; starting nest-guest"
+while true; do
+  /usr/local/bin/nest-guest
+  log "nest-guest exited ($?); restarting"
+  sleep 1
+done

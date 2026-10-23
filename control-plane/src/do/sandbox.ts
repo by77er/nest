@@ -75,6 +75,8 @@ const PLACE_RETRY_MS = 30_000;
  * suspends after 10 min paused; pausing isn't in the host contract yet, so this is both tiers.
  */
 const DEFAULT_SUSPEND_IDLE_MS = 11 * 60_000;
+/** At most one turn-end commit this often (docs/sandbox/state/#writeback-cadence). */
+const TURN_CHECKPOINT_MIN_MS = 10_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const HISTORY_MAX = 50;
 
@@ -556,6 +558,8 @@ export class SandboxDO extends DurableObject<Env> {
         // A suspended sandbox with nobody working stays unplaced until something wakes it.
         const wanted = info.state !== "suspended" || info.working.length > 0;
         if (info.host === null && info.placing === null && ACTIVE_STATES.includes(info.state) && wanted) await this.placeCurrentEpoch();
+      } else if (key === "turn_checkpoint") {
+        await this.turnEndCheckpoint();
       } else if (key === "idle") {
         const info = this.info_();
         if (info.host && info.state === "running" && info.working.length === 0) {
@@ -608,12 +612,32 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Agent activity feeds the idle refcount: the sandbox may suspend only when nobody is working. */
   async agentActivity(agent: string, working: boolean): Promise<{ idle: boolean }> {
+    const turnEnded = !working && this.info_().working.includes(agent);
     const info = this.update((i) => {
       i.working = i.working.filter((a) => a !== agent);
       if (working && i.attached.includes(agent)) i.working.push(agent);
     });
     await this.armIdle();
+    if (turnEnded) await this.turnEndCheckpoint();
     return { idle: info.working.length === 0 };
+  }
+
+  /**
+   * An agent finished a turn: commit the disk (`turn_end`), the rewind point and the bound on what a
+   * lost host loses. At most one per TURN_CHECKPOINT_MIN_MS; a turn ending sooner gets its commit
+   * when that interval is up, so the last turn's changes are never left uncommitted.
+   */
+  private async turnEndCheckpoint(): Promise<void> {
+    const last = this.get<number>("turn_checkpoint_ms") ?? 0;
+    const due = last + TURN_CHECKPOINT_MIN_MS;
+    if (Date.now() < due) {
+      await this.deadlines.set("turn_checkpoint", due);
+      return;
+    }
+    const info = this.info_();
+    if (!info.host || info.state !== "running") return;
+    this.put("turn_checkpoint_ms", Date.now());
+    await this.command([{ type: "sandbox_checkpoint", sandbox: info.sandbox, epoch: info.epoch, reason: "turn_end" }]);
   }
 
   // --- ports ----------------------------------------------------------------------------------------

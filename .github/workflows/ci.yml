@@ -117,6 +117,36 @@ jobs:
             e2e/.work/summary.json
           retention-days: 7
 
+  # The cell stack's proofs and graph policies (deploy/lean/Cell/Test.lean), with no AWS
+  # credentials: a pull request can't change IAM in a way that breaks a theorem. Plans run only
+  # in deploy.yml, which holds the credentials.
+  infra:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            ~/.cargo/bin/inframe
+            ~/.cargo/bin/.inframe-rev
+            deploy/lean/.lake
+          key: infra-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json') }}
+          restore-keys: infra-${{ runner.os }}-
+      - run: scripts/infra-tools.sh
+      - name: Proofs and policies
+        working-directory: deploy
+        run: |
+          inframe provider generate aws --frontend lean --schema-json aws-schema.json
+          # include_str isn't tracked by Lake: rebuild the stack so it reads this checkout's scripts.
+          rm -f lean/.lake/build/lib/lean/Cell/Stack.* lean/.lake/build/ir/Cell/Stack.*
+          inframe test --stack use1
+
   # Repo guards: doc links, source fences for the CLAUDE.md invariants, and tests proving each
   # guard can fail.
   guards:
@@ -166,7 +196,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [rust, control-plane, e2e, guards, deny, secrets]
+    needs: [rust, control-plane, e2e, infra, guards, deny, secrets]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -3,7 +3,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
 import { isSecretRef } from "./broker";
-import { signIntermediate, generateDevRoot, type RootCa } from "../lib/ca";
+import { createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
+import { AwsKms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
 import { awsCell, type AwsCellConfig } from "../lib/cells";
 import type { InstanceIdentity } from "../lib/aws-identity";
@@ -233,21 +234,44 @@ export class FleetDO extends DurableObject<Env> {
     };
   }
 
+  private kms(): AwsKms {
+    const e = this.env;
+    if (!e.AWS_ACCESS_KEY_ID || !e.AWS_SECRET_ACCESS_KEY) throw new NestError(ErrorCodes.INTERNAL, "AWS credentials not configured", 500);
+    return new AwsKms(e.AWS_ACCESS_KEY_ID, e.AWS_SECRET_ACCESS_KEY, e.AWS_REGION ?? "us-east-1");
+  }
+
+  /** The root CA: its key in KMS (`ROOT_CA_KMS_KEY_ID`), else a PEM key (development, and before KMS). */
   private async rootCa(): Promise<RootCa> {
-    if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KEY_PEM) {
-      return { certPem: this.env.ROOT_CA_CERT_PEM, keyPem: this.env.ROOT_CA_KEY_PEM };
+    if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KMS_KEY_ID) {
+      return kmsRoot(this.env.ROOT_CA_CERT_PEM, this.kms(), this.env.ROOT_CA_KMS_KEY_ID);
     }
+    if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KEY_PEM) return localRoot(this.env.ROOT_CA_CERT_PEM, this.env.ROOT_CA_KEY_PEM);
     if (this.env.ALLOW_DEV_CA !== "1") {
       throw new NestError(ErrorCodes.INTERNAL, "root CA not configured (ROOT_CA_CERT_PEM / ROOT_CA_KEY_PEM)", 500);
     }
+    type Dev = { certPem: string; keyPem: string };
     const stored = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'dev_root_ca'").toArray()[0];
-    if (stored) return JSON.parse(stored.value) as RootCa;
+    if (stored) {
+      const d = JSON.parse(stored.value) as Dev;
+      return localRoot(d.certPem, d.keyPem);
+    }
     const root = await generateDevRoot();
     const raced = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'dev_root_ca'").toArray()[0];
-    if (raced) return JSON.parse(raced.value) as RootCa;
-    console.warn("FleetDO: generated a development root CA (ALLOW_DEV_CA=1)");
-    this.sql.exec("INSERT INTO kv (key, value) VALUES ('dev_root_ca', ?)", JSON.stringify(root));
-    return root;
+    const d = raced ? (JSON.parse(raced.value) as Dev) : root;
+    if (!raced) {
+      console.warn("FleetDO: generated a development root CA (ALLOW_DEV_CA=1)");
+      this.sql.exec("INSERT INTO kv (key, value) VALUES ('dev_root_ca', ?)", JSON.stringify(root));
+    }
+    return localRoot(d.certPem, d.keyPem);
+  }
+
+  /**
+   * Operator, once per root: a self-signed root certificate for the KMS key, signed through KMS. The
+   * operator stores it as `ROOT_CA_CERT_PEM` (with `ROOT_CA_KMS_KEY_ID`) and bakes it into images.
+   */
+  async createKmsRootCertificate(keyId: string, name: string, ttlMs: number): Promise<string> {
+    const kms = this.kms();
+    return createRootCertificate(await kms.publicKey(keyId), kmsRoot("", kms, keyId).sign, name, ttlMs);
   }
 
   /** Root certificate to bake into sandbox images. */

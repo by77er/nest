@@ -19,6 +19,8 @@ export interface Env {
   /** Root CA for nest-proxy intermediates: PEM certificate and PKCS#8 ECDSA P-256 key. */
   ROOT_CA_CERT_PEM?: string;
   ROOT_CA_KEY_PEM?: string;
+  /** KMS key (id, ARN or alias) holding the root CA's private key; preferred over ROOT_CA_KEY_PEM. */
+  ROOT_CA_KMS_KEY_ID?: string;
   /** "1" lets FleetDO mint and persist a development root CA when none is configured. */
   ALLOW_DEV_CA?: string;
   /** AWS public certificate for the RSA-2048 instance identity signature (region-specific). */

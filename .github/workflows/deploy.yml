@@ -1,0 +1,162 @@
+# Deploys main (dev/deploy.md): the cell stack, then the control plane Worker, then the host
+# release and a new host AMI. Runs when ci.yml succeeds on a push to main, or by hand. Every job
+# runs in the `production` environment, which only main may deploy from and which holds the
+# Cloudflare secrets; AWS access is the cell's deploy role, assumed over OIDC (no stored keys).
+# Actions are pinned by commit; the comment names the release.
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# Serialized and never cancelled: a deploy half done is worse than one queued.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  DEPLOY_ROLE: arn:aws:iam::589531222691:role/nest-use1-deploy
+  BUCKET: nest-use1-589531222691
+  # The commit to deploy: the one CI passed, or the dispatched ref.
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  infra:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            ~/.cargo/bin/inframe
+            ~/.cargo/bin/.inframe-rev
+            deploy/lean/.lake
+          key: infra-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json') }}
+          restore-keys: infra-${{ runner.os }}-
+      - run: scripts/infra-tools.sh
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.10.7
+          tofu_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-infra-${{ github.run_id }}
+      - name: Plan
+        working-directory: deploy
+        run: |
+          inframe provider generate aws --frontend lean --schema-json aws-schema.json
+          rm -f lean/.lake/build/lib/lean/Cell/Stack.* lean/.lake/build/ir/Cell/Stack.*
+          inframe init --stack use1 -- -input=false
+          inframe plan --stack use1 -- -input=false -no-color -out=use1.plan | tee "$RUNNER_TEMP/plan.txt"
+          { echo '### Cell use1 plan'; echo '```'; grep -E '^  # |^Plan:|^No changes' "$RUNNER_TEMP/plan.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Apply
+        working-directory: deploy
+        run: inframe apply --stack use1 -- -input=false -no-color use1.plan
+
+  worker:
+    needs: infra
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: control-plane/package-lock.json
+      - run: npm ci
+        working-directory: control-plane
+      # The Worker's non-secret vars live in SSM; dev/deploy-use1.sh reads them.
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-worker-${{ github.run_id }}
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: dev/deploy-use1.sh "deploy.yml run ${{ github.run_id }}"
+      - name: Smoke
+        id: smoke
+        run: |
+          url=$(aws ssm get-parameter --name /nest/control-plane/vars/PUBLIC_BASE_URL --query Parameter.Value --output text)
+          for i in $(seq 12); do
+            if curl -fsS --max-time 10 "$url/v1/health"; then echo; exit 0; fi
+            sleep 10
+          done
+          exit 1
+      - name: Roll back
+        if: failure() && steps.smoke.conclusion == 'failure'
+        working-directory: control-plane
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        # No version id: wrangler rolls back to the version before this deploy.
+        run: |
+          npx wrangler rollback --yes --message "auto-rollback: /v1/health failed after ${SHA::7}"
+          echo "Rolled back: /v1/health failed after deploying ${SHA::7}." >> "$GITHUB_STEP_SUMMARY"
+
+  # After the Worker: new hosts may need what this control plane added, never the reverse.
+  release:
+    needs: worker
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-
+      - run: sudo apt-get update -q && sudo apt-get install -yq musl-tools
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-release-${{ github.run_id }}
+      - name: Publish
+        id: publish
+        run: scripts/publish-release.sh "$BUCKET" "${SHA::7}" >> "$GITHUB_OUTPUT"
+      # Hosts install a newer release at boot anyway; the AMI makes that boot fast again.
+      - name: Host AMI
+        if: steps.publish.outputs.changed == 'true'
+        run: |
+          arn=$(aws imagebuilder list-image-pipelines --query "imagePipelineList[?name=='nest-use1-host'].arn | [0]" --output text)
+          aws imagebuilder start-image-pipeline-execution --image-pipeline-arn "$arn" --query imageBuildVersionArn --output text
+      - name: Guest image
+        if: steps.publish.outputs.changed == 'true'
+        run: |
+          echo "The guest image isn't rebuilt here: if nest-guest changed, run images/guest/build-on-ec2.sh (dev/deploy.md)." >> "$GITHUB_STEP_SUMMARY"

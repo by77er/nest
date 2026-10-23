@@ -20,28 +20,44 @@ namespace Cell.Test
 /-! ### The control plane's IAM user -/
 
 /-- STONITH can only reach instances tagged `nest=true`. -/
-theorem terminate_only_tagged (spec : CellSpec) (template role : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template role,
+theorem terminate_only_tagged (spec : CellSpec) (template role key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template role key,
       s.Grants "ec2:TerminateInstances" → s.Requires "StringEquals" "aws:ResourceTag/nest" [lit "true"] := by
   simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
 
 /-- Every launch goes through the cell's launch template. -/
-theorem launch_only_from_template (spec : CellSpec) (template role : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template role,
+theorem launch_only_from_template (spec : CellSpec) (template role key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template role key,
       s.Grants "ec2:RunInstances" → s.Requires "ArnLike" "ec2:LaunchTemplate" [template] := by
   simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
 
 /-- The only IAM action is passing the host role, to EC2. -/
-theorem passes_only_the_host_role (spec : CellSpec) (template role : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template role, ∀ a ∈ s.actions,
+theorem passes_only_the_host_role (spec : CellSpec) (template role key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template role key, ∀ a ∈ s.actions,
       a.startsWith "iam:" → a = "iam:PassRole" ∧ s.resources = [role] := by
   simp [controlPlaneStatements]
 
-/-- The control plane's actions, whatever the cell: EC2 only, named exactly. -/
-theorem control_plane_actions (spec : CellSpec) (template role : Input String) :
-    ((controlPlaneStatements spec template role).map (·.actions)).flatten =
+/-- KMS only signs with (and reads the public key of) the proxy root CA key: no other key, no
+decrypt, no key management. -/
+theorem kms_only_the_root_key (spec : CellSpec) (template role key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template role key, ∀ a ∈ s.actions,
+      a.startsWith "kms:" → (a = "kms:Sign" ∨ a = "kms:GetPublicKey") ∧ s.resources = [key] := by
+  simp [controlPlaneStatements]
+
+/-- SSM only reads the host AMI parameter (the launch template's `resolve:ssm:` image). -/
+theorem ssm_only_the_host_ami (spec : CellSpec) (template role key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template role key, ∀ a ∈ s.actions,
+      a.startsWith "ssm:" → a = "ssm:GetParameters" ∧
+        s.resources = [lit s!"arn:aws:ssm:{spec.region}:{spec.accountId}:parameter{hostAmiParameter spec}"] := by
+  simp [controlPlaneStatements]
+
+/-- The control plane's actions, whatever the cell: EC2, passing the host role, resolving the host
+AMI and signing with the root key, named exactly. -/
+theorem control_plane_actions (spec : CellSpec) (template role key : Input String) :
+    ((controlPlaneStatements spec template role key).map (·.actions)).flatten =
       ["ec2:RunInstances", "ec2:RunInstances", "ec2:RunInstances", "ec2:RunInstances", "ec2:CreateTags",
-       "iam:PassRole", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:DescribeInstances"] := by
+       "iam:PassRole", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:DescribeInstances",
+       "ssm:GetParameters", "kms:Sign", "kms:GetPublicKey"] := by
   simp [controlPlaneStatements]
 
 /-- The hosts' actions, whatever the cell: object storage only, named exactly. -/
@@ -57,9 +73,16 @@ theorem hosts_only_reach_the_bucket (spec : CellSpec) :
       r = lit s!"arn:aws:s3:::{bucketName spec}" ∨ r = lit s!"arn:aws:s3:::{bucketName spec}/*" := by
   simp [hostStatements]
 
-/-- No action in either list is a wildcard, so `Grants` (exact membership) is what IAM grants. -/
+/-- The image builder only reads: it lists and gets the release, nothing else in the bucket. -/
+theorem builder_only_reads_releases (spec : CellSpec) :
+    ((builderStatements spec).map (·.actions)).flatten = ["s3:ListBucket", "s3:GetObject"] ∧
+      ∀ s ∈ builderStatements spec, s.Grants "s3:GetObject" →
+        s.resources = [lit s!"arn:aws:s3:::{bucketName spec}/releases/*"] := by
+  simp [builderStatements, Statement.Grants]
+
+/-- No action in any list is a wildcard, so `Grants` (exact membership) is what IAM grants. -/
 theorem no_wildcards : ∀ a ∈ ["ec2:RunInstances", "ec2:CreateTags", "iam:PassRole", "ec2:TerminateInstances",
-    "ec2:StopInstances", "ec2:DescribeInstances", "s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketLocation",
+    "ec2:StopInstances", "ec2:DescribeInstances", "ssm:GetParameters", "kms:Sign", "kms:GetPublicKey", "s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketLocation",
     "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion",
     "s3:AbortMultipartUpload"], '*' ∉ a.toList := by
   decide

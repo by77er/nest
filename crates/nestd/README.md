@@ -84,7 +84,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 - **Garbage collection** of the object store, and the 12 h chunk-reuse rule it depends on. (Built: the S3 `ObjectStore` with parallel transfers, retries, multipart and a capped cache; spot notices from IMDS; resuming with saved host credentials after a restart.)
 - **The preview router.** `port_expose` is recorded only. Nothing on the host uses ingress port 10000 yet: no terminal attach, no `nest port-forward`.
 - **Live forks.** They're disk-only.
-- **Firecracker itself has never run** here (no `/dev/kvm` access): the driver's API calls are unit-tested only.
+- **Firecracker** runs on EC2 burst hosts with nested virtualization and is verified there end to end ([driver](../../docs/sandbox/drivers/firecracker/)); this dev environment has no `/dev/kvm`, so locally the driver is unit-tested only.
 - **Jailer path untested against a real jailer.** The chroot hard-links require the disk and kernel on the same filesystem as the chroot base.
 - **systemd supervision** (`BindsTo=nestd` scopes for VMs, `WatchdogSec`) and **per-agent `DynamicUser` ownership** of config dirs.
 - **`capacity.warm`**, `drain` ending with nestd exiting, and the control `health` probe to the guest.
