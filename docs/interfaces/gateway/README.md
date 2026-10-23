@@ -33,7 +33,7 @@ How any client of a sandbox (the agent runner's hands client, AgentDO's `api-loo
 `resolve(sandbox, client)` on SandboxDO returns the sandbox's current placement. An agent runner reaches it through AgentDO (`hands_resolve` on the [session channel](../control-host/session/)); a person's `nest` CLI through the Worker API.
 
 ```json
-{"hostname": "h-<host>.<domain>", "epoch": 7, "binding": {"…": "…"},
+{"hostname": "<host>-gw-nest.<zone>", "epoch": 7, "binding": {"…": "…"},
  "guest": {"protocol_version": 2, "capabilities": ["pty", "cgroup_v2", "flush", "call_status", "heartbeat"]}}
 ```
 
