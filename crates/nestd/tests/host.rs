@@ -3,9 +3,11 @@
 //! agent (behind the vsock emulator), fake agent runner and fake nest-proxy.
 //!
 //! Covers: hello/hello_ack, ordered command execution with exactly one `command_result` each,
-//! dedup of redelivered commands, stale-epoch rejection, agent start with hands (guest slot +
-//! runner `agent_start`), port events, commit CAS round-trip, and self-fencing (proxy drop,
-//! runner fence, `fenced` state, salvage commit) when heartbeats stop being acknowledged.
+//! dedup of redelivered commands, stale-epoch rejection, agent start (ids only to the runner),
+//! `agent_attach`/`agent_detach` (guest slot, the gateway's client set), the gateway link (keys,
+//! upserts, removal on fence), the guest's version in `running`, port events, commit CAS
+//! round-trip, and self-fencing (proxy drop, runner fence, gateway remove, `fenced` state,
+//! salvage commit) when heartbeats stop being acknowledged.
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -19,6 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use nest_protocol::control::*;
 use nest_protocol::guest::frame::{self, Decoder};
 use nest_protocol::guest::{CliCommand, CliResult, ControlBody, ControlFrame, ListeningPort, PortProto, TaskInfo, TaskStatus};
+use nest_protocol::host::gateway_link::{GatewayCommand, GatewayEvent};
 use nest_protocol::host::proxy::{ProxyCommand, ProxyEvent};
 use nest_protocol::host::runner::{RunnerCommand, RunnerEvent};
 use nest_protocol::host::{fdpass, PROTOCOL_VERSION as HOST_PROTOCOL_VERSION};
@@ -40,8 +43,16 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 type Seen = Arc<Mutex<Vec<ControlBody>>>;
 
+/// While `held` is set, the fake guest answers the next `agent_attach` only after `release`.
+#[derive(Default)]
+struct AttachLatch {
+    held: AtomicBool,
+    release: tokio::sync::Notify,
+}
+
 struct FakeDriver {
     seen: Seen,
+    latch: Option<Arc<AttachLatch>>,
 }
 
 #[async_trait]
@@ -51,13 +62,14 @@ impl Driver for FakeDriver {
     }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: self.seen.clone(), emu: None, guest: None }))
+        Ok(Box::new(FakeVm { spec, seen: self.seen.clone(), latch: self.latch.clone(), emu: None, guest: None }))
     }
 }
 
 struct FakeVm {
     spec: VmSpec,
     seen: Seen,
+    latch: Option<Arc<AttachLatch>>,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
 }
@@ -81,7 +93,7 @@ impl Vm for FakeVm {
         std::fs::write(gdir.join("marker"), b"x")?;
         let mut f = std::fs::OpenOptions::new().write(true).open(&self.spec.disk_path)?;
         std::io::Write::write_all(&mut f, b"guest data")?;
-        self.guest = Some(fake_guest(&gdir, self.seen.clone()));
+        self.guest = Some(fake_guest(&gdir, self.seen.clone(), self.latch.clone()));
         self.emu = Some(Emulator::start(&self.vsock_uds_path(), &gdir)?);
         Ok(())
     }
@@ -100,7 +112,7 @@ impl Vm for FakeVm {
     }
 }
 
-fn fake_guest(dir: &Path, seen: Seen) -> tokio::task::JoinHandle<()> {
+fn fake_guest(dir: &Path, seen: Seen, latch: Option<Arc<AttachLatch>>) -> tokio::task::JoinHandle<()> {
     let _ = std::fs::remove_file(dir.join("1024.sock"));
     let listener = UnixListener::bind(dir.join("1024.sock")).unwrap();
     tokio::spawn(async move {
@@ -123,6 +135,11 @@ fn fake_guest(dir: &Path, seen: Seen) -> tokio::task::JoinHandle<()> {
                 while let Ok(Some(f)) = dec.next_frame() {
                     let cf: ControlFrame = serde_json::from_slice(&f.payload).unwrap();
                     seen.lock().unwrap().push(cf.body.clone());
+                    if let (ControlBody::AgentAttach { .. }, Some(l)) = (&cf.body, &latch)
+                        && l.held.load(Ordering::SeqCst)
+                    {
+                        l.release.notified().await;
+                    }
                     let ok = ControlFrame { id: None, reply_to: cf.id, body: ControlBody::Ok {} };
                     if s.write_all(&frame::encode_json(&ok).unwrap()).await.is_err() {
                         break 'conn;
@@ -186,6 +203,8 @@ struct MockFleet {
     url: String,
     log: Arc<Mutex<FleetLog>>,
     commands: mpsc::UnboundedSender<Vec<Command>>,
+    /// Any other frame FleetDO may push (a `binding_key`, for example).
+    frames: mpsc::UnboundedSender<FleetToHost>,
     partition: Arc<AtomicBool>,
     /// Fail the next events batch with a retryable error (no ack), like FleetDO's handler error.
     fail_next_events: Arc<AtomicBool>,
@@ -202,6 +221,7 @@ async fn mock_fleet() -> MockFleet {
     let partition = Arc::new(AtomicBool::new(false));
     let fail_next_events = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<Command>>();
+    let (ftx, mut frx) = mpsc::unbounded_channel::<FleetToHost>();
     let (log2, part, fail) = (log.clone(), partition.clone(), fail_next_events.clone());
     tokio::spawn(async move {
         let mut seq = 0u64;
@@ -227,6 +247,10 @@ async fn mock_fleet() -> MockFleet {
                         let Some(cmds) = cmds else { return };
                         seq += 1;
                         if ws.send(send(FleetToHost::Commands { seq: Seq(seq), commands: cmds })).await.is_err() { break; }
+                    }
+                    frame = frx.recv() => {
+                        let Some(frame) = frame else { return };
+                        if ws.send(send(frame)).await.is_err() { break; }
                     }
                     msg = ws.next() => {
                         let Some(Ok(Message::Text(t))) = msg else { break };
@@ -286,7 +310,7 @@ async fn mock_fleet() -> MockFleet {
             }
         }
     });
-    MockFleet { url, log, commands: tx, partition, fail_next_events }
+    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events }
 }
 
 impl MockFleet {
@@ -362,6 +386,45 @@ async fn fake_runner(path: &Path) -> Arc<Mutex<Vec<RunnerCommand>>> {
     got
 }
 
+struct FakeGateway {
+    got: Arc<Mutex<Vec<GatewayCommand>>>,
+    /// Frames that did not decode as a `GatewayCommand` (a contract bug, asserted empty).
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+/// A fake sandbox gateway: connects to `gateway.sock`, says hello, records every command and
+/// answers pings.
+async fn fake_gateway(path: &Path) -> FakeGateway {
+    let got = Arc::new(Mutex::new(vec![]));
+    let errors = Arc::new(Mutex::new(vec![]));
+    let s = loop {
+        match UnixStream::connect(path).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    let mut f = Framed::new(s, LengthDelimitedCodec::new());
+    let hello = GatewayEvent::Hello { protocol_version: HOST_PROTOCOL_VERSION, instance_id: "fakegw".into(), listen: "127.0.0.1:18790".into() };
+    f.send(bytes::Bytes::from(serde_json::to_vec(&hello).unwrap())).await.unwrap();
+    let (got2, errors2) = (got.clone(), errors.clone());
+    tokio::spawn(async move {
+        while let Some(Ok(b)) = f.next().await {
+            let cmd: GatewayCommand = match serde_json::from_slice(&b) {
+                Ok(c) => c,
+                Err(e) => {
+                    errors2.lock().unwrap().push(format!("{e}: {}", String::from_utf8_lossy(&b)));
+                    continue;
+                }
+            };
+            if matches!(cmd, GatewayCommand::Ping) {
+                let _ = f.send(bytes::Bytes::from(serde_json::to_vec(&GatewayEvent::Pong).unwrap())).await;
+            }
+            got2.lock().unwrap().push(cmd);
+        }
+    });
+    FakeGateway { got, errors }
+}
+
 fn fake_proxy(path: PathBuf) -> Arc<Mutex<Vec<ProxyCommand>>> {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
     let got = Arc::new(Mutex::new(vec![]));
@@ -412,19 +475,36 @@ async fn host_lifecycle_commit_and_self_fence() {
         "network": {"type": "none"},
         "flush_interval_ms": 20,
         "commit_timeout_ms": 5000,
+        "gateway_url": "ws://127.0.0.1:18790",
     }))
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let run_dir = dir.path().join("run");
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None }))).await.unwrap();
     let runner = fake_runner(&run_dir.join("runner.sock")).await;
     let proxy = fake_proxy(run_dir.join("proxy.sock"));
+    let gw = fake_gateway(&run_dir.join("gateway.sock")).await;
+    let gateway = gw.got.clone();
 
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
     let hello = fleet.log.lock().unwrap().hellos[0].clone();
     assert_eq!(hello.host.0, "hst_t");
     assert!(hello.sandboxes.is_empty());
+    assert_eq!(hello.gateway_url.as_deref(), Some("ws://127.0.0.1:18790"), "the fleet hello carries the configured gateway URL");
+
+    // 0. The gateway's replay: hello_ack, the (empty) key set, no sandboxes, resync_done. Then the
+    // keys FleetDO pushes arrive as a delta.
+    wait_until("gateway resync", || gateway.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::ResyncDone))).await;
+    {
+        let g = gateway.lock().unwrap();
+        assert!(matches!(g[0], GatewayCommand::HelloAck { ref host_id, .. } if host_id.0 == "hst_t"));
+        assert!(matches!(g[1], GatewayCommand::KeyUpdate { ref keys } if keys.is_empty()));
+        assert!(matches!(g[2], GatewayCommand::ResyncDone));
+    }
+    let key = nest_protocol::gateway::BindingKey { kid: "k1".into(), public_key: "pk".into() };
+    fleet.frames.send(FleetToHost::BindingKey { keys: vec![key.clone()] }).unwrap();
+    wait_until("binding key forwarded to the gateway", || gateway.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::KeyUpdate { keys } if keys == &vec![key.clone()]))).await;
 
     // 1. Create a sandbox.
     let sbx = SandboxId("sbx_1".into());
@@ -444,19 +524,35 @@ async fn host_lifecycle_commit_and_self_fence() {
         )])
         .unwrap();
     assert!(matches!(fleet.result("cmd_create").await, CommandOutcome::Ok { .. }));
-    fleet.wait_event("running", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Running, .. })).await;
+    // `running` carries the guest's version (from the fake guest's hello: v1, no capabilities).
+    match fleet.wait_event("running", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Running, .. })).await {
+        HostEventBody::SandboxState { guest, .. } => assert_eq!(guest, Some(nest_protocol::gateway::GuestInfo { protocol_version: 1, capabilities: vec![] })),
+        other => panic!("running: {other:?}"),
+    }
     wait_until("ack of batch 1", || fleet.log.lock().unwrap().acks.contains(&1)).await;
     assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::Configure { epoch: Epoch(1), .. })));
     wait_until("proxy upsert", || proxy.lock().unwrap().iter().any(|c| matches!(c, ProxyCommand::SandboxUpsert { .. }))).await;
     fleet.wait_event("port opened", |b| matches!(b, HostEventBody::Workstream { event } if matches!(event.kind, WorkstreamEventKind::PortOpened { port: 5173 }))).await;
+    // The gateway learned the sandbox: its epoch, the vsock socket, no clients yet, the guest.
+    let upserts = |g: &Vec<GatewayCommand>| g.iter().filter(|c| matches!(c, GatewayCommand::SandboxUpsert { sandbox, .. } if sandbox.0 == "sbx_1")).cloned().collect::<Vec<_>>();
+    wait_until("gateway upsert", || !upserts(&gateway.lock().unwrap()).is_empty()).await;
+    match upserts(&gateway.lock().unwrap()).last().unwrap() {
+        GatewayCommand::SandboxUpsert { epoch, vsock_uds_path, clients, guest, .. } => {
+            assert_eq!(*epoch, Epoch(1));
+            assert!(vsock_uds_path.ends_with("vsock.sock"));
+            assert!(clients.is_empty());
+            assert_eq!(guest.as_ref().map(|g| g.protocol_version), Some(1));
+        }
+        other => panic!("upsert: {other:?}"),
+    }
 
-    // 2. Start a worker with hands bound to the sandbox.
+    // 2. Start a worker: the runner gets the sandbox's id and epoch, never a socket path.
     let start = AgentStart {
         agent: AgentId("agt_w".into()),
         role: AgentRole::Worker,
         workstream: WorkstreamId("ws_1".into()),
         resume: None,
-        hands: Some(HandsBinding { sandbox: sbx.clone(), epoch: Epoch(1), cwd: Some("/workspace/app".into()) }),
+        hands: Some(HandsBinding { sandbox: sbx.clone(), epoch: Epoch(1) }),
         launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "w".into() } },
         oauth_token: "oauth".into(),
         session_ws_url: "ws://x".into(),
@@ -464,10 +560,26 @@ async fn host_lifecycle_commit_and_self_fence() {
     fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(start))]).unwrap();
     assert!(matches!(fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
     wait_until("runner agent_start", || {
-        runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.hands.as_ref().is_some_and(|h| h.vsock_uds_path.ends_with("vsock.sock"))))
+        runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_w" && s.start.hands.as_ref().is_some_and(|h| h.sandbox == sbx)))
     })
     .await;
+    assert!(!seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. })), "a brain start configures no guest slot");
+
+    // 2a. attach: the guest slot (explicit proxy port 3128, the cwd), and the gateway's client set.
+    let attach = |id: &str, epoch: u64, cwd: Option<&str>| cmd(id, CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(epoch), agent: AgentId("agt_w".into()), cwd: cwd.map(Into::into) });
+    fleet.commands.send(vec![attach("cmd_attach", 1, Some("/workspace/app"))]).unwrap();
+    assert!(matches!(fleet.result("cmd_attach").await, CommandOutcome::Ok { .. }));
     assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { slot } if slot.proxy_port == 3128 && slot.cwd == "/workspace/app")));
+    wait_until("gateway learns the client", || matches!(upserts(&gateway.lock().unwrap()).last(), Some(GatewayCommand::SandboxUpsert { clients, .. }) if clients == &vec!["agt_w".to_string()])).await;
+    // Idempotent: a second attach keeps the slot's port; a stale epoch is refused.
+    fleet.commands.send(vec![attach("cmd_attach2", 1, None), attach("cmd_attach_stale", 7, None)]).unwrap();
+    assert!(matches!(fleet.result("cmd_attach2").await, CommandOutcome::Ok { .. }));
+    match fleet.result("cmd_attach_stale").await {
+        CommandOutcome::Error { error } => assert_eq!(error.code, "stale_epoch"),
+        other => panic!("stale attach: {other:?}"),
+    }
+    let attaches: Vec<u16> = seen.lock().unwrap().iter().filter_map(|b| match b { ControlBody::AgentAttach { slot } => Some(slot.proxy_port), _ => None }).collect();
+    assert_eq!(attaches, vec![3128, 3128], "re-attach reuses the slot; the stale attach never reaches the guest");
 
     // 2b. Guest CLI relay: `nest ask` → guest_cli event → guest_cli_result command → cli_result to the guest.
     let request = match fleet.wait_event("guest cli", |b| matches!(b, HostEventBody::GuestCli { .. })).await {
@@ -503,14 +615,26 @@ async fn host_lifecycle_commit_and_self_fence() {
     let commits_after = fleet.log.lock().unwrap().events.iter().filter(|e| matches!(e.body, HostEventBody::CommitRequest { .. })).count();
     assert_eq!(commits_before, commits_after, "redelivered command must not re-execute");
 
+    // 4b. detach: the slot goes, the gateway's client set empties; detaching again is `ok`.
+    let detach = |id: &str| cmd(id, CommandBody::AgentDetach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), kill_processes: true });
+    fleet.commands.send(vec![detach("cmd_detach"), detach("cmd_detach_again")]).unwrap();
+    assert!(matches!(fleet.result("cmd_detach").await, CommandOutcome::Ok { detail: None }));
+    assert!(matches!(fleet.result("cmd_detach_again").await, CommandOutcome::Ok { detail: Some(_) }));
+    assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentDetach { kill_processes: true, .. })));
+    wait_until("gateway forgets the client", || matches!(upserts(&gateway.lock().unwrap()).last(), Some(GatewayCommand::SandboxUpsert { clients, .. }) if clients.is_empty())).await;
+    // The brain stays bound (ids only) for fencing; re-attach for the fence check below.
+    fleet.commands.send(vec![attach("cmd_attach3", 1, None)]).unwrap();
+    assert!(matches!(fleet.result("cmd_attach3").await, CommandOutcome::Ok { .. }));
+
     // 5. Partition: the host self-fences ~500 ms after the last acknowledged heartbeat (locally:
-    // proxy drop + runner fence), then reports it all once the partition heals.
+    // proxy drop + runner fence + gateway remove), then reports it all once the partition heals.
     let t0 = std::time::Instant::now();
     fleet.partition.store(true, Ordering::SeqCst);
     wait_until("proxy drop", || proxy.lock().unwrap().iter().any(|c| matches!(c, ProxyCommand::SandboxDrop { .. }))).await;
     let elapsed = t0.elapsed();
     assert!(elapsed >= Duration::from_millis(350) && elapsed < Duration::from_secs(3), "fence after {elapsed:?}");
     wait_until("runner fence", || runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. }))).await;
+    wait_until("gateway remove", || gateway.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::SandboxRemove { sandbox } if sandbox.0 == "sbx_1"))).await;
     // One runner fence for the whole host (no per-sandbox duplicate).
     tokio::time::sleep(Duration::from_millis(200)).await;
     let fences = runner.lock().unwrap().iter().filter(|c| matches!(c, RunnerCommand::Fence { .. })).count();
@@ -529,7 +653,10 @@ async fn host_lifecycle_commit_and_self_fence() {
     }
     assert_eq!(counts.get("cmd_create"), Some(&1));
     assert_eq!(counts.get("cmd_agent"), Some(&1));
+    assert_eq!(counts.get("cmd_attach"), Some(&1));
+    assert_eq!(counts.get("cmd_detach"), Some(&1));
     assert_eq!(counts.get("cmd_ckpt"), Some(&2));
+    assert!(gw.errors.lock().unwrap().is_empty(), "undecodable gateway commands: {:?}", gw.errors.lock().unwrap());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -546,7 +673,7 @@ impl Driver for NetnsCapture {
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         *self.0.lock().unwrap() = spec.netns.clone();
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), emu: None, guest: None }))
+        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, emu: None, guest: None }))
     }
 }
 
@@ -689,7 +816,7 @@ async fn start_host_with(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
     }))
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca };
-    let host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])) }))).await.unwrap();
+    let host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None }))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
@@ -709,6 +836,54 @@ fn create(id: &str, sandbox: &str) -> Command {
             from: None,
         },
     )
+}
+
+/// Gateway review #1: a fence lands while the guest still holds an `agent_attach` reply. The
+/// attach must answer `stale_epoch`, not `ok`, and the gateway's log for the sandbox must end
+/// with `sandbox_remove`: the late slot sync after the fence is refused by the tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "role": "burst", "cell": "test-cell",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+        "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+        "driver": {"type": "process", "guest_command": ["unused"]},
+        "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
+    }))
+    .unwrap();
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None };
+    let seen: Seen = Arc::new(Mutex::new(vec![]));
+    let latch = Arc::new(AttachLatch::default());
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()) }))).await.unwrap();
+    let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
+    let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
+    let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+
+    let sbx = SandboxId("sbx_1".into());
+    fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(matches!(fleet.result("cmd_create").await, CommandOutcome::Ok { .. }));
+    wait_until("gateway upsert", || gw.got.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::SandboxUpsert { .. }))).await;
+
+    // The guest holds the attach reply; the fence lands meanwhile; then the reply is released.
+    latch.held.store(true, Ordering::SeqCst);
+    fleet.commands.send(vec![cmd("cmd_attach", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None })]).unwrap();
+    wait_until("guest holds the attach", || seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. }))).await;
+    fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+    fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    latch.held.store(false, Ordering::SeqCst);
+    latch.release.notify_waiters();
+    match fleet.result("cmd_attach").await {
+        CommandOutcome::Error { error } => assert_eq!(error.code, "stale_epoch"),
+        other => panic!("attach after a fence: {other:?}"),
+    }
+    // Everything the fence and the attach's cleanup send has arrived; the sandbox's last word is `sandbox_remove`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let last = gw.got.lock().unwrap().iter().rev().find(|c| matches!(c, GatewayCommand::SandboxUpsert { sandbox, .. } | GatewayCommand::SandboxRemove { sandbox } if sandbox == &sbx)).cloned();
+    assert!(matches!(last, Some(GatewayCommand::SandboxRemove { .. })), "a fenced sandbox was re-added to the gateway: {last:?}");
+    assert!(gw.errors.lock().unwrap().is_empty());
 }
 
 /// Review #3: the lease lapses while `sandbox_create` is still booting. `Fenced` is terminal: the

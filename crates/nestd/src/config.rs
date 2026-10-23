@@ -31,9 +31,13 @@ pub struct Config {
     /// Component versions reported in the fleet hello.
     #[serde(default)]
     pub versions: VersionsConfig,
-    /// Who may connect to nestd's proxy and runner sockets.
+    /// Who may connect to nestd's proxy, runner and gateway sockets.
     #[serde(default)]
     pub sockets: SocketsConfig,
+    /// Where clients reach this host's sandbox gateway (`ws://` or `wss://` base URL), reported in
+    /// the fleet hello. `None` on a host that runs no sandboxes.
+    #[serde(default)]
+    pub gateway_url: Option<String>,
     /// Where generations (disk and memory chunks, manifests) go.
     #[serde(default)]
     pub storage: StorageConfig,
@@ -62,7 +66,7 @@ pub enum StorageConfig {
     },
 }
 
-/// Access control for the host-local control sockets (`proxy.sock`, `runner.sock`). Whoever
+/// Access control for the host-local control sockets (`proxy.sock`, `runner.sock`, `gateway.sock`). Whoever
 /// connects receives secrets (the proxy CA key and injection secrets; OAuth and host tokens), so
 /// the sockets are `0660` with an optional group, the peer uid is checked with `SO_PEERCRED`, and
 /// only one peer is served at a time.
@@ -77,6 +81,9 @@ pub struct SocketsConfig {
     /// Uids allowed to connect to `runner.sock`. Empty: nestd's own euid and root only.
     #[serde(default)]
     pub runner_uids: Vec<u32>,
+    /// Uids allowed to connect to `gateway.sock`. Empty: nestd's own euid and root only.
+    #[serde(default)]
+    pub gateway_uids: Vec<u32>,
 }
 
 impl SocketsConfig {
@@ -187,6 +194,9 @@ impl Config {
     }
     pub fn runner_sock(&self) -> PathBuf {
         self.run_dir.join("runner.sock")
+    }
+    pub fn gateway_sock(&self) -> PathBuf {
+        self.run_dir.join("gateway.sock")
     }
     pub fn vm_dir(&self, sandbox: &str) -> PathBuf {
         self.run_dir.join("vm").join(sandbox)

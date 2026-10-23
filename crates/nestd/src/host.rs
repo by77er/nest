@@ -24,12 +24,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nest_protocol::control::{
-    AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, EgressVerdict, HandsBinding,
-    HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
+    AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressVerdict,
+    HandsBinding, HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
 };
 use nest_protocol::guest::{AgentSlot, CliCommand, CliResult, ForkIdentity};
 use nest_protocol::host::proxy::{DropReason, ListenerPurpose, ListenerSpec, ProxyEvent, Transport, EXPLICIT_BASE_PORT, TCP_EXCEPTION_BASE_PORT};
-use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, LocalHands, RunnerEvent, StopMode};
+use nest_protocol::gateway::GuestInfo;
+use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, RunnerEvent, StopMode};
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
     error_codes, AgentId, AgentState, CommitReason, EgressPolicy, Epoch, ErrorBody, ForkMode, GenerationId, GenerationKind,
@@ -43,6 +44,7 @@ use crate::s3::{CredentialSource, S3Options, S3Store};
 use crate::driver::{Driver, Pauser, Vm, VmSpec};
 use crate::enroll::Enrolled;
 use crate::fleet::{self, FleetInput, FleetNotice, FleetParams, FleetReporter};
+use crate::gateway_link::{Entry as GatewayEntry, GatewayLink, GatewayNotice};
 use crate::guest::{GuestCtl, GuestEvent};
 use crate::net::{GATEWAY_IP, Netns};
 use crate::limits::{self, Limiter};
@@ -82,6 +84,8 @@ struct Summary {
     head: Option<GenerationId>,
     dirty: bool,
     resources: Resources,
+    /// The guest's version and capabilities, cached from its last hello (reported with `running`).
+    guest: Option<GuestInfo>,
 }
 
 struct Sbx {
@@ -100,7 +104,7 @@ struct Sbx {
     next_listener: u32,
     /// agent → (slot, listener id)
     slots: BTreeMap<AgentId, (u16, Option<u32>)>,
-    /// agent → initial Bash cwd (`HandsBinding.cwd`, default `/workspace`)
+    /// agent → initial Bash cwd (`agent_attach.cwd`, default `/workspace`)
     slot_cwds: BTreeMap<AgentId, String>,
     /// tcp exception rule (`host:port`) → (listener id, port)
     tcp_listeners: BTreeMap<String, (u32, u16)>,
@@ -108,6 +112,8 @@ struct Sbx {
     exposed: BTreeMap<u16, HostHeaderMode>,
     vm_dir: PathBuf,
     state_dir: PathBuf,
+    /// The guest's version and capabilities from its last hello (what the gateway tells clients).
+    guest_info: Option<GuestInfo>,
 }
 
 impl Sbx {
@@ -116,6 +122,9 @@ impl Sbx {
     }
 }
 
+/// A brain this host runs. `hands` names the sandbox its hands act in (ids only, from
+/// `agent_start`), so a fence of that sandbox fences the brain; the runner reaches the guest
+/// through the gateway, never through nestd.
 struct AgentRec {
     state: AgentState,
     hands: Option<HandsBinding>,
@@ -153,6 +162,7 @@ pub struct Inner {
     host_token: Mutex<Secret>,
     proxy: ProxyLink,
     runner: RunnerLink,
+    gateway: GatewayLink,
     fleet: mpsc::UnboundedSender<FleetInput>,
     guest_events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>,
     summary: Mutex<BTreeMap<SandboxId, Summary>>,
@@ -194,15 +204,16 @@ impl FleetReporter for Inner {
         let summary = self.summary.lock().expect("summary");
         let sandboxes = summary
             .iter()
-            .map(|(id, s)| SandboxReport { sandbox: id.clone(), epoch: s.epoch, state: s.state, head: s.head.clone(), dirty: s.dirty })
+            .map(|(id, s)| SandboxReport {
+                sandbox: id.clone(),
+                epoch: s.epoch,
+                state: s.state,
+                head: s.head.clone(),
+                dirty: s.dirty,
+                guest: if s.state == SandboxState::Running { s.guest.clone() } else { None },
+            })
             .collect();
-        let agents = self
-            .agents
-            .lock()
-            .expect("agents")
-            .iter()
-            .map(|(id, a)| AgentReport { agent: id.clone(), state: a.state, hands: a.hands.clone() })
-            .collect();
+        let agents = self.agents.lock().expect("agents").iter().map(|(id, a)| AgentReport { agent: id.clone(), state: a.state }).collect();
         (sandboxes, agents, self.capacity(&summary))
     }
 
@@ -263,6 +274,9 @@ impl Host {
         let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
         let runner_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.runner_uids.clone() };
         let runner = RunnerLink::start(&cfg.runner_sock(), enrolled.host.clone(), cfg.role, runner_access, runner_tx)?;
+        let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
+        let gateway_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.gateway_uids.clone() };
+        let gateway = GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, gateway_tx)?;
         let (fleet_tx, fleet_rx) = mpsc::unbounded_channel();
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
         let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
@@ -281,6 +295,7 @@ impl Host {
             host_token: Mutex::new(enrolled.host_token.clone()),
             proxy,
             runner,
+            gateway,
             fleet: fleet_tx,
             guest_events: guest_tx,
             summary: Mutex::new(BTreeMap::new()),
@@ -311,6 +326,7 @@ impl Host {
                 host: enrolled.host.clone(),
                 role: inner.cfg.role,
                 cell: inner.cfg.cell.clone(),
+                gateway_url: inner.cfg.gateway_url.clone(),
                 versions: ComponentVersions {
                     nestd: env!("CARGO_PKG_VERSION").into(),
                     nest_proxy: inner.cfg.versions.nest_proxy.clone(),
@@ -364,6 +380,14 @@ impl Host {
                 }
             });
         }
+        tokio::spawn(async move {
+            while let Some(n) = gateway_rx.recv().await {
+                match n {
+                    GatewayNotice::Connected { instance_id, listen } => tracing::info!(%instance_id, %listen, "sandbox gateway connected"),
+                    GatewayNotice::Disconnected => tracing::warn!("sandbox gateway disconnected"),
+                }
+            }
+        });
         {
             let inner = inner.clone();
             tokio::spawn(async move {
@@ -421,8 +445,19 @@ impl Inner {
                 s.state = state;
             }
         }
-        self.emit(HostEventBody::SandboxState { sandbox: sbx.clone(), epoch, state, suspend_mode, detail });
+        let guest = if state == SandboxState::Running { self.summary.lock().expect("summary").get(sbx).and_then(|s| s.guest.clone()) } else { None };
+        self.emit(HostEventBody::SandboxState { sandbox: sbx.clone(), epoch, state, suspend_mode, detail, guest });
         true
+    }
+
+    /// Tell the gateway what it needs about a sandbox (epoch, vsock socket, attached clients, the
+    /// guest's version). No VM: nothing to reach, so nothing is sent.
+    fn gateway_sync(&self, s: &Sbx) {
+        let Some(vm) = s.vm.as_ref() else { return };
+        self.gateway.upsert(
+            s.id.clone(),
+            GatewayEntry { epoch: s.epoch, vsock_uds_path: vm.vsock_uds_path().display().to_string(), clients: s.slots.keys().map(|a| a.0.clone()).collect(), guest: s.guest_info.clone() },
+        );
     }
 
     /// Whether `sbx@epoch` has been fenced (or is gone) since an operation started.
@@ -533,6 +568,10 @@ impl Inner {
                 *self.host_token.lock().expect("host token") = Secret(token.clone());
                 self.runner.host_token(Secret(token), expires_ms)
             }
+            FleetNotice::BindingKey(keys) => {
+                tracing::info!(keys = keys.len(), "binding verification keys updated");
+                self.gateway.keys(keys);
+            }
             FleetNotice::ProxyCa(ca) => {
                 // A renewal answer is for the pending key; otherwise it re-issues the current one.
                 let key = {
@@ -616,8 +655,9 @@ impl Inner {
     async fn on_runner_notice(self: &Arc<Self>, n: RunnerNotice) {
         match n {
             RunnerNotice::Event(RunnerEvent::AgentExited { agent, code, signal, reason }) => {
+                // The guest slot stays: it belongs to the attachment (SandboxDO's `agent_detach`
+                // ends it), not to the brain process, so a restarted brain finds its tasks.
                 self.runner.forget(&agent);
-                self.release_agent(&agent, true).await;
                 self.agents.lock().expect("agents").remove(&agent);
                 self.emit(HostEventBody::AgentExited { agent, exit_code: code, signal, reason: reason.as_str().into() });
             }
@@ -674,7 +714,37 @@ impl Inner {
                 let Some((_, epoch)) = self.workstream_of(&sbx) else { return };
                 self.emit(HostEventBody::TaskExited { sandbox: sbx, epoch, agent: agent_id, task });
             }
-            GuestEvent::Ready { resumed } => tracing::debug!(%sbx, resumed, "guest ready"),
+            GuestEvent::Ready { resumed, guest } => {
+                tracing::debug!(%sbx, resumed, protocol_version = guest.protocol_version, "guest ready");
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let Some(entry) = this.sandbox(&sbx) else { return };
+                    let mut s = entry.lock().await;
+                    let epoch = s.epoch;
+                    if this.fenced(&sbx, epoch) {
+                        return; // a hello from a fenced or superseded incarnation changes nothing
+                    }
+                    s.guest_info = Some(guest.clone());
+                    this.gateway_sync(&s);
+                    drop(s);
+                    // A guest agent that restarted (or reconnected) while the sandbox is already
+                    // running announced a possibly different version: report it as an update.
+                    let changed = {
+                        let mut summary = this.summary.lock().expect("summary");
+                        match summary.get_mut(&sbx) {
+                            Some(x) if x.epoch == epoch => {
+                                let changed = x.state == SandboxState::Running && x.guest.as_ref() != Some(&guest);
+                                x.guest = Some(guest.clone());
+                                changed
+                            }
+                            _ => false,
+                        }
+                    };
+                    if changed {
+                        this.emit(HostEventBody::SandboxState { sandbox: sbx, epoch, state: SandboxState::Running, suspend_mode: None, detail: None, guest: Some(guest) });
+                    }
+                });
+            }
             GuestEvent::Disconnected => tracing::debug!(%sbx, "guest control disconnected"),
         }
     }
@@ -804,7 +874,8 @@ impl Inner {
             });
         }
         self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason: DropReason::Fence });
-        self.emit(HostEventBody::SandboxState { sandbox: id.clone(), epoch, state: SandboxState::Fenced, suspend_mode: None, detail: Some(reason.into()) });
+        self.gateway.remove(id, epoch);
+        self.emit(HostEventBody::SandboxState { sandbox: id.clone(), epoch, state: SandboxState::Fenced, suspend_mode: None, detail: Some(reason.into()), guest: None });
         tracing::warn!(sandbox = %id, epoch = epoch.0, reason, "fenced");
 
         let Some(entry) = self.sandbox(id) else { return };
@@ -1007,11 +1078,11 @@ impl Inner {
             // Resolved on receipt (see `on_fleet_notice`).
             CommandBody::CommitResult { .. } | CommandBody::GuestCliResult { .. } => Ok(None),
             CommandBody::AgentStart(start) => self.agent_start(start).await,
-            CommandBody::AgentBind { agent, hands } => self.agent_bind(&agent, hands).await,
+            CommandBody::AgentAttach { sandbox, epoch, agent, cwd } => self.agent_attach(&sandbox, epoch, &agent, cwd).await,
+            CommandBody::AgentDetach { sandbox, epoch, agent, kill_processes } => self.agent_detach(&sandbox, epoch, &agent, kill_processes).await,
             CommandBody::AgentStop { agent, reason } => {
                 self.runner.agent_stop(&agent, StopMode::Graceful, &reason);
                 if !self.runner.connected() {
-                    self.release_agent(&agent, true).await;
                     self.agents.lock().expect("agents").remove(&agent);
                 }
                 Ok(None)
@@ -1068,9 +1139,9 @@ impl Inner {
         let initial = if restoring { SandboxState::Restoring } else { SandboxState::Creating };
         self.summary.lock().expect("summary").insert(
             sandbox.clone(),
-            Summary { workstream: workstream.clone(), epoch, state: initial, head: from.as_ref().map(|g| g.id.clone()), dirty: false, resources },
+            Summary { workstream: workstream.clone(), epoch, state: initial, head: from.as_ref().map(|g| g.id.clone()), dirty: false, resources, guest: None },
         );
-        self.emit(HostEventBody::SandboxState { sandbox: sandbox.clone(), epoch, state: initial, suspend_mode: None, detail: None });
+        self.emit(HostEventBody::SandboxState { sandbox: sandbox.clone(), epoch, state: initial, suspend_mode: None, detail: None, guest: None });
 
         let sbx = Sbx {
             id: sandbox.clone(),
@@ -1092,12 +1163,20 @@ impl Inner {
             exposed: BTreeMap::new(),
             vm_dir,
             state_dir,
+            guest_info: None,
         };
         // Boot while holding the sandbox's own lock: guest events and fencing wait for it.
         let entry = Arc::new(tokio::sync::Mutex::new(sbx));
         let mut guard = entry.clone().lock_owned().await;
         self.sandboxes.lock().expect("sandboxes").insert(sandbox.clone(), entry);
         let r = self.boot(&mut guard, from.as_ref(), fork).await;
+        if r.is_ok() {
+            guard.guest_info = guard.guest.as_ref().and_then(|g| g.guest());
+            if let Some(s) = self.summary.lock().expect("summary").get_mut(&sandbox) {
+                s.guest = guard.guest_info.clone();
+            }
+            self.gateway_sync(&guard);
+        }
         drop(guard);
         let mut detail = None;
         if let Some(g) = &from
@@ -1249,8 +1328,12 @@ impl Inner {
     /// Stop the VM and drop network state; forget the sandbox locally.
     async fn teardown(self: &Arc<Self>, id: &SandboxId, reason: DropReason) {
         let epoch = self.summary.lock().expect("summary").get(id).map(|s| s.epoch);
-        if let Some(epoch) = epoch {
-            self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason });
+        match epoch {
+            Some(epoch) => {
+                self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason });
+                self.gateway.remove(id, epoch);
+            }
+            None => self.gateway.forget(id),
         }
         self.pausers.lock().expect("pausers").remove(id);
         self.latest_ports.lock().expect("ports").remove(id);
@@ -1320,6 +1403,8 @@ impl Inner {
         } else if !self.driver.supports_memory_snapshots() {
             detail = Some("driver keeps memory by pausing locally; generation is disk-only".to_string());
         }
+        // Not reachable until resumed: clients re-resolve once instead of retrying `busy`.
+        self.gateway.forget(id);
         if !self.set_state(id, epoch, SandboxState::Suspended, Some(mode), detail.clone()) {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
         }
@@ -1344,6 +1429,7 @@ impl Inner {
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
             }
+            self.gateway_sync(&s);
         } else {
             // Cold boot from the local disk.
             let spec = VmSpec {
@@ -1362,14 +1448,17 @@ impl Inner {
             let guest = GuestCtl::spawn(vm.vsock_uds_path(), s.id.clone(), s.epoch, hostname(&s.id), self.guest_events.clone());
             s.vm = Some(vm);
             for (agent, (slot, _)) in s.slots.clone() {
-                let cwd = s.slot_cwds.get(&agent).cloned().unwrap_or_else(|| HandsBinding::DEFAULT_CWD.into());
+                let cwd = s.slot_cwds.get(&agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into());
                 let _ = guest.attach(slot_for(&agent, slot, cwd)).await;
             }
             guest.wait_ready(GUEST_READY_TIMEOUT).await.map_err(internal)?;
+            s.guest_info = guest.guest();
             s.guest = Some(guest);
+            self.gateway_sync(&s);
         }
         if let Some(x) = self.summary.lock().expect("summary").get_mut(id) {
             x.dirty = true;
+            x.guest = s.guest_info.clone();
         }
         if !self.set_state(id, epoch, SandboxState::Running, None, None) {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced during resume"), false));
@@ -1516,45 +1605,24 @@ impl Inner {
         Ok(None)
     }
 
+    /// Start a brain. Hands are the runner's business (it resolves a binding through AgentDO):
+    /// nestd only remembers which sandbox the brain is bound to, for fencing.
     async fn agent_start(self: &Arc<Self>, start: nest_protocol::control::AgentStart) -> CmdResult {
         let agent = start.agent.clone();
         let config_dir = self.cfg.agents_dir().join(&agent.0);
         std::fs::create_dir_all(&config_dir).map_err(internal)?;
-        let hands = match &start.hands {
-            Some(h) => Some(self.bind_hands(&agent, h).await?),
-            None => None,
-        };
         self.agents.lock().expect("agents").insert(agent.clone(), AgentRec { state: AgentState::Starting, hands: start.hands.clone() });
         let connected = self.runner.connected();
-        self.runner.agent_start(RunnerAgentStart { start, config_dir: config_dir.display().to_string(), hands });
+        self.runner.agent_start(RunnerAgentStart { start, config_dir: config_dir.display().to_string() });
         Ok(Some(serde_json::json!({ "dispatched": connected })))
     }
 
-    async fn agent_bind(self: &Arc<Self>, agent: &AgentId, hands: Option<HandsBinding>) -> CmdResult {
-        let current = match self.agents.lock().expect("agents").get(agent) {
-            None => return Err(error(error_codes::UNKNOWN_AGENT, format!("{agent} is not on this host"), false)),
-            Some(a) => a.hands.clone(),
-        };
-        let same = matches!((&current, &hands), (Some(c), Some(h)) if c.sandbox == h.sandbox && c.epoch == h.epoch);
-        if !same {
-            // Moving (or unbinding) hands: the agent's processes in the old sandbox go too.
-            self.release_agent(agent, true).await;
-        }
-        let local = match &hands {
-            Some(h) => Some(self.bind_hands(agent, h).await?),
-            None => None,
-        };
-        if let Some(a) = self.agents.lock().expect("agents").get_mut(agent) {
-            a.hands = hands;
-        }
-        self.runner.agent_bind(agent, local);
-        Ok(None)
-    }
-
-    /// Allocate a slot in the sandbox: explicit proxy listener + guest `agent_attach`.
-    async fn bind_hands(self: &Arc<Self>, agent: &AgentId, h: &HandsBinding) -> Result<LocalHands, ErrorBody> {
-        let entry = self.locked(&h.sandbox, h.epoch).await?;
+    /// The sandbox side of `attach`: a slot (explicit proxy listener + guest `agent_attach`) for
+    /// the agent, then the gateway learns the client. Idempotent: an existing slot keeps its port.
+    async fn agent_attach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, cwd: Option<String>) -> CmdResult {
+        let entry = self.locked(sandbox, epoch).await?;
         let mut s = entry.lock().await;
+        self.ensure_not_fenced(sandbox, epoch)?;
         let slot = match s.slots.get(agent) {
             Some((slot, _)) => *slot,
             None => {
@@ -1564,39 +1632,66 @@ impl Inner {
         };
         let mut listener_id = s.slots.get(agent).and_then(|(_, l)| *l);
         if listener_id.is_none()
-            && let Some(ns) = s.netns.clone() {
-                let l = bind_listener(&ns, &mut s.next_listener, Transport::Tcp, EXPLICIT_BASE_PORT + slot, ListenerPurpose::Explicit { agent: agent.clone(), slot })
-                    .map_err(internal)?;
-                listener_id = Some(l.spec.id);
-                self.proxy.apply(ProxyOp::AddListeners { sandbox: h.sandbox.clone(), epoch: h.epoch, listeners: vec![l] });
-            }
-        s.slots.insert(agent.clone(), (slot, listener_id));
-        s.slot_cwds.insert(agent.clone(), h.cwd_or_default().to_string());
+            && let Some(ns) = s.netns.clone()
+        {
+            let l = bind_listener(&ns, &mut s.next_listener, Transport::Tcp, EXPLICIT_BASE_PORT + slot, ListenerPurpose::Explicit { agent: agent.clone(), slot })
+                .map_err(internal)?;
+            listener_id = Some(l.spec.id);
+            self.proxy.apply(ProxyOp::AddListeners { sandbox: sandbox.clone(), epoch, listeners: vec![l] });
+        }
+        let cwd = cwd.unwrap_or_else(|| DEFAULT_CWD.into());
         let guest = s.guest.clone().ok_or_else(|| error(error_codes::INTERNAL, "sandbox has no guest connection", true))?;
-        let vsock = s.vm.as_ref().map(|v| v.vsock_uds_path()).ok_or_else(|| error(error_codes::INTERNAL, "sandbox has no VM", true))?;
+        let fresh = s.slots.insert(agent.clone(), (slot, listener_id)).is_none();
+        s.slot_cwds.insert(agent.clone(), cwd.clone());
+        self.gateway_sync(&s);
+        // The guest round trip (up to 30 s) runs without the sandbox lock, so a fence, suspend or
+        // checkpoint is never queued behind it.
         drop(s);
-        guest.attach(slot_for(agent, slot, h.cwd_or_default().to_string())).await.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_attach: {e}"), true))?;
-        Ok(LocalHands { sandbox: h.sandbox.clone(), epoch: h.epoch, vsock_uds_path: vsock.display().to_string() })
+        let attached = guest.attach(slot_for(agent, slot, cwd)).await;
+        // Fenced meanwhile: the slot is moot and the answer is `stale_epoch`, whatever the guest said.
+        if let Err(e) = self.ensure_not_fenced(sandbox, epoch) {
+            if fresh {
+                self.drop_slot(&entry, sandbox, epoch, agent).await;
+            }
+            return Err(e);
+        }
+        if let Err(e) = attached {
+            if fresh {
+                self.drop_slot(&entry, sandbox, epoch, agent).await;
+            }
+            return Err(error(error_codes::INTERNAL, format!("guest agent_attach: {e}"), true));
+        }
+        Ok(None)
     }
 
-    /// Release an agent's slot (guest detach, explicit listener) in whatever sandbox holds it.
-    /// `kill_processes`: also kill the agent's remaining processes (background tasks) in the
-    /// guest, so they can't keep running under a slot (and proxy port) another agent may reuse.
-    async fn release_agent(self: &Arc<Self>, agent: &AgentId, kill_processes: bool) {
-        let hands = self.agents.lock().expect("agents").get(agent).and_then(|a| a.hands.clone());
-        let Some(h) = hands else { return };
-        let Some(entry) = self.sandbox(&h.sandbox) else { return };
+    /// Undo a slot that never took: records and listener go, and the gateway hears about it.
+    async fn drop_slot(&self, entry: &Arc<tokio::sync::Mutex<Sbx>>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId) {
         let mut s = entry.lock().await;
-        let Some((_, listener)) = s.slots.remove(agent) else { return };
+        if let Some((_, Some(id))) = s.slots.remove(agent) {
+            self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
+        }
+        s.slot_cwds.remove(agent);
+        self.gateway_sync(&s);
+    }
+
+    /// Remove an agent's slot (an unknown agent is `ok`); with `kill_processes`, its whole cgroup
+    /// goes first. The gateway then refuses the agent's bindings.
+    async fn agent_detach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, kill_processes: bool) -> CmdResult {
+        let entry = self.locked(sandbox, epoch).await?;
+        let mut s = entry.lock().await;
+        let Some((_, listener)) = s.slots.remove(agent) else { return Ok(Some(serde_json::json!({ "note": "not attached" }))) };
         s.slot_cwds.remove(agent);
         if let Some(id) = listener {
-            self.proxy.apply(ProxyOp::RemoveListeners { sandbox: h.sandbox.clone(), epoch: s.epoch, ids: vec![id] });
+            self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
         }
+        self.gateway_sync(&s);
         if let Some(g) = s.guest.clone() {
             drop(s);
-            let _ = g.detach(agent, kill_processes).await;
+            g.detach(agent, kill_processes).await.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
         }
+        Ok(None)
     }
+
 
     async fn drain(self: &Arc<Self>, reason: &str, deadline_ms: i64) -> CmdResult {
         tracing::warn!(reason, deadline_ms, "draining");
@@ -1781,7 +1876,8 @@ fn command_kind(b: &CommandBody) -> &'static str {
         CommandBody::CommitResult { .. } => "commit_result",
         CommandBody::GuestCliResult { .. } => "guest_cli_result",
         CommandBody::AgentStart(_) => "agent_start",
-        CommandBody::AgentBind { .. } => "agent_bind",
+        CommandBody::AgentAttach { .. } => "agent_attach",
+        CommandBody::AgentDetach { .. } => "agent_detach",
         CommandBody::AgentStop { .. } => "agent_stop",
         CommandBody::Fence { .. } => "fence",
         CommandBody::Drain { .. } => "drain",
