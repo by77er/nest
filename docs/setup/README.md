@@ -31,6 +31,8 @@ Every nest hostname is a first-level label of the `bitcru.sh` zone, ending in `-
 | `<port>-<sandbox>-preview-nest.bitcru.sh` | Previews ([ingress](../sandbox/networking/ingress/)) | Worker route `*-preview-nest.bitcru.sh/*` | An Access application on `*-preview-nest.bitcru.sh` whose policy is me |
 | `<token>-share-nest.bitcru.sh` | Share links | Worker route `*-share-nest.bitcru.sh/*` | None; the Worker checks the signed token |
 
+The account holds tunnels that are not nest's. nest names its tunnels `nest-<host>` and its records `<host>-gw-nest.bitcru.sh`, and the Worker's cleanup and daily sweep delete only tunnels and records with those names, never anything else in the account or zone.
+
 The shapes follow two rules: a Worker route's wildcard may only lead the hostname, never sit inside it ([routes](https://developers.cloudflare.com/workers/configuration/routing/routes/)), and an Access application's wildcard may stand for part of a label, one wildcard per label, spanning one level ([application paths](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/app-paths/)). So the kind of a name is its suffix, and the wildcard is its prefix.
 
 ## Stage 1: real Claude Code (no cloud, no KVM)
