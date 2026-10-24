@@ -70,6 +70,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 
 - **Planned, not built:** each agent as a systemd unit (`DynamicUser`, `ProtectSystem=strict`, a private `/tmp`, write access only to its `CLAUDE_CONFIG_DIR`). Today every brain runs as the runner's user in its own process group, so brains on one host can read each other's environment (and OAuth token) through `/proc`; only host code execution could exploit that.
 - **Hook and MCP peers are bound to brains:** the sync hook socket and the `nest mcp` bridge accept an agent id only from a process descending from that agent's Claude Code (`SO_PEERCRED` + `/proc` ancestry). The tailer only follows session files under the agent's `<config_dir>/projects/`.
+- **WebFetch and instance metadata:** WebFetch runs on the brain's host, but it only issues GETs, and hosts require IMDSv2 tokens (a PUT with a header) with a hop limit of 1, so it cannot read the host role's credentials.
 - A brain host's egress is limited to Anthropic's hosts (every host Claude Code contacts, per its network config docs), the control plane, the gateway hostnames, and WebFetch through the host allowlist. Nothing is decrypted.
 - When the brain host's lease lapses (20 s), nestd stops every runner process on the host. AgentDO expires the agent epoch at 30 s and starts the brain again on another brain host with `--resume`.
 

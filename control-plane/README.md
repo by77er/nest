@@ -44,7 +44,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      (409 if it's placed)
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
      the only way to mint a public share link (agents can't)
-   - `POST /v1/agents {role, workstream, sandbox?, cell, start?}`: sends `agent_start` to the host
+   - `POST /v1/agents {role, workstream?, sandbox?, cell?, start?}`: sends `agent_start` to the host; a worker's
+     workstream and cell come from its sandbox (a mismatch is refused with 409)
    - `POST /v1/agents/<id>/start {host?}`: start (or restart) the brain; `host` puts it on a chosen active,
      connected host of the cell (for a test); hands still go through the sandbox's gateway
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
