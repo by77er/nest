@@ -111,7 +111,8 @@ def builderStatements (spec : CellSpec) : List Statement :=
   , { sid := "ReadReleases", actions := ["s3:GetObject"], resources := [lit s!"arn:aws:s3:::{bucketName spec}/releases/*"] } ]
 
 /-- The control plane's permissions (FleetDO): launch only from the cell's template, only 8i;
-stop and terminate only instances tagged `nest=true`; describe; resolve the host AMI parameter;
+stop and terminate only instances tagged `nest=true`; describe instances and images (the operator
+view of host AMIs); resolve the host AMI parameter;
 sign with the proxy root CA key. -/
 def controlPlaneStatements (spec : CellSpec) (template hostRole rootKey : Input String) : List Statement :=
   let fromTemplate : Condition := { op := "ArnLike", entries := [("ec2:LaunchTemplate", [template])] }
@@ -132,7 +133,7 @@ def controlPlaneStatements (spec : CellSpec) (template hostRole rootKey : Input 
       conditions := [{ op := "StringEquals", entries := [("iam:PassedToService", ["ec2.amazonaws.com"])] }] }
   , { sid := "StonithNestOnly", actions := ["ec2:TerminateInstances", "ec2:StopInstances"], resources := [ec2 "instance/*"]
       conditions := [{ op := "StringEquals", entries := [("aws:ResourceTag/nest", ["true"])] }] }
-  , { sid := "Describe", actions := ["ec2:DescribeInstances"], resources := [lit "*"] }
+  , { sid := "Describe", actions := ["ec2:DescribeInstances", "ec2:DescribeImages"], resources := [lit "*"] }
   , { sid := "ResolveHostAmi", actions := ["ssm:GetParameters"]
       resources := [lit s!"arn:aws:ssm:{spec.region}:{spec.accountId}:parameter{hostAmiParameter spec}"] }
   , { sid := "SignWithProxyRootOnly", actions := ["kms:Sign", "kms:GetPublicKey"], resources := [rootKey] } ]

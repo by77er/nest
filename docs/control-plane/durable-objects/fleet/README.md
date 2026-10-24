@@ -40,5 +40,5 @@ One per cell: hosts, enrollment, leases, placement, drains, STONITH, base genera
   - **Host kinds.** The code has `burst` and `controller` host roles, and `controllerHost()` picks a `controller` host for captains. Bindings, their keys and the tunnels are built.
   - **The desired versions** per cell, which drive [host upgrades](../../../compute/provisioning/#upgrades).
   - **Command batching:** one frame per `issueCommands` call.
-  - **Packing:** placement is least-loaded by lease count (warm snapshots first); hugepage-aware packing and the restore-ABI match aren't built.
+  - **Packing:** built as designed (warm snapshot first, then the fullest host whose reported hugepages and vCPUs, less what leases the host has not yet reported reserve, still fit), with one departure: an empty host always takes a sandbox, even one larger than its pool, so a 4096 MiB default sandbox on a 4 GiB host is placed alone and overcommitted as before; the pool size and the default size are the open item. The restore-ABI match isn't built.
   - **Drains, the drain gate and base generations.**

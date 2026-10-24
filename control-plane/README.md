@@ -57,7 +57,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      failed and left alone (`unknown`: nest-named tunnels and records this cell did not create)
    - `PUT /v1/admin/secrets/access:gateway {"value": "{\"client_id\":...,\"client_secret\":...}"}`: the Cloudflare
      Access service token `resolve` hands out as `edge` on every target that points at a host's connected tunnel
-   - `GET /v1/admin/fleet?cell=<cell>`: hosts (status, leases, idle since) and launched instances (outcome)
+   - `GET /v1/admin/fleet?cell=<cell>`: hosts (status, tunnel state, capacity, resident sandboxes and brains, idle since),
+     launched instances (outcome) and every live sandbox with its lease; `GET /v1/admin/images?cell=<cell>`: the
+     cell's host AMIs and the one the launch template resolves to (the dashboard reads both)
    - `POST /v1/admin/launched {instance_id, role, account_id?, region?, cell}`: record an instance we
      launched so it may enroll with its AWS identity document (as that role, from that account and region)
    - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<workstream>`)
@@ -114,8 +116,8 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   `WorkstreamEvent` and batched captain wakes, a role-filtered tool catalog, and a `workstream`
   egress policy layer. Taint and sinks, budgets, wake envelopes and the hands journal aren't built either.
   Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
-  commit and flushes at turn boundaries. Placement is least-loaded by lease count, where the design packs
-  by free hugepages. The contract changes are listed in `docs/interfaces/README.md`.
+  commit and flushes at turn boundaries. Placement packs by free hugepages and vCPUs as designed
+  (`test/placement.test.ts`); an empty host still takes a sandbox larger than its pool. The contract changes are listed in `docs/interfaces/README.md`.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
   `attach`, `checkpoint`, `brokered`, and all captain tools except `notify`, `ask` and `read_transcript`.
 - **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.

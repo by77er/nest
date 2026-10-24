@@ -5,7 +5,8 @@ import { num, type Env } from "../env";
 import { isSecretRef } from "./broker";
 import { createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
 import { AwsKms } from "../lib/kms";
-import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
+import { AwsEc2, CapacityError, isDead, type Ec2, type ImageInfo } from "../lib/ec2";
+import { AwsSsm, type Ssm } from "../lib/ssm";
 import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
@@ -64,6 +65,9 @@ interface LeaseRow {
   expired: number;
   /** Last state the holder reported (`suspended` leases don't keep a host busy). */
   state: string | null;
+  /** What the sandbox asked for; reserved against the host's report until the host counts it. */
+  vcpus: number | null;
+  memory_mib: number | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -135,6 +139,8 @@ export class FleetDO extends DurableObject<Env> {
   ec2Override: Ec2 | null | undefined = undefined;
   /** Override for tests; `undefined` reads the cell's entry in `AWS_CELLS`. */
   cellConfigOverride: AwsCellConfig | null | undefined = undefined;
+  /** Override for tests: SSM for the host AMI parameter; `null` = none. */
+  ssmOverride: Ssm | null | undefined = undefined;
   /** Override for tests: a fake Cloudflare API and the domain; `null` = no tunnels; `undefined` reads the env. */
   cloudflareOverride: { api: CloudflareApi; domain: string } | null | undefined = undefined;
   /** A launch is in flight (RunInstances awaits); placements meanwhile don't launch another. */
@@ -176,6 +182,9 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("hosts", "dns_record_id", "TEXT");
     this.addColumn("hosts", "tunnel_state", "TEXT");
     this.addColumn("leases", "state", "TEXT");
+    // Packing: what each lease reserves until the host's capacity report counts the sandbox.
+    this.addColumn("leases", "vcpus", "INTEGER");
+    this.addColumn("leases", "memory_mib", "INTEGER");
     // Object-store GC: the cell's sandboxes (their generations are the roots) and the runs.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS sandboxes (sandbox TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL,
       destroyed_ms INTEGER)`);
@@ -995,23 +1004,47 @@ export class FleetDO extends DurableObject<Env> {
     }
     if (req.cell) this.rememberCell(req.cell);
     this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
+    // Packing (docs/compute/autoscaling/): fill hosts before opening new ones, so idle hosts empty
+    // out. A host fits when its last capacity report, less what leases placed since reserve
+    // (a lease the host has not reported a state for), covers the sandbox's hugepages and vCPUs.
+    // An empty host always takes one: a sandbox larger than the host's pool is placed alone, as it
+    // was before packing (overcommitted; the pool and the default size are the open item).
+    const need = req.resources;
+    const free = (h: HostRow): { hugepages: number; vcpus: number; leases: number } | null => {
+      const leases = this.leasesOf(h.host);
+      if (!h.capacity) return leases.length ? null : { hugepages: Infinity, vcpus: Infinity, leases: 0 };
+      const cap = JSON.parse(h.capacity) as Capacity;
+      const pending = leases.filter((l) => l.state === null);
+      return {
+        hugepages: cap.hugepages_mib_free - pending.reduce((sum, l) => sum + (l.memory_mib ?? need.memory_mib), 0),
+        vcpus: cap.vcpus_free - pending.reduce((sum, l) => sum + (l.vcpus ?? need.vcpus), 0),
+        leases: leases.length,
+      };
+    };
+    const fits = (f: { hugepages: number; vcpus: number; leases: number } | null) =>
+      !!f && (f.leases === 0 || (f.hugepages >= need.memory_mib && f.vcpus >= need.vcpus));
     const candidates = this.sql
       .exec<HostRow>("SELECT * FROM hosts WHERE role = 'burst' AND status = 'active'")
       .toArray()
-      .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host));
+      .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
+      .map((h) => ({ h, f: free(h) }))
+      .filter((c) => fits(c.f));
     if (!candidates.length) {
       // SandboxDO retries placement on its own alarm; by then the new host may have enrolled.
       await this.scaleUp();
       return null;
     }
-    const load = (h: string) => this.leasesOf(h).length;
     const warm = (h: HostRow) => {
       if (!req.from || !h.capacity) return false;
       return (JSON.parse(h.capacity) as Capacity).warm.includes(req.from.id);
     };
-    candidates.sort((a, b) => Number(warm(b)) - Number(warm(a)) || load(a.host) - load(b.host));
-    const host = candidates[0]!.host;
-    this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired) VALUES (?, ?, ?, 0)", req.sandbox, host, req.epoch);
+    // Warm snapshot first; then the fullest host that still fits (fewest free hugepages, then
+    // fewest free vCPUs, then most leases).
+    candidates.sort((a, b) => Number(warm(b.h)) - Number(warm(a.h))
+      || a.f!.hugepages - b.f!.hugepages || a.f!.vcpus - b.f!.vcpus || b.f!.leases - a.f!.leases);
+    const host = candidates[0]!.h.host;
+    this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, vcpus, memory_mib) VALUES (?, ?, ?, 0, ?, ?)",
+      req.sandbox, host, req.epoch, need.vcpus, need.memory_mib);
     await this.issueCommands(host, [{
       type: "sandbox_create",
       sandbox: req.sandbox,
@@ -1405,14 +1438,44 @@ export class FleetDO extends DurableObject<Env> {
     };
   }
 
-  /** Operator view: hosts with their lease counts, and launched instances with their outcome. */
-  async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[] }> {
-    return {
-      hosts: this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since, h.tunnel_hostname, h.tunnel_state,
+  /**
+   * Operator view: hosts with their lease counts, capacity, resident sandboxes and brains; launched
+   * instances with their outcome; and every live sandbox of the cell (registered, not destroyed)
+   * with its lease, so an unplaced one shows too.
+   */
+  async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[]; sandboxes: Record<string, unknown>[] }> {
+    const hosts = this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since, h.enrolled_ms, h.last_rx,
+        h.tunnel_hostname, h.tunnel_state, h.capacity,
         (SELECT COUNT(*) FROM leases l WHERE l.host = h.host) AS leases FROM hosts h ORDER BY h.enrolled_ms`).toArray()
-        .map((h) => ({ ...h, connected: !!this.socketFor(h.host as string) })),
+      .map((h) => ({
+        ...h,
+        capacity: typeof h.capacity === "string" ? (JSON.parse(h.capacity) as Capacity) : null,
+        connected: !!this.socketFor(h.host as string),
+        sandboxes: this.sql.exec("SELECT sandbox, epoch, state, vcpus, memory_mib FROM leases WHERE host = ? ORDER BY sandbox", h.host as string).toArray(),
+        agents: this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ? ORDER BY agent", h.host as string).toArray().map((a) => a.agent),
+      }));
+    return {
+      hosts,
       launches: this.sql.exec("SELECT instance_id, launched_ms, host, reason, ended_ms FROM launched ORDER BY launched_ms").toArray(),
+      sandboxes: this.sql.exec(`SELECT s.sandbox, s.registered_ms, l.host, l.epoch, l.state FROM sandboxes s
+        LEFT JOIN leases l ON l.sandbox = s.sandbox WHERE s.destroyed_ms IS NULL ORDER BY s.registered_ms`).toArray(),
     };
+  }
+
+  /** Operator view: the cell's host AMIs and the one the launch template resolves to. */
+  async images(): Promise<{ current: string | null; current_since_ms: number | null; images: ImageInfo[] }> {
+    const ec2 = this.ec2();
+    const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value;
+    const ssm = this.ssm();
+    const current = ssm && cell ? await ssm.parameter(`/imagebuilder/nest-${cell}/host-ami`) : null;
+    return { current: current?.value ?? null, current_since_ms: current?.modified_ms ?? null, images: ec2 ? await ec2.images() : [] };
+  }
+
+  private ssm(): Ssm | null {
+    if (this.ssmOverride !== undefined) return this.ssmOverride;
+    const { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret } = this.env;
+    const region = this.cellConfig()?.region ?? this.env.AWS_REGION;
+    return id && secret && region ? new AwsSsm(id, secret, region) : null;
   }
 
   /** CP-side lease expiry: no sandbox on this host may run anywhere else until STONITH is confirmed. */
