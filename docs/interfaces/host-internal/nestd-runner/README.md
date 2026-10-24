@@ -8,7 +8,7 @@
 
 | `type` | Purpose |
 |---|---|
-| `hello_ack` | `host_id`, `host_role` (`burst` \| `controller`; designed: `host_kind: brain`, since the runner runs only on brain hosts). The runner starts with no agents; nestd re-issues `agent_start` for agents that should run |
+| `hello_ack` | `host_id`, `host_role` (`burst` \| `controller`; designed: `host_kind: brain`, since the runner runs only on brain hosts). The runner starts with no agents; nestd sends only starts it received while no runner was connected, and never replays one sent on an earlier connection |
 | `host_token` | Bearer for session-channel upgrades; sent after `hello_ack` and on rotation. Memory only |
 | `lease_update` | Every heartbeat. If it lapses, **or the socket closes**, the runner kills every brain (SIGKILL to its process group) |
 | `agent_start` | `{start: control::AgentStart, config_dir}`. `start.hands`, when present, names the sandbox and its epoch only; the runner fetches the gateway target from AgentDO. Refused without a valid lease mirror (`error{no_lease}` + `agent_exited{fenced}`) or when `launch.builtin_tools` names a host-side tool (`error{forbidden_tool}` + `agent_exited{crashed}`) |
@@ -23,7 +23,9 @@
 - **Undecodable commands** (version skew) are skipped with `error{invalid_message}`; the link stays up.
 - **Start registers first.** `agent_start` registers the agent before the slow steps (session rebuild ≤120 s, `claude auth status` ≤20 s, `claude --version` ≤10 s, each with a timeout), so `fence`/`agent_stop`/lease lapse reach it; a cancelled start reports `agent_exited` with the kill's reason and never spawns Claude Code.
 - **Duplicate `agent_start`** for a running brain only updates its sandbox ids (which drops any cached target) and reports `error{already_running}`; the live brain is untouched. A start for an agent whose previous brain belongs to an **earlier nestd connection** (being killed because that connection dropped) waits up to 10 s for it to exit, then starts.
-- **Connection generations:** lifecycle events are tagged with the nestd connection a brain was started under; a new connection never receives events about brains of the previous one (they were killed when it dropped, and nestd re-issues `agent_start` for what it wants running).
+- **Connection generations:** lifecycle events are tagged with the nestd connection a brain was started under; a new connection never receives events about brains of the previous one (they were killed when it dropped). nestd keeps the same rule on its side: it accepts events only for a brain whose start went out on the current connection, and drops an `agent_exited{fenced}` that arrives before that brain's `agent_started`.
+- **A lost connection loses its brains.** When the socket closes, nestd reports each brain started on it to the control plane as `agent_exited{crashed}` (`fenced` if it was already fenced), and forgets it. AgentDO restarts a `crashed` or `fenced` brain that has work with a fresh `agent_start` (current session, resume URLs and token); nestd keeps no copy of a start to replay.
+- **One brain table** in nestd holds each brain's hands binding, state and connection. A fence takes its brains out of the fleet hello at once; they leave the table when the runner reports the exit (forwarded to the control plane) or the connection drops. A fenced start that was never sent is reported `fenced` by nestd itself.
 - **Kills don't wait:** `fence`, `agent_stop{kill}` and lease lapse SIGKILL the brain's process group directly; stdin is written by a separate task, so a brain that stopped reading stdin is still killed.
 
 - **Session IDs:** `SessionId` = `ses_<Claude session UUID>` (`host::claude::session_id`). New sessions: the runner picks the UUID and passes `--session-id`. Resumes: the runner downloads `start.resume.segments` (Worker-signed URLs, `base` resets) into `claude::transcript_path(config_dir, cwd, uuid)` and passes `--resume <path>` (`--fork-session` if `fork`).

@@ -12,7 +12,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
-use nest_protocol::host::proxy::{AlertKind, ProxyEvent};
+use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyEvent};
 use nest_protocol::model::{AgentId, EgressPolicy, Epoch, InjectionSecret, SandboxId, WorkstreamId};
 
 use crate::resolve::Resolve;
@@ -69,7 +69,7 @@ pub struct Session {
     lease_until: AtomicI64,
     ca: RwLock<Option<Arc<Ca>>>,
     sandboxes: RwLock<HashMap<SandboxId, Arc<Sandbox>>>,
-    /// Sandboxes nestd dropped, with the epoch: state for that epoch (or older) is refused even
+    /// Sandboxes nestd fenced, with the epoch: state for that epoch (or older) is refused even
     /// if a late upsert/listener push arrives after the drop (fence racing setup).
     dropped: Mutex<HashMap<SandboxId, Epoch>>,
     pub events: mpsc::UnboundedSender<ProxyEvent>,
@@ -136,9 +136,12 @@ impl Session {
         )
     }
 
-    /// `sandbox_drop`: remove the sandbox (if its epoch isn't newer) and remember the drop.
-    pub fn drop_sandbox(&self, id: &SandboxId, epoch: Epoch) -> Option<Arc<Sandbox>> {
-        {
+    /// `sandbox_drop`: remove the sandbox (if its epoch isn't newer). A drop that tombstones (a
+    /// fence, [`DropReason::tombstones`], the rule nestd's mirror applies too) is remembered, so a
+    /// late push can't resurrect egress; a teardown is not, because a failed create is retried
+    /// at the same epoch and must get its egress back.
+    pub fn drop_sandbox(&self, id: &SandboxId, epoch: Epoch, reason: DropReason) -> Option<Arc<Sandbox>> {
+        if reason.tombstones() {
             let mut dropped = self.dropped.lock().unwrap();
             let e = dropped.entry(id.clone()).or_insert(epoch);
             *e = (*e).max(epoch);

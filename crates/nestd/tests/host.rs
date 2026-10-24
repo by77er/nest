@@ -55,6 +55,8 @@ struct FakeDriver {
     latch: Option<Arc<AttachLatch>>,
     /// The next VM start fails (a create that fails, to be retried at the same epoch).
     fail_next_start: Arc<AtomicBool>,
+    /// Sandboxes whose VM was stopped, in order.
+    stopped: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -64,7 +66,15 @@ impl Driver for FakeDriver {
     }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: self.seen.clone(), latch: self.latch.clone(), fail_next_start: self.fail_next_start.clone(), emu: None, guest: None }))
+        Ok(Box::new(FakeVm {
+            spec,
+            seen: self.seen.clone(),
+            latch: self.latch.clone(),
+            fail_next_start: self.fail_next_start.clone(),
+            stopped: self.stopped.clone(),
+            emu: None,
+            guest: None,
+        }))
     }
 }
 
@@ -73,6 +83,7 @@ struct FakeVm {
     seen: Seen,
     latch: Option<Arc<AttachLatch>>,
     fail_next_start: Arc<AtomicBool>,
+    stopped: Arc<Mutex<Vec<String>>>,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
 }
@@ -110,6 +121,7 @@ impl Vm for FakeVm {
         Ok(())
     }
     async fn stop(&mut self) -> std::io::Result<()> {
+        self.stopped.lock().unwrap().push(self.spec.sandbox.0.clone());
         if let Some(g) = self.guest.take() {
             g.abort();
         }
@@ -146,8 +158,19 @@ fn fake_guest(dir: &Path, seen: Seen, latch: Option<Arc<AttachLatch>>) -> tokio:
                     {
                         l.release.notified().await;
                     }
-                    let ok = ControlFrame { id: None, reply_to: cf.id, body: ControlBody::Ok {} };
-                    if s.write_all(&frame::encode_json(&ok).unwrap()).await.is_err() {
+                    // `agt_fail` is refused; `agt_bye` is attached, then the connection drops (the
+                    // guest agent restarted: nestd reconnects and configures it again).
+                    let attaching = match &cf.body {
+                        ControlBody::AgentAttach { slot } => slot.agent_id.0.clone(),
+                        _ => String::new(),
+                    };
+                    let body = if attaching == "agt_fail" {
+                        ControlBody::Error { error: ErrorBody { code: "attach_failed".into(), message: "refused".into(), retryable: false } }
+                    } else {
+                        ControlBody::Ok {}
+                    };
+                    let ok = ControlFrame { id: None, reply_to: cf.id, body };
+                    if s.write_all(&frame::encode_json(&ok).unwrap()).await.is_err() || attaching == "agt_bye" {
                         break 'conn;
                     }
                     if let ControlBody::Configure { .. } = cf.body {
@@ -214,6 +237,8 @@ struct MockFleet {
     partition: Arc<AtomicBool>,
     /// Fail the next events batch with a retryable error (no ack), like FleetDO's handler error.
     fail_next_events: Arc<AtomicBool>,
+    /// Lose this many `commit_result` answers (the commit itself is applied, as SandboxDO would).
+    lose_commit_answers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
@@ -226,12 +251,16 @@ async fn mock_fleet() -> MockFleet {
     let log = Arc::new(Mutex::new(FleetLog::default()));
     let partition = Arc::new(AtomicBool::new(false));
     let fail_next_events = Arc::new(AtomicBool::new(false));
+    let lose_commit_answers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<Command>>();
     let (ftx, mut frx) = mpsc::unbounded_channel::<FleetToHost>();
-    let (log2, part, fail) = (log.clone(), partition.clone(), fail_next_events.clone());
+    let (log2, part, fail, lose) = (log.clone(), partition.clone(), fail_next_events.clone(), lose_commit_answers.clone());
     tokio::spawn(async move {
         let mut seq = 0u64;
         let mut last_event_seq: Option<u64> = None;
+        // SandboxDO's commit compare-and-set: one head per sandbox, outcomes stored per request.
+        let mut heads: BTreeMap<SandboxId, GenerationId> = BTreeMap::new();
+        let mut outcomes: BTreeMap<RequestId, CommitOutcome> = BTreeMap::new();
         loop {
             let Ok((tcp, _)) = l.accept().await else { break };
             if part.load(Ordering::SeqCst) {
@@ -285,7 +314,8 @@ async fn mock_fleet() -> MockFleet {
                                     continue;
                                 }
                                 last_event_seq = Some(es.0);
-                                // Answer commit requests (CAS): committed, or orphaned for salvage.
+                                // Answer commit requests (CAS): committed, orphaned for salvage, or
+                                // rejected on a parent mismatch; a repeated request gets its stored outcome.
                                 let mut answers = vec![];
                                 for e in &events {
                                     if let HostEventBody::CommitRequest { request, sandbox, epoch, parent, kind, disk_manifest, mem_manifest, reason } = &e.body {
@@ -293,7 +323,20 @@ async fn mock_fleet() -> MockFleet {
                                             id: GenerationId(format!("gen_{}", request.0)), sandbox: sandbox.clone(), parent: parent.clone(), epoch: *epoch,
                                             kind: *kind, disk_manifest: disk_manifest.clone(), mem_manifest: mem_manifest.clone(), reason: *reason, created_ms: 0,
                                         };
-                                        let outcome = if *reason == CommitReason::Salvage { CommitOutcome::Orphaned { generation } } else { CommitOutcome::Committed { generation } };
+                                        let outcome = outcomes.entry(request.clone()).or_insert_with(|| {
+                                            if *reason == CommitReason::Salvage {
+                                                CommitOutcome::Orphaned { generation }
+                                            } else if parent.as_ref() != heads.get(sandbox) {
+                                                CommitOutcome::Rejected { reason: "parent_mismatch".into(), head: heads.get(sandbox).cloned() }
+                                            } else {
+                                                heads.insert(sandbox.clone(), generation.id.clone());
+                                                CommitOutcome::Committed { generation }
+                                            }
+                                        }).clone();
+                                        if lose.load(Ordering::SeqCst) > 0 {
+                                            lose.fetch_sub(1, Ordering::SeqCst);
+                                            continue;
+                                        }
                                         answers.push(Command { cmd: CommandId(format!("cmd_cr_{}", request.0)), issued_ms: 0, body: CommandBody::CommitResult { request: request.clone(), sandbox: sandbox.clone(), outcome } });
                                     }
                                 }
@@ -316,7 +359,7 @@ async fn mock_fleet() -> MockFleet {
             }
         }
     });
-    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events }
+    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events, lose_commit_answers }
 }
 
 impl MockFleet {
@@ -487,7 +530,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let run_dir = dir.path().join("run");
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
     let runner = fake_runner(&run_dir.join("runner.sock")).await;
     let proxy = fake_proxy(run_dir.join("proxy.sock"));
     let gw = fake_gateway(&run_dir.join("gateway.sock")).await;
@@ -679,7 +722,7 @@ impl Driver for NetnsCapture {
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         *self.0.lock().unwrap() = spec.netns.clone();
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), emu: None, guest: None }))
+        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), emu: None, guest: None }))
     }
 }
 
@@ -800,17 +843,26 @@ fn netns_listeners_handed_to_proxy() {
 
 struct Started {
     _host: Host,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     fleet: MockFleet,
     _runner: Arc<Mutex<Vec<RunnerCommand>>>,
     proxy: Arc<Mutex<Vec<ProxyCommand>>>,
+    gateway: FakeGateway,
+    /// Everything the fake guests received.
+    seen: Seen,
+    /// Sandboxes whose VM was stopped.
+    stopped: Arc<Mutex<Vec<String>>>,
 }
 
 async fn start_host() -> Started {
-    start_host_with(None).await
+    start_host_opts(None, 5000).await
 }
 
 async fn start_host_with(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>) -> Started {
+    start_host_opts(proxy_ca, 5000).await
+}
+
+async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64) -> Started {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
@@ -818,15 +870,18 @@ async fn start_host_with(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
-        "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
+        "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": commit_timeout_ms,
     }))
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
-    let host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
+    let (seen, stopped): (Seen, Arc<Mutex<Vec<String>>>) = (Arc::default(), Arc::default());
+    let driver = FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default(), stopped: stopped.clone() };
+    let host = Host::start(cfg, enrolled, Some(Arc::new(driver))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
+    let gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
-    Started { _host: host, _dir: dir, fleet, _runner: runner, proxy }
+    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped }
 }
 
 /// Whether `pid` is still a live process (a zombie counts as dead: it has been killed).
@@ -930,7 +985,7 @@ async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
     // The configured user: the test's own, the only one an unprivileged test can switch to.
     let me = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
     let cfg = tunnel_config_with_metrics(dir.path(), &fleet.url, &bin, Some(me), &metrics);
-    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("cloudflared spawned", || log.exists()).await;
@@ -958,7 +1013,7 @@ async fn a_missing_cloudflared_binary_is_logged_and_does_not_stop_the_host() {
     let fleet = mock_fleet().await;
     let bin = dir.path().join("no-such-cloudflared");
     let cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
-    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.unwrap();
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
@@ -984,7 +1039,7 @@ async fn a_failed_start_leaves_no_tunnel_child() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
     cfg.run_dir = "/proc/no-such-dir/run".into();
-    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.err().unwrap();
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.err().unwrap();
     assert!(!err.to_string().contains("cloudflared"), "the failure is elsewhere: {err:#}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!log.exists(), "cloudflared was started although the host did not");
@@ -996,7 +1051,7 @@ async fn an_unknown_cloudflared_user_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg = tunnel_config(dir.path(), &fleet.url, Path::new("/opt/nest/bin/cloudflared"), Some("no-such-user-nest".into()));
-    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default() }))).await.err().unwrap();
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.err().unwrap();
     assert!(err.to_string().contains("no-such-user-nest"), "{err}");
 }
 
@@ -1033,7 +1088,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let latch = Arc::new(AttachLatch::default());
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), fail_next_start: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
@@ -1080,7 +1135,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let fail = Arc::new(AtomicBool::new(true));
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: fail.clone() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: fail.clone(), stopped: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
@@ -1242,4 +1297,243 @@ async fn newer_epoch_create_salvages_old_work_first() {
 
 fn nestd_now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+// ---------------------------------------------------------------------------------------------
+// Duplicated-state review (nestd and guest-proxy findings)
+// ---------------------------------------------------------------------------------------------
+
+fn attach_cmd(id: &str, sandbox: &str, agent: &str) -> Command {
+    cmd(id, CommandBody::AgentAttach { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), agent: AgentId(agent.into()), cwd: None })
+}
+
+fn is_ok(o: &CommandOutcome) -> bool {
+    matches!(o, CommandOutcome::Ok { .. })
+}
+
+/// The last gateway command about `sandbox` (an upsert or a remove).
+fn last_gateway_word(g: &FakeGateway, sandbox: &str) -> Option<GatewayCommand> {
+    g.got
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|c| matches!(c, GatewayCommand::SandboxUpsert { sandbox: s, .. } | GatewayCommand::SandboxRemove { sandbox: s } if s.0 == sandbox))
+        .cloned()
+}
+
+/// nestd review #2: a fence stops the VM at once (its memory goes back to the host) and keeps
+/// only the disk, which salvage reads. `sandbox_destroy` at the fenced (old) epoch then reaps the
+/// rest: the disk, and the `fenced` row every hello would otherwise report forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_stops_the_vm_and_a_destroy_at_the_old_epoch_reaps_it() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = h.dir.path().join("state/sandboxes/sbx_1/disk.img");
+    assert!(disk.exists());
+
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    wait_until("the fenced VM is stopped", || h.stopped.lock().unwrap().contains(&"sbx_1".to_string())).await;
+    h.fleet.wait_event("salvage", |b| matches!(b, HostEventBody::CommitRequest { reason: CommitReason::Salvage, .. })).await;
+    assert!(disk.exists(), "the disk stays until destroy");
+
+    h.fleet.commands.send(vec![cmd("cmd_destroy", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_destroy").await));
+    assert!(!disk.parent().unwrap().exists(), "the fenced incarnation's state dir is gone");
+    // The next hello reports nothing for it.
+    let n = h.fleet.log.lock().unwrap().hellos.len();
+    h.fleet.fail_next_events.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_destroy_again", CommandBody::SandboxDestroy { sandbox: sbx, epoch: Epoch(1) })]).unwrap();
+    wait_until("reconnect", || h.fleet.log.lock().unwrap().hellos.len() > n).await;
+    let hello = h.fleet.log.lock().unwrap().hellos.last().cloned().unwrap();
+    assert!(hello.sandboxes.is_empty(), "a destroyed fenced sandbox is still reported: {:?}", hello.sandboxes);
+}
+
+/// nestd review #1/#3, end to end: the runner connection drops (the runner kills its brains), so
+/// the brain is reported `crashed`, which AgentDO restarts with a current `agent_start`. The
+/// runner that reconnects gets no replay of the stale start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "role": "burst", "cell": "test-cell",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+        "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+        "driver": {"type": "process", "guest_command": ["unused"]},
+        "network": {"type": "none"}, "flush_interval_ms": 20,
+    }))
+    .unwrap();
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::default(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    let sock = dir.path().join("run/runner.sock");
+    let connect = || async {
+        let mut f = Framed::new(UnixStream::connect(&sock).await.unwrap(), LengthDelimitedCodec::new());
+        let hello = RunnerEvent::Hello { protocol_version: HOST_PROTOCOL_VERSION, runner_version: "fake".into(), pid: 1 };
+        f.send(bytes::Bytes::from(serde_json::to_vec(&hello).unwrap())).await.unwrap();
+        f
+    };
+    // Every command the runner receives within `window`.
+    async fn drain(f: &mut Framed<UnixStream, LengthDelimitedCodec>, window: Duration) -> Vec<RunnerCommand> {
+        let mut got = vec![];
+        let end = tokio::time::Instant::now() + window;
+        while let Ok(Some(Ok(b))) = tokio::time::timeout_at(end, f.next()).await {
+            got.push(serde_json::from_slice(&b).unwrap());
+        }
+        got
+    }
+
+    let mut r = connect().await;
+    let start = AgentStart {
+        agent: AgentId("agt_c".into()),
+        role: AgentRole::Captain,
+        workstream: WorkstreamId("ws_1".into()),
+        resume: None,
+        hands: None,
+        launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "c".into() } },
+        oauth_token: "oauth".into(),
+        session_ws_url: "ws://x".into(),
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(start))]).unwrap();
+    assert!(is_ok(&fleet.result("cmd_agent").await));
+    assert!(drain(&mut r, Duration::from_millis(300)).await.iter().any(|c| matches!(c, RunnerCommand::AgentStart(_))));
+    let started = RunnerEvent::AgentStarted { agent: AgentId("agt_c".into()), pid: 9, session: SessionId("ses_1".into()), claude_version: "t".into(), capabilities: vec![] };
+    r.send(bytes::Bytes::from(serde_json::to_vec(&started).unwrap())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    drop(r);
+    fleet.wait_event("the lost brain reported", |b| matches!(b, HostEventBody::AgentExited { agent, reason, .. } if agent.0 == "agt_c" && *reason == AgentExitReason::Crashed)).await;
+    let mut r = connect().await;
+    let got = drain(&mut r, Duration::from_millis(500)).await;
+    assert!(got.iter().any(|c| matches!(c, RunnerCommand::HelloAck { .. })));
+    assert!(!got.iter().any(|c| matches!(c, RunnerCommand::AgentStart(_))), "a stale agent_start was replayed: {got:?}");
+}
+
+/// nestd review #5 / guest-proxy review #5: an attach the guest refused leaves no slot behind in
+/// the guest connection's configuration. When the guest reconnects, its `configure` names only
+/// the attached agents, each with its own proxy port (the refused agent's slot went to another).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_attach_leaves_no_slot_in_the_guest_configuration() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.fleet.commands.send(vec![attach_cmd("cmd_fail", "sbx_1", "agt_fail")]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_fail").await), "the guest refused agt_fail");
+    h.fleet.commands.send(vec![attach_cmd("cmd_x", "sbx_1", "agt_x"), attach_cmd("cmd_bye", "sbx_1", "agt_bye")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_x").await));
+    assert!(is_ok(&h.fleet.result("cmd_bye").await));
+    let configures = || -> Vec<Vec<nest_protocol::guest::AgentSlot>> {
+        h.seen.lock().unwrap().iter().filter_map(|b| match b { ControlBody::Configure { agents, .. } => Some(agents.clone()), _ => None }).collect()
+    };
+    wait_until("the guest reconnected and was configured again", || configures().len() >= 2).await;
+    let slots = configures().pop().unwrap();
+    let mut agents: Vec<&str> = slots.iter().map(|s| s.agent_id.0.as_str()).collect();
+    agents.sort();
+    assert_eq!(agents, vec!["agt_bye", "agt_x"], "{slots:?}");
+    let ports: std::collections::BTreeSet<u16> = slots.iter().map(|s| s.proxy_port).collect();
+    assert_eq!(ports.len(), slots.len(), "two agents share a proxy port: {slots:?}");
+}
+
+/// nestd review #6: a suspended sandbox is not reachable through the gateway. An attach while it
+/// is suspended (SandboxDO retries those) must not re-add it; resume does, with the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_while_suspended_does_not_make_the_sandbox_reachable() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    wait_until("gateway upsert", || matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxUpsert { .. }))).await;
+    // Memory mode: this driver keeps the paused VM (and its guest connection) locally.
+    h.fleet.commands.send(vec![cmd("cmd_suspend", CommandBody::SandboxSuspend { sandbox: sbx.clone(), epoch: Epoch(1), mode: SuspendMode::Memory })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_suspend").await));
+    wait_until("gateway remove", || matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxRemove { .. }))).await;
+
+    h.fleet.commands.send(vec![attach_cmd("cmd_attach", "sbx_1", "agt_w")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_attach").await));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let last = last_gateway_word(&h.gateway, "sbx_1");
+    assert!(matches!(last, Some(GatewayCommand::SandboxRemove { .. })), "a suspended sandbox was re-added to the gateway: {last:?}");
+
+    h.fleet.commands.send(vec![cmd("cmd_resume", CommandBody::SandboxResume { sandbox: sbx, epoch: Epoch(1) })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_resume").await));
+    wait_until("resume re-adds it with the client", || {
+        matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxUpsert { clients, .. }) if clients == vec!["agt_w".to_string()])
+    })
+    .await;
+    assert!(h.gateway.errors.lock().unwrap().is_empty());
+}
+
+/// nestd review #4: a commit's answer is lost (timeout) after SandboxDO moved its head. The next
+/// commit asks again under the same request id and adopts the stored outcome, instead of sending
+/// a new request with the stale parent (`parent_mismatch`, which fences the sandbox).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_whose_answer_was_lost_is_asked_again_under_the_same_id() {
+    let h = start_host_opts(None, 400).await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let ckpt = |id: &str| cmd(id, CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::Checkpoint });
+
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    h.fleet.commands.send(vec![ckpt("cmd_ck1")]).unwrap();
+    match h.fleet.result("cmd_ck1").await {
+        CommandOutcome::Error { error } => assert!(error.retryable && error.message.contains("timed out"), "{error:?}"),
+        other => panic!("the first checkpoint must time out: {other:?}"),
+    }
+    h.fleet.commands.send(vec![ckpt("cmd_ck2")]).unwrap();
+    let generation = match h.fleet.result("cmd_ck2").await {
+        CommandOutcome::Ok { detail: Some(d) } => d["generation"].as_str().unwrap().to_string(),
+        other => panic!("the retried checkpoint must succeed: {other:?}"),
+    };
+    let events = h.fleet.log.lock().unwrap().events.clone();
+    let requests: Vec<String> = events.iter().filter_map(|e| match &e.body { HostEventBody::CommitRequest { request, .. } => Some(request.0.clone()), _ => None }).collect();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[0], requests[1], "the lost commit is asked again under its own id");
+    assert_eq!(generation, format!("gen_{}", requests[0]), "the stored outcome's generation is adopted");
+    assert!(!events.iter().any(|e| matches!(e.body, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })), "fenced after a lost commit answer");
+}
+
+/// nestd review #5(b): an attach to a sandbox suspended to disk (no guest connection) must not
+/// bind the agent's explicit-proxy listener; otherwise every later attach, after resume
+/// included, hits EADDRINUSE on that port.
+#[test]
+fn an_attach_without_a_guest_binds_no_listener() {
+    if !nestd::net::reexec_in_userns("an_attach_without_a_guest_binds_no_listener") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = mock_fleet().await;
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "role": "burst", "cell": "c",
+            "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+            "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+            "driver": {"type": "process", "guest_command": ["unused"]},
+            "network": {"type": "netns"},
+            "flush_interval_ms": 20,
+        }))
+        .unwrap();
+        let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
+        let _host = Host::start(cfg, enrolled, Some(Arc::new(NetnsCapture(Arc::new(Mutex::new(None)))))).await.unwrap();
+        let _received = fake_proxy_keeping_fds(dir.path().join("run/proxy.sock"));
+        wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+        let sbx = SandboxId("sbx_1".into());
+        fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&fleet.result("cmd_create").await), "create");
+        fleet.commands.send(vec![cmd("cmd_suspend", CommandBody::SandboxSuspend { sandbox: sbx.clone(), epoch: Epoch(1), mode: SuspendMode::DiskOnly })]).unwrap();
+        assert!(is_ok(&fleet.result("cmd_suspend").await), "suspend");
+        fleet.commands.send(vec![attach_cmd("cmd_attach_1", "sbx_1", "agt_w")]).unwrap();
+        assert!(!is_ok(&fleet.result("cmd_attach_1").await), "no guest: the attach fails");
+        fleet.commands.send(vec![cmd("cmd_resume", CommandBody::SandboxResume { sandbox: sbx, epoch: Epoch(1) })]).unwrap();
+        assert!(is_ok(&fleet.result("cmd_resume").await), "resume");
+        fleet.commands.send(vec![attach_cmd("cmd_attach_2", "sbx_1", "agt_w")]).unwrap();
+        let r = fleet.result("cmd_attach_2").await;
+        assert!(is_ok(&r), "attach after resume: {r:?}");
+    });
 }
