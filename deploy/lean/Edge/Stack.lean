@@ -8,9 +8,9 @@ layers; docs/control-plane/dashboard/). Account-level, not per cell. The provide
 from `CLOUDFLARE_API_TOKEN` (Account › Access: Apps and Policies › Edit).
 
 Three self-hosted applications, each with one inline policy:
-- the sandbox gateways, `*-gw-<label>.<zone>`: Service Auth (`non_identity`) for any valid service
-  token of the account, answering 401 instead of a login redirect, so a machine client (the hands
-  client) sees a refusal it understands;
+- the sandbox gateways, `*-gw-<label>.<zone>`: Service Auth (`non_identity`) for one service token,
+  the one the control plane hands out as `edge` (BrokerDO `access:gateway`), answering 401 instead of
+  a login redirect, so a machine client (the hands client) sees a refusal it understands;
 - the dashboard, `dash-<label>.<zone>`: Allow for the owner's login;
 - previews, `*-preview-<label>.<zone>`: Allow for the owner's login (the routes are not built yet;
   the application is cheap and keeps the hostname closed).
@@ -30,15 +30,17 @@ structure EdgeSpec where
   label : String
   /-- The one login the identity policies allow. -/
   ownerEmail : String
+  /-- The id (not a secret) of the service token the gateways admit: the one in `access:gateway`. -/
+  gatewayServiceTokenId : String
 
 def gatewaysDomain (spec : EdgeSpec) : String := s!"*-gw-{spec.label}.{spec.zone}"
 def dashboardDomain (spec : EdgeSpec) : String := s!"dash-{spec.label}.{spec.zone}"
 def previewsDomain (spec : EdgeSpec) : String := s!"*-preview-{spec.label}.{spec.zone}"
 
-/-- The policy that admits any valid service token of the account and nobody else. -/
-def serviceAuth : ZeroTrustAccessApplication.PoliciesArgs :=
+/-- The policy that admits the gateways' service token and nobody else. -/
+def serviceAuth (spec : EdgeSpec) : ZeroTrustAccessApplication.PoliciesArgs :=
   { name := some "service token", decision := some "non_identity", precedence := some 1
-    include_ := some [{ anyValidServiceToken := some {} }] }
+    include_ := some [{ serviceToken := some { tokenId := lit spec.gatewayServiceTokenId } }] }
 
 /-- The policy that admits the owner's login and nobody else. -/
 def ownerOnly (spec : EdgeSpec) : ZeroTrustAccessApplication.PoliciesArgs :=
@@ -51,7 +53,7 @@ def edge (spec : EdgeSpec) : Infra Unit := do
     { accountId := some (lit spec.accountId), name := some (lit s!"{spec.label} gateways"), type := some "self_hosted"
       domain := some (lit (gatewaysDomain spec))
       serviceAuth401Redirect := some true, appLauncherVisible := some false
-      policies := some [serviceAuth] }
+      policies := some [serviceAuth spec] }
   let _ ← ZeroTrustAccessApplication.create "dashboard"
     { accountId := some (lit spec.accountId), name := some (lit s!"{spec.label} dashboard"), type := some "self_hosted"
       domain := some (lit (dashboardDomain spec))
