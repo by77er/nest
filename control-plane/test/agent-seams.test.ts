@@ -205,9 +205,10 @@ describe("a worker's cell and workstream are its sandbox's", () => {
     const w = await adminJson("/v1/agents", { body: base }, 201);
     expect(w).toMatchObject({ cell, workstream });
     // AgentDO checks it too, for any caller.
-    await expect(agentStub("agt_direct0000000000000000000").create({
+    // Wrapped: an RPC thenable that rejects is otherwise also reported as unhandled.
+    await expect(Promise.resolve().then(() => agentStub("agt_direct0000000000000000000").create({
       agent: "agt_direct0000000000000000000", role: "worker", workstream: other, cell, sandbox: sbx.sandbox,
-    })).rejects.toThrow(/workstream/);
+    }))).rejects.toThrow(/workstream/);
   });
 });
 
@@ -243,7 +244,7 @@ describe("captains named in several places", () => {
 
   it("a turn for an agent that was never created is refused and writes nothing", async () => {
     const ghost = agentStub("agt_ghost00000000000000000000");
-    await expect(ghost.enqueueTurn({ kind: "event_batch", text: "x" })).rejects.toThrow(/unknown agent/);
+    await expect(Promise.resolve().then(() => ghost.enqueueTurn({ kind: "event_batch", text: "x" }))).rejects.toThrow(/unknown agent/);
     const rows = await runInDurableObject(ghost, (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM turns").toArray().length);
     expect(rows).toBe(0);
   });
