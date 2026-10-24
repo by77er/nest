@@ -48,6 +48,7 @@ jobs:
             ~/.cargo/bin/inframe
             ~/.cargo/bin/.inframe-rev
             deploy/lean/.lake
+            deploy/lean/.generated
           key: infra-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json') }}
           restore-keys: infra-${{ runner.os }}-
       - run: scripts/infra-tools.sh
@@ -64,7 +65,6 @@ jobs:
         working-directory: deploy
         run: |
           inframe provider generate aws --frontend lean --schema-json aws-schema.json
-          rm -f lean/.lake/build/lib/lean/Cell/Stack.* lean/.lake/build/ir/Cell/Stack.*
           inframe init --stack use1 -- -input=false
           inframe plan --stack use1 -- -input=false -no-color -out=use1.plan | tee "$RUNNER_TEMP/plan.txt"
           { echo '### Cell use1 plan'; echo '```'; grep -E '^  # |^Plan:|^No changes' "$RUNNER_TEMP/plan.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
