@@ -122,8 +122,26 @@ def imdsV2 : Policy :=
     | some (.string "required"), some (.number 1) => none
     | _, _ => some "metadata_options must require tokens with hop limit 1"
 
+/-- A field of a block nested two levels down (`policy_detail[0].filter[0].type`). -/
+def blockField2? (r : ResourceSpec) (block inner field : String) : Option Value :=
+  match r.argument? block with
+  | some (.array [.object fields]) =>
+    match fields.lookup inner with
+    | some (.array [.object f2]) => (f2.lookup field).bind ExprNode.literal?
+    | _ => none
+  | _ => none
+
+/-- Old host images are deleted with their snapshots, but never below two images. -/
+def amiPruning : Policy :=
+  Policy.resourcesOfType "ami-pruning" "aws_imagebuilder_lifecycle_policy" fun r =>
+    match blockField2? r "policy_detail" "filter" "type", blockField2? r "policy_detail" "filter" "value",
+          blockField2? r "policy_detail" "action" "type" with
+    | some (.string "COUNT"), some (.number n), some (.string "DELETE") =>
+      if n < Lean.JsonNumber.fromNat 2 then some "the lifecycle policy must keep at least two images" else none
+    | _, _, _ => some "the lifecycle policy must delete by count with literal values"
+
 def policies : Policy :=
-  Policy.all "cell" [Policy.validGraph, noIngress, egressAllowList, imdsV2]
+  Policy.all "cell" [Policy.validGraph, noIngress, egressAllowList, imdsV2, amiPruning]
 
 #assert_policy policies (buildGraph (cell use1))
 

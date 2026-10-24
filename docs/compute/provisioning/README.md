@@ -15,7 +15,8 @@ Two host images, one per [host kind](../). Neither contains a secret ([identity]
 - **Builds run on demand.** The pipeline writes the new AMI's ID to an SSM parameter, and the launch template resolves that parameter at each launch (`resolve:ssm:`). A new image therefore needs no stack change.
 - **The builder runs in the cell's subnet.** Its role can only read the release, and it is not tagged `nest=true`, so STONITH can't reach it.
 - cloudflared is pinned in `deploy/host/install.sh` by release version and SHA-256 (downloaded from the cloudflared GitHub release at image build, and at boot only when the installed binary's checksum differs; never committed), installed as `/opt/nest/bin/cloudflared`; bootstrap names it in nestd.json (`cloudflared_bin`).
-- **Not built:** pruning old AMIs and their snapshots (an Image Builder lifecycle policy); gVisor.
+- **Old images are pruned by an Image Builder lifecycle policy** (in the cell stack): the two newest images of the host recipe stay, the rest are deleted with their AMIs and snapshots, except an AMI that launched an instance in the last seven days, so failed builds cannot remove the AMI the launch template resolves to. Image Builder evaluates it on its own daily schedule.
+- **Not built:** gVisor.
 
 **Brain host image:** nestd, Claude Code, the agent runner and the `nest` binary, `bubblewrap` (Claude Code needs it for the subprocess environment scrub nest relies on; see [runner-claude](../../interfaces/host-internal/runner-claude/)) and the Discord gateway client. The image carries the runner's pinned Claude Code version, checked by SHA-256 ([runner](../../agents/runner/)). No hypervisor, no hugepages, no S3 access, no cloudflared. Built by the same pipeline from an ARM-capable AL2023 base, for the cheapest class that runs Claude Code ([brain hosts](../brain-hosts/)). **Not built.**
 

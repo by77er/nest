@@ -35,6 +35,7 @@ import Aws.Resource.ImagebuilderImageRecipe
 import Aws.Resource.ImagebuilderInfrastructureConfiguration
 import Aws.Resource.ImagebuilderDistributionConfiguration
 import Aws.Resource.ImagebuilderImagePipeline
+import Aws.Resource.ImagebuilderLifecyclePolicy
 import Cell.Iam
 
 /-!
@@ -271,6 +272,24 @@ def cell (spec : CellSpec) : Infra Unit := do
       infrastructureConfigurationArn := builderInfra.arn, distributionConfigurationArn := distribution.arn
       -- The real test is a host enrolling; Image Builder's boot test would add ~10 minutes.
       imageTestsConfiguration := some { imageTestsEnabled := false } }
+  -- Old host images go: Image Builder's lifecycle policy keeps the two newest images of the host
+  -- recipe (every version of it, `1.0.x`) and deletes the rest with their AMIs and snapshots. An
+  -- AMI that launched an instance in the last seven days is kept regardless, so a run of failed
+  -- builds cannot delete the AMI the launch template still resolves to. Image Builder evaluates
+  -- policies on its own daily schedule.
+  let lifecycleRole ← IamRole.create "image_lifecycle"
+    { name := lit s!"nest-{spec.name}-image-lifecycle"
+      assumeRolePolicy := "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"imagebuilder.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}" }
+  let lifecycleAttachment ← IamRolePolicyAttachment.create "image_lifecycle"
+    { role := lifecycleRole.name, policyArn := "arn:aws:iam::aws:policy/service-role/EC2ImageBuilderLifecycleExecutionPolicy" }
+  let _ ← ImagebuilderLifecyclePolicy.createWith "host"
+    { name := lit s!"nest-{spec.name}-host", executionRole := lifecycleRole.arn, resourceType := "AMI_IMAGE"
+      description := "Keeps the two newest host images; deletes the rest with their AMIs and snapshots"
+      resourceSelection := [{ recipe := [{ name := lit s!"nest-{spec.name}-host", semanticVersion := "1.0.x" }] }]
+      policyDetail := [{ action := [{ type := "DELETE", includeResources := [{ amis := some true, snapshots := some true }] }]
+                         filter := [{ type := "COUNT", value := 2 }]
+                         exclusionRules := [{ amis := [{ lastLaunched := [{ unit := "DAYS", value := 7 }] }] }] }] }
+    (resourceOptions |>.dependsOn lifecycleAttachment)
 
   -- The launch template: nested virtualization, IMDSv2 with hop limit 1, tagged `nest=true`.
   -- Instance type, zone and market are chosen per launch by FleetDO; the AMI at each launch.
