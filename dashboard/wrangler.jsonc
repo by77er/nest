@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nest-dashboard",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // /api/* is the Worker's, whatever the page bundles.
+    "run_worker_first": ["/api/*"]
+  },
+  "routes": [{ "pattern": "dash-nest.bitcru.sh", "custom_domain": true }],
+  "observability": { "enabled": true },
+  "vars": {
+    // Read-only: the control plane's admin API, and the cells it may be asked about.
+    "NEST_CONTROL_PLANE": "https://nest.bitcru.sh",
+    "NEST_CELLS": "use1"
+  }
+  // Secret (wrangler secret put / .dev.vars): NEST_ADMIN_TOKEN, the control plane's admin token.
+  // The page never sees it: the Worker adds it to the two GET routes it proxies and nothing else.
+  // Cloudflare Access in front of dash-nest.bitcru.sh (an Allow policy for the owner's login) is
+  // what keeps the proxy private; it is created by hand (docs/setup/).
+}

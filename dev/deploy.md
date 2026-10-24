@@ -6,6 +6,8 @@
 1. **`infra`:** `inframe test` and `plan` (the plan's summary goes in the run summary), then `apply` for `use1`.
 2. **`worker`:** `dev/deploy-use1.sh`, then `GET /v1/health` for up to two minutes. If the health check fails, `wrangler rollback` returns to the previous version.
 3. **`release`:** `scripts/publish-release.sh` builds the host binaries (static, musl) into `releases/current/`.
+
+**The dashboard deploys apart** (`deploy-dashboard.yml`): on a push to `main` that touches `dashboard/` (or by `workflow_dispatch`), `npm ci`, typecheck, `vite build` and `wrangler deploy` of the `nest-dashboard` Worker to `dash-nest.bitcru.sh`, then `wrangler secret put NEST_ADMIN_TOKEN` from the `production` environment's secret when it is set. It needs no AWS role; it shares nothing with the platform deploy but the Cloudflare token.
    - Firecracker, the jailer, the guest kernel and the guest image carry over from the current release.
    - If no file changes, nothing is published.
    - When it does publish, a host AMI build starts.

@@ -1,0 +1,44 @@
+# Deploys the dashboard Worker (dashboard/) on every push to main that touches it, apart from the
+# platform deploy: it shares nothing with the control plane but the admin API it reads.
+name: deploy-dashboard
+on:
+  push:
+    branches: [main]
+    paths: [dashboard/**, .github/workflows/deploy-dashboard.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: dashboard
+  cancel-in-progress: false
+jobs:
+  dashboard:
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NEST_ADMIN_TOKEN: ${{ secrets.NEST_ADMIN_TOKEN }}
+        run: |
+          npx wrangler deploy
+          # The control plane's admin token, a Worker secret; it persists across versions, so it can be absent.
+          if [ -n "${NEST_ADMIN_TOKEN:-}" ]; then
+            printf '%s' "$NEST_ADMIN_TOKEN" | npx wrangler secret put NEST_ADMIN_TOKEN
+          fi
