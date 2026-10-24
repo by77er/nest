@@ -28,6 +28,17 @@ export interface Ec2 {
   terminate(instanceId: string): Promise<void>;
   /** `null` when the instance does not exist (already gone). */
   state(instanceId: string): Promise<InstanceState | null>;
+  /** The account's own AMIs tagged `nest=true` (the host images), newest first. */
+  images(): Promise<ImageInfo[]>;
+}
+
+export interface ImageInfo {
+  image_id: string;
+  name: string;
+  created: string;
+  state: string;
+  size_gib: number | null;
+  tags: Record<string, string>;
 }
 
 /** States in which the instance can no longer run anything. */
@@ -81,6 +92,23 @@ export class AwsEc2 implements Ec2 {
 
   async terminate(instanceId: string): Promise<void> {
     await this.call({ Action: "TerminateInstances", "InstanceId.1": instanceId });
+  }
+
+  async images(): Promise<ImageInfo[]> {
+    const xml = await this.call({ Action: "DescribeImages", "Owner.1": "self", "Filter.1.Name": "tag:nest", "Filter.1.Value.1": "true" });
+    // One block per image: from its <imageId> to the next. Nested items (block devices, tags) are
+    // read inside the block, so the top-level <item> split is never needed.
+    const blocks = xml.split("<imageId>").slice(1);
+    const field = (b: string, tag: string) => new RegExp(`<${tag}>([^<]*)</${tag}>`).exec(b)?.[1] ?? "";
+    return blocks.map((b) => {
+      const tags: Record<string, string> = {};
+      for (const m of b.matchAll(/<key>([^<]*)<\/key>\s*<value>([^<]*)<\/value>/g)) tags[m[1]!] = m[2]!;
+      const size = /<volumeSize>(\d+)<\/volumeSize>/.exec(b)?.[1];
+      return {
+        image_id: b.slice(0, b.indexOf("</imageId>")), name: field(b, "name"), created: field(b, "creationDate"),
+        state: field(b, "imageState"), size_gib: size ? Number(size) : null, tags,
+      };
+    }).sort((a, b) => (a.created < b.created ? 1 : a.created > b.created ? -1 : 0));
   }
 
   async state(instanceId: string): Promise<InstanceState | null> {

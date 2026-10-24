@@ -56,7 +56,7 @@ AMI and signing with the root key, named exactly. -/
 theorem control_plane_actions (spec : CellSpec) (template role key : Input String) :
     ((controlPlaneStatements spec template role key).map (·.actions)).flatten =
       ["ec2:RunInstances", "ec2:RunInstances", "ec2:RunInstances", "ec2:RunInstances", "ec2:CreateTags",
-       "iam:PassRole", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:DescribeInstances",
+       "iam:PassRole", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:DescribeInstances", "ec2:DescribeImages",
        "ssm:GetParameters", "kms:Sign", "kms:GetPublicKey"] := by
   simp [controlPlaneStatements]
 

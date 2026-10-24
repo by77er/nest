@@ -1,7 +1,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
-import { CapacityError, type Ec2, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
+import { CapacityError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
 
@@ -212,6 +212,10 @@ class MockEc2 implements Ec2 {
     if (this.noCapacity.has(`${spec.instanceType}/${spec.spot ? "spot" : "od"}`)) throw new CapacityError("InsufficientInstanceCapacity");
     this.launched.push(spec);
     return `i-0${this.launched.length.toString(16).padStart(8, "0")}`;
+  }
+  imagesList: ImageInfo[] = [];
+  async images() {
+    return this.imagesList;
   }
   async terminate(id: string) {
     this.terminated.push(id);

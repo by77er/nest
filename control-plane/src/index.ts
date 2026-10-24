@@ -162,6 +162,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     return json(await fleet(env, cell).hostStatus(p[1]!));
   }
   if (req.method === "GET" && path === "/v1/admin/fleet") return json(await fleet(env, cell).fleetView());
+  if (req.method === "GET" && path === "/v1/admin/images") return json(await fleet(env, cell).images());
   // The daily tunnel sweep, now (after a Cloudflare outage, or to see what the account holds).
   if (req.method === "POST" && path === "/v1/admin/tunnels/sweep") return json(await fleet(env, cell).tunnelSweep());
   if (req.method === "GET" && path === "/v1/admin/gc") return json(await fleet(env, cell).gcStatus());

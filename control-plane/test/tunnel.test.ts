@@ -7,7 +7,7 @@ import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import { CloudflareError, type CloudflareApi } from "../src/lib/cloudflare";
-import { CapacityError, type Ec2, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
+import { CapacityError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { NestError } from "../src/lib/util";
 import { ErrorCodes } from "../src/protocol/model";
@@ -429,7 +429,11 @@ describe("retirement releases the tunnel", () => {
       this.launched.push(spec);
       return `i-0${this.launched.length.toString(16).padStart(8, "0")}`;
     }
-    async terminate(id: string) {
+    imagesList: ImageInfo[] = [];
+  async images() {
+    return this.imagesList;
+  }
+  async terminate(id: string) {
       this.terminated.push(id);
     }
     async state(): Promise<InstanceState> {
