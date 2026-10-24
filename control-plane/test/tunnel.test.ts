@@ -419,7 +419,7 @@ describe("a revoked tunnel API token", () => {
 describe("retirement releases the tunnel", () => {
   const config: AwsCellConfig = {
     region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
-    max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+    max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
   };
   class MockEc2 implements Ec2 {
     terminated: string[] = [];

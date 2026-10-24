@@ -5,6 +5,7 @@
     "vcpus_free": 6,
     "memory_mib_free": 12288,
     "hugepages_mib_free": 8192,
+    "hugepages_mib_total": 16384,
     "sandboxes": 2,
     "agents": 3,
     "warm": [

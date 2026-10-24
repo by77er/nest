@@ -14,7 +14,16 @@ const AwsCell = z.object({
   idle_grace_ms: z.number().int().nonnegative().default(600_000),
   /** A launched instance that hasn't enrolled by then is terminated. */
   enroll_timeout_ms: z.number().int().positive().default(600_000),
+  /**
+   * What a sandbox on regular pages is expected to use (MiB), reserved against the host's reported
+   * free memory until the host counts it; its declared size is a ceiling, not a cost.
+   */
+  sandbox_reserve_mib: z.number().int().positive().default(768),
+  /** At most this many sandboxes per host on regular pages; 0 is no cap (memory decides). */
+  max_sandboxes_per_host: z.number().int().nonnegative().default(0),
 });
+
+export const DEFAULT_SANDBOX_RESERVE_MIB = 768;
 
 export type AwsCellConfig = z.infer<typeof AwsCell>;
 

@@ -322,7 +322,7 @@ describe("lease expiry and STONITH", () => {
 describe("autoscaling", () => {
   const config: AwsCellConfig = {
     region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a", "subnet-0b"],
-    instance_types: ["c8i-flex.large", "c8i.large"], spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+    instance_types: ["c8i-flex.large", "c8i.large"], spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
   };
 
   /** Run FleetDO's tick now, `ms` in the future as far as the idle and enroll clocks are concerned. */
@@ -494,7 +494,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     const ec2 = new MockEc2("running", "terminated");
     const config: AwsCellConfig = {
       region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"],
-      spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+      spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
     };
     const fleet = fleetStub(cell);
     const a = await connectHost(cell);
@@ -588,7 +588,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     const ec2 = new MockEc2("running");
     const config: AwsCellConfig = {
       region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"],
-      spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000,
+      spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
     };
     const a = await connectHost(cell);
     await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {

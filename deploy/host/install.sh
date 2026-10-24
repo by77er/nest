@@ -74,6 +74,8 @@ cat >/etc/systemd/system/nest-proxy.service <<'EOF'
 Description=nest egress proxy
 After=network-online.target
 [Service]
+# Under memory pressure the kernel kills a guest VMM (score 0), never nest's own services.
+OOMScoreAdjust=-900
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=NEST_LOG=info
@@ -90,6 +92,8 @@ Description=nest host daemon
 After=network-online.target nest-proxy.service
 Wants=network-online.target nest-proxy.service
 [Service]
+# Under memory pressure the kernel kills a guest VMM (score 0), never nest's own services.
+OOMScoreAdjust=-900
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=RUST_LOG=info
@@ -111,6 +115,8 @@ Description=nest sandbox gateway (hands over WebSocket to the guests' vsock port
 After=nestd.service
 Wants=nestd.service
 [Service]
+# Under memory pressure the kernel kills a guest VMM (score 0), never nest's own services.
+OOMScoreAdjust=-900
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=RUST_LOG=info
@@ -128,6 +134,8 @@ Description=nest agent runner (Claude Code brains)
 After=nestd.service
 Wants=nestd.service
 [Service]
+# Under memory pressure the kernel kills a guest VMM (score 0), never nest's own services.
+OOMScoreAdjust=-900
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=HOME=/root

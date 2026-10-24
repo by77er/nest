@@ -152,6 +152,11 @@ pub struct FirecrackerConfig {
     pub boot_args: String,
     /// Directory of base images: `<images_dir>/<image>.ext4`.
     pub images_dir: PathBuf,
+    /// Cap each jailed VM's memory (cgroup v2 `memory.max`) at its declared size plus this much
+    /// for the VMM itself, so a guest that outgrows its declaration dies alone instead of taking
+    /// the host with it (regular pages are overcommitted: a guest costs only what it touches).
+    #[serde(default = "default_vm_overhead_mib")]
+    pub vm_memory_overhead_mib: u32,
     /// Back guest memory with 2 MiB hugetlbfs pages.
     #[serde(default = "default_true")]
     pub huge_pages: bool,
@@ -263,6 +268,10 @@ fn default_true() -> bool {
 }
 fn default_chroot_base() -> PathBuf {
     "/srv/jailer".into()
+}
+
+fn default_vm_overhead_mib() -> u32 {
+    128
 }
 
 #[cfg(test)]

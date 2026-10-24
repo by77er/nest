@@ -11,7 +11,7 @@ import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
-import { awsCell, type AwsCellConfig } from "../lib/cells";
+import { awsCell, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig } from "../lib/cells";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
@@ -1005,30 +1005,38 @@ export class FleetDO extends DurableObject<Env> {
     if (req.cell) this.rememberCell(req.cell);
     this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     // Packing (docs/compute/autoscaling/): fill hosts before opening new ones, so idle hosts empty
-    // out. A host fits when its last capacity report, less what leases placed since reserve
-    // (a lease the host has not reported a state for), covers the sandbox's hugepages and vCPUs.
-    // An empty host always takes one: a sandbox larger than the host's pool is placed alone, as it
-    // was before packing (overcommitted; the pool and the default size are the open item).
+    // out. A host's room is its last capacity report less what leases placed since reserve (a
+    // lease the host has not reported a state for). On regular pages (no hugepage pool, the
+    // default) a sandbox costs what it touches: it reserves the cell's `sandbox_reserve_mib`
+    // against `memory_mib_free`, its declared size being a ceiling the jailer enforces, and an
+    // optional `max_sandboxes_per_host` caps the count. On a hugepage host the pool is a hard
+    // reservation: the declared size counts against `hugepages_mib_free`, declared vCPUs against
+    // `vcpus_free`. An empty host always takes one.
     const need = req.resources;
-    const free = (h: HostRow): { hugepages: number; vcpus: number; leases: number } | null => {
+    const cfg = this.cellConfig();
+    const reserveMib = cfg?.sandbox_reserve_mib ?? DEFAULT_SANDBOX_RESERVE_MIB;
+    const maxPerHost = cfg?.max_sandboxes_per_host ?? 0;
+    const room = (h: HostRow): { room: number; leases: number; fits: boolean } => {
       const leases = this.leasesOf(h.host);
-      if (!h.capacity) return leases.length ? null : { hugepages: Infinity, vcpus: Infinity, leases: 0 };
+      if (!h.capacity) return { room: leases.length ? 0 : Infinity, leases: leases.length, fits: leases.length === 0 };
       const cap = JSON.parse(h.capacity) as Capacity;
       const pending = leases.filter((l) => l.state === null);
-      return {
-        hugepages: cap.hugepages_mib_free - pending.reduce((sum, l) => sum + (l.memory_mib ?? need.memory_mib), 0),
-        vcpus: cap.vcpus_free - pending.reduce((sum, l) => sum + (l.vcpus ?? need.vcpus), 0),
-        leases: leases.length,
-      };
+      const hugepageHost = (cap.hugepages_mib_total ?? 0) > 0 || (cap.hugepages_mib_total === undefined && cap.hugepages_mib_free > 0);
+      if (hugepageHost) {
+        const huge = cap.hugepages_mib_free - pending.reduce((sum, l) => sum + (l.memory_mib ?? need.memory_mib), 0);
+        const vcpus = cap.vcpus_free - pending.reduce((sum, l) => sum + (l.vcpus ?? need.vcpus), 0);
+        return { room: huge - need.memory_mib, leases: leases.length, fits: leases.length === 0 || (huge >= need.memory_mib && vcpus >= need.vcpus) };
+      }
+      const mem = cap.memory_mib_free - pending.length * reserveMib;
+      const underCap = maxPerHost === 0 || leases.length < maxPerHost;
+      return { room: mem - reserveMib, leases: leases.length, fits: leases.length === 0 || (underCap && mem >= reserveMib) };
     };
-    const fits = (f: { hugepages: number; vcpus: number; leases: number } | null) =>
-      !!f && (f.leases === 0 || (f.hugepages >= need.memory_mib && f.vcpus >= need.vcpus));
     const candidates = this.sql
       .exec<HostRow>("SELECT * FROM hosts WHERE role = 'burst' AND status = 'active'")
       .toArray()
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
-      .map((h) => ({ h, f: free(h) }))
-      .filter((c) => fits(c.f));
+      .map((h) => ({ h, r: room(h) }))
+      .filter((c) => c.r.fits);
     if (!candidates.length) {
       // SandboxDO retries placement on its own alarm; by then the new host may have enrolled.
       await this.scaleUp();
@@ -1038,10 +1046,9 @@ export class FleetDO extends DurableObject<Env> {
       if (!req.from || !h.capacity) return false;
       return (JSON.parse(h.capacity) as Capacity).warm.includes(req.from.id);
     };
-    // Warm snapshot first; then the fullest host that still fits (fewest free hugepages, then
-    // fewest free vCPUs, then most leases).
-    candidates.sort((a, b) => Number(warm(b.h)) - Number(warm(a.h))
-      || a.f!.hugepages - b.f!.hugepages || a.f!.vcpus - b.f!.vcpus || b.f!.leases - a.f!.leases);
+    // Warm snapshot first; then the fullest host that still fits (least room left after this
+    // sandbox, then most leases).
+    candidates.sort((a, b) => Number(warm(b.h)) - Number(warm(a.h)) || a.r.room - b.r.room || b.r.leases - a.r.leases);
     const host = candidates[0]!.h.host;
     this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, vcpus, memory_mib) VALUES (?, ?, ?, 0, ?, ?)",
       req.sandbox, host, req.epoch, need.vcpus, need.memory_mib);

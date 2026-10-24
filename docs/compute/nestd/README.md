@@ -37,4 +37,5 @@ The per-host daemon. It's trusted, but it's fenced.
 - **Spot interruptions** (planned): poll instance metadata for the 2-minute notice, then cut every disk and run a prioritized checkpoint and commit ([spot notice](../../sandbox/state/#spot-notice-2-minutes)).
 - **Process supervision** (planned): VMs in systemd scopes with `BindsTo=nestd`, and `WatchdogSec` on nestd, so if nestd dies its VMs die with it.
 - **Credentials:** S3 access comes from the instance role. nestd has no R2 credentials; it reads R2 only through Worker-signed URLs from DOs.
+- **Guest memory is regular pages** on real hosts (`huge_pages: false`): a VM costs what it touches. The jailer caps each VMM's cgroup (`--cgroup-version 2 --cgroup memory.max=`) at the declared memory plus `vm_memory_overhead_mib` (128), and the capacity report carries `MemAvailable` (`memory_mib_free`) and the hugepage pool's size (`hugepages_mib_total`, 0 here), which is how the control plane packs ([memory](../../sandbox/state/memory/)).
 - **Runs alongside** [nest-proxy](../../sandbox/networking/egress/), cloudflared and the [gateway](../../sandbox/gateway/) on sandbox hosts, and the agent runner on brain hosts.

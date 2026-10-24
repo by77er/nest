@@ -77,7 +77,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `WAKE_BATCH_MS` | Captain wake batching window; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
 | `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname. The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url` |
-| `AWS_CELLS` | Autoscaled cells: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?}` (`src/lib/cells.ts`). A cell without an entry is never scaled |
+| `AWS_CELLS` | Autoscaled cells: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?, sandbox_reserve_mib?, max_sandboxes_per_host?}` (`src/lib/cells.ts`). A cell without an entry is never scaled |
 
 Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its resend queue) carry
 `$nest-secret:<name>` references, resolved when the command is sent to a host.
@@ -116,8 +116,8 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   `WorkstreamEvent` and batched captain wakes, a role-filtered tool catalog, and a `workstream`
   egress policy layer. Taint and sinks, budgets, wake envelopes and the hands journal aren't built either.
   Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
-  commit and flushes at turn boundaries. Placement packs by free hugepages and vCPUs as designed
-  (`test/placement.test.ts`); an empty host still takes a sandbox larger than its pool. The contract changes are listed in `docs/interfaces/README.md`.
+  commit and flushes at turn boundaries. Placement packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox
+  reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one. The contract changes are listed in `docs/interfaces/README.md`.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
   `attach`, `checkpoint`, `brokered`, and all captain tools except `notify`, `ask` and `read_transcript`.
 - **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.

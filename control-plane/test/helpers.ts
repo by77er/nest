@@ -132,7 +132,7 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
     gateway_url: GATEWAY_URL,
     sandboxes: [],
     agents: [],
-    capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, sandboxes: 0, agents: 0, warm: [] },
+    capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, hugepages_mib_total: 8192, sandboxes: 0, agents: 0, warm: [] },
     ...extra,
   };
 }
