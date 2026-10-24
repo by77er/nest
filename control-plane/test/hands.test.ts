@@ -32,12 +32,14 @@ async function failResult(ws: Ws, cmd: string, retryable = true) {
   await ws.next("ack", (m) => m.up_to >= seq);
 }
 
-const running = async (ws: Ws, sandbox: string, epoch: number, state = "running") => {
-  const seq = sendEvents(ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox, epoch, state }]);
+/** What nestd reports for the guest with every `running` (shape: protocol/fixtures/control/host_event/sandbox_state.running.json). */
+const GUEST = { protocol_version: 1, capabilities: [] };
+const running = async (ws: Ws, sandbox: string, epoch: number, state = "running", guest: unknown = GUEST) => {
+  const seq = sendEvents(ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox, epoch, state, ...(state === "running" && guest ? { guest } : {}) }]);
   await ws.next("ack", (m) => m.up_to >= seq);
 };
 
-async function setup() {
+async function setup(opts: { guest?: unknown } = {}) {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-hands" } });
   const host = await connectHost(cell);
@@ -47,7 +49,7 @@ async function setup() {
   const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, start: false } }, 201);
   const [attach] = await nextCommands(host.ws, (c) => c.type === "agent_attach" && c.agent === worker.agent);
   // nestd reports `running` once the guest is up, before any attach result; resolve needs it.
-  await running(host.ws, sbx.sandbox, 1);
+  await running(host.ws, sbx.sandbox, 1, "running", "guest" in opts ? opts.guest : GUEST);
   const pub = b64urlToBytes(host.keys[0]!.public_key);
   return { cell, host, workstream, sandbox: sbx.sandbox as string, agent: worker.agent as string, attach, pub };
 }
@@ -262,9 +264,11 @@ describe("attach and resolve", () => {
     await expect(Promise.resolve().then(() => sandboxStub(s.sandbox).resolve(s.agent))).rejects.toThrow(/not_bound/);
   });
 
-  it("the guest's version from a running report reaches the next target", async () => {
-    const s = await setup();
+  it("the guest's version comes only from a running report: none reported is not ready, never a guess", async () => {
+    const s = await setup({ guest: null });
     await okResult(s.host.ws, s.attach.cmd);
+    const unknown = await sandboxStub(s.sandbox).resolve(s.agent).then(() => null, (e: Error) => e);
+    expect(unknown?.message).toMatch(/^nest:sandbox_not_ready:503:1:/);
     const guest = { protocol_version: 1, capabilities: ["pty", "cgroup_v2"] };
     const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: s.sandbox, epoch: 1, state: "running", guest }]);
     await s.host.ws.next("ack", (m) => m.up_to >= seq);

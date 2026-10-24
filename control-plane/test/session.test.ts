@@ -239,7 +239,8 @@ describe("platform tool relay", () => {
 
     ws.send(toolCall("cal_t4-3", "expose_port", { port: 3000 }));
     const ex = await ws.next("tool_result", (m) => m.call === "cal_t4-3");
-    expect(ex.outcome.content[1].value.url).toBe(`https://3000-${s.sandbox}.preview.nest.localhost`);
+    // Named by the hostname rule (a first-level label, kind as suffix, no `_`), without NEST_DOMAIN under `nest.localhost`.
+    expect(ex.outcome.content[1].value.url).toBe(`https://3000-${s.sandbox.slice("sbx_".length)}-preview-nest.localhost`);
     const [expose] = await nextCommands(s.host.ws, (c) => c.type === "port_expose");
     expect(expose).toMatchObject({ sandbox: s.sandbox, epoch: 1, port: 3000, host_header: { mode: "localhost" } });
 
@@ -248,6 +249,6 @@ describe("platform tool relay", () => {
     const denied = await ws.next("tool_result", (m) => m.call === "cal_t4-4");
     expect(denied.outcome.error.code).toBe("forbidden");
     const shared = await adminJson(`/v1/sandboxes/${s.sandbox}/ports`, { body: { port: 3000, share: true } });
-    expect(shared.share_url).toMatch(/^https:\/\/3000-sbx_\w+\.share\.nest\.localhost\/\?exp=\d+&sig=/);
+    expect(shared.share_url).toMatch(/^https:\/\/3000-[0-9a-z]{26}-share-nest\.localhost\/\?exp=\d+&sig=/);
   });
 });

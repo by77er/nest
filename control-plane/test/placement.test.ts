@@ -51,7 +51,7 @@ describe("placement packs", () => {
     expect(v.sandboxes.filter((s) => s.host === null).map((s) => s.sandbox)).toEqual([s5.sandbox]);
   });
 
-  it("a reported state ends a lease's reservation; the host's report then rules", async () => {
+  it("a capacity report after the leases' first states ends their reservation; the host's report then rules", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
     const { workstream: ws } = await workstream();
@@ -91,6 +91,27 @@ describe("placement on regular pages", () => {
     const placed = [await place(cell, ws), await place(cell, ws), await place(cell, ws)];
     expect(placed.map((p) => p.host), "three fit: 2560 - 2*768 = 1024 >= 768").toEqual([a.host, a.host, a.host]);
     expect((await place(cell, ws, 202)).host, "the fourth would leave less than a reserve").toBeNull();
+  });
+
+  it("a burst keeps its reservations until a capacity report made after the sandboxes reported", async () => {
+    const cell = uniqueCell();
+    // Room for two reserves (2000 - 768 = 1232 >= 768), not three (2000 - 2*768 = 464).
+    const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 2000, vcpus_free: 2 });
+    const { workstream: ws } = await workstream();
+    const s1 = await place(cell, ws);
+    const s2 = await place(cell, ws);
+    expect([s1.host, s2.host]).toEqual([a.host, a.host]);
+    // nestd reports state at once, capacity at most every 30 s: the stale report counts neither.
+    let seq = sendEvents(a.ws, [
+      { ts_ms: Date.now(), type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "creating" },
+      { ts_ms: Date.now(), type: "sandbox_state", sandbox: s2.sandbox, epoch: 1, state: "running" },
+    ]);
+    await a.ws.next("ack", (m) => m.up_to >= seq);
+    expect((await place(cell, ws, 202)).host, "still reserved: the last report predates both").toBeNull();
+    // A report made since counts them; its free memory rules.
+    seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "capacity", capacity: { vcpus_free: 2, memory_mib_free: 2000, hugepages_mib_free: 0, hugepages_mib_total: 0, sandboxes: 2, agents: 0, warm: [] } }]);
+    await a.ws.next("ack", (m) => m.up_to >= seq);
+    expect((await place(cell, ws)).host).toBe(a.host);
   });
 
   it("declared vCPUs are a shape, not a reservation: a 2 vCPU host takes several 2 vCPU sandboxes", async () => {

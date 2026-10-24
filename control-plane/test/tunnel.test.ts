@@ -190,7 +190,7 @@ async function attached(cell: string, hello: Record<string, unknown> = {}) {
   await nextCommands(host.ws, (c) => c.type === "sandbox_create");
   const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, start: false } }, 201);
   const [attach] = await nextCommands(host.ws, (c) => c.type === "agent_attach" && c.agent === worker.agent);
-  const seq = sendEvents(host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "running" }]);
+  const seq = sendEvents(host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "running", guest: { protocol_version: 1, capabilities: [] } }]);
   await host.ws.next("ack", (m) => m.up_to >= seq);
   await okResult(host.ws, attach.cmd);
   return { host, workstream, sandbox: sbx.sandbox as string, agent: worker.agent as string };
@@ -302,17 +302,17 @@ describe("resolve through the tunnel", () => {
     expect(viaApi.edge).toEqual(t2.edge);
   });
 
-  it("the tunnel is advertised only while the host reports it connected; connecting waits, none falls back to the hello URL", async () => {
+  it("the tunnel is advertised only while the host reports it connected; connecting and none wait, never the hello URL", async () => {
     const cell = uniqueCell();
     await withCloudflare(cell);
     await storeAccessToken();
-    // An old nestd, or one without cloudflared: the hello says nothing about a tunnel. The host's
-    // own URL still works, since every brain starts on its sandbox's host; never with the edge token.
+    // An old nestd, or one without cloudflared: the hello says nothing about a tunnel. Its hello URL
+    // is its own loopback, which no runner on another host can reach: not ready, never that URL.
     const s = await attached(cell);
-    const t0 = await sandboxStub(s.sandbox).resolve(s.agent);
-    expect(t0.url).toBe("ws://127.0.0.1:18790");
-    expect(t0.edge).toBeUndefined();
-    expect(await fleetStub(cell).hostGatewayUrl(s.host.host)).toEqual({ kind: "direct", url: "ws://127.0.0.1:18790", tunnel: hostnameOf(s.host.host) });
+    const down = await sandboxStub(s.sandbox).resolve(s.agent).then(() => null, (e: unknown) => e as NestError);
+    expect(down?.code).toBe(ErrorCodes.SANDBOX_NOT_READY);
+    expect(down?.retryable).toBe(true);
+    expect(await fleetStub(cell).hostGatewayUrl(s.host.host)).toEqual({ kind: "down", tunnel: hostnameOf(s.host.host) });
     // cloudflared is up but has no ready connection: nothing answers at the hostname yet.
     let seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "tunnel_state", state: "connecting" }]);
     await s.host.ws.next("ack", (m) => m.up_to >= seq);
