@@ -47,7 +47,10 @@ export interface SandboxRow {
   registered_ms: number;
   host: string | null;
   epoch: number | null;
+  /** The lease's reported state on a host; the sandbox's own state when it has no lease. */
   state: string | null;
+  image: string | null;
+  workstream: string | null;
 }
 
 export interface Fleet {
@@ -65,10 +68,18 @@ export interface Image {
   tags: Record<string, string>;
 }
 
+export interface Template {
+  name: string;
+  default: boolean;
+  source: string;
+  in_use: number;
+}
+
 export interface Images {
   current: string | null;
   current_since_ms: number | null;
   images: Image[];
+  templates?: Template[];
 }
 
 export class ApiError extends Error {

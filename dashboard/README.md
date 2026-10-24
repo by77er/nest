@@ -1,8 +1,9 @@
 # nest dashboard
 
-A read-only page for one cell: hosts with their tunnel state, capacity, resident sandboxes and
-brains; every live sandbox (unplaced ones too); launches in flight; the host AMIs and the one the
-launch template resolves to. Vite + React, served by its own Worker (`src/worker.ts`), which
+A read-only page of what is live in one cell: agents and the host each brain runs on, sandboxes
+and the host each runs on (a sandbox suspended to S3 is counted, not listed), live hosts with
+their residents, and the sandbox templates. History (retired hosts, launches) and AMIs stay off
+it. Vite + React, served by its own Worker (`src/worker.ts`), which
 proxies exactly two routes of the control plane's admin API (`GET /v1/admin/fleet`,
 `GET /v1/admin/images`) with the admin token it holds as a secret. Nothing is shared with the
 control plane but that API; the page refreshes every 10 s.
