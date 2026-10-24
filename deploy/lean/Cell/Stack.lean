@@ -41,8 +41,9 @@ import Cell.Iam
 /-!
 One nest cell on AWS (docs/compute/provisioning/): public subnets with no NAT and an S3 gateway
 endpoint, an egress-only host security group, the cell's bucket, the burst hosts' role and launch
-template, the host-image pipeline, the control plane's IAM user, and the deploy role GitHub Actions
-assumes over OIDC. It creates no instances: FleetDO launches them.
+template, the host-image pipeline, the control plane's IAM user and its autoscaler settings
+(`AWS_CELLS` in SSM), and the deploy role GitHub Actions assumes over OIDC. It creates no
+instances: FleetDO launches them.
 -/
 
 open Inframe
@@ -59,8 +60,22 @@ structure CellSpec where
   accountId : String
   /-- The control plane's public URL, which hosts enroll with. -/
   controlUrl : String
-  /-- Instance-type patterns the control plane may launch: the 8i family only. -/
-  instanceTypes : List String := ["c8i*.*", "m8i*.*", "r8i*.*"]
+  /-- Instance families the control plane may launch, the 8i family only: IAM allows `<family>*.*`. -/
+  instanceFamilies : List String := ["c8i", "m8i", "r8i"]
+  /-- The instance types FleetDO launches, in preference order; the first is also the on-demand
+  fallback. Each must fall within `instanceFamilies` (`launch_types_within_iam` in `Cell.Test`). -/
+  launchTypes : List String
+  /-- The autoscaler's settings (control-plane/src/lib/cells.ts, `AWS_CELLS`); the defaults are its own. -/
+  spot : Bool := true
+  maxHosts : Nat := 1
+  /-- How long a burst host holding no sandbox and no agent stays before it's terminated. -/
+  idleGraceMs : Nat := 600000
+  /-- A launched instance that hasn't enrolled by then is terminated. -/
+  enrollTimeoutMs : Nat := 600000
+  /-- What a sandbox on regular pages is expected to use, reserved until the host counts it. -/
+  sandboxReserveMib : Nat := 768
+  /-- At most this many sandboxes per host on regular pages; 0 is no cap. -/
+  maxSandboxesPerHost : Nat := 0
   /-- The GitHub repository that may assume the deploy role (dev/deploy.md), in GitHub's immutable
   OIDC subject form `OWNER@OWNER-ID/REPO@REPO-ID`: repositories created after 2026-07-15 put the
   owner and repository ids in the `sub` claim, and they can't be removed. -/
@@ -71,6 +86,50 @@ structure CellSpec where
 def hostEgress : List (String × Nat) := [("tcp", 443), ("tcp", 7844), ("udp", 7844)]
 
 def bucketName (spec : CellSpec) : String := s!"nest-{spec.name}-{spec.accountId}"
+
+/-- The `ec2:InstanceType` patterns IAM allows (`EightIOnly`). -/
+def instancePatterns (spec : CellSpec) : List String := spec.instanceFamilies.map (· ++ "*.*")
+
+/-- Whether `type` matches IAM's `StringLike` pattern `<family>*.*`: it starts with the family and
+has a `.` after it. (`*` matches any run of characters, including none.) -/
+def matchesFamily (family type : String) : Bool :=
+  family.toList.isPrefixOf type.toList && (type.toList.drop family.length).contains '.'
+
+/-- Every type the autoscaler may pick is one IAM lets it launch. -/
+def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=
+  spec.launchTypes.all fun t => spec.instanceFamilies.any (matchesFamily · t)
+
+/-- The SSM parameter the control plane's deploy reads `AWS_CELLS` from (dev/deploy-use1.sh). -/
+def awsCellsParameter : String := "/nest/control-plane/vars/AWS_CELLS"
+
+/-- `AWS_CELLS` (control-plane/src/lib/cells.ts): this cell's autoscaler settings, keyed by its name,
+from a launch template id, subnet ids and the spec. Generic over the string type, so `Cell.Test`
+can render it with plain strings and parse the JSON; no value needs escaping. -/
+def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : CellSpec) (launchTemplateId : α)
+    (subnetIds : List α) : α :=
+  let quote (v : α) : α := str "\"" ++ v ++ str "\""
+  let join : List α → α
+    | [] => str ""
+    | x :: rest => rest.foldl (fun acc y => acc ++ str "," ++ y) x
+  let field (key : String) (value : α) : α := quote (str key) ++ str ":" ++ value
+  let number (n : Nat) : α := str (toString n)
+  let strings (xs : List α) : α := str "[" ++ join (xs.map quote) ++ str "]"
+  str "{" ++ quote (str spec.name) ++ str ":{" ++ join
+    [ field "region" (quote (str spec.region))
+    , field "launch_template_id" (quote launchTemplateId)
+    , field "subnet_ids" (strings subnetIds)
+    , field "instance_types" (strings (spec.launchTypes.map str))
+    , field "spot" (str (if spec.spot then "true" else "false"))
+    , field "max_hosts" (number spec.maxHosts)
+    , field "idle_grace_ms" (number spec.idleGraceMs)
+    , field "enroll_timeout_ms" (number spec.enrollTimeoutMs)
+    , field "sandbox_reserve_mib" (number spec.sandboxReserveMib)
+    , field "max_sandboxes_per_host" (number spec.maxSandboxesPerHost) ]
+    ++ str "}}"
+
+/-- `AWS_CELLS` from the stack's own launch template and subnets. -/
+def awsCells (spec : CellSpec) (launchTemplateId : Input String) (subnetIds : List (Input String)) : Input String :=
+  awsCellsWith lit spec launchTemplateId subnetIds
 
 def bootstrapTemplate : String := include_str "../../host/bootstrap.sh"
 def installTemplate : String := include_str "../../host/install.sh"
@@ -126,7 +185,7 @@ def controlPlaneStatements (spec : CellSpec) (template hostRole rootKey : Input 
   , { sid := "SecurityGroupFromTemplate", actions := ["ec2:RunInstances"], resources := [ec2 "security-group/*"]
       conditions := [fromTemplate, { op := "Bool", entries := [("ec2:IsLaunchTemplateResource", ["true"])] }] }
   , { sid := "EightIOnly", actions := ["ec2:RunInstances"], resources := [ec2 "instance/*"]
-      conditions := [fromTemplate, { op := "StringLike", entries := [("ec2:InstanceType", spec.instanceTypes.map lit)] }] }
+      conditions := [fromTemplate, { op := "StringLike", entries := [("ec2:InstanceType", (instancePatterns spec).map lit)] }] }
   , { sid := "TagAtLaunch", actions := ["ec2:CreateTags"], resources := [lit "*"]
       conditions := [{ op := "StringEquals", entries := [("ec2:CreateAction", ["RunInstances"])] }] }
   , { sid := "PassHostRole", actions := ["iam:PassRole"], resources := [hostRole]
@@ -325,6 +384,12 @@ def cell (spec : CellSpec) : Infra Unit := do
   let fleet ← IamPolicy.create "control_plane_fleet"
     { name := lit s!"nest-{spec.name}-fleet", policy := document (controlPlaneStatements spec templateArn hostRole.arn rootKey.arn) }
   let _ ← IamUserPolicyAttachment.create "control_plane_fleet" { user := cp.name, policyArn := fleet.arn }
+  -- The autoscaler's settings, from the template and subnets above: a replaced template or subnet
+  -- reaches the Worker on the deploy that follows the apply (dev/deploy-use1.sh reads it).
+  let _ ← SsmParameter.create "aws_cells"
+    { name := lit awsCellsParameter, type := "String"
+      insecureValue := awsCells spec template.id [subnetA.id, subnetB.id, subnetC.id]
+      description := lit s!"nest: AWS_CELLS for the control plane (written by the {spec.name} cell stack)" }
 
   -- Spot interruption drill: `aws fis start-experiment --experiment-template-id <output>` sends a
   -- real two-minute notice to one running nest spot instance.

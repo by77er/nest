@@ -1,7 +1,9 @@
 #!/bin/bash
 # Deploys nest-control-plane for the use1 cell: run by deploy.yml, or by hand (dev/deploy.md).
 # Worker secrets persist across versions; `--var`s don't, so every deploy passes them again. They
-# live in SSM next to the secrets (/nest/control-plane/vars/*). Needs CLOUDFLARE_* and AWS_* in env.
+# live in SSM next to the secrets (/nest/control-plane/vars/*): AWS_CELLS is written by the cell stack
+# (deploy/lean/Cell/Stack.lean, applied just before this runs), the others by hand. Needs CLOUDFLARE_*
+# and AWS_* in env.
 set -euo pipefail
 cd "$(dirname "$0")/../control-plane"
 var() { aws ssm get-parameter --region us-east-1 --name "/nest/control-plane/vars/$1" --query Parameter.Value --output text 2>/dev/null; }
@@ -27,7 +29,7 @@ if [ -n "${CLOUDFLARE_TUNNEL_API_TOKEN:-}" ]; then
   printf '%s' "$CLOUDFLARE_TUNNEL_API_TOKEN" | npx wrangler secret put CLOUDFLARE_TUNNEL_API_TOKEN
 fi
 # NEST_DOMAIN names the nest label and the zone (nest.bitcru.sh: label `nest`, zone `bitcru.sh`) for the
-# per-host tunnel hostnames; the account id is where the tunnels are created.
+# per-host tunnel, preview and share hostnames; the account id is where the tunnels are created.
 npx wrangler deploy --message "$(git rev-parse --short HEAD) ${1:-manual}" \
-  --var PREVIEW_DOMAIN:preview.nest.bitcru.sh --var CELLS:use1 --var NEST_DOMAIN:nest.bitcru.sh \
+  --var CELLS:use1 --var NEST_DOMAIN:nest.bitcru.sh \
   "${required[@]}" "${optional[@]}"

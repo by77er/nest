@@ -80,7 +80,7 @@ pub struct GuestInfo {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingScope {
     Hands,
@@ -241,13 +241,16 @@ pub mod error_code {
     pub const MOVED: &str = "moved";
     /// The client's gateway version is outside the served range, the claims format is unknown,
     /// or `bind.protocol_version` is not the guest's version (then `message` names it).
-    pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
+    pub const UNSUPPORTED_VERSION: &str = crate::model::error_codes::UNSUPPORTED_VERSION;
     /// Not yet: the binding's epoch is newer than this gateway's table (a placement that nestd
     /// has not pushed yet), the guest has not been configured, a resync is in progress, or the
     /// vsock connect failed. Retryable with the same binding after `retry_after_ms`.
     pub const BUSY: &str = "busy";
     /// The first message was not a well-formed `bind` text frame, or the route is unknown.
     pub const BAD_REQUEST: &str = "bad_request";
+
+    /// Every refusal code; `protocol/fixtures/codes.json` holds the same list (`gateway`).
+    pub const ALL: &[&str] = &[UNAUTHORIZED, UNKNOWN_KEY, STALE_EPOCH, MOVED, UNSUPPORTED_VERSION, BUSY, BAD_REQUEST];
 }
 
 /// WebSocket close codes the gateway uses after `bound`, when text frames are no longer allowed.

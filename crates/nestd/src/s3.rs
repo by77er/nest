@@ -48,6 +48,9 @@ impl Default for S3Options {
 /// A commit reuses an object only if it was last uploaded under this long ago, and uploads it again
 /// otherwise: GC deletes only objects unmarked for 24 h, so whatever a new generation needs is
 /// always inside that grace (`docs/sandbox/state/object-store/#garbage-collection`).
+///
+/// Coupled to FleetDO's `GC_GRACE_MS` (`control-plane/src/do/fleet.ts`), which must stay larger:
+/// a test reads it from there and fails if it doesn't.
 pub const REUSE_MS: i64 = 12 * 3_600_000;
 
 /// Parts of one multipart upload in flight at once.
@@ -680,6 +683,26 @@ async fn imds_credentials(http: &reqwest::Client, imds_url: &str) -> anyhow::Res
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// nestd review #9: reuse is safe only while GC's grace (FleetDO's `GC_GRACE_MS`) is longer
+    /// than [`super::REUSE_MS`]; lowering the grace below it would let a new generation reference
+    /// chunks GC is deleting.
+    #[test]
+    fn reuse_window_is_inside_the_gc_grace() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../control-plane/src/do/fleet.ts");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            eprintln!("NEST-TEST-SKIP: {} not found", path.display());
+            return;
+        };
+        let rhs = src.lines().find_map(|l| l.trim().strip_prefix("const GC_GRACE_MS =")).expect("GC_GRACE_MS in fleet.ts");
+        let grace: i64 = rhs
+            .trim()
+            .trim_end_matches(';')
+            .split('*')
+            .map(|f| f.trim().replace('_', "").parse::<i64>().unwrap_or_else(|_| panic!("GC_GRACE_MS is not a product of integers: {rhs}")))
+            .product();
+        assert!(grace > super::REUSE_MS, "GC_GRACE_MS ({grace} ms) must exceed REUSE_MS ({} ms)", super::REUSE_MS);
+    }
+
     use std::collections::HashMap;
     use std::sync::Arc;
 

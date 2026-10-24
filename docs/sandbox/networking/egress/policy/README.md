@@ -29,7 +29,7 @@ It applies to every upstream connect (inspect, passthrough, TCP exceptions) and 
 
 ## Changes
 
-- **Every policy carries a `version`** that increases per sandbox, and the proxy acknowledges each one by `(sandbox, epoch, version, sha256)` before nestd boots or resumes the VM ([steering](../steering/)).
+- **Every policy carries a `version`** that increases per sandbox; the proxy ignores one that isn't newer. Designed, not built: the proxy acknowledges each one by `(sandbox, epoch, version, sha256)` before nestd boots or resumes the VM ([steering](../steering/)).
 - **Open connections are re-checked.** Each connection records the policy version it was admitted under. When a new version arrives, or a grant expires (the proxy arms a timer for the earliest `expires`), the proxy re-evaluates every open connection of the sandbox and closes the ones the policy now denies (`policy_changed`):
   - h1 and h2 keep-alive connections (h2 gets `GOAWAY`), and upgraded WebSockets
   - passthrough splices, which are also closed when the host now requires inspection: opaque TLS can't become inspected on the same connection

@@ -70,17 +70,54 @@ fn tool_result_events(message: &Value) -> Vec<AgentEventBody> {
     out
 }
 
+/// A `result` answers one user message, not necessarily the turn: the end of the turn is the
+/// actor's to decide (no messages outstanding), from the [`TurnTally`] of its results.
 fn result_events(r: &ResultMessage) -> Vec<AgentEventBody> {
-    let usage = usage_from(&r.usage, Some(r.total_cost_usd));
-    let stop_reason = r.stop_reason.clone().unwrap_or_else(|| r.subtype.clone());
-    let mut out = vec![AgentEventBody::TurnCompleted { stop_reason, usage: Some(usage) }];
     if r.is_error {
-        out.push(AgentEventBody::Error {
+        vec![AgentEventBody::Error {
             error: ErrorBody { code: r.subtype.clone(), message: r.result.clone().unwrap_or_default(), retryable: true },
-        });
+        }]
+    } else {
+        Vec::new()
     }
-    out.push(AgentEventBody::StateChanged { state: AgentState::Idle, detail: None });
-    out
+}
+
+/// The `result`s of one turn (a turn's own message plus any inbox messages written mid-turn),
+/// reported once as `turn_completed` when the turn ends: the last stop reason, the usage summed.
+/// UNVERIFIED that each `result.total_cost_usd` covers only its own message in stream-json
+/// input mode; the cost is a client-side estimate either way.
+#[derive(Debug, Default)]
+pub struct TurnTally {
+    last: Option<(String, Usage)>,
+}
+
+impl TurnTally {
+    pub fn add(&mut self, r: &ResultMessage) {
+        let u = usage_from(&r.usage, Some(r.total_cost_usd));
+        let stop_reason = r.stop_reason.clone().unwrap_or_else(|| r.subtype.clone());
+        let usage = match self.last.take() {
+            None => u,
+            Some((_, acc)) => Usage {
+                input_tokens: acc.input_tokens + u.input_tokens,
+                output_tokens: acc.output_tokens + u.output_tokens,
+                cache_read_input_tokens: acc.cache_read_input_tokens + u.cache_read_input_tokens,
+                cache_creation_input_tokens: acc.cache_creation_input_tokens + u.cache_creation_input_tokens,
+                cost_usd_estimate: Some(acc.cost_usd_estimate.unwrap_or(0.0) + u.cost_usd_estimate.unwrap_or(0.0)),
+            },
+        };
+        self.last = Some((stop_reason, usage));
+    }
+
+    /// `turn_completed` + `state_changed idle`, and a fresh tally. Nothing if no `result` came.
+    pub fn finish(&mut self) -> Vec<AgentEventBody> {
+        match self.last.take() {
+            Some((stop_reason, usage)) => vec![
+                AgentEventBody::TurnCompleted { stop_reason, usage: Some(usage) },
+                AgentEventBody::StateChanged { state: AgentState::Idle, detail: None },
+            ],
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Parse a Messages-API-style usage object.
@@ -132,7 +169,17 @@ mod tests {
 
     #[test]
     fn maps_reference_stream() {
-        let all: Vec<AgentEventBody> = reference_lines().iter().flat_map(events_for).collect();
+        let lines = reference_lines();
+        let mut all: Vec<AgentEventBody> = lines.iter().flat_map(events_for).collect();
+        // The turn's end comes from the actor's tally of its results, not from `events_for`.
+        let mut tally = TurnTally::default();
+        for l in &lines {
+            if let StreamOut::Result(r) = l {
+                tally.add(r);
+            }
+        }
+        all.extend(tally.finish());
+        assert!(tally.finish().is_empty(), "finish resets the tally");
         let kinds: Vec<&str> = all
             .iter()
             .map(|e| match e {
@@ -168,6 +215,30 @@ mod tests {
                 assert_eq!(stop_reason, "end_turn");
                 let u = usage.unwrap();
                 assert_eq!((u.input_tokens, u.cache_read_input_tokens), (2048, 40000));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn a_result_alone_never_completes_a_turn_and_the_tally_sums_usage() {
+        let result = |stop: &str, input: u64, cost: f64| -> ResultMessage {
+            serde_json::from_value(serde_json::json!({
+                "type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "duration_ms": 1,
+                "total_cost_usd": cost, "usage": {"input_tokens": input, "output_tokens": 1}, "stop_reason": stop, "result": "x",
+                "session_id": "s"
+            }))
+            .unwrap()
+        };
+        let (r1, r2) = (result("tool_use", 10, 0.25), result("end_turn", 5, 0.5));
+        assert!(events_for(&StreamOut::Result(r1.clone())).is_empty(), "no turn_completed, no idle");
+        let mut tally = TurnTally::default();
+        tally.add(&r1);
+        tally.add(&r2);
+        match tally.finish().as_slice() {
+            [AgentEventBody::TurnCompleted { stop_reason, usage: Some(u) }, AgentEventBody::StateChanged { state: AgentState::Idle, .. }] => {
+                assert_eq!(stop_reason, "end_turn");
+                assert_eq!((u.input_tokens, u.output_tokens, u.cost_usd_estimate), (15, 2, Some(0.75)));
             }
             e => panic!("{e:?}"),
         }

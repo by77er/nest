@@ -40,7 +40,7 @@ stripe-read:
 
 ## Secrets in the proxy
 
-- **They arrive with the policy:** each push carries the policy's version and sha256 ([nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/)). The proxy **refuses a secret whose binding isn't in the installed policy**, or that names another policy version or hash.
+- **They arrive separately today** (`secrets_set`, checked against the sandbox's epoch only). Designed, not built: each push carries the policy's version and sha256, and the proxy **refuses a secret whose binding isn't in the installed policy**, or that names another policy version or hash ([nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#policy-acknowledgement)).
 - **Fenced:** after the sandbox's lease or epoch expires, bindings stop substituting.
 - **Alerts carry the binding name** (`ProxyEvent::Alert.binding`) for `placeholder_wrong_host` and `injection_after_expiry`. Domain-fronting alerts have none.
 

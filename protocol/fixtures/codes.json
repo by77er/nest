@@ -1,0 +1,29 @@
+{
+  "error_codes": [
+    "stale_epoch",
+    "parent_mismatch",
+    "unknown_sandbox",
+    "unknown_agent",
+    "unauthorized",
+    "forbidden",
+    "unsupported_version",
+    "invalid_message",
+    "unknown_tool",
+    "capacity_exhausted",
+    "rate_limited",
+    "not_bound",
+    "sandbox_not_ready",
+    "internal",
+    "not_implemented",
+    "outcome_unknown"
+  ],
+  "gateway_error_codes": [
+    "unauthorized",
+    "unknown_key",
+    "stale_epoch",
+    "moved",
+    "unsupported_version",
+    "busy",
+    "bad_request"
+  ]
+}

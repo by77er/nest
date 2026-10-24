@@ -8,7 +8,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
-import { b64url, NestError, newId } from "../lib/util";
+import { splitDomain } from "../lib/cloudflare";
+import { asNestError, b64url, NestError, newId } from "../lib/util";
 import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "../protocol/control";
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
@@ -79,6 +80,7 @@ export interface CreateSandbox {
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
+/** A `placing` marker this old belongs to a placement that never finished: reconciled against FleetDO's lease. */
 const PLACING_STALE_MS = 60_000;
 const PLACE_RETRY_MS = 30_000;
 /**
@@ -93,7 +95,22 @@ const HISTORY_MAX = 50;
 /** A failed `agent_attach` is retried with this backoff (doubling), capped, for as long as the sandbox is placed. */
 const ATTACH_RETRY_MS = 2_000;
 const ATTACH_RETRY_MAX_MS = 30_000;
-const DEFAULT_GUEST: GuestInfo = { protocol_version: 1, capabilities: [] };
+/** Previews and share links without NEST_DOMAIN (the harness, tests): never routed, only named. */
+const LOCAL_DOMAIN = "nest.localhost";
+
+/**
+ * Preview and share hostnames follow the naming rule (docs/setup/#hostnames): a first-level label of
+ * the zone whose suffix is its kind. The sandbox id loses its `sbx_` prefix (no `_` in a hostname).
+ */
+export function previewHostname(domain: string, port: number, sandbox: string): string {
+  const { label, zone } = splitDomain(domain);
+  return `${port}-${sandbox.replace(/^sbx_/, "")}-preview-${label}.${zone}`;
+}
+/** A share link's hostname, `<token>-share-<label>.<zone>`: the token names one `{sandbox, port}`. */
+export function shareHostname(domain: string, port: number, sandbox: string): string {
+  const { label, zone } = splitDomain(domain);
+  return `${port}-${sandbox.replace(/^sbx_/, "")}-share-${label}.${zone}`;
+}
 
 type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
 
@@ -131,7 +148,14 @@ export class SandboxDO extends DurableObject<Env> {
       placing: null, placing_ms: null, history: [], lost_from: null, create_attempts: 0, guest: null, attach_cwd: {},
       attach_pending: [], attach_inflight: {}, attach_attempts: {},
     };
-    return { ...defaults, ...s } as SandboxInfo;
+    const info = { ...defaults, ...s } as SandboxInfo;
+    // Derived on every read: rows written before the naming rule hold other hostnames.
+    info.ports = info.ports.map((p) => ({ port: p.port, url: this.previewUrl(info.sandbox, p.port) }));
+    return info;
+  }
+
+  private previewUrl(sandbox: string, port: number): string {
+    return `https://${previewHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, sandbox)}`;
   }
 
   /** Load, mutate and save synchronously (never across an await). */
@@ -187,26 +211,44 @@ export class SandboxDO extends DurableObject<Env> {
     return this.info_();
   }
 
-  /** An evicted placement leaves `placing` set: adopt the lease FleetDO granted, or clear it. */
+  /**
+   * A placement that never finished (this object was reset mid-call, or FleetDO's answer was lost)
+   * leaves `placing` set. Once stale, FleetDO's lease decides: a live lease at that epoch is adopted
+   * with the state (and guest) its holder last reported; no such lease clears the marker. Before
+   * then the `place` deadline is (re)armed for when it goes stale.
+   */
   private async reconcilePlacing(): Promise<void> {
     const info = this.info_();
-    if (info.placing === null || Date.now() - (info.placing_ms ?? 0) < PLACING_STALE_MS) return;
+    if (info.placing === null) return;
+    const staleAt = (info.placing_ms ?? 0) + PLACING_STALE_MS;
+    if (Date.now() < staleAt) {
+      await this.deadlines.set("place", staleAt, true);
+      return;
+    }
     const epoch = info.placing;
     const lease = await this.fleet(info.cell).leaseOf(info.sandbox);
-    let adopted = false;
+    let adopted: string | null = null;
     this.update((i) => {
       if (i.placing !== epoch) return;
       i.placing = null;
       i.placing_ms = null;
       if (lease && lease.epoch === epoch && !lease.expired) {
         i.host = lease.host;
+        i.state = lease.state ?? (i.head ? "restoring" : "creating");
+        i.guest = lease.guest;
+        i.lost_from = null;
         i.history = [...i.history, { epoch, host: lease.host }].slice(-HISTORY_MAX);
-        adopted = true;
+        adopted = lease.host;
       }
     });
     if (adopted) {
+      console.warn(`sandbox ${info.sandbox}: adopted the lease on ${adopted} (epoch ${epoch}) from an unfinished placement`);
       await this.pushSecrets();
       await this.issueAttachesOrRetry();
+      await this.notifyAgentsMoved(adopted);
+      await this.armIdle();
+    } else {
+      console.warn(`sandbox ${info.sandbox}: cleared an unfinished placement at epoch ${epoch} (no lease)`);
     }
   }
 
@@ -235,9 +277,12 @@ export class SandboxDO extends DurableObject<Env> {
       i.attach_inflight = {};
       i.attach_attempts = {};
     });
+    // If this call never finishes (a reset, a lost answer), the marker is reconciled when it goes stale.
+    await this.deadlines.set("place", now + PLACING_STALE_MS, true);
     const from = before.head ? this.generation(before.head) : undefined;
     let host: string | null = null;
     let noCapacity = false;
+    let failure: unknown = null;
     try {
       host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
@@ -251,21 +296,31 @@ export class SandboxDO extends DurableObject<Env> {
         ...(excludeHost ? { excludeHost } : {}),
       });
       noCapacity = host === null;
-    } finally {
-      this.update((i) => {
-        if (i.placing !== epoch) return;
-        i.placing = null;
-        i.placing_ms = null;
-        // FleetDO answered that no host could take it, so no lease exists under this epoch: the
-        // next attempt reuses it. (After an exception a lease may exist; the epoch stays spent.)
-        if (noCapacity && i.epoch === epoch) i.epoch = before.epoch;
-        if (host) {
-          i.host = host;
-          i.state = from ? "restoring" : "creating";
-          i.lost_from = null;
-          i.history = [...i.history, { epoch, host }].slice(-HISTORY_MAX);
-        }
-      });
+    } catch (e) {
+      failure = e;
+    }
+    // FleetDO refused outright (a lease at another epoch): no lease exists under this epoch.
+    const refused = failure !== null && asNestError(failure)?.code === ErrorCodes.FORBIDDEN;
+    this.update((i) => {
+      if (i.placing !== epoch) return;
+      // Any other failure leaves the answer unknown (a lease may exist): the marker stays for the
+      // `place` deadline to reconcile against FleetDO's lease.
+      if (failure !== null && !refused) return;
+      i.placing = null;
+      i.placing_ms = null;
+      // No host could take it, so no lease exists under this epoch: the next attempt reuses it.
+      if ((noCapacity || refused) && i.epoch === epoch) i.epoch = before.epoch;
+      if (host) {
+        i.host = host;
+        i.state = from ? "restoring" : "creating";
+        i.lost_from = null;
+        i.history = [...i.history, { epoch, host }].slice(-HISTORY_MAX);
+      }
+    });
+    if (failure !== null) {
+      // A refusal is not retried on its own (the leases disagree: an operator looks); anything else is.
+      if (refused) await this.deadlines.clear("place");
+      throw failure;
     }
     if (host) {
       await this.deadlines.clear("place");
@@ -325,9 +380,13 @@ export class SandboxDO extends DurableObject<Env> {
    * take it yet (the caller retries).
    */
   async wake(): Promise<{ host: string | null; state: SandboxState }> {
-    const info = this.info_();
+    let info = this.info_();
     if (info.state === "destroyed" || info.state === "archived") {
       throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
+    }
+    if (!info.host && info.placing !== null) {
+      await this.reconcilePlacing();
+      info = this.info_();
     }
     if (info.host) {
       if (info.state === "suspended") {
@@ -400,8 +459,11 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async leaseLost(host: string, epoch: number, hostIsDead: boolean): Promise<void> {
     const cur = this.get<SandboxInfo>("info") ? this.info_() : undefined;
-    if (!cur || !ACTIVE_STATES.includes(cur.state)) return;
-    if (cur.epoch === epoch && cur.host === host) {
+    // Keyed on the lease (host, epoch), never on the state a host reported (`fenced`, `failed`):
+    // host evidence doesn't block the control plane's own transitions. A lease this object never
+    // adopted (its placement was cut off, and the marker since cleared) counts as its own.
+    if (!cur || cur.state === "destroyed" || cur.state === "archived") return;
+    if (cur.epoch === epoch && (cur.host === host || (cur.host === null && cur.placing === null))) {
       this.update((i) => {
         i.host = null;
         i.working = [];
@@ -506,7 +568,11 @@ export class SandboxDO extends DurableObject<Env> {
 
     let outcome: CommitOutcome;
     let orphan: GenerationRecord | null = null;
-    if (ev.reason === "salvage" && ev.epoch < info.epoch) {
+    if ((ev.kind === "checkpoint") !== (ev.mem_manifest !== undefined)) {
+      // `kind` must agree with the memory manifest: the chain is immutable, and a checkpoint
+      // without one would restore without memory.
+      outcome = rejected(ErrorCodes.INVALID_MESSAGE);
+    } else if (ev.reason === "salvage" && ev.epoch < info.epoch) {
       const held = info.history.find((h) => h.epoch === ev.epoch);
       if (!held || held.host !== host) {
         outcome = rejected(ErrorCodes.STALE_EPOCH);
@@ -600,6 +666,8 @@ export class SandboxDO extends DurableObject<Env> {
         if (next) await this.deadlines.set("grants", next);
         if (expired) await this.policyChanged(false);
       } else if (key === "place") {
+        // An unfinished placement is reconciled first (or the deadline re-armed until it goes stale).
+        await this.reconcilePlacing();
         const info = this.info_();
         // A suspended sandbox with nobody working stays unplaced until something wakes it.
         const wanted = info.state !== "suspended" || info.working.length > 0;
@@ -784,9 +852,14 @@ export class SandboxDO extends DurableObject<Env> {
     // Its cloudflared has no ready connection yet (the host just started, or the tunnel is
     // reconnecting): a target now would only fail at the edge. The runner retries.
     if (gateway.kind === "connecting") throw notReady(`host ${info.host}'s tunnel is connecting`);
-    if (gateway.kind === "direct" && gateway.tunnel) {
-      console.error(`SandboxDO: host ${info.host} has the tunnel ${gateway.tunnel} but reports none; ${info.sandbox} is reached directly at ${gateway.url}`);
+    // A tunnel host serving no tunnel (an old nestd, no cloudflared) is unreachable: its hello URL is
+    // its own loopback, and a runner never shares its sandbox's host.
+    if (gateway.kind === "down") {
+      console.error(`SandboxDO: host ${info.host} has the tunnel ${gateway.tunnel} but serves none; ${info.sandbox} is unreachable until it does`);
+      throw notReady(`host ${info.host} serves no tunnel`);
     }
+    // The guest's version comes from the host's report; it is never guessed.
+    if (!info.guest) throw notReady("the guest has not reported its version yet");
     const url = gateway.url;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const binding = await broker.signBinding(info.cell, {
@@ -807,7 +880,8 @@ export class SandboxDO extends DurableObject<Env> {
     if (fresh.epoch !== info.epoch || fresh.host !== info.host || fresh.attach_pending.includes(agent)) {
       throw notReady("sandbox moved while resolving");
     }
-    return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest ?? DEFAULT_GUEST, ...(edge ? { edge } : {}) };
+    if (!fresh.guest) throw notReady("sandbox moved while resolving");
+    return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest, ...(edge ? { edge } : {}) };
   }
 
   /** Agent activity feeds the idle refcount: the sandbox may suspend only when nobody is working. */
@@ -845,7 +919,7 @@ export class SandboxDO extends DurableObject<Env> {
   async exposePort(port: number, share: boolean, hostHeader: "localhost" | "preserve" = "localhost"): Promise<{ url: string; share_url?: string }> {
     const info = this.info_();
     await this.command([{ type: "port_expose", sandbox: info.sandbox, epoch: info.epoch, port, host_header: { mode: hostHeader } }]);
-    const url = `https://${port}-${info.sandbox}.${this.env.PREVIEW_DOMAIN}`;
+    const url = this.previewUrl(info.sandbox, port);
     this.update((i) => {
       i.ports = [...i.ports.filter((p) => p.port !== port), { port, url }];
     });
@@ -855,8 +929,7 @@ export class SandboxDO extends DurableObject<Env> {
       const exp = Date.now() + 24 * 3_600_000;
       const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(this.env.HOST_TOKEN_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
       const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`share\n${info.sandbox}\n${port}\n${exp}`)));
-      const shareDomain = this.env.PREVIEW_DOMAIN.replace(/^preview\./, "share.");
-      shareUrl = `https://${port}-${info.sandbox}.${shareDomain}/?exp=${exp}&sig=${b64url(sig)}`;
+      shareUrl = `https://${shareHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, info.sandbox)}/?exp=${exp}&sig=${b64url(sig)}`;
     }
     return shareUrl ? { url, share_url: shareUrl } : { url };
   }

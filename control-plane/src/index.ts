@@ -65,7 +65,7 @@ const isUpgrade = (req: Request) => req.headers.get("upgrade")?.toLowerCase() ==
 async function enroll(req: Request, env: Env): Promise<Response> {
   const r = await body(req, EnrollRequest);
   if (r.protocol_version !== PROTOCOL_VERSION) {
-    throw new NestError(ErrorCodes.UNSUPPORTED_PROTOCOL_VERSION, `server speaks ${PROTOCOL_VERSION}`);
+    throw new NestError(ErrorCodes.UNSUPPORTED_VERSION, `server speaks ${PROTOCOL_VERSION}`);
   }
   let identity: InstanceIdentity | null = null;
   try {
@@ -263,26 +263,39 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "POST" && path === "/v1/agents") {
     const r = await body(req, z.object({
       role: AgentRole,
-      workstream: z.string().startsWith("ws_"),
+      // A worker's workstream and cell are its sandbox's: optional, and refused when they differ.
+      workstream: z.string().startsWith("ws_").optional(),
       sandbox: z.string().startsWith("sbx_").optional(),
       captain: z.string().startsWith("agt_").optional(),
       launch: LaunchConfig.optional(),
       grants: z.array(z.string()).optional(),
       rules: z.array(ToolRule).optional(),
-      cell: z.string().default(DEFAULT_CELL),
+      cell: z.string().optional(),
       start: z.boolean().default(true),
     }));
-    checkCell(env, r.cell);
     if (r.role === "worker" && !r.sandbox) throw new NestError(ErrorCodes.INVALID_MESSAGE, "workers need a sandbox");
     if (r.role === "captain" && r.sandbox) throw new NestError(ErrorCodes.INVALID_MESSAGE, "captains have no hands");
+    let wsId = r.workstream;
+    let cellName = r.cell ?? DEFAULT_CELL;
+    if (r.sandbox) {
+      const sbx = await sandbox(env, r.sandbox).info();
+      if ((r.workstream && r.workstream !== sbx.workstream) || (r.cell && r.cell !== sbx.cell)) {
+        throw new NestError(ErrorCodes.INVALID_MESSAGE,
+          `${r.sandbox} is in cell ${sbx.cell}, workstream ${sbx.workstream}; a worker takes its sandbox's`, 409);
+      }
+      wsId = sbx.workstream;
+      cellName = sbx.cell;
+    }
+    if (!wsId) throw new NestError(ErrorCodes.INVALID_MESSAGE, "captains need a workstream");
+    checkCell(env, cellName);
     const id = newId("agt_");
     const a = agent(env, id);
     await a.create({
-      agent: id, role: r.role, workstream: r.workstream, cell: r.cell, captain: r.captain ?? null,
+      agent: id, role: r.role, workstream: wsId, cell: cellName, captain: r.captain ?? null,
       sandbox: r.sandbox ?? null, ...(r.launch ? { launch: r.launch } : {}), grants: r.grants ?? null,
       ...(r.rules ? { rules: r.rules } : {}),
     });
-    if (r.role === "captain") await workstream(env, r.workstream).setCaptain(id);
+    if (r.role === "captain") await workstream(env, wsId).setCaptain(id);
     const started = r.start ? await a.start() : null;
     return json({ ...(await a.info()), started }, 201);
   }

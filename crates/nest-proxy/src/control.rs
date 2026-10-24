@@ -140,7 +140,7 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
         ProxyCommand::HelloAck { protocol_version, host_id, .. } => {
             if protocol_version != PROTOCOL_VERSION {
                 return Err(ErrorBody {
-                    code: nest_protocol::model::error_codes::UNSUPPORTED_PROTOCOL_VERSION.into(),
+                    code: nest_protocol::model::error_codes::UNSUPPORTED_VERSION.into(),
                     message: format!("nestd speaks {protocol_version}, proxy speaks {PROTOCOL_VERSION}"),
                     retryable: false,
                 });
@@ -203,9 +203,9 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
             }
         }
         ProxyCommand::SandboxDrop { sandbox, epoch, reason } => {
-            // Remembered even if the sandbox isn't here yet, so a push racing the drop can't
-            // bring it back.
-            if let Some(sb) = session.drop_sandbox(&sandbox, epoch) {
+            // A fence is remembered even if the sandbox isn't here yet, so a push racing the drop
+            // can't bring it back.
+            if let Some(sb) = session.drop_sandbox(&sandbox, epoch, reason) {
                 tracing::info!(%sandbox, ?reason, "dropping sandbox");
                 sb.drop.cancel();
             }

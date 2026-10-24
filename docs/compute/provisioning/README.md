@@ -5,7 +5,7 @@ Two host images, one per [host kind](../). Neither contains a secret ([identity]
 **Sandbox host image (EC2 Image Builder):**
 - Amazon Linux 2023 with kernel 6.18 (or 6.1), the host kernels Firecracker supports on 8i ([README](https://github.com/firecracker-microvm/firecracker/blob/main/README.md)); Ubuntu 24.04's 6.8 isn't one of them. Hugetlb needs 5.18+ and ublk needs 6.0+; whether AL2023 ships ublk is unverified.
 - Firecracker from the 1.17 line, pinned by binary digest, patch level included ([driver](../../sandbox/drivers/firecracker/)).
-- Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, the [gateway](../../sandbox/gateway/), and the guest kernel and `nest-base` image. No Claude Code, no agent runner, no bubblewrap: nothing on a sandbox host runs a brain.
+- Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, the [gateway](../../sandbox/gateway/), and the guest kernel and `nest-base` image. The target has no Claude Code, no agent runner and no bubblewrap: nothing on a sandbox host runs a brain. **Today,** until [brain hosts](../brain-hosts/) exist, `deploy/host/install.sh` installs Claude Code, the runner and bubblewrap on every host too, and a burst host runs brains beside its sandboxes; the subscription token is in the brain's process environment on the host, never in a VM.
 - **Built by the cell's Image Builder pipeline,** managed in the cell stack: AWS-native, no build host of ours. One install script runs in two places:
   - at build time, baked into the AMI;
   - at every boot, where it only fills what the AMI lacks.
@@ -21,7 +21,7 @@ Two host images, one per [host kind](../). Neither contains a secret ([identity]
 **Brain host image:** nestd, Claude Code, the agent runner and the `nest` binary, `bubblewrap` (Claude Code needs it for the subprocess environment scrub nest relies on; see [runner-claude](../../interfaces/host-internal/runner-claude/)) and the Discord gateway client. The image carries the runner's pinned Claude Code version, checked by SHA-256 ([runner](../../agents/runner/)). No hypervisor, no hugepages, no S3 access, no cloudflared. Built by the same pipeline from an ARM-capable AL2023 base, for the cheapest class that runs Claude Code ([brain hosts](../brain-hosts/)). **Not built.**
 
 **Launch templates,** one per host kind:
-- **Sandbox hosts:** nested virtualization enabled, restricted to the 8i family. Prefer `d` variants for local NVMe. Reserve a `vm.nr_hugepages` pool at boot; the remaining memory is for the host and the snapshot page cache.
+- **Sandbox hosts:** nested virtualization enabled, restricted to the 8i family (the IAM policy allows `c8i*.*`, `m8i*.*`, `r8i*.*`; the instance types the autoscaler picks are a list in the cell stack, proved to fall inside those patterns, and written with the rest of `AWS_CELLS`). Prefer `d` variants for local NVMe. No hugepage pool: guest memory is regular pages, and bootstrap clears any pool an older AMI reserved ([memory](../../sandbox/state/memory/)).
 - **Brain hosts:** the brain-host AMI, the cheapest class that runs Claude Code (`t4g.medium`-class), no hugepages, no nested virtualization. **Not built.**
 
 **Network:**

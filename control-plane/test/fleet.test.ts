@@ -199,6 +199,31 @@ describe("commit compare-and-set", () => {
   });
 });
 
+describe("commit validation", () => {
+  it("rejects a commit whose kind disagrees with its memory manifest, and the chain stays as it was", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
+    const cases = [
+      { request: "req_k1", kind: "checkpoint" }, // claims memory, carries none
+      { request: "req_k2", kind: "disk_only", mem_manifest: manifest("e") }, // carries memory, claims none
+    ];
+    for (const c of cases) {
+      sendEvents(h.ws, [{ ts_ms: Date.now(), type: "commit_request", sandbox: sbx.sandbox, epoch: 1, disk_manifest: manifest("d"), reason: "checkpoint", ...c }]);
+      const [res] = (await nextCommands(h.ws, (x) => x.type === "commit_result" && x.request === c.request)).filter((x) => x.request === c.request);
+      expect(res.outcome, c.kind).toEqual({ status: "rejected", reason: "invalid_message" });
+    }
+    expect(await sandboxStub(sbx.sandbox).generations()).toEqual([]);
+    expect((await sandboxStub(sbx.sandbox).info()).head).toBeNull();
+    // A consistent checkpoint is accepted.
+    sendEvents(h.ws, [{ ts_ms: Date.now(), type: "commit_request", request: "req_k3", sandbox: sbx.sandbox, epoch: 1, kind: "checkpoint",
+      disk_manifest: manifest("d"), mem_manifest: manifest("e"), reason: "checkpoint" }]);
+    const [ok] = (await nextCommands(h.ws, (x) => x.request === "req_k3")).filter((x) => x.request === "req_k3");
+    expect(ok.outcome).toMatchObject({ status: "committed", generation: { kind: "checkpoint", mem_manifest: manifest("e") } });
+  });
+});
+
 class MockEc2 implements Ec2 {
   terminated: string[] = [];
   launched: LaunchSpec[] = [];

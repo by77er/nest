@@ -1,8 +1,9 @@
 //! nestd configuration (JSON file, `--config`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use nest_protocol::host::paths;
 use nest_protocol::model::{HostId, HostRole};
 use serde::{Deserialize, Serialize};
 
@@ -157,8 +158,9 @@ pub struct FirecrackerConfig {
     /// the host with it (regular pages are overcommitted: a guest costs only what it touches).
     #[serde(default = "default_vm_overhead_mib")]
     pub vm_memory_overhead_mib: u32,
-    /// Back guest memory with 2 MiB hugetlbfs pages.
-    #[serde(default = "default_true")]
+    /// Back guest memory with 2 MiB hugetlbfs pages. Off by default: guest memory is regular
+    /// pages, so a VM costs what it touches (`docs/sandbox/state/memory/`).
+    #[serde(default)]
     pub huge_pages: bool,
 }
 
@@ -206,14 +208,21 @@ impl Config {
     pub fn commit_timeout(&self) -> Duration {
         Duration::from_millis(self.commit_timeout_ms)
     }
+    /// `paths::PROXY_SOCK`, under `run_dir` (which tests and dev runs move).
     pub fn proxy_sock(&self) -> PathBuf {
-        self.run_dir.join("proxy.sock")
+        self.in_run_dir(paths::PROXY_SOCK)
     }
+    /// `paths::RUNNER_SOCK`, under `run_dir`.
     pub fn runner_sock(&self) -> PathBuf {
-        self.run_dir.join("runner.sock")
+        self.in_run_dir(paths::RUNNER_SOCK)
     }
+    /// `paths::GATEWAY_SOCK`, under `run_dir`.
     pub fn gateway_sock(&self) -> PathBuf {
-        self.run_dir.join("gateway.sock")
+        self.in_run_dir(paths::GATEWAY_SOCK)
+    }
+    fn in_run_dir(&self, well_known: &str) -> PathBuf {
+        let rel = Path::new(well_known).strip_prefix(paths::RUN_DIR).expect("a socket path under paths::RUN_DIR");
+        self.run_dir.join(rel)
     }
     pub fn vm_dir(&self, sandbox: &str) -> PathBuf {
         self.run_dir.join("vm").join(sandbox)
@@ -234,7 +243,7 @@ impl Config {
 }
 
 fn default_run_dir() -> PathBuf {
-    "/run/nest".into()
+    paths::RUN_DIR.into()
 }
 fn default_state_dir() -> PathBuf {
     "/var/lib/nest".into()
@@ -263,9 +272,6 @@ fn default_s3_prefix() -> String {
 fn default_boot_args() -> String {
     "console=ttyS0 reboot=k panic=1 pci=off".into()
 }
-fn default_true() -> bool {
-    true
-}
 fn default_chroot_base() -> PathBuf {
     "/srv/jailer".into()
 }
@@ -277,6 +283,14 @@ fn default_vm_overhead_mib() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guest memory is regular pages unless a config asks for hugepages (nestd review #8).
+    #[test]
+    fn huge_pages_default_off() {
+        let fc: FirecrackerConfig =
+            serde_json::from_value(serde_json::json!({"firecracker_bin": "/fc", "kernel_image": "/k", "images_dir": "/i"})).unwrap();
+        assert!(!fc.huge_pages);
+    }
 
     #[test]
     fn parses_minimal_config() {
@@ -290,7 +304,10 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.run_dir, PathBuf::from("/run/nest"));
         assert!(matches!(cfg.enrollment, EnrollmentConfig::AwsImds { ref imds_url } if imds_url == "http://169.254.169.254"));
-        assert_eq!(cfg.proxy_sock(), PathBuf::from("/run/nest/proxy.sock"));
+        assert_eq!(cfg.proxy_sock(), PathBuf::from(paths::PROXY_SOCK));
+        assert_eq!(cfg.runner_sock(), PathBuf::from(paths::RUNNER_SOCK));
+        assert_eq!(cfg.gateway_sock(), PathBuf::from(paths::GATEWAY_SOCK));
+        assert_eq!(cfg.agents_dir(), PathBuf::from(paths::AGENTS_DIR));
         assert!(matches!(cfg.storage, StorageConfig::Local));
         let s3: StorageConfig = serde_json::from_value(serde_json::json!({"type": "s3", "bucket": "b", "region": "us-east-1"})).unwrap();
         assert!(matches!(s3, StorageConfig::S3 { ref prefix, .. } if prefix == "store/"));

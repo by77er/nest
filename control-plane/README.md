@@ -44,7 +44,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      (409 if it's placed)
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
      the only way to mint a public share link (agents can't)
-   - `POST /v1/agents {role, workstream, sandbox?, cell, start?}`: sends `agent_start` to the host
+   - `POST /v1/agents {role, workstream?, sandbox?, cell?, start?}`: sends `agent_start` to the host; a worker's
+     workstream and cell come from its sandbox (a mismatch is refused with 409)
    - `POST /v1/agents/<id>/start {host?}`: start (or restart) the brain; `host` puts it on a chosen active,
      connected host of the cell (for a test); hands still go through the sandbox's gateway
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
@@ -73,10 +74,10 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `ROOT_CA_CERT_PEM`, `ROOT_CA_KEY_PEM` | Proxy root CA (PKCS#8 ECDSA P-256 key). Without them, `ALLOW_DEV_CA=1` mints a dev root |
 | `AWS_IDENTITY_CERT_PEM` | AWS public certificate for the `rsa2048` identity signature (enables AWS enrollment) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | Scoped IAM user for STONITH. Without them, STONITH waits for the host to fence, or for an operator |
-| `PUBLIC_BASE_URL`, `PREVIEW_DOMAIN`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
+| `PUBLIC_BASE_URL`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
 | `WAKE_BATCH_MS` | Captain wake batching window; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
-| `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname. The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url` |
+| `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname (a tunnel host that serves none is not ready, never its loopback `gateway_url`). `NEST_DOMAIN` also names previews (`<port>-<sandbox>-preview-<label>.<zone>`) and share links (`<token>-share-<label>.<zone>`). The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url`, and preview names use `nest.localhost` |
 | `AWS_CELLS` | Autoscaled cells: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?, sandbox_reserve_mib?, max_sandboxes_per_host?}` (`src/lib/cells.ts`). A cell without an entry is never scaled |
 
 Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its resend queue) carry
@@ -126,10 +127,8 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 - **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
 - **Built:** the autoscaler (`AWS_CELLS`: `RunInstances` from the cell's launch template, idle retirement, enroll timeouts).
 - **Not built:** Discord, the Cloudflare Access applications (created by hand; the control plane only stores
-  the service token), the preview/share Worker routes, the api-loop backend (deferred), budgets. The share-link
-  code still mints `<port>-<sandbox>.<PREVIEW_DOMAIN>` (`sandbox.ts`), a second-level name under `nest.<zone>`
-  that Universal SSL does not cover; when the routes are built it derives `<port>-<sandbox>-preview-<label>.<zone>`
-  from `NEST_DOMAIN` and `PREVIEW_DOMAIN` goes.
+  the service token), the preview/share Worker routes, the api-loop backend (deferred), budgets. Preview and
+  share URLs are already minted by the hostname rule (`sandbox.ts`), so nothing routes them yet.
 - **Host-side behavior is driven, not modeled.** The control plane issues create (including re-place
   and reassign), destroy, fence, suspend (idle and spot drains) and resume (lazy wake); checkpoint,
   fork, archive and drain are never sent.

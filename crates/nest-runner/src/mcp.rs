@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use nest_protocol::guest::HANDS_TOOLS;
 use nest_protocol::host::mcp::{McpBridgeRequest, McpBridgeResponse, McpToolDef, ToolCallResult};
-use nest_protocol::model::{AgentRole, ErrorBody, error_codes};
+use nest_protocol::model::{ErrorBody, error_codes};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -25,10 +25,16 @@ pub fn hands_tools() -> &'static [McpToolDef] {
     })
 }
 
+/// Whether the agent may list and call hands: any agent with a bound sandbox, whatever its
+/// template (there are no roles in the platform; `docs/agents/`). The one check for both.
+fn has_hands(agent: &Agent) -> bool {
+    agent.inner.lock().unwrap().hands.is_some()
+}
+
 /// Tools for an agent right now.
 pub async fn list(rt: &Runtime, agent: &Agent) -> Vec<McpToolDef> {
     let mut tools = Vec::new();
-    if agent.role == AgentRole::Worker && agent.inner.lock().unwrap().hands.is_some() {
+    if has_hands(agent) {
         tools.extend(hands_tools().iter().cloned());
     }
     let platform = agent.platform_tools(rt.cfg.tools_list_timeout).await;
@@ -127,7 +133,7 @@ async fn call(
     cancel: oneshot::Receiver<()>,
 ) -> McpBridgeResponse {
     if HANDS_TOOLS.contains(&name) {
-        if agent.inner.lock().unwrap().hands.is_none() {
+        if !has_hands(agent) {
             let e = ErrorBody { code: error_codes::NOT_BOUND.into(), message: "this agent has no sandbox bound (no hands)".into(), retryable: false };
             return McpBridgeResponse::Error { id: Some(id), error: e };
         }
@@ -161,6 +167,24 @@ async fn call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn any_agent_with_hands_lists_them_and_one_without_does_not() {
+        use nest_protocol::control::HandsBinding;
+        use nest_protocol::model::{AgentId, AgentRole, Epoch, SandboxId};
+        let rt = Runtime::new(crate::Config { tools_list_timeout: std::time::Duration::from_millis(20), ..Default::default() });
+        let agent = |role, hands: Option<HandsBinding>| {
+            let (ctx, _) = mpsc::unbounded_channel();
+            let (otx, _) = mpsc::unbounded_channel();
+            Agent::new(AgentId("agt_m".into()), role, Epoch(1), std::env::temp_dir(), hands, None, vec![], 0, ctx, otx)
+        };
+        let bound = Some(HandsBinding { sandbox: SandboxId("sbx_m".into()), epoch: Epoch(1) });
+        let names = |tools: Vec<McpToolDef>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+        // A captain-template agent given a sandbox gets hands, as the call path already allowed.
+        assert_eq!(names(list(&rt, &agent(AgentRole::Captain, bound.clone())).await), HANDS_TOOLS);
+        assert_eq!(names(list(&rt, &agent(AgentRole::Worker, bound)).await), HANDS_TOOLS);
+        assert!(list(&rt, &agent(AgentRole::Worker, None)).await.is_empty());
+    }
 
     #[test]
     fn hands_tools_parse() {

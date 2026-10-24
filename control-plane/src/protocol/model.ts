@@ -32,6 +32,7 @@ export const ErrorBody = z.object({
 });
 export type ErrorBody = z.output<typeof ErrorBody>;
 
+/** Mirrors `model::error_codes` (`ALL`); both are asserted against protocol/fixtures/codes.json. */
 export const ErrorCodes = {
   STALE_EPOCH: "stale_epoch",
   PARENT_MISMATCH: "parent_mismatch",
@@ -39,7 +40,8 @@ export const ErrorCodes = {
   UNKNOWN_AGENT: "unknown_agent",
   UNAUTHORIZED: "unauthorized",
   FORBIDDEN: "forbidden",
-  UNSUPPORTED_PROTOCOL_VERSION: "unsupported_protocol_version",
+  /** The peer's protocol version isn't spoken here; one name on every boundary (read with `isUnsupportedVersion`). */
+  UNSUPPORTED_VERSION: "unsupported_version",
   INVALID_MESSAGE: "invalid_message",
   UNKNOWN_TOOL: "unknown_tool",
   CAPACITY_EXHAUSTED: "capacity_exhausted",
@@ -52,6 +54,20 @@ export const ErrorCodes = {
   NOT_IMPLEMENTED: "not_implemented",
   OUTCOME_UNKNOWN: "outcome_unknown",
 } as const;
+/** What the control-host channels sent for `unsupported_version` before the names merged: read, never sent. */
+export const LEGACY_UNSUPPORTED_VERSION = "unsupported_protocol_version";
+/** `unsupported_version` under either name. */
+export const isUnsupportedVersion = (code: string): boolean =>
+  code === ErrorCodes.UNSUPPORTED_VERSION || code === LEGACY_UNSUPPORTED_VERSION;
+
+/**
+ * A string enum that parses a member it doesn't know (a newer sender's, or an older sender's free
+ * text) as `fallback` instead of rejecting the message. The Rust side is a `#[serde(other)]` member.
+ */
+export function openEnum<const T extends readonly [string, ...string[]]>(members: T, fallback: T[number]) {
+  const known = new Set<string>(members);
+  return z.string().transform((s): T[number] => (known.has(s) ? (s as T[number]) : fallback));
+}
 
 export const HostRole = z.enum(["burst", "controller"]);
 export type HostRole = z.output<typeof HostRole>;
@@ -246,6 +262,11 @@ const wsEventBase = {
   epoch: Epoch.optional(),
 };
 
+/** Why nest-proxy raised an egress alert; open (an unknown reason parses as `unknown`). */
+export const EGRESS_ALERT_REASONS = ["placeholder_wrong_host", "domain_fronting", "injection_after_expiry", "unknown"] as const;
+export const EgressAlertReason = openEnum(EGRESS_ALERT_REASONS, "unknown");
+export type EgressAlertReason = z.output<typeof EgressAlertReason>;
+
 export const WorkstreamEventVariants = [
   z.object({ ...wsEventBase, type: z.literal("started"), goal: z.string() }),
   z.object({ ...wsEventBase, type: z.literal("progress"), summary: z.string() }),
@@ -258,7 +279,7 @@ export const WorkstreamEventVariants = [
   z.object({ ...wsEventBase, type: z.literal("quota_parked"), retry_after_ms: U64.optional() }),
   z.object({ ...wsEventBase, type: z.literal("orphaned_work"), generation: GenerationId, stale_epoch: Epoch }),
   z.object({ ...wsEventBase, type: z.literal("egress_denied"), host: z.string(), port: U16 }),
-  z.object({ ...wsEventBase, type: z.literal("egress_alert"), host: z.string(), binding: z.string().optional(), reason: z.string() }),
+  z.object({ ...wsEventBase, type: z.literal("egress_alert"), host: z.string(), binding: z.string().optional(), reason: EgressAlertReason }),
   z.object({ ...wsEventBase, type: z.literal("port_opened"), port: U16 }),
   z.object({ ...wsEventBase, type: z.literal("port_exposed"), port: U16, url: z.string() }),
 ] as const;
@@ -277,6 +298,7 @@ export function isDecisionEvent(e: Pick<WorkstreamEvent, "type">): boolean {
 
 export const ManifestHash = z.string().regex(/^blake3:[0-9a-f]{64}$/);
 export const GenerationKind = z.enum(["disk_only", "checkpoint"]);
+export const ManifestKind = z.enum(["disk", "memory"]);
 export const CommitReason = z.enum([
   "turn_end", "timer", "dirty_threshold", "suspend", "drain", "spot_notice", "checkpoint", "fork", "salvage", "archive",
 ]);
@@ -296,7 +318,7 @@ export type GenerationRecord = z.output<typeof GenerationRecord>;
 
 export const Manifest = z.object({
   format: z.number().int(),
-  kind: z.enum(["disk", "memory"]),
+  kind: ManifestKind,
   chunk_size: z.number().int(),
   size_bytes: U64,
   chunks: z.array(z.string().nullable()),

@@ -11,15 +11,17 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 | `hello_ack` | 0 | Starts a resync |
 | `ca_install` | 0 | `ca: control::CaCertificate` (the intermediate: pathLen 0, about 7 days) + `key_pem` (nestd generated the key for the enrollment CSR). Memory only |
 | `lease_update` | 0 | `valid_until_ms`, every heartbeat. Past it: refuse new connections and stop injecting for all sandboxes |
-| `sandbox_upsert` | 0 | `model::EgressPolicy` + `sha256` (of its canonical JSON, computed by SandboxDO) + `secrets: model::InjectionSecret[]` for its bindings. Ignored unless `version` is newer. Answered by `policy_ack`. Precedes the sandbox's first `listeners_add` |
-| `secrets_set` | 0 | Refreshed `model::InjectionSecret[]` (replace all) for the installed policy, named by `version` + `sha256`. Memory only |
+| `sandbox_upsert` | 0 | `{sandbox, epoch, workstream?, policy: model::EgressPolicy}`. Ignored unless `version` is newer. Precedes the sandbox's first `listeners_add`. Not acknowledged ([below](#policy-acknowledgement)) |
+| `secrets_set` | 0 | `{sandbox, epoch, secrets: model::InjectionSecret[]}`, replace all; checked against the epoch only. Memory only |
 | `listeners_add` | **= `listeners.len()`**, same order, ≤ 32 per packet | `ListenerSpec{id, transport, addr, purpose}` |
 | `listeners_remove` | 0 | Close listeners; established connections finish |
-| `sandbox_drop` | 0 | `reason: teardown \| fence \| moved`. Close listeners **and established connections**, forget policy and secrets |
+| `sandbox_drop` | 0 | `reason: teardown \| fence \| moved`. Close listeners **and established connections**, forget policy and secrets. Only `fence` tombstones the epoch: later pushes at or below it are refused, by nestd's mirror and by the proxy alike (`DropReason::tombstones`). A teardown or move leaves none, so a create retried at the same epoch gets its egress back |
 | `resync_complete` | 0 | Counts, so the proxy can verify |
 | `ping` | 0 | Health |
 
-**proxy → nestd (`ProxyEvent`, never fds)**: `hello`, `resync_ack`, `policy_ack{sandbox, epoch, version, sha256, outcome: installed \| refused{reason}}`, `audit{records: control::EgressAuditRecord[]}` (≤1 s / 128 records; each sets `via`; aggregated suppression summaries set `count`), `alert{kind: placeholder_wrong_host \| domain_fronting \| injection_after_expiry}` (immediate), `listener_failed`, `pong`, `error` (then close). `domain_fronting` covers both `Host` ≠ SNI and a CONNECT tunnel whose SNI ≠ the CONNECT authority.
+**proxy → nestd (`ProxyEvent`, never fds)**: `hello`, `resync_ack`, `audit{records: control::EgressAuditRecord[]}` (≤1 s / 128 records; each sets `via`), `alert{kind: placeholder_wrong_host \| domain_fronting \| injection_after_expiry}` (immediate), `listener_failed`, `pong`, `error` (then close). `domain_fronting` covers both `Host` ≠ SNI and a CONNECT tunnel whose SNI ≠ the CONNECT authority.
+
+**Aggregate audit records** have `port: 0`: a window's suppression summary (`host: "*"`, `count` set, `reason: "suppressed: …"`) and `connection_limit` (`host: ""`). nestd raises a `egress_denied` workstream event only for one request's denial (deny, no `count`, a real port); aggregates go to the audit log only.
 
 **Listener purposes** (`purpose` is flattened into the spec):
 
@@ -33,6 +35,8 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 **Ordering.** One connection, processed in order. Each fd belongs to the packet it arrived with, so there's no cross-packet fd bookkeeping. If a packet's fd count ≠ `expected_fds()`, the proxy sends `error{invalid_message}` and closes. nestd resyncs on reconnect.
 
 ## Policy acknowledgement
+
+**Not built** ([pending contract changes](../../README.md#pending-contract-changes)). Today nestd sends `sandbox_upsert`, an empty `secrets_set` and the listeners, and boots the VM without waiting; policy and secrets are separate pushes (`policy_update`, `secrets_update`). The design:
 
 - **The proxy acknowledges what it installed:** `policy_ack{sandbox, epoch, version, sha256}` after it recomputes the hash, installs the policy and its secrets together, and re-checks open connections. **nestd starts or resumes the VM only after an `installed` ack** matching what it sent ([steering](../../../sandbox/networking/egress/steering/)).
 - **Refused** (with `reason`): a hash mismatch, a secret whose binding isn't in the policy, or a stale or fenced epoch. The proxy keeps its previous policy; nestd fails the command retryably.
@@ -49,8 +53,7 @@ nest-proxy                                   nestd
  │◄────────────── ca_install{ca, key}          │
  │◄────────────── lease_update{valid_until}    │
  │   for each sandbox:                         │
- │◄────────────── sandbox_upsert{policy, sha256, secrets}
- │ policy_ack{sandbox, epoch, version, sha256} ►│
+ │◄────────────── sandbox_upsert{policy}, secrets_set{secrets}
  │◄══ fds ═══════ listeners_add{listeners[≤32]} (repeat)  nestd keeps its own dups, so
  │◄────────────── resync_complete{n, m}        │  connections queue in the kernel meanwhile
  │ resync_ack{n, m} ─────────────────────────►│  mismatch → nestd closes and retries
@@ -65,8 +68,7 @@ FleetDO         nestd (root)                                      nest-proxy    
  │ sandbox_create ►│ ip netns add ns-<id>; tap0 172.16.0.1/30; nft    │                   │
  │                 │ helper thread: setns(ns) → socket/bind/listen ×N │                   │
  │                 │ → setns(back)                                    │                   │
- │                 │ sandbox_upsert{policy, sha256, secrets} ─────────►│                   │
- │                 │◄──────────────────── policy_ack{…, installed} ───│                   │
+ │                 │ sandbox_upsert{policy}, secrets_set{} ───────────►│                   │
  │                 │ listeners_add + fds ═════════════════════════════►│ accept loops      │
  │                 │ jailer --netns ns-<id> … ──────────────────────────────────────────►│ boot/restore
  │                 │ new agent slot → bind :3128+slot → listeners_add ►│                   │
@@ -88,7 +90,7 @@ FleetDO         nestd (root)                                      nest-proxy    
 | `dns_non_public` | deny | Every address in the DNS answer was non-public, so it became SERVFAIL |
 | `connection_limit` | deny | Sandbox at `limits.max_connections` (`host: ""`) |
 | `handshake_limit` | deny | TLS handshake or leaf signing over the proxy-wide or per-sandbox bound |
-| `policy_pending` | deny | No acknowledged policy within 30 s |
+| `policy_pending` | deny | No acknowledged policy within 30 s (designed, with the ack) |
 | `policy_changed` | deny | Closed by a re-check after a policy version or grant expiry, or failed the final check before the headers went upstream |
 | `invalid_headers` | deny | Smuggling-shaped request (`Connection` naming a protected field, a transfer coding other than `chunked`, a protected `Trailer`) or over the header limits |
 | `host_sni_mismatch` | alert | Decrypted `Host` ≠ SNI (domain fronting) |

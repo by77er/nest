@@ -46,7 +46,7 @@ How any client of a sandbox (the agent runner's hands client today; AgentDO's `a
 
 - **A runner** asks through AgentDO: `hands_resolve{request}` on its [session channel](../control-host/session/), answered by `hands_resolved{request, hands | error, retry_after_ms?}` with exactly one of `hands` and `error`: `not_bound` (the agent has no hands, or the client is not attached), `sandbox_not_ready` with a retry hint (no host, placing, the slot not confirmed yet, or a host that advertised no gateway), `stale_epoch` (the asking runner process or epoch is not the current one), or another error the runner surfaces. AgentDO answers only the current runner's socket.
 - **An operator or a test harness** asks the Worker: `POST /v1/sandboxes/<sbx>/resolve {client}` with the admin token returns the same target for an attached client. Mints are not audited yet.
-- The runner prefetches a target at brain start and otherwise resolves before its first call; it caches the target until a refusal (`stale_epoch`, `moved`, `unknown_key`, or `unauthorized`, which is how an expired binding is reported) or an unreachable host, then resolves again once and retries once. A sandbox that moved answers with its new URL and epoch.
+- The runner prefetches a target at brain start and otherwise resolves before its first call; it caches the target until 60 s before the binding's `exp_ms` (read from the claims segment, unverified: the signature is the gateway's to check), or until a refusal a fresh target may cure (see [error codes](#error-codes)) or an unreachable host, then resolves again once and retries once. A sandbox that moved answers with its new URL and epoch.
 
 ```json
 {"url": "wss://01jb7k3x9q-gw-nest.example.dev", "sandbox": "sbx_01jb7m2a4c", "epoch": 4,
@@ -66,15 +66,15 @@ Before `bound`, the gateway sends a text frame `error{error{code, message, retry
 | 1 | `bad_request` | Not a well-formed text `bind` within 5 s, or an unknown route (the upgrade itself answers 404; `/pty` and `/ingress` answer 501) | No |
 | 2 | `unsupported_version` | `gateway_version` outside the served range, or a claims format this gateway does not know | No |
 | 3 | `unknown_key` | The binding's `kid` is none of the keys this gateway holds: rotated away, or never this cell's | No: resolve again |
-| 4 | `unauthorized` | Bad signature, expired, wrong scope, or a client not attached to the sandbox. The message never says which | No |
+| 4 | `unauthorized` | Bad signature, expired, wrong scope, or a client not attached to the sandbox. The message never says which | No: resolve again once (an expired or revoked binding) |
 | 5 | `moved` | The sandbox is not on this host, or the gateway has lost nestd | No: resolve again |
 | 5 | `busy` | During a resync after the gateway reconnected to nestd, an unknown sandbox is `busy`, not `moved` | Yes, after `retry_after_ms` |
 | 6 | `stale_epoch` | The binding names an epoch older than the sandbox's current one | No: resolve again |
 | 6 | `busy` | The binding names an epoch newer than the gateway's table (a placement nestd has not pushed yet) | Yes |
 | 7 | `busy` | The guest has not been configured, or its vsock port did not answer the `CONNECT` | Yes |
-| 8 | `unsupported_version` | `bind.protocol_version` is not the guest's | No |
+| 8 | `unsupported_version` | `bind.protocol_version` is not the guest's | No: resolve again once (the target was minted before SandboxDO heard of a guest upgrade) |
 
-The signature is verified before any state-dependent answer, so an unsigned probe learns nothing about which sandboxes a host runs. Only `busy` is retryable with the same binding; `stale_epoch`, `moved` and `unknown_key` mean "resolve again"; the rest are final. A client holding a cached target also resolves again on `unauthorized`, since an expired binding is refused with that code.
+The signature is verified before any state-dependent answer, so an unsigned probe learns nothing about which sandboxes a host runs. One rule for every client (`nest_hands_client::Next`): only `busy` is retried with the same binding, per `retry_after_ms` within a 30 s budget, and a guest's own `busy` error after `bound` (refused before anything ran) shares that budget; `stale_epoch`, `moved`, `unknown_key`, `unauthorized` and `unsupported_version` mean "resolve again once", since a fresh target may carry a new epoch, key, binding or guest version; `bad_request` is final.
 
 ## Sequence
 

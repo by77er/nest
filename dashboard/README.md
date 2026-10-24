@@ -12,12 +12,21 @@ control plane but that API; the page refreshes every 10 s.
 npm install
 echo 'NEST_ADMIN_TOKEN=…' > .dev.vars    # the control plane's admin token (gitignored)
 npm run dev                              # vite + workerd on http://localhost:5173, against the live control plane
-npm run typecheck && npm run build
+npm run typecheck && npm test && npm run build
 ```
 
 Deployed by `.github/workflows/deploy-dashboard.yml` on every push to `main` that touches this
-directory, to `dash-nest.bitcru.sh` (a Workers custom domain). Cloudflare Access in front of that
-hostname, an Allow policy for the owner's login, is what makes the proxy private; it is created by
-hand ([setup](../docs/setup/README.md)). The Worker's secret `NEST_ADMIN_TOKEN` comes from the
-`production` environment's secret of the same name; `NEST_CONTROL_PLANE` and `NEST_CELLS` are vars
-in `wrangler.jsonc`. Design: [docs/control-plane/dashboard/](../docs/control-plane/dashboard/README.md).
+directory, to `dash-nest.bitcru.sh` (a Workers custom domain; `workers.dev` and preview URLs off).
+Cloudflare Access in front of that hostname, an Allow policy for the owner's login, is managed by
+the `edge` inframe stack (`deploy/lean/Edge/`). The Worker does not rely on it alone: every request
+must carry a valid Access token for the dashboard's application (`Cf-Access-Jwt-Assertion`, checked
+in `src/access.ts` against the team's keys, `ACCESS_TEAM_DOMAIN` and `DASHBOARD_AUD`), or it gets 403.
+`vite dev` skips the check (there is no Access on localhost); `vite build` compiles that branch out.
+The Worker's secret `NEST_ADMIN_TOKEN` comes from the `production` environment's secret of the same
+name; `NEST_CONTROL_PLANE`, `NEST_CELLS`, `ACCESS_TEAM_DOMAIN` and `DASHBOARD_AUD` are vars in
+`wrangler.jsonc`.
+
+`src/api.ts` mirrors the control plane's two responses. `fixtures/admin.ts` holds responses recorded
+from the control plane's test pool and must satisfy those types (`npm run typecheck`), and
+`test/api.test.ts` compares the mirrored enums with the control plane's sources: re-record the
+fixture when `fleetView` or `images` change. Design: [docs/control-plane/dashboard/](../docs/control-plane/dashboard/README.md).

@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -270,7 +270,7 @@ impl ProxyLink {
             }
             ProxyOp::Drop { sandbox, epoch, reason } => {
                 m.sandboxes.remove(&sandbox);
-                if reason == DropReason::Fence {
+                if reason.tombstones() {
                     let e = m.fenced.entry(sandbox.clone()).or_insert(epoch);
                     *e = (*e).max(epoch);
                 }
@@ -501,14 +501,10 @@ fn set_timeout(fd: &OwnedFd, opt: impl nix::sys::socket::SetSockOpt<Val = nix::s
     setsockopt(fd, opt, &tv).map_err(io::Error::from)
 }
 
-/// Default socket path helper.
-pub fn default_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("proxy.sock")
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::path::PathBuf;
     use nest_protocol::host::proxy::{ListenerPurpose, Transport};
     use nest_protocol::model::{EgressLimits, HostPattern, PolicyLayer, AllowRule};
     use nix::sys::socket::connect;
@@ -638,7 +634,7 @@ pub(crate) mod tests {
         p.allow = (0..n)
             .map(|i| AllowRule { host: HostPattern(format!("host-{i}-{}.example.com", "x".repeat(40))), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None })
             .collect();
-        link.apply(ProxyOp::Upsert { sandbox: SandboxId("sbx".into()), epoch: Epoch(1), workstream: None, policy: p });
+        link.apply(ProxyOp::Upsert { sandbox: SandboxId("sbx_1".into()), epoch: Epoch(1), workstream: None, policy: p });
     }
 
     /// Review #4 (E6): a connected proxy that stops reading must not block `apply` (and so must
@@ -661,7 +657,7 @@ pub(crate) mod tests {
                 upsert(&l2, v, 200);
                 let _ = tx.send(t.elapsed());
             }
-            l2.apply(ProxyOp::Drop { sandbox: SandboxId("sbx".into()), epoch: Epoch(1), reason: DropReason::Fence });
+            l2.apply(ProxyOp::Drop { sandbox: SandboxId("sbx_1".into()), epoch: Epoch(1), reason: DropReason::Fence });
             let _ = tx.send(Duration::ZERO);
         });
         let mut n = 0;
@@ -794,7 +790,7 @@ pub(crate) mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
         let (link, _path, _nrx) = start_link(dir.path());
-        let sbx = SandboxId("sbx".into());
+        let sbx = SandboxId("sbx_1".into());
         assert!(link.apply(ProxyOp::Drop { sandbox: sbx.clone(), epoch: Epoch(3), reason: DropReason::Fence }));
         assert!(!link.apply(ProxyOp::Upsert { sandbox: sbx.clone(), epoch: Epoch(3), workstream: None, policy: policy(1) }));
         assert!(!link.apply(ProxyOp::AddListeners {
@@ -805,5 +801,20 @@ pub(crate) mod tests {
         assert!(link.listener_ids(&sbx).is_empty());
         // A newer epoch (the sandbox was re-placed here) is fine.
         assert!(link.apply(ProxyOp::Upsert { sandbox: sbx, epoch: Epoch(4), workstream: None, policy: policy(1) }));
+    }
+
+    /// Guest-proxy review #1: a teardown or move is not a fence, so a create retried at the same
+    /// epoch is accepted (nest-proxy applies the same `DropReason::tombstones` rule).
+    #[test]
+    fn a_teardown_drop_does_not_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _g = rt.enter();
+        let (link, _path, _nrx) = start_link(dir.path());
+        let sbx = SandboxId("sbx".into());
+        for reason in [DropReason::Teardown, DropReason::Moved] {
+            assert!(link.apply(ProxyOp::Drop { sandbox: sbx.clone(), epoch: Epoch(3), reason }));
+            assert!(link.apply(ProxyOp::Upsert { sandbox: sbx.clone(), epoch: Epoch(3), workstream: None, policy: policy(1) }), "{reason:?} tombstoned");
+        }
     }
 }

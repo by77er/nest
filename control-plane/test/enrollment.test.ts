@@ -212,6 +212,6 @@ describe("enrollment", () => {
     const bad = await Ws.connect("/v1/fleet", r.host_token);
     bad.send(hostHello(r.host, cell, { protocol_version: 99 }));
     const err = await bad.next("error");
-    expect(err.error.code).toBe("unsupported_protocol_version");
+    expect(err.error.code).toBe("unsupported_version");
   });
 });
