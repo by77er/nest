@@ -7,6 +7,7 @@ import { createRootCertificate, generateDevRoot, kmsRoot, localRoot, signInterme
 import { AwsKms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2, type ImageInfo } from "../lib/ec2";
 import { AwsSsm, type Ssm } from "../lib/ssm";
+import { DEFAULT_IMAGE } from "./sandbox";
 import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
@@ -1461,21 +1462,44 @@ export class FleetDO extends DurableObject<Env> {
         sandboxes: this.sql.exec("SELECT sandbox, epoch, state, vcpus, memory_mib FROM leases WHERE host = ? ORDER BY sandbox", h.host as string).toArray(),
         agents: this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ? ORDER BY agent", h.host as string).toArray().map((a) => a.agent),
       }));
+    // A sandbox without a lease (suspended to S3, or waiting for a host) is asked for its own state
+    // and image: the lease table cannot tell a suspended sandbox from an unplaced one.
+    const rows = this.sql.exec<{ sandbox: string; registered_ms: number; host: string | null; epoch: number | null; state: string | null }>(
+      `SELECT s.sandbox, s.registered_ms, l.host, l.epoch, l.state FROM sandboxes s
+        LEFT JOIN leases l ON l.sandbox = s.sandbox WHERE s.destroyed_ms IS NULL ORDER BY s.registered_ms`).toArray();
+    const sandboxes = await Promise.all(rows.map(async (r) => {
+      try {
+        const info = await this.sandbox(r.sandbox).info();
+        return { ...r, state: r.host ? r.state : info.state, epoch: r.epoch ?? info.epoch, image: info.image, workstream: info.workstream };
+      } catch {
+        return { ...r, image: null, workstream: null };
+      }
+    }));
     return {
       hosts,
       launches: this.sql.exec("SELECT instance_id, launched_ms, host, reason, ended_ms FROM launched ORDER BY launched_ms").toArray(),
-      sandboxes: this.sql.exec(`SELECT s.sandbox, s.registered_ms, l.host, l.epoch, l.state FROM sandboxes s
-        LEFT JOIN leases l ON l.sandbox = s.sandbox WHERE s.destroyed_ms IS NULL ORDER BY s.registered_ms`).toArray(),
+      sandboxes,
     };
   }
 
   /** Operator view: the cell's host AMIs and the one the launch template resolves to. */
-  async images(): Promise<{ current: string | null; current_since_ms: number | null; images: ImageInfo[] }> {
+  async images(): Promise<{
+    current: string | null; current_since_ms: number | null; images: ImageInfo[];
+    templates: { name: string; default: boolean; source: string; in_use: number }[];
+  }> {
     const ec2 = this.ec2();
     const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value;
     const ssm = this.ssm();
     const current = ssm && cell ? await ssm.parameter(`/imagebuilder/nest-${cell}/host-ami`) : null;
-    return { current: current?.value ?? null, current_since_ms: current?.modified_ms ?? null, images: ec2 ? await ec2.images() : [] };
+    // Sandbox templates (guest images): today the release carries one, `nest-base`, and every host
+    // installs it (deploy/host/install.sh); a sandbox names it by `image`. Counted by live sandbox.
+    const live = (await this.fleetView()).sandboxes as { image?: string | null }[];
+    const inUse = (name: string) => live.filter((s) => s.image === name).length;
+    const templates = [{ name: DEFAULT_IMAGE, default: true, source: "release (nest-base.ext4.zst)", in_use: inUse(DEFAULT_IMAGE) }];
+    for (const name of new Set(live.map((s) => s.image).filter((n): n is string => !!n && n !== DEFAULT_IMAGE))) {
+      templates.push({ name, default: false, source: "unknown to hosts", in_use: inUse(name) });
+    }
+    return { current: current?.value ?? null, current_since_ms: current?.modified_ms ?? null, images: ec2 ? await ec2.images() : [], templates };
   }
 
   private ssm(): Ssm | null {

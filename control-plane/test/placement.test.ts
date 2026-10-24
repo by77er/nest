@@ -124,6 +124,17 @@ describe("placement on regular pages", () => {
 });
 
 describe("operator views", () => {
+  it("a sandbox without a lease shows its own state, not 'unplaced'", async () => {
+    const cell = uniqueCell();
+    const { workstream: ws } = await workstream();
+    const s1 = await place(cell, ws, 202); // no host at all
+    const v = await view(cell);
+    expect(v.sandboxes).toEqual([expect.objectContaining({ sandbox: s1.sandbox, host: null })]);
+    const row = v.sandboxes[0] as unknown as { state: string | null; image: string };
+    expect(row.state, "the SandboxDO's own state").not.toBeNull();
+    expect(row.image).toBe("nest-base:latest");
+  });
+
   it("the fleet view lists each host's residents, brains and capacity, and every live sandbox", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
@@ -135,7 +146,7 @@ describe("operator views", () => {
     expect(h.sandboxes).toEqual([{ sandbox: s1.sandbox, epoch: 1, state: null, vcpus: 2, memory_mib: 4096 }]);
     expect(h.agents).toEqual([]);
     expect(h.tunnel_state).toBe("none");
-    expect(v.sandboxes).toEqual([expect.objectContaining({ sandbox: s1.sandbox, host: a.host, epoch: 1 })]);
+    expect(v.sandboxes).toEqual([expect.objectContaining({ sandbox: s1.sandbox, host: a.host, epoch: 1, image: "nest-base:latest" })]);
     const viaApi = await adminJson<FleetView>(`/v1/admin/fleet?cell=${cell}`);
     expect(viaApi.hosts[0]!.sandboxes).toEqual(h.sandboxes);
   });
@@ -154,6 +165,7 @@ describe("operator views", () => {
     await connectHost(cell); // registers the cell name the parameter is named after
     const v = await adminJson<{ current: string | null; current_since_ms: number | null; images: ImageInfo[] }>(`/v1/admin/images?cell=${cell}`);
     expect(v.current).toBe("ami-new");
+    expect((v as unknown as { templates: { name: string; default: boolean }[] }).templates).toEqual([expect.objectContaining({ name: "nest-base:latest", default: true })]);
     expect(v.current_since_ms).toBe(1760000000000);
     expect(v.images.map((i) => i.image_id)).toEqual(["ami-old", "ami-new"]);
   });

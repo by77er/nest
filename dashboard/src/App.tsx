@@ -152,7 +152,8 @@ export function App() {
   const dead = useMemo(() => (fleet?.hosts ?? []).filter((h) => h.status === "dead").reverse(), [fleet]);
   const inFlight = useMemo(() => (fleet?.launches ?? []).filter((l) => !l.ended_ms && !l.host), [fleet]);
   const recentLaunches = useMemo(() => (fleet?.launches ?? []).slice(-8).reverse(), [fleet]);
-  const unplaced = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => !s.host), [fleet]);
+  // Without a lease a sandbox is either waiting for a host or parked in S3; its own state says which.
+  const unplaced = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => !s.host && s.state !== "suspended" && s.state !== "archived"), [fleet]);
   const brains = useMemo(() => live.flatMap((h) => h.agents.map((a) => ({ agent: a, host: h.host }))), [live]);
   const sandboxCount = fleet?.sandboxes.length ?? 0;
 
@@ -219,14 +220,15 @@ export function App() {
         <h2>Sandboxes</h2>
         {sandboxCount === 0 ? <p className="muted">none live</p> : (
           <div className="tbl"><table>
-            <thead><tr><th>sandbox</th><th>host</th><th>epoch</th><th>state</th><th>age</th></tr></thead>
+            <thead><tr><th>sandbox</th><th>template</th><th>host</th><th>epoch</th><th>state</th><th>age</th></tr></thead>
             <tbody>
               {(fleet?.sandboxes ?? []).map((s) => (
-                <tr key={s.sandbox} className={s.host ? "" : "unplaced"}>
+                <tr key={s.sandbox} className={!s.host && s.state !== "suspended" && s.state !== "archived" ? "unplaced" : ""}>
                   <td className="mono" title={s.sandbox}>{short(s.sandbox)}</td>
-                  <td className="mono" title={s.host ?? ""}>{s.host ? short(s.host) : <Chip kind="warn">unplaced</Chip>}</td>
+                  <td className="mono">{s.image ?? "—"}</td>
+                  <td className="mono" title={s.host ?? ""}>{s.host ? short(s.host) : s.state === "suspended" ? <span className="muted">in S3</span> : <Chip kind="warn">unplaced</Chip>}</td>
                   <td>{s.epoch ?? "—"}</td>
-                  <td>{s.host ? stateChip(s.state) : <span className="muted">waiting for a host</span>}</td>
+                  <td>{stateChip(s.state)}</td>
                   <td>{age(s.registered_ms, now)}</td>
                 </tr>
               ))}
@@ -267,6 +269,25 @@ export function App() {
             </tbody>
           </table></div>
         )}
+      </section>
+
+      <section>
+        <h2>Sandbox templates</h2>
+        {!images?.templates ? <p className="muted">loading</p> : (
+          <div className="tbl"><table>
+            <thead><tr><th>template</th><th>comes from</th><th>live sandboxes</th></tr></thead>
+            <tbody>
+              {images.templates.map((t) => (
+                <tr key={t.name}>
+                  <td className="mono">{t.name} {t.default && <Chip kind="accent">default</Chip>}</td>
+                  <td>{t.source}</td>
+                  <td>{t.in_use}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table></div>
+        )}
+        <p className="muted">A sandbox names its template at create (<span className="mono">image</span>); every host installs the release's templates at boot.</p>
       </section>
 
       <section>
