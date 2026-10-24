@@ -30,11 +30,13 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 | `host_token` | no | Rotated bearer token |
 | `binding_key` | no | `keys[{kid, public_key}]`: every binding verification key still valid for the cell (ECDSA P-256, the uncompressed point, base64url); sent after `hello_ack` and on rotation; nestd forwards it to the gateway ([gateway](../../gateway/)) |
 | `proxy_ca` | no | Renewed intermediate |
-| `error` | — | `ErrorBody`. `unauthorized` and `unsupported_protocol_version` close the socket |
+| `error` | — | `ErrorBody`. `unauthorized` and `unsupported_version` close the socket (nestd also reads the older name `unsupported_protocol_version`) |
 
 **Process lineage.** Both seq lineages (host events, commands) belong to one nestd process. When `hello.instance_id` differs from the previous connection's, FleetDO **resets both**: it forgets `last_event_seq` (the new process starts its events at 1), drops unacked commands and fails them retryably (`command_result` error, `retryable: true`), and reconciles from the hello report instead of replaying. A reconnect of the same process resumes as usual.
 
 **In-order delivery.** On both channels a reliable message must carry `seq == last + 1`. A gap or a processing failure **closes the socket** instead of answering with an error and continuing. The sender then reconnects and resends everything unacked, so a later batch's cumulative ack can never cover an earlier failed one.
+
+**One bad event never blocks a batch.** FleetDO parses a batch's events one at a time. An event that fails its schema (say, a malformed id that came from inside a sandbox) is **quarantined**: logged and skipped, and the batch is acked with the rest applied. Rejecting the whole frame would make the host resend it forever and stall every sandbox on the host. A processing failure, by contrast, is retryable and closes the socket as above.
 
 ## Commands
 
@@ -73,7 +75,7 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `capacity` | Free vCPU, memory (`MemAvailable`) and hugepages, the hugepage pool's size (`hugepages_mib_total`; 0 or absent means regular pages), counts, warm generations |
 | `tunnel_state` | `state`: the host's tunnel changed to `none`, `connecting` or `connected` (from cloudflared's `/ready`); FleetDO advertises the tunnel hostname only while `connected` |
 | `spot_notice` | IMDS interruption notice; the host is draining |
-| `agent_exited` | Brain process exit (lifecycle only) |
+| `agent_exited` | Brain process exit (lifecycle only): `exit_code?`, `signal?`, `reason` (`AgentExitReason`: `idle stopped fenced auth_failed crashed`, the runner's reasons; `host_lost`, the control plane's own for a brain a reconnecting host no longer reports; `unknown`, what any other string parses as, including an older nestd's free text). AgentDO restarts the brain at once when work is waiting after `idle`, `crashed`, `fenced` or `host_lost` |
 | `guest_cli` | `request, sandbox, epoch, agent?, command` (`guest::CliCommand`): a `nest notify/emit/ask/expose` run by a program in the sandbox, attributed by `NEST_AGENT_ID`. FleetDO runs it on the agent's AgentDO as the platform tool of the same name (`expose` → `expose_port`) **without holding the event batch** (an `ask` waits ≤ 120 s, then returns `pending`), and answers with a `guest_cli_result` command. nestd gives up after `wait_s` + 15 s (`ask`) or 30 s (others) |
 | `task_exited` | `sandbox, epoch, agent, task` (`guest::TaskInfo`): a background hands task exited. FleetDO forwards it to the agent's AgentDO (mid-turn it becomes an inbox note) |
 

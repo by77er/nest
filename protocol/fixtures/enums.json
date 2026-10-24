@@ -1,0 +1,29 @@
+{
+  "AgentExitReason": ["idle", "stopped", "fenced", "auth_failed", "crashed", "host_lost", "unknown"],
+  "AgentRole": ["worker", "captain"],
+  "AgentState": [
+    "starting", "ready", "working", "waiting_permission", "waiting_input", "compacting", "idle", "errored",
+    "quota_parked", "stalled", "needs_attention", "detached"
+  ],
+  "BindingScope": ["hands", "pty", "ingress"],
+  "CommitReason": [
+    "turn_end", "timer", "dirty_threshold", "suspend", "drain", "spot_notice", "checkpoint", "fork", "salvage", "archive"
+  ],
+  "EgressAlertReason": ["placeholder_wrong_host", "domain_fronting", "injection_after_expiry", "unknown"],
+  "EgressVerdict": ["allow", "passthrough", "deny", "alert"],
+  "EgressVia": ["dns", "http_transparent", "https_transparent", "explicit", "tcp_exception"],
+  "ForkMode": ["disk_only", "live"],
+  "GenerationKind": ["disk_only", "checkpoint"],
+  "HostRole": ["burst", "controller"],
+  "ManifestKind": ["disk", "memory"],
+  "PolicyLayer": ["base", "workstream", "sandbox"],
+  "RuleDecision": ["allow", "deny", "ask"],
+  "SandboxState": [
+    "creating", "restoring", "running", "suspending", "suspended", "archiving", "archived", "fenced", "destroyed", "failed"
+  ],
+  "SuspendMode": ["memory", "disk_only"],
+  "TaskStatus": ["running", "exited", "killed", "timed_out"],
+  "TunnelState": ["none", "connecting", "connected"],
+  "TurnInputKind": ["user", "event_batch", "inbox", "ask_answer", "recovery"],
+  "Urgency": ["low", "normal", "high"]
+}

@@ -140,7 +140,7 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
         ProxyCommand::HelloAck { protocol_version, host_id, .. } => {
             if protocol_version != PROTOCOL_VERSION {
                 return Err(ErrorBody {
-                    code: nest_protocol::model::error_codes::UNSUPPORTED_PROTOCOL_VERSION.into(),
+                    code: nest_protocol::model::error_codes::UNSUPPORTED_VERSION.into(),
                     message: format!("nestd speaks {protocol_version}, proxy speaks {PROTOCOL_VERSION}"),
                     retryable: false,
                 });

@@ -1,6 +1,6 @@
 # Interfaces
 
-Boundary contracts between components. Each boundary has a spec here and Rust types in `crates/nest-protocol`. **JSON fixtures in `protocol/fixtures/` are the cross-language source of truth:** the Rust tests and the control plane's TypeScript tests both round-trip them.
+Boundary contracts between components. Each boundary has a spec here and Rust types in `crates/nest-protocol`. **JSON fixtures in `protocol/fixtures/` are the cross-language source of truth:** the Rust tests and the control plane's TypeScript tests both round-trip them. Two shared lists sit beside them, asserted equal on both sides: `codes.json` (error codes) and `enums.json` (the members of every string enum both sides define).
 
 | Boundary | Spec | Rust module |
 |---|---|---|
@@ -12,7 +12,9 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 ## Conventions
 
 - **JSON, snake_case fields.** Message enums are internally tagged: `{"type": "snake_case_name", ...}`.
-- **IDs** are prefixed strings: `hst_`, `sbx_`, `agt_`, `ws_`, `gen_`, `ses_`.
+- **IDs** are prefixed strings: `hst_`, `sbx_`, `agt_`, `ws_`, `gen_`, `ses_`. Parsing checks the prefix on both sides.
+- **Absent, never null.** An unset optional field is left out; neither side sends `null` for it (Rust skips `None`, a test checks every field; TypeScript drops `undefined`). zod rejects `null` there; serde tolerates it.
+- **Open enums** for reasons that grow: `agent_exited.reason` and `egress_alert.reason` parse a member they don't know as `unknown`, so a new reason never rejects a message.
 - **Epoch** and **Seq** are u64. Timestamps are `*_ms` (Unix milliseconds).
 - **Binary data in JSON** is base64 (standard alphabet). Bulk byte streams use raw framed channels, never JSON.
 - **Errors:** `{code, message, retryable}`.

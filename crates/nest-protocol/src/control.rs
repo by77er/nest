@@ -115,7 +115,7 @@ pub enum HostToFleet {
 /// reports no ready connection to Cloudflare yet) or `connected` (it does). Reported in the hello
 /// and as a `tunnel_state` event on every change; the control plane advertises the tunnel
 /// hostname only while `connected` (docs/sandbox/gateway/, Addressing).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum TunnelState {
     #[default]
@@ -242,7 +242,7 @@ pub enum FleetToHost {
     BindingKey { keys: Vec<BindingKey> },
     /// Renewed proxy intermediate (answer to `CaRenew`).
     ProxyCa(CaCertificate),
-    /// Fatal or per-frame error. `unsupported_protocol_version` / `unauthorized` close the socket.
+    /// Fatal or per-frame error. `unsupported_version` / `unauthorized` close the socket.
     Error { error: ErrorBody },
 }
 
@@ -526,8 +526,45 @@ pub enum HostEventBody {
         exit_code: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<i32>,
-        reason: String,
+        reason: AgentExitReason,
     },
+}
+
+/// Why a brain process ended (`HostEventBody::AgentExited.reason`); AgentDO decides whether to
+/// restart it from this. The runner's `host::runner::ExitReason` maps onto it member for member.
+/// Open: a member this build doesn't know (a newer sender, or free text from an older one) parses
+/// as `unknown`, so a new reason never rejects an event batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExitReason {
+    /// Idle grace elapsed; stdin closed; exited cleanly.
+    Idle,
+    /// `agent_stop`.
+    Stopped,
+    /// The sandbox lease (or the host's) lapsed.
+    Fenced,
+    /// Startup auth verification failed.
+    AuthFailed,
+    Crashed,
+    /// The control plane's own: the host reconnected without reporting the brain. Never sent by
+    /// a host.
+    HostLost,
+    /// Deserialize-only fallback; never sent by this build.
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<crate::host::runner::ExitReason> for AgentExitReason {
+    fn from(r: crate::host::runner::ExitReason) -> Self {
+        use crate::host::runner::ExitReason;
+        match r {
+            ExitReason::Idle => Self::Idle,
+            ExitReason::Stopped => Self::Stopped,
+            ExitReason::Fenced => Self::Fenced,
+            ExitReason::AuthFailed => Self::AuthFailed,
+            ExitReason::Crashed => Self::Crashed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -540,7 +577,7 @@ pub enum CommandOutcome {
     Error { error: ErrorBody },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressVerdict {
     Allow,
@@ -551,7 +588,7 @@ pub enum EgressVerdict {
 }
 
 /// Which nest-proxy entry point handled a connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressVia {
     Dns,
@@ -742,7 +779,7 @@ pub struct ToolRule {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleDecision {
     Allow,

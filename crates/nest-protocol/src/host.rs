@@ -360,7 +360,7 @@ pub mod proxy {
         Moved,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumIter)]
     #[serde(rename_all = "snake_case")]
     pub enum AlertKind {
         /// A binding's placeholder was sent to a host outside the binding.
@@ -473,8 +473,10 @@ pub mod runner {
         Kill,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    /// nestd forwards it as `control::AgentExitReason` (`From`), never as a string.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumIter, strum::IntoStaticStr)]
     #[serde(rename_all = "snake_case")]
+    #[strum(serialize_all = "snake_case")]
     pub enum ExitReason {
         /// Idle grace elapsed; stdin closed; exited cleanly.
         Idle,
@@ -485,15 +487,9 @@ pub mod runner {
     }
 
     impl ExitReason {
-        /// String used in `HostEventBody::AgentExited.reason`.
+        /// The wire name, for logs and state details (derived; a test pins it to the serde name).
         pub fn as_str(self) -> &'static str {
-            match self {
-                ExitReason::Idle => "idle",
-                ExitReason::Stopped => "stopped",
-                ExitReason::Fenced => "fenced",
-                ExitReason::AuthFailed => "auth_failed",
-                ExitReason::Crashed => "crashed",
-            }
+            self.into()
         }
     }
 }

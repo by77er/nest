@@ -416,7 +416,7 @@ fn default_ask_wait() -> u32 {
     120
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum Urgency {
     Low,
@@ -686,7 +686,7 @@ pub struct TaskInfo {
     pub ended_ms: Option<TimestampMs>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Running,
@@ -761,7 +761,7 @@ pub enum PtyControl {
 /// `ErrorBody::code` values used on this boundary.
 pub mod error_code {
     pub const BAD_REQUEST: &str = "bad_request";
-    pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
+    pub const UNSUPPORTED_VERSION: &str = crate::model::error_codes::UNSUPPORTED_VERSION;
     pub const STALE_EPOCH: &str = "stale_epoch";
     pub const UNKNOWN_AGENT: &str = "unknown_agent";
     pub const UNKNOWN_TASK: &str = "unknown_task";

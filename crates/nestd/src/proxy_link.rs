@@ -638,7 +638,7 @@ pub(crate) mod tests {
         p.allow = (0..n)
             .map(|i| AllowRule { host: HostPattern(format!("host-{i}-{}.example.com", "x".repeat(40))), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None })
             .collect();
-        link.apply(ProxyOp::Upsert { sandbox: SandboxId("sbx".into()), epoch: Epoch(1), workstream: None, policy: p });
+        link.apply(ProxyOp::Upsert { sandbox: SandboxId("sbx_1".into()), epoch: Epoch(1), workstream: None, policy: p });
     }
 
     /// Review #4 (E6): a connected proxy that stops reading must not block `apply` (and so must
@@ -661,7 +661,7 @@ pub(crate) mod tests {
                 upsert(&l2, v, 200);
                 let _ = tx.send(t.elapsed());
             }
-            l2.apply(ProxyOp::Drop { sandbox: SandboxId("sbx".into()), epoch: Epoch(1), reason: DropReason::Fence });
+            l2.apply(ProxyOp::Drop { sandbox: SandboxId("sbx_1".into()), epoch: Epoch(1), reason: DropReason::Fence });
             let _ = tx.send(Duration::ZERO);
         });
         let mut n = 0;
@@ -794,7 +794,7 @@ pub(crate) mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
         let (link, _path, _nrx) = start_link(dir.path());
-        let sbx = SandboxId("sbx".into());
+        let sbx = SandboxId("sbx_1".into());
         assert!(link.apply(ProxyOp::Drop { sandbox: sbx.clone(), epoch: Epoch(3), reason: DropReason::Fence }));
         assert!(!link.apply(ProxyOp::Upsert { sandbox: sbx.clone(), epoch: Epoch(3), workstream: None, policy: policy(1) }));
         assert!(!link.apply(ProxyOp::AddListeners {
