@@ -49,7 +49,7 @@ jobs:
             ~/.cargo/bin/.inframe-rev
             deploy/lean/.lake
             deploy/lean/.generated
-          key: infra-v2-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json') }}
+          key: infra-v2-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json', 'deploy/cloudflare-schema.json') }}
           restore-keys: infra-v2-${{ runner.os }}-
       - run: scripts/infra-tools.sh
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
@@ -71,6 +71,22 @@ jobs:
       - name: Apply
         working-directory: deploy
         run: inframe apply --stack use1 -- -input=false -no-color use1.plan
+      # The edge stack: Cloudflare Access in front of nest's hostnames. Needs a Cloudflare token with
+      # Access: Apps and Policies: Edit (CLOUDFLARE_ACCESS_API_TOKEN); without it the stack is skipped.
+      - name: Edge plan and apply
+        working-directory: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ACCESS_API_TOKEN }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::notice::CLOUDFLARE_ACCESS_API_TOKEN is not set; the edge stack was not planned or applied"
+            exit 0
+          fi
+          inframe provider generate cloudflare --frontend lean --schema-json cloudflare-schema.json
+          inframe init --stack edge -- -input=false
+          inframe plan --stack edge -- -input=false -no-color -out=edge.plan | tee "$RUNNER_TEMP/edge-plan.txt"
+          { echo '### Edge plan'; echo '```'; grep -E '^  # |^Plan:|^No changes' "$RUNNER_TEMP/edge-plan.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          inframe apply --stack edge -- -input=false -no-color edge.plan
 
   worker:
     needs: infra

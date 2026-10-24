@@ -13,6 +13,13 @@ source = "hashicorp/aws"
 version = "6.69.1"
 module_root = "Aws"
 
+# Cloudflare Access in front of nest's hostnames (the gateways, the dashboard, previews): the `edge`
+# stack. Trimmed to the three Access resource types.
+[providers.cloudflare]
+source = "cloudflare/cloudflare"
+version = "5.27.0"
+module_root = "Cloudflare"
+
 [workspace]
 directory = ".inframe"
 graph_directory = ".inframe/graphs"
@@ -28,6 +35,21 @@ type = "s3"
 [stacks.use1.backend.config]
 bucket = "nest-tfstate-589531222691"
 key = "cells/use1.tfstate"
+region = "us-east-1"
+use_lockfile = true
+encrypt = true
+
+[stacks.edge]
+frontend = "lean"
+main = "edge"
+test = "edge-test"
+
+[stacks.edge.backend]
+type = "s3"
+
+[stacks.edge.backend.config]
+bucket = "nest-tfstate-589531222691"
+key = "edge.tfstate"
 region = "us-east-1"
 use_lockfile = true
 encrypt = true
