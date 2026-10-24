@@ -12,6 +12,10 @@ subDir = "lean"
 name = "generated-aws"
 path = ".generated/aws"
 
+[[require]]
+name = "generated-cloudflare"
+path = ".generated/cloudflare"
+
 [[lean_lib]]
 name = "Cell"
 globs = ["Cell.+"]
@@ -23,3 +27,15 @@ root = "Cell.Use1"
 [[lean_exe]]
 name = "cell-test"
 root = "Cell.Test"
+
+[[lean_lib]]
+name = "Edge"
+globs = ["Edge.+"]
+
+[[lean_exe]]
+name = "edge"
+root = "Edge.Main"
+
+[[lean_exe]]
+name = "edge-test"
+root = "Edge.Test"

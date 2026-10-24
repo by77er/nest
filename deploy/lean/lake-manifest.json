@@ -3,6 +3,13 @@
  "packages":
  [{"type": "path",
    "scope": "",
+   "name": "«generated-cloudflare»",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": ".generated/cloudflare",
+   "configFile": "lakefile.toml"},
+  {"type": "path",
+   "scope": "",
    "name": "«generated-aws»",
    "manifestFile": "lake-manifest.json",
    "inherited": false,

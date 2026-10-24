@@ -156,15 +156,17 @@ jobs:
             ~/.cargo/bin/.inframe-rev
             deploy/lean/.lake
             deploy/lean/.generated
-          key: infra-v2-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json') }}
+          key: infra-v2-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json', 'deploy/cloudflare-schema.json') }}
           restore-keys: infra-v2-${{ runner.os }}-
       - run: scripts/infra-tools.sh
       - name: Proofs and policies
         working-directory: deploy
         run: |
           inframe provider generate aws --frontend lean --schema-json aws-schema.json
+          inframe provider generate cloudflare --frontend lean --schema-json cloudflare-schema.json
           # include_str isn't tracked by Lake: rebuild the stack so it reads this checkout's scripts.
           inframe test --stack use1
+          inframe test --stack edge
 
   # Repo guards: doc links, source fences for the CLAUDE.md invariants, and tests proving each
   # guard can fail.
