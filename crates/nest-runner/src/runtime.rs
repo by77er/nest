@@ -391,9 +391,14 @@ impl Agent {
     }
 
     /// The cached gateway target with its generation, if a `hands_resolve` has answered since
-    /// the last refusal.
+    /// the last refusal and its binding is not about to expire (`nest_hands_client::refresh_due`):
+    /// a target due for refresh is forgotten, so the caller resolves a fresh one first instead
+    /// of spending a bind on an `unauthorized`.
     pub fn hands_target(&self) -> Option<(HandsTarget, u64)> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.target.as_ref().is_some_and(|t| nest_hands_client::refresh_due(t, now_ms())) {
+            inner.target = None;
+        }
         inner.target.clone().map(|t| (t, inner.target_gen))
     }
 

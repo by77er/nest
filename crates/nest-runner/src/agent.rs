@@ -40,12 +40,22 @@ use crate::stream;
 /// `system/init.capabilities` flag for the stream-json interrupt control request.
 pub const CAP_INTERRUPT: &str = "interrupt_receipt_v1";
 
-/// Built-in tools that act on the host machine. A brain must never have them: its hands are the
-/// `mcp__nest__*` tools that run inside the sandbox.
-pub const FORBIDDEN_BUILTINS: &[&str] = &[
-    "Bash", "BashOutput", "KillShell", "KillBash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS",
-    "PowerShell", "Monitor",
+/// The only Claude Code built-ins a brain may have: none reads or writes the host's files or
+/// runs a command there (its hands are the `mcp__nest__*` tools that run inside the sandbox).
+/// Subagents (`Agent`, `Task` before Claude Code 2.1), the task and todo tools (state in the
+/// config dir), the web tools (traffic through the host's egress allowlist), and the MCP
+/// resource tools (they read only from the configured `nest` server). An allowlist, so a
+/// built-in Claude Code adds later is refused until it is reviewed and listed here.
+pub const HOST_SAFE_BUILTINS: &[&str] = &[
+    "Agent", "Task", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TodoWrite", "WebSearch", "WebFetch",
+    "ListMcpResourcesTool", "ReadMcpResourceTool",
 ];
+
+/// Whether a tool name is allowed in a brain: an MCP tool (every one comes through `nest mcp`)
+/// or a [`HOST_SAFE_BUILTINS`] entry.
+pub fn tool_allowed(name: &str) -> bool {
+    name.starts_with("mcp__") || HOST_SAFE_BUILTINS.contains(&name)
+}
 
 const MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -62,8 +72,8 @@ const SETTLE: Duration = Duration::from_secs(10);
 pub fn start(rt: Arc<Runtime>, start: AgentStart) {
     tokio::spawn(async move {
         let id = start.start.agent.clone();
-        if let Some(bad) = start.start.launch.builtin_tools.iter().find(|t| FORBIDDEN_BUILTINS.contains(&t.as_str())) {
-            let msg = format!("refusing to start: built-in tool {bad} would run on the host");
+        if let Some(bad) = start.start.launch.builtin_tools.iter().find(|t| !HOST_SAFE_BUILTINS.contains(&t.as_str())) {
+            let msg = format!("refusing to start: built-in tool {bad} is not on the runner's host-safe allowlist");
             tracing::error!(agent = %id, "{msg}");
             rt.report(RunnerEvent::Error { agent: Some(id.clone()), error: ErrorBody { code: "forbidden_tool".into(), message: msg, retryable: false } });
             rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Crashed });
@@ -320,6 +330,7 @@ async fn run(
         auth_method: auth,
         auth_reported: false,
         outstanding: 0,
+        tally: stream::TurnTally::default(),
         settle_deadline: None,
         idle_deadline: None,
         interrupt: None,
@@ -469,6 +480,8 @@ struct Actor {
     auth_reported: bool,
     /// User messages written to stdin and not yet answered by a `result`.
     outstanding: u32,
+    /// The current turn's `result`s, reported as one `turn_completed` when it ends.
+    tally: stream::TurnTally,
     settle_deadline: Option<Instant>,
     idle_deadline: Option<Instant>,
     interrupt: Option<InterruptStage>,
@@ -650,10 +663,15 @@ impl Actor {
         }
     }
 
+    /// The runner's turn is over (no message outstanding, or the settle passed): the one place
+    /// that reports `turn_completed` and `idle`, stamped with the turn that just ended.
     fn turn_finished(&mut self) {
         self.outstanding = 0;
         self.interrupt = None;
-        self.agent.inner.lock().unwrap().turn = None;
+        let turn = self.agent.inner.lock().unwrap().turn.take();
+        for body in self.tally.finish() {
+            self.agent.emit_with_turn(body, turn.clone());
+        }
         self.idle_deadline = Some(Instant::now() + self.rt.cfg.idle_grace);
     }
 
@@ -671,8 +689,8 @@ impl Actor {
         }
         if let StreamOut::System(SystemMessage::Init { session_id, api_key_source, capabilities, tools, .. }) = &out {
             tracing::info!(agent = %self.agent.id, ?tools, "system/init");
-            if let Some(bad) = tools.iter().find(|t| FORBIDDEN_BUILTINS.contains(&t.as_str())) {
-                tracing::error!(agent = %self.agent.id, tool = %bad, "Claude Code reports a host-side built-in tool; killing");
+            if let Some(bad) = tools.iter().find(|t| !tool_allowed(t)) {
+                tracing::error!(agent = %self.agent.id, tool = %bad, "Claude Code reports a built-in tool outside the host-safe allowlist; killing");
                 self.agent.emit(AgentEventBody::Error {
                     error: ErrorBody { code: "forbidden_tool".into(), message: format!("built-in tool {bad} is enabled"), retryable: false },
                 });
@@ -723,7 +741,10 @@ impl Actor {
             self.agent.emit_with_turn(body, turn.clone());
         }
         match out {
-            StreamOut::Result(_) => {
+            StreamOut::Result(r) => {
+                // One user message answered; the turn ends (and is reported) only when none
+                // is left, so an inbox message written mid-turn stays inside the turn.
+                self.tally.add(&r);
                 self.outstanding = self.outstanding.saturating_sub(1);
                 if self.outstanding == 0 {
                     self.turn_finished();
@@ -803,6 +824,7 @@ impl Actor {
         self.stdin = proc.stdin;
         self.exit_reason = None;
         self.outstanding = 0;
+        self.tally = stream::TurnTally::default();
         self.interrupt = None;
         self.idle_deadline = None;
         self.settle_deadline = None;
@@ -867,6 +889,119 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let gap = SessionResume { segments: vec![seg(2, 6, 6, false)], total_bytes: 6, ..resume };
         assert!(materialize(&gap, &path).await.is_err());
+    }
+
+    /// An actor with no process behind it: stdin lines land in the returned receiver, events
+    /// in the outbound one. `pid` 0 makes signals and kills no-ops.
+    fn bare_actor() -> (Actor, mpsc::Receiver<Vec<u8>>, mpsc::UnboundedReceiver<Outbound>) {
+        use nest_protocol::control::SystemPrompt;
+        use nest_protocol::model::{AgentId, AgentRole};
+        let rt = Runtime::new(crate::Config::default());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let agent = Agent::new(AgentId("agt_t".into()), AgentRole::Worker, Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
+        let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
+        let launch = LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: String::new() } };
+        let actor = Actor {
+            rt,
+            agent,
+            launch: Launch { launch, config_dir: String::new(), env: vec![] },
+            pid: 0,
+            stdin: StdinWriter { tx: Some(stdin_tx), task: None },
+            auth_method: "oauth_token".into(),
+            auth_reported: true,
+            outstanding: 0,
+            tally: stream::TurnTally::default(),
+            settle_deadline: None,
+            idle_deadline: None,
+            interrupt: None,
+            exit_reason: None,
+            stash: Vec::new(),
+            req_n: 0,
+        };
+        (actor, stdin_rx, out_rx)
+    }
+
+    fn result_line(stop: &str) -> String {
+        serde_json::json!({"type": "result", "subtype": "success", "is_error": false, "num_turns": 1, "duration_ms": 1,
+            "total_cost_usd": 0.01, "usage": {"input_tokens": 3, "output_tokens": 1}, "stop_reason": stop, "result": "x",
+            "session_id": "s"})
+        .to_string()
+    }
+
+    /// `(turn, kind)` for every event sent so far.
+    fn drained(out: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<(Option<String>, &'static str)> {
+        let mut v = Vec::new();
+        while let Ok(o) = out.try_recv() {
+            if let Outbound::Event(e) = o {
+                let kind = match e.body {
+                    AgentEventBody::TurnStarted { .. } => "turn_started",
+                    AgentEventBody::TurnCompleted { .. } => "turn_completed",
+                    AgentEventBody::StateChanged { state: AgentState::Idle, .. } => "idle",
+                    AgentEventBody::StateChanged { state: AgentState::Working, .. } => "working",
+                    AgentEventBody::InboxDelivered { .. } => "inbox_delivered",
+                    _ => "other",
+                };
+                v.push((e.turn.map(|t| t.0), kind));
+            }
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn an_inbox_message_delivered_mid_turn_stays_inside_the_turn() {
+        use nest_protocol::control::{InboxMessage, TurnInput};
+        use nest_protocol::model::{MessageId, TurnId};
+        let (mut actor, _stdin, mut out) = bare_actor();
+        actor.handle(AgentCmd::RunTurn { turn: TurnId("trn_1".into()), input: TurnInput { kind: TurnInputKind::User, text: "go".into() } });
+        actor.handle(AgentCmd::Inbox(InboxMessage { id: MessageId("msg_1".into()), from: "user".into(), text: "also".into(), interrupt: false, ts_ms: 0 }));
+        let t1 = Some("trn_1".to_string());
+        assert_eq!(drained(&mut out), [(t1.clone(), "turn_started"), (t1.clone(), "working"), (t1.clone(), "inbox_delivered")]);
+
+        // The first result answers the turn's own message; the inbox message is still outstanding.
+        actor.handle(AgentCmd::Line(result_line("end_turn")));
+        assert_eq!(drained(&mut out), [], "no turn_completed or idle while a message is outstanding");
+        assert_eq!(actor.agent.inner.lock().unwrap().turn.as_ref().map(|t| t.0.as_str()), Some("trn_1"));
+
+        // The second result ends the turn: reported once, with the turn's id.
+        actor.handle(AgentCmd::Line(result_line("end_turn")));
+        assert_eq!(drained(&mut out), [(t1.clone(), "turn_completed"), (t1, "idle")]);
+        assert!(actor.agent.inner.lock().unwrap().turn.is_none());
+
+        // The next turn is its own.
+        actor.handle(AgentCmd::RunTurn { turn: TurnId("trn_2".into()), input: TurnInput { kind: TurnInputKind::User, text: "next".into() } });
+        actor.handle(AgentCmd::Line(result_line("end_turn")));
+        let t2 = Some("trn_2".to_string());
+        assert_eq!(drained(&mut out), [(t2.clone(), "turn_started"), (t2.clone(), "working"), (t2.clone(), "turn_completed"), (t2, "idle")]);
+    }
+
+    #[tokio::test]
+    async fn a_result_that_leaves_messages_outstanding_ends_the_turn_after_the_settle() {
+        use nest_protocol::control::{InboxMessage, TurnInput};
+        use nest_protocol::model::{MessageId, TurnId};
+        let (mut actor, _stdin, mut out) = bare_actor();
+        actor.handle(AgentCmd::RunTurn { turn: TurnId("trn_1".into()), input: TurnInput { kind: TurnInputKind::User, text: "go".into() } });
+        actor.handle(AgentCmd::Inbox(InboxMessage { id: MessageId("msg_1".into()), from: "user".into(), text: "also".into(), interrupt: false, ts_ms: 0 }));
+        actor.handle(AgentCmd::Line(result_line("end_turn")));
+        drained(&mut out);
+        // Claude Code merged the inbox message into that answer: no second result comes.
+        assert!(actor.settle_deadline.is_some());
+        actor.settle_deadline = Some(Instant::now());
+        actor.on_deadline();
+        let t1 = Some("trn_1".to_string());
+        assert_eq!(drained(&mut out), [(t1.clone(), "turn_completed"), (t1, "idle")]);
+    }
+
+    #[test]
+    fn only_host_safe_built_ins_are_allowed() {
+        // What the control plane's default worker launch names, and the observed init names.
+        for t in ["TodoWrite", "Task", "Agent", "WebSearch", "WebFetch", "TaskCreate", "mcp__nest__Bash"] {
+            assert!(tool_allowed(t), "{t}");
+        }
+        // Host-touching built-ins, and one Claude Code might add tomorrow.
+        for t in ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit", "PowerShell", "Monitor", "SomeNewTool"] {
+            assert!(!tool_allowed(t), "{t}");
+        }
     }
 
     #[test]

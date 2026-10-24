@@ -14,7 +14,7 @@ RUST_LOG=debug   # tracing filter
 
 | Module | Role |
 |---|---|
-| `state` | What nestd said: keys (`kid` → raw P-256 point), sandboxes (epoch, vsock socket, attached clients, guest version), the resync generation, and the open connections it can cut (close code 4409) |
+| `state` | What nestd said: keys (`kid` → raw P-256 point), sandboxes (epoch, vsock socket, attached clients, guest version), the resync generation, and the open connections it can cut (close code 4409). An upsert with an epoch older than the one held is refused and logged (until a `remove` or a lost link forgets the sandbox) |
 | `verify` | The bind check in the documented precedence: gateway version → token shape → claims version → `unknown_key` → signature, expiry, scope → `moved`/`busy` → `stale_epoch`/`busy` → client attached → guest known → guest version |
 | `server` | Accept, route (`/hands` only; `/pty` and `/ingress/*` answer 501), the bind handshake (5 s), the vsock `CONNECT 1025`, then the pipe: exactly one frame per message, the first frame checked against the binding (4401), guest frames re-framed one per message, a hangup on either side ends the call |
 | `link` | Dials nestd, says hello, applies `key_update` / `sandbox_upsert` / `sandbox_remove` / `resync_done`, answers pings; losing the socket clears everything and cuts every connection, then reconnects with backoff |

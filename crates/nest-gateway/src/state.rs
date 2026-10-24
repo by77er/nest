@@ -126,8 +126,11 @@ impl State {
         Snapshot { key: g.keys.get(kid).cloned(), entry: g.sandboxes.get(sandbox).cloned(), resyncing: g.resyncing }
     }
 
-    /// Add or replace a sandbox. A changed epoch cuts every connection of the old epoch
-    /// (`close_code::MOVED`): their bindings named an epoch that is no longer current.
+    /// Add or replace a sandbox. A newer epoch cuts every connection of the old one
+    /// (`close_code::MOVED`): their bindings named an epoch that is no longer current. An older
+    /// epoch than the one held is refused (logged, the entry kept): accepting it would cut the
+    /// current calls and admit the old epoch's bindings again. Only a `remove` (or a lost nestd
+    /// link) first lets a sandbox come back at a lower epoch.
     pub fn upsert_sandbox(
         &self,
         sandbox: SandboxId,
@@ -140,6 +143,12 @@ impl State {
         let mut g = self.write();
         let generation = g.generation;
         let old_epoch = g.sandboxes.get(&sandbox).map(|e| e.epoch);
+        if let Some(old) = old_epoch
+            && epoch.0 < old.0
+        {
+            tracing::error!(sandbox = %sandbox.0, held = old.0, sent = epoch.0, "refusing an epoch older than the one held");
+            return;
+        }
         g.sandboxes.insert(sandbox.clone(), SandboxEntry { epoch, vsock_uds_path, clients, guest, generation });
         if let Some(old) = old_epoch
             && old != epoch
@@ -252,5 +261,28 @@ mod tests {
         state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v"), ["agt_a"], None);
         state.clear();
         assert_eq!((state.key_count(), state.sandbox_count()), (1, 0));
+    }
+
+    #[test]
+    fn an_epoch_going_backwards_is_refused_until_the_sandbox_is_removed() {
+        let state = State::new();
+        state.upsert_sandbox(sbx(), Epoch(5), PathBuf::from("/v5"), ["agt_a"], None);
+        let mut guard = state.register_conn(sbx(), Epoch(5)).expect("current epoch");
+        // A late update for epoch 4: the entry, and the call on epoch 5, stay.
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v4"), ["agt_a"], None);
+        let e = state.sandbox(&sbx()).unwrap();
+        assert_eq!((e.epoch, e.vsock_uds_path), (Epoch(5), PathBuf::from("/v5")));
+        assert!(state.register_conn(sbx(), Epoch(4)).is_none(), "the old epoch is not admitted again");
+        assert!(guard.rx.borrow().is_none(), "the current call was not cut");
+        // The same epoch updates in place (clients, guest); a newer one cuts the old calls.
+        state.upsert_sandbox(sbx(), Epoch(5), PathBuf::from("/v5"), ["agt_a", "agt_b"], None);
+        assert!(guard.rx.borrow().is_none());
+        assert_eq!(state.sandbox(&sbx()).unwrap().clients.len(), 2);
+        state.upsert_sandbox(sbx(), Epoch(6), PathBuf::from("/v6"), ["agt_a"], None);
+        assert_eq!(*guard.rx.borrow_and_update(), Some(close_code::MOVED));
+        // After a remove, any epoch is a fresh placement.
+        state.remove_sandbox(&sbx());
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v4"), ["agt_a"], None);
+        assert_eq!(state.sandbox(&sbx()).unwrap().epoch, Epoch(4));
     }
 }

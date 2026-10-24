@@ -15,9 +15,10 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::gateway::{
     ClientMessage, GatewayMessage, GuestInfo, HandsTarget, MIN_SUPPORTED_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code,
+    PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code, parse_binding,
 };
 use nest_protocol::guest::frame::{self, Kind, MAX_FRAME_LEN};
+use nest_protocol::model::ErrorBody;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -97,28 +98,81 @@ impl RefusalCode {
 pub struct Refusal {
     pub code: RefusalCode,
     pub message: String,
-    /// Retryable with the same binding (`busy`); otherwise resolve again or give up.
+    /// The wire's flag; [`Refusal::next`] decides by `code`, not by this.
     pub retryable: bool,
     pub retry_after_ms: Option<u64>,
 }
 
-impl Refusal {
-    /// The same binding can never succeed, but a fresh one from `hands_resolve` may:
-    /// `stale_epoch`, `moved`, `unknown_key`.
-    pub fn resolve_again(&self) -> bool {
-        matches!(
-            self.code,
-            RefusalCode::StaleEpoch | RefusalCode::Moved | RefusalCode::UnknownKey
-        )
-    }
+/// The pause before trying the same target again after a `busy` that carried no
+/// `retry_after_ms` (the gateway's `busy` carries one; the guest's never does).
+pub const BUSY_RETRY: Duration = Duration::from_millis(500);
+/// The pause before asking for a target again after a `sandbox_not_ready` that carried no
+/// `retry_after_ms`.
+pub const NOT_READY_RETRY: Duration = Duration::from_secs(2);
+/// A cached target whose binding expires within this margin is resolved again before use, so
+/// a call never spends a bind on a binding about to be refused as `unauthorized`.
+pub const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
-    /// Neither a retry nor a new binding helps: `unauthorized`, `bad_request`, `unsupported_version`.
-    pub fn is_final(&self) -> bool {
-        matches!(
-            self.code,
-            RefusalCode::Unauthorized | RefusalCode::BadRequest | RefusalCode::UnsupportedVersion
-        )
+/// What a client does next about a refusal or a failed open: the one classification every
+/// client (the runner today, `api-loop` later) applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// The same target can succeed later: wait `after`, then open again (within the caller's
+    /// `busy` budget).
+    RetrySame { after: Duration },
+    /// The same target can never succeed, but a fresh one from `resolve` may: drop it, resolve
+    /// again once, and retry once.
+    Resolve,
+    /// Neither helps: show the error.
+    Final,
+}
+
+impl Refusal {
+    /// `busy` → [`Next::RetrySame`] after `retry_after_ms` (else [`BUSY_RETRY`]);
+    /// `stale_epoch`, `moved`, `unknown_key`, `unauthorized` (an expired or revoked binding)
+    /// and `unsupported_version` (a target minted with a guest version that is no longer the
+    /// guest's) → [`Next::Resolve`]; `bad_request` and unknown codes → [`Next::Final`].
+    pub fn next(&self) -> Next {
+        match self.code {
+            RefusalCode::Busy => Next::RetrySame {
+                after: self
+                    .retry_after_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or(BUSY_RETRY),
+            },
+            RefusalCode::StaleEpoch
+            | RefusalCode::Moved
+            | RefusalCode::UnknownKey
+            | RefusalCode::Unauthorized
+            | RefusalCode::UnsupportedVersion => Next::Resolve,
+            RefusalCode::BadRequest | RefusalCode::Other(_) => Next::Final,
+        }
     }
+}
+
+/// A guest's `error` frame in answer to a request. A `busy` (not configured yet, filesystems
+/// frozen for a snapshot) is refused before anything runs, so it is retried like a gateway
+/// `busy`, within the same budget; every other guest error goes to the caller as it is.
+pub fn guest_error_next(error: &ErrorBody) -> Next {
+    if error.code == nest_protocol::guest::error_code::BUSY {
+        Next::RetrySame { after: BUSY_RETRY }
+    } else {
+        Next::Final
+    }
+}
+
+/// When the target's binding expires: `exp_ms` from its claims segment (the signature is the
+/// gateway's to check). `None` if the token does not parse.
+pub fn binding_exp_ms(target: &HandsTarget) -> Option<i64> {
+    parse_binding(target.binding.expose())
+        .ok()
+        .map(|p| p.claims.exp_ms)
+}
+
+/// True when a cached target should be resolved again before use: its binding expires within
+/// [`REFRESH_MARGIN`] of `now_ms`. A binding that does not parse is left to the gateway.
+pub fn refresh_due(target: &HandsTarget, now_ms: i64) -> bool {
+    binding_exp_ms(target).is_some_and(|exp| exp - REFRESH_MARGIN.as_millis() as i64 <= now_ms)
 }
 
 /// Which timer of [`OpenOptions`] elapsed.
@@ -230,6 +284,22 @@ impl std::fmt::Display for OpenError {
 }
 
 impl std::error::Error for OpenError {}
+
+impl OpenError {
+    /// [`Refusal::next`] for a refusal; [`Next::Resolve`] when nothing usable answered where
+    /// the target points ([`TransportError::is_unreachable`], or a connect that timed out: a
+    /// host that accepts TCP and never completes the upgrade); otherwise [`Next::Final`].
+    pub fn next(&self) -> Next {
+        match self {
+            OpenError::Refused(r) => r.next(),
+            OpenError::Transport(t) if t.is_unreachable() => Next::Resolve,
+            OpenError::Timeout(Phase::Connect) => Next::Resolve,
+            OpenError::Transport(_) | OpenError::Timeout(Phase::Bind) | OpenError::Protocol(_) => {
+                Next::Final
+            }
+        }
+    }
+}
 
 /// A close frame with a gateway close code: 4400 protocol, 4401 unauthorized, 4409 moved, or any
 /// other code that is not the normal 1000.

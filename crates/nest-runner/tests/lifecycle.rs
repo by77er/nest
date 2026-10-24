@@ -162,6 +162,11 @@ async fn refuses_without_lease_and_with_host_tools() {
     let evs = events(&e.rt, Duration::from_millis(500)).await;
     assert!(evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "forbidden_tool")), "{evs:?}");
     assert_eq!(exited(&evs), [ExitReason::Crashed]);
+    // An allowlist, not a denylist: a built-in the runner has not reviewed is refused too.
+    nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_new_tool", &["TodoWrite", "SomeNewBuiltin"]));
+    let evs = events(&e.rt, Duration::from_millis(500)).await;
+    assert!(evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "forbidden_tool" && error.message.contains("SomeNewBuiltin"))), "{evs:?}");
+    assert!(pids(e.dir.path()).is_empty(), "Claude Code was never spawned");
     *e.rt.lease.lock().unwrap() = Some(now_ms() - 1);
     nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_nolease", &[]));
     let evs = events(&e.rt, Duration::from_millis(500)).await;
