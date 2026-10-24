@@ -54,7 +54,7 @@ def edge (spec : EdgeSpec) : Infra Unit := do
       domain := some (lit (gatewaysDomain spec))
       serviceAuth401Redirect := some true, appLauncherVisible := some false
       policies := some [serviceAuth spec] }
-  let _ ← ZeroTrustAccessApplication.create "dashboard"
+  let dashboard ← ZeroTrustAccessApplication.create "dashboard"
     { accountId := some (lit spec.accountId), name := some (lit s!"{spec.label} dashboard"), type := some "self_hosted"
       domain := some (lit (dashboardDomain spec))
       sessionDuration := some "24h", appLauncherVisible := some true
@@ -64,5 +64,7 @@ def edge (spec : EdgeSpec) : Infra Unit := do
       domain := some (lit (previewsDomain spec))
       sessionDuration := some "24h", appLauncherVisible := some false
       policies := some [ownerOnly spec] }
+  -- The dashboard Worker checks Access tokens against this audience (dashboard/wrangler.jsonc).
+  output "dashboard_aud" dashboard.aud
 
 end Edge

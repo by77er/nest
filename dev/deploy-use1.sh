@@ -1,7 +1,9 @@
 #!/bin/bash
 # Deploys nest-control-plane for the use1 cell: run by deploy.yml, or by hand (dev/deploy.md).
 # Worker secrets persist across versions; `--var`s don't, so every deploy passes them again. They
-# live in SSM next to the secrets (/nest/control-plane/vars/*). Needs CLOUDFLARE_* and AWS_* in env.
+# live in SSM next to the secrets (/nest/control-plane/vars/*): AWS_CELLS is written by the cell stack
+# (deploy/lean/Cell/Stack.lean, applied just before this runs), the others by hand. Needs CLOUDFLARE_*
+# and AWS_* in env.
 set -euo pipefail
 cd "$(dirname "$0")/../control-plane"
 var() { aws ssm get-parameter --region us-east-1 --name "/nest/control-plane/vars/$1" --query Parameter.Value --output text 2>/dev/null; }
