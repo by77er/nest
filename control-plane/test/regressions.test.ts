@@ -707,10 +707,22 @@ describe("#26 a recovery turn says what the transcript can't", () => {
     }]);
     await nextCommands(s.host.ws, (c) => c.type === "commit_result" && c.request === "req_rec");
     const head = (await env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)).headGeneration())!;
-    await agentStub(s.agent).onSandboxMoved(s.sandbox, 1, s.host.host);
+    // Its host dies: the sandbox gets a new lease (epoch 2) on another host, and the brain follows.
+    const b = await connectHost(s.cell);
+    s.host.ws.close();
     r1.ws.close();
+    await adminJson(`/v1/admin/hosts/${s.host.host}/confirm-dead?cell=${s.cell}`, { body: {} });
+    expect(await sandboxStub(s.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+    await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === s.agent && c.hands.epoch === 2);
+    // "Moved during the turn" is SandboxDO's epoch against the one recorded at turn start, not AgentDO's
+    // record of the move push (which can be lost): forget that record.
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      delete info.hands_moved_ms;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
 
-    const r2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_two");
+    const r2 = await runner(s.agent, b.host, b.host_token, "rin_two", 2);
     const rec = await r2.ws.next("run_turn");
     expect(rec.input.kind).toBe("recovery");
     expect(rec.input.text).toContain(`saved transcript ends at ${new Date(durable).toISOString()}`);
@@ -719,7 +731,7 @@ describe("#26 a recovery turn says what the transcript can't", () => {
     r2.ws.close();
 
     // Interrupted again: the next recovery turn still carries the original text, once.
-    const r3 = await runner(s.agent, s.host.host, s.host.host_token, "rin_three");
+    const r3 = await runner(s.agent, b.host, b.host_token, "rin_three", 2);
     const rec2 = await r3.ws.next("run_turn");
     expect(rec2.input.kind).toBe("recovery");
     expect(rec2.input.text.split("refactor the parser").length).toBe(2);

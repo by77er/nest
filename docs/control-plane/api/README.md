@@ -11,6 +11,7 @@
 - **Operator API:** endpoints are listed in `control-plane/README.md`.
   - **Includes:** egress policy layers (`PUT /v1/sandboxes/<id>/policy`), ports and public share links (operator-only), paged transcripts, a sandbox's hands target for a person or a harness (`POST /v1/sandboxes/<id>/resolve`), starting a brain on a named host (`POST /v1/agents/<id>/start {host}`), and the Access service token for the gateways (`PUT /v1/admin/secrets/access:gateway`).
   - **Cells:** must be well-formed names, and must be in `CELLS` when that's set.
+  - **Workers:** `POST /v1/agents` takes a worker's workstream and cell from its sandbox; both are optional, and a value that differs from the sandbox's is refused (409).
 
 ## Operator tokens
 
