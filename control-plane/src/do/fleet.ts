@@ -2,7 +2,7 @@
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
-import { isSecretRef } from "./broker";
+import { commandRefSlots, REF_PURPOSES, type RefPurpose, type RefSlot } from "./broker";
 import { createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
 import { AwsKms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2, type ImageInfo } from "../lib/ec2";
@@ -610,35 +610,36 @@ export class FleetDO extends DurableObject<Env> {
     }
   }
 
-  /** Send messages after replacing BrokerDO secret references with current values. */
+  /**
+   * Send messages after replacing BrokerDO secret references with current values. Only the typed
+   * slots `commandRefSlots` names are resolved, each to the names valid for its purpose
+   * (`REF_PURPOSES`). A reference anywhere else (a launch prompt, say) goes out as its literal text,
+   * so no command field can pull an arbitrary secret (a binding key) out of BrokerDO.
+   */
   private async sendResolved(ws: WebSocket, msgs: unknown[]): Promise<void> {
-    const refs = new Set<string>();
-    const collect = (v: unknown): void => {
-      if (isSecretRef(v)) refs.add(v);
-      else if (Array.isArray(v)) v.forEach(collect);
-      else if (v && typeof v === "object") Object.values(v).forEach(collect);
-    };
-    msgs.forEach(collect);
-    let values: Record<string, string | null> = {};
-    if (refs.size) {
+    const out = msgs.map((m) => structuredClone(m) as { type?: unknown; commands?: unknown });
+    const slots: RefSlot[] = [];
+    for (const m of out) {
+      if (m.type === "commands" && Array.isArray(m.commands)) {
+        for (const c of m.commands as Record<string, unknown>[]) slots.push(...commandRefSlots(c));
+      }
+    }
+    const values = new Map<RefPurpose, Record<string, string | null>>();
+    for (const purpose of new Set(slots.map((s) => s.purpose))) {
+      const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
       try {
-        values = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs([...refs]);
+        values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
       } catch (e) {
         console.error("FleetDO: resolving secret references failed; not sending", e);
         return; // stays queued; resent after the next hello
       }
     }
-    const replace = (v: unknown): unknown => {
-      if (isSecretRef(v)) {
-        const value = values[v];
-        if (value === null || value === undefined) console.warn(`FleetDO: secret ${v.slice(v.indexOf(":") + 1)} is missing or expired`);
-        return value ?? "";
-      }
-      if (Array.isArray(v)) return v.map(replace);
-      if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, replace(x)]));
-      return v;
-    };
-    for (const m of msgs) this.send(ws, replace(m) as FleetToHost);
+    for (const s of slots) {
+      const value = values.get(s.purpose)?.[s.ref];
+      if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
+      s.set(value ?? "");
+    }
+    for (const m of out) this.send(ws, m as FleetToHost);
   }
 
   private socketFor(host: string): WebSocket | undefined {

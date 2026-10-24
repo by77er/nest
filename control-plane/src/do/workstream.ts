@@ -2,7 +2,7 @@
 // (docs/control-plane/durable-objects/workstream/).
 import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
-import { NestError } from "../lib/util";
+import { asNestError, NestError } from "../lib/util";
 import { ErrorCodes, isDecisionEvent, type WorkstreamEvent } from "../protocol/model";
 
 export interface WorkstreamInfo {
@@ -121,7 +121,16 @@ export class WorkstreamDO extends DurableObject<Env> {
       ...decisions.map((e) => line(e.body)),
       ...(progress.length ? ["Recent progress:", ...progress.map((e) => line(e.body))] : []),
     ].join("\n");
-    await this.env.AGENT.get(this.env.AGENT.idFromName(info.captain)).enqueueTurn({ kind: "event_batch", text });
+    try {
+      await this.env.AGENT.get(this.env.AGENT.idFromName(info.captain)).enqueueTurn({ kind: "event_batch", text });
+    } catch (e) {
+      // A captain id that names no agent: keep the events for a real captain instead of retrying.
+      if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) {
+        console.error(`workstream ${info.workstream}: captain ${info.captain} is not an agent; events wait`);
+        return;
+      }
+      throw e;
+    }
     const last = pending[pending.length - 1]!.id;
     this.sql.exec("UPDATE events SET woke = 1 WHERE id <= ?", last);
   }

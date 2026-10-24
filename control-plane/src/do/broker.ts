@@ -141,10 +141,18 @@ export class BrokerDO extends DurableObject<Env> {
     return signBindingToken(await signer, { v: BINDING_VERSION, kid: k.kid, ...claims });
   }
 
-  /** Resolve references to current values; missing or expired secrets resolve to `null`. */
-  async resolveRefs(refs: string[]): Promise<Record<string, string | null>> {
+  /**
+   * Resolve references to current values, for one purpose: only names `allow` admits (see
+   * {@link nameAllowed}) and never a name in {@link NEVER_RESOLVED}. Anything else, and missing or
+   * expired secrets, resolve to `null`.
+   */
+  async resolveRefs(refs: string[], allow: readonly string[]): Promise<Record<string, string | null>> {
     const out: Record<string, string | null> = {};
-    for (const ref of refs) out[ref] = isSecretRef(ref) ? this.secret(ref.slice(SECRET_REF_PREFIX.length))?.value ?? null : null;
+    for (const ref of refs) {
+      const name = isSecretRef(ref) ? ref.slice(SECRET_REF_PREFIX.length) : null;
+      if (name !== null && !nameAllowed(name, allow)) console.warn(`BrokerDO: refusing to resolve ${name} here`);
+      out[ref] = name !== null && nameAllowed(name, allow) ? this.secret(name)?.value ?? null : null;
+    }
     return out;
   }
 }
@@ -153,3 +161,43 @@ export class BrokerDO extends DurableObject<Env> {
 export const SECRET_REF_PREFIX = "$nest-secret:";
 export const secretRef = (name: string) => `${SECRET_REF_PREFIX}${name}`;
 export const isSecretRef = (v: unknown): v is string => typeof v === "string" && v.startsWith(SECRET_REF_PREFIX);
+
+/**
+ * Which secret names a reference may resolve to, by where it sits in a host command. Only these slots
+ * are resolved (FleetDO), so a reference anywhere else (a prompt, say) goes out as its literal text.
+ */
+export const REF_PURPOSES = {
+  /** `agent_start.oauth_token`: the Claude setup token (`claude_oauth_token`, `claude_oauth_token:<name>`). */
+  agent_start: ["claude_oauth_token"],
+  /** `secrets_update.secrets[].value`: injection secrets for nest-proxy. */
+  secrets_update: ["inject:"],
+} as const satisfies Record<string, readonly string[]>;
+
+export type RefPurpose = keyof typeof REF_PURPOSES;
+export interface RefSlot {
+  purpose: RefPurpose;
+  ref: string;
+  set: (value: string) => void;
+}
+
+/** The secret-reference slots of one host command (mutated in place by `set`). */
+export function commandRefSlots(cmd: Record<string, unknown>): RefSlot[] {
+  const slots: RefSlot[] = [];
+  if (cmd.type === "agent_start" && isSecretRef(cmd.oauth_token)) {
+    slots.push({ purpose: "agent_start", ref: cmd.oauth_token, set: (v) => { cmd.oauth_token = v; } });
+  } else if (cmd.type === "secrets_update" && Array.isArray(cmd.secrets)) {
+    for (const s of cmd.secrets as { value?: unknown }[]) {
+      if (isSecretRef(s.value)) slots.push({ purpose: "secrets_update", ref: s.value, set: (v) => { s.value = v; } });
+    }
+  }
+  return slots;
+}
+
+/** Never resolvable into a command, whatever the purpose: they never leave the control plane. */
+export const NEVER_RESOLVED = ["binding_key:", "access:", "cap:", "hook:"] as const;
+
+/** An entry ending in `:` admits that prefix; any other admits the name itself and `<name>:…`. */
+export function nameAllowed(name: string, allow: readonly string[]): boolean {
+  if (NEVER_RESOLVED.some((p) => name.startsWith(p))) return false;
+  return allow.some((p) => (p.endsWith(":") ? name.startsWith(p) && name.length > p.length : name === p || name.startsWith(`${p}:`)));
+}

@@ -31,6 +31,13 @@ const SIGNED_URL_TTL_MS = 15 * 60_000;
 const WORKING_STATES: AgentState[] = ["working", "compacting", "waiting_permission", "waiting_input"];
 const MAX_START_ATTEMPTS = 3;
 const START_RETRY_MS = 5_000;
+/**
+ * A brain that hasn't said hello this long after its `agent_start` (the command was lost, or the host
+ * never ran it) is given up on: `errored`, which waiting work and new turns wake again.
+ */
+const START_DEADLINE_MS = 120_000;
+/** A failed `SandboxDO.agentActivity` is tried again after this long. */
+const ACTIVITY_RETRY_MS = 5_000;
 /** States with no brain running, which waiting work starts one from (see `wake()`). */
 const WAKE_STATES: AgentState[] = ["detached", "errored"];
 /** A wake that found no host (or failed transiently) retries this often. */
@@ -73,6 +80,12 @@ export interface AgentInfo {
   workstream: string;
   cell: string;
   captain: string | null;
+  /**
+   * The bound sandbox. `epoch` is the epoch the current brain was started with, which is also its
+   * session epoch (the separate agent epoch isn't built): a cache of SandboxDO's epoch, refreshed by
+   * `onSandboxMoved` and at every start. Never an authority on the sandbox's epoch: FleetDO's lease
+   * check fences host-relayed calls, and SandboxDO is read for the current value.
+   */
   hands: { sandbox: string; epoch: number } | null;
   launch: LaunchConfig;
   grants: string[] | null;
@@ -107,6 +120,8 @@ export interface AgentInfo {
   durable_ms?: number;
   /** When the bound sandbox last moved to a new lease (it was restored from its head). */
   hands_moved_ms?: number;
+  /** What SandboxDO last acknowledged from `agentActivity`; absent = unknown (tell it again). */
+  activity_sent?: boolean;
 }
 
 export interface CreateAgent {
@@ -172,6 +187,9 @@ export class AgentDO extends DurableObject<Env> {
     // Idempotent admission: a retried submission with the same request id gets the same turn / message.
     this.addColumn("turns", "request_id", "TEXT");
     this.addColumn("turns", "started_ms", "INTEGER");
+    // The bound sandbox's epoch (read from SandboxDO) when the turn started: a recovery turn compares
+    // it with the current one to say whether the sandbox moved meanwhile.
+    this.addColumn("turns", "hands_epoch", "INTEGER");
     this.addColumn("inbox", "request_id", "TEXT");
     this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS turns_request ON turns (request_id) WHERE request_id IS NOT NULL");
     this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS inbox_request ON inbox (request_id) WHERE request_id IS NOT NULL");
@@ -222,7 +240,15 @@ export class AgentDO extends DurableObject<Env> {
     if (this.exists()) return this.load();
     let hands: AgentInfo["hands"] = null;
     if (req.role === "worker" && req.sandbox) {
-      const sbx = await this.sandboxStub(req.sandbox).attach(req.agent);
+      // A worker's cell and workstream are its sandbox's: its brain starts through that cell's FleetDO,
+      // and its sandbox's secrets and events belong to that workstream. Checked before attaching.
+      const stub = this.sandboxStub(req.sandbox);
+      const cur = await stub.info();
+      if (cur.cell !== req.cell || cur.workstream !== req.workstream) {
+        throw new NestError(ErrorCodes.INVALID_MESSAGE,
+          `${req.sandbox} is in cell ${cur.cell}, workstream ${cur.workstream}; the worker must be too`, 409);
+      }
+      const sbx = await stub.attach(req.agent);
       hands = { sandbox: req.sandbox, epoch: sbx.epoch };
     }
     if (this.exists()) return this.load();
@@ -271,9 +297,58 @@ export class AgentDO extends DurableObject<Env> {
     return this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(id));
   }
 
-  /** Epoch a runner must present: the bound sandbox's lease for workers, 0 for captains. */
+  /** Epoch a runner must present: the one its brain was started with for workers, 0 for captains. */
   private expectedEpoch(info: AgentInfo): number {
     return info.hands?.epoch ?? 0;
+  }
+
+  /**
+   * `sandbox` and `epoch` for an event about the bound sandbox. The epoch is SandboxDO's current one
+   * (or `known`, one FleetDO's lease check just verified), never AgentDO's cached copy.
+   */
+  private async sandboxFields(info: AgentInfo, known?: number): Promise<{ sandbox?: string; epoch?: number }> {
+    if (!info.hands) return {};
+    const epoch = known ?? (await this.sandboxStub(info.hands.sandbox).info()).epoch;
+    return { sandbox: info.hands.sandbox, epoch };
+  }
+
+  /**
+   * Working, as the sandbox's idle refcount should see it: a brain is running and is busy or in a turn
+   * (SessionStart says `ready` mid-turn, so a turn in progress is work whatever state it reports).
+   */
+  private working(info: AgentInfo): boolean {
+    return !WAKE_STATES.includes(info.state) && (WORKING_STATES.includes(info.state) || info.current_turn !== null);
+  }
+
+  /**
+   * AgentDO owns "working": tell SandboxDO (an idempotent "set to") whenever it differs from what
+   * SandboxDO last acknowledged, or always with `force`. Never throws: a failed call is retried from
+   * the alarm, so a lost call can neither suspend a sandbox mid-turn nor keep it awake for ever.
+   * Loops because a concurrent change may land while a call is in flight.
+   */
+  private async syncActivity(force = false): Promise<void> {
+    for (let n = 0; n < 3; n++) {
+      const info = this.load();
+      if (!info.hands || info.role !== "worker") return;
+      const want = this.working(info);
+      if (!force && info.activity_sent === want) return;
+      force = false;
+      try {
+        await this.sandboxStub(info.hands.sandbox).agentActivity(info.agent, want);
+      } catch (e) {
+        console.warn(`agent ${info.agent}: telling ${info.hands.sandbox} working=${want} failed; retrying`, e);
+        this.update((i) => {
+          delete i.activity_sent;
+        });
+        await this.deadlines.set("activity", Date.now() + ACTIVITY_RETRY_MS, true);
+        return;
+      }
+      this.update((i) => {
+        i.activity_sent = want;
+      });
+    }
+    // Still changing under us: check again shortly.
+    await this.deadlines.set("activity", Date.now() + ACTIVITY_RETRY_MS, true);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -301,6 +376,14 @@ export class AgentDO extends DurableObject<Env> {
       // Lazy start: a suspended sandbox resumes, an unplaced one is placed (maybe on a new host).
       // Without a host yet this fails retryably; the placement then moves the agent onto it.
       host = hostHint ?? (await this.sandboxStub(info.hands.sandbox).wake()).host;
+      // The cached epoch is whatever SandboxDO last pushed (`onSandboxMoved`, best effort): refresh it
+      // at every start, so a missed push heals here and the new brain starts at the current epoch.
+      const { epoch } = await this.sandboxStub(info.hands.sandbox).info();
+      this.update((i) => {
+        if (!i.hands || i.hands.epoch === epoch) return;
+        i.hands = { sandbox: i.hands.sandbox, epoch };
+        i.hands_moved_ms = Date.now();
+      });
     } else {
       host = hostHint ?? (await this.fleet(info.cell).controllerHost());
     }
@@ -325,7 +408,19 @@ export class AgentDO extends DurableObject<Env> {
       i.host = host;
       i.state = "starting";
     });
-    const [cmd] = await this.fleet(info.cell).issueCommands(host, [{ type: "agent_start", ...body }]);
+    // `starting` never outlives this deadline without a hello (see the `starting` alarm).
+    await this.deadlines.set("starting", Date.now() + START_DEADLINE_MS);
+    let cmd: string | undefined;
+    try {
+      [cmd] = await this.fleet(info.cell).issueCommands(host, [{ type: "agent_start", ...body }]);
+    } catch (e) {
+      // Nothing was queued: don't leave the agent `starting` with nothing on the way.
+      this.update((i) => {
+        if (i.state === "starting" && i.host === host) i.state = "detached";
+      });
+      await this.deadlines.clear("starting");
+      throw e;
+    }
     return { host, cmd: cmd! };
   }
 
@@ -360,7 +455,7 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.update((i) => {
       i.state = "detached";
     });
-    if (info.hands && info.role === "worker") await this.sandboxStub(info.hands.sandbox).agentActivity(info.agent, false);
+    await this.syncActivity();
     console.log(`agent ${info.agent}: brain exited (${reason})`);
     // Work that arrived while it was exiting, or the turn it died in, brings it straight back.
     if (RESTART_ON_EXIT.includes(reason)) await this.wake(reason !== "idle");
@@ -692,6 +787,9 @@ export class AgentDO extends DurableObject<Env> {
     if (!newLineage && hello.last_seq !== undefined) this.rel.ack(CHAN, hello.last_seq);
     for (const m of this.rel.pendingAfter(CHAN, newLineage ? undefined : hello.last_seq)) this.send(ws, m as AgentToRunner);
     this.pushCache();
+    await this.deadlines.clear("starting");
+    // Re-assert working to SandboxDO: a call lost before this session must not outlive it.
+    await this.syncActivity(true);
     await this.pump();
   }
 
@@ -703,8 +801,8 @@ export class AgentDO extends DurableObject<Env> {
    * sandbox was restored from a saved generation meanwhile (changes after that are gone).
    */
   private async requeueAsRecovery(turn: string): Promise<void> {
-    const row = this.sql.exec<{ input: string; started_ms: number | null; created_ms: number }>(
-      "SELECT input, started_ms, created_ms FROM turns WHERE turn = ?", turn).toArray()[0];
+    const row = this.sql.exec<{ input: string; started_ms: number | null; created_ms: number; hands_epoch: number | null }>(
+      "SELECT input, started_ms, created_ms, hands_epoch FROM turns WHERE turn = ?", turn).toArray()[0];
     this.sql.exec("UPDATE turns SET status = 'interrupted' WHERE turn = ?", turn);
     if (!row) return;
     const orig = JSON.parse(row.input) as TurnInput;
@@ -717,7 +815,18 @@ export class AgentDO extends DurableObject<Env> {
       notes.push(`Your saved transcript ends at ${iso(info.durable_ms)}. Anything you did after that may be missing from it but may still have taken effect: check the workspace (e.g. git status) before redoing work.`);
     }
     const started = row.started_ms ?? row.created_ms;
-    if (info.hands && (info.hands_moved_ms ?? 0) >= started) {
+    // Moved during the turn: SandboxDO's epoch now differs from the one recorded when the turn started.
+    // Without both (an older turn row, or SandboxDO unreachable) fall back to the last move AgentDO heard of.
+    let current: number | null = null;
+    if (info.hands && row.hands_epoch !== null) {
+      try {
+        current = (await this.sandboxStub(info.hands.sandbox).info()).epoch;
+      } catch (e) {
+        console.warn(`agent ${info.agent}: reading the sandbox epoch failed`, e);
+      }
+    }
+    const moved = current !== null ? current !== row.hands_epoch : (info.hands_moved_ms ?? 0) >= started;
+    if (info.hands && moved) {
       let head: GenerationRecord | null = null;
       try {
         head = await this.sandboxStub(info.hands.sandbox).headGeneration();
@@ -904,9 +1013,10 @@ export class AgentDO extends DurableObject<Env> {
   private async applyEvent(ev: AgentEvent): Promise<void> {
     const before = this.load();
     if (ev.agent !== before.agent || ev.epoch !== this.expectedEpoch(before)) return;
+    // The event is recorded as seen only after its side effects succeeded: if one throws, the batch
+    // isn't acked and the resend runs them again. Each is safe to repeat: the state change, the keyed
+    // ingest, `postAsk` (keyed by call) and `syncActivity` (a "set to", compared with what was sent).
     if (this.sql.exec("SELECT 1 FROM events WHERE seq = ?", ev.seq).toArray().length) return;
-    this.sql.exec("INSERT INTO events (seq, body) VALUES (?, ?)", ev.seq, JSON.stringify(ev));
-    this.sql.exec("DELETE FROM events WHERE seq < ?", ev.seq - 500);
     const completed = ev.type === "turn_completed" && !!ev.turn && ev.turn === before.current_turn;
     const info = this.update((i) => {
       switch (ev.type) {
@@ -939,7 +1049,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.workstream(info.workstream).ingest({
         workstream: info.workstream, ts_ms: ev.ts_ms, agent: info.agent, type: "quota_parked",
         ...(ev.retry_after_ms !== undefined ? { retry_after_ms: ev.retry_after_ms } : {}),
-      });
+      }, `${info.agent}/${info.runner_instance ?? ""}/ev${ev.seq}`);
     } else if (ev.type === "inbox_delivered") {
       const n = this.sql.exec("UPDATE inbox SET status = 'consumed' WHERE id = ? AND status = 'delivered'", ev.message).rowsWritten;
       if (n > 0) this.pushCache();
@@ -950,15 +1060,13 @@ export class AgentDO extends DurableObject<Env> {
       const question = `Allow ${ev.tool}? (request ${ev.call}) input: ${input.length > 500 ? `${input.slice(0, 500)}…` : input}`;
       await this.postAsk(info, ev.call, ev.epoch, question, "async", "captain");
     }
-    // A turn in progress is work whatever state it reports (SessionStart says `ready` mid-turn):
-    // the sandbox hears "not working" only when no turn is running.
-    const wasWorking = WORKING_STATES.includes(before.state) || before.current_turn !== null;
-    const isWorking = WORKING_STATES.includes(info.state) || info.current_turn !== null;
-    if (info.hands && wasWorking !== isWorking) await this.sandboxStub(info.hands.sandbox).agentActivity(info.agent, isWorking);
+    await this.syncActivity();
     if (completed) {
       this.pushCache();
       await this.pump();
     }
+    this.sql.exec("INSERT OR IGNORE INTO events (seq, body) VALUES (?, ?)", ev.seq, JSON.stringify(ev));
+    this.sql.exec("DELETE FROM events WHERE seq < ?", ev.seq - 500);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -967,6 +1075,8 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Queue a turn. A retried submission with the same `requestId` gets the same turn, queued once. */
   async enqueueTurn(input: TurnInput, requestId?: string): Promise<string> {
+    // Never write a turn into an AgentDO that was never created (e.g. a captain id that names nobody).
+    if (!this.exists()) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
     if (requestId) {
       const prior = this.sql.exec<{ turn: string }>("SELECT turn FROM turns WHERE request_id = ?", requestId).toArray()[0];
       if (prior) return prior.turn;
@@ -995,7 +1105,16 @@ export class AgentDO extends DurableObject<Env> {
     });
     const { turn, input } = next;
     this.pushReliable((seq) => ({ type: "run_turn", seq, turn, input: JSON.parse(input) as TurnInput }));
-    if (info.hands) await this.sandboxStub(info.hands.sandbox).agentActivity(info.agent, true);
+    await this.syncActivity();
+    if (info.hands) {
+      // Best effort: without it, a recovery turn falls back to the last move AgentDO heard of.
+      try {
+        const { epoch } = await this.sandboxStub(info.hands.sandbox).info();
+        this.sql.exec("UPDATE turns SET hands_epoch = ? WHERE turn = ?", epoch, turn);
+      } catch (e) {
+        console.warn(`agent ${info.agent}: reading the sandbox epoch at turn start failed`, e);
+      }
+    }
   }
 
   async turns(): Promise<{ turn: string; status: string; input: TurnInput }[]> {
@@ -1150,7 +1269,11 @@ export class AgentDO extends DurableObject<Env> {
     this.pushReliable((seq) => ({ type: "tool_result", seq, call, outcome }));
   }
 
-  private async dispatch(epoch: number, call: string, name: string, args: unknown): Promise<DispatchResult> {
+  /**
+   * `sandboxEpoch`: the sandbox epoch FleetDO's lease check verified for a host-relayed call (guest
+   * CLI); without it, events about the sandbox read the epoch from SandboxDO.
+   */
+  private async dispatch(epoch: number, call: string, name: string, args: unknown, sandboxEpoch?: number): Promise<DispatchResult> {
     const info = this.load();
     const def = toolDef(name);
     if (!def) throw new NestError(ErrorCodes.UNKNOWN_TOOL, `unknown tool ${name}`);
@@ -1173,19 +1296,17 @@ export class AgentDO extends DurableObject<Env> {
           const target = to === "captain" ? info.captain ?? wsCaptain : to;
           if (!target?.startsWith("agt_")) throw new NestError(ErrorCodes.INVALID_MESSAGE, `no recipient for ${to}`);
           const stub = this.env.AGENT.get(this.env.AGENT.idFromName(target));
-          // Only within the workstream (or to its captain): a prompt-injected agent can't reach others.
-          if (target !== info.captain && target !== wsCaptain) {
-            const other = await stub.info();
-            if (other.workstream !== info.workstream) throw new NestError(ErrorCodes.FORBIDDEN, `${target} is in another workstream`, 403);
-          }
+          // Only within the workstream, captains included: a prompt-injected agent can't reach others,
+          // and a recorded captain (set at create, or by the workstream route) is no exception.
+          const other = await stub.info();
+          if (other.workstream !== info.workstream) throw new NestError(ErrorCodes.FORBIDDEN, `${target} is in another workstream`, 403);
           await stub.postInbox(`${info.role}:${info.agent}`, message, false, key);
         }
         return text(`Delivered to ${to}.`);
       }
       case "emit": {
         const base = {
-          workstream: info.workstream, ts_ms: Date.now(), agent: info.agent,
-          ...(info.hands ? { sandbox: info.hands.sandbox, epoch: info.hands.epoch } : {}),
+          workstream: info.workstream, ts_ms: Date.now(), agent: info.agent, ...(await this.sandboxFields(info, sandboxEpoch)),
         };
         const summary = String(a.summary);
         let event: WorkstreamEvent;
@@ -1207,7 +1328,7 @@ export class AgentDO extends DurableObject<Env> {
         const question = String(a.question);
         const options = Array.isArray(a.options) ? (a.options as unknown[]).map(String) : [];
         const full = options.length ? `${question} (options: ${options.join(" | ")})` : question;
-        await this.postAsk(info, call, epoch, full, "sync", a.to === "user" ? "user" : "captain");
+        await this.postAsk(info, call, epoch, full, "sync", a.to === "user" ? "user" : "captain", sandboxEpoch);
         return "wait";
       }
       case "read_transcript": {
@@ -1254,21 +1375,27 @@ export class AgentDO extends DurableObject<Env> {
    */
   private async postAsk(
     info: AgentInfo, call: string, epoch: number, question: string, status: "sync" | "cli" | "async", to: "captain" | "user",
+    sandboxEpoch?: number,
   ): Promise<string> {
-    // Re-run for the same call (after an eviction): the question is already out.
-    const prior = this.sql.exec<{ ask: string }>("SELECT ask FROM asks WHERE call = ? AND epoch = ?", call, epoch).toArray()[0];
-    if (prior) return prior.ask;
-    const ask = newId("ask_");
-    const deadline = Date.now() + num(this.env.ASK_SYNC_WINDOW_MS, 120_000);
-    this.sql.exec("INSERT INTO asks (ask, call, epoch, question, status, deadline, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ask, call, epoch, question, status, deadline, Date.now());
-    if (status === "sync") await this.deadlines.set(`ask:${ask}`, deadline);
+    // Re-run for the same call (after an eviction, or an event resent because routing failed): the
+    // same ask, routed again under the same key, which the workstream applies once.
+    const prior = this.sql.exec<{ ask: string; question: string; status: string; deadline: number }>(
+      "SELECT ask, question, status, deadline FROM asks WHERE call = ? AND epoch = ?", call, epoch).toArray()[0];
+    if (prior?.status === "answered") return prior.ask;
+    const ask = prior?.ask ?? newId("ask_");
+    const deadline = prior?.deadline ?? Date.now() + num(this.env.ASK_SYNC_WINDOW_MS, 120_000);
+    if (!prior) {
+      this.sql.exec("INSERT INTO asks (ask, call, epoch, question, status, deadline, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ask, call, epoch, question, status, deadline, Date.now());
+    }
+    if ((prior?.status ?? status) === "sync") await this.deadlines.set(`ask:${ask}`, deadline);
+    const q = prior?.question ?? question;
     if (to === "user") {
-      await this.workstream(info.workstream).notifyUser(`[${ask}] ${info.agent} asks: ${question}`, "high", `${info.agent}/${ask}`);
+      await this.workstream(info.workstream).notifyUser(`[${ask}] ${info.agent} asks: ${q}`, "high", `${info.agent}/${ask}`);
     } else {
       await this.workstream(info.workstream).ingest({
-        workstream: info.workstream, ts_ms: Date.now(), agent: info.agent, type: "needs_input", ask, question,
-        ...(info.hands ? { sandbox: info.hands.sandbox, epoch: info.hands.epoch } : {}),
+        workstream: info.workstream, ts_ms: Date.now(), agent: info.agent, type: "needs_input", ask, question: q,
+        ...(await this.sandboxFields(info, sandboxEpoch)),
       }, `${info.agent}/${ask}`);
     }
     return ask;
@@ -1279,17 +1406,18 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * A `nest` CLI command from a program in this agent's sandbox (relayed guest → nestd → FleetDO),
-   * mapped onto the platform tools of the same name.
+   * mapped onto the platform tools of the same name. `epoch` is the sandbox's: FleetDO relays the
+   * command only from the host holding that lease, which is the fence, so AgentDO doesn't compare it
+   * with its cached copy (which lags when a move's push was lost).
    */
   async guestCli(sandbox: string, epoch: number, command: CliCommand): Promise<CliResult> {
     const info = this.load();
     if (!info.hands || info.hands.sandbox !== sandbox) {
       return { status: "error", error: errorBody(ErrorCodes.NOT_BOUND, `${info.agent} is not bound to ${sandbox}`) };
     }
-    if (info.hands.epoch !== epoch) return { status: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "stale epoch") };
     const call = newId("cal_cli-");
     const run = async (name: string, args: Record<string, unknown>): Promise<CliResult> => {
-      const r = await this.dispatch(epoch, call, name, args);
+      const r = await this.dispatch(epoch, call, name, args, epoch);
       if (r === "wait") return { status: "error", error: errorBody(ErrorCodes.INTERNAL, "unexpected wait", true) };
       if (r.status === "error") return { status: "error", error: r.error };
       return { status: "ok", data: r.status === "ok" ? (r.content.find((c) => c.type === "json") as { value?: unknown } | undefined)?.value ?? null : null };
@@ -1320,7 +1448,7 @@ export class AgentDO extends DurableObject<Env> {
           return await run("expose_port", { port: command.port });
         case "ask": {
           const full = command.options.length ? `${command.question} (options: ${command.options.join(" | ")})` : command.question;
-          const ask = await this.postAsk(info, call, epoch, full, "cli", "captain");
+          const ask = await this.postAsk(info, call, epoch, full, "cli", "captain", epoch);
           const waitMs = Math.min(command.wait_s, 120) * 1000;
           const answer = await new Promise<string | null>((resolve) => {
             const timer = setTimeout(() => { this.cliWaiters.delete(ask); resolve(null); }, waitMs);
@@ -1339,11 +1467,14 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
-  /** A background hands task exited (relayed by the lease holder). Surfaced mid-turn. */
-  async onTaskExited(sandbox: string, epoch: number, task: TaskInfo): Promise<void> {
+  /**
+   * A background hands task exited, relayed by FleetDO only from the host holding the sandbox's lease
+   * at `epoch` (the fence; AgentDO's cached epoch isn't compared). Surfaced mid-turn.
+   */
+  async onTaskExited(sandbox: string, _epoch: number, task: TaskInfo): Promise<void> {
     if (!this.exists()) return;
     const info = this.load();
-    if (!info.hands || info.hands.sandbox !== sandbox || info.hands.epoch !== epoch) return;
+    if (!info.hands || info.hands.sandbox !== sandbox) return;
     const how = task.status === "exited" ? `exited with code ${task.exit_code ?? "?"}` : task.status.replace("_", " ");
     const what = task.description ? `${task.task_id} (${task.description})` : task.task_id;
     // Only interesting while the agent is working; otherwise it reads TaskOutput when it next looks.
@@ -1384,7 +1515,27 @@ export class AgentDO extends DurableObject<Env> {
         await this.flush();
       } else if (key === "restart") {
         const info = this.load();
-        if (info.state === "starting" && info.host && !this.socket()) await this.start();
+        if (info.state === "starting" && info.host && !this.socket()) {
+          try {
+            await this.start();
+          } catch (e) {
+            // start() put the agent back to `detached`: waiting work retries from the wake alarm.
+            console.warn(`agent ${info.agent}: restart failed`, e);
+            await this.deadlines.set("wake", Date.now() + WAKE_RETRY_MS, true);
+          }
+        }
+      } else if (key === "starting") {
+        const info = this.load();
+        if (info.state === "starting" && !this.socket()) {
+          // No hello since agent_start: give up on that start, so waiting work and new turns wake it.
+          this.update((i) => {
+            i.state = "errored";
+          });
+          console.warn(`agent ${info.agent}: no brain connected within ${START_DEADLINE_MS} ms of agent_start`);
+          await this.wake(true);
+        }
+      } else if (key === "activity") {
+        await this.syncActivity();
       } else if (key === "wake") {
         await this.wake();
       } else if (key === "prune") {
