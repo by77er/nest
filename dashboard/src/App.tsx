@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, ApiError, type Fleet, type Host, type Images } from "./api";
+import { api, ApiError, type Fleet, type Host, type Images, type SandboxState } from "./api";
 
 const REFRESH_MS = 10_000;
 
@@ -19,12 +19,18 @@ function Chip({ kind, children }: { kind: "good" | "warn" | "bad" | "muted" | "a
   return <span className={`chip ${kind}`}>{children}</span>;
 }
 
-function stateChip(state: string | null) {
+/** Every sandbox state has a kind, so a new state fails the typecheck until it has one. */
+const STATE_KIND: Record<SandboxState, "good" | "warn" | "bad" | "muted"> = {
+  running: "good",
+  creating: "warn", restoring: "warn", suspending: "warn", archiving: "warn",
+  suspended: "muted", archived: "muted", destroyed: "muted",
+  failed: "bad", fenced: "bad",
+};
+
+/** A lease's state; null before the host's first report. */
+function stateChip(state: SandboxState | null) {
   if (!state) return <Chip kind="muted">starting</Chip>;
-  if (state === "running") return <Chip kind="good">running</Chip>;
-  if (state === "evacuating" || state === "paused") return <Chip kind="warn">{state}</Chip>;
-  if (state === "failed" || state === "fenced") return <Chip kind="bad">{state}</Chip>;
-  return <Chip kind="muted">{state}</Chip>;
+  return <Chip kind={STATE_KIND[state]}>{state}</Chip>;
 }
 
 /** A host is live when it is active and connected; everything else is history. */
@@ -116,8 +122,12 @@ export function App() {
   const agents = useMemo(() => hosts.flatMap((h) => h.agents.map((a) => ({ agent: a, host: h.host }))), [hosts]);
   // Live sandboxes are the ones on a host; one parked in S3 is counted, not listed.
   const sandboxes = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => s.host), [fleet]);
-  const parked = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => !s.host && s.state === "suspended").length, [fleet]);
-  const waiting = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => !s.host && s.state !== "suspended" && s.state !== "archived").length, [fleet]);
+  // Without a host, `state` is the sandbox's own: parked in S3, waiting for a host (a new one, or
+  // one resuming), or anything else (failed, fenced, or unreadable: null), counted apart.
+  const unplaced = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => !s.host), [fleet]);
+  const parked = unplaced.filter((s) => s.state === "suspended" || s.state === "archived").length;
+  const waiting = unplaced.filter((s) => s.state === "creating" || s.state === "restoring").length;
+  const other = unplaced.length - parked - waiting;
 
   return (
     <main>
@@ -173,10 +183,11 @@ export function App() {
             </tbody>
           </table></div>
         )}
-        {(parked > 0 || waiting > 0) && (
+        {(parked > 0 || waiting > 0 || other > 0) && (
           <p className="muted">
-            {parked > 0 && <>{parked} suspended in S3, not on a host. </>}
-            {waiting > 0 && <>{waiting} waiting for a host.</>}
+            {parked > 0 && <>{parked} suspended or archived in S3, not on a host. </>}
+            {waiting > 0 && <>{waiting} waiting for a host. </>}
+            {other > 0 && <>{other} off any host in another state (failed, fenced or unreadable).</>}
           </p>
         )}
       </section>
@@ -190,7 +201,7 @@ export function App() {
 
       <section>
         <h2>Templates</h2>
-        {!images?.templates ? <p className="muted">loading</p> : (
+        {!images ? <p className="muted">loading</p> : (
           <div className="tbl"><table>
             <thead><tr><th>template</th><th>live sandboxes</th></tr></thead>
             <tbody>

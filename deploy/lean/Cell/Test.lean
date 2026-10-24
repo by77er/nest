@@ -60,6 +60,43 @@ theorem control_plane_actions (spec : CellSpec) (template role key : Input Strin
        "ssm:GetParameters", "kms:Sign", "kms:GetPublicKey"] := by
   simp [controlPlaneStatements]
 
+/-- The instance-type condition is the cell's families as `<family>*.*`, and nothing else. -/
+theorem launch_only_listed_families (spec : CellSpec) (template role key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template role key,
+      s.Grants "ec2:RunInstances" → s.sid = "EightIOnly" →
+        s.Requires "StringLike" "ec2:InstanceType" ((instancePatterns spec).map lit) := by
+  simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
+
+/-- `matchesFamily` is IAM's `StringLike` on `<family>*.*`: another family, or no `.`, is refused. -/
+example : matchesFamily "c8i" "c8i-flex.large" ∧ !matchesFamily "c8i" "c7i.large" ∧ !matchesFamily "c8i" "c8i"
+    ∧ !matchesFamily "c8i" "m8i.large" := by decide
+
+/-- Every instance type `use1`'s autoscaler may pick (`AWS_CELLS`) is one IAM lets it launch, so a
+launch never fails on `EightIOnly`. -/
+theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
+
+/-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template and subnets and the spec's
+instance types (the shape control-plane/src/lib/cells.ts parses). -/
+def awsCellsHolds (spec : CellSpec) : Bool :=
+  match Lean.Json.parse (awsCellsWith id spec "lt-0abc" ["subnet-0a", "subnet-0b"]) with
+  | .ok json =>
+    match json.getObjVal? spec.name with
+    | .ok cell =>
+      cell.getObjValAs? String "region" == .ok spec.region
+        && cell.getObjValAs? String "launch_template_id" == .ok "lt-0abc"
+        && cell.getObjValAs? (List String) "subnet_ids" == .ok ["subnet-0a", "subnet-0b"]
+        && cell.getObjValAs? (List String) "instance_types" == .ok spec.launchTypes
+        && cell.getObjValAs? Bool "spot" == .ok spec.spot
+        && cell.getObjValAs? Nat "max_hosts" == .ok spec.maxHosts
+        && cell.getObjValAs? Nat "idle_grace_ms" == .ok spec.idleGraceMs
+        && cell.getObjValAs? Nat "enroll_timeout_ms" == .ok spec.enrollTimeoutMs
+        && cell.getObjValAs? Nat "sandbox_reserve_mib" == .ok spec.sandboxReserveMib
+        && cell.getObjValAs? Nat "max_sandboxes_per_host" == .ok spec.maxSandboxesPerHost
+    | .error _ => false
+  | .error _ => false
+
+#guard awsCellsHolds use1
+
 /-- The hosts' actions, whatever the cell: object storage only, named exactly. -/
 theorem host_actions (spec : CellSpec) :
     ((hostStatements spec).map (·.actions)).flatten =
