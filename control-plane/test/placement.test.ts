@@ -81,6 +81,48 @@ describe("placement packs", () => {
   });
 });
 
+describe("placement on regular pages", () => {
+  // No hugepage pool: a sandbox reserves the cell's `sandbox_reserve_mib` (768 by default)
+  // against the host's free memory until the host counts it; its declared 4096 MiB is a ceiling.
+  it("packs by free memory: a 2.5 GiB host takes three default sandboxes, not a fourth", async () => {
+    const cell = uniqueCell();
+    const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 2560, vcpus_free: 2 });
+    const { workstream: ws } = await workstream();
+    const placed = [await place(cell, ws), await place(cell, ws), await place(cell, ws)];
+    expect(placed.map((p) => p.host), "three fit: 2560 - 2*768 = 1024 >= 768").toEqual([a.host, a.host, a.host]);
+    expect((await place(cell, ws, 202)).host, "the fourth would leave less than a reserve").toBeNull();
+  });
+
+  it("declared vCPUs are a shape, not a reservation: a 2 vCPU host takes several 2 vCPU sandboxes", async () => {
+    const cell = uniqueCell();
+    const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 8192, vcpus_free: 2 });
+    const { workstream: ws } = await workstream();
+    for (let i = 0; i < 5; i++) expect((await place(cell, ws)).host).toBe(a.host);
+  });
+
+  it("the host's report rules once it counts a sandbox: a report with less room stops placement", async () => {
+    const cell = uniqueCell();
+    const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 4096, vcpus_free: 2 });
+    const { workstream: ws } = await workstream();
+    const s1 = await place(cell, ws);
+    expect(s1.host).toBe(a.host);
+    const seq = sendEvents(a.ws, [
+      { ts_ms: Date.now(), type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "running" },
+      { ts_ms: Date.now(), type: "capacity", capacity: { vcpus_free: 0, memory_mib_free: 500, hugepages_mib_free: 0, hugepages_mib_total: 0, sandboxes: 1, agents: 0, warm: [] } },
+    ]);
+    await a.ws.next("ack", (m) => m.up_to >= seq);
+    expect((await place(cell, ws, 202)).host, "500 MiB free is under a reserve").toBeNull();
+  });
+
+  it("a hugepage host keeps the pool rule: the declared size counts against the pool", async () => {
+    const cell = uniqueCell();
+    const a = await hostWithCapacity(cell, { hugepages_mib_free: 8192, hugepages_mib_total: 8192, memory_mib_free: 16384, vcpus_free: 8 });
+    const { workstream: ws } = await workstream();
+    expect([(await place(cell, ws)).host, (await place(cell, ws)).host]).toEqual([a.host, a.host]);
+    expect((await place(cell, ws, 202)).host, "two 4096 MiB sandboxes fill an 8192 MiB pool").toBeNull();
+  });
+});
+
 describe("operator views", () => {
   it("the fleet view lists each host's residents, brains and capacity, and every live sandbox", async () => {
     const cell = uniqueCell();

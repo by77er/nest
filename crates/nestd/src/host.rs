@@ -517,10 +517,12 @@ impl Inner {
             mem.lines().find_map(|l| l.strip_prefix(name).and_then(|v| v.split_whitespace().next()?.parse().ok())).unwrap_or(0)
         };
         let huge_free_mib = field("HugePages_Free:") * field("Hugepagesize:") / 1024;
+        let huge_total_mib = field("HugePages_Total:") * field("Hugepagesize:") / 1024;
         Capacity {
             vcpus_free: total_vcpus.saturating_sub(used_vcpus),
             memory_mib_free: (field("MemAvailable:") / 1024) as u32,
             hugepages_mib_free: huge_free_mib as u32,
+            hugepages_mib_total: huge_total_mib as u32,
             sandboxes: summary.values().filter(|s| holds_lease(s.state)).count() as u32,
             agents: self.agents.lock().expect("agents").len() as u32,
             warm: vec![],

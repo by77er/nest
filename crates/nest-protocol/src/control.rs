@@ -195,11 +195,20 @@ pub struct LeaseClaim {
     pub epoch: Epoch,
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capacity {
     pub vcpus_free: u32,
+    /// `MemAvailable`: what the host can still give sandboxes backed by regular pages.
     pub memory_mib_free: u32,
     pub hugepages_mib_free: u32,
+    /// The hugepage pool's size; 0 (the wire default) means guest memory is regular pages and
+    /// placement packs by `memory_mib_free`, otherwise by `hugepages_mib_free`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hugepages_mib_total: u32,
     pub sandboxes: u32,
     pub agents: u32,
     /// Generations whose snapshots are warm locally (page cache or NVMe); placement prefers them.

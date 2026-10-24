@@ -138,9 +138,15 @@ impl FirecrackerVm {
     }
 }
 
-/// The jailer command line (pure, unit-tested).
-pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: &Path) -> Vec<String> {
+/// The jailer command line (pure, unit-tested). `memory_mib` is the guest's declared size: the
+/// jailer puts the VMM in its own cgroup v2 with `memory.max` at that plus the configured overhead.
+pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: &Path, memory_mib: u32) -> Vec<String> {
+    let cap_bytes = (u64::from(memory_mib) + u64::from(fc.vm_memory_overhead_mib)) * 1024 * 1024;
     let mut a: Vec<String> = vec![
+        "--cgroup-version".into(),
+        "2".into(),
+        "--cgroup".into(),
+        format!("memory.max={cap_bytes}"),
         "--id".into(),
         jail.id.clone(),
         "--exec-file".into(),
@@ -220,7 +226,7 @@ impl Vm for FirecrackerVm {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the jailer needs a persisted netns (network.persist_dir)"))?;
                 jail.populate(&self.cfg, &self.spec)?;
                 let mut c = std::process::Command::new(jailer);
-                c.args(jailer_args(&self.cfg, jail, ns_path, &paths.api_sock));
+                c.args(jailer_args(&self.cfg, jail, ns_path, &paths.api_sock, self.spec.resources.memory_mib));
                 c
             }
             _ => {
@@ -389,6 +395,7 @@ mod tests {
             boot_args: "console=ttyS0".into(),
             images_dir: "/var/lib/nest/images".into(),
             huge_pages: true,
+            vm_memory_overhead_mib: 128,
         }
     }
 
@@ -439,9 +446,10 @@ mod tests {
         let jail = Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s);
         assert_ne!(jail.id, Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s).id);
         assert!(jail.id.len() <= 64 && jail.id.chars().all(|c| c == '-' || c.is_ascii_alphanumeric()), "{}", jail.id);
-        let args = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"));
+        let args = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"), s.resources.memory_mib);
         let joined = args.join(" ");
-        assert!(joined.starts_with(&format!("--id {} ", jail.id)), "{joined}");
+        // The VMM's cgroup caps memory at the declared size plus the overhead: 2048 + 128 MiB here.
+        assert!(joined.starts_with(&format!("--cgroup-version 2 --cgroup memory.max={} --id {} ", 2176u64 * 1024 * 1024, jail.id)), "{joined}");
         assert!(joined.contains("--uid 900 --gid 900 --chroot-base-dir /srv/jailer --netns /run/netns/ns-sbx_1 -- --api-sock /api.sock"), "{joined}");
         let paths = FcPaths { api_sock: "/api.sock".into(), kernel: "/vmlinux".into(), disk: "/disk.img".into(), vsock: "/vsock.sock".into() };
         let reqs = boot_requests(&fc, &s, &paths);

@@ -70,7 +70,7 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `commit_request` | Chunks and manifest are already uploaded. Asks for a CAS with `request`, epoch, parent, kind, manifests, reason (`salvage` marks the commit as orphaned work) |
 | `workstream` | A host-originated `WorkstreamEvent` (`port_opened`, `port_exposed`, `egress_denied`, `egress_alert`) |
 | `egress_audit` | Batches of `EgressAuditRecord` (no secret values, no query strings), written to R2. `via?` names the nest-proxy entry point: `dns http_transparent https_transparent explicit tcp_exception`; `reason` values are listed in [nestd-proxy](../../host-internal/nestd-proxy/). `count?` marks an aggregated record (how many requests it stands for), used for nest-proxy's per-window suppression summaries |
-| `capacity` | Free vCPU, memory and hugepages, counts, warm generations |
+| `capacity` | Free vCPU, memory (`MemAvailable`) and hugepages, the hugepage pool's size (`hugepages_mib_total`; 0 or absent means regular pages), counts, warm generations |
 | `tunnel_state` | `state`: the host's tunnel changed to `none`, `connecting` or `connected` (from cloudflared's `/ready`); FleetDO advertises the tunnel hostname only while `connected` |
 | `spot_notice` | IMDS interruption notice; the host is draining |
 | `agent_exited` | Brain process exit (lifecycle only) |

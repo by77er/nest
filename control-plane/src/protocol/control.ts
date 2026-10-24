@@ -87,6 +87,8 @@ export const Capacity = z.object({
   vcpus_free: z.number().int().nonnegative(),
   memory_mib_free: z.number().int().nonnegative(),
   hugepages_mib_free: z.number().int().nonnegative(),
+  /** The pool's size; 0 or absent means regular pages (placement packs by `memory_mib_free`). */
+  hugepages_mib_total: z.number().int().nonnegative().optional(),
   sandboxes: z.number().int().nonnegative(),
   agents: z.number().int().nonnegative(),
   warm: z.array(GenerationId).default([]),

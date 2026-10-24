@@ -24,13 +24,16 @@ install -d -m 0755 /run/nest /run/nest/runner
 if [ -e /dev/kvm ] && [ -x /opt/nest/bin/firecracker ]; then
   BASE=/var/lib/nest/images/nest-base:latest.ext4
   [ -f "$BASE" ] || { zstd -q -d -f /var/lib/nest/images/nest-base.ext4.zst -o "$BASE.tmp" && mv "$BASE.tmp" "$BASE"; }
-  # Guest memory is backed by 2 MiB hugepages, reserved up front (half the host's memory, so the
-  # brain, nestd and the proxy keep the rest). sysctl.d, so a reboot reserves them again.
-  echo "vm.nr_hugepages = $(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 2 / 2048 ))" > /etc/sysctl.d/90-nest-hugepages.conf
-  sysctl -q -p /etc/sysctl.d/90-nest-hugepages.conf
+  # Guest memory is regular pages, demand-paged and overcommitted: a guest costs what it touches,
+  # and the control plane packs by MemAvailable (docs/sandbox/state/memory/). No hugepage pool:
+  # one would be a reservation that caps occupancy at pool / declared size. The jailer caps each
+  # VM's cgroup at its declared memory plus a VMM overhead, and nest's services carry a low OOM
+  # score, so a guest that outgrows its declaration dies alone.
+  rm -f /etc/sysctl.d/90-nest-hugepages.conf
+  sysctl -q -w vm.nr_hugepages=0 || true
   DRIVER='{"type": "firecracker", "firecracker_bin": "/opt/nest/bin/firecracker", "jailer_bin": "/opt/nest/bin/jailer",
     "jailer": {"uid": 900, "gid": 900, "chroot_base_dir": "/srv/jailer"},
-    "kernel_image": "/var/lib/nest/kernel/vmlinux", "images_dir": "/var/lib/nest/images", "huge_pages": true}'
+    "kernel_image": "/var/lib/nest/kernel/vmlinux", "images_dir": "/var/lib/nest/images", "huge_pages": false}'
 else
   echo "no /dev/kvm (or no firecracker in the release): using the process driver"
   DRIVER='{"type": "process", "guest_command": ["/opt/nest/bin/nest-guest", "--state-dir", "/var/lib/nest/guest",
