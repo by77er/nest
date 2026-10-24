@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use nest_hands_client::{
-    EDGE_CLIENT_ID_HEADER, EDGE_CLIENT_SECRET_HEADER, OpenError, OpenOptions, Phase, RecvError,
-    RefusalCode, TransportError, open,
+    BUSY_RETRY, EDGE_CLIENT_ID_HEADER, EDGE_CLIENT_SECRET_HEADER, Next, OpenError, OpenOptions,
+    Phase, REFRESH_MARGIN, RecvError, Refusal, RefusalCode, TransportError, binding_exp_ms,
+    guest_error_next, open, refresh_due,
 };
+use nest_protocol::model::ErrorBody;
 use nest_protocol::gateway::{
     ClientMessage, EdgeAuth, GuestInfo, HandsTarget, PROTOCOL_VERSION, close_code,
 };
@@ -345,19 +347,24 @@ async fn each_refusal_fixture_maps_to_refused_with_its_fields() {
         (
             "error.stale_epoch.json",
             RefusalCode::StaleEpoch,
-            true,
-            false,
+            Next::Resolve,
         ),
-        ("error.busy.json", RefusalCode::Busy, false, false),
-        ("error.json", RefusalCode::Unauthorized, false, true),
+        (
+            "error.busy.json",
+            RefusalCode::Busy,
+            Next::RetrySame {
+                after: Duration::from_millis(500),
+            },
+        ),
+        // An expired or revoked binding: a fresh one may cure it.
+        ("error.json", RefusalCode::Unauthorized, Next::Resolve),
         (
             "error.unknown_key.json",
             RefusalCode::UnknownKey,
-            true,
-            false,
+            Next::Resolve,
         ),
     ];
-    for (name, code, resolve_again, is_final) in cases {
+    for (name, code, next) in cases {
         let expected: serde_json::Value = serde_json::from_str(&fixture(name)).unwrap();
         let gw = gateway(Mode::Refuse(name)).await;
         match open(&target(&gw.url, None), &opts()).await {
@@ -370,8 +377,7 @@ async fn each_refusal_fixture_maps_to_refused_with_its_fields() {
                     expected["error"]["retryable"].as_bool().unwrap()
                 );
                 assert_eq!(r.retry_after_ms, expected["retry_after_ms"].as_u64());
-                assert_eq!(r.resolve_again(), resolve_again, "{name}");
-                assert_eq!(r.is_final(), is_final, "{name}");
+                assert_eq!(r.next(), next, "{name}");
             }
             other => panic!("{name}: expected Refused, got {other:?}"),
         }
@@ -380,6 +386,84 @@ async fn each_refusal_fixture_maps_to_refused_with_its_fields() {
         RefusalCode::parse("something_new"),
         RefusalCode::Other("something_new".into())
     );
+}
+
+#[test]
+fn one_classification_for_every_refusal_and_guest_error() {
+    let refusal = |code: RefusalCode, retry_after_ms: Option<u64>| Refusal {
+        code,
+        message: String::new(),
+        retryable: false,
+        retry_after_ms,
+    };
+    // A target minted with a guest version that is no longer the guest's: a fresh target
+    // carries the current one.
+    assert_eq!(
+        refusal(RefusalCode::UnsupportedVersion, None).next(),
+        Next::Resolve
+    );
+    assert_eq!(refusal(RefusalCode::Moved, None).next(), Next::Resolve);
+    assert_eq!(refusal(RefusalCode::BadRequest, None).next(), Next::Final);
+    assert_eq!(
+        refusal(RefusalCode::Other("new".into()), None).next(),
+        Next::Final
+    );
+    // `busy` without a hint waits the one default; the decision is by code, not the flag.
+    assert_eq!(
+        refusal(RefusalCode::Busy, None).next(),
+        Next::RetrySame { after: BUSY_RETRY }
+    );
+    assert_eq!(
+        OpenError::Timeout(Phase::Connect).next(),
+        Next::Resolve,
+        "a host that never completes the upgrade"
+    );
+    assert_eq!(OpenError::Timeout(Phase::Bind).next(), Next::Final);
+    assert_eq!(
+        OpenError::Transport(TransportError::Http(404)).next(),
+        Next::Final
+    );
+    assert_eq!(
+        OpenError::Transport(TransportError::Http(530)).next(),
+        Next::Resolve
+    );
+    // The guest's own `busy` is retried like the gateway's; its other errors are the answer.
+    let guest = |code: &str| ErrorBody {
+        code: code.into(),
+        message: String::new(),
+        retryable: true,
+    };
+    assert_eq!(
+        guest_error_next(&guest("busy")),
+        Next::RetrySame { after: BUSY_RETRY }
+    );
+    assert_eq!(guest_error_next(&guest("stale_epoch")), Next::Final);
+    assert_eq!(guest_error_next(&guest("not_found")), Next::Final);
+}
+
+#[test]
+fn a_target_is_due_for_refresh_shortly_before_its_binding_expires() {
+    // The cross-language fixture's token: claims `exp_ms` 1760274000000.
+    let signed: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../protocol/fixtures/gateway/binding_token/signed.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut t = target("ws://127.0.0.1:1", None);
+    t.binding = Secret(signed["token"].as_str().unwrap().into());
+    let exp = signed["claims"]["exp_ms"].as_i64().unwrap();
+    assert_eq!(binding_exp_ms(&t), Some(exp));
+    let margin = REFRESH_MARGIN.as_millis() as i64;
+    assert!(!refresh_due(&t, exp - margin - 1));
+    assert!(refresh_due(&t, exp - margin));
+    assert!(refresh_due(&t, exp + 1));
+    // A token that does not parse is the gateway's to refuse, not a reason to resolve.
+    t.binding = Secret("nbd_garbage".into());
+    assert_eq!(binding_exp_ms(&t), None);
+    assert!(!refresh_due(&t, i64::MAX));
 }
 
 #[tokio::test]

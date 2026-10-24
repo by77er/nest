@@ -2,19 +2,19 @@
 //!
 //! The runner never sees a vsock socket. It holds the sandbox's ids from `agent_start` and asks
 //! AgentDO for the target (gateway URL, binding, guest version) over its own session channel
-//! (`hands_resolve`), lazily before the first call and again whenever a gateway refuses the
-//! target. The MCP arguments are forwarded verbatim (tagged with the tool name), and the
+//! (`hands_resolve`), lazily before the first call, again shortly before the binding expires,
+//! and whenever a gateway refuses the target (classified by `nest_hands_client::Next`). The MCP arguments are forwarded verbatim (tagged with the tool name), and the
 //! guest's `HandsResult` content maps 1:1 to MCP content. Cancelling sends `cancel` and, if the
 //! guest doesn't answer promptly, hangs up (which also cancels).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nest_hands_client::{OpenError, OpenOptions, Phase, RecvError, RefusalCode};
+use nest_hands_client::{HandsConn, NOT_READY_RETRY, Next, OpenError, OpenOptions, RecvError, guest_error_next};
 use nest_protocol::gateway::HandsTarget;
 use nest_protocol::guest::{HandsCancel, HandsOp, HandsRequest, HandsResponse, HandsResult, ToolContent};
 use nest_protocol::host::mcp::{McpContent, ToolCallResult};
-use nest_protocol::model::ErrorBody;
+use nest_protocol::model::{Epoch, ErrorBody};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -56,9 +56,6 @@ impl Default for Budgets {
     }
 }
 
-const NOT_READY_RETRY: Duration = Duration::from_secs(2);
-const BUSY_RETRY: Duration = Duration::from_millis(500);
-
 /// Build the RPC op from an MCP `tools/call` (`name` is the bare tool name, e.g. `Bash`).
 pub fn op_from_mcp(name: &str, arguments: &Value) -> Result<HandsOp, String> {
     let mut v = match arguments {
@@ -98,55 +95,112 @@ pub async fn call_with(
     mut cancel: oneshot::Receiver<()>,
     budgets: &Budgets,
 ) -> ToolCallResult {
-    let mut re_resolved = false;
-    let mut busy_since: Option<Instant> = None;
-    let (mut conn, epoch, generation) = loop {
-        let (target, generation) = match ensure_target(agent, &mut cancel, budgets).await {
-            Ok(t) => t,
+    let mut retries = Retries { re_resolved: false, busy_since: None };
+    loop {
+        let (mut conn, epoch, generation) = match connect(agent, &mut cancel, budgets, &mut retries).await {
+            Ok(c) => c,
             Err(r) => return r,
         };
-        match nest_hands_client::open(&target, &budgets.open).await {
-            Ok(c) => break (c, target.epoch, generation),
-            Err(OpenError::Refused(r)) if r.code == RefusalCode::Busy => {
-                let since = *busy_since.get_or_insert_with(Instant::now);
-                let wait = r.retry_after_ms.map(Duration::from_millis).unwrap_or(BUSY_RETRY);
-                let Some(wait) = capped(wait, since, budgets.busy, budgets.max_sleep) else {
-                    return ToolCallResult::error(format!(
-                        "hands unavailable: the gateway stayed busy for {}s ({})",
-                        budgets.busy.as_secs(),
-                        r.message
-                    ));
-                };
-                if sleep_or_cancel(wait, &mut cancel).await {
-                    return ToolCallResult::error("interrupted");
+        let req = HandsRequest {
+            protocol_version: conn.guest().protocol_version,
+            call_id: call_id.clone(),
+            agent_id: agent.id.clone(),
+            epoch,
+            op: op.clone(),
+        };
+        if let Err(e) = conn.send_json(&req).await {
+            return ToolCallResult::error(format!("hands request failed: {e}"));
+        }
+        let outcome = exchange(agent, &mut conn, generation, &mut cancel).await;
+        tokio::spawn(conn.close());
+        match outcome {
+            Exchange::Done(r) => return r,
+            // Refused before anything ran (e.g. filesystems frozen for a snapshot): the same
+            // policy and budget as the gateway's `busy`.
+            Exchange::GuestBusy(error, after) => {
+                if let Err(r) = busy_wait(&mut retries, after, budgets, &mut cancel, &error.message).await {
+                    return r;
                 }
             }
-            Err(e) => {
+        }
+    }
+}
+
+/// What one call's setup has spent: the one re-resolve, and when the first `busy` came.
+struct Retries {
+    re_resolved: bool,
+    busy_since: Option<Instant>,
+}
+
+/// Wait out a `busy` (gateway or guest) within [`Budgets::busy`]; the error result once spent.
+async fn busy_wait(
+    retries: &mut Retries,
+    after: Duration,
+    budgets: &Budgets,
+    cancel: &mut oneshot::Receiver<()>,
+    message: &str,
+) -> Result<(), ToolCallResult> {
+    let since = *retries.busy_since.get_or_insert_with(Instant::now);
+    let Some(wait) = capped(after, since, budgets.busy, budgets.max_sleep) else {
+        return Err(ToolCallResult::error(format!(
+            "hands unavailable: the sandbox stayed busy for {}s ({message})",
+            budgets.busy.as_secs()
+        )));
+    };
+    if sleep_or_cancel(wait, cancel).await {
+        return Err(ToolCallResult::error("interrupted"));
+    }
+    Ok(())
+}
+
+/// A bound connection for this call, per [`OpenError::next`]: `busy` waits, a refusal a fresh
+/// target may cure resolves again once, anything else is the error result.
+async fn connect(
+    agent: &Arc<Agent>,
+    cancel: &mut oneshot::Receiver<()>,
+    budgets: &Budgets,
+    retries: &mut Retries,
+) -> Result<(HandsConn, Epoch, u64), ToolCallResult> {
+    loop {
+        let (target, generation) = ensure_target(agent, cancel, budgets).await?;
+        let e = match nest_hands_client::open(&target, &budgets.open).await {
+            Ok(c) => return Ok((c, target.epoch, generation)),
+            Err(e) => e,
+        };
+        match e.next() {
+            Next::RetrySame { after } => {
+                let msg = match &e {
+                    OpenError::Refused(r) => r.message.clone(),
+                    other => other.to_string(),
+                };
+                busy_wait(retries, after, budgets, cancel, &msg).await?;
+            }
+            next => {
                 // Whatever refused this target, it is not worth keeping: the next call fetches
                 // a fresh one. Refusals a fresh target may cure get one retry in this call.
                 agent.drop_target_if(generation);
-                if !re_resolved && needs_resolve(&e) {
+                if next == Next::Resolve && !retries.re_resolved {
                     tracing::info!(agent = %agent.id, sandbox = %target.sandbox, "hands target refused ({e}); resolving again");
-                    re_resolved = true;
-                    if edge_outage(&e) && sleep_or_cancel(budgets.edge_pause.min(budgets.max_sleep), &mut cancel).await {
-                        return ToolCallResult::error("interrupted");
+                    retries.re_resolved = true;
+                    if edge_outage(&e) && sleep_or_cancel(budgets.edge_pause.min(budgets.max_sleep), cancel).await {
+                        return Err(ToolCallResult::error("interrupted"));
                     }
                     continue;
                 }
-                return ToolCallResult::error(format!("hands unavailable: {e}"));
+                return Err(ToolCallResult::error(format!("hands unavailable: {e}")));
             }
         }
-    };
-    let req = HandsRequest {
-        protocol_version: conn.guest().protocol_version,
-        call_id,
-        agent_id: agent.id.clone(),
-        epoch,
-        op,
-    };
-    if let Err(e) = conn.send_json(&req).await {
-        return ToolCallResult::error(format!("hands request failed: {e}"));
     }
+}
+
+enum Exchange {
+    Done(ToolCallResult),
+    /// The guest refused the request as `busy`; nothing ran. Retry after the pause.
+    GuestBusy(ErrorBody, Duration),
+}
+
+/// Read the guest's answer to the request just sent, honoring a cancel.
+async fn exchange(agent: &Arc<Agent>, conn: &mut HandsConn, generation: u64, cancel: &mut oneshot::Receiver<()>) -> Exchange {
     let mut cancelled = false;
     let mut cancel_sent = false;
     let outcome = loop {
@@ -162,7 +216,7 @@ pub async fn call_with(
         } else {
             tokio::select! {
                 r = conn.recv_json::<HandsResponse>() => r,
-                _ = &mut cancel => {
+                _ = &mut *cancel => {
                     cancelled = true;
                     continue;
                 }
@@ -171,6 +225,10 @@ pub async fn call_with(
         match next {
             Ok(Some(HandsResponse::Started { .. })) => continue,
             Ok(Some(HandsResponse::Result { result, .. })) => break to_mcp(result),
+            Ok(Some(HandsResponse::Error { error, .. })) if !cancelled => match guest_error_next(&error) {
+                Next::RetrySame { after } => return Exchange::GuestBusy(error, after),
+                _ => break error_result(&error),
+            },
             Ok(Some(HandsResponse::Error { error, .. })) => break error_result(&error),
             Ok(None) if cancelled => break ToolCallResult::error("interrupted"),
             // The request was sent: a close or a broken connection before the result (a guest
@@ -188,8 +246,7 @@ pub async fn call_with(
             Err(e) => break unknown_outcome(&format!("the connection failed before a result arrived ({e})")),
         }
     };
-    tokio::spawn(conn.close());
-    outcome
+    Exchange::Done(outcome)
 }
 
 /// After the request frame went out, losing the connection says nothing about the command.
@@ -198,19 +255,6 @@ fn unknown_outcome(why: &str) -> ToolCallResult {
         "{OUTCOME_UNKNOWN}: {why}; the call may or may not have taken effect. Check before retrying anything with side \
          effects."
     ))
-}
-
-/// A refusal that a fresh target may cure: the binding is stale, expired or for a rotated key,
-/// the sandbox moved, or nothing usable answers where the target points (refused, reset, a
-/// hostname that no longer resolves, an edge with no connector behind the hostname or one that
-/// refused the credential, or a host that never completes the upgrade).
-fn needs_resolve(e: &OpenError) -> bool {
-    match e {
-        OpenError::Refused(r) => r.resolve_again() || r.code == RefusalCode::Unauthorized,
-        OpenError::Transport(t) => t.is_unreachable(),
-        OpenError::Timeout(Phase::Connect) => true,
-        OpenError::Timeout(Phase::Bind) | OpenError::Protocol(_) => false,
-    }
 }
 
 /// An HTTP 5xx from in front of the gateway: the next resolve waits `Budgets::edge_pause` first.
@@ -533,6 +577,74 @@ mod tests {
         assert!(!r.is_error, "{r:?}");
         assert_eq!(*resolves.lock().unwrap(), 2, "unauthorized (expired) resolves again once");
         assert_eq!(guest.requests().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_target_with_a_stale_guest_version_is_resolved_again_once() {
+        // SandboxDO minted the target before it heard the guest was upgraded: the gateway
+        // refuses the bind as `unsupported_version`; the fresh target carries the current one.
+        let (gw, guest) = gateway_with_guest().await;
+        let mut stale = gw.target(SBX, 4, AGENT);
+        stale.guest.protocol_version += 1;
+        let (agent, resolves) = agent_with_resolver(vec![target(stale.clone()), target(gw.target(SBX, 4, AGENT))]);
+        let (_tx, rx) = oneshot::channel();
+        let r = call(&agent, "c1".into(), bash("echo hi"), rx).await;
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(*resolves.lock().unwrap(), 2);
+        assert_eq!(guest.requests().await.len(), 1);
+
+        // Still stale after the re-resolve: an error result, never a loop.
+        let (agent, resolves) = agent_with_resolver(vec![target(stale)]);
+        let (_tx, rx) = oneshot::channel();
+        let r = call(&agent, "c2".into(), bash("echo hi"), rx).await;
+        assert!(text_of(&r).contains("unsupported_version"), "{r:?}");
+        assert_eq!(*resolves.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_target_is_resolved_again_shortly_before_its_binding_expires() {
+        let (gw, guest) = gateway_with_guest().await;
+        let soon = crate::runtime::now_ms() + 30_000;
+        assert!(Duration::from_secs(30) < nest_hands_client::REFRESH_MARGIN);
+        let (agent, resolves) = agent_with_resolver(vec![target(gw.target_with_exp(SBX, 4, AGENT, soon)), target(gw.target(SBX, 4, AGENT))]);
+        let (_tx, rx) = oneshot::channel();
+        let r = call(&agent, "c1".into(), bash("echo one"), rx).await;
+        assert!(!r.is_error, "{r:?}");
+        // The cached binding has 30 s left, inside the margin: the next call resolves first
+        // instead of finding out from a refused bind.
+        let (_tx, rx) = oneshot::channel();
+        let r = call(&agent, "c2".into(), bash("echo two"), rx).await;
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(*resolves.lock().unwrap(), 2);
+        assert_eq!(guest.requests().await.len(), 2);
+        // A target with an hour left stays cached.
+        let (_tx, rx) = oneshot::channel();
+        let r = call(&agent, "c3".into(), bash("echo three"), rx).await;
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(*resolves.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_guests_busy_is_retried_like_the_gateways() {
+        let (gw, guest) = gateway_with_guest().await;
+        guest.refuse_busy(2).await;
+        let (agent, resolves) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
+        let (_tx, rx) = oneshot::channel();
+        let r = call_with(&agent, "c1".into(), bash("echo hi"), rx, &quick()).await;
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(r.content, vec![McpContent::Text { text: "ran: echo hi".into() }]);
+        let seen = guest.requests().await;
+        assert_eq!(seen.len(), 3, "two refusals, then the call ran");
+        assert!(seen.iter().all(|r| r.call_id == "c1"), "the same call each time");
+        assert_eq!(*resolves.lock().unwrap(), 1, "busy keeps the target");
+
+        // Within the same wall-clock budget.
+        guest.refuse_busy(usize::MAX).await;
+        let (_tx, rx) = oneshot::channel();
+        let started = Instant::now();
+        let r = call_with(&agent, "c2".into(), bash("echo hi"), rx, &quick()).await;
+        assert!(text_of(&r).contains("stayed busy") && text_of(&r).contains("frozen"), "{r:?}");
+        assert!(started.elapsed() < quick().busy + Duration::from_secs(2), "took {:?}", started.elapsed());
     }
 
     #[tokio::test]

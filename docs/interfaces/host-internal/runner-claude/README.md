@@ -22,7 +22,7 @@ cd /var/lib/nest/empty && exec claude -p --input-format stream-json --output-for
 
 Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended worker built-ins: `Agent, TaskCreate, TaskGet, TaskUpdate, TaskList, TodoWrite, WebSearch, WebFetch`. **Observed on 2.1.301** (`e2e/claude-verify`, with a real turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools, `WebSearch` and `WebFetch`; `TodoWrite` is missing even when named, which is why the designed invocation leaves it out. A captain's `--tools ""` gives no built-ins. The runner logs `system/init.tools`.
 
-**Host-side built-ins are refused:** a `launch.builtin_tools` naming `Bash`, `BashOutput`, `KillShell`, `KillBash`, `Read`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`, `Grep`, `LS`, `PowerShell` or `Monitor` fails the start, and if `system/init.tools` reports one the brain is killed (`--restricted` re-enables tools named individually in `--tools`).
+**Built-ins are an allowlist** (`nest_runner::agent::HOST_SAFE_BUILTINS`): `Agent`, `Task`, `TaskCreate`, `TaskGet`, `TaskUpdate`, `TaskList`, `TodoWrite`, `WebSearch`, `WebFetch`, `ListMcpResourcesTool`, `ReadMcpResourceTool`. A `launch.builtin_tools` naming anything else fails the start, and if `system/init.tools` reports anything else besides `mcp__*` tools the brain is killed (`--restricted` re-enables tools named individually in `--tools`), so a built-in Claude Code adds later is refused until reviewed.
 
 **Process:** Claude Code runs in its own process group (with `nest mcp` and hooks). SIGINT goes to the Claude Code pid only; SIGKILL to the group. Startup subprocesses (`auth status`, `--version`) run in the empty cwd with timeouts and are killed if abandoned.
 

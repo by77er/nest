@@ -15,6 +15,8 @@ use crate::framing;
 struct GuestLog {
     requests: Vec<HandsRequest>,
     cancelled: Vec<String>,
+    /// The next this many requests are refused `busy` before anything runs (a snapshot freeze).
+    busy_left: usize,
 }
 
 /// A fake guest agent behind a hybrid-vsock-style unix socket (`CONNECT 1025\n` → `OK n\n`).
@@ -51,6 +53,12 @@ impl FakeGuest {
     pub async fn cancelled(&self) -> Vec<String> {
         self.log.lock().await.cancelled.clone()
     }
+
+    /// Refuse the next `n` requests with the guest's own `busy` error (logged, never run), as
+    /// the guest does while a snapshot freezes its filesystems.
+    pub async fn refuse_busy(&self, n: usize) {
+        self.log.lock().await.busy_left = n;
+    }
 }
 
 async fn serve(mut s: tokio::net::UnixStream, log: Arc<Mutex<GuestLog>>) {
@@ -72,8 +80,22 @@ async fn serve(mut s: tokio::net::UnixStream, log: Arc<Mutex<GuestLog>>) {
     let _ = s.write_all(guest::handshake::ok_line(1_073_741_824).as_bytes()).await;
     let Ok(frame) = framing::read_guest(&mut s).await else { return };
     let Ok(req) = serde_json::from_slice::<HandsRequest>(&frame.payload) else { return };
-    log.lock().await.requests.push(req.clone());
     let call_id = req.call_id.clone();
+    {
+        let mut l = log.lock().await;
+        l.requests.push(req.clone());
+        if l.busy_left > 0 {
+            l.busy_left -= 1;
+            drop(l);
+            let error = nest_protocol::model::ErrorBody {
+                code: guest::error_code::BUSY.into(),
+                message: "filesystems are frozen for a snapshot".into(),
+                retryable: true,
+            };
+            let _ = framing::write_guest_json(&mut s, &HandsResponse::Error { call_id, error }).await;
+            return;
+        }
+    }
     let reply = match &req.op {
         HandsOp::Bash(b) if b.command.starts_with("hangup") => return,
         HandsOp::Bash(b) if b.command.starts_with("sleep") => {
