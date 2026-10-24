@@ -18,7 +18,7 @@ nest runs many long-lived Claude Code agents at once. Each agent's brain is an u
 
 ## Status
 
-Early implementation. The runtime (control plane, host daemon, egress proxy, guest agent, agent runner) exists, is tested locally, and has run on EC2 with Firecracker. The seam of the split into a sandbox system and an agent system (the gateway, bindings, per-host tunnels) is built and verified on AWS (2026-10-23; the Access check in front of the gateway hostnames is still to be made effective); brain hosts and the coordination layer (channels, hooks, grants, capabilities, scheduled wakes) are designed but not built.
+Early implementation. The runtime (control plane, host daemon, egress proxy, guest agent, agent runner) exists, is tested locally, and has run on EC2 with Firecracker. The seam of the split into a sandbox system and an agent system (the gateway, bindings, per-host tunnels) is built and verified on AWS (2026-10-23, with Cloudflare Access in front since 2026-10-24); brain hosts and the coordination layer (channels, hooks, grants, capabilities, scheduled wakes) are designed but not built.
 
 ## Learn more
 
