@@ -33,7 +33,6 @@ export interface Env {
   AWS_CELLS?: string;
 
   PUBLIC_BASE_URL: string;
-  PREVIEW_DOMAIN: string;
   ASK_SYNC_WINDOW_MS: string;
   HOST_TOKEN_TTL_MS: string;
   PROXY_CA_TTL_MS: string;
@@ -43,7 +42,7 @@ export interface Env {
   SANDBOX_SUSPEND_IDLE_MS?: string;
   /** Captain wake batching window. */
   WAKE_BATCH_MS?: string;
-  /** The nest domain, `<label>.<zone>` (e.g. `nest.bitcru.sh`): sandbox hosts get `<host>-gw-<label>.<zone>`. Unset: no tunnels. */
+  /** The nest domain, `<label>.<zone>` (e.g. `nest.bitcru.sh`): sandbox hosts get `<host>-gw-<label>.<zone>`, previews `<port>-<sandbox>-preview-<label>.<zone>`, share links `<token>-share-<label>.<zone>`. Unset: no tunnels, and preview names use `nest.localhost`. */
   NEST_DOMAIN?: string;
   /** The Cloudflare account that holds the tunnels (a var) and a token with Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit (a secret). */
   CLOUDFLARE_ACCOUNT_ID?: string;
