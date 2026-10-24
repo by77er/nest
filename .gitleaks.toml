@@ -40,3 +40,10 @@ description = "The example tunnel token in the enrollment-response fixture: base
 condition = "AND"
 paths = ['''^protocol/fixtures/control/enroll_response/enroll_response\.tunnel\.json$''']
 regexes = ['''^eyJhIjoiOGRiZWM2MTQ4MzAwNDgzODAxZDcyMTg4OWEyZjQ3NDkiLCJ0IjoiYzE3NDRmOGItZmFhMS00OGE0LTllNWMtMDJhYzkyMTQ2N2ZhIiwicyI6IlJFREFDVEVELUVYQU1QTEUifQ$''']
+
+[[allowlists]]
+targetRules = ["generic-api-key"]
+description = "The id (not the secret) of the Access service token the gateways admit, in the edge stack"
+condition = "AND"
+paths = ['''^deploy/lean/Edge/Edges\.lean$''']
+regexes = ['''^3d8b66b9-bcd1-43a1-99db-5b2703a4c031$''']
