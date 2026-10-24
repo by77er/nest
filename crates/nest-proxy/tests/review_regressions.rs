@@ -159,6 +159,24 @@ async fn pushes_after_drop_are_refused_until_a_newer_epoch() {
     assert!(matches!(pong, ProxyEvent::Pong { sandboxes: 1, .. }), "{pong:?}");
 }
 
+/// Guest-proxy review #1: a failed create's teardown drops the sandbox without fencing it, and
+/// SandboxDO retries the create at the SAME epoch. Only a fence tombstones (the rule nestd's
+/// mirror applies), so the retried upsert gets the sandbox back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_teardown_drop_leaves_no_tombstone_for_a_retry_at_the_same_epoch() {
+    let mut env = env().await;
+    let sbx = sandbox();
+    env.conn.send(&ProxyCommand::SandboxDrop { sandbox: sbx.clone(), epoch: Epoch(4), reason: DropReason::Teardown }, &[]);
+    env.conn.send(&ProxyCommand::Ping { nonce: 1 }, &[]);
+    let pong = env.conn.wait(|e| matches!(e, ProxyEvent::Pong { nonce: 1, .. })).await;
+    assert!(matches!(pong, ProxyEvent::Pong { sandboxes: 0, .. }), "{pong:?}");
+
+    env.conn.send(&ProxyCommand::SandboxUpsert { sandbox: sbx.clone(), epoch: Epoch(4), workstream: None, policy: policy(9, 1) }, &[]);
+    env.conn.send(&ProxyCommand::Ping { nonce: 2 }, &[]);
+    let pong = env.conn.wait(|e| matches!(e, ProxyEvent::Pong { nonce: 2, .. })).await;
+    assert!(matches!(pong, ProxyEvent::Pong { sandboxes: 1, .. }), "the retried create got no egress: {pong:?}");
+}
+
 async fn inspected_tls_opt(env: &Env, sni: &str) -> Option<()> {
     let r = tokio::time::timeout(
         Duration::from_secs(2),

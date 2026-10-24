@@ -24,16 +24,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nest_protocol::control::{
-    AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressVerdict,
-    HandsBinding, HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
+    AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressAuditRecord,
+    EgressVerdict, HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
 };
 use nest_protocol::guest::{AgentSlot, CliCommand, CliResult, ForkIdentity};
 use nest_protocol::host::proxy::{DropReason, ListenerPurpose, ListenerSpec, ProxyEvent, Transport, EXPLICIT_BASE_PORT, TCP_EXCEPTION_BASE_PORT};
 use nest_protocol::gateway::GuestInfo;
-use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, RunnerEvent, StopMode};
+use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, ExitReason, RunnerEvent, StopMode};
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
-    error_codes, AgentId, AgentState, CommitReason, EgressPolicy, Epoch, ErrorBody, ForkMode, GenerationId, GenerationKind,
+    error_codes, AgentId, CommitReason, EgressPolicy, Epoch, ErrorBody, ForkMode, GenerationId, GenerationKind,
     GenerationRecord, HostId, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, WorkstreamEvent,
     WorkstreamEventKind, WorkstreamId,
 };
@@ -114,20 +114,26 @@ struct Sbx {
     state_dir: PathBuf,
     /// The guest's version and capabilities from its last hello (what the gateway tells clients).
     guest_info: Option<GuestInfo>,
+    /// A `commit_request` whose answer never came (timed out). The next commit asks again under
+    /// the same request id first: SandboxDO answers a repeated id with its stored outcome.
+    unanswered: Option<SentCommit>,
+}
+
+/// A `commit_request` as sent.
+#[derive(Clone, Debug)]
+struct SentCommit {
+    request: RequestId,
+    parent: Option<GenerationId>,
+    kind: GenerationKind,
+    disk_manifest: ManifestHash,
+    mem_manifest: Option<ManifestHash>,
+    reason: CommitReason,
 }
 
 impl Sbx {
     fn disk_path(&self) -> PathBuf {
         self.state_dir.join("disk.img")
     }
-}
-
-/// A brain this host runs. `hands` names the sandbox its hands act in (ids only, from
-/// `agent_start`), so a fence of that sandbox fences the brain; the runner reaches the guest
-/// through the gateway, never through nestd.
-struct AgentRec {
-    state: AgentState,
-    hands: Option<HandsBinding>,
 }
 
 /// Bounded `cmd` → outcome cache for redelivered commands.
@@ -167,7 +173,6 @@ pub struct Inner {
     guest_events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>,
     summary: Mutex<BTreeMap<SandboxId, Summary>>,
     sandboxes: Mutex<BTreeMap<SandboxId, Arc<tokio::sync::Mutex<Sbx>>>>,
-    agents: Mutex<BTreeMap<AgentId, AgentRec>>,
     pending_commits: Mutex<HashMap<RequestId, oneshot::Sender<CommitOutcome>>>,
     /// Guest `nest` CLI relays awaiting `guest_cli_result`.
     pending_cli: Mutex<HashMap<RequestId, oneshot::Sender<CliResult>>>,
@@ -225,7 +230,7 @@ impl FleetReporter for Inner {
                 guest: if s.state == SandboxState::Running { s.guest.clone() } else { None },
             })
             .collect();
-        let agents = self.agents.lock().expect("agents").iter().map(|(id, a)| AgentReport { agent: id.clone(), state: a.state }).collect();
+        let agents: Vec<AgentReport> = self.runner.report();
         (sandboxes, agents, self.capacity(&summary))
     }
 
@@ -320,7 +325,6 @@ impl Host {
             guest_events: guest_tx,
             summary: Mutex::new(BTreeMap::new()),
             sandboxes: Mutex::new(BTreeMap::new()),
-            agents: Mutex::new(BTreeMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             pending_cli: Mutex::new(HashMap::new()),
             results: Mutex::new(Results::default()),
@@ -463,6 +467,15 @@ impl Inner {
         let _ = self.fleet.send(FleetInput::Event(HostEvent { ts_ms: now_ms(), body }));
     }
 
+    /// Report brains that are gone without a runner exit of their own (the runner connection
+    /// dropped, or a fenced start was never sent). AgentDO restarts `crashed` and `fenced` brains
+    /// that have work with a current `agent_start`.
+    fn brains_exited(&self, gone: impl IntoIterator<Item = (AgentId, ExitReason)>) {
+        for (agent, reason) in gone {
+            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: reason.as_str().into() });
+        }
+    }
+
     /// Record and report a state transition. `Fenced` is terminal for its epoch: a transition out
     /// of it (e.g. an in-flight create finishing after a fence) is refused and returns `false`.
     fn set_state(&self, sbx: &SandboxId, epoch: Epoch, state: SandboxState, suspend_mode: Option<SuspendMode>, detail: Option<String>) -> bool {
@@ -484,9 +497,21 @@ impl Inner {
         true
     }
 
-    /// Tell the gateway what it needs about a sandbox (epoch, vsock socket, attached clients, the
-    /// guest's version). No VM: nothing to reach, so nothing is sent.
+    /// Refresh the gateway's entry for a **running** sandbox (attached clients, the guest's
+    /// version). In any other state this does nothing: membership follows the lifecycle (create
+    /// and resume add the sandbox, suspend, fence and teardown remove it), so an attach, detach or
+    /// guest hello while suspended never makes a paused VM reachable again.
     fn gateway_sync(&self, s: &Sbx) {
+        let running = self.summary.lock().expect("summary").get(&s.id).is_some_and(|x| x.epoch == s.epoch && x.state == SandboxState::Running);
+        if running {
+            self.gateway_upsert(s);
+        }
+    }
+
+    /// Tell the gateway what it needs about a sandbox (epoch, vsock socket, attached clients, the
+    /// guest's version). Called directly only on the way into `running` (create, resume), just
+    /// before the state is reported. No VM: nothing to reach, so nothing is sent.
+    fn gateway_upsert(&self, s: &Sbx) {
         let Some(vm) = s.vm.as_ref() else { return };
         self.gateway.upsert(
             s.id.clone(),
@@ -524,7 +549,7 @@ impl Inner {
             hugepages_mib_free: huge_free_mib as u32,
             hugepages_mib_total: huge_total_mib as u32,
             sandboxes: summary.values().filter(|s| holds_lease(s.state)).count() as u32,
-            agents: self.agents.lock().expect("agents").len() as u32,
+            agents: self.runner.count() as u32,
             warm: vec![],
         }
     }
@@ -637,7 +662,7 @@ impl Inner {
     fn on_proxy_notice(&self, n: ProxyNotice) {
         match n {
             ProxyNotice::Event(ProxyEvent::Audit { records }) => {
-                for r in records.iter().filter(|r| r.verdict == EgressVerdict::Deny) {
+                for r in records.iter().filter(|r| is_request_denial(r)) {
                     let key = (r.sandbox.clone(), r.host.clone(), r.port);
                     let fresh = {
                         let mut seen = self.denied_seen.lock().expect("denied");
@@ -690,18 +715,14 @@ impl Inner {
 
     async fn on_runner_notice(self: &Arc<Self>, n: RunnerNotice) {
         match n {
+            // The runner link already updated its brain table (and dropped stale events).
             RunnerNotice::Event(RunnerEvent::AgentExited { agent, code, signal, reason }) => {
                 // The guest slot stays: it belongs to the attachment (SandboxDO's `agent_detach`
                 // ends it), not to the brain process, so a restarted brain finds its tasks.
-                self.runner.forget(&agent);
-                self.agents.lock().expect("agents").remove(&agent);
                 self.emit(HostEventBody::AgentExited { agent, exit_code: code, signal, reason: reason.as_str().into() });
             }
             RunnerNotice::Event(RunnerEvent::AgentStarted { agent, pid, session, .. }) => {
                 tracing::info!(%agent, pid, %session, "brain started");
-                if let Some(a) = self.agents.lock().expect("agents").get_mut(&agent) {
-                    a.state = AgentState::Ready;
-                }
             }
             RunnerNotice::Event(RunnerEvent::AuthCheck { agent, auth_method, api_key_source, ok }) => {
                 if !ok {
@@ -713,7 +734,10 @@ impl Inner {
             }
             RunnerNotice::Event(_) => {}
             RunnerNotice::Connected { runner_version, pid } => tracing::info!(%runner_version, pid, "agent runner connected"),
-            RunnerNotice::Disconnected => tracing::warn!("agent runner disconnected"),
+            RunnerNotice::Disconnected { lost } => {
+                tracing::warn!(brains = lost.len(), "agent runner disconnected; its brains are gone");
+                self.brains_exited(lost);
+            }
         }
     }
 
@@ -869,7 +893,8 @@ impl Inner {
     async fn self_fence(self: &Arc<Self>) {
         let ids: Vec<SandboxId> = self.summary.lock().expect("summary").iter().filter(|(_, s)| holds_lease(s.state)).map(|(id, _)| id.clone()).collect();
         tracing::error!(sandboxes = ids.len(), "lease expired: self-fencing");
-        self.runner.fence(vec![], "host lease expired");
+        let unsent = self.runner.fence(vec![], "host lease expired");
+        self.brains_exited(unsent.into_iter().map(|a| (a, ExitReason::Fenced)));
         for id in ids {
             self.fence_sandbox(&id, "host lease expired", true, false).await;
         }
@@ -890,17 +915,8 @@ impl Inner {
             (s.epoch, s.dirty)
         };
         if fence_brains {
-            let bound: Vec<AgentId> = self
-                .agents
-                .lock()
-                .expect("agents")
-                .iter()
-                .filter(|(_, a)| a.hands.as_ref().is_some_and(|h| &h.sandbox == id))
-                .map(|(id, _)| id.clone())
-                .collect();
-            if !bound.is_empty() {
-                self.runner.fence(bound, reason);
-            }
+            let unsent = self.runner.fence_sandbox(id, reason);
+            self.brains_exited(unsent.into_iter().map(|a| (a, ExitReason::Fenced)));
         }
         if let Some(pauser) = self.pausers.lock().expect("pausers").get(id).cloned() {
             tokio::spawn(async move {
@@ -922,10 +938,14 @@ impl Inner {
             if let Some(g) = s.guest.take() {
                 g.shutdown();
             }
-            if let Some(vm) = s.vm.as_mut() {
-                let _ = vm.pause().await;
-                s.paused = true;
+            // `Fenced` is terminal: this VM never runs again. Stop it now so its memory goes back
+            // to the host; salvage needs only the disk, which stays until `sandbox_destroy` (or a
+            // newer epoch's create) removes it.
+            this.pausers.lock().expect("pausers").remove(&id);
+            if let Some(mut vm) = s.vm.take() {
+                let _ = vm.stop().await;
             }
+            s.paused = false;
             s.netns = None; // drops (and unmounts) the namespace
             drop(s);
             if salvage && dirty {
@@ -1118,9 +1138,6 @@ impl Inner {
             CommandBody::AgentDetach { sandbox, epoch, agent, kill_processes } => self.agent_detach(&sandbox, epoch, &agent, kill_processes).await,
             CommandBody::AgentStop { agent, reason } => {
                 self.runner.agent_stop(&agent, StopMode::Graceful, &reason);
-                if !self.runner.connected() {
-                    self.agents.lock().expect("agents").remove(&agent);
-                }
                 Ok(None)
             }
             // Already applied on arrival (`on_fleet_notice`); this is the in-order no-op.
@@ -1200,6 +1217,7 @@ impl Inner {
             vm_dir,
             state_dir,
             guest_info: None,
+            unanswered: None,
         };
         // Boot while holding the sandbox's own lock: guest events and fencing wait for it.
         let entry = Arc::new(tokio::sync::Mutex::new(sbx));
@@ -1211,7 +1229,8 @@ impl Inner {
             if let Some(s) = self.summary.lock().expect("summary").get_mut(&sandbox) {
                 s.guest = guard.guest_info.clone();
             }
-            self.gateway_sync(&guard);
+            // Into `running`: reachable from the moment the state is reported.
+            self.gateway_upsert(&guard);
         }
         drop(guard);
         let mut detail = None;
@@ -1464,7 +1483,7 @@ impl Inner {
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
             }
-            self.gateway_sync(&s);
+            self.gateway_upsert(&s);
         } else {
             // Cold boot from the local disk.
             let spec = VmSpec {
@@ -1489,7 +1508,7 @@ impl Inner {
             guest.wait_ready(GUEST_READY_TIMEOUT).await.map_err(internal)?;
             s.guest_info = guest.guest();
             s.guest = Some(guest);
-            self.gateway_sync(&s);
+            self.gateway_upsert(&s);
         }
         if let Some(x) = self.summary.lock().expect("summary").get_mut(id) {
             x.dirty = true;
@@ -1646,10 +1665,8 @@ impl Inner {
         let agent = start.agent.clone();
         let config_dir = self.cfg.agents_dir().join(&agent.0);
         std::fs::create_dir_all(&config_dir).map_err(internal)?;
-        self.agents.lock().expect("agents").insert(agent.clone(), AgentRec { state: AgentState::Starting, hands: start.hands.clone() });
-        let connected = self.runner.connected();
-        self.runner.agent_start(RunnerAgentStart { start, config_dir: config_dir.display().to_string() });
-        Ok(Some(serde_json::json!({ "dispatched": connected })))
+        let dispatched = self.runner.agent_start(RunnerAgentStart { start, config_dir: config_dir.display().to_string() });
+        Ok(Some(serde_json::json!({ "dispatched": dispatched })))
     }
 
     /// The sandbox side of `attach`: a slot (explicit proxy listener + guest `agent_attach`) for
@@ -1665,6 +1682,9 @@ impl Inner {
                 (0..MAX_AGENT_SLOTS).find(|n| !used.contains(n)).ok_or_else(|| error(error_codes::CAPACITY_EXHAUSTED, "no free agent slots", false))?
             }
         };
+        // No guest (a sandbox suspended to disk): refuse before binding anything, so no listener
+        // outlives the failed attach and a later one finds its port free.
+        let guest = s.guest.clone().ok_or_else(|| error(error_codes::INTERNAL, "sandbox has no guest connection", true))?;
         let mut listener_id = s.slots.get(agent).and_then(|(_, l)| *l);
         if listener_id.is_none()
             && let Some(ns) = s.netns.clone()
@@ -1675,7 +1695,6 @@ impl Inner {
             self.proxy.apply(ProxyOp::AddListeners { sandbox: sandbox.clone(), epoch, listeners: vec![l] });
         }
         let cwd = cwd.unwrap_or_else(|| DEFAULT_CWD.into());
-        let guest = s.guest.clone().ok_or_else(|| error(error_codes::INTERNAL, "sandbox has no guest connection", true))?;
         let fresh = s.slots.insert(agent.clone(), (slot, listener_id)).is_none();
         s.slot_cwds.insert(agent.clone(), cwd.clone());
         self.gateway_sync(&s);
@@ -1699,13 +1718,17 @@ impl Inner {
         Ok(None)
     }
 
-    /// Undo a slot that never took: records and listener go, and the gateway hears about it.
+    /// Undo a slot that never took: records (the guest connection's copy included, so no later
+    /// `configure` brings it back) and listener go, and the gateway hears about it.
     async fn drop_slot(&self, entry: &Arc<tokio::sync::Mutex<Sbx>>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId) {
         let mut s = entry.lock().await;
         if let Some((_, Some(id))) = s.slots.remove(agent) {
             self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
         }
         s.slot_cwds.remove(agent);
+        if let Some(g) = &s.guest {
+            g.forget_slot(agent);
+        }
         self.gateway_sync(&s);
     }
 
@@ -1714,7 +1737,13 @@ impl Inner {
     async fn agent_detach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, kill_processes: bool) -> CmdResult {
         let entry = self.locked(sandbox, epoch).await?;
         let mut s = entry.lock().await;
-        let Some((_, listener)) = s.slots.remove(agent) else { return Ok(Some(serde_json::json!({ "note": "not attached" }))) };
+        let Some((_, listener)) = s.slots.remove(agent) else {
+            // Not ours, and not the guest connection's either (no stale slot is re-configured).
+            if let Some(g) = &s.guest {
+                g.forget_slot(agent);
+            }
+            return Ok(Some(serde_json::json!({ "note": "not attached" })));
+        };
         s.slot_cwds.remove(agent);
         if let Some(id) = listener {
             self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
@@ -1764,30 +1793,80 @@ impl Inner {
         mem: Option<PathBuf>,
         timeout: Duration,
     ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
-        let (request, rx) = match self.prepare_commit(&mut s, reason, mem).await {
-            Ok(Some(p)) => p,
-            Ok(None) => return (s, Ok(None)),
+        // An earlier commit's answer was lost (timed out), but SandboxDO may have moved its head:
+        // ask again under the same request id (idempotent per id) and adopt the outcome, rather
+        // than send a new request with a stale parent that is rejected and fences the sandbox.
+        let mut answered = None;
+        if let Some(prev) = s.unanswered.clone() {
+            let (s2, r) = self.send_commit(entry, s, prev.clone(), timeout).await;
+            s = s2;
+            match r {
+                Ok(g) => answered = Some((prev, g)),
+                Err(e) => return (s, Err(e)),
+            }
+        }
+        let c = match self.prepare_commit(&mut s, reason, mem).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return (s, Ok(answered.and_then(|(_, g)| g))),
             Err(e) => return (s, Err(e)),
         };
+        // Nothing changed since the commit just answered: its generation is this one.
+        if let Some((prev, g)) = answered
+            && (&prev.disk_manifest, &prev.mem_manifest) == (&c.disk_manifest, &c.mem_manifest)
+        {
+            return (s, Ok(g));
+        }
+        self.send_commit(entry, s, c, timeout).await
+    }
+
+    /// Send a `commit_request` and wait (unlocked) for its answer; a timeout keeps it as
+    /// [`Sbx::unanswered`] for the next commit to ask again.
+    async fn send_commit<'a>(
+        self: &Arc<Self>,
+        entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
+        s: tokio::sync::MutexGuard<'a, Sbx>,
+        c: SentCommit,
+        timeout: Duration,
+    ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
+        let (tx, rx) = oneshot::channel();
+        self.pending_commits.lock().expect("pending").insert(c.request.clone(), tx);
+        self.emit(HostEventBody::CommitRequest {
+            request: c.request.clone(),
+            sandbox: s.id.clone(),
+            epoch: s.epoch,
+            parent: c.parent.clone(),
+            kind: c.kind,
+            disk_manifest: c.disk_manifest.clone(),
+            mem_manifest: c.mem_manifest.clone(),
+            reason: c.reason,
+        });
         let id = s.id.clone();
         drop(s);
         let outcome = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(o)) => Ok(o),
             _ => {
-                self.pending_commits.lock().expect("pending").remove(&request);
-                Err(error(error_codes::INTERNAL, format!("commit {request} timed out"), true))
+                self.pending_commits.lock().expect("pending").remove(&c.request);
+                Err(error(error_codes::INTERNAL, format!("commit {} timed out", c.request), true))
             }
         };
         let mut s = entry.lock().await;
         let r = match outcome {
-            Ok(o) => self.apply_commit(&mut s, &id, o),
-            Err(e) => Err(e),
+            Ok(o) => {
+                if s.unanswered.as_ref().is_some_and(|u| u.request == c.request) {
+                    s.unanswered = None;
+                }
+                self.apply_commit(&mut s, &id, o)
+            }
+            Err(e) => {
+                s.unanswered = Some(c);
+                Err(e)
+            }
         };
         (s, r)
     }
 
-    /// Chunk and send the `commit_request`; returns the request id and the answer channel.
-    async fn prepare_commit(self: &Arc<Self>, s: &mut Sbx, reason: CommitReason, mem: Option<PathBuf>) -> Result<Option<(RequestId, oneshot::Receiver<CommitOutcome>)>, ErrorBody> {
+    /// Chunk disk (+ memory) into the store and build the `commit_request` (a new request id).
+    async fn prepare_commit(self: &Arc<Self>, s: &mut Sbx, reason: CommitReason, mem: Option<PathBuf>) -> Result<Option<SentCommit>, ErrorBody> {
         let disk = s.disk_path();
         if !disk.exists() {
             return Ok(None);
@@ -1811,20 +1890,7 @@ impl Inner {
             x.dirty = false;
         }
         let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
-        let request = RequestId(new_id("req_"));
-        let (tx, rx) = oneshot::channel();
-        self.pending_commits.lock().expect("pending").insert(request.clone(), tx);
-        self.emit(HostEventBody::CommitRequest {
-            request: request.clone(),
-            sandbox: s.id.clone(),
-            epoch: s.epoch,
-            parent: s.head.as_ref().map(|h| h.id.clone()),
-            kind,
-            disk_manifest,
-            mem_manifest,
-            reason,
-        });
-        Ok(Some((request, rx)))
+        Ok(Some(SentCommit { request: RequestId(new_id("req_")), parent: s.head.as_ref().map(|h| h.id.clone()), kind, disk_manifest, mem_manifest, reason }))
     }
 
     fn apply_commit(self: &Arc<Self>, s: &mut Sbx, id: &SandboxId, outcome: CommitOutcome) -> Result<Option<GenerationRecord>, ErrorBody> {
@@ -1864,6 +1930,13 @@ fn bind_listener(ns: &Netns, next: &mut u32, transport: Transport, port: u16, pu
 fn spawn_boxed(f: impl std::future::Future<Output = ()> + Send + 'static) {
     let f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(f);
     tokio::spawn(f);
+}
+
+/// Whether an audit record is one request's denial: what `egress_denied` reports. nest-proxy's
+/// other deny records are aggregates with port 0 — a window's suppression summary (`count` set,
+/// host `*`) and `connection_limit` (no host) — and stay in the audit log only.
+fn is_request_denial(r: &EgressAuditRecord) -> bool {
+    r.verdict == EgressVerdict::Deny && r.count.is_none() && r.port != 0
 }
 
 fn slot_for(agent: &AgentId, slot: u16, cwd: String) -> AgentSlot {
@@ -1930,6 +2003,42 @@ fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
+    use nest_protocol::model::{Epoch, SandboxId};
+
+    fn record(host: &str, port: u16, verdict: EgressVerdict, reason: &str, count: Option<u32>) -> EgressAuditRecord {
+        EgressAuditRecord {
+            sandbox: SandboxId("sbx_1".into()),
+            epoch: Epoch(1),
+            agent: None,
+            ts_ms: 0,
+            via: None,
+            host: host.into(),
+            port,
+            method: None,
+            path: None,
+            status: None,
+            bytes_up: 0,
+            bytes_down: 0,
+            verdict,
+            binding: None,
+            reason: Some(reason.into()),
+            count,
+        }
+    }
+
+    /// Guest-proxy review #2: only one request's denial becomes `egress_denied`; nest-proxy's
+    /// suppression summaries and connection-limit records are aggregates, not denied hosts.
+    #[test]
+    fn only_request_denials_become_egress_denied() {
+        use super::is_request_denial;
+        assert!(is_request_denial(&record("evil.example", 443, EgressVerdict::Deny, "not_allowed", None)));
+        assert!(is_request_denial(&record("x.example", 53, EgressVerdict::Deny, "dns_nxdomain", None)));
+        assert!(!is_request_denial(&record("*", 0, EgressVerdict::Deny, "suppressed: 9 duplicate or excess deny records", Some(9))), "summary");
+        assert!(!is_request_denial(&record("", 0, EgressVerdict::Deny, "connection_limit", None)), "connection limit");
+        assert!(!is_request_denial(&record("github.com", 443, EgressVerdict::Allow, "", None)));
+    }
+
     /// A base image extended to a sandbox's disk size gets a filesystem that fills it.
     #[test]
     fn grows_a_copied_base_image_to_its_disk() {

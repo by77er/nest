@@ -112,6 +112,12 @@ impl GuestCtl {
         expect_ok(self.request(ControlBody::AgentAttach { slot }).await?)
     }
 
+    /// Drop an agent's slot from the set `configure` sends, without telling the guest (a slot
+    /// that never took, or one nestd no longer has).
+    pub fn forget_slot(&self, agent: &AgentId) {
+        self.cfg.lock().expect("guest cfg").slots.retain(|s| &s.agent_id != agent);
+    }
+
     pub async fn detach(&self, agent: &AgentId, kill_processes: bool) -> io::Result<()> {
         self.cfg.lock().expect("guest cfg").slots.retain(|s| &s.agent_id != agent);
         if !self.is_ready() {

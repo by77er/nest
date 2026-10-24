@@ -13,7 +13,7 @@
    - `:3128 + slot` per agent (explicit proxy)
    - one port per TCP-exception rule
 4. Send the fds to **nest-proxy** over a unix socket (`SCM_RIGHTS`), each tagged `{sandbox, epoch, purpose, agent?, rule?}`. nestd keeps duplicates.
-5. **Wait for the policy acknowledgement.** nestd pushes the policy with its sha256 and the binding secrets in one `sandbox_upsert`, and starts or resumes the VM only after nest-proxy answers `policy_ack` with the same `(sandbox, epoch, version, sha256)`. A guest never runs against a missing or wrong policy. See [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/).
+5. **Push the policy.** nestd sends `sandbox_upsert` (the policy) and `secrets_set`, and boots the VM without waiting for an answer. **Designed, not built:** the policy, its sha256 and the binding secrets travel in one `sandbox_upsert`, and the VM starts or resumes only after nest-proxy answers `policy_ack` with the same `(sandbox, epoch, version, sha256)`, so a guest never runs against a missing or wrong policy. See [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#policy-acknowledgement).
 
 - **nest-proxy never calls `setns`** and needs no privileges. It accepts on the fds it was given. Connections to the internet are opened from the root namespace.
 - **On proxy restart,** the proxy reconnects and nestd resends the full state: every listener, from duplicated fds. Pending connections wait in the kernel's accept queue. If the counts in `resync_ack` don't match what nestd sent, nestd closes the connection so the proxy resyncs again.

@@ -360,6 +360,16 @@ pub mod proxy {
         Moved,
     }
 
+    impl DropReason {
+        /// Whether this drop tombstones the epoch: later pushes at or below it are refused. Only a
+        /// fence does; a teardown or move ends the sandbox's time here without fencing it, and a
+        /// failed create is retried at the same epoch. nestd's mirror and nest-proxy both apply
+        /// this one rule.
+        pub fn tombstones(self) -> bool {
+            matches!(self, DropReason::Fence)
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum AlertKind {

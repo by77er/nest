@@ -1,15 +1,26 @@
 //! nestd side of the nestd ↔ agent runner protocol (`docs/interfaces/host-internal/nestd-runner/`).
 //!
-//! Lifecycle only: nestd keeps the *desired* set of brains and on every runner (re)connection
-//! re-issues `agent_start` for each of them (the runner starts with no agents and kills every
-//! brain when the nestd socket closes or the lease lapses). Nothing about hands crosses this
+//! Lifecycle only. The link holds the host's **one brain table** ([`Brain`]: hands, state, and
+//! the runner connection its start went out on): it is what the fleet hello reports, what a
+//! sandbox fence looks up, and the filter for runner events. Nothing about hands crosses this
 //! link: the runner reaches a sandbox's guest through the gateway with a binding it gets from
 //! AgentDO, and the guest slot is configured by `agent_attach` from SandboxDO.
 //!
-//! Replay vs. stale exits: a runner that lost its nestd connection may still deliver
-//! `agent_exited{fenced}` for brains it killed *before* the reconnect. Those must not cancel the
-//! starts nestd just replayed, so for each replayed agent an `agent_exited{fenced}` is dropped
-//! until that agent's `agent_started` arrives on the new connection.
+//! **No replay.** The runner kills every brain when the nestd socket closes. Each brain whose
+//! start went out on the lost connection is reported as exited ([`RunnerNotice::Disconnected`]:
+//! `crashed`, or `fenced` for one already fenced) and leaves the table, so AgentDO restarts it with
+//! a current `agent_start` (its own session, fresh resume URLs and token). A stale copy of the
+//! original start is never re-sent. A start that arrives while no runner is connected was never
+//! sent: it waits in the table and goes out once on the next connection.
+//!
+//! **Fence.** A fenced brain leaves the report at once, but stays in the table until the runner
+//! reports its exit (forwarded, so AgentDO restarts it only once the runner has let go of it) or
+//! the connection drops. A fenced start that was never sent leaves the table at once and is
+//! returned to the caller to report.
+//!
+//! **Stale events.** Runner events are accepted only for a brain whose start went out on the
+//! current connection; an `agent_exited{fenced}` for a brain that hasn't reported
+//! `agent_started` yet is one the runner queued before this connection, and is dropped.
 //!
 //! Access: the socket is `0660` (optional group), the peer uid is checked with `SO_PEERCRED`,
 //! and only one runner is served at a time (the connection receives OAuth and host tokens).
@@ -20,11 +31,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
-use std::collections::BTreeSet;
 
+use nest_protocol::control::{AgentReport, HandsBinding};
 use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerCommand, RunnerEvent, StopMode};
 use nest_protocol::host::{PROTOCOL_VERSION, Secret};
-use nest_protocol::model::{AgentId, HostId, HostRole, TimestampMs};
+use nest_protocol::model::{AgentId, AgentState, HostId, HostRole, SandboxId, TimestampMs};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -33,17 +44,37 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 pub enum RunnerNotice {
     Connected { runner_version: String, pid: u32 },
     Event(RunnerEvent),
-    Disconnected,
+    /// The runner is gone, and with it every brain started on that connection: report each as
+    /// exited with the reason given.
+    Disconnected { lost: Vec<(AgentId, ExitReason)> },
+}
+
+/// Where a brain's `agent_start` stands with the runner.
+enum Sent {
+    /// Received while no runner was connected; sent once on the next connection.
+    Pending(Box<AgentStart>),
+    /// Sent on runner connection `conn`; `started` once its `agent_started` arrived.
+    On { conn: u64, started: bool },
+}
+
+/// A brain this host runs. `hands` names the sandbox its hands act in (ids only, from
+/// `agent_start`), so a fence of that sandbox fences the brain.
+struct Brain {
+    hands: Option<HandsBinding>,
+    state: AgentState,
+    sent: Sent,
+    /// Fenced: no longer reported; gone once the runner reports the exit or the connection drops.
+    fenced: bool,
 }
 
 #[derive(Default)]
 struct State {
-    desired: BTreeMap<AgentId, AgentStart>,
+    brains: BTreeMap<AgentId, Brain>,
     token: Option<(Secret, TimestampMs)>,
     lease_valid_until: Option<TimestampMs>,
     conn: Option<UnboundedSender<RunnerCommand>>,
-    /// Agents replayed on the current connection whose `agent_started` hasn't arrived yet.
-    replayed: BTreeSet<AgentId>,
+    /// Generation of the current (or last) runner connection.
+    conn_gen: u64,
 }
 
 #[derive(Clone)]
@@ -100,39 +131,84 @@ impl RunnerLink {
         self.send(RunnerCommand::LeaseUpdate { valid_until_ms });
     }
 
-    pub fn agent_start(&self, start: AgentStart) {
+    /// Record the brain and send its start now, or on the next connection. Returns whether it was
+    /// dispatched now.
+    pub fn agent_start(&self, start: AgentStart) -> bool {
+        let mut st = self.state.lock().expect("runner state");
         let agent = start.start.agent.clone();
-        self.state.lock().expect("runner state").desired.insert(agent, start.clone());
-        self.send(RunnerCommand::AgentStart(Box::new(start)));
+        let hands = start.start.hands.clone();
+        let (sent, dispatched) = match &st.conn {
+            Some(c) => {
+                let _ = c.send(RunnerCommand::AgentStart(Box::new(start)));
+                (Sent::On { conn: st.conn_gen, started: false }, true)
+            }
+            None => (Sent::Pending(Box::new(start)), false),
+        };
+        st.brains.insert(agent, Brain { hands, state: AgentState::Starting, sent, fenced: false });
+        dispatched
     }
 
+    /// Stop a brain. Without a runner there is nothing to stop: the brain leaves the table (a
+    /// pending start is never sent). Otherwise it leaves when the runner reports the exit.
     pub fn agent_stop(&self, agent: &AgentId, mode: StopMode, reason: &str) {
-        self.state.lock().expect("runner state").desired.remove(agent);
-        self.send(RunnerCommand::AgentStop { agent: agent.clone(), mode, reason: reason.into() });
-    }
-
-    /// Kill these brains now (empty = all).
-    pub fn fence(&self, agents: Vec<AgentId>, reason: &str) {
-        {
-            let mut st = self.state.lock().expect("runner state");
-            if agents.is_empty() {
-                st.desired.clear();
-            } else {
-                for a in &agents {
-                    st.desired.remove(a);
-                }
+        let mut st = self.state.lock().expect("runner state");
+        match &st.conn {
+            Some(c) => {
+                let _ = c.send(RunnerCommand::AgentStop { agent: agent.clone(), mode, reason: reason.into() });
+            }
+            None => {
+                st.brains.remove(agent);
             }
         }
-        self.send(RunnerCommand::Fence { agents, reason: reason.into() });
     }
 
-    /// A brain exited on its own: forget it (it is restarted only by a new `agent_start`).
-    pub fn forget(&self, agent: &AgentId) {
-        self.state.lock().expect("runner state").desired.remove(agent);
+    /// Kill these brains now (empty = all). They leave the report at once. Returns the fenced
+    /// brains whose start was never sent: they left the table, and no runner exit will come for
+    /// them, so the caller reports them.
+    pub fn fence(&self, agents: Vec<AgentId>, reason: &str) -> Vec<AgentId> {
+        let mut st = self.state.lock().expect("runner state");
+        let targets: Vec<AgentId> = if agents.is_empty() { st.brains.keys().cloned().collect() } else { agents.clone() };
+        let mut unsent = vec![];
+        for a in targets {
+            let pending = match st.brains.get_mut(&a) {
+                Some(b) if matches!(b.sent, Sent::Pending(_)) => true,
+                Some(b) => {
+                    b.fenced = true;
+                    false
+                }
+                None => false,
+            };
+            if pending {
+                st.brains.remove(&a);
+                unsent.push(a);
+            }
+        }
+        if let Some(c) = &st.conn {
+            let _ = c.send(RunnerCommand::Fence { agents, reason: reason.into() });
+        }
+        unsent
     }
 
-    pub fn desired(&self) -> Vec<AgentStart> {
-        self.state.lock().expect("runner state").desired.values().cloned().collect()
+    /// Fence the brains whose hands act in `sandbox` (see [`RunnerLink::fence`]).
+    pub fn fence_sandbox(&self, sandbox: &SandboxId, reason: &str) -> Vec<AgentId> {
+        let bound: Vec<AgentId> = {
+            let st = self.state.lock().expect("runner state");
+            st.brains.iter().filter(|(_, b)| !b.fenced && b.hands.as_ref().is_some_and(|h| &h.sandbox == sandbox)).map(|(id, _)| id.clone()).collect()
+        };
+        if bound.is_empty() {
+            return vec![];
+        }
+        self.fence(bound, reason)
+    }
+
+    /// The brains this host runs (fenced ones excluded), for the fleet hello.
+    pub fn report(&self) -> Vec<AgentReport> {
+        let st = self.state.lock().expect("runner state");
+        st.brains.iter().filter(|(_, b)| !b.fenced).map(|(id, b)| AgentReport { agent: id.clone(), state: b.state }).collect()
+    }
+
+    pub fn count(&self) -> usize {
+        self.state.lock().expect("runner state").brains.values().filter(|b| !b.fenced).count()
     }
 
     pub fn connected(&self) -> bool {
@@ -159,9 +235,14 @@ async fn serve(
         }
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<RunnerCommand>();
-    // Handshake + replay under the lock so concurrent commands queue behind it.
-    {
+    // Handshake + pending starts under the lock so concurrent commands queue behind it.
+    let conn = {
         let mut st = state.lock().expect("runner state");
+        if st.conn.is_some() {
+            drop(st);
+            tracing::warn!("refusing a second concurrent agent-runner connection");
+            return;
+        }
         let _ = tx.send(RunnerCommand::HelloAck { protocol_version: PROTOCOL_VERSION, host_id, host_role: role });
         if let Some((token, exp)) = st.token.clone() {
             let _ = tx.send(RunnerCommand::HostToken { token, expires_ms: exp });
@@ -169,17 +250,18 @@ async fn serve(
         if let Some(v) = st.lease_valid_until {
             let _ = tx.send(RunnerCommand::LeaseUpdate { valid_until_ms: v });
         }
-        if st.conn.is_some() {
-            drop(st);
-            tracing::warn!("refusing a second concurrent agent-runner connection");
-            return;
-        }
-        st.replayed = st.desired.keys().cloned().collect();
-        for s in st.desired.values() {
-            let _ = tx.send(RunnerCommand::AgentStart(Box::new(s.clone())));
+        st.conn_gen += 1;
+        let conn = st.conn_gen;
+        for b in st.brains.values_mut() {
+            if matches!(b.sent, Sent::Pending(_))
+                && let Sent::Pending(start) = std::mem::replace(&mut b.sent, Sent::On { conn, started: false })
+            {
+                let _ = tx.send(RunnerCommand::AgentStart(start));
+            }
         }
         st.conn = Some(tx.clone());
-    }
+        conn
+    };
     let _ = notices.send(RunnerNotice::Connected { runner_version, pid });
     loop {
         tokio::select! {
@@ -192,8 +274,8 @@ async fn serve(
                 match inc {
                     Some(Ok(b)) => match serde_json::from_slice::<RunnerEvent>(&b) {
                         Ok(ev) => {
-                            if stale_exit(&state, &ev) {
-                                tracing::info!(?ev, "dropping a stale fenced exit from before the runner reconnected");
+                            if !accept_event(&state, conn, &ev) {
+                                tracing::info!(?ev, "dropping a runner event for a brain not started on this connection");
                                 continue;
                             }
                             let _ = notices.send(RunnerNotice::Event(ev));
@@ -205,31 +287,46 @@ async fn serve(
             }
         }
     }
-    {
+    let lost = {
         let mut st = state.lock().expect("runner state");
         if st.conn.as_ref().is_some_and(|c| c.same_channel(&tx)) {
             st.conn = None;
-            st.replayed.clear();
         }
-    }
-    let _ = notices.send(RunnerNotice::Disconnected);
+        // The runner killed every brain when the socket closed.
+        let gone: Vec<AgentId> = st.brains.iter().filter(|(_, b)| matches!(b.sent, Sent::On { .. })).map(|(id, _)| id.clone()).collect();
+        gone.into_iter()
+            .filter_map(|id| st.brains.remove(&id).map(|b| (id, if b.fenced { ExitReason::Fenced } else { ExitReason::Crashed })))
+            .collect()
+    };
+    let _ = notices.send(RunnerNotice::Disconnected { lost });
 }
 
-/// Whether `ev` is an `agent_exited{fenced}` queued by the runner before this connection, for an
-/// agent nestd has just replayed (cleared once that agent's `agent_started` arrives).
-fn stale_exit(state: &Mutex<State>, ev: &RunnerEvent) -> bool {
+/// Apply a runner event to the brain table; `false` drops it. Events about a brain count only if
+/// its start went out on this connection (`conn`). An `agent_exited{fenced}` for a live brain
+/// that hasn't reported `agent_started` is one the runner queued before this connection.
+fn accept_event(state: &Mutex<State>, conn: u64, ev: &RunnerEvent) -> bool {
     let mut st = state.lock().expect("runner state");
-    match ev {
-        RunnerEvent::AgentStarted { agent, .. } => {
-            st.replayed.remove(agent);
-            false
+    let (agent, exit) = match ev {
+        RunnerEvent::AgentStarted { agent, .. } => (agent, None),
+        RunnerEvent::AgentExited { agent, reason, .. } => (agent, Some(*reason)),
+        _ => return true,
+    };
+    let Some(b) = st.brains.get_mut(agent) else { return false };
+    let Sent::On { conn: c, started } = &mut b.sent else { return false };
+    if *c != conn {
+        return false;
+    }
+    match exit {
+        None => {
+            *started = true;
+            b.state = AgentState::Ready;
+            true
         }
-        RunnerEvent::AgentExited { agent, reason: ExitReason::Fenced, .. } => st.replayed.contains(agent),
-        RunnerEvent::AgentExited { agent, .. } => {
-            st.replayed.remove(agent);
-            false
+        Some(ExitReason::Fenced) if !*started && !b.fenced => false,
+        Some(_) => {
+            st.brains.remove(agent);
+            true
         }
-        _ => false,
     }
 }
 
@@ -237,8 +334,10 @@ fn stale_exit(state: &Mutex<State>, ev: &RunnerEvent) -> bool {
 mod tests {
     use super::*;
     use nest_protocol::control::{AgentStart as CpAgentStart, LaunchConfig, SystemPrompt};
-    use nest_protocol::model::{AgentRole, WorkstreamId};
+    use nest_protocol::model::{AgentRole, Epoch, SessionId, WorkstreamId};
     use tokio::net::UnixStream;
+
+    type Conn = Framed<UnixStream, LengthDelimitedCodec>;
 
     pub fn cp_start(agent: &str) -> CpAgentStart {
         CpAgentStart {
@@ -253,84 +352,152 @@ mod tests {
         }
     }
 
-    async fn read(f: &mut Framed<UnixStream, LengthDelimitedCodec>) -> RunnerCommand {
+    fn start(agent: &str) -> AgentStart {
+        AgentStart { start: cp_start(agent), config_dir: format!("/tmp/{agent}") }
+    }
+
+    fn bound(agent: &str, sandbox: &str) -> AgentStart {
+        let mut s = start(agent);
+        s.start.hands = Some(HandsBinding { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1) });
+        s
+    }
+
+    async fn read(f: &mut Conn) -> RunnerCommand {
         let b = tokio::time::timeout(std::time::Duration::from_secs(5), f.next()).await.unwrap().unwrap().unwrap();
         serde_json::from_slice(&b).unwrap()
     }
 
-    #[tokio::test]
-    async fn replays_desired_agents_on_reconnect() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runner.sock");
-        let (ntx, mut nrx) = mpsc::unbounded_channel();
-        let link = RunnerLink::start(&path, HostId("hst_1".into()), HostRole::Burst, crate::proxy_link::Access::default(), ntx).unwrap();
-        link.host_token(Secret("t1".into()), 99);
-        link.agent_start(AgentStart { start: cp_start("agt_a"), config_dir: "/tmp/a".into() });
-
-        let connect = || async {
-            let s = UnixStream::connect(&path).await.unwrap();
-            let mut f = Framed::new(s, LengthDelimitedCodec::new());
-            let hello = RunnerEvent::Hello { protocol_version: PROTOCOL_VERSION, runner_version: "t".into(), pid: 7 };
-            f.send(bytes::Bytes::from(serde_json::to_vec(&hello).unwrap())).await.unwrap();
-            f
-        };
-        let mut f = connect().await;
-        assert!(matches!(read(&mut f).await, RunnerCommand::HelloAck { .. }));
-        assert!(matches!(read(&mut f).await, RunnerCommand::HostToken { .. }));
-        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_a"));
-        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Connected { pid: 7, .. })));
-
-        // Events flow up; exits forget the agent.
-        let ev = RunnerEvent::AgentExited { agent: AgentId("agt_a".into()), code: Some(0), signal: None, reason: nest_protocol::host::runner::ExitReason::Idle };
+    async fn send(f: &mut Conn, ev: RunnerEvent) {
         f.send(bytes::Bytes::from(serde_json::to_vec(&ev).unwrap())).await.unwrap();
-        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentExited { .. }))));
-        link.forget(&AgentId("agt_a".into()));
-        link.agent_start(AgentStart { start: cp_start("agt_b"), config_dir: "/tmp/b".into() });
-        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_b"));
-
-        // Reconnect: only agt_b is replayed.
-        drop(f);
-        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Disconnected)));
-        let mut f = connect().await;
-        let _ = read(&mut f).await;
-        let _ = read(&mut f).await;
-        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_b"));
-        link.fence(vec![], "lease");
-        assert!(matches!(read(&mut f).await, RunnerCommand::Fence { ref agents, .. } if agents.is_empty()));
-        assert!(link.desired().is_empty());
     }
 
-    /// Docs review #4: after a reconnect, the runner's queued `agent_exited{fenced}` from the old
-    /// connection must not cancel the replayed start; a real exit after `agent_started` still
-    /// arrives. A second concurrent runner is refused.
-    #[tokio::test]
-    async fn stale_fenced_exit_after_replay_is_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runner.sock");
-        let (ntx, mut nrx) = mpsc::unbounded_channel();
+    async fn connect(path: &Path) -> Conn {
+        let mut f = Framed::new(UnixStream::connect(path).await.unwrap(), LengthDelimitedCodec::new());
+        send(&mut f, RunnerEvent::Hello { protocol_version: PROTOCOL_VERSION, runner_version: "t".into(), pid: 7 }).await;
+        f
+    }
+
+    fn link(dir: &Path) -> (RunnerLink, std::path::PathBuf, mpsc::UnboundedReceiver<RunnerNotice>) {
+        let path = dir.join("runner.sock");
+        let (ntx, nrx) = mpsc::unbounded_channel();
         let link = RunnerLink::start(&path, HostId("hst_1".into()), HostRole::Burst, crate::proxy_link::Access::default(), ntx).unwrap();
-        link.agent_start(AgentStart { start: cp_start("agt_a"), config_dir: "/tmp/a".into() });
-        let s = UnixStream::connect(&path).await.unwrap();
-        let mut f = Framed::new(s, LengthDelimitedCodec::new());
-        let hello = RunnerEvent::Hello { protocol_version: PROTOCOL_VERSION, runner_version: "t".into(), pid: 7 };
-        f.send(bytes::Bytes::from(serde_json::to_vec(&hello).unwrap())).await.unwrap();
+        (link, path, nrx)
+    }
+
+    fn started(agent: &AgentId) -> RunnerEvent {
+        RunnerEvent::AgentStarted { agent: agent.clone(), pid: 1, session: SessionId("ses_x".into()), claude_version: "t".into(), capabilities: vec![] }
+    }
+
+    fn exited(agent: &AgentId, reason: ExitReason) -> RunnerEvent {
+        RunnerEvent::AgentExited { agent: agent.clone(), code: None, signal: Some(9), reason }
+    }
+
+    fn agents(link: &RunnerLink) -> Vec<String> {
+        link.report().into_iter().map(|r| r.agent.0).collect()
+    }
+
+    /// nestd review #1 and #3: a start received with no runner goes out once on connect. When the
+    /// runner goes away (killing its brains), each brain is reported lost (`crashed`, which AgentDO
+    /// restarts with a current start) and leaves the table; the next connection gets no replay of
+    /// the stale start, and a late event about the old brain is dropped.
+    #[tokio::test]
+    async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, path, mut nrx) = link(dir.path());
+        link.host_token(Secret("t1".into()), 99);
+        let a = AgentId("agt_a".into());
+        assert!(!link.agent_start(start("agt_a")), "no runner yet: pending");
+        assert_eq!(agents(&link), vec!["agt_a"]);
+
+        let mut f = connect(&path).await;
+        assert!(matches!(read(&mut f).await, RunnerCommand::HelloAck { .. }));
+        assert!(matches!(read(&mut f).await, RunnerCommand::HostToken { .. }));
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent == a), "the pending start goes out once");
+        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Connected { pid: 7, .. })));
+        send(&mut f, started(&a)).await;
+        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentStarted { .. }))));
+        assert_eq!(link.report()[0].state, AgentState::Ready);
+
+        drop(f);
+        match nrx.recv().await {
+            Some(RunnerNotice::Disconnected { lost }) => assert_eq!(lost, vec![(a.clone(), ExitReason::Crashed)]),
+            other => panic!("disconnect: {other:?}"),
+        }
+        assert!(agents(&link).is_empty(), "a lost brain is not reported in the hello");
+
+        let mut f = connect(&path).await;
+        assert!(matches!(read(&mut f).await, RunnerCommand::HelloAck { .. }));
+        assert!(matches!(read(&mut f).await, RunnerCommand::HostToken { .. }));
+        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Connected { .. })));
+        link.lease(5);
+        assert!(matches!(read(&mut f).await, RunnerCommand::LeaseUpdate { valid_until_ms: 5 }), "no stale agent_start replayed");
+        // The runner's queued exit for the old brain is not news.
+        send(&mut f, exited(&a, ExitReason::Fenced)).await;
+        send(&mut f, RunnerEvent::Pong { nonce: 1, agents: 0 }).await;
+        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::Pong { .. }))));
+    }
+
+    /// nestd review #3: a fence takes brains out of the report at once (the one table); the
+    /// runner's exit for them still reaches AgentDO, once. A start never sent is fenced on the spot
+    /// and handed back to report.
+    #[tokio::test]
+    async fn a_fence_clears_the_brain_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, path, mut nrx) = link(dir.path());
+        assert!(!link.agent_start(bound("agt_p", "sbx_1")), "pending");
+        assert_eq!(link.fence_sandbox(&SandboxId("sbx_1".into()), "test"), vec![AgentId("agt_p".into())]);
+        assert!(agents(&link).is_empty());
+
+        let mut f = connect(&path).await;
+        assert!(matches!(read(&mut f).await, RunnerCommand::HelloAck { .. }));
+        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Connected { .. })));
+        let (a, b) = (AgentId("agt_a".into()), AgentId("agt_b".into()));
+        assert!(link.agent_start(start("agt_a")));
+        assert!(link.agent_start(bound("agt_b", "sbx_1")));
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent == a), "the fenced pending start never goes out");
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent == b));
+
+        assert!(link.fence_sandbox(&SandboxId("sbx_1".into()), "fenced").is_empty());
+        assert!(matches!(read(&mut f).await, RunnerCommand::Fence { ref agents, .. } if agents == std::slice::from_ref(&b)));
+        assert_eq!(agents(&link), vec!["agt_a"], "the fenced brain left the report");
+        assert_eq!(link.count(), 1);
+        send(&mut f, exited(&b, ExitReason::Fenced)).await;
+        assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentExited { ref agent, .. })) if agent == &b));
+
+        link.fence(vec![], "lease");
+        assert!(matches!(read(&mut f).await, RunnerCommand::Fence { ref agents, .. } if agents.is_empty()));
+        assert!(agents(&link).is_empty());
+        drop(f);
+        match nrx.recv().await {
+            Some(RunnerNotice::Disconnected { lost }) => assert_eq!(lost, vec![(a, ExitReason::Fenced)], "only the brain whose exit never came"),
+            other => panic!("disconnect: {other:?}"),
+        }
+    }
+
+    /// Docs review #4: a runner's queued `agent_exited{fenced}` for an earlier brain must not cancel
+    /// a start that just went out; a real exit after `agent_started` still arrives. A second
+    /// concurrent runner is refused.
+    #[tokio::test]
+    async fn stale_fenced_exit_before_started_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, path, mut nrx) = link(dir.path());
+        link.agent_start(start("agt_a"));
+        let mut f = connect(&path).await;
         assert!(matches!(read(&mut f).await, RunnerCommand::HelloAck { .. }));
         assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(_)));
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Connected { .. })));
 
         // A second runner is refused while the first is connected.
-        let mut f2 = Framed::new(UnixStream::connect(&path).await.unwrap(), LengthDelimitedCodec::new());
-        f2.send(bytes::Bytes::from(serde_json::to_vec(&hello).unwrap())).await.ok();
+        let mut f2 = connect(&path).await;
         let r = tokio::time::timeout(std::time::Duration::from_secs(5), f2.next()).await.unwrap();
         assert!(!matches!(r, Some(Ok(_))), "second runner must get nothing");
 
-        let send = |ev: RunnerEvent| bytes::Bytes::from(serde_json::to_vec(&ev).unwrap());
         let a = AgentId("agt_a".into());
-        f.send(send(RunnerEvent::AgentExited { agent: a.clone(), code: None, signal: Some(9), reason: ExitReason::Fenced })).await.unwrap();
-        f.send(send(RunnerEvent::AgentStarted { agent: a.clone(), pid: 1, session: nest_protocol::model::SessionId("ses_x".into()), claude_version: "t".into(), capabilities: vec![] })).await.unwrap();
-        f.send(send(RunnerEvent::AgentExited { agent: a.clone(), code: Some(0), signal: None, reason: ExitReason::Fenced })).await.unwrap();
-        // Started arrives; the first (stale) exit was dropped; the later one is delivered.
+        send(&mut f, exited(&a, ExitReason::Fenced)).await;
+        send(&mut f, started(&a)).await;
+        send(&mut f, RunnerEvent::AgentExited { agent: a.clone(), code: Some(0), signal: None, reason: ExitReason::Fenced }).await;
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentStarted { .. }))));
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentExited { code: Some(0), .. }))));
+        assert!(agents(&link).is_empty());
     }
 }
