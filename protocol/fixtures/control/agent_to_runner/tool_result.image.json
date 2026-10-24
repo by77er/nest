@@ -1,0 +1,15 @@
+{
+  "type": "tool_result",
+  "seq": 16,
+  "call": "cal_trn01jb7t0a-5",
+  "outcome": {
+    "status": "ok",
+    "content": [
+      {
+        "type": "image",
+        "media_type": "image/png",
+        "data_b64": "iVBORw0KGgo="
+      }
+    ]
+  }
+}

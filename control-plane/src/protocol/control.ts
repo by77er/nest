@@ -4,7 +4,7 @@ import { z } from "zod";
 import {
   AgentEvent, AgentId, AgentRole, AgentState, AskId, CallId, CliCommand, CliResult, CommandId, CommitReason, Epoch, ErrorBody,
   EgressPolicy, ForkMode, GenerationId, GenerationKind, GenerationRecord, HostId, HostRole, InjectionSecret,
-  ManifestHash, MessageId, RequestId, Resources, SandboxId, SandboxState, Seq, SessionId, SuspendMode,
+  ManifestHash, MessageId, openEnum, RequestId, Resources, SandboxId, SandboxState, Seq, SessionId, SuspendMode,
   TaskInfo, TimestampMs, TurnId, TurnInputKind, WorkstreamEvent, WorkstreamId,
 } from "./model";
 import { BindingKey, GuestInfo, HandsTarget } from "./gateway";
@@ -264,6 +264,15 @@ export const EgressAuditRecord = z.object({
 });
 export type EgressAuditRecord = z.output<typeof EgressAuditRecord>;
 
+/**
+ * Why a brain process ended (`agent_exited.reason`); AgentDO decides restarts from it. `host_lost`
+ * is the control plane's own (a host reconnected without reporting the brain). Open: a reason this
+ * build doesn't know, including an older nestd's free text, parses as `unknown`.
+ */
+export const AGENT_EXIT_REASONS = ["idle", "stopped", "fenced", "auth_failed", "crashed", "host_lost", "unknown"] as const;
+export const AgentExitReason = openEnum(AGENT_EXIT_REASONS, "unknown");
+export type AgentExitReason = z.output<typeof AgentExitReason>;
+
 const hostEventBase = { ts_ms: TimestampMs };
 export const HostEventVariants = [
   z.object({ ...hostEventBase, type: z.literal("command_result"), cmd: CommandId, outcome: CommandOutcome }),
@@ -284,7 +293,7 @@ export const HostEventVariants = [
   z.object({ ...hostEventBase, type: z.literal("spot_notice"), deadline_ms: TimestampMs }),
   z.object({
     ...hostEventBase, type: z.literal("agent_exited"), agent: AgentId, exit_code: z.number().int().optional(),
-    signal: z.number().int().optional(), reason: z.string(),
+    signal: z.number().int().optional(), reason: AgentExitReason,
   }),
   z.object({
     ...hostEventBase, type: z.literal("guest_cli"), request: RequestId, sandbox: SandboxId, epoch: Epoch,
@@ -305,6 +314,39 @@ export const HostToFleetVariants = [
 ] as const;
 export const HostToFleet = z.discriminatedUnion("type", HostToFleetVariants);
 export type HostToFleet = z.output<typeof HostToFleet>;
+
+/**
+ * What FleetDO parses a frame with: `HostToFleet`, except that an `events` batch's events stay
+ * unparsed for `parseHostEvents`, so one bad event (say, a malformed id that came from inside a
+ * sandbox) is quarantined on its own instead of rejecting the batch and stalling the host's stream.
+ */
+export const HostToFleetFrame = z.discriminatedUnion("type", [
+  HostToFleetVariants[0],
+  HostToFleetVariants[1],
+  z.object({ type: z.literal("events"), seq: Seq, events: z.array(z.unknown()) }),
+  HostToFleetVariants[3],
+  HostToFleetVariants[4],
+]);
+export type HostToFleetFrame = z.output<typeof HostToFleetFrame>;
+
+/** One event of a batch that failed its schema: logged and skipped, never retried. */
+export type QuarantinedEvent = { index: number; type: string; error: string };
+
+/** Parse a batch's events one by one: the valid ones in order, and the rest quarantined. */
+export function parseHostEvents(raw: readonly unknown[]): { events: HostEvent[]; quarantined: QuarantinedEvent[] } {
+  const events: HostEvent[] = [];
+  const quarantined: QuarantinedEvent[] = [];
+  raw.forEach((value, index) => {
+    const r = HostEvent.safeParse(value);
+    if (r.success) {
+      events.push(r.data);
+      return;
+    }
+    const t = (value as { type?: unknown } | null)?.type;
+    quarantined.push({ index, type: typeof t === "string" ? t.slice(0, 64) : "?", error: r.error.message.slice(0, 500) });
+  });
+  return { events, quarantined };
+}
 
 export const FleetToHostVariants = [
   HelloAck.extend({ type: z.literal("hello_ack") }),

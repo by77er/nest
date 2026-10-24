@@ -414,7 +414,7 @@ impl State {
             }
             FleetToHost::Error { error } => {
                 let fatal = error.code == nest_protocol::model::error_codes::UNAUTHORIZED
-                    || error.code == nest_protocol::model::error_codes::UNSUPPORTED_PROTOCOL_VERSION;
+                    || nest_protocol::model::error_codes::is_unsupported_version(&error.code);
                 // A retryable error means FleetDO failed to process something we sent (it did not
                 // ack it). Reconnect so everything unacked is resent in order; carrying on would
                 // let a later batch's cumulative ack cover the failed one.

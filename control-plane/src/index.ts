@@ -65,7 +65,7 @@ const isUpgrade = (req: Request) => req.headers.get("upgrade")?.toLowerCase() ==
 async function enroll(req: Request, env: Env): Promise<Response> {
   const r = await body(req, EnrollRequest);
   if (r.protocol_version !== PROTOCOL_VERSION) {
-    throw new NestError(ErrorCodes.UNSUPPORTED_PROTOCOL_VERSION, `server speaks ${PROTOCOL_VERSION}`);
+    throw new NestError(ErrorCodes.UNSUPPORTED_VERSION, `server speaks ${PROTOCOL_VERSION}`);
   }
   let identity: InstanceIdentity | null = null;
   try {

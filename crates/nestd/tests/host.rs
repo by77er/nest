@@ -744,7 +744,7 @@ fn netns_listeners_handed_to_proxy() {
                 "cmd_create",
                 CommandBody::SandboxCreate {
                     sandbox: SandboxId("sbx_n".into()),
-                    workstream: WorkstreamId("ws".into()),
+                    workstream: WorkstreamId("ws_1".into()),
                     epoch: Epoch(1),
                     image: "base".into(),
                     resources: Resources { vcpus: 1, memory_mib: 256, disk_gib: 1 },

@@ -661,20 +661,16 @@ impl Inner {
                 }
             }
             ProxyNotice::Event(ProxyEvent::Alert { sandbox, agent, kind, host, binding, .. }) => {
-                let kind = match kind {
-                    nest_protocol::host::proxy::AlertKind::PlaceholderWrongHost => "placeholder_wrong_host",
-                    nest_protocol::host::proxy::AlertKind::DomainFronting => "domain_fronting",
-                    nest_protocol::host::proxy::AlertKind::InjectionAfterExpiry => "injection_after_expiry",
-                };
+                let reason = nest_protocol::model::EgressAlertReason::from(kind);
                 let host: String = host.chars().take(253).collect();
                 let fresh = {
                     let mut seen = self.alerts_seen.lock().expect("alerts");
                     let now = Instant::now();
                     seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                    seen.len() < MAX_DENIED_SEEN && seen.insert((sandbox.clone(), kind.to_string(), host.clone()), now).is_none()
+                    seen.len() < MAX_DENIED_SEEN && seen.insert((sandbox.clone(), format!("{reason:?}"), host.clone()), now).is_none()
                 };
                 if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS, 1.0) {
-                    self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason: kind.into() });
+                    self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason });
                 }
             }
             ProxyNotice::Event(ProxyEvent::ListenerFailed { sandbox, listener_id, error }) => {
@@ -695,7 +691,7 @@ impl Inner {
                 // ends it), not to the brain process, so a restarted brain finds its tasks.
                 self.runner.forget(&agent);
                 self.agents.lock().expect("agents").remove(&agent);
-                self.emit(HostEventBody::AgentExited { agent, exit_code: code, signal, reason: reason.as_str().into() });
+                self.emit(HostEventBody::AgentExited { agent, exit_code: code, signal, reason: reason.into() });
             }
             RunnerNotice::Event(RunnerEvent::AgentStarted { agent, pid, session, .. }) => {
                 tracing::info!(%agent, pid, %session, "brain started");
@@ -788,6 +784,10 @@ impl Inner {
     /// Relay a guest `nest` CLI command to the control plane; the answer comes back as a
     /// `guest_cli_result` command. `ask` may take up to its `wait_s` (≤ 120 s).
     fn relay_cli(self: &Arc<Self>, sbx: SandboxId, agent: Option<AgentId>, command: CliCommand, reply: oneshot::Sender<CliResult>) {
+        if let Some(refusal) = cli_agent_refusal(agent.as_ref()) {
+            let _ = reply.send(refusal);
+            return;
+        }
         let Some((_, epoch)) = self.workstream_of(&sbx) else {
             let _ = reply.send(CliResult::Error { error: error(error_codes::UNKNOWN_SANDBOX, format!("{sbx} is not on this host"), false) });
             return;
@@ -1922,6 +1922,15 @@ fn command_kind(b: &CommandBody) -> &'static str {
 
 /// Grow the ext4 filesystem in a freshly copied base image to fill its (just extended) file. The
 /// image is new from `mkfs`, so the check resize2fs wants first is skipped (`-f`).
+/// A guest CLI call whose `NEST_AGENT_ID` is not an agent id is answered here, never relayed: the
+/// control plane would refuse the event (deserializing already checks the prefix; this also covers
+/// ids built in code).
+fn cli_agent_refusal(agent: Option<&AgentId>) -> Option<CliResult> {
+    let bad = agent.filter(|a| !a.is_valid())?;
+    let shown: String = bad.0.chars().take(32).collect();
+    Some(CliResult::Error { error: error(error_codes::INVALID_MESSAGE, format!("NEST_AGENT_ID {shown:?} is not an agent id"), false) })
+}
+
 fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
     let out = std::process::Command::new("resize2fs").arg("-f").arg(disk).output().context("run resize2fs")?;
     anyhow::ensure!(out.status.success(), "resize2fs {}: {}", disk.display(), String::from_utf8_lossy(&out.stderr).trim());
@@ -1930,6 +1939,20 @@ fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use nest_protocol::guest::CliResult;
+    use nest_protocol::model::AgentId;
+
+    /// A malformed agent id from inside a sandbox stops at nestd instead of reaching FleetDO.
+    #[test]
+    fn refuses_a_guest_cli_call_with_a_bad_agent_id() {
+        match super::cli_agent_refusal(Some(&AgentId("x".into()))) {
+            Some(CliResult::Error { error }) => assert_eq!(error.code, "invalid_message"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(super::cli_agent_refusal(Some(&AgentId("agt_w".into()))).is_none());
+        assert!(super::cli_agent_refusal(None).is_none(), "no agent id is the control plane's call");
+    }
+
     /// A base image extended to a sandbox's disk size gets a filesystem that fills it.
     #[test]
     fn grows_a_copied_base_image_to_its_disk() {

@@ -16,7 +16,7 @@
 | `fence` | Kill listed brains (empty = all) now, including ones still starting |
 | `ping` | Health |
 
-**runner → nestd (`RunnerEvent`)**: `hello`, `agent_started{pid, session, claude_version, capabilities}`, `agent_capabilities{agent, capabilities}` (whenever `system/init` reports new capabilities, which may be after `agent_started`; the same list goes to AgentDO as a `capabilities` agent event), `auth_check{auth_method, api_key_source, ok}`, `agent_exited{code?, signal?, reason: idle|stopped|fenced|auth_failed|crashed}` (nestd forwards as `HostEventBody::AgentExited`), `pong`, `error`.
+**runner → nestd (`RunnerEvent`)**: `hello`, `agent_started{pid, session, claude_version, capabilities}`, `agent_capabilities{agent, capabilities}` (whenever `system/init` reports new capabilities, which may be after `agent_started`; the same list goes to AgentDO as a `capabilities` agent event), `auth_check{auth_method, api_key_source, ok}`, `agent_exited{code?, signal?, reason: idle|stopped|fenced|auth_failed|crashed}` (nestd forwards as `HostEventBody::AgentExited`, the reason mapped member for member onto `control::AgentExitReason`, never as free text), `pong`, `error`.
 
 ## Rules
 

@@ -6,12 +6,34 @@ use serde::{Deserialize, Serialize};
 macro_rules! id_type {
     ($name:ident, $prefix:literal) => {
         #[doc = concat!("Opaque identifier, rendered as `", $prefix, "<suffix>`.")]
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        ///
+        /// Deserializing checks the prefix (the same check the control plane's schemas make), so a
+        /// malformed id from an untrusted sender (a guest, a program in a sandbox) fails where it
+        /// is parsed instead of travelling on to reject a whole batch somewhere else.
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
         impl $name {
             pub const PREFIX: &'static str = $prefix;
+
+            /// Whether the id carries its kind's prefix: what deserializing enforces. Values built
+            /// in code with the tuple constructor are not checked.
+            pub fn is_valid(&self) -> bool {
+                self.0.starts_with(Self::PREFIX)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                if s.starts_with($prefix) {
+                    Ok(Self(s))
+                } else {
+                    // Not echoed: the value comes from an untrusted sender and may be large.
+                    Err(serde::de::Error::custom(concat!("expected an id starting with `", $prefix, "`")))
+                }
+            }
         }
 
         impl std::fmt::Display for $name {
@@ -96,7 +118,8 @@ id_type!(MessageId, "msg_");
 /// Protocol version spoken on every control-host channel. Bumped on incompatible changes.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Well-known `ErrorBody::code` values shared by every boundary.
+/// Well-known `ErrorBody::code` values shared by every boundary. [`ALL`](error_codes::ALL) is
+/// the list; `protocol/fixtures/codes.json` holds the same list and both mirrors assert against it.
 pub mod error_codes {
     pub const STALE_EPOCH: &str = "stale_epoch";
     pub const PARENT_MISMATCH: &str = "parent_mismatch";
@@ -104,12 +127,21 @@ pub mod error_codes {
     pub const UNKNOWN_AGENT: &str = "unknown_agent";
     pub const UNAUTHORIZED: &str = "unauthorized";
     pub const FORBIDDEN: &str = "forbidden";
-    pub const UNSUPPORTED_PROTOCOL_VERSION: &str = "unsupported_protocol_version";
+    /// The peer speaks a protocol (or gateway, or claims-format) version this side doesn't. The
+    /// same name on every boundary; read it with [`is_unsupported_version`], which also accepts
+    /// [`LEGACY_UNSUPPORTED_VERSION`].
+    pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
+    /// What the control-host channels sent for [`UNSUPPORTED_VERSION`] before the names were
+    /// merged. Accepted on read only; never sent.
+    pub const LEGACY_UNSUPPORTED_VERSION: &str = "unsupported_protocol_version";
     pub const INVALID_MESSAGE: &str = "invalid_message";
     pub const UNKNOWN_TOOL: &str = "unknown_tool";
     pub const CAPACITY_EXHAUSTED: &str = "capacity_exhausted";
     pub const RATE_LIMITED: &str = "rate_limited";
     pub const NOT_BOUND: &str = "not_bound";
+    /// `hands_resolve` can't hand out a binding yet (unplaced, placing, waking, or the agent's
+    /// slot isn't configured): ask again after `retry_after_ms`.
+    pub const SANDBOX_NOT_READY: &str = "sandbox_not_ready";
     pub const INTERNAL: &str = "internal";
     /// The operation exists in the contract but has no implementation yet. Hosts and nest-mcp
     /// pass it through as an ordinary tool error.
@@ -117,10 +149,22 @@ pub mod error_codes {
     /// The caller gave up waiting (e.g. a platform tool call that timed out in the runner): the
     /// operation may or may not have taken effect. Not retryable under the same call id.
     pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
+
+    /// Every code above that is sent (the legacy alias is not).
+    pub const ALL: &[&str] = &[
+        STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
+        UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
+        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN,
+    ];
+
+    /// `unsupported_version` under either name.
+    pub fn is_unsupported_version(code: &str) -> bool {
+        code == UNSUPPORTED_VERSION || code == LEGACY_UNSUPPORTED_VERSION
+    }
 }
 
 /// What a host is for. See docs/compute/.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRole {
     /// Spot host: Firecracker sandboxes plus their workers' brains.
@@ -129,7 +173,7 @@ pub enum HostRole {
     Controller,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     /// Brain with hands bound to a sandbox.
@@ -149,7 +193,7 @@ pub struct Resources {
 // --- Sandbox and agent state ------------------------------------------------------------------
 
 /// Sandbox lifecycle (docs/sandbox/). Reported by hosts; SandboxDO holds the authoritative copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
     Creating,
@@ -167,7 +211,7 @@ pub enum SandboxState {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum SuspendMode {
     /// Full hugepage memory snapshot + disk: resumes with processes intact.
@@ -176,7 +220,7 @@ pub enum SuspendMode {
     DiskOnly,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkMode {
     /// Child head = parent's freshly committed disk manifest; child cold-boots.
@@ -186,7 +230,7 @@ pub enum ForkMode {
 }
 
 /// Agent state machine (docs/agents/state-tracking/).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
     Starting,
@@ -222,7 +266,7 @@ impl HostPattern {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyLayer {
     /// Image defaults (package registries, GitHub, distro mirrors).
@@ -350,7 +394,7 @@ impl EgressPolicy {
 
 // --- Canonical agent events ---------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnInputKind {
     /// Me (Discord, UI, CLI).
@@ -477,10 +521,35 @@ pub enum WorkstreamEventKind {
         /// Injection binding involved, when there is one (absent for e.g. domain fronting).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding: Option<String>,
-        reason: String,
+        reason: EgressAlertReason,
     },
     PortOpened { port: u16 },
     PortExposed { port: u16, url: String },
+}
+
+/// Why nest-proxy raised an egress alert (`WorkstreamEventKind::EgressAlert.reason`): nest-proxy's
+/// `host::proxy::AlertKind`, plus a catch-all. Open: a member this build doesn't know (a newer
+/// sender, or free text from an older one) parses as `unknown` instead of failing the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressAlertReason {
+    PlaceholderWrongHost,
+    DomainFronting,
+    InjectionAfterExpiry,
+    /// Deserialize-only fallback; never sent by this build.
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<crate::host::proxy::AlertKind> for EgressAlertReason {
+    fn from(k: crate::host::proxy::AlertKind) -> Self {
+        use crate::host::proxy::AlertKind;
+        match k {
+            AlertKind::PlaceholderWrongHost => Self::PlaceholderWrongHost,
+            AlertKind::DomainFronting => Self::DomainFronting,
+            AlertKind::InjectionAfterExpiry => Self::InjectionAfterExpiry,
+        }
+    }
 }
 
 impl WorkstreamEventKind {
@@ -507,7 +576,7 @@ impl WorkstreamEventKind {
 #[serde(transparent)]
 pub struct ManifestHash(pub String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerationKind {
     /// Disk only. Head of this kind ⇒ restore is a cold boot.
@@ -516,7 +585,7 @@ pub enum GenerationKind {
     Checkpoint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitReason {
     TurnEnd,
@@ -549,7 +618,7 @@ pub struct GenerationRecord {
     pub created_ms: TimestampMs,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestKind {
     /// 4 MiB chunks of a ublk volume.

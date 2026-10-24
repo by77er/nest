@@ -13,7 +13,7 @@ import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { signBlobUrl } from "../lib/tokens";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
 import {
-  type AgentCache, type AgentStart, type AgentToRunner, type InboxMessage, type LaunchConfig, RunnerToAgent,
+  type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, type InboxMessage, type LaunchConfig, RunnerToAgent,
   type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
@@ -44,8 +44,13 @@ const WAKE_STATES: AgentState[] = ["detached", "errored"];
 const WAKE_RETRY_MS = 30_000;
 /** `hands_resolved{error}` hint when the sandbox isn't ready: how long the runner waits before asking again. */
 const HANDS_RETRY_MS = 2_000;
-/** Exits that restart the brain at once when work is waiting (not `stopped`, not `auth_failed`). */
-const RESTART_ON_EXIT = ["idle", "crashed", "fenced", "not running after host reconnect"];
+/**
+ * Which exits restart the brain at once when work is waiting. A `Record` over every member, so a
+ * new exit reason doesn't compile until it has a decision here.
+ */
+const RESTART_ON_EXIT: Record<AgentExitReason, boolean> = {
+  idle: true, crashed: true, fenced: true, host_lost: true, stopped: false, auth_failed: false, unknown: false,
+};
 /** Restarts after an exit without a turn completing in between, before giving up (`errored`). */
 const MAX_EXIT_RESTARTS = 3;
 const RETENTION_MS = 7 * 86_400_000;
@@ -449,7 +454,7 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** The brain on `host` exited. Reports from any other host are ignored (e.g. after a move). */
-  async onExited(host: string, reason: string): Promise<void> {
+  async onExited(host: string, reason: AgentExitReason): Promise<void> {
     if (!this.exists()) return;
     if (this.load().host !== host) return;
     const info = this.update((i) => {
@@ -458,7 +463,7 @@ export class AgentDO extends DurableObject<Env> {
     await this.syncActivity();
     console.log(`agent ${info.agent}: brain exited (${reason})`);
     // Work that arrived while it was exiting, or the turn it died in, brings it straight back.
-    if (RESTART_ON_EXIT.includes(reason)) await this.wake(reason !== "idle");
+    if (RESTART_ON_EXIT[reason]) await this.wake(reason !== "idle");
   }
 
   /**
@@ -724,7 +729,7 @@ export class AgentDO extends DurableObject<Env> {
 
   private async onHello(ws: WebSocket, att: Attachment, hello: Extract<RunnerToAgent, { type: "hello" }>): Promise<void> {
     if (hello.protocol_version !== PROTOCOL_VERSION) {
-      this.send(ws, { type: "error", error: errorBody(ErrorCodes.UNSUPPORTED_PROTOCOL_VERSION, `server speaks ${PROTOCOL_VERSION}`) });
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.UNSUPPORTED_VERSION, `server speaks ${PROTOCOL_VERSION}`) });
       ws.close(4426, "unsupported protocol version");
       return;
     }

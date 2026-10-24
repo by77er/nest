@@ -19,7 +19,7 @@ import { issueHostToken } from "../lib/tokens";
 import { errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import {
   type Capacity, type CommandBody, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
-  type EnrollResponse, type FleetToHost, type HostEvent, HostToFleet, type LeaseClaim, type CaCertificate, type SandboxReport,
+  type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
   type TunnelState,
 } from "../protocol/control";
 import {
@@ -559,9 +559,9 @@ export class FleetDO extends DurableObject<Env> {
 
   override async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
     const att = ws.deserializeAttachment() as Attachment;
-    let parsed: HostToFleet;
+    let parsed: HostToFleetFrame;
     try {
-      const r = HostToFleet.safeParse(JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw)));
+      const r = HostToFleetFrame.safeParse(JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw)));
       if (!r.success) throw new Error(r.error.message);
       parsed = r.data;
     } catch (e) {
@@ -578,8 +578,15 @@ export class FleetDO extends DurableObject<Env> {
         return this.queue(att.host).run(() => this.onHello(ws, att, parsed));
       case "heartbeat":
         return this.onHeartbeat(ws, att.host, parsed.sent_ms, parsed.leases);
-      case "events":
-        return this.queue(att.host).run(() => this.onEvents(ws, att.host, parsed.seq, parsed.events));
+      case "events": {
+        // One bad event is quarantined (logged, skipped, acked with its batch), never the whole
+        // batch: a rejected batch is resent forever and stalls every sandbox on the host.
+        const { events, quarantined } = parseHostEvents(parsed.events);
+        for (const q of quarantined) {
+          console.warn(`FleetDO: quarantined event ${q.index} (${q.type}) of batch ${parsed.seq} from ${att.host}: ${q.error}`);
+        }
+        return this.queue(att.host).run(() => this.onEvents(ws, att.host, parsed.seq, events));
+      }
       case "ack":
         this.rel.ack(att.host, parsed.up_to);
         return;
@@ -650,7 +657,7 @@ export class FleetDO extends DurableObject<Env> {
     if (hello.protocol_version !== PROTOCOL_VERSION) {
       this.send(ws, {
         type: "error",
-        error: errorBody(ErrorCodes.UNSUPPORTED_PROTOCOL_VERSION, `server speaks ${PROTOCOL_VERSION}`),
+        error: errorBody(ErrorCodes.UNSUPPORTED_VERSION, `server speaks ${PROTOCOL_VERSION}`),
       });
       ws.close(4426, "unsupported protocol version");
       return;
@@ -770,7 +777,7 @@ export class FleetDO extends DurableObject<Env> {
       if (k.c_cmd !== null && k.result === null) continue;
       this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", k.agent, host);
       try {
-        await this.agentStub(k.agent).onExited(host, "not running after host reconnect");
+        await this.agentStub(k.agent).onExited(host, "host_lost");
       } catch (e) {
         console.error(`FleetDO: marking ${k.agent} exited failed`, e);
       }

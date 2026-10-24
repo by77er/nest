@@ -7,5 +7,5 @@
   "type": "egress_alert",
   "host": "evil.example",
   "binding": "github",
-  "reason": "placeholder sent outside binding hosts"
+  "reason": "placeholder_wrong_host"
 }
