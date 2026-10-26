@@ -254,6 +254,7 @@ impl State {
             tunnel: *self.params.tunnel.borrow(),
             last_command_seq: self.last_command_seq,
             cgroup_delegation_error: self.params.cgroup_delegation_error.clone(),
+            brain_epochs: true,
             sandboxes,
             agents,
             capacity,

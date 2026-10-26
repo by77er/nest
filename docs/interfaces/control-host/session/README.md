@@ -3,7 +3,7 @@
 > **Implemented contract.** In the design, `segment_ack` follows the SQLite commit and there are no roles; see [pending contract changes](../../README.md#pending-contract-changes).
 
 
-One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello includes the agent's epoch: the bound sandbox's epoch for workers, `0` for captains (designed: the agent epoch AgentDO issues per brain start, for every agent; the sandbox epoch travels inside the agent's binding, [gateway](../../gateway/)).
+One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello carries the agent epoch AgentDO issued for this brain start (`agent_start.epoch`), for every agent; the sandbox epoch travels only inside the agent's binding ([gateway](../../gateway/)). For one release a hello with epoch `0` is accepted for an agent without hands, from runners of the previous release.
 
 ## Messages
 
@@ -11,9 +11,9 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello` | first frame | agent, host, `instance_id` (random per brain process), epoch, `session?`, `local_bytes?`, `last_seq?` |
+| `hello` | first frame | agent, host, `instance_id` (random per brain process), epoch (the agent epoch), `session?`, `local_bytes?`, `last_seq?` |
 | `segment` | by offset | Raw JSONL bytes `[offset, offset+len)` of the native session file, base64. `base: true` means the file was rewritten (it shrank or its inode changed): discard earlier segments; this one starts at offset 0 |
-| `events` | seq | A batch of `model::AgentEvent` (each with its own per-agent `seq`), coalesced |
+| `events` | seq | A batch of `model::AgentEvent` (each with its own per-agent `seq`), coalesced. Each event's `epoch` is the one this connection's hello presented; AgentDO drops any other |
 | `tool_call` | seq | A platform tool call relayed from nest-mcp: `call`, `turn?`, `name`, `arguments` |
 | `tools_list_request` | no | nest-mcp `tools/list` |
 | `cancel_call` | seq | `call`, `reason`. The runner abandoned a platform call (it timed out locally and the model was told `outcome_unknown`). An unacked `tool_call` is replaced in place by a `cancel_call` with the same seq, and a fresh one is always sent too. AgentDO marks the call done with `outcome_unknown` without running it (a later `tool_call` with that id gets that outcome), stops a pending `ask`'s sync wait (its answer then arrives as a turn), and sends no `tool_result`. Idempotent. |
@@ -32,7 +32,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `cache_update` | seq | `AgentCache{version, rules, inbox, max_stop_continuations}` for answering hooks locally |
 | `tool_result` | seq | `outcome: ok{content} \| error{error} \| pending{ask, message}` |
 | `tools_list` | no | `ToolDef[]` (MCP `tools/list` plus nest metadata) |
-| `hands_resolved` | no (`request`) | Exactly one of `hands{url, sandbox, epoch, binding, guest, edge?}` and `error`: `not_bound` (no hands, or not attached), `sandbox_not_ready` with `retry_after_ms` (no host, placing, the slot not confirmed, no gateway advertised), `stale_epoch` (not the current runner process or epoch). The binding travels only here, never in a command |
+| `hands_resolved` | no (`request`) | `outcome`: `{status: ok, hands{url, binding, guest, edge?}}` or `{status: error, error, retry_after_ms?}`: `not_bound` (no hands, or not attached), `sandbox_not_ready` with `retry_after_ms` (no host, placing, the slot not confirmed, no gateway advertised), `stale_epoch` (not the current runner process or epoch). The binding travels only here, never in a command. For one release AgentDO also sends the previous shape (exactly one of `hands` and `error`, and `retry_after_ms`), and runners accept it when `outcome` is absent; `hands` still carries unsigned `sandbox` and `epoch` copies for those runners |
 | `ack` / `error` | — | |
 
 ## Session stream and acks

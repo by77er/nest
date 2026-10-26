@@ -37,19 +37,21 @@ How any client of a sandbox (the agent runner's hands client today; AgentDO's `a
 - **Minted at `resolve`, never at `attach`.** `attach` configures the client's slot in the guest (cwd, env, cgroup, through nestd's `agent_attach`); the binding names only the client (`agent_id` for an agent, a person's id for a terminal) and travels only over the session channel from AgentDO to the runner, never through FleetDO, nestd or a command at rest. In code it is a redacting `Secret`; it is never put in a URL or a log.
 - **Keys:** the per-cell private key lives in BrokerDO; hosts hold a list of public keys (`binding_key{keys}` on the fleet channel, `key_update{keys}` to the gateway), so a rotation can keep the previous key listed for a binding lifetime. A `kid` that is not listed is `unknown_key`.
 - **Revoked** by `detach` (the gateway refuses a client that is not in the sandbox's attached set, which nestd sends with every `sandbox_upsert`) and by any epoch bump, since the token names the epoch and the gateway accepts only the sandbox's current one.
+- **Superseded brains:** a binding names the sandbox, not the brain, so the gateway can't tell an old brain of an agent from its new one. **One brain per agent** is a control-plane rule, not a gateway fence: AgentDO issues a start on another host than the previous brain's only once that brain is confirmed gone, by its `agent_exited` at its agent epoch or later, or its host dead or expired (a host whose lease lapses kills its brains at 20 s; FleetDO expires it at 30 s). Until then the old brain is killed on arrival (`agent_stop{mode: kill}`), its sessions are fenced, and the start waits. A same-host restart is serialized by that host's runner. Old hosts are covered by the same rule. So a binding an old brain cached dies with that brain ([AgentDO](../../control-plane/durable-objects/agent/)).
 - A call admitted on a valid binding runs to completion; the next connection needs a renewed one.
 - **The cross-language oracle:** `protocol/fixtures/gateway/binding_token/signed.json` holds a reproducible P-256 key, a signed token and its claims. The control plane's tests verify it with WebCrypto, the gateway's tests with `ring`, and both refuse a tampered copy, which pins base64url without padding, the signing domain and the `r‖s` format on both sides.
 
 ## Resolve
 
-`resolve(agent)` on SandboxDO returns the sandbox's current placement as a `HandsTarget`: `{url, sandbox, epoch, binding, guest{protocol_version, capabilities}, edge?}`, where `url` is `wss://` plus the tunnel hostname FleetDO recorded for the host at enrollment, or the host's own `gateway_url` from its fleet hello when it has no tunnel; `guest` is what nestd last reported (the gateway's `bound.guest` is authoritative); and `edge` is the Access service token from BrokerDO (`access:gateway`), present only for a `wss://` URL.
+`resolve(agent)` on SandboxDO returns the sandbox's current placement as a `HandsTarget`: `{url, binding, guest{protocol_version, capabilities}, edge?}`, where `url` is `wss://` plus the tunnel hostname FleetDO recorded for the host at enrollment, or the host's own `gateway_url` from its fleet hello when it has no tunnel; `guest` is what nestd last reported (the gateway's `bound.guest` is authoritative); and `edge` is the Access service token from BrokerDO (`access:gateway`), present only for a `wss://` URL.
 
-- **A runner** asks through AgentDO: `hands_resolve{request}` on its [session channel](../control-host/session/), answered by `hands_resolved{request, hands | error, retry_after_ms?}` with exactly one of `hands` and `error`: `not_bound` (the agent has no hands, or the client is not attached), `sandbox_not_ready` with a retry hint (no host, placing, the slot not confirmed yet, or a host that advertised no gateway), `stale_epoch` (the asking runner process or epoch is not the current one), or another error the runner surfaces. AgentDO answers only the current runner's socket.
+- **The sandbox and epoch are the binding's claims,** which a client reads from the token (unverified; the signature is the gateway's to check) and stamps on every request. The target's `sandbox` and `epoch` fields are unsigned copies sent for one release for clients of the previous release; current clients ignore them.
+- **A runner** asks through AgentDO: `hands_resolve{request}` on its [session channel](../control-host/session/), answered by `hands_resolved{request, outcome}`, `outcome` being `{status: ok, hands}` or `{status: error, error, retry_after_ms?}`: `not_bound` (the agent has no hands, or the client is not attached), `sandbox_not_ready` with a retry hint (no host, placing, the slot not confirmed yet, or a host that advertised no gateway), `stale_epoch` (the asking runner process or epoch is not the current one), or another error the runner surfaces. AgentDO answers only the current runner's socket.
 - **An operator or a test harness** asks the Worker: `POST /v1/sandboxes/<sbx>/resolve {client}` with the admin token returns the same target for an attached client. Mints are not audited yet.
 - The runner prefetches a target at brain start and otherwise resolves before its first call; it caches the target until 60 s before the binding's `exp_ms` (read from the claims segment, unverified: the signature is the gateway's to check), or until a refusal a fresh target may cure (see [error codes](#error-codes)) or an unreachable host, then resolves again once and retries once. A sandbox that moved answers with its new URL and epoch.
 
 ```json
-{"url": "wss://01jb7k3x9q-gw-nest.example.dev", "sandbox": "sbx_01jb7m2a4c", "epoch": 4,
+{"url": "wss://01jb7k3x9q-gw-nest.example.dev",
  "binding": "nbd_…", "guest": {"protocol_version": 1, "capabilities": ["pty", "cgroup_v2", "pdf", "fsfreeze"]}}
 ```
 
@@ -80,7 +82,7 @@ The signature is verified before any state-dependent answer, so an unsigned prob
 
 ```
 runner (brain host)                   gateway (sandbox host)               guest
-  │ hands_resolve via AgentDO → {url, epoch 4, binding, guest v1}
+  │ hands_resolve via AgentDO → {url, binding (epoch 4), guest v1}
   │ WS /hands ─────────────────────────►│ verify binding; epoch 4 == the sandbox's; client attached
   │ bind{binding, v1, gw 1} ───────────►│ CONNECT 1025 / OK ──────────────────►│
   │◄── bound{guest, gateway_version 1}  │                                      │
@@ -91,6 +93,6 @@ runner (brain host)                   gateway (sandbox host)               guest
 
 ## What other boundaries adopt
 
-- **Runner:** the hands client speaks this; `agent_start` carries the sandbox's id and epoch only, and nestd carries nothing about hands to the runner ([nestd-runner](../host-internal/nestd-runner/)).
+- **Runner:** the hands client speaks this; `agent_start` carries the sandbox's id only, and nestd carries nothing about hands to the runner ([nestd-runner](../host-internal/nestd-runner/)).
 - **AgentDO:** the session channel carries `hands_resolve` / `hands_resolved` ([session](../control-host/session/)).
 - **FleetDO and nestd:** the public keys travel on the fleet channel (`binding_key`) and over `gateway.sock` ([nestd-gateway](../host-internal/nestd-gateway/)); a sandbox host's enrollment response carries its tunnel token and the gateway URL the control plane will advertise for it ([enrollment](../control-host/enrollment/)).

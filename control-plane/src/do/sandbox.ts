@@ -477,16 +477,30 @@ export class SandboxDO extends DurableObject<Env> {
     if (!placed) await this.notifyAgentsMoved(null);
   }
 
-  /** Bound agents follow their hands; one agent's failure doesn't stop the others. */
-  private async notifyAgentsMoved(host: string | null): Promise<void> {
+  /**
+   * Tell bound agents their sandbox moved: from this object's own alarm, never inline. A placement
+   * can be made on an agent's behalf (its start wakes the sandbox), and calling back into that
+   * agent from inside its own call would deadlock. A brain needs nothing from it (its next hands
+   * call resolves the new placement); the agent records the move, tells a working brain what was
+   * lost, and wakes a stopped one with work waiting. The latest placement is what is sent.
+   */
+  private async notifyAgentsMoved(_host: string | null): Promise<void> {
+    await this.deadlines.set("notify_moved", Date.now(), true);
+  }
+
+  /** The `notify_moved` alarm: one agent's failure doesn't stop the others, and is retried. */
+  private async sendMoveNotices(): Promise<void> {
     const info = this.info_();
+    let failed = false;
     for (const agent of info.attached) {
       try {
-        await this.env.AGENT.get(this.env.AGENT.idFromName(agent)).onSandboxMoved(info.sandbox, info.epoch, host);
+        await this.env.AGENT.get(this.env.AGENT.idFromName(agent)).onSandboxMoved(info.sandbox, info.epoch, info.host);
       } catch (e) {
-        console.error(`sandbox ${info.sandbox}: notifying ${agent} of the move failed`, e);
+        failed = true;
+        console.error(`sandbox ${info.sandbox}: notifying ${agent} of the move failed; retrying`, e);
       }
     }
+    if (failed) await this.deadlines.set("notify_moved", Date.now() + ATTACH_RETRY_MS, true);
   }
 
   /**
@@ -681,6 +695,8 @@ export class SandboxDO extends DurableObject<Env> {
         }
       } else if (key === "attach_retry") {
         await this.reissuePendingAttaches(false);
+      } else if (key === "notify_moved") {
+        await this.sendMoveNotices();
       }
     });
   }
@@ -881,6 +897,7 @@ export class SandboxDO extends DurableObject<Env> {
       throw notReady("sandbox moved while resolving");
     }
     if (!fresh.guest) throw notReady("sandbox moved while resolving");
+    // `sandbox` and `epoch`: unsigned copies of the claims, for clients of the previous release only.
     return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest, ...(edge ? { edge } : {}) };
   }
 

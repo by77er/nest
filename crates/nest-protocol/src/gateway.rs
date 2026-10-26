@@ -40,9 +40,14 @@ pub const ROUTE_INGRESS_PREFIX: &str = "/ingress/";
 pub struct HandsTarget {
     /// `ws://` or `wss://` base URL of the sandbox host's gateway (no path).
     pub url: String,
-    pub sandbox: SandboxId,
-    /// The sandbox epoch the binding names; every `HandsRequest` carries it too.
-    pub epoch: Epoch,
+    /// Deprecated, for one release: unsigned copies of the binding's `sandbox` and `epoch`
+    /// claims, still sent for clients of the previous release, which require them. Current
+    /// clients read both from the binding's claims ([`parse_binding`]), the copy the gateway
+    /// checks, and ignore these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<Epoch>,
     /// The binding token (`nbd_…`), sent as the first message. Never in a URL, never logged
     /// (`Secret` redacts `Debug`); held in memory only.
     pub binding: Secret,

@@ -319,7 +319,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (req.method === "POST" && p[2] === "/start") {
       // An optional host: a brain on a chosen enrolled host (hands still reach the sandbox's gateway).
       const text = await req.text();
-      let r: { host?: string } = {};
+      let r: { host?: string; restart?: boolean } = {};
       if (text.trim()) {
         let raw: unknown;
         try {
@@ -327,11 +327,11 @@ async function route(req: Request, env: Env): Promise<Response> {
         } catch {
           throw new NestError(ErrorCodes.INVALID_MESSAGE, "body must be JSON");
         }
-        const parsed = z.object({ host: HostId.optional() }).safeParse(raw);
+        const parsed = z.object({ host: HostId.optional(), restart: z.boolean().optional() }).safeParse(raw);
         if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, parsed.error.message);
         r = parsed.data;
       }
-      return json(await a.start(r.host));
+      return json(await a.start(r.host, undefined, r.restart ?? false));
     }
 
     if (req.method === "POST" && p[2] === "/stop") {

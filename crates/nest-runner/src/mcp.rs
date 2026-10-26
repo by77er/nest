@@ -178,7 +178,7 @@ mod tests {
             let (otx, _) = mpsc::unbounded_channel();
             Agent::new(AgentId("agt_m".into()), role, Epoch(1), std::env::temp_dir(), hands, None, vec![], 0, ctx, otx)
         };
-        let bound = Some(HandsBinding { sandbox: SandboxId("sbx_m".into()), epoch: Epoch(1) });
+        let bound = Some(HandsBinding { sandbox: SandboxId("sbx_m".into()), epoch: None });
         let names = |tools: Vec<McpToolDef>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
         // A captain-template agent given a sandbox gets hands, as the call path already allowed.
         assert_eq!(names(list(&rt, &agent(AgentRole::Captain, bound.clone())).await), HANDS_TOOLS);
