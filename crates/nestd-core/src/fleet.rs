@@ -156,6 +156,14 @@ pub enum Effect<E, C, R, O> {
     Log(Log),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Phase {
+    Idle,
+    Connecting,
+    AwaitingAck,
+    Open,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Conn {
     /// Not connected; connect at `retry_at`.
@@ -225,6 +233,16 @@ impl<E: OutboxEvent> FleetLink<E> {
             Conn::Connecting => None,
             Conn::AwaitingAck { deadline, .. } => Some(deadline),
             Conn::Open { next_heartbeat, next_flush, .. } => Some(next_heartbeat.min(next_flush)),
+        }
+    }
+
+    /// Where the connection stands.
+    pub fn phase(&self) -> Phase {
+        match self.conn {
+            Conn::Idle { .. } => Phase::Idle,
+            Conn::Connecting => Phase::Connecting,
+            Conn::AwaitingAck { .. } => Phase::AwaitingAck,
+            Conn::Open { .. } => Phase::Open,
         }
     }
 
