@@ -76,7 +76,7 @@ Not `CLAUDE_CODE_OAUTH_TOKEN`: that name could change how the session's own Clau
 | A budget alarm | Billing → Budgets → a monthly cost budget at the spend cap, emailing me | — |
 
 The provisioning key creates the narrow credentials nest actually runs with:
-- the cell's control-plane IAM user (`RunInstances` with the launch template only; terminate and stop only instances tagged `nest=true`; `kms:Sign` on the cell's proxy root CA key only), whose access key goes in the Worker secret `AWS_CELL_CREDENTIALS` under the cell's name ([cells](../compute/cells/));
+- the cell's control-plane IAM user (`RunInstances` with the launch template only; terminate and stop only instances tagged `nest=true`; `kms:Sign` and `kms:GetPublicKey` on the cell's proxy root CA key only), whose access key goes in the Worker secret `AWS_CELL_CREDENTIALS` under the cell's name ([cells](../compute/cells/));
 - the hosts' instance role (S3 access to the cell's bucket only);
 - **the proxy root CA key:** a KMS key (`ECC_NIST_P256`, sign and verify), which never leaves KMS. The cell stack creates it; FleetDO self-signs the cell's root certificate through KMS `Sign` the first time it is needed, and the guest image bakes it in, fetched from `GET /v1/admin/root-ca?cell=<cell>` ([tls](../sandbox/networking/egress/tls/)).
 

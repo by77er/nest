@@ -186,10 +186,20 @@ function derInt(v: Uint8Array): number[] {
 }
 
 /** Stands in for KMS: signs with a local key and answers in KMS's format (a DER ECDSA-Sig-Value). */
+/** The same P-256 key as a compressed-point SubjectPublicKeyInfo: valid DER, but not WebCrypto's encoding. */
+export function compressedSpki(spki: Uint8Array): Uint8Array {
+  if (spki.length !== 91 || spki[26] !== 0x04) throw new Error("not an uncompressed P-256 SubjectPublicKeyInfo");
+  const x = spki.slice(27, 59);
+  const yOdd = spki[90]! & 1;
+  return new Uint8Array([0x30, 0x39, ...spki.slice(2, 23), 0x03, 0x22, 0x00, 0x02 + yOdd, ...x]);
+}
+
 export class FakeKms implements Kms {
   calls = 0;
   /** Every key id asked for, in order. */
   keyIds: string[] = [];
+  /** How `publicKey` encodes the key: WebCrypto's form, or another valid DER (a compressed point). */
+  encoding: "webcrypto" | "compressed" = "webcrypto";
   constructor(private readonly keys: CryptoKeyPair) {}
   static async create() {
     return new FakeKms((await crypto.subtle.generateKey(EC, true, ["sign", "verify"])) as CryptoKeyPair);
@@ -203,6 +213,7 @@ export class FakeKms implements Kms {
   }
   async publicKey(keyId = "") {
     this.keyIds.push(keyId);
-    return new Uint8Array((await crypto.subtle.exportKey("spki", this.keys.publicKey)) as ArrayBuffer);
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", this.keys.publicKey)) as ArrayBuffer);
+    return this.encoding === "compressed" ? compressedSpki(spki) : spki;
   }
 }

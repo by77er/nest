@@ -71,7 +71,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 |---|---|
 | `ADMIN_TOKEN` | Admin API bearer token (Cloudflare Access replaces it later) |
 | `HOST_TOKEN_SECRET` | HMAC key for host tokens, signed blob URLs and share links |
-| `ROOT_CA_CERT_PEM`, `ROOT_CA_KEY_PEM` | Development proxy root CA (PKCS#8 ECDSA P-256 key), for a cell with no KMS key. Without them, `ALLOW_DEV_CA=1` mints a dev root. A cell with a KMS key derives its certificate (`docs/sandbox/networking/egress/tls/`) and, for one release, adopts `ROOT_CA_CERT_PEM` when it is that key's |
+| `ROOT_CA_CERT_PEM`, `ROOT_CA_KEY_PEM` | Development proxy root CA (PKCS#8 ECDSA P-256 key), for a cell with no KMS key. Without them, `ALLOW_DEV_CA=1` mints a dev root. A cell with a KMS key derives its certificate (`docs/sandbox/networking/egress/tls/`) and, for one release, adopts `ROOT_CA_CERT_PEM` when it is that key's and refuses one for another key |
 | `AWS_IDENTITY_CERT_PEM` | AWS public certificate for the `rsa2048` identity signature (enables AWS enrollment) |
 | `AWS_CELL_CREDENTIALS` | Secret: JSON object of cell → `{access_key_id, secret_access_key}` of `nest-<cell>-control-plane` (STONITH, the autoscaler, KMS). Without an entry, STONITH waits for the host to fence, or for an operator |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID` | Legacy, one release: used for a cell missing from `AWS_CELL_CREDENTIALS` / `AWS_CELLS`; `GET /v1/admin/fleet` shows which source each cell uses (`docs/compute/cells/`) |

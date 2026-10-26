@@ -32,7 +32,7 @@ Two host images, one per [host kind](../). Neither contains a secret ([identity]
 **IAM:**
 - **Sandbox host instance role:** S3 access scoped to the cell's bucket.
 - **Brain host instance role:** nothing. A brain host holds no S3 access; enrollment needs only IMDS, which is local.
-- **Control-plane IAM user, one per cell ([cells](../cells/)):** `RunInstances` with the cell's launch template only; `Terminate` and `Stop` only on instances tagged `nest=true`; `Describe*`; `kms:Sign` on the proxy root CA key only ([TLS](../../sandbox/networking/egress/tls/)).
+- **Control-plane IAM user, one per cell ([cells](../cells/)):** `RunInstances` with the cell's launch template only; `Terminate` and `Stop` only on instances tagged `nest=true`; `Describe*`; `kms:Sign` and `kms:GetPublicKey` on the cell's proxy root CA key only ([TLS](../../sandbox/networking/egress/tls/)).
 - **Deploy role** (`nest-<cell>-deploy`): assumed from GitHub Actions over OIDC, only by the repo's `production` environment; administrator-equivalent, because applying the stack manages IAM ([deploys](../../../dev/deploy.md)).
 
 **Host authentication:**

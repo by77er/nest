@@ -12,7 +12,7 @@ import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
-import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
+import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, valueOf, type AwsCellConfig, type AwsSource, type CellAws } from "../lib/cells";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
@@ -145,8 +145,13 @@ export interface GcClaim {
   max_deletes: number;
 }
 
-/** The operator view's `aws`: the cell's region and each setting's source, or why they're unusable. */
-export type AwsView = { cell: string | null; region: string | null; sources: CellAws["sources"] } | { cell: string | null; error: string };
+/**
+ * The operator view's `aws`: the cell's region and each setting's source, with `error` when the cell's
+ * own credentials were malformed and passed over; or only `error` when its `AWS_CELLS` entry is unusable.
+ */
+export type AwsView =
+  | { cell: string | null; region: string | null; sources: { region: AwsSource; credentials: AwsSource; kms_key: AwsSource }; error?: string }
+  | { cell: string | null; error: string };
 
 export class FleetDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -269,7 +274,6 @@ export class FleetDO extends DurableObject<Env> {
    * an enrollment token. The CSR is validated (signed) before the one-time proof is consumed.
    */
   async enroll(req: EnrollRequest, cell: string, identity: InstanceIdentity | null): Promise<EnrollResponse> {
-    this.rememberCell(cell);
     const proxyCa = await this.signProxyCa(req.proxy_ca_csr_pem);
     const hash = req.proof.type === "enrollment_token" ? hex(await sha256(req.proof.token)) : "";
     const host = newId("hst_");
@@ -530,16 +534,18 @@ export class FleetDO extends DurableObject<Env> {
       if (!this.kmsOverride) throw new NestError(ErrorCodes.INTERNAL, "AWS credentials not configured", 500);
       return this.kmsOverride;
     }
-    const { credentials, region } = this.aws();
+    const a = this.aws();
+    const credentials = valueOf(a.credentials);
+    const region = valueOf(a.region);
     if (!credentials || !region) {
-      throw new NestError(ErrorCodes.INTERNAL, `AWS credentials or region not configured for cell ${this.cellName() ?? "(unknown)"}`, 500);
+      throw new NestError(ErrorCodes.INTERNAL, `AWS credentials or region not configured for cell ${this.cellName() ?? "(unnamed)"}`, 500);
     }
     return new AwsKms(credentials.access_key_id, credentials.secret_access_key, region);
   }
 
   /** The root CA: the cell's KMS key, else a PEM key (development, and before KMS). */
   private async rootCa(): Promise<RootCa> {
-    const keyId = this.aws().kmsKeyId;
+    const keyId = valueOf(this.aws().kmsKey);
     if (keyId) return this.kmsRootCa(keyId);
     if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KEY_PEM) return localRoot(this.env.ROOT_CA_CERT_PEM, this.env.ROOT_CA_KEY_PEM);
     if (this.env.ALLOW_DEV_CA !== "1") {
@@ -563,59 +569,41 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * The cell's root in KMS. Its certificate follows from the key and isn't configured: FleetDO keeps
-   * one per cell (`kv.root_ca`, beside the key's public key) and self-signs it through KMS the first
-   * time, unless the legacy `ROOT_CA_CERT_PEM` is a certificate for the same key, which it adopts so
-   * the certificate already baked into guest images stays the cell's. A different key (rotation)
-   * gets a new certificate, and the guest image has to be rebuilt with it.
+   * one per cell (`kv.root_ca`). The first time, it adopts the legacy `ROOT_CA_CERT_PEM`, which
+   * guest images already trust, or self-signs one through KMS when there is none. It fails closed:
+   * a legacy or kept certificate for any other key is refused, so enrollment and renewal fail loudly
+   * rather than issue intermediates that baked images don't trust. Rotating the root is an operator
+   * action (not built), never a side effect of configuration.
    */
   private async kmsRootCa(keyId: string): Promise<RootCa> {
     if (this.kmsRoot?.keyId === keyId) return this.kmsRoot.root;
     const kms = this.kms();
-    const spki = await canonicalSpki(await kms.publicKey(keyId));
-    const spkiB64 = bytesToB64(spki);
-    type Stored = { spki: string; cert_pem: string };
-    const load = () => {
-      const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'root_ca'").toArray()[0];
-      return row ? (JSON.parse(row.value) as Stored) : null;
-    };
-    let stored = load();
-    if (stored?.spki !== spkiB64) {
+    const keySpki = await canonicalSpki(await kms.publicKey(keyId));
+    const cell = this.cellName();
+    const forKey = async (pem: string) => bytesToB64(await certificateSpki(pem)) === bytesToB64(keySpki);
+    const refuse = (what: string) => new NestError(ErrorCodes.INTERNAL,
+      `cell ${cell ?? "(unnamed)"}: ${what} is not a certificate for the cell's KMS key ${keyId}; rotating the root is an operator action`, 500);
+    const load = () => this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'root_ca'").toArray()[0]?.value ?? null;
+    let certPem = load();
+    if (certPem === null) {
       const legacy = this.env.ROOT_CA_CERT_PEM;
-      const adopt = !!legacy && bytesToB64(await certificateSpki(legacy)) === spkiB64;
-      const cell = this.cellName();
-      if (legacy && !adopt) console.warn(`FleetDO: cell ${cell}: ROOT_CA_CERT_PEM is not a certificate for the cell's KMS key, so it is not adopted`);
-      const certPem = adopt
-        ? legacy
-        : await createRootCertificate(spki, kmsRoot("", kms, keyId).sign, `CN=nest ${cell ? `${cell} ` : ""}proxy root CA`, ROOT_CA_TTL_MS);
-      // The awaits above yield: another call may have stored this key's certificate meanwhile.
-      const raced = load();
-      if (raced?.spki === spkiB64) {
-        stored = raced;
-      } else {
-        if (raced) console.warn(`FleetDO: cell ${cell}: the proxy root CA key changed; a new root certificate replaces the old one, so rebuild the guest image with it`);
-        console.log(`FleetDO: cell ${cell}: root CA certificate ${adopt ? "adopted from ROOT_CA_CERT_PEM" : "self-signed through KMS"}`);
-        stored = { spki: spkiB64, cert_pem: certPem };
-        this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('root_ca', ?)", JSON.stringify(stored));
+      if (legacy && !(await forKey(legacy))) throw refuse("ROOT_CA_CERT_PEM");
+      const candidate = legacy ?? (await createRootCertificate(keySpki, kmsRoot("", kms, keyId).sign, `CN=nest ${cell ? `${cell} ` : ""}proxy root CA`, ROOT_CA_TTL_MS));
+      // The awaits above yield, so another call may have kept one meanwhile; no await from here to the insert.
+      certPem = load() ?? candidate;
+      if (certPem === candidate) {
+        this.sql.exec("INSERT INTO kv (key, value) VALUES ('root_ca', ?)", certPem);
+        console.log(`FleetDO: cell ${cell}: root CA certificate ${legacy ? "adopted from ROOT_CA_CERT_PEM" : "self-signed through KMS"}`);
       }
     }
-    const root = kmsRoot(stored.cert_pem, kms, keyId);
+    if (!(await forKey(certPem))) throw refuse("the root certificate the cell keeps");
+    const root = kmsRoot(certPem, kms, keyId);
     this.kmsRoot = { keyId, root };
     return root;
   }
 
-  /**
-   * Operator: a self-signed root certificate for any KMS key the cell's credentials may use, signed
-   * through KMS and not kept. The cell's own certificate needs no call: `rootCertificatePem` derives it.
-   */
-  async createKmsRootCertificate(keyId: string, name: string, ttlMs: number, cell?: string): Promise<string> {
-    if (cell) this.rememberCell(cell);
-    const kms = this.kms();
-    return createRootCertificate(await kms.publicKey(keyId), kmsRoot("", kms, keyId).sign, name, ttlMs);
-  }
-
   /** The cell's root certificate, to bake into its sandbox images. */
-  async rootCertificatePem(cell?: string): Promise<string> {
-    if (cell) this.rememberCell(cell);
+  async rootCertificatePem(): Promise<string> {
     return (await this.rootCa()).certPem;
   }
 
@@ -1196,7 +1184,6 @@ export class FleetDO extends DurableObject<Env> {
     if (existing) {
       throw new NestError(ErrorCodes.FORBIDDEN, `sandbox ${req.sandbox} already holds a lease (epoch ${existing.epoch} on ${existing.host})`, 409);
     }
-    if (req.cell) this.rememberCell(req.cell);
     this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     // Packing (docs/compute/autoscaling/): fill hosts before opening new ones, so idle hosts empty
     // out. A host's room is its last capacity report less what leases placed since reserve (a
@@ -1396,12 +1383,14 @@ export class FleetDO extends DurableObject<Env> {
   private ec2(): Ec2 | null {
     if (this.ec2Override !== undefined) return this.ec2Override;
     const a = this.awsOrNull();
-    return a?.credentials && a.region ? new AwsEc2(a.credentials.access_key_id, a.credentials.secret_access_key, a.region) : null;
+    const c = a && valueOf(a.credentials);
+    const region = a && valueOf(a.region);
+    return c && region ? new AwsEc2(c.access_key_id, c.secret_access_key, region) : null;
   }
 
   /**
    * The cell's AWS access for EC2 and SSM, whose callers (STONITH, the autoscaler) treat "no AWS" as
-   * waiting for an operator: a malformed setting is logged and counts as none rather than throwing.
+   * waiting for an operator: an unusable `AWS_CELLS` entry is logged and counts as none rather than throwing.
    */
   private awsOrNull(): CellAws | null {
     try {
@@ -1416,13 +1405,12 @@ export class FleetDO extends DurableObject<Env> {
   // Autoscaling (docs/compute/autoscaling/): launch on demand, retire idle hosts, scale to zero
   // ---------------------------------------------------------------------------------------------
 
-  private rememberCell(cell: string): void {
-    this.sql.exec("INSERT OR IGNORE INTO kv (key, value) VALUES ('cell', ?)", cell);
-  }
-
-  /** The cell this FleetDO serves, once a host, placement or operator call has named it. */
+  /**
+   * The cell this FleetDO serves: its own name (every FleetDO is `idFromName(cell)`). Legacy, one
+   * release: the `kv.cell` row older code wrote, read only, should a runtime not expose the name.
+   */
   private cellName(): string | null {
-    return this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value ?? null;
+    return this.ctx.id.name ?? this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value ?? null;
   }
 
   private cellConfig(): AwsCellConfig | null {
@@ -1446,7 +1434,7 @@ export class FleetDO extends DurableObject<Env> {
       .exec("SELECT 1 FROM hosts WHERE role = 'burst' AND status IN ('active', 'stonith_pending')")
       .toArray().length;
     if (live >= cfg.max_hosts) return;
-    const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value ?? null;
+    const cell = this.cellName();
     const now = Date.now();
     const zone = (i: number) => cfg.subnet_ids[(Math.floor(now / 1000) + i) % cfg.subnet_ids.length]!;
     const attempts = [
@@ -1709,7 +1697,11 @@ export class FleetDO extends DurableObject<Env> {
     const cell = this.cellName();
     try {
       const a = this.aws();
-      return { cell, region: a.region, sources: a.sources };
+      return {
+        cell, region: valueOf(a.region),
+        sources: { region: a.region.source, credentials: a.credentials.source, kms_key: a.kmsKey.source },
+        ...(a.credentialsError ? { error: a.credentialsError } : {}),
+      };
     } catch (e) {
       return { cell, error: (e as Error).message };
     }
@@ -1721,7 +1713,7 @@ export class FleetDO extends DurableObject<Env> {
     templates: { name: string; default: boolean; source: string; in_use: number }[];
   }> {
     const ec2 = this.ec2();
-    const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value;
+    const cell = this.cellName();
     const ssm = this.ssm();
     const current = ssm && cell ? await ssm.parameter(`/imagebuilder/nest-${cell}/host-ami`) : null;
     // Sandbox templates (guest images): today the release carries one, `nest-base`, and every host
@@ -1738,7 +1730,9 @@ export class FleetDO extends DurableObject<Env> {
   private ssm(): Ssm | null {
     if (this.ssmOverride !== undefined) return this.ssmOverride;
     const a = this.awsOrNull();
-    return a?.credentials && a.region ? new AwsSsm(a.credentials.access_key_id, a.credentials.secret_access_key, a.region) : null;
+    const c = a && valueOf(a.credentials);
+    const region = a && valueOf(a.region);
+    return c && region ? new AwsSsm(c.access_key_id, c.secret_access_key, region) : null;
   }
 
   /** CP-side lease expiry: no sandbox on this host may run anywhere else until STONITH is confirmed. */

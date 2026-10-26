@@ -23,14 +23,28 @@ for name in PUBLIC_BASE_URL CLOUDFLARE_ACCOUNT_ID; do
   fi
   required+=(--var "$name:$value")
 done
-# AWS_CELLS: every cell's entry (each parameter is `{"<cell>": {...}}`), merged into one object. No
-# entry fails the deploy: without one FleetDO would neither scale nor find its KMS key.
+# AWS_CELLS: every cell's entry (the parameter /nest/control-plane/aws-cells/<cell> holds
+# `{"<cell>": {...}}`), merged into one object. A parameter whose one key isn't its own name fails the
+# deploy, so no entry silently overrides another; so does no entry at all, since without one FleetDO
+# would neither scale nor find its KMS key.
 entries=$(aws ssm get-parameters-by-path --region us-east-1 --path /nest/control-plane/aws-cells/ \
-  --query 'Parameters[].Value' --output json)
+  --query 'Parameters[].{name: Name, value: Value}' --output json)
 aws_cells=$(node -e '
-  const entries = JSON.parse(require("fs").readFileSync(0, "utf8")).map((v) => JSON.parse(v));
-  if (!entries.length) { console.error("deploy: no SSM parameter under /nest/control-plane/aws-cells/"); process.exit(1); }
-  process.stdout.write(JSON.stringify(Object.assign({}, ...entries)));
+  const prefix = "/nest/control-plane/aws-cells/";
+  const params = JSON.parse(require("fs").readFileSync(0, "utf8"));
+  if (!params.length) { console.error(`deploy: no SSM parameter under ${prefix}`); process.exit(1); }
+  const cells = {};
+  for (const { name, value } of params) {
+    const cell = name.slice(prefix.length);
+    const entry = JSON.parse(value);
+    const keys = Object.keys(entry);
+    if (keys.length !== 1 || keys[0] !== cell) {
+      console.error(`deploy: ${name} must hold exactly one key, "${cell}"; it holds ${JSON.stringify(keys)}`);
+      process.exit(1);
+    }
+    cells[cell] = entry[cell];
+  }
+  process.stdout.write(JSON.stringify(cells));
 ' <<<"$entries")
 required+=(--var "AWS_CELLS:$aws_cells")
 # The tunnel API token (Account: Cloudflare One Connector: cloudflared: Edit; Zone: DNS: Edit) is a Worker

@@ -19,8 +19,8 @@ export interface Env {
   /**
    * Root CA for nest-proxy intermediates, development form: PEM certificate and PKCS#8 ECDSA P-256
    * key. A cell with a KMS key uses that instead, and FleetDO keeps the cell's root certificate.
-   * Legacy (one release): with `ROOT_CA_KMS_KEY_ID`, a `ROOT_CA_CERT_PEM` for the cell's key is
-   * adopted as the cell's certificate rather than minting a new one.
+   * Legacy (one release): for a cell with a KMS key, a `ROOT_CA_CERT_PEM` for that key is
+   * adopted as the cell's certificate rather than minting a new one; one for another key is refused.
    */
   ROOT_CA_CERT_PEM?: string;
   ROOT_CA_KEY_PEM?: string;

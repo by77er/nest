@@ -73,48 +73,80 @@ const Credentials = z.object({
 
 export type AwsCredentials = z.infer<typeof Credentials>;
 
+/** A cell name, as the Worker accepts one. */
+const CELL_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+function credentialsEntry(entry: unknown, cell: string): AwsCredentials {
+  const r = Credentials.safeParse(entry);
+  if (r.success) return r.data;
+  const fields = [...new Set(r.error.issues.flatMap((i) => ("keys" in i ? (i.keys as string[]) : [i.path.join(".") || "(entry)"])))];
+  throw new Error(`AWS_CELL_CREDENTIALS.${cell} is malformed (${fields.join(", ")})`);
+}
+
 /** The cell's entry in `AWS_CELL_CREDENTIALS`, or `null` when it has none. Errors name fields, never values. */
 export function cellCredentials(json: string | undefined, cell: string): AwsCredentials | null {
   if (!json) return null;
   const entry = keyed(json, "AWS_CELL_CREDENTIALS")[cell];
-  if (entry === undefined) return null;
-  const r = Credentials.safeParse(entry);
-  if (!r.success) {
-    const fields = [...new Set(r.error.issues.flatMap((i) => ("keys" in i ? (i.keys as string[]) : [i.path.join(".") || "(entry)"])))];
-    throw new Error(`AWS_CELL_CREDENTIALS.${cell} is malformed (${fields.join(", ")})`);
-  }
-  return r.data;
+  return entry === undefined ? null : credentialsEntry(entry, cell);
 }
 
-/** Where a cell's AWS setting came from: its own entry, the legacy global, or nowhere. */
-export type AwsSource = "cell" | "legacy" | "none";
+/** The whole of `AWS_CELL_CREDENTIALS`, every entry checked (`dev/cell-credentials.sh` runs this before putting it). */
+export function parseCellCredentials(json: string): Record<string, AwsCredentials> {
+  const out: Record<string, AwsCredentials> = {};
+  const all = keyed(json, "AWS_CELL_CREDENTIALS");
+  if (!Object.keys(all).length) throw new Error("AWS_CELL_CREDENTIALS has no cells");
+  for (const [cell, entry] of Object.entries(all)) {
+    if (!CELL_NAME.test(cell)) throw new Error(`AWS_CELL_CREDENTIALS: "${cell}" is not a cell name`);
+    out[cell] = credentialsEntry(entry, cell);
+  }
+  return out;
+}
+
+/** A setting and where it came from: the cell's own entry, the legacy global, or nowhere. */
+export type Sourced<T> = { source: "cell" | "legacy"; value: T } | { source: "none" };
+export type AwsSource = Sourced<unknown>["source"];
+
+export const valueOf = <T>(s: Sourced<T>): T | null => (s.source === "none" ? null : s.value);
 
 /** What FleetDO uses to reach AWS for one cell. */
 export interface CellAws {
-  region: string | null;
-  credentials: AwsCredentials | null;
+  region: Sourced<string>;
+  credentials: Sourced<AwsCredentials>;
   /** The proxy root CA key: an ARN, or for the legacy global any id or alias KMS accepts. */
-  kmsKeyId: string | null;
-  /** Which source each setting came from, never the values: FleetDO's operator view shows it. */
-  sources: { region: AwsSource; credentials: AwsSource; kms_key: AwsSource };
+  kmsKey: Sourced<string>;
+  /** Why the cell's own credentials were passed over (fields named, never values). */
+  credentialsError?: string;
 }
 
 export type AwsEnv = Pick<Env, "AWS_CELL_CREDENTIALS" | "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_REGION" | "ROOT_CA_KMS_KEY_ID">;
 
+function pick<T>(mine: T | null | undefined, global: T | null | undefined): Sourced<T> {
+  if (mine) return { source: "cell", value: mine };
+  if (global) return { source: "legacy", value: global };
+  return { source: "none" };
+}
+
 /**
  * A cell's AWS access: its `AWS_CELLS` entry (`config`) and its `AWS_CELL_CREDENTIALS` entry first,
- * each setting falling back to its legacy global on its own. `cell` is `null` when FleetDO doesn't
- * know its cell yet, so only the legacy globals can apply.
+ * each setting falling back to its legacy global on its own. A malformed credentials entry falls back
+ * too, with the error kept for the operator view. `cell` is `null` when FleetDO has no name, so only
+ * the legacy globals can apply.
  */
 export function cellAws(env: AwsEnv, cell: string | null, config: AwsCellConfig | null): CellAws {
-  const own = cell ? cellCredentials(env.AWS_CELL_CREDENTIALS, cell) : null;
+  let own: AwsCredentials | null = null;
+  let credentialsError: string | undefined;
+  try {
+    own = cell ? cellCredentials(env.AWS_CELL_CREDENTIALS, cell) : null;
+  } catch (e) {
+    credentialsError = (e as Error).message;
+  }
   const legacy = env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY
     ? { access_key_id: env.AWS_ACCESS_KEY_ID, secret_access_key: env.AWS_SECRET_ACCESS_KEY }
     : null;
-  const pick = <T>(mine: T | null | undefined, global: T | null | undefined): [T | null, AwsSource] =>
-    mine ? [mine, "cell"] : global ? [global, "legacy"] : [null, "none"];
-  const [region, regionSource] = pick(config?.region, env.AWS_REGION);
-  const [credentials, credentialsSource] = pick(own, legacy);
-  const [kmsKeyId, kmsSource] = pick(config?.proxy_root_key_arn, env.ROOT_CA_KMS_KEY_ID);
-  return { region, credentials, kmsKeyId, sources: { region: regionSource, credentials: credentialsSource, kms_key: kmsSource } };
+  return {
+    region: pick(config?.region, env.AWS_REGION),
+    credentials: pick(own, legacy),
+    kmsKey: pick(config?.proxy_root_key_arn, env.ROOT_CA_KMS_KEY_ID),
+    ...(credentialsError ? { credentialsError } : {}),
+  };
 }
