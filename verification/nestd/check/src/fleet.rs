@@ -472,9 +472,9 @@ impl Model for FleetModel {
         if s.nestd.connecting {
             a.push(Action::NestdConnectOk);
         }
-        match (s.nestd.link.phase(), s.nestd.link.wake_at()) {
-            (Phase::Idle, Some(_)) => a.push(Action::NestdTick),
-            _ => {}
+        // Time moves only to a reconnect (an open link's next timer is far off; see the module docs).
+        if s.nestd.link.phase() == Phase::Idle && s.nestd.link.wake_at().is_some() {
+            a.push(Action::NestdTick);
         }
         if !s.nestd.exec.is_empty() {
             a.push(Action::Exec);
