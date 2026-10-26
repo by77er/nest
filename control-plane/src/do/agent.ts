@@ -605,13 +605,15 @@ export class AgentDO extends DurableObject<Env> {
         }
         if (brain) {
           // A brain that isn't condemned: never a second start for it (no same-host re-issue). It
-          // moves (another hint, its host avoided, or its host no longer active and connected: N19)
+          // moves (another hint, its host avoided, or its host no longer active: draining, expired,
+          // lost or wedged, N19)
           // or restarts (an operator's explicit restart) by being condemned with the intent kept,
           // which then starts once it is released (maybe on the same host). Otherwise the start
           // answers `none`; an operator's intent stays, so it runs after this brain exits (N14: a
           // graceful stop's `stopped` exit), any other is dropped.
+          // By the host's status (N24): a brief socket drop isn't a reason to move a brain.
           const st = await this.fleet(snap.cell).hostStatus(brain.host);
-          const healthy = !!st && st.status === "active" && st.connected;
+          const healthy = !!st && st.status === "active" && !st.lost && !st.wedged;
           const moves = (intent.host_hint !== undefined && intent.host_hint !== brain.host) || intent.avoid === brain.host
             || intent.reason === "restart" || !healthy;
           await this.hook("intent:beforeCommit");
@@ -858,8 +860,14 @@ export class AgentDO extends DurableObject<Env> {
     if (!st?.current) {
       // A host of the previous release (no brain epochs): its brain is released only by that
       // host's loss (confirmed death or lease expiry), never by a processed kill without a row or
-      // an exit, and the host is never wedged. FleetDO drains and retires it.
-      console.error(`agent ${info.agent}: ${b.host}@${b.epoch} is on a previous-release host; waiting for its loss`);
+      // an exit. Past the cap the host is wedged like any other (N21): no start ever reaches it,
+      // and its nestd kills every brain when its lease lapses (origin/main crates/nestd/src/host.rs
+      // :1085-1090, `self_fence`), so its loss ends the wait.
+      if (Date.now() - b.kill.ms >= ESCALATION_CAP_MS) {
+        await this.fleet(info.cell).hostWedged(b.host, `${info.agent}@${b.epoch} on a previous-release host outlived its kill`);
+      } else {
+        console.warn(`agent ${info.agent}: ${b.host}@${b.epoch} is on a previous-release host; waiting for its loss`);
+      }
       await this.deadlines.set("condemned", Date.now() + EXIT_WAIT_MS);
       return;
     }
@@ -904,6 +912,11 @@ export class AgentDO extends DurableObject<Env> {
       // Counted once, where it happens (the crash-loop guard): here for a brain that ended on its
       // own; a condemned brain's exit is the condemn's outcome, counted by its cause if at all.
       if (restarts && i.brain.phase !== "condemned") i.exit_restarts = (i.exit_restarts ?? 0) + 1;
+      // An operator's plain start kept while this brain ran (N14) is for after a graceful stop: any
+      // other end of a brain that wasn't condemned drops it (N20), so it never lingers.
+      if (i.intent?.reason === "operator" && !i.intent.host_hint && !i.intent.avoid && i.brain.phase !== "condemned" && reason !== "stopped") {
+        i.intent = null;
+      }
       i.prev_host = i.brain.host;
       i.brain = null;
       i.state = "detached";

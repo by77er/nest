@@ -386,3 +386,19 @@ async fn an_older_start_never_ends_a_newer_brain() {
     assert_eq!(e.rt.agent(&id).expect("registered").epoch(), nest_protocol::model::Epoch(2));
     e.rt.kill_all(ExitReason::Fenced);
 }
+
+/// N22: the same start again is a no-op: no exit reported, the brain runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicate_start_is_a_no_op() {
+    let e = env();
+    let id = AgentId("agt_same".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_same", 2));
+    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    let pid = pids(e.dir.path())[0];
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_same", 2));
+    let evs = events(&e.rt, Duration::from_millis(800)).await;
+    assert!(exits_at(&evs).is_empty(), "{evs:?}");
+    assert!(alive(pid));
+    assert!(e.rt.agent(&id).is_some());
+    e.rt.kill_all(ExitReason::Fenced);
+}

@@ -124,9 +124,14 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
                     return;
                 }
-                Err(Refused::Running(existing)) if existing.epoch() >= epoch => {
-                    // A newer (or the same) brain is registered: this start is stale (N18). It never
-                    // runs, never ends the newer brain, and its exit says so at its own epoch.
+                Err(Refused::Running(existing)) if existing.epoch() == epoch => {
+                    // The same start again (a duplicate): a no-op; the brain runs on (N22).
+                    tracing::warn!(agent = %id, epoch = epoch.0, "duplicate agent_start for the registered brain: ignored");
+                    return;
+                }
+                Err(Refused::Running(existing)) if existing.epoch() > epoch => {
+                    // A newer brain is registered: this start is stale (N18). It never runs, never
+                    // ends the newer brain, and its exit says so at its own epoch.
                     tracing::warn!(agent = %id, epoch = epoch.0, running = existing.epoch().0, "agent_start older than the registered brain: refused");
                     rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
                     return;

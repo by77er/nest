@@ -822,11 +822,12 @@ export class FleetDO extends DurableObject<Env> {
       await this.dropUnreported(att.host, reported);
       await this.failPendingCommands(att.host, "host process restarted before running this command", reported, pending);
     }
+    // A host of the previous release (no brain epochs) is drained of brains on sight, before its
+    // agents are reconciled: no new placements and its brains condemned; its sandboxes are left as
+    // they are (they leave as they would), and it is retired once empty. It never receives a brain
+    // (AgentDO starts brains only on hosts of this release, and `issueCommands` refuses one).
+    if (!hello.brain_epochs) await this.drainBrains(att.host, "a previous-release nestd");
     await this.reconcileAgents(att.host, hello.agents);
-    // A host of the previous release (no brain epochs) is drained on sight: no new placements, its
-    // sandboxes leave, its brains are condemned, and it is retired when empty, ending in a confirmed
-    // death. It never receives a brain (AgentDO starts brains only on hosts of this release).
-    if (!hello.brain_epochs) await this.drain(att.host, Date.now(), "a previous-release nestd");
     // A host whose leases we expired came back: it must fence them before we reassign (STONITH by fence).
     await this.ensureStonithFence(att.host);
     await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
@@ -990,6 +991,8 @@ export class FleetDO extends DurableObject<Env> {
    */
   private addHostAgentsColumns(): void {
     this.addColumn("host_agents", "gone", "INTEGER NOT NULL DEFAULT 0");
+    // Whether its agent took the host's drain (`onHostDraining`); retried by the tick until it did.
+    this.addColumn("host_agents", "drain_told", "INTEGER NOT NULL DEFAULT 0");
   }
 
   /**
@@ -1272,10 +1275,14 @@ export class FleetDO extends DurableObject<Env> {
    */
   async issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): Promise<string[]> {
     const now = Date.now();
-    // A start never goes to a host whose loss is (being) announced: expired, dead or unknown (A3).
+    // A start never goes to a host whose loss is (being) announced: expired, dead or unknown (A3),
+    // nor to a host of the previous release (N23: closes the gap between AgentDO's pick and this send).
     const target = this.host(host);
-    if (bodies.some((b) => b.type === "agent_start") && (!target || target.status === "expired" || target.status === "dead")) {
-      throw new NestError(ErrorCodes.FORBIDDEN, `host ${host} is ${target?.status ?? "unknown"}: no agent_start goes there`, 409, true);
+    if (bodies.some((b) => b.type === "agent_start")) {
+      const prev = !!target && this.sql.exec<{ b: number }>("SELECT brain_epochs AS b FROM hosts WHERE host = ?", host).one().b === 0;
+      if (!target || target.status === "expired" || target.status === "dead" || prev) {
+        throw new NestError(ErrorCodes.FORBIDDEN, `host ${host} is ${prev ? "of the previous release" : target?.status ?? "unknown"}: no agent_start goes there`, 409, true);
+      }
     }
     const commands = bodies.map((body) => ({ cmd: newId("cmd_"), issued_ms: now, ...body }));
     for (const c of commands) {
@@ -1468,11 +1475,14 @@ export class FleetDO extends DurableObject<Env> {
 
   /** `lost`: its brains are proven gone (A6): lease expired, or death confirmed. */
   /** `current`: its nestd keys brains by agent epoch (not the previous release's). */
-  async hostStatus(host: string): Promise<{ status: HostStatus; connected: boolean; last_rx: number | null; lost: boolean; current: boolean } | null> {
+  async hostStatus(host: string): Promise<{ status: HostStatus; connected: boolean; last_rx: number | null; lost: boolean; current: boolean; wedged: boolean } | null> {
     const h = this.host(host);
     if (!h) return null;
     const current = this.sql.exec<{ b: number }>("SELECT brain_epochs AS b FROM hosts WHERE host = ?", host).one().b === 1;
-    return { status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx, lost: this.hostLost(host), current };
+    return {
+      status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx, lost: this.hostLost(host), current,
+      wedged: h.wedged_ms !== null && h.wedged_ms !== undefined,
+    };
   }
 
   /**
@@ -1536,6 +1546,10 @@ export class FleetDO extends DurableObject<Env> {
     // hello no longer reported.
     for (const h of this.sql.exec<{ host: string }>(LOST_WITH_BRAINS).toArray()) await this.brainsLost(h.host);
     for (const h of this.sql.exec<{ host: string }>("SELECT DISTINCT host FROM host_agents WHERE gone = 1").toArray()) await this.goneExits(h.host);
+    for (const h of this.sql.exec<{ host: string }>(
+      "SELECT DISTINCT a.host FROM host_agents a JOIN hosts h ON h.host = a.host WHERE h.status = 'draining' AND a.drain_told = 0").toArray()) {
+      await this.tellDraining(h.host);
+    }
     await this.reapStale();
     await this.scaleDown(now);
     this.sql.exec("DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?", now - COMMAND_RETENTION_MS);
@@ -1556,6 +1570,9 @@ export class FleetDO extends DurableObject<Env> {
    * The cell's binding verification keys, for the host's sandbox gateway (docs/sandbox/gateway/).
    * Sent after every hello: the gateway verifies bindings with them and holds nothing else.
    */
+  /** Empty draining hosts without an instance already reported for an operator (in memory: reported again after a restart). */
+  private readonly reportedEmpty = new Set<string>();
+
   /** Hosts that have the cell's binding keys since their last hello; in memory only, so a restart resends once. */
   private readonly keysSent = new Set<string>();
 
@@ -1741,11 +1758,21 @@ export class FleetDO extends DurableObject<Env> {
     // A draining host whose sandboxes and brains have all left goes now rather than at its deadline.
     // Never with a brain still indexed there: that brain is alive until its exit is reported (or the
     // host goes silent and is expired), so declaring the host dead would let it run twice.
-    // Any role: a controller host of the previous release is drained and retired too.
-    for (const h of this.sql.exec<HostRow>(
-      "SELECT * FROM hosts WHERE status = 'draining' AND instance_id IS NOT NULL").toArray()) {
+    // Any role: a controller host of the previous release is drained and retired too. Never with a
+    // lease, a brain recorded, or a stale incarnation not yet salvaged (its disk is still there).
+    for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'draining'").toArray()) {
       if (this.leasesOf(h.host).length) continue;
       if (this.sql.exec("SELECT 1 FROM host_agents WHERE host = ?", h.host).toArray().length) continue;
+      if (this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length) continue;
+      if (!h.instance_id) {
+        // Enrolled with a token (no instance to terminate): empty, and waiting for an operator's
+        // confirm-dead.
+        if (!this.reportedEmpty.has(h.host)) {
+          this.reportedEmpty.add(h.host);
+          console.error(`FleetDO: draining ${h.host} is empty but has no instance to retire; confirm it dead`);
+        }
+        continue;
+      }
       this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", h.host);
       this.endInstance(h.instance_id!, "drained");
       this.releaseTunnel(h.host, "drained");
@@ -1787,18 +1814,34 @@ export class FleetDO extends DurableObject<Env> {
       await this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
     }
     // Its brains move now, where another host can take them; the rest restart once it is dead. In
-    // the background and in parallel: the host's event batch isn't held for brain starts.
-    const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray();
-    if (agents.length) {
-      this.ctx.waitUntil(Promise.all(agents.map(async ({ agent }) => {
-        try {
-          await this.agentStub(agent).onHostDraining(host);
-        } catch (e) {
-          console.error(`FleetDO: moving ${agent} off draining ${host} failed`, e);
-        }
-      })));
-    }
+    // the background (the host's event batch isn't held for brain starts), and retried by the tick
+    // until each agent took it.
+    this.ctx.waitUntil(this.tellDraining(host));
     if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+  }
+
+  /**
+   * A previous-release host: no new placements (`draining`) and its brains condemned, its sandboxes
+   * left as they are. Applies again whenever the host is active again (after STONITH by fence).
+   */
+  private async drainBrains(host: string, why: string): Promise<void> {
+    if (this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host).rowsWritten === 0) return;
+    console.warn(`FleetDO: ${host} draining of brains (${why})`);
+    this.ctx.waitUntil(this.tellDraining(host));
+    if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+  }
+
+  /** Tell each agent with a brain on draining `host` to move it, until it took it (the tick retries). */
+  private async tellDraining(host: string): Promise<void> {
+    const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ? AND drain_told = 0", host).toArray();
+    await Promise.all(agents.map(async ({ agent }) => {
+      try {
+        await this.agentStub(agent).onHostDraining(host);
+        this.sql.exec("UPDATE host_agents SET drain_told = 1 WHERE agent = ? AND host = ?", agent, host);
+      } catch (e) {
+        console.error(`FleetDO: moving ${agent} off draining ${host} failed; will retry`, e);
+      }
+    }));
   }
 
   /**
@@ -2108,7 +2151,11 @@ export class FleetDO extends DurableObject<Env> {
   private stonithDoneIfClear(host: string, fenced = new Set<string>()): void {
     if (this.leasesOf(host).some((l) => l.expired && !fenced.has(l.sandbox)) || !this.socketFor(host)) return;
     // A wedged host is done only when STONITH confirms it dead (D5), never by a fence it runs itself.
-    this.sql.exec("UPDATE hosts SET status = 'active' WHERE host = ? AND status = 'stonith_pending' AND wedged_ms IS NULL", host);
+    const back = this.sql.exec("UPDATE hosts SET status = 'active' WHERE host = ? AND status = 'stonith_pending' AND wedged_ms IS NULL", host).rowsWritten > 0;
+    // A previous-release host active again is drained of brains again (N21).
+    if (back && this.sql.exec("SELECT 1 FROM hosts WHERE host = ? AND brain_epochs = 0", host).toArray().length) {
+      this.ctx.waitUntil(this.drainBrains(host, "a previous-release nestd, active again"));
+    }
   }
 
   /** STONITH confirmed (EC2 says terminated, or an operator confirmed): reassign every lease. */
