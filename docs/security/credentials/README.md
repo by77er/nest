@@ -7,7 +7,7 @@
 | GitHub installation tokens | nest-proxy memory | Proxy only | Injected by placeholder, on the binding's exact hosts, methods and path |
 | Other injected secrets | BrokerDO → nest-proxy memory | Proxy only | Per host and grant. Pushed with the policy hash; the proxy refuses one whose binding isn't in the installed policy. Every push and refusal is audited |
 | Brokered-action secrets (email, …) | BrokerDO | Never a VM | Executed outside the VM |
-| Proxy root CA key | AWS KMS (`ECC_NIST_P256`, non-exportable) | Nobody: FleetDO calls `kms:Sign` | Signs per-host intermediates at enrollment and renewal; CloudTrail logs each issuance; the root certificate is in the image. See [tls](../../sandbox/networking/egress/tls/) |
+| Proxy root CA key (per cell) | AWS KMS (`ECC_NIST_P256`, non-exportable) | Nobody: the cell's FleetDO calls `kms:Sign` | Signs per-host intermediates at enrollment and renewal; CloudTrail logs each issuance; the root certificate, derived from the key by FleetDO, is in the cell's image. See [tls](../../sandbox/networking/egress/tls/) |
 | Per-host intermediate CA (~7 days, pathLen 0) | nest-proxy memory; the key is generated on the host | Proxy | Signs leaf certificates (≤ 24 h) on the fly |
 | OIDC signing key (deferred) | Worker secret | Control plane | JWKS published |
 | Host token | FleetDO issues it; nestd and the runner hold it in memory | Host | Obtained with the signed identity document; rotated; void when the [revocation counter](../../control-plane/api/) moves |
@@ -22,7 +22,7 @@
 | Cloudflare Access token (Account › Access: Apps and Policies › Edit) | GitHub `production` secret `CLOUDFLARE_ACCESS_API_TOKEN` | `deploy.yml`'s infra job, for the `edge` stack | Manages the Access applications in front of the gateways, the dashboard and previews |
 | AWS: deploy role (`nest-<cell>-deploy`) | Nothing stored: assumed over GitHub OIDC | `deploy.yml` jobs in the `production` environment | Administrator-equivalent (applying the stack manages IAM); its trust policy admits only this repo's `production` environment ([dev/deploy](../../../dev/deploy.md)) |
 | AWS: host role | Instance profile | nestd (nest-proxy is kernel-blocked from IMDS) | S3 for its whole cell (below) |
-| AWS: control plane | Worker secret | FleetDO | Launch template only; terminate/stop only instances tagged `nest=true`; `kms:Sign` on the proxy root CA key only |
+| AWS: control plane (per cell, `nest-<cell>-control-plane`) | Worker secret `AWS_CELL_CREDENTIALS`, keyed by cell; for one release a cell without an entry uses the legacy `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | That cell's FleetDO | The cell's launch template only; terminate/stop only instances tagged `nest=true`; `kms:Sign` and `kms:GetPublicKey` on the cell's proxy root CA key only. The operator view names each cell's source, never the key. See [cells](../../compute/cells/) |
 | R2 | DO bindings | Control plane | Hosts use Worker-signed URLs only (no R2 S3 credentials exist) |
 | Webhook secrets (`hook:<hk_…>`) | BrokerDO | Control plane only | BrokerDO verifies signatures itself; brokered actions send the secret straight to the provider |
 | MCP server and API credentials (`cap:<name>`) | BrokerDO | Control plane only | One per `mcp` or `api` capability; attached per call |

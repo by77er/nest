@@ -16,21 +16,28 @@ export interface Env {
   ADMIN_TOKEN: string;
   /** HMAC key for host tokens and signed blob URLs. */
   HOST_TOKEN_SECRET: string;
-  /** Root CA for nest-proxy intermediates: PEM certificate and PKCS#8 ECDSA P-256 key. */
+  /**
+   * Root CA for nest-proxy intermediates, development form: PEM certificate and PKCS#8 ECDSA P-256
+   * key. A cell with a KMS key uses that instead, and FleetDO keeps the cell's root certificate.
+   * Legacy (one release): for a cell with a KMS key, a `ROOT_CA_CERT_PEM` for that key is
+   * adopted as the cell's certificate rather than minting a new one; one for another key is refused.
+   */
   ROOT_CA_CERT_PEM?: string;
   ROOT_CA_KEY_PEM?: string;
-  /** KMS key (id, ARN or alias) holding the root CA's private key; preferred over ROOT_CA_KEY_PEM. */
+  /** Legacy (one release): the KMS key for cells whose `AWS_CELLS` entry carries no `proxy_root_key_arn`. */
   ROOT_CA_KMS_KEY_ID?: string;
   /** "1" lets FleetDO mint and persist a development root CA when none is configured. */
   ALLOW_DEV_CA?: string;
   /** AWS public certificate for the RSA-2048 instance identity signature (region-specific). */
   AWS_IDENTITY_CERT_PEM?: string;
-  /** Scoped IAM user for STONITH (TerminateInstances / DescribeInstances on tagged instances). */
+  /** Per-cell AWS settings (a var from the cell stacks): JSON object of cell → `AwsCellConfig` (`src/lib/cells.ts`). */
+  AWS_CELLS?: string;
+  /** Per-cell AWS credentials (a secret): JSON object of cell → `{access_key_id, secret_access_key}` of `nest-<cell>-control-plane`. */
+  AWS_CELL_CREDENTIALS?: string;
+  /** Legacy (one release): the credentials and region for a cell missing from `AWS_CELL_CREDENTIALS` / `AWS_CELLS`. */
   AWS_ACCESS_KEY_ID?: string;
   AWS_SECRET_ACCESS_KEY?: string;
   AWS_REGION?: string;
-  /** Autoscaled cells: JSON object of cell → `AwsCellConfig` (`src/lib/cells.ts`). */
-  AWS_CELLS?: string;
 
   PUBLIC_BASE_URL: string;
   ASK_SYNC_WINDOW_MS: string;

@@ -41,9 +41,9 @@ import Cell.Iam
 /-!
 One nest cell on AWS (docs/compute/provisioning/): public subnets with no NAT and an S3 gateway
 endpoint, an egress-only host security group, the cell's bucket, the burst hosts' role and launch
-template, the host-image pipeline, the control plane's IAM user and its autoscaler settings
-(`AWS_CELLS` in SSM), and the deploy role GitHub Actions assumes over OIDC. It creates no
-instances: FleetDO launches them.
+template, the host-image pipeline, the proxy root CA key, the control plane's IAM user and its
+settings for this cell (its `AWS_CELLS` entry in SSM), and the deploy role GitHub Actions assumes
+over OIDC. It creates no instances: FleetDO launches them.
 -/
 
 open Inframe
@@ -99,14 +99,18 @@ def matchesFamily (family type : String) : Bool :=
 def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=
   spec.launchTypes.all fun t => spec.instanceFamilies.any (matchesFamily · t)
 
-/-- The SSM parameter the control plane's deploy reads `AWS_CELLS` from (dev/deploy-use1.sh). -/
-def awsCellsParameter : String := "/nest/control-plane/vars/AWS_CELLS"
+/-- The prefix under which each cell stack writes its own `AWS_CELLS` entry; the control plane's
+deploy merges every parameter under it (dev/deploy-use1.sh). -/
+def awsCellsPrefix : String := "/nest/control-plane/aws-cells/"
 
-/-- `AWS_CELLS` (control-plane/src/lib/cells.ts): this cell's autoscaler settings, keyed by its name,
-from a launch template id, subnet ids and the spec. Generic over the string type, so `Cell.Test`
-can render it with plain strings and parse the JSON; no value needs escaping. -/
+/-- This cell's `AWS_CELLS` parameter: one per cell, so no cell stack overwrites another's entry. -/
+def awsCellsParameter (spec : CellSpec) : String := awsCellsPrefix ++ spec.name
+
+/-- `AWS_CELLS` (control-plane/src/lib/cells.ts): this cell's settings, keyed by its name, from a
+launch template id, subnet ids, the proxy root CA key's ARN and the spec. Generic over the string
+type, so `Cell.Test` can render it with plain strings and parse the JSON; no value needs escaping. -/
 def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : CellSpec) (launchTemplateId : α)
-    (subnetIds : List α) : α :=
+    (subnetIds : List α) (proxyRootKeyArn : α) : α :=
   let quote (v : α) : α := str "\"" ++ v ++ str "\""
   let join : List α → α
     | [] => str ""
@@ -124,12 +128,14 @@ def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : Ce
     , field "idle_grace_ms" (number spec.idleGraceMs)
     , field "enroll_timeout_ms" (number spec.enrollTimeoutMs)
     , field "sandbox_reserve_mib" (number spec.sandboxReserveMib)
-    , field "max_sandboxes_per_host" (number spec.maxSandboxesPerHost) ]
+    , field "max_sandboxes_per_host" (number spec.maxSandboxesPerHost)
+    , field "proxy_root_key_arn" (quote proxyRootKeyArn) ]
     ++ str "}}"
 
-/-- `AWS_CELLS` from the stack's own launch template and subnets. -/
-def awsCells (spec : CellSpec) (launchTemplateId : Input String) (subnetIds : List (Input String)) : Input String :=
-  awsCellsWith lit spec launchTemplateId subnetIds
+/-- `AWS_CELLS` from the stack's own launch template, subnets and proxy root CA key. -/
+def awsCells (spec : CellSpec) (launchTemplateId : Input String) (subnetIds : List (Input String))
+    (proxyRootKeyArn : Input String) : Input String :=
+  awsCellsWith lit spec launchTemplateId subnetIds proxyRootKeyArn
 
 def bootstrapTemplate : String := include_str "../../host/bootstrap.sh"
 def installTemplate : String := include_str "../../host/install.sh"
@@ -377,19 +383,21 @@ def cell (spec : CellSpec) : Infra Unit := do
     (resourceOptions |>.preventDestroy true)
   let _ ← KmsAlias.create "proxy_root" { name := lit s!"alias/nest-{spec.name}-proxy-root", targetKeyId := rootKey.keyId }
 
-  -- The control plane (FleetDO). Its access key is created out of band and kept as a Worker secret.
+  -- The control plane (FleetDO). Its access key is created out of band and kept in the Worker
+  -- secret `AWS_CELL_CREDENTIALS` under this cell's name (dev/deploy.md).
   let cp ← IamUser.create "control_plane" { name := lit s!"nest-{spec.name}-control-plane" }
   let templateArn : Input String := template.arn
   -- A managed policy: the document is over IAM's 2,048-byte limit for inline user policies.
   let fleet ← IamPolicy.create "control_plane_fleet"
     { name := lit s!"nest-{spec.name}-fleet", policy := document (controlPlaneStatements spec templateArn hostRole.arn rootKey.arn) }
   let _ ← IamUserPolicyAttachment.create "control_plane_fleet" { user := cp.name, policyArn := fleet.arn }
-  -- The autoscaler's settings, from the template and subnets above: a replaced template or subnet
-  -- reaches the Worker on the deploy that follows the apply (dev/deploy-use1.sh reads it).
+  -- This cell's settings, from the template, subnets and root key above: a replaced template,
+  -- subnet or key reaches the Worker on the deploy that follows the apply (dev/deploy-use1.sh
+  -- merges every cell's parameter into `AWS_CELLS`).
   let _ ← SsmParameter.create "aws_cells"
-    { name := lit awsCellsParameter, type := "String"
-      insecureValue := awsCells spec template.id [subnetA.id, subnetB.id, subnetC.id]
-      description := lit s!"nest: AWS_CELLS for the control plane (written by the {spec.name} cell stack)" }
+    { name := lit (awsCellsParameter spec), type := "String"
+      insecureValue := awsCells spec template.id [subnetA.id, subnetB.id, subnetC.id] rootKey.arn
+      description := lit s!"nest: the {spec.name} cell's AWS_CELLS entry for the control plane (written by its cell stack)" }
 
   -- Spot interruption drill: `aws fis start-experiment --experiment-template-id <output>` sends a
   -- real two-minute notice to one running nest spot instance.
