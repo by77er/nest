@@ -1,1 +1,0 @@
-{"type":"alert","ts_ms":1760270400009,"sandbox":"sbx_01jb7m2a4c","epoch":4,"agent":"agt_01jb7n0w1e","kind":"placeholder_wrong_host","host":"evil.example","binding":"github","detail":"placeholder for binding 'github' in Authorization header"}

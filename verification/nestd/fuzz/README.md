@@ -26,11 +26,11 @@ cargo-fuzz needs nightly. [rust-toolchain.toml](rust-toolchain.toml) pins `night
 ```sh
 cargo install --locked cargo-fuzz           # 0.13.2 was used
 verification/nestd/fuzz/run.sh guest_stream 600   # target, seconds, extra libFuzzer flags
-cargo test                                  # from this directory: the seeds still decode
+python3 -I gen_seeds.py && cargo test       # from this directory: the seeds still decode
 ```
 
 `run.sh` sets `-rss_limit_mb=2048 -malloc_limit_mb=2048 -timeout=60` (generous: every input runs in milliseconds, and on a heavily loaded machine a 10 s limit fired on stalls, not hangs) and a `-max_len` per target: 64 KiB (one socket read), 128 KiB with `-len_control=0` for `proxy_events` (past the 64 KiB packet limit, below the socket buffer, reached early), and 256 B for `vsock_handshake`. The corpus grows in `corpus/<target>/` and crashes land in `artifacts/<target>/` (both gitignored). Reproduce a crash with `cargo fuzz run --fuzz-dir . <target> <artifact>` and minimize it with `cargo fuzz tmin --fuzz-dir . <target> <artifact>`.
 
 ## Seeds
 
-`seeds/<target>/` holds valid inputs generated from `protocol/fixtures/` by [gen_seeds.py](gen_seeds.py), so every run starts from frames that reach the deep parsers. Guest seeds come from `guest/control/`, plus a multi-frame session and a DATA frame. Proxy, gateway and runner seeds come from `host/{proxy,gateway,runner}_event/`, and the link targets also get all frames in one chunked stream. Fleet seeds come from `control/fleet_to_host/`. `meta.json` seeds are built from `control/generation_record/`. Run `python3 -I gen_seeds.py` after changing fixtures; `cargo test` checks that every seed still decodes.
+`seeds/<target>/` holds valid inputs generated from `protocol/fixtures/` by [gen_seeds.py](gen_seeds.py) (gitignored: `run.sh` regenerates them at every run, so the fixtures stay the only copy), so every run starts from frames that reach the deep parsers. Guest seeds come from `guest/control/`, plus a multi-frame session and a DATA frame. Proxy, gateway and runner seeds come from `host/{proxy,gateway,runner}_event/`, and the link targets also get all frames in one chunked stream. Fleet seeds come from `control/fleet_to_host/`. `meta.json` seeds are built from `control/generation_record/`. `cargo test`, after `gen_seeds.py`, checks that every seed still decodes.

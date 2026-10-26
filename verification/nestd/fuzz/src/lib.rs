@@ -230,7 +230,7 @@ mod tests {
     fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds").join(target);
         let mut out: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .unwrap_or_else(|e| panic!("{}: {e} (run `python3 -I gen_seeds.py` first)", dir.display()))
             .map(|e| e.unwrap().path())
             .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
             .collect();

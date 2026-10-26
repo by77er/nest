@@ -1,1 +1,0 @@
-{"type":"listener_failed","sandbox":"sbx_01jb7m2a4c","listener_id":4,"error":{"code":"internal","message":"accept: EMFILE","retryable":true}}

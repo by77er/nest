@@ -16,6 +16,8 @@ case $target in
 esac
 # rust-toolchain.toml pins the nightly; a RUSTUP_TOOLCHAIN in the environment would override it.
 unset RUSTUP_TOOLCHAIN
+# The seeds are built from protocol/fixtures/ (the source of truth) at every run, never committed.
+python3 -I gen_seeds.py >/dev/null
 mkdir -p "corpus/$target"
 exec cargo fuzz run --fuzz-dir . "$target" "corpus/$target" "seeds/$target" -- \
   -max_total_time="$secs" -rss_limit_mb=2048 -malloc_limit_mb=2048 -max_len="$max_len" -timeout=60 -print_final_stats=1 "$@"
