@@ -1,0 +1,13 @@
+{
+  "type": "hello_ack",
+  "protocol_version": 1,
+  "server_ms": 1760270400000,
+  "last_event_seq": 107,
+  "lease": {
+    "heartbeat_ms": 5000,
+    "host_fence_ms": 20000,
+    "cp_expiry_ms": 30000
+  },
+  "host_token_expires_ms": 1760274000000,
+  "next_command_seq": 42
+}

@@ -44,6 +44,17 @@ export class ReliableChannels {
       .map((r) => JSON.parse(r.body) as unknown);
   }
 
+  /**
+   * The lowest seq a resend after `after` or any later push can carry: the first unacked message
+   * above `after`, else the next seq to assign. The peer's in-order baseline for a new connection.
+   */
+  firstToSend(chan: string, after: number | undefined): number {
+    const row = this.sql
+      .exec<{ seq: number | null }>("SELECT MIN(seq) AS seq FROM rel_out WHERE chan = ? AND seq > ?", chan, after ?? 0)
+      .toArray()[0];
+    return row?.seq ?? this.state(chan).next_out;
+  }
+
   /** Highest inbound seq fully processed, if any. */
   lastIn(chan: string): number | undefined {
     return this.state(chan).last_in ?? undefined;

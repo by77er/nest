@@ -260,6 +260,10 @@ pub struct HelloAck {
     pub last_event_seq: Option<Seq>,
     pub lease: LeaseTiming,
     pub host_token_expires_ms: TimestampMs,
+    /// Seq of the first `FleetToHost::Commands` batch FleetDO sends on this connection; no batch it
+    /// sends here has a lower seq. The host's baseline for accepting only the next seq in order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_command_seq: Option<Seq>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

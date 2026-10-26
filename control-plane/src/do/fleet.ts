@@ -710,8 +710,12 @@ export class FleetDO extends DurableObject<Env> {
       try {
         values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
       } catch (e) {
-        console.error("FleetDO: resolving secret references failed; not sending", e);
-        return; // stays queued; resent after the next hello
+        // Nothing is sent; the batch stays queued. Closing makes the host reconnect at once, so its
+        // hello resends the batch instead of it waiting for an unrelated reconnect.
+        console.error("FleetDO: resolving secret references failed; not sending, closing", e);
+        this.send(ws, { type: "error", error: errorBody(ErrorCodes.INTERNAL, "resolving secret references failed; reconnect", true) });
+        ws.close(4503, "secret references unavailable; reconnect and resend");
+        return;
       }
     }
     for (const s of slots) {
@@ -748,11 +752,20 @@ export class FleetDO extends DurableObject<Env> {
       old.close(4000, "superseded by a new connection");
     }
     const now = Date.now();
-    // A new nestd process (new instance_id): both seq lineages restart. Its unacked commands fail
-    // (retryably) or are reconciled from the report below.
+    // A new nestd process (new instance_id): both seq lineages restart. The old process's unanswered
+    // commands are captured in the same step as the reset, before any await lets a command to the
+    // new process be issued, and fail (retryably) or are reconciled from the report below. The
+    // capture is kept in `kv` until they are failed, so a FleetDO restart midway leaves them to the
+    // next hello (the same instance_id, so no reset then).
     const lastInstance = prior.nestd_instance as string | null;
     const newProcess = lastInstance !== null && lastInstance !== hello.instance_id;
-    if (newProcess) this.rel.reset(att.host);
+    const orphansKey = `orphaned_commands:${att.host}`;
+    if (newProcess) {
+      this.rel.reset(att.host);
+      const unanswered = this.sql.exec<{ cmd: string }>("SELECT cmd FROM commands WHERE host = ? AND result IS NULL", att.host).toArray().map((r) => r.cmd);
+      this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", orphansKey, JSON.stringify(unanswered));
+    }
+    const orphaned = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", orphansKey).toArray()[0]?.value;
     this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ? WHERE host = ?",
       now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior as HostRow);
@@ -768,6 +781,9 @@ export class FleetDO extends DurableObject<Env> {
       ...(this.rel.lastIn(att.host) !== undefined ? { last_event_seq: this.rel.lastIn(att.host) } : {}),
       lease: DEFAULT_LEASE_TIMING,
       host_token_expires_ms: prior.token_exp,
+      // Read in the same step as the reset and `helloed`: the resend below starts here, and anything
+      // issued meanwhile is pushed above it.
+      next_command_seq: this.rel.firstToSend(att.host, hello.last_command_seq),
     });
     if (prior.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, att.host);
     this.keysSent.delete(att.host);
@@ -784,11 +800,9 @@ export class FleetDO extends DurableObject<Env> {
     // The hello's capacity counts the sandboxes it reports: marked after their first states.
     this.sql.exec("UPDATE hosts SET capacity_seq = ? WHERE host = ?", this.mark(), att.host);
     const reported = new Map(hello.sandboxes.map((s) => [s.sandbox, s]));
-    if (newProcess) {
-      // What the old process never answered, captured before re-placement issues anything new.
-      const pending = new Set(this.sql.exec<{ cmd: string }>("SELECT cmd FROM commands WHERE host = ? AND result IS NULL", att.host).toArray().map((r) => r.cmd));
-      await this.dropUnreported(att.host, reported);
-      await this.failPendingCommands(att.host, "host process restarted before running this command", reported, pending);
+    if (newProcess) await this.dropUnreported(att.host, reported);
+    if (orphaned !== undefined) {
+      await this.failPendingCommands(att.host, "host process restarted before running this command", reported, JSON.parse(orphaned) as string[]);
     }
     await this.reconcileAgents(att.host, hello.agents);
     // A host whose leases we expired came back: it must fence them before we reassign (STONITH by fence).
@@ -1080,20 +1094,23 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Fail every command still awaiting a result on `host` (retryable). A `sandbox_create` the new
-   * process reports running anyway is completed instead.
+   * Fail (retryably) the commands an old nestd process never answered: `cmds`, captured at its
+   * lineage reset and kept under `orphaned_commands:<host>` in `kv` until this finishes. One answered
+   * since is skipped. A `sandbox_create` the new process reports running anyway is completed instead.
    */
-  private async failPendingCommands(host: string, message: string, reported = new Map<string, SandboxReport>(), only?: Set<string>): Promise<void> {
+  private async failPendingCommands(host: string, message: string, reported: Map<string, SandboxReport>, cmds: string[]): Promise<void> {
+    const only = new Set(cmds);
     const pending = this.sql
       .exec<{ cmd: string; type: string; sandbox: string | null; epoch: number | null }>(
         "SELECT cmd, type, sandbox, epoch FROM commands WHERE host = ? AND result IS NULL ORDER BY issued_ms", host)
       .toArray()
-      .filter((c) => !only || only.has(c.cmd));
+      .filter((c) => only.has(c.cmd));
     for (const c of pending) {
       const r = c.sandbox ? reported.get(c.sandbox) : undefined;
       const done = c.type === "sandbox_create" && r && r.epoch === c.epoch;
       await this.onCommandResult(host, c.cmd, done ? { status: "ok" } : { status: "error", error: errorBody(ErrorCodes.INTERNAL, message, true) });
     }
+    this.sql.exec("DELETE FROM kv WHERE key = ?", `orphaned_commands:${host}`);
   }
 
   private async onCommandResult(host: string, cmd: string, outcome: Extract<HostEvent, { type: "command_result" }>["outcome"]) {
