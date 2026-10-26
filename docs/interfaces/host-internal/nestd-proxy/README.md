@@ -15,7 +15,7 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 | `secrets_set` | 0 | `{sandbox, epoch, secrets: model::InjectionSecret[]}`, replace all; checked against the epoch only. Memory only |
 | `listeners_add` | **= `listeners.len()`**, same order, ≤ 32 per packet | `ListenerSpec{id, transport, addr, purpose}` |
 | `listeners_remove` | 0 | Close listeners; established connections finish |
-| `sandbox_drop` | 0 | `reason: teardown \| fence \| moved`. Close listeners **and established connections**, forget policy and secrets. Only `fence` tombstones the epoch: later pushes at or below it are refused, by nestd's mirror and by the proxy alike (`DropReason::tombstones`). A teardown or move leaves none, so a create retried at the same epoch gets its egress back |
+| `sandbox_drop` | 0 | `reason: teardown \| fence \| moved`. Close listeners **and established connections**, forget policy and secrets. Only `fence` tombstones the epoch: later pushes at or below it are refused, by nestd (its one tombstone map, recorded before the drop is sent) and by the proxy alike (`DropReason::tombstones`). A teardown or move leaves none, so a create retried at the same epoch gets its egress back |
 | `resync_complete` | 0 | Counts, so the proxy can verify |
 | `ping` | 0 | Health |
 

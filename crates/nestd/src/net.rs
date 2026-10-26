@@ -124,6 +124,12 @@ impl Netns {
     }
 }
 
+impl AsFd for Netns {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 impl Drop for Netns {
     fn drop(&mut self) {
         if let Some(p) = &self.persisted {
@@ -131,6 +137,44 @@ impl Drop for Netns {
             let _ = std::fs::remove_file(p);
         }
     }
+}
+
+/// File-name prefix of a persisted sandbox netns under `persist_dir` (`ns-<sandbox>`).
+pub const PERSIST_PREFIX: &str = "ns-sbx_";
+
+/// Tear down every sandbox netns bind mount left under `dir` by a previous nestd process (at
+/// start no sandbox is live, so every one is a leftover). Inside each namespace still reachable
+/// through its mount, `tap0` and the `inet nest` table are deleted first, so a namespace that
+/// something else still pins keeps neither; then the mount is detached and the file removed,
+/// which releases the namespace. Only `ns-sbx_*` entries are touched (`dir` may be shared with
+/// `ip netns`). Returns how many were removed.
+pub fn sweep_persisted(dir: &Path) -> usize {
+    let mut n = 0;
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if !e.file_name().to_string_lossy().starts_with(PERSIST_PREFIX) {
+            continue;
+        }
+        let path = e.path();
+        // A file that never got its bind mount (a crash in between) is not a namespace: setns fails.
+        if let Ok(f) = File::open(&path) {
+            let fd: OwnedFd = f.into();
+            let _ = std::thread::scope(|s| {
+                s.spawn(|| -> io::Result<()> {
+                    setns(fd.as_fd(), CloneFlags::CLONE_NEWNET).map_err(io::Error::from)?;
+                    let _ = run_cmd("ip", &["link", "del", TAP_NAME]);
+                    let _ = run_cmd("nft", &["delete", "table", "inet", "nest"]);
+                    Ok(())
+                })
+                .join()
+            });
+        }
+        let _ = nix::mount::umount2(&path, nix::mount::MntFlags::MNT_DETACH);
+        match std::fs::remove_file(&path) {
+            Ok(()) => n += 1,
+            Err(err) => tracing::warn!(path = %path.display(), error = %err, "removing a leftover netns bind mount"),
+        }
+    }
+    n
 }
 
 pub enum LinkSetup {
@@ -260,6 +304,36 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+
+    /// A netns bind mount left by a crashed nestd (its tap and nft table still in place) is torn
+    /// down at the next start: the tap and the table are deleted inside it, the mount is detached
+    /// and the file removed. Other entries in the directory are left alone.
+    #[test]
+    fn sweep_tears_down_leftover_netns() {
+        if !reexec_in_userns("net::tests::sweep_tears_down_leftover_netns") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns-sbx_left");
+        let ns = Netns::create(Some(&path)).expect("persisted netns");
+        ns.configure(None).expect("tap0 and nft");
+        // Keep our own handle to the namespace (as a stray process would), then lose the Netns
+        // without its Drop (a crash): the bind mount stays.
+        let pinned = Netns { fd: ns.fd.try_clone().unwrap(), persisted: None };
+        std::mem::forget(ns);
+        let other = dir.path().join("ns-other");
+        std::fs::write(&other, b"").unwrap();
+        let has = |what: &[&str]| pinned.run(|| Ok(Command::new(what[0]).args(&what[1..]).stdout(Stdio::null()).stderr(Stdio::null()).status()?.success())).unwrap();
+        assert!(has(&["ip", "link", "show", TAP_NAME]) && has(&["nft", "list", "table", "inet", "nest"]), "set up");
+
+        assert_eq!(sweep_persisted(dir.path()), 1);
+        assert!(!path.exists(), "the bind mount file is gone");
+        assert!(other.exists(), "only ns-sbx_* entries are swept");
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(!mounts.contains(&path.display().to_string()), "still mounted: {mounts}");
+        assert!(!has(&["ip", "link", "show", TAP_NAME]), "tap0 survived");
+        assert!(!has(&["nft", "list", "table", "inet", "nest"]), "the nft table survived");
+    }
 
     #[test]
     fn ruleset_mentions_tap_and_ranges() {

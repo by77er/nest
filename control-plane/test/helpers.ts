@@ -2,6 +2,7 @@ import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
 import { SELF } from "cloudflare:test";
 import { expect } from "vitest";
+import type { Kms } from "../src/lib/kms";
 import type { EnrollResponse, FleetToHost } from "../src/protocol/control";
 
 export const ADMIN = "test-admin-token";
@@ -171,3 +172,48 @@ export async function okResult(ws: Ws, cmd: string) {
 export const manifest = (c: string) => `blake3:${c.repeat(64)}`;
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export type { FleetToHost };
+
+const EC = { name: "ECDSA", namedCurve: "P-256" } as const;
+const SIGN = { name: "ECDSA", hash: "SHA-256" } as const;
+
+/** DER INTEGER for an unsigned big-endian value (a leading 0x00 when the high bit is set). */
+function derInt(v: Uint8Array): number[] {
+  let i = 0;
+  while (i < v.length - 1 && v[i] === 0) i++;
+  const body = [...v.subarray(i)];
+  if (body[0]! & 0x80) body.unshift(0);
+  return [0x02, body.length, ...body];
+}
+
+/** Stands in for KMS: signs with a local key and answers in KMS's format (a DER ECDSA-Sig-Value). */
+/** The same P-256 key as a compressed-point SubjectPublicKeyInfo: valid DER, but not WebCrypto's encoding. */
+export function compressedSpki(spki: Uint8Array): Uint8Array {
+  if (spki.length !== 91 || spki[26] !== 0x04) throw new Error("not an uncompressed P-256 SubjectPublicKeyInfo");
+  const x = spki.slice(27, 59);
+  const yOdd = spki[90]! & 1;
+  return new Uint8Array([0x30, 0x39, ...spki.slice(2, 23), 0x03, 0x22, 0x00, 0x02 + yOdd, ...x]);
+}
+
+export class FakeKms implements Kms {
+  calls = 0;
+  /** Every key id asked for, in order. */
+  keyIds: string[] = [];
+  /** How `publicKey` encodes the key: WebCrypto's form, or another valid DER (a compressed point). */
+  encoding: "webcrypto" | "compressed" = "webcrypto";
+  constructor(private readonly keys: CryptoKeyPair) {}
+  static async create() {
+    return new FakeKms((await crypto.subtle.generateKey(EC, true, ["sign", "verify"])) as CryptoKeyPair);
+  }
+  async sign(keyId: string, message: Uint8Array) {
+    this.calls++;
+    this.keyIds.push(keyId);
+    const raw = new Uint8Array(await crypto.subtle.sign(SIGN, this.keys.privateKey, message));
+    const seq = [...derInt(raw.subarray(0, 32)), ...derInt(raw.subarray(32))];
+    return new Uint8Array([0x30, seq.length, ...seq]);
+  }
+  async publicKey(keyId = "") {
+    this.keyIds.push(keyId);
+    const spki = new Uint8Array((await crypto.subtle.exportKey("spki", this.keys.publicKey)) as ArrayBuffer);
+    return this.encoding === "compressed" ? compressedSpki(spki) : spki;
+  }
+}

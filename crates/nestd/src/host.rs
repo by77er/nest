@@ -50,8 +50,10 @@ use crate::guest::{GuestCtl, GuestEvent};
 use crate::net::{GATEWAY_IP, Netns};
 use crate::limits::{self, Limiter};
 use crate::proxy_link::{Access, HeldListener, ProxyLink, ProxyNotice, ProxyOp};
+use crate::recovery::{self, META_VERSION, SandboxMeta, SentCommit};
 use crate::runner_link::{RunnerLink, RunnerNotice};
 use crate::storage::{self, ObjectStore};
+use crate::tombstones::Tombstones;
 use crate::util::{error, new_id, now_ms};
 
 const MAX_AGENT_SLOTS: u16 = 64;
@@ -83,7 +85,10 @@ struct EgressLosses {
     /// When a host fault was last reported.
     reported: Option<Instant>,
 }
-const SALVAGE_TIMEOUT: Duration = Duration::from_secs(600);
+/// A retired incarnation's salvage is retried after this, doubling up to the max, until it lands
+/// or the incarnation is destroyed (FleetDO destroys a dirty one after its salvage window).
+const RETIRE_RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETIRE_RETRY_MAX: Duration = Duration::from_secs(300);
 /// How long a non-`ask` guest CLI relay waits for `guest_cli_result`. The guest gives up after
 /// 30 s; nestd answers 3 s earlier so the caller gets nestd's error, not a bare guest timeout.
 const CLI_RELAY_TIMEOUT_S: u64 = 27;
@@ -120,8 +125,15 @@ struct Sbx {
     epoch: Epoch,
     image: String,
     resources: Resources,
-    policy: EgressPolicy,
+    /// `None` only for an incarnation found on disk at start, which never runs again.
+    policy: Option<EgressPolicy>,
     head: Option<GenerationRecord>,
+    /// The disk is known to equal `head`: a commit landed while no VM ran on it (stopped or
+    /// paused), and none has since. Persisted in `meta.json`; a restart deletes a clean incarnation
+    /// without salvage or report.
+    disk_clean: bool,
+    /// Its salvage-and-delete has started (`Inner::retire`): one per incarnation.
+    retiring: bool,
     vm: Option<Box<dyn Vm>>,
     /// The VM is paused (not stopped): resume continues processes.
     paused: bool,
@@ -145,23 +157,53 @@ struct Sbx {
     state_dir: PathBuf,
     /// The guest's version and capabilities from its last hello (what the gateway tells clients).
     guest_info: Option<GuestInfo>,
-    /// A `commit_request` whose answer never came (timed out). The next commit asks again under
-    /// the same request id first: SandboxDO answers a repeated id with its stored outcome.
+    /// A `commit_request` whose answer never came (timed out, or sent by a previous nestd). The
+    /// next commit asks again under the same request id first: SandboxDO answers a repeated id with
+    /// its stored outcome.
     unanswered: Option<SentCommit>,
 }
 
-/// A `commit_request` as sent.
-#[derive(Clone, Debug)]
-struct SentCommit {
-    request: RequestId,
-    parent: Option<GenerationId>,
-    kind: GenerationKind,
-    disk_manifest: ManifestHash,
-    mem_manifest: Option<ManifestHash>,
-    reason: CommitReason,
-}
-
 impl Sbx {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: SandboxId,
+        workstream: WorkstreamId,
+        epoch: Epoch,
+        image: String,
+        resources: Resources,
+        policy: Option<EgressPolicy>,
+        head: Option<GenerationRecord>,
+        vm_dir: PathBuf,
+        state_dir: PathBuf,
+    ) -> Sbx {
+        Sbx {
+            id,
+            workstream,
+            epoch,
+            image,
+            resources,
+            policy,
+            head,
+            disk_clean: false,
+            retiring: false,
+            vm: None,
+            paused: false,
+            netns: None,
+            guest: None,
+            std_listeners: BTreeMap::new(),
+            listener_failures: HashMap::new(),
+            slots: BTreeMap::new(),
+            slot_cwds: BTreeMap::new(),
+            tcp_listeners: BTreeMap::new(),
+            known_ports: BTreeSet::new(),
+            exposed: BTreeMap::new(),
+            vm_dir,
+            state_dir,
+            guest_info: None,
+            unanswered: None,
+        }
+    }
+
     fn disk_path(&self) -> PathBuf {
         self.state_dir.join("disk.img")
     }
@@ -192,6 +234,54 @@ impl Sbx {
             }
         }
         self.listener_failures.remove(&id);
+    }
+
+    /// What `meta.json` records about this incarnation (see `recovery.rs`), with `inflight` as the
+    /// unanswered request while one is being sent.
+    fn meta(&self, inflight: Option<&SentCommit>) -> SandboxMeta {
+        SandboxMeta {
+            version: META_VERSION,
+            sandbox: self.id.clone(),
+            workstream: self.workstream.clone(),
+            epoch: self.epoch,
+            image: self.image.clone(),
+            resources: self.resources,
+            head: self.head.clone(),
+            clean: self.disk_clean,
+            unanswered: inflight.or(self.unanswered.as_ref()).cloned(),
+        }
+    }
+
+    /// Rewrite this incarnation's `meta.json`.
+    fn persist(&self, inflight: Option<&SentCommit>) -> std::io::Result<()> {
+        recovery::write_meta(&self.state_dir, &self.meta(inflight))
+    }
+
+    /// [`Sbx::persist`] where a failure only costs precision after a restart: logged.
+    fn persist_or_log(&self, inflight: Option<&SentCommit>) {
+        if let Err(e) = self.persist(inflight) {
+            // A destroyed incarnation's directory is gone: nothing to record.
+            if self.state_dir.exists() {
+                tracing::error!(sandbox = %self.id, epoch = self.epoch.0, error = %e, "updating meta.json");
+            }
+        }
+    }
+}
+
+/// Lock-free pause handles of running VMs, one per incarnation: a late step of an older epoch (its
+/// fence task, queued behind a long salvage) never takes a newer epoch's handle.
+#[derive(Default)]
+struct Pausers(Mutex<HashMap<(SandboxId, Epoch), Arc<dyn Pauser>>>);
+
+impl Pausers {
+    fn insert(&self, id: &SandboxId, epoch: Epoch, p: Arc<dyn Pauser>) {
+        self.0.lock().expect("pausers").insert((id.clone(), epoch), p);
+    }
+    fn get(&self, id: &SandboxId, epoch: Epoch) -> Option<Arc<dyn Pauser>> {
+        self.0.lock().expect("pausers").get(&(id.clone(), epoch)).cloned()
+    }
+    fn remove(&self, id: &SandboxId, epoch: Epoch) {
+        self.0.lock().expect("pausers").remove(&(id.clone(), epoch));
     }
 }
 
@@ -228,6 +318,8 @@ pub struct Inner {
     proxy: ProxyLink,
     runner: RunnerLink,
     gateway: GatewayLink,
+    /// Fenced epochs, the one map both links consult (`tombstones.rs`); written by `fence_sandbox`.
+    tombstones: Tombstones,
     fleet: mpsc::UnboundedSender<FleetInput>,
     guest_events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>,
     summary: Mutex<BTreeMap<SandboxId, Summary>>,
@@ -239,7 +331,7 @@ pub struct Inner {
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
     proxy_ca: Mutex<CaState>,
     /// Lock-free pause handles of running VMs (fencing freezes vCPUs without the sandbox lock).
-    pausers: Mutex<HashMap<SandboxId, Arc<dyn Pauser>>>,
+    pausers: Pausers,
     limiter: Limiter,
     /// Listener ids, host-wide and never reused while nestd runs: a late report about one
     /// incarnation's listener can never name a newer one's.
@@ -325,6 +417,63 @@ impl Host {
         std::fs::create_dir_all(&cfg.run_dir).with_context(|| format!("create {}", cfg.run_dir.display()))?;
         std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("create {}", cfg.state_dir.display()))?;
         std::fs::create_dir_all(cfg.agents_dir())?;
+        // What a previous nestd process left, before anything new starts and before the first
+        // fleet hello. First no VM process may survive it: kill them (their cgroups, and pidfiles).
+        // (`main` entered the delegated cgroup before the runtime started; this reads the outcome.)
+        let (delegated, delegation_error) = if cfg.delegated_cgroup {
+            match crate::cgroup::delegate(&cfg.cgroup_root) {
+                Ok(d) => {
+                    tracing::info!(supervisor = %d.supervisor, vms = %d.vms, "running in a delegated cgroup: the unit's stop kills every VMM");
+                    (Some(d.clone()), None)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "delegated_cgroup is set but nestd could not set up its cgroups: VMMs start under the jailer's default parent");
+                    (None, Some(e.clone()))
+                }
+            }
+        } else {
+            (None, None)
+        };
+        if let DriverConfig::Firecracker(fc) = &cfg.driver
+            && fc.jailer_bin.is_some()
+        {
+            let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
+            for parent in crate::cgroup::vm_parents(&cfg.cgroup_root, &exe, delegated.as_ref()) {
+                let n = crate::cgroup::kill_children(&parent, Duration::from_secs(10));
+                if n > 0 {
+                    tracing::warn!(n, parent = %parent.display(), "killed VMMs left by a previous nestd");
+                }
+            }
+        }
+        let n = crate::driver::supervise::kill_leftovers(&cfg.vms_dir());
+        if n > 0 {
+            tracing::warn!(n, "killed VM processes left by a previous nestd");
+        }
+        // Then their network namespaces (with tap0 and nft inside) and runtime directories.
+        if let NetworkConfig::Netns { persist_dir: Some(dir) } = &cfg.network {
+            let n = crate::net::sweep_persisted(dir);
+            if n > 0 {
+                tracing::info!(n, "removed netns bind mounts left by a previous nestd");
+            }
+        }
+        let n = recovery::sweep_vm_dirs(&cfg.vms_dir());
+        if n > 0 {
+            tracing::info!(n, "removed VM runtime directories left by a previous nestd");
+        }
+        // Then their disks: a clean one (it equals its head) goes at once, unreported (a suspended
+        // sandbox wakes from its head anyway); the others are reported fenced, salvaged, deleted.
+        let mut found = vec![];
+        for f in recovery::scan(&cfg.sandboxes_dir()) {
+            if f.meta.clean && f.meta.unanswered.is_none() {
+                tracing::info!(sandbox = %f.meta.sandbox, epoch = f.meta.epoch.0, "deleting a clean incarnation left by a previous nestd");
+                recovery::remove_incarnation(&f.state_dir);
+            } else {
+                found.push(f);
+            }
+        }
+        if !found.is_empty() {
+            tracing::warn!(incarnations = found.len(), "incarnations with uncommitted work left by a previous nestd: reporting them fenced, salvaging, then deleting them");
+        }
         let driver: Arc<dyn Driver> = match driver {
             Some(d) => d,
             None => match &cfg.driver {
@@ -339,7 +488,7 @@ impl Host {
                             Err(e) => tracing::warn!("removing stale jails: {e}"),
                         }
                     }
-                    Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone() })
+                    Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone(), parent_cgroup: delegated.as_ref().map(|d| d.vms.clone()), cgroup_root: cfg.cgroup_root.clone() })
                 }
             },
         };
@@ -355,15 +504,16 @@ impl Host {
         // Random per nestd process: the fleet hello's `instance_id` and the proxy's `nestd_boot_id`.
         let instance_id = crate::util::random_hex(8);
 
+        let tombstones = Tombstones::default();
         let (proxy_tx, mut proxy_rx) = mpsc::unbounded_channel();
         let proxy_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.proxy_uids.clone() };
-        let proxy = ProxyLink::start(&cfg.proxy_sock(), enrolled.host.clone(), instance_id.clone(), proxy_access, proxy_tx)?;
+        let proxy = ProxyLink::start(&cfg.proxy_sock(), enrolled.host.clone(), instance_id.clone(), proxy_access, tombstones.clone(), proxy_tx)?;
         let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
         let runner_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.runner_uids.clone() };
         let runner = RunnerLink::start(&cfg.runner_sock(), enrolled.host.clone(), cfg.role, runner_access, runner_tx)?;
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
         let gateway_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.gateway_uids.clone() };
-        let gateway = GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, gateway_tx)?;
+        let gateway = GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, tombstones.clone(), gateway_tx)?;
         let (fleet_tx, fleet_rx) = mpsc::unbounded_channel();
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
         let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
@@ -374,6 +524,31 @@ impl Host {
         }
         runner.host_token(enrolled.host_token.clone(), enrolled.host_token_expires_ms);
 
+        // Each incarnation found is a fenced row (one per sandbox: its newest epoch), reported in
+        // the hello, with its epoch tombstoned; its Sbx holds only the disk and is not listed
+        // among the sandboxes: `retire` owns it.
+        let mut summary = BTreeMap::new();
+        let mut recovered = vec![];
+        for f in found {
+            let m = f.meta;
+            tombstones.fence(&m.sandbox, m.epoch);
+            summary.insert(
+                m.sandbox.clone(),
+                Summary {
+                    workstream: m.workstream.clone(),
+                    epoch: m.epoch,
+                    state: SandboxState::Fenced,
+                    head: m.head.as_ref().map(|g| g.id.clone()),
+                    dirty: true,
+                    resources: m.resources,
+                    guest: None,
+                },
+            );
+            let mut sbx = Sbx::new(m.sandbox.clone(), m.workstream, m.epoch, m.image, m.resources, None, m.head, cfg.vm_dir(&m.sandbox.0, m.epoch.0), f.state_dir);
+            sbx.unanswered = m.unanswered;
+            recovered.push(Arc::new(tokio::sync::Mutex::new(sbx)));
+        }
+
         let inner = Arc::new(Inner {
             host_id: enrolled.host.clone(),
             driver,
@@ -383,9 +558,10 @@ impl Host {
             proxy,
             runner,
             gateway,
+            tombstones,
             fleet: fleet_tx,
             guest_events: guest_tx,
-            summary: Mutex::new(BTreeMap::new()),
+            summary: Mutex::new(summary),
             sandboxes: Mutex::new(BTreeMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             pending_cli: Mutex::new(HashMap::new()),
@@ -396,7 +572,7 @@ impl Host {
                 expires_ms: enrolled.proxy_ca.as_ref().map(|(c, _)| c.expires_ms),
                 pending: None,
             }),
-            pausers: Mutex::new(HashMap::new()),
+            pausers: Pausers::default(),
             limiter: Limiter::default(),
             next_listener: AtomicU32::new(1),
             egress_losses: Mutex::default(),
@@ -422,11 +598,18 @@ impl Host {
                 },
                 instance_id,
                 flush_interval: inner.cfg.flush_interval(),
+                cgroup_delegation_error: delegation_error,
             },
             inner.clone(),
             fleet_rx,
             notice_tx,
         );
+
+        // Incarnations left by a previous nestd: salvage (the commit request queues until the fleet
+        // connects, after the hello), then delete.
+        for entry in recovered {
+            inner.retire(entry, true);
+        }
 
         // Command executor: in order, one at a time.
         let (exec_tx, mut exec_rx) = mpsc::unbounded_channel::<(Seq, Vec<Command>)>();
@@ -523,6 +706,17 @@ impl Host {
 impl Inner {
     pub fn host_id(&self) -> &HostId {
         &self.host_id
+    }
+
+    /// The fenced epoch tombstoned for `sandbox` on this host, if any (introspection and tests).
+    pub fn fenced_epoch(&self, sandbox: &SandboxId) -> Option<Epoch> {
+        self.tombstones.get(sandbox)
+    }
+
+    /// Apply `f` to `sandbox`'s summary row only while it is `epoch`'s: an older incarnation (a
+    /// retiring one, a late commit answer) never touches a newer one's row.
+    fn with_row<R>(&self, sandbox: &SandboxId, epoch: Epoch, f: impl FnOnce(&mut Summary) -> R) -> Option<R> {
+        self.summary.lock().expect("summary").get_mut(sandbox).filter(|x| x.epoch == epoch).map(f)
     }
 
     fn emit(&self, body: HostEventBody) {
@@ -665,7 +859,7 @@ impl Inner {
                         // (a no-op) in order so the result is still acked in sequence.
                         CommandBody::Fence { sandboxes, reason } => {
                             for s in sandboxes {
-                                self.fence_sandbox(s, reason, true, true).await;
+                                self.fence_current(s, reason).await;
                             }
                         }
                         _ => {}
@@ -682,7 +876,7 @@ impl Inner {
                 for c in claims {
                     let current = self.summary.lock().expect("summary").get(&c.sandbox).map(|s| s.epoch);
                     if current == Some(c.epoch) {
-                        self.fence_sandbox(&c.sandbox, "lease revoked by control plane", true, true).await;
+                        self.fence_sandbox(&c.sandbox, c.epoch, "lease revoked by control plane", true, true).await;
                     }
                 }
             }
@@ -856,7 +1050,7 @@ impl Inner {
                 EgressLoss::Reported => {}
                 EgressLoss::Sandbox => {
                     let reason = format!("egress listener {addr} lost: {why:#}");
-                    self.fence_sandbox_with(sandbox, Some(epoch), &reason, true, true, Some(FenceCause::EgressLost)).await;
+                    self.fence_sandbox_caused(sandbox, epoch, &reason, true, true, Some(FenceCause::EgressLost)).await;
                 }
             },
             ListenerPurpose::TcpException { rule } => {
@@ -1082,48 +1276,60 @@ impl Inner {
 
     /// Lease lapsed: kill every brain (one runner fence), then fence every sandbox.
     async fn self_fence(self: &Arc<Self>) {
-        let ids: Vec<SandboxId> = self.summary.lock().expect("summary").iter().filter(|(_, s)| holds_lease(s.state)).map(|(id, _)| id.clone()).collect();
+        let ids: Vec<(SandboxId, Epoch)> = self.summary.lock().expect("summary").iter().filter(|(_, s)| holds_lease(s.state)).map(|(id, s)| (id.clone(), s.epoch)).collect();
         tracing::error!(sandboxes = ids.len(), "lease expired: self-fencing");
         let unsent = self.runner.fence(vec![], "host lease expired");
         self.brains_exited(unsent.into_iter().map(|a| (a, ExitReason::Fenced)));
-        for id in ids {
-            self.fence_sandbox(&id, "host lease expired", true, false).await;
+        for (id, epoch) in ids {
+            self.fence_sandbox(&id, epoch, "host lease expired", true, false).await;
         }
     }
 
-    /// Fence one sandbox. Immediately and without the sandbox lock: mark it `Fenced` (terminal for
-    /// the epoch), fence its brains (unless the caller already fenced all of them), drop its egress
-    /// (the proxy link never blocks), and freeze its vCPUs through the lock-free pauser. Then,
-    /// under the lock: close the guest connection, pause, drop the netns, and offer salvage.
-    async fn fence_sandbox(self: &Arc<Self>, id: &SandboxId, reason: &str, salvage: bool, fence_brains: bool) {
-        self.fence_sandbox_with(id, None, reason, salvage, fence_brains, None).await
+    /// Fence whatever incarnation of `id` this host has now (a `fence` command names no epoch).
+    async fn fence_current(self: &Arc<Self>, id: &SandboxId, reason: &str) {
+        let epoch = self.summary.lock().expect("summary").get(id).map(|s| s.epoch);
+        if let Some(epoch) = epoch {
+            self.fence_sandbox(id, epoch, reason, true, true).await;
+        }
     }
 
-    /// [`Self::fence_sandbox`], only if the sandbox is still at `expect_epoch` here (checked under
-    /// the same lock that marks it fenced), and reporting `cause` with the `fenced` state.
-    async fn fence_sandbox_with(self: &Arc<Self>, id: &SandboxId, expect_epoch: Option<Epoch>, reason: &str, salvage: bool, fence_brains: bool, cause: Option<FenceCause>) {
-        let (epoch, dirty) = {
+    /// Fence `id@epoch` (see [`Self::fence_sandbox_caused`]), reporting no cause.
+    async fn fence_sandbox(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: &str, salvage: bool, fence_brains: bool) {
+        self.fence_sandbox_caused(id, epoch, reason, salvage, fence_brains, None).await
+    }
+
+    /// Fence `id@epoch`; a no-op when this host's row for `id` is another epoch (an older
+    /// incarnation's late rejection never fences a newer one). Immediately and without the sandbox
+    /// lock: mark it `Fenced` (terminal for the epoch), fence its brains (unless the caller already
+    /// fenced all of them), drop its egress (the proxy link never blocks), and freeze its vCPUs
+    /// through the lock-free pauser. Then, under the lock: close the guest connection, stop the
+    /// VM, drop the netns, and retire it (salvage, then delete) when `salvage` is set. `cause`
+    /// goes out with the `fenced` state (FleetDO acts on `egress_lost`).
+    async fn fence_sandbox_caused(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: &str, salvage: bool, fence_brains: bool, cause: Option<FenceCause>) {
+        let dirty = {
             let mut summary = self.summary.lock().expect("summary");
             let Some(s) = summary.get_mut(id) else { return };
-            if s.state == SandboxState::Fenced || expect_epoch.is_some_and(|e| e != s.epoch) {
+            if s.epoch != epoch || s.state == SandboxState::Fenced {
                 return;
             }
             s.state = SandboxState::Fenced;
-            (s.epoch, s.dirty)
+            s.dirty
         };
         if fence_brains {
             let unsent = self.runner.fence_sandbox(id, reason);
             self.brains_exited(unsent.into_iter().map(|a| (a, ExitReason::Fenced)));
         }
-        if let Some(pauser) = self.pausers.lock().expect("pausers").get(id).cloned() {
+        if let Some(pauser) = self.pausers.get(id, epoch) {
             tokio::spawn(async move {
                 if let Err(e) = pauser.pause().await {
                     tracing::warn!(error = %e, "fence: lock-free pause failed (retried under the sandbox lock)");
                 }
             });
         }
+        // Tombstone first: from here on neither link accepts anything for this epoch.
+        self.tombstones.fence(id, epoch);
         self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason: DropReason::Fence });
-        self.gateway.remove(id, epoch);
+        self.gateway.forget(id);
         self.emit(HostEventBody::SandboxState { sandbox: id.clone(), epoch, state: SandboxState::Fenced, suspend_mode: None, detail: Some(reason.into()), cause, guest: None });
         tracing::warn!(sandbox = %id, epoch = epoch.0, reason, "fenced");
 
@@ -1136,34 +1342,78 @@ impl Inner {
                 g.shutdown();
             }
             // `Fenced` is terminal: this VM never runs again. Stop it now so its memory goes back
-            // to the host; salvage needs only the disk, which stays until `sandbox_destroy` (or a
-            // newer epoch's create) removes it.
-            this.pausers.lock().expect("pausers").remove(&id);
+            // to the host; salvage needs only the disk.
+            this.pausers.remove(&id, epoch);
             if let Some(mut vm) = s.vm.take() {
                 let _ = vm.stop().await;
             }
             s.paused = false;
             s.netns = None; // drops (and unmounts) the namespace
             drop(s);
-            if salvage && dirty {
-                this.salvage(entry, id, SALVAGE_TIMEOUT).await;
+            if salvage {
+                this.retire(entry, dirty);
             }
         });
     }
 
-    /// Offer a fenced sandbox's uncommitted work as a sibling branch (may wait for reconnection).
-    /// The sandbox lock is held only while chunking, not while waiting for the answer.
-    /// Returns a boxed future: fencing and committing call each other.
-    fn salvage(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, id: SandboxId, timeout: Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(async move {
-            let s = entry.lock().await;
-            let (_s, r) = self.commit(&entry, s, CommitReason::Salvage, None, timeout).await;
+    /// An incarnation that never runs again (fenced, superseded by a newer epoch here, or left by
+    /// a previous nestd): salvage its uncommitted work as a sibling branch, if `dirty`. A transient
+    /// failure (a timeout, a store error, `parent_mismatch`, anything retryable) keeps the disk and
+    /// is retried with backoff; a final refusal (`stale_epoch`, `invalid_message`: SandboxDO will
+    /// never take that work) is logged with the error and ends it, like a landed salvage. Then its
+    /// directories are deleted, its `fenced` row (while still this epoch's) marked clean, and
+    /// `incarnation_retired` reported, so FleetDO need not wait out the salvage window. A destroy
+    /// that removed the directory meanwhile ends it silently. Once per incarnation; the sandbox
+    /// lock is held only while chunking.
+    fn retire(self: &Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, dirty: bool) {
+        let this = self.clone();
+        // Boxed: retiring commits, a commit's rejection fences, a fence retires.
+        spawn_boxed(async move { this.retire_now(entry, dirty).await });
+    }
+
+    async fn retire_now(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, dirty: bool) {
+        let mut s = entry.lock().await;
+        if s.retiring {
+            return;
+        }
+        s.retiring = true;
+        let (id, epoch) = (s.id.clone(), s.epoch);
+        let mut backoff = RETIRE_RETRY_FIRST;
+        while dirty && s.state_dir.exists() {
+            let (s2, r) = self.commit(&entry, s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
+            s = s2;
             match r {
-                Ok(Some(g)) => tracing::info!(sandbox = %id, generation = %g.id, "salvage committed"),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(sandbox = %id, code = %e.code, "salvage commit failed"),
+                Ok(Some(g)) => {
+                    tracing::info!(sandbox = %id, epoch = epoch.0, generation = %g.id, "salvaged");
+                    break;
+                }
+                Ok(None) => break, // nothing written since the head, or the disk is gone
+                Err(e) if !salvage_retryable(&e) => {
+                    tracing::error!(sandbox = %id, epoch = epoch.0, code = %e.code, message = %e.message, "salvage refused for good: this incarnation's uncommitted work is dropped");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(sandbox = %id, epoch = epoch.0, code = %e.code, message = %e.message, retry_in = ?backoff, "salvage failed: the disk is kept and the salvage retried");
+                    drop(s);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RETIRE_RETRY_MAX);
+                    s = entry.lock().await;
+                }
             }
-        })
+        }
+        let destroyed = !s.state_dir.exists();
+        recovery::remove_incarnation(&s.state_dir);
+        recovery::remove_incarnation(&s.vm_dir);
+        drop(s);
+        if destroyed {
+            return; // a destroy took it: nothing left to report
+        }
+        self.with_row(&id, epoch, |x| {
+            if x.state == SandboxState::Fenced {
+                x.dirty = false;
+            }
+        });
+        self.emit(HostEventBody::IncarnationRetired { sandbox: id, epoch });
     }
 
     /// Ask the control plane whether a GC pass is due, soon after start and then hourly (hosts
@@ -1340,7 +1590,7 @@ impl Inner {
             // Already applied on arrival (`on_fleet_notice`); this is the in-order no-op.
             CommandBody::Fence { sandboxes, reason } => {
                 for s in sandboxes {
-                    self.fence_sandbox(&s, &reason, true, true).await;
+                    self.fence_current(&s, &reason).await;
                 }
                 Ok(None)
             }
@@ -1360,6 +1610,10 @@ impl Inner {
         from: Option<GenerationRecord>,
         fork: Option<ForkIdentity>,
     ) -> CmdResult {
+        // A tombstoned epoch was fenced here: final, whatever the summary still holds.
+        if self.tombstones.refuses(&sandbox, epoch) {
+            return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced here", epoch.0), false));
+        }
         let existing = self.summary.lock().expect("summary").get(&sandbox).cloned();
         if let Some(s) = existing {
             if s.epoch == epoch && s.state == SandboxState::Running {
@@ -1371,19 +1625,15 @@ impl Inner {
             if s.epoch > epoch {
                 return Err(error(error_codes::STALE_EPOCH, format!("{sandbox} already at epoch {}", s.epoch.0), false));
             }
-            // An older local incarnation. Its lease has moved on: fence it, and salvage its
-            // uncommitted work before the new epoch reuses the sandbox's disk.
-            self.fence_sandbox(&sandbox, "superseded by a newer epoch", false, true).await;
-            let dirty = self.summary.lock().expect("summary").get(&sandbox).is_some_and(|x| x.dirty);
-            if dirty
-                && let Some(entry) = self.sandbox(&sandbox)
-            {
-                self.clone().salvage(entry, sandbox.clone(), self.cfg.commit_timeout()).await;
+            // An older local incarnation. Its lease has moved on: fence it, and retire it in the
+            // background (salvage, then delete). It has its own directory, so this one never waits.
+            self.fence_sandbox(&sandbox, s.epoch, "superseded by a newer epoch", false, true).await;
+            if let Some(old) = self.teardown(&sandbox, DropReason::Moved).await {
+                self.retire(old, s.dirty);
             }
-            self.teardown(&sandbox, DropReason::Moved).await;
         }
-        let vm_dir = self.cfg.vm_dir(&sandbox.0);
-        let state_dir = self.cfg.sandbox_state_dir(&sandbox.0);
+        let vm_dir = self.cfg.vm_dir(&sandbox.0, epoch.0);
+        let state_dir = self.cfg.sandbox_state_dir(&sandbox.0, epoch.0);
         std::fs::create_dir_all(&state_dir).map_err(internal)?;
         let restoring = from.is_some();
         let initial = if restoring { SandboxState::Restoring } else { SandboxState::Creating };
@@ -1393,30 +1643,7 @@ impl Inner {
         );
         self.emit(HostEventBody::SandboxState { sandbox: sandbox.clone(), epoch, state: initial, suspend_mode: None, detail: None, cause: None, guest: None });
 
-        let sbx = Sbx {
-            id: sandbox.clone(),
-            workstream: workstream.clone(),
-            epoch,
-            image: image.clone(),
-            resources,
-            policy: policy.clone(),
-            head: from.clone(),
-            vm: None,
-            paused: false,
-            netns: None,
-            guest: None,
-            slots: BTreeMap::new(),
-            slot_cwds: BTreeMap::new(),
-            tcp_listeners: BTreeMap::new(),
-            std_listeners: BTreeMap::new(),
-            listener_failures: HashMap::new(),
-            known_ports: BTreeSet::new(),
-            exposed: BTreeMap::new(),
-            vm_dir,
-            state_dir,
-            guest_info: None,
-            unanswered: None,
-        };
+        let sbx = Sbx::new(sandbox.clone(), workstream.clone(), epoch, image.clone(), resources, Some(policy.clone()), from.clone(), vm_dir.clone(), state_dir.clone());
         // Boot while holding the sandbox's own lock: guest events and fencing wait for it.
         let entry = Arc::new(tokio::sync::Mutex::new(sbx));
         let mut guard = entry.clone().lock_owned().await;
@@ -1441,17 +1668,21 @@ impl Inner {
         self.ensure_not_fenced(&sandbox, epoch)?;
         match r {
             Ok(()) => {
-                if let Some(s) = self.summary.lock().expect("summary").get_mut(&sandbox) {
-                    s.dirty = true;
-                }
+                self.with_row(&sandbox, epoch, |s| s.dirty = true);
                 if !self.set_state(&sandbox, epoch, SandboxState::Running, None, detail.clone()) {
                     return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced during create", epoch.0), false));
                 }
+                // A newer epoch runs here: the summary's epoch refuses older ones from now on, so
+                // their tombstone goes (never this epoch's, should a fence land right now).
+                self.tombstones.prune_below(&sandbox, epoch);
                 Ok(detail.map(|d| serde_json::json!({ "note": d })))
             }
             Err(e) => {
                 self.set_state(&sandbox, epoch, SandboxState::Failed, None, Some(e.to_string()));
                 self.teardown(&sandbox, DropReason::Teardown).await;
+                // It never ran for an agent: nothing to keep, and a retry at this epoch starts clean.
+                recovery::remove_incarnation(&state_dir);
+                recovery::remove_incarnation(&vm_dir);
                 Err(error(error_codes::INTERNAL, format!("create {sandbox}: {e:#}"), true))
             }
         }
@@ -1494,9 +1725,15 @@ impl Inner {
                 }
                 _ => storage::create_sparse(&disk, disk_gib << 30).context("create sparse disk")?,
             }
+            // Durable before meta.json says the disk is complete.
+            std::fs::File::open(&disk)?.sync_all()?;
             Ok(())
         })
         .await??;
+        // The disk is complete, and nothing has written to it yet (it is its head, or the base
+        // image): a restart finds this incarnation and, while no VM has run, just deletes it.
+        sbx.disk_clean = true;
+        sbx.persist(None).context("write meta.json")?;
 
         // Network (pushes listeners to the proxy).
         check("network setup")?;
@@ -1514,9 +1751,12 @@ impl Inner {
             netns: sbx.netns.clone(),
         };
         let mut vm = self.driver.create(spec).await.context("create VM")?;
+        // A VM writes to the disk from here on: recorded first, so a restart salvages it.
+        sbx.disk_clean = false;
+        sbx.persist(None).context("write meta.json")?;
         vm.start().await.context("start VM")?;
         let uds = vm.vsock_uds_path();
-        self.register_pauser(&sbx.id, vm.as_ref());
+        self.register_pauser(&sbx.id, sbx.epoch, vm.as_ref());
         sbx.vm = Some(vm);
         sbx.paused = false;
         check("guest connection")?;
@@ -1531,14 +1771,15 @@ impl Inner {
         Ok(())
     }
 
-    fn register_pauser(&self, id: &SandboxId, vm: &dyn Vm) {
+    fn register_pauser(&self, id: &SandboxId, epoch: Epoch, vm: &dyn Vm) {
         if let Some(p) = vm.pauser() {
-            self.pausers.lock().expect("pausers").insert(id.clone(), p);
+            self.pausers.insert(id, epoch, p);
         }
     }
 
     /// Create the netns, its standard listeners, and push policy + listeners to the proxy.
     fn setup_network(&self, sbx: &mut Sbx) -> anyhow::Result<()> {
+        let policy = sbx.policy.clone().context("no egress policy (an incarnation found at start never runs)")?;
         let mut listeners = vec![];
         if let NetworkConfig::Netns { persist_dir } = &self.cfg.network {
             let persist = persist_dir.as_ref().map(|d| d.join(format!("ns-{}", sbx.id.0)));
@@ -1560,7 +1801,7 @@ impl Inner {
                 sbx.std_listeners.insert(l.spec.id, (transport, port, purpose));
                 listeners.push(l);
             }
-            for (i, rule) in sbx.policy.tcp.iter().enumerate() {
+            for (i, rule) in policy.tcp.iter().enumerate() {
                 let key = format!("{}:{}", rule.host, rule.port);
                 let port = TCP_EXCEPTION_BASE_PORT + i as u16;
                 let l = bind_listener(&ns, &self.next_listener, Transport::Tcp, port, ListenerPurpose::TcpException { rule: key.clone() })?;
@@ -1570,7 +1811,7 @@ impl Inner {
             sbx.netns = Some(ns);
         }
         // The proxy link refuses all of these for an epoch already dropped by a fence.
-        if !self.proxy.apply(ProxyOp::Upsert { sandbox: sbx.id.clone(), epoch: sbx.epoch, workstream: Some(sbx.workstream.clone()), policy: sbx.policy.clone() }) {
+        if !self.proxy.apply(ProxyOp::Upsert { sandbox: sbx.id.clone(), epoch: sbx.epoch, workstream: Some(sbx.workstream.clone()), policy }) {
             anyhow::bail!("{} was fenced: proxy refused the sandbox", sbx.id);
         }
         self.proxy.apply(ProxyOp::Secrets { sandbox: sbx.id.clone(), epoch: sbx.epoch, secrets: vec![] });
@@ -1580,8 +1821,9 @@ impl Inner {
         Ok(())
     }
 
-    /// Stop the VM and drop network state; forget the sandbox locally.
-    async fn teardown(self: &Arc<Self>, id: &SandboxId, reason: DropReason) {
+    /// Stop the VM and drop network state; forget the sandbox locally. Its state directory stays:
+    /// the caller retires or deletes it. Returns the incarnation's entry, if there was one.
+    async fn teardown(self: &Arc<Self>, id: &SandboxId, reason: DropReason) -> Option<Arc<tokio::sync::Mutex<Sbx>>> {
         let epoch = self.summary.lock().expect("summary").get(id).map(|s| s.epoch);
         if let Some(epoch) = epoch {
             self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason });
@@ -1589,12 +1831,14 @@ impl Inner {
         // No tombstone here: a failed create is retried at the same epoch, and a destroy, archive
         // or move ends the sandbox's time here without fencing it. Only a fence tombstones.
         self.gateway.forget(id);
-        self.pausers.lock().expect("pausers").remove(id);
+        if let Some(epoch) = epoch {
+            self.pausers.remove(id, epoch);
+        }
         self.latest_ports.lock().expect("ports").remove(id);
         self.cli_inflight.lock().expect("cli").remove(id);
         self.limiter.forget(id);
         let entry = self.sandboxes.lock().expect("sandboxes").remove(id);
-        if let Some(entry) = entry {
+        if let Some(entry) = &entry {
             let mut s = entry.lock().await;
             if let Some(g) = s.guest.take() {
                 g.shutdown();
@@ -1606,6 +1850,7 @@ impl Inner {
             let _ = std::fs::remove_dir_all(&s.vm_dir);
         }
         self.summary.lock().expect("summary").remove(id);
+        entry
     }
 
     async fn locked(&self, id: &SandboxId, epoch: Epoch) -> Result<Arc<tokio::sync::Mutex<Sbx>>, ErrorBody> {
@@ -1652,7 +1897,7 @@ impl Inner {
             if let Some(mut vm) = s.vm.take() {
                 let _ = vm.stop().await;
             }
-            self.pausers.lock().expect("pausers").remove(id);
+            self.pausers.remove(id, epoch);
             s.paused = false;
         } else if !self.driver.supports_memory_snapshots() {
             detail = Some("driver keeps memory by pausing locally; generation is disk-only".to_string());
@@ -1676,6 +1921,10 @@ impl Inner {
         if state != Some(SandboxState::Suspended) {
             return Err(error(error_codes::INVALID_MESSAGE, format!("{id} is {state:?}, not suspended"), false));
         }
+        // A VM runs on the disk again: from here on it may differ from its head. Recorded first,
+        // or a restart would delete work as clean.
+        s.disk_clean = false;
+        s.persist(None).map_err(internal)?;
         if s.vm.is_some() && s.paused {
             self.ensure_not_fenced(id, epoch)?;
             s.vm.as_mut().expect("checked").resume().await.map_err(internal)?;
@@ -1698,7 +1947,7 @@ impl Inner {
             let mut vm = self.driver.create(spec).await.map_err(internal)?;
             self.ensure_not_fenced(id, epoch)?;
             vm.start().await.map_err(internal)?;
-            self.register_pauser(id, vm.as_ref());
+            self.register_pauser(id, epoch, vm.as_ref());
             let guest = GuestCtl::spawn(vm.vsock_uds_path(), s.id.clone(), s.epoch, hostname(&s.id), self.guest_events.clone());
             s.vm = Some(vm);
             for (agent, (slot, _)) in s.slots.clone() {
@@ -1710,10 +1959,11 @@ impl Inner {
             s.guest = Some(guest);
             self.gateway_upsert(&s);
         }
-        if let Some(x) = self.summary.lock().expect("summary").get_mut(id) {
+        let guest = s.guest_info.clone();
+        self.with_row(id, epoch, |x| {
             x.dirty = true;
-            x.guest = s.guest_info.clone();
-        }
+            x.guest = guest;
+        });
         if !self.set_state(id, epoch, SandboxState::Running, None, None) {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced during resume"), false));
         }
@@ -1740,9 +1990,7 @@ impl Inner {
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
             }
-            if let Some(x) = self.summary.lock().expect("summary").get_mut(id) {
-                x.dirty = true;
-            }
+            self.with_row(id, epoch, |x| x.dirty = true);
         }
         let g = r?;
         Ok(g.map(|g| serde_json::json!({ "generation": g.id })))
@@ -1765,7 +2013,7 @@ impl Inner {
                 r?;
             }
             self.ensure_not_fenced(id, epoch)?;
-            let _ = std::fs::remove_dir_all(&s.state_dir);
+            recovery::remove_incarnation(&s.state_dir);
         }
         if !self.set_state(id, epoch, SandboxState::Archived, None, None) {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
@@ -1783,13 +2031,17 @@ impl Inner {
         {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} is at epoch {} here", local.0), false));
         }
-        let state_dir = self.cfg.sandbox_state_dir(&id.0);
         let exists = self.summary.lock().expect("summary").contains_key(id);
         if exists {
             self.set_state(id, epoch, SandboxState::Destroyed, None, None);
         }
         self.teardown(id, DropReason::Teardown).await;
-        let _ = std::fs::remove_dir_all(state_dir);
+        // Every incarnation of it here at or below this epoch, a retiring one included (its
+        // salvage stops once its directory is gone).
+        recovery::remove_up_to(&self.cfg.sandboxes_dir(), id, epoch);
+        recovery::remove_up_to(&self.cfg.vms_dir(), id, epoch);
+        // Nothing of the sandbox is left here at or below this epoch: neither is its tombstone.
+        self.tombstones.prune_up_to(id, epoch);
         Ok(None)
     }
 
@@ -1827,10 +2079,10 @@ impl Inner {
     async fn policy_update(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, policy: EgressPolicy) -> CmdResult {
         let entry = self.locked(id, epoch).await?;
         let mut s = entry.lock().await;
-        if policy.version <= s.policy.version {
+        if s.policy.as_ref().is_some_and(|p| policy.version <= p.version) {
             return Ok(Some(serde_json::json!({ "note": "stale policy version ignored" })));
         }
-        s.policy = policy.clone();
+        s.policy = Some(policy.clone());
         self.proxy.apply(ProxyOp::Upsert { sandbox: id.clone(), epoch, workstream: Some(s.workstream.clone()), policy: policy.clone() });
         // Reconcile TCP-exception listeners.
         if let Some(ns) = s.netns.clone() {
@@ -2028,6 +2280,8 @@ impl Inner {
         c: SentCommit,
         timeout: Duration,
     ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
+        // Recorded before it goes out: a restart asks again under this id rather than send another.
+        s.persist_or_log(Some(&c));
         let (tx, rx) = oneshot::channel();
         self.pending_commits.lock().expect("pending").insert(c.request.clone(), tx);
         self.emit(HostEventBody::CommitRequest {
@@ -2062,6 +2316,7 @@ impl Inner {
                 Err(e)
             }
         };
+        s.persist_or_log(None);
         (s, r)
     }
 
@@ -2083,11 +2338,10 @@ impl Inner {
         .await
         .map_err(internal)?
         .map_err(internal)?;
-        if reason == CommitReason::Salvage
-            && let Some(x) = self.summary.lock().expect("summary").get_mut(&s.id)
-        {
-            // The work is captured in the store now: the disk may be reused by a newer epoch.
-            x.dirty = false;
+        // The disk is exactly its head's (nothing written since; a head's memory doesn't matter to
+        // a salvage, which has none): there is no work to salvage.
+        if reason == CommitReason::Salvage && s.head.as_ref().is_some_and(|h| h.disk_manifest == disk_manifest) {
+            return Ok(None);
         }
         let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
         Ok(Some(SentCommit { request: RequestId(new_id("req_")), parent: s.head.as_ref().map(|h| h.id.clone()), kind, disk_manifest, mem_manifest, reason }))
@@ -2097,19 +2351,22 @@ impl Inner {
         match outcome {
             CommitOutcome::Committed { generation } => {
                 s.head = Some(generation.clone());
-                if let Some(x) = self.summary.lock().expect("summary").get_mut(id) {
+                // Clean only while no VM runs on the disk (a suspend); `send_commit` persists it.
+                s.disk_clean = s.vm.is_none() || s.paused;
+                self.with_row(id, s.epoch, |x| {
                     x.head = Some(generation.id.clone());
                     x.dirty = false;
-                }
+                });
                 Ok(Some(generation))
             }
             CommitOutcome::Orphaned { generation } => Ok(Some(generation)),
             CommitOutcome::Rejected { reason: why, .. } => {
                 if why == error_codes::STALE_EPOCH || why == error_codes::PARENT_MISMATCH {
                     let this = self.clone();
-                    let id = id.clone();
-                    // Fence; the uncommitted work is offered as salvage (a sibling branch).
-                    spawn_boxed(async move { this.fence_sandbox(&id, "commit rejected", true, true).await });
+                    let (id, epoch) = (id.clone(), s.epoch);
+                    // Fence this incarnation (`fence_sandbox` checks the epoch under the summary lock:
+                    // never a newer one that replaced it meanwhile); its work goes to salvage.
+                    spawn_boxed(async move { this.fence_sandbox(&id, epoch, "commit rejected", true, true).await });
                 }
                 Err(error(&why, format!("commit rejected: {why}"), false))
             }
@@ -2144,6 +2401,13 @@ fn slot_for(agent: &AgentId, slot: u16, cwd: String) -> AgentSlot {
 
 fn hostname(id: &SandboxId) -> String {
     id.0.replace('_', "-")
+}
+
+/// Whether a failed salvage may succeed if tried again: a timeout or store error (`internal`,
+/// retryable), or a `parent_mismatch`. A non-retryable refusal (`stale_epoch`, `invalid_message`)
+/// is SandboxDO's final word on that work.
+fn salvage_retryable(e: &ErrorBody) -> bool {
+    e.retryable || e.code == error_codes::PARENT_MISMATCH
 }
 
 fn internal(e: impl std::fmt::Display) -> ErrorBody {
@@ -2206,6 +2470,39 @@ fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
+
+    struct NoPause;
+    #[async_trait::async_trait]
+    impl crate::driver::Pauser for NoPause {
+        async fn pause(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// nestd review (M1): pause handles are per incarnation. Removing an older epoch's handle (its
+    /// fence task running late, after a newer epoch booted) leaves the newer one's in place.
+    #[test]
+    fn an_older_epoch_never_takes_a_newer_epochs_pause_handle() {
+        let p = super::Pausers::default();
+        let s = SandboxId("sbx_1".into());
+        p.insert(&s, Epoch(2), std::sync::Arc::new(NoPause));
+        p.remove(&s, Epoch(1));
+        assert!(p.get(&s, Epoch(2)).is_some());
+        assert!(p.get(&s, Epoch(1)).is_none());
+        p.remove(&s, Epoch(2));
+        assert!(p.get(&s, Epoch(2)).is_none());
+    }
+
+    /// Which salvage failures are retried and which end the retire.
+    #[test]
+    fn a_salvage_is_retried_only_when_it_may_still_land() {
+        use nest_protocol::model::error_codes;
+        let e = |code: &str, retryable| super::error(code, "x", retryable);
+        assert!(super::salvage_retryable(&e(error_codes::INTERNAL, true)), "a timeout or store error");
+        assert!(super::salvage_retryable(&e(error_codes::PARENT_MISMATCH, false)));
+        assert!(!super::salvage_retryable(&e(error_codes::STALE_EPOCH, false)));
+        assert!(!super::salvage_retryable(&e(error_codes::INVALID_MESSAGE, false)));
+    }
     use nest_protocol::guest::CliResult;
     use nest_protocol::model::{AgentId, Epoch, SandboxId};
 

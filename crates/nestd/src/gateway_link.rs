@@ -66,9 +66,9 @@ pub struct Entry {
 struct State {
     keys: Vec<BindingKey>,
     sandboxes: BTreeMap<SandboxId, Entry>,
-    /// Highest fenced (or torn-down) epoch per sandbox: an upsert at or below it is refused, so
-    /// a late `gateway_sync` after a fence can't re-add the sandbox (the proxy link's rule).
-    fenced: BTreeMap<SandboxId, Epoch>,
+    /// The host's fenced epochs (shared with the proxy link; the host core writes them): an upsert
+    /// at or below one is refused, so a late `gateway_sync` after a fence can't re-add the sandbox.
+    tombstones: crate::tombstones::Tombstones,
     conn: Option<UnboundedSender<GatewayCommand>>,
 }
 
@@ -78,15 +78,29 @@ pub struct GatewayLink {
 }
 
 impl GatewayLink {
-    pub fn start(path: &Path, host_id: HostId, access: crate::proxy_link::Access, notices: UnboundedSender<GatewayNotice>) -> io::Result<GatewayLink> {
-        Self::start_with(path, host_id, access, notices, Timings::default())
+    /// `tombstones` is the host's one map of fenced epochs: no upsert at or below one is sent.
+    pub fn start(
+        path: &Path,
+        host_id: HostId,
+        access: crate::proxy_link::Access,
+        tombstones: crate::tombstones::Tombstones,
+        notices: UnboundedSender<GatewayNotice>,
+    ) -> io::Result<GatewayLink> {
+        Self::start_with(path, host_id, access, tombstones, notices, Timings::default())
     }
 
-    pub fn start_with(path: &Path, host_id: HostId, access: crate::proxy_link::Access, notices: UnboundedSender<GatewayNotice>, timings: Timings) -> io::Result<GatewayLink> {
+    pub fn start_with(
+        path: &Path,
+        host_id: HostId,
+        access: crate::proxy_link::Access,
+        tombstones: crate::tombstones::Tombstones,
+        notices: UnboundedSender<GatewayNotice>,
+        timings: Timings,
+    ) -> io::Result<GatewayLink> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         crate::proxy_link::secure_socket_path(path, access.gid)?;
-        let link = GatewayLink { state: Arc::new(Mutex::new(State::default())) };
+        let link = GatewayLink { state: Arc::new(Mutex::new(State { tombstones, ..State::default() })) };
         let state = link.state.clone();
         tokio::spawn(async move {
             loop {
@@ -127,12 +141,12 @@ impl GatewayLink {
     }
 
     /// Record a sandbox (new or changed) and tell the gateway. A no-op when nothing changed, and
-    /// refused (with a warning) for an epoch that was fenced or torn down: a sync that raced a
-    /// fence must not bring the sandbox back.
+    /// refused (with a warning) for a tombstoned (fenced) epoch: a sync that raced a fence must
+    /// not bring the sandbox back.
     pub fn upsert(&self, sandbox: SandboxId, entry: Entry) {
         {
             let mut st = self.state.lock().expect("gateway state");
-            if st.fenced.get(&sandbox).is_some_and(|f| entry.epoch <= *f) {
+            if st.tombstones.refuses(&sandbox, entry.epoch) {
                 tracing::warn!(%sandbox, epoch = entry.epoch.0, "refusing to re-add a fenced epoch to the gateway");
                 return;
             }
@@ -144,24 +158,10 @@ impl GatewayLink {
         self.send(GatewayCommand::SandboxUpsert { sandbox, epoch: entry.epoch, vsock_uds_path: entry.vsock_uds_path, clients: entry.clients, guest: entry.guest });
     }
 
-    /// The sandbox's `epoch` is over on this host (fenced, destroyed, moved): drop it and refuse
-    /// every later upsert at or below `epoch`.
-    pub fn remove(&self, sandbox: &SandboxId, epoch: Epoch) {
-        let present = {
-            let mut st = self.state.lock().expect("gateway state");
-            let f = st.fenced.entry(sandbox.clone()).or_insert(epoch);
-            if *f < epoch {
-                *f = epoch;
-            }
-            st.sandboxes.remove(sandbox).is_some()
-        };
-        if present {
-            self.send(GatewayCommand::SandboxRemove { sandbox: sandbox.clone() });
-        }
-    }
-
-    /// The sandbox is not reachable for now (suspended) but the same epoch may come back: drop
-    /// it without a tombstone, so clients re-resolve once instead of retrying `busy`.
+    /// Drop the sandbox from the gateway (its open calls close). On its own this leaves no
+    /// tombstone: a suspended sandbox's epoch comes back on resume, and a failed create is retried
+    /// at the same epoch. A fence records the epoch in the host's tombstones first, which keeps
+    /// every later upsert at or below it out.
     pub fn forget(&self, sandbox: &SandboxId) {
         if self.state.lock().expect("gateway state").sandboxes.remove(sandbox).is_none() {
             return;
@@ -292,6 +292,11 @@ mod tests {
         f
     }
 
+    fn test_policy() -> nest_protocol::model::EgressPolicy {
+        use nest_protocol::model::EgressLimits;
+        nest_protocol::model::EgressPolicy { version: 1, allow: vec![], passthrough: vec![], inject: vec![], tcp: vec![], limits: EgressLimits { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 } }
+    }
+
     fn entry(epoch: u64, clients: &[&str], guest: Option<GuestInfo>) -> Entry {
         Entry { epoch: Epoch(epoch), vsock_uds_path: "/run/nest/vm/sbx_1/vsock.sock".into(), clients: clients.iter().map(|c| c.to_string()).collect(), guest }
     }
@@ -303,7 +308,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gateway.sock");
         let (ntx, mut nrx) = mpsc::unbounded_channel();
-        let link = GatewayLink::start(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), ntx).unwrap();
+        let link = GatewayLink::start(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), Default::default(), ntx).unwrap();
         link.keys(vec![BindingKey { kid: "k1".into(), public_key: "pk".into() }]);
         let sbx = SandboxId("sbx_1".into());
         link.upsert(sbx.clone(), entry(1, &[], None));
@@ -337,15 +342,19 @@ mod tests {
         assert!(matches!(read(&mut f).await, GatewayCommand::ResyncDone));
     }
 
-    /// A fence tombstones the epoch: a later upsert at that epoch (a sync that raced the fence)
-    /// changes nothing and sends nothing; the next epoch is accepted. `forget` (suspend) leaves no
-    /// tombstone, so the same epoch comes back on resume.
+    /// A fence tombstones the epoch in the host's one map, which this link and the proxy link
+    /// both consult: a later upsert at that epoch (a sync that raced the fence) changes nothing
+    /// and sends nothing, here and at the proxy; the next epoch is accepted. `forget` alone
+    /// (suspend) leaves no tombstone, so the same epoch comes back on resume.
     #[tokio::test]
     async fn fenced_epoch_cannot_be_re_added() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gateway.sock");
         let (ntx, _nrx) = mpsc::unbounded_channel();
-        let link = GatewayLink::start(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), ntx).unwrap();
+        let tombstones = crate::tombstones::Tombstones::default();
+        let link = GatewayLink::start(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), tombstones.clone(), ntx).unwrap();
+        let (ptx, _prx) = mpsc::unbounded_channel();
+        let proxy = crate::proxy_link::ProxyLink::start(&dir.path().join("proxy.sock"), HostId("hst_1".into()), "boot".into(), Default::default(), tombstones.clone(), ptx).unwrap();
         let sbx = SandboxId("sbx_1".into());
         let mut f = connect(&path).await;
         for _ in 0..3 {
@@ -353,10 +362,14 @@ mod tests {
         }
         link.upsert(sbx.clone(), entry(1, &[], None));
         assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { epoch: Epoch(1), .. }));
-        link.remove(&sbx, Epoch(1));
+        tombstones.fence(&sbx, Epoch(1));
+        link.forget(&sbx);
         assert!(matches!(read(&mut f).await, GatewayCommand::SandboxRemove { .. }));
         link.upsert(sbx.clone(), entry(1, &["agt_a"], None));
         assert_eq!(link.entry(&sbx), None, "a fenced epoch is not re-added");
+        let upsert = |epoch| crate::proxy_link::ProxyOp::Upsert { sandbox: sbx.clone(), epoch: Epoch(epoch), workstream: None, policy: test_policy() };
+        assert!(!proxy.apply(upsert(1)), "the proxy link refuses the same tombstone");
+        assert!(proxy.apply(upsert(2)));
         link.upsert(sbx.clone(), entry(2, &[], None));
         assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { epoch: Epoch(2), .. }), "the next epoch is accepted; nothing was sent for the fenced one");
         assert_eq!(link.entry(&sbx).map(|e| e.epoch), Some(Epoch(2)));
@@ -374,7 +387,7 @@ mod tests {
         let path = dir.path().join("gateway.sock");
         let (ntx, mut nrx) = mpsc::unbounded_channel();
         let timings = Timings { ping_interval: Duration::from_millis(100), pong_timeout: Duration::from_millis(500) };
-        let _link = GatewayLink::start_with(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), ntx, timings).unwrap();
+        let _link = GatewayLink::start_with(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), Default::default(), ntx, timings).unwrap();
         let started = Instant::now();
         let mut f = connect(&path).await;
         assert!(matches!(read(&mut f).await, GatewayCommand::HelloAck { .. }));

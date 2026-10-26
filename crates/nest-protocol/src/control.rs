@@ -153,6 +153,11 @@ pub struct HostHello {
     /// Highest `FleetToHost::Commands.seq` this host fully processed (reconnect resume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_command_seq: Option<Seq>,
+    /// Set when nestd is configured to run its VMMs in its delegated unit cgroup and could not set
+    /// that up: its VMMs then sit outside the unit, so a restart of the unit doesn't kill them
+    /// (nestd still kills leftovers at start). Absent when delegation works or isn't configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_delegation_error: Option<String>,
     /// Everything this host currently holds; FleetDO reconciles against it.
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,
@@ -486,6 +491,11 @@ pub enum HostEventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guest: Option<GuestInfo>,
     },
+    /// A fenced (or superseded) incarnation is gone from this host: its uncommitted work was
+    /// salvaged, there was none, or SandboxDO refused it for good; its disk is deleted. FleetDO marks
+    /// the stale incarnation clean, so it is destroyed without waiting out the salvage window. An
+    /// older Worker quarantines the unknown event and loses only that shortcut.
+    IncarnationRetired { sandbox: SandboxId, epoch: Epoch },
     /// Chunks are already uploaded; asks SandboxDO to compare-and-set head. Answered by
     /// `CommandBody::CommitResult`.
     CommitRequest {
@@ -1197,12 +1207,13 @@ mod tests {
             HostEventBody::AgentExited { .. } => "agent_exited",
             HostEventBody::GuestCli { .. } => "guest_cli",
             HostEventBody::TaskExited { .. } => "task_exited",
+            HostEventBody::IncarnationRetired { .. } => "incarnation_retired",
         }
     }
     const HOST_EVENTS: &[&str] = &[
         "command_result", "sandbox_state", "commit_request", "workstream", "egress_audit", "capacity",
         "tunnel_state",
-        "spot_notice", "host_fault", "agent_exited", "guest_cli", "task_exited",
+        "spot_notice", "host_fault", "agent_exited", "guest_cli", "task_exited", "incarnation_retired",
     ];
 
     fn runner_to_agent(m: &RunnerToAgent) -> &'static str {

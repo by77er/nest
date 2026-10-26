@@ -20,12 +20,12 @@
 //! [`ProxyNotice::ListenerFailed`], tagged with the connection; the sandbox's owner (`host.rs`)
 //! rebinds or gives up, and the mirror follows it like any other change. Only a `resync_ack`
 //! whose counts those failures don't explain closes the connection (the proxy reconnects and
-//! resyncs). Once a sandbox epoch has been dropped for fencing, later upserts, secrets and
-//! listeners for that epoch are refused.
+//! resyncs). Upserts, secrets and listeners for an epoch the host has tombstoned (fenced; see
+//! [`crate::tombstones`]) are refused.
 //!
 //! Seqpacket + `SCM_RIGHTS` is done with blocking threads (`nest_protocol::host::fdpass`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
@@ -72,8 +72,6 @@ struct Mirror {
     ca: Option<(CaCertificate, Secret)>,
     lease_valid_until: Option<TimestampMs>,
     sandboxes: BTreeMap<SandboxId, SandboxMirror>,
-    /// Highest epoch dropped for fencing, per sandbox: nothing at or below it is re-added.
-    fenced: HashMap<SandboxId, Epoch>,
 }
 
 /// A change to the proxy's state.
@@ -104,6 +102,8 @@ enum WriterMsg {
 struct Shared {
     mirror: Mirror,
     next_seq: u64,
+    /// The host's fenced epochs (shared with the gateway link; the host core writes them).
+    tombstones: crate::tombstones::Tombstones,
 }
 
 #[derive(Clone)]
@@ -145,14 +145,22 @@ pub(crate) fn secure_socket_path(path: &Path, gid: Option<u32>) -> io::Result<()
 
 impl ProxyLink {
     /// Listen on `path` and serve one nest-proxy connection at a time.
-    pub fn start(path: &Path, host_id: HostId, boot_id: String, access: Access, notices: UnboundedSender<ProxyNotice>) -> io::Result<ProxyLink> {
+    /// `tombstones` is the host's one map of fenced epochs: nothing at or below one is pushed.
+    pub fn start(
+        path: &Path,
+        host_id: HostId,
+        boot_id: String,
+        access: Access,
+        tombstones: crate::tombstones::Tombstones,
+        notices: UnboundedSender<ProxyNotice>,
+    ) -> io::Result<ProxyLink> {
         let _ = std::fs::remove_file(path);
         let sock = socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::SOCK_CLOEXEC, None).map_err(io::Error::from)?;
         bind(sock.as_raw_fd(), &UnixAddr::new(path).map_err(io::Error::from)?).map_err(io::Error::from)?;
         secure_socket_path(path, access.gid)?;
         listen(&sock, Backlog::new(8).map_err(io::Error::from)?).map_err(io::Error::from)?;
 
-        let shared = Arc::new(Mutex::new(Shared { mirror: Mirror::default(), next_seq: 1 }));
+        let shared = Arc::new(Mutex::new(Shared { mirror: Mirror::default(), next_seq: 1, tombstones }));
         let generation = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::channel();
         let accept_tx = tx.clone();
@@ -206,11 +214,12 @@ impl ProxyLink {
 
     /// Apply a state change: update the mirror and queue the command (atomically, briefly locked;
     /// never blocks on the proxy). Returns `false` if the change was refused because the sandbox
-    /// epoch was already dropped for fencing.
+    /// epoch is tombstoned (fenced).
     pub fn apply(&self, op: ProxyOp) -> bool {
         let mut sh = self.shared.lock().expect("proxy mirror poisoned");
+        let tombstones = sh.tombstones.clone();
         let m = &mut sh.mirror;
-        let refused = |m: &Mirror, sandbox: &SandboxId, epoch: Epoch| m.fenced.get(sandbox).is_some_and(|f| epoch <= *f);
+        let refused = |_: &Mirror, sandbox: &SandboxId, epoch: Epoch| tombstones.refuses(sandbox, epoch);
         let (cmd, fds) = match op {
             ProxyOp::CaInstall { ca, key_pem } => {
                 m.ca = Some((ca.clone(), key_pem.clone()));
@@ -278,12 +287,9 @@ impl ProxyLink {
                 }
                 (ProxyCommand::ListenersRemove { sandbox, epoch, listener_ids: ids }, vec![])
             }
+            // A fence's tombstone is already recorded by the host (before this drop is queued).
             ProxyOp::Drop { sandbox, epoch, reason } => {
                 m.sandboxes.remove(&sandbox);
-                if reason.tombstones() {
-                    let e = m.fenced.entry(sandbox.clone()).or_insert(epoch);
-                    *e = (*e).max(epoch);
-                }
                 (ProxyCommand::SandboxDrop { sandbox, epoch, reason }, vec![])
             }
         };
@@ -601,7 +607,7 @@ pub(crate) mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
         let (ntx, _nrx) = tokio::sync::mpsc::unbounded_channel();
-        let link = ProxyLink::start(&path, HostId("hst_1".into()), "boot".into(), Access::default(), ntx).unwrap();
+        let link = ProxyLink::start(&path, HostId("hst_1".into()), "boot".into(), Access::default(), Default::default(), ntx).unwrap();
         let sbx = SandboxId("sbx_a".into());
 
         // State applied before any proxy connects goes into the mirror only.
@@ -657,9 +663,13 @@ pub(crate) mod tests {
     }
 
     fn start_link(dir: &Path) -> (ProxyLink, PathBuf, tokio::sync::mpsc::UnboundedReceiver<ProxyNotice>) {
+        start_link_with(dir, Default::default())
+    }
+
+    fn start_link_with(dir: &Path, tombstones: crate::tombstones::Tombstones) -> (ProxyLink, PathBuf, tokio::sync::mpsc::UnboundedReceiver<ProxyNotice>) {
         let path = dir.join("proxy.sock");
         let (ntx, nrx) = tokio::sync::mpsc::unbounded_channel();
-        let link = ProxyLink::start(&path, HostId("hst_1".into()), "boot".into(), Access::default(), ntx).unwrap();
+        let link = ProxyLink::start(&path, HostId("hst_1".into()), "boot".into(), Access::default(), tombstones, ntx).unwrap();
         (link, path, nrx)
     }
 
@@ -900,14 +910,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// Review #3: once an epoch is dropped for fencing, nothing re-adds it.
+    /// Review #3: once the host tombstones an epoch (a fence), nothing re-adds it to the proxy.
     #[test]
     fn fenced_epoch_cannot_be_re_added() {
         let dir = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
-        let (link, _path, _nrx) = start_link(dir.path());
+        let tombstones = crate::tombstones::Tombstones::default();
+        let (link, _path, _nrx) = start_link_with(dir.path(), tombstones.clone());
         let sbx = SandboxId("sbx_1".into());
+        tombstones.fence(&sbx, Epoch(3));
         assert!(link.apply(ProxyOp::Drop { sandbox: sbx.clone(), epoch: Epoch(3), reason: DropReason::Fence }));
         assert!(!link.apply(ProxyOp::Upsert { sandbox: sbx.clone(), epoch: Epoch(3), workstream: None, policy: policy(1) }));
         assert!(!link.apply(ProxyOp::AddListeners {
@@ -921,14 +933,18 @@ pub(crate) mod tests {
     }
 
     /// Guest-proxy review #1: a teardown or move is not a fence, so a create retried at the same
-    /// epoch is accepted (nest-proxy applies the same `DropReason::tombstones` rule).
+    /// epoch is accepted (nest-proxy applies the same `DropReason::tombstones` rule). A drop never
+    /// writes the host's tombstone map itself: the host records a fence before it drops.
     #[test]
     fn a_teardown_drop_does_not_tombstone() {
         let dir = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
-        let (link, _path, _nrx) = start_link(dir.path());
+        let tombstones = crate::tombstones::Tombstones::default();
+        let (link, _path, _nrx) = start_link_with(dir.path(), tombstones.clone());
         let sbx = SandboxId("sbx".into());
+        assert!(link.apply(ProxyOp::Drop { sandbox: sbx.clone(), epoch: Epoch(2), reason: DropReason::Fence }));
+        assert!(tombstones.is_empty(), "the link wrote a tombstone");
         for reason in [DropReason::Teardown, DropReason::Moved] {
             assert!(link.apply(ProxyOp::Drop { sandbox: sbx.clone(), epoch: Epoch(3), reason }));
             assert!(link.apply(ProxyOp::Upsert { sandbox: sbx.clone(), epoch: Epoch(3), workstream: None, policy: policy(1) }), "{reason:?} tombstoned");

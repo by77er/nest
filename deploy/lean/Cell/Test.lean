@@ -75,10 +75,11 @@ example : matchesFamily "c8i" "c8i-flex.large" ∧ !matchesFamily "c8i" "c7i.lar
 launch never fails on `EightIOnly`. -/
 theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
 
-/-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template and subnets and the spec's
-instance types (the shape control-plane/src/lib/cells.ts parses). -/
+/-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template, subnets and proxy root CA
+key and the spec's instance types (the shape control-plane/src/lib/cells.ts parses). -/
 def awsCellsHolds (spec : CellSpec) : Bool :=
-  match Lean.Json.parse (awsCellsWith id spec "lt-0abc" ["subnet-0a", "subnet-0b"]) with
+  let key := s!"arn:aws:kms:{spec.region}:{spec.accountId}:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+  match Lean.Json.parse (awsCellsWith id spec "lt-0abc" ["subnet-0a", "subnet-0b"] key) with
   | .ok json =>
     match json.getObjVal? spec.name with
     | .ok cell =>
@@ -92,6 +93,7 @@ def awsCellsHolds (spec : CellSpec) : Bool :=
         && cell.getObjValAs? Nat "enroll_timeout_ms" == .ok spec.enrollTimeoutMs
         && cell.getObjValAs? Nat "sandbox_reserve_mib" == .ok spec.sandboxReserveMib
         && cell.getObjValAs? Nat "max_sandboxes_per_host" == .ok spec.maxSandboxesPerHost
+        && cell.getObjValAs? String "proxy_root_key_arn" == .ok key
     | .error _ => false
   | .error _ => false
 
