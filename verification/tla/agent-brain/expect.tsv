@@ -38,6 +38,36 @@ AgentBrain.tla  MC_built_idle.cfg      holds                     full
 AgentBrain.tla  MC_built_part.cfg      holds                     full
 AgentBrain.tla  MC_built_drain.cfg     holds                     full
 AgentBrain.tla  MC_n1_on.cfg           holds                     full
+# Current design (brain-record 82396b3): as built, no same-host re-issue,
+# never-adopt, tick expiry re-checked (N1 fixed); epochs <= 2, one fault kind
+AgentBrain.tla  MC_nr_n1off.cfg        violates:OneActingBrain   ci
+AgentBrain.tla  MC_nr_none.cfg         holds                     ci
+AgentBrain.tla  MC_nr_reset.cfg        holds                     ci
+AgentBrain.tla  MC_nr_lost.cfg         holds                     full
+AgentBrain.tla  MC_nr_idle.cfg         holds                     full
+AgentBrain.tla  MC_nr_crash.cfg        holds                     full
+AgentBrain.tla  MC_nr_restart.cfg      holds                     full
+AgentBrain.tla  MC_nr_part.cfg         holds                     full
+# drain: no violation through BFS depth ~40 (72.2M states) but never finished
+# (60 min, shared box out of memory) - expected holds, not yet confirmed
+AgentBrain.tla  MC_nr_drain.cfg        holds                     full
+# wedge alone is vacuous at one fault; restart + wedge (2 faults) has teeth
+AgentBrain.tla  MC_nr_wedge.cfg        holds                     ci
+AgentBrain.tla  MC_nr_restart_wedge.cfg holds                    full
+# Mixed-version closure: h2 runs the previous release, seeded with a live brain
+# (MC_old_part/_crash/_live: expected outcomes not yet confirmed)
+AgentBrain.tla  MC_old_none.cfg        holds                     ci
+AgentBrain.tla  MC_old_part.cfg        holds                     full
+AgentBrain.tla  MC_old_crash.cfg       holds                     full
+AgentBrain.tla  MC_old_live.cfg        holds                     full
+# Epochs <= 3 sweep of the current design (E3Bounds); none finished within
+# 15 min on the shared box - see the pilot report for the partial counts
+AgentBrain.tla  MC_e3_none.cfg         holds                     full
+AgentBrain.tla  MC_e3_drain.cfg        holds                     full
+AgentBrain.tla  MC_e3_part.cfg         holds                     full
+AgentBrain.tla  MC_e3_idle.cfg         holds                     full
+AgentBrain.tla  MC_e3_lost.cfg         holds                     full
+AgentBrain.tla  MC_e3_wedge.cfg        holds                     full
 # Liveness (in progress: expectations not yet confirmed on the current spec)
 AgentBrain.tla  MC_rec_live_lost.cfg   violates:NoWedge          full
 AgentBrain.tla  MC_amend_live_lost.cfg holds                     full

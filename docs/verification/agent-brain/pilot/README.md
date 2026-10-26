@@ -4,18 +4,19 @@ A TLC-checked model of how an agent's brain is started, killed, moved and releas
 
 - `origin/deferred/agent-epoch` at 65bf6ef;
 - the single-record design the owner chose on 2026-10-25 (`BRAIN-RECORD-DESIGN.md`), with the amendments A1-A6 this model's counterexamples led to;
-- two as-built choices of `origin/deferred/brain-record` at 6073da7.
+- the as-built choices of `origin/deferred/brain-record`: 6073da7 (host-loss release ignores the epoch), and 82396b3/36b60d5, the **current design** (no same-host re-issue, never adopt, the tick re-checks before expiring, a previous-release host closure).
 
-Spec, configs and expected outcomes: [verification/tla/agent-brain/](../../../../verification/tla/agent-brain/). Tools: TLC 2026.10.24 (nightly) for exploration, TLC v1.7.4 for every `ci` config. Prose inventory: [../](../README.md). Conformance against the code: [../conformance/](../conformance/README.md).
+Spec, configs and expected outcomes: [verification/tla/agent-brain/](../../../../verification/tla/agent-brain/). Tools: TLC 2026.10.24 (nightly) for exploration, TLC v1.7.4 for every `ci` config and the current-design runs. Prose inventory: [../](../README.md). Conformance against the code: [../conformance/](../conformance/README.md). PR #29 captured an earlier state of this report; this version supersedes it.
 
-**In progress:** the design change that drops same-host re-issue (a start while a non-condemned brain exists answers `none`); the epochs ≤ 3 sweep; liveness on the amended design. Results below are as of 2026-10-26 00:30.
+**Not covered yet** (as of 2026-10-26 04:00): drain exhaustively on the current design; the previous-release host with faults (`MC_old_part`, `MC_old_crash`) and its liveness (`MC_old_live`); the epochs ≤ 3 sweep (configs `MC_e3_*` ready, not run); liveness re-runs on the current design; epoch-less exits and other mixed-version behaviour. The shared box ran out of memory several times (other sessions' builds), which cut drain short.
 
 ## Verdict
 
 | Question | Answer |
 |---|---|
-| S (at most one brain can act, on AgentDO or through a hands binding) on the fully amended design | **Holds exhaustively** at the small bound (epochs ≤ 2, one fault of each kind; table below). Not yet at epochs ≤ 3, which every counterexample here needed. |
-| S on the as-built variant (6073da7: host-loss release ignores the epoch) | Holds at the same bound with atomic expiry. With the tick's expiry split at its await (N1), **violated with zero faults**; with the re-check, holds. |
+| S (at most one brain can act, on AgentDO or through a hands binding) on the **current design** (82396b3) | **Holds exhaustively** at the small bound (epochs ≤ 2, one fault) for none, reset, lost RPC, crash, idle exit, partition and operator restart, and for restart + ignored kill (two faults). Drain: **no violation through BFS depth ~40 (72.2M states), not exhaustive.** Ignored kill alone: holds, but vacuous at one fault. |
+| S on the fully amended design (A1-A6) and the 6073da7 variant | Holds exhaustively at the small bound for every fault kind. With the tick's expiry split at its await and no re-check (N1), **violated with zero faults**; the re-check fixes it. |
+| Epochs ≤ 3, where most counterexamples live | Not covered exhaustively; only partial runs (largest 67.1M states, depth 30). |
 | The review's H1-H4 on 65bf6ef | All four reproduced. |
 | The record design as first written | Two L counterexamples (C1, C2), then three S counterexamples in the amended versions (C3, C5, N1) and two in the refused-start contract (C4, D1). Each led to an amendment or fix (A1-A6, A4's scope, the N1 re-check). |
 | Timing (self-fence F < expiry E) | Load-bearing: with F = E, TLC finds two acting brains. |
@@ -26,20 +27,21 @@ One agent with hands, two hosts that can run its brain, and the sandbox's gatewa
 
 | Model | Design rule / code |
 |---|---|
-| `RWake`, `RStart`, `RKill`/`RKillAlarm`, `REscalate`, `RDeadline`, `RStatusRelease` | Rules 2-4, A1, A2. `RDeadline` (a starting brain that can't say hello is condemned) is **assumed**: the design doesn't say how a start that never arrives ends. |
+| `RWake`, `RStart`, `RKill`/`RKillAlarm`, `REscalate`, `RDeadline`, `RStatusRelease` | Rules 2-4, A1, A2. `RDeadline` (a starting brain that can't say hello is condemned) is **assumed**: the design doesn't say how a start that never arrives ends. With `NO_REISSUE`, `RStart` answers `none` when a non-condemned brain exists. |
+| `ROpRestart`, `ROldCap` | `POST /start {restart:true}`: condemn and keep the intent; a previous-release host wedged at the 15 min cap (36b60d5, N21) |
 | `RExited`, `RHostLost` | Rule 3: release only on an exit at or above `brain.epoch`, or on host loss |
 | `SessOK`, `Hello`, `ResolveReq/Resp` | Rule 1; 65bf6ef `current()`, `onHello`, `hands_resolve` (re-checked after its await) |
 | `T*` actions | 65bf6ef `startBrain`, `killForMove` (split at its await), `onExited`, `onHostLost`, the `exit_wait` and `pending_start` alarms |
 | `Issue`, `IssueFail`, `RKillFail`, `ResetAgentDO` | `issueCommands` RPCs; an AgentDO eviction between awaits |
 | `Deliver`, `Exec`, `ApplyKill` | The fleet channel: in order, resent after reconnect; a kill applied on arrival. A kill is two-phase: the process lives, still holding its binding, until it exits. |
-| `RunnerStart`, `Register`, `StopExit`, `IdleBegin` | The runner's start (lease check, a brain on its way out is replaced once gone, a live one adopts the newer epoch); an `AgentStop` for an unregistered agent is a no-op |
+| `RunnerStart`, `Register`, `StopExit`, `IdleBegin` | The runner's start (lease check; a brain on its way out is replaced once gone; a live one adopts the newer epoch, or with `NO_ADOPT` is ended and replaced); an `AgentStop` for an unregistered agent is a no-op |
 | `AccOut`/`AccSet`, `OwedExit` | nestd's `accept_event` (65bf6ef: keyed by agent; `FIX_H1`: by epoch); A4's owed exit |
 | `LeaseLapse` | nestd `self_fence` and the runner's watchdog, each once per lapse |
 | `HostHello`, `Heartbeat`, `Tick`, `Expire`/`ExpireRead`+`ExpireCommit`, `LostSend/Deliver/Drop`, `DrainRetire`, `ConfirmDead` | fleet.ts hello and reconcile, lease expiry (atomic, or split at the tick's await), A2's retried `onHostLost`, scaleDown's drained branch, STONITH |
 
 **Time.** Ages instead of clocks. The host lease holds while the time since its newest acked heartbeat was sent is below F; FleetDO may expire a host once `last_rx` is E old. Heartbeats are received and acked instantly, the worst case for safety. Time never passes a lapse the host hasn't acted on. The 60 s and 15 min timers fire only when nothing is in flight on a connected link (including a dying process or an owed exit), or the host is disconnected.
 
-**Abstracted / not modelled:** sandbox moves (the binding stays valid); one queued turn; nestd restarts; the runner crashing while Claude Code survives; binding expiry; epoch-less exits from an old nestd or old rows (6073da7's choice 2, a gap); mixed versions per host; and the newest 6073da7 additions (orphan-kill backstop, version gating, wedge closing the socket, runner restart before STONITH).
+**Abstracted / not modelled:** sandbox moves (the binding stays valid); one queued turn; nestd restarts; the runner crashing while Claude Code survives; binding expiry; epoch-less exits (6073da7's choice 2 and 82396b3's "stands for its row's start": a gap); the previous release's own behaviour beyond the `OLD_HOST` closure; the orphan-kill backstop; nestd dropping its runner connection before a wedge (the model relies on the lease lapse alone, which is more conservative); re-draining a host reactivated by STONITH-by-fence.
 
 ## Properties
 
@@ -48,7 +50,7 @@ One agent with hands, two hosts that can run its brain, and the sandbox's gatewa
 | `OneActingBrain` (S) | At most one brain process is acting: AgentDO would accept its platform call or `hands_resolve`, or the gateway would admit its hands call (it holds a binding and lives) |
 | `CondemnedFenced` | A brain being killed never acts on AgentDO (rule 1, H3) |
 | `KillTombstone` | No runner registers or adopts a start at or below a kill that reached its host first |
-| `NoHealthyWedge` (L3) | A host never partitioned, crashed, terminated or kill-ignoring is never wedged |
+| `NoHealthyWedge` (L3) | A host never partitioned, crashed, terminated or kill-ignoring is never wedged (a previous-release host is excluded: it is wedged at the cap by design) |
 | `AwaitConsistent` | 65bf6ef: `awaiting_exit` names the assigned host at the current epoch (H2) |
 | `NoEpochRegression` | Epoch counters, tombstones and a process's adopted epoch never decrease |
 | `TurnsDrain`, `NoWedge` (L1, L2) | A queued turn eventually runs; a condemned brain is eventually resolved (weak fairness, finite faults) |
@@ -68,6 +70,28 @@ Bound: 2 hosts (symmetry), agent epochs ≤ 2, one turn, F = 1 < E = 2, queues �
 | idle exit / session drop | 6,457,924 / 56 / 3m16s | 6,566,829 / 58 / 7m35s | holds |
 | runner ignores a kill | 1,675,968 / 53 / 42 s | not run | holds, but **vacuous**: at this bound no kill meets a live brain |
 | none, as built with split expiry + re-check (N1 fixed) | | 5,345,649 / 59 / 3m59s | holds |
+
+### Current design (brain-record 82396b3 / 36b60d5)
+
+As built: host-loss release ignores the epoch; A1-A6 and A4 on; the tick's expiry is split at its await and re-checked (`SPLIT_EXPIRE`, `EXPIRE_RECHECK`); a start while a non-condemned brain exists answers `none` (`NO_REISSUE`); an operator restart condemns and keeps the intent (`ROpRestart`); the runner never adopts (`NO_ADOPT`). Same bound as above. TLC v1.7.4; heap and workers per run.
+
+| Fault kind | Distinct states | Depth | Time | Result |
+|---|---|---|---|---|
+| none | 5,345,649 | 59 | 83 s | holds, exhaustive |
+| AgentDO reset | 8,510,580 | 60 | 155 s | holds, exhaustive |
+| lost RPC | 10,794,534 | 61 | 209 s | holds, exhaustive |
+| idle exit / session drop | 20,310,444 | 62 | 303 s | holds, exhaustive |
+| crash | 26,456,116 | 61 | 449 s | holds, exhaustive |
+| operator restart | 24,636,012 | 59 | 463 s | holds, exhaustive |
+| partition | 43,765,849 | 65 | 781 s | holds, exhaustive |
+| drain | 72,174,177 (2,832,984 still queued) | 46 reached | 60 min, cut | **no violation through BFS depth ~40; not exhaustive** (box out of memory; `-Xmx6g`, 8 workers) |
+| runner ignores a kill | 5,345,649 | 59 | 111 s | holds, exhaustive, but **vacuous**: same states as zero faults, because no kill meets a live brain with one fault (`-Xmx4g`, 6 workers, `-fpmem 0.25`) |
+| restart + ignored kill (2 faults) | 53,924,181 | 59 | 26 min | holds, exhaustive; not vacuous (2.2x restart alone): the ignored kill, escalation, wedge, lapse and expiry are all explored (`-Xmx3g`, 6 workers, `-fpmem 0.25`) |
+| N1 re-check off, zero faults | 380,822 | 26 | 7 s | **violates** `OneActingBrain` |
+
+The reset, lost, idle, crash, partition and restart runs above were made before `NO_ADOPT` was added. With no re-issue, at most one start is outstanding per (agent, host), so the adopt branch is not expected to be reachable; `MC_nr_none` and `MC_nr_wedge` were re-run with it on and gave the same state count.
+
+**Previous-release host** (`OLD_HOST = h2`, 82396b3 + 36b60d5's N21): h2 starts with a live brain at epoch 1 (binding, current session) and is drained on sight. It gets no starts; exits and kill progress never release its brain; escalation waits for its loss and wedges it at the 15 min cap (`ROldCap`); only loss releases. `MC_old_none` (zero faults): holds, exhaustive, 5,427,050 states, depth 55, 75 s. `MC_old_part`, `MC_old_crash` (S) and `MC_old_live` (L): in progress.
 
 **Partial only** (cut at 10-15 min, no violation): epochs ≤ 3 with zero faults (31.1M states, depth 41); epochs ≤ 3 with idle exit + drain before A5/A6 (67.1M states, depth 30); A1-A3 with one host fault before A4 (36M states). Every counterexample below needed 3 epochs, except N1 and C3, so the epochs ≤ 2 result is weak evidence; the epochs ≤ 3 sweep is in progress.
 
@@ -117,7 +141,7 @@ Each comes from a TLC trace and is reproduced by a `ci` config (TLC v1.7.4; step
 
 ## Conformance items added
 
-From [../conformance/](../conformance/README.md#what-the-model-should-add): item 1 (`START_FAIL`, D1) is added and reproduced; item 2 (`LostDeliver` racing `HostHello` plus a resent start, and a cmd- or epoch-keyed delete) is added as C3 and A5; N1 is added as `SPLIT_EXPIRE`. Items 3-6 (reconcile failure and epoch-less redelivery, a reset dropping deadlines armed after an await, a runner that also skips its watchdog, mixed versions) are not modelled.
+From [../conformance/](../conformance/README.md#what-the-model-should-add): item 1 (`START_FAIL`, D1) is added and reproduced; item 2 (`LostDeliver` racing `HostHello` plus a resent start, and a cmd- or epoch-keyed delete) is added as C3 and A5; N1 is added as `SPLIT_EXPIRE`. Item 6 (mixed versions) is covered only as the `OLD_HOST` closure, a previous-release host that never gets a start. Items 3-5 (reconcile failure and epoch-less redelivery, a reset dropping deadlines armed after an await, a runner that also skips its watchdog) are not modelled.
 
 ## What the model cannot catch
 
@@ -125,10 +149,10 @@ Code that diverges from these actions (the model encodes the design and a readin
 
 ## Effort
 
-About 990 spec lines, 37 configs, about 10 hours. The design moved five times during the pilot: 65bf6ef, the record design, A1-A3, A4 and D1, then A5, A6 and the as-built choices. About 15 TLC iterations went to fixing model artifacts: a terminated host counted as healthy, delayed acks exploding the state space, a silently dropped start, and a dying process missing from the timer guard. State space was the main cost: the all-faults configurations at epochs ≤ 3 don't finish, so faults are split by kind.
+About 1,050 spec lines, 59 configs, about 13 hours. The design moved seven times during the pilot: 65bf6ef, the record design, A1-A3, A4 and D1, A5 and A6, the 6073da7 choices, and 82396b3/36b60d5 (no re-issue, never adopt, the N1 fix, the previous-release closure). About 15 TLC iterations went to fixing model artifacts: a terminated host counted as healthy, delayed acks exploding the state space, a silently dropped start, and a dying process missing from the timer guard. State space was the main cost: the all-faults configurations at epochs ≤ 3 don't finish, so faults are split by kind.
 
 ## Next steps
 
-1. Model the design change (no same-host re-issue: at most one start per (agent, host)), then re-run the exhaustive table and N1.
-2. Finish the epochs ≤ 3 sweep (drain, partition, idle exit, ignored kill, lost RPC) and liveness L on the amended design.
-3. Add conformance items 3-6 and epoch-less exits.
+1. Finish drain exhaustively on the current design on a quiet machine (90 min limit), and restart + ignored kill.
+2. Run the epochs ≤ 3 sweep (`MC_e3_*`) and liveness L (`MC_old_live`, `MC_amend_live_lost`, `MC_rec_live`) on the current design.
+3. Add conformance items 3-5, epoch-less exits, and the orphan-kill backstop.
