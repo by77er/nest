@@ -217,7 +217,7 @@ async fn a_start_for_a_stopping_brain_replaces_it_instead_of_adopting_it() {
         RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "stop".into(), epoch: None },
     );
     assert!(first.is_stopping());
-    nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_stopping", &[]));
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_stopping", 2));
     wait_for("the stopping brain gone", || !alive(pid)).await;
     wait_for("a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
     let evs = events(&e.rt, Duration::from_millis(300)).await;
@@ -368,5 +368,21 @@ async fn a_graceful_stop_for_an_older_epoch_spares_a_newer_brain() {
         RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "now".into(), epoch: Some(nest_protocol::model::Epoch(2)) },
     );
     assert!(e.rt.agent(&id).expect("registered").is_stopping());
+    e.rt.kill_all(ExitReason::Fenced);
+}
+
+/// N18: a start older than the registered brain never ends it; it is refused at its own epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_start_never_ends_a_newer_brain() {
+    let e = env();
+    let id = AgentId("agt_old".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_old", 2));
+    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    let pid = pids(e.dir.path())[0];
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_old", 1));
+    let evs = events(&e.rt, Duration::from_millis(800)).await;
+    assert!(exits_at(&evs).contains(&(ExitReason::Fenced, Some(1))), "{evs:?}");
+    assert!(alive(pid), "the newer brain was ended");
+    assert_eq!(e.rt.agent(&id).expect("registered").epoch(), nest_protocol::model::Epoch(2));
     e.rt.kill_all(ExitReason::Fenced);
 }

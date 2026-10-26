@@ -294,7 +294,11 @@ impl RunnerLink {
                 let _ = c.send(RunnerCommand::AgentStop { agent: agent.clone(), mode: StopMode::Kill, reason: reason.into(), epoch });
                 // The narrower step before any wedge (M1): if the brain hasn't exited after the
                 // wait, the runner connection is dropped, so the runner kills every brain here
-                // (sandboxes are untouched) and their exits are reported.
+                // (sandboxes are untouched) and their exits are reported. Reported without the
+                // runner's confirmation (N17), on the same footing as any lost connection: the
+                // runner SIGKILLs every brain's process group the moment its nestd socket closes,
+                // before it could act again, and a runner that couldn't is one the lease lapse,
+                // the expiry and STONITH handle.
                 let (state, agent, conn_gen) = (self.state.clone(), agent.clone(), st.conn_gen);
                 let wait = st.kill_exit_wait.unwrap_or(KILL_EXIT_WAIT);
                 tokio::spawn(async move {
@@ -869,5 +873,26 @@ mod tests {
         link.kill(&a, Some(Epoch(2)), "x");
         assert!(link.killed_at_or_above(&a, Epoch(3)));
         assert!(!link.killed_at_or_above(&a, Epoch(4)));
+    }
+
+    /// The drop is for the connection the kill went out on: a runner that reconnected since keeps
+    /// its new connection.
+    #[tokio::test]
+    async fn a_late_kill_timer_never_drops_a_newer_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, path, mut nrx) = link(dir.path());
+        link.set_kill_exit_wait(std::time::Duration::from_millis(300));
+        let mut f = connected(&path, &mut nrx).await;
+        let a = AgentId("agt_a".into());
+        assert!(link.agent_start(start_at("agt_a", 1)));
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(_)));
+        assert!(link.kill(&a, Some(Epoch(1)), "x"));
+        drop(f);
+        assert!(matches!(notice(&mut nrx).await, RunnerNotice::Disconnected { .. }));
+        let _g = connected(&path, &mut nrx).await;
+        // A start at or below the old kill's epoch out on the new connection.
+        assert!(link.agent_start(start_at("agt_a", 1)));
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(link.connected(), "the new connection was dropped by the old kill's timer");
     }
 }

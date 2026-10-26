@@ -124,11 +124,18 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
                     return;
                 }
+                Err(Refused::Running(existing)) if existing.epoch() >= epoch => {
+                    // A newer (or the same) brain is registered: this start is stale (N18). It never
+                    // runs, never ends the newer brain, and its exit says so at its own epoch.
+                    tracing::warn!(agent = %id, epoch = epoch.0, running = existing.epoch().0, "agent_start older than the registered brain: refused");
+                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
+                    return;
+                }
                 Err(Refused::Running(existing)) => {
-                    // AgentDO starts a brain only once the previous one is released, so a brain
-                    // still registered here is one on its way out (of an earlier nestd connection,
-                    // fenced when it dropped, or killed): never adopted, never run beside. It is
-                    // ended, and this start registers once it is gone.
+                    // AgentDO starts a brain only once the previous one is released, so an older
+                    // brain still registered here is one on its way out (of an earlier nestd
+                    // connection, fenced when it dropped, or killed): never adopted, never run
+                    // beside. It is ended, and this start registers once it is gone.
                     if existing.conn_gen == agent.conn_gen && !existing.is_stopping() {
                         tracing::warn!(agent = %id, epoch = epoch.0, "agent_start while a brain of this agent is registered; ending it first");
                     }

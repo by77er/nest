@@ -811,7 +811,7 @@ export class FleetDO extends DurableObject<Env> {
     // A silent host is back. Its expiry proved its brains gone (its lease lapsed, and nestd refused
     // or killed every start it held); the same identity comes back with none of them (re-enrolling
     // a host that once connected isn't supported, so it keeps its identity), and `lost` clears.
-    if (prior.status === "expired") this.sql.exec("UPDATE hosts SET status = 'active', lost = 0 WHERE host = ?", att.host);
+    if (prior.status === "expired") this.sql.exec("UPDATE hosts SET status = 'active', lost = 0 WHERE host = ? AND status = 'expired'", att.host);
     await this.reconcileSandboxes(att.host, hello.sandboxes);
     // The hello's capacity counts the sandboxes it reports: marked after their first states.
     this.sql.exec("UPDATE hosts SET capacity_seq = ? WHERE host = ?", this.mark(), att.host);
@@ -823,6 +823,10 @@ export class FleetDO extends DurableObject<Env> {
       await this.failPendingCommands(att.host, "host process restarted before running this command", reported, pending);
     }
     await this.reconcileAgents(att.host, hello.agents);
+    // A host of the previous release (no brain epochs) is drained on sight: no new placements, its
+    // sandboxes leave, its brains are condemned, and it is retired when empty, ending in a confirmed
+    // death. It never receives a brain (AgentDO starts brains only on hosts of this release).
+    if (!hello.brain_epochs) await this.drain(att.host, Date.now(), "a previous-release nestd");
     // A host whose leases we expired came back: it must fence them before we reassign (STONITH by fence).
     await this.ensureStonithFence(att.host);
     await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
@@ -1737,8 +1741,9 @@ export class FleetDO extends DurableObject<Env> {
     // A draining host whose sandboxes and brains have all left goes now rather than at its deadline.
     // Never with a brain still indexed there: that brain is alive until its exit is reported (or the
     // host goes silent and is expired), so declaring the host dead would let it run twice.
+    // Any role: a controller host of the previous release is drained and retired too.
     for (const h of this.sql.exec<HostRow>(
-      "SELECT * FROM hosts WHERE role = 'burst' AND status = 'draining' AND instance_id IS NOT NULL").toArray()) {
+      "SELECT * FROM hosts WHERE status = 'draining' AND instance_id IS NOT NULL").toArray()) {
       if (this.leasesOf(h.host).length) continue;
       if (this.sql.exec("SELECT 1 FROM host_agents WHERE host = ?", h.host).toArray().length) continue;
       this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", h.host);
@@ -1771,9 +1776,10 @@ export class FleetDO extends DurableObject<Env> {
    * suspended to the object store and leave as they report `suspended`. SandboxDO re-places a
    * sandbox whose agents are mid-turn at once; the others wait until something needs them.
    */
-  private async drain(host: string, deadlineMs: number): Promise<void> {
-    this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host);
-    console.warn(`FleetDO: ${host} draining (spot interruption at ${new Date(deadlineMs).toISOString()})`);
+  private async drain(host: string, deadlineMs: number, why = "spot interruption"): Promise<void> {
+    if (this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host).rowsWritten === 0
+      && why !== "spot interruption") return;
+    console.warn(`FleetDO: ${host} draining (${why} at ${new Date(deadlineMs).toISOString()})`);
     const leases = this.leasesOf(host).filter((l) => !l.expired);
     await this.evict(host, leases.filter((l) => l.state === "suspended").map((l) => l.sandbox));
     const running = leases.filter((l) => l.state !== "suspended");
