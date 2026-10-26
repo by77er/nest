@@ -9,5 +9,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod incarnation;
 pub mod invariant;
 pub mod results;
