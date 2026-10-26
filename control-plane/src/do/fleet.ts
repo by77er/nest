@@ -731,6 +731,9 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   private async onHello(ws: WebSocket, att: Attachment, hello: Extract<HostToFleet, { type: "hello" }>): Promise<void> {
+    // A hello that waited in the host's queue while its socket closed is stale: the host has
+    // reconnected or will. Acting on it would supersede the live socket before its own hello runs.
+    if (ws.readyState !== WebSocket.OPEN) return;
     if (hello.protocol_version !== PROTOCOL_VERSION) {
       this.send(ws, {
         type: "error",

@@ -905,4 +905,31 @@ describe("#28 command delivery across nestd reconnects", () => {
     const [start] = await nextCommands(ws2, (c) => c.cmd === cmd);
     expect(start).toMatchObject({ type: "agent_start", oauth_token: "sk-ant-oat01-regress" });
   });
+
+  it("a hello whose socket closed while it waited in the host's queue doesn't supersede the live socket", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    // A hello that holds the host's queue on BrokerDO.
+    const busy = await Ws.connect("/v1/fleet", h.host_token);
+    busy.send(hostHello(h.host, cell));
+    await busy.next("hello_ack");
+    await until("the queue to be held", () => keys.entered);
+    // Hello A waits in the queue, and A drops before it runs.
+    const a = await Ws.connect("/v1/fleet", h.host_token);
+    a.send(hostHello(h.host, cell));
+    a.close();
+    await until("FleetDO to see A close", () => a.closed !== null);
+    // The host reconnects on B; its hello waits behind A's.
+    const b = await Ws.connect("/v1/fleet", h.host_token);
+    b.send(hostHello(h.host, cell));
+    keys.released = true;
+
+    await b.next("hello_ack");
+    expect(a.received.some((m) => m.type === "hello_ack")).toBe(false);
+    const [cmd] = await fleetStub(cell).issueCommands(h.host, [fence("after")]);
+    expect((await b.next("commands")).commands[0].cmd).toBe(cmd);
+    expect(b.closed).toBeNull();
+  });
 });
