@@ -56,6 +56,15 @@ export function hostOfHostname(label: string, zone: string, name: string): strin
   return HOST_ID_BODY.test(id) ? `hst_${id}` : null;
 }
 
+/** How many pages of 100 a listing reads at most. */
+export const LIST_MAX_PAGES = 10;
+
+/** A listing; `complete` is false when it stopped at `LIST_MAX_PAGES` with more pages left. */
+export interface Listing {
+  items: { id: string; name: string }[];
+  complete: boolean;
+}
+
 export interface CloudflareApi {
   zoneId(zone: string): Promise<string>;
   /** A remotely managed tunnel; the token is what cloudflared runs with. */
@@ -64,9 +73,9 @@ export interface CloudflareApi {
   configureIngress(tunnelId: string, hostname: string): Promise<void>;
   /** Cleans up stale connections first; throws (retryable) while connections are still active. Already gone is success. */
   deleteTunnel(tunnelId: string): Promise<void>;
-  listTunnels(namePrefix: string): Promise<{ id: string; name: string }[]>;
+  listTunnels(namePrefix: string): Promise<Listing>;
   createRecord(zoneId: string, hostname: string, tunnelId: string, comment: string): Promise<{ id: string }>;
-  listRecords(zoneId: string, hostnameSuffix: string): Promise<{ id: string; name: string }[]>;
+  listRecords(zoneId: string, hostnameSuffix: string): Promise<Listing>;
   /** Already gone is success. */
   deleteRecord(zoneId: string, recordId: string): Promise<void>;
 }
@@ -160,14 +169,14 @@ export class CloudflareHttp implements CloudflareApi {
     await this.call("DELETE", `${this.account}/cfd_tunnel/${tunnelId}`, undefined, { retryable: true, notFoundOk: true });
   }
 
-  async listTunnels(namePrefix: string): Promise<{ id: string; name: string }[]> {
-    const out: { id: string; name: string }[] = [];
-    for (let page = 1; page <= 10; page++) {
+  async listTunnels(namePrefix: string): Promise<Listing> {
+    const items: { id: string; name: string }[] = [];
+    for (let page = 1; page <= LIST_MAX_PAGES; page++) {
       const tunnels = await this.call<{ id: string; name: string }[]>("GET", `${this.account}/cfd_tunnel?is_deleted=false&per_page=100&page=${page}`);
-      out.push(...tunnels.filter((t) => t.name.startsWith(namePrefix)));
-      if (tunnels.length < 100) break;
+      items.push(...tunnels.filter((t) => t.name.startsWith(namePrefix)));
+      if (tunnels.length < 100) return { items, complete: true };
     }
-    return out;
+    return { items, complete: false };
   }
 
   async createRecord(zoneId: string, hostname: string, tunnelId: string, comment: string): Promise<{ id: string }> {
@@ -177,15 +186,15 @@ export class CloudflareHttp implements CloudflareApi {
     return { id: r.id };
   }
 
-  async listRecords(zoneId: string, suffix: string): Promise<{ id: string; name: string }[]> {
-    const out: { id: string; name: string }[] = [];
-    for (let page = 1; page <= 10; page++) {
+  async listRecords(zoneId: string, suffix: string): Promise<Listing> {
+    const items: { id: string; name: string }[] = [];
+    for (let page = 1; page <= LIST_MAX_PAGES; page++) {
       const records = await this.call<{ id: string; name: string; type: string }[]>(
         "GET", `/zones/${zoneId}/dns_records?type=CNAME&name.endswith=${encodeURIComponent(suffix)}&per_page=100&page=${page}`);
-      out.push(...records.filter((r) => r.name.endsWith(suffix)).map((r) => ({ id: r.id, name: r.name })));
-      if (records.length < 100) break;
+      items.push(...records.filter((r) => r.name.endsWith(suffix)).map((r) => ({ id: r.id, name: r.name })));
+      if (records.length < 100) return { items, complete: true };
     }
-    return out;
+    return { items, complete: false };
   }
 
   async deleteRecord(zoneId: string, recordId: string): Promise<void> {

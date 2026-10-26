@@ -1,117 +1,56 @@
-// What the control plane's two read routes return (control-plane/src/do/fleet.ts: fleetView, images;
-// the enums from control-plane/src/protocol). The control plane does not export these shapes, so
-// they are mirrored here and held to a recorded response: fixtures/admin.ts must satisfy them, and
-// `npm run typecheck` fails when the two disagree. The enums are compared with the control plane's
-// sources by test/api.test.ts.
+// What the control plane's two read routes return: the admin view contract in
+// protocol/admin/view.ts, which the control plane's `fleetView` and `images` are typed by too. The
+// dashboard imports nothing from the control plane, and only types from protocol/: it stays an
+// independent Worker, and `npm run typecheck` fails when the page reads a field the view lacks.
+export type {
+  CapacityView as Capacity, FleetView as Fleet, HostRole, HostStatus, HostView as Host, ImageView as Image, ImagesView as Images,
+  LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
+  TunnelState,
+} from "../../protocol/admin/view";
+import type { AwsView, FleetView, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../protocol/admin/view";
 
-/** control-plane/src/protocol/model.ts `SandboxState`. */
-export const SANDBOX_STATES = [
-  "creating", "restoring", "running", "suspending", "suspended", "archiving", "archived", "fenced", "destroyed", "failed",
-] as const;
-export type SandboxState = (typeof SANDBOX_STATES)[number];
-
-/** control-plane/src/protocol/model.ts `HostRole`. */
-export const HOST_ROLES = ["burst", "controller"] as const;
-export type HostRole = (typeof HOST_ROLES)[number];
-
-/** control-plane/src/protocol/control.ts `TunnelState`. */
-export const TUNNEL_STATES = ["none", "connecting", "connected"] as const;
-export type TunnelState = (typeof TUNNEL_STATES)[number];
-
-/** control-plane/src/do/fleet.ts `HostStatus`. */
-export const HOST_STATUSES = ["active", "draining", "expired", "stonith_pending", "dead"] as const;
-export type HostStatus = (typeof HOST_STATUSES)[number];
-
-/** control-plane/src/protocol/control.ts `Capacity`, as the host last reported it. */
-export interface Capacity {
-  vcpus_free: number;
-  memory_mib_free: number;
-  hugepages_mib_free: number;
-  /** The hugepage pool's size; 0 or absent (a host from before the field) means regular pages. */
-  hugepages_mib_total?: number;
-  sandboxes: number;
-  agents: number;
-  warm: string[];
-}
-
-/** A lease on a host. `state` is what the host last reported; null until its first report. */
-export interface Resident {
-  sandbox: string;
-  epoch: number;
-  state: SandboxState | null;
-  vcpus: number | null;
-  memory_mib: number | null;
-}
-
-export interface Host {
-  host: string;
-  role: HostRole;
-  instance_id: string | null;
-  status: HostStatus;
-  idle_since: number | null;
-  enrolled_ms: number;
-  last_rx: number | null;
-  tunnel_hostname: string | null;
-  /** Null on a host row from before the field. */
-  tunnel_state: TunnelState | null;
-  capacity: Capacity | null;
-  leases: number;
-  connected: boolean;
-  sandboxes: Resident[];
-  agents: string[];
-}
-
-export interface Launch {
-  instance_id: string;
-  launched_ms: number;
-  host: string | null;
-  reason: string | null;
-  ended_ms: number | null;
-}
-
-export interface SandboxRow {
+/**
+ * A sandbox row as the control plane before the typed view returned it: one `state`, the lease's
+ * with a host and the sandbox's own without. Accepted for one release, since the dashboard and the
+ * control plane deploy separately.
+ */
+export interface LegacySandboxRow {
   sandbox: string;
   registered_ms: number;
   host: string | null;
   epoch: number | null;
-  /**
-   * With a host: the lease's state as the host reported it (null before its first report). Without
-   * one: the sandbox's own state, or null when the control plane could not read it (then `image`
-   * and `workstream` are null too).
-   */
   state: SandboxState | null;
   image: string | null;
   workstream: string | null;
 }
 
-export interface Fleet {
-  hosts: Host[];
-  launches: Launch[];
-  sandboxes: SandboxRow[];
+/** What `GET /api/fleet` may answer during that release. */
+export interface FleetResponse {
+  /** The previous release sends `tunnel_state` null for `none`, and `lost`/`brain_epochs` as 0/1 (or not at all, before them). */
+  hosts: (Omit<HostView, "tunnel_state" | "lost" | "brain_epochs" | "wedged_ms"> & {
+    tunnel_state: TunnelState | null; lost?: boolean | number; brain_epochs?: boolean | number; wedged_ms?: number | null;
+  })[];
+  launches: FleetView["launches"];
+  sandboxes: (SandboxView | LegacySandboxRow)[];
+  aws?: AwsView;
 }
 
-/** control-plane/src/lib/ec2.ts `ImageInfo`: a host AMI. `state` is EC2's image state. */
-export interface Image {
-  image_id: string;
-  name: string;
-  created: string;
-  state: string;
-  size_gib: number | null;
-  tags: Record<string, string>;
-}
-
-export interface Template {
-  name: string;
-  default: boolean;
-  source: string;
-  in_use: number;
-}
-
-export interface Images {
-  current: string | null;
-  current_since_ms: number | null;
-  images: Image[];
-  templates: Template[];
+/** Either shape as the current one. */
+export function normalizeFleet(raw: FleetResponse): FleetView {
+  return {
+    hosts: raw.hosts.map((h) => ({
+      ...h, tunnel_state: h.tunnel_state ?? "none", lost: !!h.lost, brain_epochs: !!h.brain_epochs, wedged_ms: h.wedged_ms ?? null,
+    })),
+    launches: raw.launches,
+    aws: raw.aws ?? { cell: null, error: "not reported by this control plane" },
+    sandboxes: raw.sandboxes.map((s): SandboxView => {
+      if ("lease_state" in s) return s;
+      const { state, ...rest } = s;
+      // The old view could not read the sandbox when it returned neither image nor workstream.
+      const infoError = s.image === null && s.workstream === null;
+      return { ...rest, lease_state: s.host ? state : null, sandbox_state: s.host || infoError ? null : state, info_error: infoError };
+    }),
+  };
 }
 
 export class ApiError extends Error {
@@ -138,6 +77,6 @@ async function get<T>(path: string): Promise<T> {
 
 export const api = {
   cells: () => get<{ cells: string[]; control_plane: string }>("/api/cells"),
-  fleet: (cell: string) => get<Fleet>(`/api/fleet?cell=${encodeURIComponent(cell)}`),
-  images: (cell: string) => get<Images>(`/api/images?cell=${encodeURIComponent(cell)}`),
+  fleet: async (cell: string) => normalizeFleet(await get<FleetResponse>(`/api/fleet?cell=${encodeURIComponent(cell)}`)),
+  images: (cell: string) => get<ImagesView>(`/api/images?cell=${encodeURIComponent(cell)}`),
 };

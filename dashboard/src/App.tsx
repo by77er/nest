@@ -44,7 +44,7 @@ function HostCard({ h, now }: { h: Host; now: number }) {
         <h3 title={h.host}><span className="mono">{short(h.host)}</span></h3>
         <div className="chips">
           {h.tunnel_state === "connected" ? <Chip kind="good">reachable</Chip>
-            : h.tunnel_hostname ? <Chip kind="warn">tunnel {h.tunnel_state ?? "starting"}</Chip> : <Chip kind="muted">no tunnel</Chip>}
+            : h.tunnel_hostname ? <Chip kind="warn">tunnel {h.tunnel_state}</Chip> : <Chip kind="muted">no tunnel</Chip>}
         </div>
       </header>
       <p className="muted small">
@@ -122,11 +122,11 @@ export function App() {
   const agents = useMemo(() => hosts.flatMap((h) => h.agents.map((a) => ({ agent: a, host: h.host }))), [hosts]);
   // Live sandboxes are the ones on a host; one parked in S3 is counted, not listed.
   const sandboxes = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => s.host), [fleet]);
-  // Without a host, `state` is the sandbox's own: parked in S3, waiting for a host (a new one, or
-  // one resuming), or anything else (failed, fenced, or unreadable: null), counted apart.
+  // Without a host, the sandbox's own state says where it is: parked in S3, waiting for a host (a
+  // new one, or one resuming), or anything else (failed, fenced, or unreadable), counted apart.
   const unplaced = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => !s.host), [fleet]);
-  const parked = unplaced.filter((s) => s.state === "suspended" || s.state === "archived").length;
-  const waiting = unplaced.filter((s) => s.state === "creating" || s.state === "restoring").length;
+  const parked = unplaced.filter((s) => s.sandbox_state === "suspended" || s.sandbox_state === "archived").length;
+  const waiting = unplaced.filter((s) => s.sandbox_state === "creating" || s.sandbox_state === "restoring").length;
   const other = unplaced.length - parked - waiting;
 
   return (
@@ -176,7 +176,7 @@ export function App() {
                   <td className="mono" title={s.sandbox}>{short(s.sandbox)}</td>
                   <td className="mono">{s.image ?? "—"}</td>
                   <td className="mono" title={s.host ?? ""}>{short(s.host)}</td>
-                  <td>{stateChip(s.state)}</td>
+                  <td>{stateChip(s.lease_state)}</td>
                   <td>{age(s.registered_ms, now)}</td>
                 </tr>
               ))}

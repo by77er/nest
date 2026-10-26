@@ -10,11 +10,12 @@ import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { asNestError, b64url, NestError, newId } from "../lib/util";
+import { storedEnum } from "../lib/stored";
 import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "../protocol/control";
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
-  type InjectionBinding, type Resources, type SandboxState,
+  type InjectionBinding, type Resources, SandboxState,
 } from "../protocol/model";
 
 export const DEFAULT_IMAGE = "nest-base:latest";
@@ -52,7 +53,10 @@ export interface SandboxInfo {
   /** Epoch currently being placed (FleetDO.place in flight), and since when. */
   placing: number | null;
   placing_ms: number | null;
-  /** Which host held which epoch (salvage commits are checked against it). */
+  /**
+   * The last `HISTORY_MAX` epochs and the host that held each, read from the `epochs` table (which
+   * keeps every one: salvage commits are checked against it); also saved in the blob for one release.
+   */
   history: { epoch: number; host: string }[];
   /** Host whose lease was lost, while the sandbox waits for a new placement. */
   lost_from: string | null;
@@ -91,7 +95,16 @@ const DEFAULT_SUSPEND_IDLE_MS = 11 * 60_000;
 /** At most one turn-end commit this often (docs/sandbox/state/#writeback-cadence). */
 const TURN_CHECKPOINT_MIN_MS = 10_000;
 const MAX_CREATE_ATTEMPTS = 3;
+/** How many epochs `info().history` shows; the `epochs` table keeps them all. */
 const HISTORY_MAX = 50;
+/**
+ * `commits` (the idempotency record of commit requests): a rejected request's record, or one whose
+ * generation is no longer in the chain, is dropped this long after it was made. A record whose
+ * generation is still kept stays as long as the generation (docs/data/#retention).
+ */
+const COMMIT_RECORD_RETENTION_MS = 7 * 86_400_000;
+/** Commit records are pruned from a deadline at most this often, never on the commit path. */
+const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
 /** A failed `agent_attach` is retried with this backoff (doubling), capped, for as long as the sandbox is placed. */
 const ATTACH_RETRY_MS = 2_000;
 const ATTACH_RETRY_MAX_MS = 30_000;
@@ -125,9 +138,28 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS generations (id TEXT PRIMARY KEY, record TEXT NOT NULL,
       orphaned INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS commits (request TEXT PRIMARY KEY, outcome TEXT NOT NULL)");
+    // When the request was answered (null only until the start below stamps it), and
+    // the generation it committed (null: rejected), so retention needs no JSON scan.
+    const commitCols = this.sql.exec<{ name: string }>("PRAGMA table_info(commits)").toArray().map((c) => c.name);
+    if (!commitCols.includes("created_ms")) this.sql.exec("ALTER TABLE commits ADD COLUMN created_ms INTEGER");
+    if (!commitCols.includes("generation_id")) this.sql.exec("ALTER TABLE commits ADD COLUMN generation_id TEXT");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS commits_generation ON commits (generation_id)");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS commits_rejected ON commits (created_ms) WHERE generation_id IS NULL");
+    // On every start: a record written by a release without these columns (before them, or during a
+    // rollback to one) gets its generation from its outcome, and counts its age from now, so a
+    // committed record is never mistaken for a rejected one and nothing is pruned at once.
+    this.sql.exec("UPDATE commits SET generation_id = json_extract(outcome, '$.generation.id'), created_ms = ? WHERE generation_id IS NULL AND created_ms IS NULL",
+      Date.now());
+    // Every epoch and the host that held it: salvage from any older epoch is authorized against it.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, host TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
       expires_ms INTEGER NOT NULL)`);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
+    // The blob's capped `history` is merged in on every start: it holds what a release before the
+    // table (or a rollback to one) recorded. The table never loses an epoch it already has.
+    for (const h of this.get<{ history?: { epoch: number; host: string }[] }>("info")?.history ?? []) {
+      this.sql.exec("INSERT OR IGNORE INTO epochs (epoch, host) VALUES (?, ?)", h.epoch, h.host);
+    }
   }
 
   // --- state helpers ------------------------------------------------------------------------------
@@ -149,19 +181,41 @@ export class SandboxDO extends DurableObject<Env> {
       attach_pending: [], attach_inflight: {}, attach_attempts: {},
     };
     const info = { ...defaults, ...s } as SandboxInfo;
+    info.state = storedEnum(SandboxState, info.state, "info.state");
     // Derived on every read: rows written before the naming rule hold other hostnames.
     info.ports = info.ports.map((p) => ({ port: p.port, url: this.previewUrl(info.sandbox, p.port) }));
+    info.history = this.recentEpochs();
     return info;
+  }
+
+  private recentEpochs(): { epoch: number; host: string }[] {
+    return this.sql.exec<{ epoch: number; host: string }>(
+      "SELECT epoch, host FROM epochs ORDER BY epoch DESC LIMIT ?", HISTORY_MAX).toArray().reverse();
+  }
+
+  /** `host` holds `epoch` (a placement, or an adopted lease). Kept for the sandbox's life. */
+  private recordEpoch(epoch: number, host: string): void {
+    this.sql.exec("INSERT INTO epochs (epoch, host) VALUES (?, ?) ON CONFLICT(epoch) DO UPDATE SET host = excluded.host", epoch, host);
+  }
+
+  /** The host that held `epoch`, if any did. */
+  private epochHost(epoch: number): string | undefined {
+    return this.sql.exec<{ host: string }>("SELECT host FROM epochs WHERE epoch = ?", epoch).toArray()[0]?.host;
   }
 
   private previewUrl(sandbox: string, port: number): string {
     return `https://${previewHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, sandbox)}`;
   }
 
-  /** Load, mutate and save synchronously (never across an await). */
+  /**
+   * Load, mutate and save synchronously (never across an await). The saved `history` is the
+   * table's last `HISTORY_MAX` epochs, re-read after `fn`: written for one release, so the release
+   * before the table (after a rollback) still authorizes salvage from recent epochs.
+   */
   private update(fn: (info: SandboxInfo) => void): SandboxInfo {
     const info = this.info_();
     fn(info);
+    info.history = this.recentEpochs();
     this.put("info", info);
     return info;
   }
@@ -174,7 +228,11 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Create (idempotent) and place the sandbox; the first placement grants epoch 1. */
   async create(req: CreateSandbox): Promise<SandboxInfo> {
+    // The cell's registry is the authority for which sandboxes exist (its GC roots): registered
+    // before anything can be written for the sandbox, and again on a retried create, but never
+    // again once destroyed (its registry row may already be pruned).
     const existing = this.get<SandboxInfo>("info");
+    if (existing?.state !== "destroyed") await this.fleet(req.cell).registerSandbox(req.sandbox);
     if (existing) return this.info_();
     const info: SandboxInfo = {
       sandbox: req.sandbox,
@@ -237,7 +295,7 @@ export class SandboxDO extends DurableObject<Env> {
         i.state = lease.state ?? (i.head ? "restoring" : "creating");
         i.guest = lease.guest;
         i.lost_from = null;
-        i.history = [...i.history, { epoch, host: lease.host }].slice(-HISTORY_MAX);
+        this.recordEpoch(epoch, lease.host);
         adopted = lease.host;
       }
     });
@@ -314,7 +372,7 @@ export class SandboxDO extends DurableObject<Env> {
         i.host = host;
         i.state = from ? "restoring" : "creating";
         i.lost_from = null;
-        i.history = [...i.history, { epoch, host }].slice(-HISTORY_MAX);
+        this.recordEpoch(epoch, host);
       }
     });
     if (failure !== null) {
@@ -587,8 +645,7 @@ export class SandboxDO extends DurableObject<Env> {
       // without one would restore without memory.
       outcome = rejected(ErrorCodes.INVALID_MESSAGE);
     } else if (ev.reason === "salvage" && ev.epoch < info.epoch) {
-      const held = info.history.find((h) => h.epoch === ev.epoch);
-      if (!held || held.host !== host) {
+      if (this.epochHost(ev.epoch) !== host) {
         outcome = rejected(ErrorCodes.STALE_EPOCH);
       } else {
         orphan = record();
@@ -609,7 +666,9 @@ export class SandboxDO extends DurableObject<Env> {
       });
       outcome = { status: "committed", generation };
     }
-    this.sql.exec("INSERT INTO commits (request, outcome) VALUES (?, ?)", ev.request, JSON.stringify(outcome));
+    this.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES (?, ?, ?, ?)",
+      ev.request, JSON.stringify(outcome), Date.now(), outcome.status === "rejected" ? null : outcome.generation.id);
+    await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
     if (orphan) {
       await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(info.workstream)).ingest({
         workstream: info.workstream,
@@ -622,6 +681,26 @@ export class SandboxDO extends DurableObject<Env> {
       });
     }
     return outcome;
+  }
+
+  /**
+   * Retention of the idempotency records (docs/data/#retention): a record past
+   * `COMMIT_RECORD_RETENTION_MS` goes unless its generation is still in the chain. nestd asks again
+   * with an unanswered request's id before its next commit, which may be days later: a committed
+   * request finds its record while the generation is kept, and any other meets the compare-and-set
+   * again, against the current epoch and head, as a new request would.
+   */
+  private async pruneCommitRecords(): Promise<void> {
+    const cutoff = Date.now() - COMMIT_RECORD_RETENTION_MS;
+    // Rejected requests (the partial index), then records whose generation left the chain.
+    this.sql.exec("DELETE FROM commits WHERE generation_id IS NULL AND created_ms < ?", cutoff);
+    this.sql.exec(`DELETE FROM commits WHERE generation_id IS NOT NULL AND created_ms < ?
+      AND NOT EXISTS (SELECT 1 FROM generations g WHERE g.id = commits.generation_id)`, cutoff);
+    // Again when the oldest rejected record left ages out (a commit arms it sooner, hourly).
+    const oldest = this.sql.exec<{ at: number | null }>("SELECT MIN(created_ms) AS at FROM commits WHERE generation_id IS NULL").toArray()[0]?.at;
+    if (oldest !== null && oldest !== undefined) {
+      await this.deadlines.set("commit_prune", Math.max(oldest + COMMIT_RECORD_RETENTION_MS, Date.now() + COMMIT_PRUNE_INTERVAL_MS), true);
+    }
   }
 
   // --- egress policy --------------------------------------------------------------------------------
@@ -695,6 +774,8 @@ export class SandboxDO extends DurableObject<Env> {
         }
       } else if (key === "attach_retry") {
         await this.reissuePendingAttaches(false);
+      } else if (key === "commit_prune") {
+        await this.pruneCommitRecords();
       } else if (key === "notify_moved") {
         await this.sendMoveNotices();
       }
