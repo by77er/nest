@@ -92,6 +92,7 @@ pub fn handle(rt: &Arc<Runtime>, cmd: RunnerCommand) {
         RunnerCommand::AgentStop { agent, mode, reason } => {
             tracing::info!(%agent, ?mode, %reason, "agent_stop");
             if let Some(a) = rt.agent(&agent) {
+                a.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
                 match mode {
                     StopMode::Kill => a.kill_now(ExitReason::Stopped),
                     StopMode::Graceful if a.pid.load(std::sync::atomic::Ordering::SeqCst) == 0 => {

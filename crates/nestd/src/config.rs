@@ -54,6 +54,15 @@ pub struct Config {
     /// Where generations (disk and memory chunks, manifests) go.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// nestd's systemd unit delegates its cgroup (`Delegate=yes`): at start nestd moves itself into
+    /// the leaf `<own>/supervisor` and starts jailed VMMs under `<own>/vms`, so stopping or
+    /// restarting the unit kills every VMM with it (`cgroup.rs`). Off: the jailer's default parent
+    /// cgroup (outside the unit), where only nestd's start-up kill reaches leftovers.
+    #[serde(default)]
+    pub delegated_cgroup: bool,
+    /// The cgroup v2 mount (tests point it elsewhere).
+    #[serde(default = "default_cgroup_root")]
+    pub cgroup_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -224,11 +233,20 @@ impl Config {
         let rel = Path::new(well_known).strip_prefix(paths::RUN_DIR).expect("a socket path under paths::RUN_DIR");
         self.run_dir.join(rel)
     }
-    pub fn vm_dir(&self, sandbox: &str) -> PathBuf {
-        self.run_dir.join("vm").join(sandbox)
+    /// Per-VM runtime directory (sockets), one per incarnation: `<run_dir>/vm/<sandbox>/<epoch>`.
+    pub fn vm_dir(&self, sandbox: &str, epoch: u64) -> PathBuf {
+        self.vms_dir().join(sandbox).join(epoch.to_string())
     }
-    pub fn sandbox_state_dir(&self, sandbox: &str) -> PathBuf {
-        self.state_dir.join("sandboxes").join(sandbox)
+    pub fn vms_dir(&self) -> PathBuf {
+        self.run_dir.join("vm")
+    }
+    /// One incarnation's state (disk, `meta.json`, snapshot): `<state_dir>/sandboxes/<sandbox>/<epoch>`.
+    /// Incarnations never share files, so a newer epoch never waits on, or overwrites, an older one.
+    pub fn sandbox_state_dir(&self, sandbox: &str, epoch: u64) -> PathBuf {
+        self.sandboxes_dir().join(sandbox).join(epoch.to_string())
+    }
+    pub fn sandboxes_dir(&self) -> PathBuf {
+        self.state_dir.join("sandboxes")
     }
     pub fn agents_dir(&self) -> PathBuf {
         self.state_dir.join("agents")
@@ -244,6 +262,9 @@ impl Config {
 
 fn default_run_dir() -> PathBuf {
     paths::RUN_DIR.into()
+}
+fn default_cgroup_root() -> PathBuf {
+    "/sys/fs/cgroup".into()
 }
 fn default_state_dir() -> PathBuf {
     "/var/lib/nest".into()

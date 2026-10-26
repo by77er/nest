@@ -254,6 +254,8 @@ pub struct Agent {
     pub pid: AtomicU32,
     /// Cancelled by any kill/stop: aborts startup steps and tells the actor.
     pub cancel: CancellationToken,
+    /// An `agent_stop` reached this brain: it is on its way out, and a later start must not adopt it.
+    pub stopping: std::sync::atomic::AtomicBool,
     kill_reason: Mutex<Option<ExitReason>>,
     pub inner: Mutex<AgentInner>,
     epoch: AtomicU64,
@@ -295,6 +297,7 @@ impl Agent {
             conn_gen,
             pid: AtomicU32::new(0),
             cancel: CancellationToken::new(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             kill_reason: Mutex::new(None),
             inner: Mutex::new(AgentInner { hands, session, ..Default::default() }),
             epoch: AtomicU64::new(epoch.0),
@@ -334,6 +337,11 @@ impl Agent {
     }
 
     /// First kill reason recorded by [`Agent::kill_now`].
+    /// Told to stop, or being killed: never adopted by a later start (which waits for it instead).
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || self.kill_reason().is_some()
+    }
+
     pub fn kill_reason(&self) -> Option<ExitReason> {
         *self.kill_reason.lock().unwrap()
     }

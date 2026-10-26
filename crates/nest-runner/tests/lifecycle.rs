@@ -200,3 +200,25 @@ async fn timed_out_platform_calls_are_abandoned_and_not_retryable() {
     }
     assert!(sent.is_some() && sent == abandoned);
 }
+
+/// A brain told to stop is never adopted by a later start: the start ends it and a new brain
+/// registers (a fresh instance), instead of the stopping one taking the new epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_for_a_stopping_brain_replaces_it_instead_of_adopting_it() {
+    let e = env();
+    let id = AgentId("agt_stopping".into());
+    nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_stopping", &[]));
+    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    let first = e.rt.agent(&id).expect("registered");
+    let pid = pids(e.dir.path())[0];
+    nest_runner::supervisor::handle(
+        &e.rt,
+        RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "stop".into() },
+    );
+    assert!(first.is_stopping());
+    nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_stopping", &[]));
+    wait_for("the stopping brain gone", || !alive(pid)).await;
+    wait_for("a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
+    let evs = events(&e.rt, Duration::from_millis(300)).await;
+    assert!(!evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "already_running")), "{evs:?}");
+}

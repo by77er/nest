@@ -57,6 +57,8 @@ struct FakeDriver {
     fail_next_start: Arc<AtomicBool>,
     /// Sandboxes whose VM was stopped, in order.
     stopped: Arc<Mutex<Vec<String>>>,
+    /// Lock-free pauses, as (sandbox, epoch).
+    paused: Arc<Mutex<Vec<(String, u64)>>>,
 }
 
 #[async_trait]
@@ -66,7 +68,12 @@ impl Driver for FakeDriver {
     }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         std::fs::create_dir_all(&spec.vm_dir)?;
+        // Never gets to a VM (the test kills the process meanwhile).
+        if spec.sandbox.0.starts_with("sbx_hang") {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
         Ok(Box::new(FakeVm {
+            paused: self.paused.clone(),
             spec,
             seen: self.seen.clone(),
             latch: self.latch.clone(),
@@ -79,6 +86,7 @@ impl Driver for FakeDriver {
 }
 
 struct FakeVm {
+    paused: Arc<Mutex<Vec<(String, u64)>>>,
     spec: VmSpec,
     seen: Seen,
     latch: Option<Arc<AttachLatch>>,
@@ -88,8 +96,21 @@ struct FakeVm {
     guest: Option<tokio::task::JoinHandle<()>>,
 }
 
+struct FakePauser(Arc<Mutex<Vec<(String, u64)>>>, String, u64);
+
+#[async_trait]
+impl nestd::driver::Pauser for FakePauser {
+    async fn pause(&self) -> std::io::Result<()> {
+        self.0.lock().unwrap().push((self.1.clone(), self.2));
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Vm for FakeVm {
+    fn pauser(&self) -> Option<Arc<dyn nestd::driver::Pauser>> {
+        Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0)))
+    }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
     }
@@ -239,6 +260,11 @@ struct MockFleet {
     fail_next_events: Arc<AtomicBool>,
     /// Lose this many `commit_result` answers (the commit itself is applied, as SandboxDO would).
     lose_commit_answers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Answer new salvage requests `rejected` with this reason (`parent_mismatch`: transient;
+    /// `stale_epoch`: SandboxDO's final word).
+    reject_salvage: Arc<Mutex<Option<String>>>,
+    /// Answer new salvage requests `committed` (the host still held that epoch), not `orphaned`.
+    commit_salvage: Arc<AtomicBool>,
 }
 
 const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
@@ -252,9 +278,11 @@ async fn mock_fleet() -> MockFleet {
     let partition = Arc::new(AtomicBool::new(false));
     let fail_next_events = Arc::new(AtomicBool::new(false));
     let lose_commit_answers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (reject_salvage, commit_salvage) = (Arc::new(Mutex::new(None::<String>)), Arc::new(AtomicBool::new(false)));
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<Command>>();
     let (ftx, mut frx) = mpsc::unbounded_channel::<FleetToHost>();
     let (log2, part, fail, lose) = (log.clone(), partition.clone(), fail_next_events.clone(), lose_commit_answers.clone());
+    let (reject, commit_s) = (reject_salvage.clone(), commit_salvage.clone());
     tokio::spawn(async move {
         let mut seq = 0u64;
         let mut last_event_seq: Option<u64> = None;
@@ -324,7 +352,13 @@ async fn mock_fleet() -> MockFleet {
                                             kind: *kind, disk_manifest: disk_manifest.clone(), mem_manifest: mem_manifest.clone(), reason: *reason, created_ms: 0,
                                         };
                                         let outcome = outcomes.entry(request.clone()).or_insert_with(|| {
-                                            if *reason == CommitReason::Salvage {
+                                            let rejection = reject.lock().unwrap().clone();
+                                            if let (CommitReason::Salvage, Some(why)) = (reason, rejection) {
+                                                CommitOutcome::Rejected { reason: why, head: heads.get(sandbox).cloned() }
+                                            } else if *reason == CommitReason::Salvage && commit_s.load(Ordering::SeqCst) {
+                                                heads.insert(sandbox.clone(), generation.id.clone());
+                                                CommitOutcome::Committed { generation }
+                                            } else if *reason == CommitReason::Salvage {
                                                 CommitOutcome::Orphaned { generation }
                                             } else if parent.as_ref() != heads.get(sandbox) {
                                                 CommitOutcome::Rejected { reason: "parent_mismatch".into(), head: heads.get(sandbox).cloned() }
@@ -359,7 +393,7 @@ async fn mock_fleet() -> MockFleet {
             }
         }
     });
-    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events, lose_commit_answers }
+    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events, lose_commit_answers, reject_salvage, commit_salvage }
 }
 
 impl MockFleet {
@@ -468,6 +502,10 @@ async fn fake_gateway(path: &Path) -> FakeGateway {
             if matches!(cmd, GatewayCommand::Ping) {
                 let _ = f.send(bytes::Bytes::from(serde_json::to_vec(&GatewayEvent::Pong).unwrap())).await;
             }
+            if let GatewayCommand::ClientFloor { sandbox, client, agent_epoch } = &cmd {
+                let ev = GatewayEvent::FloorApplied { sandbox: sandbox.clone(), client: client.clone(), agent_epoch: *agent_epoch };
+                let _ = f.send(bytes::Bytes::from(serde_json::to_vec(&ev).unwrap())).await;
+            }
             got2.lock().unwrap().push(cmd);
         }
     });
@@ -530,7 +568,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let run_dir = dir.path().join("run");
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
     let runner = fake_runner(&run_dir.join("runner.sock")).await;
     let proxy = fake_proxy(run_dir.join("proxy.sock"));
     let gw = fake_gateway(&run_dir.join("gateway.sock")).await;
@@ -630,12 +668,12 @@ async fn host_lifecycle_commit_and_self_fence() {
     }
     let attaches: Vec<u16> = seen.lock().unwrap().iter().filter_map(|b| match b { ControlBody::AgentAttach { slot } => Some(slot.proxy_port), _ => None }).collect();
     assert_eq!(attaches, vec![3128, 3128], "re-attach reuses the slot; the stale attach never reaches the guest");
-    // A new brain start re-sends the attach with its agent epoch: the gateway gets the floor.
+    // A new placement's attach carries the agent's floor: in effect at the gateway with the slot.
     let floor = cmd("cmd_attach_floor", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None, agent_epoch: Some(Epoch(3)) });
     fleet.commands.send(vec![floor]).unwrap();
     assert!(matches!(fleet.result("cmd_attach_floor").await, CommandOutcome::Ok { .. }));
-    wait_until("gateway learns the agent epoch floor", || matches!(upserts(&gateway.lock().unwrap()).last(),
-        Some(GatewayCommand::SandboxUpsert { client_floors, .. }) if client_floors.get("agt_w") == Some(&Epoch(3)))).await;
+    assert!(gateway.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::ClientFloor { client, agent_epoch: Epoch(3), .. } if client == "agt_w")),
+        "the floor reached the gateway before the attach's ok");
 
     // 2b. Guest CLI relay: `nest ask` → guest_cli event → guest_cli_result command → cli_result to the guest.
     let request = match fleet.wait_event("guest cli", |b| matches!(b, HostEventBody::GuestCli { .. })).await {
@@ -682,6 +720,12 @@ async fn host_lifecycle_commit_and_self_fence() {
     fleet.commands.send(vec![attach("cmd_attach3", 1, None)]).unwrap();
     assert!(matches!(fleet.result("cmd_attach3").await, CommandOutcome::Ok { .. }));
 
+    // The guest writes after the checkpoint: work the commit doesn't cover (salvage, below, skips
+    // a disk that still matches its head).
+    let mut disk = std::fs::OpenOptions::new().append(true).open(dir.path().join("state/sandboxes/sbx_1/1/disk.img")).unwrap();
+    std::io::Write::write_all(&mut disk, b"after the checkpoint").unwrap();
+    drop(disk);
+
     // 5. Partition: the host self-fences ~500 ms after the last acknowledged heartbeat (locally:
     // proxy drop + runner fence + gateway remove), then reports it all once the partition heals.
     let t0 = std::time::Instant::now();
@@ -697,7 +741,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     assert_eq!(fences, 1, "self-fence must fence the runner once");
     fleet.partition.store(false, Ordering::SeqCst);
     fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
-    // The sandbox was dirty again after the checkpoint (it resumed running): salvage is offered.
+    // The disk changed after the checkpoint: salvage is offered.
     fleet.wait_event("salvage", |b| matches!(b, HostEventBody::CommitRequest { reason: CommitReason::Salvage, .. })).await;
 
     // Every command got exactly one result per delivery.
@@ -729,7 +773,7 @@ impl Driver for NetnsCapture {
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         *self.0.lock().unwrap() = spec.netns.clone();
         std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), emu: None, guest: None }))
+        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default(), emu: None, guest: None }))
     }
 }
 
@@ -859,6 +903,10 @@ struct Started {
     seen: Seen,
     /// Sandboxes whose VM was stopped.
     stopped: Arc<Mutex<Vec<String>>>,
+    /// Set it to make the next VM start fail.
+    fail_next_start: Arc<AtomicBool>,
+    /// Lock-free pauses, as (sandbox, epoch).
+    paused: Arc<Mutex<Vec<(String, u64)>>>,
 }
 
 async fn start_host() -> Started {
@@ -882,13 +930,15 @@ async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
     let (seen, stopped): (Seen, Arc<Mutex<Vec<String>>>) = (Arc::default(), Arc::default());
-    let driver = FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default(), stopped: stopped.clone() };
+    let fail_next_start: Arc<AtomicBool> = Arc::default();
+    let paused: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
+    let driver = FakeDriver { seen: seen.clone(), latch: None, fail_next_start: fail_next_start.clone(), stopped: stopped.clone(), paused: paused.clone() };
     let host = Host::start(cfg, enrolled, Some(Arc::new(driver))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
-    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped }
+    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped, fail_next_start, paused }
 }
 
 /// Whether `pid` is still a live process (a zombie counts as dead: it has been killed).
@@ -992,7 +1042,7 @@ async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
     // The configured user: the test's own, the only one an unprivileged test can switch to.
     let me = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
     let cfg = tunnel_config_with_metrics(dir.path(), &fleet.url, &bin, Some(me), &metrics);
-    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("cloudflared spawned", || log.exists()).await;
@@ -1020,7 +1070,7 @@ async fn a_missing_cloudflared_binary_is_logged_and_does_not_stop_the_host() {
     let fleet = mock_fleet().await;
     let bin = dir.path().join("no-such-cloudflared");
     let cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
-    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
@@ -1046,7 +1096,7 @@ async fn a_failed_start_leaves_no_tunnel_child() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
     cfg.run_dir = "/proc/no-such-dir/run".into();
-    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.err().unwrap();
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.err().unwrap();
     assert!(!err.to_string().contains("cloudflared"), "the failure is elsewhere: {err:#}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!log.exists(), "cloudflared was started although the host did not");
@@ -1058,7 +1108,7 @@ async fn an_unknown_cloudflared_user_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg = tunnel_config(dir.path(), &fleet.url, Path::new("/opt/nest/bin/cloudflared"), Some("no-such-user-nest".into()));
-    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.err().unwrap();
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.err().unwrap();
     assert!(err.to_string().contains("no-such-user-nest"), "{err}");
 }
 
@@ -1095,7 +1145,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let latch = Arc::new(AttachLatch::default());
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
@@ -1142,7 +1192,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let fail = Arc::new(AtomicBool::new(true));
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: fail.clone(), stopped: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: fail.clone(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
@@ -1277,8 +1327,9 @@ async fn proxy_ca_is_renewed_before_expiry() {
     .await;
 }
 
-/// Review #17: a newer-epoch create of a sandbox that still has uncommitted work here salvages
-/// that work (sibling branch) before the new incarnation reuses the disk.
+/// Review #17, revised for per-incarnation directories: a newer-epoch create of a sandbox that
+/// still has uncommitted work here doesn't wait for it: the old incarnation is salvaged (sibling
+/// branch) in the background from its own directory, then deleted, and the new one's is untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn newer_epoch_create_salvages_old_work_first() {
     let h = start_host().await;
@@ -1290,16 +1341,10 @@ async fn newer_epoch_create_salvages_old_work_first() {
     }
     h.fleet.commands.send(vec![c2]).unwrap();
     assert!(matches!(h.fleet.result("cmd_2").await, CommandOutcome::Ok { .. }));
-    let events = h.fleet.log.lock().unwrap().events.clone();
-    let salvage = events
-        .iter()
-        .position(|e| matches!(&e.body, HostEventBody::CommitRequest { reason: CommitReason::Salvage, epoch: Epoch(1), .. }))
-        .expect("old epoch's work salvaged");
-    let running2 = events
-        .iter()
-        .position(|e| matches!(&e.body, HostEventBody::SandboxState { state: SandboxState::Running, epoch: Epoch(2), .. }))
-        .unwrap();
-    assert!(salvage < running2);
+    h.fleet.wait_event("old epoch's work salvaged", |b| matches!(b, HostEventBody::CommitRequest { reason: CommitReason::Salvage, epoch: Epoch(1), .. })).await;
+    let state = h.dir.path().join("state/sandboxes/sbx_m");
+    wait_until("the old incarnation deleted", || !state.join("1").exists()).await;
+    assert!(state.join("2/disk.img").exists() && state.join("2/meta.json").exists(), "the new incarnation's directory");
 }
 
 fn nestd_now_ms() -> i64 {
@@ -1330,30 +1375,40 @@ fn last_gateway_word(g: &FakeGateway, sandbox: &str) -> Option<GatewayCommand> {
 }
 
 /// nestd review #2: a fence stops the VM at once (its memory goes back to the host) and keeps
-/// only the disk, which salvage reads. `sandbox_destroy` at the fenced (old) epoch then reaps the
-/// rest: the disk, and the `fenced` row every hello would otherwise report forever.
+/// only the disk, which salvage reads; once the salvage lands the disk goes too, and nestd says so
+/// (`fenced` with `dirty: false`, so FleetDO doesn't wait out the salvage window). The clean
+/// `fenced` row stays in every hello until `sandbox_destroy` at that (old) epoch removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_stops_the_vm_and_a_destroy_at_the_old_epoch_reaps_it() {
     let h = start_host().await;
     let sbx = SandboxId("sbx_1".into());
     h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_create").await));
-    let disk = h.dir.path().join("state/sandboxes/sbx_1/disk.img");
+    let disk = h.dir.path().join("state/sandboxes/sbx_1/1/disk.img");
     assert!(disk.exists());
 
     h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
     h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
     wait_until("the fenced VM is stopped", || h.stopped.lock().unwrap().contains(&"sbx_1".to_string())).await;
     h.fleet.wait_event("salvage", |b| matches!(b, HostEventBody::CommitRequest { reason: CommitReason::Salvage, .. })).await;
-    assert!(disk.exists(), "the disk stays until destroy");
+    h.fleet.wait_event("reported clean", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+    assert!(!disk.parent().unwrap().exists(), "the salvaged incarnation's directory is gone");
+
+    // The row stays, clean, until the destroy.
+    let reconnect = |id: &str| {
+        let n = h.fleet.log.lock().unwrap().hellos.len();
+        h.fleet.fail_next_events.store(true, Ordering::SeqCst);
+        h.fleet.commands.send(vec![cmd(id, CommandBody::PortUnexpose { sandbox: SandboxId("sbx_none".into()), epoch: Epoch(1), port: 1 })]).unwrap();
+        n
+    };
+    let n = reconnect("cmd_poke");
+    wait_until("reconnect", || h.fleet.log.lock().unwrap().hellos.len() > n).await;
+    let hello = h.fleet.log.lock().unwrap().hellos.last().cloned().unwrap();
+    assert!(matches!(hello.sandboxes.as_slice(), [r] if r.state == SandboxState::Fenced && !r.dirty), "{:?}", hello.sandboxes);
 
     h.fleet.commands.send(vec![cmd("cmd_destroy", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_destroy").await));
-    assert!(!disk.parent().unwrap().exists(), "the fenced incarnation's state dir is gone");
-    // The next hello reports nothing for it.
-    let n = h.fleet.log.lock().unwrap().hellos.len();
-    h.fleet.fail_next_events.store(true, Ordering::SeqCst);
-    h.fleet.commands.send(vec![cmd("cmd_destroy_again", CommandBody::SandboxDestroy { sandbox: sbx, epoch: Epoch(1) })]).unwrap();
+    let n = reconnect("cmd_poke_2");
     wait_until("reconnect", || h.fleet.log.lock().unwrap().hellos.len() > n).await;
     let hello = h.fleet.log.lock().unwrap().hellos.last().cloned().unwrap();
     assert!(hello.sandboxes.is_empty(), "a destroyed fenced sandbox is still reported: {:?}", hello.sandboxes);
@@ -1375,7 +1430,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     }))
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::default(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::default(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
     let sock = dir.path().join("run/runner.sock");
     let connect = || async {
@@ -1546,6 +1601,455 @@ fn an_attach_without_a_guest_binds_no_listener() {
     });
 }
 
+// ---------------------------------------------------------------------------------------------
+// After a nestd restart (nestd review #7), retiring incarnations, and the tombstones (#12)
+// ---------------------------------------------------------------------------------------------
+
+fn harness_config(dir: &Path, fleet_url: &str, commit_timeout_ms: u64) -> Config {
+    serde_json::from_value(serde_json::json!({
+        "role": "burst", "cell": "test-cell",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet_url},
+        "run_dir": dir.join("run"), "state_dir": dir.join("state"),
+        "driver": {"type": "process", "guest_command": ["unused"]},
+        "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": commit_timeout_ms,
+    }))
+    .unwrap()
+}
+
+fn harness_enrolled(fleet_url: &str) -> Enrolled {
+    Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet_url.into(), proxy_ca: None, tunnel_token: None, gateway_url: None }
+}
+
+/// One nestd process on `dir` against `fleet`, with its fake peers, after its first hello.
+/// `driver: None` runs the process driver from the config.
+struct Proc {
+    host: Host,
+    fleet: MockFleet,
+    _runner: Arc<Mutex<Vec<RunnerCommand>>>,
+    _proxy: Arc<Mutex<Vec<ProxyCommand>>>,
+    _gw: FakeGateway,
+}
+
+async fn nestd_process(dir: &Path, fleet: MockFleet, commit_timeout_ms: u64, driver: Option<Arc<dyn Driver>>) -> Proc {
+    let host = Host::start(harness_config(dir, &fleet.url, commit_timeout_ms), harness_enrolled(&fleet.url), driver).await.unwrap();
+    let _runner = fake_runner(&dir.join("run/runner.sock")).await;
+    let _proxy = fake_proxy(dir.join("run/proxy.sock"));
+    let _gw = fake_gateway(&dir.join("run/gateway.sock")).await;
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    Proc { host, fleet, _runner, _proxy, _gw }
+}
+
+fn fake_driver() -> Arc<dyn Driver> {
+    Arc::new(FakeDriver { seen: Arc::default(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() })
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
+}
+
+fn sandbox_meta(dir: &Path, sandbox: &str, epoch: u64) -> nestd::recovery::SandboxMeta {
+    nestd::recovery::read_meta(&dir.join("state/sandboxes").join(sandbox).join(epoch.to_string())).expect("meta.json")
+}
+
+fn append_to_disk(dir: &Path, sandbox: &str, epoch: u64, what: &[u8]) {
+    let path = dir.join("state/sandboxes").join(sandbox).join(epoch.to_string()).join("disk.img");
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut f, what).unwrap();
+}
+
+fn create_at(id: &str, sandbox: &str, epoch: u64) -> Command {
+    let mut c = create(id, sandbox);
+    if let CommandBody::SandboxCreate { epoch: e, .. } = &mut c.body {
+        *e = Epoch(epoch);
+    }
+    c
+}
+
+fn error_code(o: &CommandOutcome) -> Option<(String, bool)> {
+    match o {
+        CommandOutcome::Error { error } => Some((error.code.clone(), error.retryable)),
+        CommandOutcome::Ok { .. } => None,
+    }
+}
+
+/// Every salvage `commit_request` for `sandbox@epoch` logged so far: its request id, in order.
+fn salvage_requests(fleet: &MockFleet, sandbox: &str, epoch: u64) -> Vec<RequestId> {
+    fleet
+        .log
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|e| match &e.body {
+            HostEventBody::CommitRequest { request, sandbox: s, epoch: ep, reason: CommitReason::Salvage, .. } if s.0 == sandbox && ep.0 == epoch => Some(request.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn distinct(ids: &[RequestId]) -> usize {
+    ids.iter().collect::<std::collections::BTreeSet<_>>().len()
+}
+
+async fn checkpoint(fleet: &MockFleet, id: &str, sandbox: &str, epoch: u64) -> GenerationId {
+    fleet.commands.send(vec![cmd(id, CommandBody::SandboxCheckpoint { sandbox: SandboxId(sandbox.into()), epoch: Epoch(epoch), reason: CommitReason::TurnEnd })]).unwrap();
+    match fleet.result(id).await {
+        CommandOutcome::Ok { detail: Some(d) } => GenerationId(d["generation"].as_str().unwrap().into()),
+        other => panic!("checkpoint: {other:?}"),
+    }
+}
+
+/// Make the fleet connection drop and come back (a failed events batch), and return the next hello.
+async fn next_hello(fleet: &MockFleet, poke: &str) -> HostHello {
+    let n = fleet.log.lock().unwrap().hellos.len();
+    fleet.fail_next_events.store(true, Ordering::SeqCst);
+    fleet.commands.send(vec![cmd(poke, CommandBody::PortUnexpose { sandbox: SandboxId("sbx_none".into()), epoch: Epoch(1), port: 1 })]).unwrap();
+    wait_until("reconnect", || fleet.log.lock().unwrap().hellos.len() > n).await;
+    fleet.log.lock().unwrap().hellos.last().cloned().unwrap()
+}
+
+/// nestd review #7 (and the review of its fix: M1, L2). Three nestd processes on one state
+/// directory, each dying with its runtime (every task and VM with it):
+///
+/// 1. The first leaves three sandboxes: one suspended (its `meta.json` says the disk equals its
+///    head; resume clears that, the next suspend sets it again), one written to after its last
+///    commit, and one unchanged since a commit whose head carries memory (as after a memory
+///    suspend that was resumed).
+/// 2. The second deletes the suspended one, and one whose create died before its VM started,
+///    without reporting them (FleetDO evicts or re-places them, as before), and removes a directory
+///    without `meta.json` and an older nestd's flat layout, all before its first hello. That hello reports the other two `fenced`. The unchanged one has
+///    nothing to salvage (its head's memory doesn't matter) and is deleted and reported clean; the
+///    changed one's salvage request is sent, its answer lost, and the process dies waiting.
+/// 3. The third asks again under the same request id (from `meta.json`), deletes it once
+///    answered, reports it clean, and keeps the epoch tombstoned until a destroy.
+///
+/// Evidence: the nestd harness. The first process boots the fake guest behind the vsock emulator;
+/// the others run the process driver from their config and boot nothing. No VM, no Firecracker.
+#[test]
+fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state/sandboxes");
+
+    let rt1 = runtime();
+    let heads: BTreeMap<String, GenerationId> = rt1.block_on(async {
+        let p = nestd_process(dir.path(), mock_fleet().await, 5000, Some(fake_driver())).await;
+        let f = &p.fleet;
+        let suspend = |id: &str| cmd(id, CommandBody::SandboxSuspend { sandbox: SandboxId("sbx_clean".into()), epoch: Epoch(1), mode: SuspendMode::DiskOnly });
+        f.commands.send(vec![create("cmd_c_clean", "sbx_clean")]).unwrap();
+        assert!(is_ok(&f.result("cmd_c_clean").await));
+        assert!(!sandbox_meta(dir.path(), "sbx_clean", 1).clean, "a running disk is never clean");
+        f.commands.send(vec![suspend("cmd_s1")]).unwrap();
+        assert!(is_ok(&f.result("cmd_s1").await));
+        assert!(sandbox_meta(dir.path(), "sbx_clean", 1).clean, "suspended: the disk equals its head");
+        f.commands.send(vec![cmd("cmd_r1", CommandBody::SandboxResume { sandbox: SandboxId("sbx_clean".into()), epoch: Epoch(1) })]).unwrap();
+        assert!(is_ok(&f.result("cmd_r1").await));
+        assert!(!sandbox_meta(dir.path(), "sbx_clean", 1).clean, "resumed: a VM writes to the disk again");
+        f.commands.send(vec![suspend("cmd_s2")]).unwrap();
+        assert!(is_ok(&f.result("cmd_s2").await));
+        assert!(sandbox_meta(dir.path(), "sbx_clean", 1).clean);
+
+        let mut heads = BTreeMap::new();
+        for sbx in ["sbx_dirty", "sbx_memhead"] {
+            f.commands.send(vec![create(&format!("cmd_c_{sbx}"), sbx)]).unwrap();
+            assert!(is_ok(&f.result(&format!("cmd_c_{sbx}")).await));
+            let m = sandbox_meta(dir.path(), sbx, 1);
+            assert_eq!((m.version, m.epoch, m.head.is_none()), (nestd::recovery::META_VERSION, Epoch(1), true), "meta.json once the disk is ready");
+            let g = checkpoint(f, &format!("cmd_k_{sbx}"), sbx, 1).await;
+            assert_eq!(sandbox_meta(dir.path(), sbx, 1).head.map(|h| h.id), Some(g.clone()), "meta.json follows the head");
+            heads.insert(sbx.to_string(), g);
+        }
+        append_to_disk(dir.path(), "sbx_dirty", 1, b"uncommitted work");
+        // A create that dies before its VM starts: the disk is still the untouched base.
+        f.commands.send(vec![create("cmd_c_hang", "sbx_hang")]).unwrap();
+        wait_until("the hanging create's disk", || state.join("sbx_hang/1/meta.json").exists()).await;
+        assert!(sandbox_meta(dir.path(), "sbx_hang", 1).clean, "no VM has run on it");
+        let inc = state.join("sbx_memhead/1");
+        let mut m = nestd::recovery::read_meta(&inc).unwrap();
+        let head = m.head.as_mut().unwrap();
+        head.kind = GenerationKind::Checkpoint;
+        head.mem_manifest = Some(ManifestHash(format!("blake3:{}", "2".repeat(64))));
+        nestd::recovery::write_meta(&inc, &m).unwrap();
+        drop(p);
+        heads
+    });
+    rt1.shutdown_timeout(Duration::from_secs(2)); // the process is gone
+    assert!(dir.path().join("run/vm/sbx_dirty/1").exists(), "the dead process's VM runtime directory");
+    std::fs::create_dir_all(state.join("sbx_junk/1")).unwrap();
+    std::fs::write(state.join("sbx_junk/1/disk.img"), b"half restored").unwrap();
+    std::fs::create_dir_all(state.join("sbx_flat")).unwrap();
+    std::fs::write(state.join("sbx_flat/disk.img"), b"an older nestd's").unwrap();
+
+    let rt2 = runtime();
+    let lost: RequestId = rt2.block_on(async {
+        let fleet = mock_fleet().await;
+        fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+        let p = nestd_process(dir.path(), fleet, 5000, None).await;
+        for gone in ["sbx_clean", "sbx_hang", "sbx_junk", "sbx_flat"] {
+            assert!(!state.join(gone).exists(), "{gone} is still there after start");
+        }
+        assert!(!dir.path().join("run/vm/sbx_dirty").exists(), "VM runtime directories are swept at start");
+        let hello = p.fleet.log.lock().unwrap().hellos[0].clone();
+        let reported: Vec<(String, Epoch, SandboxState, Option<GenerationId>)> = hello.sandboxes.iter().map(|s| (s.sandbox.0.clone(), s.epoch, s.state, s.head.clone())).collect();
+        assert_eq!(
+            reported,
+            vec![
+                ("sbx_dirty".into(), Epoch(1), SandboxState::Fenced, Some(heads["sbx_dirty"].clone())),
+                ("sbx_memhead".into(), Epoch(1), SandboxState::Fenced, Some(heads["sbx_memhead"].clone())),
+            ],
+            "the first hello reports the incarnations with possible work as fenced, and nothing else"
+        );
+        assert!(hello.sandboxes[0].dirty);
+
+        p.fleet.wait_event("the unchanged one reported clean", |b| matches!(b, HostEventBody::IncarnationRetired { sandbox, .. } if sandbox.0 == "sbx_memhead")).await;
+        assert!(!state.join("sbx_memhead").exists());
+        assert!(salvage_requests(&p.fleet, "sbx_memhead", 1).is_empty(), "a disk equal to its head's has nothing to salvage");
+        wait_until("the changed one's salvage", || !salvage_requests(&p.fleet, "sbx_dirty", 1).is_empty()).await;
+        let sent = salvage_requests(&p.fleet, "sbx_dirty", 1)[0].clone();
+        let HostEventBody::CommitRequest { parent, .. } = p.fleet.wait_event("salvage", |b| matches!(b, HostEventBody::CommitRequest { .. })).await else { unreachable!() };
+        assert_eq!(parent, Some(heads["sbx_dirty"].clone()), "a sibling of the head meta.json names");
+        assert_eq!(sandbox_meta(dir.path(), "sbx_dirty", 1).unanswered.map(|u| u.request), Some(sent.clone()), "the request is on disk before its answer");
+        let claimed = p.fleet.log.lock().unwrap().claims.iter().flatten().any(|c| c.sandbox.0.starts_with("sbx_"));
+        assert!(!claimed, "a heartbeat claimed a lease for a dead incarnation");
+        drop(p);
+        sent
+    });
+    rt2.shutdown_timeout(Duration::from_secs(2));
+    assert!(state.join("sbx_dirty/1/disk.img").exists(), "an unanswered salvage keeps the disk");
+
+    let rt3 = runtime();
+    rt3.block_on(async {
+        let p = nestd_process(dir.path(), mock_fleet().await, 5000, None).await;
+        wait_until("the salvage asked again", || !salvage_requests(&p.fleet, "sbx_dirty", 1).is_empty()).await;
+        assert_eq!(salvage_requests(&p.fleet, "sbx_dirty", 1)[0], lost, "asked again under the request id the last process sent");
+        p.fleet.wait_event("reported clean", |b| matches!(b, HostEventBody::IncarnationRetired { sandbox, .. } if sandbox.0 == "sbx_dirty")).await;
+        assert!(!state.join("sbx_dirty").exists());
+
+        // The epoch is over here: a create at it is final, not retried.
+        let sbx = SandboxId("sbx_dirty".into());
+        assert_eq!(p.host.inner.fenced_epoch(&sbx), Some(Epoch(1)));
+        p.fleet.commands.send(vec![create("cmd_again", "sbx_dirty")]).unwrap();
+        assert_eq!(error_code(&p.fleet.result("cmd_again").await), Some(("stale_epoch".into(), false)));
+        let hello = next_hello(&p.fleet, "cmd_poke").await;
+        assert!(matches!(hello.sandboxes.as_slice(), [r] if r.sandbox == sbx && r.state == SandboxState::Fenced && !r.dirty), "the row stays fenced, now clean: {:?}", hello.sandboxes);
+        p.fleet.commands.send(vec![cmd("cmd_destroy", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
+        assert!(is_ok(&p.fleet.result("cmd_destroy").await));
+        assert_eq!(p.host.inner.fenced_epoch(&sbx), None, "a destroy at the fenced epoch prunes its tombstone");
+        drop(p);
+    });
+    rt3.shutdown_timeout(Duration::from_secs(2));
+}
+
+/// The review of #7's fix (M2, M3): a create at a newer epoch races the salvage of an incarnation a
+/// previous nestd left. The create doesn't wait for it (each incarnation has its own directory),
+/// and nothing the old incarnation's salvage hears touches the new one: a rejection doesn't fence
+/// it, and a salvage that SandboxDO commits doesn't move its row's head. The salvage is retried
+/// with backoff while it fails transiently (first answer lost, then `parent_mismatch`) until it
+/// lands; then only the old directory goes.
+#[test]
+fn a_newer_create_races_the_salvage_of_what_a_dead_nestd_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state/sandboxes/sbx_x");
+    let rt1 = runtime();
+    rt1.block_on(async {
+        let p = nestd_process(dir.path(), mock_fleet().await, 5000, Some(fake_driver())).await;
+        p.fleet.commands.send(vec![create("cmd_c1", "sbx_x")]).unwrap();
+        assert!(is_ok(&p.fleet.result("cmd_c1").await));
+        append_to_disk(dir.path(), "sbx_x", 1, b"work");
+        drop(p);
+    });
+    rt1.shutdown_timeout(Duration::from_secs(2));
+
+    let rt2 = runtime();
+    rt2.block_on(async {
+        let fleet = mock_fleet().await;
+        fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+        *fleet.reject_salvage.lock().unwrap() = Some("parent_mismatch".into());
+        // Commit answers time out after 300 ms; retries wait 1 s, then 2 s, 4 s (RETIRE_RETRY_FIRST).
+        let p = nestd_process(dir.path(), fleet, 300, Some(fake_driver())).await;
+        let f = &p.fleet;
+        f.commands.send(vec![create_at("cmd_c2", "sbx_x", 2)]).unwrap();
+        assert!(is_ok(&f.result("cmd_c2").await), "the newer epoch doesn't wait for the old one's salvage");
+        // Lost, asked again (the stored rejection), then a new request (rejected again).
+        wait_until("two salvage requests", || distinct(&salvage_requests(f, "sbx_x", 1)) >= 2).await;
+        let first = salvage_requests(f, "sbx_x", 1);
+        assert_eq!(first[0], first[1], "a lost answer is asked again under the same id");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let fenced_new = f.log.lock().unwrap().events.iter().any(|e| matches!(e.body, HostEventBody::SandboxState { state: SandboxState::Fenced, epoch: Epoch(2), .. }));
+        assert!(!fenced_new, "the old incarnation's rejected salvage fenced the new one");
+
+        *f.reject_salvage.lock().unwrap() = None;
+        f.commit_salvage.store(true, Ordering::SeqCst);
+        wait_until("the old incarnation deleted", || !state.join("1").exists()).await;
+        assert!(state.join("2/disk.img").exists(), "the new incarnation's directory");
+        let hello = next_hello(f, "cmd_poke").await;
+        assert!(
+            matches!(hello.sandboxes.as_slice(), [r] if r.epoch == Epoch(2) && r.state == SandboxState::Running && r.head.is_none() && r.dirty),
+            "the old incarnation's salvage changed the new one's row: {:?}",
+            hello.sandboxes
+        );
+        drop(p);
+    });
+    rt2.shutdown_timeout(Duration::from_secs(2));
+}
+
+/// The review of #7's fix (M3): a fenced incarnation's salvage whose answer is lost is retried
+/// under the same request id until it lands; then the disk goes and the row is reported clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_salvage_is_retried_until_it_lands() {
+    let h = start_host_opts(None, 300).await;
+    h.fleet.commands.send(vec![create("cmd_c", "sbx_r")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c").await));
+    append_to_disk(h.dir.path(), "sbx_r", 1, b"work");
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_f", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_r".into())], reason: "test".into() })]).unwrap();
+    // The answer times out after 300 ms; the retry follows 1 s later (RETIRE_RETRY_FIRST).
+    wait_until("the salvage asked again", || salvage_requests(&h.fleet, "sbx_r", 1).len() >= 2).await;
+    let ids = salvage_requests(&h.fleet, "sbx_r", 1);
+    assert_eq!(distinct(&ids), 1, "the retry asks under the same id: {ids:?}");
+    h.fleet.wait_event("reported clean", |b| matches!(b, HostEventBody::IncarnationRetired { .. })).await;
+    assert!(!h.dir.path().join("state/sandboxes/sbx_r").exists());
+}
+
+/// A fenced incarnation is retired once: superseded by a newer create while its salvage waits for
+/// an answer, it still makes one sibling branch, not two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fenced_incarnation_is_salvaged_once_even_when_superseded() {
+    let h = start_host_opts(None, 300).await;
+    h.fleet.commands.send(vec![create("cmd_c1", "sbx_o")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c1").await));
+    append_to_disk(h.dir.path(), "sbx_o", 1, b"work");
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_f", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_o".into())], reason: "test".into() })]).unwrap();
+    wait_until("the fence's salvage", || !salvage_requests(&h.fleet, "sbx_o", 1).is_empty()).await;
+    h.fleet.commands.send(vec![create_at("cmd_c2", "sbx_o", 2)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c2").await));
+    wait_until("the old incarnation deleted", || !h.dir.path().join("state/sandboxes/sbx_o/1").exists()).await;
+    let ids = salvage_requests(&h.fleet, "sbx_o", 1);
+    assert_eq!(distinct(&ids), 1, "one salvage per incarnation: {ids:?}");
+    assert!(h.dir.path().join("state/sandboxes/sbx_o/2/disk.img").exists());
+}
+
+/// nestd review #12: the fenced epoch's tombstone (one map that the proxy and gateway links both
+/// consult) lives as long as the fenced incarnation, not forever. A create at that epoch answers
+/// `stale_epoch`, final, even after a newer epoch's failed create tore the fenced row down (it
+/// used to fail inside the proxy link as a retryable `internal`); a newer epoch that runs prunes
+/// it, and a destroy prunes the next one. A failed create leaves no directory behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fenced_epoch_stays_stale_until_a_newer_epoch_runs() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_t".into());
+    h.fleet.commands.send(vec![create_at("cmd_c1", "sbx_t", 1)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c1").await));
+    h.fleet.commands.send(vec![cmd("cmd_f1", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_f1").await));
+    assert_eq!(h._host.inner.fenced_epoch(&sbx), Some(Epoch(1)));
+
+    // A newer epoch's create replaces the fenced row, then fails to boot.
+    h.fail_next_start.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![create_at("cmd_c2", "sbx_t", 2)]).unwrap();
+    assert_eq!(error_code(&h.fleet.result("cmd_c2").await).map(|(c, _)| c), Some("internal".into()));
+    assert!(!h.dir.path().join("state/sandboxes/sbx_t/2").exists(), "a failed create left its directory");
+    assert_eq!(h._host.inner.fenced_epoch(&sbx), Some(Epoch(1)), "a newer epoch that never ran prunes nothing");
+    h.fleet.commands.send(vec![create_at("cmd_c1_again", "sbx_t", 1)]).unwrap();
+    assert_eq!(error_code(&h.fleet.result("cmd_c1_again").await), Some(("stale_epoch".into(), false)), "the fenced epoch is final");
+
+    h.fleet.commands.send(vec![create_at("cmd_c2_again", "sbx_t", 2)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c2_again").await));
+    assert_eq!(h._host.inner.fenced_epoch(&sbx), None, "the newer epoch runs: the old tombstone is pruned");
+
+    h.fleet.commands.send(vec![cmd("cmd_f2", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_f2").await));
+    assert_eq!(h._host.inner.fenced_epoch(&sbx), Some(Epoch(2)));
+    h.fleet.commands.send(vec![cmd("cmd_d2", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(2) })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_d2").await));
+    assert_eq!(h._host.inner.fenced_epoch(&sbx), None, "a destroy at the fenced epoch prunes it");
+}
+
+/// nestd review #7, the network half: a netns bind mount a dead nestd left under `persist_dir`
+/// (its tap and nft table inside) is torn down when the next nestd starts, before `Host::start`
+/// returns (the fleet client starts after it). Evidence: the harness in a user namespace (a real
+/// netns, tap and nft); no VM.
+#[test]
+fn a_restarted_nestd_tears_down_leftover_netns_mounts() {
+    if !nestd::net::reexec_in_userns("a_restarted_nestd_tears_down_leftover_netns_mounts") {
+        return;
+    }
+    let rt = runtime();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = dir.path().join("netns");
+        let left = persist.join("ns-sbx_left");
+        let ns = nestd::net::Netns::create(Some(&left)).unwrap();
+        ns.configure(None).unwrap();
+        std::mem::forget(ns); // the old process died without unmounting it
+        let mounted = || std::fs::read_to_string("/proc/self/mountinfo").unwrap().contains(&left.display().to_string());
+        assert!(mounted());
+        let fleet = mock_fleet().await;
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "role": "burst", "cell": "c",
+            "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+            "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+            "driver": {"type": "process", "guest_command": ["unused"]},
+            "network": {"type": "netns", "persist_dir": persist},
+            "flush_interval_ms": 20,
+        }))
+        .unwrap();
+        let _host = Host::start(cfg, harness_enrolled(&fleet.url), Some(Arc::new(NetnsCapture(Arc::new(Mutex::new(None)))))).await.unwrap();
+        assert!(!left.exists() && !mounted(), "the leftover netns mount survived the start");
+    });
+}
+
+/// The review of the fix (M2): a final refusal of a salvage (`stale_epoch`: SandboxDO will never
+/// take that work) ends the retire at once: no retry, the disk deleted, `incarnation_retired`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_final_salvage_refusal_ends_the_retire() {
+    let h = start_host_opts(None, 300).await;
+    h.fleet.commands.send(vec![create("cmd_c", "sbx_f")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c").await));
+    append_to_disk(h.dir.path(), "sbx_f", 1, b"work");
+    *h.fleet.reject_salvage.lock().unwrap() = Some("stale_epoch".into());
+    h.fleet.commands.send(vec![cmd("cmd_f", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_f".into())], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { sandbox, epoch: Epoch(1) } if sandbox.0 == "sbx_f")).await;
+    assert!(!h.dir.path().join("state/sandboxes/sbx_f").exists());
+    // Past the first retry's backoff (RETIRE_RETRY_FIRST, 1 s): no second request.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(salvage_requests(&h.fleet, "sbx_f", 1).len(), 1, "a refused salvage was retried");
+}
+
+/// The review of the fix (M1): a fence of a newer epoch that superseded an older one here freezes
+/// it through its own lock-free pause handle (pause handles are per incarnation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_newer_epoch_is_frozen_through_its_own_pause_handle() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create_at("cmd_c1", "sbx_p", 1)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c1").await));
+    append_to_disk(h.dir.path(), "sbx_p", 1, b"work");
+    h.fleet.commands.send(vec![create_at("cmd_c2", "sbx_p", 2)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_c2").await));
+    wait_until("the old incarnation retired", || !h.dir.path().join("state/sandboxes/sbx_p/1").exists()).await;
+    h.fleet.commands.send(vec![cmd("cmd_f2", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_p".into())], reason: "test".into() })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_f2").await));
+    wait_until("the lock-free pause of epoch 2", || h.paused.lock().unwrap().contains(&("sbx_p".to_string(), 2))).await;
+}
+
+/// The review of the fix (L9): a configured cgroup delegation that fails doesn't stop nestd; it
+/// runs on and says so in every fleet hello (here the cgroup root is a file, so no cgroup can be
+/// made under it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_cgroup_delegation_is_reported_in_the_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_a_cgroup_root = dir.path().join("cgroup-root-file");
+    std::fs::write(&not_a_cgroup_root, b"").unwrap();
+    let fleet = mock_fleet().await;
+    let mut cfg = harness_config(dir.path(), &fleet.url, 5000);
+    cfg.delegated_cgroup = true;
+    cfg.cgroup_root = not_a_cgroup_root;
+    let _host = Host::start(cfg, harness_enrolled(&fleet.url), Some(fake_driver())).await.unwrap();
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    let hello = fleet.log.lock().unwrap().hellos[0].clone();
+    assert!(hello.cgroup_delegation_error.is_some(), "the failed delegation is not reported");
+}
+
 /// A sandbox fence never fences the brains whose hands act in it: a brain survives its sandbox
 /// moving. Brains are fenced by their own host's lease and their agent epoch; hands by the gateway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1553,18 +2057,7 @@ async fn a_sandbox_fence_leaves_its_brains_running() {
     let h = start_host().await;
     h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
     assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
-    let start = AgentStart {
-        agent: AgentId("agt_b".into()),
-        role: AgentRole::Worker,
-        workstream: WorkstreamId("ws_1".into()),
-        epoch: Some(Epoch(1)),
-        resume: None,
-        hands: Some(HandsBinding { sandbox: SandboxId("sbx_a".into()), epoch: None }),
-        launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "w".into() } },
-        oauth_token: "oauth".into(),
-        session_ws_url: "ws://x".into(),
-    };
-    h.fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(start))]).unwrap();
+    h.fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_b", "sbx_a")))]).unwrap();
     assert!(matches!(h.fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
     wait_until("runner agent_start", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(_)))).await;
     h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_a".into())], reason: "moved".into() })]).unwrap();
@@ -1572,9 +2065,48 @@ async fn a_sandbox_fence_leaves_its_brains_running() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. })), "a sandbox fence fenced a brain");
     assert!(!h.fleet.log.lock().unwrap().events.iter().any(|e| matches!(e.body, HostEventBody::AgentExited { .. })));
-    // A brain started elsewhere replaces it: killed, not left to finish its turn.
+}
+
+fn bound_start(agent: &str, sandbox: &str) -> AgentStart {
+    AgentStart {
+        agent: AgentId(agent.into()),
+        role: AgentRole::Worker,
+        workstream: WorkstreamId("ws_1".into()),
+        epoch: Some(Epoch(1)),
+        resume: None,
+        hands: Some(HandsBinding { sandbox: SandboxId(sandbox.into()), epoch: None }),
+        launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "w".into() } },
+        oauth_token: "oauth".into(),
+        session_ws_url: "ws://x".into(),
+    }
+}
+
+/// A gateway floor and a kill take effect on arrival, not behind a slow command in the in-order
+/// executor; their results still come in order, the floor's once the gateway confirmed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_floor_and_a_kill_apply_on_arrival_behind_slow_commands() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    h.fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_b", "sbx_a")))]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
+    h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2")]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = std::time::Instant::now();
+    let floor = CommandBody::ClientFloor { sandbox: SandboxId("sbx_a".into()), epoch: Epoch(1), agent: AgentId("agt_b".into()), agent_epoch: Epoch(2) };
     let stop = CommandBody::AgentStop { agent: AgentId("agt_b".into()), reason: "starting elsewhere".into(), mode: Some(nest_protocol::host::runner::StopMode::Kill), epoch: Some(Epoch(1)) };
-    h.fleet.commands.send(vec![cmd("cmd_stop", stop)]).unwrap();
-    assert!(matches!(h.fleet.result("cmd_stop").await, CommandOutcome::Ok { .. }));
-    wait_until("runner kill", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStop { mode: nest_protocol::host::runner::StopMode::Kill, .. }))).await;
+    h.fleet.commands.send(vec![cmd("cmd_floor", floor), cmd("cmd_kill", stop)]).unwrap();
+    wait_until("the gateway gets the floor", || {
+        h.gateway.got.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::ClientFloor { client, agent_epoch: Epoch(2), .. } if client == "agt_b"))
+    })
+    .await;
+    wait_until("the runner gets the kill", || {
+        h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStop { mode: nest_protocol::host::runner::StopMode::Kill, .. }))
+    })
+    .await;
+    assert!(t0.elapsed() < Duration::from_millis(800), "waited behind the slow create: {:?}", t0.elapsed());
+    assert!(matches!(h.fleet.result("cmd_floor").await, CommandOutcome::Ok { .. }), "confirmed by the gateway");
+    assert!(matches!(h.fleet.result("cmd_kill").await, CommandOutcome::Ok { .. }));
+    let kills = h._runner.lock().unwrap().iter().filter(|c| matches!(c, RunnerCommand::AgentStop { .. })).count();
+    assert_eq!(kills, 1, "the in-order pass does not kill again");
 }

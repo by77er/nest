@@ -102,6 +102,11 @@ ExecStartPre=/bin/mkdir -p /run/nest/netns /run/nest/runner
 ExecStart=/opt/nest/bin/nestd --config /etc/nest/nestd.json
 Restart=always
 RestartSec=5
+# nestd's cgroup is delegated: nestd moves itself into <unit>/supervisor and the jailer puts each
+# VMM under <unit>/vms (delegated_cgroup in nestd.json), so stopping or restarting the unit, a
+# crash included, kills every VMM with it (KillMode=control-group, the default). Unverified on a
+# real host.
+Delegate=yes
 [Install]
 WantedBy=multi-user.target
 EOF

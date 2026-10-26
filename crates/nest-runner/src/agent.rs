@@ -115,6 +115,12 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     existing.kill_now(ExitReason::Fenced);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                Err(existing) if existing.is_stopping() && Instant::now() < deadline => {
+                    // A brain told to stop is never adopted: this start replaces it, so it ends now
+                    // and the new brain registers once it is gone.
+                    existing.kill_now(ExitReason::Stopped);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
                 Err(existing) => {
                     // AgentDO started this brain again (it lost sight of it): the live brain keeps
                     // running, takes the new hands and adopts the newer agent epoch, which

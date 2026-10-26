@@ -57,8 +57,7 @@ enum Sent {
     On { conn: u64, started: bool },
 }
 
-/// A brain this host runs. `hands` names the sandbox its hands act in (ids only, from
-/// `agent_start`), so a fence of that sandbox fences the brain.
+/// A brain this host runs.
 struct Brain {
     state: AgentState,
     sent: Sent,
@@ -74,6 +73,9 @@ struct State {
     conn: Option<UnboundedSender<RunnerCommand>>,
     /// Generation of the current (or last) runner connection.
     conn_gen: u64,
+    /// Each agent's agent epoch from its latest `agent_start` here, for the exits nestd reports
+    /// itself (a lost runner connection, a start never sent): AgentDO ignores an older start's exit.
+    epochs: BTreeMap<AgentId, nest_protocol::model::Epoch>,
 }
 
 #[derive(Clone)]
@@ -135,6 +137,7 @@ impl RunnerLink {
     pub fn agent_start(&self, start: AgentStart) -> bool {
         let mut st = self.state.lock().expect("runner state");
         let agent = start.start.agent.clone();
+        st.epochs.insert(agent.clone(), start.start.agent_epoch());
         let (sent, dispatched) = match &st.conn {
             Some(c) => {
                 let _ = c.send(RunnerCommand::AgentStart(Box::new(start)));
@@ -191,6 +194,11 @@ impl RunnerLink {
     pub fn report(&self) -> Vec<AgentReport> {
         let st = self.state.lock().expect("runner state");
         st.brains.iter().filter(|(_, b)| !b.fenced).map(|(id, b)| AgentReport { agent: id.clone(), state: b.state }).collect()
+    }
+
+    /// The agent epoch of `agent`'s latest start here.
+    pub fn epoch_of(&self, agent: &AgentId) -> Option<nest_protocol::model::Epoch> {
+        self.state.lock().expect("runner state").epochs.get(agent).copied()
     }
 
     pub fn count(&self) -> usize {

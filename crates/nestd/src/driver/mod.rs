@@ -14,6 +14,7 @@ use crate::net::Netns;
 
 pub mod firecracker;
 pub mod process;
+pub mod supervise;
 
 #[derive(Clone)]
 pub struct VmSpec {

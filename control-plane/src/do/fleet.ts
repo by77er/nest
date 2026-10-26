@@ -761,6 +761,9 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, capabilities = ? WHERE host = ?",
       now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, JSON.stringify(hello.capabilities ?? []), att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior as HostRow);
+    if (hello.cgroup_delegation_error) {
+      console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
+    }
     ws.serializeAttachment({ host: att.host, helloed: true } satisfies Attachment);
 
     this.send(ws, {
@@ -1025,6 +1028,13 @@ export class FleetDO extends DurableObject<Env> {
     switch (ev.type) {
       case "command_result":
         return this.onCommandResult(host, ev.cmd, ev.outcome);
+      case "incarnation_retired":
+        // The host salvaged (or gave up on) that incarnation and deleted its disk: it is clean, so
+        // its destroy needn't wait out the salvage window. reapStale keeps its usual lease checks
+        // (one still leased to this host at that epoch waits; one superseded here is dropped).
+        this.recordStale(ev.sandbox, host, ev.epoch, true);
+        await this.reapStale();
+        return;
       case "sandbox_state":
         // The lease is the one authority for who holds a sandbox: only its holder's reports reach
         // SandboxDO. A stale incarnation's `fenced` (a STONITH fence, a revoked claim) is noted for

@@ -13,7 +13,7 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `gateway_url?` (where clients reach this host's sandbox gateway, from nestd's configuration), `tunnel` (`none` | `connecting` | `connected`; absent from a nestd that predates it, read as `none`), `last_command_seq`, and **a full report** of local sandboxes (epoch, state, head, dirty, and `guest{protocol_version, capabilities}` for a running one), agents (state) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
+| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `gateway_url?` (where clients reach this host's sandbox gateway, from nestd's configuration), `tunnel` (`none` | `connecting` | `connected`; absent from a nestd that predates it, read as `none`), `last_command_seq`, `cgroup_delegation_error?` (nestd was configured to keep its VMMs in its delegated unit cgroup and that setup failed; FleetDO logs it), and **a full report** of local sandboxes (epoch, state, head, dirty, and `guest{protocol_version, capabilities}` for a running one), agents (state) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
 | `heartbeat` | no | Every 5 s: `sent_ms` and `leases[(sandbox, epoch)]`. **Renews every listed lease.** |
 | `events` | seq | A batch of `HostEvent`s (below) |
 | `ack` | — | Cumulative ack of `commands` |
@@ -68,7 +68,8 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `type` | Purpose |
 |---|---|
 | `command_result` | `outcome: {status: ok, detail?}` or `{status: error, error}` |
-| `sandbox_state` | Every transition (`model::SandboxState`), with `suspend_mode?`, `detail?` and, for `running`, `guest{protocol_version, capabilities}` (nestd caches the guest's hello, so a resume reports it too; a repeated `running` with a new `guest` is an update) |
+| `sandbox_state` | Every transition (`model::SandboxState`), with `suspend_mode?`, `detail?` and, for `running`, `guest{protocol_version, capabilities}` (nestd caches the guest's hello, so a resume reports it too; a repeated `running` with a new `guest` is an update). |
+| `incarnation_retired` | `sandbox`, `epoch`: a fenced or superseded incarnation is gone from the host (salvaged, nothing to salvage, or refused for good by SandboxDO), its disk deleted. FleetDO marks the stale incarnation clean, so it is destroyed without waiting out the salvage window. A Worker that predates it quarantines the event (logged, skipped, acked with its batch) and only loses that shortcut |
 | `commit_request` | Chunks and manifest are already uploaded. Asks for a CAS with `request`, epoch, parent, kind, manifests, reason (`salvage` marks the commit as orphaned work) |
 | `workstream` | A host-originated `WorkstreamEvent` (`port_opened`, `port_exposed`, `egress_denied`, `egress_alert`) |
 | `egress_audit` | Batches of `EgressAuditRecord` (no secret values, no query strings), written to R2. `via?` names the nest-proxy entry point: `dns http_transparent https_transparent explicit tcp_exception`; `reason` values are listed in [nestd-proxy](../../host-internal/nestd-proxy/). `count?` marks an aggregated record (how many requests it stands for), used for nest-proxy's per-window suppression summaries |
