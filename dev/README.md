@@ -48,6 +48,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | [setup.md](setup.md) | What I set up on GitHub and Cloudflare for all of the above |
 | [practices.md](practices.md) | Guards, test rules, evidence tiers, review and supply chain: what keeps agent-written changes safe |
 | [review-lessons.md](review-lessons.md) | Standalone lessons from real findings, checked on every review |
+| [verification.md](verification.md) | Proposal: the formal models in `verification/` as a CI job |
 
 ## Path to self-maintenance
 

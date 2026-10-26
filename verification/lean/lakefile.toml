@@ -1,0 +1,6 @@
+name = "nest-verification"
+version = "0.1.0"
+defaultTargets = ["Nest"]
+
+[[lean_lib]]
+name = "Nest"

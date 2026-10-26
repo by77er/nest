@@ -1,0 +1,18 @@
+[package]
+name = "nest-verify-stateright"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Stateright pilot: FleetDO -> nestd command delivery (reliable channel)"
+
+# Standalone: not a member of the repo's workspace (root Cargo.toml lists members explicitly).
+[workspace]
+
+[dependencies]
+stateright = "=0.31.0"
+
+[profile.dev]
+opt-level = 2
+
+[profile.test]
+opt-level = 2
