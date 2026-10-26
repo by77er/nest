@@ -46,6 +46,12 @@ pub struct Config {
     pub send_baseline: bool,
     /// A BrokerDO failure in `sendResolved` closes the socket (main: returns quietly).
     pub close_on_broker_fail: bool,
+    /// A hello whose socket closed while it waited in the queue does nothing (main: it runs, and
+    /// supersedes, so closes, the newer socket the host reconnected on).
+    pub stale_hello_guard: bool,
+    /// `onEvents` processes a batch only if its socket is still the host's helloed one (main: the
+    /// attachment read at arrival, so a dead process's batch can become the new lineage's baseline).
+    pub events_socket_guard: bool,
     pub max_cmds: u8,
     pub secrets: bool,
     pub max_drops: u8,
@@ -62,6 +68,8 @@ impl Config {
             durable_capture: false,
             send_baseline: false,
             close_on_broker_fail: false,
+            stale_hello_guard: false,
+            events_socket_guard: false,
             max_cmds: 3,
             secrets: true,
             max_drops: 1,
@@ -72,7 +80,7 @@ impl Config {
     }
     /// FleetDO with this branch's fixes.
     pub fn fixed() -> Self {
-        Config { capture_at_reset: true, durable_capture: true, send_baseline: true, close_on_broker_fail: true, ..Self::main() }
+        Config { capture_at_reset: true, durable_capture: true, send_baseline: true, close_on_broker_fail: true, stale_hello_guard: true, events_socket_guard: true, ..Self::main() }
     }
     pub fn faults(self, drops: u8, restarts: u8, resets: u8, broker_fails: u8) -> Self {
         Config { max_drops: drops, max_restarts: restarts, max_fleet_resets: resets, max_broker_fails: broker_fails, ..self }
@@ -290,7 +298,9 @@ impl FleetModel {
                         };
                         match s.nestd.conn.and_then(|id| s.wire(id)) {
                             Some(w) => {
-                                if w.fleet_open {
+                                // FleetDO's answer to a heartbeat only renews the lease, outside
+                                // this model: leaving the frame out removes its interleavings.
+                                if w.fleet_open && !matches!(up, Up::Heartbeat(_)) {
                                     w.up.push_back(up);
                                 }
                             }
@@ -319,8 +329,17 @@ impl FleetModel {
     fn hello_start(&self, s: &mut State) {
         let c = &self.cfg;
         let Some(Job::Hello { wire, inst, last, .. }) = s.fleet.queue.front().cloned() else { return };
-        // Older sockets are superseded (744-749).
+        if c.stale_hello_guard && !s.wires.iter().any(|w| w.id == wire && w.fleet_open) {
+            // Its socket closed while the hello waited in the queue: nothing to do.
+            s.fleet.queue.pop_front();
+            return;
+        }
+        // Every other socket is superseded (744-749), a newer one included. A newer one nestd
+        // still uses counts as a close, so a supersede loop shows as `reconnects_bounded`.
         for id in s.wires.iter().map(|w| w.id).filter(|id| *id != wire).collect::<Vec<_>>() {
+            if s.wires.iter().any(|w| w.id == id && w.fleet_open && w.host_reading) {
+                s.closes += 1;
+            }
             s.fleet_close(id);
         }
         let np = s.fleet.nestd_instance.is_some_and(|i| i != inst);
@@ -352,10 +371,16 @@ impl FleetModel {
         s.send_down(wire, Down::HelloAck { last_event_seq: s.fleet.last_in, next_command_seq });
     }
 
-    /// After a hello's resend: fail the old lineage (new process), then the job ends.
+    /// After a hello's resend: fail the old lineage (new process), then the job ends. A hello with
+    /// nothing to fail ends here: its remaining awaits change nothing this model sees.
     fn hello_after_resend(&self, s: &mut State) {
-        if let Some(Job::Hello { stage, .. }) = s.fleet.queue.front_mut() {
-            *stage = HelloStage::Reconcile;
+        let orphans = s.fleet.orphans.is_some();
+        match s.fleet.queue.front_mut() {
+            Some(Job::Hello { new_process: false, .. }) if !(self.cfg.durable_capture && orphans) => {
+                s.fleet.queue.pop_front();
+            }
+            Some(Job::Hello { stage, .. }) => *stage = HelloStage::Reconcile,
+            _ => {}
         }
     }
 
@@ -366,6 +391,11 @@ impl FleetModel {
             s.send_down(wire, Down::Error);
             s.fleet_close(wire);
         }
+    }
+
+    /// Closes the faults so far can explain: 3 each, plus 2.
+    fn close_allowance(&self, s: &State) -> u8 {
+        3 * (s.drops + s.restarts + s.resets + s.broker_fails) + 2
     }
 
     fn issued(s: &State) -> u8 {
@@ -444,7 +474,6 @@ impl Model for FleetModel {
         }
         match (s.nestd.link.phase(), s.nestd.link.wake_at()) {
             (Phase::Idle, Some(_)) => a.push(Action::NestdTick),
-            (Phase::Open, Some(w)) if w <= s.nestd.t => a.push(Action::NestdTick),
             _ => {}
         }
         if !s.nestd.exec.is_empty() {
@@ -545,6 +574,10 @@ impl Model for FleetModel {
                 // fleet.ts:962-983.
                 Job::Events { wire, seq, results } => {
                     s.fleet.queue.pop_front();
+                    if c.events_socket_guard && !s.wires.iter().any(|w| w.id == wire && w.fleet_open && w.helloed) {
+                        // A superseded socket's batch: its lineage is over; neither processed nor acked.
+                        return Some(s);
+                    }
                     match s.fleet.last_in {
                         Some(l) if seq <= l => s.send_down(wire, Down::Ack(l)),
                         Some(l) if seq != l + 1 => {
@@ -602,6 +635,11 @@ impl Model for FleetModel {
                     }
                 };
                 self.run_nestd(&mut s, input);
+                // A fresh connection's timers fire at once (the heartbeat, a flush): folded into the
+                // step that opened it.
+                if s.nestd.link.is_open() && s.nestd.link.wake_at().is_some_and(|w| w <= s.nestd.t) {
+                    self.run_nestd(&mut s, Input::Tick);
+                }
             }
             Action::NestdTick => {
                 if s.nestd.link.phase() == Phase::Idle {
@@ -675,7 +713,7 @@ impl Model for FleetModel {
 
     /// Caps a close/reconnect loop; `reconnects_bounded` reports it before the cap is reached.
     fn within_boundary(&self, s: &State) -> bool {
-        s.closes <= 5
+        s.closes <= self.close_allowance(s) + 1
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
@@ -688,7 +726,9 @@ impl Model for FleetModel {
                     _ => true,
                 })
             }),
-            Property::always("reconnects_bounded", |_, s: &State| s.closes <= 4),
+            // A fault can cause a few closes (a BrokerDO failure closes both ends; a restart's hello
+            // supersedes); a close/reconnect loop causes them with no fault at all.
+            Property::always("reconnects_bounded", |m: &FleetModel, s: &State| s.closes <= m.close_allowance(s)),
             // Monotone once true (every command issued; results are never cleared), and faults are
             // bounded, so a terminal state has the link up with nothing left to do.
             Property::eventually("every_command_answered", |m: &FleetModel, s: &State| {

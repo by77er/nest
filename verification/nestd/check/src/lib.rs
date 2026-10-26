@@ -36,7 +36,11 @@ where
 {
     let props = model.properties();
     let start = Instant::now();
-    let checker = model.checker().threads(threads()).spawn_bfs().join();
+    let mut builder = model.checker().threads(threads());
+    if let Some(d) = std::env::var("CHECK_MAX_DEPTH").ok().and_then(|d| d.parse().ok()) {
+        builder = builder.target_max_depth(d);
+    }
+    let checker = builder.spawn_bfs().join();
     let elapsed = start.elapsed();
     let mut violations = vec![];
     let mut examples = vec![];
