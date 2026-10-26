@@ -81,6 +81,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
   - **`proxy_ca_is_renewed_before_expiry`** (review #10)
   - **`newer_epoch_create_salvages_old_work_first`** (review #17)
   - `netns_listeners_handed_to_proxy` (in a user namespace): real netns, tap0 and nft; five listeners reach the fake proxy, and its copy of `:443` accepts a connection made inside the sandbox netns.
+  - Listener recovery (in a user namespace, a running sandbox): a failed listener is rebound under its id and serves (`a_failed_listener_is_rebound_in_the_netns`); one removed by `policy_update` or `agent_detach` while its rebind waits is not restored (`a_listener_removed_during_its_rebind_is_not_restored`); one that can't be bound again raises `blocked` (a TCP exception) or fences the sandbox (`:443`) (`a_listener_that_cannot_be_rebound_is_given_up_with_an_event`).
 
 ## Not implemented yet (TODO)
 

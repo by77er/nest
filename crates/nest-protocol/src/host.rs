@@ -311,8 +311,9 @@ pub mod proxy {
             detail: String,
         },
         /// A handed-over listener failed (unusable fd, or a fatal accept error); the proxy has
-        /// closed its copy. nestd rebinds it under the same id and resends it, a bounded number of
-        /// times, then drops it from its mirror.
+        /// closed its copy. If the sandbox still has it, nestd rebinds it under the same id and
+        /// resends it, a bounded number of times, then gives it up (docs/interfaces/host-internal/
+        /// nestd-proxy/, listener failures).
         ListenerFailed { sandbox: SandboxId, listener_id: u32, error: ErrorBody },
         Pong { nonce: u64, sandboxes: u32, active_connections: u32 },
         /// Protocol error; the sender closes the connection after this.
@@ -327,10 +328,10 @@ pub mod proxy {
         pub listener_ids: Vec<u32>,
     }
 
-    /// At most this many listener ids are reported in one `resync_ack` (it must fit
-    /// [`super::fdpass::MAX_PACKET_FROM_PROXY`]); failures past it leave the counts unexplained,
-    /// and nestd resyncs.
-    pub const MAX_RESYNC_FAILURES: usize = 1024;
+    /// Bytes of `resync_ack.failed` (as JSON) one ack may carry: half of
+    /// [`super::fdpass::MAX_PACKET_FROM_PROXY`], leaving room for the rest of the packet. Failures
+    /// past it are left out; they leave the counts unexplained, and nestd resyncs.
+    pub const RESYNC_FAILURES_BYTES: usize = super::fdpass::MAX_PACKET_FROM_PROXY / 2;
 
     /// A pre-bound socket inside a sandbox's netns. Serialized flat:
     /// `{"id":5,"transport":"tcp","addr":"172.16.0.1:3128","purpose":"explicit","agent":"agt_…","slot":0}`.

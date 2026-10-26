@@ -12,7 +12,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use nest_protocol::control::{EgressAuditKind, EgressAuditRecord, EgressReason, EgressVerdict};
-use nest_protocol::host::proxy::{AlertKind, DropReason, MAX_RESYNC_FAILURES, ProxyEvent, ResyncFailure};
+use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyEvent, RESYNC_FAILURES_BYTES, ResyncFailure};
 use nest_protocol::model::{AgentId, EgressPolicy, Epoch, ErrorBody, InjectionSecret, SandboxId, WorkstreamId};
 
 use crate::resolve::Resolve;
@@ -177,18 +177,24 @@ impl Session {
         self.emit(ProxyEvent::ListenerFailed { sandbox: sandbox.clone(), listener_id, error });
     }
 
-    /// `resync_complete`: end the resync and take what failed during it, capped at
-    /// [`MAX_RESYNC_FAILURES`] ids (the rest leave nestd's count unexplained, so it resyncs).
+    /// `resync_complete`: end the resync and take what failed during it, as much as fits
+    /// [`RESYNC_FAILURES_BYTES`] of JSON (the rest leave nestd's count unexplained, so it resyncs).
     pub fn finish_resync(&self) -> Vec<ResyncFailure> {
+        // Upper bounds of the JSON: one id is at most 10 digits and a comma; one entry's frame is
+        // `{"sandbox":"<id>","listener_ids":[]},`.
+        const PER_ID: usize = 11;
+        const PER_ENTRY: usize = 36;
         let failed = self.resync_failed.lock().unwrap().take().unwrap_or_default();
-        let mut room = MAX_RESYNC_FAILURES;
+        let mut room = RESYNC_FAILURES_BYTES;
         let mut out = vec![];
         for (sandbox, mut listener_ids) in failed {
-            if room == 0 {
+            let frame = PER_ENTRY + sandbox.0.len();
+            if room < frame + PER_ID {
                 break;
             }
-            listener_ids.truncate(room);
-            room -= listener_ids.len();
+            room -= frame;
+            listener_ids.truncate(room / PER_ID);
+            room -= listener_ids.len() * PER_ID;
             out.push(ResyncFailure { sandbox, listener_ids });
         }
         out
@@ -497,5 +503,26 @@ mod tests {
         s.listener_failed(&a, 5, err());
         assert!(matches!(events.try_recv().unwrap(), ProxyEvent::ListenerFailed { listener_id: 5, .. }));
         assert!(s.finish_resync().is_empty());
+    }
+
+    /// However many listeners fail in a resync, the ack still fits one packet to nestd.
+    #[test]
+    fn a_huge_failure_list_still_fits_the_ack() {
+        let (s, _events, _audit) = session();
+        let err = || ErrorBody { code: "x".into(), message: "y".into(), retryable: true };
+        s.reset();
+        for n in 0..3000u32 {
+            let sbx = SandboxId(format!("sbx_{}", "a".repeat(40) + &n.to_string()));
+            for id in [u32::MAX - 1, u32::MAX - 2] {
+                s.listener_failed(&sbx, id, err());
+            }
+        }
+        let failed = s.finish_resync();
+        assert!(!failed.is_empty());
+        let budget = serde_json::to_vec(&failed).unwrap().len();
+        assert!(budget <= RESYNC_FAILURES_BYTES, "{budget} bytes of failures");
+        let ack = ProxyEvent::ResyncAck { sandboxes: u32::MAX, listeners: u32::MAX, failed };
+        let len = serde_json::to_vec(&ack).unwrap().len();
+        assert!(len <= nest_protocol::host::fdpass::MAX_PACKET_FROM_PROXY, "{len} bytes");
     }
 }

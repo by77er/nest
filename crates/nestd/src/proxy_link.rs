@@ -16,10 +16,11 @@
 //! Access: the socket is `0660` (optional group), the peer uid is checked with `SO_PEERCRED`, and
 //! only one proxy connection is served at a time (a second one is refused until the first closes).
 //! A packet from the proxy that is oversized or undecodable is dropped, not the connection.
-//! Listeners the proxy couldn't serve (`listener_failed`, or named in `resync_ack.failed`) are
-//! rebound one by one, a bounded number of times ([`ProxyLink::listener_failed`]); only a
-//! `resync_ack` whose counts those failures don't explain closes the connection (the proxy
-//! reconnects and resyncs). Once a sandbox epoch has been dropped for fencing, later upserts, secrets and
+//! Listeners the proxy couldn't serve (`listener_failed`, or named in `resync_ack.failed`) become
+//! [`ProxyNotice::ListenerFailed`], tagged with the connection; the sandbox's owner (`host.rs`)
+//! rebinds or gives up, and the mirror follows it like any other change. Only a `resync_ack`
+//! whose counts those failures don't explain closes the connection (the proxy reconnects and
+//! resyncs). Once a sandbox epoch has been dropped for fencing, later upserts, secrets and
 //! listeners for that epoch are refused.
 //!
 //! Seqpacket + `SCM_RIGHTS` is done with blocking threads (`nest_protocol::host::fdpass`).
@@ -50,10 +51,6 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// No pong for this long: the proxy is presumed wedged and is disconnected (it fails closed).
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(15);
-/// A listener that fails more than this many times within [`LISTENER_RETRY_WINDOW`] is dropped
-/// from the mirror instead of rebound.
-pub const MAX_LISTENER_REBINDS: u32 = 3;
-pub const LISTENER_RETRY_WINDOW: Duration = Duration::from_secs(600);
 
 /// A listener held by nestd (the original fd; the proxy receives its own copy).
 pub struct HeldListener {
@@ -77,8 +74,6 @@ struct Mirror {
     sandboxes: BTreeMap<SandboxId, SandboxMirror>,
     /// Highest epoch dropped for fencing, per sandbox: nothing at or below it is re-added.
     fenced: HashMap<SandboxId, Epoch>,
-    /// Recent failures per listener: (count in the window, start of the window).
-    listener_failures: HashMap<(SandboxId, u32), (u32, Instant)>,
 }
 
 /// A change to the proxy's state.
@@ -89,22 +84,7 @@ pub enum ProxyOp {
     Secrets { sandbox: SandboxId, epoch: Epoch, secrets: Vec<InjectionSecret> },
     AddListeners { sandbox: SandboxId, epoch: Epoch, listeners: Vec<HeldListener> },
     RemoveListeners { sandbox: SandboxId, epoch: Epoch, ids: Vec<u32> },
-    /// A rebound listener (see [`ProxyLink::listener_failed`]): added back under its id only if
-    /// the sandbox is still mirrored at `epoch` and the id is free.
-    RestoreListener { sandbox: SandboxId, epoch: Epoch, listener: HeldListener },
     Drop { sandbox: SandboxId, epoch: Epoch, reason: DropReason },
-}
-
-/// What nestd does about a listener nest-proxy reported failed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ListenerRecovery {
-    /// Released from the mirror (nestd's fd closed): bind `spec.addr` afresh and hand it back
-    /// with [`ProxyOp::RestoreListener`].
-    Rebind { epoch: Epoch, spec: ListenerSpec },
-    /// Failed too often: dropped from the mirror for good.
-    GaveUp { spec: ListenerSpec },
-    /// Not (or no longer) in the mirror: nothing to do.
-    Unknown,
 }
 
 /// A command to send, with its own (duplicated) fds.
@@ -130,6 +110,8 @@ struct Shared {
 pub struct ProxyLink {
     shared: Arc<Mutex<Shared>>,
     writer: mpsc::Sender<WriterMsg>,
+    /// The connection being served (see [`ProxyLink::connection`]).
+    generation: Arc<AtomicU64>,
 }
 
 /// Notifications for the rest of nestd.
@@ -138,6 +120,9 @@ pub enum ProxyNotice {
     Connected { proxy_version: String, pid: u32 },
     /// `matched`: the counts equal the snapshot; otherwise the connection is being closed.
     ResyncAck { sandboxes: u32, listeners: u32, matched: bool },
+    /// A listener the proxy can't serve, from `listener_failed` or `resync_ack.failed`, on proxy
+    /// connection `conn` ([`ProxyLink::connection`]). The sandbox's owner decides what happens.
+    ListenerFailed { conn: u64, sandbox: SandboxId, listener_id: u32, error: ErrorBody },
     Event(ProxyEvent),
     Disconnected,
 }
@@ -168,6 +153,7 @@ impl ProxyLink {
         listen(&sock, Backlog::new(8).map_err(io::Error::from)?).map_err(io::Error::from)?;
 
         let shared = Arc::new(Mutex::new(Shared { mirror: Mirror::default(), next_seq: 1 }));
+        let generation = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::channel();
         let accept_tx = tx.clone();
         let allowed = access.allowed_uids.clone();
@@ -208,13 +194,14 @@ impl ProxyLink {
             boot_id,
             conn: None,
             conn_id: 0,
+            generation: generation.clone(),
             snapshot_seq: 0,
             last_pong: Arc::new(AtomicU64::new(0)),
             started: Instant::now(),
             next_nonce: 1,
         };
         std::thread::Builder::new().name("proxy-writer".into()).spawn(move || writer.run(rx))?;
-        Ok(ProxyLink { shared, writer: tx })
+        Ok(ProxyLink { shared, writer: tx, generation })
     }
 
     /// Apply a state change: update the mirror and queue the command (atomically, briefly locked;
@@ -291,24 +278,8 @@ impl ProxyLink {
                 }
                 (ProxyCommand::ListenersRemove { sandbox, epoch, listener_ids: ids }, vec![])
             }
-            ProxyOp::RestoreListener { sandbox, epoch, listener } => {
-                let Some(s) = m.sandboxes.get_mut(&sandbox).filter(|s| s.epoch == Some(epoch) && !s.listeners.contains_key(&listener.spec.id)) else {
-                    return false;
-                };
-                let fd = match listener.fd.try_clone() {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        tracing::error!(error = %e, "dup listener fd");
-                        return false;
-                    }
-                };
-                let cmd = ProxyCommand::ListenersAdd { sandbox, epoch, listeners: vec![listener.spec.clone()] };
-                s.listeners.insert(listener.spec.id, listener);
-                (cmd, vec![fd])
-            }
             ProxyOp::Drop { sandbox, epoch, reason } => {
                 m.sandboxes.remove(&sandbox);
-                m.listener_failures.retain(|(s, _), _| *s != sandbox);
                 if reason.tombstones() {
                     let e = m.fenced.entry(sandbox.clone()).or_insert(epoch);
                     *e = (*e).max(epoch);
@@ -326,30 +297,11 @@ impl ProxyLink {
         let _ = self.writer.send(WriterMsg::Ping(nonce));
     }
 
-    /// nest-proxy reported a listener failed (it has closed its copy). The listener is released
-    /// from the mirror, closing nestd's copy so its address is free, and is either to be rebound
-    /// under the same id or, past [`MAX_LISTENER_REBINDS`] failures within
-    /// [`LISTENER_RETRY_WINDOW`], given up: the guest then gets connection refused, not a hang.
-    /// Nothing is sent: the proxy no longer holds it.
-    pub fn listener_failed(&self, sandbox: &SandboxId, id: u32) -> ListenerRecovery {
-        let mut sh = self.shared.lock().expect("proxy mirror poisoned");
-        let m = &mut sh.mirror;
-        let Some(s) = m.sandboxes.get_mut(sandbox) else { return ListenerRecovery::Unknown };
-        let Some(epoch) = s.epoch else { return ListenerRecovery::Unknown };
-        let Some(held) = s.listeners.remove(&id) else { return ListenerRecovery::Unknown };
-        let spec = held.spec.clone();
-        drop(held);
-        let now = Instant::now();
-        let entry = m.listener_failures.entry((sandbox.clone(), id)).or_insert((0, now));
-        if now.duration_since(entry.1) > LISTENER_RETRY_WINDOW {
-            *entry = (0, now);
-        }
-        entry.0 += 1;
-        if entry.0 > MAX_LISTENER_REBINDS {
-            m.listener_failures.remove(&(sandbox.clone(), id));
-            return ListenerRecovery::GaveUp { spec };
-        }
-        ListenerRecovery::Rebind { epoch, spec }
+    /// The proxy connection being served now (0 when none). A [`ProxyNotice::ListenerFailed`]
+    /// from another connection is stale: the resync that followed handed every listener over
+    /// again, and a socket that is really broken is reported again on the new connection.
+    pub fn connection(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Listener ids currently held for a sandbox.
@@ -367,6 +319,8 @@ struct Writer {
     boot_id: String,
     conn: Option<Arc<OwnedFd>>,
     conn_id: u64,
+    /// `conn_id` once its resync is sent, 0 while no connection is served.
+    generation: Arc<AtomicU64>,
     snapshot_seq: u64,
     /// Milliseconds since `started` of the last pong (or connection).
     last_pong: Arc<AtomicU64>,
@@ -414,6 +368,7 @@ impl Writer {
                     }
                 }
                 WriterMsg::Closed(id) if id == self.conn_id => {
+                    self.generation.store(0, Ordering::SeqCst);
                     self.conn = None;
                     let _ = self.notices.send(ProxyNotice::Disconnected);
                 }
@@ -524,6 +479,7 @@ impl Writer {
         let notices = self.notices.clone();
         let tx = self.tx.clone();
         let conn_id = self.conn_id;
+        self.generation.store(conn_id, Ordering::SeqCst);
         let last_pong = self.last_pong.clone();
         let started = self.started;
         std::thread::Builder::new().name("proxy-reader".into()).spawn(move || {
@@ -545,9 +501,12 @@ impl Writer {
                         for f in failed {
                             for listener_id in f.listener_ids {
                                 let error = ErrorBody { code: "resync_failed".into(), message: "not served after the resync".into(), retryable: true };
-                                let _ = notices.send(ProxyNotice::Event(ProxyEvent::ListenerFailed { sandbox: f.sandbox.clone(), listener_id, error }));
+                                let _ = notices.send(ProxyNotice::ListenerFailed { conn: conn_id, sandbox: f.sandbox.clone(), listener_id, error });
                             }
                         }
+                    }
+                    Ok(Some((ProxyEvent::ListenerFailed { sandbox, listener_id, error }, _))) => {
+                        let _ = notices.send(ProxyNotice::ListenerFailed { conn: conn_id, sandbox, listener_id, error });
                     }
                     Ok(Some((ProxyEvent::Pong { .. }, _))) => {
                         last_pong.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -890,8 +849,9 @@ pub(crate) mod tests {
         while !seen_failed && Instant::now() < deadline {
             match nrx.try_recv() {
                 Ok(ProxyNotice::ResyncAck { matched, .. }) => assert!(matched, "the failure explains the shortfall"),
-                Ok(ProxyNotice::Event(ProxyEvent::ListenerFailed { sandbox, listener_id, .. })) => {
+                Ok(ProxyNotice::ListenerFailed { conn, sandbox, listener_id, .. }) => {
                     assert_eq!((sandbox, listener_id), (sbx.clone(), 2));
+                    assert_eq!(conn, link.connection(), "tagged with the connection it came from");
                     seen_failed = true;
                 }
                 Ok(ProxyNotice::Disconnected) => panic!("one bad listener closed the link"),
@@ -905,41 +865,39 @@ pub(crate) mod tests {
         assert!(matches!(p.recv().0, ProxyCommand::SandboxUpsert { .. }));
     }
 
-    /// Guest-proxy review #6: a failed listener is released and rebound under its id a bounded
-    /// number of times, then dropped from the mirror, so the next resync expects it no more.
+    /// A `listener_failed` is tagged with the proxy connection it came on; after a reconnect the
+    /// link serves another one, so a report still queued from the old connection is told apart.
     #[test]
-    fn a_failing_listener_is_rebound_then_given_up() {
+    fn listener_failures_carry_their_connection() {
         let dir = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
-        let (link, path, _nrx) = start_link(dir.path());
-        let sbx = SandboxId("sbx_1".into());
-        upsert(&link, 1, 1);
-        link.apply(ProxyOp::AddListeners { sandbox: sbx.clone(), epoch: Epoch(1), listeners: vec![held(1), held(2)] });
+        let (link, path, mut nrx) = start_link(dir.path());
+        assert_eq!(link.connection(), 0, "no proxy yet");
         let p = FakeProxy::connect(&path);
         let _ = p.recv();
         let _ = p.resync();
-        for _ in 0..MAX_LISTENER_REBINDS {
-            let ListenerRecovery::Rebind { epoch, spec } = link.listener_failed(&sbx, 2) else { panic!("expected a rebind") };
-            assert_eq!((epoch, spec.id), (Epoch(1), 2));
-            assert_eq!(link.listener_ids(&sbx), vec![1], "released while it is rebound");
-            assert_eq!(link.listener_failed(&sbx, 2), ListenerRecovery::Unknown, "a second report of the same failure is a no-op");
-            assert!(link.apply(ProxyOp::RestoreListener { sandbox: sbx.clone(), epoch, listener: held(2) }));
-            let (c, fds) = p.recv();
-            assert!(matches!(c, ProxyCommand::ListenersAdd { ref listeners, .. } if listeners.len() == 1 && listeners[0].id == 2));
-            assert_eq!(fds.len(), 1);
-        }
-        assert!(matches!(link.listener_failed(&sbx, 2), ListenerRecovery::GaveUp { .. }));
-        assert_eq!(link.listener_ids(&sbx), vec![1]);
-        // A restore for a sandbox no longer mirrored at that epoch is refused.
-        assert!(!link.apply(ProxyOp::RestoreListener { sandbox: sbx.clone(), epoch: Epoch(9), listener: held(2) }));
-        // The next resync hands over only what is left.
+        let error = ErrorBody { code: "accept_failed".into(), message: "x".into(), retryable: true };
+        fdpass::send(p.fd.as_fd(), &ProxyEvent::ListenerFailed { sandbox: SandboxId("sbx_1".into()), listener_id: 3, error }, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            assert!(Instant::now() < deadline, "no listener_failed notice");
+            match nrx.try_recv() {
+                Ok(ProxyNotice::ListenerFailed { conn, listener_id: 3, .. }) => break conn,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        assert!(first != 0 && first == link.connection());
         drop(p);
-        std::thread::sleep(Duration::from_millis(50));
         let p2 = FakeProxy::connect(&path);
         let _ = p2.recv();
-        let fds: usize = p2.resync().iter().map(|(_, f)| f.len()).sum();
-        assert_eq!(fds, 1);
+        let _ = p2.resync();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while link.connection() == first || link.connection() == 0 {
+            assert!(Instant::now() < deadline, "the new connection never became current");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Review #3: once an epoch is dropped for fencing, nothing re-adds it.

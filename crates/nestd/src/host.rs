@@ -48,13 +48,19 @@ use crate::gateway_link::{Entry as GatewayEntry, GatewayLink, GatewayNotice};
 use crate::guest::{GuestCtl, GuestEvent};
 use crate::net::{GATEWAY_IP, Netns};
 use crate::limits::{self, Limiter};
-use crate::proxy_link::{Access, HeldListener, ListenerRecovery, ProxyLink, ProxyNotice, ProxyOp};
+use crate::proxy_link::{Access, HeldListener, ProxyLink, ProxyNotice, ProxyOp};
 use crate::runner_link::{RunnerLink, RunnerNotice};
 use crate::storage::{self, ObjectStore};
 use crate::util::{error, new_id, now_ms};
 
 const MAX_AGENT_SLOTS: u16 = 64;
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// A listener that fails more than this many times within [`LISTENER_RETRY_WINDOW`] is given up.
+const MAX_LISTENER_REBINDS: u32 = 3;
+const LISTENER_RETRY_WINDOW: Duration = Duration::from_secs(600);
+/// Wait before recovering a failed listener (and the step between bind attempts).
+const LISTENER_REBIND_DELAY: Duration = Duration::from_millis(200);
+const LISTENER_BIND_TRIES: u32 = 3;
 const SALVAGE_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long a non-`ask` guest CLI relay waits for `guest_cli_result`. The guest gives up after
 /// 30 s; nestd answers 3 s earlier so the caller gets nestd's error, not a bare guest timeout.
@@ -106,6 +112,12 @@ struct Sbx {
     slot_cwds: BTreeMap<AgentId, String>,
     /// tcp exception rule (`host:port`) → (listener id, port)
     tcp_listeners: BTreeMap<String, (u32, u16)>,
+    /// The standard listeners (DNS, transparent HTTP/HTTPS): id → (transport, port, purpose).
+    /// With `slots` and `tcp_listeners`, the one record of which listeners this incarnation has;
+    /// the proxy mirror follows it ([`Sbx::listener`]).
+    std_listeners: BTreeMap<u32, (Transport, u16, ListenerPurpose)>,
+    /// Recent failures per listener id: (count in the window, start of the window).
+    listener_failures: HashMap<u32, (u32, Instant)>,
     known_ports: BTreeSet<u16>,
     exposed: BTreeMap<u16, HostHeaderMode>,
     vm_dir: PathBuf,
@@ -131,6 +143,34 @@ struct SentCommit {
 impl Sbx {
     fn disk_path(&self) -> PathBuf {
         self.state_dir.join("disk.img")
+    }
+
+    /// The listener `id` as this incarnation records it, if it still has it: a standard listener,
+    /// a TCP exception, or an agent slot's explicit proxy.
+    fn listener(&self, id: u32) -> Option<(Transport, u16, ListenerPurpose)> {
+        if let Some(l) = self.std_listeners.get(&id) {
+            return Some(l.clone());
+        }
+        if let Some((rule, (_, port))) = self.tcp_listeners.iter().find(|(_, (l, _))| *l == id) {
+            return Some((Transport::Tcp, *port, ListenerPurpose::TcpException { rule: rule.clone() }));
+        }
+        self.slots
+            .iter()
+            .find(|(_, (_, l))| *l == Some(id))
+            .map(|(agent, (slot, _))| (Transport::Tcp, EXPLICIT_BASE_PORT + slot, ListenerPurpose::Explicit { agent: agent.clone(), slot: *slot }))
+    }
+
+    /// Forget a listener given up on. A TCP exception is bound again by the next `policy_update`
+    /// that still names its rule; an agent's explicit listener by its next `agent_attach`.
+    fn forget_listener(&mut self, id: u32) {
+        self.std_listeners.remove(&id);
+        self.tcp_listeners.retain(|_, (l, _)| *l != id);
+        for (_, l) in self.slots.values_mut() {
+            if *l == Some(id) {
+                *l = None;
+            }
+        }
+        self.listener_failures.remove(&id);
     }
 }
 
@@ -676,9 +716,9 @@ impl Inner {
                     self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason });
                 }
             }
-            ProxyNotice::Event(ProxyEvent::ListenerFailed { sandbox, listener_id, error }) => {
+            ProxyNotice::ListenerFailed { conn, sandbox, listener_id, error } => {
                 tracing::warn!(%sandbox, listener_id, code = %error.code, message = %error.message, "proxy listener failed");
-                self.recover_listener(sandbox, listener_id);
+                self.recover_listener(conn, sandbox, listener_id);
             }
             ProxyNotice::Event(ProxyEvent::Error { error }) => tracing::warn!(code = %error.code, message = %error.message, "proxy error"),
             ProxyNotice::Event(_) => {}
@@ -688,43 +728,90 @@ impl Inner {
         }
     }
 
-    /// A listener nest-proxy couldn't serve: rebind it at the same address in the sandbox's netns
-    /// and hand it back under the same id, or give up after a bounded number of failures
-    /// ([`ProxyLink::listener_failed`]).
-    fn recover_listener(self: &Arc<Self>, sandbox: SandboxId, listener_id: u32) {
-        let (epoch, spec) = match self.proxy.listener_failed(&sandbox, listener_id) {
-            ListenerRecovery::Rebind { epoch, spec } => (epoch, spec),
-            ListenerRecovery::GaveUp { spec } => {
-                return tracing::error!(%sandbox, listener_id, addr = %spec.addr, "listener keeps failing; dropped (the guest gets connection refused)");
-            }
-            ListenerRecovery::Unknown => return,
-        };
+    /// A listener nest-proxy couldn't serve (it has closed its copy). The sandbox's own record
+    /// decides, under the sandbox lock like any other listener change: if this incarnation still
+    /// has the listener, nestd closes its copy, binds the same address in the netns again and
+    /// hands it over under the same id; past [`MAX_LISTENER_REBINDS`] failures in
+    /// [`LISTENER_RETRY_WINDOW`], or when every bind fails, it gives up ([`Self::listener_lost`]).
+    /// A report from an older proxy connection is ignored: the resync since handed every listener
+    /// over again, and a broken one is reported again on the new connection.
+    fn recover_listener(self: &Arc<Self>, conn: u64, sandbox: SandboxId, listener_id: u32) {
+        // The incarnation the report is about: a newer one (even at the same epoch) never gets
+        // this one's listener.
+        let Some(entry) = self.sandbox(&sandbox) else { return };
         let this = self.clone();
         tokio::spawn(async move {
-            let Some(entry) = this.sandbox(&sandbox) else { return };
-            let Some(ns) = entry.lock().await.netns.clone() else { return };
-            let Ok(addr) = spec.addr.parse::<SocketAddr>() else {
-                return tracing::error!(%sandbox, listener_id, addr = %spec.addr, "listener address does not parse; not rebound");
-            };
-            // The proxy closed its copy before reporting; give the kernel a moment either way.
-            for attempt in 1..=3u32 {
-                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
-                let ns = ns.clone();
-                let transport = spec.transport;
-                match tokio::task::spawn_blocking(move || ns.bind(transport, addr)).await {
-                    Ok(Ok(fd)) => {
-                        let listener = HeldListener { spec: spec.clone(), fd };
-                        if this.proxy.apply(ProxyOp::RestoreListener { sandbox: sandbox.clone(), epoch, listener }) {
-                            tracing::info!(%sandbox, listener_id, "listener rebound");
-                        }
-                        return;
-                    }
-                    Ok(Err(e)) => tracing::warn!(%sandbox, listener_id, attempt, error = %e, "rebinding listener"),
-                    Err(e) => return tracing::error!(error = %e, "rebind task failed"),
+            tokio::time::sleep(LISTENER_REBIND_DELAY).await;
+            let lost = {
+                let mut s = entry.lock().await;
+                if !this.sandbox(&sandbox).is_some_and(|e| Arc::ptr_eq(&e, &entry)) || this.proxy.connection() != conn {
+                    return;
                 }
+                // Removed meanwhile (policy_update, agent_detach, a dropped slot): nothing to restore.
+                let Some((transport, port, purpose)) = s.listener(listener_id) else { return };
+                let Some(ns) = s.netns.clone() else { return };
+                let epoch = s.epoch;
+                let now = Instant::now();
+                let failures = {
+                    let f = s.listener_failures.entry(listener_id).or_insert((0, now));
+                    if now.duration_since(f.1) > LISTENER_RETRY_WINDOW {
+                        *f = (0, now);
+                    }
+                    f.0 += 1;
+                    f.0
+                };
+                // nestd's copy goes first, so the address is free to bind again.
+                this.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![listener_id] });
+                let addr: SocketAddr = format!("{GATEWAY_IP}:{port}").parse().expect("valid address");
+                let mut bound = Err(anyhow::anyhow!("failed {failures} times in {LISTENER_RETRY_WINDOW:?}"));
+                if failures <= MAX_LISTENER_REBINDS {
+                    for attempt in 1..=LISTENER_BIND_TRIES {
+                        bound = ns.bind(transport, addr).map_err(anyhow::Error::from);
+                        if bound.is_ok() || attempt == LISTENER_BIND_TRIES {
+                            break;
+                        }
+                        tokio::time::sleep(LISTENER_REBIND_DELAY * attempt).await;
+                    }
+                }
+                match bound {
+                    Ok(fd) => {
+                        let spec = ListenerSpec { id: listener_id, transport, addr: addr.to_string(), purpose };
+                        this.proxy.apply(ProxyOp::AddListeners { sandbox: sandbox.clone(), epoch, listeners: vec![HeldListener { spec, fd }] });
+                        tracing::info!(%sandbox, listener_id, failures, "listener rebound");
+                        None
+                    }
+                    Err(e) => {
+                        s.forget_listener(listener_id);
+                        Some((epoch, purpose, addr, e))
+                    }
+                }
+            };
+            if let Some((epoch, purpose, addr, e)) = lost {
+                this.listener_lost(&sandbox, epoch, purpose, addr, &e).await;
             }
-            tracing::error!(%sandbox, listener_id, addr = %spec.addr, "could not rebind listener; dropped");
         });
+    }
+
+    /// A listener given up on (already forgotten by the sandbox and the proxy mirror). Without a
+    /// DNS or transparent HTTP(S) listener the incarnation has no egress at all, so it is fenced
+    /// (with salvage): the control plane sees `fenced` and places the sandbox again. A TCP
+    /// exception or an agent's explicit proxy is narrower: a `blocked` workstream event says what
+    /// was lost and what brings it back.
+    async fn listener_lost(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, purpose: ListenerPurpose, addr: SocketAddr, why: &anyhow::Error) {
+        tracing::error!(%sandbox, epoch = epoch.0, %addr, ?purpose, error = %why, "egress listener lost");
+        match purpose {
+            ListenerPurpose::Dns | ListenerPurpose::HttpTransparent | ListenerPurpose::HttpsTransparent => {
+                self.fence_sandbox(sandbox, &format!("egress listener {addr} lost: {why:#}"), true, true).await;
+            }
+            ListenerPurpose::TcpException { rule } => {
+                let reason = format!("the TCP exception listener for {rule} ({addr}) failed and could not be rebound ({why:#}); a policy update that keeps the rule binds it again");
+                self.workstream_event(sandbox, None, WorkstreamEventKind::Blocked { reason });
+            }
+            ListenerPurpose::Explicit { agent, .. } => {
+                let reason = format!("the explicit proxy listener for {agent} ({addr}) failed and could not be rebound ({why:#}); attaching the agent again binds it again");
+                self.workstream_event(sandbox, Some(agent), WorkstreamEventKind::Blocked { reason });
+            }
+        }
     }
 
     async fn on_runner_notice(self: &Arc<Self>, n: RunnerNotice) {
@@ -1230,6 +1317,8 @@ impl Inner {
             slots: BTreeMap::new(),
             slot_cwds: BTreeMap::new(),
             tcp_listeners: BTreeMap::new(),
+            std_listeners: BTreeMap::new(),
+            listener_failures: HashMap::new(),
             known_ports: BTreeSet::new(),
             exposed: BTreeMap::new(),
             vm_dir,
@@ -1376,7 +1465,9 @@ impl Inner {
                 (Transport::Tcp, 443, ListenerPurpose::HttpsTransparent),
             ];
             for (transport, port, purpose) in std_listeners {
-                listeners.push(bind_listener(&ns, &mut sbx.next_listener, transport, port, purpose)?);
+                let l = bind_listener(&ns, &mut sbx.next_listener, transport, port, purpose.clone())?;
+                sbx.std_listeners.insert(l.spec.id, (transport, port, purpose));
+                listeners.push(l);
             }
             for (i, rule) in sbx.policy.tcp.iter().enumerate() {
                 let key = format!("{}:{}", rule.host, rule.port);

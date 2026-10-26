@@ -7,7 +7,8 @@ export const PROTOCOL_VERSION = 1;
 const prefixed = (prefix: string) => z.string().startsWith(prefix);
 
 export const HostId = prefixed("hst_");
-export const SandboxId = prefixed("sbx_");
+/** Strict: `sbx_` and a lowercase alphanumeric suffix (what `newId` makes), since it names R2 keys. */
+export const SandboxId = z.string().regex(/^sbx_[0-9a-z]{1,64}$/);
 export const AgentId = prefixed("agt_");
 export const WorkstreamId = prefixed("ws_");
 export const GenerationId = prefixed("gen_");

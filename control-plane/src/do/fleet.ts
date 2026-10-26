@@ -24,7 +24,7 @@ import {
 } from "../protocol/control";
 import type { GuestInfo } from "../protocol/gateway";
 import {
-  type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, type HostRole, PROTOCOL_VERSION, type Resources, type SandboxState,
+  type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, type HostRole, PROTOCOL_VERSION, type Resources, SandboxId, type SandboxState,
 } from "../protocol/model";
 
 type HostStatus = "active" | "draining" | "expired" | "stonith_pending" | "dead";
@@ -111,6 +111,11 @@ type Purpose = "stonith_fence" | null;
 
 const TOKEN_ROTATE_BEFORE_MS = 10 * 60_000;
 const COMMAND_RETENTION_MS = 24 * 3_600_000;
+/** Largest |ms| a JS Date can hold. */
+const MAX_DATE_MS = 8.64e15;
+/** A host-supplied timestamp, or `fallback` when it is no date at all: never throws. */
+const utcMs = (ms: number, fallback = Date.now()) => (Number.isSafeInteger(ms) && Math.abs(ms) <= MAX_DATE_MS ? ms : fallback);
+const utcDay = (ms: number, fallback: number) => new Date(utcMs(ms, utcMs(fallback))).toISOString().slice(0, 10);
 /**
  * How long a stale incarnation's salvage may take before FleetDO destroys it anyway: nestd gives a
  * salvage commit 600 s (`SALVAGE_TIMEOUT`), plus a margin.
@@ -935,25 +940,46 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Egress audit goes to R2 as `audit/<sandbox>/<YYYY-MM-DD>/<ts_ms>-<id>.jsonl` (UTC day of each
-   * record): one sandbox's history sits under one prefix whichever hosts served it, and the R2
-   * lifecycle rule on `audit/` expires it (docs/data/). Like host-originated workstream events, only
-   * the lease holder's records for the epoch it holds are kept.
+   * Whether `host` held `sandbox` at `epoch` at some point FleetDO still knows of: its lease now
+   * (expired or not), an incarnation recorded as stale there, or a command sent to it for that
+   * sandbox at that epoch (kept `COMMAND_RETENTION_MS`). A host cut off at its own epoch flushes
+   * what it buffered once it reconnects, after the lease moved on: that audit counts most.
+   */
+  private heldAt(host: string, sandbox: string, epoch: number): boolean {
+    const lease = this.lease(sandbox);
+    if (lease && lease.host === host && lease.epoch === epoch) return true;
+    return this.sql.exec(
+      `SELECT 1 FROM stale_incarnations WHERE sandbox = ? AND host = ? AND epoch = ?
+       UNION ALL SELECT 1 FROM commands WHERE sandbox = ? AND host = ? AND epoch = ? LIMIT 1`,
+      sandbox, host, epoch, sandbox, host, epoch).toArray().length > 0;
+  }
+
+  /**
+   * Egress audit goes to R2 as `audit/<sandbox>/<YYYY-MM-DD>/<epoch>-<host>-<ts_ms>-<digest>.jsonl`
+   * (UTC day of each record): one sandbox's history under one prefix whichever hosts served it, each
+   * incarnation's records told apart, and expired by the lifecycle rule on `audit/` (docs/data/).
+   * Records are kept from a host that held the sandbox at that epoch (`heldAt`). The object name
+   * ends in a digest of its content, so a batch the host resends overwrites instead of duplicating.
    */
   private async writeAudit(host: string, tsMs: number, records: EgressAuditRecord[]): Promise<void> {
     const groups = new Map<string, EgressAuditRecord[]>();
+    const held = new Map<string, boolean>();
     let dropped = 0;
     for (const r of records) {
-      if (!this.holds(host, r.sandbox, r.epoch)) {
+      const who = `${r.sandbox}/${r.epoch}`;
+      if (!held.has(who)) held.set(who, SandboxId.safeParse(r.sandbox).success && this.heldAt(host, r.sandbox, r.epoch));
+      if (!held.get(who)) {
         dropped++;
         continue;
       }
-      const key = `${r.sandbox}/${new Date(r.ts_ms).toISOString().slice(0, 10)}`;
+      const key = `${r.sandbox}/${utcDay(r.ts_ms, tsMs)}/${r.epoch}-${host}`;
       groups.set(key, [...(groups.get(key) ?? []), r]);
     }
-    if (dropped) console.warn(`FleetDO: dropping ${dropped} egress audit record(s) from ${host}: not the lease holder`);
+    if (dropped) console.warn(`FleetDO: dropping ${dropped} egress audit record(s) from ${host}: it never held their sandbox at that epoch`);
     for (const [key, rs] of groups) {
-      await this.env.BUCKET.put(`audit/${key}/${tsMs}-${newId("")}.jsonl`, rs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+      const body = rs.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      const digest = hex(await sha256(body)).slice(0, 32);
+      await this.env.BUCKET.put(`audit/${key}-${utcMs(tsMs)}-${digest}.jsonl`, body);
     }
   }
 

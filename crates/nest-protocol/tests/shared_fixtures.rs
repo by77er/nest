@@ -105,6 +105,12 @@ fn ids_check_their_prefix_when_parsed() {
     assert!(!AgentId("x".into()).is_valid());
     rejects::<HostId>("sbx_1");
     rejects::<SandboxId>("agt_1");
+    // A sandbox id names R2 object keys: its suffix is lowercase letters and digits only.
+    for bad in ["sbx_", "sbx_A1", "sbx_a/../b", "sbx_a-b", "sbx_a b", &format!("sbx_{}", "a".repeat(65))] {
+        rejects::<SandboxId>(bad);
+        assert!(!SandboxId(bad.to_owned()).is_valid(), "{bad}");
+    }
+    assert!(serde_json::from_value::<SandboxId>(json!(format!("sbx_{}", "z9".repeat(32)))).is_ok());
     rejects::<AgentId>("x");
     rejects::<AgentId>("");
     rejects::<WorkstreamId>("w_1");

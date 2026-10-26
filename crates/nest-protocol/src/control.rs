@@ -686,7 +686,8 @@ pub enum EgressReason {
     Suppressed,
     /// Reaching the upstream failed; `detail` is the resolver's, the socket's or TLS's own text.
     Upstream { stage: UpstreamStage, detail: String },
-    /// Deserialize-only fallback, never sent by this build: the string as received.
+    /// Deserialize-only fallback: the string as received. This build's proxy never emits it, but
+    /// nestd forwards it as it came (from an older or newer proxy), and FleetDO stores it.
     Other(String),
 }
 

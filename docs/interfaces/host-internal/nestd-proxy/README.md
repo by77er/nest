@@ -25,7 +25,9 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 
 **Aggregation is the proxy's** (per sandbox, see [policy](../../../sandbox/networking/egress/policy/#audit)). nestd only rate-limits per sandbox: it raises an `egress_denied` workstream event for a `request` record denied by policy (`not_allowed`, `dns_nxdomain`, `tcp_exception_not_in_policy`: `EgressAuditRecord::is_policy_denial`), and an `egress_alert` for every `alert`, binding included. Everything else stays in the audit log.
 
-**Listener failures.** nestd owns listeners. On `listener_failed` it closes its own copy, binds a fresh socket at the same address in the sandbox's netns and resends it under the same id; after 3 failures of one listener within 10 minutes it drops the listener from its mirror instead (the guest then gets connection refused, not a hang).
+**Listener failures.** The sandbox owns its listeners (its standard listeners, TCP exceptions and agent slots, under the sandbox lock); the proxy mirror follows it. On `listener_failed` nestd waits 200 ms, takes the sandbox lock and acts only if the same incarnation still has that listener (a rule removed by `policy_update`, a slot removed by `agent_detach`, a newer incarnation at the same epoch: nothing happens). It then closes its own copy, binds the same address in the netns again and resends it under the same id. A report from an older proxy connection is ignored: the resync since handed every listener over again. After 3 failures of one listener within 10 minutes, or when 3 binds fail, nestd gives up and forgets the listener:
+- **DNS or transparent HTTP(S):** the incarnation is fenced (with salvage). Without them it has no egress at all; a fence is what the control plane already handles by placing the sandbox again.
+- **A TCP exception or an agent's explicit proxy:** a `blocked` workstream event names what was lost. The next `policy_update` that keeps the rule, or the agent's next `agent_attach`, binds it again.
 
 **Listener purposes** (`purpose` is flattened into the spec):
 
@@ -63,7 +65,7 @@ nest-proxy                                   nestd
  │ resync_ack{n, m, failed} ─────────────────►│  failed listeners → rebound one by one
 ```
 
-**Resync counts.** `resync_ack` carries the proxy's **own** counts of sandboxes and listeners it now holds, plus `failed: [{sandbox, listener_ids}]`: listeners it was handed during the resync but couldn't serve (no separate `listener_failed` is sent for those; at most 1024 ids). nestd checks `listeners + failed = sent` and handles each failed listener like a `listener_failed`, so one bad sandbox can't make the whole host reconnect in a loop. Only a mismatch the failures don't explain closes the connection for a fresh resync. An older proxy sends no `failed`, which is the plain totals check.
+**Resync counts.** `resync_ack` carries the proxy's **own** counts of sandboxes and listeners it now holds, plus `failed: [{sandbox, listener_ids}]`: listeners it was handed during the resync but couldn't serve (no separate `listener_failed` is sent for those; at most half a packet of them, `RESYNC_FAILURES_BYTES`). nestd checks `listeners + failed = sent` and handles each failed listener like a `listener_failed`, so one bad sandbox can't make the whole host reconnect in a loop. Only a mismatch the failures don't explain closes the connection for a fresh resync. An older proxy sends no `failed`, which is the plain totals check.
 
 ## Sandbox network setup → listener handoff
 

@@ -59,9 +59,9 @@ def auditExpiry (spec : EdgeSpec) : R2BucketLifecycle.RulesArgs :=
     deleteObjectsTransition := some
       { condition := some { type := "Age", maxAge := some (lit (Lean.JsonNumber.fromNat (spec.auditRetentionDays * 86400))) } } }
 
-/-- The rule R2 gives a new bucket (abort incomplete multipart uploads after 7 days; unverified
-against `nest-control`'s current configuration, which a plan shows), kept: the lifecycle resource
-replaces the bucket's whole configuration. -/
+/-- The rule R2 gave the bucket at creation, kept because the lifecycle resource replaces the whole
+configuration: verified on `nest-control` (id `Default Multipart Abort Rule`, enabled, abort after
+604800 s, empty conditions, which the provider writes as the empty prefix). -/
 def multipartAbort : R2BucketLifecycle.RulesArgs :=
   { id := "Default Multipart Abort Rule", enabled := true, conditions := { prefix_ := "" }
     abortMultipartUploadsTransition := some { condition := some { type := "Age", maxAge := 604800 } } }
