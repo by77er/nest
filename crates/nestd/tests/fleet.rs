@@ -68,10 +68,16 @@ impl Conn {
         end.await.expect("the host closes the connection");
     }
     fn hello_ack(&self, last_event_seq: Option<u64>) {
+        self.hello_ack_from(last_event_seq, None);
+    }
+    fn hello_ack_from(&self, last_event_seq: Option<u64>, next_command_seq: Option<u64>) {
         let mut ack = json!({ "type": "hello_ack", "protocol_version": PROTOCOL_VERSION, "server_ms": 0,
             "lease": { "heartbeat_ms": HB_MS, "host_fence_ms": 10_000, "cp_expiry_ms": 15_000 }, "host_token_expires_ms": 0 });
         if let Some(s) = last_event_seq {
             ack["last_event_seq"] = json!(s);
+        }
+        if let Some(s) = next_command_seq {
+            ack["next_command_seq"] = json!(s);
         }
         self.send(ack);
     }
@@ -403,4 +409,27 @@ async fn an_overflowing_offline_outbox_sheds_low_value_events_only() {
     assert_eq!(kept_tasks, 10, "non-sheddable events are never shed");
     // Past 4096 pending, capacity events are shed down to 3072; the 113 pushed after that stay.
     assert_eq!(events.len(), 3072 + 113, "one batch, shed once");
+}
+
+#[tokio::test]
+async fn a_command_batch_that_overtakes_a_lower_one_makes_the_host_reconnect() {
+    let mut peer = Peer::start().await;
+    let mut link = Link::start(&peer.url);
+    let (mut c, _) = connect(&mut peer).await;
+    c.hello_ack_from(None, Some(1));
+    // Batch 2 arrives before 1 (FleetDO's send of 1 still awaits BrokerDO): not forwarded, not
+    // acked; the host closes the connection so the hello resends from 1.
+    c.commands(2);
+    c.closed().await;
+    link.no_commands_for(50).await;
+    let (c, h) = connect(&mut peer).await;
+    assert_eq!(h.last_command_seq, None);
+    c.hello_ack_from(None, Some(1));
+    c.commands(1);
+    c.commands(2);
+    let mut got = vec![];
+    while got.len() < 2 {
+        got.push(link.notice(|n| if let FleetNotice::Commands { seq, .. } = n { Some(seq.0) } else { None }).await);
+    }
+    assert_eq!(got, vec![1, 2]);
 }

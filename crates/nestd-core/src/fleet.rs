@@ -139,6 +139,7 @@ pub enum Log {
     Silent { silent_ms: u64 },
     PeerError { reconnect: bool },
     Unparseable { error: String },
+    CommandGap { seq: Seq, expected: Seq },
     OutboxShed { shed: u64 },
 }
 
@@ -193,6 +194,9 @@ pub struct FleetLink<E> {
     last_command_seq: Option<Seq>,
     /// Highest command batch handed to the host (may still be processing).
     forwarded_command_seq: Option<Seq>,
+    /// The only command batch that may be forwarded next: FleetDO's baseline for this connection
+    /// (`hello_ack.next_command_seq`), then one past the last forwarded. `None`: take the first.
+    expected_command_seq: Option<Seq>,
     /// Heartbeat `sent_ms` → (monotonic, boottime) send instants.
     sent: BTreeMap<i64, (u64, u64)>,
     /// Last `sent_ms` used: heartbeat keys strictly increase even if the wall clock steps back.
@@ -219,6 +223,7 @@ impl<E: OutboxEvent> FleetLink<E> {
             next_seq: 1,
             last_command_seq: None,
             forwarded_command_seq: None,
+            expected_command_seq: None,
             sent: BTreeMap::new(),
             last_sent_ms: 0,
             pending_ca_renew: None,
@@ -284,7 +289,9 @@ impl<E: OutboxEvent> FleetLink<E> {
                     self.flush(&mut fx);
                     fx.push(Effect::Send(Outbound::Ack { up_to: seq }));
                 } else {
-                    self.last_command_seq = Some(seq);
+                    // Never backwards: a replayed older batch finishing late must not make the next
+                    // hello ask for batches already processed (and acked).
+                    self.last_command_seq = Some(self.last_command_seq.map_or(seq, |s| s.max(seq)));
                 }
             }
             Input::CaRenew(csr_pem) => {
@@ -409,7 +416,7 @@ impl<E: OutboxEvent> FleetLink<E> {
         self.heard(now);
         match self.conn {
             Conn::AwaitingAck { hello_sent, .. } => match f {
-                Inbound::HelloAck { protocol_version, last_event_seq, next_command_seq: _, lease } => {
+                Inbound::HelloAck { protocol_version, last_event_seq, next_command_seq, lease } => {
                     if protocol_version != self.cfg.protocol_version {
                         fx.push(Effect::Log(Log::ProtocolMismatch { theirs: protocol_version }));
                         return self.close(now, fx);
@@ -426,6 +433,14 @@ impl<E: OutboxEvent> FleetLink<E> {
                     }
                     // The forwarded-but-unprocessed batch will be resent by FleetDO; dedup handles it.
                     self.forwarded_command_seq = self.last_command_seq;
+                    // Commands are taken strictly in order from FleetDO's baseline (or, from a
+                    // FleetDO that sends none, one past the last processed): a batch that overtakes
+                    // a lower one is a gap, never a cumulative ack that covers the lower one.
+                    let next_after_last = self.last_command_seq.map(|l| l + 1);
+                    self.expected_command_seq = match next_command_seq {
+                        Some(n) => Some(n.max(next_after_last.unwrap_or(0))),
+                        None => next_after_last,
+                    };
                     if let Some(csr_pem) = self.pending_ca_renew.take() {
                         fx.push(Effect::Send(Outbound::CaRenew { csr_pem }));
                     }
@@ -457,8 +472,14 @@ impl<E: OutboxEvent> FleetLink<E> {
                         fx.push(Effect::Send(Outbound::Ack { up_to: last }));
                     } else if self.forwarded_command_seq.is_some_and(|f| seq <= f) {
                         // Still processing.
+                    } else if let Some(expected) = self.expected_command_seq.filter(|x| seq != *x) {
+                        // A gap: an earlier batch is missing. Reconnect; the hello resends in order.
+                        fx.push(Effect::Log(Log::CommandGap { seq, expected }));
+                        self.close(now, fx);
                     } else {
+                        invariant::check(self.forwarded_command_seq.is_none_or(|f| seq > f), "fleet_commands_forwarded_in_order");
                         self.forwarded_command_seq = Some(seq);
+                        self.expected_command_seq = Some(seq + 1);
                         fx.push(Effect::Notify(Notice::Commands { seq, commands }));
                     }
                 }
@@ -520,7 +541,7 @@ impl<E: OutboxEvent> FleetLink<E> {
             let target = MAX_OUTBOX_EVENTS * 3 / 4;
             for rank in 0..=1u8 {
                 let before = self.pending.len();
-                let mut excess = total.saturating_sub(target);
+                let mut excess = self.outbox_len().saturating_sub(target);
                 self.pending.retain(|e| {
                     if excess > 0 && e.shed_rank() == Some(rank) {
                         excess -= 1;

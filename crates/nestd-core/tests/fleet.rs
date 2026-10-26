@@ -182,3 +182,70 @@ fn audit_events_coalesce_within_their_bound() {
     }
     assert_eq!(h.link.pending_len(), 2, "3 records merge into one event, the 4th starts another");
 }
+
+/// Model-checker counterexample (verification/nestd/check, `no_ack_without_execution`, 11 steps on
+/// the core before this fix): FleetDO sends batch 2 while batch 1 awaits BrokerDO; the core
+/// forwarded 2, dropped 1 as "still processing" when it came, and 2's cumulative ack deleted 1.
+/// Now 2 is a gap against the hello_ack's baseline: the core reconnects and forwards nothing.
+#[test]
+fn a_batch_that_overtakes_a_lower_one_is_a_gap_not_an_ack() {
+    let mut h = H::new();
+    assert_eq!(h.step(Input::Tick), vec![Effect::Connect { token: "tok".into() }]);
+    h.step(Input::Connected);
+    h.step(H::ack(None, Some(1)));
+    let fx = h.commands(2);
+    assert!(forwarded(&fx).is_empty() && fx.contains(&Effect::Close), "{fx:?}");
+    assert!(fx.contains(&Effect::Notify(Notice::Disconnected)));
+    // The reconnect's hello resends in order: 1 then 2 are forwarded, each once.
+    h.at(200).step(Input::Tick);
+    h.step(Input::Connected);
+    h.step(H::ack(None, Some(1)));
+    assert_eq!(forwarded(&h.commands(1)), vec![1]);
+    assert_eq!(forwarded(&h.commands(2)), vec![2]);
+    assert!(h.commands(4).contains(&Effect::Close), "3 is missing");
+}
+
+/// Without a baseline (a FleetDO from before `next_command_seq`) the first batch after the hello is
+/// taken, then strict order; one past the last processed when the host has processed any.
+#[test]
+fn without_a_baseline_the_order_starts_after_the_last_processed_batch() {
+    let mut h = H::new();
+    h.open();
+    assert_eq!(forwarded(&h.commands(5)), vec![5]);
+    assert!(h.commands(7).contains(&Effect::Close));
+    h.step(Input::CommandsDone(5));
+    h.at(200).step(Input::Tick);
+    h.step(Input::Connected);
+    h.step(H::ack(None, None));
+    assert!(h.commands(7).contains(&Effect::Close), "6 is next");
+}
+
+/// A batch replayed at a reconnect finishes after a later one did, while offline: the next hello
+/// must not report the older seq (FleetDO would resend what was acked, and a strict host would see
+/// a gap on every reconnect).
+#[test]
+fn last_processed_never_moves_back_while_offline() {
+    let mut h = H::new();
+    h.open();
+    h.commands(1);
+    h.commands(2);
+    h.step(Input::CommandsDone(2));
+    h.step(Input::Closed);
+    h.step(Input::CommandsDone(1));
+    assert_eq!(h.link.last_command_seq(), Some(2));
+}
+
+/// Shedding stops at the target: rank 1 sheds only what rank 0 couldn't.
+#[test]
+fn shedding_rank_one_takes_only_the_remaining_excess() {
+    let mut h = H::new();
+    let ranked = |id, r| Ev { id, rank: Some(r), audit: 0 };
+    for i in 0..100 {
+        h.step(Input::Event(ranked(i, 0)));
+    }
+    for i in 0..(MAX_OUTBOX_EVENTS as u32 - 100) {
+        h.step(Input::Event(ranked(1_000 + i, 1)));
+    }
+    h.step(Input::Event(ranked(9_999, 1))); // the 4097th: 100 of rank 0 go, then 925 of rank 1
+    assert_eq!(h.link.pending_len(), MAX_OUTBOX_EVENTS * 3 / 4);
+}

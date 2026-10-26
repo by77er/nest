@@ -275,7 +275,7 @@ fn inbound(f: FleetToHost) -> Inbound<Vec<Command>, Vec<LeaseClaim>, Other> {
         FleetToHost::HelloAck(a) => Inbound::HelloAck {
             protocol_version: a.protocol_version,
             last_event_seq: a.last_event_seq.map(|s| s.0),
-            next_command_seq: None,
+            next_command_seq: a.next_command_seq.map(|s| s.0),
             lease: core::Lease { heartbeat_ms: a.lease.heartbeat_ms, host_fence_ms: a.lease.host_fence_ms, cp_expiry_ms: a.lease.cp_expiry_ms },
         },
         FleetToHost::HeartbeatAck { sent_ms, revoked, .. } => Inbound::HeartbeatAck { sent_ms, revoked: (!revoked.is_empty()).then_some(revoked) },
@@ -300,6 +300,7 @@ fn log(url: &str, l: Log) {
         Log::Silent { silent_ms } => tracing::warn!(silent_ms, "fleet connection silent; reconnecting"),
         Log::PeerError { reconnect } => tracing::warn!(reconnect, "fleet error"),
         Log::Unparseable { error } => tracing::warn!(%error, "unparseable fleet message"),
+        Log::CommandGap { seq, expected } => tracing::warn!(seq, expected, "fleet command batch out of order; reconnecting"),
         Log::OutboxShed { shed } => tracing::warn!(shed, "fleet outbox full: shed low-value events"),
     }
 }
