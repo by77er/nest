@@ -213,7 +213,7 @@ async fn a_start_for_a_stopping_brain_replaces_it_instead_of_adopting_it() {
     let pid = pids(e.dir.path())[0];
     nest_runner::supervisor::handle(
         &e.rt,
-        RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "stop".into() },
+        RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "stop".into(), epoch: None },
     );
     assert!(first.is_stopping());
     nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_stopping", &[]));
@@ -221,4 +221,82 @@ async fn a_start_for_a_stopping_brain_replaces_it_instead_of_adopting_it() {
     wait_for("a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
     let evs = events(&e.rt, Duration::from_millis(300)).await;
     assert!(!evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "already_running")), "{evs:?}");
+}
+
+fn start_at(dir: &Path, agent: &str, epoch: u64) -> RunnerCommand {
+    match start_cmd(dir, agent, &[]) {
+        RunnerCommand::AgentStart(mut s) => {
+            s.start.epoch = Some(nest_protocol::model::Epoch(epoch));
+            RunnerCommand::AgentStart(s)
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn kill_at(agent: &AgentId, epoch: u64) -> RunnerCommand {
+    RunnerCommand::AgentStop {
+        agent: agent.clone(),
+        mode: nest_protocol::host::runner::StopMode::Kill,
+        reason: "moving".into(),
+        epoch: Some(nest_protocol::model::Epoch(epoch)),
+    }
+}
+
+fn exits_at(evs: &[RunnerEvent]) -> Vec<(ExitReason, Option<u64>)> {
+    evs.iter()
+        .filter_map(|e| match e {
+            RunnerEvent::AgentExited { reason, epoch, .. } => Some((*reason, epoch.map(|e| e.0))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fourth review M2: a kill names its agent epoch and leaves a tombstone, so a start at or below it
+/// that hasn't registered yet (here: one waiting for its stopping predecessor to go away) never
+/// runs; its exit says so, at its epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_before_its_start_registers_means_it_never_runs() {
+    let e = env();
+    let id = AgentId("agt_tomb".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_tomb", 1));
+    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    let first_pid = pids(e.dir.path())[0];
+    // Stopping; the start at epoch 2 waits for it, and the kill for epoch 2 lands meanwhile.
+    nest_runner::supervisor::handle(
+        &e.rt,
+        RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "stop".into(), epoch: None },
+    );
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_tomb", 2));
+    nest_runner::supervisor::handle(&e.rt, kill_at(&id, 2));
+    wait_for("the first brain gone", || !alive(first_pid)).await;
+    let evs = events(&e.rt, Duration::from_millis(1500)).await;
+    let exits = exits_at(&evs);
+    let refused = exits.iter().position(|x| *x == (ExitReason::Fenced, Some(2)));
+    let older = exits.iter().position(|x| x.1 == Some(1));
+    assert!(refused.is_some(), "the refused start reports its exit at its epoch: {evs:?}");
+    assert!(older.is_some() && older < refused, "only once the older brain has gone: {evs:?}");
+    assert_eq!(pids(e.dir.path()).len(), 1, "no Claude Code for the killed epoch");
+    assert!(e.rt.agent(&id).is_none());
+    // A start that arrives after the kill is refused the same way.
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_tomb", 2));
+    let evs = events(&e.rt, Duration::from_millis(500)).await;
+    assert_eq!(exits_at(&evs), vec![(ExitReason::Fenced, Some(2))]);
+    assert!(e.rt.tombstoned(&id, nest_protocol::model::Epoch(2)));
+}
+
+/// A kill for an older epoch never ends a newer brain; one at its epoch does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_spares_a_newer_brain() {
+    let e = env();
+    let id = AgentId("agt_newer".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_newer", 2));
+    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    let pid = pids(e.dir.path())[0];
+    nest_runner::supervisor::handle(&e.rt, kill_at(&id, 1));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(alive(pid), "a kill for epoch 1 ended the brain at epoch 2");
+    nest_runner::supervisor::handle(&e.rt, kill_at(&id, 2));
+    wait_for("brain killed", || !alive(pid)).await;
+    let evs = events(&e.rt, Duration::from_millis(800)).await;
+    assert!(exits_at(&evs).contains(&(ExitReason::Stopped, Some(2))), "{evs:?}");
 }

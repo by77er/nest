@@ -663,11 +663,10 @@ impl Inner {
     /// Report brains that are gone without a runner exit of their own (the runner connection
     /// dropped, or a fenced start was never sent). AgentDO restarts `crashed` and `fenced` brains
     /// that have work with a current `agent_start`.
-    fn brains_exited(&self, gone: impl IntoIterator<Item = (AgentId, ExitReason)>) {
-        for (agent, reason) in gone {
-            // With the agent epoch of its latest start here, so an older start's exit is ignored.
-            let epoch = self.runner.epoch_of(&agent);
-            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: reason.into(), epoch });
+    fn brains_exited(&self, gone: impl IntoIterator<Item = (AgentId, Epoch, ExitReason)>) {
+        for (agent, epoch, reason) in gone {
+            // With the agent epoch of that start, so it never counts for a newer one.
+            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: reason.into(), epoch: Some(epoch) });
         }
     }
 
@@ -803,11 +802,18 @@ impl Inner {
                         }
                         // A kill takes effect at once too, not behind slow commands: AgentDO starts the
                         // agent elsewhere only once this brain's exit is reported. Its epoch is
-                        // remembered, so a start at or below it still queued here never runs; a brain
-                        // that isn't running here is reported exited now.
-                        CommandBody::AgentStop { agent, reason, mode: Some(StopMode::Kill), epoch } if !self.runner.kill(agent, *epoch, reason) => {
-                            let epoch = epoch.or_else(|| self.runner.epoch_of(agent));
-                            self.emit(HostEventBody::AgentExited { agent: agent.clone(), exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Stopped, epoch });
+                        // remembered (here and, forwarded, in the runner), so a start at or below it
+                        // never runs; when no start at or below it went out to the runner, the exit
+                        // is reported now. Its result goes out now as well: AgentDO reads a kill
+                        // with a result as "this host processes commands" (the in-order no-op in the
+                        // executor repeats it, which FleetDO ignores).
+                        CommandBody::AgentStop { agent, reason, mode: Some(StopMode::Kill), epoch } => {
+                            if !self.runner.kill(agent, *epoch, reason) {
+                                self.emit(HostEventBody::AgentExited { agent: agent.clone(), exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Stopped, epoch: *epoch });
+                            }
+                            let outcome = CommandOutcome::Ok { detail: None };
+                            self.results.lock().expect("results").insert(&c.cmd.0, outcome.clone());
+                            self.emit(HostEventBody::CommandResult { cmd: c.cmd.clone(), outcome });
                         }
                         _ => {}
                     }
@@ -1097,7 +1103,7 @@ impl Inner {
         let ids: Vec<(SandboxId, Epoch)> = self.summary.lock().expect("summary").iter().filter(|(_, s)| holds_lease(s.state)).map(|(id, s)| (id.clone(), s.epoch)).collect();
         tracing::error!(sandboxes = ids.len(), "lease expired: self-fencing");
         let unsent = self.runner.fence(vec![], "host lease expired");
-        self.brains_exited(unsent.into_iter().map(|a| (a, ExitReason::Fenced)));
+        self.brains_exited(unsent.into_iter().map(|(a, e)| (a, e, ExitReason::Fenced)));
         for (id, epoch) in ids {
             self.fence_sandbox(&id, epoch, "host lease expired", true).await;
         }
@@ -1393,7 +1399,9 @@ impl Inner {
             // A kill was applied on arrival; a graceful stop (or one from the previous release) goes in order.
             CommandBody::AgentStop { mode: Some(StopMode::Kill), .. } => Ok(None),
             CommandBody::AgentStop { agent, reason, .. } => {
-                self.runner.agent_stop(&agent, StopMode::Graceful, &reason);
+                // A start never sent to the runner ends here, and its exit is reported now.
+                let unsent = self.runner.agent_stop(&agent, StopMode::Graceful, &reason);
+                self.brains_exited(unsent.into_iter().map(|e| (agent.clone(), e, ExitReason::Stopped)));
                 Ok(None)
             }
             // Already applied on arrival (`on_fleet_notice`); this is the in-order no-op.
@@ -1925,7 +1933,11 @@ impl Inner {
         // A kill for this epoch (or a later one) overtook it: it never runs, and its exit says so.
         let epoch = start.agent_epoch();
         if self.runner.killed_at_or_above(&agent, epoch) {
-            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Fenced, epoch: Some(epoch) });
+            // Its exit says no brain at or below this epoch runs here: owed until an older start
+            // still out has exited (the runner link reports it then).
+            if self.runner.refused(&agent, epoch) {
+                self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Fenced, epoch: Some(epoch) });
+            }
             return Err(error(error_codes::STALE_EPOCH, "a kill for this agent epoch arrived first", false));
         }
         let config_dir = self.cfg.agents_dir().join(&agent.0);

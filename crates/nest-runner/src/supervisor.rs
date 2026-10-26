@@ -89,7 +89,16 @@ pub fn handle(rt: &Arc<Runtime>, cmd: RunnerCommand) {
         }
         RunnerCommand::LeaseUpdate { valid_until_ms } => *rt.lease.lock().unwrap() = Some(valid_until_ms),
         RunnerCommand::AgentStart(start) => agent::start(rt.clone(), *start),
-        RunnerCommand::AgentStop { agent, mode, reason } => {
+        RunnerCommand::AgentStop { agent, mode: StopMode::Kill, reason, epoch: Some(epoch) } => {
+            // A kill names the agent epoch it is for: it ends a brain at or below it, never a newer
+            // one, and a start at or below it that hasn't registered yet never will.
+            tracing::info!(%agent, %reason, epoch = epoch.0, "agent_stop (kill)");
+            if let Some(a) = rt.tombstone(&agent, epoch) {
+                a.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+                a.kill_now(ExitReason::Stopped);
+            }
+        }
+        RunnerCommand::AgentStop { agent, mode, reason, .. } => {
             tracing::info!(%agent, ?mode, %reason, "agent_stop");
             if let Some(a) = rt.agent(&agent) {
                 a.stopping.store(true, std::sync::atomic::Ordering::SeqCst);

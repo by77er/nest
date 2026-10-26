@@ -1455,7 +1455,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(start))]).unwrap();
     assert!(is_ok(&fleet.result("cmd_agent").await));
     assert!(drain(&mut r, Duration::from_millis(300)).await.iter().any(|c| matches!(c, RunnerCommand::AgentStart(_))));
-    let started = RunnerEvent::AgentStarted { agent: AgentId("agt_c".into()), pid: 9, session: SessionId("ses_1".into()), claude_version: "t".into(), capabilities: vec![] };
+    let started = RunnerEvent::AgentStarted { agent: AgentId("agt_c".into()), pid: 9, session: SessionId("ses_1".into()), claude_version: "t".into(), capabilities: vec![], epoch: Some(Epoch(1)) };
     r.send(bytes::Bytes::from(serde_json::to_vec(&started).unwrap())).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2072,8 +2072,9 @@ fn bound_start(agent: &str, sandbox: &str) -> AgentStart {
     }
 }
 
-/// A kill takes effect on arrival, not behind a slow command in the in-order executor; the in-order
-/// pass doesn't kill again, and the result still comes in order.
+/// A kill takes effect on arrival, not behind a slow command in the in-order executor, and its
+/// result goes out on arrival too (AgentDO's escalation reads a kill with a result as "this host
+/// processes commands"); the in-order pass doesn't kill again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kill_applies_on_arrival_behind_slow_commands() {
     let h = start_host().await;
@@ -2093,6 +2094,7 @@ async fn a_kill_applies_on_arrival_behind_slow_commands() {
     .await;
     assert!(t0.elapsed() < Duration::from_millis(800), "waited behind the slow create: {:?}", t0.elapsed());
     assert!(matches!(h.fleet.result("cmd_kill").await, CommandOutcome::Ok { .. }));
+    assert!(h.fleet.results_for("cmd_slow").is_empty(), "the kill's result came on arrival, not behind the slow command");
     let kills = h._runner.lock().unwrap().iter().filter(|c| matches!(c, RunnerCommand::AgentStop { .. })).count();
     assert_eq!(kills, 1, "the in-order pass does not kill again");
 }

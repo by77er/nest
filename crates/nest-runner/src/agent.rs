@@ -33,7 +33,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::framing;
-use crate::runtime::{Agent, AgentCmd, Outbound, Runtime};
+use crate::runtime::{Agent, AgentCmd, Outbound, Refused, Runtime};
 use crate::session;
 use crate::stream;
 
@@ -60,8 +60,8 @@ pub fn tool_allowed(name: &str) -> bool {
 const MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to wait for a previous connection's brain (being killed) to go away.
-const DYING_WAIT: Duration = Duration::from_secs(10);
+/// How often a start waiting for the previous brain (being killed) to go away looks again.
+const DYING_POLL: Duration = Duration::from_millis(100);
 /// Pending stdin messages per brain before a write is refused.
 const STDIN_QUEUE: usize = 64;
 /// After a `result` while more user messages are outstanding: if Claude Code shows no further
@@ -105,26 +105,39 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             cmd_tx,
             out_tx,
         );
-        let deadline = Instant::now() + DYING_WAIT;
+        // An exit this runner reports at an agent epoch means no brain of the agent at or below it
+        // runs here any more (AgentDO releases the brain on it): a start that never runs reports
+        // its exit only once any older brain has gone.
+        let older_gone = |rt: &Runtime| rt.agent(&id).is_none_or(|a| a.epoch() > epoch);
         loop {
             match rt.register(agent.clone()) {
                 Ok(()) => break,
-                Err(existing) if existing.conn_gen != agent.conn_gen && Instant::now() < deadline => {
-                    // A brain from an earlier nestd connection: it was fenced when that
-                    // connection dropped and is on its way out.
+                Err(Refused::Killed) => {
+                    // A kill for this epoch (or a later one) overtook the start: it never runs. The
+                    // kill also ended any older brain; its exit is reported once that one is gone.
+                    tracing::warn!(agent = %id, epoch = epoch.0, "agent_start below a kill's epoch: refused");
+                    while !older_gone(&rt) {
+                        tokio::time::sleep(DYING_POLL).await;
+                    }
+                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
+                    return;
+                }
+                Err(Refused::Running(existing)) if existing.conn_gen != agent.conn_gen => {
+                    // A brain from an earlier nestd connection: it was fenced when that connection
+                    // dropped and is on its way out; this start registers once it is gone.
                     existing.kill_now(ExitReason::Fenced);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(DYING_POLL).await;
                 }
-                Err(existing) if existing.is_stopping() && Instant::now() < deadline => {
+                Err(Refused::Running(existing)) if existing.is_stopping() => {
                     // A brain told to stop is never adopted: this start replaces it, so it ends now
-                    // and the new brain registers once it is gone.
+                    // and the new brain registers once it is gone (never alongside it).
                     existing.kill_now(ExitReason::Stopped);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(DYING_POLL).await;
                 }
-                Err(existing) => {
-                    // AgentDO started this brain again (it lost sight of it): the live brain keeps
-                    // running, takes the new hands and adopts the newer agent epoch, which
-                    // re-handshakes its session channel.
+                Err(Refused::Running(existing)) => {
+                    // AgentDO started this brain again on this host (a same-host restart): the live
+                    // brain keeps running, takes the new hands and adopts the newer agent epoch,
+                    // which re-handshakes its session channel. Its exit names that epoch.
                     tracing::warn!(agent = %id, "agent_start for a brain that is already running; updating its hands and epoch only");
                     existing.set_hands(start.start.hands.clone());
                     existing.adopt_epoch(start.start.agent_epoch());
@@ -325,10 +338,12 @@ async fn run(
         let session = session_id.clone().unwrap_or_else(|| SessionId("ses_pending".into()));
         let timeout = rt.cfg.session_open_timeout;
         let pid = proc.pid;
+        // The epoch this start registered under (not one adopted since): nestd marks that start.
+        let epoch = s.start.agent_epoch();
         tokio::spawn(async move {
             let _ = tokio::time::timeout(timeout, opened).await;
             let capabilities = agent.inner.lock().unwrap().capabilities.clone();
-            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities });
+            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities, epoch: Some(epoch) });
         });
     }
 

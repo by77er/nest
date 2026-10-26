@@ -538,7 +538,7 @@ async fn resume_argv_and_interrupt_cancels_hands() {
     assert_eq!(h.guest.cancelled().await.len(), 1, "the in-flight hands call was cancelled");
 
     // Stop the agent so the fake writes its run log.
-    h.nestd.send(RunnerCommand::AgentStop { agent: AgentId(AGENT.into()), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "test".into() });
+    h.nestd.send(RunnerCommand::AgentStop { agent: AgentId(AGENT.into()), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "test".into(), epoch: None });
     let reason = h.nestd.expect("exit", |e| if let RunnerEvent::AgentExited { reason, .. } = e { Some(*reason) } else { None }).await;
     assert_eq!(reason, ExitReason::Stopped);
     let runs = h.runs();

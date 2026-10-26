@@ -35,7 +35,9 @@ pub use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 /// Process-wide state.
 pub struct Runtime {
     pub cfg: Config,
-    agents: Mutex<HashMap<AgentId, Arc<Agent>>>,
+    /// Registered brains and the kill tombstones, under one lock: a registration and a kill for
+    /// the same agent are ordered, so a kill can't slip between a start's spawn and its registration.
+    agents: Mutex<Registry>,
     /// Newest host token from nestd (memory only).
     pub host_token: watch::Sender<Option<Secret>>,
     pub host_id: Mutex<Option<HostId>>,
@@ -55,7 +57,7 @@ impl Runtime {
         let (tx, rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             cfg,
-            agents: Mutex::new(HashMap::new()),
+            agents: Mutex::new(Registry::default()),
             host_token: watch::channel(None).0,
             host_id: Mutex::new(None),
             to_nestd: tx,
@@ -66,31 +68,50 @@ impl Runtime {
     }
 
     pub fn agent(&self, id: &AgentId) -> Option<Arc<Agent>> {
-        self.agents.lock().unwrap().get(id).cloned()
+        self.agents.lock().unwrap().agents.get(id).cloned()
     }
 
     pub fn agents(&self) -> Vec<Arc<Agent>> {
-        self.agents.lock().unwrap().values().cloned().collect()
+        self.agents.lock().unwrap().agents.values().cloned().collect()
     }
 
-    /// Register (first thing a start does, before any slow step); returns the agent already
-    /// registered under this id instead, if any.
-    pub fn register(&self, a: Arc<Agent>) -> Result<(), Arc<Agent>> {
-        let mut m = self.agents.lock().unwrap();
-        if let Some(existing) = m.get(&a.id) {
-            return Err(existing.clone());
+    /// Register (first thing a start does, before any slow step). Refused when a kill at or above
+    /// the start's agent epoch arrived first (its tombstone), or when another brain is registered
+    /// under this id.
+    pub fn register(&self, a: Arc<Agent>) -> Result<(), Refused> {
+        let mut r = self.agents.lock().unwrap();
+        if r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch().0) {
+            return Err(Refused::Killed);
         }
-        m.insert(a.id.clone(), a);
+        if let Some(existing) = r.agents.get(&a.id) {
+            return Err(Refused::Running(existing.clone()));
+        }
+        r.agents.insert(a.id.clone(), a);
         Ok(())
     }
 
     /// Remove `a` — only if it is still the registered instance (a duplicate start must never
     /// deregister the live brain).
     pub fn deregister(&self, a: &Arc<Agent>) {
-        let mut m = self.agents.lock().unwrap();
-        if m.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
-            m.remove(&a.id);
+        let mut r = self.agents.lock().unwrap();
+        if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
+            r.agents.remove(&a.id);
         }
+    }
+
+    /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
+    /// so no start at or below it registers from now on, and return the registered brain if it
+    /// runs at or below it (the caller kills it). A newer brain is left alone.
+    pub fn tombstone(&self, agent: &AgentId, epoch: Epoch) -> Option<Arc<Agent>> {
+        let mut r = self.agents.lock().unwrap();
+        let k = r.tombstones.entry(agent.clone()).or_insert(epoch.0);
+        *k = (*k).max(epoch.0);
+        r.agents.get(agent).filter(|a| a.epoch() <= epoch).cloned()
+    }
+
+    /// Whether a kill at or above `epoch` arrived for `agent`.
+    pub fn tombstoned(&self, agent: &AgentId, epoch: Epoch) -> bool {
+        self.agents.lock().unwrap().tombstones.get(agent).is_some_and(|k| *k >= epoch.0)
     }
 
     pub fn current_gen(&self) -> u64 {
@@ -140,6 +161,22 @@ impl Runtime {
     pub fn host(&self) -> HostId {
         self.host_id.lock().unwrap().clone().unwrap_or_else(|| HostId("hst_unknown".into()))
     }
+}
+
+/// The brains this runner runs, and per agent the highest agent epoch a kill named (kept for the
+/// process's life: one number per agent).
+#[derive(Default)]
+struct Registry {
+    agents: HashMap<AgentId, Arc<Agent>>,
+    tombstones: HashMap<AgentId, u64>,
+}
+
+/// Why [`Runtime::register`] refused a brain.
+pub enum Refused {
+    /// A kill at or above its agent epoch arrived first: it must never run.
+    Killed,
+    /// Another brain is registered under the id.
+    Running(Arc<Agent>),
 }
 
 /// Removes a `hands_resolve` request from the pending map when its waiter goes away.
@@ -336,12 +373,12 @@ impl Agent {
         self.command(AgentCmd::Kill(reason));
     }
 
-    /// First kill reason recorded by [`Agent::kill_now`].
     /// Told to stop, or being killed: never adopted by a later start (which waits for it instead).
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst) || self.kill_reason().is_some()
     }
 
+    /// First kill reason recorded by [`Agent::kill_now`].
     pub fn kill_reason(&self) -> Option<ExitReason> {
         *self.kill_reason.lock().unwrap()
     }

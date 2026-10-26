@@ -409,7 +409,17 @@ pub mod runner {
         LeaseUpdate { valid_until_ms: TimestampMs },
         /// Start (or resume) a brain.
         AgentStart(Box<AgentStart>),
-        AgentStop { agent: AgentId, mode: StopMode, reason: String },
+        /// `epoch`: for a kill, the agent epoch it is for (nestd forwards the control plane's).
+        /// The runner keeps it as the agent's tombstone: a brain at or below it is killed, a newer
+        /// one is left alone, and a start at or below it is refused even if it registers later.
+        /// Absent (a graceful stop, or nestd of the previous release): whatever runs is stopped.
+        AgentStop {
+            agent: AgentId,
+            mode: StopMode,
+            reason: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            epoch: Option<Epoch>,
+        },
         /// Kill these brains now (empty = all). The runner then reports
         /// `AgentExited { reason: fenced }` and closes their session channels.
         Fence {
@@ -435,6 +445,10 @@ pub mod runner {
             claude_version: String,
             /// `system/init.capabilities` (feature detection, e.g. `interrupt_receipt_v1`).
             capabilities: Vec<String>,
+            /// The agent epoch of the start this brain registered under (absent from a runner of
+            /// the previous release): nestd marks that start's entry, and no other.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            epoch: Option<Epoch>,
         },
         /// Claude Code capabilities, sent whenever they become known (`system/init` may only
         /// arrive after the first user message, i.e. after `agent_started`).

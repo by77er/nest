@@ -626,7 +626,7 @@ describe("docs #8 hello.agents reconciliation", () => {
     // A brain AgentDO took for detached that the host does report is kept.
     await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
       const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
-      info.host = s.host.host;
+      info.brain = { host: s.host.host, epoch: info.agent_epoch, phase: "live", since_ms: Date.now() };
       st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
     });
     const third = await Ws.connect("/v1/fleet", s.host.host_token);
