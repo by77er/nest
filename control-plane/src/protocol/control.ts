@@ -116,6 +116,8 @@ export const HostHello = z.object({
   /** Absent from a nestd that predates the field: `none`. */
   tunnel: TunnelState.optional(),
   last_command_seq: Seq.optional(),
+  /** Set when nestd's VMMs should run in its delegated unit cgroup and that setup failed. */
+  cgroup_delegation_error: z.string().optional(),
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
   capacity: Capacity,
@@ -280,6 +282,8 @@ export const HostEventVariants = [
     ...hostEventBase, type: z.literal("sandbox_state"), sandbox: SandboxId, epoch: Epoch, state: SandboxState,
     suspend_mode: SuspendMode.optional(), detail: z.string().optional(), guest: GuestInfo.optional(),
   }),
+  /** A fenced or superseded incarnation is gone from the host (salvaged, nothing to salvage, or refused for good). */
+  z.object({ ...hostEventBase, type: z.literal("incarnation_retired"), sandbox: SandboxId, epoch: Epoch }),
   z.object({
     ...hostEventBase, type: z.literal("commit_request"), request: RequestId, sandbox: SandboxId, epoch: Epoch,
     parent: GenerationId.optional(), kind: GenerationKind, disk_manifest: ManifestHash,
