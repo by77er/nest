@@ -782,10 +782,10 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * AgentDO is starting `agent`'s brain under `agentEpoch`: raise the agent's floor at the gateway
-   * (an `agent_attach` carrying it, sent now if the sandbox is placed, and with every later attach),
-   * so bindings minted for an older brain start are refused from then on, even before the new brain
-   * calls. Never lowered. The slot itself is unchanged: a confirmed agent stays confirmed.
+   * AgentDO is starting `agent`'s brain under `agentEpoch`: record it as the agent's wanted floor and
+   * send it to the gateway (`client_floor`, now if the sandbox is placed; every later attach carries
+   * it). `resolve` mints no binding at that epoch until the gateway confirmed it, so an older brain's
+   * bindings are refused before the new brain can call. Never lowered; the slot is unchanged.
    */
   async fenceClient(agent: string, agentEpoch: number): Promise<void> {
     const before = this.info_();

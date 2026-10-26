@@ -47,7 +47,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/agents {role, workstream?, sandbox?, cell?, start?}`: sends `agent_start` to the host; a worker's
      workstream and cell come from its sandbox (a mismatch is refused with 409)
    - `POST /v1/agents/<id>/start {host?}`: start (or restart) the brain; `host` puts it on a chosen active,
-     connected host of the cell (for a test); hands still go through the sandbox's gateway
+     connected host of the cell (for a test); hands still go through the sandbox's gateway. Answers `{host, cmd}`;
+     `cmd: null` when the brain already runs there (nothing sent); 409 (retryable) while another start with other
+     arguments is in flight, or while the old host can't kill the brain on arrival
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:

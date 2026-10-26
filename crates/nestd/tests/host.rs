@@ -1470,7 +1470,8 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     drop(r);
-    fleet.wait_event("the lost brain reported", |b| matches!(b, HostEventBody::AgentExited { agent, reason, .. } if agent.0 == "agt_c" && *reason == AgentExitReason::Crashed)).await;
+    // nestd reports it itself (the runner is gone), with the agent epoch of its start here.
+    fleet.wait_event("the lost brain reported", |b| matches!(b, HostEventBody::AgentExited { agent, reason, epoch, .. } if agent.0 == "agt_c" && *reason == AgentExitReason::Crashed && *epoch == Some(Epoch(1)))).await;
     let mut r = connect().await;
     let got = drain(&mut r, Duration::from_millis(500)).await;
     assert!(got.iter().any(|c| matches!(c, RunnerCommand::HelloAck { .. })));
