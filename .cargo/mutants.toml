@@ -13,7 +13,7 @@ exclude_re = [
   # fleet_commands_forwarded_in_order (the branch before it already took `seq <= forwarded`),
   'crates/nestd-core/src/fleet\.rs:480:88: replace > with >= in FleetLink<E>::on_frame',
   # result_cache_bounded (`&&` -> `||`; the cache's other `&&` is a let chain, unviable).
-  'crates/nestd-core/src/results\.rs:\d+:\d+: replace && with \|\| in ResultCache<V>::insert',
+  'crates/nestd-core/src/results\.rs:\d+:\d+: replace && with \|\| in ResultCache<V, K, M, O>::insert',
 
   # Heartbeat send times kept: 63 instead of HEARTBEATS_KEPT (64). Only an ack for exactly the 64th
   # newest heartbeat, with none of the 63 after it acked, would tell; the link closes after 2.5
@@ -29,6 +29,11 @@ exclude_re = [
   'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace FleetLink<E>::forwarded_command_seq -> ',
   # The release-build reporter: a debug build (every test) panics before reaching the hook.
   'crates/nestd-core/src/invariant\.rs:\d+:\d+: replace set_hook with \(\)',
-  # No caller: it exists because clippy's len_without_is_empty asks for it beside `len`.
-  'crates/nestd-core/src/results\.rs:\d+:\d+: replace ResultCache<V>::is_empty -> bool',
+  # No caller: they exist because clippy's len_without_is_empty asks for them beside `len`.
+  'crates/nestd-core/src/results\.rs:\d+:\d+: replace (ResultCache<V, K, M, O>|OutcomeMap|KeyOrder)::is_empty -> bool',
+  'crates/nestd-core/src/results\.rs:\d+:\d+: replace == with != in (OutcomeMap|KeyOrder)::is_empty',
+
+  # Kani harnesses and their stand-ins (`#[cfg(kani)] mod proofs`): cargo test never compiles them,
+  # so a mutant there can't fail a test; `cargo kani` is what runs them.
+  'crates/nestd-core/src/[a-z_]+\.rs:\d+:\d+: .*\bproofs::',
 ]

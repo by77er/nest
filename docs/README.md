@@ -34,6 +34,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `control-plane/` | Worker and Durable Objects |
 | `crates/nest-protocol` | Wire types for every boundary |
 | `crates/nestd` | Host daemon |
+| `crates/nestd-core` | nestd's pure state-machine cores, checked as shipped ([verification](verification/nestd/)) |
 | `crates/nest-proxy` | Egress proxy |
 | `crates/nest-guest` | Guest agent (hands server) |
 | `crates/nest-runner` | Agent runner |
@@ -77,7 +78,7 @@ cross-cutting   security (authority, model access, identity, credentials) · dat
 contracts       boundary interfaces (wire protocols, the gateway contract, tool schemas) interfaces/
 ```
 
-See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [interfaces/](interfaces/) and [setup/](setup/).
+See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [verification/](verification/), [interfaces/](interfaces/) and [setup/](setup/).
 
 ## Glossary
 
@@ -208,6 +209,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Open:** turn-end generations are always kept, so a long-lived sandbox's history grows without bound; it may need a cap. See [sandbox/state/](sandbox/state/#retention).
 - **Open:** per-sandbox I/O limits don't make a dense host fair when many sandboxes spend their burst at once. See [sandbox/state/disk/](sandbox/state/disk/#io-limits).
 - **Open:** upgrading the guest agent in place by re-exec, which needs a task registry rebuildable from tmpfs. See [sandbox/guest-agent/](sandbox/guest-agent/#versions).
+- **Open:** gate new fleet command variants on the host's capabilities, so a nestd one release behind never meets a batch it can't parse (it now reconnects on the gap that leaves instead of losing it silently). See [verification/nestd/](verification/nestd/#open-questions).
 - **Open:** resolving upstream names with a DNS client instead of getaddrinfo, so TTL and CNAME caps can apply. Which origins honor `X-Forwarded-Host` and similar overrides is unverified (nest strips them regardless). See [sandbox/networking/egress/dns/](sandbox/networking/egress/dns/).
 - **Open:** taint is one bit, so it can't tell sandbox output from outside content; auto-merging agents' PRs relies on keeping outside content from the repo's workers. Recording a taint source would let PRs from sessions that read the web wait for me. See [repo maintenance](orchestration/repo-maintenance/#why-auto-merge-is-safe-enough).
 - **Not designed yet:** the sandbox-to-sandbox **link** (an opt-in path through the proxy). See [sandbox/](sandbox/).
