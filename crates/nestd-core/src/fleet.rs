@@ -559,3 +559,34 @@ impl<E: OutboxEvent> FleetLink<E> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct E;
+
+    impl OutboxEvent for E {
+        fn shed_rank(&self) -> Option<u8> {
+            None
+        }
+        fn absorb(&mut self, _: &Self) -> bool {
+            false
+        }
+    }
+
+    /// The `fleet_effects_well_formed` invariant is what flags, in tests and in the model checker,
+    /// a step that sends on a connection it has just closed or opens two at once; a check that
+    /// accepts those hides the bug it exists to catch.
+    #[test]
+    fn the_effects_check_rejects_a_send_after_a_close_and_a_second_connect() {
+        let ok = |fx: Effects<E, (), (), ()>| FleetLink::<E>::effects_well_formed(&fx);
+        let connect = || Effect::Connect { token: String::new() };
+        let send = || Effect::Send(Outbound::Ack { up_to: 1 });
+        assert!(ok(vec![send(), Effect::Close, Effect::Notify(Notice::Disconnected), Effect::Log(Log::HelloRefused)]));
+        assert!(!ok(vec![Effect::Close, send()]));
+        assert!(!ok(vec![Effect::Close, Effect::Close]));
+        assert!(!ok(vec![connect(), connect()]));
+    }
+}
