@@ -122,7 +122,9 @@ pub fn deletes_unreported(clean: bool, unanswered: bool) -> bool {
 
 // Retiring an incarnation (`Host::retire`).
 
-/// First wait before a failed salvage is retried.
+/// First wait before a failed salvage is retried. Retries go on, doubling up to the max, until the
+/// salvage lands or the incarnation is destroyed (FleetDO destroys a dirty one after its salvage
+/// window).
 pub const RETIRE_RETRY_FIRST: Duration = Duration::from_secs(1);
 /// The longest wait between salvage retries.
 pub const RETIRE_RETRY_MAX: Duration = Duration::from_secs(300);

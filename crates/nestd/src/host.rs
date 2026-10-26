@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use nestd_core::incarnation;
 use nestd_core::results::ResultCache;
 use nest_protocol::control::{
     AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressAuditRecord,
@@ -58,10 +59,6 @@ use crate::util::{error, new_id, now_ms};
 
 const MAX_AGENT_SLOTS: u16 = 64;
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(60);
-/// A retired incarnation's salvage is retried after this, doubling up to the max, until it lands
-/// or the incarnation is destroyed (FleetDO destroys a dirty one after its salvage window).
-const RETIRE_RETRY_FIRST: Duration = Duration::from_secs(1);
-const RETIRE_RETRY_MAX: Duration = Duration::from_secs(300);
 /// How long a non-`ask` guest CLI relay waits for `guest_cli_result`. The guest gives up after
 /// 30 s; nestd answers 3 s earlier so the caller gets nestd's error, not a bare guest timeout.
 const CLI_RELAY_TIMEOUT_S: u64 = 27;
@@ -384,7 +381,7 @@ impl Host {
         // sandbox wakes from its head anyway); the others are reported fenced, salvaged, deleted.
         let mut found = vec![];
         for f in recovery::scan(&cfg.sandboxes_dir()) {
-            if f.meta.clean && f.meta.unanswered.is_none() {
+            if incarnation::deletes_unreported(f.meta.clean, f.meta.unanswered.is_some()) {
                 tracing::info!(sandbox = %f.meta.sandbox, epoch = f.meta.epoch.0, "deleting a clean incarnation left by a previous nestd");
                 recovery::remove_incarnation(&f.state_dir);
             } else {
@@ -1163,7 +1160,7 @@ impl Inner {
         }
         s.retiring = true;
         let (id, epoch) = (s.id.clone(), s.epoch);
-        let mut backoff = RETIRE_RETRY_FIRST;
+        let mut backoff = incarnation::RETIRE_RETRY_FIRST;
         while dirty && s.state_dir.exists() {
             let (s2, r) = self.commit(&entry, s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
             s = s2;
@@ -1181,7 +1178,7 @@ impl Inner {
                     tracing::warn!(sandbox = %id, epoch = epoch.0, code = %e.code, message = %e.message, retry_in = ?backoff, "salvage failed: the disk is kept and the salvage retried");
                     drop(s);
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(RETIRE_RETRY_MAX);
+                    backoff = incarnation::retire_backoff(backoff);
                     s = entry.lock().await;
                 }
             }
@@ -2123,7 +2120,7 @@ impl Inner {
         .map_err(internal)?;
         // The disk is exactly its head's (nothing written since; a head's memory doesn't matter to
         // a salvage, which has none): there is no work to salvage.
-        if reason == CommitReason::Salvage && s.head.as_ref().is_some_and(|h| h.disk_manifest == disk_manifest) {
+        if incarnation::nothing_to_salvage(reason == CommitReason::Salvage, s.head.as_ref().map(|h| &h.disk_manifest), &disk_manifest) {
             return Ok(None);
         }
         let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
@@ -2197,7 +2194,7 @@ fn hostname(id: &SandboxId) -> String {
 /// retryable), or a `parent_mismatch`. A non-retryable refusal (`stale_epoch`, `invalid_message`)
 /// is SandboxDO's final word on that work.
 fn salvage_retryable(e: &ErrorBody) -> bool {
-    e.retryable || e.code == error_codes::PARENT_MISMATCH
+    incarnation::salvage_retryable(e.retryable, e.code == error_codes::PARENT_MISMATCH)
 }
 
 fn internal(e: impl std::fmt::Display) -> ErrorBody {

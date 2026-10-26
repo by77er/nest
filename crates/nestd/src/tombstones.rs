@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nest_protocol::model::{Epoch, SandboxId};
+use nestd_core::incarnation;
 
 /// Highest fenced epoch per sandbox; nothing at or below it is accepted. Cheap to clone (shared).
 /// Its lock is a leaf: taken inside the links' own locks, never around another lock.
@@ -23,20 +24,20 @@ impl Tombstones {
     /// `sandbox@epoch` was fenced: refuse it and every older epoch from now on.
     pub fn fence(&self, sandbox: &SandboxId, epoch: Epoch) {
         let mut m = self.0.lock().expect("tombstones");
-        let e = m.entry(sandbox.clone()).or_insert(epoch);
-        *e = (*e).max(epoch);
+        let fenced = incarnation::fenced_after(m.get(sandbox).map(|f| f.0), epoch.0);
+        m.insert(sandbox.clone(), Epoch(fenced));
     }
 
     /// Whether `sandbox@epoch` is at or below a fenced epoch.
     pub fn refuses(&self, sandbox: &SandboxId, epoch: Epoch) -> bool {
-        self.0.lock().expect("tombstones").get(sandbox).is_some_and(|f| epoch <= *f)
+        incarnation::refuses(self.0.lock().expect("tombstones").get(sandbox).map(|f| f.0), epoch.0)
     }
 
     /// Drop the sandbox's tombstone if it is at or below `epoch` (the sandbox was destroyed at
     /// that epoch). A tombstone above `epoch` stays.
     pub fn prune_up_to(&self, sandbox: &SandboxId, epoch: Epoch) {
         let mut m = self.0.lock().expect("tombstones");
-        if m.get(sandbox).is_some_and(|f| *f <= epoch) {
+        if m.get(sandbox).is_some_and(|f| incarnation::destroy_prunes(f.0, epoch.0)) {
             m.remove(sandbox);
         }
     }
@@ -44,7 +45,7 @@ impl Tombstones {
     /// Drop the sandbox's tombstone if it is below `epoch` (that newer epoch now runs here).
     pub fn prune_below(&self, sandbox: &SandboxId, epoch: Epoch) {
         let mut m = self.0.lock().expect("tombstones");
-        if m.get(sandbox).is_some_and(|f| *f < epoch) {
+        if m.get(sandbox).is_some_and(|f| incarnation::run_prunes(f.0, epoch.0)) {
             m.remove(sandbox);
         }
     }
