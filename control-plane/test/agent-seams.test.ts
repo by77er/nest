@@ -1852,6 +1852,74 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect((await nextCommands(t.host.ws, isStartOf(t.agent))).find(isStartOf(t.agent))).toMatchObject({ epoch: 2 });
   });
 
+  it("N20: a start kept before a later graceful stop doesn't run after it; a condemned brain's operator intent survives any exit; a same-host hint is dropped like a plain start", async () => {
+    const exit = async (ws: Ws, agent: string, reason: string, epoch: number) => {
+      const q = sendEvents(ws, [{ ts_ms: Date.now(), type: "agent_exited", agent, reason, epoch }]);
+      await ws.next("ack", (m) => m.up_to >= q);
+    };
+    // Start first, then a stop: the stop ends that start's wait.
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await agentStub(s.agent).start();
+    await agentStub(s.agent).stop("requested");
+    await exit(s.host.ws, s.agent, "stopped", 1);
+    expect(await agentStub(s.agent).info()).toMatchObject({ brain: null, intent: null });
+    // A brain condemned for a move (its host draining) keeps its operator intent through a crash.
+    const t = await setup();
+    await okResult(t.host.ws, t.start.cmd);
+    await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(t.cell)), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", t.host.host);
+    });
+    expect(await agentStub(t.agent).start()).toMatchObject({ kind: "waiting" });
+    await exit(t.host.ws, t.agent, "crashed", 1);
+    // Kept (or already run by its alarm: a new start at epoch 2).
+    const ti = await agentStub(t.agent).info();
+    expect(ti.intent?.reason === "operator" || ti.brain?.epoch === 2).toBe(true);
+    // An operator start naming the brain's own host answers `none` and is dropped by an idle exit.
+    const u = await setup();
+    await okResult(u.host.ws, u.start.cmd);
+    await runner(u.agent, u.host.host, u.host.host_token, "rin_one", 1);
+    expect(await agentStub(u.agent).start(u.host.host)).toMatchObject({ kind: "none" });
+    await exit(u.host.ws, u.agent, "idle", 1);
+    expect(await agentStub(u.agent).info()).toMatchObject({ brain: null, intent: null });
+  });
+
+  it("a newer start on a host resets its drain notice; a stale notice's ack marks only its own start", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell, "controller");
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    const r = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
+      st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone, drain_told) VALUES ('agt_dt', ?, 'cmd_old', 1, 0, 1)", a.host);
+      // A newer start recorded there: its drain notice is owed again.
+      st.storage.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch, gone, drain_told) VALUES ('agt_dt', ?, 'cmd_new', 2, 0, 0)
+        ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch, gone = 0, drain_told = 0`, a.host);
+      void inst;
+      return st.storage.sql.exec<{ t: number }>("SELECT drain_told AS t FROM host_agents WHERE agent = 'agt_dt'").one().t;
+    });
+    expect(r).toBe(0);
+    // Through issueCommands itself.
+    const told = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
+      st.storage.sql.exec("UPDATE host_agents SET drain_told = 1 WHERE agent = 'agt_dt'");
+      await inst.issueCommands(a.host, [{
+        type: "agent_start", agent: "agt_dt", role: "captain", workstream: "ws_x", epoch: 3,
+        launch: { builtin_tools: [], system_prompt: { mode: "replace", text: "x" } }, oauth_token: "t", session_ws_url: "ws://x",
+      } as any]);
+      const afterStart = st.storage.sql.exec<{ t: number }>("SELECT drain_told AS t FROM host_agents WHERE agent = 'agt_dt'").one().t;
+      // A notice told for that start, acked after a newer start replaced it, marks nothing.
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", a.host);
+      (inst as any).agentStub = () => ({
+        onHostDraining: async () => {
+          st.storage.sql.exec("UPDATE host_agents SET cmd = 'cmd_newer' WHERE agent = 'agt_dt'");
+        },
+      });
+      await (inst as any).tellDraining(a.host);
+      const afterAck = st.storage.sql.exec<{ t: number }>("SELECT drain_told AS t FROM host_agents WHERE agent = 'agt_dt'").one().t;
+      return { afterStart, afterAck };
+    });
+    expect(told).toEqual({ afterStart: 0, afterAck: 0 });
+  });
+
   it("hello order: a previous-release host is drained of brains before its agents are reconciled, and keeps its sandboxes", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);

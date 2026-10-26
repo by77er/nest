@@ -1295,8 +1295,8 @@ export class FleetDO extends DurableObject<Env> {
         c.cmd, host, c.type, sandbox, agent, epoch, purpose, JSON.stringify(c), now,
       );
       if (c.type === "agent_start") {
-        this.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch, gone) VALUES (?, ?, ?, ?, 0)
-          ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch, gone = 0`,
+        this.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch, gone, drain_told) VALUES (?, ?, ?, ?, 0, 0)
+          ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch, gone = 0, drain_told = 0`,
           c.agent, host, c.cmd, c.epoch ?? null);
       }
     }
@@ -1831,13 +1831,17 @@ export class FleetDO extends DurableObject<Env> {
     if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
 
-  /** Tell each agent with a brain on draining `host` to move it, until it took it (the tick retries). */
+  /**
+   * Tell each agent with a brain on draining `host` to move it, until it took it. Retried by the
+   * tick, which every hello arms (so a reconnect after this object's reset is covered within a
+   * heartbeat). Marked only for the start it was told about (by command id).
+   */
   private async tellDraining(host: string): Promise<void> {
-    const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ? AND drain_told = 0", host).toArray();
-    await Promise.all(agents.map(async ({ agent }) => {
+    const agents = this.sql.exec<{ agent: string; cmd: string }>("SELECT agent, cmd FROM host_agents WHERE host = ? AND drain_told = 0", host).toArray();
+    await Promise.all(agents.map(async ({ agent, cmd }) => {
       try {
         await this.agentStub(agent).onHostDraining(host);
-        this.sql.exec("UPDATE host_agents SET drain_told = 1 WHERE agent = ? AND host = ?", agent, host);
+        this.sql.exec("UPDATE host_agents SET drain_told = 1 WHERE agent = ? AND host = ? AND cmd = ?", agent, host, cmd);
       } catch (e) {
         console.error(`FleetDO: moving ${agent} off draining ${host} failed; will retry`, e);
       }

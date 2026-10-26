@@ -167,6 +167,8 @@ export type Brain =
 
 /** Who wanted a start. */
 export type IntentReason = "operator" | "restart" | "wake" | "drain" | "retry";
+/** Whether an intent moves a brain off `host` (another host named, or `host` avoided). */
+const moves = (intent: StartIntent, host: string) => (intent.host_hint !== undefined && intent.host_hint !== host) || intent.avoid === host;
 /** Which reason wins when two starts merge into one intent. */
 const INTENT_RANK: Record<IntentReason, number> = { wake: 0, retry: 1, drain: 2, operator: 3, restart: 4 };
 
@@ -912,9 +914,11 @@ export class AgentDO extends DurableObject<Env> {
       // Counted once, where it happens (the crash-loop guard): here for a brain that ended on its
       // own; a condemned brain's exit is the condemn's outcome, counted by its cause if at all.
       if (restarts && i.brain.phase !== "condemned") i.exit_restarts = (i.exit_restarts ?? 0) + 1;
-      // An operator's plain start kept while this brain ran (N14) is for after a graceful stop: any
-      // other end of a brain that wasn't condemned drops it (N20), so it never lingers.
-      if (i.intent?.reason === "operator" && !i.intent.host_hint && !i.intent.avoid && i.brain.phase !== "condemned" && reason !== "stopped") {
+      // An operator's start kept while this brain ran (N14: it answered `none`) is for after a
+      // graceful stop: any other end of a brain that wasn't condemned drops it (N20), so it never
+      // lingers. A move (another host named, or this one avoided, even before it condemned the
+      // brain) and a condemned brain's intent always run.
+      if (i.intent?.reason === "operator" && i.brain.phase !== "condemned" && reason !== "stopped" && !moves(i.intent, i.brain.host)) {
         i.intent = null;
       }
       i.prev_host = i.brain.host;
@@ -945,7 +949,11 @@ export class AgentDO extends DurableObject<Env> {
    * start meanwhile is kept as the intent and runs after that exit; nothing about the stop is stored.
    */
   async stop(reason: string): Promise<void> {
-    const info = this.load();
+    // An operator's start kept from before this stop is for the brain this stop ends: dropped, so
+    // only a start made after the stop runs after its exit (N20).
+    const info = this.update((i) => {
+      if (i.intent?.reason === "operator" && i.brain && i.brain.phase !== "condemned" && !moves(i.intent, i.brain.host)) i.intent = null;
+    });
     const b = info.brain;
     if (!b || b.phase === "condemned") return;
     await this.fleet(info.cell).issueCommands(b.host, [{ type: "agent_stop", agent: info.agent, reason, mode: "graceful", epoch: b.epoch }]);
