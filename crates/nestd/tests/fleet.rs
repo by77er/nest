@@ -3,6 +3,8 @@
 //! behaviour across the extraction of its core (`nestd_core::fleet`): what goes on the wire, in
 //! which order, and what the host is told.
 
+#![allow(clippy::result_large_err)] // tungstenite's handshake callback type
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

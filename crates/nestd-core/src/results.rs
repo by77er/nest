@@ -2,7 +2,7 @@
 //! command, so a redelivered command (a resend after a reconnect) answers with its first outcome
 //! instead of running again.
 //!
-//! Ordered maps only (no `HashMap`): its hasher seeds itself from the OS, which a core must not
+//! Ordered maps only, never a hashed one: its hasher seeds itself from the OS, which a core must not
 //! touch, and Kani can't reason about it.
 
 use std::collections::{BTreeMap, VecDeque};
