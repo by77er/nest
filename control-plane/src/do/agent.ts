@@ -13,8 +13,8 @@ import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { signBlobUrl } from "../lib/tokens";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
 import {
-  type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage, type LaunchConfig,
-  RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
+  type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, HOST_CAPABILITIES, type InboxMessage,
+  type LaunchConfig, RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
   type AgentEvent, type AgentRole, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
@@ -132,6 +132,10 @@ export interface AgentInfo {
   hands_moved_ms?: number;
   /** What SandboxDO last acknowledged from `agentActivity`; absent = unknown (tell it again). */
   activity_sent?: boolean;
+  /** The agent epoch an `agent_stop` was sent for: that brain is on its way out (a start doesn't count it as live). */
+  stop_requested?: number;
+  /** What the bound sandbox lost in a move the running brain survived, said before its next turn. */
+  pending_note?: string;
 }
 
 export interface CreateAgent {
@@ -179,7 +183,7 @@ export class AgentDO extends DurableObject<Env> {
   /** A `wake()` is starting a brain (its awaits open the input gate). */
   private waking = false;
   /** The `start()` in flight: concurrent starts (a wake, the restart alarm, an operator) share it. */
-  private inflightStart: Promise<StartResult> | null = null;
+  private inflightStart: { key: string; p: Promise<StartResult> } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -393,13 +397,19 @@ export class AgentDO extends DurableObject<Env> {
    * BrokerDO reference, resolved by FleetDO when it sends.
    */
   async start(hostHint?: string, avoid?: string): Promise<StartResult> {
-    if (this.inflightStart) return this.inflightStart;
+    const key = `${hostHint ?? ""}|${avoid ?? ""}`;
+    if (this.inflightStart) {
+      // The same request joins the one in flight; a different one (another host, or moving off a
+      // host) is refused rather than dropped: the caller tries again once this start is done.
+      if (this.inflightStart.key === key) return this.inflightStart.p;
+      throw new NestError(ErrorCodes.FORBIDDEN, "another start of this agent is in progress; try again", 409, true);
+    }
     const p = this.startBrain(hostHint, avoid);
-    this.inflightStart = p;
+    this.inflightStart = { key, p };
     try {
       return await p;
     } finally {
-      if (this.inflightStart === p) this.inflightStart = null;
+      if (this.inflightStart?.p === p) this.inflightStart = null;
     }
   }
 
@@ -430,17 +440,31 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no host available for this agent", 503, true);
     // Already running there (e.g. an operator's start of a live agent): a second agent_start would
-    // only re-tag the same brain.
-    if (this.socket() && this.load().host === host) return { host, cmd: null };
+    // only re-tag the same brain. Not when that brain was told to stop: it is on its way out.
+    const live = this.load();
+    if (this.socket() && live.host === host && live.stop_requested !== live.agent_epoch) return { host, cmd: null };
     const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).oauthTokenRef(info.role);
+    // Moving: the old brain is killed where it ran, and fenced here first, before the transcript is
+    // made durable for the resume, so its late bytes go to the orphan branch instead of being
+    // accepted and missing from the new brain's session.
+    const prev = this.load();
+    let moving = prev.host !== null && prev.host !== host;
+    if (moving) {
+      const old = await this.fleet(info.cell).hostStatus(prev.host!);
+      const gone = !old || old.status === "dead" || old.status === "expired";
+      // A host of the previous release can't kill on arrival (and its gateway has no floor): the
+      // old brain could finish its turn alongside the new one. Wait for its exit or its host's end.
+      if (!gone && !old.capabilities.includes(HOST_CAPABILITIES.STOP_KILL)) {
+        throw new NestError(ErrorCodes.FORBIDDEN, `the brain on ${prev.host} must exit first (its host can't kill it on arrival)`, 409, true);
+      }
+      if (gone) moving = false;
+      if (moving) this.fenceSessions("the brain is starting on another host");
+    }
     // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
     // resume from up to a flush interval ago.
     await this.flush();
     const resume = this.load().session ? await this.sessionResume(this.load()) : undefined;
-    // Kill the brain where it ran before starting it elsewhere. Read fresh, right before: nothing
-    // changes here if the stop can't be queued, so the next attempt still knows the old host.
-    const prev = this.load();
-    const moving = prev.host !== null && prev.host !== host;
+    // Nothing changes here if the stop can't be queued, so the next attempt still knows the old host.
     if (moving) {
       await this.fleet(info.cell).issueCommands(prev.host!, [{
         type: "agent_stop", agent: prev.agent, reason: `starting on ${host}`, mode: "kill", epoch: prev.agent_epoch,
@@ -450,14 +474,9 @@ export class AgentDO extends DurableObject<Env> {
       i.agent_epoch += 1;
       i.host = host;
       i.state = "starting";
+      delete i.stop_requested;
     });
     const epoch = started.agent_epoch;
-    if (moving) {
-      for (const ws of this.ctx.getWebSockets("session")) {
-        ws.serializeAttachment({ ...(ws.deserializeAttachment() as Attachment), helloed: false, stale: true });
-        ws.close(4409, "the brain is starting on another host");
-      }
-    }
     // Any other session (an exiting brain on this host still flushing) is of an older epoch now:
     // `current()` refuses what it sends, and the new brain's hello supersedes it.
     const body: AgentStartBody = {
@@ -490,11 +509,22 @@ export class AgentDO extends DurableObject<Env> {
     return { host, cmd: cmd! };
   }
 
-  /** Stop the brain (an operator's request): it finishes its turn. */
+  /** Stop the brain (an operator's request): it finishes its turn. A start meanwhile starts a new one. */
   async stop(reason: string): Promise<void> {
     const info = this.load();
     if (info.host) {
       await this.fleet(info.cell).issueCommands(info.host, [{ type: "agent_stop", agent: info.agent, reason, mode: "graceful", epoch: info.agent_epoch }]);
+      this.update((i) => {
+        if (i.agent_epoch === info.agent_epoch) i.stop_requested = info.agent_epoch;
+      });
+    }
+  }
+
+  /** Mark every session stale and close it: nothing it sends is accepted from here on. */
+  private fenceSessions(reason: string): void {
+    for (const ws of this.ctx.getWebSockets("session")) {
+      ws.serializeAttachment({ ...(ws.deserializeAttachment() as Attachment), helloed: false, stale: true });
+      ws.close(4409, reason);
     }
   }
 
@@ -576,7 +606,7 @@ export class AgentDO extends DurableObject<Env> {
    * alarm. `afterExit` counts towards the crash-loop guard; new input always gets a fresh try.
    */
   private async wake(afterExit = false): Promise<void> {
-    if (this.waking || this.inflightStart) return;
+    if (this.waking) return;
     const info = this.load();
     if (!WAKE_STATES.includes(info.state) || this.socket()) return;
     const queued = this.sql.exec("SELECT 1 FROM turns WHERE status = 'queued' LIMIT 1").toArray().length > 0;
@@ -629,7 +659,32 @@ export class AgentDO extends DurableObject<Env> {
     this.update((i) => {
       i.hands_moved_ms = Date.now();
     });
-    if (host) await this.wake();
+    if (!host) return;
+    // The brain must learn what the restore lost: mid-turn as an inbox message (like a background
+    // task's exit), otherwise ahead of its next turn. A brain that isn't running mid-turn gets it
+    // from its recovery turn instead.
+    const note = await this.movedNote(info);
+    const now = this.load();
+    if (now.current_turn && this.socket()) await this.postInbox("system", note);
+    else if (!now.current_turn) {
+      this.update((i) => {
+        i.pending_note = note;
+      });
+    }
+    await this.wake();
+  }
+
+  /** What a sandbox restored from its head after a move lost, as told to the model. */
+  private async movedNote(info: AgentInfo): Promise<string> {
+    let head: GenerationRecord | null = null;
+    try {
+      if (info.hands) head = await this.sandboxStub(info.hands.sandbox).headGeneration();
+    } catch (e) {
+      console.warn(`agent ${info.agent}: reading the sandbox head failed`, e);
+    }
+    return head
+      ? `Your sandbox moved to another machine and was restored from its state saved at ${iso(head.created_ms)}${head.kind === "disk_only" ? "; running processes stopped" : ""}. File changes after that were lost.`
+      : "Your sandbox moved to another machine; it may have lost recent file changes and running processes.";
   }
 
   /**
@@ -736,7 +791,13 @@ export class AgentDO extends DurableObject<Env> {
         this.send(ws, handsResolved(msg.request, { status: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "not the current runner process or epoch") }));
         return;
       }
-      this.send(ws, await this.resolveHands(msg.request));
+      const answer = await this.resolveHands(msg.request);
+      // A newer start may have been issued while resolving: never hand a superseded brain a binding.
+      if (!this.current(ws.deserializeAttachment() as Attachment)) {
+        this.send(ws, handsResolved(msg.request, { status: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "not the current runner process or epoch") }));
+        return;
+      }
+      this.send(ws, answer);
       return;
     }
     // Everything else is processed strictly one at a time, in arrival order.
@@ -917,17 +978,7 @@ export class AgentDO extends DurableObject<Env> {
       }
     }
     const moved = current !== null ? current !== row.hands_epoch : (info.hands_moved_ms ?? 0) >= started;
-    if (info.hands && moved) {
-      let head: GenerationRecord | null = null;
-      try {
-        head = await this.sandboxStub(info.hands.sandbox).headGeneration();
-      } catch (e) {
-        console.warn(`agent ${info.agent}: reading the sandbox head failed`, e);
-      }
-      notes.push(head
-        ? `Your sandbox moved to another machine and was restored from its state saved at ${iso(head.created_ms)}${head.kind === "disk_only" ? "; running processes stopped" : ""}. File changes after that were lost.`
-        : "Your sandbox moved to another machine; it may have lost recent file changes and running processes.");
-    }
+    if (info.hands && moved) notes.push(await this.movedNote(info));
     notes.push("If the turn isn't finished, continue it.");
     const ord = (this.sql.exec<{ m: number | null }>("SELECT MIN(ord) AS m FROM turns").toArray()[0]?.m ?? 0) - 1;
     this.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES (?, ?, ?, 'queued', ?)",
@@ -1193,12 +1244,17 @@ export class AgentDO extends DurableObject<Env> {
     if (!next) return;
     // Synchronous from the check above: no other pump can claim a turn in between.
     this.sql.exec("UPDATE turns SET status = 'active', started_ms = ? WHERE turn = ?", Date.now(), next.turn);
+    const note = this.load().pending_note;
     const info = this.update((i) => {
       i.current_turn = next.turn;
       i.state = "working";
+      delete i.pending_note;
     });
-    const { turn, input } = next;
-    this.pushReliable((seq) => ({ type: "run_turn", seq, turn, input: JSON.parse(input) as TurnInput }));
+    const { turn } = next;
+    const parsed = JSON.parse(next.input) as TurnInput;
+    // What a sandbox move lost since the last turn comes first.
+    const input: TurnInput = note ? { ...parsed, text: `${note}\n\n${parsed.text}` } : parsed;
+    this.pushReliable((seq) => ({ type: "run_turn", seq, turn, input }));
     await this.syncActivity();
     if (info.hands) {
       // Best effort: without it, a recovery turn falls back to the last move AgentDO heard of.

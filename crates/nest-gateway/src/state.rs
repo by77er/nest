@@ -143,20 +143,7 @@ impl State {
     /// nothing). A raise cuts that client's open connections whose binding is below it
     /// (`close_code::MOVED`: the call may have run): a superseded brain loses its hands at once.
     pub fn raise_floors(&self, sandbox: &SandboxId, floors: impl IntoIterator<Item = (String, Epoch)>) {
-        let mut g = self.write();
-        let mut raised = vec![];
-        let held = g.floors.entry(sandbox.clone()).or_default();
-        for (client, floor) in floors {
-            let cur = held.entry(client.clone()).or_insert(Epoch(0));
-            if floor.0 > cur.0 {
-                *cur = floor;
-                raised.push((client, floor));
-            }
-        }
-        for (client, floor) in raised {
-            tracing::info!(sandbox = %sandbox.0, client = %client, floor = floor.0, "client floor raised");
-            close_matching(&mut g, |c| &c.sandbox == sandbox && c.client == client && c.agent_epoch.0 < floor.0, close_code::MOVED);
-        }
+        raise_locked(&mut self.write(), sandbox, floors);
     }
 
     /// The floor for one client (0 when none was set).
@@ -177,8 +164,25 @@ impl State {
         clients: impl IntoIterator<Item = impl Into<String>>,
         guest: Option<GuestInfo>,
     ) {
+        self.upsert_sandbox_with_floors(sandbox, epoch, vsock_uds_path, clients, guest, BTreeMap::new());
+    }
+
+    /// [`State::upsert_sandbox`] with the clients' agent-epoch floors, raised under the same lock
+    /// before the entry is (re)inserted: no bind can see the entry without its floors.
+    pub fn upsert_sandbox_with_floors(
+        &self,
+        sandbox: SandboxId,
+        epoch: Epoch,
+        vsock_uds_path: PathBuf,
+        clients: impl IntoIterator<Item = impl Into<String>>,
+        guest: Option<GuestInfo>,
+        floors: BTreeMap<String, Epoch>,
+    ) {
         let clients: BTreeSet<String> = clients.into_iter().map(Into::into).collect();
         let mut g = self.write();
+        if !floors.is_empty() {
+            raise_locked(&mut g, &sandbox, floors);
+        }
         let generation = g.generation;
         let old_epoch = g.sandboxes.get(&sandbox).map(|e| e.epoch);
         if let Some(old) = old_epoch
@@ -274,6 +278,22 @@ impl State {
 
     pub fn open_connections(&self) -> usize {
         self.read().conns.len()
+    }
+}
+
+fn raise_locked(g: &mut Inner, sandbox: &SandboxId, floors: impl IntoIterator<Item = (String, Epoch)>) {
+    let mut raised = vec![];
+    let held = g.floors.entry(sandbox.clone()).or_default();
+    for (client, floor) in floors {
+        let cur = held.entry(client.clone()).or_insert(Epoch(0));
+        if floor.0 > cur.0 {
+            *cur = floor;
+            raised.push((client, floor));
+        }
+    }
+    for (client, floor) in raised {
+        tracing::info!(sandbox = %sandbox.0, client = %client, floor = floor.0, "client floor raised");
+        close_matching(g, |c| &c.sandbox == sandbox && c.client == client && c.agent_epoch.0 < floor.0, close_code::MOVED);
     }
 }
 

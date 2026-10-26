@@ -134,6 +134,8 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
     sandboxes: [],
     agents: [],
     capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, hugepages_mib_total: 8192, sandboxes: 0, agents: 0, warm: [] },
+    // A host of this release: gateway floors and kill-on-arrival.
+    capabilities: ["client_floor", "stop_kill"],
     ...extra,
   };
 }

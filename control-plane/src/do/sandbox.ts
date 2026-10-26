@@ -10,7 +10,7 @@ import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { asNestError, b64url, NestError, newId } from "../lib/util";
-import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "../protocol/control";
+import { type CommandBody, type CommitOutcome, type CommitRequestEvent, HOST_CAPABILITIES, type HostEvent } from "../protocol/control";
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
@@ -74,6 +74,14 @@ export interface SandboxInfo {
    * state stored before it.
    */
   client_epochs?: Record<string, number>;
+  /**
+   * Per attached agent, the agent epoch whose floor the current placement's gateway confirmed (a
+   * `client_floor`'s, or an `agent_attach`'s carrying it, `ok`). `resolve` mints no binding above
+   * it on a host that implements floors. Reset with every placement.
+   */
+  floor_acked?: Record<string, number>;
+  /** In-flight commands carrying a floor: cmd → the agent and agent epoch it raises. */
+  floor_cmds?: Record<string, { agent: string; agent_epoch: number }>;
 }
 
 export interface CreateSandbox {
@@ -282,6 +290,9 @@ export class SandboxDO extends DurableObject<Env> {
       i.attach_pending = [...i.attached];
       i.attach_inflight = {};
       i.attach_attempts = {};
+      // The new gateway knows no floor yet: the attaches carry them, and their `ok` confirms them.
+      i.floor_acked = {};
+      i.floor_cmds = {};
     });
     // If this call never finishes (a reset, a lost answer), the marker is reconciled when it goes stale.
     await this.deadlines.set("place", now + PLACING_STALE_MS, true);
@@ -691,6 +702,8 @@ export class SandboxDO extends DurableObject<Env> {
         }
       } else if (key === "attach_retry") {
         await this.reissuePendingAttaches(false);
+      } else if (key === "floor_retry") {
+        for (const agent of this.info_().attached) await this.sendFloorIfDue(agent);
       }
     });
   }
@@ -777,21 +790,72 @@ export class SandboxDO extends DurableObject<Env> {
   async fenceClient(agent: string, agentEpoch: number): Promise<void> {
     const before = this.info_();
     if (!before.attached.includes(agent) || (before.client_epochs?.[agent] ?? 0) >= agentEpoch) return;
-    const info = this.update((i) => {
+    this.update((i) => {
       i.client_epochs = { ...(i.client_epochs ?? {}), [agent]: Math.max(i.client_epochs?.[agent] ?? 0, agentEpoch) };
     });
-    if (info.host) await this.issueAttachCommands([agent]);
+    await this.sendFloorIfDue(agent);
+  }
+
+  /**
+   * Send a `client_floor` for `agent` when its wanted floor is above the confirmed one and none is in
+   * flight, to a placed sandbox whose host implements floors (an older host gets none: its gateway
+   * has no floors, and `resolve` doesn't wait for one). Applied on arrival by nestd, `ok` once the
+   * gateway confirmed it; a retryable failure is retried from the alarm until confirmed.
+   */
+  private async sendFloorIfDue(agent: string): Promise<boolean> {
+    const info = this.info_();
+    const want = info.client_epochs?.[agent];
+    if (!info.host || want === undefined || !info.attached.includes(agent)) return false;
+    if ((info.floor_acked?.[agent] ?? 0) >= want) return false;
+    if (Object.values(info.floor_cmds ?? {}).some((f) => f.agent === agent && f.agent_epoch >= want)) return true;
+    if (!(await this.fleet(info.cell).hostCapabilities(info.host)).includes(HOST_CAPABILITIES.CLIENT_FLOOR)) return false;
+    const [cmd] = await this.fleet(info.cell).issueCommands(info.host, [
+      { type: "client_floor", sandbox: info.sandbox, epoch: info.epoch, agent, agent_epoch: want },
+    ]);
+    this.update((i) => {
+      if (i.host !== info.host || i.epoch !== info.epoch) return;
+      i.floor_cmds = { ...(i.floor_cmds ?? {}), [cmd!]: { agent, agent_epoch: want } };
+    });
+    return true;
+  }
+
+  /** A command that carried a floor came back: `ok` confirms it at this placement; a retryable failure is retried. */
+  private async noteFloorResult(host: string, epoch: number, cmd: string, outcome: CommandOutcome): Promise<void> {
+    const info = this.info_();
+    const f = info.floor_cmds?.[cmd];
+    if (!f) return;
+    const current = info.host === host && info.epoch === epoch;
+    this.update((i) => {
+      if (i.floor_cmds) delete i.floor_cmds[cmd];
+      if (current && outcome.status === "ok") {
+        i.floor_acked = { ...(i.floor_acked ?? {}), [f.agent]: Math.max(i.floor_acked?.[f.agent] ?? 0, f.agent_epoch) };
+      }
+    });
+    if (current && outcome.status === "error" && outcome.error.retryable) {
+      await this.deadlines.set("floor_retry", Date.now() + ATTACH_RETRY_MS, true);
+    }
+  }
+
+  /** FleetDO routes each `client_floor` result here. */
+  async clientFloorResult(host: string, epoch: number, cmd: string, outcome: CommandOutcome): Promise<void> {
+    if (!this.get<SandboxInfo>("info")) return;
+    await this.noteFloorResult(host, epoch, cmd, outcome);
   }
 
   /** Send `agent_attach` for these agents and remember each command as the agent's one in flight. */
   private async issueAttachCommands(agents: string[]): Promise<void> {
     const info = this.info_();
     if (!info.host || !agents.length) return;
-    const cmds = await this.fleet(info.cell).issueCommands(info.host, agents.map((a) => this.attachBody(info, a)));
+    const bodies = agents.map((a) => this.attachBody(info, a));
+    const cmds = await this.fleet(info.cell).issueCommands(info.host, bodies);
     this.update((i) => {
       if (i.host !== info.host || i.epoch !== info.epoch) return;
       agents.forEach((a, n) => {
         if (i.attached.includes(a)) i.attach_inflight[a] = cmds[n]!;
+        const b = bodies[n]!;
+        if (b.type === "agent_attach" && b.agent_epoch !== undefined) {
+          i.floor_cmds = { ...(i.floor_cmds ?? {}), [cmds[n]!]: { agent: a, agent_epoch: b.agent_epoch } };
+        }
       });
     });
   }
@@ -832,7 +896,10 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async attachResult(host: string, epoch: number, agent: string, cmd: string, outcome: CommandOutcome): Promise<void> {
     const info = this.get<SandboxInfo>("info") ? this.info_() : undefined;
-    if (!info || epoch !== info.epoch || host !== info.host || !info.attached.includes(agent)) return;
+    if (!info) return;
+    // nestd raised the floor it carried before the slot work: its `ok` confirms that floor too.
+    await this.noteFloorResult(host, epoch, cmd, outcome);
+    if (epoch !== info.epoch || host !== info.host || !info.attached.includes(agent)) return;
     if (info.attach_inflight[agent] !== cmd) return; // a superseded attempt's result
     if (outcome.status === "ok") {
       this.update((i) => {
@@ -882,6 +949,13 @@ export class SandboxDO extends DurableObject<Env> {
     // so a target minted during a resume would only ever be refused as `moved`.
     if (info.state !== "running") throw notReady(`sandbox is ${info.state}`);
     if (info.attach_pending.includes(agent)) throw notReady(`${agent}'s slot is not configured yet`);
+    // A binding at a newer agent epoch only once the gateway confirmed that floor for the agent, so
+    // an older brain's bindings are refused before a newer brain can call (hosts with floors).
+    if (claimEpoch !== undefined && claimEpoch > (info.floor_acked?.[agent] ?? 0)
+      && (await this.fleet(info.cell).hostCapabilities(info.host)).includes(HOST_CAPABILITIES.CLIENT_FLOOR)) {
+      await this.sendFloorIfDue(agent);
+      throw notReady(`${agent}'s gateway floor ${claimEpoch} is not confirmed yet`);
+    }
     const gateway = await this.fleet(info.cell).hostGatewayUrl(info.host);
     // The host may advertise one on its next hello (a restart, an upgrade): not an error, not yet.
     if (!gateway) throw notReady(`host ${info.host} advertises no gateway yet`);
@@ -918,6 +992,10 @@ export class SandboxDO extends DurableObject<Env> {
       throw notReady("sandbox moved while resolving");
     }
     if (!fresh.guest) throw notReady("sandbox moved while resolving");
+    // A newer brain start meanwhile: this binding would be refused at the gateway.
+    if (claimEpoch !== undefined && (fresh.client_epochs?.[agent] ?? 0) > claimEpoch) {
+      throw new NestError(ErrorCodes.STALE_EPOCH, `agent epoch ${claimEpoch} was superseded while resolving`, 409);
+    }
     // `sandbox` and `epoch`: unsigned copies of the claims, for clients of the previous release only.
     return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest, ...(edge ? { edge } : {}) };
   }

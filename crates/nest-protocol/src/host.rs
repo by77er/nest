@@ -558,6 +558,10 @@ pub mod gateway_link {
         /// The sandbox left this host (destroyed, evicted, fenced): open connections close with
         /// `close_code::MOVED` and bindings get `moved`.
         SandboxRemove { sandbox: SandboxId },
+        /// Raise one client's agent-epoch floor on a sandbox (see `sandbox_upsert.client_floors`);
+        /// answered by `floor_applied` once in effect (also when the gateway holds no such sandbox:
+        /// the floor then comes with its next upsert).
+        ClientFloor { sandbox: SandboxId, client: String, agent_epoch: Epoch },
         /// Ends the resync that follows `hello_ack`: entries not re-sent since `hello` are
         /// dropped, and unknown sandboxes answer `moved` instead of `busy` from here on.
         ResyncDone,
@@ -575,6 +579,8 @@ pub mod gateway_link {
         Hello { protocol_version: u32, instance_id: String, listen: String },
         Pong,
         Error { error: ErrorBody },
+        /// The floor of `client_floor` is in effect (bindings below it refused, calls below it cut).
+        FloorApplied { sandbox: SandboxId, client: String, agent_epoch: Epoch },
     }
 }
 

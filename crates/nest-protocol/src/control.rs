@@ -157,6 +157,21 @@ pub struct HostHello {
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,
     pub capacity: Capacity,
+    /// Optional behaviours this host implements ([`host_capabilities`]); absent from a nestd of
+    /// the previous release, which FleetDO then never sends them to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+/// Names a host lists in `HostHello.capabilities`.
+pub mod host_capabilities {
+    /// `client_floor` commands (and `agent_attach.agent_epoch`): the gateway's agent-epoch floors,
+    /// applied on arrival and answered once the gateway confirmed them.
+    pub const CLIENT_FLOOR: &str = "client_floor";
+    /// `agent_stop{mode: kill}`, applied on arrival.
+    pub const STOP_KILL: &str = "stop_kill";
+    /// Everything this release's nestd implements.
+    pub const ALL: &[&str] = &[CLIENT_FLOOR, STOP_KILL];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +379,12 @@ pub enum CommandBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         epoch: Option<Epoch>,
     },
+    /// Raise the gateway's agent-epoch floor for `agent` on the sandbox at `epoch` (bindings minted
+    /// for an older brain start are refused from then on, and its open calls cut). Applied on
+    /// arrival, not behind slower commands; its `ok` comes once the gateway confirmed the floor
+    /// (or holds no such sandbox now: the floor is replayed with it). Idempotent. Sent only to
+    /// hosts advertising [`host_capabilities::CLIENT_FLOOR`].
+    ClientFloor { sandbox: SandboxId, epoch: Epoch, agent: AgentId, agent_epoch: Epoch },
     /// Fence immediately: pause these sandboxes' VMs, drop their listeners/netns. Brains are not
     /// touched: they are fenced by their own host's lease and their agent epoch, and their hands
     /// by the gateway.
@@ -985,6 +1006,7 @@ mod tests {
             CommandBody::AgentAttach { .. } => "agent_attach",
             CommandBody::AgentDetach { .. } => "agent_detach",
             CommandBody::AgentStop { .. } => "agent_stop",
+            CommandBody::ClientFloor { .. } => "client_floor",
             CommandBody::Fence { .. } => "fence",
             CommandBody::Drain { .. } => "drain",
         }
@@ -992,7 +1014,7 @@ mod tests {
     const COMMANDS: &[&str] = &[
         "sandbox_create", "sandbox_suspend", "sandbox_resume", "sandbox_archive", "sandbox_checkpoint",
         "sandbox_fork", "sandbox_destroy", "policy_update", "secrets_update", "port_expose", "port_unexpose",
-        "commit_result", "guest_cli_result", "agent_start", "agent_attach", "agent_detach", "agent_stop", "fence",
+        "commit_result", "guest_cli_result", "agent_start", "agent_attach", "agent_detach", "agent_stop", "client_floor", "fence",
         "drain",
     ];
 

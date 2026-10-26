@@ -187,6 +187,8 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS leases (sandbox TEXT PRIMARY KEY, host TEXT NOT NULL,
       epoch INTEGER NOT NULL, expired INTEGER NOT NULL DEFAULT 0)`);
     // Command bodies hold BrokerDO secret references, never secret values (resolved only when sent).
+    // `epoch` is the body's own: the sandbox epoch for sandbox commands, the agent epoch for
+    // `agent_start` / `agent_stop` (read by type, never across types).
     this.sql.exec(`CREATE TABLE IF NOT EXISTS commands (cmd TEXT PRIMARY KEY, host TEXT NOT NULL, type TEXT NOT NULL,
       sandbox TEXT, agent TEXT, epoch INTEGER, purpose TEXT, body TEXT NOT NULL, issued_ms INTEGER NOT NULL,
       result TEXT, result_ms INTEGER)`);
@@ -209,6 +211,8 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("hosts", "tunnel_hostname", "TEXT");
     this.addColumn("hosts", "dns_record_id", "TEXT");
     this.addColumn("hosts", "tunnel_state", "TEXT");
+    // `HostHello.capabilities` (JSON array): which optional commands a host may be sent.
+    this.addColumn("hosts", "capabilities", "TEXT");
     this.addColumn("leases", "state", "TEXT");
     // Packing: what each lease reserves until the host's capacity report counts the sandbox.
     this.addColumn("leases", "vcpus", "INTEGER");
@@ -754,8 +758,8 @@ export class FleetDO extends DurableObject<Env> {
     const lastInstance = prior.nestd_instance as string | null;
     const newProcess = lastInstance !== null && lastInstance !== hello.instance_id;
     if (newProcess) this.rel.reset(att.host);
-    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ? WHERE host = ?",
-      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, att.host);
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, capabilities = ? WHERE host = ?",
+      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, JSON.stringify(hello.capabilities ?? []), att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior as HostRow);
     ws.serializeAttachment({ host: att.host, helloed: true } satisfies Attachment);
 
@@ -1141,9 +1145,10 @@ export class FleetDO extends DurableObject<Env> {
       await this.queueReassign(host, body.sandboxes, false);
       return;
     }
-    if (row.type === "agent_stop" && outcome.status === "ok" && row.agent) {
-      // `epoch` (the stop's): the newest start it ends; a start sent after it keeps its row.
-      this.brainGone(row.agent, host, row.epoch);
+    // An `agent_stop`'s `ok` drops no index row: the brain is gone only once its exit is reported
+    // (`agent_exited`), or its host is.
+    if (row.type === "client_floor" && row.sandbox && row.epoch !== null) {
+      await this.sandbox(row.sandbox).clientFloorResult(host, row.epoch, cmd, outcome);
     }
     // The sandbox side of `attach`: SandboxDO hands out no binding for an agent until its slot exists.
     if (row.type === "agent_attach" && row.sandbox && row.epoch !== null && row.agent) {
@@ -1295,21 +1300,27 @@ export class FleetDO extends DurableObject<Env> {
     } : null;
   }
 
-  /** A connected, active controller host for captains. */
   /** An active, connected host other than `exclude` (a brain moving off a host that is going away). */
   async otherHost(exclude: string): Promise<string | null> {
     const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'active' AND host <> ? ORDER BY role", exclude).toArray();
     return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
   }
 
+  /** The optional behaviours a host's last hello advertised (`HostHello.capabilities`); none for an older nestd. */
+  async hostCapabilities(host: string): Promise<string[]> {
+    const row = this.sql.exec<{ capabilities: string | null }>("SELECT capabilities FROM hosts WHERE host = ?", host).toArray()[0];
+    return row?.capabilities ? (JSON.parse(row.capabilities) as string[]) : [];
+  }
+
+  /** A connected, active controller host for captains. */
   async controllerHost(): Promise<string | null> {
     const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE role = 'controller' AND status = 'active'").toArray();
     return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
   }
 
-  async hostStatus(host: string): Promise<{ status: HostStatus; connected: boolean; last_rx: number | null } | null> {
+  async hostStatus(host: string): Promise<{ status: HostStatus; connected: boolean; last_rx: number | null; capabilities: string[] } | null> {
     const h = this.host(host);
-    return h ? { status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx } : null;
+    return h ? { status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx, capabilities: await this.hostCapabilities(host) } : null;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1580,13 +1591,17 @@ export class FleetDO extends DurableObject<Env> {
     if (running.length) {
       await this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
     }
-    // Its brains move now, where another host can take them; the rest restart once it is dead.
-    for (const { agent } of this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray()) {
-      try {
-        await this.agentStub(agent).onHostDraining(host);
-      } catch (e) {
-        console.error(`FleetDO: moving ${agent} off draining ${host} failed`, e);
-      }
+    // Its brains move now, where another host can take them; the rest restart once it is dead. In
+    // the background and in parallel: the host's event batch isn't held for brain starts.
+    const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray();
+    if (agents.length) {
+      this.ctx.waitUntil(Promise.all(agents.map(async ({ agent }) => {
+        try {
+          await this.agentStub(agent).onHostDraining(host);
+        } catch (e) {
+          console.error(`FleetDO: moving ${agent} off draining ${host} failed`, e);
+        }
+      })));
     }
     if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }

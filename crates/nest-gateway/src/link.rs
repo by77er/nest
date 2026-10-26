@@ -116,8 +116,11 @@ pub async fn session(
             }
             GatewayCommand::SandboxUpsert { sandbox, epoch, vsock_uds_path, clients, guest, client_floors } => {
                 tracing::debug!(sandbox = %sandbox.0, epoch = epoch.0, clients = clients.len(), guest = guest.is_some(), "sandbox upsert");
-                state.upsert_sandbox(sandbox.clone(), epoch, PathBuf::from(vsock_uds_path), clients, guest);
-                state.raise_floors(&sandbox, client_floors);
+                state.upsert_sandbox_with_floors(sandbox, epoch, PathBuf::from(vsock_uds_path), clients, guest, client_floors);
+            }
+            GatewayCommand::ClientFloor { sandbox, client, agent_epoch } => {
+                state.raise_floors(&sandbox, [(client.clone(), agent_epoch)]);
+                write(&mut stream, &GatewayEvent::FloorApplied { sandbox, client, agent_epoch }).await?;
             }
             GatewayCommand::SandboxRemove { sandbox } => {
                 tracing::debug!(sandbox = %sandbox.0, "sandbox removed");

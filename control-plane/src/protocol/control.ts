@@ -123,7 +123,12 @@ export const HostHello = z.object({
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
   capacity: Capacity,
+  /** Optional behaviours this host implements (`HOST_CAPABILITIES`); absent from the previous release's nestd. */
+  capabilities: z.array(z.string()).optional(),
 });
+
+/** `HostHello.capabilities` names (`control::host_capabilities`). */
+export const HOST_CAPABILITIES = { CLIENT_FLOOR: "client_floor", STOP_KILL: "stop_kill" } as const;
 
 export const LeaseTiming = z.object({
   heartbeat_ms: U64,
@@ -232,6 +237,8 @@ export const CommandBodyVariants = [
   z.object({ type: z.literal("agent_detach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, kill_processes: z.boolean().default(false) }),
   /** `mode`: absent = graceful (all the previous release's nestd does); `epoch`: the newest agent epoch this stop ends there. */
   z.object({ type: z.literal("agent_stop"), agent: AgentId, reason: z.string(), mode: StopMode.optional(), epoch: Epoch.optional() }),
+  /** Raise the gateway's agent-epoch floor for `agent`; applied on arrival, `ok` once the gateway confirmed it. Only to hosts with `client_floor`. */
+  z.object({ type: z.literal("client_floor"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, agent_epoch: Epoch }),
   z.object({ type: z.literal("fence"), sandboxes: z.array(SandboxId), reason: z.string() }),
   z.object({ type: z.literal("drain"), reason: z.string(), deadline_ms: TimestampMs }),
 ] as const;
@@ -472,7 +479,7 @@ export type HandsOutcome = z.output<typeof HandsOutcome>;
  * A `hands_resolved` carrying `outcome` and, for runners of the previous release (one release), the
  * same answer in their three-optional shape.
  */
-export function handsResolved(request: string, outcome: HandsOutcome): Extract<AgentToRunner, { type: "hands_resolved" }> {
+export function handsResolved(request: string, outcome: HandsOutcome): Extract<AgentToRunner, { type: "hands_resolved" }> & { outcome: HandsOutcome } {
   const legacy = outcome.status === "ok"
     ? { hands: outcome.hands }
     : { error: outcome.error, ...(outcome.retry_after_ms !== undefined ? { retry_after_ms: outcome.retry_after_ms } : {}) };

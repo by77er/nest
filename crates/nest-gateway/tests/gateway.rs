@@ -765,4 +765,11 @@ async fn nestd_upserts_carry_the_floors() {
     write_cmd(&mut s, &up).await;
     write_cmd(&mut s, &GatewayCommand::ResyncDone).await;
     wait_until("the floor arrived", || state.floor(&sbx(), AGENT) == Epoch(5)).await;
+    // A single floor is answered once it is in effect.
+    write_cmd(&mut s, &GatewayCommand::ClientFloor { sandbox: sbx(), client: AGENT.into(), agent_epoch: Epoch(6) }).await;
+    match read_event(&mut s).await {
+        GatewayEvent::FloorApplied { sandbox, client, agent_epoch } => assert_eq!((sandbox, client.as_str(), agent_epoch), (sbx(), AGENT, Epoch(6))),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(state.floor(&sbx(), AGENT), Epoch(6), "in effect by the time it is answered");
 }

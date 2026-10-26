@@ -201,7 +201,7 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     expect((await r2.next("run_turn")).input.kind).toBe("recovery");
   });
 
-  it("a start elsewhere stops the old brain, and FleetDO lists it until the stop is confirmed", async () => {
+  it("a start elsewhere stops the old brain, and FleetDO lists it until its exit is reported", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
     const b = await connectHost(s.cell);
@@ -210,11 +210,13 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     expect(stop).toMatchObject({ mode: "kill", epoch: 1 });
     await nextCommands(b.ws, (c) => c.cmd === cmd);
     expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: s.host.host }, { agent: s.agent, host: b.host }].sort((x, y) => x.host.localeCompare(y.host)));
+    // The stop's `ok` isn't the brain gone; its exit is.
     await okResult(s.host.ws, stop.cmd);
-    expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: b.host }]);
-    // The old host's late report of the brain's exit changes nothing.
-    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped" }]);
+    expect(await fleetRows(s.cell, s.agent)).toHaveLength(2);
+    // The old host's report of the brain's exit drops its row and changes nothing else.
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
     await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: b.host }]);
     expect(await agentStub(s.agent).info()).toMatchObject({ host: b.host, state: "starting", agent_epoch: 2 });
   });
 
@@ -282,7 +284,7 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
 });
 
 describe("one brain per agent, also while a sandbox stays put", () => {
-  const isFloor = (agent: string, e: number) => (c: any) => c.type === "agent_attach" && c.agent === agent && c.agent_epoch === e;
+  const isFloor = (agent: string, e: number) => (c: any) => c.type === "client_floor" && c.agent === agent && c.agent_epoch === e;
 
   it("a brain moving hosts: the old one is killed, and the gateway refuses its bindings before the new one starts", async () => {
     const s = await setup();
@@ -300,6 +302,78 @@ describe("one brain per agent, also while a sandbox stays put", () => {
     // A binding for the old start is no longer minted, even if asked for directly.
     await expect(Promise.resolve().then(() => sandboxStub(s.sandbox).resolve(s.agent, 1))).rejects.toThrow(/superseded/);
     expect((await sandboxStub(s.sandbox).info()).client_epochs).toEqual({ [s.agent]: 2 });
+
+    // The new brain's binding waits for the gateway to confirm floor 2: the sandbox is running and
+    // the slot confirmed, but until the floor's `ok` there is no binding at epoch 2.
+    const isAttach = (c: any) => c.type === "agent_attach" && c.agent === s.agent;
+    const attach = (await nextCommands(s.host.ws, isAttach)).find(isAttach);
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: s.sandbox, epoch: 1, state: "running", guest: { protocol_version: 1, capabilities: [] } }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    await okResult(s.host.ws, attach.cmd);
+    await expect(Promise.resolve().then(() => sandboxStub(s.sandbox).resolve(s.agent, 2))).rejects.toThrow(/floor 2 is not confirmed/);
+    await okResult(s.host.ws, floor.cmd);
+    const target = await sandboxStub(s.sandbox).resolve(s.agent, 2);
+    const claims = await verifyBinding(b64urlToBytes(s.host.keys[0]!.public_key), target.binding);
+    expect(claims).toMatchObject({ agent_epoch: 2, client: s.agent });
+  });
+
+  it("a host of the previous release (no kill on arrival) holds a move until its brain exits or it is dead", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    // The brain's host predates the capability.
+    await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET capabilities = '[]' WHERE host = ?", s.host.host);
+    });
+    const b = await connectHost(s.cell);
+    await expect(Promise.resolve().then(() => agentStub(s.agent).start(b.host))).rejects.toThrow(/must exit first/);
+    expect((await agentStub(s.agent).info()).agent_epoch).toBe(1);
+    // Once it exits (the host's report clears the agent's host), the start goes ahead.
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    const { cmd } = await agentStub(s.agent).start(b.host);
+    expect((await nextCommands(b.ws, (c) => c.cmd === cmd))[0]).toMatchObject({ epoch: 2 });
+  });
+
+  it("a brain told to stop isn't taken for live: a start on its host starts a new one", async () => {
+    const s = await setup();
+    await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await agentStub(s.agent).stop("requested");
+    const { cmd } = await agentStub(s.agent).start();
+    expect(cmd).not.toBeNull();
+    expect((await agentStub(s.agent).info()).agent_epoch).toBe(2);
+  });
+
+  it("a concurrent start with other arguments is refused, not dropped", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell);
+    const stub = agentStub(s.agent);
+    const results = await Promise.allSettled([stub.start(b.host), stub.start()]);
+    expect(results[0]!.status).toBe("fulfilled");
+    expect(results[1]!.status === "rejected" && String(results[1]!.reason)).toMatch(/another start/);
+  });
+
+  it("a brain that survives its sandbox moving is told what was lost: mid-turn as inbox, otherwise before its next turn", async () => {
+    const s = await setup();
+    const b = await connectHost(s.cell);
+    const { cmd } = await agentStub(s.agent).start(b.host);
+    await nextCommands(b.ws, (c) => c.cmd === cmd);
+    const ws = await runner(s.agent, b.host, b.host_token, "rin_b", 2);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "first" } }, 201);
+    const t1 = await ws.next("run_turn");
+    // The sandbox's host dies mid-turn; the sandbox is restored elsewhere.
+    s.host.ws.close();
+    await adminJson(`/v1/admin/hosts/${s.host.host}/confirm-dead?cell=${s.cell}`, { body: {} });
+    const inbox = await ws.next("inbox");
+    expect(inbox.message).toMatchObject({ from: "system" });
+    expect(inbox.message.text).toMatch(/Your sandbox moved to another machine/);
+    // Between turns: the next turn starts with the note.
+    ws.send({ type: "events", seq: 1, events: [{ agent: s.agent, epoch: 2, seq: 1, ts_ms: Date.now(), turn: t1.turn, type: "turn_completed", stop_reason: "end_turn" }] });
+    await ws.next("ack");
+    await agentStub(s.agent).onSandboxMoved(s.sandbox, b.host);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "second" } }, 201);
+    const t2 = await ws.next("run_turn", (m) => m.input.text.endsWith("second"));
+    expect(t2.input.text).toMatch(/^Your sandbox moved to another machine[\s\S]*\n\nsecond$/);
   });
 
   it("concurrent starts share one: one epoch, one agent_start; a wake meanwhile starts nothing", async () => {
@@ -417,7 +491,7 @@ describe("a draining host's brains", () => {
     await spotNotice(s.host.ws);
     const [stop] = await nextCommands(s.host.ws, (c) => c.type === "agent_stop" && c.agent === s.agent);
     expect(stop).toMatchObject({ mode: "kill", epoch: 1 });
-    await nextCommands(s.host.ws, isAttachFloor(s.agent, 2));
+    await nextCommands(s.host.ws, isClientFloor(s.agent, 2));
     const start = (await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === s.agent)).find((c) => c.type === "agent_start");
     expect(start.epoch).toBe(2);
     expect(await agentStub(s.agent).info()).toMatchObject({ host: b.host, agent_epoch: 2 });
@@ -452,7 +526,7 @@ describe("a draining host's brains", () => {
   });
 });
 
-const isAttachFloor = (agent: string, e: number) => (c: any) => c.type === "agent_attach" && c.agent === agent && c.agent_epoch === e;
+const isClientFloor = (agent: string, e: number) => (c: any) => c.type === "client_floor" && c.agent === agent && c.agent_epoch === e;
 
 /** Issue order (rowid) of FleetDO commands. */
 async function commandOrder(cell: string, cmds: string[]) {
