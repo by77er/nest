@@ -977,6 +977,10 @@ export class FleetDO extends DurableObject<Env> {
    * failure closes the connection so the host reconnects and resends from `last_event_seq`.
    */
   private async onEvents(ws: WebSocket, host: string, seq: number, events: HostEvent[]): Promise<void> {
+    // Checked here, not at arrival: a hello queued ahead of this batch may have superseded its
+    // socket and reset the lineage. A superseded socket's lineage is over; its batch, processed,
+    // would become the new lineage's baseline. Dropped unacked (its sender is gone).
+    if (this.socketFor(host) !== ws) return;
     const verdict = this.rel.classify(host, seq);
     if (verdict === "duplicate") {
       this.send(ws, { type: "ack", up_to: this.rel.lastIn(host)! });

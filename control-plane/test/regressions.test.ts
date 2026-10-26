@@ -932,4 +932,31 @@ describe("#28 command delivery across nestd reconnects", () => {
     expect((await b.next("commands")).commands[0].cmd).toBe(cmd);
     expect(b.closed).toBeNull();
   });
+
+  it("an old process's event batch queued behind the new process's hello doesn't become the new lineage's baseline", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    // The old process reconnects on `old`; its hello holds the host's queue on BrokerDO.
+    const old = await Ws.connect("/v1/fleet", h.host_token);
+    old.send(hostHello(h.host, cell));
+    await old.next("hello_ack");
+    await until("the queue to be held", () => keys.entered);
+    // The new process's hello queues next; then the old socket's batch 1 arrives while that socket
+    // is still the helloed one, and queues behind it.
+    const fresh = await Ws.connect("/v1/fleet", h.host_token);
+    fresh.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    await sleep(50); // the frames come over different sockets: let the hello be queued first
+    sendEvents(old, [], 1);
+    keys.released = true;
+    await fresh.next("hello_ack");
+
+    // The new process's own batch 1 answers a command it ran.
+    const [cmd] = await fleetStub(cell).issueCommands(h.host, [fence("new")]);
+    await fresh.next("commands", (m) => m.commands[0].cmd === cmd);
+    sendEvents(fresh, [{ ts_ms: Date.now(), type: "command_result", cmd, outcome: { status: "ok" } }], 1);
+    await fresh.next("ack", (m) => m.up_to === 1);
+    expect(await fleetStub(cell).commandResult(cmd!)).toEqual({ status: "ok" });
+  });
 });
