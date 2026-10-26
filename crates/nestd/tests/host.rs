@@ -490,7 +490,7 @@ fn fake_proxy(path: PathBuf) -> Arc<Mutex<Vec<ProxyCommand>>> {
         let mut buf = vec![];
         while let Ok(Some((c, _fds))) = fdpass::recv::<ProxyCommand>(fd.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY) {
             if let ProxyCommand::ResyncComplete { sandboxes, listeners } = &c {
-                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes: *sandboxes, listeners: *listeners }, &[]);
+                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes: *sandboxes, listeners: *listeners, failed: vec![] }, &[]);
             }
             got2.lock().unwrap().push(c);
         }
@@ -747,7 +747,7 @@ fn fake_proxy_keeping_fds(path: PathBuf) -> Received {
             if let ProxyCommand::ListenersAdd { listeners, .. } = c {
                 got2.lock().unwrap().extend(listeners.into_iter().zip(fds));
             } else if let ProxyCommand::ResyncComplete { sandboxes, listeners } = c {
-                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes, listeners }, &[]);
+                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes, listeners, failed: vec![] }, &[]);
             }
         }
     });
@@ -835,6 +835,109 @@ fn netns_listeners_handed_to_proxy() {
         .unwrap();
         acceptor.join().unwrap();
     });
+}
+
+/// Guest-proxy review #6: a listener the proxy reports failed is rebound by nestd at the same
+/// address in the sandbox's netns and handed back under the same id, and the new socket serves.
+#[test]
+fn a_failed_listener_is_rebound_in_the_netns() {
+    if !nestd::net::reexec_in_userns("a_failed_listener_is_rebound_in_the_netns") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        use nest_protocol::host::proxy::ListenerPurpose;
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = mock_fleet().await;
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "role": "burst", "cell": "c",
+            "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+            "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+            "driver": {"type": "process", "guest_command": ["unused"]},
+            "network": {"type": "netns"},
+            "flush_interval_ms": 20,
+        }))
+        .unwrap();
+        let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
+        let ns_slot = Arc::new(Mutex::new(None));
+        let _host = Host::start(cfg, enrolled, Some(Arc::new(NetnsCapture(ns_slot.clone())))).await.unwrap();
+        let link: Arc<Mutex<Option<OwnedFd>>> = Arc::default();
+        let received = fake_proxy_keeping_fds_with_link(dir.path().join("run/proxy.sock"), link.clone());
+        wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+        let create = CommandBody::SandboxCreate {
+            sandbox: SandboxId("sbx_n".into()),
+            workstream: WorkstreamId("ws_1".into()),
+            epoch: Epoch(1),
+            image: "base".into(),
+            resources: Resources { vcpus: 1, memory_mib: 256, disk_gib: 1 },
+            policy: policy(),
+            from: None,
+        };
+        fleet.commands.send(vec![cmd("cmd_create", create)]).unwrap();
+        wait_until("listeners handed over", || received.lock().unwrap().len() == 4).await;
+        let ns = ns_slot.lock().unwrap().clone().expect("netns captured");
+        // The proxy loses its :443 listener (closing its copy) and says so.
+        let id = {
+            let mut r = received.lock().unwrap();
+            let i = r.iter().position(|(s, _)| s.purpose == ListenerPurpose::HttpsTransparent).unwrap();
+            r.remove(i).0.id
+        };
+        let error = ErrorBody { code: "accept_failed".into(), message: "test".into(), retryable: true };
+        let ev = ProxyEvent::ListenerFailed { sandbox: SandboxId("sbx_n".into()), listener_id: id, error };
+        fdpass::send(link.lock().unwrap().as_ref().unwrap().as_fd(), &ev, &[]).unwrap();
+        wait_until("the listener handed back", || received.lock().unwrap().iter().any(|(s, _)| s.id == id)).await;
+        let https = {
+            let mut r = received.lock().unwrap();
+            let i = r.iter().position(|(s, _)| s.id == id).unwrap();
+            let (spec, fd) = r.remove(i);
+            assert_eq!((spec.purpose, spec.addr.as_str()), (ListenerPurpose::HttpsTransparent, "172.16.0.1:443"));
+            std::net::TcpListener::from(fd)
+        };
+        let acceptor = std::thread::spawn(move || {
+            let (mut s, _) = https.accept().unwrap();
+            let mut b = [0u8; 2];
+            s.read_exact(&mut b).unwrap();
+            s.write_all(b"ok").unwrap();
+        });
+        ns.run(|| {
+            let mut c = std::net::TcpStream::connect("172.16.0.1:443")?;
+            c.write_all(b"hi")?;
+            let mut b = [0u8; 2];
+            c.read_exact(&mut b)?;
+            assert_eq!(&b, b"ok");
+            Ok(())
+        })
+        .unwrap();
+        acceptor.join().unwrap();
+    });
+}
+
+/// [`fake_proxy_keeping_fds`] that also shares its socket, so a test can send events.
+fn fake_proxy_keeping_fds_with_link(path: PathBuf, link: Arc<Mutex<Option<OwnedFd>>>) -> Received {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    let got: Received = Arc::new(Mutex::new(vec![]));
+    let got2 = got.clone();
+    std::thread::spawn(move || {
+        let fd: OwnedFd = loop {
+            let fd = socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::SOCK_CLOEXEC, None).unwrap();
+            if connect(fd.as_raw_fd(), &UnixAddr::new(&path).unwrap()).is_ok() {
+                break fd;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        fdpass::send(fd.as_fd(), &ProxyEvent::Hello { protocol_version: HOST_PROTOCOL_VERSION, proxy_version: "fake".into(), pid: 1 }, &[]).unwrap();
+        *link.lock().unwrap() = Some(fd.try_clone().unwrap());
+        let mut buf = vec![];
+        while let Ok(Some((c, fds))) = fdpass::recv::<ProxyCommand>(fd.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY) {
+            if let ProxyCommand::ListenersAdd { listeners, .. } = c {
+                got2.lock().unwrap().extend(listeners.into_iter().zip(fds));
+            } else if let ProxyCommand::ResyncComplete { sandboxes, listeners } = c {
+                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes, listeners, failed: vec![] }, &[]);
+            }
+        }
+    });
+    got
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -21,6 +21,10 @@ const guestFiles = import.meta.glob("../../protocol/fixtures/guest/{cli,control}
 >;
 
 type Entry = { schema: z.ZodType; variants: string[]; tag: (v: Record<string, unknown>) => string };
+const reasonTag = (v: unknown) => {
+  const p = C.egressReasonParts(v as string);
+  return p.kind === "unit" ? p.name : p.kind;
+};
 const byType = (variants: readonly { shape: { type: { value: unknown } } }[]): Entry["variants"] =>
   variants.map((v) => String(v.shape.type.value));
 const typeTag = (v: Record<string, unknown>) => String(v.type);
@@ -43,6 +47,8 @@ const dirs: Record<string, Entry> = {
   egress_policy: { schema: M.EgressPolicy, variants: ["egress_policy"], tag: () => "egress_policy" },
   generation_record: { schema: M.GenerationRecord, variants: ["generation_record"], tag: () => "generation_record" },
   manifest: { schema: M.Manifest, variants: ["manifest"], tag: () => "manifest" },
+  egress_reason: { schema: C.EgressReason, variants: [...C.EGRESS_REASONS, "upstream", "other"], tag: reasonTag },
+  egress_audit_kind: { schema: C.EgressAuditKind, variants: ["request", "suppressed", "limit"], tag: typeTag },
 };
 
 const grouped = new Map<string, { name: string; value: unknown }[]>();
@@ -163,6 +169,7 @@ describe("shared lists (the Rust crate asserts the same files)", () => {
     ForkMode: [M.ForkMode, M.ForkMode.options],
     GenerationKind: [M.GenerationKind, M.GenerationKind.options],
     HostRole: [M.HostRole, M.HostRole.options],
+    LimitKind: [C.LimitKind, C.LimitKind.options],
     ManifestKind: [M.ManifestKind, M.ManifestKind.options],
     PolicyLayer: [M.PolicyLayer, M.PolicyLayer.options],
     RuleDecision: [C.RuleDecision, C.RuleDecision.options],
@@ -171,6 +178,7 @@ describe("shared lists (the Rust crate asserts the same files)", () => {
     TaskStatus: [M.TaskStatus, M.TaskStatus.options],
     TunnelState: [C.TunnelState, C.TunnelState.options],
     TurnInputKind: [M.TurnInputKind, M.TurnInputKind.options],
+    UpstreamStage: [C.UpstreamStage, C.UpstreamStage.options],
     Urgency: [M.Urgency, M.Urgency.options],
   };
 
@@ -191,6 +199,14 @@ describe("shared lists (the Rust crate asserts the same files)", () => {
     expect(C.AgentExitReason.parse("idle grace elapsed")).toBe("unknown");
     expect(M.EgressAlertReason.parse("placeholder sent outside binding hosts")).toBe("unknown");
     expect(C.AgentExitReason.safeParse(7).success).toBe(false);
+  });
+
+  it("egress reasons from a proxy one release older normalize as in Rust; unknown text is kept", () => {
+    expect(C.EgressReason.parse("upstream: invalid peer certificate")).toBe("exchange: invalid peer certificate");
+    expect(C.EgressReason.parse("suppressed: 9 duplicate or excess deny records")).toBe("suppressed");
+    expect(C.EgressReason.parse("connect: a: b")).toBe("connect: a: b");
+    expect(C.egressReasonParts("connect: a: b")).toEqual({ kind: "upstream", stage: "connect", detail: "a: b" });
+    expect(C.EgressReason.parse("not in allowlist")).toBe("not in allowlist");
   });
 });
 

@@ -15,6 +15,7 @@
   "ForkMode": ["disk_only", "live"],
   "GenerationKind": ["disk_only", "checkpoint"],
   "HostRole": ["burst", "controller"],
+  "LimitKind": ["connections"],
   "ManifestKind": ["disk", "memory"],
   "PolicyLayer": ["base", "workstream", "sandbox"],
   "RuleDecision": ["allow", "deny", "ask"],
@@ -25,5 +26,6 @@
   "TaskStatus": ["running", "exited", "killed", "timed_out"],
   "TunnelState": ["none", "connecting", "connected"],
   "TurnInputKind": ["user", "event_batch", "inbox", "ask_answer", "recovery"],
+  "UpstreamStage": ["resolve", "connect", "exchange"],
   "Urgency": ["low", "normal", "high"]
 }

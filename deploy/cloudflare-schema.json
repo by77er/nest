@@ -67,6 +67,259 @@
     "blocks": {}
   },
   "resources": {
+    "cloudflare_r2_bucket_lifecycle": {
+      "block": {
+        "attributes": {
+          "account_id": {
+            "type": {
+              "kind": "string"
+            },
+            "required": true,
+            "optional": false,
+            "computed": false,
+            "sensitive": false,
+            "description": "Cloudflare account ID that owns the R2 resource."
+          },
+          "bucket_name": {
+            "type": {
+              "kind": "string"
+            },
+            "required": true,
+            "optional": false,
+            "computed": false,
+            "sensitive": false,
+            "description": "Name of the bucket."
+          },
+          "jurisdiction": {
+            "type": {
+              "kind": "string"
+            },
+            "required": false,
+            "optional": true,
+            "computed": true,
+            "sensitive": false,
+            "description": "Jurisdiction of the bucket"
+          },
+          "rules": {
+            "type": {
+              "kind": "list",
+              "value": {
+                "kind": "object",
+                "value": {
+                  "abort_multipart_uploads_transition": {
+                    "type": {
+                      "kind": "object",
+                      "value": {
+                        "condition": {
+                          "type": {
+                            "kind": "object",
+                            "value": {
+                              "max_age": {
+                                "type": {
+                                  "kind": "number"
+                                },
+                                "required": true,
+                                "optional": false,
+                                "computed": false,
+                                "sensitive": false
+                              },
+                              "type": {
+                                "type": {
+                                  "kind": "string"
+                                },
+                                "required": true,
+                                "optional": false,
+                                "computed": false,
+                                "sensitive": false,
+                                "description": "Available values: \"Age\"."
+                              }
+                            }
+                          },
+                          "required": false,
+                          "optional": true,
+                          "computed": false,
+                          "sensitive": false,
+                          "description": "Condition for lifecycle transitions to apply after an object reaches an age in seconds."
+                        }
+                      }
+                    },
+                    "required": false,
+                    "optional": true,
+                    "computed": false,
+                    "sensitive": false,
+                    "description": "Transition to abort ongoing multipart uploads."
+                  },
+                  "conditions": {
+                    "type": {
+                      "kind": "object",
+                      "value": {
+                        "prefix": {
+                          "type": {
+                            "kind": "string"
+                          },
+                          "required": true,
+                          "optional": false,
+                          "computed": false,
+                          "sensitive": false,
+                          "description": "Transitions will only apply to objects/uploads in the bucket that start with the given prefix, an empty prefix can be provided to scope rule to all objects/uploads."
+                        }
+                      }
+                    },
+                    "required": true,
+                    "optional": false,
+                    "computed": false,
+                    "sensitive": false,
+                    "description": "Conditions that apply to all transitions of this rule."
+                  },
+                  "delete_objects_transition": {
+                    "type": {
+                      "kind": "object",
+                      "value": {
+                        "condition": {
+                          "type": {
+                            "kind": "object",
+                            "value": {
+                              "date": {
+                                "type": {
+                                  "kind": "string"
+                                },
+                                "required": false,
+                                "optional": true,
+                                "computed": false,
+                                "sensitive": false
+                              },
+                              "max_age": {
+                                "type": {
+                                  "kind": "number"
+                                },
+                                "required": false,
+                                "optional": true,
+                                "computed": false,
+                                "sensitive": false
+                              },
+                              "type": {
+                                "type": {
+                                  "kind": "string"
+                                },
+                                "required": true,
+                                "optional": false,
+                                "computed": false,
+                                "sensitive": false,
+                                "description": "Available values: \"Age\", \"Date\"."
+                              }
+                            }
+                          },
+                          "required": false,
+                          "optional": true,
+                          "computed": false,
+                          "sensitive": false,
+                          "description": "Condition for lifecycle transitions to apply after an object reaches an age in seconds."
+                        }
+                      }
+                    },
+                    "required": false,
+                    "optional": true,
+                    "computed": false,
+                    "sensitive": false,
+                    "description": "Transition to delete objects."
+                  },
+                  "enabled": {
+                    "type": {
+                      "kind": "bool"
+                    },
+                    "required": true,
+                    "optional": false,
+                    "computed": false,
+                    "sensitive": false,
+                    "description": "Whether or not this rule is in effect."
+                  },
+                  "id": {
+                    "type": {
+                      "kind": "string"
+                    },
+                    "required": true,
+                    "optional": false,
+                    "computed": false,
+                    "sensitive": false,
+                    "description": "Unique identifier for this rule."
+                  },
+                  "storage_class_transitions": {
+                    "type": {
+                      "kind": "list",
+                      "value": {
+                        "kind": "object",
+                        "value": {
+                          "condition": {
+                            "type": {
+                              "kind": "object",
+                              "value": {
+                                "date": {
+                                  "type": {
+                                    "kind": "string"
+                                  },
+                                  "required": false,
+                                  "optional": true,
+                                  "computed": false,
+                                  "sensitive": false
+                                },
+                                "max_age": {
+                                  "type": {
+                                    "kind": "number"
+                                  },
+                                  "required": false,
+                                  "optional": true,
+                                  "computed": false,
+                                  "sensitive": false
+                                },
+                                "type": {
+                                  "type": {
+                                    "kind": "string"
+                                  },
+                                  "required": true,
+                                  "optional": false,
+                                  "computed": false,
+                                  "sensitive": false,
+                                  "description": "Available values: \"Age\", \"Date\"."
+                                }
+                              }
+                            },
+                            "required": true,
+                            "optional": false,
+                            "computed": false,
+                            "sensitive": false,
+                            "description": "Condition for lifecycle transitions to apply after an object reaches an age in seconds."
+                          },
+                          "storage_class": {
+                            "type": {
+                              "kind": "string"
+                            },
+                            "required": true,
+                            "optional": false,
+                            "computed": false,
+                            "sensitive": false,
+                            "description": "Available values: \"InfrequentAccess\"."
+                          }
+                        }
+                      }
+                    },
+                    "required": false,
+                    "optional": true,
+                    "computed": false,
+                    "sensitive": false,
+                    "description": "Transitions to change the storage class of objects."
+                  }
+                }
+              }
+            },
+            "required": false,
+            "optional": true,
+            "computed": false,
+            "sensitive": false
+          }
+        },
+        "blocks": {}
+      }
+    },
     "cloudflare_zero_trust_access_application": {
       "block": {
         "attributes": {

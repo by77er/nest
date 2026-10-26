@@ -1,0 +1,8 @@
+{
+  "type": "resync_ack",
+  "sandboxes": 2,
+  "listeners": 11,
+  "failed": [
+    { "sandbox": "sbx_01jb7m2a4c", "listener_ids": [4] }
+  ]
+}

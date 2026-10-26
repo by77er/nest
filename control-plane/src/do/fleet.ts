@@ -19,7 +19,7 @@ import { issueHostToken } from "../lib/tokens";
 import { errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import {
   type Capacity, type CommandBody, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
-  type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
+  type EgressAuditRecord, type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
   type TunnelState,
 } from "../protocol/control";
 import type { GuestInfo } from "../protocol/gateway";
@@ -934,6 +934,29 @@ export class FleetDO extends DurableObject<Env> {
     return !!lease && lease.host === host && !lease.expired && (epoch === undefined || lease.epoch === epoch);
   }
 
+  /**
+   * Egress audit goes to R2 as `audit/<sandbox>/<YYYY-MM-DD>/<ts_ms>-<id>.jsonl` (UTC day of each
+   * record): one sandbox's history sits under one prefix whichever hosts served it, and the R2
+   * lifecycle rule on `audit/` expires it (docs/data/). Like host-originated workstream events, only
+   * the lease holder's records for the epoch it holds are kept.
+   */
+  private async writeAudit(host: string, tsMs: number, records: EgressAuditRecord[]): Promise<void> {
+    const groups = new Map<string, EgressAuditRecord[]>();
+    let dropped = 0;
+    for (const r of records) {
+      if (!this.holds(host, r.sandbox, r.epoch)) {
+        dropped++;
+        continue;
+      }
+      const key = `${r.sandbox}/${new Date(r.ts_ms).toISOString().slice(0, 10)}`;
+      groups.set(key, [...(groups.get(key) ?? []), r]);
+    }
+    if (dropped) console.warn(`FleetDO: dropping ${dropped} egress audit record(s) from ${host}: not the lease holder`);
+    for (const [key, rs] of groups) {
+      await this.env.BUCKET.put(`audit/${key}/${tsMs}-${newId("")}.jsonl`, rs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    }
+  }
+
   private async handleEvent(host: string, ev: HostEvent): Promise<void> {
     switch (ev.type) {
       case "command_result":
@@ -966,11 +989,8 @@ export class FleetDO extends DurableObject<Env> {
         await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(ev.event.workstream)).ingest(ev.event);
         return;
       }
-      case "egress_audit": {
-        const body = ev.records.map((r) => JSON.stringify(r)).join("\n") + "\n";
-        await this.env.BUCKET.put(`audit/${host}/${ev.ts_ms}-${newId("")}.jsonl`, body);
-        return;
-      }
+      case "egress_audit":
+        return this.writeAudit(host, ev.ts_ms, ev.records);
       case "capacity":
         this.sql.exec("UPDATE hosts SET capacity = ?, capacity_seq = ? WHERE host = ?", JSON.stringify(ev.capacity), this.mark(), host);
         return;

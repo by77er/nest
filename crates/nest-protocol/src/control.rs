@@ -599,8 +599,228 @@ pub enum EgressVia {
     TcpException,
 }
 
-/// One proxied connection/request. Never contains secret values or query strings.
-/// `reason` values are listed in docs/interfaces/host-internal/nestd-proxy/.
+/// Which step of reaching an upstream failed ([`EgressReason::Upstream`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamStage {
+    /// Resolving the name (TCP exceptions resolve before connecting).
+    Resolve,
+    /// Resolving and connecting over TCP (passthrough, TCP exceptions).
+    Connect,
+    /// Everything up to and including the upstream TLS handshake and certificate check, or the
+    /// request itself (inspected traffic).
+    #[default]
+    Exchange,
+}
+
+impl UpstreamStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Connect => "connect",
+            Self::Exchange => "exchange",
+        }
+    }
+
+    /// The stage a wire prefix names; `upstream` is what a proxy one release older wrote for
+    /// [`Self::Exchange`].
+    fn from_prefix(s: &str) -> Option<Self> {
+        match s {
+            "resolve" => Some(Self::Resolve),
+            "connect" => Some(Self::Connect),
+            "exchange" | "upstream" => Some(Self::Exchange),
+            _ => None,
+        }
+    }
+}
+
+/// Why nest-proxy decided what it did (`EgressAuditRecord.reason`). On the wire it is one string:
+/// a unit member is its snake_case name, [`Self::Upstream`] is `"<stage>: <detail>"`. The table in
+/// docs/interfaces/host-internal/nestd-proxy/ lists exactly [`Self::documented`] (a test checks).
+///
+/// Open: a string this build doesn't know (a newer sender, or an older one's prose) parses as
+/// [`Self::Other`] with its text kept, so no audit batch is rejected and nothing is lost. What a
+/// proxy one release older wrote as `suppressed: …` parses as [`Self::Suppressed`], and
+/// `upstream: …` as stage `exchange`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, strum::EnumIter)]
+pub enum EgressReason {
+    /// Host (or port) not in the effective allowlist.
+    NotAllowed,
+    /// SNI, Host or CONNECT authority isn't a DNS name or IP literal (≤ 253 bytes).
+    InvalidHost,
+    /// `:443` traffic without a TLS ClientHello.
+    NotTls,
+    /// A ClientHello without SNI.
+    NoSni,
+    /// No intermediate CA installed yet, so inspection is impossible.
+    NoCa,
+    /// DNS name not allowlisted (`via: dns`, `port: 53`), answered NXDOMAIN.
+    DnsNxdomain,
+    /// Sandbox at `limits.max_connections` (record kind `limit`).
+    ConnectionLimit,
+    /// Plaintext request whose target or `Host` names another host than the one that routed it.
+    HostMismatch,
+    /// Decrypted `Host` or request target ≠ SNI: domain fronting.
+    HostSniMismatch,
+    /// More than one `Host` header.
+    DuplicateHost,
+    /// CONNECT tunnel whose SNI ≠ the CONNECT authority: domain fronting.
+    SniMismatch,
+    /// CONNECT tunnel to an allowed host that didn't start TLS.
+    NonTlsTunnel,
+    /// A binding's placeholder sent to a host outside the binding.
+    PlaceholderWrongHost,
+    /// Placeholder present but its secret is missing, expired or fenced.
+    InjectionUnavailable,
+    /// Placeholder over plain HTTP.
+    InjectionRequiresTls,
+    /// TRACE/TRACK on a request carrying an injected credential.
+    TraceWithCredential,
+    /// A TCP exception listener whose rule is no longer in policy.
+    TcpExceptionNotInPolicy,
+    /// Spliced TCP exception (allow).
+    TcpException,
+    /// Connection upgraded (WebSocket) and spliced after the handshake (allow).
+    Upgraded,
+    /// A window's suppression summary (record kind `suppressed`).
+    Suppressed,
+    /// Reaching the upstream failed; `detail` is the resolver's, the socket's or TLS's own text.
+    Upstream { stage: UpstreamStage, detail: String },
+    /// Deserialize-only fallback, never sent by this build: the string as received.
+    Other(String),
+}
+
+impl EgressReason {
+    pub fn upstream(stage: UpstreamStage, detail: impl std::fmt::Display) -> Self {
+        Self::Upstream { stage, detail: detail.to_string() }
+    }
+
+    /// The wire name of a unit member (`None` for `Upstream` and `Other`).
+    pub fn unit_name(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::NotAllowed => "not_allowed",
+            Self::InvalidHost => "invalid_host",
+            Self::NotTls => "not_tls",
+            Self::NoSni => "no_sni",
+            Self::NoCa => "no_ca",
+            Self::DnsNxdomain => "dns_nxdomain",
+            Self::ConnectionLimit => "connection_limit",
+            Self::HostMismatch => "host_mismatch",
+            Self::HostSniMismatch => "host_sni_mismatch",
+            Self::DuplicateHost => "duplicate_host",
+            Self::SniMismatch => "sni_mismatch",
+            Self::NonTlsTunnel => "non_tls_tunnel",
+            Self::PlaceholderWrongHost => "placeholder_wrong_host",
+            Self::InjectionUnavailable => "injection_unavailable",
+            Self::InjectionRequiresTls => "injection_requires_tls",
+            Self::TraceWithCredential => "trace_with_credential",
+            Self::TcpExceptionNotInPolicy => "tcp_exception_not_in_policy",
+            Self::TcpException => "tcp_exception",
+            Self::Upgraded => "upgraded",
+            Self::Suppressed => "suppressed",
+            Self::Upstream { .. } | Self::Other(_) => return None,
+        })
+    }
+
+    /// What the doc table lists: each unit member's name, and `<stage>: …` for each upstream
+    /// stage. `Other` is never sent, so it isn't listed.
+    pub fn documented() -> Vec<String> {
+        use strum::IntoEnumIterator;
+        let mut out = vec![];
+        for r in Self::iter() {
+            match r {
+                Self::Upstream { .. } => out.extend(UpstreamStage::iter().map(|s| format!("{}: …", s.as_str()))),
+                Self::Other(_) => {}
+                unit => out.push(unit.unit_name().expect("a unit member").to_owned()),
+            }
+        }
+        out
+    }
+
+    /// A denial by policy: the host or name isn't granted, so someone could grant it. Only these
+    /// raise an `egress_denied` workstream event; protocol refusals, upstream failures, limits and
+    /// summaries stay in the audit log.
+    pub fn is_policy_denial(&self) -> bool {
+        matches!(self, Self::NotAllowed | Self::DnsNxdomain | Self::TcpExceptionNotInPolicy)
+    }
+}
+
+impl std::fmt::Display for EgressReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Upstream { stage, detail } => write!(f, "{}: {detail}", stage.as_str()),
+            Self::Other(s) => f.write_str(s),
+            unit => f.write_str(unit.unit_name().expect("a unit member")),
+        }
+    }
+}
+
+impl std::str::FromStr for EgressReason {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use strum::IntoEnumIterator;
+        if let Some(unit) = Self::iter().find(|r| r.unit_name() == Some(s)) {
+            return Ok(unit);
+        }
+        if let Some((prefix, detail)) = s.split_once(": ") {
+            if let Some(stage) = UpstreamStage::from_prefix(prefix) {
+                return Ok(Self::Upstream { stage, detail: detail.to_owned() });
+            }
+            if prefix == "suppressed" {
+                return Ok(Self::Suppressed);
+            }
+        }
+        Ok(Self::Other(s.to_owned()))
+    }
+}
+
+impl Serialize for EgressReason {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for EgressReason {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        let Ok(r) = s.parse::<Self>();
+        Ok(r)
+    }
+}
+
+/// Which limit an aggregate `limit` record reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    /// `limits.max_connections`: a connection was refused before anything was read.
+    Connections,
+}
+
+/// What an audit record stands for (`EgressAuditRecord.kind`; absent on the wire = `request`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[strum_discriminants(name(EgressAuditKindTag), derive(strum::EnumIter, strum::IntoStaticStr))]
+#[strum_discriminants(strum(serialize_all = "snake_case"))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EgressAuditKind {
+    /// One connection or request.
+    #[default]
+    Request,
+    /// The previous aggregation window's summary: how many deny and alert records were dropped as
+    /// duplicates or over the cap (`host: "*"`, `port: 0`, `count` = their sum).
+    Suppressed { denials: u64, alerts: u64 },
+    /// A connection refused by a limit before any host was known (`host: ""`, `port: 0`).
+    Limit { which: LimitKind },
+}
+
+impl EgressAuditKind {
+    pub fn is_request(&self) -> bool {
+        matches!(self, Self::Request)
+    }
+}
+
+/// One proxied connection/request, or an aggregate (`kind`). Never contains secret values or
+/// query strings. `reason` values are listed in docs/interfaces/host-internal/nestd-proxy/.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressAuditRecord {
     pub sandbox: SandboxId,
@@ -625,10 +845,24 @@ pub struct EgressAuditRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<EgressReason>,
     /// For an aggregated record: how many requests it stands for (absent = 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+    /// What the record stands for; absent = one request. A proxy one release older never sets it
+    /// (its aggregates are told apart by `reason`).
+    #[serde(default, skip_serializing_if = "EgressAuditKind::is_request")]
+    pub kind: EgressAuditKind,
+}
+
+impl EgressAuditRecord {
+    /// One request denied by policy: what nestd raises as an `egress_denied` workstream event.
+    /// Aggregates (a summary, a connection limit) never are, whichever proxy version sent them.
+    pub fn is_policy_denial(&self) -> bool {
+        self.verdict == EgressVerdict::Deny
+            && self.kind.is_request()
+            && self.reason.as_ref().is_some_and(EgressReason::is_policy_denial)
+    }
 }
 
 // =================================================================================================
@@ -1048,6 +1282,102 @@ mod tests {
         roundtrip::<crate::model::EgressPolicy>("egress_policy", &["egress_policy"], |_| "egress_policy");
         roundtrip::<crate::model::GenerationRecord>("generation_record", &["generation_record"], |_| "generation_record");
         roundtrip::<crate::model::Manifest>("manifest", &["manifest"], |_| "manifest");
+    }
+
+    fn egress_reason(r: &EgressReason) -> &'static str {
+        match r {
+            EgressReason::Upstream { .. } => "upstream",
+            EgressReason::Other(_) => "other",
+            unit => unit.unit_name().unwrap(),
+        }
+    }
+
+    /// One fixture per `EgressReason` member (and per audit kind), round-tripped; TypeScript
+    /// round-trips the same files.
+    #[test]
+    fn egress_audit_fixtures() {
+        use strum::IntoEnumIterator;
+        let reasons: Vec<&'static str> = EgressReason::iter().map(|r| egress_reason(&r)).collect();
+        roundtrip::<EgressReason>("egress_reason", &reasons, egress_reason);
+        let kinds: Vec<&'static str> = EgressAuditKindTag::iter().map(Into::into).collect();
+        roundtrip::<EgressAuditKind>("egress_audit_kind", &kinds, |k| EgressAuditKindTag::from(k).into());
+        // Every upstream stage has its fixture.
+        let stages: BTreeSet<UpstreamStage> = fixtures("egress_reason")
+            .into_iter()
+            .filter_map(|(_, v)| match serde_json::from_value(v).unwrap() {
+                EgressReason::Upstream { stage, .. } => Some(stage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stages, UpstreamStage::iter().collect(), "an upstream stage without a fixture");
+    }
+
+    /// What a proxy one release older wrote still parses, into the member it meant.
+    #[test]
+    fn legacy_egress_reasons_parse() {
+        let parse = |s: &str| serde_json::from_value::<EgressReason>(serde_json::json!(s)).unwrap();
+        assert_eq!(parse("suppressed: 9 duplicate or excess deny records and 0 alerts in the previous 60s window"), EgressReason::Suppressed);
+        assert_eq!(parse("upstream: invalid peer certificate"), EgressReason::upstream(UpstreamStage::Exchange, "invalid peer certificate"));
+        assert_eq!(parse("connect: a: b"), EgressReason::upstream(UpstreamStage::Connect, "a: b"), "only the first `: ` splits");
+        assert_eq!(parse("not in allowlist"), EgressReason::Other("not in allowlist".into()), "unknown prose is kept");
+        // The older form re-serializes as this build's.
+        assert_eq!(serde_json::to_value(parse("upstream: x")).unwrap(), "exchange: x");
+        // An old proxy's aggregates are told apart by reason alone (it sets no `kind`).
+        let summary: EgressAuditRecord = serde_json::from_value(serde_json::json!({
+            "sandbox": "sbx_1", "epoch": 1, "ts_ms": 1, "host": "*", "port": 0, "bytes_up": 0, "bytes_down": 0,
+            "verdict": "deny", "reason": "suppressed: 3 duplicate or excess deny records", "count": 3
+        }))
+        .unwrap();
+        assert!(summary.kind.is_request() && !summary.is_policy_denial());
+    }
+
+    /// The reason table in the nestd ↔ nest-proxy contract lists exactly `EgressReason::documented`.
+    #[test]
+    fn reason_table_matches_the_enum() {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/interfaces/host-internal/nestd-proxy/README.md");
+        let doc = std::fs::read_to_string(&p).unwrap();
+        let table = doc.split("## Audit `reason` values").nth(1).expect("the reason section").split("\n## ").next().unwrap();
+        let mut listed = vec![];
+        for row in table.lines().filter(|l| l.starts_with("| `")) {
+            let cell = row.split('|').nth(1).unwrap();
+            listed.extend(cell.split('`').skip(1).step_by(2).map(str::to_owned));
+        }
+        let ours = EgressReason::documented();
+        assert_eq!(listed.iter().collect::<BTreeSet<_>>(), ours.iter().collect::<BTreeSet<_>>(), "doc table vs EgressReason");
+        assert_eq!(listed.len(), ours.len(), "a reason listed twice");
+    }
+
+    #[test]
+    fn only_policy_denials_raise_egress_denied() {
+        let rec = |reason: EgressReason, verdict: EgressVerdict, kind: EgressAuditKind| EgressAuditRecord {
+            sandbox: SandboxId("sbx_1".into()),
+            epoch: Epoch(1),
+            agent: None,
+            ts_ms: 0,
+            via: None,
+            host: "h.example".into(),
+            port: 443,
+            method: None,
+            path: None,
+            status: None,
+            bytes_up: 0,
+            bytes_down: 0,
+            verdict,
+            binding: None,
+            reason: Some(reason),
+            count: None,
+            kind,
+        };
+        use EgressAuditKind::Request;
+        assert!(rec(EgressReason::NotAllowed, EgressVerdict::Deny, Request).is_policy_denial());
+        assert!(rec(EgressReason::DnsNxdomain, EgressVerdict::Deny, Request).is_policy_denial());
+        assert!(rec(EgressReason::TcpExceptionNotInPolicy, EgressVerdict::Deny, Request).is_policy_denial());
+        assert!(!rec(EgressReason::upstream(UpstreamStage::Connect, "refused"), EgressVerdict::Deny, Request).is_policy_denial(), "upstream failure");
+        assert!(!rec(EgressReason::NonTlsTunnel, EgressVerdict::Deny, Request).is_policy_denial(), "protocol refusal");
+        assert!(!rec(EgressReason::Suppressed, EgressVerdict::Deny, EgressAuditKind::Suppressed { denials: 3, alerts: 0 }).is_policy_denial());
+        assert!(!rec(EgressReason::ConnectionLimit, EgressVerdict::Deny, EgressAuditKind::Limit { which: LimitKind::Connections }).is_policy_denial());
+        assert!(!rec(EgressReason::NotAllowed, EgressVerdict::Deny, EgressAuditKind::Limit { which: LimitKind::Connections }).is_policy_denial(), "kind wins");
+        assert!(!rec(EgressReason::NotAllowed, EgressVerdict::Allow, Request).is_policy_denial());
     }
 
     #[test]

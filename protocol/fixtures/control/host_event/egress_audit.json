@@ -27,7 +27,7 @@
       "bytes_up": 0,
       "bytes_down": 0,
       "verdict": "deny",
-      "reason": "not in allowlist",
+      "reason": "not_allowed",
       "via": "https_transparent"
     },
     {
@@ -43,20 +43,34 @@
       "bytes_down": 0,
       "verdict": "alert",
       "binding": "github",
-      "reason": "placeholder sent outside binding hosts"
+      "reason": "placeholder_wrong_host",
+      "via": "explicit"
+    },
+    {
+      "sandbox": "sbx_01jb7m2a4c",
+      "epoch": 4,
+      "ts_ms": 1760270400010,
+      "host": "",
+      "port": 0,
+      "bytes_up": 0,
+      "bytes_down": 0,
+      "verdict": "deny",
+      "reason": "connection_limit",
+      "via": "https_transparent",
+      "kind": { "type": "limit", "which": "connections" }
     },
     {
       "sandbox": "sbx_01jb7m2a4c",
       "epoch": 4,
       "ts_ms": 1760270460000,
       "host": "*",
-      "port": 53,
+      "port": 0,
       "bytes_up": 0,
       "bytes_down": 0,
       "verdict": "deny",
-      "reason": "suppressed: 412 denied DNS lookups in the last 60 s",
-      "via": "dns",
-      "count": 412
+      "reason": "suppressed",
+      "count": 412,
+      "kind": { "type": "suppressed", "denials": 412, "alerts": 0 }
     }
   ]
 }

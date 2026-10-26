@@ -188,7 +188,7 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
             for (spec, fd) in listeners.into_iter().zip(fds) {
                 let id = spec.id;
                 if let Err(error) = listener::spawn(session, &sb, spec, fd) {
-                    session.emit(ProxyEvent::ListenerFailed { sandbox: sandbox.clone(), listener_id: id, error });
+                    session.listener_failed(&sandbox, id, error);
                 }
             }
         }
@@ -212,10 +212,12 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
         }
         ProxyCommand::ResyncComplete { sandboxes, listeners } => {
             let (n, m) = session.counts();
-            if (n, m) != (sandboxes, listeners) {
-                tracing::warn!(expected = ?(sandboxes, listeners), got = ?(n, m), "resync count mismatch");
+            let failed = session.finish_resync();
+            let nfailed: usize = failed.iter().map(|f| f.listener_ids.len()).sum();
+            if (n, m as usize + nfailed) != (sandboxes, listeners as usize) {
+                tracing::warn!(expected = ?(sandboxes, listeners), got = ?(n, m), nfailed, "resync count mismatch");
             }
-            session.emit(ProxyEvent::ResyncAck { sandboxes: n, listeners: m });
+            session.emit(ProxyEvent::ResyncAck { sandboxes: n, listeners: m, failed });
         }
         ProxyCommand::Ping { nonce } => {
             let (n, _) = session.counts();

@@ -71,3 +71,40 @@ describe("agent_exited reasons", () => {
     await nextCommands(host.ws, isStart(agent));
   });
 });
+
+describe("egress audit in R2", () => {
+  const record = (sandbox: string, epoch: number, ts: number, host: string) => ({
+    sandbox, epoch, ts_ms: ts, host, port: 443, bytes_up: 0, bytes_down: 0, verdict: "deny", reason: "not_allowed",
+  });
+  async function auditUnder(prefix: string): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    for (const o of (await env.BUCKET.list({ prefix })).objects) out[o.key] = await (await env.BUCKET.get(o.key))!.text();
+    return out;
+  }
+
+  it("is written per sandbox and UTC day, and only from the lease holder at its epoch", async () => {
+    const cell = uniqueCell();
+    const holder = await connectHost(cell);
+    const ws = (await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "audit" } }, 201)).workstream;
+    const sbx = await adminJson<{ sandbox: string; host: string }>("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    expect(sbx.host).toBe(holder.host);
+    const other = await connectHost(cell);
+    const day1 = Date.UTC(2026, 9, 24, 23, 59);
+    const day2 = Date.UTC(2026, 9, 25, 0, 1);
+    const records = [record(sbx.sandbox, 1, day1, "a.example"), record(sbx.sandbox, 1, day2, "b.example"), record(sbx.sandbox, 2, day2, "stale-epoch.example")];
+    const seq = sendEvents(holder.ws, [{ ts_ms: day2, type: "egress_audit", records }]);
+    await holder.ws.next("ack", (m) => m.up_to === seq);
+    const seq2 = sendEvents(other.ws, [{ ts_ms: day2, type: "egress_audit", records: [record(sbx.sandbox, 1, day2, "not-holder.example")] }]);
+    await other.ws.next("ack", (m) => m.up_to === seq2);
+
+    const objects = await auditUnder(`audit/${sbx.sandbox}/`);
+    const byDay = (day: string) => Object.entries(objects).filter(([k]) => k.startsWith(`audit/${sbx.sandbox}/${day}/`)).map(([, v]) => v).join("");
+    expect(byDay("2026-10-24")).toContain("a.example");
+    expect(byDay("2026-10-25")).toContain("b.example");
+    expect(Object.keys(objects)).toHaveLength(2);
+    const all = Object.values(objects).join("");
+    expect(all).not.toContain("stale-epoch.example");
+    expect(all).not.toContain("not-holder.example");
+    expect(await auditUnder(`audit/${holder.host}/`)).toEqual({});
+  });
+});

@@ -1,7 +1,7 @@
 //! In-memory state for one nestd connection ("session"). Everything here is discarded when the
 //! connection ends; nestd resyncs it on reconnect.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -11,9 +11,9 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
-use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyEvent};
-use nest_protocol::model::{AgentId, EgressPolicy, Epoch, InjectionSecret, SandboxId, WorkstreamId};
+use nest_protocol::control::{EgressAuditKind, EgressAuditRecord, EgressReason, EgressVerdict};
+use nest_protocol::host::proxy::{AlertKind, DropReason, MAX_RESYNC_FAILURES, ProxyEvent, ResyncFailure};
+use nest_protocol::model::{AgentId, EgressPolicy, Epoch, ErrorBody, InjectionSecret, SandboxId, WorkstreamId};
 
 use crate::resolve::Resolve;
 use crate::tls::{Ca, UpstreamTls};
@@ -72,6 +72,9 @@ pub struct Session {
     /// Sandboxes nestd fenced, with the epoch: state for that epoch (or older) is refused even
     /// if a late upsert/listener push arrives after the drop (fence racing setup).
     dropped: Mutex<HashMap<SandboxId, Epoch>>,
+    /// `Some` between `hello_ack` and `resync_complete`: listeners that failed meanwhile, per
+    /// sandbox, reported in `resync_ack` instead of one `listener_failed` each.
+    resync_failed: Mutex<Option<BTreeMap<SandboxId, Vec<u32>>>>,
     pub events: mpsc::UnboundedSender<ProxyEvent>,
     pub audit_tx: mpsc::Sender<EgressAuditRecord>,
 }
@@ -89,6 +92,7 @@ impl Session {
             ca: RwLock::new(None),
             sandboxes: RwLock::new(HashMap::new()),
             dropped: Mutex::new(HashMap::new()),
+            resync_failed: Mutex::new(None),
             events,
             audit_tx,
         })
@@ -157,8 +161,37 @@ impl Session {
             s.drop.cancel();
         }
         self.dropped.lock().unwrap().clear();
+        *self.resync_failed.lock().unwrap() = Some(BTreeMap::new());
         *self.ca.write().unwrap() = None;
         self.set_lease(0);
+    }
+
+    /// A listener this proxy was handed can't be served (its loop has stopped and its fd is
+    /// closed). During a resync it's collected for `resync_ack`; otherwise nestd hears at once.
+    pub fn listener_failed(&self, sandbox: &SandboxId, listener_id: u32, error: ErrorBody) {
+        tracing::warn!(%sandbox, listener_id, code = %error.code, message = %error.message, "listener failed");
+        if let Some(failed) = self.resync_failed.lock().unwrap().as_mut() {
+            failed.entry(sandbox.clone()).or_default().push(listener_id);
+            return;
+        }
+        self.emit(ProxyEvent::ListenerFailed { sandbox: sandbox.clone(), listener_id, error });
+    }
+
+    /// `resync_complete`: end the resync and take what failed during it, capped at
+    /// [`MAX_RESYNC_FAILURES`] ids (the rest leave nestd's count unexplained, so it resyncs).
+    pub fn finish_resync(&self) -> Vec<ResyncFailure> {
+        let failed = self.resync_failed.lock().unwrap().take().unwrap_or_default();
+        let mut room = MAX_RESYNC_FAILURES;
+        let mut out = vec![];
+        for (sandbox, mut listener_ids) in failed {
+            if room == 0 {
+                break;
+            }
+            listener_ids.truncate(room);
+            room -= listener_ids.len();
+            out.push(ResyncFailure { sandbox, listener_ids });
+        }
+        out
     }
 
     pub fn counts(&self) -> (u32, u32) {
@@ -244,10 +277,10 @@ impl Sandbox {
     /// Gate a deny/alert audit record: one record per distinct (host, port, reason) per window,
     /// at most [`MAX_DENIALS_PER_WINDOW`] distinct ones. A summary of what was suppressed is
     /// returned (to emit first) when a new window starts.
-    pub fn gate_denial(&self, rec: &EgressAuditRecord) -> (Gate, Option<(String, u32)>) {
+    pub fn gate_denial(&self, rec: &EgressAuditRecord) -> (Gate, Option<(u64, u64)>) {
         let mut l = self.limiter.lock().unwrap();
-        let summary = l.roll(now_ms()).map(summary_reason);
-        let key = format!("{}|{}|{}", rec.host, rec.port, rec.reason.as_deref().unwrap_or(""));
+        let summary = l.roll(now_ms());
+        let key = format!("{}|{}|{}", rec.host, rec.port, rec.reason.as_ref().map(ToString::to_string).unwrap_or_default());
         let gate = if l.denials.contains(&key) || l.denials.len() >= MAX_DENIALS_PER_WINDOW {
             l.suppressed_denials += 1;
             Gate::Drop
@@ -259,9 +292,9 @@ impl Sandbox {
     }
 
     /// Gate an alert event: one per distinct (kind, host, binding) per window, capped.
-    pub fn gate_alert(&self, kind: AlertKind, host: &str, binding: Option<&str>) -> (Gate, Option<(String, u32)>) {
+    pub fn gate_alert(&self, kind: AlertKind, host: &str, binding: Option<&str>) -> (Gate, Option<(u64, u64)>) {
         let mut l = self.limiter.lock().unwrap();
-        let summary = l.roll(now_ms()).map(summary_reason);
+        let summary = l.roll(now_ms());
         let key = format!("{kind:?}|{host}|{}", binding.unwrap_or(""));
         let gate = if l.alerts.contains(&key) || l.alerts.len() >= MAX_ALERTS_PER_WINDOW {
             l.suppressed_alerts += 1;
@@ -363,8 +396,8 @@ impl ConnCtx {
 
     pub fn alert(&self, kind: AlertKind, host: &str, binding: Option<&str>, detail: impl Into<String>) {
         let (gate, summary) = self.sandbox.gate_alert(kind, host, binding);
-        if let Some(reason) = summary {
-            submit_summary(&self.session, &self.sandbox, reason);
+        if let Some(counts) = summary {
+            submit_summary(&self.session, &self.sandbox, counts);
         }
         if matches!(gate, Gate::Drop) {
             return;
@@ -391,8 +424,8 @@ impl ConnCtx {
 pub fn submit_audit(session: &Session, sandbox: &Sandbox, rec: EgressAuditRecord) {
     if matches!(rec.verdict, EgressVerdict::Deny | EgressVerdict::Alert) {
         let (gate, summary) = sandbox.gate_denial(&rec);
-        if let Some(reason) = summary {
-            submit_summary(session, sandbox, reason);
+        if let Some(counts) = summary {
+            submit_summary(session, sandbox, counts);
         }
         if matches!(gate, Gate::Drop) {
             return;
@@ -401,13 +434,68 @@ pub fn submit_audit(session: &Session, sandbox: &Sandbox, rec: EgressAuditRecord
     let _ = session.audit_tx.try_send(rec);
 }
 
-fn submit_summary(session: &Session, sandbox: &Sandbox, (reason, count): (String, u32)) {
-    let mut a = crate::audit::Audit::new("*", 0, EgressVerdict::Deny).reason(reason);
-    a.count = Some(count);
+/// The previous window's summary: a `suppressed` record (host `*`, port 0) with the counts.
+fn submit_summary(session: &Session, sandbox: &Sandbox, (denials, alerts): (u64, u64)) {
+    let mut a = crate::audit::Audit::new("*", 0, EgressVerdict::Deny).reason(EgressReason::Suppressed);
+    a.count = Some(u32::try_from(denials + alerts).unwrap_or(u32::MAX));
+    a.kind = EgressAuditKind::Suppressed { denials, alerts };
     let _ = session.audit_tx.try_send(a.into_record(&sandbox.id, sandbox.view().epoch, None, None));
 }
 
-fn summary_reason((denials, alerts): (u64, u64)) -> (String, u32) {
-    let reason = format!("suppressed: {denials} duplicate or excess deny records and {alerts} alerts in the previous {}s window", LIMIT_WINDOW_MS / 1000);
-    (reason, u32::try_from(denials + alerts).unwrap_or(u32::MAX))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::Audit;
+
+    type Channels = (Arc<Session>, mpsc::UnboundedReceiver<ProxyEvent>, mpsc::Receiver<EgressAuditRecord>);
+
+    fn session() -> Channels {
+        let tls = UpstreamTls::new(false, &[]).unwrap();
+        let upstream = Arc::new(Upstream::new(Arc::new(crate::resolve::StaticResolver::new()), tls, true));
+        let (etx, erx) = mpsc::unbounded_channel();
+        let (atx, arx) = mpsc::channel(64);
+        (Session::new(upstream, etx, atx), erx, arx)
+    }
+
+    fn deny(sbx: &Sandbox, host: &str) -> EgressAuditRecord {
+        Audit::new(host, 443, EgressVerdict::Deny).reason(EgressReason::NotAllowed).into_record(&sbx.id, Epoch(1), None, None)
+    }
+
+    /// Guest-proxy review #2: a window's summary is a `suppressed` record with its counts, never
+    /// a policy denial of host `*`.
+    #[test]
+    fn the_suppression_summary_is_its_own_kind() {
+        let (s, _events, mut audit) = session();
+        let sbx = s.sandbox_for(&SandboxId("sbx_1".into()), Epoch(1)).unwrap();
+        submit_audit(&s, &sbx, deny(&sbx, "a.example"));
+        submit_audit(&s, &sbx, deny(&sbx, "a.example"));
+        assert!(audit.try_recv().unwrap().is_policy_denial());
+        assert!(audit.try_recv().is_err(), "the duplicate is suppressed");
+        sbx.limiter.lock().unwrap().window_start -= LIMIT_WINDOW_MS; // the window ends
+        submit_audit(&s, &sbx, deny(&sbx, "b.example"));
+        let summary = audit.try_recv().unwrap();
+        assert_eq!(summary.kind, EgressAuditKind::Suppressed { denials: 1, alerts: 0 });
+        assert_eq!((summary.reason.clone(), summary.count, summary.host.as_str(), summary.port), (Some(EgressReason::Suppressed), Some(1), "*", 0));
+        assert!(!summary.is_policy_denial());
+        assert_eq!(audit.try_recv().unwrap().host, "b.example");
+    }
+
+    /// Guest-proxy review #6: listeners that fail during a resync are reported in `resync_ack`,
+    /// grouped per sandbox; after it, each is reported on its own at once.
+    #[test]
+    fn listener_failures_during_a_resync_go_into_the_ack() {
+        let (s, mut events, _audit) = session();
+        let err = || ErrorBody { code: "x".into(), message: "y".into(), retryable: true };
+        let (a, b) = (SandboxId("sbx_a".into()), SandboxId("sbx_b".into()));
+        s.reset(); // hello_ack
+        s.listener_failed(&a, 3, err());
+        s.listener_failed(&b, 1, err());
+        s.listener_failed(&a, 4, err());
+        assert!(events.try_recv().is_err(), "no listener_failed during a resync");
+        let want = vec![ResyncFailure { sandbox: a.clone(), listener_ids: vec![3, 4] }, ResyncFailure { sandbox: b, listener_ids: vec![1] }];
+        assert_eq!(s.finish_resync(), want);
+        s.listener_failed(&a, 5, err());
+        assert!(matches!(events.try_recv().unwrap(), ProxyEvent::ListenerFailed { listener_id: 5, .. }));
+        assert!(s.finish_resync().is_empty());
+    }
 }

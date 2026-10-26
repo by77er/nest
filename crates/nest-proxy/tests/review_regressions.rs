@@ -10,8 +10,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use common::*;
-use nest_protocol::control::EgressVerdict;
-use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyCommand, ProxyEvent};
+use nest_protocol::control::{EgressReason, EgressVerdict};
+use nest_protocol::host::proxy::{AlertKind, DropReason, ListenerPurpose, ListenerSpec, ProxyCommand, ProxyEvent, ResyncFailure, Transport};
 use nest_protocol::model::Epoch;
 
 fn audit_with(ev: &ProxyEvent, f: impl Fn(&nest_protocol::control::EgressAuditRecord) -> bool) -> bool {
@@ -82,7 +82,7 @@ async fn e2_explicit_absolute_form_with_foreign_host_is_blocked() {
     s.write_all(b"GET http://plain.test/y HTTP/1.1\r\nHost: evil.test\r\nConnection: close\r\n\r\n").await.unwrap();
     let resp = read_all(&mut s).await;
     assert!(resp.starts_with("HTTP/1.1 403") && resp.contains("host_mismatch"), "{resp}");
-    env.conn.wait(|e| audit_with(e, |r| r.host == "plain.test" && r.reason.as_deref() == Some("host_mismatch"))).await;
+    env.conn.wait(|e| audit_with(e, |r| r.host == "plain.test" && r.reason == Some(EgressReason::HostMismatch))).await;
 }
 
 /// E3: a CONNECT tunnel that doesn't start TLS is denied with a readable plaintext 403 instead
@@ -96,7 +96,7 @@ async fn e3_non_tls_connect_tunnel_is_denied() {
     let resp = read_all(&mut s).await;
     assert!(resp.starts_with("HTTP/1.1 403") && resp.contains("must carry TLS"), "{resp}");
     env.conn
-        .wait(|e| audit_with(e, |r| r.host == "plain.test" && r.verdict == EgressVerdict::Deny && r.reason.as_deref() == Some("non_tls_tunnel")))
+        .wait(|e| audit_with(e, |r| r.host == "plain.test" && r.verdict == EgressVerdict::Deny && r.reason == Some(EgressReason::NonTlsTunnel)))
         .await;
 
     // Passthrough hosts too: a pinned client speaks TLS; plaintext through CONNECT is refused.
@@ -175,6 +175,28 @@ async fn a_teardown_drop_leaves_no_tombstone_for_a_retry_at_the_same_epoch() {
     env.conn.send(&ProxyCommand::Ping { nonce: 2 }, &[]);
     let pong = env.conn.wait(|e| matches!(e, ProxyEvent::Pong { nonce: 2, .. })).await;
     assert!(matches!(pong, ProxyEvent::Pong { sandboxes: 1, .. }), "the retried create got no egress: {pong:?}");
+}
+
+/// Guest-proxy review #6: a listener the proxy can't serve during a resync is named in
+/// `resync_ack.failed` (per sandbox), so nestd can rebind that one listener instead of tearing
+/// down the whole host; it gets no separate `listener_failed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_listener_in_a_resync_is_reported_per_sandbox() {
+    let mut env = env().await;
+    let sbx = sandbox();
+    env.conn.send(&ProxyCommand::HelloAck { protocol_version: nest_protocol::host::PROTOCOL_VERSION, host_id: nest_protocol::model::HostId("hst_test".into()), nestd_boot_id: "boot".into() }, &[]);
+    env.conn.send(&ProxyCommand::SandboxUpsert { sandbox: sbx.clone(), epoch: Epoch(4), workstream: None, policy: policy(1, 1) }, &[]);
+    let good = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let not_udp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let specs = vec![
+        ListenerSpec { id: 7, transport: Transport::Tcp, addr: good.local_addr().unwrap().to_string(), purpose: ListenerPurpose::HttpTransparent },
+        ListenerSpec { id: 8, transport: Transport::Udp, addr: not_udp.local_addr().unwrap().to_string(), purpose: ListenerPurpose::Dns },
+    ];
+    let fds = [std::os::fd::OwnedFd::from(good), std::os::fd::OwnedFd::from(not_udp)];
+    env.conn.send(&ProxyCommand::ListenersAdd { sandbox: sbx.clone(), epoch: Epoch(4), listeners: specs }, &fds.iter().collect::<Vec<_>>());
+    env.conn.send(&ProxyCommand::ResyncComplete { sandboxes: 1, listeners: 2 }, &[]);
+    let ack = env.conn.wait(|e| matches!(e, ProxyEvent::ResyncAck { .. } | ProxyEvent::ListenerFailed { .. })).await;
+    assert_eq!(ack, ProxyEvent::ResyncAck { sandboxes: 1, listeners: 1, failed: vec![ResyncFailure { sandbox: sbx, listener_ids: vec![8] }] });
 }
 
 async fn inspected_tls_opt(env: &Env, sni: &str) -> Option<()> {

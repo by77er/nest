@@ -52,7 +52,7 @@ pub async fn answer(session: &Session, sandbox: &Sandbox, query: &[u8]) -> Optio
         let view = sandbox.view();
         let Some(policy) = view.policy else { break 'r ResponseCode::Refused };
         if !name_allowed(&policy, &name, now_ms()) {
-            let a = Audit::new(&name, 53, EgressVerdict::Deny).reason("dns_nxdomain");
+            let a = Audit::new(&name, 53, EgressVerdict::Deny).reason(nest_protocol::control::EgressReason::DnsNxdomain);
             submit_audit(session, sandbox, a.into_record(&sandbox.id, view.epoch, None, Some(nest_protocol::control::EgressVia::Dns)));
             break 'r ResponseCode::NXDomain;
         }

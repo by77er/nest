@@ -10,8 +10,8 @@ use nix::sys::socket::{SockType, getsockopt, sockopt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
-use nest_protocol::control::EgressVerdict;
-use nest_protocol::host::proxy::{ListenerPurpose, ListenerSpec, ProxyEvent, Transport};
+use nest_protocol::control::{EgressAuditKind, EgressReason, EgressVerdict, LimitKind};
+use nest_protocol::host::proxy::{ListenerPurpose, ListenerSpec, Transport};
 use nest_protocol::model::ErrorBody;
 
 use crate::audit::Audit;
@@ -71,12 +71,11 @@ async fn accept_loop(
                 Ok((s, _)) => s,
                 Err(e) if transient(&e) => { tokio::time::sleep(Duration::from_millis(50)).await; continue }
                 Err(e) => {
-                    session.emit(ProxyEvent::ListenerFailed {
-                        sandbox: sandbox.id.clone(),
-                        listener_id: id,
-                        error: ErrorBody { code: "accept_failed".into(), message: e.to_string(), retryable: true },
-                    });
+                    // Close our copy before telling nestd, which rebinds the same address.
                     sandbox.listeners.lock().unwrap().remove(&id);
+                    drop(l);
+                    let error = ErrorBody { code: "accept_failed".into(), message: e.to_string(), retryable: true };
+                    session.listener_failed(&sandbox.id, id, error);
                     return;
                 }
             },
@@ -90,7 +89,8 @@ async fn accept_loop(
             _ => None,
         };
         let Some(guard) = sandbox.try_acquire() else {
-            let a = Audit::new("", 0, EgressVerdict::Deny).reason("connection_limit");
+            let mut a = Audit::new("", 0, EgressVerdict::Deny).reason(EgressReason::ConnectionLimit);
+            a.kind = EgressAuditKind::Limit { which: LimitKind::Connections };
             crate::state::submit_audit(&session, &sandbox, a.into_record(&sandbox.id, sandbox.view().epoch, agent, Some(crate::audit::via(&purpose))));
             continue;
         };

@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use nest_protocol::control::EgressVerdict;
+use nest_protocol::control::{EgressReason as R, EgressVerdict, UpstreamStage as Stage};
 use nest_protocol::host::proxy::AlertKind;
 use nest_protocol::model::EgressDecision;
 
@@ -65,16 +65,16 @@ pub async fn serve_https_transparent(ctx: Arc<ConnCtx>, mut s: TcpStream) {
         Err(e) => return tracing::debug!("https transparent: {e}"),
     };
     let Some(info) = info else {
-        ctx.audit(Audit::new("", 443, EgressVerdict::Deny).reason("not_tls"));
+        ctx.audit(Audit::new("", 443, EgressVerdict::Deny).reason(R::NotTls));
         return;
     };
     let Some(sni) = info.sni.clone() else {
-        ctx.audit(Audit::new("", 443, EgressVerdict::Deny).reason("no_sni"));
+        ctx.audit(Audit::new("", 443, EgressVerdict::Deny).reason(R::NoSni));
         return;
     };
     let host = norm_host(&sni);
     if !valid_host(&host) {
-        ctx.audit(Audit::new(&host, 443, EgressVerdict::Deny).reason("invalid_host"));
+        ctx.audit(Audit::new(&host, 443, EgressVerdict::Deny).reason(R::InvalidHost));
         return;
     }
     tls_flow(ctx, Prefixed::new(raw, s), host, 443, info).await;
@@ -117,7 +117,7 @@ pub async fn serve_tcp_exception(ctx: Arc<ConnCtx>, s: TcpStream, rule: String) 
     let view = ctx.view();
     let permitted = view.policy.as_ref().is_some_and(|p| p.tcp.iter().any(|t| norm_host(&t.host) == host && t.port == port));
     if !permitted || port == 0 {
-        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("tcp_exception_not_in_policy"));
+        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::TcpExceptionNotInPolicy));
         return;
     }
     let mut ips = ctx.sandbox.dns_ips(&host);
@@ -129,15 +129,15 @@ pub async fn serve_tcp_exception(ctx: Arc<ConnCtx>, s: TcpStream, rule: String) 
                 ctx.sandbox.record_dns(&host, &ips);
             }
             Err(e) => {
-                ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(format!("resolve: {e}")));
+                ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::upstream(Stage::Resolve, e)));
                 return;
             }
         }
     }
     let addrs: Vec<SocketAddr> = ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
     match connect_addrs(&ctx, &addrs).await {
-        Ok(up) => splice(&ctx, s, up, &host, port, EgressVerdict::Allow, Some("tcp_exception")).await,
-        Err(e) => ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(format!("connect: {e}"))),
+        Ok(up) => splice(&ctx, s, up, &host, port, EgressVerdict::Allow, Some(R::TcpException)).await,
+        Err(e) => ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::upstream(Stage::Connect, e))),
     }
 }
 
@@ -152,12 +152,12 @@ where
     let decision = decide(&ctx, &host, port);
     match decision {
         EgressDecision::Deny => {
-            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("not_allowed"));
+            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::NotAllowed));
             deny_tls(&ctx, client, &host, port, &info, "not in this sandbox's egress policy").await;
         }
         EgressDecision::Passthrough => match connect_host(&ctx, &host, port).await {
             Ok(up) => splice(&ctx, client, up, &host, port, EgressVerdict::Passthrough, None).await,
-            Err(e) => ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(format!("connect: {e}"))),
+            Err(e) => ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::upstream(Stage::Connect, e))),
         },
         EgressDecision::Inspect => inspect_tls(ctx, client, host, port, info).await,
     }
@@ -198,7 +198,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Some(ca) = ctx.session.ca() else {
-        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("no_ca"));
+        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::NoCa));
         return;
     };
     // Upstream first: its negotiated ALPN is what we offer the client (mirroring).
@@ -207,7 +207,7 @@ where
         Ok(u) => u,
         Err(e) => {
             // Fail closed: tell the client why, over our own TLS.
-            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(format!("upstream: {e}")));
+            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::upstream(Stage::Exchange, e)));
             deny_tls(&ctx, client, &host, port, &info, "upstream connection or certificate verification failed").await;
             return;
         }
@@ -261,12 +261,12 @@ async fn explicit_request(ctx: Arc<ConnCtx>, req: Request<Incoming>) -> Response
         let (host, port) = split_authority(auth.as_str(), 443);
         let host = norm_host(&host);
         if !valid_host(&host) || port == 0 {
-            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("invalid_host"));
+            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::InvalidHost));
             return simple(StatusCode::BAD_REQUEST, "CONNECT target is not a valid host:port");
         }
         let decision = decide(&ctx, &host, port);
         if decision == EgressDecision::Deny {
-            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("not_allowed"));
+            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::NotAllowed));
         }
         // Even a denied CONNECT is accepted, then answered *inside* the tunnel (a 403 over our TLS,
         // or a plaintext 403): clients like curl hide a CONNECT error body, and the readable
@@ -299,7 +299,7 @@ where
     };
     let Some(info) = info else {
         if decision != EgressDecision::Deny {
-            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("non_tls_tunnel"));
+            ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::NonTlsTunnel));
         }
         let reason = if decision == EgressDecision::Deny {
             "not in this sandbox's egress policy"
@@ -313,7 +313,7 @@ where
         && norm_host(sni) != host
     {
         ctx.alert(AlertKind::DomainFronting, &host, None, format!("CONNECT {host} but SNI {}", clip(sni, 256)));
-        ctx.audit(Audit::new(&host, port, EgressVerdict::Alert).reason("sni_mismatch"));
+        ctx.audit(Audit::new(&host, port, EgressVerdict::Alert).reason(R::SniMismatch));
         return;
     }
     if decision == EgressDecision::Deny {
@@ -353,11 +353,11 @@ async fn plain_request(ctx: Arc<ConnCtx>, req: Request<Incoming>, absolute: bool
     let (host, port) = split_authority(&authority, 80);
     let host = norm_host(&host);
     if !valid_host(&host) || port == 0 {
-        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("invalid_host"));
+        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason(R::InvalidHost));
         return simple(StatusCode::BAD_REQUEST, "request target is not a valid host");
     }
     if decide(&ctx, &host, port) == EgressDecision::Deny {
-        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).request(req.method(), req.uri()).reason("not_allowed"));
+        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).request(req.method(), req.uri()).reason(R::NotAllowed));
         return deny_response(StatusCode::FORBIDDEN, "egress_denied", &host, port, "not in this sandbox's egress policy");
     }
     let target = Arc::new(Target { host, port, tls: false });
@@ -384,7 +384,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
     if let Err((reason, seen)) = check_request_host(&req, target) {
         if target.tls {
             ctx.alert(AlertKind::DomainFronting, &target.host, None, format!("routed to {} but request names {}", target.host, clip(&seen, 256)));
-            ctx.audit(mk_audit(&req, EgressVerdict::Alert).reason(if reason == "host_mismatch" { "host_sni_mismatch" } else { reason }));
+            ctx.audit(mk_audit(&req, EgressVerdict::Alert).reason(if reason == R::HostMismatch { R::HostSniMismatch } else { reason }));
         } else {
             ctx.audit(mk_audit(&req, EgressVerdict::Deny).reason(reason));
         }
@@ -412,20 +412,20 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
     match &verdict {
         Verdict::WrongHost(b) => {
             ctx.alert(AlertKind::PlaceholderWrongHost, &target.host, Some(b.as_str()), format!("placeholder for binding {b} sent to {}", target.host));
-            let mut a = mk_audit(&req, EgressVerdict::Alert).reason("placeholder_wrong_host");
+            let mut a = mk_audit(&req, EgressVerdict::Alert).reason(R::PlaceholderWrongHost);
             a.binding = Some(b.clone());
             ctx.audit(a);
             return deny_response(StatusCode::FORBIDDEN, "credential_blocked", &target.host, target.port, "a credential placeholder was sent to a host outside its binding");
         }
         Verdict::Expired(b) => {
             ctx.alert(AlertKind::InjectionAfterExpiry, &target.host, Some(b.as_str()), format!("binding {b}: no valid secret (expired, fenced or missing)"));
-            let mut a = mk_audit(&req, EgressVerdict::Alert).reason("injection_unavailable");
+            let mut a = mk_audit(&req, EgressVerdict::Alert).reason(R::InjectionUnavailable);
             a.binding = Some(b.clone());
             ctx.audit(a);
             return deny_response(StatusCode::FORBIDDEN, "credential_unavailable", &target.host, target.port, "the credential for this host is not available right now");
         }
         Verdict::Plaintext(b) => {
-            let mut a = mk_audit(&req, EgressVerdict::Deny).reason("injection_requires_tls");
+            let mut a = mk_audit(&req, EgressVerdict::Deny).reason(R::InjectionRequiresTls);
             a.binding = Some(b.clone());
             ctx.audit(a);
             return deny_response(StatusCode::FORBIDDEN, "credential_requires_tls", &target.host, target.port, "credentials are only injected over HTTPS");
@@ -436,7 +436,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
     let mut needles: Vec<Vec<u8>> = Vec::new();
     if let Verdict::Substituted(b) = &verdict {
         if req.method() == Method::TRACE || req.method().as_str() == "TRACK" {
-            let mut a = mk_audit(&req, EgressVerdict::Deny).reason("trace_with_credential");
+            let mut a = mk_audit(&req, EgressVerdict::Deny).reason(R::TraceWithCredential);
             a.binding = Some(b.clone());
             ctx.audit(a);
             return deny_response(StatusCode::METHOD_NOT_ALLOWED, "method_blocked", &target.host, target.port, "TRACE is not allowed on requests carrying an injected credential");
@@ -487,7 +487,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
         Ok(r) => r,
         Err(e) => {
             audit.bytes_up = up_bytes.load(Ordering::Relaxed);
-            audit.reason = Some(format!("upstream: {e}"));
+            audit.reason = Some(R::upstream(Stage::Exchange, e));
             audit.status = Some(502);
             ctx.audit(audit);
             return json_response(StatusCode::BAD_GATEWAY, serde_json::json!({"error": "upstream_error", "host": target.host}));
@@ -508,7 +508,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
             let drop = ctx2.sandbox.drop.clone();
             let r = tokio::select! { _ = drop.cancelled() => Ok((0, 0)), r = tokio::io::copy_bidirectional(&mut c, &mut u) => r };
             let (a, b) = r.unwrap_or((0, 0));
-            let mut au = Audit::new(&host, port, EgressVerdict::Allow).reason("upgraded");
+            let mut au = Audit::new(&host, port, EgressVerdict::Allow).reason(R::Upgraded);
             au.bytes_up = a;
             au.bytes_down = b;
             au.status = Some(101);
@@ -539,10 +539,10 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
 
 /// The routed host must be the only name in the request: the request-target authority (if
 /// any) and the single `Host` header (if any) must both normalize to `target.host`.
-fn check_request_host(req: &Request<Incoming>, target: &Target) -> Result<(), (&'static str, String)> {
+fn check_request_host(req: &Request<Incoming>, target: &Target) -> Result<(), (R, String)> {
     let hosts: Vec<&http::HeaderValue> = req.headers().get_all(HOST).iter().collect();
     if hosts.len() > 1 {
-        return Err(("duplicate_host", format!("{} Host headers", hosts.len())));
+        return Err((R::DuplicateHost, format!("{} Host headers", hosts.len())));
     }
     let mut names: Vec<String> = Vec::new();
     if let Some(a) = req.uri().authority() {
@@ -551,11 +551,11 @@ fn check_request_host(req: &Request<Incoming>, target: &Target) -> Result<(), (&
     for h in hosts {
         match h.to_str() {
             Ok(s) => names.push(s.to_string()),
-            Err(_) => return Err(("invalid_host", "non-ASCII Host header".into())),
+            Err(_) => return Err((R::InvalidHost, "non-ASCII Host header".into())),
         }
     }
     match names.into_iter().find(|n| norm_host(n) != target.host) {
-        Some(n) => Err(("host_mismatch", n)),
+        Some(n) => Err((R::HostMismatch, n)),
         None => Ok(()),
     }
 }
@@ -895,7 +895,7 @@ pub fn is_public(ip: IpAddr) -> bool {
 }
 
 /// Bidirectional copy until either side closes or the sandbox is dropped; audited at the end.
-async fn splice<A, B>(ctx: &ConnCtx, mut a: A, mut b: B, host: &str, port: u16, verdict: EgressVerdict, reason: Option<&str>)
+async fn splice<A, B>(ctx: &ConnCtx, mut a: A, mut b: B, host: &str, port: u16, verdict: EgressVerdict, reason: Option<R>)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -909,7 +909,7 @@ where
     let mut au = Audit::new(host, port, verdict);
     au.bytes_up = up;
     au.bytes_down = down;
-    au.reason = reason.map(str::to_string);
+    au.reason = reason;
     ctx.audit(au);
 }
 

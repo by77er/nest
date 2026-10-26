@@ -37,8 +37,10 @@ NEST_LOG=debug   # tracing filter
   - **Inspect:** the upstream TLS connection comes first (its ALPN is mirrored to the client). The request target's authority and the single `Host` header must both equal the routed host; the h1 upstream always gets a `Host` set by the proxy.
 - **CONNECT:** tunnels must carry TLS with SNI equal to the authority; plaintext tunnels are denied (`non_tls_tunnel`). A denied CONNECT is accepted and answered inside the tunnel with the readable 403 (over our TLS, or plaintext).
 - **Guest-controlled names** are validated (DNS name or IP literal, ≤253 bytes) before policy. Every event to nestd has its strings capped, and an event that would still exceed `MAX_PACKET_FROM_PROXY` is dropped rather than breaking the link.
-- **Dropped sandboxes stay dropped:** a `sandbox_drop` is remembered per epoch, so a late upsert, secrets or listener push for that epoch is refused.
-- **Deny/alert aggregation per sandbox:** one record per distinct key per minute, capped (128 denials, 32 alerts), with a `suppressed: …` summary record.
+- **Fenced sandboxes stay dropped:** a `sandbox_drop{fence}` is remembered per epoch (`DropReason::tombstones`, the rule nestd's mirror applies), so a late upsert, secrets or listener push for that epoch is refused. A teardown or move leaves no tombstone: a failed create is retried at the same epoch.
+- **Deny/alert aggregation per sandbox:** one record per distinct key per minute, capped (128 denials, 32 alerts), with a summary record of kind `suppressed` carrying the dropped counts. The proxy is the only place that aggregates; nestd only rate-limits.
+- **Audit reasons** are `nest_protocol::control::EgressReason`; a connection refused at the connection limit is a record of kind `limit`.
+- **A listener that fails** (unusable fd, fatal accept error) is closed and reported: `listener_failed`, or during a resync in `resync_ack.failed`, so nestd rebinds that one listener instead of resyncing the host.
 - **Injection** only happens over TLS, and only to the binding's own hosts. A placeholder seen anywhere in the headers or URI for another host is blocked and raises `placeholder_wrong_host`. On substituted requests, TRACE/TRACK are refused, and the secret is masked (length-preserving) in response headers and uncompressed bodies.
 - **Non-public upstreams** also cover NAT64 / 6to4 / IPv4-compatible IPv6 (judged by the embedded IPv4), local-use NAT64, site-local, Teredo and 192.0.0.0/24.
 - **`te: trailers`** is kept on h2 upstreams (gRPC).
@@ -50,7 +52,7 @@ NEST_LOG=debug   # tracing filter
 CARGO_TARGET_DIR=target/nest-proxy cargo test -p nest-proxy
 ```
 
-- **Unit tests:** SNI parsing (real rustls ClientHellos, fragmented), leaf certificates chaining to the root, injection cases, the DNS allowlist, address filtering, header and URI handling, audit batching.
+- **Unit tests:** SNI parsing (real rustls ClientHellos, fragmented), leaf certificates chaining to the root, injection cases, the DNS allowlist, address filtering, header and URI handling, audit batching, the suppression summary's kind, listener failures during a resync.
 - **End-to-end tests (`tests/egress.rs`):**
   - Setup: a real proxy driven by a fake nestd over SEQPACKET with fds bound on 127.0.0.1, a TLS echo upstream (h1/h2/WebSocket), a plaintext upstream and a TCP echo.
   - Covered:
@@ -67,7 +69,7 @@ CARGO_TARGET_DIR=target/nest-proxy cargo test -p nest-proxy
     - stale policy pushes ignored
     - WebSocket through inspection
     - h2 multiplexing
-- **Security regression tests (`tests/review_regressions.rs`):** absolute-form/Host fronting with injection, duplicate Host, upstream Host rewrite, explicit-proxy fronting, plaintext CONNECT tunnels (incl. passthrough hosts), denied CONNECT answered in-tunnel, a 70 KB Host not breaking the nestd link, pushes after `sandbox_drop`, DNS-flood aggregation, TRACE with a credential, `te: trailers` over h2.
+- **Security regression tests (`tests/review_regressions.rs`):** absolute-form/Host fronting with injection, duplicate Host, upstream Host rewrite, explicit-proxy fronting, plaintext CONNECT tunnels (incl. passthrough hosts), denied CONNECT answered in-tunnel, a 70 KB Host not breaking the nestd link, pushes after `sandbox_drop` (and none after a teardown), DNS-flood aggregation, a bad listener in a resync reported per sandbox, TRACE with a credential, `te: trailers` over h2.
 
 ## Gaps
 

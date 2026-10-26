@@ -6,6 +6,7 @@
       "epoch": 4,
       "agent": "agt_01jb7n0w1e",
       "ts_ms": 1760270400000,
+      "via": "explicit",
       "host": "github.com",
       "port": 443,
       "method": "POST",
@@ -20,23 +21,63 @@
       "sandbox": "sbx_01jb7m2a4c",
       "epoch": 4,
       "ts_ms": 1760270400003,
+      "via": "https_transparent",
       "host": "pastebin.com",
       "port": 443,
       "bytes_up": 0,
       "bytes_down": 0,
       "verdict": "deny",
-      "reason": "not in allowlist"
+      "reason": "not_allowed"
     },
     {
       "sandbox": "sbx_01jb7m2a4c",
       "epoch": 4,
       "ts_ms": 1760270400004,
+      "via": "dns",
       "host": "exfil.attacker.example",
       "port": 53,
       "bytes_up": 0,
       "bytes_down": 0,
       "verdict": "deny",
-      "reason": "dns: name not allowlisted"
+      "reason": "dns_nxdomain"
+    },
+    {
+      "sandbox": "sbx_01jb7m2a4c",
+      "epoch": 4,
+      "ts_ms": 1760270400005,
+      "via": "https_transparent",
+      "host": "registry.npmjs.org",
+      "port": 443,
+      "bytes_up": 0,
+      "bytes_down": 0,
+      "verdict": "deny",
+      "reason": "exchange: invalid peer certificate: UnknownIssuer"
+    },
+    {
+      "sandbox": "sbx_01jb7m2a4c",
+      "epoch": 4,
+      "ts_ms": 1760270400006,
+      "via": "https_transparent",
+      "host": "",
+      "port": 0,
+      "bytes_up": 0,
+      "bytes_down": 0,
+      "verdict": "deny",
+      "reason": "connection_limit",
+      "kind": { "type": "limit", "which": "connections" }
+    },
+    {
+      "sandbox": "sbx_01jb7m2a4c",
+      "epoch": 4,
+      "ts_ms": 1760270460000,
+      "host": "*",
+      "port": 0,
+      "bytes_up": 0,
+      "bytes_down": 0,
+      "verdict": "deny",
+      "reason": "suppressed",
+      "count": 412,
+      "kind": { "type": "suppressed", "denials": 410, "alerts": 2 }
     }
   ]
 }

@@ -21,7 +21,11 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 
 **proxy → nestd (`ProxyEvent`, never fds)**: `hello`, `resync_ack`, `audit{records: control::EgressAuditRecord[]}` (≤1 s / 128 records; each sets `via`), `alert{kind: placeholder_wrong_host \| domain_fronting \| injection_after_expiry}` (immediate), `listener_failed`, `pong`, `error` (then close). `domain_fronting` covers both `Host` ≠ SNI and a CONNECT tunnel whose SNI ≠ the CONNECT authority.
 
-**Aggregate audit records** have `port: 0`: a window's suppression summary (`host: "*"`, `count` set, `reason: "suppressed: …"`) and `connection_limit` (`host: ""`). nestd raises a `egress_denied` workstream event only for one request's denial (deny, no `count`, a real port); aggregates go to the audit log only.
+**Audit record `kind`** (`control::EgressAuditKind`, absent = `request`): `request` is one connection or request; `suppressed{denials, alerts}` is a window's aggregation summary (`host: "*"`, `port: 0`, `count`, `reason: suppressed`); `limit{which: connections}` is a connection refused at `limits.max_connections` (`host: ""`, `port: 0`, `reason: connection_limit`). A proxy one release older sets no `kind`; its aggregates are told apart by `reason`.
+
+**Aggregation is the proxy's** (per sandbox, see [policy](../../../sandbox/networking/egress/policy/#audit)). nestd only rate-limits per sandbox: it raises an `egress_denied` workstream event for a `request` record denied by policy (`not_allowed`, `dns_nxdomain`, `tcp_exception_not_in_policy`: `EgressAuditRecord::is_policy_denial`), and an `egress_alert` for every `alert`, binding included. Everything else stays in the audit log.
+
+**Listener failures.** nestd owns listeners. On `listener_failed` it closes its own copy, binds a fresh socket at the same address in the sandbox's netns and resends it under the same id; after 3 failures of one listener within 10 minutes it drops the listener from its mirror instead (the guest then gets connection refused, not a hang).
 
 **Listener purposes** (`purpose` is flattened into the spec):
 
@@ -56,10 +60,10 @@ nest-proxy                                   nestd
  │◄────────────── sandbox_upsert{policy}, secrets_set{secrets}
  │◄══ fds ═══════ listeners_add{listeners[≤32]} (repeat)  nestd keeps its own dups, so
  │◄────────────── resync_complete{n, m}        │  connections queue in the kernel meanwhile
- │ resync_ack{n, m} ─────────────────────────►│  mismatch → nestd closes and retries
+ │ resync_ack{n, m, failed} ─────────────────►│  failed listeners → rebound one by one
 ```
 
-**Resync counts.** `resync_ack` carries the proxy's **own** counts of sandboxes and listeners it now holds. nestd compares them with what it sent; on a mismatch nestd closes and resyncs (the proxy only logs it).
+**Resync counts.** `resync_ack` carries the proxy's **own** counts of sandboxes and listeners it now holds, plus `failed: [{sandbox, listener_ids}]`: listeners it was handed during the resync but couldn't serve (no separate `listener_failed` is sent for those; at most 1024 ids). nestd checks `listeners + failed = sent` and handles each failed listener like a `listener_failed`, so one bad sandbox can't make the whole host reconnect in a loop. Only a mismatch the failures don't explain closes the connection for a fresh resync. An older proxy sends no `failed`, which is the plain totals check.
 
 ## Sandbox network setup → listener handoff
 
@@ -79,29 +83,29 @@ FleetDO         nestd (root)                                      nest-proxy    
 
 ## Audit `reason` values
 
-`reason` is a string on the wire. nest-proxy emits:
+`reason` is one string on the wire: `control::EgressReason`, mirrored in the control plane's zod schema. A unit member is its name; an upstream failure is `<stage>: <detail>`, with the resolver's, socket's or TLS library's own text. A string a reader doesn't know parses as `other` with its text kept. This table lists exactly what nest-proxy emits (a test in `nest-protocol` compares it with the enum). Rows already in R2 stay as written: older ones may hold `suppressed: …` prose, `upstream: …` (now `exchange: …`) or other prose.
 
 | Reason | Verdict | Meaning |
 |---|---|---|
-| `not_allowed` | deny | Host not in the effective allowlist |
+| `not_allowed` | deny | Host (or port) not in the effective allowlist. Raises `egress_denied` |
+| `dns_nxdomain` | deny | DNS name not allowlisted (`via: dns`, `port: 53`), answered NXDOMAIN. Raises `egress_denied` |
+| `tcp_exception_not_in_policy` | deny | A TCP exception listener whose rule is no longer in policy. Raises `egress_denied` |
+| `invalid_host` | deny (alert when inspected) | SNI, `Host` or CONNECT authority isn't a DNS name or IP literal (≤ 253 bytes) |
 | `not_tls` / `no_sni` | deny | `:443` traffic without a TLS ClientHello / without SNI |
 | `no_ca` | deny | No intermediate CA installed yet, so inspection is impossible |
-| `dns_nxdomain` | deny | DNS name not allowlisted (`via: dns`, `port: 53`) |
-| `dns_non_public` | deny | Every address in the DNS answer was non-public, so it became SERVFAIL |
-| `connection_limit` | deny | Sandbox at `limits.max_connections` (`host: ""`) |
-| `handshake_limit` | deny | TLS handshake or leaf signing over the proxy-wide or per-sandbox bound |
-| `policy_pending` | deny | No acknowledged policy within 30 s (designed, with the ack) |
-| `policy_changed` | deny | Closed by a re-check after a policy version or grant expiry, or failed the final check before the headers went upstream |
-| `invalid_headers` | deny | Smuggling-shaped request (`Connection` naming a protected field, a transfer coding other than `chunked`, a protected `Trailer`) or over the header limits |
-| `host_sni_mismatch` | alert | Decrypted `Host` ≠ SNI (domain fronting) |
+| `connection_limit` | deny | Sandbox at `limits.max_connections` (kind `limit`) |
+| `host_mismatch` | deny | Plaintext request whose target or `Host` names another host than the one that routed it |
+| `host_sni_mismatch` | alert | Decrypted `Host` or request target ≠ SNI (domain fronting) |
+| `duplicate_host` | deny (alert when inspected) | More than one `Host` header |
 | `sni_mismatch` | alert | CONNECT tunnel's SNI ≠ the CONNECT authority (domain fronting) |
+| `non_tls_tunnel` | deny | CONNECT tunnel to an allowed host that didn't start TLS |
 | `placeholder_wrong_host` | alert | A binding's placeholder sent to a host outside the binding |
-| `injection_unavailable` | deny | Placeholder present but its secret is missing, expired or fenced |
+| `injection_unavailable` | alert | Placeholder present but its secret is missing, expired or fenced |
 | `injection_requires_tls` | deny | Placeholder over plain HTTP |
-| `injection_out_of_scope` | deny | Placeholder on a method or path outside the binding |
-| `injection_upgrade` | deny | Protocol upgrade on a request that had a placeholder substituted |
-| `tcp_exception_not_in_policy` | deny | A TCP exception listener whose rule is no longer in policy |
-| `non_tls_tunnel` | deny | CONNECT tunnel to an inspected host that didn't start TLS |
-| `upgraded` | allow | Connection upgraded (WebSocket) and spliced after the handshake |
+| `trace_with_credential` | deny | TRACE/TRACK on a request carrying an injected credential |
 | `tcp_exception` | allow | Spliced TCP exception |
-| `upstream: …` / `connect: …` / `resolve: …` | deny | Upstream failure (TLS verification, connect or resolution), with detail |
+| `upgraded` | allow | Connection upgraded (WebSocket) and spliced after the handshake |
+| `suppressed` | deny | A window's aggregation summary (kind `suppressed`) |
+| `resolve: …` / `connect: …` / `exchange: …` | deny (allow with `status: 502` mid-request) | Upstream failure: resolving the name; resolving and connecting; or the upstream TLS handshake, certificate check or the request |
+
+**Designed, not emitted yet** (they arrive with their features in the [egress](../../../sandbox/networking/egress/) design, and join the enum then): `dns_non_public`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `injection_out_of_scope`, `injection_upgrade`.

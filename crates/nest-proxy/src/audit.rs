@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use nest_protocol::control::{EgressAuditRecord, EgressVerdict, EgressVia};
+use nest_protocol::control::{EgressAuditKind, EgressAuditRecord, EgressReason, EgressVerdict, EgressVia};
 use nest_protocol::host::proxy::ListenerPurpose;
 use nest_protocol::host::fdpass::MAX_PACKET_FROM_PROXY;
 use nest_protocol::host::proxy::ProxyEvent;
@@ -35,9 +35,10 @@ pub struct Audit {
     pub bytes_down: u64,
     pub verdict: EgressVerdict,
     pub binding: Option<String>,
-    pub reason: Option<String>,
+    pub reason: Option<EgressReason>,
     /// Aggregated records: how many requests this record stands for.
     pub count: Option<u32>,
+    pub kind: EgressAuditKind,
 }
 
 impl Audit {
@@ -53,12 +54,13 @@ impl Audit {
             verdict,
             binding: None,
             reason: None,
+            kind: EgressAuditKind::Request,
             count: None,
         }
     }
 
-    pub fn reason(mut self, r: impl Into<String>) -> Self {
-        self.reason = Some(r.into());
+    pub fn reason(mut self, r: EgressReason) -> Self {
+        self.reason = Some(r);
         self
     }
 
@@ -84,8 +86,9 @@ impl Audit {
             bytes_down: self.bytes_down,
             verdict: self.verdict,
             binding: self.binding.map(|b| clip(&b, MAX_SHORT)),
-            reason: self.reason.map(|r| clip(&r, MAX_DETAIL)),
+            reason: self.reason.map(clip_reason),
             count: self.count,
+            kind: self.kind,
         }
     }
 }
@@ -98,6 +101,21 @@ pub fn via(purpose: &ListenerPurpose) -> EgressVia {
         ListenerPurpose::HttpsTransparent => EgressVia::HttpsTransparent,
         ListenerPurpose::Explicit { .. } => EgressVia::Explicit,
         ListenerPurpose::TcpException { .. } => EgressVia::TcpException,
+    }
+}
+
+/// Cap the free text a reason may carry (an upstream error can echo guest-chosen names).
+pub fn clip_reason(r: EgressReason) -> EgressReason {
+    match r {
+        EgressReason::Upstream { stage, mut detail } => {
+            clip_in_place(&mut detail, MAX_DETAIL);
+            EgressReason::Upstream { stage, detail }
+        }
+        EgressReason::Other(mut s) => {
+            clip_in_place(&mut s, MAX_DETAIL);
+            EgressReason::Other(s)
+        }
+        unit => unit,
     }
 }
 
@@ -123,8 +141,8 @@ pub fn clip_event(mut ev: ProxyEvent) -> ProxyEvent {
                 if let Some(b) = &mut r.binding {
                     clip_in_place(b, MAX_SHORT);
                 }
-                if let Some(x) = &mut r.reason {
-                    clip_in_place(x, MAX_DETAIL);
+                if let Some(x) = r.reason.take() {
+                    r.reason = Some(clip_reason(x));
                 }
             }
         }
@@ -228,10 +246,12 @@ mod tests {
 
     #[test]
     fn oversized_strings_are_clipped() {
-        let mut a = Audit::new(&"h".repeat(70_000), 443, EgressVerdict::Alert).reason("r".repeat(70_000));
+        let reason = EgressReason::upstream(nest_protocol::control::UpstreamStage::Exchange, "r".repeat(70_000));
+        let mut a = Audit::new(&"h".repeat(70_000), 443, EgressVerdict::Alert).reason(reason);
         a.path = Some("/".repeat(70_000));
         let rec = a.into_record(&SandboxId("sbx_1".into()), Epoch(1), None, None);
         assert!(rec.host.len() <= MAX_HOST && rec.path.as_ref().unwrap().len() <= MAX_PATH);
+        assert!(rec.reason.as_ref().unwrap().to_string().len() <= MAX_DETAIL + "exchange: ".len());
         let ev = clip_event(ProxyEvent::Alert {
             ts_ms: 0,
             sandbox: SandboxId("sbx_1".into()),

@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nest_protocol::control::{
-    AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressAuditRecord,
-    EgressVerdict, HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
+    AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD,
+    HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
 };
 use nest_protocol::guest::{AgentSlot, CliCommand, CliResult, ForkIdentity};
 use nest_protocol::host::proxy::{DropReason, ListenerPurpose, ListenerSpec, ProxyEvent, Transport, EXPLICIT_BASE_PORT, TCP_EXCEPTION_BASE_PORT};
@@ -48,7 +48,7 @@ use crate::gateway_link::{Entry as GatewayEntry, GatewayLink, GatewayNotice};
 use crate::guest::{GuestCtl, GuestEvent};
 use crate::net::{GATEWAY_IP, Netns};
 use crate::limits::{self, Limiter};
-use crate::proxy_link::{Access, HeldListener, ProxyLink, ProxyNotice, ProxyOp};
+use crate::proxy_link::{Access, HeldListener, ListenerRecovery, ProxyLink, ProxyNotice, ProxyOp};
 use crate::runner_link::{RunnerLink, RunnerNotice};
 use crate::storage::{self, ObjectStore};
 use crate::util::{error, new_id, now_ms};
@@ -73,8 +73,6 @@ const GC_FIRST_CHECK: Duration = Duration::from_secs(180);
 const GC_CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Coalescing window for guest port reports.
 const PORTS_COALESCE: Duration = Duration::from_millis(500);
-/// Bound on the (sandbox, host, port) dedup map for egress denials.
-const MAX_DENIED_SEEN: usize = 10_000;
 
 #[derive(Clone, Debug)]
 struct Summary {
@@ -178,8 +176,6 @@ pub struct Inner {
     pending_cli: Mutex<HashMap<RequestId, oneshot::Sender<CliResult>>>,
     results: Mutex<Results>,
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
-    denied_seen: Mutex<HashMap<(SandboxId, String, u16), Instant>>,
-    alerts_seen: Mutex<HashMap<(SandboxId, String, String), Instant>>,
     proxy_ca: Mutex<CaState>,
     /// Lock-free pause handles of running VMs (fencing freezes vCPUs without the sandbox lock).
     pausers: Mutex<HashMap<SandboxId, Arc<dyn Pauser>>>,
@@ -329,8 +325,6 @@ impl Host {
             pending_cli: Mutex::new(HashMap::new()),
             results: Mutex::new(Results::default()),
             lease_deadline: lease_tx,
-            denied_seen: Mutex::new(HashMap::new()),
-            alerts_seen: Mutex::new(HashMap::new()),
             proxy_ca: Mutex::new(CaState {
                 key: enrolled.proxy_ca.as_ref().map(|(_, k)| k.clone()),
                 expires_ms: enrolled.proxy_ca.as_ref().map(|(c, _)| c.expires_ms),
@@ -659,23 +653,13 @@ impl Inner {
         }
     }
 
-    fn on_proxy_notice(&self, n: ProxyNotice) {
+    /// nest-proxy's events. The proxy owns aggregation (one record per distinct deny or alert per
+    /// sandbox per minute); nestd only rate-limits per sandbox.
+    fn on_proxy_notice(self: &Arc<Self>, n: ProxyNotice) {
         match n {
             ProxyNotice::Event(ProxyEvent::Audit { records }) => {
-                for r in records.iter().filter(|r| is_request_denial(r)) {
-                    let key = (r.sandbox.clone(), r.host.clone(), r.port);
-                    let fresh = {
-                        let mut seen = self.denied_seen.lock().expect("denied");
-                        let now = Instant::now();
-                        seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                        // Bounded: random names can't grow the map without limit.
-                        if seen.len() >= MAX_DENIED_SEEN && !seen.contains_key(&key) {
-                            false
-                        } else {
-                            seen.insert(key, now).is_none()
-                        }
-                    };
-                    if fresh && self.limiter.allow(&r.sandbox, "denied", limits::DENIED, 1.0) {
+                for r in records.iter().filter(|r| r.is_policy_denial()) {
+                    if self.limiter.allow(&r.sandbox, "denied", limits::DENIED, 1.0) {
                         self.workstream_event(&r.sandbox, r.agent.clone(), WorkstreamEventKind::EgressDenied { host: r.host.clone(), port: r.port });
                     }
                 }
@@ -688,18 +672,13 @@ impl Inner {
             ProxyNotice::Event(ProxyEvent::Alert { sandbox, agent, kind, host, binding, .. }) => {
                 let reason = nest_protocol::model::EgressAlertReason::from(kind);
                 let host: String = host.chars().take(253).collect();
-                let fresh = {
-                    let mut seen = self.alerts_seen.lock().expect("alerts");
-                    let now = Instant::now();
-                    seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                    seen.len() < MAX_DENIED_SEEN && seen.insert((sandbox.clone(), format!("{reason:?}"), host.clone()), now).is_none()
-                };
-                if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS, 1.0) {
+                if self.limiter.allow(&sandbox, "alert", limits::ALERTS, 1.0) {
                     self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason });
                 }
             }
             ProxyNotice::Event(ProxyEvent::ListenerFailed { sandbox, listener_id, error }) => {
                 tracing::warn!(%sandbox, listener_id, code = %error.code, message = %error.message, "proxy listener failed");
+                self.recover_listener(sandbox, listener_id);
             }
             ProxyNotice::Event(ProxyEvent::Error { error }) => tracing::warn!(code = %error.code, message = %error.message, "proxy error"),
             ProxyNotice::Event(_) => {}
@@ -707,6 +686,45 @@ impl Inner {
             ProxyNotice::ResyncAck { sandboxes, listeners, matched } => tracing::info!(sandboxes, listeners, matched, "nest-proxy resynced"),
             ProxyNotice::Disconnected => tracing::warn!("nest-proxy disconnected (fails closed)"),
         }
+    }
+
+    /// A listener nest-proxy couldn't serve: rebind it at the same address in the sandbox's netns
+    /// and hand it back under the same id, or give up after a bounded number of failures
+    /// ([`ProxyLink::listener_failed`]).
+    fn recover_listener(self: &Arc<Self>, sandbox: SandboxId, listener_id: u32) {
+        let (epoch, spec) = match self.proxy.listener_failed(&sandbox, listener_id) {
+            ListenerRecovery::Rebind { epoch, spec } => (epoch, spec),
+            ListenerRecovery::GaveUp { spec } => {
+                return tracing::error!(%sandbox, listener_id, addr = %spec.addr, "listener keeps failing; dropped (the guest gets connection refused)");
+            }
+            ListenerRecovery::Unknown => return,
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            let Some(entry) = this.sandbox(&sandbox) else { return };
+            let Some(ns) = entry.lock().await.netns.clone() else { return };
+            let Ok(addr) = spec.addr.parse::<SocketAddr>() else {
+                return tracing::error!(%sandbox, listener_id, addr = %spec.addr, "listener address does not parse; not rebound");
+            };
+            // The proxy closed its copy before reporting; give the kernel a moment either way.
+            for attempt in 1..=3u32 {
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                let ns = ns.clone();
+                let transport = spec.transport;
+                match tokio::task::spawn_blocking(move || ns.bind(transport, addr)).await {
+                    Ok(Ok(fd)) => {
+                        let listener = HeldListener { spec: spec.clone(), fd };
+                        if this.proxy.apply(ProxyOp::RestoreListener { sandbox: sandbox.clone(), epoch, listener }) {
+                            tracing::info!(%sandbox, listener_id, "listener rebound");
+                        }
+                        return;
+                    }
+                    Ok(Err(e)) => tracing::warn!(%sandbox, listener_id, attempt, error = %e, "rebinding listener"),
+                    Err(e) => return tracing::error!(error = %e, "rebind task failed"),
+                }
+            }
+            tracing::error!(%sandbox, listener_id, addr = %spec.addr, "could not rebind listener; dropped");
+        });
     }
 
     async fn on_runner_notice(self: &Arc<Self>, n: RunnerNotice) {
@@ -1932,12 +1950,6 @@ fn spawn_boxed(f: impl std::future::Future<Output = ()> + Send + 'static) {
     tokio::spawn(f);
 }
 
-/// Whether an audit record is one request's denial: what `egress_denied` reports. nest-proxy's
-/// other deny records are aggregates with port 0 — a window's suppression summary (`count` set,
-/// host `*`) and `connection_limit` (no host) — and stay in the audit log only.
-fn is_request_denial(r: &EgressAuditRecord) -> bool {
-    r.verdict == EgressVerdict::Deny && r.count.is_none() && r.port != 0
-}
 
 fn slot_for(agent: &AgentId, slot: u16, cwd: String) -> AgentSlot {
     AgentSlot {
@@ -2043,21 +2055,23 @@ mod tests {
             bytes_down: 0,
             verdict,
             binding: None,
-            reason: Some(reason.into()),
+            reason: Some(reason.parse().unwrap()),
             count,
+            kind: Default::default(),
         }
     }
 
-    /// Guest-proxy review #2: only one request's denial becomes `egress_denied`; nest-proxy's
-    /// suppression summaries and connection-limit records are aggregates, not denied hosts.
+    /// Guest-proxy review #2: records as a proxy one release older sends them (no `kind`): only a
+    /// policy denial becomes `egress_denied`, never its suppression summaries, connection-limit
+    /// records or upstream failures.
     #[test]
-    fn only_request_denials_become_egress_denied() {
-        use super::is_request_denial;
-        assert!(is_request_denial(&record("evil.example", 443, EgressVerdict::Deny, "not_allowed", None)));
-        assert!(is_request_denial(&record("x.example", 53, EgressVerdict::Deny, "dns_nxdomain", None)));
-        assert!(!is_request_denial(&record("*", 0, EgressVerdict::Deny, "suppressed: 9 duplicate or excess deny records", Some(9))), "summary");
-        assert!(!is_request_denial(&record("", 0, EgressVerdict::Deny, "connection_limit", None)), "connection limit");
-        assert!(!is_request_denial(&record("github.com", 443, EgressVerdict::Allow, "", None)));
+    fn an_older_proxys_aggregates_never_become_egress_denied() {
+        assert!(record("evil.example", 443, EgressVerdict::Deny, "not_allowed", None).is_policy_denial());
+        assert!(record("x.example", 53, EgressVerdict::Deny, "dns_nxdomain", None).is_policy_denial());
+        assert!(!record("*", 0, EgressVerdict::Deny, "suppressed: 9 duplicate or excess deny records", Some(9)).is_policy_denial(), "summary");
+        assert!(!record("", 0, EgressVerdict::Deny, "connection_limit", None).is_policy_denial(), "connection limit");
+        assert!(!record("x.example", 443, EgressVerdict::Deny, "connect: Connection refused", None).is_policy_denial(), "upstream failure");
+        assert!(!record("github.com", 443, EgressVerdict::Allow, "", None).is_policy_denial());
     }
 
     /// A base image extended to a sandbox's disk size gets a filesystem that fills it.

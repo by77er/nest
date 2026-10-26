@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use strum::IntoEnumIterator;
 
-use nest_protocol::control::{AgentExitReason, EgressVerdict, EgressVia, HostEvent, RuleDecision, TunnelState};
+use nest_protocol::control::{AgentExitReason, EgressVerdict, EgressVia, HostEvent, LimitKind, RuleDecision, TunnelState, UpstreamStage};
 use nest_protocol::gateway::BindingScope;
 use nest_protocol::guest::{CliRequest, ControlFrame, TaskStatus, Urgency};
 use nest_protocol::host::{proxy::AlertKind, runner::ExitReason};
@@ -80,6 +80,7 @@ fn enum_members_match_enums_json() {
     check_enum::<ForkMode>(&enums, "ForkMode", s);
     check_enum::<GenerationKind>(&enums, "GenerationKind", s);
     check_enum::<HostRole>(&enums, "HostRole", s);
+    check_enum::<LimitKind>(&enums, "LimitKind", s);
     check_enum::<ManifestKind>(&enums, "ManifestKind", s);
     check_enum::<PolicyLayer>(&enums, "PolicyLayer", s);
     check_enum::<RuleDecision>(&enums, "RuleDecision", s);
@@ -88,6 +89,7 @@ fn enum_members_match_enums_json() {
     check_enum::<TaskStatus>(&enums, "TaskStatus", s);
     check_enum::<TunnelState>(&enums, "TunnelState", s);
     check_enum::<TurnInputKind>(&enums, "TurnInputKind", s);
+    check_enum::<UpstreamStage>(&enums, "UpstreamStage", s);
     check_enum::<Urgency>(&enums, "Urgency", s);
     let listed: BTreeSet<String> = enums.as_object().unwrap().keys().cloned().collect();
     assert_eq!(listed, seen, "enums.json lists an enum this test doesn't check");

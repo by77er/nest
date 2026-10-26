@@ -243,6 +243,56 @@ export type CommandOutcome = z.output<typeof CommandOutcome>;
 export const EgressVerdict = z.enum(["allow", "passthrough", "deny", "alert"]);
 export const EgressVia = z.enum(["dns", "http_transparent", "https_transparent", "explicit", "tcp_exception"]);
 
+/** Which step of reaching an upstream failed (`EgressReason`'s `<stage>: <detail>` form). */
+export const UpstreamStage = z.enum(["resolve", "connect", "exchange"]);
+export type UpstreamStage = z.output<typeof UpstreamStage>;
+
+/** `EgressReason`'s unit members, in the Rust enum's order. */
+export const EGRESS_REASONS = [
+  "not_allowed", "invalid_host", "not_tls", "no_sni", "no_ca", "dns_nxdomain", "connection_limit", "host_mismatch",
+  "host_sni_mismatch", "duplicate_host", "sni_mismatch", "non_tls_tunnel", "placeholder_wrong_host", "injection_unavailable",
+  "injection_requires_tls", "trace_with_credential", "tcp_exception_not_in_policy", "tcp_exception", "upgraded", "suppressed",
+] as const;
+export type EgressReasonName = (typeof EGRESS_REASONS)[number];
+
+/**
+ * Why nest-proxy decided what it did: one string on the wire, a unit member's name or
+ * `<stage>: <detail>` for an upstream failure. Open, like the Rust `EgressReason`: any other string
+ * is kept as it is (`other`). What a proxy one release older wrote is normalized the way Rust does:
+ * `suppressed: …` becomes `suppressed`, `upstream: …` becomes `exchange: …`.
+ */
+export type EgressReason = EgressReasonName | `${UpstreamStage}: ${string}` | (string & {});
+const reasonNames = new Set<string>(EGRESS_REASONS);
+export const EgressReason = z.string().transform((s): EgressReason => {
+  if (reasonNames.has(s)) return s;
+  const at = s.indexOf(": ");
+  if (at < 0) return s;
+  const [prefix, detail] = [s.slice(0, at), s.slice(at + 2)];
+  if (prefix === "upstream") return `exchange: ${detail}`;
+  if (prefix === "suppressed") return "suppressed";
+  return s;
+});
+
+/** The parts of a reason: `unit` (a member), `upstream` (stage and detail) or `other` (kept text). */
+export function egressReasonParts(
+  r: string,
+): { kind: "unit"; name: EgressReasonName } | { kind: "upstream"; stage: UpstreamStage; detail: string } | { kind: "other"; text: string } {
+  if (reasonNames.has(r)) return { kind: "unit", name: r as EgressReasonName };
+  const at = r.indexOf(": ");
+  const stage = UpstreamStage.safeParse(at < 0 ? "" : r.slice(0, at));
+  if (stage.success) return { kind: "upstream", stage: stage.data, detail: r.slice(at + 2) };
+  return { kind: "other", text: r };
+}
+
+export const LimitKind = z.enum(["connections"]);
+/** What an audit record stands for (absent = `request`), as `EgressAuditKind` in Rust. */
+export const EgressAuditKind = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("request") }),
+  z.object({ type: z.literal("suppressed"), denials: U64, alerts: U64 }),
+  z.object({ type: z.literal("limit"), which: LimitKind }),
+]);
+export type EgressAuditKind = z.output<typeof EgressAuditKind>;
+
 export const EgressAuditRecord = z.object({
   sandbox: SandboxId,
   epoch: Epoch,
@@ -258,9 +308,11 @@ export const EgressAuditRecord = z.object({
   bytes_down: U64,
   verdict: EgressVerdict,
   binding: z.string().optional(),
-  reason: z.string().optional(),
+  reason: EgressReason.optional(),
   /** Aggregated records: how many requests this record stands for (absent = 1). */
   count: z.number().int().nonnegative().optional(),
+  /** Absent = one request; an older proxy never sets it. */
+  kind: EgressAuditKind.optional(),
 });
 export type EgressAuditRecord = z.output<typeof EgressAuditRecord>;
 

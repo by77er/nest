@@ -279,8 +279,17 @@ pub mod proxy {
     pub enum ProxyEvent {
         /// First packet after connecting.
         Hello { protocol_version: u32, proxy_version: String, pid: u32 },
-        /// The proxy applied a full resync.
-        ResyncAck { sandboxes: u32, listeners: u32 },
+        /// The proxy applied a full resync. `sandboxes` and `listeners` count what it now holds;
+        /// `failed` names, per sandbox, the listeners it was handed during the resync but couldn't
+        /// serve (no separate `listener_failed` is sent for those). nestd reconciles them one by
+        /// one and closes the link only for a mismatch they don't explain. A proxy one release
+        /// older sends no `failed`.
+        ResyncAck {
+            sandboxes: u32,
+            listeners: u32,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            failed: Vec<ResyncFailure>,
+        },
         /// Batched audit records (flushed every ≤1 s or 128 records; must fit
         /// [`super::fdpass::MAX_PACKET_FROM_PROXY`]). nestd forwards them as
         /// `HostEventBody::EgressAudit`.
@@ -301,18 +310,33 @@ pub mod proxy {
             /// Human-readable detail; truncated to keep the packet under the size limit.
             detail: String,
         },
-        /// A handed-over listener failed (accept error). nestd may rebind and resend.
+        /// A handed-over listener failed (unusable fd, or a fatal accept error); the proxy has
+        /// closed its copy. nestd rebinds it under the same id and resends it, a bounded number of
+        /// times, then drops it from its mirror.
         ListenerFailed { sandbox: SandboxId, listener_id: u32, error: ErrorBody },
         Pong { nonce: u64, sandboxes: u32, active_connections: u32 },
         /// Protocol error; the sender closes the connection after this.
         Error { error: ErrorBody },
     }
 
+    /// Listeners of one sandbox that the proxy couldn't serve during a resync
+    /// ([`ProxyEvent::ResyncAck`]).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ResyncFailure {
+        pub sandbox: SandboxId,
+        pub listener_ids: Vec<u32>,
+    }
+
+    /// At most this many listener ids are reported in one `resync_ack` (it must fit
+    /// [`super::fdpass::MAX_PACKET_FROM_PROXY`]); failures past it leave the counts unexplained,
+    /// and nestd resyncs.
+    pub const MAX_RESYNC_FAILURES: usize = 1024;
+
     /// A pre-bound socket inside a sandbox's netns. Serialized flat:
     /// `{"id":5,"transport":"tcp","addr":"172.16.0.1:3128","purpose":"explicit","agent":"agt_…","slot":0}`.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ListenerSpec {
-        /// Unique per sandbox for the sandbox's lifetime on this host.
+        /// Unique per sandbox for the sandbox's lifetime on this host; a rebind keeps it.
         pub id: u32,
         pub transport: Transport,
         /// Bound address inside the netns, e.g. `172.16.0.1:443`.
