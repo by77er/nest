@@ -138,17 +138,18 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS generations (id TEXT PRIMARY KEY, record TEXT NOT NULL,
       orphaned INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS commits (request TEXT PRIMARY KEY, outcome TEXT NOT NULL)");
-    // When the request was answered (null: before the column; such a record counts as old), and
+    // When the request was answered (null only until the start below stamps it), and
     // the generation it committed (null: rejected), so retention needs no JSON scan.
     const commitCols = this.sql.exec<{ name: string }>("PRAGMA table_info(commits)").toArray().map((c) => c.name);
     if (!commitCols.includes("created_ms")) this.sql.exec("ALTER TABLE commits ADD COLUMN created_ms INTEGER");
-    if (!commitCols.includes("generation_id")) {
-      this.sql.exec("ALTER TABLE commits ADD COLUMN generation_id TEXT");
-      // Once, in the same constructor that added the column: rows written after it carry their own.
-      this.sql.exec("UPDATE commits SET generation_id = json_extract(outcome, '$.generation.id')");
-    }
+    if (!commitCols.includes("generation_id")) this.sql.exec("ALTER TABLE commits ADD COLUMN generation_id TEXT");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_generation ON commits (generation_id)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_rejected ON commits (created_ms) WHERE generation_id IS NULL");
+    // On every start: a record written by a release without these columns (before them, or during a
+    // rollback to one) gets its generation from its outcome, and counts its age from now, so a
+    // committed record is never mistaken for a rejected one and nothing is pruned at once.
+    this.sql.exec("UPDATE commits SET generation_id = json_extract(outcome, '$.generation.id'), created_ms = ? WHERE generation_id IS NULL AND created_ms IS NULL",
+      Date.now());
     // Every epoch and the host that held it: salvage from any older epoch is authorized against it.
     this.sql.exec("CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, host TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
@@ -692,11 +693,11 @@ export class SandboxDO extends DurableObject<Env> {
   private async pruneCommitRecords(): Promise<void> {
     const cutoff = Date.now() - COMMIT_RECORD_RETENTION_MS;
     // Rejected requests (the partial index), then records whose generation left the chain.
-    this.sql.exec("DELETE FROM commits WHERE generation_id IS NULL AND COALESCE(created_ms, 0) < ?", cutoff);
-    this.sql.exec(`DELETE FROM commits WHERE generation_id IS NOT NULL AND COALESCE(created_ms, 0) < ?
+    this.sql.exec("DELETE FROM commits WHERE generation_id IS NULL AND created_ms < ?", cutoff);
+    this.sql.exec(`DELETE FROM commits WHERE generation_id IS NOT NULL AND created_ms < ?
       AND NOT EXISTS (SELECT 1 FROM generations g WHERE g.id = commits.generation_id)`, cutoff);
     // Again when the oldest rejected record left ages out (a commit arms it sooner, hourly).
-    const oldest = this.sql.exec<{ at: number | null }>("SELECT MIN(COALESCE(created_ms, 0)) AS at FROM commits WHERE generation_id IS NULL").toArray()[0]?.at;
+    const oldest = this.sql.exec<{ at: number | null }>("SELECT MIN(created_ms) AS at FROM commits WHERE generation_id IS NULL").toArray()[0]?.at;
     if (oldest !== null && oldest !== undefined) {
       await this.deadlines.set("commit_prune", Math.max(oldest + COMMIT_RECORD_RETENTION_MS, Date.now() + COMMIT_PRUNE_INTERVAL_MS), true);
     }

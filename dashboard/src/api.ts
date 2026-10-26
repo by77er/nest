@@ -1,13 +1,13 @@
-// What the control plane's two read routes return. The shapes are the control plane's own
-// (control-plane/src/protocol/admin.ts, the return types of FleetDO's `fleetView` and `images`),
-// imported as types only: the dashboard stays an independent Worker with no runtime dependency on
-// the control plane, and `npm run typecheck` fails when the page reads a field the view lacks.
+// What the control plane's two read routes return: the admin view contract in
+// protocol/admin/view.ts, which the control plane's `fleetView` and `images` are typed by too. The
+// dashboard imports nothing from the control plane, and only types from protocol/: it stays an
+// independent Worker, and `npm run typecheck` fails when the page reads a field the view lacks.
 export type {
   CapacityView as Capacity, FleetView as Fleet, HostRole, HostStatus, HostView as Host, ImageView as Image, ImagesView as Images,
   LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
   TunnelState,
-} from "../../control-plane/src/protocol/admin";
-import type { AwsView, FleetView, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../control-plane/src/protocol/admin";
+} from "../../protocol/admin/view";
+import type { AwsView, FleetView, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../protocol/admin/view";
 
 /**
  * A sandbox row as the control plane before the typed view returned it: one `state`, the lease's

@@ -1,8 +1,9 @@
-// The admin API's read views (`GET /v1/admin/fleet`, `GET /v1/admin/images`): what FleetDO's
-// `fleetView` and `images` return. This module imports nothing, so the dashboard (an independent
-// Worker) can check its client against it with `import type` and no runtime dependency on the
-// control plane. The enum lists here must equal the protocol's zod enums; fleet.ts asserts that at
-// compile time.
+// The admin API's read views (`GET /v1/admin/fleet`, `GET /v1/admin/images`): the contract between
+// the control plane (FleetDO's `fleetView` and `images` return these types) and the dashboard
+// (which checks its client against them). It lives in protocol/, which both depend on, so neither
+// imports the other; it imports nothing, so the dashboard needs only `import type` and carries no
+// code from here. The enum lists must equal the control plane's zod enums
+// (control-plane/src/do/fleet.ts asserts that at compile time).
 
 /** protocol/model.ts `SandboxState`. */
 export const SANDBOX_STATES = [

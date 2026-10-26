@@ -33,7 +33,7 @@ import {
   type LaunchView, type SandboxView, type TemplateView,
   type HostRole as AdminHostRole, type SandboxState as AdminSandboxState, type TunnelState as AdminTunnelState,
   type AwsSource as AdminAwsSource, type AwsView,
-} from "../protocol/admin";
+} from "../../../protocol/admin/view";
 
 // Closed unions for every status/kind column (docs/data/#enums): written through these types, read
 // back through `storedEnum` (a value outside the union is logged as an error).
@@ -43,6 +43,9 @@ const LaunchEndReason = z.enum(LAUNCH_END_REASONS);
 const PURPOSES = ["stonith_fence"] as const;
 const PurposeEnum = z.enum(PURPOSES);
 type Purpose = (typeof PURPOSES)[number] | null;
+/** `commands.answered_by`: FleetDO answered the command itself (null: the host did). */
+const AnsweredByEnum = z.enum(["fleet"]);
+type AnsweredBy = z.output<typeof AnsweredByEnum>;
 /** `commands.type`: the type of the command body it stores. */
 type CommandType = CommandBody["type"];
 const CommandTypeEnum = typeEnum<CommandType>(CommandBodyVariants);
@@ -52,7 +55,7 @@ const CONTROLLER_ROLE: HostRole = "controller";
 /** Statuses in which a host is (or may be) running: it is ticked, polled and counted. */
 const LIVE_STATUSES = ["active", "draining", "stonith_pending"] as const satisfies readonly HostStatus[];
 
-// The admin view (protocol/admin.ts, imported by the dashboard) repeats the protocol's enums
+// The admin view (protocol/admin/view.ts, the contract with the dashboard) repeats the protocol's enums
 // without zod; they must be the same sets.
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 export const ADMIN_ENUMS_AGREE: [
@@ -165,8 +168,11 @@ const LAUNCH_RETENTION_MS = 7 * 86_400_000;
 const GC_RUN_RETENTION_MS = 30 * 86_400_000;
 /** `sandboxes`: a destroyed sandbox's registry row (its generations stopped being roots when it was destroyed). */
 const DESTROYED_SANDBOX_RETENTION_MS = 30 * 86_400_000;
-/** The pruning pass runs at most this often, from any alarm (the tick, the daily tunnel sweep). */
+/** The pruning pass runs at most this often, from any alarm (the tick, the daily tunnel sweep, its own). */
 const PRUNE_INTERVAL_MS = 3_600_000;
+/** Its own deadline, so a quiet cell (no tick, no tunnels) still prunes: armed on every start. */
+const ALARM_PRUNE = "prune";
+const PRUNE_DAILY_MS = 24 * 3_600_000;
 /** Lost hosts (expired or dead) whose brains' agents haven't all acknowledged the loss yet. */
 const LOST_WITH_BRAINS = "SELECT host FROM hosts WHERE lost = 1 AND host IN (SELECT host FROM host_agents)";
 /**
@@ -205,7 +211,7 @@ export interface GcClaim {
   max_deletes: number;
 }
 
-export type { AwsView } from "../protocol/admin";
+export type { AwsView } from "../../../protocol/admin/view";
 
 export class FleetDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -285,6 +291,10 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("leases", "state_seq", "INTEGER");
     this.addColumn("hosts", "capacity_seq", "INTEGER");
     this.addColumn("leases", "guest", "TEXT");
+    // Who answered a command: `fleet` when FleetDO answered it itself (its host died, or was dead or
+    // unknown when it was issued); null for the host's own result (and the answers older releases
+    // already wrote). Only a host's answer means the host ran it (`killProgress`).
+    this.addColumn("commands", "answered_by", "TEXT");
     // `tunnel_state` null meant `none` (a row from before the field): made explicit, once.
     this.sql.exec("UPDATE hosts SET tunnel_state = 'none' WHERE tunnel_state IS NULL");
     // Retention: when a host died. A row that was dead before the column counts from now.
@@ -306,6 +316,10 @@ export class FleetDO extends DurableObject<Env> {
       PRIMARY KEY (sandbox, host, epoch))`);
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
+    // Retention runs at least daily, whether or not the cell is busy or has tunnels.
+    ctx.blockConcurrencyWhile(async () => {
+      if (!this.deadlines.has(ALARM_PRUNE)) await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
+    });
   }
 
   private addColumn(table: string, column: string, type: string): void {
@@ -1387,9 +1401,10 @@ export class FleetDO extends DurableObject<Env> {
       const epoch = "epoch" in c ? c.epoch : c.type === "sandbox_fork" ? c.child_epoch : null;
       const agent = "agent" in c ? c.agent : null;
       this.sql.exec(
-        `INSERT INTO commands (cmd, host, type, sandbox, agent, epoch, purpose, body, issued_ms, result, result_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO commands (cmd, host, type, sandbox, agent, epoch, purpose, body, issued_ms, result, result_ms, answered_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         c.cmd, host, c.type, sandbox, agent, epoch, purpose, JSON.stringify(c), now, answer, answer === null ? null : now,
+        answer === null ? null : ("fleet" satisfies AnsweredBy),
       );
       if (undeliverable) continue;
       if (c.type === "agent_start") {
@@ -1540,16 +1555,21 @@ export class FleetDO extends DurableObject<Env> {
    * behind them).
    */
   async killProgress(cmd: string, agent: string, host: string, epoch: number): Promise<{ processed: boolean; indexed: boolean; host_processing: boolean }> {
-    const row = this.sql.exec<{ result: string | null; issued_ms: number }>("SELECT result, issued_ms FROM commands WHERE cmd = ?", cmd).toArray()[0];
+    const row = this.sql.exec<{ result: string | null; issued_ms: number; answered_by: string | null }>(
+      "SELECT result, issued_ms, answered_by FROM commands WHERE cmd = ?", cmd).toArray()[0];
     const since = row?.issued_ms ?? 0;
+    // Only the host's own answers count: one FleetDO wrote (its host died, or was dead when the kill
+    // was issued) says nothing about what ran there; such a brain waits for its host's `lost` (A6).
+    const byHost = (by: string | null) => storedEnumOrNull(AnsweredByEnum, by, "commands.answered_by") !== "fleet";
     const host_processing = this.sql.exec(
-      `SELECT 1 FROM commands WHERE host = ? AND cmd <> ? AND ((result IS NOT NULL AND result_ms >= ?) OR (result IS NULL AND issued_ms < ?)) LIMIT 1`,
+      `SELECT 1 FROM commands WHERE host = ? AND cmd <> ? AND ((result IS NOT NULL AND result_ms >= ? AND answered_by IS NULL)
+         OR (result IS NULL AND issued_ms < ?)) LIMIT 1`,
       host, cmd, since, since).toArray().length > 0;
     // A row without an epoch (the previous release's) proves nothing either way: not counted; the
     // host's next hello resolves it (a brain not reported is gone).
     const indexed = this.sql.exec("SELECT 1 FROM host_agents WHERE agent = ? AND host = ? AND epoch IS NOT NULL AND epoch <= ?", agent, host, epoch)
       .toArray().length > 0;
-    return { processed: !row || row.result !== null, indexed, host_processing };
+    return { processed: !row || (row.result !== null && byHost(row.answered_by)), indexed, host_processing };
   }
 
   /**
@@ -1614,6 +1634,7 @@ export class FleetDO extends DurableObject<Env> {
     this.prune(Date.now());
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === ALARM_TICK) await this.tick();
+      if (key === ALARM_PRUNE) await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
       if (key === ALARM_TUNNEL_SWEEP) {
         try {
           await this.tunnelSweep();
@@ -1693,7 +1714,10 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   private pruneTables(now: number): void {
-    this.sql.exec("DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?", now - COMMAND_RETENTION_MS);
+    // A command FleetDO answered for a host whose death isn't proof yet stays: `killProgress` would
+    // read a missing row as processed.
+    this.sql.exec(`DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?
+      AND (answered_by IS NULL OR host NOT IN (SELECT host FROM hosts WHERE lost = 0))`, now - COMMAND_RETENTION_MS);
     this.sql.exec("DELETE FROM stale_incarnations WHERE cmd IS NOT NULL AND first_seen_ms < ?", now - STALE_INCARNATION_RETENTION_MS);
     this.sql.exec("DELETE FROM enroll_tokens WHERE used_ms IS NOT NULL AND used_ms < ?", now - ENROLL_TOKEN_RETENTION_MS);
     const dead = this.hostsBy({
@@ -2311,7 +2335,8 @@ export class FleetDO extends DurableObject<Env> {
     for (const ws of this.ctx.getWebSockets(host)) ws.close(4410, why);
     this.releaseTunnel(host, why);
     const closed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, `host is dead (${why})`, false) });
-    this.sql.exec("UPDATE commands SET result = ?, result_ms = ? WHERE host = ? AND result IS NULL", closed, Date.now(), host);
+    this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE host = ? AND result IS NULL",
+      closed, Date.now(), "fleet" satisfies AnsweredBy, host);
     this.rel.reset(host);
   }
 

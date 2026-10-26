@@ -7,11 +7,12 @@ import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FleetDO } from "../src/do/fleet";
 import { SandboxDO } from "../src/do/sandbox";
-import type { FleetView } from "../src/protocol/admin";
+import type { FleetView } from "../../protocol/admin/view";
 import type { CommitRequestEvent } from "../src/protocol/control";
 import { storedEnum } from "../src/lib/stored";
 import { SandboxState } from "../src/protocol/model";
-import { adminJson, BASE, connectHost, csrPem, manifest, nextCommands, uniqueCell } from "./helpers";
+import type { AgentDO } from "../src/do/agent";
+import { adminJson, BASE, connectHost, csrPem, manifest, nextCommands, okResult, uniqueCell } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
@@ -316,6 +317,34 @@ describe("salvage authorization", () => {
   });
 });
 
+describe("commit records written by a release without their columns (a rollback)", () => {
+  it("get their generation and an age from now on the next start, and none is pruned at once", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "rollback commits" } }, 201);
+    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
+    const before = Date.now();
+    const out = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
+      const sql = st.storage.sql;
+      // What the previous release inserts: the columns exist (this release added them), it leaves them null.
+      sql.exec("INSERT INTO commits (request, outcome) VALUES ('req_rb_c', ?), ('req_rb_r', ?)",
+        JSON.stringify({ status: "committed", generation: { id: "gen_rollback" } }), JSON.stringify({ status: "rejected", reason: "parent_mismatch" }));
+      new SandboxDO(st, env);
+      return sql.exec("SELECT request, generation_id, created_ms FROM commits WHERE request LIKE 'req_rb_%' ORDER BY request").toArray();
+    });
+    expect(out).toEqual([
+      { request: "req_rb_c", generation_id: "gen_rollback", created_ms: expect.any(Number) },
+      { request: "req_rb_r", generation_id: null, created_ms: expect.any(Number) },
+    ]);
+    expect((out[0] as { created_ms: number }).created_ms).toBeGreaterThanOrEqual(before);
+    await runSandboxAlarm(sandbox, "commit_prune");
+    const left = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) =>
+      st.storage.sql.exec<{ request: string }>("SELECT request FROM commits WHERE request LIKE 'req_rb_%' ORDER BY request").toArray().map((r) => r.request));
+    expect(left).toEqual(["req_rb_c", "req_rb_r"]);
+  });
+});
+
 describe("commit records", () => {
   it("drop after their retention unless their generation is still in the chain", async () => {
     const cell = uniqueCell();
@@ -332,8 +361,8 @@ describe("commit records", () => {
     expect(await commit("req_rejected")).toMatchObject({ status: "rejected" }); // parent mismatch
     await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
       st.storage.sql.exec("UPDATE commits SET created_ms = ?", Date.now() - 8 * DAY);
-      st.storage.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES ('req_gone', ?, NULL, 'gen_notinthechain00000000000')",
-        JSON.stringify({ status: "committed", generation: { id: "gen_notinthechain00000000000" } }));
+      st.storage.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES ('req_gone', ?, ?, 'gen_notinthechain00000000000')",
+        JSON.stringify({ status: "committed", generation: { id: "gen_notinthechain00000000000" } }), Date.now() - 8 * DAY);
     });
     const gen = (first as { generation: { id: string } }).generation.id;
     await commit("req_next", gen);
@@ -493,6 +522,57 @@ describe("a dead host whose death is not proof", () => {
   });
 });
 
+describe("a kill FleetDO answered itself", () => {
+  const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
+  const brainOf = (agent: string) => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+    (JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value) as {
+      brain: { host: string; phase: string } | null;
+    }).brain);
+  /** Run the agent's `condemned` deadline now, as if a minute had passed since the kill. */
+  const escalate = async (agent: string) => {
+    await runInDurableObject(agentStub(agent), async (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      if (info.brain?.kill) info.brain.kill.ms = Date.now() - 61_000;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('condemned', 0)");
+      await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
+    });
+    await runDurableObjectAlarm(agentStub(agent));
+  };
+
+  it("never releases a brain on a retired host whose death isn't proof; its loss does", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-killed" } });
+    const a = await connectHost(cell, "controller");
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "kill answered by fleet" } }, 201);
+    const captain = (await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
+    const [start] = await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
+    await okResult(a.ws, start.cmd);
+    const b = await connectHost(cell, "controller");
+    await agentStub(captain).start(b.host);
+    await nextCommands(a.ws, (c) => c.type === "agent_stop" && c.agent === captain && c.mode === "kill");
+    // `a` is retired by FleetDO alone (a drain or idle retirement: dead, but not proof), its
+    // index row gone, and the kill it never answered answered by FleetDO.
+    const kill = await fleetSql(cell, (sql, inst) => {
+      sql.exec("DELETE FROM host_agents WHERE host = ?", a.host);
+      (inst as unknown as { hostDied(h: string, why: string): void }).hostDied(a.host, "drained");
+      return rows(sql, "SELECT result, answered_by, (SELECT lost FROM hosts WHERE host = ?) AS lost FROM commands WHERE host = ? AND type = 'agent_stop'", a.host, a.host)[0];
+    });
+    expect(kill).toMatchObject({ result: expect.any(String), answered_by: "fleet", lost: 0 });
+    await escalate(captain);
+    expect(await brainOf(captain), "a FleetDO answer is not the host running the kill").toMatchObject({ host: a.host, phase: "condemned" });
+    // A day later its answered commands are still kept (a missing kill would read as processed).
+    await fleetSql(cell, (sql) => sql.exec("UPDATE commands SET result_ms = ? WHERE host = ?", Date.now() - 2 * DAY, a.host));
+    await prune(cell);
+    await escalate(captain);
+    expect(await brainOf(captain)).toMatchObject({ host: a.host, phase: "condemned" });
+    // Its death becomes proof: released.
+    await fleetSql(cell, (sql) => sql.exec("UPDATE hosts SET lost = 1 WHERE host = ?", a.host));
+    await escalate(captain);
+    expect((await brainOf(captain))?.host ?? null).not.toBe(a.host);
+  });
+});
+
 describe("commands for a dead or unknown host", () => {
   it("a kill for a dead host is stored once: a retried issueKill gets the same command", async () => {
     const cell = uniqueCell();
@@ -504,6 +584,9 @@ describe("commands for a dead or unknown host", () => {
       await inst.issueKill(h.host, "agt_01killdedupe00000000000000", 3, "test"),
     ]);
     expect(again).toBe(first);
+    // FleetDO's answer, not the host's: the kill is not processed.
+    const p = await fleetSql(cell, (_sql, inst) => inst.killProgress(first!, "agt_01killdedupe00000000000000", h.host, 3));
+    expect(p.processed).toBe(false);
   });
 
   it("are answered at once with an error, never queued", async () => {
@@ -557,6 +640,34 @@ describe("confirming a host dead", () => {
 });
 
 describe("the pruning pass", () => {
+  it("has its own daily deadline, armed on every start, so a quiet cell without tunnels prunes", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    h.ws.close();
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const at = await fleetSql(cell, (sql) => rows(sql, "SELECT at FROM deadlines WHERE key = 'prune'")[0]?.at as number | undefined);
+    expect(at).toBeGreaterThan(Date.now() + 23 * 3_600_000);
+    // Quiet: no tick, no sweep; only the prune deadline is due.
+    await runInDurableObject(fleetStub(cell), async (_inst: FleetDO, st) => {
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key <> 'prune'");
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+      st.storage.sql.exec("DELETE FROM kv WHERE key = 'pruned_ms'");
+      st.storage.sql.exec("UPDATE hosts SET dead_ms = ? WHERE host = ?", Date.now() - 8 * DAY, h.host);
+      await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
+    });
+    expect(await runDurableObjectAlarm(fleetStub(cell))).toBe(true);
+    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT 1 FROM hosts WHERE host = ?", h.host).length)).toBe(0);
+    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT at FROM deadlines WHERE key = 'prune'")[0]?.at as number)).toBeGreaterThan(Date.now() + 23 * 3_600_000);
+    // A fresh start re-arms a missing one.
+    const rearmed = await runInDurableObject(fleetStub(cell), async (_inst: FleetDO, st) => {
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'prune'");
+      new FleetDO(st, env);
+      await new Promise((r) => setTimeout(r, 50));
+      return st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'prune'").toArray().length;
+    });
+    expect(rearmed).toBe(1);
+  });
+
   it("never stalls the alarm it runs from", async () => {
     const cell = uniqueCell();
     await connectHost(cell);
