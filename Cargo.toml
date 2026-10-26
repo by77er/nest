@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/nest-protocol",
   "crates/nestd",
+  "crates/nestd-core",
   "crates/nest-proxy",
   "crates/nest-guest",
   "crates/nest-runner",
@@ -16,6 +17,10 @@ edition = "2024"
 version = "0.1.0"
 license = "UNLICENSED"
 publish = false
+
+[workspace.lints.rust]
+# Kani proof harnesses (`cargo kani -p nestd-core`) sit behind `#[cfg(kani)]`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

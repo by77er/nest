@@ -16,13 +16,14 @@
 //! vCPUs are frozen through a lock-free [`Pauser`] — none of these wait for the sandbox mutex or for
 //! nest-proxy.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use nestd_core::results::ResultCache;
 use nest_protocol::control::{
     AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressAuditRecord,
     EgressVerdict, HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
@@ -225,25 +226,6 @@ impl Pausers {
     }
 }
 
-/// Bounded `cmd` → outcome cache for redelivered commands.
-#[derive(Default)]
-struct Results {
-    map: HashMap<String, CommandOutcome>,
-    order: VecDeque<String>,
-}
-
-impl Results {
-    fn insert(&mut self, cmd: &str, o: CommandOutcome) {
-        if self.map.insert(cmd.to_string(), o).is_none() {
-            self.order.push_back(cmd.to_string());
-            if self.order.len() > 4096
-                && let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
-                }
-        }
-    }
-}
-
 type CmdResult = Result<Option<serde_json::Value>, ErrorBody>;
 
 pub struct Inner {
@@ -267,7 +249,8 @@ pub struct Inner {
     pending_commits: Mutex<HashMap<RequestId, oneshot::Sender<CommitOutcome>>>,
     /// Guest `nest` CLI relays awaiting `guest_cli_result`.
     pending_cli: Mutex<HashMap<RequestId, oneshot::Sender<CliResult>>>,
-    results: Mutex<Results>,
+    /// Command dedup (`nestd_core::results`): a redelivered `cmd` answers with its first outcome.
+    results: Mutex<ResultCache<CommandOutcome>>,
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
     denied_seen: Mutex<HashMap<(SandboxId, String, u16), Instant>>,
     alerts_seen: Mutex<HashMap<(SandboxId, String, String), Instant>>,
@@ -502,7 +485,7 @@ impl Host {
             sandboxes: Mutex::new(BTreeMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             pending_cli: Mutex::new(HashMap::new()),
-            results: Mutex::new(Results::default()),
+            results: Mutex::new(ResultCache::default()),
             lease_deadline: lease_tx,
             denied_seen: Mutex::new(HashMap::new()),
             alerts_seen: Mutex::new(HashMap::new()),
@@ -1328,7 +1311,7 @@ impl Inner {
     // ------------------------------------------------------------------------------------------
 
     async fn execute(self: &Arc<Self>, cmd: Command) {
-        let cached = self.results.lock().expect("results").map.get(&cmd.cmd.0).cloned();
+        let cached = self.results.lock().expect("results").get(&cmd.cmd.0).cloned();
         if let Some(outcome) = cached {
             self.emit(HostEventBody::CommandResult { cmd: cmd.cmd, outcome });
             return;

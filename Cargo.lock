@@ -1271,6 +1271,7 @@ dependencies = [
  "hex",
  "libc",
  "nest-protocol",
+ "nestd-core",
  "nix",
  "rand",
  "rcgen",
@@ -1288,6 +1289,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "nestd-core"
+version = "0.1.0"
 
 [[package]]
 name = "nix"
