@@ -96,7 +96,11 @@ async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
 fn exited(evs: &[RunnerEvent]) -> Vec<ExitReason> {
     evs.iter()
         .filter_map(|e| match e {
-            RunnerEvent::AgentExited { reason, .. } => Some(*reason),
+            RunnerEvent::AgentExited { reason, epoch, .. } => {
+                // Every exit names the agent epoch it ran under (AgentDO ignores older starts' exits).
+                assert_eq!(*epoch, Some(nest_protocol::model::Epoch(1)), "exit without its agent epoch");
+                Some(*reason)
+            }
             _ => None,
         })
         .collect()

@@ -76,7 +76,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             let msg = format!("refusing to start: built-in tool {bad} is not on the runner's host-safe allowlist");
             tracing::error!(agent = %id, "{msg}");
             rt.report(RunnerEvent::Error { agent: Some(id.clone()), error: ErrorBody { code: "forbidden_tool".into(), message: msg, retryable: false } });
-            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Crashed });
+            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Crashed, epoch: Some(start.start.agent_epoch()) });
             return;
         }
         if !rt.lease_valid() {
@@ -84,7 +84,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 agent: Some(id.clone()),
                 error: ErrorBody { code: "no_lease".into(), message: "no valid host lease; refusing to start a brain".into(), retryable: true },
             });
-            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced });
+            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(start.start.agent_epoch()) });
             return;
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -144,7 +144,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             }
             agent.send_out(Outbound::Close);
             rt.deregister(&agent);
-            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason });
+            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason, epoch: Some(agent.epoch()) });
         }
     });
 }
@@ -303,7 +303,7 @@ async fn run(
     if auth != "oauth_token" {
         rt.report_for(&agent, RunnerEvent::AuthCheck { agent: agent.id.clone(), auth_method: auth, api_key_source: "unknown".into(), ok: false });
         rt.deregister(&agent);
-        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed });
+        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed, epoch: Some(agent.epoch()) });
         return Ok(());
     }
     let version = step(&cancel, "claude --version", VERSION_TIMEOUT, async { Ok(claude_version(&rt, &launch.env).await) }).await?;
@@ -808,7 +808,7 @@ impl Actor {
         self.agent.emit(AgentEventBody::StateChanged { state: AgentState::Detached, detail: Some(reason.as_str().into()) });
         self.agent.send_out(Outbound::Close);
         self.rt.deregister(&self.agent);
-        self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason });
+        self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason, epoch: Some(self.agent.epoch()) });
         true
     }
 

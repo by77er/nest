@@ -69,7 +69,23 @@ struct State {
     /// Highest fenced (or torn-down) epoch per sandbox: an upsert at or below it is refused, so
     /// a late `gateway_sync` after a fence can't re-add the sandbox (the proxy link's rule).
     fenced: BTreeMap<SandboxId, Epoch>,
+    /// Per sandbox, per client, the agent-epoch floor (`agent_attach.agent_epoch`). Only raised;
+    /// kept while the sandbox is merely forgotten (suspended), dropped when its epoch ends here.
+    floors: BTreeMap<SandboxId, BTreeMap<String, Epoch>>,
     conn: Option<UnboundedSender<GatewayCommand>>,
+}
+
+impl State {
+    fn upsert_cmd(&self, sandbox: &SandboxId, e: &Entry) -> GatewayCommand {
+        GatewayCommand::SandboxUpsert {
+            sandbox: sandbox.clone(),
+            epoch: e.epoch,
+            vsock_uds_path: e.vsock_uds_path.clone(),
+            clients: e.clients.clone(),
+            guest: e.guest.clone(),
+            client_floors: self.floors.get(sandbox).cloned().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -130,7 +146,7 @@ impl GatewayLink {
     /// refused (with a warning) for an epoch that was fenced or torn down: a sync that raced a
     /// fence must not bring the sandbox back.
     pub fn upsert(&self, sandbox: SandboxId, entry: Entry) {
-        {
+        let cmd = {
             let mut st = self.state.lock().expect("gateway state");
             if st.fenced.get(&sandbox).is_some_and(|f| entry.epoch <= *f) {
                 tracing::warn!(%sandbox, epoch = entry.epoch.0, "refusing to re-add a fenced epoch to the gateway");
@@ -140,8 +156,31 @@ impl GatewayLink {
                 return;
             }
             st.sandboxes.insert(sandbox.clone(), entry.clone());
+            st.upsert_cmd(&sandbox, &entry)
+        };
+        self.send(cmd);
+    }
+
+    /// Raise a client's agent-epoch floor on a sandbox at `epoch` (`agent_attach.agent_epoch`) and
+    /// tell the gateway at once if it holds the sandbox: from then on it refuses that client's
+    /// bindings minted for an older brain start, and cuts their open connections. A floor for an
+    /// epoch already ended here is ignored.
+    pub fn raise_floor(&self, sandbox: &SandboxId, epoch: Epoch, client: &str, agent_epoch: Epoch) {
+        let cmd = {
+            let mut st = self.state.lock().expect("gateway state");
+            if st.fenced.get(sandbox).is_some_and(|f| epoch <= *f) {
+                return;
+            }
+            let cur = st.floors.entry(sandbox.clone()).or_default().entry(client.to_string()).or_insert(Epoch(0));
+            if agent_epoch <= *cur {
+                return;
+            }
+            *cur = agent_epoch;
+            st.sandboxes.get(sandbox).map(|e| st.upsert_cmd(sandbox, e))
+        };
+        if let Some(cmd) = cmd {
+            self.send(cmd);
         }
-        self.send(GatewayCommand::SandboxUpsert { sandbox, epoch: entry.epoch, vsock_uds_path: entry.vsock_uds_path, clients: entry.clients, guest: entry.guest });
     }
 
     /// The sandbox's `epoch` is over on this host (fenced, destroyed, moved): drop it and refuse
@@ -153,6 +192,7 @@ impl GatewayLink {
             if *f < epoch {
                 *f = epoch;
             }
+            st.floors.remove(sandbox);
             st.sandboxes.remove(sandbox).is_some()
         };
         if present {
@@ -202,13 +242,7 @@ async fn serve(mut framed: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
         let _ = tx.send(GatewayCommand::HelloAck { protocol_version: PROTOCOL_VERSION, host_id });
         let _ = tx.send(GatewayCommand::KeyUpdate { keys: st.keys.clone() });
         for (sandbox, e) in &st.sandboxes {
-            let _ = tx.send(GatewayCommand::SandboxUpsert {
-                sandbox: sandbox.clone(),
-                epoch: e.epoch,
-                vsock_uds_path: e.vsock_uds_path.clone(),
-                clients: e.clients.clone(),
-                guest: e.guest.clone(),
-            });
+            let _ = tx.send(st.upsert_cmd(sandbox, e));
         }
         let _ = tx.send(GatewayCommand::ResyncDone);
         st.conn = Some(tx.clone());

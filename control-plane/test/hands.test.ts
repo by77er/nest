@@ -307,6 +307,9 @@ describe("hands_resolve on the session channel", () => {
   it("answers not-ready with a retry hint while the slot is pending, then a verifying target", async () => {
     const s = await setup();
     const { cmd } = await agentStub(s.agent).start();
+    // Before the start, the sandbox re-sent the attach with the agent epoch: the gateway's floor.
+    const isFloor = (c: any) => c.type === "agent_attach" && c.agent === s.agent && c.agent_epoch === 1;
+    const floor = (await nextCommands(s.host.ws, isFloor)).find(isFloor);
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
     expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 } });
     expect(start.hands.binding, "no binding ever passes through a host command").toBeUndefined();
@@ -320,13 +323,14 @@ describe("hands_resolve on the session channel", () => {
     expect(notReady.hands).toBeUndefined();
     expect(notReady.error).toEqual(notReady.outcome.error);
     expect(notReady.retry_after_ms).toBe(2000);
-    await okResult(s.host.ws, s.attach.cmd);
+    await okResult(s.host.ws, s.attach.cmd); // superseded by the floor's attach: changes nothing
+    await okResult(s.host.ws, floor.cmd);
     ws.send({ type: "hands_resolve", request: "req_2" });
     const ready = await ws.next("hands_resolved", (m) => m.request === "req_2");
     expect(ready.outcome.status).toBe("ok");
     expect(ready.outcome.hands).toMatchObject({ url: GATEWAY_URL });
     const claims = await verified(s.pub, ready.outcome.hands as HandsTarget);
-    expect(claims).toMatchObject({ client: s.agent, sandbox: s.sandbox, epoch: 1 });
+    expect(claims).toMatchObject({ client: s.agent, sandbox: s.sandbox, epoch: 1, agent_epoch: 1 });
     expect(ready.error).toBeUndefined();
     expect(ready.hands).toEqual(ready.outcome.hands);
     // The target went AgentDO → runner and nowhere else: nothing of it rests in AgentDO either.

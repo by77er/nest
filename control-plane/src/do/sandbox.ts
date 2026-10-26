@@ -68,6 +68,12 @@ export interface SandboxInfo {
   attach_inflight: Record<string, string>;
   /** Failed attempts at the current placement, per agent (drives the retry backoff). */
   attach_attempts: Record<string, number>;
+  /**
+   * Per attached agent, its current agent epoch (from AgentDO at each brain start): the floor every
+   * `agent_attach` carries to the gateway, and the `agent_epoch` claim of its bindings. Absent in
+   * state stored before it.
+   */
+  client_epochs?: Record<string, number>;
 }
 
 export interface CreateSandbox {
@@ -745,6 +751,7 @@ export class SandboxDO extends DurableObject<Env> {
       delete i.attach_cwd[agent];
       delete i.attach_inflight[agent];
       delete i.attach_attempts[agent];
+      if (i.client_epochs) delete i.client_epochs[agent];
     });
     if (info.host) {
       await this.command([{ type: "agent_detach", sandbox: info.sandbox, epoch: info.epoch, agent, kill_processes: true }]);
@@ -754,7 +761,26 @@ export class SandboxDO extends DurableObject<Env> {
 
   private attachBody(info: SandboxInfo, agent: string): CommandBody {
     const cwd = info.attach_cwd[agent];
-    return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}) };
+    const agentEpoch = info.client_epochs?.[agent];
+    return {
+      type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}),
+      ...(agentEpoch !== undefined ? { agent_epoch: agentEpoch } : {}),
+    };
+  }
+
+  /**
+   * AgentDO is starting `agent`'s brain under `agentEpoch`: raise the agent's floor at the gateway
+   * (an `agent_attach` carrying it, sent now if the sandbox is placed, and with every later attach),
+   * so bindings minted for an older brain start are refused from then on, even before the new brain
+   * calls. Never lowered. The slot itself is unchanged: a confirmed agent stays confirmed.
+   */
+  async fenceClient(agent: string, agentEpoch: number): Promise<void> {
+    const before = this.info_();
+    if (!before.attached.includes(agent) || (before.client_epochs?.[agent] ?? 0) >= agentEpoch) return;
+    const info = this.update((i) => {
+      i.client_epochs = { ...(i.client_epochs ?? {}), [agent]: Math.max(i.client_epochs?.[agent] ?? 0, agentEpoch) };
+    });
+    if (info.host) await this.issueAttachCommands([agent]);
   }
 
   /** Send `agent_attach` for these agents and remember each command as the agent's one in flight. */
@@ -836,10 +862,16 @@ export class SandboxDO extends DurableObject<Env> {
    * while the sandbox has no host, is being placed, or the agent's slot isn't confirmed; a suspended
    * sandbox on a host is resumed first. The token is minted by BrokerDO and never stored here.
    */
-  async resolve(agent: string): Promise<HandsTarget> {
+  async resolve(agent: string, agentEpoch?: number): Promise<HandsTarget> {
     let info = this.info_();
     const notReady = (why: string) => new NestError(ErrorCodes.SANDBOX_NOT_READY, why, 503, true);
     if (!info.attached.includes(agent)) throw new NestError(ErrorCodes.NOT_BOUND, `${agent} is not attached to this sandbox`, 409);
+    // The binding names the brain start it is for; an older start than the floor gets none.
+    const floor = info.client_epochs?.[agent];
+    if (agentEpoch !== undefined && floor !== undefined && agentEpoch < floor) {
+      throw new NestError(ErrorCodes.STALE_EPOCH, `agent epoch ${agentEpoch} is superseded by ${floor}`, 409);
+    }
+    const claimEpoch = agentEpoch ?? floor;
     if (info.state === "destroyed" || info.state === "archived") throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
     if (info.host && info.state === "suspended") {
       await this.wake();
@@ -868,6 +900,7 @@ export class SandboxDO extends DurableObject<Env> {
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const binding = await broker.signBinding(info.cell, {
       sandbox: info.sandbox, epoch: info.epoch, client: agent, scope: "hands", exp_ms: Date.now() + BINDING_LIFETIME_MS,
+      ...(claimEpoch !== undefined ? { agent_epoch: claimEpoch } : {}),
     });
     // Only a tunnel has the Access edge in front of it; a gateway reached directly (the harness, a
     // host's own address) would receive the service token and front nothing, so it never travels.

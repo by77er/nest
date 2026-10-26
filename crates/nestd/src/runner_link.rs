@@ -32,10 +32,10 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 
-use nest_protocol::control::{AgentReport, HandsBinding};
+use nest_protocol::control::AgentReport;
 use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerCommand, RunnerEvent, StopMode};
 use nest_protocol::host::{PROTOCOL_VERSION, Secret};
-use nest_protocol::model::{AgentId, AgentState, HostId, HostRole, SandboxId, TimestampMs};
+use nest_protocol::model::{AgentId, AgentState, HostId, HostRole, TimestampMs};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -60,7 +60,6 @@ enum Sent {
 /// A brain this host runs. `hands` names the sandbox its hands act in (ids only, from
 /// `agent_start`), so a fence of that sandbox fences the brain.
 struct Brain {
-    hands: Option<HandsBinding>,
     state: AgentState,
     sent: Sent,
     /// Fenced: no longer reported; gone once the runner reports the exit or the connection drops.
@@ -136,7 +135,6 @@ impl RunnerLink {
     pub fn agent_start(&self, start: AgentStart) -> bool {
         let mut st = self.state.lock().expect("runner state");
         let agent = start.start.agent.clone();
-        let hands = start.start.hands.clone();
         let (sent, dispatched) = match &st.conn {
             Some(c) => {
                 let _ = c.send(RunnerCommand::AgentStart(Box::new(start)));
@@ -144,7 +142,7 @@ impl RunnerLink {
             }
             None => (Sent::Pending(Box::new(start)), false),
         };
-        st.brains.insert(agent, Brain { hands, state: AgentState::Starting, sent, fenced: false });
+        st.brains.insert(agent, Brain { state: AgentState::Starting, sent, fenced: false });
         dispatched
     }
 
@@ -187,18 +185,6 @@ impl RunnerLink {
             let _ = c.send(RunnerCommand::Fence { agents, reason: reason.into() });
         }
         unsent
-    }
-
-    /// Fence the brains whose hands act in `sandbox` (see [`RunnerLink::fence`]).
-    pub fn fence_sandbox(&self, sandbox: &SandboxId, reason: &str) -> Vec<AgentId> {
-        let bound: Vec<AgentId> = {
-            let st = self.state.lock().expect("runner state");
-            st.brains.iter().filter(|(_, b)| !b.fenced && b.hands.as_ref().is_some_and(|h| &h.sandbox == sandbox)).map(|(id, _)| id.clone()).collect()
-        };
-        if bound.is_empty() {
-            return vec![];
-        }
-        self.fence(bound, reason)
     }
 
     /// The brains this host runs (fenced ones excluded), for the fleet hello.
@@ -333,8 +319,8 @@ fn accept_event(state: &Mutex<State>, conn: u64, ev: &RunnerEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nest_protocol::control::{AgentStart as CpAgentStart, LaunchConfig, SystemPrompt};
-    use nest_protocol::model::{AgentRole, Epoch, SessionId, WorkstreamId};
+    use nest_protocol::control::{AgentStart as CpAgentStart, HandsBinding, LaunchConfig, SystemPrompt};
+    use nest_protocol::model::{AgentRole, Epoch, SandboxId, SessionId, WorkstreamId};
     use tokio::net::UnixStream;
 
     type Conn = Framed<UnixStream, LengthDelimitedCodec>;
@@ -390,7 +376,7 @@ mod tests {
     }
 
     fn exited(agent: &AgentId, reason: ExitReason) -> RunnerEvent {
-        RunnerEvent::AgentExited { agent: agent.clone(), code: None, signal: Some(9), reason }
+        RunnerEvent::AgentExited { agent: agent.clone(), code: None, signal: Some(9), reason, epoch: None }
     }
 
     fn agents(link: &RunnerLink) -> Vec<String> {
@@ -446,7 +432,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (link, path, mut nrx) = link(dir.path());
         assert!(!link.agent_start(bound("agt_p", "sbx_1")), "pending");
-        assert_eq!(link.fence_sandbox(&SandboxId("sbx_1".into()), "test"), vec![AgentId("agt_p".into())]);
+        assert_eq!(link.fence(vec![AgentId("agt_p".into())], "test"), vec![AgentId("agt_p".into())]);
         assert!(agents(&link).is_empty());
 
         let mut f = connect(&path).await;
@@ -458,7 +444,7 @@ mod tests {
         assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent == a), "the fenced pending start never goes out");
         assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent == b));
 
-        assert!(link.fence_sandbox(&SandboxId("sbx_1".into()), "fenced").is_empty());
+        assert!(link.fence(vec![b.clone()], "fenced").is_empty());
         assert!(matches!(read(&mut f).await, RunnerCommand::Fence { ref agents, .. } if agents == std::slice::from_ref(&b)));
         assert_eq!(agents(&link), vec!["agt_a"], "the fenced brain left the report");
         assert_eq!(link.count(), 1);
@@ -496,7 +482,7 @@ mod tests {
         let a = AgentId("agt_a".into());
         send(&mut f, exited(&a, ExitReason::Fenced)).await;
         send(&mut f, started(&a)).await;
-        send(&mut f, RunnerEvent::AgentExited { agent: a.clone(), code: Some(0), signal: None, reason: ExitReason::Fenced }).await;
+        send(&mut f, RunnerEvent::AgentExited { agent: a.clone(), code: Some(0), signal: None, reason: ExitReason::Fenced, epoch: None }).await;
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentStarted { .. }))));
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentExited { code: Some(0), .. }))));
         assert!(agents(&link).is_empty());

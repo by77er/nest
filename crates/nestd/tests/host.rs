@@ -616,7 +616,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     assert!(!seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. })), "a brain start configures no guest slot");
 
     // 2a. attach: the guest slot (explicit proxy port 3128, the cwd), and the gateway's client set.
-    let attach = |id: &str, epoch: u64, cwd: Option<&str>| cmd(id, CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(epoch), agent: AgentId("agt_w".into()), cwd: cwd.map(Into::into) });
+    let attach = |id: &str, epoch: u64, cwd: Option<&str>| cmd(id, CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(epoch), agent: AgentId("agt_w".into()), cwd: cwd.map(Into::into), agent_epoch: None });
     fleet.commands.send(vec![attach("cmd_attach", 1, Some("/workspace/app"))]).unwrap();
     assert!(matches!(fleet.result("cmd_attach").await, CommandOutcome::Ok { .. }));
     assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { slot } if slot.proxy_port == 3128 && slot.cwd == "/workspace/app")));
@@ -630,6 +630,12 @@ async fn host_lifecycle_commit_and_self_fence() {
     }
     let attaches: Vec<u16> = seen.lock().unwrap().iter().filter_map(|b| match b { ControlBody::AgentAttach { slot } => Some(slot.proxy_port), _ => None }).collect();
     assert_eq!(attaches, vec![3128, 3128], "re-attach reuses the slot; the stale attach never reaches the guest");
+    // A new brain start re-sends the attach with its agent epoch: the gateway gets the floor.
+    let floor = cmd("cmd_attach_floor", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None, agent_epoch: Some(Epoch(3)) });
+    fleet.commands.send(vec![floor]).unwrap();
+    assert!(matches!(fleet.result("cmd_attach_floor").await, CommandOutcome::Ok { .. }));
+    wait_until("gateway learns the agent epoch floor", || matches!(upserts(&gateway.lock().unwrap()).last(),
+        Some(GatewayCommand::SandboxUpsert { client_floors, .. }) if client_floors.get("agt_w") == Some(&Epoch(3)))).await;
 
     // 2b. Guest CLI relay: `nest ask` → guest_cli event → guest_cli_result command → cli_result to the guest.
     let request = match fleet.wait_event("guest cli", |b| matches!(b, HostEventBody::GuestCli { .. })).await {
@@ -1102,7 +1108,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
 
     // The guest holds the attach reply; the fence lands meanwhile; then the reply is released.
     latch.held.store(true, Ordering::SeqCst);
-    fleet.commands.send(vec![cmd("cmd_attach", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None })]).unwrap();
+    fleet.commands.send(vec![cmd("cmd_attach", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None, agent_epoch: None })]).unwrap();
     wait_until("guest holds the attach", || seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. }))).await;
     fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
     fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
@@ -1305,7 +1311,7 @@ fn nestd_now_ms() -> i64 {
 // ---------------------------------------------------------------------------------------------
 
 fn attach_cmd(id: &str, sandbox: &str, agent: &str) -> Command {
-    cmd(id, CommandBody::AgentAttach { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), agent: AgentId(agent.into()), cwd: None })
+    cmd(id, CommandBody::AgentAttach { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), agent: AgentId(agent.into()), cwd: None, agent_epoch: None })
 }
 
 fn is_ok(o: &CommandOutcome) -> bool {
@@ -1538,4 +1544,37 @@ fn an_attach_without_a_guest_binds_no_listener() {
         let r = fleet.result("cmd_attach_2").await;
         assert!(is_ok(&r), "attach after resume: {r:?}");
     });
+}
+
+/// A sandbox fence never fences the brains whose hands act in it: a brain survives its sandbox
+/// moving. Brains are fenced by their own host's lease and their agent epoch; hands by the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandbox_fence_leaves_its_brains_running() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    let start = AgentStart {
+        agent: AgentId("agt_b".into()),
+        role: AgentRole::Worker,
+        workstream: WorkstreamId("ws_1".into()),
+        epoch: Some(Epoch(1)),
+        resume: None,
+        hands: Some(HandsBinding { sandbox: SandboxId("sbx_a".into()), epoch: None }),
+        launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "w".into() } },
+        oauth_token: "oauth".into(),
+        session_ws_url: "ws://x".into(),
+    };
+    h.fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(start))]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
+    wait_until("runner agent_start", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(_)))).await;
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_a".into())], reason: "moved".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. })), "a sandbox fence fenced a brain");
+    assert!(!h.fleet.log.lock().unwrap().events.iter().any(|e| matches!(e.body, HostEventBody::AgentExited { .. })));
+    // A brain started elsewhere replaces it: killed, not left to finish its turn.
+    let stop = CommandBody::AgentStop { agent: AgentId("agt_b".into()), reason: "starting elsewhere".into(), mode: Some(nest_protocol::host::runner::StopMode::Kill), epoch: Some(Epoch(1)) };
+    h.fleet.commands.send(vec![cmd("cmd_stop", stop)]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_stop").await, CommandOutcome::Ok { .. }));
+    wait_until("runner kill", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStop { mode: nest_protocol::host::runner::StopMode::Kill, .. }))).await;
 }

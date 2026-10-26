@@ -106,6 +106,12 @@ pub struct BindingClaims {
     pub client: String,
     pub scope: BindingScope,
     pub exp_ms: TimestampMs,
+    /// The agent epoch of the brain the binding was minted for (an agent client). The gateway
+    /// refuses it below the client's floor (`sandbox_upsert.client_floors`), so a superseded
+    /// brain's cached binding stops working as soon as a newer brain start is announced. Absent
+    /// from bindings minted by the previous release, and ignored by its gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_epoch: Option<Epoch>,
 }
 
 pub const BINDING_VERSION: u32 = 1;
@@ -351,6 +357,7 @@ mod tests {
             client: "agt_01jb7n0w1e".into(),
             scope: BindingScope::Hands,
             exp_ms: 1_760_274_000_000,
+            agent_epoch: Some(Epoch(3)),
         }
     }
 

@@ -341,6 +341,7 @@ export class FleetDO extends DurableObject<Env> {
     this.releaseTunnel(host, "re-enrolled before connecting");
     const leases = this.leasesOf(host).map((l) => l.sandbox);
     if (leases.length) this.ctx.waitUntil(this.queueReassign(host, leases, true));
+    this.ctx.waitUntil(this.brainsLost(host));
     console.warn(`FleetDO: ${host} never connected; its proof enrolls again as ${successor}`);
   }
 
@@ -909,24 +910,33 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * The brain index: one row per (agent, host) an `agent_start` went to, until that brain is seen to
-   * stop there (`agent_stop`'s result, its exit, or its host lost). Written only by those; AgentDO
-   * owns where a brain runs. Keyed by both, so a brain being stopped on its old host stays listed
-   * while it starts on a new one. Rows from before were keyed by agent alone: rekeyed in place.
+   * The brain index: one row per (agent, host) an `agent_start` went to, with that start's agent
+   * epoch, until that brain is seen to stop there (`agent_stop`'s result or its exit, each for an
+   * epoch at or above the row's, or its host lost). Written only by those; AgentDO owns where a
+   * brain runs. Keyed by both, so a brain being stopped on its old host stays listed while it starts
+   * on a new one, and a stop or exit of an older start never drops a newer start's row. Rows from
+   * before were keyed by agent alone: rekeyed in place (their epoch is unknown: NULL, any stop ends it).
    */
   private createHostAgents(): void {
-    const create = "CREATE TABLE IF NOT EXISTS host_agents (agent TEXT NOT NULL, host TEXT NOT NULL, cmd TEXT NOT NULL, PRIMARY KEY (agent, host))";
+    const create = "CREATE TABLE IF NOT EXISTS host_agents (agent TEXT NOT NULL, host TEXT NOT NULL, cmd TEXT NOT NULL, epoch INTEGER, PRIMARY KEY (agent, host))";
     const cols = this.sql.exec<{ name: string; pk: number }>("PRAGMA table_info(host_agents)").toArray();
     if (cols.length === 0 || cols.find((c) => c.name === "host")?.pk !== 0) {
       this.sql.exec(create);
+      this.addColumn("host_agents", "epoch", "INTEGER");
       return;
     }
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("ALTER TABLE host_agents RENAME TO host_agents_by_agent");
       this.sql.exec(create);
-      this.sql.exec("INSERT INTO host_agents (agent, host, cmd) SELECT agent, host, cmd FROM host_agents_by_agent");
+      this.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch) SELECT agent, host, cmd, NULL FROM host_agents_by_agent");
       this.sql.exec("DROP TABLE host_agents_by_agent");
     });
+  }
+
+  /** A brain on `host` stopped or exited at agent epoch `epoch` (unknown: any): its index row goes unless a newer start replaced it. */
+  private brainGone(agent: string, host: string, epoch: number | null | undefined): void {
+    this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND (? IS NULL OR epoch IS NULL OR epoch <= ?)",
+      agent, host, epoch ?? null, epoch ?? null);
   }
 
   /** Brains the host doesn't report (after its agent_start completed) are gone. */
@@ -1053,8 +1063,8 @@ export class FleetDO extends DurableObject<Env> {
       case "spot_notice":
         return this.drain(host, ev.deadline_ms);
       case "agent_exited":
-        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", ev.agent, host);
-        await this.agentStub(ev.agent).onExited(host, ev.reason);
+        this.brainGone(ev.agent, host, ev.epoch);
+        await this.agentStub(ev.agent).onExited(host, ev.reason, ev.epoch);
         return;
       case "guest_cli":
         if (!this.holds(host, ev.sandbox, ev.epoch)) {
@@ -1132,7 +1142,8 @@ export class FleetDO extends DurableObject<Env> {
       return;
     }
     if (row.type === "agent_stop" && outcome.status === "ok" && row.agent) {
-      this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", row.agent, host);
+      // `epoch` (the stop's): the newest start it ends; a start sent after it keeps its row.
+      this.brainGone(row.agent, host, row.epoch);
     }
     // The sandbox side of `attach`: SandboxDO hands out no binding for an agent until its slot exists.
     if (row.type === "agent_attach" && row.sandbox && row.epoch !== null && row.agent) {
@@ -1173,8 +1184,8 @@ export class FleetDO extends DurableObject<Env> {
         c.cmd, host, c.type, sandbox, agent, epoch, purpose, JSON.stringify(c), now,
       );
       if (c.type === "agent_start") {
-        this.sql.exec("INSERT INTO host_agents (agent, host, cmd) VALUES (?, ?, ?) ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd",
-          c.agent, host, c.cmd);
+        this.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch) VALUES (?, ?, ?, ?)
+          ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch`, c.agent, host, c.cmd, c.epoch ?? null);
       }
     }
     const msg = this.rel.push(host, (seq) => ({ type: "commands" as const, seq, commands }));
@@ -1285,6 +1296,12 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** A connected, active controller host for captains. */
+  /** An active, connected host other than `exclude` (a brain moving off a host that is going away). */
+  async otherHost(exclude: string): Promise<string | null> {
+    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'active' AND host <> ? ORDER BY role", exclude).toArray();
+    return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
+  }
+
   async controllerHost(): Promise<string | null> {
     const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE role = 'controller' AND status = 'active'").toArray();
     return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
@@ -1520,6 +1537,7 @@ export class FleetDO extends DurableObject<Env> {
         for (const ws of this.ctx.getWebSockets(h.host)) ws.close(4410, "idle: retired");
         console.log(`FleetDO: retiring idle host ${h.host} (${h.instance_id})`);
         await this.evict(h.host, this.leasesOf(h.host).map((l) => l.sandbox));
+        await this.brainsLost(h.host);
       }
     }
     // A draining host whose sandboxes have all left goes now rather than at its deadline.
@@ -1531,6 +1549,7 @@ export class FleetDO extends DurableObject<Env> {
       this.releaseTunnel(h.host, "drained");
       for (const ws of this.ctx.getWebSockets(h.host)) ws.close(4410, "drained");
       console.log(`FleetDO: drained ${h.host} (${h.instance_id})`);
+      await this.brainsLost(h.host);
     }
     await this.processEvictions();
     const ec2 = this.ec2();
@@ -1560,6 +1579,14 @@ export class FleetDO extends DurableObject<Env> {
     const running = leases.filter((l) => l.state !== "suspended");
     if (running.length) {
       await this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
+    }
+    // Its brains move now, where another host can take them; the rest restart once it is dead.
+    for (const { agent } of this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray()) {
+      try {
+        await this.agentStub(agent).onHostDraining(host);
+      } catch (e) {
+        console.error(`FleetDO: moving ${agent} off draining ${host} failed`, e);
+      }
     }
     if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
@@ -1788,8 +1815,11 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Every brain on a host that is gone (its runner killed them when the host lease lapsed): AgentDO
-   * starts each again elsewhere. A brain follows its own host's fate, never its sandbox's.
+   * Every brain on a host that is gone (its runner killed them when the host lease lapsed, or the
+   * instance is being terminated): AgentDO starts each again elsewhere. The one place for this,
+   * called on every transition to dead or expired (STONITH confirmed, a controller expired, drained,
+   * idle-retired, re-enrolled before connecting). A brain follows its own host's fate, never its
+   * sandbox's.
    */
   private async brainsLost(host: string): Promise<void> {
     const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray();

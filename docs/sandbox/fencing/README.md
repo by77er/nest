@@ -11,7 +11,7 @@ SandboxDO issues a new epoch with every [placement claim](../../control-plane/du
 - **Heartbeat** every 5 s.
 - **The host** treats its lease as expired **20 s after it *sent*** the renewal.
 - **The DO** waits **30 s** before treating it as expired. The gap absorbs clock drift, and both sides measure durations, not timestamps.
-- **On local expiry,** nestd freezes the VMs, then stops them so their memory goes back to the host, keeping each disk for the salvage commit, and drops their proxy listeners and netns. The control plane later sends that host `sandbox_destroy` at the fenced epoch once the sandbox lives elsewhere and the disk is clean or the salvage window (11 min) has passed, which reaps the disk and the summary row ([FleetDO](../../control-plane/durable-objects/fleet/)). Sandbox hosts run no brains; a brain host whose lease lapses kills its brains the same way, and AgentDO restarts them elsewhere under a new agent epoch once its own 30 s expiry passes ([runner](../../agents/runner/)). The deadline is also checked on `CLOCK_BOOTTIME`, so a host that was suspended notices the lapse when it wakes.
+- **On local expiry,** nestd freezes the VMs, then stops them so their memory goes back to the host, keeping each disk for the salvage commit, and drops their proxy listeners and netns. The control plane later sends that host `sandbox_destroy` at the fenced epoch once the sandbox lives elsewhere and the disk is clean or the salvage window (11 min) has passed, which reaps the disk and the summary row ([FleetDO](../../control-plane/durable-objects/fleet/)). A sandbox fence never touches brains. In the design sandbox hosts run no brains; a brain host whose lease lapses kills its brains the same way, and AgentDO restarts them elsewhere under a new agent epoch once its own 30 s expiry passes ([runner](../../agents/runner/)). Today brains also run on sandbox hosts; the runner kills them when the host lease lapses, and AgentDO restarts them once FleetDO gives the host up (STONITH confirmed, or the host drained or retired), not at 30 s. The deadline is also checked on `CLOCK_BOOTTIME`, so a host that was suspended notices the lapse when it wakes.
 - **Fencing is authoritative and never waits:**
   - **Immediate:** a `fence` command (or a revoked lease) takes effect when it arrives, not behind slow commands. The command result is still reported in order.
   - **Terminal per epoch:** an in-flight create, resume or suspend that finishes after a fence can't move the sandbox back to `running`. Long operations re-check for a fence after every await.
@@ -28,7 +28,7 @@ Every STONITH records each sandbox's loss explicitly ("work since generation G a
 
 ## 4. External side effects
 
-- Every sandbox event and commit carries `(sandbox, epoch)`, every hands call carries the sandbox epoch inside its binding, and platform tool calls carry the agent epoch; stale ones are rejected.
+- Every sandbox event and commit carries `(sandbox, epoch)`, every hands call carries the sandbox epoch and the agent epoch inside its binding (the gateway refuses an agent epoch below the client's floor), and platform tool calls carry the agent epoch; stale ones are rejected.
 - Brokered actions carry `(agent, epoch, call_id)`, rejected when stale, and use a natural idempotency key for the external effect (e.g. `(repo, head_sha)`).
 - A `PreToolUse` gate blocks, for example, `git push` from a stale sandbox epoch; the runner knows the epoch from its binding.
 - Pushes use `--force-with-lease` (a template convention).

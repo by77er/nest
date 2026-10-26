@@ -342,13 +342,31 @@ pub enum CommandBody {
         agent: AgentId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// The agent's current agent epoch: the gateway's floor for this client from now on, so a
+        /// binding minted for an older brain start is refused (`stale_epoch`). Raised before the
+        /// slot work, even when that fails. Sent again (with the slot unchanged) whenever AgentDO
+        /// starts the agent's brain under a new epoch. Ignored by nestd of the previous release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_epoch: Option<Epoch>,
     },
     /// Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's whole
     /// cgroup first. The gateway then refuses the agent's bindings (`unauthorized`).
     AgentDetach { sandbox: SandboxId, epoch: Epoch, agent: AgentId, #[serde(default)] kill_processes: bool },
-    /// Stop the brain process (end the current turn cleanly if possible).
-    AgentStop { agent: AgentId, reason: String },
-    /// Fence immediately: stop brains bound to these sandboxes, pause VMs, drop listeners/netns.
+    /// Stop the brain process: `graceful` (absent: nestd of the previous release always does so)
+    /// lets the current turn finish; `kill` ends it now (a brain started elsewhere replaces it).
+    /// `epoch`: the newest agent epoch this stop ends on the host; FleetDO's brain index keeps a
+    /// newer start's row. Nestd ignores it.
+    AgentStop {
+        agent: AgentId,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<crate::host::runner::StopMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<Epoch>,
+    },
+    /// Fence immediately: pause these sandboxes' VMs, drop their listeners/netns. Brains are not
+    /// touched: they are fenced by their own host's lease and their agent epoch, and their hands
+    /// by the gateway.
     Fence { sandboxes: Vec<SandboxId>, reason: String },
     /// Spot reclaim or scale-down: commit/suspend everything by `deadline_ms`, then exit.
     Drain { reason: String, deadline_ms: TimestampMs },
@@ -547,6 +565,10 @@ pub enum HostEventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<i32>,
         reason: AgentExitReason,
+        /// The agent epoch the brain ran under (absent from the previous release, or for a brain
+        /// the runner never reported): an exit of an older start than AgentDO's is ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<Epoch>,
     },
 }
 

@@ -47,6 +47,7 @@ fn claims(signer: &Signer) -> BindingClaims {
         client: AGENT.into(),
         scope: BindingScope::Hands,
         exp_ms: now_ms() + 60_000,
+        agent_epoch: None,
     }
 }
 
@@ -607,6 +608,7 @@ fn upsert(guest: &FakeGuest, with_guest: bool) -> GatewayCommand {
         vsock_uds_path: guest.path.to_string_lossy().into_owned(),
         clients: vec![AGENT.into()],
         guest: with_guest.then(guest_v1),
+        client_floors: Default::default(),
     }
 }
 
@@ -637,7 +639,7 @@ async fn the_link_resyncs_on_hello_drops_what_nestd_did_not_resend_and_answers_p
     write_cmd(&mut s, &GatewayCommand::KeyUpdate { keys: vec![key_of(&signer)] }).await;
     write_cmd(&mut s, &upsert(&guest, true)).await;
     // A second sandbox that the next resync will not re-send.
-    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: SandboxId("sbx_second".into()), epoch: Epoch(1), vsock_uds_path: "/x".into(), clients: vec![], guest: None }).await;
+    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: SandboxId("sbx_second".into()), epoch: Epoch(1), vsock_uds_path: "/x".into(), clients: vec![], guest: None, client_floors: Default::default() }).await;
     write_cmd(&mut s, &GatewayCommand::ResyncDone).await;
     wait_until("resync done", || !state.resyncing() && state.sandbox_count() == 2).await;
     assert_eq!(state.key(&signer.kid()), Some(signer.public_key()));
@@ -693,7 +695,7 @@ async fn the_link_resyncs_on_hello_drops_what_nestd_did_not_resend_and_answers_p
     assert_eq!(state.sandbox_count(), 1, "the sandbox nestd did not re-send is gone");
     let mut ws = bound_ws(&addr, &signer).await;
     // An epoch bump from nestd cuts the open connection and refuses the old binding as stale.
-    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: sbx(), epoch: Epoch(5), vsock_uds_path: guest.path.to_string_lossy().into_owned(), clients: vec![AGENT.into()], guest: Some(guest_v1()) }).await;
+    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: sbx(), epoch: Epoch(5), vsock_uds_path: guest.path.to_string_lossy().into_owned(), clients: vec![AGENT.into()], guest: Some(guest_v1()), client_floors: Default::default() }).await;
     assert_eq!(close_code(&mut ws).await, Some(close_code::MOVED));
     let mut ws = connect(&addr, "/hands").await;
     assert_eq!(refusal(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await.0, error_code::STALE_EPOCH);
@@ -702,4 +704,65 @@ async fn the_link_resyncs_on_hello_drops_what_nestd_did_not_resend_and_answers_p
     wait_until("removed", || state.sandbox_count() == 0).await;
     let mut ws = connect(&addr, "/hands").await;
     assert_eq!(refusal(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await.0, error_code::MOVED);
+}
+
+// --- agent-epoch floors --------------------------------------------------------------------------
+
+/// A binding for agent epoch `e` (or without the claim, as the previous release minted them).
+fn token_for(signer: &Signer, agent_epoch: Option<u64>) -> String {
+    signer.sign(&BindingClaims { agent_epoch: agent_epoch.map(Epoch), ..claims(signer) })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_below_the_clients_floor_is_stale_and_a_raised_floor_cuts_open_calls() {
+    let signer = Signer::generate();
+    let guest = FakeGuest::start().await;
+    let state = ready_state(&signer, &guest);
+    let addr = start_server(state.clone()).await;
+    // No floor yet: any agent epoch, or none, is admitted (the previous release's bindings).
+    let mut old = connect(&addr, "/hands").await;
+    assert!(matches!(bind(&mut old, &token_for(&signer, Some(2)), 1, PROTOCOL_VERSION).await, GatewayMessage::Bound { .. }));
+    let mut legacy = connect(&addr, "/hands").await;
+    assert!(matches!(bind(&mut legacy, &token_for(&signer, None), 1, PROTOCOL_VERSION).await, GatewayMessage::Bound { .. }));
+
+    // AgentDO started the brain again under epoch 3: the floor goes up, open calls below it end.
+    state.raise_floors(&sbx(), [(AGENT.to_string(), Epoch(3))]);
+    assert_eq!(close_code(&mut old).await, Some(close_code::MOVED));
+    assert_eq!(close_code(&mut legacy).await, Some(close_code::MOVED));
+    // New binds below it are refused; at or above it they are admitted.
+    let mut ws = connect(&addr, "/hands").await;
+    assert_eq!(refusal(&mut ws, &token_for(&signer, Some(2)), 1, PROTOCOL_VERSION).await.0, error_code::STALE_EPOCH);
+    let mut ws = connect(&addr, "/hands").await;
+    assert_eq!(refusal(&mut ws, &token_for(&signer, None), 1, PROTOCOL_VERSION).await.0, error_code::STALE_EPOCH);
+    let mut cur = connect(&addr, "/hands").await;
+    assert!(matches!(bind(&mut cur, &token_for(&signer, Some(3)), 1, PROTOCOL_VERSION).await, GatewayMessage::Bound { .. }));
+    // A lower floor (a late, older attach) changes nothing; the current brain's call stays.
+    state.raise_floors(&sbx(), [(AGENT.to_string(), Epoch(1))]);
+    assert_eq!(state.floor(&sbx(), AGENT), Epoch(3));
+    wait_until("only the current call is open", || state.open_connections() == 1).await;
+    // The floor goes with the sandbox.
+    state.remove_sandbox(&sbx());
+    assert_eq!(state.floor(&sbx(), AGENT), Epoch(0));
+}
+
+#[tokio::test]
+async fn nestd_upserts_carry_the_floors() {
+    let signer = Signer::generate();
+    let guest = FakeGuest::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("gateway.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let state = State::new();
+    tokio::spawn(nest_gateway::link(sock.clone(), "127.0.0.1:0".into(), state.clone()));
+    let (mut s, _) = listener.accept().await.unwrap();
+    let _hello = read_event(&mut s).await;
+    write_cmd(&mut s, &GatewayCommand::HelloAck { protocol_version: nest_protocol::host::PROTOCOL_VERSION, host_id: nest_protocol::model::HostId("hst_1".into()) }).await;
+    write_cmd(&mut s, &GatewayCommand::KeyUpdate { keys: vec![key_of(&signer)] }).await;
+    let mut up = upsert(&guest, true);
+    if let GatewayCommand::SandboxUpsert { client_floors, .. } = &mut up {
+        client_floors.insert(AGENT.to_string(), Epoch(5));
+    }
+    write_cmd(&mut s, &up).await;
+    write_cmd(&mut s, &GatewayCommand::ResyncDone).await;
+    wait_until("the floor arrived", || state.floor(&sbx(), AGENT) == Epoch(5)).await;
 }

@@ -97,7 +97,8 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
     // Registered before the guest is touched, atomically with a re-check of the sandbox and
     // epoch: a removal, epoch bump or link loss since the bind check is refused here, and one
     // during the vsock connect cuts the connect below.
-    let Some(mut guard) = state.register_conn(sandbox.clone(), accepted.claims.epoch) else {
+    let agent_epoch = accepted.claims.agent_epoch.unwrap_or(nest_protocol::model::Epoch(0));
+    let Some(mut guard) = state.register_client_conn(sandbox.clone(), accepted.claims.epoch, &client, agent_epoch) else {
         refuse(&mut ws, &Refusal::moved("the sandbox left this host")).await;
         return Ok(());
     };

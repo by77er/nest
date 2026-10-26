@@ -187,6 +187,9 @@ export const LaunchConfig = z.object({
 });
 export type LaunchConfig = z.output<typeof LaunchConfig>;
 
+/** How a brain stops (`host::runner::StopMode`). */
+export const StopMode = z.enum(["graceful", "kill"]);
+
 const AgentStartFields = {
   agent: AgentId,
   role: AgentRole,
@@ -221,9 +224,14 @@ export const CommandBodyVariants = [
   z.object({ type: z.literal("commit_result"), request: RequestId, sandbox: SandboxId, outcome: CommitOutcome }),
   z.object({ type: z.literal("guest_cli_result"), request: RequestId, result: CliResult }),
   z.object({ type: z.literal("agent_start"), ...AgentStartFields }),
-  z.object({ type: z.literal("agent_attach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, cwd: z.string().optional() }),
+  /** `agent_epoch`: the agent's current agent epoch, the gateway's floor for this client from now on. */
+  z.object({
+    type: z.literal("agent_attach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, cwd: z.string().optional(),
+    agent_epoch: Epoch.optional(),
+  }),
   z.object({ type: z.literal("agent_detach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, kill_processes: z.boolean().default(false) }),
-  z.object({ type: z.literal("agent_stop"), agent: AgentId, reason: z.string() }),
+  /** `mode`: absent = graceful (all the previous release's nestd does); `epoch`: the newest agent epoch this stop ends there. */
+  z.object({ type: z.literal("agent_stop"), agent: AgentId, reason: z.string(), mode: StopMode.optional(), epoch: Epoch.optional() }),
   z.object({ type: z.literal("fence"), sandboxes: z.array(SandboxId), reason: z.string() }),
   z.object({ type: z.literal("drain"), reason: z.string(), deadline_ms: TimestampMs }),
 ] as const;
@@ -299,7 +307,7 @@ export const HostEventVariants = [
   z.object({ ...hostEventBase, type: z.literal("spot_notice"), deadline_ms: TimestampMs }),
   z.object({
     ...hostEventBase, type: z.literal("agent_exited"), agent: AgentId, exit_code: z.number().int().optional(),
-    signal: z.number().int().optional(), reason: AgentExitReason,
+    signal: z.number().int().optional(), reason: AgentExitReason, epoch: Epoch.optional(),
   }),
   z.object({
     ...hostEventBase, type: z.literal("guest_cli"), request: RequestId, sandbox: SandboxId, epoch: Epoch,

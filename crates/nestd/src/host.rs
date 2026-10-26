@@ -472,7 +472,7 @@ impl Inner {
     /// that have work with a current `agent_start`.
     fn brains_exited(&self, gone: impl IntoIterator<Item = (AgentId, ExitReason)>) {
         for (agent, reason) in gone {
-            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: reason.into() });
+            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: reason.into(), epoch: None });
         }
     }
 
@@ -603,7 +603,7 @@ impl Inner {
                         // (a no-op) in order so the result is still acked in sequence.
                         CommandBody::Fence { sandboxes, reason } => {
                             for s in sandboxes {
-                                self.fence_sandbox(s, reason, true, true).await;
+                                self.fence_sandbox(s, reason, true).await;
                             }
                         }
                         _ => {}
@@ -620,7 +620,7 @@ impl Inner {
                 for c in claims {
                     let current = self.summary.lock().expect("summary").get(&c.sandbox).map(|s| s.epoch);
                     if current == Some(c.epoch) {
-                        self.fence_sandbox(&c.sandbox, "lease revoked by control plane", true, true).await;
+                        self.fence_sandbox(&c.sandbox, "lease revoked by control plane", true).await;
                     }
                 }
             }
@@ -712,10 +712,10 @@ impl Inner {
     async fn on_runner_notice(self: &Arc<Self>, n: RunnerNotice) {
         match n {
             // The runner link already updated its brain table (and dropped stale events).
-            RunnerNotice::Event(RunnerEvent::AgentExited { agent, code, signal, reason }) => {
+            RunnerNotice::Event(RunnerEvent::AgentExited { agent, code, signal, reason, epoch }) => {
                 // The guest slot stays: it belongs to the attachment (SandboxDO's `agent_detach`
                 // ends it), not to the brain process, so a restarted brain finds its tasks.
-                self.emit(HostEventBody::AgentExited { agent, exit_code: code, signal, reason: reason.into() });
+                self.emit(HostEventBody::AgentExited { agent, exit_code: code, signal, reason: reason.into(), epoch });
             }
             RunnerNotice::Event(RunnerEvent::AgentStarted { agent, pid, session, .. }) => {
                 tracing::info!(%agent, pid, %session, "brain started");
@@ -896,15 +896,16 @@ impl Inner {
         let unsent = self.runner.fence(vec![], "host lease expired");
         self.brains_exited(unsent.into_iter().map(|a| (a, ExitReason::Fenced)));
         for id in ids {
-            self.fence_sandbox(&id, "host lease expired", true, false).await;
+            self.fence_sandbox(&id, "host lease expired", true).await;
         }
     }
 
     /// Fence one sandbox. Immediately and without the sandbox lock: mark it `Fenced` (terminal for
-    /// the epoch), fence its brains (unless the caller already fenced all of them), drop its egress
-    /// (the proxy link never blocks), and freeze its vCPUs through the lock-free pauser. Then,
-    /// under the lock: close the guest connection, pause, drop the netns, and offer salvage.
-    async fn fence_sandbox(self: &Arc<Self>, id: &SandboxId, reason: &str, salvage: bool, fence_brains: bool) {
+    /// the epoch), drop its egress (the proxy link never blocks), and freeze its vCPUs through the
+    /// lock-free pauser. Then, under the lock: close the guest connection, pause, drop the netns,
+    /// and offer salvage. Brains are never fenced with their sandbox: a brain survives its sandbox
+    /// moving; brains are fenced by their own host's lease and agent epoch, hands by the gateway.
+    async fn fence_sandbox(self: &Arc<Self>, id: &SandboxId, reason: &str, salvage: bool) {
         let (epoch, dirty) = {
             let mut summary = self.summary.lock().expect("summary");
             let Some(s) = summary.get_mut(id) else { return };
@@ -914,10 +915,6 @@ impl Inner {
             s.state = SandboxState::Fenced;
             (s.epoch, s.dirty)
         };
-        if fence_brains {
-            let unsent = self.runner.fence_sandbox(id, reason);
-            self.brains_exited(unsent.into_iter().map(|a| (a, ExitReason::Fenced)));
-        }
         if let Some(pauser) = self.pausers.lock().expect("pausers").get(id).cloned() {
             tokio::spawn(async move {
                 if let Err(e) = pauser.pause().await {
@@ -1134,16 +1131,23 @@ impl Inner {
             // Resolved on receipt (see `on_fleet_notice`).
             CommandBody::CommitResult { .. } | CommandBody::GuestCliResult { .. } => Ok(None),
             CommandBody::AgentStart(start) => self.agent_start(start).await,
-            CommandBody::AgentAttach { sandbox, epoch, agent, cwd } => self.agent_attach(&sandbox, epoch, &agent, cwd).await,
+            CommandBody::AgentAttach { sandbox, epoch, agent, cwd, agent_epoch } => {
+                // The floor goes to the gateway first, whatever the slot work answers: a superseded
+                // brain's bindings are refused from here on.
+                if let Some(e) = agent_epoch {
+                    self.gateway.raise_floor(&sandbox, epoch, &agent.0, e);
+                }
+                self.agent_attach(&sandbox, epoch, &agent, cwd).await
+            }
             CommandBody::AgentDetach { sandbox, epoch, agent, kill_processes } => self.agent_detach(&sandbox, epoch, &agent, kill_processes).await,
-            CommandBody::AgentStop { agent, reason } => {
-                self.runner.agent_stop(&agent, StopMode::Graceful, &reason);
+            CommandBody::AgentStop { agent, reason, mode, .. } => {
+                self.runner.agent_stop(&agent, mode.unwrap_or(StopMode::Graceful), &reason);
                 Ok(None)
             }
             // Already applied on arrival (`on_fleet_notice`); this is the in-order no-op.
             CommandBody::Fence { sandboxes, reason } => {
                 for s in sandboxes {
-                    self.fence_sandbox(&s, &reason, true, true).await;
+                    self.fence_sandbox(&s, &reason, true).await;
                 }
                 Ok(None)
             }
@@ -1176,7 +1180,7 @@ impl Inner {
             }
             // An older local incarnation. Its lease has moved on: fence it, and salvage its
             // uncommitted work before the new epoch reuses the sandbox's disk.
-            self.fence_sandbox(&sandbox, "superseded by a newer epoch", false, true).await;
+            self.fence_sandbox(&sandbox, "superseded by a newer epoch", false).await;
             let dirty = self.summary.lock().expect("summary").get(&sandbox).is_some_and(|x| x.dirty);
             if dirty
                 && let Some(entry) = self.sandbox(&sandbox)
@@ -1909,7 +1913,7 @@ impl Inner {
                     let this = self.clone();
                     let id = id.clone();
                     // Fence; the uncommitted work is offered as salvage (a sibling branch).
-                    spawn_boxed(async move { this.fence_sandbox(&id, "commit rejected", true, true).await });
+                    spawn_boxed(async move { this.fence_sandbox(&id, "commit rejected", true).await });
                 }
                 Err(error(&why, format!("commit rejected: {why}"), false))
             }

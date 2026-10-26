@@ -225,6 +225,7 @@ pub mod gateway {
                 client: client.into(),
                 scope: BindingScope::Hands,
                 exp_ms,
+                agent_epoch: None,
             };
             HandsTarget {
                 url: self.url.clone(),

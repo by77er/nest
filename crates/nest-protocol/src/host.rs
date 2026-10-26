@@ -451,6 +451,9 @@ pub mod runner {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             signal: Option<i32>,
             reason: ExitReason,
+            /// The agent epoch the brain ran under (its last adopted one).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            epoch: Option<Epoch>,
         },
         Pong { nonce: u64, agents: u32 },
         Error {
@@ -546,6 +549,11 @@ pub mod gateway_link {
             clients: Vec<String>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             guest: Option<GuestInfo>,
+            /// Per client, the lowest agent epoch a binding may carry (`BindingClaims.agent_epoch`,
+            /// absent counting as 0): raised by `agent_attach.agent_epoch`, never lowered while
+            /// the sandbox stays. A raise cuts that client's open connections below it.
+            #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+            client_floors: std::collections::BTreeMap<String, Epoch>,
         },
         /// The sandbox left this host (destroyed, evicted, fenced): open connections close with
         /// `close_code::MOVED` and bindings get `moved`.

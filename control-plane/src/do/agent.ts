@@ -155,6 +155,10 @@ interface Attachment {
 }
 
 type DispatchResult = ToolOutcome | "wait";
+/** What `start()` did: the host, and the `agent_start` command (`null`: the brain already runs there). */
+export type StartResult = { host: string; cmd: string | null };
+/** What AgentDO sends: `epoch` is required here, optional on the wire only for the previous release's commands. */
+type AgentStartBody = Omit<AgentStart, "type" | "epoch"> & { epoch: number };
 
 export interface TranscriptPage {
   lines: string[];
@@ -174,8 +178,8 @@ export class AgentDO extends DurableObject<Env> {
   private readonly inbound = new SerialQueue();
   /** A `wake()` is starting a brain (its awaits open the input gate). */
   private waking = false;
-  /** A `start()` is in progress: a wake meanwhile (e.g. from the placement it triggers) waits for it. */
-  private launching = false;
+  /** The `start()` in flight: concurrent starts (a wake, the restart alarm, an operator) share it. */
+  private inflightStart: Promise<StartResult> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -378,22 +382,28 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * Send `agent_start` to the host that should run this brain (placed today on its sandbox's host
-   * when it starts; it doesn't follow the sandbox afterwards), under a new agent epoch. AgentDO is
-   * the one authority for (brain host, start command, agent epoch): a brain started somewhere new
-   * is first stopped where it ran, and its old session is fenced. A live brain already on that host
-   * is left alone (`cmd: null`). The setup token travels as a BrokerDO reference, resolved by
-   * FleetDO when it sends.
+   * when it starts, never on `avoid`; it doesn't follow the sandbox afterwards), under a new agent
+   * epoch. AgentDO is the one authority for (brain host, start command, agent epoch):
+   * - single-flight: a start while one is in flight gets that one's result;
+   * - before anything is issued, the sandbox raises the agent's floor at its gateway, so an older
+   *   brain's cached binding is refused from then on, even before the new brain calls;
+   * - a brain started somewhere new is first killed where it ran (`agent_stop{mode: kill}`), and its
+   *   old session is fenced.
+   * A live brain already on that host is left alone (`cmd: null`). The setup token travels as a
+   * BrokerDO reference, resolved by FleetDO when it sends.
    */
-  async start(hostHint?: string): Promise<{ host: string; cmd: string | null }> {
-    this.launching = true;
+  async start(hostHint?: string, avoid?: string): Promise<StartResult> {
+    if (this.inflightStart) return this.inflightStart;
+    const p = this.startBrain(hostHint, avoid);
+    this.inflightStart = p;
     try {
-      return await this.startBrain(hostHint);
+      return await p;
     } finally {
-      this.launching = false;
+      if (this.inflightStart === p) this.inflightStart = null;
     }
   }
 
-  private async startBrain(hostHint?: string): Promise<{ host: string; cmd: string | null }> {
+  private async startBrain(hostHint?: string, avoid?: string): Promise<StartResult> {
     const info = this.load();
     let host: string | null;
     if (hostHint) {
@@ -404,14 +414,19 @@ export class AgentDO extends DurableObject<Env> {
         throw new NestError(ErrorCodes.FORBIDDEN, `${hostHint} is not an active, connected host in ${info.cell}`, 409);
       }
       if (info.role === "worker" && info.hands) await this.sandboxStub(info.hands.sandbox).wake();
-    }
-    if (info.role === "worker") {
+      host = hostHint;
+    } else if (avoid) {
+      // Moving off a host that is going away: any other active, connected host (the sandbox, which
+      // is leaving that host too, is not woken there).
+      host = info.role === "worker" ? await this.fleet(info.cell).otherHost(avoid) : await this.fleet(info.cell).controllerHost();
+      if (host === avoid) host = null;
+    } else if (info.role === "worker") {
       if (!info.hands) throw new NestError(ErrorCodes.NOT_BOUND, "worker has no hands binding", 409);
       // Lazy start: a suspended sandbox resumes, an unplaced one is placed (maybe on a new host).
-      // Without a host yet this fails retryably; the placement then moves the agent onto it.
-      host = hostHint ?? (await this.sandboxStub(info.hands.sandbox).wake()).host;
+      // Without a host yet this fails retryably; the placement then wakes the agent.
+      host = (await this.sandboxStub(info.hands.sandbox).wake()).host;
     } else {
-      host = hostHint ?? (await this.fleet(info.cell).controllerHost());
+      host = await this.fleet(info.cell).controllerHost();
     }
     if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no host available for this agent", 503, true);
     // Already running there (e.g. an operator's start of a live agent): a second agent_start would
@@ -421,13 +436,15 @@ export class AgentDO extends DurableObject<Env> {
     // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
     // resume from up to a flush interval ago.
     await this.flush();
-    const fresh = this.load();
-    const resume = fresh.session ? await this.sessionResume(fresh) : undefined;
-    // Stop the brain where it ran before starting it elsewhere, and fence its session. Nothing
+    const resume = this.load().session ? await this.sessionResume(this.load()) : undefined;
+    // Kill the brain where it ran before starting it elsewhere. Read fresh, right before: nothing
     // changes here if the stop can't be queued, so the next attempt still knows the old host.
-    const moving = fresh.host !== null && fresh.host !== host;
+    const prev = this.load();
+    const moving = prev.host !== null && prev.host !== host;
     if (moving) {
-      await this.fleet(info.cell).issueCommands(fresh.host!, [{ type: "agent_stop", agent: fresh.agent, reason: `starting on ${host}` }]);
+      await this.fleet(info.cell).issueCommands(prev.host!, [{
+        type: "agent_stop", agent: prev.agent, reason: `starting on ${host}`, mode: "kill", epoch: prev.agent_epoch,
+      }]);
     }
     const started = this.update((i) => {
       i.agent_epoch += 1;
@@ -441,24 +458,26 @@ export class AgentDO extends DurableObject<Env> {
         ws.close(4409, "the brain is starting on another host");
       }
     }
-    // On the same host, an exiting brain's open session may still be flushing its last bytes and
-    // events; the new brain's hello supersedes it (its reconnects present the old epoch: stale).
-    const body: Omit<AgentStart, "type"> = {
-      agent: fresh.agent,
-      role: fresh.role,
-      workstream: fresh.workstream,
+    // Any other session (an exiting brain on this host still flushing) is of an older epoch now:
+    // `current()` refuses what it sends, and the new brain's hello supersedes it.
+    const body: AgentStartBody = {
+      agent: started.agent,
+      role: started.role,
+      workstream: started.workstream,
       epoch,
       ...(resume ? { resume } : {}),
       // `hands.epoch`: the same agent epoch again, for runners of the previous release (one release).
-      ...(fresh.hands ? { hands: { sandbox: fresh.hands.sandbox, epoch } } : {}),
-      launch: fresh.launch,
+      ...(started.hands ? { hands: { sandbox: started.hands.sandbox, epoch } } : {}),
+      launch: started.launch,
       oauth_token: oauthRef,
-      session_ws_url: `${this.env.PUBLIC_BASE_URL.replace(/^http/, "ws")}/v1/agents/${fresh.agent}/session`,
+      session_ws_url: `${this.env.PUBLIC_BASE_URL.replace(/^http/, "ws")}/v1/agents/${started.agent}/session`,
     };
     // `starting` never outlives this deadline without a hello (see the `starting` alarm).
     await this.deadlines.set("starting", Date.now() + START_DEADLINE_MS);
     let cmd: string | undefined;
     try {
+      // Hands first: the gateway refuses the older brains' bindings before the new brain exists.
+      if (started.hands) await this.sandboxStub(started.hands.sandbox).fenceClient(started.agent, epoch);
       [cmd] = await this.fleet(info.cell).issueCommands(host, [{ type: "agent_start", ...body }]);
     } catch (e) {
       // Nothing was queued: don't leave the agent `starting` with nothing on the way.
@@ -471,9 +490,23 @@ export class AgentDO extends DurableObject<Env> {
     return { host, cmd: cmd! };
   }
 
+  /** Stop the brain (an operator's request): it finishes its turn. */
   async stop(reason: string): Promise<void> {
     const info = this.load();
-    if (info.host) await this.fleet(info.cell).issueCommands(info.host, [{ type: "agent_stop", agent: info.agent, reason }]);
+    if (info.host) {
+      await this.fleet(info.cell).issueCommands(info.host, [{ type: "agent_stop", agent: info.agent, reason, mode: "graceful", epoch: info.agent_epoch }]);
+    }
+  }
+
+  /** The host running this brain is going away (a spot drain): start it elsewhere now, if any host can take it. */
+  async onHostDraining(host: string): Promise<void> {
+    if (!this.exists() || this.load().host !== host) return;
+    try {
+      await this.start(undefined, host);
+    } catch (e) {
+      // No other host now: it restarts when its host is given up on (`onHostLost`).
+      console.warn(`agent ${this.load().agent}: moving off draining ${host} failed`, e);
+    }
   }
 
   /** `agent_start` failed on `host`: retry a few times when retryable, otherwise give up. */
@@ -495,12 +528,19 @@ export class AgentDO extends DurableObject<Env> {
     console.warn(`agent ${info.agent}: start failed: ${error.code} ${error.message}`);
   }
 
-  /** The brain on `host` exited. Reports from any other host are ignored (e.g. after a move). */
-  async onExited(host: string, reason: AgentExitReason): Promise<void> {
+  /**
+   * The brain on `host` exited. Reports from any other host, or of an older start than the current
+   * one (`epoch`, absent from hosts of the previous release), are ignored. The brain is gone, so
+   * the agent no longer has a host: a later start sends no `agent_stop` to it.
+   */
+  async onExited(host: string, reason: AgentExitReason, epoch?: number): Promise<void> {
     if (!this.exists()) return;
-    if (this.load().host !== host) return;
+    const before = this.load();
+    if (before.host !== host) return;
+    if (epoch !== undefined && epoch < before.agent_epoch) return;
     const info = this.update((i) => {
       i.state = "detached";
+      if (epoch !== undefined) i.host = null;
     });
     await this.syncActivity();
     console.log(`agent ${info.agent}: brain exited (${reason})`);
@@ -536,7 +576,7 @@ export class AgentDO extends DurableObject<Env> {
    * alarm. `afterExit` counts towards the crash-loop guard; new input always gets a fresh try.
    */
   private async wake(afterExit = false): Promise<void> {
-    if (this.waking || this.launching) return;
+    if (this.waking || this.inflightStart) return;
     const info = this.load();
     if (!WAKE_STATES.includes(info.state) || this.socket()) return;
     const queued = this.sql.exec("SELECT 1 FROM turns WHERE status = 'queued' LIMIT 1").toArray().length > 0;
@@ -610,7 +650,7 @@ export class AgentDO extends DurableObject<Env> {
       console.warn(`agent ${info.agent}: waking ${info.hands.sandbox} for hands failed`, e);
     }
     try {
-      const hands = await stub.resolve(info.agent);
+      const hands = await stub.resolve(info.agent, info.agent_epoch);
       return handsResolved(request, { status: "ok", hands });
     } catch (e) {
       const ne = asNestError(e);
@@ -747,12 +787,12 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
-  /** The live, non-stale session socket of the current runner process, if any. */
+  /** The live, non-stale session socket of the current runner process at the current agent epoch, if any. */
   private socket(): WebSocket | undefined {
-    const instance = this.load().runner_instance;
+    const info = this.load();
     return this.ctx.getWebSockets("session").find((ws) => {
       const a = ws.deserializeAttachment() as Attachment;
-      return a.helloed && !a.stale && a.instance === instance;
+      return a.helloed && !a.stale && a.instance === info.runner_instance && this.currentEpoch(info, a.epoch);
     });
   }
 
@@ -763,9 +803,14 @@ export class AgentDO extends DurableObject<Env> {
     if (ws) this.send(ws, msg);
   }
 
-  /** A message from a socket that isn't the current runner process is ignored. */
+  /**
+   * A message from a socket that isn't the current runner process at the current agent epoch is
+   * ignored: once a start issued a newer epoch, the older brain's session gets nothing (no tool call
+   * runs, no event applies, no binding) even before the new brain's hello supersedes it.
+   */
   private current(att: Attachment): boolean {
-    return !att.stale && att.instance === this.load().runner_instance;
+    const info = this.load();
+    return !att.stale && att.instance === info.runner_instance && this.currentEpoch(info, att.epoch);
   }
 
   private async onHello(ws: WebSocket, att: Attachment, hello: Extract<RunnerToAgent, { type: "hello" }>): Promise<void> {
@@ -1059,6 +1104,8 @@ export class AgentDO extends DurableObject<Env> {
 
   private async applyEvent(ev: AgentEvent, sessionEpoch: number): Promise<void> {
     const before = this.load();
+    // Redundant with `current()` (the session's epoch is the current one), kept as a cheap guard
+    // against a runner that stamps an event with another epoch than its session's.
     if (ev.agent !== before.agent || ev.epoch !== sessionEpoch) return;
     // The event is recorded as seen only after its side effects succeeded: if one throws, the batch
     // isn't acked and the resend runs them again. Each is safe to repeat: the state change, the keyed

@@ -228,6 +228,8 @@ describe("platform tool relay", () => {
     const s = await setup({ captain: true });
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     ws.send(seg(0, "line one\nline two\n"));
+    // The segment is processed in order on the socket; flush only once it has arrived.
+    for (let i = 0; i < 100 && (await agentStub(s.agent).info()).received_bytes < 18; i++) await sleep(10);
     await agentStub(s.agent).flush();
 
     ws.send(toolCall("cal_t4-1", "emit", { event: "pr_opened", summary: "dark mode", url: "https://github.com/x/y/pull/1" }));
