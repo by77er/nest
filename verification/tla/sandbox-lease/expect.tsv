@@ -1,0 +1,27 @@
+# SandboxLease: <spec> <config> <expected> <tier>
+# expected: holds | violates:<Name>. TLC v1.7.4 prints "Temporal properties were violated."
+# without the name; each liveness config checks exactly one property, named here.
+# ci: under 3 min with 8 workers (measured with v1.7.4). full: did not finish in the pilot.
+#
+# Bugs on main (each a counterexample)
+SandboxLease.tla MCB1.cfg violates:SalvageNeverDropped ci
+SandboxLease.tla MCBB1.cfg violates:SalvageNeverDropped ci
+SandboxLease.tla MCB2.cfg violates:DestroyIsTerminal ci
+SandboxLease.tla MCDoubleRun.cfg violates:NoDoubleRun ci
+SandboxLease.tla MCEpochMonotone.cfg violates:EpochMonotone ci
+SandboxLease.tla MCL1.cfg violates:HostTruthful ci
+SandboxLease.tla MCL2.cfg violates:Placed ci
+SandboxLease.tla MCLiveDelayedRpc.cfg violates:Placed ci
+# Mutations (teeth)
+SandboxLease.tla MCMutFgeE.cfg violates:NoDoubleRun ci
+SandboxLease.tla MCMutNoStonith.cfg violates:StonithBeforeReassign ci
+SandboxLease.tla MCMutNoEpochCheck.cfg violates:SingleWriter ci
+SandboxLease.tla MCMutHistory.cfg violates:SalvageNeverDropped ci
+# With the fixes modelled
+SandboxLease.tla MCFixedS2.cfg holds ci
+SandboxLease.tla MCFixedS1.cfg holds full
+SandboxLease.tla MCFixedS3.cfg holds full
+SandboxLease.tla MCFixedS4.cfg holds full
+SandboxLease.tla MCFixedS5.cfg holds full
+SandboxLease.tla MCDoubleRunNoShutting.cfg holds full
+SandboxLease.tla MCLive.cfg holds full

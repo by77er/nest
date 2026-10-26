@@ -45,6 +45,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `deploy/` | Cells as an inframe stack (OpenTofu): network, bucket, IAM, the host-image pipeline; the sandbox-host install and bootstrap |
 | `images/` | The Firecracker guest image (kernel and `nest-base` rootfs) and its EC2 builder |
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
+| `verification/` | Formal models and proofs of the protocols (TLA+, Lean, Stateright) and their runner ([verification](verification/)) |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
 
 UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`); memory snapshots are deferred by decision until cold boot proves too slow ([memory](sandbox/state/memory/)).
@@ -74,10 +75,11 @@ sandbox         drivers · state · fencing · networking · gateway · guest ag
 compute         cells · sandbox hosts · brain hosts · nestd · autoscaling · provisioning  compute/
 control plane   Cloudflare Workers + Durable Objects · API · activator                 control-plane/
 cross-cutting   security (authority, model access, identity, credentials) · data      security/  data/
+                verification (state-machine inventory, models, proofs)                verification/
 contracts       boundary interfaces (wire protocols, the gateway contract, tool schemas) interfaces/
 ```
 
-See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [interfaces/](interfaces/) and [setup/](setup/).
+See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [verification/](verification/), [interfaces/](interfaces/) and [setup/](setup/).
 
 ## Glossary
 
@@ -214,6 +216,9 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Measure:** the edge round trip a hands call pays over the tunnel, in the remote-brain arm of the fidelity eval (spike item 10). A VPC endpoint for same-cell brain hosts waits on this number. See [sandbox/gateway/](sandbox/gateway/).
 - **Measure:** a worker's wall time inside hands calls per turn, before `api-loop` ships: a Durable Object is billed while an outbound WebSocket is open. See [agents/backends/api-loop/](agents/backends/api-loop/).
 - **Access in front of the gateway hostnames is in place** (2026-10-24): the application on `*-gw-nest.bitcru.sh` answers 403 without the service token and admits it with a Service Auth policy (an Allow policy redirects a service token to the login page, which is what the first cross-host run hit). Every brain now depends on the token the control plane hands out as `edge`.
+- **Open:** the long-run spec language for protocol models: TLA+ with TLC (what the pilots used, and found bugs with) or Quint (the survey's pick, for model-based testing). See [verification/](verification/#open-questions).
+- **Decide:** the no-capacity placement rollback reuses an epoch number, contrary to "an epoch is never retried", and makes the old holder's salvage fail for good. Keep it and authorize that salvage, or spend an epoch per attempt? See [verification/sandbox-lease/](verification/sandbox-lease/).
+- **Docs ahead of code (found by the verification study):** hands-call journaling (`call_status`, `executed: false`) and the single `isRestoreSource` predicate are settled here but not built, and nestd's command receiver has no gap check. See [verification/](verification/#real-bugs-found).
 
 ## First spike
 

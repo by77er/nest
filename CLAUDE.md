@@ -26,6 +26,7 @@ docs/
   security/        model access, identity (credential injection, OIDC), credentials inventory
   data/            what lives in DO SQLite, R2 and S3
   interfaces/      boundary contracts (wire protocols, the gateway contract, tool schemas); fixtures in protocol/fixtures/ are the source of truth
+  verification/    the state machines worth modelling, the methods evaluation, pilots (specs in verification/ at the root), roadmap
   setup/           everything needed to bring nest up: accounts, credentials, where they go, what each unlocks
 ```
 
