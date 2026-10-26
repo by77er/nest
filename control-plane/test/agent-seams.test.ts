@@ -12,6 +12,8 @@ import { adminJson, connectHost, hostHello, nextCommands, okResult, sendEvents, 
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
+const isStartOf = (agent: string) => (c: any) => c.type === "agent_start" && c.agent === agent;
+const isKillOf = (agent: string) => (c: any) => c.type === "agent_stop" && c.agent === agent && c.mode === "kill";
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const wsStub = (id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
 
@@ -252,41 +254,63 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     expect(start).toMatchObject({ epoch: 8, hands: { sandbox: s.sandbox, epoch: 8 } });
   });
 
-  it("old stored state (the agent-epoch branch): `host`, `awaiting_exit`, `pending_start` and `stop_requested` become the brain record and intent", async () => {
+  it("main (M1/D13): a detached agent that kept its host is condemned, migrated once with its alarm; its kill and escalation release it", async () => {
     const s = await setup();
-    const b = await connectHost(s.cell);
+    await okResult(s.host.ws, s.start.cmd);
+    // As main stored it after an idle exit: `host` kept, detached; main's FleetDO had dropped the row.
+    await editAgent(s.agent, (i) => {
+      delete i.brain;
+      delete i.intent;
+      delete i.agent_epoch;
+      i.hands = { sandbox: s.sandbox, epoch: 1 };
+      i.host = s.host.host;
+      i.state = "detached";
+    });
+    await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
+      st.storage.sql.exec("DELETE FROM host_agents WHERE agent = ?", s.agent);
+    });
+    const first = (await agentStub(s.agent).info()).brain;
+    expect(first).toMatchObject({ host: s.host.host, epoch: 1, phase: "condemned" });
+    expect(await deadlineAt(s.agent, "condemned")).not.toBeNull();
+    expect((await agentStub(s.agent).info()).brain).toEqual(first); // persisted once, not re-derived per read
+    await runDeadline(s.agent, "condemned");
+    const [kill] = await nextCommands(s.host.ws, isKillOf(s.agent));
+    expect(kill).toMatchObject({ mode: "kill", epoch: 1 });
+    await okResult(s.host.ws, kill.cmd);
+    await runDeadline(s.agent, "condemned");
+    expect((await agentStub(s.agent).info()).brain).toBeNull();
+    // No host at all: no brain.
+    await editAgent(s.agent, (i) => {
+      delete i.brain;
+      i.host = null;
+    });
+    expect((await agentStub(s.agent).info()).brain).toBeNull();
+  });
+
+  it("H1: upgrading from main, an epoch-less exit for a migrated live brain (row without an epoch) condemns it, and a queued turn starts once escalation proves it gone", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
     await editAgent(s.agent, (i) => {
       delete i.brain;
       delete i.intent;
       i.host = s.host.host;
-      i.awaiting_exit = { host: s.host.host, epoch: 1, since_ms: 1234 };
-      i.pending_start = { host_hint: b.host };
-      i.stop_requested = 1;
+      i.state = "ready";
     });
-    const info = await agentStub(s.agent).info();
-    expect(info).toMatchObject({ brain: { host: s.host.host, epoch: 1, phase: "condemned", since_ms: 1234 }, intent: { host_hint: b.host } });
-    for (const k of ["awaiting_exit", "pending_start", "stop_requested"]) expect(info).not.toHaveProperty(k);
-    // The old escalation key runs the new escalation: the kill it never recorded is sent (again).
-    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
-      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('exit_wait', 0)");
+    // main's index row, rekeyed with no epoch.
+    await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
+      st.storage.sql.exec("UPDATE host_agents SET epoch = NULL, min_epoch = NULL WHERE agent = ?", s.agent);
     });
-    await runDurableObjectAlarm(agentStub(s.agent));
-    expect((await nextCommands(s.host.ws, (c) => c.type === "agent_stop"))[0]).toMatchObject({ mode: "kill", epoch: 1 });
-    // A brain an epoch-less exit left behind (host kept, agent detached) is condemned, not trusted.
-    const t = await setup();
-    await editAgent(t.agent, (i) => {
-      delete i.brain;
-      delete i.intent;
-      i.host = t.host.host;
-      i.state = "detached";
-    });
-    expect((await agentStub(t.agent).info()).brain).toMatchObject({ host: t.host.host, phase: "condemned" });
-    // And no host at all: no brain.
-    await editAgent(t.agent, (i) => {
-      delete i.brain;
-      i.host = null;
-    });
-    expect((await agentStub(t.agent).info()).brain).toBeNull();
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ phase: "live", epoch: 1 });
+    // Its old nestd reports the exit without an epoch.
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "idle" }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ phase: "condemned", epoch: 1 });
+    const [kill] = await nextCommands(s.host.ws, isKillOf(s.agent));
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "after the upgrade" } }, 201);
+    await okResult(s.host.ws, kill.cmd);
+    await runDeadline(s.agent, "condemned");
+    await runDeadline(s.agent, "intent");
+    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
   });
 
   it("a previous-release runner's 0 is accepted for an agent without hands (one release), never for a worker", async () => {
@@ -309,8 +333,6 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
 });
 
 describe("one brain per agent: the brain record", () => {
-  const isStartOf = (agent: string) => (c: any) => c.type === "agent_start" && c.agent === agent;
-  const isKillOf = (agent: string) => (c: any) => c.type === "agent_stop" && c.agent === agent && c.mode === "kill";
   const exited = async (ws: Ws, agent: string, epoch: number | undefined, reason = "stopped") => {
     const seq = sendEvents(ws, [{ ts_ms: Date.now(), type: "agent_exited", agent, reason, ...(epoch !== undefined ? { epoch } : {}) }]);
     await ws.next("ack", (m) => m.up_to >= seq);
@@ -321,7 +343,7 @@ describe("one brain per agent: the brain record", () => {
     await okResult(s.host.ws, s.start.cmd);
     const b = await connectHost(s.cell);
     const stub = agentStub(s.agent);
-    expect(await stub.start(b.host)).toEqual({ host: b.host, cmd: null, waiting_for: s.host.host });
+    expect(await stub.start(b.host)).toEqual({ kind: "waiting", host: b.host, cmd: null, waiting_for: s.host.host });
     const [stop] = await nextCommands(s.host.ws, isKillOf(s.agent));
     expect(stop).toMatchObject({ mode: "kill", epoch: 1 });
     // Asked again while waiting: nothing new is sent, and still no start on b.
@@ -378,26 +400,38 @@ describe("one brain per agent: the brain record", () => {
     expect((await nextCommands(b.ws, isStartOf(captain))).find(isStartOf(captain))).toMatchObject({ epoch: 2 });
   });
 
-  it("rule 4: a kill that isn't processed wedges its host; its lease lapses and it is expired, releasing the brain", async () => {
+  it("rule 4 / D5: a host processing no commands is wedged; it goes to STONITH (with no lease), and only its confirmed death releases the brain", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "controller");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "wedge" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
-    await nextCommands(a.ws, isStartOf(captain));
+    const [start1] = await nextCommands(a.ws, isStartOf(captain));
+    await okResult(a.ws, start1.cmd);
     const b = await connectHost(cell, "controller");
     await agentStub(captain).start(b.host);
     await nextCommands(a.ws, (c) => c.type === "agent_stop");
-    // 60 s pass and the kill has no result: AgentDO reports the host wedged.
+    // Not yet 60 s: nothing happens.
+    await runDeadline(captain, "condemned");
+    expect(await wedgedMs(cell, a.host)).toBeNull();
+    // 60 s pass, the kill has no result and nothing else from that host does: wedged.
+    await editAgent(captain, (i) => {
+      i.brain.kill_ms = Date.now() - 61_000;
+    });
     await runDeadline(captain, "condemned");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     expect(await wedgedMs(cell, a.host)).not.toBeNull();
     // Its heartbeats get no ack (no renewal: its lease lapses and nestd kills its brains) ...
     a.ws.send({ type: "heartbeat", sent_ms: Date.now(), leases: [] });
     expect(await a.ws.none("heartbeat_ack", 200)).toBe(true);
-    // ... and 30 s after its last renewal it is expired like a silent host: the start goes ahead.
+    // ... and 30 s after its last renewal it goes to STONITH, holding no lease: never released on
+    // the strength of its own watchdog.
     await silent(cell, a.host);
-    expect((await fleet.hostStatus(a.host))!.status).toBe("expired");
+    expect((await fleet.hostStatus(a.host))!.status).toBe("stonith_pending");
+    await runDeadline(captain, "condemned");
+    expect((await agentStub(captain).info()).brain).toMatchObject({ host: a.host, phase: "condemned" });
+    // Confirmed dead (EC2, or here an operator): released, and the start goes ahead.
+    await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
     expect(await wedgedMs(cell, a.host)).toBeNull();
     await runDeadline(captain, "intent");
     expect((await nextCommands(b.ws, isStartOf(captain))).find(isStartOf(captain))).toMatchObject({ epoch: 2 });
@@ -446,7 +480,7 @@ describe("one brain per agent: the brain record", () => {
     await agentStub(s.agent).start(b.host);
     await nextCommands(s.host.ws, isKillOf(s.agent));
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
-      st.storage.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", s.host.host);
+      st.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", s.host.host);
     });
     await runDeadline(s.agent, "condemned");
     expect((await agentStub(s.agent).info()).brain).toBeNull();
@@ -495,7 +529,7 @@ describe("one brain per agent: the brain record", () => {
     const b = await connectHost(s.cell);
     const stub = agentStub(s.agent);
     const [r1, r2, r3] = await Promise.all([stub.start(b.host), stub.start(b.host), stub.start()]);
-    expect(r1).toEqual({ host: b.host, cmd: null, waiting_for: s.host.host });
+    expect(r1).toEqual({ kind: "waiting", host: b.host, cmd: null, waiting_for: s.host.host });
     expect(r2).toEqual(r1);
     expect(r3).toEqual(r1);
     const stops = await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) =>
@@ -644,7 +678,7 @@ describe("one brain per agent: the brain record", () => {
     const stub = agentStub(s.agent);
     await stub.start(b.host);
     await nextCommands(s.host.ws, isKillOf(s.agent));
-    expect(await stub.start(s.host.host)).toEqual({ host: s.host.host, cmd: null, waiting_for: s.host.host });
+    expect(await stub.start(s.host.host)).toEqual({ kind: "waiting", host: s.host.host, cmd: null, waiting_for: s.host.host });
     await exited(s.host.ws, s.agent, 1);
     await runDeadline(s.agent, "intent");
     const start = (await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent));
@@ -706,7 +740,7 @@ describe("one brain per agent: the brain record", () => {
     });
     await stub.start(b.host);
     expect((await stub.info()).brain).toMatchObject({ phase: "condemned", epoch: 1 });
-    expect((await stub.info()).brain!.kill_cmd).toBeUndefined();
+    expect((await stub.info()).brain).not.toHaveProperty("kill_cmd");
     expect(armedBeforeIssue).toBe(1);
     // Escalation finds no stored kill: it sends it, and never wedges the host.
     await runDeadline(s.agent, "condemned");
@@ -758,7 +792,7 @@ describe("one brain per agent: the brain record", () => {
     const b = await connectHost(s.cell);
     // The host expired and the agent never heard (its notice lost for good).
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
-      st.storage.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", s.host.host);
+      st.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", s.host.host);
     });
     const r = await agentStub(s.agent).start(b.host);
     expect(r).toMatchObject({ host: b.host });
@@ -832,14 +866,249 @@ describe("one brain per agent: the brain record", () => {
     expect(rows).toBe(0);
   });
 
-  it("startFailed releases only the brain whose start failed", async () => {
+  it("D1/H2: a failed start never releases the record: it condemns that epoch (killing anything at or below it there), and only the exit releases", async () => {
     const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
     const stub = agentStub(s.agent);
-    await stub.start(); // same-host restart: brain at epoch 2
+    await stub.start(); // same-host re-issue: brain at epoch 2, brain 1 maybe still on its way out
     await stub.startFailed(s.host.host, { code: "internal", message: "x", retryable: false }, 1);
+    expect((await stub.info()).brain).toMatchObject({ epoch: 2, phase: "starting" });
+    await stub.startFailed(s.host.host, { code: "stale_epoch", message: "refused", retryable: false }, 2);
+    expect(await stub.info()).toMatchObject({ brain: { epoch: 2, phase: "condemned" }, state: "errored" });
+    const [kill] = await nextCommands(s.host.ws, isKillOf(s.agent));
+    expect(kill).toMatchObject({ epoch: 2 });
+    // The refusal's owed exit (once brain 1 has gone) is what releases it.
+    await exited(s.host.ws, s.agent, 2, "fenced");
+    expect((await stub.info()).brain).toBeNull();
+  });
+
+  it("D1: a failed agent_start's result drops no index row and releases nothing (only the start's exit does)", async () => {
+    const s = await setup();
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "command_result", cmd: s.start.cmd, outcome: { status: "error", error: { code: "stale_epoch", message: "refused", retryable: false } } }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: s.host.host }]);
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ epoch: 1, phase: "condemned" });
+  });
+
+  it("D1: a retryable failed start keeps a retry intent, which runs once the condemned start is released", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const stub = agentStub(s.agent);
+    await stub.startFailed(s.host.host, { code: "internal", message: "nestd restarted", retryable: true }, 1);
+    expect(await stub.info()).toMatchObject({ brain: { epoch: 1, phase: "condemned" }, intent: { reason: "retry" }, start_attempts: 1 });
+    await exited(s.host.ws, s.agent, 1, "stopped");
+    await runDeadline(s.agent, "intent");
+    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+  });
+
+  it("D2/M4: a host-loss notice releases only the record at or below its epoch, and only while the host is still lost", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const stub = agentStub(s.agent);
+    const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
+    // The host is active: a (stale) loss notice releases nothing.
+    await stub.onHostLost(s.host.host, 1);
+    expect((await stub.info()).brain).toMatchObject({ epoch: 1 });
+    await stub.start(); // epoch 2 on the same host
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", s.host.host);
+    });
+    // An older start's notice doesn't release the newer record.
+    await stub.onHostLost(s.host.host, 1);
     expect((await stub.info()).brain).toMatchObject({ epoch: 2 });
-    await stub.startFailed(s.host.host, { code: "internal", message: "x", retryable: false }, 2);
-    expect(await stub.info()).toMatchObject({ brain: null, state: "errored" });
+    await stub.onHostLost(s.host.host, 2);
+    expect((await stub.info()).brain).toBeNull();
+  });
+
+  it("D3: a start's record and its deadline are committed together, before anything can interleave", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'starting'");
+    });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["start:afterCommit"] = async () => {
+        delete inst.testHooks["start:afterCommit"];
+        throw new Error("reset right after the commit");
+      };
+    });
+    try {
+      await agentStub(s.agent).start();
+    } catch {
+      // the hook's reset
+    }
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ epoch: 2, phase: "starting" });
+    expect(await deadlineAt(s.agent, "starting")).not.toBeNull();
+  });
+
+  it("D12: a release and the alarm that carries it on are committed together", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell);
+    await agentStub(s.agent).start(b.host); // intent kept while the brain is condemned
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["release:afterCommit"] = async () => {
+        delete inst.testHooks["release:afterCommit"];
+        throw new Error("reset right after the release");
+      };
+    });
+    await Promise.resolve().then(() => agentStub(s.agent).onExited(s.host.host, "stopped", 1)).catch(() => {});
+    expect((await agentStub(s.agent).info()).brain).toBeNull();
+    expect(await deadlineAt(s.agent, "intent")).not.toBeNull();
+    expect(await deadlineAt(s.agent, "condemned")).toBeNull();
+  });
+
+  it("D4: a brain the host's hello no longer reports is told to AgentDO until it takes it; the row goes only then", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      let fails = 1;
+      inst.testHooks["exited:enter"] = async () => {
+        if (fails-- > 0) throw new Error("onExited lost");
+        delete inst.testHooks["exited:enter"];
+      };
+    });
+    const again = await Ws.connect("/v1/fleet", s.host.host_token);
+    again.send(hostHello(s.host.host, s.cell, { agents: [] }));
+    await again.next("hello_ack");
+    await sleep(50);
+    expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: s.host.host }]);
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ epoch: 1 });
+    const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+    });
+    await runDurableObjectAlarm(fleet);
+    expect(await fleetRows(s.cell, s.agent)).toEqual([]);
+    expect((await agentStub(s.agent).info()).brain).toBeNull();
+  });
+
+  it("D6/D8: an exit without an epoch stands for the oldest outstanding start; a failed delivery is redelivered with the same epoch", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const stub = agentStub(s.agent);
+    await stub.start(); // epoch 2 re-issued on the same host: starts 1 and 2 outstanding there
+    await runInDurableObject(stub, (inst: AgentDO) => {
+      let fails = 1;
+      inst.testHooks["exited:enter"] = async () => {
+        if (fails-- > 0) throw new Error("onExited lost");
+        delete inst.testHooks["exited:enter"];
+      };
+    });
+    // The first delivery fails (the batch isn't acked); the host resends it.
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped" }]);
+    await s.host.ws.next("error");
+    const back = await Ws.connect("/v1/fleet", s.host.host_token);
+    back.send(hostHello(s.host.host, s.cell, { agents: [{ agent: s.agent, state: "idle" }] }));
+    await back.next("hello_ack");
+    sendEvents(back, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped" }], seq);
+    await back.next("ack", (m) => m.up_to >= seq);
+    // Taken for start 1 (the oldest): the record at 2 stays.
+    expect((await stub.info()).brain).toMatchObject({ epoch: 2 });
+    const seq2 = sendEvents(back, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped" }]);
+    await back.next("ack", (m) => m.up_to >= seq2);
+    expect((await stub.info()).brain).toBeNull();
+  });
+
+  it("D7: an event batch stops applying once the brain is no longer current mid-batch", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    const b = await connectHost(s.cell);
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["event:afterApply"] = async () => {
+        delete inst.testHooks["event:afterApply"];
+        await inst.start(b.host); // condemned between two events of one batch
+      };
+    });
+    ws.send({ type: "events", seq: 1, events: [
+      { agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), type: "state_changed", state: "working" },
+      { agent: s.agent, epoch: 1, seq: 2, ts_ms: Date.now(), type: "capabilities", capabilities: ["late"] },
+    ] });
+    await sleep(200);
+    expect((await agentStub(s.agent).info()).capabilities).toBeUndefined();
+  });
+
+  it("D9: a live brain whose session went away and never came back is condemned", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    ws.close();
+    await sleep(50);
+    expect(await deadlineAt(s.agent, "no_session")).not.toBeNull();
+    await runDeadline(s.agent, "no_session");
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ phase: "condemned", epoch: 1 });
+    // A session that comes back in time clears it.
+    const t = await setup();
+    const w1 = await runner(t.agent, t.host.host, t.host.host_token, "rin_t", 1);
+    w1.close();
+    await sleep(50);
+    await runner(t.agent, t.host.host, t.host.host_token, "rin_t", 1);
+    expect(await deadlineAt(t.agent, "no_session")).toBeNull();
+  });
+
+  it("M3/D10: the start deadline is above the runner's budget before its hello, and backs off per consecutive timeout", async () => {
+    const s = await setup();
+    const at1 = (await deadlineAt(s.agent, "starting"))! - Date.now();
+    expect(at1).toBeGreaterThan(160_000);
+    await runDeadline(s.agent, "starting");
+    const [kill] = await nextCommands(s.host.ws, isKillOf(s.agent));
+    await exited(s.host.ws, s.agent, kill.epoch);
+    await agentStub(s.agent).start();
+    const at2 = (await deadlineAt(s.agent, "starting"))! - Date.now();
+    expect(at2).toBeGreaterThan(at1 * 1.8);
+  });
+
+  it("M2: a kill not yet processed doesn't wedge a host that is still working through older commands", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell);
+    const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
+    // An older command still pending there (an old nestd runs the kill behind it).
+    await fleet.issueCommands(s.host.host, [{ type: "sandbox_suspend", sandbox: s.sandbox, epoch: 1, mode: "disk_only" } as any]);
+    await agentStub(s.agent).start(b.host);
+    await nextCommands(s.host.ws, isKillOf(s.agent));
+    await editAgent(s.agent, (i) => {
+      i.brain.kill_ms = Date.now() - 61_000;
+    });
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("UPDATE commands SET issued_ms = issued_ms - 1000 WHERE type = 'sandbox_suspend'");
+    });
+    await runDeadline(s.agent, "condemned");
+    expect(await wedgedMs(s.cell, s.host.host)).toBeNull();
+  });
+
+  it("main's `restart` alarm wakes the agent", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    await editAgent(s.agent, (i) => {
+      i.brain = null;
+      i.state = "detached";
+    });
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES ('trn_r', 1, ?, 'queued', ?)", JSON.stringify({ kind: "user", text: "go" }), Date.now());
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('restart', 0)");
+    });
+    await runDurableObjectAlarm(agentStub(s.agent));
+    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+  });
+
+  it("a platform call cut short and redelivered after its brain adopted a newer epoch keeps its first key (no double side effect)", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await ws.next("cache_update");
+    ws.send({ type: "tool_call", seq: 1, call: "cal_keep-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "once" } });
+    const first = await ws.next("tool_result", (m) => m.call === "cal_keep-1");
+    // As if an eviction cut it short before its outcome was stored and its seq processed.
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("UPDATE tool_calls SET status = 'dispatching', outcome = NULL WHERE call = 'cal_keep-1'");
+      st.storage.sql.exec("UPDATE rel_state SET last_in = NULL WHERE chan = 'runner'");
+    });
+    await agentStub(s.agent).start(); // same-host re-issue: the runner adopts epoch 2
+    const ws2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 2);
+    ws2.send({ type: "tool_call", seq: 1, call: "cal_keep-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "once" } });
+    // The re-run's own result (not the first one's, resent after the hello).
+    await ws2.next("tool_result", (m) => m.call === "cal_keep-1" && m.seq > first.seq);
+    const n = (await wsStub(s.workstream).events()).filter((e: any) => e.type === "progress" && e.summary === "once").length;
+    expect(n).toBe(1);
   });
 });
 
@@ -926,6 +1195,156 @@ describe("FleetDO and SandboxDO at the seam", () => {
     again.send(hostHello(a.host, cell, { role: "controller" }));
     expect(await again.none("hello_ack", 200)).toBe(true);
     expect(again.closed?.code).toBe(4408);
+  });
+
+  it("A5: a host-loss (or gone) notice's acknowledgement deletes only the row it was for; a newer start's row stays", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell, "controller");
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    const rows = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
+      st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, min_epoch, gone) VALUES ('agt_a5', ?, 'cmd_old', 1, 1, 1)", a.host);
+      st.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", a.host);
+      // While each notice is in flight, a newer start is recorded on that host.
+      const newer = async () => {
+        st.storage.sql.exec("UPDATE host_agents SET cmd = 'cmd_new', epoch = 2, gone = 0 WHERE agent = 'agt_a5'");
+      };
+      (inst as any).agentStub = () => ({ onHostLost: newer, onExited: newer });
+      await (inst as any).brainsLost(a.host);
+      const afterLost = st.storage.sql.exec("SELECT cmd FROM host_agents WHERE agent = 'agt_a5'").toArray();
+      st.storage.sql.exec("UPDATE host_agents SET cmd = 'cmd_old', epoch = 1, gone = 1 WHERE agent = 'agt_a5'");
+      await (inst as any).goneExits(a.host);
+      const afterGone = st.storage.sql.exec("SELECT cmd FROM host_agents WHERE agent = 'agt_a5'").toArray();
+      return { afterLost, afterGone };
+    });
+    expect(rows.afterLost).toEqual([{ cmd: "cmd_new" }]);
+    expect(rows.afterGone).toEqual([{ cmd: "cmd_new" }]);
+  });
+
+  it("A6: a host merely retired as dead (no confirmation) proves nothing; a confirmed death or lease expiry does", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell);
+    const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'dead', lost = 0 WHERE host = ?", s.host.host);
+    });
+    expect(await agentStub(s.agent).start(b.host)).toMatchObject({ kind: "waiting", waiting_for: s.host.host });
+    await runDeadline(s.agent, "condemned");
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ host: s.host.host, phase: "condemned" });
+    await fleet.confirmHostDead(s.host.host);
+    await runDeadline(s.agent, "condemned");
+    expect((await agentStub(s.agent).info()).brain).not.toMatchObject({ host: s.host.host });
+  });
+
+  it("an idle burst host with a brain recorded is never retired", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
+    await runInDurableObject(fleet, (inst: FleetDO, st) => {
+      st.storage.sql.exec("DELETE FROM leases WHERE sandbox = ?", s.sandbox);
+      st.storage.sql.exec("UPDATE hosts SET instance_id = 'i-0idle', idle_since = 1 WHERE host = ?", s.host.host);
+      inst.cellConfigOverride = {
+        region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
+        max_hosts: 1, idle_grace_ms: 0, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
+      };
+      inst.ec2Override = null;
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+    });
+    await runDurableObjectAlarm(fleet);
+    expect((await fleet.hostStatus(s.host.host))!.status).toBe("active");
+  });
+
+  it("a start re-reads its intent before committing: one changed meanwhile is the one started", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell);
+    const c = await connectHost(s.cell);
+    await editAgent(s.agent, (i) => {
+      i.brain = null;
+      i.state = "detached";
+    });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["intent:beforeCommit"] = async () => {
+        delete inst.testHooks["intent:beforeCommit"];
+        await (inst as any).setIntent({ host_hint: c.host, reason: "operator" });
+      };
+    });
+    const r = await agentStub(s.agent).start(b.host);
+    expect(r).toMatchObject({ kind: "started", host: c.host });
+  });
+
+  it("a start whose send fails is condemned and its intent kept; the host's confirmed death releases it and the start runs elsewhere", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell);
+    const c = await connectHost(s.cell);
+    await editAgent(s.agent, (i) => {
+      i.brain = null;
+      i.state = "detached";
+    });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["intent:beforeCommit"] = async () => {
+        delete inst.testHooks["intent:beforeCommit"];
+        await (inst as any).env.FLEET.get((inst as any).env.FLEET.idFromName(s.cell)).confirmHostDead(b.host);
+      };
+    });
+    let failed: unknown = null;
+    try {
+      await agentStub(s.agent).start(b.host);
+    } catch (e) {
+      failed = e;
+    }
+    expect(String(failed)).toMatch(/dead/);
+    expect(await agentStub(s.agent).info()).toMatchObject({ brain: { host: b.host, epoch: 2, phase: "condemned" }, intent: { host_hint: b.host } });
+    await runDeadline(s.agent, "condemned");
+    expect((await agentStub(s.agent).info()).brain).toBeNull();
+    // The kept intent's hint no longer works: dropped, and the start goes to another host.
+    await runDeadline(s.agent, "intent");
+    await runDeadline(s.agent, "intent");
+    const info = await agentStub(s.agent).info();
+    expect(info.brain).toMatchObject({ epoch: 3 });
+    expect(info.brain!.host).not.toBe(b.host);
+    void c;
+  });
+
+  it("a kill stored after its brain was released records nothing and arms no escalation", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell);
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["kill:beforeIssue"] = async () => {
+        delete inst.testHooks["kill:beforeIssue"];
+        await inst.onExited(s.host.host, "stopped", 1); // released while its kill is on the way
+      };
+    });
+    await agentStub(s.agent).start(b.host);
+    const info = await agentStub(s.agent).info();
+    expect(info.brain === null || info.brain.host !== s.host.host).toBe(true);
+    expect(await deadlineAt(s.agent, "condemned")).toBeNull();
+  });
+
+  it("escalation decides only against the record it asked about: one replaced meanwhile isn't wedged for", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
+    const a = await connectHost(cell, "controller");
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "esc" } }, 201);
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const [st1] = await nextCommands(a.ws, isStartOf(captain));
+    await okResult(a.ws, st1.cmd);
+    const b = await connectHost(cell, "controller");
+    await agentStub(captain).start(b.host);
+    await nextCommands(a.ws, isKillOf(captain));
+    await editAgent(captain, (i) => {
+      i.brain.kill_ms = Date.now() - 61_000; // stuck by every measure
+    });
+    await runInDurableObject(agentStub(captain), (inst: AgentDO) => {
+      inst.testHooks["escalate:afterProgress"] = async () => {
+        delete inst.testHooks["escalate:afterProgress"];
+        await inst.onExited(a.host, "stopped", 1); // its exit lands while escalation asks
+      };
+    });
+    await runDeadline(captain, "condemned");
+    expect(await wedgedMs(cell, a.host)).toBeNull();
   });
 
   it("rule 5: a silent burst host expired without leases is retired once the idle grace passes", async () => {

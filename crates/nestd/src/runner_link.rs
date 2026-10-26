@@ -98,9 +98,15 @@ impl State {
         self.brains.keys().filter(|(a, _)| a == agent).cloned().collect()
     }
 
-    /// The agent's newest entry (an event without an epoch, from a runner of the previous release).
+    /// The agent's newest entry (an `agent_started` without an epoch, from a runner of the previous release).
     fn newest(&self, agent: &AgentId) -> Option<Epoch> {
         self.keys_of(agent).last().map(|(_, e)| *e)
+    }
+
+    /// The agent's oldest entry (an exit without an epoch: taken for the oldest start, so it can
+    /// never stand for a newer one).
+    fn oldest(&self, agent: &AgentId) -> Option<Epoch> {
+        self.keys_of(agent).first().map(|(_, e)| *e)
     }
 
     /// Remove the agent's never-sent starts at or below `bound` (all for `None`); returns their epochs.
@@ -206,13 +212,15 @@ impl RunnerLink {
         dispatched
     }
 
-    /// Stop a brain gracefully. A start never sent leaves the table at once and is returned
-    /// (with its epoch) for the caller to report; a sent one leaves when the runner reports its exit.
-    pub fn agent_stop(&self, agent: &AgentId, mode: StopMode, reason: &str) -> Vec<Epoch> {
+    /// Stop a brain gracefully: the one at or below `epoch` (every one for `None`, a control plane
+    /// that names none), never a newer start. A start never sent leaves the table at once and is
+    /// returned (with its epoch) for the caller to report; a sent one leaves when the runner reports
+    /// its exit. The epoch is forwarded.
+    pub fn agent_stop(&self, agent: &AgentId, mode: StopMode, reason: &str, epoch: Option<Epoch>) -> Vec<Epoch> {
         let mut st = self.state.lock().expect("runner state");
-        let unsent = st.drop_pending(agent, None);
+        let unsent = st.drop_pending(agent, epoch);
         if let Some(c) = &st.conn {
-            let _ = c.send(RunnerCommand::AgentStop { agent: agent.clone(), mode, reason: reason.into(), epoch: None });
+            let _ = c.send(RunnerCommand::AgentStop { agent: agent.clone(), mode, reason: reason.into(), epoch });
         }
         unsent
     }
@@ -409,9 +417,9 @@ async fn serve(
 /// Apply a runner event to the brain table; `None` drops it. Events about a brain count only if a
 /// matching start went out on this connection (`conn`). An `agent_started` marks its epoch's
 /// entry; an exit removes the agent's entries at or below its epoch and is forwarded with that
-/// epoch. Without an epoch (a runner of the previous release) both are for the newest entry, and
-/// an `agent_exited{fenced}` for one that hasn't reported `agent_started` is one the runner queued
-/// before this connection, and is dropped.
+/// epoch. Without an epoch (a runner of the previous release) `agent_started` is for the newest
+/// entry and an exit for the oldest, and an `agent_exited{fenced}` for one that hasn't reported
+/// `agent_started` is one the runner queued before this connection, and is dropped.
 fn accept_event(state: &Mutex<State>, conn: u64, ev: RunnerEvent) -> Vec<RunnerEvent> {
     let mut st = state.lock().expect("runner state");
     let (agent, epoch, exit) = match &ev {
@@ -420,7 +428,8 @@ fn accept_event(state: &Mutex<State>, conn: u64, ev: RunnerEvent) -> Vec<RunnerE
         _ => return vec![ev],
     };
     let legacy = epoch.is_none();
-    let Some(e) = epoch.or_else(|| st.newest(&agent)) else { return vec![] };
+    let fill = if exit.is_some() { st.oldest(&agent) } else { st.newest(&agent) };
+    let Some(e) = epoch.or(fill) else { return vec![] };
     let on_conn = |b: &Brain| matches!(b.sent, Sent::On { conn: c, .. } if c == conn);
     match exit {
         None => {
@@ -728,14 +737,39 @@ mod tests {
         assert!(agents(&link).is_empty());
     }
 
-    /// A graceful stop of a start never sent ends it here and hands its epoch back to report.
+    /// A graceful stop of a start never sent ends it here and hands its epoch back to report; one
+    /// naming an older epoch (D11) leaves a newer start alone, and the epoch is forwarded.
     #[tokio::test]
     async fn a_graceful_stop_of_an_unsent_start_returns_it() {
         let dir = tempfile::tempdir().unwrap();
-        let (link, _path, _nrx) = link(dir.path());
+        let (link, path, mut nrx) = link(dir.path());
+        let a = AgentId("agt_a".into());
         assert!(!link.agent_start(start_at("agt_a", 5)));
-        assert_eq!(link.agent_stop(&AgentId("agt_a".into()), StopMode::Graceful, "x"), vec![Epoch(5)]);
+        assert!(link.agent_stop(&a, StopMode::Graceful, "x", Some(Epoch(4))).is_empty(), "a stop for epoch 4 spares the start at 5");
+        assert_eq!(link.agent_stop(&a, StopMode::Graceful, "x", Some(Epoch(5))), vec![Epoch(5)]);
         assert!(agents(&link).is_empty());
+        let mut f = connected(&path, &mut nrx).await;
+        link.agent_stop(&a, StopMode::Graceful, "x", Some(Epoch(7)));
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStop { mode: StopMode::Graceful, epoch: Some(Epoch(7)), .. }));
+    }
+
+    /// D8: an exit without an epoch (a runner of the previous release) stands for the agent's
+    /// oldest start here, never a newer one.
+    #[tokio::test]
+    async fn an_exit_without_an_epoch_is_taken_for_the_oldest_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, path, mut nrx) = link(dir.path());
+        let mut f = connected(&path, &mut nrx).await;
+        let a = AgentId("agt_a".into());
+        assert!(link.agent_start(start_at("agt_a", 1)));
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(_)));
+        send(&mut f, started(&a)).await;
+        assert!(matches!(notice(&mut nrx).await, RunnerNotice::Event(RunnerEvent::AgentStarted { .. })));
+        assert!(link.agent_start(start_at("agt_a", 2)));
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(_)));
+        send(&mut f, exited(&a, ExitReason::Stopped)).await;
+        assert!(matches!(notice(&mut nrx).await, RunnerNotice::Event(RunnerEvent::AgentExited { epoch: Some(Epoch(1)), .. })));
+        assert_eq!(agents(&link), vec!["agt_a"], "the start at 2 is still here");
     }
 
     /// An exit at an epoch means nothing of the agent at or below it runs here: a start refused
@@ -756,5 +790,22 @@ mod tests {
         assert!(matches!(notice(&mut nrx).await, RunnerNotice::Event(RunnerEvent::AgentExited { epoch: Some(Epoch(1)), .. })));
         assert!(matches!(notice(&mut nrx).await, RunnerNotice::Event(RunnerEvent::AgentExited { epoch: Some(Epoch(2)), reason: ExitReason::Fenced, .. })), "the owed exit follows");
         assert!(link.refused(&a, Epoch(3)), "nothing older out: report now");
+    }
+
+    /// An owed exit whose older start is lost with the runner's connection goes out with the losses.
+    #[tokio::test]
+    async fn owed_exits_go_out_when_the_runner_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, path, mut nrx) = link(dir.path());
+        let f = connected(&path, &mut nrx).await;
+        let a = AgentId("agt_a".into());
+        assert!(link.agent_start(start_at("agt_a", 1)));
+        link.kill(&a, Some(Epoch(2)), "x");
+        assert!(!link.refused(&a, Epoch(2)));
+        drop(f);
+        match notice(&mut nrx).await {
+            RunnerNotice::Disconnected { lost } => assert_eq!(lost, vec![(a.clone(), Epoch(1), ExitReason::Crashed), (a, Epoch(2), ExitReason::Fenced)]),
+            other => panic!("{other:?}"),
+        }
     }
 }

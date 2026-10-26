@@ -78,7 +78,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             let msg = format!("refusing to start: built-in tool {bad} is not on the runner's host-safe allowlist");
             tracing::error!(agent = %id, "{msg}");
             rt.report(RunnerEvent::Error { agent: Some(id.clone()), error: ErrorBody { code: "forbidden_tool".into(), message: msg, retryable: false } });
-            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Crashed, epoch: Some(start.start.agent_epoch()) });
+            refuse_superseding(&rt, &id, start.start.agent_epoch(), ExitReason::Crashed).await;
             return;
         }
         if !rt.lease_valid() {
@@ -86,7 +86,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 agent: Some(id.clone()),
                 error: ErrorBody { code: "no_lease".into(), message: "no valid host lease; refusing to start a brain".into(), retryable: true },
             });
-            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(start.start.agent_epoch()) });
+            refuse_superseding(&rt, &id, start.start.agent_epoch(), ExitReason::Fenced).await;
             return;
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -168,6 +168,21 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason, epoch: Some(agent.epoch()) });
         }
     });
+}
+
+/// Refuse a start before it registers (a forbidden built-in, no lease). It supersedes any older brain
+/// of the agent here, which is ended under the start's epoch (its tombstone); the refusal's exit is
+/// reported only once that brain has gone, since an exit at an epoch means nothing of the agent at
+/// or below it runs here (A4).
+async fn refuse_superseding(rt: &Arc<Runtime>, id: &nest_protocol::model::AgentId, epoch: nest_protocol::model::Epoch, reason: ExitReason) {
+    if let Some(old) = rt.tombstone(id, epoch) {
+        old.stopping.store(true, Ordering::SeqCst);
+        old.kill_now(ExitReason::Stopped);
+    }
+    while rt.agent(id).is_some_and(|a| a.epoch() <= epoch) {
+        tokio::time::sleep(DYING_POLL).await;
+    }
+    rt.report(RunnerEvent::AgentExited { agent: id.clone(), code: None, signal: None, reason, epoch: Some(epoch) });
 }
 
 /// Run one startup step with a deadline; a kill/stop cancels it.

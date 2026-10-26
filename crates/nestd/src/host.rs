@@ -1446,9 +1446,9 @@ impl Inner {
             CommandBody::AgentDetach { sandbox, epoch, agent, kill_processes } => self.agent_detach(&sandbox, epoch, &agent, kill_processes).await,
             // A kill was applied on arrival; a graceful stop (or one from the previous release) goes in order.
             CommandBody::AgentStop { mode: Some(StopMode::Kill), .. } => Ok(None),
-            CommandBody::AgentStop { agent, reason, .. } => {
+            CommandBody::AgentStop { agent, reason, epoch, .. } => {
                 // A start never sent to the runner ends here, and its exit is reported now.
-                let unsent = self.runner.agent_stop(&agent, StopMode::Graceful, &reason);
+                let unsent = self.runner.agent_stop(&agent, StopMode::Graceful, &reason, epoch);
                 self.brains_exited(unsent.into_iter().map(|e| (agent.clone(), e, ExitReason::Stopped)));
                 Ok(None)
             }

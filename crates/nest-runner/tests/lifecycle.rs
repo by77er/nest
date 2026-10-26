@@ -323,3 +323,65 @@ async fn a_fence_of_every_brain_drops_a_waiting_start() {
     assert_eq!(pids(e.dir.path()).len(), 1, "the waiting start ran after the fence");
     assert!(e.rt.agent(&id).is_none());
 }
+
+/// D8 / A4: a start refused before it registers (a forbidden built-in) supersedes the older brain:
+/// that brain is ended, and the refusal's exit is reported only once it has gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_start_ends_the_older_brain_before_its_exit() {
+    let e = env();
+    let id = AgentId("agt_forbid".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_forbid", 1));
+    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    let pid = pids(e.dir.path())[0];
+    let bad = match start_cmd(e.dir.path(), "agt_forbid", &["Bash"]) {
+        RunnerCommand::AgentStart(mut s) => {
+            s.start.epoch = Some(nest_protocol::model::Epoch(2));
+            RunnerCommand::AgentStart(s)
+        }
+        _ => unreachable!(),
+    };
+    nest_runner::supervisor::handle(&e.rt, bad);
+    wait_for("the older brain ended", || !alive(pid)).await;
+    let evs = events(&e.rt, Duration::from_millis(1500)).await;
+    let exits = exits_at(&evs);
+    let refused = exits.iter().position(|x| *x == (ExitReason::Crashed, Some(2)));
+    let older = exits.iter().position(|x| x.1 == Some(1));
+    assert!(refused.is_some() && older.is_some() && older < refused, "{evs:?}");
+    assert!(e.rt.agent(&id).is_none());
+}
+
+/// D11: a graceful stop that names an epoch never stops a newer brain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_graceful_stop_for_an_older_epoch_spares_a_newer_brain() {
+    let e = env();
+    let id = AgentId("agt_grace".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_grace", 2));
+    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    nest_runner::supervisor::handle(
+        &e.rt,
+        RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "old".into(), epoch: Some(nest_protocol::model::Epoch(1)) },
+    );
+    assert!(!e.rt.agent(&id).expect("registered").is_stopping(), "a stop for epoch 1 reached the brain at 2");
+    nest_runner::supervisor::handle(
+        &e.rt,
+        RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "now".into(), epoch: Some(nest_protocol::model::Epoch(2)) },
+    );
+    assert!(e.rt.agent(&id).expect("registered").is_stopping());
+    e.rt.kill_all(ExitReason::Fenced);
+}
+
+/// A same-host re-issue of a live brain: the running brain adopts the newer epoch (its exit names
+/// it), and no second Claude Code starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_brain_adopts_a_reissued_epoch() {
+    let e = env();
+    let id = AgentId("agt_adopt".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_adopt", 1));
+    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_adopt", 2));
+    wait_for("adopted", || e.rt.agent(&id).is_some_and(|a| a.epoch() == nest_protocol::model::Epoch(2))).await;
+    assert_eq!(pids(e.dir.path()).len(), 1);
+    e.rt.kill_all(ExitReason::Fenced);
+    let evs = events(&e.rt, Duration::from_millis(1500)).await;
+    assert!(exits_at(&evs).contains(&(ExitReason::Fenced, Some(2))), "{evs:?}");
+}

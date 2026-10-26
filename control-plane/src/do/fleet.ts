@@ -112,7 +112,7 @@ type Purpose = "stonith_fence" | null;
 const TOKEN_ROTATE_BEFORE_MS = 10 * 60_000;
 const COMMAND_RETENTION_MS = 24 * 3_600_000;
 /** Lost hosts (expired or dead) whose brains' agents haven't all acknowledged the loss yet. */
-const LOST_WITH_BRAINS = "SELECT host FROM hosts WHERE status IN ('expired', 'dead') AND host IN (SELECT host FROM host_agents)";
+const LOST_WITH_BRAINS = "SELECT host FROM hosts WHERE lost = 1 AND host IN (SELECT host FROM host_agents)";
 /**
  * How long a stale incarnation's salvage may take before FleetDO destroys it anyway: nestd gives a
  * salvage commit 600 s (`SALVAGE_TIMEOUT`), plus a margin.
@@ -216,6 +216,14 @@ export class FleetDO extends DurableObject<Env> {
     // When AgentDO reported a brain on this host that didn't exit after a kill (`hostWedged`): its
     // heartbeats and hellos go unanswered until it is expired, so its own lease fences it.
     this.addColumn("hosts", "wedged_ms", "INTEGER");
+    // Amendment A6: whether the host's brains are proven gone: its lease expired (it was silent past
+    // the lease; nestd refused or killed every start it held), or its death was confirmed (EC2 or
+    // STONITH, an operator, or it never connected). A retirement that only marks it `dead` (idle,
+    // drained) isn't proof. Rows from before were the previous release's word: dead or expired.
+    if (!this.sql.exec<{ name: string }>("PRAGMA table_info(hosts)").toArray().some((c) => c.name === "lost")) {
+      this.addColumn("hosts", "lost", "INTEGER NOT NULL DEFAULT 0");
+      this.sql.exec("UPDATE hosts SET lost = 1 WHERE status IN ('dead', 'expired')");
+    }
     this.addColumn("leases", "state", "TEXT");
     // Packing: what each lease reserves until the host's capacity report counts the sandbox.
     this.addColumn("leases", "vcpus", "INTEGER");
@@ -343,7 +351,8 @@ export class FleetDO extends DurableObject<Env> {
   /** The prior, never-connected holder of a proof gives way to `successor`: dead, tunnel released. */
   private retireNeverConnected(host: string, successor: string): void {
     if (!this.neverConnected(host)) return;
-    this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", host);
+    // Never connected: nothing was ever delivered to it, so nothing runs there (A6).
+    this.sql.exec("UPDATE hosts SET status = 'dead', lost = 1 WHERE host = ?", host);
     for (const ws of this.ctx.getWebSockets(host)) ws.close(4410, "re-enrolled before connecting");
     this.releaseTunnel(host, "re-enrolled before connecting");
     const leases = this.leasesOf(host).map((l) => l.sandbox);
@@ -799,7 +808,7 @@ export class FleetDO extends DurableObject<Env> {
 
     // A silent controller is back. A `stonith_pending` host stays so (liveness is `last_rx` and the
     // socket) until its fence succeeds or EC2 confirms the instance gone.
-    if (prior.status === "expired") this.sql.exec("UPDATE hosts SET status = 'active' WHERE host = ?", att.host);
+    if (prior.status === "expired") this.sql.exec("UPDATE hosts SET status = 'active', lost = 0 WHERE host = ?", att.host);
     await this.reconcileSandboxes(att.host, hello.sandboxes);
     // The hello's capacity counts the sandboxes it reports: marked after their first states.
     this.sql.exec("UPDATE hosts SET capacity_seq = ? WHERE host = ?", this.mark(), att.host);
@@ -945,6 +954,7 @@ export class FleetDO extends DurableObject<Env> {
     if (cols.length === 0 || cols.find((c) => c.name === "host")?.pk !== 0) {
       this.sql.exec(create);
       this.addColumn("host_agents", "epoch", "INTEGER");
+      this.addHostAgentsColumns();
       return;
     }
     this.ctx.storage.transactionSync(() => {
@@ -953,17 +963,56 @@ export class FleetDO extends DurableObject<Env> {
       this.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch) SELECT agent, host, cmd, NULL FROM host_agents_by_agent");
       this.sql.exec("DROP TABLE host_agents_by_agent");
     });
+    this.addHostAgentsColumns();
   }
 
-  /** The agent epoch of the newest `agent_start` sent to `host` for `agent`, if its row is there and records one. */
-  private brainEpoch(agent: string, host: string): number | undefined {
-    return this.sql.exec<{ epoch: number | null }>("SELECT epoch FROM host_agents WHERE agent = ? AND host = ?", agent, host).toArray()[0]?.epoch ?? undefined;
+  /**
+   * `min_epoch`: the oldest start there not known to have exited (an exit without an epoch is taken
+   * for it, never for a newer one; NULL with a NULL `epoch`, a row stored by the previous release).
+   * `gone`: the host's hello no longer reports the agent; its exit is owed to AgentDO (retried by the
+   * tick until acknowledged, then the row goes).
+   */
+  private addHostAgentsColumns(): void {
+    this.addColumn("host_agents", "min_epoch", "INTEGER");
+    this.addColumn("host_agents", "gone", "INTEGER NOT NULL DEFAULT 0");
   }
 
-  /** A brain on `host` stopped or exited at agent epoch `epoch` (unknown: any): its index row goes unless a newer start replaced it. */
-  private brainGone(agent: string, host: string, epoch: number | null | undefined): void {
-    this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND (? IS NULL OR epoch IS NULL OR epoch <= ?)",
-      agent, host, epoch ?? null, epoch ?? null);
+  /**
+   * The epoch an exit without one (nestd of the previous release) stands for: the oldest start there
+   * not known to have exited, so it never releases a newer record early. None for a row stored by
+   * the previous release (AgentDO then condemns the brain and proves it gone).
+   */
+  private exitEpoch(agent: string, host: string): number | undefined {
+    const r = this.sql.exec<{ epoch: number | null; min_epoch: number | null }>(
+      "SELECT epoch, min_epoch FROM host_agents WHERE agent = ? AND host = ?", agent, host).toArray()[0];
+    if (!r || r.epoch === null) return undefined;
+    return r.min_epoch ?? r.epoch;
+  }
+
+  /**
+   * A brain on `host` exited at agent epoch `epoch` (unknown: the row is the previous release's):
+   * the row goes once that covers its newest start; otherwise only its oldest outstanding start moves on.
+   */
+  private brainGone(agent: string, host: string, epoch: number | undefined): void {
+    if (epoch === undefined) {
+      this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND epoch IS NULL", agent, host);
+      return;
+    }
+    this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND (epoch IS NULL OR epoch <= ?)", agent, host, epoch);
+    this.sql.exec("UPDATE host_agents SET min_epoch = MAX(COALESCE(min_epoch, 0), ?) WHERE agent = ? AND host = ?", epoch + 1, agent, host);
+  }
+
+  /** Owed exits of brains a host's hello no longer reports: told to AgentDO, the row going only once it took it. */
+  private async goneExits(host: string): Promise<void> {
+    for (const k of this.sql.exec<{ agent: string; epoch: number | null; cmd: string }>("SELECT agent, epoch, cmd FROM host_agents WHERE host = ? AND gone = 1", host).toArray()) {
+      try {
+        await this.agentStub(k.agent).onExited(host, "host_lost", k.epoch ?? undefined);
+        // Only the row that notice was for (A5).
+        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND gone = 1 AND cmd = ?", k.agent, host, k.cmd);
+      } catch (e) {
+        console.error(`FleetDO: marking ${k.agent} exited on ${host} failed; will retry`, e);
+      }
+    }
   }
 
   /** Brains the host doesn't report (after its agent_start completed) are gone. */
@@ -984,13 +1033,10 @@ export class FleetDO extends DurableObject<Env> {
       if (reported.has(k.agent)) continue;
       // Only once its agent_start completed (or the command aged out); a pending start isn't running yet.
       if (k.c_cmd !== null && k.result === null) continue;
-      this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", k.agent, host);
-      try {
-        await this.agentStub(k.agent).onExited(host, "host_lost", k.epoch ?? undefined);
-      } catch (e) {
-        console.error(`FleetDO: marking ${k.agent} exited failed`, e);
-      }
+      this.sql.exec("UPDATE host_agents SET gone = 1 WHERE agent = ? AND host = ?", k.agent, host);
     }
+    // Told until acknowledged (the tick retries), and only then forgotten.
+    await this.goneExits(host);
   }
 
   private async onHeartbeat(ws: WebSocket, host: string, sentMs: number, claims: LeaseClaim[]): Promise<void> {
@@ -1100,11 +1146,12 @@ export class FleetDO extends DurableObject<Env> {
       case "spot_notice":
         return this.drain(host, ev.deadline_ms);
       case "agent_exited": {
-        // An exit without an epoch (nestd of the previous release) is for the newest start sent
-        // there: the row's, so AgentDO can tell whether a newer start went elsewhere since.
-        const epoch = ev.epoch ?? this.brainEpoch(ev.agent, host);
-        this.brainGone(ev.agent, host, epoch);
+        // An exit without an epoch (nestd of the previous release) stands for the oldest start there
+        // not known to have exited. AgentDO is told first and the row moves on only after: a call
+        // that fails fails the batch, and its redelivery computes the same epoch.
+        const epoch = ev.epoch ?? this.exitEpoch(ev.agent, host);
         await this.agentStub(ev.agent).onExited(host, ev.reason, epoch);
+        this.brainGone(ev.agent, host, epoch);
         return;
       }
       case "guest_cli":
@@ -1191,7 +1238,8 @@ export class FleetDO extends DurableObject<Env> {
     if (outcome.status === "error") {
       if (row.sandbox && row.epoch !== null) await this.sandbox(row.sandbox).commandFailed(host, row.type, row.epoch, outcome.error);
       if (row.agent && row.type === "agent_start") {
-        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND cmd = ?", row.agent, cmd);
+        // Its index row stays: the start's own exit (owed by nestd until older brains there have
+        // gone) or the host's loss removes it. AgentDO condemns the brain, never releases it here.
         await this.agentStub(row.agent).startFailed(host, outcome.error, row.epoch ?? undefined);
       }
     }
@@ -1228,8 +1276,12 @@ export class FleetDO extends DurableObject<Env> {
         c.cmd, host, c.type, sandbox, agent, epoch, purpose, JSON.stringify(c), now,
       );
       if (c.type === "agent_start") {
-        this.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch) VALUES (?, ?, ?, ?)
-          ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch`, c.agent, host, c.cmd, c.epoch ?? null);
+        // A newer start there keeps the oldest outstanding one (`min_epoch`); a row stored by the
+        // previous release keeps none (its older start's epoch is unknown).
+        this.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch, min_epoch, gone) VALUES (?, ?, ?, ?, ?, 0)
+          ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch, gone = 0,
+            min_epoch = CASE WHEN host_agents.epoch IS NULL THEN NULL ELSE COALESCE(host_agents.min_epoch, host_agents.epoch) END`,
+          c.agent, host, c.cmd, c.epoch ?? null, c.epoch ?? null);
       }
     }
     const msg = this.rel.push(host, (seq) => ({ type: "commands" as const, seq, commands }));
@@ -1360,25 +1412,32 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * Where a condemned brain's kill stands, for AgentDO's escalation: whether `host` processed the
-   * kill (`cmd` has a result; a command row is pruned only a day after its result), and whether
-   * this index still has a start at or below `epoch` for the agent there (an unknown epoch counts).
+   * kill (`cmd` has a result; a command row is pruned only a day after its result), whether this
+   * index still has a start at or below `epoch` for the agent there (an unknown epoch counts), and
+   * whether the host is processing commands at all: a result from it since the kill was stored, or
+   * an older command still pending there (nestd of the previous release runs a kill in order,
+   * behind them).
    */
-  async killProgress(cmd: string, agent: string, host: string, epoch: number): Promise<{ processed: boolean; indexed: boolean }> {
-    const row = this.sql.exec<{ result: string | null }>("SELECT result FROM commands WHERE cmd = ?", cmd).toArray()[0];
+  async killProgress(cmd: string, agent: string, host: string, epoch: number): Promise<{ processed: boolean; indexed: boolean; host_processing: boolean }> {
+    const row = this.sql.exec<{ result: string | null; issued_ms: number }>("SELECT result, issued_ms FROM commands WHERE cmd = ?", cmd).toArray()[0];
+    const since = row?.issued_ms ?? 0;
+    const host_processing = this.sql.exec(
+      `SELECT 1 FROM commands WHERE host = ? AND cmd <> ? AND ((result IS NOT NULL AND result_ms >= ?) OR (result IS NULL AND issued_ms < ?)) LIMIT 1`,
+      host, cmd, since, since).toArray().length > 0;
     const indexed = this.sql.exec("SELECT 1 FROM host_agents WHERE agent = ? AND host = ? AND (epoch IS NULL OR epoch <= ?)", agent, host, epoch)
       .toArray().length > 0;
-    return { processed: !row || row.result !== null, indexed };
+    return { processed: !row || row.result !== null, indexed, host_processing };
   }
 
   /**
-   * AgentDO's escalation found a host that doesn't process commands (a kill without a result after
-   * 60 s), or a brain that outlived its kill by 15 minutes: treat the host as wedged. Its
-   * heartbeats and hellos go unanswered from now on, so its own lease lapses (nestd kills every
-   * brain at 20 s), and at 30 s of that silence it is expired like any silent host: STONITH if it
-   * holds leases, otherwise expired at once, and its brains handed back to AgentDO either way. The
-   * blast radius is the whole host: every brain on it restarts, and every sandbox on it is placed
-   * again from its head (losing what it hadn't committed). A host already dead or expired needs
-   * nothing.
+   * AgentDO's escalation found a host that processes no commands (no result since a kill, and
+   * nothing older pending, for 60 s), or a brain that outlived its kill by 15 minutes: treat the
+   * host as wedged. Its heartbeats and hellos go unanswered from now on, so no renewal reaches it,
+   * and 30 s after its last one the tick sends it to STONITH whether or not it holds leases (D5):
+   * its brains are handed back only once the instance is confirmed terminated (or an operator
+   * confirms it dead), never on the strength of its own watchdog. The blast radius is the whole
+   * host: every brain on it restarts, and every sandbox on it is placed again from its head (losing
+   * what it hadn't committed). A host already dead or expired needs nothing.
    */
   async hostWedged(host: string, reason: string): Promise<void> {
     const h = this.host(host);
@@ -1394,9 +1453,16 @@ export class FleetDO extends DurableObject<Env> {
     return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
   }
 
-  async hostStatus(host: string): Promise<{ status: HostStatus; connected: boolean; last_rx: number | null } | null> {
+  /** `lost`: its brains are proven gone (A6): lease expired, or death confirmed. */
+  async hostStatus(host: string): Promise<{ status: HostStatus; connected: boolean; last_rx: number | null; lost: boolean } | null> {
     const h = this.host(host);
-    return h ? { status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx } : null;
+    return h ? { status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx, lost: this.hostLost(host) } : null;
+  }
+
+  /** A6: proven gone (see the `lost` column); a row never seen at all counts as gone. */
+  private hostLost(host: string): boolean {
+    const r = this.sql.exec<{ lost: number }>("SELECT lost FROM hosts WHERE host = ?", host).toArray()[0];
+    return !r || r.lost === 1;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1422,9 +1488,10 @@ export class FleetDO extends DurableObject<Env> {
     for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status IN ('active', 'draining')").toArray()) {
       if (h.last_rx === null || now - h.last_rx < expiry) continue;
       // Any silent host is expired (design rule 5), whatever its role and whether or not it holds
-      // leases: one that does waits for STONITH, one that doesn't is expired at once.
-      this.sql.exec("UPDATE hosts SET wedged_ms = NULL WHERE host = ?", h.host);
-      if (this.leasesOf(h.host).some((l) => !l.expired)) await this.expireHost(h.host);
+      // leases: one that does waits for STONITH, one that doesn't is expired at once. A wedged host
+      // always waits for STONITH (D5): its own watchdog is not trusted to have killed its brains.
+      const wedged = h.wedged_ms !== null && h.wedged_ms !== undefined;
+      if (wedged || this.leasesOf(h.host).some((l) => !l.expired)) await this.expireHost(h.host);
       else await this.expireSilent(h.host);
     }
     for (const h of this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'stonith_pending'").toArray()) {
@@ -1436,8 +1503,10 @@ export class FleetDO extends DurableObject<Env> {
       if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
     }
     await this.processReassign();
-    // Brains of a lost host whose agent wasn't told yet (its call failed).
+    // Brains of a lost host whose agent wasn't told yet (its call failed), and owed exits of brains a
+    // hello no longer reported.
     for (const h of this.sql.exec<{ host: string }>(LOST_WITH_BRAINS).toArray()) await this.brainsLost(h.host);
+    for (const h of this.sql.exec<{ host: string }>("SELECT DISTINCT host FROM host_agents WHERE gone = 1").toArray()) await this.goneExits(h.host);
     await this.reapStale();
     await this.scaleDown(now);
     this.sql.exec("DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?", now - COMMAND_RETENTION_MS);
@@ -1446,6 +1515,7 @@ export class FleetDO extends DurableObject<Env> {
     const busy = this.sql.exec("SELECT 1 FROM hosts WHERE status IN ('active', 'draining', 'stonith_pending')").toArray().length
       || this.sql.exec("SELECT 1 FROM hosts WHERE status = 'expired' AND role = 'burst' AND instance_id IS NOT NULL").toArray().length
       || this.sql.exec(LOST_WITH_BRAINS).toArray().length
+      || this.sql.exec("SELECT 1 FROM host_agents WHERE gone = 1").toArray().length
       || this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length
       || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND (host IS NULL OR reason IS NOT NULL)").toArray().length
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length
@@ -1655,7 +1725,11 @@ export class FleetDO extends DurableObject<Env> {
       "SELECT instance_id FROM launched WHERE reason IS NOT NULL AND ended_ms IS NULL").toArray()) {
       try {
         const state = await ec2.state(r.instance_id);
-        if (isDead(state)) this.sql.exec("UPDATE launched SET ended_ms = ? WHERE instance_id = ?", Date.now(), r.instance_id);
+        if (isDead(state)) {
+          this.sql.exec("UPDATE launched SET ended_ms = ? WHERE instance_id = ?", Date.now(), r.instance_id);
+          // EC2 confirms a retired host's instance gone: now its death is proof (A6).
+          this.sql.exec("UPDATE hosts SET lost = 1 WHERE instance_id = ? AND status = 'dead'", r.instance_id);
+        }
         else await ec2.terminate(r.instance_id);
       } catch (e) {
         console.error(`FleetDO: terminating ${r.instance_id} failed; will retry`, e);
@@ -1901,7 +1975,11 @@ export class FleetDO extends DurableObject<Env> {
       await this.pollStonith(row);
     }
     // Without an instance id or EC2 access, STONITH waits for the host to reconnect and fence, or for
-    // an operator to confirm (`confirmHostDead`). Never double-run.
+    // an operator to confirm (`confirmHostDead`). Never double-run. A wedged host never reconnects
+    // (its hellos are refused): its brains wait for STONITH or the operator.
+    else if (row.wedged_ms !== null && row.wedged_ms !== undefined) {
+      console.error(`FleetDO: wedged ${host} has no STONITH (no instance id or EC2); its brains stay recorded until an operator confirms it dead`);
+    }
   }
 
   /**
@@ -1911,7 +1989,7 @@ export class FleetDO extends DurableObject<Env> {
    * session, so they start again elsewhere (or here once it reconnects; `hello` makes it active again).
    */
   private async expireSilent(host: string): Promise<void> {
-    this.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", host);
+    this.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", host);
     for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "lease expired");
     this.failStarts(host);
     await this.brainsLost(host);
@@ -1936,12 +2014,16 @@ export class FleetDO extends DurableObject<Env> {
    * sandbox's.
    */
   private async brainsLost(host: string): Promise<void> {
-    const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray();
-    for (const { agent } of agents) {
+    const agents = this.sql.exec<{ agent: string; epoch: number | null; cmd: string }>("SELECT agent, epoch, cmd FROM host_agents WHERE host = ?", host).toArray();
+    for (const { agent, epoch, cmd } of agents) {
+      // Only while the host's brains are proven gone (A6); one that came back reconciles its brains
+      // from its hello.
+      if (!this.hostLost(host)) return;
       try {
-        await this.agentStub(agent).onHostLost(host);
-        // Forgotten only once the agent took it (amendment A2): a failed call is retried from the tick.
-        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", agent, host);
+        await this.agentStub(agent).onHostLost(host, epoch ?? undefined);
+        // Forgotten only once the agent took it (A2), and only the row that notice was for (A5): a
+        // newer start's row recorded meanwhile stays.
+        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND cmd = ?", agent, host, cmd);
       } catch (e) {
         console.error(`FleetDO: telling ${agent} that ${host} is lost failed; will retry`, e);
       }
@@ -1990,7 +2072,8 @@ export class FleetDO extends DurableObject<Env> {
    */
   private stonithDoneIfClear(host: string, fenced = new Set<string>()): void {
     if (this.leasesOf(host).some((l) => l.expired && !fenced.has(l.sandbox)) || !this.socketFor(host)) return;
-    this.sql.exec("UPDATE hosts SET status = 'active' WHERE host = ? AND status = 'stonith_pending'", host);
+    // A wedged host is done only when STONITH confirms it dead (D5), never by a fence it runs itself.
+    this.sql.exec("UPDATE hosts SET status = 'active' WHERE host = ? AND status = 'stonith_pending' AND wedged_ms IS NULL", host);
   }
 
   /** STONITH confirmed (EC2 says terminated, or an operator confirmed): reassign every lease. */
@@ -1998,10 +2081,12 @@ export class FleetDO extends DurableObject<Env> {
     const h = this.host(host);
     if (!h) return;
     if (h.status !== "dead") {
-      this.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", host);
+      this.sql.exec("UPDATE hosts SET status = 'dead', wedged_ms = NULL WHERE host = ?", host);
       for (const ws of this.ctx.getWebSockets(host)) ws.close(4410, "host declared dead");
       this.releaseTunnel(host, "dead");
     }
+    // Confirmed (EC2/STONITH or an operator): its brains are proven gone (A6).
+    this.sql.exec("UPDATE hosts SET lost = 1 WHERE host = ?", host);
     await this.queueReassign(host, this.leasesOf(host).map((l) => l.sandbox), true);
     // Brains placed on it (today's placement co-locates a worker with its sandbox) died with it.
     await this.brainsLost(host);
