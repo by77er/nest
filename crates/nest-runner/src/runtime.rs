@@ -92,28 +92,13 @@ impl Runtime {
     }
 
     /// Remove `a` — only if it is still the registered instance (a duplicate start must never
-    /// deregister the live brain) — and return the agent epoch its exit reports, read under the
-    /// same lock as [`Runtime::adopt`]: an adoption either lands before this (the exit names the
-    /// adopted epoch) or fails (the start registers a new brain), never in between (N2).
+    /// deregister another brain) — and return the agent epoch its exit reports.
     pub fn deregister(&self, a: &Arc<Agent>) -> Epoch {
         let mut r = self.agents.lock().unwrap();
         if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
             r.agents.remove(&a.id);
         }
         a.epoch()
-    }
-
-    /// A same-host re-issue for a live brain: it adopts `epoch` (and the new hands), but only while
-    /// it is still the registered brain; `false` once it deregistered (its exit already names
-    /// its epoch), and the start then registers a brain of its own.
-    pub fn adopt(&self, a: &Arc<Agent>, epoch: Epoch, hands: Option<HandsBinding>) -> bool {
-        let r = self.agents.lock().unwrap();
-        if !r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
-            return false;
-        }
-        a.set_hands(hands);
-        a.adopt_epoch(epoch);
-        true
     }
 
     /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
@@ -636,23 +621,6 @@ mod registry_tests {
         let (cmd, _crx) = mpsc::unbounded_channel();
         let (out, _orx) = mpsc::unbounded_channel();
         Agent::new(AgentId("agt_r".into()), AgentRole::Captain, Epoch(epoch), PathBuf::from("/tmp"), None, None, vec![], rt.current_gen(), cmd, out)
-    }
-
-    /// N2: an adoption and the brain's deregistration (which reads the epoch its exit reports) are
-    /// ordered: adopted first, the exit names the adopted epoch; deregistered first, the adoption
-    /// fails (the start registers a brain of its own) and the exit keeps its own epoch.
-    #[test]
-    fn an_adoption_and_a_deregistration_are_ordered() {
-        let rt = Runtime::new(Config::default());
-        let a = agent(&rt, 1);
-        assert!(rt.register(a.clone(), rt.fence_gen()).is_ok());
-        assert!(rt.adopt(&a, Epoch(2), None));
-        assert_eq!(rt.deregister(&a), Epoch(2));
-        let b = agent(&rt, 3);
-        assert!(rt.register(b.clone(), rt.fence_gen()).is_ok());
-        assert_eq!(rt.deregister(&b), Epoch(3));
-        assert!(!rt.adopt(&b, Epoch(4), None), "a brain that went can't adopt");
-        assert_eq!(b.epoch(), Epoch(3));
     }
 
     /// N9: a call id outside a turn carries 128 random bits.

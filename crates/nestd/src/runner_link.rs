@@ -51,6 +51,9 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+/// A forwarded kill whose brain hasn't exited after this long drops the runner connection.
+pub const KILL_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug)]
 pub enum RunnerNotice {
     Connected { runner_version: String, pid: u32 },
@@ -78,6 +81,10 @@ struct Brain {
 
 #[derive(Default)]
 struct State {
+    /// Signalled to drop the current runner connection (the runner then kills every brain).
+    drop_conn: Option<Arc<tokio::sync::Notify>>,
+    /// How long a forwarded kill waits for its brain's exit before the connection is dropped.
+    kill_exit_wait: Option<std::time::Duration>,
     /// One entry per (agent, agent epoch) start.
     brains: BTreeMap<(AgentId, Epoch), Brain>,
     token: Option<(Secret, TimestampMs)>,
@@ -285,11 +292,32 @@ impl RunnerLink {
         match &st.conn {
             Some(c) => {
                 let _ = c.send(RunnerCommand::AgentStop { agent: agent.clone(), mode: StopMode::Kill, reason: reason.into(), epoch });
+                // The narrower step before any wedge (M1): if the brain hasn't exited after the
+                // wait, the runner connection is dropped, so the runner kills every brain here
+                // (sandboxes are untouched) and their exits are reported.
+                let (state, agent, conn_gen) = (self.state.clone(), agent.clone(), st.conn_gen);
+                let wait = st.kill_exit_wait.unwrap_or(KILL_EXIT_WAIT);
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    let st = state.lock().expect("runner state");
+                    let out = st.keys_of(&agent).into_iter().any(|(_, e)| epoch.is_none_or(|b| e <= b));
+                    if out && st.conn_gen == conn_gen && st.conn.is_some() {
+                        tracing::error!(%agent, "a killed brain did not exit; dropping the runner connection");
+                        if let Some(n) = &st.drop_conn {
+                            n.notify_one();
+                        }
+                    }
+                });
                 true
             }
             // A sent start without a connection doesn't outlive the disconnect; nothing runs.
             None => false,
         }
+    }
+
+    /// Test seam: how long a forwarded kill waits for its brain's exit (default `KILL_EXIT_WAIT`).
+    pub fn set_kill_exit_wait(&self, wait: std::time::Duration) {
+        self.state.lock().expect("runner state").kill_exit_wait = Some(wait);
     }
 
     /// Whether a kill at or above `epoch` arrived for `agent` (its tombstone).
@@ -338,6 +366,7 @@ async fn serve(
         }
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<RunnerCommand>();
+    let drop_conn = Arc::new(tokio::sync::Notify::new());
     // Handshake + pending starts under the lock so concurrent commands queue behind it.
     let conn = {
         let mut st = state.lock().expect("runner state");
@@ -355,6 +384,7 @@ async fn serve(
         }
         st.conn_gen += 1;
         let conn = st.conn_gen;
+        st.drop_conn = Some(drop_conn.clone());
         for b in st.brains.values_mut() {
             if matches!(b.sent, Sent::Pending(_))
                 && let Sent::Pending(start) = std::mem::replace(&mut b.sent, Sent::On { conn, started: false })
@@ -368,6 +398,7 @@ async fn serve(
     let _ = notices.send(RunnerNotice::Connected { runner_version, pid });
     loop {
         tokio::select! {
+            _ = drop_conn.notified() => break,
             out = rx.recv() => {
                 let Some(cmd) = out else { break };
                 let Ok(bytes) = serde_json::to_vec(&cmd) else { continue };
@@ -807,5 +838,36 @@ mod tests {
             RunnerNotice::Disconnected { lost } => assert_eq!(lost, vec![(a.clone(), Epoch(1), ExitReason::Crashed), (a, Epoch(2), ExitReason::Fenced)]),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// M1's narrower step: a forwarded kill whose brain never exits drops the runner connection
+    /// (the runner kills every brain), and the brains are reported lost, sandboxes untouched.
+    #[tokio::test]
+    async fn a_kill_without_an_exit_drops_the_runner_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, path, mut nrx) = link(dir.path());
+        link.set_kill_exit_wait(std::time::Duration::from_millis(100));
+        let mut f = connected(&path, &mut nrx).await;
+        let a = AgentId("agt_a".into());
+        assert!(link.agent_start(start_at("agt_a", 1)));
+        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(_)));
+        assert!(link.kill(&a, Some(Epoch(1)), "x"));
+        match notice(&mut nrx).await {
+            RunnerNotice::Disconnected { lost } => assert_eq!(lost, vec![(a, Epoch(1), ExitReason::Crashed)]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The tombstone only rises: a lower kill never lowers it.
+    #[tokio::test]
+    async fn the_kill_tombstone_only_rises() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, _path, _nrx) = link(dir.path());
+        let a = AgentId("agt_a".into());
+        link.kill(&a, Some(Epoch(1)), "x");
+        link.kill(&a, Some(Epoch(3)), "x");
+        link.kill(&a, Some(Epoch(2)), "x");
+        assert!(link.killed_at_or_above(&a, Epoch(3)));
+        assert!(!link.killed_at_or_above(&a, Epoch(4)));
     }
 }

@@ -261,7 +261,7 @@ describe("#8 tool calls cut off by an eviction", () => {
 
 describe("#9 no secrets at rest outside BrokerDO", () => {
   it("stored command bodies hold references; the host receives the value", async () => {
-    const s = await setup();
+    const s = await setup({ start: false });
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
     expect(start.oauth_token).toBe("sk-ant-oat01-regress");
@@ -612,7 +612,7 @@ describe("docs #13 guest CLI mapping", () => {
 
 describe("docs #8 hello.agents reconciliation", () => {
   it("a started brain the host no longer reports is marked detached; a reported one is kept", async () => {
-    const s = await setup();
+    const s = await setup({ start: false });
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
     await okResult(s.host.ws, start.cmd);

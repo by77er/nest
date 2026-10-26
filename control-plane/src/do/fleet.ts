@@ -981,39 +981,31 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * `min_epoch`: the oldest start there not known to have exited (an exit without an epoch is taken
-   * for it, never for a newer one; NULL with a NULL `epoch`, a row stored by the previous release).
    * `gone`: the host's hello no longer reports the agent; its exit is owed to AgentDO (retried by the
    * tick until acknowledged, then the row goes).
    */
   private addHostAgentsColumns(): void {
-    this.addColumn("host_agents", "min_epoch", "INTEGER");
     this.addColumn("host_agents", "gone", "INTEGER NOT NULL DEFAULT 0");
   }
 
   /**
-   * The epoch an exit without one (nestd of the previous release) stands for: the oldest start there
-   * not known to have exited, so it never releases a newer record early. None for a row stored by
-   * the previous release (AgentDO then condemns the brain and proves it gone).
+   * The epoch an exit without one (nestd of the previous release) stands for: the row's, since at
+   * most one start of an agent is ever outstanding on a host (AgentDO never re-issues a start for a
+   * brain it hasn't released). None for a row stored by the previous release (AgentDO then condemns
+   * the brain and proves it gone).
    */
   private exitEpoch(agent: string, host: string): number | undefined {
-    const r = this.sql.exec<{ epoch: number | null; min_epoch: number | null }>(
-      "SELECT epoch, min_epoch FROM host_agents WHERE agent = ? AND host = ?", agent, host).toArray()[0];
-    if (!r || r.epoch === null) return undefined;
-    return r.min_epoch ?? r.epoch;
+    const r = this.sql.exec<{ epoch: number | null }>("SELECT epoch FROM host_agents WHERE agent = ? AND host = ?", agent, host).toArray()[0];
+    return r?.epoch ?? undefined;
   }
 
-  /**
-   * A brain on `host` exited at agent epoch `epoch` (unknown: the row is the previous release's):
-   * the row goes once that covers its newest start; otherwise only its oldest outstanding start moves on.
-   */
+  /** A brain on `host` exited at agent epoch `epoch` (unknown: the row is the previous release's): its row goes unless a newer start replaced it. */
   private brainGone(agent: string, host: string, epoch: number | undefined): void {
     if (epoch === undefined) {
       this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND epoch IS NULL", agent, host);
       return;
     }
     this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND (epoch IS NULL OR epoch <= ?)", agent, host, epoch);
-    this.sql.exec("UPDATE host_agents SET min_epoch = MAX(COALESCE(min_epoch, 0), ?) WHERE agent = ? AND host = ?", epoch + 1, agent, host);
   }
 
   /** Owed exits of brains a host's hello no longer reports: told to AgentDO, the row going only once it took it. */
@@ -1292,12 +1284,9 @@ export class FleetDO extends DurableObject<Env> {
         c.cmd, host, c.type, sandbox, agent, epoch, purpose, JSON.stringify(c), now,
       );
       if (c.type === "agent_start") {
-        // A newer start there keeps the oldest outstanding one (`min_epoch`); a row stored by the
-        // previous release keeps none (its older start's epoch is unknown).
-        this.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch, min_epoch, gone) VALUES (?, ?, ?, ?, ?, 0)
-          ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch, gone = 0,
-            min_epoch = CASE WHEN host_agents.epoch IS NULL THEN NULL ELSE COALESCE(host_agents.min_epoch, host_agents.epoch) END`,
-          c.agent, host, c.cmd, c.epoch ?? null, c.epoch ?? null);
+        this.sql.exec(`INSERT INTO host_agents (agent, host, cmd, epoch, gone) VALUES (?, ?, ?, ?, 0)
+          ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd, epoch = excluded.epoch, gone = 0`,
+          c.agent, host, c.cmd, c.epoch ?? null);
       }
     }
     const msg = this.rel.push(host, (seq) => ({ type: "commands" as const, seq, commands }));
@@ -1360,7 +1349,7 @@ export class FleetDO extends DurableObject<Env> {
       return { room: mem - reserveMib, leases: leases.length, fits: leases.length === 0 || (underCap && mem >= reserveMib) };
     };
     const candidates = this.sql
-      .exec<HostRow>("SELECT * FROM hosts WHERE role = 'burst' AND status = 'active'")
+      .exec<HostRow>("SELECT * FROM hosts WHERE role = 'burst' AND status = 'active' AND wedged_ms IS NULL")
       .toArray()
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => ({ h, r: room(h) }))
@@ -1409,7 +1398,7 @@ export class FleetDO extends DurableObject<Env> {
 
   /** An active, connected host other than `exclude` (a brain moving off a host that is going away). */
   async otherHost(exclude: string): Promise<string | null> {
-    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'active' AND host <> ? ORDER BY role", exclude).toArray();
+    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'active' AND wedged_ms IS NULL AND host <> ? ORDER BY role", exclude).toArray();
     return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
   }
 
@@ -1429,7 +1418,7 @@ export class FleetDO extends DurableObject<Env> {
   /**
    * Where a condemned brain's kill stands, for AgentDO's escalation: whether `host` processed the
    * kill (`cmd` has a result; a command row is pruned only a day after its result), whether this
-   * index still has a start at or below `epoch` for the agent there (an unknown epoch counts), and
+   * index still has a start at or below `epoch` for the agent there, and
    * whether the host is processing commands at all: a result from it since the kill was stored, or
    * an older command still pending there (nestd of the previous release runs a kill in order,
    * behind them).
@@ -1440,7 +1429,9 @@ export class FleetDO extends DurableObject<Env> {
     const host_processing = this.sql.exec(
       `SELECT 1 FROM commands WHERE host = ? AND cmd <> ? AND ((result IS NOT NULL AND result_ms >= ?) OR (result IS NULL AND issued_ms < ?)) LIMIT 1`,
       host, cmd, since, since).toArray().length > 0;
-    const indexed = this.sql.exec("SELECT 1 FROM host_agents WHERE agent = ? AND host = ? AND (epoch IS NULL OR epoch <= ?)", agent, host, epoch)
+    // A row without an epoch (the previous release's) proves nothing either way: not counted; the
+    // host's next hello resolves it (a brain not reported is gone).
+    const indexed = this.sql.exec("SELECT 1 FROM host_agents WHERE agent = ? AND host = ? AND epoch IS NOT NULL AND epoch <= ?", agent, host, epoch)
       .toArray().length > 0;
     return { processed: !row || row.result !== null, indexed, host_processing };
   }
@@ -1459,13 +1450,15 @@ export class FleetDO extends DurableObject<Env> {
     const h = this.host(host);
     if (!h || (h.status !== "active" && h.status !== "draining") || (h.wedged_ms !== null && h.wedged_ms !== undefined)) return;
     this.sql.exec("UPDATE hosts SET wedged_ms = ? WHERE host = ?", Date.now(), host);
+    // Cut off at once: no socket (its hellos are refused), and no placement of anything on it.
+    for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "wedged");
     console.error(`FleetDO: ${host} is wedged (${reason}); no lease renewal until it is expired`);
     if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
 
   /** A connected, active controller host for captains. */
   async controllerHost(): Promise<string | null> {
-    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE role = 'controller' AND status = 'active'").toArray();
+    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE role = 'controller' AND status = 'active' AND wedged_ms IS NULL").toArray();
     return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
   }
 
@@ -1483,7 +1476,7 @@ export class FleetDO extends DurableObject<Env> {
    * than `exclude`: where a new brain goes rather than a host of the previous release.
    */
   async currentHost(role: HostRole | null, exclude?: string): Promise<string | null> {
-    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'active' AND brain_epochs = 1 AND host <> ? AND (? IS NULL OR role = ?) ORDER BY role",
+    const hosts = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE status = 'active' AND wedged_ms IS NULL AND brain_epochs = 1 AND host <> ? AND (? IS NULL OR role = ?) ORDER BY role",
       exclude ?? "", role, role).toArray();
     return hosts.find((h) => this.socketFor(h.host))?.host ?? null;
   }
@@ -1921,7 +1914,7 @@ export class FleetDO extends DurableObject<Env> {
    */
   async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[]; sandboxes: Record<string, unknown>[]; aws: AwsView }> {
     const hosts = this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since, h.enrolled_ms, h.last_rx,
-        h.tunnel_hostname, h.tunnel_state, h.capacity,
+        h.tunnel_hostname, h.tunnel_state, h.capacity, h.wedged_ms, h.lost, h.brain_epochs,
         (SELECT COUNT(*) FROM leases l WHERE l.host = h.host) AS leases FROM hosts h ORDER BY h.enrolled_ms`).toArray()
       .map((h) => ({
         ...h,

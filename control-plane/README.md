@@ -46,11 +46,12 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      the only way to mint a public share link (agents can't)
    - `POST /v1/agents {role, workstream?, sandbox?, cell?, start?}`: sends `agent_start` to the host; a worker's
      workstream and cell come from its sandbox (a mismatch is refused with 409)
-   - `POST /v1/agents/<id>/start {host?}`: start (or restart) the brain; `host` puts it on a chosen active,
+   - `POST /v1/agents/<id>/start {host?, restart?}`: start (or restart) the brain; `host` puts it on a chosen active,
      connected host of the cell (for a test); hands still go through the sandbox's gateway. Answers `{host, cmd}`;
-     a brain running on that host is restarted there under a new epoch; `cmd: null, waiting_for: <host>` when the
-     brain runs on another host: it is condemned and killed there, and this start (kept as the agent's intent, merged
-     with any other start wanted meanwhile) runs once that brain's exit or its host's loss releases it
+     `kind: none` when the brain already runs (nothing sent; `{restart: true}` restarts it: condemned, then started
+     again once released); `kind: waiting, waiting_for: <host>` when the brain runs on another host: it is condemned
+     and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
+     once that brain's exit or its host's loss releases it
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:

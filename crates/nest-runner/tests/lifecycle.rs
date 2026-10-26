@@ -106,24 +106,25 @@ fn exited(evs: &[RunnerEvent]) -> Vec<ExitReason> {
         .collect()
 }
 
+/// No re-issue: a start for an agent whose brain is still registered (AgentDO never sends one
+/// while it hasn't released that brain, so it is one on its way out) ends it first and never runs
+/// beside it or adopts it; the old brain's exit names its own epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn duplicate_start_never_deregisters_the_live_brain() {
+async fn a_start_never_runs_beside_or_adopts_a_registered_brain() {
     let e = env();
     let id = AgentId("agt_dup".into());
-    nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_dup", &[]));
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_dup", 1));
     wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
     let first = e.rt.agent(&id).expect("registered");
-    nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_dup", &[]));
-    let evs = events(&e.rt, Duration::from_millis(800)).await;
-    assert!(exited(&evs).is_empty(), "a duplicate start must not report the brain as exited: {evs:?}");
-    assert!(evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "already_running")));
-    assert!(Arc::ptr_eq(&e.rt.agent(&id).expect("still registered"), &first));
-    assert_eq!(pids(e.dir.path()).len(), 1, "no second Claude Code");
-    // And it is still fenceable.
-    e.rt.kill_all(ExitReason::Fenced);
     let pid = pids(e.dir.path())[0];
-    wait_for("brain killed", || !alive(pid)).await;
-    wait_for("deregistered", || e.rt.agent(&id).is_none()).await;
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_dup", 2));
+    wait_for("the first brain gone", || !alive(pid)).await;
+    wait_for("a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
+    assert_eq!(first.epoch(), nest_protocol::model::Epoch(1), "never adopted");
+    assert!(pids(e.dir.path()).iter().filter(|p| alive(**p)).count() <= 1, "never two at once");
+    let evs = events(&e.rt, Duration::from_millis(500)).await;
+    assert!(exits_at(&evs).iter().any(|x| x.1 == Some(1)), "{evs:?}");
+    e.rt.kill_all(ExitReason::Fenced);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -368,20 +369,4 @@ async fn a_graceful_stop_for_an_older_epoch_spares_a_newer_brain() {
     );
     assert!(e.rt.agent(&id).expect("registered").is_stopping());
     e.rt.kill_all(ExitReason::Fenced);
-}
-
-/// A same-host re-issue of a live brain: the running brain adopts the newer epoch (its exit names
-/// it), and no second Claude Code starts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_live_brain_adopts_a_reissued_epoch() {
-    let e = env();
-    let id = AgentId("agt_adopt".into());
-    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_adopt", 1));
-    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
-    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_adopt", 2));
-    wait_for("adopted", || e.rt.agent(&id).is_some_and(|a| a.epoch() == nest_protocol::model::Epoch(2))).await;
-    assert_eq!(pids(e.dir.path()).len(), 1);
-    e.rt.kill_all(ExitReason::Fenced);
-    let evs = events(&e.rt, Duration::from_millis(1500)).await;
-    assert!(exits_at(&evs).contains(&(ExitReason::Fenced, Some(2))), "{evs:?}");
 }

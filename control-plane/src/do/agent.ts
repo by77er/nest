@@ -163,10 +163,10 @@ export interface AgentInfo {
  */
 export type Brain =
   | { phase: "starting" | "live"; host: string; epoch: number; since_ms: number }
-  | { phase: "condemned"; host: string; epoch: number; since_ms: number; kill_cmd?: string; kill_ms?: number };
+  | { phase: "condemned"; host: string; epoch: number; since_ms: number; kill?: { cmd: string; ms: number } };
 
 /** Who wanted a start. */
-export type IntentReason = "operator" | "wake" | "drain" | "retry";
+export type IntentReason = "operator" | "restart" | "wake" | "drain" | "retry";
 
 /** A start someone wants: on a chosen host, or anywhere but a host going away. */
 export interface StartIntent {
@@ -501,7 +501,7 @@ export class AgentDO extends DurableObject<Env> {
    * Recorded as the intent, then run: see `processIntent`. The setup token travels as a BrokerDO
    * reference, resolved by FleetDO when it sends.
    */
-  async start(hostHint?: string, avoid?: string): Promise<StartResult> {
+  async start(hostHint?: string, avoid?: string, restart = false): Promise<StartResult> {
     const info = this.load();
     if (hostHint) {
       // An active, connected host of this cell, like `controllerHost` picks. Hands still go
@@ -511,7 +511,7 @@ export class AgentDO extends DurableObject<Env> {
         throw new NestError(ErrorCodes.FORBIDDEN, `${hostHint} is not an active, connected host in ${info.cell}`, 409);
       }
     }
-    await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), ...(avoid ? { avoid } : {}), reason: "operator" });
+    await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), ...(avoid ? { avoid } : {}), reason: restart ? "restart" : "operator" });
     const r = await this.runIntent(true);
     return r ?? this.startStatus();
   }
@@ -597,13 +597,25 @@ export class AgentDO extends DurableObject<Env> {
           if (!this.deadlines.has("condemned")) await this.deadlines.set("condemned", Date.now(), true);
           return this.startStatus();
         }
-        if (brain && ((intent.host_hint && intent.host_hint !== brain.host) || intent.avoid === brain.host)) {
+        if (brain) {
+          // A brain that isn't condemned: never a second start for it (no same-host re-issue). It
+          // moves (another hint, or its host avoided) or restarts (an operator's explicit restart)
+          // by being condemned with the intent kept, which then starts once it is released (maybe
+          // on the same host); any other start finds it running and answers `none`.
+          const moves = (intent.host_hint !== undefined && intent.host_hint !== brain.host) || intent.avoid === brain.host || intent.reason === "restart";
           await this.hook("intent:beforeCommit");
           if (!this.unchanged(snap)) continue;
-          await this.condemn(`starting on ${intent.host_hint ?? "another host"}`, brain.epoch);
+          if (moves) {
+            await this.condemn(intent.reason === "restart" ? "restarting" : `starting on ${intent.host_hint ?? "another host"}`, brain.epoch);
+            return this.startStatus();
+          }
+          this.update((i) => {
+            i.intent = null;
+          });
+          await this.deadlines.clear("intent");
           return this.startStatus();
         }
-        const host = brain ? await this.reissueHost(snap, brain.host) : await this.pickHost(snap, intent);
+        const host = await this.pickHost(snap, intent);
         const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).oauthTokenRef(snap.role);
         // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
         // resume from up to a flush interval ago.
@@ -626,15 +638,6 @@ export class AgentDO extends DurableObject<Env> {
   private unchanged(snap: AgentInfo): boolean {
     const now = this.load();
     return JSON.stringify(now.brain) === JSON.stringify(snap.brain) && JSON.stringify(now.intent) === JSON.stringify(snap.intent);
-  }
-
-  /** A same-host re-issue needs its host active and connected, like any start (N8); otherwise it waits. */
-  private async reissueHost(info: AgentInfo, host: string): Promise<string> {
-    const st = await this.fleet(info.cell).hostStatus(host);
-    if (!st || st.status !== "active" || !st.connected) {
-      throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, `${host}, where the brain runs, is not active and connected`, 503, true);
-    }
-    return host;
   }
 
   /** Where a start with no brain goes (see `processIntent`). Throws when no host can take it now. */
@@ -764,7 +767,7 @@ export class AgentDO extends DurableObject<Env> {
    * open sessions are closed before anything is made durable (late bytes go to the orphan branch),
    * and its host is told to kill it (`agent_stop{kill, epoch}`, applied on arrival; the host and
    * its runner refuse any start at or below that epoch). Amendment A1: the kill is part of the
-   * transition. The record says it is owed (no `kill_cmd`) and the `condemned` alarm is armed in
+   * transition. The record says it is owed (no `kill`) and the `condemned` alarm is armed in
    * the same synchronous step, so the kill is issued (idempotently: FleetDO keeps one per agent
    * and epoch) until FleetDO has stored it, whatever happens to this call; escalation takes over
    * once it is stored.
@@ -802,8 +805,8 @@ export class AgentDO extends DurableObject<Env> {
     this.update((i) => {
       const cur = i.brain;
       if (cur && cur.phase === "condemned" && cur.host === b.host && cur.epoch === b.epoch) {
-        if (cur.kill_cmd !== cmd) i.brain = { ...cur, kill_cmd: cmd, kill_ms: now };
-        killMs = (i.brain as Extract<Brain, { phase: "condemned" }>).kill_ms ?? now;
+        if (cur.kill?.cmd !== cmd) i.brain = { ...cur, kill: { cmd, ms: now } };
+        killMs = (i.brain as Extract<Brain, { phase: "condemned" }>).kill?.ms ?? now;
       }
     });
     if (killMs !== null) await this.deadlines.set("condemned", killMs + EXIT_WAIT_MS);
@@ -829,11 +832,11 @@ export class AgentDO extends DurableObject<Env> {
       await this.release(b.host, b.epoch, "host_lost");
       return;
     }
-    if (!b.kill_cmd) {
+    if (!b.kill) {
       await this.sendKill(b, "condemned");
       return;
     }
-    const p = await this.fleet(info.cell).killProgress(b.kill_cmd, info.agent, b.host, b.epoch);
+    const p = await this.fleet(info.cell).killProgress(b.kill.cmd, info.agent, b.host, b.epoch);
     await this.hook("escalate:afterProgress");
     // Decided only against the record it was asked for: one released or replaced meanwhile isn't wedged for.
     if (JSON.stringify(this.load().brain) !== JSON.stringify(b)) return;
@@ -841,7 +844,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.release(b.host, b.epoch, "stopped");
       return;
     }
-    const age = Date.now() - (b.kill_ms ?? b.since_ms);
+    const age = Date.now() - b.kill.ms;
     const stuck = !p.processed && !p.host_processing && age >= EXIT_WAIT_MS;
     if ((stuck || age >= ESCALATION_CAP_MS) && !(await this.fleet(info.cell).hostStatus(b.host))?.current) {
       // A host of the previous release (no brain epochs) is never wedged for it (N3): its kill runs
@@ -873,14 +876,15 @@ export class AgentDO extends DurableObject<Env> {
    */
   private async release(host: string, epoch: number, reason: AgentExitReason): Promise<boolean> {
     let released = false;
-    const counted = RESTART_ON_EXIT[reason] && reason !== "idle";
+    const restarts = RESTART_ON_EXIT[reason] && reason !== "idle";
     const info = this.update((i) => {
       if (!i.brain || i.brain.host !== host || epoch < i.brain.epoch) return;
+      // Counted once, where it happens (the crash-loop guard): here for a brain that ended on its
+      // own; a condemned brain's exit is the condemn's outcome, counted by its cause if at all.
+      if (restarts && i.brain.phase !== "condemned") i.exit_restarts = (i.exit_restarts ?? 0) + 1;
       i.prev_host = i.brain.host;
       i.brain = null;
       i.state = "detached";
-      // Counted once, here (the crash-loop guard); the wakes that follow only check it.
-      if (counted) i.exit_restarts = (i.exit_restarts ?? 0) + 1;
       released = true;
     });
     if (!released) return false;
@@ -897,7 +901,7 @@ export class AgentDO extends DurableObject<Env> {
     console.log(`agent ${info.agent}: brain on ${host}@${epoch} released (${reason})`);
     this.fenceSessions(`brain released (${reason})`, host);
     await this.syncActivity();
-    if (!info.intent && RESTART_ON_EXIT[reason]) await this.wake(counted);
+    if (!info.intent && RESTART_ON_EXIT[reason]) await this.wake(restarts);
     return true;
   }
 

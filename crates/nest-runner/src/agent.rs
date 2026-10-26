@@ -124,32 +124,17 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
                     return;
                 }
-                Err(Refused::Running(existing)) if existing.conn_gen != agent.conn_gen => {
-                    // A brain from an earlier nestd connection: it was fenced when that connection
-                    // dropped and is on its way out; this start registers once it is gone.
-                    existing.kill_now(ExitReason::Fenced);
-                    tokio::time::sleep(DYING_POLL).await;
-                }
-                Err(Refused::Running(existing)) if existing.is_stopping() => {
-                    // A brain told to stop is never adopted: this start replaces it, so it ends now
-                    // and the new brain registers once it is gone (never alongside it).
-                    existing.kill_now(ExitReason::Stopped);
-                    tokio::time::sleep(DYING_POLL).await;
-                }
                 Err(Refused::Running(existing)) => {
-                    // AgentDO started this brain again on this host (a same-host re-issue): the live
-                    // brain keeps running, takes the new hands and adopts the newer agent epoch,
-                    // which re-handshakes its session channel. Its exit names that epoch. Atomic
-                    // with its deregistration: one that already went is replaced instead.
-                    if !rt.adopt(&existing, start.start.agent_epoch(), start.start.hands.clone()) {
-                        continue;
+                    // AgentDO starts a brain only once the previous one is released, so a brain
+                    // still registered here is one on its way out (of an earlier nestd connection,
+                    // fenced when it dropped, or killed): never adopted, never run beside. It is
+                    // ended, and this start registers once it is gone.
+                    if existing.conn_gen == agent.conn_gen && !existing.is_stopping() {
+                        tracing::warn!(agent = %id, epoch = epoch.0, "agent_start while a brain of this agent is registered; ending it first");
                     }
-                    tracing::warn!(agent = %id, "agent_start for a brain that is already running; updating its hands and epoch only");
-                    rt.report(RunnerEvent::Error {
-                        agent: Some(id),
-                        error: ErrorBody { code: "already_running".into(), message: "brain already running".into(), retryable: false },
-                    });
-                    return;
+                    existing.stopping.store(true, Ordering::SeqCst);
+                    existing.kill_now(if existing.conn_gen != agent.conn_gen { ExitReason::Fenced } else { ExitReason::Stopped });
+                    tokio::time::sleep(DYING_POLL).await;
                 }
             }
         }

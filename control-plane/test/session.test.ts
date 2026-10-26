@@ -124,6 +124,7 @@ describe("session channel", () => {
     // Restarting the brain (once it's gone) rebuilds the session file from signed segment URLs.
     again.ws.close();
     await sleep(50);
+    await agentStub(s.agent).onExited(s.host.host, "idle", 1); // gone: its exit released it
     const { cmd } = await agentStub(s.agent).start();
     const [restart] = await nextCommands(s.host.ws, (x) => x.cmd === cmd);
     expect(restart.resume).toMatchObject({ session: SESSION, total_bytes: c.length });
