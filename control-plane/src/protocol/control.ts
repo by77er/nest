@@ -140,6 +140,8 @@ export const HelloAck = z.object({
   last_event_seq: Seq.optional(),
   lease: LeaseTiming,
   host_token_expires_ms: TimestampMs,
+  /** Seq of the first `commands` batch sent on this connection; no batch sent on it has a lower one. */
+  next_command_seq: Seq.optional(),
 });
 
 // --- Commands ----------------------------------------------------------------------------------------
