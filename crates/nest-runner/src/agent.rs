@@ -70,6 +70,8 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 /// Start an agent in the background. Errors are reported to nestd.
 pub fn start(rt: Arc<Runtime>, start: AgentStart) {
+    // Taken on arrival, before the task runs: a fence of every brain after this drops the start.
+    let fence_gen = rt.fence_gen();
     tokio::spawn(async move {
         let id = start.start.agent.clone();
         if let Some(bad) = start.start.launch.builtin_tools.iter().find(|t| !HOST_SAFE_BUILTINS.contains(&t.as_str())) {
@@ -110,7 +112,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
         // its exit only once any older brain has gone.
         let older_gone = |rt: &Runtime| rt.agent(&id).is_none_or(|a| a.epoch() > epoch);
         loop {
-            match rt.register(agent.clone()) {
+            match rt.register(agent.clone(), fence_gen) {
                 Ok(()) => break,
                 Err(Refused::Killed) => {
                     // A kill for this epoch (or a later one) overtook the start: it never runs. The

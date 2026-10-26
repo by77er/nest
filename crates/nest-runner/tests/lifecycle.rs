@@ -300,3 +300,26 @@ async fn a_kill_spares_a_newer_brain() {
     let evs = events(&e.rt, Duration::from_millis(800)).await;
     assert!(exits_at(&evs).contains(&(ExitReason::Stopped, Some(2))), "{evs:?}");
 }
+
+/// Amendment A3 (a): a fence of every brain (lease lapse, nestd gone) also drops a start that is
+/// still waiting to register: it never runs, and its exit says so at its epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_of_every_brain_drops_a_waiting_start() {
+    let e = env();
+    let id = AgentId("agt_lapse".into());
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_lapse", 1));
+    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    let first_pid = pids(e.dir.path())[0];
+    // Stopping, so the start at epoch 2 waits for it; then the lease lapses.
+    nest_runner::supervisor::handle(
+        &e.rt,
+        RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "stop".into(), epoch: None },
+    );
+    nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_lapse", 2));
+    nest_runner::supervisor::handle(&e.rt, RunnerCommand::Fence { agents: vec![], reason: "host lease expired".into() });
+    wait_for("the first brain gone", || !alive(first_pid)).await;
+    let evs = events(&e.rt, Duration::from_millis(1500)).await;
+    assert!(exits_at(&evs).contains(&(ExitReason::Fenced, Some(2))), "{evs:?}");
+    assert_eq!(pids(e.dir.path()).len(), 1, "the waiting start ran after the fence");
+    assert!(e.rt.agent(&id).is_none());
+}

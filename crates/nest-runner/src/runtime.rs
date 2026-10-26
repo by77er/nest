@@ -78,9 +78,10 @@ impl Runtime {
     /// Register (first thing a start does, before any slow step). Refused when a kill at or above
     /// the start's agent epoch arrived first (its tombstone), or when another brain is registered
     /// under this id.
-    pub fn register(&self, a: Arc<Agent>) -> Result<(), Refused> {
+    pub fn register(&self, a: Arc<Agent>, fence_gen: u64) -> Result<(), Refused> {
         let mut r = self.agents.lock().unwrap();
-        if r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch().0) {
+        // A fence of every brain (lease lapse, nestd gone) since this start arrived: it never runs.
+        if r.fence_gen != fence_gen || r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch().0) {
             return Err(Refused::Killed);
         }
         if let Some(existing) = r.agents.get(&a.id) {
@@ -133,9 +134,21 @@ impl Runtime {
         self.lease.lock().unwrap().is_some_and(|v| now_ms() <= v)
     }
 
-    /// Kill every brain (lease lapse, nestd gone, `fence` with an empty list).
+    /// The fence generation now: a start takes it when it arrives and registers only if no fence
+    /// of every brain came in between ([`Runtime::register`]).
+    pub fn fence_gen(&self) -> u64 {
+        self.agents.lock().unwrap().fence_gen
+    }
+
+    /// Kill every brain (lease lapse, nestd gone, `fence` with an empty list), and every start that
+    /// arrived before this and hasn't registered yet (it never will).
     pub fn kill_all(&self, reason: ExitReason) {
-        for a in self.agents() {
+        let agents: Vec<Arc<Agent>> = {
+            let mut r = self.agents.lock().unwrap();
+            r.fence_gen += 1;
+            r.agents.values().cloned().collect()
+        };
+        for a in agents {
             a.kill_now(reason);
         }
     }
@@ -169,11 +182,13 @@ impl Runtime {
 struct Registry {
     agents: HashMap<AgentId, Arc<Agent>>,
     tombstones: HashMap<AgentId, u64>,
+    /// Bumped by every fence of all brains (under this lock, so it orders against registrations).
+    fence_gen: u64,
 }
 
 /// Why [`Runtime::register`] refused a brain.
 pub enum Refused {
-    /// A kill at or above its agent epoch arrived first: it must never run.
+    /// A kill at or above its agent epoch, or a fence of every brain, arrived first: it must never run.
     Killed,
     /// Another brain is registered under the id.
     Running(Arc<Agent>),

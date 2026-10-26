@@ -276,7 +276,7 @@ mod tests {
         let (ctx, crx) = mpsc::unbounded_channel();
         let (otx, orx) = mpsc::unbounded_channel();
         let a = Agent::new(AgentId("agt_h".into()), AgentRole::Worker, Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
-        assert!(rt.register(a.clone()).is_ok());
+        assert!(rt.register(a.clone(), rt.fence_gen()).is_ok());
         (rt, a, orx, crx)
     }
 

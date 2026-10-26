@@ -767,6 +767,71 @@ describe("one brain per agent: the brain record", () => {
     expect((await agentStub(s.agent).info()).brain).toMatchObject({ host: b.host, epoch: 2 });
   });
 
+  it("A3: an expired host that comes back never runs a start issued before its loss (the TLC trace)", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
+    const a = await connectHost(cell, "controller");
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "a3" } }, 201);
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    // start{1} went to a, which never acked or answered it; its lease lapses before the brain runs.
+    const batch = await a.ws.next("commands", (m) => (m.commands as any[]).some(isStartOf(captain)));
+    const start1 = (batch.commands as any[]).find(isStartOf(captain));
+    expect(start1.epoch).toBe(1);
+    // The loss notice is delayed (its delivery fails until later).
+    await runInDurableObject(agentStub(captain), (inst: AgentDO) => {
+      inst.testHooks["hostLost:enter"] = async () => {
+        throw new Error("onHostLost not delivered yet");
+      };
+    });
+    await silent(cell, a.host);
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    expect((await fleet.hostStatus(a.host))!.status).toBe("expired");
+    // The unanswered start failed with the expiry: the index row is gone and AgentDO heard it.
+    const failed = await runInDurableObject(fleet, (_i, st) =>
+      st.storage.sql.exec<{ result: string | null }>("SELECT result FROM commands WHERE cmd = ?", start1.cmd).one().result);
+    expect(failed).toContain("error");
+    // a comes back: its hello reactivates it, and the failed start is not resent. Its report
+    // (no brain) releases the record for that epoch, though the loss notice is still delayed.
+    const back = await Ws.connect("/v1/fleet", a.host_token);
+    back.send(hostHello(a.host, cell, { role: "controller" }));
+    await back.next("hello_ack");
+    expect(await back.none("commands", 300, (m) => (m.commands as any[]).some((c) => c.cmd === start1.cmd))).toBe(true);
+    expect((await agentStub(captain).info()).brain).not.toMatchObject({ host: a.host, epoch: 1 });
+    // Had brain 1 run anyway, its hello would not be current.
+    const ws1 = await Ws.connect(`/v1/agents/${captain}/session`, a.host_token).catch(() => null);
+    if (ws1) {
+      ws1.send({ type: "hello", protocol_version: 1, agent: captain, host: a.host, instance_id: "rin_late", epoch: 1, session: SESSION });
+      const first = await Promise.race([ws1.next("error").then((m) => m.error.code), sleep(1500).then(() => "none")]);
+      expect(first).not.toBe("none");
+    }
+    // The delayed notice finally lands: nothing it releases is a running brain.
+    await runInDurableObject(agentStub(captain), (inst: AgentDO) => {
+      delete inst.testHooks["hostLost:enter"];
+    });
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+    });
+    await runDurableObjectAlarm(fleet);
+    expect((await agentStub(captain).info()).agent_epoch).toBeGreaterThanOrEqual(1);
+  });
+
+  it("A3 (c): FleetDO refuses an agent_start for an expired or dead host; the start is retried elsewhere", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell, "controller");
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    const body = {
+      type: "agent_start", agent: "agt_x0000000000000000000000000", role: "captain", workstream: "ws_x", epoch: 1,
+      launch: { builtin_tools: [], system_prompt: { mode: "replace", text: "x" } }, oauth_token: "t", session_ws_url: "ws://x",
+    } as const;
+    await silent(cell, a.host);
+    expect((await fleet.hostStatus(a.host))!.status).toBe("expired");
+    await expect(Promise.resolve().then(() => fleet.issueCommands(a.host, [body as any]))).rejects.toThrow(/expired/);
+    await fleet.confirmHostDead(a.host);
+    await expect(Promise.resolve().then(() => fleet.issueCommands(a.host, [body as any]))).rejects.toThrow(/dead/);
+    const rows = await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec("SELECT 1 FROM host_agents").toArray().length);
+    expect(rows).toBe(0);
+  });
+
   it("startFailed releases only the brain whose start failed", async () => {
     const s = await setup();
     const stub = agentStub(s.agent);

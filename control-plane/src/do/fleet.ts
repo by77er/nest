@@ -706,6 +706,13 @@ export class FleetDO extends DurableObject<Env> {
    */
   private async sendResolved(ws: WebSocket, msgs: unknown[]): Promise<void> {
     const out = msgs.map((m) => structuredClone(m) as { type?: unknown; commands?: unknown });
+    // An `agent_start` already answered (failed when its host was expired: A3) is never resent.
+    for (const m of out) {
+      if (m.type === "commands" && Array.isArray(m.commands)) {
+        m.commands = (m.commands as { cmd: string; type: string }[]).filter((c) => c.type !== "agent_start"
+          || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd).toArray().length === 0);
+      }
+    }
     const slots: RefSlot[] = [];
     for (const m of out) {
       if (m.type === "commands" && Array.isArray(m.commands)) {
@@ -1205,6 +1212,11 @@ export class FleetDO extends DurableObject<Env> {
    */
   async issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): Promise<string[]> {
     const now = Date.now();
+    // A start never goes to a host whose loss is (being) announced: expired, dead or unknown (A3).
+    const target = this.host(host);
+    if (bodies.some((b) => b.type === "agent_start") && (!target || target.status === "expired" || target.status === "dead")) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `host ${host} is ${target?.status ?? "unknown"}: no agent_start goes there`, 409, true);
+    }
     const commands = bodies.map((body) => ({ cmd: newId("cmd_"), issued_ms: now, ...body }));
     for (const c of commands) {
       const sandbox = "sandbox" in c ? c.sandbox : c.type === "sandbox_fork" ? c.child : null;
@@ -1877,6 +1889,7 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("UPDATE leases SET expired = 1 WHERE host = ?", host);
     this.sql.exec("UPDATE hosts SET status = 'stonith_pending' WHERE host = ?", host);
     for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "lease expired");
+    this.failStarts(host);
     const row = this.host(host)!;
     const ec2 = this.ec2();
     if (row.instance_id && ec2) {
@@ -1900,7 +1913,19 @@ export class FleetDO extends DurableObject<Env> {
   private async expireSilent(host: string): Promise<void> {
     this.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", host);
     for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "lease expired");
+    this.failStarts(host);
     await this.brainsLost(host);
+  }
+
+  /**
+   * A start never outlives its host's expiry (amendment A3): every `agent_start` the host hasn't
+   * answered is failed now and never resent if the host comes back (`sendResolved`); nestd refuses
+   * one it still holds, since its own lease lapsed first. Its index row stays, so AgentDO hears the
+   * loss for that epoch from `brainsLost` (delivered until acknowledged).
+   */
+  private failStarts(host: string): void {
+    const failed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, "host expired before running this start", true) });
+    this.sql.exec("UPDATE commands SET result = ?, result_ms = ? WHERE host = ? AND type = 'agent_start' AND result IS NULL", failed, Date.now(), host);
   }
 
   /**

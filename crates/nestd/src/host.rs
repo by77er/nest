@@ -269,6 +269,8 @@ pub struct Inner {
     pending_cli: Mutex<HashMap<RequestId, oneshot::Sender<CliResult>>>,
     results: Mutex<Results>,
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
+    /// Starts against lease lapses (amendment A3).
+    lapse_guard: LapseGuard,
     denied_seen: Mutex<HashMap<(SandboxId, String, u16), Instant>>,
     alerts_seen: Mutex<HashMap<(SandboxId, String, String), Instant>>,
     proxy_ca: Mutex<CaState>,
@@ -333,6 +335,42 @@ impl FleetReporter for Inner {
             .filter(|(_, s)| holds_lease(s.state))
             .map(|(id, s)| LeaseClaim { sandbox: id.clone(), epoch: s.epoch })
             .collect()
+    }
+}
+
+/// A start never outlives a lease lapse (amendment A3): each `agent_start` command is stamped with
+/// the lapse count when it arrives, or as arriving while lapsed, and runs only if neither holds
+/// when the executor reaches it.
+#[derive(Default)]
+struct LapseGuard {
+    lapses: std::sync::atomic::AtomicU64,
+    lapsed: std::sync::atomic::AtomicBool,
+    seen: Mutex<HashMap<String, u64>>,
+}
+
+impl LapseGuard {
+    /// Arrived while lapsed: never runs.
+    const WHILE_LAPSED: u64 = u64::MAX;
+
+    fn arrived(&self, cmd: &str) {
+        let stamp = if self.lapsed.load(std::sync::atomic::Ordering::SeqCst) { Self::WHILE_LAPSED } else { self.lapses.load(std::sync::atomic::Ordering::SeqCst) };
+        self.seen.lock().expect("lapse guard").entry(cmd.to_owned()).or_insert(stamp);
+    }
+
+    fn lapsed(&self) {
+        self.lapsed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.lapses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn renewed(&self) {
+        self.lapsed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this start arrived while lapsed or a lapse came since (forgotten once asked: the
+    /// command's result is cached).
+    fn outlived(&self, cmd: &str) -> bool {
+        let stamp = self.seen.lock().expect("lapse guard").remove(cmd);
+        stamp.is_some_and(|s| s != self.lapses.load(std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -504,6 +542,7 @@ impl Host {
             pending_cli: Mutex::new(HashMap::new()),
             results: Mutex::new(Results::default()),
             lease_deadline: lease_tx,
+            lapse_guard: LapseGuard::default(),
             denied_seen: Mutex::new(HashMap::new()),
             alerts_seen: Mutex::new(HashMap::new()),
             proxy_ca: Mutex::new(CaState {
@@ -782,6 +821,9 @@ impl Inner {
             FleetNotice::Commands { seq, commands } => {
                 // Resolve commit results now so a commit awaiting in the executor can finish.
                 for c in &commands {
+                    if matches!(c.body, CommandBody::AgentStart(_)) {
+                        self.lapse_guard.arrived(&c.cmd.0);
+                    }
                     match &c.body {
                         CommandBody::CommitResult { request, outcome, .. } => {
                             if let Some(tx) = self.pending_commits.lock().expect("pending").remove(request) {
@@ -821,6 +863,7 @@ impl Inner {
                 let _ = exec.send((seq, commands));
             }
             FleetNotice::LeaseRenewed { deadline, deadline_boot, valid_until_ms } => {
+                self.lapse_guard.renewed();
                 self.lease_deadline.send_replace(Some((deadline, deadline_boot)));
                 self.proxy.apply(ProxyOp::Lease { valid_until_ms });
                 self.runner.lease(valid_until_ms);
@@ -1102,6 +1145,8 @@ impl Inner {
     async fn self_fence(self: &Arc<Self>) {
         let ids: Vec<(SandboxId, Epoch)> = self.summary.lock().expect("summary").iter().filter(|(_, s)| holds_lease(s.state)).map(|(id, s)| (id.clone(), s.epoch)).collect();
         tracing::error!(sandboxes = ids.len(), "lease expired: self-fencing");
+        // Every start held now (queued, or arriving before the next renewal) is refused (A3).
+        self.lapse_guard.lapsed();
         let unsent = self.runner.fence(vec![], "host lease expired");
         self.brains_exited(unsent.into_iter().map(|(a, e)| (a, e, ExitReason::Fenced)));
         for (id, epoch) in ids {
@@ -1345,7 +1390,10 @@ impl Inner {
             return;
         }
         let kind = command_kind(&cmd.body);
-        let result = self.dispatch(cmd.body).await;
+        let result = match cmd.body {
+            CommandBody::AgentStart(start) if self.lapse_guard.outlived(&cmd.cmd.0) => self.refuse_start(&start, "the host lease lapsed since this start arrived"),
+            body => self.dispatch(body).await,
+        };
         let outcome = match result {
             Ok(detail) => CommandOutcome::Ok { detail },
             Err(error) => {
@@ -1926,6 +1974,17 @@ impl Inner {
         Ok(None)
     }
 
+    /// Refuse a start that must never run: its `agent_exited{fenced}` at its epoch is reported now,
+    /// or once no older start of the agent is out here (an exit at an epoch means nothing at or
+    /// below it runs here).
+    fn refuse_start(&self, start: &nest_protocol::control::AgentStart, why: &str) -> CmdResult {
+        let (agent, epoch) = (start.agent.clone(), start.agent_epoch());
+        if self.runner.refused(&agent, epoch) {
+            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Fenced, epoch: Some(epoch) });
+        }
+        Err(error(error_codes::STALE_EPOCH, why, false))
+    }
+
     /// Start a brain. Hands are the runner's business (it resolves a binding through AgentDO):
     /// nestd only remembers which sandbox the brain is bound to, for fencing.
     async fn agent_start(self: &Arc<Self>, start: nest_protocol::control::AgentStart) -> CmdResult {
@@ -1933,12 +1992,7 @@ impl Inner {
         // A kill for this epoch (or a later one) overtook it: it never runs, and its exit says so.
         let epoch = start.agent_epoch();
         if self.runner.killed_at_or_above(&agent, epoch) {
-            // Its exit says no brain at or below this epoch runs here: owed until an older start
-            // still out has exited (the runner link reports it then).
-            if self.runner.refused(&agent, epoch) {
-                self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Fenced, epoch: Some(epoch) });
-            }
-            return Err(error(error_codes::STALE_EPOCH, "a kill for this agent epoch arrived first", false));
+            return self.refuse_start(&start, "a kill for this agent epoch arrived first");
         }
         let config_dir = self.cfg.agents_dir().join(&agent.0);
         std::fs::create_dir_all(&config_dir).map_err(internal)?;
@@ -2301,6 +2355,7 @@ fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::LapseGuard;
     use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
 
     struct NoPause;
@@ -2326,6 +2381,22 @@ mod tests {
     }
 
     /// Which salvage failures are retried and which end the retire.
+    /// Amendment A3 (a): a start that arrived before a lapse, or while lapsed, never runs, even
+    /// once the lease is renewed; one that arrived after the renewal runs.
+    #[test]
+    fn a_start_never_outlives_a_lease_lapse() {
+        let g = LapseGuard::default();
+        g.arrived("before");
+        g.lapsed();
+        g.arrived("during");
+        g.renewed();
+        g.arrived("after");
+        assert!(g.outlived("before"));
+        assert!(g.outlived("during"));
+        assert!(!g.outlived("after"));
+        assert!(!g.outlived("unknown"), "a command never stamped (e.g. replayed from the cache path) is not refused here");
+    }
+
     #[test]
     fn a_salvage_is_retried_only_when_it_may_still_land() {
         use nest_protocol::model::error_codes;

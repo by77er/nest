@@ -2127,3 +2127,24 @@ async fn a_kill_overtaking_a_queued_start_means_it_never_runs() {
     h.fleet.commands.send(vec![cmd("cmd_agent2", CommandBody::AgentStart(newer))]).unwrap();
     assert!(matches!(h.fleet.result("cmd_agent2").await, CommandOutcome::Ok { .. }));
 }
+
+/// Amendment A3 (a): a start never outlives a lease lapse. One queued behind a slow command when the
+/// lease lapses is refused when the executor reaches it, even after the lease was renewed; its exit
+/// (`fenced`, at its epoch) is reported and it never reaches the runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_held_across_a_lease_lapse_never_runs() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2"), cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_l", "sbx_a")))]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.fleet.partition.store(true, Ordering::SeqCst); // the lease lapses while the start waits
+    wait_until("runner fence", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. }))).await;
+    h.fleet.partition.store(false, Ordering::SeqCst); // renewed before the executor reaches the start
+    match h.fleet.result("cmd_agent").await {
+        CommandOutcome::Error { error } => assert_eq!(error.code, "stale_epoch"),
+        other => panic!("a start held across a lapse ran: {other:?}"),
+    }
+    h.fleet.wait_event("its exit", |b| matches!(b, HostEventBody::AgentExited { agent, epoch: Some(Epoch(1)), reason: AgentExitReason::Fenced, .. } if agent.0 == "agt_l")).await;
+    assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_l")));
+}
