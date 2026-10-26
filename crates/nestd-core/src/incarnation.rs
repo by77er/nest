@@ -258,3 +258,207 @@ mod tests {
         assert!(!nothing_to_salvage(false, Some(&a), &a), "only a salvage is skipped");
     }
 }
+
+/// Kani harnesses (`cargo kani -p nestd-core`). Epochs, versions and flags range over every value
+/// of their type unless a harness says otherwise; the bounds of the bounded ones are in their docs.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn any_epoch() -> Option<u64> {
+        if kani::any() { Some(kani::any()) } else { None }
+    }
+
+    /// A fence never lowers a tombstone: the epoch recorded is the higher of the old one and the
+    /// fenced one, so it is never below either.
+    #[kani::proof]
+    fn a_fence_never_lowers_the_tombstone() {
+        let (fenced, epoch) = (any_epoch(), kani::any());
+        let after = fenced_after(fenced, epoch);
+        assert!(after >= epoch && fenced.is_none_or(|f| after >= f));
+        assert!(after == epoch || Some(after) == fenced);
+    }
+
+    /// After `fence(e)`, every epoch at or below `e` is refused, and no epoch above both `e` and
+    /// the old tombstone is.
+    #[kani::proof]
+    fn a_fence_refuses_its_epoch_and_every_older_one() {
+        let (fenced, e, other): (Option<u64>, u64, u64) = (any_epoch(), kani::any(), kani::any());
+        let after = Some(fenced_after(fenced, e));
+        if other <= e {
+            assert!(refuses(after, other));
+        }
+        if other > e && fenced.is_none_or(|f| other > f) {
+            assert!(!refuses(after, other));
+        }
+    }
+
+    /// No tombstone refuses nothing; a higher tombstone refuses everything a lower one does.
+    #[kani::proof]
+    fn refusal_is_monotone_in_the_fenced_epoch() {
+        let (f1, f2, e): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        assert!(!refuses(None, e));
+        if f1 <= f2 && refuses(Some(f1), e) {
+            assert!(refuses(Some(f2), e));
+        }
+    }
+
+    /// A run at `e` (prune_below) never lets go of a tombstone at or above `e`, and lets go of
+    /// exactly the tombstones that would not refuse `e`: a create the tombstone admits always
+    /// clears it, one it refuses never does.
+    #[kani::proof]
+    fn a_run_prunes_exactly_the_tombstones_it_gets_past() {
+        let (f, e): (u64, u64) = (kani::any(), kani::any());
+        if run_prunes(f, e) {
+            assert!(f < e);
+        }
+        assert!(run_prunes(f, e) != refuses(Some(f), e));
+    }
+
+    /// A destroy at `e` (prune_up_to) never lets go of a tombstone above `e`; one it keeps still
+    /// refuses the destroyed epoch.
+    #[kani::proof]
+    fn a_destroy_keeps_every_tombstone_above_it() {
+        let (f, e): (u64, u64) = (kani::any(), kani::any());
+        if destroy_prunes(f, e) {
+            assert!(f <= e);
+        } else {
+            assert!(refuses(Some(f), e));
+        }
+    }
+
+    /// Any sequence of fences, destroys and runs (bounded: 4 operations after the fence, each at
+    /// any epoch) on one sandbox's tombstone, applied as `Tombstones` applies them: an epoch `e`
+    /// once fenced is refused until a destroy at or above `e`, or a run above `e`, lets it go.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn a_fenced_epoch_stays_refused_until_a_destroy_or_newer_run_reaches_it() {
+        let e: u64 = kani::any();
+        let mut t = Some(fenced_after(any_epoch(), e));
+        let mut released = false;
+        for _ in 0..4 {
+            let at: u64 = kani::any();
+            match kani::any::<u8>() % 3 {
+                0 => t = Some(fenced_after(t, at)),
+                1 => {
+                    released |= at >= e;
+                    if t.is_some_and(|f| destroy_prunes(f, at)) {
+                        t = None;
+                    }
+                }
+                _ => {
+                    released |= at > e;
+                    if t.is_some_and(|f| run_prunes(f, at)) {
+                        t = None;
+                    }
+                }
+            }
+            assert!(released || refuses(t, e));
+        }
+    }
+
+    /// Only the current version reads on, for every pair of versions; another version is kept with
+    /// its number, and a missing one is unusable.
+    #[kani::proof]
+    fn only_the_current_meta_version_reads_on() {
+        let (version, current): (Option<u64>, u64) = (any_epoch(), kani::any());
+        match meta_version(version, current) {
+            MetaVersion::Current => {
+                assert!(version == Some(current));
+            }
+            MetaVersion::Other(v) => {
+                assert!(version == Some(v) && v != current);
+            }
+            MetaVersion::Missing => {
+                assert!(version.is_none());
+            }
+        }
+    }
+
+    /// The scan's disposition of an incarnation directory: only a meta.json naming this very
+    /// incarnation is returned as found, one naming another incarnation is removed, and one that
+    /// can't be read for another reason is never removed.
+    #[kani::proof]
+    fn the_scan_finds_only_its_own_incarnation_and_never_removes_an_unreadable_one() {
+        let read = match kani::any::<u8>() % 4 {
+            0 => MetaRead::ThisIncarnation,
+            1 => MetaRead::AnotherIncarnation,
+            2 => MetaRead::Unusable,
+            _ => MetaRead::Unreadable,
+        };
+        let d = disposition(read);
+        assert!((d == Disposition::Found) == (read == MetaRead::ThisIncarnation));
+        if read == MetaRead::Unreadable {
+            assert!(d == Disposition::Keep);
+        }
+    }
+
+    /// Every entry name (bounded: up to 6 ASCII bytes) ending in `.del` is a deletion to finish
+    /// (removed), whatever its type, never an incarnation; nothing but a directory is an
+    /// incarnation.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn a_deleting_entry_is_always_removed() {
+        let bytes: [u8; 6] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= 6);
+        kani::assume(bytes[..len].is_ascii());
+        let name = std::str::from_utf8(&bytes[..len]).unwrap();
+        let is_dir: bool = kani::any();
+        let entry = classify_entry(name, is_dir);
+        if name.ends_with(DELETING) {
+            assert!(entry == Entry::Deleting);
+        }
+        if let Entry::Incarnation(_) = entry {
+            assert!(is_dir && !name.ends_with(DELETING));
+        }
+    }
+
+    /// A starting nestd never deletes unreported an incarnation with uncommitted work: a disk not
+    /// known to equal its head, or a commit request still unanswered.
+    #[kani::proof]
+    fn a_found_incarnation_with_work_is_always_reported() {
+        let (clean, unanswered): (bool, bool) = (kani::any(), kani::any());
+        if !clean || unanswered {
+            assert!(!deletes_unreported(clean, unanswered));
+        }
+    }
+
+    /// A `parent_mismatch` is always retried; a refusal neither retryable nor a parent mismatch
+    /// (`stale_epoch`, `invalid_message`) is always final.
+    #[kani::proof]
+    fn a_final_refusal_ends_the_salvage_and_a_parent_mismatch_never_does() {
+        let retryable: bool = kani::any();
+        assert!(salvage_retryable(retryable, true));
+        assert!(!salvage_retryable(false, false));
+        assert!(salvage_retryable(true, false));
+    }
+
+    /// From any wait between the first and the max, the next is no shorter, never past the max,
+    /// double unless capped; and within 9 steps every wait has reached the max and stays there.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn the_retire_backoff_grows_to_the_max_and_stays() {
+        let start = Duration::from_nanos(kani::any_where(|n: &u64| *n >= RETIRE_RETRY_FIRST.as_nanos() as u64 && *n <= RETIRE_RETRY_MAX.as_nanos() as u64));
+        let next = retire_backoff(start);
+        assert!(next >= start && next <= RETIRE_RETRY_MAX);
+        assert!(next == RETIRE_RETRY_MAX || next == start * 2);
+        let mut b = start;
+        for _ in 0..9 {
+            b = retire_backoff(b);
+        }
+        assert!(b == RETIRE_RETRY_MAX && retire_backoff(b) == RETIRE_RETRY_MAX);
+    }
+
+    /// Only a salvage of a disk equal to its head's disk is skipped: a commit that isn't a salvage,
+    /// or a disk with no head, always has something to send.
+    #[kani::proof]
+    fn only_a_salvage_of_the_heads_own_disk_is_skipped() {
+        let (salvage, head, disk): (bool, Option<u8>, u8) = (kani::any(), kani::any(), kani::any());
+        if nothing_to_salvage(salvage, head.as_ref(), &disk) {
+            assert!(salvage && head == Some(disk));
+        }
+        if salvage && head == Some(disk) {
+            assert!(nothing_to_salvage(salvage, head.as_ref(), &disk));
+        }
+    }
+}
