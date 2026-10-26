@@ -3,9 +3,10 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
+import { Credential } from "../lib/spec";
 import { b64url, NestError } from "../lib/util";
 import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
-import { type AgentRole, ErrorCodes, type InjectionSecret } from "../protocol/model";
+import { ErrorCodes, type InjectionSecret } from "../protocol/model";
 
 /** The per-cell binding signing key, stored as a secret named `binding_key:<cell>`. */
 type StoredBindingKey = { kid: string; public_key: string; private_jwk: JsonWebKey };
@@ -60,13 +61,18 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /**
-   * Reference to the `claude setup-token` OAuth token for a role: `claude_oauth_token:<role>`, falling
-   * back to `claude_oauth_token`. Other objects store and pass the reference ({@link SECRET_REF_PREFIX});
+   * Reference to the `claude setup-token` OAuth token an agent's spec names (`credential`):
+   * `claude_oauth_token:<name>`, falling back to `claude_oauth_token` while the named one isn't
+   * configured. Only those names: the value is sent to a brain host, so a credential naming any
+   * other secret is refused. Other objects store and pass the reference ({@link SECRET_REF_PREFIX});
    * FleetDO resolves it only when it sends `agent_start`, so no copy of the value is kept elsewhere.
    */
-  async oauthTokenRef(role: AgentRole): Promise<string> {
-    const name = this.secret(`claude_oauth_token:${role}`) ? `claude_oauth_token:${role}` : "claude_oauth_token";
-    if (!this.secret(name)) throw new NestError(ErrorCodes.FORBIDDEN, `no Claude setup token configured for ${role}`, 409);
+  async credentialRef(credential: string): Promise<string> {
+    if (!Credential.safeParse(credential).success) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `${credential} is not a Claude setup token credential`, 403);
+    }
+    const name = this.secret(credential) ? credential : "claude_oauth_token";
+    if (!this.secret(name)) throw new NestError(ErrorCodes.FORBIDDEN, `no Claude setup token configured for ${credential}`, 409);
     return secretRef(name);
   }
 

@@ -6,10 +6,12 @@ import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identit
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
+import { Capability, CatalogName, SpecOverrides, Template } from "./lib/spec";
 import { AgentRole, ErrorCodes, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
+export { CatalogDO } from "./do/catalog";
 export { FleetDO } from "./do/fleet";
 export { SandboxDO } from "./do/sandbox";
 export { WorkstreamDO } from "./do/workstream";
@@ -39,6 +41,12 @@ const sandbox = (env: Env, id: string) => env.SANDBOX.get(env.SANDBOX.idFromName
 const agent = (env: Env, id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const workstream = (env: Env, id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
 const broker = (env: Env) => env.BROKER.get(env.BROKER.idFromName("broker"));
+const catalog = (env: Env) => env.CATALOG.get(env.CATALOG.idFromName("catalog"));
+
+/** An agent id that names an agent (404 otherwise): the subscriber or owner a route records. */
+async function existingAgent(env: Env, id: string): Promise<{ workstream: string }> {
+  return await agent(env, id).info();
+}
 
 async function body<T extends z.ZodType>(req: Request, schema: T): Promise<z.output<T>> {
   let raw: unknown;
@@ -185,19 +193,44 @@ async function route(req: Request, env: Env): Promise<Response> {
     return json({ ok: true });
   }
 
-  if (req.method === "POST" && path === "/v1/workstreams") {
-    const r = await body(req, z.object({ goal: z.string(), captain: z.string().startsWith("agt_").nullable().default(null) }));
-    const id = newId("ws_");
-    return json(await workstream(env, id).init(id, r.goal, r.captain), 201);
+  // Templates and capabilities (docs/agents/capabilities/): data the operator edits.
+  if (req.method === "GET" && path === "/v1/admin/catalog") return json(await catalog(env).catalog());
+  if ((p = m(/^\/v1\/admin\/(capabilities|templates)\/([^/]+)$/))) {
+    const name = CatalogName.safeParse(p[2]);
+    if (!name.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, name.error.message);
+    const c = catalog(env);
+    if (req.method === "PUT" && p[1] === "capabilities") return json(await c.putCapability(name.data, await body(req, Capability)));
+    if (req.method === "PUT" && p[1] === "templates") return json(await c.putTemplate(name.data, await body(req, Template)));
+    if (req.method === "DELETE") {
+      await (p[1] === "capabilities" ? c.deleteCapability(name.data) : c.deleteTemplate(name.data));
+      return json({ ok: true });
+    }
   }
-  if ((p = m(/^\/v1\/workstreams\/(ws_[A-Za-z0-9]+)(\/events|\/captain|\/notifications)?$/))) {
+
+  // Workstreams: the interim workstream channel (docs/orchestration/workstreams/). `captain` is the
+  // previous release's name for `subscriber`, accepted for one release.
+  if (req.method === "POST" && path === "/v1/workstreams") {
+    const r = await body(req, z.object({
+      goal: z.string(), subscriber: z.string().startsWith("agt_").nullable().optional(), captain: z.string().startsWith("agt_").nullable().optional(),
+    }));
+    const subscriber = r.subscriber ?? r.captain ?? null;
+    if (subscriber) await existingAgent(env, subscriber);
+    const id = newId("ws_");
+    return json(await workstream(env, id).init(id, r.goal, subscriber), 201);
+  }
+  if ((p = m(/^\/v1\/workstreams\/(ws_[A-Za-z0-9]+)(\/events|\/subscriber|\/captain|\/notifications)?$/))) {
     const ws = workstream(env, p[1]!);
     if (req.method === "GET" && !p[2]) return json(await ws.info());
     if (req.method === "GET" && p[2] === "/events") return json(await ws.events(num(url.searchParams.get("limit") ?? undefined, 100)));
     if (req.method === "GET" && p[2] === "/notifications") return json(await ws.userNotifications());
-    if (req.method === "PUT" && p[2] === "/captain") {
-      const r = await body(req, z.object({ captain: z.string().startsWith("agt_").nullable() }));
-      await ws.setCaptain(r.captain);
+    if (req.method === "PUT" && (p[2] === "/subscriber" || p[2] === "/captain")) {
+      const r = await body(req, z.object({
+        subscriber: z.string().startsWith("agt_").nullable().optional(), captain: z.string().startsWith("agt_").nullable().optional(),
+      }));
+      const subscriber = r.subscriber !== undefined ? r.subscriber : r.captain;
+      if (subscriber === undefined) throw new NestError(ErrorCodes.INVALID_MESSAGE, "subscriber is required (an agent id, or null)");
+      if (subscriber) await existingAgent(env, subscriber);
+      await ws.setSubscriber(subscriber);
       return json({ ok: true });
     }
   }
@@ -254,20 +287,32 @@ async function route(req: Request, env: Env): Promise<Response> {
   }
 
   if (req.method === "POST" && path === "/v1/agents") {
+    // A spawn spec: a template, a sandbox (hands) or none, and overrides. For one release the
+    // previous release's fields are accepted: `role` (the same-named template), `captain` (`owner`),
+    // and top-level `launch`, `rules` and `grants` (overrides; `grants` narrows the tools).
     const r = await body(req, z.object({
-      role: AgentRole,
-      // A worker's workstream and cell are its sandbox's: optional, and refused when they differ.
+      template: CatalogName.optional(),
+      role: AgentRole.optional(),
+      // An agent's workstream and cell are its sandbox's: optional, and refused when they differ.
       workstream: z.string().startsWith("ws_").optional(),
       sandbox: z.string().startsWith("sbx_").optional(),
+      owner: z.string().startsWith("agt_").optional(),
       captain: z.string().startsWith("agt_").optional(),
+      overrides: SpecOverrides.optional(),
       launch: LaunchConfig.optional(),
       grants: z.array(z.string()).optional(),
       rules: z.array(ToolRule).optional(),
       cell: z.string().optional(),
       start: z.boolean().default(true),
     }));
-    if (r.role === "worker" && !r.sandbox) throw new NestError(ErrorCodes.INVALID_MESSAGE, "workers need a sandbox");
-    if (r.role === "captain" && r.sandbox) throw new NestError(ErrorCodes.INVALID_MESSAGE, "captains have no hands");
+    if (r.template && r.role && r.template !== r.role) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template and role differ");
+    const template = r.template ?? r.role;
+    if (!template) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template is required");
+    if (r.owner && r.captain && r.owner !== r.captain) throw new NestError(ErrorCodes.INVALID_MESSAGE, "owner and captain differ");
+    const overrides: SpecOverrides = {
+      ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...(r.grants ? { tools: r.grants } : {}),
+      ...r.overrides,
+    };
     let wsId = r.workstream;
     let cellName = r.cell ?? DEFAULT_CELL;
     if (r.sandbox) {
@@ -279,16 +324,13 @@ async function route(req: Request, env: Env): Promise<Response> {
       wsId = sbx.workstream;
       cellName = sbx.cell;
     }
-    if (!wsId) throw new NestError(ErrorCodes.INVALID_MESSAGE, "captains need a workstream");
+    if (!wsId) throw new NestError(ErrorCodes.INVALID_MESSAGE, "an agent without a sandbox needs a workstream");
     checkCell(env, cellName);
+    const spec = await catalog(env).expand({ template, hands: !!r.sandbox, overrides });
     const id = newId("agt_");
     const a = agent(env, id);
-    await a.create({
-      agent: id, role: r.role, workstream: wsId, cell: cellName, captain: r.captain ?? null,
-      sandbox: r.sandbox ?? null, ...(r.launch ? { launch: r.launch } : {}), grants: r.grants ?? null,
-      ...(r.rules ? { rules: r.rules } : {}),
-    });
-    if (r.role === "captain") await workstream(env, wsId).setCaptain(id);
+    await a.create({ agent: id, workstream: wsId, cell: cellName, spec, owner: r.owner ?? r.captain ?? null, sandbox: r.sandbox ?? null });
+    if (spec.subscribe.includes("workstream")) await workstream(env, wsId).setSubscriber(id);
     const started = r.start ? await a.start() : null;
     return json({ ...(await a.info()), started }, 201);
   }

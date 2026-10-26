@@ -97,7 +97,6 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
         let secrets = vec![start.start.oauth_token.expose().to_owned()];
         let agent = Agent::new(
             id.clone(),
-            start.start.role,
             epoch,
             PathBuf::from(&start.config_dir),
             hands,
@@ -937,11 +936,11 @@ mod tests {
     /// in the outbound one. `pid` 0 makes signals and kills no-ops.
     fn bare_actor() -> (Actor, mpsc::Receiver<Vec<u8>>, mpsc::UnboundedReceiver<Outbound>) {
         use nest_protocol::control::SystemPrompt;
-        use nest_protocol::model::{AgentId, AgentRole};
+        use nest_protocol::model::AgentId;
         let rt = Runtime::new(crate::Config::default());
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let agent = Agent::new(AgentId("agt_t".into()), AgentRole::Worker, nest_protocol::model::Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
+        let agent = Agent::new(AgentId("agt_t".into()), nest_protocol::model::Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
         let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
         let launch = LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: String::new() } };
         let actor = Actor {

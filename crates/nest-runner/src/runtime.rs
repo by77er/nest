@@ -13,7 +13,7 @@ use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
 use nest_protocol::host::runner::{ExitReason, RunnerEvent, StopMode};
 use nest_protocol::model::{
-    AgentEvent, AgentEventBody, AgentId, AgentRole, CallId, Epoch, ErrorBody, HostId, MessageId, RequestId,
+    AgentEvent, AgentEventBody, AgentId, CallId, Epoch, ErrorBody, HostId, MessageId, RequestId,
     SessionId, TimestampMs, TurnId,
 };
 use serde_json::Value;
@@ -298,7 +298,6 @@ pub struct AgentInner {
 /// Handle to one agent.
 pub struct Agent {
     pub id: AgentId,
-    pub role: AgentRole,
     pub config_dir: PathBuf,
     /// nestd connection generation this brain was started under.
     pub conn_gen: u64,
@@ -333,7 +332,6 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: AgentId,
-        role: AgentRole,
         epoch: Epoch,
         config_dir: PathBuf,
         hands: Option<HandsBinding>,
@@ -345,7 +343,6 @@ impl Agent {
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
-            role,
             config_dir,
             conn_gen,
             pid: AtomicU32::new(0),
@@ -620,7 +617,7 @@ mod registry_tests {
     fn agent(rt: &Runtime, epoch: u64) -> Arc<Agent> {
         let (cmd, _crx) = mpsc::unbounded_channel();
         let (out, _orx) = mpsc::unbounded_channel();
-        Agent::new(AgentId("agt_r".into()), AgentRole::Captain, Epoch(epoch), PathBuf::from("/tmp"), None, None, vec![], rt.current_gen(), cmd, out)
+        Agent::new(AgentId("agt_r".into()), Epoch(epoch), PathBuf::from("/tmp"), None, None, vec![], rt.current_gen(), cmd, out)
     }
 
     /// N9: a call id outside a turn carries 128 random bits.

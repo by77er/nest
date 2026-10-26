@@ -1,5 +1,7 @@
-// WorkstreamDO: event fan-in for one workstream; decision events are batched into captain wakes
-// (docs/control-plane/durable-objects/workstream/).
+// WorkstreamDO: the interim workstream channel, one per workstream label, until channels (ChannelDO)
+// exist (docs/orchestration/workstreams/#the-interim-workstream-channel). A log of events with one
+// subscriber, woken with batches of decision events, and the user-notification queue. It knows no
+// roles: its subscriber is whichever agent subscribed.
 import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
 import { asNestError, NestError } from "../lib/util";
@@ -8,8 +10,14 @@ import { ErrorCodes, isDecisionEvent, type WorkstreamEvent } from "../protocol/m
 export interface WorkstreamInfo {
   workstream: string;
   goal: string;
-  captain: string | null;
+  /** The agent woken with batches of decision events (one subscription; null: none). */
+  subscriber: string | null;
   created_ms: number;
+}
+
+/** Stored before the subscriber was named: the field was `captain`. */
+interface PreviousReleaseFields {
+  captain?: string | null;
 }
 
 const DIGEST_PROGRESS = 5;
@@ -44,17 +52,19 @@ export class WorkstreamDO extends DurableObject<Env> {
 
   private info_(): WorkstreamInfo | undefined {
     const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0];
-    return row ? (JSON.parse(row.value) as WorkstreamInfo) : undefined;
+    if (!row) return undefined;
+    const { captain, ...info } = JSON.parse(row.value) as Partial<WorkstreamInfo> & Omit<WorkstreamInfo, "subscriber"> & PreviousReleaseFields;
+    return { ...info, subscriber: info.subscriber ?? captain ?? null };
   }
 
   private save(info: WorkstreamInfo): void {
     this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(info));
   }
 
-  async init(workstream: string, goal: string, captain: string | null): Promise<WorkstreamInfo> {
+  async init(workstream: string, goal: string, subscriber: string | null): Promise<WorkstreamInfo> {
     const existing = this.info_();
     if (existing) return existing;
-    const info = { workstream, goal, captain, created_ms: Date.now() };
+    const info = { workstream, goal, subscriber, created_ms: Date.now() };
     this.save(info);
     await this.ingest({ workstream, ts_ms: info.created_ms, type: "started", goal });
     return info;
@@ -66,13 +76,14 @@ export class WorkstreamDO extends DurableObject<Env> {
     return info;
   }
 
-  async setCaptain(captain: string | null): Promise<void> {
+  /** Replace the subscriber (null: none). The caller checked that it names an agent of this workstream. */
+  async setSubscriber(subscriber: string | null): Promise<void> {
     const info = await this.info();
-    info.captain = captain;
+    info.subscriber = subscriber;
     this.save(info);
   }
 
-  /** Record an event; decision events schedule a (batched) captain wake. At most once per `key`. */
+  /** Record an event; decision events schedule a (batched) subscriber wake. At most once per `key`. */
   async ingest(event: WorkstreamEvent, key?: string): Promise<void> {
     if (!this.firstTime(key)) return;
     const decision = isDecisionEvent(event);
@@ -80,7 +91,7 @@ export class WorkstreamDO extends DurableObject<Env> {
       event.ts_ms, event.type, decision ? 1 : 0, JSON.stringify(event));
     // Bounded history: keep the most recent events only.
     this.sql.exec("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?", EVENT_RETENTION);
-    if (decision && this.info_()?.captain && (await this.ctx.storage.getAlarm()) === null) {
+    if (decision && this.info_()?.subscriber && (await this.ctx.storage.getAlarm()) === null) {
       await this.ctx.storage.setAlarm(Date.now() + num(this.env.WAKE_BATCH_MS, 2_000));
     }
   }
@@ -105,10 +116,10 @@ export class WorkstreamDO extends DurableObject<Env> {
       "SELECT ts_ms, urgency, text FROM user_notifications ORDER BY id").toArray();
   }
 
-  /** Batch window elapsed: wake the captain with one `event_batch` turn (decisions + recent progress). */
+  /** Batch window elapsed: wake the subscriber with one `event_batch` turn (decisions + recent progress). */
   override async alarm(): Promise<void> {
     const info = this.info_();
-    if (!info?.captain) return;
+    if (!info?.subscriber) return;
     const pending = this.sql
       .exec<{ id: number; body: string; decision: number }>("SELECT id, body, decision FROM events WHERE woke = 0 ORDER BY id")
       .toArray();
@@ -122,11 +133,12 @@ export class WorkstreamDO extends DurableObject<Env> {
       ...(progress.length ? ["Recent progress:", ...progress.map((e) => line(e.body))] : []),
     ].join("\n");
     try {
-      await this.env.AGENT.get(this.env.AGENT.idFromName(info.captain)).enqueueTurn({ kind: "event_batch", text });
+      await this.env.AGENT.get(this.env.AGENT.idFromName(info.subscriber)).enqueueTurn({ kind: "event_batch", text });
     } catch (e) {
-      // A captain id that names no agent: keep the events for a real captain instead of retrying.
+      // A subscriber that names no agent (stored before subscribers were checked): keep the events
+      // for a real one instead of retrying.
       if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) {
-        console.error(`workstream ${info.workstream}: captain ${info.captain} is not an agent; events wait`);
+        console.error(`workstream ${info.workstream}: subscriber ${info.subscriber} is not an agent; events wait`);
         return;
       }
       throw e;

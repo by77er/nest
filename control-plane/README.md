@@ -10,8 +10,9 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/fleet.ts` | **FleetDO** (one per cell): enrollment, fleet channel, leases, expiry, STONITH, placement, commands |
 | `src/do/sandbox.ts` | **SandboxDO**: epoch, commit compare-and-set, generations, layered policy and expiring grants, idle refcount, ports |
 | `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay |
-| `src/do/workstream.ts` | **WorkstreamDO**: event fan-in, batched captain wakes, user-notification queue |
+| `src/do/workstream.ts` | **WorkstreamDO**: the interim workstream channel: event log, batched wakes of its one subscriber, user-notification queue |
 | `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, GitHub App minter (interface only) |
+| `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain`; expansion is `src/lib/spec.ts` (pure) |
 | `src/lib/` | Reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry |
 | `test/regressions.test.ts` | One regression test per finding of the control-plane review |
 
@@ -33,10 +34,14 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    The host then enrolls with `POST /v1/hosts/enroll` (proof `enrollment_token`) and dials
    `ws://127.0.0.1:8787/v1/fleet` with the returned host token.
 3. Fetch the root certificate to trust in test sandboxes: `GET /v1/admin/root-ca`.
-4. Store a Claude setup token: `PUT /v1/admin/secrets/claude_oauth_token {"value": "..."}`. Optional
-   per-role overrides are `claude_oauth_token:worker` and `claude_oauth_token:captain`.
+4. Store a Claude setup token: `PUT /v1/admin/secrets/claude_oauth_token {"value": "..."}`. A template's
+   `credential` may name another, `claude_oauth_token:<name>` (the seeds use `:worker` and `:captain`), which
+   falls back to `claude_oauth_token` while it isn't set.
 5. Create work (all admin endpoints use `Authorization: Bearer $ADMIN_TOKEN`):
-   - `POST /v1/workstreams {goal}`
+   - `GET /v1/admin/catalog` · `PUT|DELETE /v1/admin/capabilities/<name> {tools, rules, prompt}` ·
+     `PUT|DELETE /v1/admin/templates/<name> {capabilities, launch, hands, credential, escalate_to, subscribe}`
+   - `POST /v1/workstreams {goal, subscriber?}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent
+     id or null; `captain` is accepted for one release)
    - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (the `burst` role; 201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
@@ -44,8 +49,11 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      (409 if it's placed)
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
      the only way to mint a public share link (agents can't)
-   - `POST /v1/agents {role, workstream?, sandbox?, cell?, start?}`: sends `agent_start` to the host; a worker's
-     workstream and cell come from its sandbox (a mismatch is refused with 409)
+   - `POST /v1/agents {template, workstream?, sandbox?, owner?, overrides?, cell?, start?}`: expands the template
+     (`overrides`: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`) and sends `agent_start` to
+     the host; an agent with a sandbox takes its workstream and cell (a mismatch is refused with 409), and an
+     `owner` must be an agent of the same workstream. For one release `role` is read as the same-named template,
+     `captain` as `owner`, and top-level `launch`, `rules` and `grants` as overrides
    - `POST /v1/agents/<id>/start {host?, restart?}`: start (or restart) the brain; `host` puts it on a chosen active,
      connected host of the cell (for a test); hands still go through the sandbox's gateway. Answers `{host, cmd}`;
      `kind: none` when the brain already runs (nothing sent; `{restart: true}` restarts it: condemned, then started
@@ -80,7 +88,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `AWS_CELL_CREDENTIALS` | Secret: JSON object of cell → `{access_key_id, secret_access_key}` of `nest-<cell>-control-plane` (STONITH, the autoscaler, KMS). Without an entry, STONITH waits for the host to fence, or for an operator |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID` | Legacy, one release: used for a cell missing from `AWS_CELL_CREDENTIALS` / `AWS_CELLS`; `GET /v1/admin/fleet` shows which source each cell uses (`docs/compute/cells/`) |
 | `PUBLIC_BASE_URL`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
-| `WAKE_BATCH_MS` | Captain wake batching window; defaults to 2000 in code (not in `wrangler.jsonc`) |
+| `WAKE_BATCH_MS` | Batching window of the workstream channel's subscriber wakes; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
 | `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname (a tunnel host that serves none is not ready, never its loopback `gateway_url`). `NEST_DOMAIN` also names previews (`<port>-<sandbox>-preview-<label>.<zone>`) and share links (`<token>-share-<label>.<zone>`). The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url`, and preview names use `nest.localhost` |
 | `AWS_CELLS` | Per-cell AWS settings, written by the cell stacks: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?, sandbox_reserve_mib?, max_sandboxes_per_host?, proxy_root_key_arn?}` (`src/lib/cells.ts`). A cell without an entry is never scaled |
@@ -114,19 +122,20 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   never because a URL happens to be `wss://`. A sandbox host enrolled before this change has no tunnel until it
   re-enrolls (a new instance). Not built: host kinds with brain placement by capacity, key
   rotation and the three desired versions. The code has `burst` and `controller` host roles
-  (`HostRole`), `FleetDO.controllerHost()` starts captains on a `controller` host, other brains start on the
-  sandbox's host when they start (AgentDO issues an agent epoch per start; a sandbox move doesn't restart them),
+  (`HostRole`), `FleetDO.controllerHost()` starts agents without hands on a `controller` host, others start on
+  the sandbox's host when they start (AgentDO issues an agent epoch per start; a sandbox move doesn't restart them),
   and `agent_start.hands` carries the sandbox id only (the runner fetches its target).
 - **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
-  with attenuation, spawn specs, templates and capabilities, owners and labels aren't built. The code still has
-  `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with
-  `WorkstreamEvent` and batched captain wakes, a role-filtered tool catalog, and a `workstream`
+  with attenuation, capability sources (`mcp`, `api`) and parameters, `agent_spawn`, and labels aren't built.
+  Templates and capabilities are data (CatalogDO), an agent stores its expanded spec and `owner`, and nothing
+  decides on a role; `agent_start.role` and `ToolDef.roles` are still sent for one release. WorkstreamDO is the
+  interim workstream channel (`WorkstreamEvent`, one subscriber woken with batches), and there is a `workstream`
   egress policy layer. Taint and sinks, budgets, wake envelopes and the hands journal aren't built either.
   Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
   commit and flushes at turn boundaries. Placement packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox
   reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one. The contract changes are listed in `docs/interfaces/README.md`.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
-  `attach`, `checkpoint`, `brokered`, and all captain tools except `notify`, `ask` and `read_transcript`.
+  `attach`, `checkpoint`, `brokered`, and the seeded `management` and `memory` capabilities' tools.
 - **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`; `/v1/health` doesn't reach the DOs yet.
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO has no issuance audit.

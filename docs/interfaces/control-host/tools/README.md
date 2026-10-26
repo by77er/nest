@@ -2,9 +2,9 @@
 
 > **Implemented contract.** For the designed catalog, see [agents/tools/](../../../agents/tools/) and [pending contract changes](../../README.md#pending-contract-changes).
 
-**Canonical catalog:** `protocol/schemas/control/platform-tools.json`, a list of `ToolDef{name, description, input_schema, roles, requires_approval}`. Every input schema is an object schema with `additionalProperties: false`. The **control plane's tool registry** and nest-mcp's `tools/list` both come from this file. Hands tools (`Bash`, `Read`, …) are defined by the [host ↔ guest](../../host-guest/) boundary and aren't part of it.
+**Canonical catalog:** `protocol/schemas/control/platform-tools.json`, a list of `ToolDef{name, description, input_schema, requires_approval}`. Which tools an agent gets is its spec's ([CatalogDO](../../../control-plane/durable-objects/catalog/)); the column below is what the seed templates give. `tools_list` still carries `roles: []` on each definition for one release (runners of the previous release require the field). Every input schema is an object schema with `additionalProperties: false`. The **control plane's tool registry** and nest-mcp's `tools/list` both come from this file. Hands tools (`Bash`, `Read`, …) are defined by the [host ↔ guest](../../host-guest/) boundary and aren't part of it.
 
-| Tool | Roles | Notes |
+| Tool | Seed templates | Notes |
 |---|---|---|
 | `notify` | worker, captain | To `captain`, `user` (Discord) or `agt_…`. Doesn't wait for a reply |
 | `emit` | worker | Workstream event: `progress`, `blocked`, `pr_opened`, `completed`, `failed`. Decision events wake the captain |
@@ -21,7 +21,7 @@
 Only `notify`, `emit`, `ask`, `read_transcript` and `expose_port` run; the rest return `not_implemented`.
 
 **Grants:**
-- AgentDO filters `tools_list` by role and grants, and checks every `tool_call` again.
+- AgentDO lists exactly the tools in the agent's expanded spec, and checks every `tool_call` against it again.
 - A captain can only give its workers grants it holds itself.
 - `requires_approval` tools always go through the approval gate.
 

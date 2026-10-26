@@ -28,10 +28,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -70,9 +66,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker"
-    ],
     "requires_approval": false
   },
   {
@@ -106,10 +99,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -141,9 +130,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -174,10 +160,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -200,9 +182,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -233,10 +212,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -253,9 +228,6 @@
       "required": [],
       "additionalProperties": false
     },
-    "roles": [
-      "worker"
-    ],
     "requires_approval": false
   },
   {
@@ -288,9 +260,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker"
-    ],
     "requires_approval": false
   },
   {
@@ -314,10 +283,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -353,9 +318,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -387,9 +349,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -412,9 +371,6 @@
       "required": [],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -433,9 +389,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -467,9 +420,6 @@
       "required": [],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -492,9 +442,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -517,9 +464,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -542,9 +486,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": true
   },
   {
@@ -568,9 +509,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -605,9 +543,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -626,9 +561,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -652,9 +584,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -681,9 +610,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   }
 ]

@@ -196,7 +196,11 @@ export const StopMode = z.enum(["graceful", "kill"]);
 
 const AgentStartFields = {
   agent: AgentId,
-  role: AgentRole,
+  /**
+   * Deprecated, for one release: runners of the previous release require it (and ignore it). An
+   * agent's tools, hands and prompt come from its spec, never from a role.
+   */
+  role: AgentRole.optional(),
   workstream: WorkstreamId,
   /** The agent epoch AgentDO issued for this brain start; absent only from the previous release. */
   epoch: Epoch.optional(),
@@ -461,7 +465,8 @@ export const ToolDef = z.object({
   name: z.string(),
   description: z.string(),
   input_schema: z.unknown(),
-  roles: z.array(AgentRole),
+  /** Deprecated, for one release: sent as `[]` because runners of the previous release require it. */
+  roles: z.array(AgentRole).optional(),
   requires_approval: z.boolean().default(false),
 });
 export type ToolDef = z.output<typeof ToolDef>;

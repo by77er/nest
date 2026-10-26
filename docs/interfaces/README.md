@@ -24,7 +24,7 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 ## Pending contract changes
 
 The design in [agents/](../agents/) and [channels/](../channels/) needs these contract changes; the specs below and the fixtures describe what's implemented until they land:
-- **Agents** carry `owner`, `labels` and a spawn spec (with `capabilities`) instead of a role. A brain is placed on a brain host by backend and capacity, and its hands are a binding to a sandbox anywhere ([gateway](gateway/)). Capability definitions are control-plane data, not contract.
+- **Agents** carry `owner`, `labels` and a spawn spec (with `capabilities`) instead of a role (built in the control plane: AgentDO stores the expanded spec and `owner`; `agent_start.role` and `ToolDef.roles` are deprecated, still sent for one release for runners that require them, and go in the next). A brain is placed on a brain host by backend and capacity, and its hands are a binding to a sandbox anywhere ([gateway](gateway/)). Capability definitions are control-plane data, not contract.
 - **Sandboxes** carry `owner`, `labels` and the channels their programs may post to; sandbox commands carry no grouping field. Every `workstream` field goes; grouping is labels.
 - **Platform events** are posts to `<sbx>/events` and `<agt>/events`: `ChannelMessage{seq, ts_ms, from, taint, kind?, text, data?, reply_to?, key?, mentions?}`, with kinds such as `port_opened`, `egress_denied`, `egress_alert` and `orphaned_work`.
 - **`EgressPolicy` layers** are `base`, `sandbox` and `grant`.

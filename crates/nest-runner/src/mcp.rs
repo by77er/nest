@@ -169,21 +169,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn any_agent_with_hands_lists_them_and_one_without_does_not() {
-        use nest_protocol::control::HandsBinding;
-        use nest_protocol::model::{AgentId, AgentRole, Epoch, SandboxId};
+    async fn lists_hands_when_bound_and_exactly_agentdos_platform_tools() {
+        use nest_protocol::control::{HandsBinding, ToolDef};
+        use nest_protocol::model::{AgentId, Epoch, SandboxId};
         let rt = Runtime::new(crate::Config { tools_list_timeout: std::time::Duration::from_millis(20), ..Default::default() });
-        let agent = |role, hands: Option<HandsBinding>| {
+        let def = |name: &str| ToolDef {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            roles: None,
+            requires_approval: false,
+        };
+        let agent = |hands: Option<HandsBinding>, platform: &[&str]| {
             let (ctx, _) = mpsc::unbounded_channel();
             let (otx, _) = mpsc::unbounded_channel();
-            Agent::new(AgentId("agt_m".into()), role, Epoch(1), std::env::temp_dir(), hands, None, vec![], 0, ctx, otx)
+            let a = Agent::new(AgentId("agt_m".into()), Epoch(1), std::env::temp_dir(), hands, None, vec![], 0, ctx, otx);
+            // What AgentDO last listed (no AgentDO here: the list request times out to it).
+            a.inner.lock().unwrap().tools = platform.iter().map(|n| def(n)).collect();
+            a
         };
         let bound = Some(HandsBinding { sandbox: SandboxId("sbx_m".into()), epoch: None });
         let names = |tools: Vec<McpToolDef>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
-        // A captain-template agent given a sandbox gets hands, as the call path already allowed.
-        assert_eq!(names(list(&rt, &agent(AgentRole::Captain, bound.clone())).await), HANDS_TOOLS);
-        assert_eq!(names(list(&rt, &agent(AgentRole::Worker, bound)).await), HANDS_TOOLS);
-        assert!(list(&rt, &agent(AgentRole::Worker, None)).await.is_empty());
+        let hands: Vec<String> = HANDS_TOOLS.iter().map(|s| s.to_string()).collect();
+        // Hands come with a bound sandbox (the spec's hands), whatever else the agent is.
+        assert_eq!(names(list(&rt, &agent(bound.clone(), &[])).await), hands);
+        assert!(list(&rt, &agent(None, &[])).await.is_empty());
+        // Platform tools: exactly what AgentDO lists, in its order (a hands name in it isn't listed twice).
+        let mut want = hands.clone();
+        want.extend(["spawn_agent".to_string(), "notify".to_string()]);
+        assert_eq!(names(list(&rt, &agent(bound, &["spawn_agent", "Bash", "notify"])).await), want);
+        assert_eq!(names(list(&rt, &agent(None, &["emit"])).await), vec!["emit".to_string()]);
     }
 
     #[test]

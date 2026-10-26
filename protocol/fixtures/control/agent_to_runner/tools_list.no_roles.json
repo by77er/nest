@@ -1,0 +1,70 @@
+{
+  "type": "tools_list",
+  "request": "req_01jb7u2v3x",
+  "tools": [
+    {
+      "name": "notify",
+      "description": "Send a short message to your captain, to the user (via Discord), or to another agent's inbox. Does not wait for a reply.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "Recipient: 'captain', 'user', or an agent id (agt_...)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Message text."
+          },
+          "urgency": {
+            "type": "string",
+            "description": "normal or high (high may @-mention the user).",
+            "enum": [
+              "normal",
+              "high"
+            ]
+          }
+        },
+        "required": [
+          "to",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "requires_approval": false
+    },
+    {
+      "name": "ask",
+      "description": "Ask your captain or the user a question. Answers within ~2 minutes are returned directly; otherwise the call returns 'pending', you should end your turn, and the answer arrives as your next input.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The question."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Suggested answers."
+          },
+          "to": {
+            "type": "string",
+            "description": "captain (default) or user.",
+            "enum": [
+              "captain",
+              "user"
+            ]
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "additionalProperties": false
+      },
+      "requires_approval": false
+    }
+  ]
+}

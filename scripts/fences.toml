@@ -16,6 +16,7 @@ files = ["crates/**", "control-plane/src/**", "protocol/**"]
 allow = [
   "control-plane/src/do/broker.ts",          # stores it
   "control-plane/src/do/agent.ts",           # passes its reference in agent_start
+  "control-plane/src/lib/spec.ts",           # names the setup token a template's credential picks (never its value)
   "control-plane/src/protocol/control.ts",   # the agent_start schema
   "crates/nest-protocol/src/control.rs",     # the agent_start type (a redacting Secret)
   "crates/nest-protocol/src/host.rs",        # Claude Code's environment, built on the host

@@ -7,7 +7,7 @@ nest is two systems with one seam between them:
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
-> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13)). **Not built:** brain hosts (today every brain starts on its sandbox's host, stays there when the sandbox moves, and reaches the guest only through its gateway; FleetDO has `burst` and `controller` host roles, and AgentDO starts captains on a `controller` host), and the coordination layer (ChannelDO, HookDO, grants, taint, capabilities, `wake_at`); the code still has roles and WorkstreamDO. `control-plane/README.md` lists the gaps.
+> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13)). **Not built:** brain hosts (today every brain starts on its sandbox's host, stays there when the sandbox moves, and reaches the guest only through its gateway; FleetDO has `burst` and `controller` host roles, and AgentDO starts captains on a `controller` host), and the coordination layer (ChannelDO, HookDO, grants, taint, `wake_at`). Templates and capabilities are data in CatalogDO, and nothing decides on an agent role; WorkstreamDO stands in for the workstream channel until ChannelDO exists. `control-plane/README.md` lists the gaps.
 
 ## At a glance
 
@@ -18,7 +18,7 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 ┌────────────────────── Cloudflare control plane (authoritative) ──────────────────────┐
 │ Worker: API · webhook route · Discord interactions · signed blob URLs (stateless)     │
 │ Durable Objects, one writer per entity:                                               │
-│   FleetDO (per cell) · SandboxDO · AgentDO · ChannelDO · HookDO · BrokerDO (secrets)  │
+│  FleetDO (per cell) · SandboxDO · AgentDO · ChannelDO · HookDO · BrokerDO · CatalogDO │
 │ R2: session transcripts · large and older channel messages · audit                   │
 └────────────▲──────────────────────────────────────────────────▲──────────────────────┘
              │ WebSockets that hosts dial out:                  │
@@ -46,6 +46,7 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 | **ChannelDO** | Cloudflare, one per channel | Message log, keyed view, subscriptions, fan-out | [channel/](../control-plane/durable-objects/channel/) |
 | **HookDO** | Cloudflare, one per webhook | Verification (through BrokerDO), mapping, dedup, posting | [hook/](../control-plane/durable-objects/hook/) |
 | **BrokerDO** | Cloudflare, one | The only DO that stores secret values: setup tokens, injection secrets, hook and capability credentials, the Access service token. Platform keys (AWS, the host-token secret, operator-token hashes, the revocation counter, the Cloudflare Tunnel API token) are Worker secrets; the proxy root CA key is in AWS KMS | [broker/](../control-plane/durable-objects/broker/) |
+| **CatalogDO** | Cloudflare, one | Templates and capabilities, as data I edit; expands spawn specs | [catalog/](../control-plane/durable-objects/catalog/) |
 | **nestd** | Every host | Enrollment, the lease, command delivery, self-fencing. On sandbox hosts: runs sandboxes, builds their network namespaces, launches cloudflared and the gateway, commits sandbox state to S3. On brain hosts: supervises the runner | [compute/nestd/](../compute/nestd/) |
 | **nest-proxy** | Sandbox hosts | All sandbox egress: allowlist, TLS inspection, credential injection by placeholder, audit | [egress/](../sandbox/networking/egress/) |
 | **Gateway** | Sandbox hosts | The one door into a sandbox: checks the binding, pins `(sandbox, epoch)`, forwards hands, terminal and ingress connections to the guest over vsock | [sandbox/gateway/](../sandbox/gateway/) |
