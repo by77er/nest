@@ -13,7 +13,7 @@ The study found these on `main` (`edf6829`) or on the brain branch. Each one nee
 | Salvage refused after a no-capacity epoch rollback | `sandbox.ts:312`, `:575`, `:585` | vitest sketch in [sandbox-lease/](../sandbox-lease/#8-real-and-suspected-bugs) | [sandbox-lease/](../sandbox-lease/) |
 | `destroy` during an in-flight placement resurrects the sandbox | `sandbox.ts:304-319`, `:507-519` | `const p = stub.wake(); await stub.destroy(); await p` and assert it stays `destroyed` with no lease | [sandbox-lease/](../sandbox-lease/) |
 | A resent commit has no age bound against the GC grace (B1, proved as a Lean counterexample) | `host.rs:2052`, `sandbox.ts:552`, `gc.rs:97` | fake-S3 test: prepare, age 25 h, GC with no roots, evaluate the saved request, expect a refusal | [commit-gc/](../commit-gc/) |
-| Brain record: three holes found and fixed in the design (A1 to A3), plus A4 from the implementer | `origin/deferred/brain-record` | one test per amendment, mirroring the TLC trace | [agent-brain/pilot/](../agent-brain/pilot/) |
+| Brain record: six design holes (amendments A1 to A6) and 38 code divergences across five heads; N25 (old sandbox hosts wedged in the mixed-version window) and a few lows still open at 36b60d5 | `origin/deferred/brain-record` | one test per amendment and per N item, mirroring the TLC trace or the conformance interleaving; the untested lines listed in the conformance doc | [agent-brain/conformance/](../agent-brain/conformance/) |
 
 The hosts, gateway and channel inventories list more suspected bugs, each with a confirming test.
 
@@ -35,7 +35,7 @@ They are cheap and catch drift that the models can't see. Each throws in tests a
 
 | # | What | Tool | Why now |
 |---|---|---|---|
-| 1 | Keep the brain record model in lockstep with `deferred/brain-record` until it merges: re-run the conformance check at each head | TLA+/TLC (pilot) | Three design holes in one day; the rule is still moving |
+| 1 | Finish the brain record's follow-up assurance: the epochs ≤ 3 sweep, liveness on the final design, the previous-release host (`OLD_HOST`) runs, and the drain run to exhaustion; re-run the conformance check at any later change | TLA+/TLC (pilot) | Every counterexample found needed 3 epochs; the gate ran at 2 |
 | 2 | Extend the sandbox lease model with host lifecycle and STONITH by fence (stonith_pending, re-activation, drain) | TLA+/TLC | Most of the hosts inventory's suspected bugs sit on that boundary |
 | 3 | Port the command-channel model's fixed variant to whichever fix lands, then run it as a regression | Stateright (pilot) | Already written; it checks the fix's pieces, not just the idea |
 | 4 | Gateway bindings: detach window, attach/detach ordering, the ghost fenced epoch | TLA+ | Bounded windows of a second binding are the remaining one-brain gap for hands |

@@ -2,7 +2,7 @@
 
 How nest's state machines and protocols can be formally checked, which ones are worth it, and what four pilots found. The subject is the platform design: it doesn't depend on how this repo is built.
 
-**Status:** a study (2026-10-25/26). Code examined: `main` at `edf6829`, plus the brain-lifecycle branches `origin/deferred/agent-epoch` (65bf6ef) and `origin/deferred/brain-record` (a38d3c0, 6073da7).
+**Status:** a study (2026-10-25/26). Code examined: `main` at `edf6829`, plus the brain-lifecycle branches `origin/deferred/agent-epoch` (65bf6ef) and `origin/deferred/brain-record` (a38d3c0 through 36b60d5, the merge gate).
 - **Pilots:** two TLA+ models checked with TLC, one Lean 4 proof, one Stateright model. Their sources are in [`verification/`](../../verification/README.md).
 - **Not yet wired into CI.** The proposal is in [dev/verification.md](../../dev/verification.md).
 
@@ -38,8 +38,8 @@ Each row is a machine or protocol worth modelling. Its doc lists states, transit
 | Pilot | Tool | Checked | Result |
 |---|---|---|---|
 | [Sandbox lease](sandbox-lease/pilot/) | TLA+/TLC | main's placement, lease, fencing, STONITH, salvage and commit; 9 properties plus 5 liveness | Seven real defects (below); vitest against the real DOs reproduces B1 and B2. With the seven modelled fixes on, every safety invariant holds exhaustively at 2 hosts, 2 epochs, no commits and one disconnect (4.3M states). Larger fixed runs are partial (up to 84M states, no violation). Mutations show each invariant can fail |
-| [Brain lifecycle](agent-brain/pilot/) | TLA+/TLC | 65bf6ef, then the single-record design and its amendments, then 6073da7 as built | Reproduced the four review findings on 65bf6ef. Found six holes in the new design, each adopted as an amendment or fix the same day (below). The amended design holds exhaustively at 2 hosts, epochs ≤ 2 and one fault of each kind (up to 24.7M states per run); runs at epochs ≤ 3 are partial |
-| [Brain conformance](agent-brain/conformance/) | review | brain-record a38d3c0, then 6073da7, action by action against the model | 13 divergences at a38d3c0 (D1 then confirmed by TLC). At 6073da7, all 13 were fixed and N1 to N10 were found; TLC reproduces N1 with zero faults |
+| [Brain lifecycle](agent-brain/pilot/) | TLA+/TLC | 65bf6ef, then the single-record design and its amendments, then the branch as built (6073da7; 82396b3 with no same-host re-issue) | Reproduced the four review findings on 65bf6ef. Found six holes in the new design, each adopted as an amendment or fix the same day (below), and reproduced N1 with zero faults. The 82396b3 design holds exhaustively at 2 hosts and epochs ≤ 2 for each single fault (none, reset, lost RPC, crash, idle exit, partition, operator restart) and for restart plus an ignored kill (53.9M states). Drain is depth-bounded: no violation through BFS depth ~40 (72.2M states). Not yet covered: epochs ≤ 3, liveness on the final design, mixed versions |
+| [Brain conformance](agent-brain/conformance/) | review | brain-record at a38d3c0, 6073da7, 82396b3, fb9b836 and 36b60d5, action by action against the model and design | D1 to D13, then N1 to N25. Each was fixed by the next head except the lows listed in the doc. At 36b60d5, S conforms for an all-new fleet and in the mixed-version window. L conforms for an all-new fleet; in the mixed window, N25 wedges healthy old sandbox hosts unless their sandboxes are suspended or the hosts are upgraded first |
 | [Commit chain and GC](commit-gc/pilot/) | Lean 4 | SandboxDO.commit guard for guard; the GC mark and sweep with reuse and grace | Chain shape, orphan never head, CAS-only head moves and idempotence proved for every reachable state. GC safety proved under assumption A1. B1 (no age bound on a resent commit) checked as a 6-step counterexample. No `sorry`; standard axioms only |
 | [Command delivery](reliable-channels/pilot/) | Stateright | FleetDO → nestd commands: send, BrokerDO resolution, hello, ack, restarts | main loses an acked command in 8 steps with no fault. Both fix shapes hold (7.4M and 12.5M states), and the model showed which extra pieces each fix needs |
 
@@ -57,7 +57,7 @@ On `main` (`edf6829`), unless marked. "Confirmed" means a checker trace, a test 
 | Stuck sandboxes: a late placement answer adopts a lost host; a reassignment is dropped by `INSERT OR IGNORE` | `sandbox.ts:466-473`; `fleet.ts:1849-1850` | The sandbox never runs again without an operator | TLC (L1, L2) | [sandbox-lease/pilot/](sandbox-lease/pilot/) |
 | A resent commit has no age bound against the GC grace | `host.rs:2052`; `sandbox.ts:552`; `gc.rs:97` | A generation can name deleted chunks; every later GC pass then fails closed | inventory; Lean counterexample | [commit-gc/](commit-gc/) |
 | A host terminated outside FleetDO counts toward `max_hosts` until idle retirement | `fleet.ts:1443-1446` | Explains the ~10 min wait in the open watch item | inventory | [hosts/](hosts/) |
-| Brain record (branch): six design holes and N1 | `deferred/brain-record` | Two brains acting, or a wedged agent or healthy host. Each was adopted as an amendment or fixed | TLC; conformance | [agent-brain/pilot/](agent-brain/pilot/) |
+| Brain record (branch): six design holes, then 38 divergences across five heads (D1-D13, N1-N25) | `deferred/brain-record` | Two brains acting, or a wedged agent or healthy host. Each was adopted as an amendment or fixed, except the lows and N25 (mixed-window availability) | TLC; conformance | [agent-brain/conformance/](agent-brain/conformance/) |
 
 The inventories list more suspected bugs, each with what would confirm it.
 
