@@ -17,7 +17,9 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
 | `host` | Core: in-order command executor (exactly one `command_result` per command, deduplicated by `cmd`), sandbox lifecycle, commit compare-and-set (lock released while waiting), fencing and self-fencing, event relay, CA renewal, capacity reports |
 | `limits` | Per-sandbox token buckets for guest- and proxy-originated events |
 | `net` | Netns with no uplink: `unshare(CLONE_NEWNET)` in a helper thread, tap0 plus the nft ruleset, listeners bound inside the namespace via `setns` on a fresh thread |
-| `proxy_link` | nestd ↔ nest-proxy over SEQPACKET + `SCM_RIGHTS`. A state mirror plus sequence-tagged ops gives a full resync on every reconnect with nothing lost or duplicated. `apply` never blocks: queued ops carry duplicated fds, and sends have a timeout. Also: ping watchdog, resync count check, refusal of fenced epochs, socket access control |
+| `proxy_link` | nestd ↔ nest-proxy over SEQPACKET + `SCM_RIGHTS`. A state mirror plus sequence-tagged ops gives a full resync on every reconnect with nothing lost or duplicated. `apply` never blocks: queued ops carry duplicated fds, and sends have a timeout. Also: ping watchdog, resync count check, refusal of tombstoned (fenced) epochs, socket access control |
+| `tombstones` | The host's one map of fenced epochs, written by the host core's fence and consulted by the proxy and gateway links; pruned when a newer epoch runs here or the sandbox is destroyed |
+| `recovery` | `meta.json` beside each disk (sandbox, epoch, head; written atomically once the disk is complete and after every commit), and the start-up scan of what a previous nestd left |
 | `runner_link` | nestd ↔ agent runner, lifecycle only. Keeps the desired set of brains and re-issues `agent_start` on reconnect (the sandbox's id and epoch, never a socket path or a binding). Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
 | `gateway_link` | nestd ↔ sandbox gateway (`gateway.sock`). A mirror of the binding verification keys and, per sandbox, the epoch, the vsock socket, the attached clients and the guest's version; replayed in full on every (re)connection and closed with `resync_done`, then deltas on attach, detach, boot, resume, the guest's hello, fence and teardown. Ping every 5 s, a silent gateway is dropped after 15 s. Socket access control, one gateway at a time |
 | `guest` | Guest control connection (vsock 1024): hello (the guest's version and capabilities are kept and reported with `running`), configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
@@ -80,6 +82,9 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
   - **`retryable_fleet_error_resends_the_failed_batch`** (review #7)
   - **`proxy_ca_is_renewed_before_expiry`** (review #10)
   - **`newer_epoch_create_salvages_old_work_first`** (review #17)
+  - **`a_restarted_nestd_reports_salvages_and_deletes_what_it_left`** (nestd review #7): a first process dies (its runtime dropped) with two sandboxes on disk; the next reports both `fenced` in its first hello, salvages only the one written to since its last commit (parent from `meta.json`), deletes both, and removes a directory without `meta.json` and the old VM runtime directories before the hello. The second process runs the process driver and boots nothing.
+  - **`a_fenced_epoch_stays_stale_until_a_newer_epoch_runs`** (nestd review #12)
+  - `a_restarted_nestd_tears_down_leftover_netns_mounts` (in a user namespace): a netns bind mount left under `persist_dir` is gone when `Host::start` returns
   - `netns_listeners_handed_to_proxy` (in a user namespace): real netns, tap0 and nft; five listeners reach the fake proxy, and its copy of `:443` accepts a connection made inside the sandbox netns.
 
 ## Not implemented yet (TODO)

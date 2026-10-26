@@ -17,7 +17,7 @@ SandboxDO issues a new epoch with every [placement claim](../../control-plane/du
   - **Terminal per epoch:** an in-flight create, resume or suspend that finishes after a fence can't move the sandbox back to `running`. Long operations re-check for a fence after every await.
   - **Proxy:** nest-proxy refuses to re-add an epoch it dropped for fencing.
   - **Without the sandbox lock:** vCPUs are frozen through a pause handle that doesn't need it, and egress is dropped through a proxy link that never blocks. Bindings die with the epoch: the [gateway](../gateway/) and the guest refuse hands calls for any other, so no brain needs to be told.
-- **If nestd crashes,** its VMs should die with it (systemd `BindsTo` plus a watchdog; planned, not implemented yet).
+- **If nestd crashes,** its VMs should die with it (systemd `BindsTo` plus a watchdog; planned, not implemented yet). The next nestd reports every sandbox it finds on disk as `fenced` in its first hello and never runs one again: it salvages each disk that differs from its head, then deletes it ([nestd](../../compute/nestd/)).
 - **Heartbeats are evidence, not authority.** They renew leases, and their silence lets FleetDO expire them; they never move a sandbox's placement. Only a claim and its epoch do.
 
 ## 3. STONITH before reassigning

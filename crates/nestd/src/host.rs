@@ -49,8 +49,10 @@ use crate::guest::{GuestCtl, GuestEvent};
 use crate::net::{GATEWAY_IP, Netns};
 use crate::limits::{self, Limiter};
 use crate::proxy_link::{Access, HeldListener, ProxyLink, ProxyNotice, ProxyOp};
+use crate::recovery::{self, SandboxMeta};
 use crate::runner_link::{RunnerLink, RunnerNotice};
 use crate::storage::{self, ObjectStore};
+use crate::tombstones::Tombstones;
 use crate::util::{error, new_id, now_ms};
 
 const MAX_AGENT_SLOTS: u16 = 64;
@@ -131,8 +133,62 @@ struct SentCommit {
 }
 
 impl Sbx {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: SandboxId,
+        workstream: WorkstreamId,
+        epoch: Epoch,
+        image: String,
+        resources: Resources,
+        policy: EgressPolicy,
+        head: Option<GenerationRecord>,
+        vm_dir: PathBuf,
+        state_dir: PathBuf,
+    ) -> Sbx {
+        Sbx {
+            id,
+            workstream,
+            epoch,
+            image,
+            resources,
+            policy,
+            head,
+            vm: None,
+            paused: false,
+            netns: None,
+            guest: None,
+            next_listener: 1,
+            slots: BTreeMap::new(),
+            slot_cwds: BTreeMap::new(),
+            tcp_listeners: BTreeMap::new(),
+            known_ports: BTreeSet::new(),
+            exposed: BTreeMap::new(),
+            vm_dir,
+            state_dir,
+            guest_info: None,
+            unanswered: None,
+        }
+    }
+
     fn disk_path(&self) -> PathBuf {
         self.state_dir.join("disk.img")
+    }
+
+    /// What `meta.json` records about this incarnation (see `recovery.rs`).
+    fn meta(&self) -> SandboxMeta {
+        SandboxMeta { sandbox: self.id.clone(), workstream: self.workstream.clone(), epoch: self.epoch, image: self.image.clone(), resources: self.resources, head: self.head.clone() }
+    }
+}
+
+/// The policy of an incarnation found on disk at start: it never runs again, so it allows nothing.
+fn deny_all_policy() -> EgressPolicy {
+    EgressPolicy {
+        version: 0,
+        allow: vec![],
+        passthrough: vec![],
+        inject: vec![],
+        tcp: vec![],
+        limits: nest_protocol::model::EgressLimits { max_connections: 0, bandwidth_mbps: 0, max_inspected_body_bytes: 0 },
     }
 }
 
@@ -169,6 +225,8 @@ pub struct Inner {
     proxy: ProxyLink,
     runner: RunnerLink,
     gateway: GatewayLink,
+    /// Fenced epochs, the one map both links consult (`tombstones.rs`); written by `fence_sandbox`.
+    tombstones: Tombstones,
     fleet: mpsc::UnboundedSender<FleetInput>,
     guest_events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>,
     summary: Mutex<BTreeMap<SandboxId, Summary>>,
@@ -263,6 +321,23 @@ impl Host {
         std::fs::create_dir_all(&cfg.run_dir).with_context(|| format!("create {}", cfg.run_dir.display()))?;
         std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("create {}", cfg.state_dir.display()))?;
         std::fs::create_dir_all(cfg.agents_dir())?;
+        // What a previous nestd process left (before anything new starts, and before the first
+        // fleet hello, which reports every incarnation found as `fenced`). No VM survives nestd,
+        // so every netns bind mount and VM runtime directory is a leftover.
+        if let NetworkConfig::Netns { persist_dir: Some(dir) } = &cfg.network {
+            let n = crate::net::sweep_persisted(dir);
+            if n > 0 {
+                tracing::info!(n, "removed netns bind mounts left by a previous nestd");
+            }
+        }
+        let n = recovery::sweep_vm_dirs(&cfg.run_dir.join("vm"));
+        if n > 0 {
+            tracing::info!(n, "removed VM runtime directories left by a previous nestd");
+        }
+        let found = recovery::scan(&cfg.state_dir.join("sandboxes"));
+        if !found.is_empty() {
+            tracing::warn!(sandboxes = found.len(), "sandboxes left by a previous nestd: reporting them fenced, salvaging, then deleting them");
+        }
         let driver: Arc<dyn Driver> = match driver {
             Some(d) => d,
             None => match &cfg.driver {
@@ -293,15 +368,16 @@ impl Host {
         // Random per nestd process: the fleet hello's `instance_id` and the proxy's `nestd_boot_id`.
         let instance_id = crate::util::random_hex(8);
 
+        let tombstones = Tombstones::default();
         let (proxy_tx, mut proxy_rx) = mpsc::unbounded_channel();
         let proxy_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.proxy_uids.clone() };
-        let proxy = ProxyLink::start(&cfg.proxy_sock(), enrolled.host.clone(), instance_id.clone(), proxy_access, proxy_tx)?;
+        let proxy = ProxyLink::start(&cfg.proxy_sock(), enrolled.host.clone(), instance_id.clone(), proxy_access, tombstones.clone(), proxy_tx)?;
         let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
         let runner_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.runner_uids.clone() };
         let runner = RunnerLink::start(&cfg.runner_sock(), enrolled.host.clone(), cfg.role, runner_access, runner_tx)?;
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
         let gateway_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.gateway_uids.clone() };
-        let gateway = GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, gateway_tx)?;
+        let gateway = GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, tombstones.clone(), gateway_tx)?;
         let (fleet_tx, fleet_rx) = mpsc::unbounded_channel();
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
         let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
@@ -312,6 +388,41 @@ impl Host {
         }
         runner.host_token(enrolled.host_token.clone(), enrolled.host_token_expires_ms);
 
+        // Each incarnation found is a fenced row (reported in the hello) with an Sbx holding only
+        // its disk, which the existing salvage path reads.
+        let mut summary = BTreeMap::new();
+        let mut sandboxes = BTreeMap::new();
+        for f in &found {
+            let m = &f.meta;
+            tombstones.fence(&m.sandbox, m.epoch);
+            summary.insert(
+                m.sandbox.clone(),
+                Summary {
+                    workstream: m.workstream.clone(),
+                    epoch: m.epoch,
+                    state: SandboxState::Fenced,
+                    head: m.head.as_ref().map(|g| g.id.clone()),
+                    // Unknown until salvage compares the disk with its head.
+                    dirty: true,
+                    resources: m.resources,
+                    guest: None,
+                },
+            );
+            let sbx = Sbx::new(
+                m.sandbox.clone(),
+                m.workstream.clone(),
+                m.epoch,
+                m.image.clone(),
+                m.resources,
+                deny_all_policy(),
+                m.head.clone(),
+                cfg.vm_dir(&m.sandbox.0),
+                f.state_dir.clone(),
+            );
+            sandboxes.insert(m.sandbox.clone(), Arc::new(tokio::sync::Mutex::new(sbx)));
+        }
+        let recovered: Vec<(SandboxId, Arc<tokio::sync::Mutex<Sbx>>)> = sandboxes.iter().map(|(id, e)| (id.clone(), e.clone())).collect();
+
         let inner = Arc::new(Inner {
             host_id: enrolled.host.clone(),
             driver,
@@ -321,10 +432,11 @@ impl Host {
             proxy,
             runner,
             gateway,
+            tombstones,
             fleet: fleet_tx,
             guest_events: guest_tx,
-            summary: Mutex::new(BTreeMap::new()),
-            sandboxes: Mutex::new(BTreeMap::new()),
+            summary: Mutex::new(summary),
+            sandboxes: Mutex::new(sandboxes),
             pending_commits: Mutex::new(HashMap::new()),
             pending_cli: Mutex::new(HashMap::new()),
             results: Mutex::new(Results::default()),
@@ -365,6 +477,13 @@ impl Host {
             fleet_rx,
             notice_tx,
         );
+
+        // Incarnations left by a previous nestd: salvage (the commit request queues until the fleet
+        // connects, after the hello), then delete.
+        for (id, entry) in recovered {
+            let inner = inner.clone();
+            tokio::spawn(async move { inner.settle_recovered(id, entry).await });
+        }
 
         // Command executor: in order, one at a time.
         let (exec_tx, mut exec_rx) = mpsc::unbounded_channel::<(Seq, Vec<Command>)>();
@@ -461,6 +580,11 @@ impl Host {
 impl Inner {
     pub fn host_id(&self) -> &HostId {
         &self.host_id
+    }
+
+    /// The fenced epoch tombstoned for `sandbox` on this host, if any (introspection and tests).
+    pub fn fenced_epoch(&self, sandbox: &SandboxId) -> Option<Epoch> {
+        self.tombstones.get(sandbox)
     }
 
     fn emit(&self, body: HostEventBody) {
@@ -925,8 +1049,10 @@ impl Inner {
                 }
             });
         }
+        // Tombstone first: from here on neither link accepts anything for this epoch.
+        self.tombstones.fence(id, epoch);
         self.proxy.apply(ProxyOp::Drop { sandbox: id.clone(), epoch, reason: DropReason::Fence });
-        self.gateway.remove(id, epoch);
+        self.gateway.forget(id);
         self.emit(HostEventBody::SandboxState { sandbox: id.clone(), epoch, state: SandboxState::Fenced, suspend_mode: None, detail: Some(reason.into()), guest: None });
         tracing::warn!(sandbox = %id, epoch = epoch.0, reason, "fenced");
 
@@ -960,6 +1086,12 @@ impl Inner {
     fn salvage(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, id: SandboxId, timeout: Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move {
             let s = entry.lock().await;
+            // Another salvage of this incarnation (one started at nestd start, say) may have
+            // captured the work while we waited for the lock: one sibling branch, not two.
+            let dirty = self.summary.lock().expect("summary").get(&id).is_some_and(|x| x.epoch == s.epoch && x.dirty);
+            if !dirty {
+                return;
+            }
             let (_s, r) = self.commit(&entry, s, CommitReason::Salvage, None, timeout).await;
             match r {
                 Ok(Some(g)) => tracing::info!(sandbox = %id, generation = %g.id, "salvage committed"),
@@ -967,6 +1099,56 @@ impl Inner {
                 Err(e) => tracing::warn!(sandbox = %id, code = %e.code, "salvage commit failed"),
             }
         })
+    }
+
+    /// An incarnation a previous nestd left on disk (reported `fenced` in the hello): salvage its
+    /// disk if it differs from its head, then delete its state and VM directories and its Sbx. The
+    /// `fenced` row stays (clean) until `sandbox_destroy` at that epoch or a newer epoch's create,
+    /// like any fenced incarnation's. If salvage fails, nothing is deleted and the row stays dirty,
+    /// so a newer create here salvages again (asking first under the unanswered request id) before
+    /// it reuses the disk.
+    async fn settle_recovered(self: Arc<Self>, id: SandboxId, entry: Arc<tokio::sync::Mutex<Sbx>>) {
+        let s = entry.lock().await;
+        let epoch = s.epoch;
+        let (s, r) = self.commit(&entry, s, CommitReason::Salvage, None, SALVAGE_TIMEOUT).await;
+        let mark_dirty = |dirty: bool| {
+            if let Some(x) = self.summary.lock().expect("summary").get_mut(&id)
+                && x.epoch == epoch
+            {
+                x.dirty = dirty;
+            }
+        };
+        match r {
+            Ok(Some(g)) => tracing::info!(sandbox = %id, epoch = epoch.0, generation = %g.id, "salvaged the work of an incarnation left by a previous nestd"),
+            Ok(None) => tracing::info!(sandbox = %id, epoch = epoch.0, "an incarnation left by a previous nestd had nothing uncommitted"),
+            Err(e) => {
+                tracing::warn!(sandbox = %id, epoch = epoch.0, code = %e.code, message = %e.message, "salvage of an incarnation left by a previous nestd failed: its disk is kept");
+                mark_dirty(true);
+                return;
+            }
+        }
+        // Still ours? A newer create or a destroy may have torn it down while the commit was
+        // awaited; then its state directory is no longer this incarnation's to delete. Holding the
+        // entry's lock keeps a teardown that already unlisted it waiting until we are done.
+        let ours = {
+            let mut map = self.sandboxes.lock().expect("sandboxes");
+            let ours = map.get(&id).is_some_and(|e| Arc::ptr_eq(e, &entry));
+            if ours {
+                map.remove(&id);
+            }
+            ours
+        };
+        if !ours {
+            return;
+        }
+        for dir in [&s.state_dir, &s.vm_dir] {
+            match std::fs::remove_dir_all(dir) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::error!(path = %dir.display(), error = %e, "deleting a recovered incarnation"),
+                _ => {}
+            }
+        }
+        drop(s);
+        mark_dirty(false);
     }
 
     /// Ask the control plane whether a GC pass is due, soon after start and then hourly (hosts
@@ -1163,6 +1345,10 @@ impl Inner {
         from: Option<GenerationRecord>,
         fork: Option<ForkIdentity>,
     ) -> CmdResult {
+        // A tombstoned epoch was fenced here: final, whatever the summary still holds.
+        if self.tombstones.refuses(&sandbox, epoch) {
+            return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced here", epoch.0), false));
+        }
         let existing = self.summary.lock().expect("summary").get(&sandbox).cloned();
         if let Some(s) = existing {
             if s.epoch == epoch && s.state == SandboxState::Running {
@@ -1188,6 +1374,9 @@ impl Inner {
         let vm_dir = self.cfg.vm_dir(&sandbox.0);
         let state_dir = self.cfg.sandbox_state_dir(&sandbox.0);
         std::fs::create_dir_all(&state_dir).map_err(internal)?;
+        // The old incarnation's record goes before this one's disk is prepared over it: a crash
+        // in between leaves a directory without meta.json, which the next start removes.
+        recovery::remove_meta(&state_dir).map_err(internal)?;
         let restoring = from.is_some();
         let initial = if restoring { SandboxState::Restoring } else { SandboxState::Creating };
         self.summary.lock().expect("summary").insert(
@@ -1196,29 +1385,7 @@ impl Inner {
         );
         self.emit(HostEventBody::SandboxState { sandbox: sandbox.clone(), epoch, state: initial, suspend_mode: None, detail: None, guest: None });
 
-        let sbx = Sbx {
-            id: sandbox.clone(),
-            workstream: workstream.clone(),
-            epoch,
-            image: image.clone(),
-            resources,
-            policy: policy.clone(),
-            head: from.clone(),
-            vm: None,
-            paused: false,
-            netns: None,
-            guest: None,
-            next_listener: 1,
-            slots: BTreeMap::new(),
-            slot_cwds: BTreeMap::new(),
-            tcp_listeners: BTreeMap::new(),
-            known_ports: BTreeSet::new(),
-            exposed: BTreeMap::new(),
-            vm_dir,
-            state_dir,
-            guest_info: None,
-            unanswered: None,
-        };
+        let sbx = Sbx::new(sandbox.clone(), workstream.clone(), epoch, image.clone(), resources, policy.clone(), from.clone(), vm_dir, state_dir);
         // Boot while holding the sandbox's own lock: guest events and fencing wait for it.
         let entry = Arc::new(tokio::sync::Mutex::new(sbx));
         let mut guard = entry.clone().lock_owned().await;
@@ -1249,6 +1416,9 @@ impl Inner {
                 if !self.set_state(&sandbox, epoch, SandboxState::Running, None, detail.clone()) {
                     return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced during create", epoch.0), false));
                 }
+                // A newer epoch runs here: the summary's epoch refuses older ones from now on, so
+                // their tombstone goes (never this epoch's, should a fence land right now).
+                self.tombstones.prune_below(&sandbox, epoch);
                 Ok(detail.map(|d| serde_json::json!({ "note": d })))
             }
             Err(e) => {
@@ -1299,6 +1469,8 @@ impl Inner {
             Ok(())
         })
         .await??;
+        // The disk is complete: from now on a restart finds this incarnation and salvages it.
+        recovery::write_meta(&sbx.state_dir, &sbx.meta()).context("write meta.json")?;
 
         // Network (pushes listeners to the proxy).
         check("network setup")?;
@@ -1590,6 +1762,8 @@ impl Inner {
         }
         self.teardown(id, DropReason::Teardown).await;
         let _ = std::fs::remove_dir_all(state_dir);
+        // Nothing of the sandbox is left here at or below this epoch: neither is its tombstone.
+        self.tombstones.prune_up_to(id, epoch);
         Ok(None)
     }
 
@@ -1883,11 +2057,17 @@ impl Inner {
         .await
         .map_err(internal)?
         .map_err(internal)?;
-        if reason == CommitReason::Salvage
-            && let Some(x) = self.summary.lock().expect("summary").get_mut(&s.id)
-        {
-            // The work is captured in the store now: the disk may be reused by a newer epoch.
-            x.dirty = false;
+        if reason == CommitReason::Salvage {
+            if let Some(x) = self.summary.lock().expect("summary").get_mut(&s.id)
+                && x.epoch == s.epoch
+            {
+                // The work is captured in the store now: the disk may be reused by a newer epoch.
+                x.dirty = false;
+            }
+            // The disk is exactly its head (nothing written since): there is no work to salvage.
+            if mem_manifest.is_none() && s.head.as_ref().is_some_and(|h| h.disk_manifest == disk_manifest && h.mem_manifest.is_none()) {
+                return Ok(None);
+            }
         }
         let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
         Ok(Some(SentCommit { request: RequestId(new_id("req_")), parent: s.head.as_ref().map(|h| h.id.clone()), kind, disk_manifest, mem_manifest, reason }))
@@ -1897,9 +2077,18 @@ impl Inner {
         match outcome {
             CommitOutcome::Committed { generation } => {
                 s.head = Some(generation.clone());
-                if let Some(x) = self.summary.lock().expect("summary").get_mut(id) {
-                    x.head = Some(generation.id.clone());
-                    x.dirty = false;
+                let current = match self.summary.lock().expect("summary").get_mut(id) {
+                    Some(x) if x.epoch == s.epoch => {
+                        x.head = Some(generation.id.clone());
+                        x.dirty = false;
+                        true
+                    }
+                    _ => false,
+                };
+                // The disk now matches this generation (salvage's next parent). Only while this
+                // incarnation still owns the directory: a newer epoch's create may have reused it.
+                if current && let Err(e) = recovery::write_meta(&s.state_dir, &s.meta()) {
+                    tracing::error!(sandbox = %id, error = %e, "updating meta.json after a commit");
                 }
                 Ok(Some(generation))
             }
@@ -1907,9 +2096,14 @@ impl Inner {
             CommitOutcome::Rejected { reason: why, .. } => {
                 if why == error_codes::STALE_EPOCH || why == error_codes::PARENT_MISMATCH {
                     let this = self.clone();
-                    let id = id.clone();
-                    // Fence; the uncommitted work is offered as salvage (a sibling branch).
-                    spawn_boxed(async move { this.fence_sandbox(&id, "commit rejected", true, true).await });
+                    let (id, epoch) = (id.clone(), s.epoch);
+                    // Fence this incarnation (never a newer one that replaced it meanwhile); the
+                    // uncommitted work is offered as salvage (a sibling branch).
+                    spawn_boxed(async move {
+                        if !this.fenced(&id, epoch) {
+                            this.fence_sandbox(&id, "commit rejected", true, true).await;
+                        }
+                    });
                 }
                 Err(error(&why, format!("commit rejected: {why}"), false))
             }
