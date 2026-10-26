@@ -1043,19 +1043,19 @@ impl Inner {
                     }
                 }
                 Some((d, db)) => {
-                    let expired = Instant::now() >= d || crate::util::boottime() >= db;
-                    if expired {
-                        self.self_fence().await;
-                        // Stay fenced until the next renewal.
-                        if rx.changed().await.is_err() {
-                            return;
+                    let remaining = (d.saturating_duration_since(Instant::now()), db.saturating_sub(crate::util::boottime()));
+                    match nestd_core::lease::check(remaining.0.as_millis() as u64, remaining.1.as_millis() as u64) {
+                        nestd_core::lease::LeaseCheck::Expired => {
+                            self.self_fence().await;
+                            // Stay fenced until the next renewal.
+                            if rx.changed().await.is_err() {
+                                return;
+                            }
                         }
-                        continue;
-                    }
-                    let wait = d.saturating_duration_since(Instant::now()).min(db.saturating_sub(crate::util::boottime())).min(Duration::from_millis(250));
-                    tokio::select! {
-                        changed = rx.changed() => { if changed.is_err() { return; } }
-                        _ = tokio::time::sleep(wait) => {}
+                        nestd_core::lease::LeaseCheck::Valid { recheck_ms } => tokio::select! {
+                            changed = rx.changed() => { if changed.is_err() { return; } }
+                            _ = tokio::time::sleep(Duration::from_millis(recheck_ms)) => {}
+                        },
                     }
                 }
             }

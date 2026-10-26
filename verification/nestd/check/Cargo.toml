@@ -1,0 +1,26 @@
+[package]
+name = "nestd-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "UNLICENSED"
+description = "Stateright checks of nestd's real cores (nestd-core) against environment models (docs/verification/nestd/)"
+
+# Standalone: not a member of the repo's workspace, so `cargo test --workspace` doesn't run the
+# checker (CI runs it in its own bounded job).
+[workspace]
+
+[dependencies]
+nestd-core = { path = "../../../crates/nestd-core" }
+stateright = "=0.31.0"
+
+# The checker is CPU-bound: optimize, but keep debug assertions so a core invariant that fails
+# (nestd_core::invariant) panics the run instead of being counted.
+[profile.dev]
+opt-level = 2
+
+[profile.test]
+opt-level = 2
+
+[profile.release]
+debug-assertions = true

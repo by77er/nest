@@ -16,6 +16,9 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+    // A core invariant that fails in production is counted and logged, never fatal (a test build
+    // panics on it instead): `nestd_core::invariant`.
+    nestd_core::invariant::set_hook(|name| tracing::error!(invariant = name, total = nestd_core::invariant::violations(), "core invariant violated"));
     let args = Args::parse();
     let text = std::fs::read_to_string(&args.config).with_context(|| format!("read {}", args.config.display()))?;
     let cfg: Config = serde_json::from_str(&text).with_context(|| format!("parse {}", args.config.display()))?;

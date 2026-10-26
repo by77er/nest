@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fleet;
 pub mod incarnation;
 pub mod invariant;
+pub mod lease;
 pub mod results;
