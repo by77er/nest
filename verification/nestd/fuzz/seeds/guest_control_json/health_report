@@ -1,0 +1,1 @@
+{"reply_to":7,"type":"health_report","report":{"uptime_ms":3600000,"load1":0.42,"mem_total_kb":4012000,"mem_available_kb":2500000,"disks":[{"mount":"/workspace","total_bytes":21474836480,"avail_bytes":15032385536}],"agents":[{"agent_id":"agt_01JB8Z3K7Q2M","running_calls":1,"background_tasks":1,"cpu_usage_usec":91234567,"memory_current_bytes":734003200}]}}
