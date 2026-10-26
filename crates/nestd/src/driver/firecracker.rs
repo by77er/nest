@@ -37,6 +37,8 @@ pub struct FirecrackerDriver {
     /// unit delegates its cgroup (`cgroup.rs`), so the unit's stop kills every VMM. `None`: the
     /// jailer's default parent, outside the unit.
     pub parent_cgroup: Option<String>,
+    /// The cgroup v2 mount: a jailed VMM's cgroup is removed there once it has exited.
+    pub cgroup_root: PathBuf,
 }
 
 #[async_trait]
@@ -57,7 +59,7 @@ impl Driver for FirecrackerDriver {
                 None
             }
         };
-        Ok(Box::new(FirecrackerVm { cfg: self.cfg.clone(), parent_cgroup: self.parent_cgroup.clone(), spec, child: None, jail }))
+        Ok(Box::new(FirecrackerVm { cfg: self.cfg.clone(), parent_cgroup: self.parent_cgroup.clone(), cgroup_root: self.cgroup_root.clone(), spec, child: None, jail }))
     }
 }
 
@@ -107,6 +109,7 @@ pub struct FcPaths {
 pub struct FirecrackerVm {
     cfg: FirecrackerConfig,
     parent_cgroup: Option<String>,
+    cgroup_root: PathBuf,
     spec: VmSpec,
     child: Option<std::process::Child>,
     jail: Option<Jail>,
@@ -251,8 +254,10 @@ impl Vm for FirecrackerVm {
         // covered by its cgroup instead). Unjailed, it enters the netns itself; the jailer does that.
         let netns = if self.jail.is_none() { self.spec.netns.clone() } else { None };
         let child = super::supervise::spawn(cmd, netns)?;
-        super::supervise::write_pidfile(&self.spec.vm_dir, child.id())?;
+        let pid = child.id();
+        // Held first: on any error below, stop or drop reaps it.
         self.child = Some(child);
+        super::supervise::write_pidfile(&self.spec.vm_dir, pid)?;
         // Wait for the API socket (the jailer first copies Firecracker into the chroot).
         for _ in 0..500 {
             if self.api_sock().exists() {
@@ -285,9 +290,24 @@ impl Vm for FirecrackerVm {
             let _ = tokio::task::spawn_blocking(move || c.wait()).await;
         }
         if let Some(j) = &self.jail {
+            // The VMM has exited: its (now empty) cgroup goes too, so they don't pile up.
+            let cg = self.vmm_cgroup(j);
+            match std::fs::remove_dir(&cg) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(cgroup = %cg.display(), error = %e, "removing a stopped VMM's cgroup"),
+                _ => {}
+            }
             j.remove()?;
         }
         Ok(())
+    }
+}
+
+impl FirecrackerVm {
+    /// The jailer's cgroup for this VMM: `<root>/<parent>/<jail id>`, the parent being the
+    /// delegated one or the jailer's default (the exec file's name).
+    fn vmm_cgroup(&self, j: &Jail) -> PathBuf {
+        let parent = self.parent_cgroup.clone().unwrap_or_else(|| self.cfg.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into()));
+        self.cgroup_root.join(parent).join(&j.id)
     }
 }
 
@@ -436,6 +456,28 @@ mod tests {
         assert_eq!(reqs.last().unwrap().2["action_type"], "InstanceStart");
     }
 
+    /// A stopped jailed VMM's cgroup is removed (under the delegated parent here), and nothing else.
+    #[tokio::test]
+    async fn stop_removes_the_vmm_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fc = cfg();
+        fc.jailer_bin = Some("/usr/bin/jailer".into());
+        fc.jailer = Some(JailerConfig { uid: 900, gid: 900, chroot_base_dir: dir.path().join("jail") });
+        let root = dir.path().join("cgroup");
+        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: Some("system.slice/nestd.service/vms".into()), cgroup_root: root.clone() };
+        let mut s = spec();
+        s.vm_dir = dir.path().join("vm");
+        let mut vm = driver.create(s).await.unwrap();
+        let uds = vm.vsock_uds_path();
+        let id = uds.parent().unwrap().parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let vms = root.join("system.slice/nestd.service/vms");
+        std::fs::create_dir_all(vms.join(&id)).unwrap();
+        std::fs::create_dir_all(vms.join("sbx-other-1234")).unwrap();
+        vm.stop().await.unwrap();
+        assert!(!vms.join(&id).exists(), "the stopped VMM's cgroup is still there");
+        assert!(vms.join("sbx-other-1234").exists());
+    }
+
     /// Review #16: the jailer gets uid/gid/chroot, and Firecracker sees jail-relative paths while
     /// nestd uses the host paths under the jail root.
     #[tokio::test]
@@ -443,7 +485,7 @@ mod tests {
         let mut fc = cfg();
         fc.jailer_bin = Some("/usr/bin/jailer".into());
         fc.jailer = Some(JailerConfig { uid: 900, gid: 900, chroot_base_dir: "/srv/jailer".into() });
-        let driver = FirecrackerDriver { cfg: fc.clone(), parent_cgroup: None };
+        let driver = FirecrackerDriver { cfg: fc.clone(), parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into() };
         let dir = tempfile::tempdir().unwrap();
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
@@ -469,7 +511,7 @@ mod tests {
         assert_eq!(reqs[2].2["path_on_host"], "/disk.img");
         // A jailer without uid/gid/chroot settings is a configuration error.
         fc.jailer = None;
-        assert!(FirecrackerDriver { cfg: fc, parent_cgroup: None }.create(s).await.is_err());
+        assert!(FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into() }.create(s).await.is_err());
     }
 
     /// Stopping a jailed VM removes its jail directory, and only that.

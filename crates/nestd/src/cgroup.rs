@@ -14,6 +14,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Prefix of a jailed VMM's cgroup (its jail id: the sandbox id with `_` as `-`).
@@ -39,6 +40,15 @@ impl Delegated {
         let join = |leaf: &str| if own.is_empty() { leaf.to_string() } else { format!("{own}/{leaf}") };
         Delegated { supervisor: join("supervisor"), vms: join("vms") }
     }
+}
+
+/// Set up the delegated cgroups once per process ([`enter_delegated`]) and remember the outcome.
+/// `main` calls it first thing, before the runtime or any child exists; `Host::start` reads it
+/// (and calls it itself when `main` didn't, as in tests). A failure never stops nestd: it runs
+/// with the jailer's default parent and reports the error in every fleet hello.
+pub fn delegate(root: &Path) -> &'static Result<Delegated, String> {
+    static DELEGATION: OnceLock<Result<Delegated, String>> = OnceLock::new();
+    DELEGATION.get_or_init(|| enter_delegated(root).map_err(|e| e.to_string()))
 }
 
 /// Move this process into `<own>/supervisor` and prepare `<own>/vms` for the jailer: memory

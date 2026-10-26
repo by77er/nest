@@ -84,7 +84,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
   - **`proxy_ca_is_renewed_before_expiry`** (review #10)
   - **`newer_epoch_create_salvages_old_work_first`** (review #17)
   - **`a_restarted_nestd_reports_salvages_and_deletes_what_it_left`** (nestd review #7): three processes on one state directory, each dying with its runtime. The second deletes a suspended (clean) incarnation unreported, removes an incarnation without `meta.json` and the old flat layout, reports the rest `fenced`, skips the salvage of a disk equal to its head (whose head has memory), and dies with a salvage answer lost; the third asks again under the persisted request id. The later processes run the process driver and boot nothing.
-  - **`a_newer_create_races_the_salvage_of_what_a_dead_nestd_left`**, **`a_failed_salvage_is_retried_until_it_lands`**, **`a_fenced_incarnation_is_salvaged_once_even_when_superseded`**
+  - **`a_newer_create_races_the_salvage_of_what_a_dead_nestd_left`**, **`a_failed_salvage_is_retried_until_it_lands`**, **`a_final_salvage_refusal_ends_the_retire`**, **`a_fenced_incarnation_is_salvaged_once_even_when_superseded`**, **`a_newer_epoch_is_frozen_through_its_own_pause_handle`**
   - **`a_fenced_epoch_stays_stale_until_a_newer_epoch_runs`** (nestd review #12)
   - `a_restarted_nestd_tears_down_leftover_netns_mounts` (in a user namespace): a netns bind mount left under `persist_dir` is gone when `Host::start` returns
   - `netns_listeners_handed_to_proxy` (in a user namespace): real netns, tap0 and nft; five listeners reach the fake proxy, and its copy of `:443` accepts a connection made inside the sandbox netns.

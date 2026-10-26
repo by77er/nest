@@ -78,6 +78,8 @@ pub struct FleetParams {
     /// Random per nestd process; FleetDO resets both seq lineages when it changes.
     pub instance_id: String,
     pub flush_interval: Duration,
+    /// Reported in every hello: why the configured cgroup delegation failed (`cgroup.rs`).
+    pub cgroup_delegation_error: Option<String>,
 }
 
 
@@ -251,6 +253,7 @@ impl State {
             gateway_url: self.params.gateway_url.clone(),
             tunnel: *self.params.tunnel.borrow(),
             last_command_seq: self.last_command_seq,
+            cgroup_delegation_error: self.params.cgroup_delegation_error.clone(),
             sandboxes,
             agents,
             capacity,

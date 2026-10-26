@@ -259,7 +259,7 @@ describe("stale incarnations are destroyed on their old host", () => {
   });
 });
 
-describe("a salvaged incarnation reported clean", () => {
+describe("a retired incarnation (incarnation_retired)", () => {
   it("is destroyed at its old epoch without waiting out the salvage window", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
@@ -270,7 +270,7 @@ describe("a salvaged incarnation reported clean", () => {
     await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "fenced", detail: "host lease lapsed" }]);
     await nextCommands(b.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
     expect(await a.ws.none("commands", 200, (m) => m.commands.some((c: { type: string }) => c.type === "sandbox_destroy"))).toBe(true);
-    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "fenced", detail: "salvaged", dirty: false }]);
+    await events(a.ws, [{ type: "incarnation_retired", sandbox: sbx.sandbox, epoch: 1 }]);
     const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
     expect(destroy).toMatchObject({ sandbox: sbx.sandbox, epoch: 1 });
     // The clean report changed nothing else: the sandbox stays where it moved.

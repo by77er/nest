@@ -139,8 +139,10 @@ impl Vm for ProcessVm {
             .stdin(std::process::Stdio::null());
         // Dies with nestd, and starts inside the sandbox netns (`supervise.rs`).
         let child = super::supervise::spawn(cmd, self.spec.netns.clone())?;
-        super::supervise::write_pidfile(&self.spec.vm_dir, child.id())?;
+        let pid = child.id();
+        // Held first: on any error below, stop or drop reaps it.
         self.child = Some(child);
+        super::supervise::write_pidfile(&self.spec.vm_dir, pid)?;
         Ok(())
     }
     async fn pause(&mut self) -> io::Result<()> {

@@ -126,7 +126,11 @@ pub fn scan(sandboxes_dir: &Path) -> Vec<Found> {
             let path = inc.path();
             let epoch = inc.file_name().to_string_lossy().parse::<u64>().ok().filter(|_| inc.file_type().is_ok_and(|t| t.is_dir()));
             let Some(epoch) = epoch else {
-                tracing::warn!(path = %path.display(), "removing what is not an incarnation directory (an older nestd's flat layout, without meta.json)");
+                if inc.file_name().to_string_lossy().ends_with(DELETING) {
+                    tracing::info!(path = %path.display(), "finishing the deletion of an incarnation");
+                } else {
+                    tracing::warn!(path = %path.display(), "removing what is not an incarnation directory (an older nestd's flat layout, without meta.json)");
+                }
                 remove(&path);
                 continue;
             };
@@ -149,13 +153,16 @@ pub fn scan(sandboxes_dir: &Path) -> Vec<Found> {
     found
 }
 
+/// Suffix an incarnation directory takes while it is being deleted.
+const DELETING: &str = ".del";
+
 /// Remove the incarnation directories `<root>/<sandbox>/<epoch>` at or below `up_to` (a destroy),
 /// and `<root>/<sandbox>` once empty.
 pub fn remove_up_to(root: &Path, sandbox: &SandboxId, up_to: Epoch) {
     let dir = root.join(&sandbox.0);
     for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         if e.file_name().to_string_lossy().parse::<u64>().is_ok_and(|n| n <= up_to.0) {
-            remove(&e.path());
+            delete_atomically(&e.path());
         }
     }
     let _ = std::fs::remove_dir(&dir);
@@ -163,9 +170,25 @@ pub fn remove_up_to(root: &Path, sandbox: &SandboxId, up_to: Epoch) {
 
 /// Remove one incarnation directory, and its sandbox's directory once empty.
 pub fn remove_incarnation(dir: &Path) {
-    remove(dir);
+    delete_atomically(dir);
     if let Some(parent) = dir.parent() {
         let _ = std::fs::remove_dir(parent);
+    }
+}
+
+/// Rename `<epoch>` to `<epoch>.del`, then remove that: a crash midway leaves a `.del` directory
+/// the next scan removes, never a half-deleted incarnation whose `meta.json` still names it.
+fn delete_atomically(dir: &Path) {
+    let Some(name) = dir.file_name() else { return };
+    let doomed = dir.with_file_name(format!("{}{DELETING}", name.to_string_lossy()));
+    remove(&doomed); // a previous attempt's
+    match std::fs::rename(dir, &doomed) {
+        Ok(()) => remove(&doomed),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "renaming an incarnation for deletion; deleting it in place");
+            remove(dir);
+        }
     }
 }
 
@@ -258,6 +281,9 @@ mod tests {
         v2["version"] = 2.into();
         std::fs::write(future.join(META_FILE), serde_json::to_vec(&v2).unwrap()).unwrap();
         std::fs::write(root.join("stray"), b"x").unwrap();
+        // An incarnation whose deletion a crash interrupted: its meta.json must not revive it.
+        let half_deleted = mk("sbx_good/7.del");
+        write_meta(&half_deleted, &meta("sbx_good", 7)).unwrap();
 
         let found = scan(&root);
         let names: Vec<(String, u64)> = found.iter().map(|f| (f.meta.sandbox.0.clone(), f.meta.epoch.0)).collect();
@@ -268,6 +294,7 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["sbx_future".to_string(), "sbx_good".to_string()]);
         assert!(future.join(META_FILE).exists(), "another version's incarnation is kept");
+        assert!(!half_deleted.exists(), "a half-deleted incarnation is finished off");
         assert!(scan(&dir.path().join("missing")).is_empty());
     }
 
