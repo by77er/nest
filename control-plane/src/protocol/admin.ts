@@ -26,7 +26,7 @@ export const HOST_STATUSES = ["active", "draining", "expired", "stonith_pending"
 export type HostStatus = (typeof HOST_STATUSES)[number];
 
 /** Why FleetDO stopped counting a launched instance (`launched.reason`); null while it counts. */
-export const LAUNCH_END_REASONS = ["enroll_timeout", "idle", "drained"] as const;
+export const LAUNCH_END_REASONS = ["enroll_timeout", "idle", "drained", "dead"] as const;
 export type LaunchEndReason = (typeof LAUNCH_END_REASONS)[number];
 
 /** protocol/control.ts `Capacity`, as the host last reported it. */

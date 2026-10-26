@@ -6,7 +6,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
-import { CloudflareError, type CloudflareApi } from "../src/lib/cloudflare";
+import { CloudflareError, type CloudflareApi, type Listing } from "../src/lib/cloudflare";
 import { CapacityError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { NestError } from "../src/lib/util";
@@ -88,9 +88,11 @@ class FakeCloudflare implements CloudflareApi {
     if (this.undeletable.has(tunnelId)) this.refuse("tunnel has active connections");
     this.tunnels.delete(tunnelId);
   }
-  async listTunnels(prefix: string): Promise<{ id: string; name: string }[]> {
+  /** What the listings say about themselves (false: stopped at the page limit). */
+  complete = { tunnels: true, records: true };
+  async listTunnels(prefix: string): Promise<Listing> {
     this.calls.push(`listTunnels ${prefix}`);
-    return [...this.tunnels].filter(([, t]) => t.name.startsWith(prefix)).map(([id, t]) => ({ id, name: t.name }));
+    return { items: [...this.tunnels].filter(([, t]) => t.name.startsWith(prefix)).map(([id, t]) => ({ id, name: t.name })), complete: this.complete.tunnels };
   }
   async createRecord(zoneId: string, hostname: string, tunnelId: string, comment: string): Promise<{ id: string }> {
     this.calls.push(`createRecord ${zoneId} ${hostname} ${tunnelId} ${comment}`);
@@ -100,9 +102,9 @@ class FakeCloudflare implements CloudflareApi {
     this.records.set(id, { zone: zoneId, name: hostname, content: `${tunnelId}.cfargotunnel.com` });
     return { id };
   }
-  async listRecords(zoneId: string, suffix: string): Promise<{ id: string; name: string }[]> {
+  async listRecords(zoneId: string, suffix: string): Promise<Listing> {
     this.calls.push(`listRecords ${zoneId} ${suffix}`);
-    return [...this.records].filter(([, r]) => r.zone === zoneId && r.name.endsWith(suffix)).map(([id, r]) => ({ id, name: r.name }));
+    return { items: [...this.records].filter(([, r]) => r.zone === zoneId && r.name.endsWith(suffix)).map(([id, r]) => ({ id, name: r.name })), complete: this.complete.records };
   }
   async deleteRecord(zoneId: string, recordId: string): Promise<void> {
     this.calls.push(`deleteRecord ${zoneId} ${recordId}`);
@@ -651,6 +653,11 @@ describe("the sweep", () => {
     cf.listRecords = listRecords;
     expect(await sweep(cell)).toMatchObject({ records: 1, failed: 0, forgotten: 0 });
     expect(cf.records.has(staleRec)).toBe(false);
+    // A listing cut off at its page limit proves nothing either.
+    cf.complete.tunnels = false;
+    expect(await sweep(cell)).toMatchObject({ records: 0, failed: 0, forgotten: 0 });
+    expect(await intents(cell)).toEqual([`hst_${STALE}`]);
+    cf.complete.tunnels = true;
     expect(await sweep(cell)).toMatchObject({ records: 0, forgotten: 1 });
     expect(await intents(cell)).toEqual([]);
   });

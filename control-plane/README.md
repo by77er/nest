@@ -55,7 +55,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/admin/hosts/<id>/confirm-dead`: manual STONITH (also releases the host's tunnel and record; a host
      still running cloudflared keeps its tunnel undeletable until the instance is gone, and the sweep finishes it)
    - `POST /v1/admin/tunnels/sweep?cell=<cell>`: run the daily tunnel sweep now; returns what it deleted, retried,
-     failed and left alone (`unknown`: nest-named tunnels and records this cell did not create)
+     failed and left alone (`unknown`: nest-named tunnels and records this cell did not create), and how many of
+     its own records of creating a tunnel it forgot (`forgotten`: no host row, and two complete listings show nothing)
    - `PUT /v1/admin/secrets/access:gateway {"value": "{\"client_id\":...,\"client_secret\":...}"}`: the Cloudflare
      Access service token `resolve` hands out as `edge` on every target that points at a host's connected tunnel
    - `GET /v1/admin/fleet?cell=<cell>`: hosts (status, tunnel state, capacity, resident sandboxes and brains, idle since),

@@ -18,7 +18,7 @@ import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
-import { sqlIn, storedEnum, storedEnumOrNull } from "../lib/stored";
+import { sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
 import {
   Capacity, type CommandBody, CommandBodyVariants, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
   type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
@@ -44,16 +44,14 @@ const PurposeEnum = z.enum(PURPOSES);
 type Purpose = (typeof PURPOSES)[number] | null;
 /** `commands.type`: the type of the command body it stores. */
 type CommandType = CommandBody["type"];
-const COMMAND_TYPES = new Set<string>(CommandBodyVariants.map((v) => v.shape.type.value));
-const CommandTypeEnum = {
-  safeParse: (v: unknown): { success: true; data: CommandType } | { success: false } =>
-    typeof v === "string" && COMMAND_TYPES.has(v) ? { success: true, data: v as CommandType } : { success: false },
-};
+const CommandTypeEnum = typeEnum<CommandType>(CommandBodyVariants);
 /** The host role that holds sandbox leases, and the one that runs captains. */
 const SANDBOX_ROLE: HostRole = "burst";
 const CONTROLLER_ROLE: HostRole = "controller";
 /** Statuses in which a host is (or may be) running: it is ticked, polled and counted. */
 const LIVE_STATUSES = ["active", "draining", "stonith_pending"] as const satisfies readonly HostStatus[];
+/** Statuses whose brains are gone (an expired controller, a dead host): their agents are told, with retries. */
+const LOST_STATUSES = ["expired", "dead"] as const satisfies readonly HostStatus[];
 
 // The admin view (protocol/admin.ts, imported by the dashboard) repeats the protocol's enums
 // without zod; they must be the same sets.
@@ -382,8 +380,11 @@ export class FleetDO extends DurableObject<Env> {
     if (!this.neverConnected(host)) return;
     this.hostDied(host, "re-enrolled before connecting");
     const leases = this.leasesOf(host).map((l) => l.sandbox);
-    if (leases.length) this.ctx.waitUntil(this.queueReassign(host, leases, true));
-    this.ctx.waitUntil(this.hostAgentsLost(host));
+    // Sandboxes first, then brains, as on every death (`hostDied`).
+    this.ctx.waitUntil((async () => {
+      if (leases.length) await this.queueReassign(host, leases, true);
+      await this.hostAgentsLost(host);
+    })());
     console.warn(`FleetDO: ${host} never connected; its proof enrolls again as ${successor}`);
   }
 
@@ -524,6 +525,7 @@ export class FleetDO extends DurableObject<Env> {
     const unknown: string[] = [];
     /** Hosts whose tunnel or record either listing showed (deleted in this pass or not). */
     const seen = new Set<string>();
+    /** Listings that succeeded and were complete. */
     let listed = 0;
     const disposable = (host: string | null, name: string): boolean => {
       if (host) seen.add(host);
@@ -539,8 +541,8 @@ export class FleetDO extends DurableObject<Env> {
     try {
       const zone = await this.zoneId(cf);
       const records = await cf.api.listRecords(zone, hostnameSuffix(cf.label, cf.zone));
-      listed++;
-      for (const r of records) {
+      if (records.complete) listed++;
+      for (const r of records.items) {
         if (!disposable(hostOfHostname(cf.label, cf.zone, r.name), r.name)) continue;
         try {
           await cf.api.deleteRecord(zone, r.id);
@@ -556,8 +558,8 @@ export class FleetDO extends DurableObject<Env> {
     }
     try {
       const tunnels = await cf.api.listTunnels(tunnelPrefix(cf.label));
-      listed++;
-      for (const t of tunnels) {
+      if (tunnels.complete) listed++;
+      for (const t of tunnels.items) {
         if (!disposable(hostOfTunnelName(cf.label, t.name), t.name)) continue;
         try {
           await cf.api.deleteTunnel(t.id);
@@ -571,8 +573,8 @@ export class FleetDO extends DurableObject<Env> {
       counts.failed++;
       console.error("FleetDO: sweep could not list the account's tunnels", e);
     }
-    // Rows with a hosts row go with it (prune); one without that no complete listing shows has
-    // nothing left on Cloudflare (a listing capped at its page limit could hide one: docs/data/).
+    // Rows with a hosts row go with it (prune); one without, that neither listing shows when both
+    // succeeded and neither stopped at its page limit, has nothing left on Cloudflare.
     if (listed === 2) {
       for (const r of this.sql.exec<{ host: string; created_ms: number }>(
         "SELECT host, created_ms FROM tunnels_created WHERE host NOT IN (SELECT host FROM hosts) AND created_ms < ?", now - TUNNEL_INTENT_GRACE_MS).toArray()) {
@@ -1172,6 +1174,20 @@ export class FleetDO extends DurableObject<Env> {
   async issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): Promise<string[]> {
     const now = Date.now();
     const commands = bodies.map((body) => ({ cmd: newId("cmd_"), issued_ms: now, ...body }));
+    const target = this.host(host);
+    if (!target || target.status === "dead") {
+      // Nothing will ever deliver it: answered at once (like a dead host's unanswered commands,
+      // without failure handling), never queued, and no channel is made for the host.
+      const result = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, `host ${host} is ${target ? "dead" : "unknown"}`, false) });
+      for (const c of commands) {
+        this.sql.exec(
+          `INSERT INTO commands (cmd, host, type, sandbox, agent, epoch, purpose, body, issued_ms, result, result_ms)
+           VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
+          c.cmd, host, c.type, purpose, JSON.stringify(c), now, result, now);
+      }
+      console.warn(`FleetDO: ${commands.map((c) => c.type).join(", ")} for ${target ? "dead" : "unknown"} host ${host} answered with an error`);
+      return commands.map((c) => c.cmd);
+    }
     for (const c of commands) {
       const sandbox = "sandbox" in c ? c.sandbox : c.type === "sandbox_fork" ? c.child : null;
       const epoch = "epoch" in c ? c.epoch : c.type === "sandbox_fork" ? c.child_epoch : null;
@@ -1343,11 +1359,16 @@ export class FleetDO extends DurableObject<Env> {
       if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
     }
     await this.processReassign();
+    // Brains of a lost host whose agent was not told yet (its call failed).
+    for (const h of this.hostsBy({ status: LOST_STATUSES, where: "host IN (SELECT host FROM host_agents)" })) await this.hostAgentsLost(h.host);
     await this.reapStale();
     await this.scaleDown(now);
+    await this.confirmTerminations();
     const busy = this.hostsBy({ status: LIVE_STATUSES }).length
       || this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length
-      || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND (host IS NULL OR reason IS NOT NULL)").toArray().length
+      || this.hostsBy({ status: LOST_STATUSES, where: "host IN (SELECT host FROM host_agents)" }).length
+      || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND host IS NULL AND reason IS NULL").toArray().length
+      || (this.ec2() && this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND reason IS NOT NULL").toArray().length)
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length
       || this.sql.exec("SELECT 1 FROM stale_incarnations WHERE cmd IS NULL").toArray().length;
     if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
@@ -1364,6 +1385,15 @@ export class FleetDO extends DurableObject<Env> {
     const last = Number(this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'pruned_ms'").toArray()[0]?.value ?? 0);
     if (now - last < PRUNE_INTERVAL_MS) return;
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('pruned_ms', ?)", String(now));
+    // Housekeeping never stalls the alarm (the tick, the sweep) it runs from.
+    try {
+      this.pruneTables(now);
+    } catch (e) {
+      console.error("FleetDO: pruning failed; next pass in an hour", e);
+    }
+  }
+
+  private pruneTables(now: number): void {
     this.sql.exec("DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?", now - COMMAND_RETENTION_MS);
     this.sql.exec("DELETE FROM stale_incarnations WHERE cmd IS NOT NULL AND first_seen_ms < ?", now - STALE_INCARNATION_RETENTION_MS);
     this.sql.exec("DELETE FROM enroll_tokens WHERE used_ms IS NOT NULL AND used_ms < ?", now - ENROLL_TOKEN_RETENTION_MS);
@@ -1371,7 +1401,8 @@ export class FleetDO extends DurableObject<Env> {
       status: "dead",
       where: `dead_ms < ? AND tunnel_id IS NULL AND dns_record_id IS NULL
         AND host NOT IN (SELECT host FROM leases) AND host NOT IN (SELECT host FROM stale_incarnations)
-        AND host NOT IN (SELECT host FROM reassign_queue) AND host NOT IN (SELECT host FROM evictions)`,
+        AND host NOT IN (SELECT host FROM reassign_queue) AND host NOT IN (SELECT host FROM evictions)
+        AND host NOT IN (SELECT host FROM host_agents)`,
     }, now - DEAD_HOST_RETENTION_MS);
     for (const { host } of dead) {
       this.sql.exec("DELETE FROM hosts WHERE host = ?", host);
@@ -1382,11 +1413,8 @@ export class FleetDO extends DurableObject<Env> {
       this.rel.forget(host);
       this.keysSent.delete(host);
     }
-    // Deleting a launch record only ever takes a permission away: that instance can no longer enroll.
-    this.sql.exec(
-      `DELETE FROM launched WHERE ended_ms < ?
-         OR (reason IS NULL AND host IS NOT NULL AND host NOT IN (SELECT host FROM hosts) AND launched_ms < ?)`,
-      now - LAUNCH_RETENTION_MS, now - LAUNCH_RETENTION_MS);
+    // Only an instance EC2 confirmed gone: a record still names one that may run, or be terminated.
+    this.sql.exec("DELETE FROM launched WHERE ended_ms < ?", now - LAUNCH_RETENTION_MS);
     this.sql.exec(
       `DELETE FROM gc_runs WHERE finished_ms IS NOT NULL AND finished_ms < ?
          AND run NOT IN (SELECT run FROM gc_runs ORDER BY marked_ms DESC LIMIT 1)
@@ -1562,6 +1590,10 @@ export class FleetDO extends DurableObject<Env> {
       await this.hostAgentsLost(h.host);
     }
     await this.processEvictions();
+  }
+
+  /** Terminate what was marked to end (`launched.reason`) until EC2 confirms it gone (`ended_ms`). */
+  private async confirmTerminations(): Promise<void> {
     const ec2 = this.ec2();
     if (!ec2) return;
     for (const r of this.sql.exec<{ instance_id: string }>(
@@ -1834,12 +1866,13 @@ export class FleetDO extends DurableObject<Env> {
   /** The brains `host` ran are gone with it: forgotten here, and each agent starts again elsewhere. */
   private async hostAgentsLost(host: string): Promise<void> {
     const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray();
-    this.sql.exec("DELETE FROM host_agents WHERE host = ?", host);
     for (const { agent } of agents) {
       try {
         await this.agentStub(agent).onHostLost(host);
+        // Forgotten only once the agent knows: a failed call is retried from the tick.
+        this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", agent, host);
       } catch (e) {
-        console.error(`FleetDO: moving ${agent} off ${host} failed`, e);
+        console.error(`FleetDO: moving ${agent} off ${host} failed; will retry`, e);
       }
     }
   }
@@ -1909,7 +1942,12 @@ export class FleetDO extends DurableObject<Env> {
   async confirmHostDead(host: string): Promise<void> {
     const h = this.host(host);
     if (!h) return;
-    if (h.status !== "dead") this.hostDied(host, "host declared dead");
+    if (h.status !== "dead") {
+      // Terminated if it still runs (an operator's confirmation), and confirmed gone, so the
+      // instance is never orphaned and its launch record ends.
+      if (h.instance_id) this.endInstance(h.instance_id, "dead");
+      this.hostDied(host, "host declared dead");
+    }
     await this.queueReassign(host, this.leasesOf(host).map((l) => l.sandbox), true);
     await this.hostAgentsLost(host);
   }

@@ -3,9 +3,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { num, type Env } from "../env";
-import { storedEnum } from "../lib/stored";
+import { storedEnum, typeEnum } from "../lib/stored";
 import { asNestError, NestError } from "../lib/util";
-import { ErrorCodes, isDecisionEvent, type WorkstreamEvent } from "../protocol/model";
+import { ErrorCodes, isDecisionEvent, type WorkstreamEvent, WorkstreamEventVariants } from "../protocol/model";
 
 export interface WorkstreamInfo {
   workstream: string;
@@ -22,6 +22,8 @@ const NOTIFICATION_RETENTION = 1_000;
 /** `user_notifications.urgency`. */
 const NotificationUrgency = z.enum(["normal", "high"]);
 type NotificationUrgency = z.output<typeof NotificationUrgency>;
+/** `events.type`: the event's own `type`. */
+const EventType = typeEnum<WorkstreamEvent["type"]>(WorkstreamEventVariants);
 
 /** Idempotency keys are kept a week, as long as a call's outcome. */
 const APPLIED_RETENTION_MS = 7 * 86_400_000;
@@ -83,8 +85,9 @@ export class WorkstreamDO extends DurableObject<Env> {
   async ingest(event: WorkstreamEvent, key?: string): Promise<void> {
     if (!this.firstTime(key)) return;
     const decision = isDecisionEvent(event);
+    const type: WorkstreamEvent["type"] = event.type;
     this.sql.exec("INSERT INTO events (ts_ms, type, decision, body) VALUES (?, ?, ?, ?)",
-      event.ts_ms, event.type, decision ? 1 : 0, JSON.stringify(event));
+      event.ts_ms, type, decision ? 1 : 0, JSON.stringify(event));
     // Bounded history: keep the most recent events only.
     this.sql.exec("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?", EVENT_RETENTION);
     if (decision && this.info_()?.captain && (await this.ctx.storage.getAlarm()) === null) {
@@ -94,9 +97,12 @@ export class WorkstreamDO extends DurableObject<Env> {
 
   async events(limit = 100): Promise<WorkstreamEvent[]> {
     return this.sql
-      .exec<{ body: string }>("SELECT body FROM events ORDER BY id DESC LIMIT ?", limit)
+      .exec<{ type: string; body: string }>("SELECT type, body FROM events ORDER BY id DESC LIMIT ?", limit)
       .toArray()
-      .map((r) => JSON.parse(r.body) as WorkstreamEvent)
+      .map((r) => {
+        storedEnum(EventType, r.type, "events.type");
+        return JSON.parse(r.body) as WorkstreamEvent;
+      })
       .reverse();
   }
 

@@ -4,7 +4,8 @@ name: deploy-dashboard
 on:
   push:
     branches: [main]
-    paths: [dashboard/**, .github/workflows/deploy-dashboard.yml]
+    # The view types it is checked against live in the control plane (type-only imports).
+    paths: [dashboard/**, control-plane/src/protocol/admin.ts, .github/workflows/deploy-dashboard.yml]
   workflow_dispatch:
 permissions:
   contents: read

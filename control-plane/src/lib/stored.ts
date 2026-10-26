@@ -32,3 +32,11 @@ export function storedEnumOrNull<T extends string>(schema: EnumSchema<T>, value:
 export function sqlIn<T extends string>(members: readonly T[]): string {
   return members.map((m) => `'${m.replace(/'/g, "''")}'`).join(", ");
 }
+
+/** The closed enum of a discriminated union's `type` literals (zod variants), for a `type` column. */
+export function typeEnum<T extends string>(variants: readonly { shape: { type: { value: T } } }[]): EnumSchema<T> {
+  const known = new Set<string>(variants.map((v) => v.shape.type.value));
+  return {
+    safeParse: (v: unknown) => (typeof v === "string" && known.has(v) ? { success: true, data: v as T } : { success: false }),
+  };
+}

@@ -7,7 +7,44 @@ export type {
   LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
   TunnelState,
 } from "../../control-plane/src/protocol/admin";
-import type { FleetView, ImagesView } from "../../control-plane/src/protocol/admin";
+import type { FleetView, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../control-plane/src/protocol/admin";
+
+/**
+ * A sandbox row as the control plane before the typed view returned it: one `state`, the lease's
+ * with a host and the sandbox's own without. Accepted for one release, since the dashboard and the
+ * control plane deploy separately.
+ */
+export interface LegacySandboxRow {
+  sandbox: string;
+  registered_ms: number;
+  host: string | null;
+  epoch: number | null;
+  state: SandboxState | null;
+  image: string | null;
+  workstream: string | null;
+}
+
+/** What `GET /api/fleet` may answer during that release. */
+export interface FleetResponse {
+  hosts: (Omit<HostView, "tunnel_state"> & { tunnel_state: TunnelState | null })[];
+  launches: FleetView["launches"];
+  sandboxes: (SandboxView | LegacySandboxRow)[];
+}
+
+/** Either shape as the current one. */
+export function normalizeFleet(raw: FleetResponse): FleetView {
+  return {
+    hosts: raw.hosts.map((h) => ({ ...h, tunnel_state: h.tunnel_state ?? "none" })),
+    launches: raw.launches,
+    sandboxes: raw.sandboxes.map((s): SandboxView => {
+      if ("lease_state" in s) return s;
+      const { state, ...rest } = s;
+      // The old view could not read the sandbox when it returned neither image nor workstream.
+      const infoError = s.image === null && s.workstream === null;
+      return { ...rest, lease_state: s.host ? state : null, sandbox_state: s.host || infoError ? null : state, info_error: infoError };
+    }),
+  };
+}
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string) {
@@ -33,6 +70,6 @@ async function get<T>(path: string): Promise<T> {
 
 export const api = {
   cells: () => get<{ cells: string[]; control_plane: string }>("/api/cells"),
-  fleet: (cell: string) => get<FleetView>(`/api/fleet?cell=${encodeURIComponent(cell)}`),
+  fleet: async (cell: string) => normalizeFleet(await get<FleetResponse>(`/api/fleet?cell=${encodeURIComponent(cell)}`)),
   images: (cell: string) => get<ImagesView>(`/api/images?cell=${encodeURIComponent(cell)}`),
 };

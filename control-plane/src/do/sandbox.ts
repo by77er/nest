@@ -103,6 +103,8 @@ const HISTORY_MAX = 50;
  * generation is still kept stays as long as the generation (docs/data/#retention).
  */
 const COMMIT_RECORD_RETENTION_MS = 7 * 86_400_000;
+/** Commit records are pruned from a deadline at most this often, never on the commit path. */
+const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
 /** A failed `agent_attach` is retried with this backoff (doubling), capped, for as long as the sandbox is placed. */
 const ATTACH_RETRY_MS = 2_000;
 const ATTACH_RETRY_MAX_MS = 30_000;
@@ -136,19 +138,26 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS generations (id TEXT PRIMARY KEY, record TEXT NOT NULL,
       orphaned INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS commits (request TEXT PRIMARY KEY, outcome TEXT NOT NULL)");
-    // When the request was answered (null: before the column; such a record counts as old).
-    if (!this.sql.exec<{ name: string }>("PRAGMA table_info(commits)").toArray().some((c) => c.name === "created_ms")) {
-      this.sql.exec("ALTER TABLE commits ADD COLUMN created_ms INTEGER");
+    // When the request was answered (null: before the column; such a record counts as old), and
+    // the generation it committed (null: rejected), so retention needs no JSON scan.
+    const commitCols = this.sql.exec<{ name: string }>("PRAGMA table_info(commits)").toArray().map((c) => c.name);
+    if (!commitCols.includes("created_ms")) this.sql.exec("ALTER TABLE commits ADD COLUMN created_ms INTEGER");
+    if (!commitCols.includes("generation_id")) {
+      this.sql.exec("ALTER TABLE commits ADD COLUMN generation_id TEXT");
+      // Once, in the same constructor that added the column: rows written after it carry their own.
+      this.sql.exec("UPDATE commits SET generation_id = json_extract(outcome, '$.generation.id')");
     }
+    this.sql.exec("CREATE INDEX IF NOT EXISTS commits_generation ON commits (generation_id)");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS commits_rejected ON commits (created_ms) WHERE generation_id IS NULL");
     // Every epoch and the host that held it: salvage from any older epoch is authorized against it.
     this.sql.exec("CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, host TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
       expires_ms INTEGER NOT NULL)`);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
-    // The blob's capped `history`, from before the table: copied once.
-    const legacy = this.get<{ history?: { epoch: number; host: string }[] }>("info")?.history;
-    if (legacy?.length && !this.sql.exec("SELECT 1 FROM epochs LIMIT 1").toArray().length) {
-      for (const h of legacy) this.sql.exec("INSERT OR IGNORE INTO epochs (epoch, host) VALUES (?, ?)", h.epoch, h.host);
+    // The blob's capped `history` is merged in on every start: it holds what a release before the
+    // table (or a rollback to one) recorded. The table never loses an epoch it already has.
+    for (const h of this.get<{ history?: { epoch: number; host: string }[] }>("info")?.history ?? []) {
+      this.sql.exec("INSERT OR IGNORE INTO epochs (epoch, host) VALUES (?, ?)", h.epoch, h.host);
     }
   }
 
@@ -174,9 +183,13 @@ export class SandboxDO extends DurableObject<Env> {
     info.state = storedEnum(SandboxState, info.state, "info.state");
     // Derived on every read: rows written before the naming rule hold other hostnames.
     info.ports = info.ports.map((p) => ({ port: p.port, url: this.previewUrl(info.sandbox, p.port) }));
-    info.history = this.sql.exec<{ epoch: number; host: string }>(
-      "SELECT epoch, host FROM epochs ORDER BY epoch DESC LIMIT ?", HISTORY_MAX).toArray().reverse();
+    info.history = this.recentEpochs();
     return info;
+  }
+
+  private recentEpochs(): { epoch: number; host: string }[] {
+    return this.sql.exec<{ epoch: number; host: string }>(
+      "SELECT epoch, host FROM epochs ORDER BY epoch DESC LIMIT ?", HISTORY_MAX).toArray().reverse();
   }
 
   /** `host` holds `epoch` (a placement, or an adopted lease). Kept for the sandbox's life. */
@@ -193,12 +206,16 @@ export class SandboxDO extends DurableObject<Env> {
     return `https://${previewHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, sandbox)}`;
   }
 
-  /** Load, mutate and save synchronously (never across an await). `history` is the table's, never saved. */
+  /**
+   * Load, mutate and save synchronously (never across an await). The saved `history` is the
+   * table's last `HISTORY_MAX` epochs, re-read after `fn`: written for one release, so the release
+   * before the table (after a rollback) still authorizes salvage from recent epochs.
+   */
   private update(fn: (info: SandboxInfo) => void): SandboxInfo {
     const info = this.info_();
     fn(info);
-    const { history: _history, ...stored } = info;
-    this.put("info", stored);
+    info.history = this.recentEpochs();
+    this.put("info", info);
     return info;
   }
 
@@ -211,11 +228,12 @@ export class SandboxDO extends DurableObject<Env> {
   /** Create (idempotent) and place the sandbox; the first placement grants epoch 1. */
   async create(req: CreateSandbox): Promise<SandboxInfo> {
     // The cell's registry is the authority for which sandboxes exist (its GC roots): registered
-    // before anything can be written for the sandbox, and again on a retried create.
-    await this.fleet(req.cell).registerSandbox(req.sandbox);
+    // before anything can be written for the sandbox, and again on a retried create, but never
+    // again once destroyed (its registry row may already be pruned).
     const existing = this.get<SandboxInfo>("info");
+    if (existing?.state !== "destroyed") await this.fleet(req.cell).registerSandbox(req.sandbox);
     if (existing) return this.info_();
-    const info: Omit<SandboxInfo, "history"> = {
+    const info: SandboxInfo = {
       sandbox: req.sandbox,
       workstream: req.workstream,
       cell: req.cell,
@@ -231,6 +249,7 @@ export class SandboxDO extends DurableObject<Env> {
       ports: [],
       placing: null,
       placing_ms: null,
+      history: [],
       lost_from: null,
       create_attempts: 0,
       guest: null,
@@ -632,8 +651,9 @@ export class SandboxDO extends DurableObject<Env> {
       });
       outcome = { status: "committed", generation };
     }
-    this.sql.exec("INSERT INTO commits (request, outcome, created_ms) VALUES (?, ?, ?)", ev.request, JSON.stringify(outcome), Date.now());
-    this.pruneCommitRecords();
+    this.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES (?, ?, ?, ?)",
+      ev.request, JSON.stringify(outcome), Date.now(), outcome.status === "rejected" ? null : outcome.generation.id);
+    await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
     if (orphan) {
       await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(info.workstream)).ingest({
         workstream: info.workstream,
@@ -655,12 +675,17 @@ export class SandboxDO extends DurableObject<Env> {
    * request finds its record while the generation is kept, and any other meets the compare-and-set
    * again, against the current epoch and head, as a new request would.
    */
-  private pruneCommitRecords(): void {
-    this.sql.exec(
-      `DELETE FROM commits WHERE COALESCE(created_ms, 0) < ?
-         AND (json_extract(outcome, '$.generation.id') IS NULL
-           OR json_extract(outcome, '$.generation.id') NOT IN (SELECT id FROM generations))`,
-      Date.now() - COMMIT_RECORD_RETENTION_MS);
+  private async pruneCommitRecords(): Promise<void> {
+    const cutoff = Date.now() - COMMIT_RECORD_RETENTION_MS;
+    // Rejected requests (the partial index), then records whose generation left the chain.
+    this.sql.exec("DELETE FROM commits WHERE generation_id IS NULL AND COALESCE(created_ms, 0) < ?", cutoff);
+    this.sql.exec(`DELETE FROM commits WHERE generation_id IS NOT NULL AND COALESCE(created_ms, 0) < ?
+      AND NOT EXISTS (SELECT 1 FROM generations g WHERE g.id = commits.generation_id)`, cutoff);
+    // Again when the oldest rejected record left ages out (a commit arms it sooner, hourly).
+    const oldest = this.sql.exec<{ at: number | null }>("SELECT MIN(COALESCE(created_ms, 0)) AS at FROM commits WHERE generation_id IS NULL").toArray()[0]?.at;
+    if (oldest !== null && oldest !== undefined) {
+      await this.deadlines.set("commit_prune", Math.max(oldest + COMMIT_RECORD_RETENTION_MS, Date.now() + COMMIT_PRUNE_INTERVAL_MS), true);
+    }
   }
 
   // --- egress policy --------------------------------------------------------------------------------
@@ -734,6 +759,8 @@ export class SandboxDO extends DurableObject<Env> {
         }
       } else if (key === "attach_retry") {
         await this.reissuePendingAttaches(false);
+      } else if (key === "commit_prune") {
+        await this.pruneCommitRecords();
       }
     });
   }
