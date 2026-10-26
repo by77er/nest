@@ -159,6 +159,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Every commit, pause and suspend requires a guest `syncfs` | [sandbox/state/disk/](sandbox/state/disk/#flush-before-commit) |
 | Per-sandbox disk I/O is limited (10,000 ops/s, 100 MiB/s, 30 s burst) | [sandbox/state/disk/](sandbox/state/disk/#io-limits) |
 | The AWS burst fleet is the 8i family only | [compute/](compute/) |
+| Everything AWS is per cell, keyed by the cell name: resources, settings (`AWS_CELLS`), the control plane's credentials (`AWS_CELL_CREDENTIALS`), the proxy root CA key and its certificate, which FleetDO derives from the key | [compute/cells/](compute/cells/) |
 | Placement packs by free hugepages | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
 | The harness runs on brain hosts; hands are RPC into the sandbox through the gateway; no credentials in VMs or on sandbox hosts | [agents/](agents/) |
