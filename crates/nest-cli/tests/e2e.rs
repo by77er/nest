@@ -11,7 +11,7 @@ use std::time::Duration;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::control::{
-    self, AgentCache, AgentToRunner, HandsBinding, InboxMessage, LaunchConfig, RuleDecision, RunnerToAgent, SessionResume,
+    self, AgentCache, AgentToRunner, HandsBinding, HandsOutcome, InboxMessage, LaunchConfig, RuleDecision, RunnerToAgent, SessionResume,
     SystemPrompt, ToolContent, ToolDef, ToolOutcome, ToolRule, TurnInput,
 };
 use nest_protocol::host::claude;
@@ -182,13 +182,24 @@ impl MockDo {
                             }
                             RunnerToAgent::HandsResolve { request } => {
                                 l.resolves += 1;
-                                let hands = hands.lock().await.clone();
-                                let error = hands.is_none().then(|| nest_protocol::model::ErrorBody {
-                                    code: "not_bound".into(),
-                                    message: "no sandbox in this test".into(),
-                                    retryable: false,
+                                let outcome = match hands.lock().await.clone() {
+                                    Some(hands) => HandsOutcome::Ok { hands },
+                                    None => HandsOutcome::Error {
+                                        error: nest_protocol::model::ErrorBody {
+                                            code: "not_bound".into(),
+                                            message: "no sandbox in this test".into(),
+                                            retryable: false,
+                                        },
+                                        retry_after_ms: None,
+                                    },
+                                };
+                                let _ = tx.send(AgentToRunner::HandsResolved {
+                                    request,
+                                    outcome: Some(Box::new(outcome)),
+                                    hands: None,
+                                    error: None,
+                                    retry_after_ms: None,
                                 });
-                                let _ = tx.send(AgentToRunner::HandsResolved { request, hands, error, retry_after_ms: None });
                             }
                             RunnerToAgent::CancelCall { seq, .. } => {
                                 let _ = tx.send(AgentToRunner::Ack { up_to: seq });
@@ -319,8 +330,10 @@ impl Harness {
             agent: AgentId(AGENT.into()),
             role: AgentRole::Worker,
             workstream: WorkstreamId("ws_e2e".into()),
+            // The agent epoch (3) is unrelated to the sandbox's (7, inside the binding).
+            epoch: Some(Epoch(3)),
             resume,
-            hands: Some(HandsBinding { sandbox: SandboxId("sbx_e2e".into()), epoch: Epoch(7) }),
+            hands: Some(HandsBinding { sandbox: SandboxId("sbx_e2e".into()), epoch: None }),
             launch: LaunchConfig {
                 model: None,
                 effort: Some("high".into()),
@@ -383,7 +396,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
     assert_eq!((auth_method.as_str(), api_key_source.as_str(), ok), ("oauth_token", "none", true));
 
     let hello = h.agentdo.wait_for("hello", |l| l.hellos.first().cloned()).await;
-    assert_eq!((hello.agent.0.as_str(), hello.epoch, hello.host.0.as_str()), (AGENT, Epoch(7), "hst_test"));
+    assert_eq!((hello.agent.0.as_str(), hello.epoch, hello.host.0.as_str()), (AGENT, Epoch(3), "hst_test"));
     assert_eq!(h.agentdo.log.lock().await.authorization[0], "Bearer host-token-abc");
 
     let started = h
@@ -425,7 +438,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
         );
         let seqs: Vec<u64> = l.events.iter().map(|e| e.seq.0).collect();
         assert!(seqs.windows(2).all(|w| w[0] < w[1]), "event seqs increase: {seqs:?}");
-        assert!(l.events.iter().all(|e| e.epoch == Epoch(7) && e.agent.0 == AGENT));
+        assert!(l.events.iter().all(|e| e.epoch == Epoch(3) && e.agent.0 == AGENT));
         // The platform tool went through the relay with a cal_<turn>-<n> id.
         let call = &l.tool_calls[0];
         assert_eq!(call.name, "notify");
@@ -445,6 +458,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
     assert_eq!(h.agentdo.log.lock().await.resolves, 1, "one hands_resolve serves the hook read and both turn steps");
     assert!(cmds.iter().any(|c| c == "echo PLATFORM hello"), "{cmds:?}");
     assert!(cmds.iter().any(|c| c.starts_with("echo New messages arrived")), "{cmds:?}");
+    // Hands requests carry the sandbox epoch from the binding, not the agent epoch.
     assert!(reqs.iter().all(|r| r.epoch == Epoch(7) && r.agent_id.0 == AGENT));
 
     // Session file streamed contiguously, redacted, and complete.

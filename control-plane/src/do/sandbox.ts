@@ -477,12 +477,16 @@ export class SandboxDO extends DurableObject<Env> {
     if (!placed) await this.notifyAgentsMoved(null);
   }
 
-  /** Bound agents follow their hands; one agent's failure doesn't stop the others. */
+  /**
+   * Tell bound agents their sandbox moved (best effort: a brain needs nothing from it, since its next
+   * hands call resolves the new placement; it only records the move and wakes a stopped brain with
+   * work waiting). One agent's failure doesn't stop the others.
+   */
   private async notifyAgentsMoved(host: string | null): Promise<void> {
     const info = this.info_();
     for (const agent of info.attached) {
       try {
-        await this.env.AGENT.get(this.env.AGENT.idFromName(agent)).onSandboxMoved(info.sandbox, info.epoch, host);
+        await this.env.AGENT.get(this.env.AGENT.idFromName(agent)).onSandboxMoved(info.sandbox, host);
       } catch (e) {
         console.error(`sandbox ${info.sandbox}: notifying ${agent} of the move failed`, e);
       }
@@ -881,6 +885,7 @@ export class SandboxDO extends DurableObject<Env> {
       throw notReady("sandbox moved while resolving");
     }
     if (!fresh.guest) throw notReady("sandbox moved while resolving");
+    // `sandbox` and `epoch`: unsigned copies of the claims, for clients of the previous release only.
     return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest, ...(edge ? { edge } : {}) };
   }
 

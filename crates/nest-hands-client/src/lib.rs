@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::gateway::{
-    ClientMessage, GatewayMessage, GuestInfo, HandsTarget, MIN_SUPPORTED_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code, parse_binding,
+    BindingClaims, ClientMessage, GatewayMessage, GuestInfo, HandsTarget,
+    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code,
+    parse_binding,
 };
 use nest_protocol::guest::frame::{self, Kind, MAX_FRAME_LEN};
-use nest_protocol::model::ErrorBody;
+use nest_protocol::model::{Epoch, ErrorBody, SandboxId};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -161,12 +162,17 @@ pub fn guest_error_next(error: &ErrorBody) -> Next {
     }
 }
 
-/// When the target's binding expires: `exp_ms` from its claims segment (the signature is the
-/// gateway's to check). `None` if the token does not parse.
+/// The claims of the target's binding, unverified (the signature is the gateway's to check):
+/// the one source of the sandbox, epoch and expiry a client acts on. `HandsTarget.sandbox` and
+/// `.epoch` are unsigned copies the gateway never reads. `None` if the token does not parse.
+pub fn binding_claims(target: &HandsTarget) -> Option<BindingClaims> {
+    parse_binding(target.binding.expose()).ok().map(|p| p.claims)
+}
+
+/// When the target's binding expires: `exp_ms` from its claims segment. `None` if the token
+/// does not parse.
 pub fn binding_exp_ms(target: &HandsTarget) -> Option<i64> {
-    parse_binding(target.binding.expose())
-        .ok()
-        .map(|p| p.claims.exp_ms)
+    binding_claims(target).map(|c| c.exp_ms)
 }
 
 /// True when a cached target should be resolved again before use: its binding expires within
@@ -411,6 +417,8 @@ pub struct HandsConn {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     guest: GuestInfo,
     gateway_version: u32,
+    /// The binding's claims (the gateway verified them before `bound`).
+    claims: Option<BindingClaims>,
 }
 
 impl std::fmt::Debug for HandsConn {
@@ -419,6 +427,19 @@ impl std::fmt::Debug for HandsConn {
             .field("guest", &self.guest)
             .field("gateway_version", &self.gateway_version)
             .finish_non_exhaustive()
+    }
+}
+
+impl HandsConn {
+    /// The sandbox this connection is bound to, from the binding's claims.
+    pub fn sandbox(&self) -> Option<&SandboxId> {
+        self.claims.as_ref().map(|c| &c.sandbox)
+    }
+
+    /// The sandbox epoch this connection is bound to, from the binding's claims: the epoch the
+    /// first frame must carry (the gateway closes with 4401 on any other).
+    pub fn epoch(&self) -> Option<Epoch> {
+        self.claims.as_ref().map(|c| c.epoch)
     }
 }
 
@@ -454,7 +475,13 @@ pub async fn open(target: &HandsTarget, opts: &OpenOptions) -> Result<HandsConn,
         req.headers_mut().insert(EDGE_CLIENT_ID_HEADER, id);
         req.headers_mut().insert(EDGE_CLIENT_SECRET_HEADER, secret);
     }
-    tracing::debug!(url = %url, sandbox = %target.sandbox.0, epoch = target.epoch.0, "opening hands connection");
+    let claims = binding_claims(target);
+    tracing::debug!(
+        url = %url,
+        sandbox = claims.as_ref().map(|c| c.sandbox.0.as_str()).unwrap_or("?"),
+        epoch = claims.as_ref().map(|c| c.epoch.0),
+        "opening hands connection"
+    );
     let host = req.uri().host().unwrap_or("").to_string();
     let port = req.uri().port_u16().unwrap_or(if scheme == "wss" { 443 } else { 80 });
     let connector = (scheme == "wss").then(tls_connector);
@@ -512,6 +539,7 @@ pub async fn open(target: &HandsTarget, opts: &OpenOptions) -> Result<HandsConn,
                     ws,
                     guest,
                     gateway_version,
+                    claims,
                 })
             }
             Ok(GatewayMessage::Error {

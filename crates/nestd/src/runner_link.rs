@@ -344,6 +344,7 @@ mod tests {
             agent: AgentId(agent.into()),
             role: AgentRole::Captain,
             workstream: WorkstreamId("ws_1".into()),
+            epoch: Some(Epoch(1)),
             resume: None,
             hands: None,
             launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Replace { text: "x".into() } },
@@ -358,7 +359,7 @@ mod tests {
 
     fn bound(agent: &str, sandbox: &str) -> AgentStart {
         let mut s = start(agent);
-        s.start.hands = Some(HandsBinding { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1) });
+        s.start.hands = Some(HandsBinding { sandbox: SandboxId(sandbox.into()), epoch: None });
         s
     }
 

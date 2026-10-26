@@ -72,8 +72,12 @@ export const SandboxReport = z.object({
 });
 export type SandboxReport = z.output<typeof SandboxReport>;
 
-/** The sandbox an agent's hands act in, by id and epoch only; the runner fetches the target with `hands_resolve`. */
-export const HandsBinding = z.object({ sandbox: SandboxId, epoch: Epoch });
+/**
+ * The sandbox an agent's hands act in, by id only; the runner fetches the target with `hands_resolve`.
+ * `epoch` is deprecated, for one release: a copy of `agent_start.epoch` for runners of the previous
+ * release, which take their session epoch from it.
+ */
+export const HandsBinding = z.object({ sandbox: SandboxId, epoch: Epoch.optional() });
 export type HandsBinding = z.output<typeof HandsBinding>;
 /** Default working directory of an agent's slot (`agent_attach.cwd`). */
 export const DEFAULT_CWD = "/workspace";
@@ -187,6 +191,8 @@ const AgentStartFields = {
   agent: AgentId,
   role: AgentRole,
   workstream: WorkstreamId,
+  /** The agent epoch AgentDO issued for this brain start; absent only from the previous release. */
+  epoch: Epoch.optional(),
   resume: SessionResume.optional(),
   hands: HandsBinding.optional(),
   launch: LaunchConfig,
@@ -447,6 +453,24 @@ export const ToolDef = z.object({
 });
 export type ToolDef = z.output<typeof ToolDef>;
 
+/** What `hands_resolve` produced: a fresh target, or the reason there is none (with a retry hint). */
+export const HandsOutcome = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), hands: HandsTarget }),
+  z.object({ status: z.literal("error"), error: ErrorBody, retry_after_ms: z.number().int().nonnegative().optional() }),
+]);
+export type HandsOutcome = z.output<typeof HandsOutcome>;
+
+/**
+ * A `hands_resolved` carrying `outcome` and, for runners of the previous release (one release), the
+ * same answer in their three-optional shape.
+ */
+export function handsResolved(request: string, outcome: HandsOutcome): Extract<AgentToRunner, { type: "hands_resolved" }> {
+  const legacy = outcome.status === "ok"
+    ? { hands: outcome.hands }
+    : { error: outcome.error, ...(outcome.retry_after_ms !== undefined ? { retry_after_ms: outcome.retry_after_ms } : {}) };
+  return { type: "hands_resolved", request, outcome, ...legacy };
+}
+
 export const AgentToRunnerVariants = [
   z.object({ type: z.literal("hello_ack"), protocol_version: z.number().int(), durable_bytes: U64, last_seq: Seq.optional() }),
   z.object({ type: z.literal("segment_ack"), session: SessionId, durable_bytes: U64 }),
@@ -456,10 +480,13 @@ export const AgentToRunnerVariants = [
   z.object({ type: z.literal("cache_update"), seq: Seq, cache: AgentCache }),
   z.object({ type: z.literal("tool_result"), seq: Seq, call: CallId, outcome: ToolOutcome }),
   z.object({ type: z.literal("tools_list"), request: RequestId, tools: z.array(ToolDef) }),
-  /** Answer to `hands_resolve`: exactly one of `hands` and `error` (`not_bound`, or `sandbox_not_ready` with `retry_after_ms`). */
+  /**
+   * Answer to `hands_resolve`: `outcome`. `hands` / `error` / `retry_after_ms` are the previous
+   * release's shape of the same answer, sent alongside it for one release (see `handsResolved`).
+   */
   z.object({
-    type: z.literal("hands_resolved"), request: RequestId, hands: HandsTarget.optional(), error: ErrorBody.optional(),
-    retry_after_ms: z.number().int().nonnegative().optional(),
+    type: z.literal("hands_resolved"), request: RequestId, outcome: HandsOutcome.optional(),
+    hands: HandsTarget.optional(), error: ErrorBody.optional(), retry_after_ms: z.number().int().nonnegative().optional(),
   }),
   z.object({ type: z.literal("ack"), up_to: Seq }),
   z.object({ type: z.literal("error"), error: ErrorBody }),

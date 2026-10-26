@@ -11,7 +11,7 @@
 | `hello_ack` | `host_id`, `host_role` (`burst` \| `controller`; designed: `host_kind: brain`, since the runner runs only on brain hosts). The runner starts with no agents; nestd sends only starts it received while no runner was connected, and never replays one sent on an earlier connection |
 | `host_token` | Bearer for session-channel upgrades; sent after `hello_ack` and on rotation. Memory only |
 | `lease_update` | Every heartbeat. If it lapses, **or the socket closes**, the runner kills every brain (SIGKILL to its process group) |
-| `agent_start` | `{start: control::AgentStart, config_dir}`. `start.hands`, when present, names the sandbox and its epoch only; the runner fetches the gateway target from AgentDO. Refused without a valid lease mirror (`error{no_lease}` + `agent_exited{fenced}`) or when `launch.builtin_tools` names a host-side tool (`error{forbidden_tool}` + `agent_exited{crashed}`) |
+| `agent_start` | `{start: control::AgentStart, config_dir}`. `start.epoch` is the agent epoch; `start.hands`, when present, names the sandbox only; the runner fetches the gateway target from AgentDO. A start for a brain already running adopts a newer epoch and the new hands (the brain keeps running). Refused without a valid lease mirror (`error{no_lease}` + `agent_exited{fenced}`) or when `launch.builtin_tools` names a host-side tool (`error{forbidden_tool}` + `agent_exited{crashed}`) |
 | `agent_stop` | `mode: graceful` (close stdin, finish turn; a brain still starting is killed) \| `kill` |
 | `fence` | Kill listed brains (empty = all) now, including ones still starting |
 | `ping` | Health |

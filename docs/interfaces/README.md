@@ -33,7 +33,7 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **IDs:** `chn_` (channel), `tpl_` (template) and `hk_` (hook) are added; `ws_` goes.
 - **Webhook route:** `POST /v1/hooks/<hk_…>` on the Worker (see [sources](../channels/sources/)). Hook maps produce keys, and subscription filters take `keys` prefixes.
 - **Metrics:** hosts send a `metrics` frame on the fleet channel every 60 s; `GET /v1/health` makes one round trip to each DO class (see [metrics](../control-plane/metrics/) and [upgrades](../control-plane/#upgrades)).
-- **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit; the runner's hello carries the agent epoch AgentDO issues per brain start. (`hands_resolve` / `hands_resolved` are built.)
+- **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit. (`hands_resolve` / `hands_resolved` with a tagged `outcome`, and the agent epoch in the hello, are built.) The next release drops the previous release's shapes kept for one release: `hands_resolved`'s `hands` / `error` / `retry_after_ms`, `HandsTarget.sandbox` / `.epoch`, `agent_start.hands.epoch`, and the hello epoch `0` accepted for an agent without hands.
 - **Hands journal:** records stay in the guest, keyed by `(agent, epoch, tool_use_id)`; the runner's `call_status` lookups go through the gateway, and outcomes reach AgentDO as the runner's canonical events. nestd relays none of it.
 - **Gateway** ([gateway/](gateway/)): the `/hands` route, bindings and `resolve` are built; the `/pty` and `/ingress/<port>` routes and the `edge` credential's use are pending.
 - **`GenerationRecord`** gains `restore_abi` (a `sha256:` reference), `reason`, `state` and `session{offset, last_tool_use}`.
@@ -56,7 +56,7 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
   - **Drain:** `drain{mode: gentle|forced}`, and an all-or-nothing `pending_uploads` report with each sandbox's last committed generation.
   - **Sandboxes:** ingress-guard `activity` events; `base_prepare` and `from: base`; drive rate limits in `resources`.
   - **CLI and metrics:** `guest_cli` carries `hold`; the metrics frame carries guest log-site counts.
-  - **Agents:** `agent_start` goes to a brain host chosen by capacity; platform tool calls and brokered actions carry the agent epoch. (Its `hands` field is the sandbox's id and epoch only: built.)
+  - **Agents:** `agent_start` goes to a brain host chosen by capacity; brokered actions carry the agent epoch. (`agent_start.epoch`, the agent epoch AgentDO issues per start, and a `hands` field naming the sandbox's id only: built.)
 - **Enrollment:** a fixed-shape CSR, and `proxy_ca` is pathLen 0. (A sandbox host's response carrying `tunnel_token` and `gateway_url`, a brain host's neither: built.)
 - **Operator API:** scoped tokens, never accepted in URLs; the revocation counter goes into share links, terminal sessions and host tokens.
 - **Channels:** a loss-record kind on `<sbx>/events`. **Tool schema:** a per-tool list of rejected fields in `hands-tools.json`.

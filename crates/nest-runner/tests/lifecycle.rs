@@ -47,6 +47,7 @@ fn start_cmd(dir: &Path, agent: &str, tools: &[&str]) -> RunnerCommand {
         agent: AgentId(agent.into()),
         role: AgentRole::Captain,
         workstream: WorkstreamId("ws_t".into()),
+        epoch: Some(nest_protocol::model::Epoch(1)),
         resume: None,
         hands: None,
         launch: LaunchConfig {

@@ -42,7 +42,7 @@ describe("agent start", () => {
   it("sends agent_start to the sandbox's host with the setup token, hands and session URL", async () => {
     const s = await setup();
     expect(s.start).toMatchObject({
-      agent: s.agent, role: "worker", workstream: s.workstream, hands: { sandbox: s.sandbox, epoch: 1 },
+      agent: s.agent, role: "worker", workstream: s.workstream, epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 },
       oauth_token: "sk-ant-oat01-test", launch: { system_prompt: { mode: "append" } },
     });
     expect(s.start.session_ws_url).toMatch(new RegExp(`/v1/agents/${s.agent}/session$`));
@@ -121,7 +121,9 @@ describe("session channel", () => {
     const again = await connectRunner(s.agent, s.host.host, s.host.host_token, 1, { local_bytes: 500 });
     expect(again.ack.durable_bytes).toBe(c.length);
 
-    // Restarting the brain rebuilds the session file from signed segment URLs.
+    // Restarting the brain (once it's gone) rebuilds the session file from signed segment URLs.
+    again.ws.close();
+    await sleep(50);
     const { cmd } = await agentStub(s.agent).start();
     const [restart] = await nextCommands(s.host.ws, (x) => x.cmd === cmd);
     expect(restart.resume).toMatchObject({ session: SESSION, total_bytes: c.length });

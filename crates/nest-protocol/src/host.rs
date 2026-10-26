@@ -465,7 +465,7 @@ pub mod runner {
     pub struct AgentStart {
         /// As received from FleetDO (`CommandBody::AgentStart`), including `oauth_token`,
         /// `session_ws_url`, `resume` (Worker-signed segment URLs the runner downloads) and
-        /// `hands` (the sandbox's id and epoch only; the runner fetches the gateway target over
+        /// `hands` (the sandbox's id only; the runner fetches the gateway target over
         /// its session channel). nestd adds nothing about hands: the runner never touches a
         /// vsock socket.
         pub start: crate::control::AgentStart,

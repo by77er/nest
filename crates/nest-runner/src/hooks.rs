@@ -428,7 +428,7 @@ mod session_start_tests {
             AgentRole::Worker,
             Epoch(2),
             std::env::temp_dir(),
-            Some(HandsBinding { sandbox: SandboxId("sbx_s".into()), epoch: Epoch(2) }),
+            Some(HandsBinding { sandbox: SandboxId("sbx_s".into()), epoch: None }),
             None,
             vec![],
             0,

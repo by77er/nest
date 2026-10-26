@@ -13,8 +13,8 @@ import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { signBlobUrl } from "../lib/tokens";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
 import {
-  type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, type InboxMessage, type LaunchConfig, RunnerToAgent,
-  type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
+  type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage, type LaunchConfig,
+  RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
   type AgentEvent, type AgentRole, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
@@ -86,12 +86,17 @@ export interface AgentInfo {
   cell: string;
   captain: string | null;
   /**
-   * The bound sandbox. `epoch` is the epoch the current brain was started with, which is also its
-   * session epoch (the separate agent epoch isn't built): a cache of SandboxDO's epoch, refreshed by
-   * `onSandboxMoved` and at every start. Never an authority on the sandbox's epoch: FleetDO's lease
-   * check fences host-relayed calls, and SandboxDO is read for the current value.
+   * The bound sandbox, by id only. Its epoch is SandboxDO's (read there when needed, and fenced by
+   * FleetDO's lease check for host-relayed calls); AgentDO keeps no copy.
    */
-  hands: { sandbox: string; epoch: number } | null;
+  hands: { sandbox: string } | null;
+  /**
+   * The agent epoch: bumped by every `agent_start` (never reused), unrelated to the sandbox's epoch.
+   * The brain presents it in its session hello; platform tool calls and asks are keyed by it and
+   * events filtered by it. Rows stored before it existed carry the sandbox epoch the brain was
+   * started with, which is where `load()` starts the counter.
+   */
+  agent_epoch: number;
   launch: LaunchConfig;
   grants: string[] | null;
   rules: ToolRule[];
@@ -169,6 +174,8 @@ export class AgentDO extends DurableObject<Env> {
   private readonly inbound = new SerialQueue();
   /** A `wake()` is starting a brain (its awaits open the input gate). */
   private waking = false;
+  /** A `start()` is in progress: a wake meanwhile (e.g. from the placement it triggers) waits for it. */
+  private launching = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -215,8 +222,12 @@ export class AgentDO extends DurableObject<Env> {
     const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0];
     if (!row) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
     const info = JSON.parse(row.value) as Partial<AgentInfo> & AgentInfo;
+    // Stored before the agent epoch: `hands.epoch` was the session epoch of the running brain.
+    const legacy = info.hands as { sandbox: string; epoch?: number } | null;
     return {
       ...info,
+      hands: legacy ? { sandbox: legacy.sandbox } : null,
+      agent_epoch: info.agent_epoch ?? legacy?.epoch ?? 0,
       recv_base: info.recv_base ?? info.base_gen,
       recv_session: info.recv_session ?? info.session,
       recv_durable: info.recv_durable ?? info.durable_bytes,
@@ -253,8 +264,8 @@ export class AgentDO extends DurableObject<Env> {
         throw new NestError(ErrorCodes.INVALID_MESSAGE,
           `${req.sandbox} is in cell ${cur.cell}, workstream ${cur.workstream}; the worker must be too`, 409);
       }
-      const sbx = await stub.attach(req.agent);
-      hands = { sandbox: req.sandbox, epoch: sbx.epoch };
+      await stub.attach(req.agent);
+      hands = { sandbox: req.sandbox };
     }
     if (this.exists()) return this.load();
     const info: AgentInfo = {
@@ -264,6 +275,7 @@ export class AgentDO extends DurableObject<Env> {
       cell: req.cell,
       captain: req.captain ?? null,
       hands,
+      agent_epoch: 0,
       launch: req.launch ?? (req.role === "captain" ? DEFAULT_CAPTAIN_LAUNCH : DEFAULT_WORKER_LAUNCH),
       grants: req.grants ?? null,
       rules: req.rules ?? (req.role === "worker" ? DEFAULT_WORKER_RULES : DEFAULT_RULES),
@@ -302,9 +314,13 @@ export class AgentDO extends DurableObject<Env> {
     return this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(id));
   }
 
-  /** Epoch a runner must present: the one its brain was started with for workers, 0 for captains. */
-  private expectedEpoch(info: AgentInfo): number {
-    return info.hands?.epoch ?? 0;
+  /**
+   * Whether a session hello's epoch is the current brain start's. For one release a runner that
+   * predates the agent epoch presents `0` for an agent without hands (that release's captains), and
+   * is accepted as before; current runners always present the issued epoch (from 1).
+   */
+  private currentEpoch(info: AgentInfo, epoch: number): boolean {
+    return epoch === info.agent_epoch || (epoch === 0 && !info.hands);
   }
 
   /**
@@ -361,10 +377,23 @@ export class AgentDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------------
 
   /**
-   * Send `agent_start` to the host that should run this brain (co-located with its sandbox). The
-   * setup token travels as a BrokerDO reference, resolved by FleetDO when it sends.
+   * Send `agent_start` to the host that should run this brain (placed today on its sandbox's host
+   * when it starts; it doesn't follow the sandbox afterwards), under a new agent epoch. AgentDO is
+   * the one authority for (brain host, start command, agent epoch): a brain started somewhere new
+   * is first stopped where it ran, and its old session is fenced. A live brain already on that host
+   * is left alone (`cmd: null`). The setup token travels as a BrokerDO reference, resolved by
+   * FleetDO when it sends.
    */
-  async start(hostHint?: string): Promise<{ host: string; cmd: string }> {
+  async start(hostHint?: string): Promise<{ host: string; cmd: string | null }> {
+    this.launching = true;
+    try {
+      return await this.startBrain(hostHint);
+    } finally {
+      this.launching = false;
+    }
+  }
+
+  private async startBrain(hostHint?: string): Promise<{ host: string; cmd: string | null }> {
     const info = this.load();
     let host: string | null;
     if (hostHint) {
@@ -381,38 +410,51 @@ export class AgentDO extends DurableObject<Env> {
       // Lazy start: a suspended sandbox resumes, an unplaced one is placed (maybe on a new host).
       // Without a host yet this fails retryably; the placement then moves the agent onto it.
       host = hostHint ?? (await this.sandboxStub(info.hands.sandbox).wake()).host;
-      // The cached epoch is whatever SandboxDO last pushed (`onSandboxMoved`, best effort): refresh it
-      // at every start, so a missed push heals here and the new brain starts at the current epoch.
-      const { epoch } = await this.sandboxStub(info.hands.sandbox).info();
-      this.update((i) => {
-        if (!i.hands || i.hands.epoch === epoch) return;
-        i.hands = { sandbox: i.hands.sandbox, epoch };
-        i.hands_moved_ms = Date.now();
-      });
     } else {
       host = hostHint ?? (await this.fleet(info.cell).controllerHost());
     }
     if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no host available for this agent", 503, true);
+    // Already running there (e.g. an operator's start of a live agent): a second agent_start would
+    // only re-tag the same brain.
+    if (this.socket() && this.load().host === host) return { host, cmd: null };
     const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).oauthTokenRef(info.role);
     // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
     // resume from up to a flush interval ago.
     await this.flush();
     const fresh = this.load();
     const resume = fresh.session ? await this.sessionResume(fresh) : undefined;
+    // Stop the brain where it ran before starting it elsewhere, and fence its session. Nothing
+    // changes here if the stop can't be queued, so the next attempt still knows the old host.
+    const moving = fresh.host !== null && fresh.host !== host;
+    if (moving) {
+      await this.fleet(info.cell).issueCommands(fresh.host!, [{ type: "agent_stop", agent: fresh.agent, reason: `starting on ${host}` }]);
+    }
+    const started = this.update((i) => {
+      i.agent_epoch += 1;
+      i.host = host;
+      i.state = "starting";
+    });
+    const epoch = started.agent_epoch;
+    if (moving) {
+      for (const ws of this.ctx.getWebSockets("session")) {
+        ws.serializeAttachment({ ...(ws.deserializeAttachment() as Attachment), helloed: false, stale: true });
+        ws.close(4409, "the brain is starting on another host");
+      }
+    }
+    // On the same host, an exiting brain's open session may still be flushing its last bytes and
+    // events; the new brain's hello supersedes it (its reconnects present the old epoch: stale).
     const body: Omit<AgentStart, "type"> = {
       agent: fresh.agent,
       role: fresh.role,
       workstream: fresh.workstream,
+      epoch,
       ...(resume ? { resume } : {}),
-      ...(fresh.hands ? { hands: fresh.hands } : {}),
+      // `hands.epoch`: the same agent epoch again, for runners of the previous release (one release).
+      ...(fresh.hands ? { hands: { sandbox: fresh.hands.sandbox, epoch } } : {}),
       launch: fresh.launch,
       oauth_token: oauthRef,
       session_ws_url: `${this.env.PUBLIC_BASE_URL.replace(/^http/, "ws")}/v1/agents/${fresh.agent}/session`,
     };
-    this.update((i) => {
-      i.host = host;
-      i.state = "starting";
-    });
     // `starting` never outlives this deadline without a hello (see the `starting` alarm).
     await this.deadlines.set("starting", Date.now() + START_DEADLINE_MS);
     let cmd: string | undefined;
@@ -467,9 +509,9 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * The host running this brain went silent past its lease. Only controller hosts get here: captains
-   * have no sandbox to follow. Their brains fenced themselves when the host's lease lapsed, so another
-   * one can start elsewhere.
+   * The host running this brain is gone (a controller host silent past its lease, or a sandbox host
+   * declared dead). Its runner killed its brains when the host's lease lapsed, so another one can
+   * start elsewhere. A brain follows its own host, never its sandbox.
    */
   async onHostLost(host: string): Promise<void> {
     if (!this.exists() || this.load().host !== host) return;
@@ -483,6 +525,7 @@ export class AgentDO extends DurableObject<Env> {
       ws.serializeAttachment({ ...a, helloed: false, stale: true });
       ws.close(4409, "host lost");
     }
+    await this.syncActivity();
     await this.wake(true);
   }
 
@@ -493,7 +536,7 @@ export class AgentDO extends DurableObject<Env> {
    * alarm. `afterExit` counts towards the crash-loop guard; new input always gets a fresh try.
    */
   private async wake(afterExit = false): Promise<void> {
-    if (this.waking) return;
+    if (this.waking || this.launching) return;
     const info = this.load();
     if (!WAKE_STATES.includes(info.state) || this.socket()) return;
     const queued = this.sql.exec("SELECT 1 FROM turns WHERE status = 'queued' LIMIT 1").toArray().length > 0;
@@ -533,31 +576,20 @@ export class AgentDO extends DurableObject<Env> {
     });
   }
 
-  /** The bound sandbox got a new lease (and maybe host): follow it; the brain is co-located. */
-  async onSandboxMoved(sandbox: string, epoch: number, host: string | null): Promise<void> {
+  /**
+   * The bound sandbox got a new lease (and maybe a new host). The brain survives it: nothing is
+   * restarted or reconnected, and the agent epoch stays. Its cached target is refused at its next
+   * hands call, and it resolves fresh hands (the new placement and binding) through `hands_resolve`.
+   * A brain that isn't running starts now if work is waiting, since its sandbox has a host again.
+   */
+  async onSandboxMoved(sandbox: string, host: string | null): Promise<void> {
+    if (!this.exists()) return;
     const info = this.load();
     if (!info.hands || info.hands.sandbox !== sandbox) return;
     this.update((i) => {
-      i.hands = { sandbox, epoch };
-      i.host = null;
-      i.start_attempts = 0;
       i.hands_moved_ms = Date.now();
     });
-    for (const ws of this.ctx.getWebSockets("session")) {
-      ws.serializeAttachment({ ...(ws.deserializeAttachment() as Attachment), helloed: false, stale: true });
-      ws.close(4409, "sandbox moved; reconnect with the new epoch");
-    }
-    if (!host) return;
-    try {
-      await this.start(host);
-    } catch (e) {
-      this.update((i) => {
-        i.state = "errored";
-      });
-      // Waiting work retries from the alarm instead of stranding the agent.
-      await this.deadlines.set("wake", Date.now() + WAKE_RETRY_MS, true);
-      throw e;
-    }
+    if (host) await this.wake();
   }
 
   /**
@@ -567,14 +599,23 @@ export class AgentDO extends DurableObject<Env> {
    */
   private async resolveHands(request: string): Promise<AgentToRunner> {
     const info = this.load();
-    if (!info.hands) return { type: "hands_resolved", request, error: errorBody(ErrorCodes.NOT_BOUND, "agent has no hands") };
+    if (!info.hands) return handsResolved(request, { status: "error", error: errorBody(ErrorCodes.NOT_BOUND, "agent has no hands") });
+    const stub = this.sandboxStub(info.hands.sandbox);
     try {
-      const hands = await this.sandboxStub(info.hands.sandbox).resolve(info.agent);
-      return { type: "hands_resolved", request, hands };
+      // A sandbox left unplaced (evicted, suspended, from a host going away while nobody worked in
+      // it) is placed on demand: its brain keeps running across the move, so no start places it.
+      const cur = await stub.info();
+      if (!cur.host && cur.placing === null && cur.state === "suspended") await stub.wake();
+    } catch (e) {
+      console.warn(`agent ${info.agent}: waking ${info.hands.sandbox} for hands failed`, e);
+    }
+    try {
+      const hands = await stub.resolve(info.agent);
+      return handsResolved(request, { status: "ok", hands });
     } catch (e) {
       const ne = asNestError(e);
       const error = ne ? ne.body() : errorBody(ErrorCodes.INTERNAL, "resolving hands failed", true);
-      return { type: "hands_resolved", request, error, ...(error.retryable ? { retry_after_ms: HANDS_RETRY_MS } : {}) };
+      return handsResolved(request, { status: "error", error, ...(error.retryable ? { retry_after_ms: HANDS_RETRY_MS } : {}) });
     }
   }
 
@@ -652,7 +693,7 @@ export class AgentDO extends DurableObject<Env> {
       // Only the current runner process at the current epoch gets a target: a superseded or stale
       // brain must never hold a binding for the new epoch.
       if (!this.current(pre)) {
-        this.send(ws, { type: "hands_resolved", request: msg.request, error: errorBody(ErrorCodes.STALE_EPOCH, "not the current runner process or epoch") });
+        this.send(ws, handsResolved(msg.request, { status: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "not the current runner process or epoch") }));
         return;
       }
       this.send(ws, await this.resolveHands(msg.request));
@@ -740,13 +781,13 @@ export class AgentDO extends DurableObject<Env> {
       return;
     }
     // A stale epoch is still accepted, but its segments go to the orphan branch and nothing else flows.
-    const stale = hello.epoch !== this.expectedEpoch(before);
+    const stale = !this.currentEpoch(before, hello.epoch);
     ws.serializeAttachment({ host: att.host, epoch: hello.epoch, helloed: true, stale, instance: hello.instance_id } satisfies Attachment);
     if (stale) {
       this.send(ws, {
         type: "hello_ack", protocol_version: PROTOCOL_VERSION, durable_bytes: hello.local_bytes ?? 0,
       });
-      this.send(ws, { type: "error", error: errorBody(ErrorCodes.STALE_EPOCH, `expected epoch ${this.expectedEpoch(before)}`) });
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.STALE_EPOCH, `expected epoch ${before.agent_epoch}`) });
       return;
     }
     for (const old of this.ctx.getWebSockets("session")) {
@@ -1002,6 +1043,7 @@ export class AgentDO extends DurableObject<Env> {
 
   private async onEvents(ws: WebSocket, att: Attachment, seq: number, events: AgentEvent[]): Promise<void> {
     if (!this.current(att)) return;
+    // Every event on a session speaks for the epoch its hello presented (the runner stamps them so).
     const verdict = this.rel.classify(CHAN, seq);
     if (verdict === "duplicate") {
       this.send(ws, { type: "ack", up_to: this.rel.lastIn(CHAN)! });
@@ -1010,14 +1052,14 @@ export class AgentDO extends DurableObject<Env> {
     if (verdict === "gap") {
       throw new NestError(ErrorCodes.INVALID_MESSAGE, `message ${seq} out of order; expected ${this.rel.lastIn(CHAN)! + 1}`, 400, true);
     }
-    for (const ev of events) await this.applyEvent(ev);
+    for (const ev of events) await this.applyEvent(ev, att.epoch);
     this.rel.markProcessed(CHAN, seq);
     this.send(ws, { type: "ack", up_to: seq });
   }
 
-  private async applyEvent(ev: AgentEvent): Promise<void> {
+  private async applyEvent(ev: AgentEvent, sessionEpoch: number): Promise<void> {
     const before = this.load();
-    if (ev.agent !== before.agent || ev.epoch !== this.expectedEpoch(before)) return;
+    if (ev.agent !== before.agent || ev.epoch !== sessionEpoch) return;
     // The event is recorded as seen only after its side effects succeeded: if one throws, the batch
     // isn't acked and the resend runs them again. Each is safe to repeat: the state change, the keyed
     // ingest, `postAsk` (keyed by call) and `syncActivity` (a "set to", compared with what was sent).
@@ -1412,8 +1454,8 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * A `nest` CLI command from a program in this agent's sandbox (relayed guest → nestd → FleetDO),
    * mapped onto the platform tools of the same name. `epoch` is the sandbox's: FleetDO relays the
-   * command only from the host holding that lease, which is the fence, so AgentDO doesn't compare it
-   * with its cached copy (which lags when a move's push was lost).
+   * command only from the host holding that lease (`holds()`), which is the fence; AgentDO holds no
+   * copy to compare. The call and any ask are keyed by the agent epoch, like the brain's own calls.
    */
   async guestCli(sandbox: string, epoch: number, command: CliCommand): Promise<CliResult> {
     const info = this.load();
@@ -1421,8 +1463,9 @@ export class AgentDO extends DurableObject<Env> {
       return { status: "error", error: errorBody(ErrorCodes.NOT_BOUND, `${info.agent} is not bound to ${sandbox}`) };
     }
     const call = newId("cal_cli-");
+    const key = info.agent_epoch;
     const run = async (name: string, args: Record<string, unknown>): Promise<CliResult> => {
-      const r = await this.dispatch(epoch, call, name, args, epoch);
+      const r = await this.dispatch(key, call, name, args, epoch);
       if (r === "wait") return { status: "error", error: errorBody(ErrorCodes.INTERNAL, "unexpected wait", true) };
       if (r.status === "error") return { status: "error", error: r.error };
       return { status: "ok", data: r.status === "ok" ? (r.content.find((c) => c.type === "json") as { value?: unknown } | undefined)?.value ?? null : null };
@@ -1453,7 +1496,7 @@ export class AgentDO extends DurableObject<Env> {
           return await run("expose_port", { port: command.port });
         case "ask": {
           const full = command.options.length ? `${command.question} (options: ${command.options.join(" | ")})` : command.question;
-          const ask = await this.postAsk(info, call, epoch, full, "cli", "captain", epoch);
+          const ask = await this.postAsk(info, call, key, full, "cli", "captain", epoch);
           const waitMs = Math.min(command.wait_s, 120) * 1000;
           const answer = await new Promise<string | null>((resolve) => {
             const timer = setTimeout(() => { this.cliWaiters.delete(ask); resolve(null); }, waitMs);
@@ -1474,7 +1517,7 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * A background hands task exited, relayed by FleetDO only from the host holding the sandbox's lease
-   * at `epoch` (the fence; AgentDO's cached epoch isn't compared). Surfaced mid-turn.
+   * at `epoch` (`holds()` is the fence; AgentDO holds no copy of the sandbox epoch). Surfaced mid-turn.
    */
   async onTaskExited(sandbox: string, _epoch: number, task: TaskInfo): Promise<void> {
     if (!this.exists()) return;

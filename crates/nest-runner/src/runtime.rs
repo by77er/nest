@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::control::{AgentCache, HandsBinding, InboxMessage, ToolDef, ToolOutcome, TurnInput};
+use nest_protocol::control::{AgentCache, HandsBinding, HandsOutcome, InboxMessage, ToolDef, ToolOutcome, TurnInput};
 use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
@@ -188,7 +188,7 @@ pub enum Outbound {
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
     SetSession(SessionId),
-    /// Re-handshake (epoch changed after a rebind).
+    /// Re-handshake (the brain adopted a newer agent epoch).
     Reconnect,
     /// A platform tool call timed out: never (re)send it.
     AbandonCall(CallId),
@@ -203,21 +203,11 @@ pub enum HandsResolveOutcome {
     Error { error: ErrorBody, retry_after_ms: Option<u64> },
 }
 
-impl HandsResolveOutcome {
-    /// From a `hands_resolved` frame: exactly one of `hands` and `error`; neither is a protocol
-    /// error the caller surfaces as `invalid_message`.
-    pub fn from_wire(hands: Option<HandsTarget>, error: Option<ErrorBody>, retry_after_ms: Option<u64>) -> Self {
-        match (hands, error) {
-            (Some(t), _) => HandsResolveOutcome::Target(t),
-            (None, Some(error)) => HandsResolveOutcome::Error { error, retry_after_ms },
-            (None, None) => HandsResolveOutcome::Error {
-                error: ErrorBody {
-                    code: nest_protocol::model::error_codes::INVALID_MESSAGE.into(),
-                    message: "hands_resolved carried neither hands nor error".into(),
-                    retryable: false,
-                },
-                retry_after_ms: None,
-            },
+impl From<HandsOutcome> for HandsResolveOutcome {
+    fn from(o: HandsOutcome) -> Self {
+        match o {
+            HandsOutcome::Ok { hands } => HandsResolveOutcome::Target(hands),
+            HandsOutcome::Error { error, retry_after_ms } => HandsResolveOutcome::Error { error, retry_after_ms },
         }
     }
 }
@@ -229,11 +219,10 @@ pub struct ResolveTimeout;
 /// Mutable per-agent state shared with hooks and the MCP bridge.
 #[derive(Debug, Default)]
 pub struct AgentInner {
-    /// The sandbox this agent's hands act in (ids only, from `agent_start`); `None` = no hands.
-    /// Its `epoch` is the session channel's epoch for this brain and is updated only by a new
-    /// `agent_start`; a target fetched later may name a newer sandbox epoch (the sandbox moved
-    /// while the brain stayed), and hands calls use the target's epoch, not this one. Making
-    /// the brain's own epoch independent of the sandbox's is step 3 of the seam.
+    /// The sandbox this agent's hands act in (its id, from `agent_start`); `None` = no hands.
+    /// Only whether and where: the sandbox's epoch comes from each target's binding claims, and
+    /// the brain's own (agent) epoch is [`Agent::epoch`]. A sandbox move changes neither this
+    /// nor the agent epoch; the next call finds the old target refused and resolves again.
     pub hands: Option<HandsBinding>,
     /// The gateway target for those hands, fetched from AgentDO (`hands_resolve`) and dropped
     /// whenever a gateway refuses it, so the next call asks again.
@@ -370,24 +359,32 @@ impl Agent {
         self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch(), seq, ts_ms: now_ms(), turn, body }));
     }
 
-    /// Set the hands ids (a duplicate `agent_start` for a live brain). A changed binding drops
-    /// the cached target; a new epoch re-handshakes the session channel; MCP clients are told
-    /// the tool list changed.
+    /// Set the hands (a later `agent_start` for this live brain). Another sandbox drops the
+    /// cached target and bumps its generation, so a resolve in flight for the old sandbox can't
+    /// store its answer over the new one; MCP clients are told the tool list changed.
     pub fn set_hands(&self, hands: Option<HandsBinding>) {
-        let new_epoch = hands.as_ref().map(|h| h.epoch);
         {
             let mut inner = self.inner.lock().unwrap();
-            if inner.hands != hands {
+            if inner.hands.as_ref().map(|h| &h.sandbox) != hands.as_ref().map(|h| &h.sandbox) {
                 inner.target = None;
+                inner.target_gen += 1;
             }
             inner.hands = hands;
         }
-        if let Some(e) = new_epoch
-            && self.epoch.swap(e.0, Ordering::SeqCst) != e.0
-        {
-            self.send_out(Outbound::Reconnect);
-        }
         let _ = self.tools_changed.send(());
+    }
+
+    /// Adopt the agent epoch of a later `agent_start` for this live brain: AgentDO issued a new
+    /// one and fences the old, so the session channel re-handshakes with it. Epochs only grow:
+    /// an older one (a command overtaken by a newer start) changes nothing. Returns whether
+    /// the epoch changed.
+    pub fn adopt_epoch(&self, epoch: Epoch) -> bool {
+        let prev = self.epoch.fetch_max(epoch.0, Ordering::SeqCst);
+        if epoch.0 > prev {
+            self.send_out(Outbound::Reconnect);
+            return true;
+        }
+        false
     }
 
     /// The cached gateway target with its generation, if a `hands_resolve` has answered since
@@ -402,12 +399,22 @@ impl Agent {
         inner.target.clone().map(|t| (t, inner.target_gen))
     }
 
-    /// Cache a target; returns its generation.
-    pub fn set_hands_target(&self, target: HandsTarget) -> u64 {
+    /// Cache a target; returns its generation. `None` (nothing cached) when the hands changed
+    /// since `seen_gen` was read: the answer was for the previous sandbox.
+    pub fn set_hands_target(&self, target: HandsTarget, seen_gen: u64) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.target_gen != seen_gen {
+            return None;
+        }
         inner.target_gen += 1;
         inner.target = Some(target);
-        inner.target_gen
+        Some(inner.target_gen)
+    }
+
+    /// The target generation now (read before a `hands_resolve`, passed to
+    /// [`Agent::set_hands_target`]).
+    pub fn target_gen(&self) -> u64 {
+        self.inner.lock().unwrap().target_gen
     }
 
     /// Forget the target a call was using (a gateway refused it, or the sandbox moved mid-call),

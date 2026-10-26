@@ -177,7 +177,7 @@ export class FleetDO extends DurableObject<Env> {
       sandbox TEXT, agent TEXT, epoch INTEGER, purpose TEXT, body TEXT NOT NULL, issued_ms INTEGER NOT NULL,
       result TEXT, result_ms INTEGER)`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS commands_host_result ON commands (host, result)");
-    this.sql.exec("CREATE TABLE IF NOT EXISTS host_agents (agent TEXT PRIMARY KEY, host TEXT NOT NULL, cmd TEXT NOT NULL)");
+    this.createHostAgents();
     this.sql.exec(`CREATE TABLE IF NOT EXISTS reassign_queue (sandbox TEXT PRIMARY KEY, host TEXT NOT NULL,
       epoch INTEGER NOT NULL, host_dead INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
@@ -856,6 +856,27 @@ export class FleetDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * The brain index: one row per (agent, host) an `agent_start` went to, until that brain is seen to
+   * stop there (`agent_stop`'s result, its exit, or its host lost). Written only by those; AgentDO
+   * owns where a brain runs. Keyed by both, so a brain being stopped on its old host stays listed
+   * while it starts on a new one. Rows from before were keyed by agent alone: rekeyed in place.
+   */
+  private createHostAgents(): void {
+    const create = "CREATE TABLE IF NOT EXISTS host_agents (agent TEXT NOT NULL, host TEXT NOT NULL, cmd TEXT NOT NULL, PRIMARY KEY (agent, host))";
+    const cols = this.sql.exec<{ name: string; pk: number }>("PRAGMA table_info(host_agents)").toArray();
+    if (cols.length === 0 || cols.find((c) => c.name === "host")?.pk !== 0) {
+      this.sql.exec(create);
+      return;
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("ALTER TABLE host_agents RENAME TO host_agents_by_agent");
+      this.sql.exec(create);
+      this.sql.exec("INSERT INTO host_agents (agent, host, cmd) SELECT agent, host, cmd FROM host_agents_by_agent");
+      this.sql.exec("DROP TABLE host_agents_by_agent");
+    });
+  }
+
   /** Brains the host doesn't report (after its agent_start completed) are gone. */
   private async reconcileAgents(host: string, agents: Extract<HostToFleet, { type: "hello" }>["agents"]): Promise<void> {
     const reported = new Set(agents.map((a) => a.agent));
@@ -1100,7 +1121,7 @@ export class FleetDO extends DurableObject<Env> {
         c.cmd, host, c.type, sandbox, agent, epoch, purpose, JSON.stringify(c), now,
       );
       if (c.type === "agent_start") {
-        this.sql.exec("INSERT INTO host_agents (agent, host, cmd) VALUES (?, ?, ?) ON CONFLICT(agent) DO UPDATE SET host = excluded.host, cmd = excluded.cmd",
+        this.sql.exec("INSERT INTO host_agents (agent, host, cmd) VALUES (?, ?, ?) ON CONFLICT(agent, host) DO UPDATE SET cmd = excluded.cmd",
           c.agent, host, c.cmd);
       }
     }
@@ -1677,6 +1698,14 @@ export class FleetDO extends DurableObject<Env> {
   private async expireController(host: string): Promise<void> {
     this.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", host);
     for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "lease expired");
+    await this.brainsLost(host);
+  }
+
+  /**
+   * Every brain on a host that is gone (its runner killed them when the host lease lapsed): AgentDO
+   * starts each again elsewhere. A brain follows its own host's fate, never its sandbox's.
+   */
+  private async brainsLost(host: string): Promise<void> {
     const agents = this.sql.exec<{ agent: string }>("SELECT agent FROM host_agents WHERE host = ?", host).toArray();
     this.sql.exec("DELETE FROM host_agents WHERE host = ?", host);
     for (const { agent } of agents) {
@@ -1743,6 +1772,8 @@ export class FleetDO extends DurableObject<Env> {
       this.releaseTunnel(host, "dead");
     }
     await this.queueReassign(host, this.leasesOf(host).map((l) => l.sandbox), true);
+    // Brains placed on it (today's placement co-locates a worker with its sandbox) died with it.
+    await this.brainsLost(host);
   }
 
   /** Queue leases for reassignment and work the queue; failures are retried from the alarm. */

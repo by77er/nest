@@ -595,13 +595,14 @@ async fn host_lifecycle_commit_and_self_fence() {
         other => panic!("upsert: {other:?}"),
     }
 
-    // 2. Start a worker: the runner gets the sandbox's id and epoch, never a socket path.
+    // 2. Start a worker: the runner gets the sandbox's id and its agent epoch, never a socket path.
     let start = AgentStart {
         agent: AgentId("agt_w".into()),
         role: AgentRole::Worker,
         workstream: WorkstreamId("ws_1".into()),
+        epoch: Some(Epoch(1)),
         resume: None,
-        hands: Some(HandsBinding { sandbox: sbx.clone(), epoch: Epoch(1) }),
+        hands: Some(HandsBinding { sandbox: sbx.clone(), epoch: None }),
         launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "w".into() } },
         oauth_token: "oauth".into(),
         session_ws_url: "ws://x".into(),
@@ -1392,6 +1393,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
         agent: AgentId("agt_c".into()),
         role: AgentRole::Captain,
         workstream: WorkstreamId("ws_1".into()),
+        epoch: Some(Epoch(1)),
         resume: None,
         hands: None,
         launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "c".into() } },

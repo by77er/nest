@@ -22,7 +22,7 @@ use nest_protocol::control::{SegmentRef, SessionResume};
 use nest_protocol::host::claude::{self, SessionArgs, StreamIn, StreamOut, SystemMessage};
 use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerEvent, StopMode};
 use nest_protocol::control::LaunchConfig;
-use nest_protocol::model::{AgentEventBody, AgentState, Epoch, ErrorBody, SessionId, TurnInputKind};
+use nest_protocol::model::{AgentEventBody, AgentState, ErrorBody, SessionId, TurnInputKind};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use tokio::io::AsyncWriteExt;
@@ -90,7 +90,8 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let hands = start.start.hands.clone();
-        let epoch = hands.as_ref().map(|h| h.epoch).unwrap_or(Epoch(0));
+        // The agent epoch AgentDO issued for this start; never the sandbox's.
+        let epoch = start.start.agent_epoch();
         let secrets = vec![start.start.oauth_token.expose().to_owned()];
         let agent = Agent::new(
             id.clone(),
@@ -115,8 +116,12 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(existing) => {
-                    tracing::warn!(agent = %id, "agent_start for a brain that is already running; updating its hands only");
+                    // AgentDO started this brain again (it lost sight of it): the live brain keeps
+                    // running, takes the new hands and adopts the newer agent epoch, which
+                    // re-handshakes its session channel.
+                    tracing::warn!(agent = %id, "agent_start for a brain that is already running; updating its hands and epoch only");
                     existing.set_hands(start.start.hands.clone());
+                    existing.adopt_epoch(start.start.agent_epoch());
                     rt.report(RunnerEvent::Error {
                         agent: Some(id),
                         error: ErrorBody { code: "already_running".into(), message: "brain already running".into(), retryable: false },
@@ -899,7 +904,7 @@ mod tests {
         let rt = Runtime::new(crate::Config::default());
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let agent = Agent::new(AgentId("agt_t".into()), AgentRole::Worker, Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
+        let agent = Agent::new(AgentId("agt_t".into()), AgentRole::Worker, nest_protocol::model::Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
         let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
         let launch = LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: String::new() } };
         let actor = Actor {

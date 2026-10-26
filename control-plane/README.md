@@ -107,10 +107,11 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   first Cloudflare call, for a host that is dead or never got a row within an hour; every other nest-shaped name
   is counted as `unknown` and logged. `resolve` carries the Access service token only when the host has a tunnel,
   never because a URL happens to be `wss://`. A sandbox host enrolled before this change has no tunnel until it
-  re-enrolls (a new instance). Not built: the agent epoch, host kinds with brain placement by capacity, key
+  re-enrolls (a new instance). Not built: host kinds with brain placement by capacity, key
   rotation and the three desired versions. The code has `burst` and `controller` host roles
   (`HostRole`), `FleetDO.controllerHost()` starts captains on a `controller` host, other brains start on the
-  sandbox's host, and `agent_start.hands` carries the sandbox id and epoch only (the runner fetches its target).
+  sandbox's host when they start (AgentDO issues an agent epoch per start; a sandbox move doesn't restart them),
+  and `agent_start.hands` carries the sandbox id only (the runner fetches its target).
 - **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
   with attenuation, spawn specs, templates and capabilities, owners and labels aren't built. The code still has
   `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with
