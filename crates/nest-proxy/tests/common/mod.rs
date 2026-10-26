@@ -390,7 +390,7 @@ pub async fn resync(conn: &mut NestdConn, pki: &Pki, net: &Net, secret_expiry: O
     conn.send(&ProxyCommand::ListenersAdd { sandbox: sandbox(), epoch: Epoch(4), listeners: specs }, &refs);
     conn.send(&ProxyCommand::ResyncComplete { sandboxes: 1, listeners: 6 }, &[]);
     let ack = conn.wait(|e| matches!(e, ProxyEvent::ResyncAck { .. })).await;
-    assert_eq!(ack, ProxyEvent::ResyncAck { sandboxes: 1, listeners: 6 });
+    assert_eq!(ack, ProxyEvent::ResyncAck { sandboxes: 1, listeners: 6, failed: vec![] });
 }
 
 // ------------------------------------------------------------------------------------------

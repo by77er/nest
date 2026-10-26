@@ -39,7 +39,14 @@ pub struct Config {
     /// Permit loopback/private upstream addresses. Tests only: in production this would expose
     /// IMDS and the VPC to sandboxes through policy names that resolve there.
     pub allow_private_upstreams: bool,
+    /// Proxied connections open at once across every sandbox on the host (each holds two fds;
+    /// the unit's `LimitNOFILE` must cover them). Each sandbox's own `limits.max_connections`
+    /// applies too.
+    pub max_connections: u32,
 }
+
+/// Default host-wide connection budget: 2 fds each, far below the unit's `LimitNOFILE`.
+pub const HOST_CONNECTION_BUDGET: u32 = 65_536;
 
 impl Config {
     pub fn new(nestd_sock: impl Into<PathBuf>) -> Self {
@@ -49,6 +56,7 @@ impl Config {
             webpki_roots: true,
             extra_roots: Vec::new(),
             allow_private_upstreams: false,
+            max_connections: HOST_CONNECTION_BUDGET,
         }
     }
 }

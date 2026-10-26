@@ -1,11 +1,13 @@
 import Inframe
 import Cloudflare.Provider
 import Cloudflare.Resource.ZeroTrustAccessApplication
+import Cloudflare.Resource.R2BucketLifecycle
 
 /-!
 Cloudflare Access in front of nest's hostnames: the `edge` stack (docs/sandbox/gateway/, Auth
-layers; docs/control-plane/dashboard/). Account-level, not per cell. The provider reads its token
-from `CLOUDFLARE_API_TOKEN` (Account › Access: Apps and Policies › Edit).
+layers; docs/control-plane/dashboard/), and the lifecycle of the control plane's R2 bucket
+(docs/data/). Account-level, not per cell. The provider reads its token from
+`CLOUDFLARE_API_TOKEN` (Account › Access: Apps and Policies › Edit, and Workers R2 Storage › Edit).
 
 Three self-hosted applications, each with one inline policy:
 - the sandbox gateways, `*-gw-<label>.<zone>`: Service Auth (`non_identity`) for one service token,
@@ -32,6 +34,10 @@ structure EdgeSpec where
   ownerEmail : String
   /-- The id (not a secret) of the service token the gateways admit: the one in `access:gateway`. -/
   gatewayServiceTokenId : String
+  /-- The control plane's R2 bucket (`control-plane/wrangler.jsonc`, binding `BUCKET`). -/
+  controlBucket : String
+  /-- Days FleetDO's egress audit (`audit/<sandbox>/<day>/…`) is kept (docs/data/). -/
+  auditRetentionDays : Nat
 
 def gatewaysDomain (spec : EdgeSpec) : String := s!"*-gw-{spec.label}.{spec.zone}"
 def dashboardDomain (spec : EdgeSpec) : String := s!"dash-{spec.label}.{spec.zone}"
@@ -46,6 +52,19 @@ def serviceAuth (spec : EdgeSpec) : ZeroTrustAccessApplication.PoliciesArgs :=
 def ownerOnly (spec : EdgeSpec) : ZeroTrustAccessApplication.PoliciesArgs :=
   { name := some "owner", decision := some "allow", precedence := some 1
     include_ := some [{ email := some { email := lit spec.ownerEmail } }] }
+
+/-- Egress audit objects are deleted `auditRetentionDays` after they are written. -/
+def auditExpiry (spec : EdgeSpec) : R2BucketLifecycle.RulesArgs :=
+  { id := "audit-expiry", enabled := true, conditions := { prefix_ := "audit/" }
+    deleteObjectsTransition := some
+      { condition := some { type := "Age", maxAge := some (lit (Lean.JsonNumber.fromNat (spec.auditRetentionDays * 86400))) } } }
+
+/-- The rule R2 gave the bucket at creation, kept because the lifecycle resource replaces the whole
+configuration: verified on `nest-control` (id `Default Multipart Abort Rule`, enabled, abort after
+604800 s, empty conditions, which the provider writes as the empty prefix). -/
+def multipartAbort : R2BucketLifecycle.RulesArgs :=
+  { id := "Default Multipart Abort Rule", enabled := true, conditions := { prefix_ := "" }
+    abortMultipartUploadsTransition := some { condition := some { type := "Age", maxAge := 604800 } } }
 
 def edge (spec : EdgeSpec) : Infra Unit := do
   let _ ← Provider.configure {}
@@ -66,5 +85,10 @@ def edge (spec : EdgeSpec) : Infra Unit := do
       policies := some [ownerOnly spec] }
   -- The dashboard Worker checks Access tokens against this audience (dashboard/wrangler.jsonc).
   output "dashboard_aud" dashboard.aud
+  -- This resource owns the bucket's whole lifecycle configuration: a rule for another prefix goes
+  -- here too (one set by hand in the Cloudflare dashboard is replaced on apply).
+  let _ ← R2BucketLifecycle.create "control_bucket"
+    { accountId := lit spec.accountId, bucketName := lit spec.controlBucket
+      rules := some [multipartAbort, auditExpiry spec] }
 
 end Edge

@@ -16,7 +16,7 @@
 5. **Push the policy.** nestd sends `sandbox_upsert` (the policy) and `secrets_set`, and boots the VM without waiting for an answer. **Designed, not built:** the policy, its sha256 and the binding secrets travel in one `sandbox_upsert`, and the VM starts or resumes only after nest-proxy answers `policy_ack` with the same `(sandbox, epoch, version, sha256)`, so a guest never runs against a missing or wrong policy. See [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#policy-acknowledgement).
 
 - **nest-proxy never calls `setns`** and needs no privileges. It accepts on the fds it was given. Connections to the internet are opened from the root namespace.
-- **On proxy restart,** the proxy reconnects and nestd resends the full state: every listener, from duplicated fds. Pending connections wait in the kernel's accept queue. If the counts in `resync_ack` don't match what nestd sent, nestd closes the connection so the proxy resyncs again.
+- **On proxy restart,** the proxy reconnects and nestd resends the full state: every listener, from duplicated fds. Pending connections wait in the kernel's accept queue. Listeners the proxy can't serve are named in `resync_ack` and rebound one by one; only counts those failures don't explain make nestd close the connection for a fresh resync ([nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#proxy-restart-resync)).
 - **Access:** `proxy.sock` is mode `0660` with an optional group, the peer uid is checked with `SO_PEERCRED`, and only one proxy is served at a time.
 - **The link never blocks nestd:**
   - Queued commands carry their own duplicated fds, so the mirror lock is never held during a send.

@@ -524,7 +524,7 @@ fn fake_proxy(path: PathBuf) -> Arc<Mutex<Vec<ProxyCommand>>> {
         let mut buf = vec![];
         while let Ok(Some((c, _fds))) = fdpass::recv::<ProxyCommand>(fd.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY) {
             if let ProxyCommand::ResyncComplete { sandboxes, listeners } = &c {
-                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes: *sandboxes, listeners: *listeners }, &[]);
+                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes: *sandboxes, listeners: *listeners, failed: vec![] }, &[]);
             }
             got2.lock().unwrap().push(c);
         }
@@ -787,7 +787,7 @@ fn fake_proxy_keeping_fds(path: PathBuf) -> Received {
             if let ProxyCommand::ListenersAdd { listeners, .. } = c {
                 got2.lock().unwrap().extend(listeners.into_iter().zip(fds));
             } else if let ProxyCommand::ResyncComplete { sandboxes, listeners } = c {
-                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes, listeners }, &[]);
+                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes, listeners, failed: vec![] }, &[]);
             }
         }
     });
@@ -875,6 +875,365 @@ fn netns_listeners_handed_to_proxy() {
         .unwrap();
         acceptor.join().unwrap();
     });
+}
+
+/// A running sandbox in a real netns: the fake guest boots (so the sandbox reaches `running`),
+/// and the driver captures the namespace.
+struct NetnsGuestDriver {
+    inner: FakeDriver,
+    ns: Arc<Mutex<Option<Arc<nestd::net::Netns>>>>,
+}
+
+#[async_trait]
+impl Driver for NetnsGuestDriver {
+    fn name(&self) -> &'static str {
+        "fake-netns-guest"
+    }
+    async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
+        *self.ns.lock().unwrap() = spec.netns.clone();
+        self.inner.create(spec).await
+    }
+}
+
+struct NetnsHost {
+    _host: Host,
+    dir: tempfile::TempDir,
+    fleet: MockFleet,
+    /// Every listener handed to the fake proxy, with the fd it got.
+    received: Received,
+    /// The fake proxy's end of the link, to send events on.
+    link: Arc<Mutex<Option<OwnedFd>>>,
+    ns: Arc<nestd::net::Netns>,
+}
+
+impl NetnsHost {
+    /// Report listener `id` of `sbx_n` failed, as nest-proxy does.
+    fn fail(&self, id: u32) {
+        self.fail_in("sbx_n", id);
+    }
+
+    fn fail_in(&self, sandbox: &str, id: u32) {
+        let error = ErrorBody { code: "accept_failed".into(), message: "test".into(), retryable: true };
+        let ev = ProxyEvent::ListenerFailed { sandbox: SandboxId(sandbox.into()), listener_id: id, error };
+        fdpass::send(self.link.lock().unwrap().as_ref().unwrap().as_fd(), &ev, &[]).unwrap();
+    }
+
+    /// Create `sandbox` at `epoch` and wait until it runs.
+    async fn create(&self, id: &str, sandbox: &str, epoch: u64) {
+        let body = CommandBody::SandboxCreate {
+            sandbox: SandboxId(sandbox.into()),
+            workstream: WorkstreamId("ws_1".into()),
+            epoch: Epoch(epoch),
+            image: "base".into(),
+            resources: Resources { vcpus: 1, memory_mib: 256, disk_gib: 1 },
+            policy: policy(),
+            from: None,
+        };
+        self.command(id, body).await;
+    }
+
+    fn fenced(&self, sandbox: &str, epoch: u64) -> Option<HostEventBody> {
+        let sbx = SandboxId(sandbox.into());
+        self.fleet.log.lock().unwrap().events.iter().map(|e| e.body.clone()).find(|b| {
+            matches!(b, HostEventBody::SandboxState { sandbox, epoch: e, state: SandboxState::Fenced, .. } if *sandbox == sbx && e.0 == epoch)
+        })
+    }
+
+    /// Take (out of `received`) the listener that matches.
+    fn take(&self, f: impl Fn(&nest_protocol::host::proxy::ListenerSpec) -> bool) -> (nest_protocol::host::proxy::ListenerSpec, OwnedFd) {
+        let mut r = self.received.lock().unwrap();
+        let i = r.iter().position(|(s, _)| f(s)).expect("listener handed over");
+        r.remove(i)
+    }
+
+    async fn command(&self, id: &str, body: CommandBody) {
+        self.fleet.commands.send(vec![cmd(id, body)]).unwrap();
+        wait_until(id, || !self.fleet.results_for(id).is_empty()).await;
+        assert!(is_ok(&self.fleet.results_for(id)[0]), "{id}: {:?}", self.fleet.results_for(id));
+    }
+}
+
+/// `sbx_n` running at epoch 1 with `policy` in a real netns, behind a fake proxy that keeps fds.
+async fn netns_host(policy: EgressPolicy) -> NetnsHost {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "role": "burst", "cell": "c",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+        "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+        "driver": {"type": "process", "guest_command": ["unused"]},
+        "network": {"type": "netns"},
+        "flush_interval_ms": 20,
+    }))
+    .unwrap();
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
+    let ns_slot = Arc::new(Mutex::new(None));
+    let inner = FakeDriver { seen: Arc::default(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() };
+    let host = Host::start(cfg, enrolled, Some(Arc::new(NetnsGuestDriver { inner, ns: ns_slot.clone() }))).await.unwrap();
+    let link: Arc<Mutex<Option<OwnedFd>>> = Arc::default();
+    let received = fake_proxy_keeping_fds_with_link(dir.path().join("run/proxy.sock"), link.clone());
+    let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
+    let _gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    let create = CommandBody::SandboxCreate {
+        sandbox: SandboxId("sbx_n".into()),
+        workstream: WorkstreamId("ws_1".into()),
+        epoch: Epoch(1),
+        image: "base".into(),
+        resources: Resources { vcpus: 1, memory_mib: 256, disk_gib: 1 },
+        policy,
+        from: None,
+    };
+    fleet.commands.send(vec![cmd("cmd_create", create)]).unwrap();
+    fleet.wait_event("running", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Running, .. })).await;
+    let ns = ns_slot.lock().unwrap().clone().expect("netns captured");
+    NetnsHost { _host: host, dir, fleet, received, link, ns }
+}
+
+fn with_tcp_exception(version: u64) -> EgressPolicy {
+    EgressPolicy { version, tcp: vec![TcpException { host: "db.example.com".into(), port: 5432 }], ..policy() }
+}
+
+fn is_tcp_exception(s: &nest_protocol::host::proxy::ListenerSpec) -> bool {
+    matches!(&s.purpose, nest_protocol::host::proxy::ListenerPurpose::TcpException { .. })
+}
+
+/// Guest-proxy review #6: a listener the proxy reports failed is rebound by nestd at the same
+/// address in the sandbox's netns and handed back under the same id, and the new socket serves.
+#[test]
+fn a_failed_listener_is_rebound_in_the_netns() {
+    if !nestd::net::reexec_in_userns("a_failed_listener_is_rebound_in_the_netns") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        use nest_protocol::host::proxy::ListenerPurpose;
+        use std::io::{Read, Write};
+        let h = netns_host(policy()).await;
+        // The proxy loses its :443 listener (closing its copy) and says so.
+        let (spec, fd) = h.take(|s| s.purpose == ListenerPurpose::HttpsTransparent);
+        drop(fd);
+        h.fail(spec.id);
+        wait_until("the listener handed back", || h.received.lock().unwrap().iter().any(|(s, _)| s.id == spec.id)).await;
+        let (again, fd) = h.take(|s| s.id == spec.id);
+        assert_eq!((again.purpose, again.addr.as_str()), (ListenerPurpose::HttpsTransparent, "172.16.0.1:443"));
+        let https = std::net::TcpListener::from(fd);
+        let acceptor = std::thread::spawn(move || {
+            let (mut s, _) = https.accept().unwrap();
+            let mut b = [0u8; 2];
+            s.read_exact(&mut b).unwrap();
+            s.write_all(b"ok").unwrap();
+        });
+        h.ns.run(|| {
+            let mut c = std::net::TcpStream::connect("172.16.0.1:443")?;
+            c.write_all(b"hi")?;
+            let mut b = [0u8; 2];
+            c.read_exact(&mut b)?;
+            assert_eq!(&b, b"ok");
+            Ok(())
+        })
+        .unwrap();
+        acceptor.join().unwrap();
+    });
+}
+
+/// Guest-proxy review #6 (M1): a listener removed by its owner while its rebind waits (the rule
+/// left the policy, the agent detached) is not brought back: the sandbox's own record decides.
+#[test]
+fn a_listener_removed_during_its_rebind_is_not_restored() {
+    if !nestd::net::reexec_in_userns("a_listener_removed_during_its_rebind_is_not_restored") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        use nest_protocol::host::proxy::ListenerPurpose;
+        let h = netns_host(with_tcp_exception(1)).await;
+        h.command("cmd_attach", attach_cmd("cmd_attach", "sbx_n", "agt_w").body).await;
+        let (tcp, tcp_fd) = h.take(is_tcp_exception);
+        let (explicit, explicit_fd) = h.take(|s| matches!(s.purpose, ListenerPurpose::Explicit { .. }));
+        drop((tcp_fd, explicit_fd));
+        h.fail(tcp.id);
+        h.fail(explicit.id);
+        // Both owners act before the rebind (it waits LISTENER_REBIND_DELAY first).
+        let sbx = SandboxId("sbx_n".into());
+        h.command("cmd_policy", CommandBody::PolicyUpdate { sandbox: sbx.clone(), epoch: Epoch(1), policy: EgressPolicy { version: 2, ..policy() } }).await;
+        h.command("cmd_detach", CommandBody::AgentDetach { sandbox: sbx, epoch: Epoch(1), agent: AgentId("agt_w".into()), kill_processes: false }).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let back: Vec<u32> = h.received.lock().unwrap().iter().map(|(s, _)| s.id).filter(|id| [tcp.id, explicit.id].contains(id)).collect();
+        assert!(back.is_empty(), "removed listeners were restored: {back:?}");
+        // Their ports are free: nothing of nestd's holds them.
+        h.ns.run(|| {
+            std::net::TcpListener::bind(tcp.addr.as_str())?;
+            std::net::TcpListener::bind(explicit.addr.as_str())?;
+            Ok(())
+        })
+        .unwrap();
+    });
+}
+
+/// Guest-proxy review #6 (M4): a listener that can't be bound again is given up with an event
+/// the control plane sees: `blocked` for a TCP exception (which the next policy update binds
+/// again), and a fence for a transparent listener (no egress at all otherwise).
+#[test]
+fn a_listener_that_cannot_be_rebound_is_given_up_with_an_event() {
+    if !nestd::net::reexec_in_userns("a_listener_that_cannot_be_rebound_is_given_up_with_an_event") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        use nest_protocol::host::proxy::ListenerPurpose;
+        let h = netns_host(with_tcp_exception(1)).await;
+        // The "proxy" keeps its copy open: the address stays taken, so every bind fails.
+        let (tcp, tcp_fd) = h.take(is_tcp_exception);
+        h.fail(tcp.id);
+        let ev = h
+            .fleet
+            .wait_event("listener_lost", |b| matches!(b, HostEventBody::Workstream { event } if matches!(&event.kind, WorkstreamEventKind::EgressAlert { host, reason: EgressAlertReason::ListenerLost, .. } if host == "db.example.com:5432")))
+            .await;
+        assert!(matches!(ev, HostEventBody::Workstream { event } if event.sandbox == Some(SandboxId("sbx_n".into()))));
+        // Forgotten, so a policy update that keeps the rule binds it again (under a new id).
+        drop(tcp_fd);
+        h.command("cmd_policy", CommandBody::PolicyUpdate { sandbox: SandboxId("sbx_n".into()), epoch: Epoch(1), policy: with_tcp_exception(2) }).await;
+        let (again, _fd) = h.take(is_tcp_exception);
+        assert_ne!(again.id, tcp.id);
+
+        let (https, _https_fd) = h.take(|s| s.purpose == ListenerPurpose::HttpsTransparent);
+        h.fail(https.id);
+        let fenced = h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+        assert!(matches!(fenced, HostEventBody::SandboxState { detail: Some(d), cause: Some(FenceCause::EgressLost), .. } if d.contains("172.16.0.1:443")));
+    });
+}
+
+/// Review L7: the rebind binds without the sandbox lock, so a `policy_update` lands while the
+/// binds are still being retried; the listener it removed is not handed over when a bind then
+/// succeeds, and nothing is reported lost.
+#[test]
+fn a_listener_removed_while_it_binds_is_not_handed_over() {
+    if !nestd::net::reexec_in_userns("a_listener_removed_while_it_binds_is_not_handed_over") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        let h = netns_host(with_tcp_exception(1)).await;
+        // The "proxy" holds the address, so the first binds fail (tries at ~200, ~400, ~800 ms).
+        let (tcp, tcp_fd) = h.take(is_tcp_exception);
+        h.fail(tcp.id);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t = std::time::Instant::now();
+        h.command("cmd_policy", CommandBody::PolicyUpdate { sandbox: SandboxId("sbx_n".into()), epoch: Epoch(1), policy: EgressPolicy { version: 2, ..policy() } }).await;
+        assert!(t.elapsed() < Duration::from_millis(300), "policy_update waited for the binds ({:?})", t.elapsed());
+        drop(tcp_fd); // the last bind can now succeed
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!h.received.lock().unwrap().iter().any(|(s, _)| s.id == tcp.id), "a removed listener was handed over");
+        let lost = h.fleet.log.lock().unwrap().events.iter().any(|e| matches!(&e.body, HostEventBody::Workstream { event } if matches!(event.kind, WorkstreamEventKind::EgressAlert { reason: EgressAlertReason::ListenerLost, .. })));
+        assert!(!lost, "a removed listener was reported lost");
+    });
+}
+
+/// Review L2: a failure reported on a proxy connection that has since been replaced is ignored;
+/// the new connection's resync already handed the listener over (once), and nothing is fenced.
+#[test]
+fn a_failure_from_an_old_proxy_connection_is_ignored() {
+    if !nestd::net::reexec_in_userns("a_failure_from_an_old_proxy_connection_is_ignored") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        use nest_protocol::host::proxy::ListenerPurpose;
+        let h = netns_host(policy()).await;
+        let (https, _old_fd) = h.take(|s| s.purpose == ListenerPurpose::HttpsTransparent);
+        h.fail(https.id);
+        // The proxy restarts right after reporting it.
+        let old = h.link.lock().unwrap().take().unwrap();
+        nix::sys::socket::shutdown(old.as_raw_fd(), nix::sys::socket::Shutdown::Both).unwrap();
+        let link: Arc<Mutex<Option<OwnedFd>>> = Arc::default();
+        let received = fake_proxy_keeping_fds_with_link(h.dir.path().join("run/proxy.sock"), link);
+        wait_until("the new connection's resync", || received.lock().unwrap().iter().any(|(s, _)| s.id == https.id)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let handed = received.lock().unwrap().iter().filter(|(s, _)| s.id == https.id).count();
+        assert_eq!(handed, 1, "handed over once, by the resync");
+        assert!(h.fenced("sbx_n", 1).is_none(), "fenced over a stale report");
+    });
+}
+
+/// Review L2: a report about an incarnation replaced during the wait (a create at a newer epoch)
+/// touches neither: the new incarnation keeps its listeners and is not fenced.
+#[test]
+fn a_failure_of_a_replaced_incarnation_is_ignored() {
+    if !nestd::net::reexec_in_userns("a_failure_of_a_replaced_incarnation_is_ignored") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        use nest_protocol::host::proxy::ListenerPurpose;
+        let h = netns_host(policy()).await;
+        let (old, old_fd) = h.take(|s| s.purpose == ListenerPurpose::HttpsTransparent);
+        drop(old_fd);
+        h.fail(old.id);
+        h.create("cmd_create2", "sbx_n", 2).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let r = h.received.lock().unwrap();
+        assert!(!r.iter().any(|(s, _)| s.id == old.id), "the old incarnation's listener came back");
+        assert_eq!(r.iter().filter(|(s, _)| s.purpose == ListenerPurpose::HttpsTransparent).count(), 1, "the new incarnation's :443, once");
+        drop(r);
+        assert!(h.fenced("sbx_n", 2).is_none(), "the new incarnation was fenced");
+    });
+}
+
+/// Review M1: when several sandboxes lose a standard listener in a short window, the fault is the
+/// host's: the first is fenced (`egress_lost`, so FleetDO places it elsewhere), the next makes a
+/// `host_fault` (FleetDO drains the host) and is not fenced itself.
+#[test]
+fn listener_losses_in_several_sandboxes_are_a_host_fault() {
+    if !nestd::net::reexec_in_userns("listener_losses_in_several_sandboxes_are_a_host_fault") {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        use nest_protocol::host::proxy::ListenerPurpose;
+        let h = netns_host(policy()).await;
+        h.create("cmd_create_m", "sbx_m", 1).await;
+        // Ids are host-wide and increasing: sbx_n's :443 first, then sbx_m's. The "proxy" keeps
+        // both open, so neither can be bound again.
+        let (n443, _n_fd) = h.take(|s| s.purpose == ListenerPurpose::HttpsTransparent);
+        let (m443, _m_fd) = h.take(|s| s.purpose == ListenerPurpose::HttpsTransparent);
+        assert!(m443.id > n443.id);
+        h.fail_in("sbx_n", n443.id);
+        let fenced = h.fleet.wait_event("sbx_n fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+        assert!(matches!(fenced, HostEventBody::SandboxState { cause: Some(FenceCause::EgressLost), .. }));
+        h.fail_in("sbx_m", m443.id);
+        let fault = h.fleet.wait_event("host fault", |b| matches!(b, HostEventBody::HostFault { .. })).await;
+        assert!(matches!(fault, HostEventBody::HostFault { kind: HostFaultKind::EgressListeners, .. }));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(h.fenced("sbx_m", 1).is_none(), "the host's fault fences no second sandbox");
+    });
+}
+
+/// [`fake_proxy_keeping_fds`] that also shares its socket, so a test can send events.
+fn fake_proxy_keeping_fds_with_link(path: PathBuf, link: Arc<Mutex<Option<OwnedFd>>>) -> Received {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    let got: Received = Arc::new(Mutex::new(vec![]));
+    let got2 = got.clone();
+    std::thread::spawn(move || {
+        let fd: OwnedFd = loop {
+            let fd = socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::SOCK_CLOEXEC, None).unwrap();
+            if connect(fd.as_raw_fd(), &UnixAddr::new(&path).unwrap()).is_ok() {
+                break fd;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        fdpass::send(fd.as_fd(), &ProxyEvent::Hello { protocol_version: HOST_PROTOCOL_VERSION, proxy_version: "fake".into(), pid: 1 }, &[]).unwrap();
+        *link.lock().unwrap() = Some(fd.try_clone().unwrap());
+        let mut buf = vec![];
+        while let Ok(Some((c, fds))) = fdpass::recv::<ProxyCommand>(fd.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY) {
+            if let ProxyCommand::ListenersAdd { listeners, .. } = c {
+                got2.lock().unwrap().extend(listeners.into_iter().zip(fds));
+            } else if let ProxyCommand::ResyncComplete { sandboxes, listeners } = c {
+                let _ = fdpass::send(fd.as_fd(), &ProxyEvent::ResyncAck { sandboxes, listeners, failed: vec![] }, &[]);
+            }
+        }
+    });
+    got
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -171,41 +171,111 @@ pub mod fdpass {
         Ok(())
     }
 
-    /// Receive one packet into `buf` (resized to `max_len`). Returns `Ok(None)` on EOF.
+    /// Receive one packet into `buf` (resized to `max_len`). Returns `Ok(None)` on EOF. A packet
+    /// whose fds didn't all arrive (`MSG_CTRUNC`) is an error; see [`recv_lenient`].
     pub fn recv<T: DeserializeOwned>(
         sock: BorrowedFd<'_>,
         buf: &mut Vec<u8>,
         max_len: usize,
     ) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
+        match recv_lenient(sock, buf, max_len)? {
+            Some(r) if r.fds_truncated => Err(io::Error::new(io::ErrorKind::InvalidData, "truncated control data")),
+            Some(r) => Ok(Some((r.msg, r.fds))),
+            None => Ok(None),
+        }
+    }
+
+    /// One received packet.
+    pub struct Received<T> {
+        pub msg: T,
+        pub fds: Vec<OwnedFd>,
+        /// The packet's fds didn't all arrive (`MSG_CTRUNC`: the receiver is out of descriptors,
+        /// say): `fds` is empty, the message itself is whole. The receiver fails just what needed
+        /// the fds.
+        pub fds_truncated: bool,
+    }
+
+    /// Like [`recv`], but a packet that lost its fds is returned (with `fds_truncated`) instead of
+    /// failing, so the receiver can fail that one handover and keep the connection.
+    pub fn recv_lenient<T: DeserializeOwned>(sock: BorrowedFd<'_>, buf: &mut Vec<u8>, max_len: usize) -> io::Result<Option<Received<T>>> {
+        recv_into(sock, buf, max_len, &mut nix::cmsg_space!([RawFd; MAX_FDS_PER_PACKET]))
+    }
+
+    #[allow(clippy::ptr_arg, reason = "nix's recvmsg takes the control buffer as &mut Vec<u8>")]
+    fn recv_into<T: DeserializeOwned>(
+        sock: BorrowedFd<'_>,
+        buf: &mut Vec<u8>,
+        max_len: usize,
+        cmsg_space: &mut Vec<u8>,
+    ) -> io::Result<Option<Received<T>>> {
         buf.resize(max_len, 0);
-        let mut cmsg_space = nix::cmsg_space!([RawFd; MAX_FDS_PER_PACKET]);
         let (len, flags, fds) = {
             let mut iov = [IoSliceMut::new(&mut buf[..])];
             let msg = recvmsg::<()>(
                 sock.as_raw_fd(),
                 &mut iov,
-                Some(&mut cmsg_space),
+                Some(cmsg_space),
                 MsgFlags::MSG_CMSG_CLOEXEC,
             )
             .map_err(io::Error::from)?;
             let mut fds = Vec::new();
-            for c in msg.cmsgs().map_err(io::Error::from)? {
-                if let ControlMessageOwned::ScmRights(raw) = c {
-                    // SAFETY: the kernel just installed these descriptors in our table; we take
-                    // sole ownership of each exactly once.
-                    fds.extend(raw.into_iter().map(|r| unsafe { OwnedFd::from_raw_fd(r) }));
+            // nix refuses to iterate a truncated control buffer; those fds are closed below.
+            if !msg.flags.contains(MsgFlags::MSG_CTRUNC) {
+                for c in msg.cmsgs().map_err(io::Error::from)? {
+                    if let ControlMessageOwned::ScmRights(raw) = c {
+                        // SAFETY: the kernel just installed these descriptors in our table; we
+                        // take sole ownership of each exactly once.
+                        fds.extend(raw.into_iter().map(|r| unsafe { OwnedFd::from_raw_fd(r) }));
+                    }
                 }
             }
             (msg.bytes, msg.flags, fds)
         };
-        if flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated packet or control data"));
+        let fds_truncated = flags.contains(MsgFlags::MSG_CTRUNC);
+        if fds_truncated {
+            close_installed(cmsg_space);
         }
-        if len == 0 && fds.is_empty() {
+        if flags.contains(MsgFlags::MSG_TRUNC) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated packet"));
+        }
+        if len == 0 && fds.is_empty() && !fds_truncated {
             return Ok(None);
         }
         let msg = serde_json::from_slice(&buf[..len]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(Some((msg, fds)))
+        // A partial set of fds is useless (they pair with the message by position): close them.
+        Ok(Some(Received { msg, fds: if fds_truncated { vec![] } else { fds }, fds_truncated }))
+    }
+
+    /// Close the fds the kernel did install in a truncated (`MSG_CTRUNC`) control buffer: the
+    /// first `SCM_RIGHTS` message, as far as it lies inside the buffer.
+    fn close_installed(cmsg: &[u8]) {
+        use nix::libc;
+        let hdr = std::mem::size_of::<libc::cmsghdr>();
+        if cmsg.len() < hdr {
+            return;
+        }
+        // SAFETY: `cmsg` holds at least one header; read unaligned, it's a byte buffer.
+        let h: libc::cmsghdr = unsafe { std::ptr::read_unaligned(cmsg.as_ptr().cast()) };
+        if h.cmsg_level != libc::SOL_SOCKET || h.cmsg_type != libc::SCM_RIGHTS {
+            return;
+        }
+        // SAFETY: CMSG_LEN is pure arithmetic.
+        let data = unsafe { libc::CMSG_LEN(0) } as usize;
+        let end = (h.cmsg_len as usize).min(cmsg.len());
+        let mut at = data;
+        while at + std::mem::size_of::<RawFd>() <= end {
+            let fd = RawFd::from_ne_bytes(cmsg[at..at + 4].try_into().expect("four bytes"));
+            if fd >= 0 {
+                // SAFETY: the kernel installed this descriptor for us and nothing else owns it.
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+            at += std::mem::size_of::<RawFd>();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn recv_with_room_for<T: DeserializeOwned>(sock: BorrowedFd<'_>, buf: &mut Vec<u8>, max_len: usize) -> io::Result<Option<Received<T>>> {
+        recv_into(sock, buf, max_len, &mut nix::cmsg_space!([RawFd; 1]))
     }
 }
 
@@ -279,8 +349,17 @@ pub mod proxy {
     pub enum ProxyEvent {
         /// First packet after connecting.
         Hello { protocol_version: u32, proxy_version: String, pid: u32 },
-        /// The proxy applied a full resync.
-        ResyncAck { sandboxes: u32, listeners: u32 },
+        /// The proxy applied a full resync. `sandboxes` and `listeners` count what it now holds;
+        /// `failed` names, per sandbox, the listeners it was handed during the resync but couldn't
+        /// serve (no separate `listener_failed` is sent for those). nestd reconciles them one by
+        /// one and closes the link only for a mismatch they don't explain. A proxy one release
+        /// older sends no `failed`.
+        ResyncAck {
+            sandboxes: u32,
+            listeners: u32,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            failed: Vec<ResyncFailure>,
+        },
         /// Batched audit records (flushed every ≤1 s or 128 records; must fit
         /// [`super::fdpass::MAX_PACKET_FROM_PROXY`]). nestd forwards them as
         /// `HostEventBody::EgressAudit`.
@@ -301,18 +380,34 @@ pub mod proxy {
             /// Human-readable detail; truncated to keep the packet under the size limit.
             detail: String,
         },
-        /// A handed-over listener failed (accept error). nestd may rebind and resend.
+        /// A handed-over listener failed (unusable fd, or a fatal accept error); the proxy has
+        /// closed its copy. If the sandbox still has it, nestd rebinds it under the same id and
+        /// resends it, a bounded number of times, then gives it up (docs/interfaces/host-internal/
+        /// nestd-proxy/, listener failures).
         ListenerFailed { sandbox: SandboxId, listener_id: u32, error: ErrorBody },
         Pong { nonce: u64, sandboxes: u32, active_connections: u32 },
         /// Protocol error; the sender closes the connection after this.
         Error { error: ErrorBody },
     }
 
+    /// Listeners of one sandbox that the proxy couldn't serve during a resync
+    /// ([`ProxyEvent::ResyncAck`]).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ResyncFailure {
+        pub sandbox: SandboxId,
+        pub listener_ids: Vec<u32>,
+    }
+
+    /// Bytes of `resync_ack.failed` (as JSON) one ack may carry: half of
+    /// [`super::fdpass::MAX_PACKET_FROM_PROXY`], leaving room for the rest of the packet. Failures
+    /// past it are left out; they leave the counts unexplained, and nestd resyncs.
+    pub const RESYNC_FAILURES_BYTES: usize = super::fdpass::MAX_PACKET_FROM_PROXY / 2;
+
     /// A pre-bound socket inside a sandbox's netns. Serialized flat:
     /// `{"id":5,"transport":"tcp","addr":"172.16.0.1:3128","purpose":"explicit","agent":"agt_…","slot":0}`.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ListenerSpec {
-        /// Unique per sandbox for the sandbox's lifetime on this host.
+        /// Unique on the host while nestd runs (never reused); a rebind keeps it.
         pub id: u32,
         pub transport: Transport,
         /// Bound address inside the netns, e.g. `172.16.0.1:443`.
@@ -1530,6 +1625,39 @@ mod tests {
             assert_eq!(got, ev);
             assert!(fds.is_empty());
             assert!(fdpass::recv::<proxy::ProxyEvent>(b.as_fd(), &mut buf, fdpass::MAX_PACKET_FROM_PROXY).unwrap().is_none());
+        }
+
+        /// fds that don't all arrive (`MSG_CTRUNC`, as when the receiver is out of descriptors)
+        /// leave the message whole and flag the loss, so one handover can fail alone.
+        #[test]
+        fn lost_fds_are_flagged_not_fatal() {
+            let (a, b) = seqpacket_pair();
+            // Room for one fd is padded to fit two on 64-bit, so send four.
+            let pairs: Vec<_> = (0..4).map(|_| UnixStream::pair().unwrap()).collect();
+            let msg = proxy::ProxyCommand::ListenersAdd {
+                sandbox: SandboxId("sbx_1".into()),
+                epoch: Epoch(4),
+                listeners: (1..=4)
+                    .map(|id| proxy::ListenerSpec { id, transport: proxy::Transport::Tcp, addr: format!("172.16.0.1:{id}"), purpose: proxy::ListenerPurpose::HttpTransparent })
+                    .collect(),
+            };
+            let fds: Vec<_> = pairs.iter().map(|(l, _)| l.as_fd()).collect();
+            fdpass::send(a.as_fd(), &msg, &fds).unwrap();
+            fdpass::send(a.as_fd(), &proxy::ProxyCommand::Ping { nonce: 1 }, &[]).unwrap();
+            drop(fds);
+            let peers: Vec<UnixStream> = pairs.into_iter().map(|(_, p)| p).collect(); // our ends of the passed sockets are closed
+            let mut buf = Vec::new();
+            let r: fdpass::Received<proxy::ProxyCommand> = fdpass::recv_with_room_for(b.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY).unwrap().unwrap();
+            assert!(r.fds_truncated && r.fds.is_empty());
+            assert_eq!(r.msg, msg);
+            // The fds that did arrive were closed, not leaked: the first passed socket's peer sees EOF.
+            let mut p0 = &peers[0];
+            p0.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut byte = [0u8; 1];
+            assert_eq!(p0.read(&mut byte).unwrap(), 0, "an installed fd leaked");
+            // The connection goes on.
+            let (next, _): (proxy::ProxyCommand, _) = fdpass::recv(b.as_fd(), &mut buf, fdpass::MAX_PACKET_TO_PROXY).unwrap().unwrap();
+            assert_eq!(next, proxy::ProxyCommand::Ping { nonce: 1 });
         }
 
         #[test]

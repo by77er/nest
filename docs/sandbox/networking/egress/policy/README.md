@@ -52,11 +52,12 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 ## Audit
 
-- **Every connection or request is logged** with sandbox, agent (if known), entry point (`via`), SNI/host, method, path (no query string), status, bytes, the decision, and the *name* of any binding used (never its value). Records are batched through nestd to the control plane and written to R2. Denials and alerts are also posted to the sandbox's `events` channel.
+- **Every connection or request is logged** with sandbox, agent (if known), entry point (`via`), SNI/host, method, path (no query string), status, bytes, the decision, and the *name* of any binding used (never its value). Records are batched through nestd to the control plane and written to R2 per sandbox and day, expired after 90 days by a lifecycle rule the `edge` stack sets ([data](../../../../data/)). Policy denials and alerts are also posted to the sandbox's `events` channel.
 - **Deny and alert records are aggregated per sandbox,** so a guest can't flood nestd, the control plane or its subscribers:
   - one record per distinct `(host, port, reason)` per minute, at most 128 distinct ones per minute
   - one alert per distinct `(kind, host, binding)` per minute, at most 32 per minute
-  - when a new minute starts, a summary record (host `*`, reason `suppressed: …`) reports what was dropped
+  - when a new minute starts, a summary record of kind `suppressed` (with the dropped deny and alert counts) reports what was dropped
 
-  Allowed traffic isn't aggregated; it's bounded by the connection limit.
-- **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `dns_non_public`, `connection_limit`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `injection_out_of_scope`, `injection_upgrade`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors. The wire list is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).
+  Allowed traffic isn't aggregated; it's bounded by the connection limit. The proxy is the one place that aggregates; nestd only rate-limits per sandbox.
+- **Only a denial by policy** (`not_allowed`, `dns_nxdomain`, `tcp_exception_not_in_policy`) becomes an `egress_denied` event: someone can grant it. Protocol refusals, upstream failures, limits and summaries stay in the audit log.
+- **Reason values** are `EgressReason`, defined once in `nest-protocol` and mirrored in the control plane: a fixed list of what this proxy emits, open on parse (an unknown string is kept as `other`); the table is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).

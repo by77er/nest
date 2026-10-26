@@ -19,12 +19,12 @@ import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import {
   type Capacity, type CommandBody, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
-  type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
+  type EgressAuditRecord, type EnrollResponse, type FenceCause, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
   type TunnelState,
 } from "../protocol/control";
 import type { GuestInfo } from "../protocol/gateway";
 import {
-  type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, type HostRole, PROTOCOL_VERSION, type Resources, type SandboxState,
+  type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, type HostRole, PROTOCOL_VERSION, type Resources, SandboxId, type SandboxState,
 } from "../protocol/model";
 
 type HostStatus = "active" | "draining" | "expired" | "stonith_pending" | "dead";
@@ -111,6 +111,13 @@ type Purpose = "stonith_fence" | null;
 
 const TOKEN_ROTATE_BEFORE_MS = 10 * 60_000;
 const COMMAND_RETENTION_MS = 24 * 3_600_000;
+/** How long a faulty host gets to suspend its sandboxes once it reports a `host_fault`. */
+const HOST_FAULT_DRAIN_MS = 120_000;
+/** Largest |ms| a JS Date can hold. */
+const MAX_DATE_MS = 8.64e15;
+/** A host-supplied timestamp, or `fallback` when it is no date at all: never throws. */
+const utcMs = (ms: number, fallback = Date.now()) => (Number.isSafeInteger(ms) && Math.abs(ms) <= MAX_DATE_MS ? ms : fallback);
+const utcDay = (ms: number, fallback: number) => new Date(utcMs(ms, utcMs(fallback))).toISOString().slice(0, 10);
 /**
  * How long a stale incarnation's salvage may take before FleetDO destroys it anyway: nestd gives a
  * salvage commit 600 s (`SALVAGE_TIMEOUT`), plus a margin.
@@ -854,13 +861,15 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * The holder fenced the sandbox itself (nestd self-fences when its host lease lapses): the VM is
-   * paused for good, so the sandbox is placed again (on any host, this one included) from its head,
-   * and the fenced incarnation is destroyed once its salvage is done.
+   * paused for good, so the sandbox is placed again from its head, and the fenced incarnation is
+   * destroyed once its salvage is done. After a lease lapse any host may take it, this one
+   * included; after `egress_lost` (the host could not serve its egress) this host is excluded.
    */
-  private async holderFenced(host: string, sandbox: string, epoch: number, clean: boolean): Promise<void> {
-    console.warn(`FleetDO: ${host} reports ${sandbox}@${epoch} fenced; placing it again`);
+  private async holderFenced(host: string, sandbox: string, epoch: number, clean: boolean, cause?: FenceCause): Promise<void> {
+    console.warn(`FleetDO: ${host} reports ${sandbox}@${epoch} fenced${cause ? ` (${cause})` : ""}; placing it again`);
     this.recordStale(sandbox, host, epoch, clean);
-    await this.queueReassign(host, [sandbox], false);
+    // The queue's `host_dead` flag is what makes SandboxDO exclude the host from the placement.
+    await this.queueReassign(host, [sandbox], cause === "egress_lost");
   }
 
   /** A strictly increasing number: orders capacity reports against leases' first states. */
@@ -989,6 +998,50 @@ export class FleetDO extends DurableObject<Env> {
     return !!lease && lease.host === host && !lease.expired && (epoch === undefined || lease.epoch === epoch);
   }
 
+  /**
+   * Whether `host` held `sandbox` at `epoch` at some point FleetDO still knows of: its lease now
+   * (expired or not), an incarnation recorded as stale there, or a command sent to it for that
+   * sandbox at that epoch (kept `COMMAND_RETENTION_MS`). A host cut off at its own epoch flushes
+   * what it buffered once it reconnects, after the lease moved on: that audit counts most.
+   */
+  private heldAt(host: string, sandbox: string, epoch: number): boolean {
+    const lease = this.lease(sandbox);
+    if (lease && lease.host === host && lease.epoch === epoch) return true;
+    return this.sql.exec(
+      `SELECT 1 FROM stale_incarnations WHERE sandbox = ? AND host = ? AND epoch = ?
+       UNION ALL SELECT 1 FROM commands WHERE sandbox = ? AND host = ? AND epoch = ? LIMIT 1`,
+      sandbox, host, epoch, sandbox, host, epoch).toArray().length > 0;
+  }
+
+  /**
+   * Egress audit goes to R2 as `audit/<sandbox>/<YYYY-MM-DD>/<epoch>-<host>-<ts_ms>-<digest>.jsonl`
+   * (UTC day of each record): one sandbox's history under one prefix whichever hosts served it, each
+   * incarnation's records told apart, and expired by the lifecycle rule on `audit/` (docs/data/).
+   * Records are kept from a host that held the sandbox at that epoch (`heldAt`). The object name
+   * ends in a digest of its content, so a batch the host resends overwrites instead of duplicating.
+   */
+  private async writeAudit(host: string, tsMs: number, records: EgressAuditRecord[]): Promise<void> {
+    const groups = new Map<string, EgressAuditRecord[]>();
+    const held = new Map<string, boolean>();
+    let dropped = 0;
+    for (const r of records) {
+      const who = `${r.sandbox}/${r.epoch}`;
+      if (!held.has(who)) held.set(who, SandboxId.safeParse(r.sandbox).success && this.heldAt(host, r.sandbox, r.epoch));
+      if (!held.get(who)) {
+        dropped++;
+        continue;
+      }
+      const key = `${r.sandbox}/${utcDay(r.ts_ms, tsMs)}/${r.epoch}-${host}`;
+      groups.set(key, [...(groups.get(key) ?? []), r]);
+    }
+    if (dropped) console.warn(`FleetDO: dropping ${dropped} egress audit record(s) from ${host}: it never held their sandbox at that epoch`);
+    for (const [key, rs] of groups) {
+      const body = rs.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      const digest = hex(await sha256(body)).slice(0, 32);
+      await this.env.BUCKET.put(`audit/${key}-${utcMs(tsMs)}-${digest}.jsonl`, body);
+    }
+  }
+
   private async handleEvent(host: string, ev: HostEvent): Promise<void> {
     switch (ev.type) {
       case "command_result":
@@ -1013,7 +1066,7 @@ export class FleetDO extends DurableObject<Env> {
         }
         this.recordState(host, ev.sandbox, ev.epoch, ev.state, ev.guest);
         await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.suspend_mode ?? null, ev.detail ?? null, ev.guest ?? null);
-        if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false);
+        if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false, ev.cause);
         // A draining host's sandboxes leave as soon as they're safely suspended.
         else if (ev.state === "suspended" && this.host(host)?.status === "draining") await this.evict(host, [ev.sandbox]);
         return;
@@ -1028,11 +1081,8 @@ export class FleetDO extends DurableObject<Env> {
         await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(ev.event.workstream)).ingest(ev.event);
         return;
       }
-      case "egress_audit": {
-        const body = ev.records.map((r) => JSON.stringify(r)).join("\n") + "\n";
-        await this.env.BUCKET.put(`audit/${host}/${ev.ts_ms}-${newId("")}.jsonl`, body);
-        return;
-      }
+      case "egress_audit":
+        return this.writeAudit(host, ev.ts_ms, ev.records);
       case "capacity":
         this.sql.exec("UPDATE hosts SET capacity = ?, capacity_seq = ? WHERE host = ?", JSON.stringify(ev.capacity), this.mark(), host);
         return;
@@ -1041,6 +1091,8 @@ export class FleetDO extends DurableObject<Env> {
         return;
       case "spot_notice":
         return this.drain(host, ev.deadline_ms);
+      case "host_fault":
+        return this.drain(host, Date.now() + HOST_FAULT_DRAIN_MS, `host fault (${ev.kind}): ${ev.detail}`);
       case "agent_exited":
         this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", ev.agent, host);
         await this.agentStub(ev.agent).onExited(host, ev.reason);
@@ -1537,13 +1589,14 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Forced drain (spot notice): no new placements; suspended sandboxes leave now, the rest are
-   * suspended to the object store and leave as they report `suspended`. SandboxDO re-places a
-   * sandbox whose agents are mid-turn at once; the others wait until something needs them.
+   * Forced drain (a spot notice, or the host reporting a fault): no new placements; suspended
+   * sandboxes leave now, the rest are suspended to the object store and leave as they report
+   * `suspended`. SandboxDO re-places a sandbox whose agents are mid-turn at once; the others wait
+   * until something needs them.
    */
-  private async drain(host: string, deadlineMs: number): Promise<void> {
+  private async drain(host: string, deadlineMs: number, why = "spot interruption"): Promise<void> {
     this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host);
-    console.warn(`FleetDO: ${host} draining (spot interruption at ${new Date(deadlineMs).toISOString()})`);
+    console.warn(`FleetDO: ${host} draining (${why}, by ${new Date(deadlineMs).toISOString()})`);
     const leases = this.leasesOf(host).filter((l) => !l.expired);
     await this.evict(host, leases.filter((l) => l.state === "suspended").map((l) => l.sandbox));
     const running = leases.filter((l) => l.state !== "suspended");

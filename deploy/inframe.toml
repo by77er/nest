@@ -14,7 +14,7 @@ version = "6.69.1"
 module_root = "Aws"
 
 # Cloudflare Access in front of nest's hostnames (the gateways, the dashboard, previews): the `edge`
-# stack. Trimmed to the three Access resource types.
+# stack, and the control plane's R2 bucket lifecycle. Trimmed to the resource types it uses.
 [providers.cloudflare]
 source = "cloudflare/cloudflare"
 version = "5.27.0"

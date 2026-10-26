@@ -32,6 +32,7 @@ pub async fn run(config: Config) -> Result<()> {
         config.resolver.clone(),
         UpstreamTls::new(config.webpki_roots, &config.extra_roots)?,
         config.allow_private_upstreams,
+        config.max_connections,
     ));
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -101,7 +102,7 @@ pub async fn serve(upstream: Arc<Upstream>, fd: OwnedFd) -> Result<()> {
             _ = session.cancel.cancelled() => break Err(anyhow::anyhow!("writer failed")),
             p = recv_packet(&fd, &mut buf) => p,
         };
-        let (cmd, fds) = match pkt {
+        let fdpass::Received { msg: cmd, fds, fds_truncated } = match pkt {
             Ok(Some(v)) => v,
             Ok(None) => break Ok(()),
             Err(e) => {
@@ -109,6 +110,15 @@ pub async fn serve(upstream: Arc<Upstream>, fd: OwnedFd) -> Result<()> {
                 break Err(e.into());
             }
         };
+        if fds_truncated {
+            // Out of descriptors, say: that handover fails alone, the session goes on.
+            if let Err(e) = handover_lost(&session, cmd) {
+                let msg = e.message.clone();
+                session.emit(ProxyEvent::Error { error: e });
+                break Err(anyhow::anyhow!(msg));
+            }
+            continue;
+        }
         if fds.len() != cmd.expected_fds() {
             let msg = format!("expected {} fds, got {}", cmd.expected_fds(), fds.len());
             protocol_error(&session, "invalid_message", &msg);
@@ -188,7 +198,7 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
             for (spec, fd) in listeners.into_iter().zip(fds) {
                 let id = spec.id;
                 if let Err(error) = listener::spawn(session, &sb, spec, fd) {
-                    session.emit(ProxyEvent::ListenerFailed { sandbox: sandbox.clone(), listener_id: id, error });
+                    session.listener_failed(&sandbox, id, error);
                 }
             }
         }
@@ -212,10 +222,12 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
         }
         ProxyCommand::ResyncComplete { sandboxes, listeners } => {
             let (n, m) = session.counts();
-            if (n, m) != (sandboxes, listeners) {
-                tracing::warn!(expected = ?(sandboxes, listeners), got = ?(n, m), "resync count mismatch");
+            let failed = session.finish_resync();
+            let nfailed: usize = failed.iter().map(|f| f.listener_ids.len()).sum();
+            if (n, m as usize + nfailed) != (sandboxes, listeners as usize) {
+                tracing::warn!(expected = ?(sandboxes, listeners), got = ?(n, m), nfailed, "resync count mismatch");
             }
-            session.emit(ProxyEvent::ResyncAck { sandboxes: n, listeners: m });
+            session.emit(ProxyEvent::ResyncAck { sandboxes: n, listeners: m, failed });
         }
         ProxyCommand::Ping { nonce } => {
             let (n, _) = session.counts();
@@ -225,10 +237,25 @@ fn handle(session: &Arc<Session>, cmd: ProxyCommand, fds: Vec<OwnedFd>) -> Resul
     Ok(())
 }
 
-async fn recv_packet(fd: &AsyncFd<OwnedFd>, buf: &mut Vec<u8>) -> io::Result<Option<(ProxyCommand, Vec<OwnedFd>)>> {
+/// A packet whose fds didn't arrive (`MSG_CTRUNC`): each listener it handed over is reported
+/// failed (nestd rebinds and resends it); any other such packet is a protocol error.
+pub(crate) fn handover_lost(session: &Session, cmd: ProxyCommand) -> Result<(), ErrorBody> {
+    match cmd {
+        ProxyCommand::ListenersAdd { sandbox, listeners, .. } => {
+            for spec in listeners {
+                let error = ErrorBody { code: "fds_lost".into(), message: "the listener's fd did not arrive (out of descriptors?)".into(), retryable: true };
+                session.listener_failed(&sandbox, spec.id, error);
+            }
+            Ok(())
+        }
+        _ => Err(ErrorBody { code: "invalid_message".into(), message: "control data truncated on a packet without fds".into(), retryable: false }),
+    }
+}
+
+async fn recv_packet(fd: &AsyncFd<OwnedFd>, buf: &mut Vec<u8>) -> io::Result<Option<fdpass::Received<ProxyCommand>>> {
     loop {
         let mut guard = fd.readable().await?;
-        match guard.try_io(|inner| fdpass::recv(inner.get_ref().as_fd(), buf, MAX_PACKET_TO_PROXY)) {
+        match guard.try_io(|inner| fdpass::recv_lenient(inner.get_ref().as_fd(), buf, MAX_PACKET_TO_PROXY)) {
             Ok(r) => return r,
             Err(_would_block) => continue,
         }

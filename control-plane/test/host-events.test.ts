@@ -2,6 +2,7 @@
 // wire (an older nestd's free text still parses).
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { SandboxId } from "../src/protocol/model";
 import { adminJson, connectHost, nextCommands, sendEvents, uniqueCell } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
@@ -69,5 +70,98 @@ describe("agent_exited reasons", () => {
     const seq = exited(host.ws, agent, "fenced");
     await host.ws.next("ack", (m) => m.up_to === seq);
     await nextCommands(host.ws, isStart(agent));
+  });
+});
+
+describe("egress audit in R2", () => {
+  const record = (sandbox: string, epoch: number, ts: number, host: string) => ({
+    sandbox, epoch, ts_ms: ts, host, port: 443, bytes_up: 0, bytes_down: 0, verdict: "deny", reason: "not_allowed",
+  });
+  async function auditUnder(prefix: string): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    for (const o of (await env.BUCKET.list({ prefix })).objects) out[o.key] = await (await env.BUCKET.get(o.key))!.text();
+    return out;
+  }
+  async function placed() {
+    const cell = uniqueCell();
+    const holder = await connectHost(cell);
+    const ws = (await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "audit" } }, 201)).workstream;
+    const sbx = await adminJson<{ sandbox: string; host: string }>("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    expect(sbx.host).toBe(holder.host);
+    await nextCommands(holder.ws, (c) => c.type === "sandbox_create");
+    const other = await connectHost(cell);
+    return { cell, holder, other, sandbox: sbx.sandbox };
+  }
+  const audit = async (h: Awaited<ReturnType<typeof connectHost>>, ts: number, records: unknown[]) => {
+    const seq = sendEvents(h.ws, [{ ts_ms: ts, type: "egress_audit", records }]);
+    await h.ws.next("ack", (m) => m.up_to === seq);
+  };
+  const day1 = Date.UTC(2026, 9, 24, 23, 59);
+  const day2 = Date.UTC(2026, 9, 25, 0, 1);
+
+  it("is written per sandbox, UTC day, epoch and host, only from a host that held the sandbox at that epoch", async () => {
+    const { holder, other, sandbox } = await placed();
+    await audit(holder, day2, [record(sandbox, 1, day1, "a.example"), record(sandbox, 1, day2, "b.example"), record(sandbox, 2, day2, "never-held-epoch.example")]);
+    await audit(other, day2, [record(sandbox, 1, day2, "never-held-host.example")]);
+    const objects = await auditUnder(`audit/${sandbox}/`);
+    const keys = Object.keys(objects);
+    expect(keys).toHaveLength(2);
+    expect(keys.find((k) => k.startsWith(`audit/${sandbox}/2026-10-24/1-${holder.host}-${day2}-`))).toBeDefined();
+    expect(objects[keys.find((k) => k.includes("/2026-10-25/"))!]).toContain("b.example");
+    const all = Object.values(objects).join("");
+    expect(all).not.toContain("never-held-epoch.example");
+    expect(all).not.toContain("never-held-host.example");
+  });
+
+  it("keeps what a cut-off host buffered at its own epoch after the lease moved on", async () => {
+    const { cell, holder, other, sandbox } = await placed();
+    // The lease moves to another host at a newer epoch while the holder is partitioned.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE leases SET host = ?, epoch = 2 WHERE sandbox = ?", other.host, sandbox);
+    });
+    await audit(holder, day2, [record(sandbox, 1, day2, "zombie-buffered.example")]);
+    await audit(other, day2, [record(sandbox, 1, day2, "other-at-old-epoch.example")]);
+    const all = Object.values(await auditUnder(`audit/${sandbox}/`)).join("");
+    expect(all).toContain("zombie-buffered.example");
+    expect(all).not.toContain("other-at-old-epoch.example");
+  });
+
+  it("keeps a host's audit for an incarnation FleetDO recorded as stale there, or destroyed by a command it sent", async () => {
+    const { cell, holder, other, sandbox } = await placed();
+    const exec = (sql: string, ...args: unknown[]) =>
+      runInDurableObject(fleetStub(cell), (_i, st) => {
+        st.storage.sql.exec(sql, ...args);
+      });
+    // The lease moved on and FleetDO no longer has the create command: only the stale row is left.
+    await exec("UPDATE leases SET host = ?, epoch = 2 WHERE sandbox = ?", other.host, sandbox);
+    await exec("DELETE FROM commands WHERE sandbox = ?", sandbox);
+    await audit(holder, day2, [record(sandbox, 1, day2, "nothing-left.example")]);
+    await exec("INSERT INTO stale_incarnations (sandbox, host, epoch, first_seen_ms) VALUES (?, ?, 1, ?)", sandbox, holder.host, Date.now());
+    await audit(holder, day2, [record(sandbox, 1, day2, "stale-row.example")]);
+    // Destroyed: the stale row is gone once reaped; the destroy command it sent remains (24 h).
+    await exec("DELETE FROM stale_incarnations WHERE sandbox = ?", sandbox);
+    await exec(
+      "INSERT INTO commands (cmd, host, type, sandbox, epoch, body, issued_ms) VALUES ('cmd_destroy1', ?, 'sandbox_destroy', ?, 1, '{}', ?)",
+      holder.host, sandbox, Date.now());
+    await audit(holder, day2, [record(sandbox, 1, day2, "after-destroy.example")]);
+    const all = Object.values(await auditUnder(`audit/${sandbox}/`)).join("");
+    expect(all).not.toContain("nothing-left.example");
+    expect(all).toContain("stale-row.example");
+    expect(all).toContain("after-destroy.example");
+  });
+
+  it("a resent batch overwrites itself, and a timestamp no Date can hold is still written (never nacked)", async () => {
+    const { holder, sandbox } = await placed();
+    const batch = [record(sandbox, 1, day2, "twice.example")];
+    await audit(holder, day2, batch);
+    await audit(holder, day2, batch);
+    expect(Object.keys(await auditUnder(`audit/${sandbox}/`))).toHaveLength(1);
+    await audit(holder, 9e15, [record(sandbox, 1, 9e15, "far-future.example")]);
+    expect(Object.values(await auditUnder(`audit/${sandbox}/`)).join("")).toContain("far-future.example");
+  });
+
+  it("a sandbox id is lowercase letters and digits after `sbx_`, since it names R2 keys", () => {
+    for (const bad of ["sbx_../x", "sbx_A1", "sbx_", "sbx_a-b", `sbx_${"a".repeat(65)}`]) expect(SandboxId.safeParse(bad).success, bad).toBe(false);
+    expect(SandboxId.safeParse("sbx_01jb7m2a4c").success).toBe(true);
   });
 });

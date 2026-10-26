@@ -33,7 +33,7 @@ accept (listener ⇒ sandbox [, agent])
 | Hard deny, policy layers, live re-checks, temporary grants, TCP exceptions, limits, audit | [policy/](policy/) |
 | Placeholder credential injection, binding scope, GitHub App | [injection/](injection/) |
 
-**Late pushes can't revive a dropped sandbox:** the proxy remembers `sandbox_drop` per epoch and refuses policy, secrets and listeners for that epoch or older, so a fence racing sandbox setup stays fenced. A newer epoch (re-placement) is accepted.
+**Late pushes can't revive a fenced sandbox:** the proxy remembers a fencing `sandbox_drop` per epoch and refuses policy, secrets and listeners for that epoch or older, so a fence racing sandbox setup stays fenced. A newer epoch (re-placement) is accepted, and so is the same epoch after a teardown (a failed create is retried at it).
 
 **Fails closed:** if nest-proxy dies, sandboxes have no egress. systemd restarts it, and nestd hands back every listener (connections wait in the kernel's accept queue meanwhile).
 

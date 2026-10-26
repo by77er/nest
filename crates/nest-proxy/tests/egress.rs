@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use common::*;
-use nest_protocol::control::{EgressVerdict, EgressVia};
+use nest_protocol::control::{EgressReason, EgressVerdict, EgressVia};
 use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyCommand, ProxyEvent};
 use nest_protocol::model::Epoch;
 
@@ -355,7 +355,7 @@ async fn websocket_upgrade_through_inspection() {
     tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut buf)).await.unwrap().unwrap();
     assert_eq!(&buf, b"frame-bytes");
     drop(tls);
-    env.conn.wait(|e| audit_with(e, |r| r.status == Some(101) && r.reason.as_deref() == Some("upgraded"))).await;
+    env.conn.wait(|e| audit_with(e, |r| r.status == Some(101) && r.reason == Some(EgressReason::Upgraded))).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

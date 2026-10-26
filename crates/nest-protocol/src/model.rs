@@ -3,8 +3,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Whether `s` is `prefix` followed by a suffix; a `strict` id's suffix is 1–64 lowercase ASCII
+/// letters or digits (what the control plane's `newId` makes), since it shapes object keys.
+fn valid_id(s: &str, prefix: &str, strict: bool) -> bool {
+    s.strip_prefix(prefix)
+        .is_some_and(|rest| !strict || (!rest.is_empty() && rest.len() <= 64 && rest.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())))
+}
+
 macro_rules! id_type {
     ($name:ident, $prefix:literal) => {
+        id_type!($name, $prefix, false, concat!("expected an id starting with `", $prefix, "`"));
+    };
+    ($name:ident, $prefix:literal, strict) => {
+        id_type!($name, $prefix, true, concat!("expected `", $prefix, "` and 1-64 lowercase letters or digits"));
+    };
+    ($name:ident, $prefix:literal, $strict:literal, $expected:expr) => {
         #[doc = concat!("Opaque identifier, rendered as `", $prefix, "<suffix>`.")]
         ///
         /// Deserializing checks the prefix (the same check the control plane's schemas make), so a
@@ -20,18 +33,18 @@ macro_rules! id_type {
             /// Whether the id carries its kind's prefix: what deserializing enforces. Values built
             /// in code with the tuple constructor are not checked.
             pub fn is_valid(&self) -> bool {
-                self.0.starts_with(Self::PREFIX)
+                valid_id(&self.0, $prefix, $strict)
             }
         }
 
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 let s = String::deserialize(d)?;
-                if s.starts_with($prefix) {
+                if valid_id(&s, $prefix, $strict) {
                     Ok(Self(s))
                 } else {
                     // Not echoed: the value comes from an untrusted sender and may be large.
-                    Err(serde::de::Error::custom(concat!("expected an id starting with `", $prefix, "`")))
+                    Err(serde::de::Error::custom($expected))
                 }
             }
         }
@@ -45,7 +58,7 @@ macro_rules! id_type {
 }
 
 id_type!(HostId, "hst_");
-id_type!(SandboxId, "sbx_");
+id_type!(SandboxId, "sbx_", strict);
 id_type!(AgentId, "agt_");
 id_type!(WorkstreamId, "ws_");
 id_type!(GenerationId, "gen_");
@@ -528,7 +541,7 @@ pub enum WorkstreamEventKind {
 }
 
 /// Why nest-proxy raised an egress alert (`WorkstreamEventKind::EgressAlert.reason`): nest-proxy's
-/// `host::proxy::AlertKind`, plus a catch-all. Open: a member this build doesn't know (a newer
+/// `host::proxy::AlertKind`, nestd's `listener_lost`, plus a catch-all. Open: a member this build doesn't know (a newer
 /// sender, or free text from an older one) parses as `unknown` instead of failing the event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
@@ -536,6 +549,10 @@ pub enum EgressAlertReason {
     PlaceholderWrongHost,
     DomainFronting,
     InjectionAfterExpiry,
+    /// nestd's own, not nest-proxy's: a TCP exception or agent's explicit proxy listener failed
+    /// and could not be bound again (`host` names the rule or the address). The next policy update
+    /// that keeps the rule, or the agent's next attach, binds it again.
+    ListenerLost,
     /// Deserialize-only fallback; never sent by this build.
     #[serde(other)]
     Unknown,

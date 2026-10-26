@@ -88,6 +88,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
   - **`a_fenced_epoch_stays_stale_until_a_newer_epoch_runs`** (nestd review #12)
   - `a_restarted_nestd_tears_down_leftover_netns_mounts` (in a user namespace): a netns bind mount left under `persist_dir` is gone when `Host::start` returns
   - `netns_listeners_handed_to_proxy` (in a user namespace): real netns, tap0 and nft; five listeners reach the fake proxy, and its copy of `:443` accepts a connection made inside the sandbox netns.
+  - Listener recovery (in a user namespace, a running sandbox): a failed listener is rebound under its id and serves (`a_failed_listener_is_rebound_in_the_netns`); one removed by `policy_update` or `agent_detach` while its rebind waits, or while it binds, is not restored (`a_listener_removed_during_its_rebind_is_not_restored`, `a_listener_removed_while_it_binds_is_not_handed_over`); one that can't be bound again raises `egress_alert{listener_lost}` (a TCP exception) or fences the sandbox with `egress_lost` (`:443`) (`a_listener_that_cannot_be_rebound_is_given_up_with_an_event`); losses in two sandboxes are a `host_fault` (`listener_losses_in_several_sandboxes_are_a_host_fault`); a report from an old proxy connection, or about a replaced incarnation, is ignored (`a_failure_from_an_old_proxy_connection_is_ignored`, `a_failure_of_a_replaced_incarnation_is_ignored`).
 
 ## Not implemented yet (TODO)
 
