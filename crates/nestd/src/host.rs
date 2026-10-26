@@ -801,19 +801,13 @@ impl Inner {
                                 self.fence_current(s, reason).await;
                             }
                         }
-                        // A gateway floor and a kill take effect at once too: a superseded brain
-                        // loses its hands, and its process, without waiting behind slow commands.
-                        CommandBody::ClientFloor { sandbox, epoch, agent, agent_epoch } => {
-                            let gateway = self.gateway.clone();
-                            let (sandbox, epoch, client, agent_epoch) = (sandbox.clone(), *epoch, agent.0.clone(), *agent_epoch);
-                            tokio::spawn(async move {
-                                if let Err(e) = gateway.apply_floor(&sandbox, epoch, &client, agent_epoch).await {
-                                    tracing::warn!(%sandbox, %client, error = %e, "gateway floor not applied on arrival");
-                                }
-                            });
-                        }
-                        CommandBody::AgentStop { agent, reason, mode: Some(StopMode::Kill), .. } => {
-                            self.runner.agent_stop(agent, StopMode::Kill, reason);
+                        // A kill takes effect at once too, not behind slow commands: AgentDO starts the
+                        // agent elsewhere only once this brain's exit is reported. Its epoch is
+                        // remembered, so a start at or below it still queued here never runs; a brain
+                        // that isn't running here is reported exited now.
+                        CommandBody::AgentStop { agent, reason, mode: Some(StopMode::Kill), epoch } if !self.runner.kill(agent, *epoch, reason) => {
+                            let epoch = epoch.or_else(|| self.runner.epoch_of(agent));
+                            self.emit(HostEventBody::AgentExited { agent: agent.clone(), exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Stopped, epoch });
                         }
                         _ => {}
                     }
@@ -1394,19 +1388,7 @@ impl Inner {
             // Resolved on receipt (see `on_fleet_notice`).
             CommandBody::CommitResult { .. } | CommandBody::GuestCliResult { .. } => Ok(None),
             CommandBody::AgentStart(start) => self.agent_start(start).await,
-            CommandBody::AgentAttach { sandbox, epoch, agent, cwd, agent_epoch } => {
-                // The floor it carries is in effect before the slot work, whatever that answers:
-                // its `ok` confirms the floor too.
-                if let Some(e) = agent_epoch {
-                    self.gateway.apply_floor(&sandbox, epoch, &agent.0, e).await.map_err(|m| error(error_codes::INTERNAL, m, true))?;
-                }
-                self.agent_attach(&sandbox, epoch, &agent, cwd).await
-            }
-            // Applied on arrival (`on_fleet_notice`); in order it returns once the gateway confirmed it.
-            CommandBody::ClientFloor { sandbox, epoch, agent, agent_epoch } => {
-                self.gateway.apply_floor(&sandbox, epoch, &agent.0, agent_epoch).await.map_err(|m| error(error_codes::INTERNAL, m, true))?;
-                Ok(None)
-            }
+            CommandBody::AgentAttach { sandbox, epoch, agent, cwd } => self.agent_attach(&sandbox, epoch, &agent, cwd).await,
             CommandBody::AgentDetach { sandbox, epoch, agent, kill_processes } => self.agent_detach(&sandbox, epoch, &agent, kill_processes).await,
             // A kill was applied on arrival; a graceful stop (or one from the previous release) goes in order.
             CommandBody::AgentStop { mode: Some(StopMode::Kill), .. } => Ok(None),
@@ -1656,10 +1638,6 @@ impl Inner {
         // No tombstone here: a failed create is retried at the same epoch, and a destroy, archive
         // or move ends the sandbox's time here without fencing it. Only a fence tombstones.
         self.gateway.forget(id);
-        // The sandbox leaves this host: its floors go with it (a fenced one keeps them; they only grow).
-        if !reason.tombstones() {
-            self.gateway.drop_floors(id);
-        }
         if let Some(epoch) = epoch {
             self.pausers.remove(id, epoch);
         }
@@ -1944,6 +1922,12 @@ impl Inner {
     /// nestd only remembers which sandbox the brain is bound to, for fencing.
     async fn agent_start(self: &Arc<Self>, start: nest_protocol::control::AgentStart) -> CmdResult {
         let agent = start.agent.clone();
+        // A kill for this epoch (or a later one) overtook it: it never runs, and its exit says so.
+        let epoch = start.agent_epoch();
+        if self.runner.killed_at_or_above(&agent, epoch) {
+            self.emit(HostEventBody::AgentExited { agent, exit_code: None, signal: None, reason: nest_protocol::control::AgentExitReason::Fenced, epoch: Some(epoch) });
+            return Err(error(error_codes::STALE_EPOCH, "a kill for this agent epoch arrived first", false));
+        }
         let config_dir = self.cfg.agents_dir().join(&agent.0);
         std::fs::create_dir_all(&config_dir).map_err(internal)?;
         let dispatched = self.runner.agent_start(RunnerAgentStart { start, config_dir: config_dir.display().to_string() });
@@ -2280,7 +2264,6 @@ fn command_kind(b: &CommandBody) -> &'static str {
         CommandBody::AgentAttach { .. } => "agent_attach",
         CommandBody::AgentDetach { .. } => "agent_detach",
         CommandBody::AgentStop { .. } => "agent_stop",
-        CommandBody::ClientFloor { .. } => "client_floor",
         CommandBody::Fence { .. } => "fence",
         CommandBody::Drain { .. } => "drain",
     }

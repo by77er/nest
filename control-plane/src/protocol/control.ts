@@ -125,12 +125,7 @@ export const HostHello = z.object({
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
   capacity: Capacity,
-  /** Optional behaviours this host implements (`HOST_CAPABILITIES`); absent from the previous release's nestd. */
-  capabilities: z.array(z.string()).optional(),
 });
-
-/** `HostHello.capabilities` names (`control::host_capabilities`). */
-export const HOST_CAPABILITIES = { CLIENT_FLOOR: "client_floor", STOP_KILL: "stop_kill" } as const;
 
 export const LeaseTiming = z.object({
   heartbeat_ms: U64,
@@ -231,16 +226,13 @@ export const CommandBodyVariants = [
   z.object({ type: z.literal("commit_result"), request: RequestId, sandbox: SandboxId, outcome: CommitOutcome }),
   z.object({ type: z.literal("guest_cli_result"), request: RequestId, result: CliResult }),
   z.object({ type: z.literal("agent_start"), ...AgentStartFields }),
-  /** `agent_epoch`: the agent's current agent epoch, the gateway's floor for this client from now on. */
-  z.object({
-    type: z.literal("agent_attach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, cwd: z.string().optional(),
-    agent_epoch: Epoch.optional(),
-  }),
+  z.object({ type: z.literal("agent_attach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, cwd: z.string().optional() }),
   z.object({ type: z.literal("agent_detach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, kill_processes: z.boolean().default(false) }),
-  /** `mode`: absent = graceful (all the previous release's nestd does); `epoch`: the newest agent epoch this stop ends there. */
+  /**
+   * `mode`: absent = graceful (all the previous release's nestd does); `kill` is applied on arrival.
+   * `epoch`: the newest agent epoch it ends; nestd refuses a later start at or below it.
+   */
   z.object({ type: z.literal("agent_stop"), agent: AgentId, reason: z.string(), mode: StopMode.optional(), epoch: Epoch.optional() }),
-  /** Raise the gateway's agent-epoch floor for `agent`; applied on arrival, `ok` once the gateway confirmed it. Only to hosts with `client_floor`. */
-  z.object({ type: z.literal("client_floor"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, agent_epoch: Epoch }),
   z.object({ type: z.literal("fence"), sandboxes: z.array(SandboxId), reason: z.string() }),
   z.object({ type: z.literal("drain"), reason: z.string(), deadline_ms: TimestampMs }),
 ] as const;

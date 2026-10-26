@@ -1,6 +1,6 @@
 //! What nestd tells the gateway, and the open connections it may have to cut.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -28,16 +28,11 @@ pub struct Snapshot {
     pub key: Option<Vec<u8>>,
     pub entry: Option<SandboxEntry>,
     pub resyncing: bool,
-    /// The sandbox's per-client agent-epoch floors (see [`State::raise_floors`]).
-    pub floors: BTreeMap<String, Epoch>,
 }
 
 struct Conn {
     sandbox: SandboxId,
     epoch: Epoch,
-    /// The binding's client and agent epoch (absent: 0), so a raised floor can cut it.
-    client: String,
-    agent_epoch: Epoch,
     close: watch::Sender<Option<u16>>,
 }
 
@@ -47,9 +42,6 @@ struct Inner {
     /// stable, and a bind after the loss must be `moved`, not `unknown_key`.
     keys: HashMap<String, Vec<u8>>,
     sandboxes: HashMap<SandboxId, SandboxEntry>,
-    /// Per sandbox, per client, the lowest agent epoch a binding may carry. Only ever raised;
-    /// dropped with the sandbox. Kept apart from the entry, which every upsert replaces.
-    floors: HashMap<SandboxId, BTreeMap<String, Epoch>>,
     /// Between `hello_ack` and `resync_done`: unknown sandboxes are `busy`, not `moved`.
     resyncing: bool,
     generation: u64,
@@ -131,24 +123,7 @@ impl State {
     /// Everything one bind check needs, read under one lock.
     pub fn snapshot(&self, kid: &str, sandbox: &SandboxId) -> Snapshot {
         let g = self.read();
-        Snapshot {
-            key: g.keys.get(kid).cloned(),
-            entry: g.sandboxes.get(sandbox).cloned(),
-            resyncing: g.resyncing,
-            floors: g.floors.get(sandbox).cloned().unwrap_or_default(),
-        }
-    }
-
-    /// Raise clients' agent-epoch floors on a sandbox (a lower value than the one held changes
-    /// nothing). A raise cuts that client's open connections whose binding is below it
-    /// (`close_code::MOVED`: the call may have run): a superseded brain loses its hands at once.
-    pub fn raise_floors(&self, sandbox: &SandboxId, floors: impl IntoIterator<Item = (String, Epoch)>) {
-        raise_locked(&mut self.write(), sandbox, floors);
-    }
-
-    /// The floor for one client (0 when none was set).
-    pub fn floor(&self, sandbox: &SandboxId, client: &str) -> Epoch {
-        self.read().floors.get(sandbox).and_then(|f| f.get(client)).copied().unwrap_or(Epoch(0))
+        Snapshot { key: g.keys.get(kid).cloned(), entry: g.sandboxes.get(sandbox).cloned(), resyncing: g.resyncing }
     }
 
     /// Add or replace a sandbox. A newer epoch cuts every connection of the old one
@@ -164,25 +139,8 @@ impl State {
         clients: impl IntoIterator<Item = impl Into<String>>,
         guest: Option<GuestInfo>,
     ) {
-        self.upsert_sandbox_with_floors(sandbox, epoch, vsock_uds_path, clients, guest, BTreeMap::new());
-    }
-
-    /// [`State::upsert_sandbox`] with the clients' agent-epoch floors, raised under the same lock
-    /// before the entry is (re)inserted: no bind can see the entry without its floors.
-    pub fn upsert_sandbox_with_floors(
-        &self,
-        sandbox: SandboxId,
-        epoch: Epoch,
-        vsock_uds_path: PathBuf,
-        clients: impl IntoIterator<Item = impl Into<String>>,
-        guest: Option<GuestInfo>,
-        floors: BTreeMap<String, Epoch>,
-    ) {
         let clients: BTreeSet<String> = clients.into_iter().map(Into::into).collect();
         let mut g = self.write();
-        if !floors.is_empty() {
-            raise_locked(&mut g, &sandbox, floors);
-        }
         let generation = g.generation;
         let old_epoch = g.sandboxes.get(&sandbox).map(|e| e.epoch);
         if let Some(old) = old_epoch
@@ -203,7 +161,6 @@ impl State {
     pub fn remove_sandbox(&self, sandbox: &SandboxId) {
         let mut g = self.write();
         g.sandboxes.remove(sandbox);
-        g.floors.remove(sandbox);
         close_matching(&mut g, |c| &c.sandbox == sandbox, close_code::MOVED);
         tracing::info!(sandbox = %sandbox.0, "sandbox removed");
     }
@@ -213,7 +170,6 @@ impl State {
     pub fn clear(&self) {
         let mut g = self.write();
         g.sandboxes.clear();
-        g.floors.clear();
         g.resyncing = false;
         close_matching(&mut g, |_| true, close_code::MOVED);
     }
@@ -234,7 +190,6 @@ impl State {
             g.sandboxes.iter().filter(|(_, e)| e.generation < current).map(|(id, _)| id.clone()).collect();
         for id in stale {
             g.sandboxes.remove(&id);
-            g.floors.remove(&id);
             close_matching(&mut g, |c| c.sandbox == id, close_code::MOVED);
         }
         g.resyncing = false;
@@ -256,44 +211,19 @@ impl State {
     /// check that the sandbox is still here at this epoch happens under the same lock, so a
     /// change between the bind check and this call cannot slip through: `None` means refuse.
     pub fn register_conn(self: &Arc<Self>, sandbox: SandboxId, epoch: Epoch) -> Option<ConnGuard> {
-        self.register_client_conn(sandbox, epoch, "", Epoch(u64::MAX))
-    }
-
-    /// [`State::register_conn`] for a binding's client and agent epoch: also refused when a
-    /// floor raised since the bind check is above `agent_epoch`, and cut by a later raise.
-    pub fn register_client_conn(self: &Arc<Self>, sandbox: SandboxId, epoch: Epoch, client: &str, agent_epoch: Epoch) -> Option<ConnGuard> {
         let (tx, rx) = watch::channel(None);
         let mut g = self.write();
         if g.sandboxes.get(&sandbox).map(|e| e.epoch) != Some(epoch) {
             return None;
         }
-        if g.floors.get(&sandbox).and_then(|f| f.get(client)).is_some_and(|floor| agent_epoch.0 < floor.0) {
-            return None;
-        }
         let id = g.next_conn;
         g.next_conn += 1;
-        g.conns.insert(id, Conn { sandbox, epoch, client: client.to_string(), agent_epoch, close: tx });
+        g.conns.insert(id, Conn { sandbox, epoch, close: tx });
         Some(ConnGuard { id, state: Arc::clone(self), rx })
     }
 
     pub fn open_connections(&self) -> usize {
         self.read().conns.len()
-    }
-}
-
-fn raise_locked(g: &mut Inner, sandbox: &SandboxId, floors: impl IntoIterator<Item = (String, Epoch)>) {
-    let mut raised = vec![];
-    let held = g.floors.entry(sandbox.clone()).or_default();
-    for (client, floor) in floors {
-        let cur = held.entry(client.clone()).or_insert(Epoch(0));
-        if floor.0 > cur.0 {
-            *cur = floor;
-            raised.push((client, floor));
-        }
-    }
-    for (client, floor) in raised {
-        tracing::info!(sandbox = %sandbox.0, client = %client, floor = floor.0, "client floor raised");
-        close_matching(g, |c| &c.sandbox == sandbox && c.client == client && c.agent_epoch.0 < floor.0, close_code::MOVED);
     }
 }
 

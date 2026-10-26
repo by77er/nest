@@ -114,13 +114,9 @@ pub async fn session(
                 tracing::info!(keys = decoded.len(), "binding keys updated");
                 state.set_keys(decoded);
             }
-            GatewayCommand::SandboxUpsert { sandbox, epoch, vsock_uds_path, clients, guest, client_floors } => {
+            GatewayCommand::SandboxUpsert { sandbox, epoch, vsock_uds_path, clients, guest } => {
                 tracing::debug!(sandbox = %sandbox.0, epoch = epoch.0, clients = clients.len(), guest = guest.is_some(), "sandbox upsert");
-                state.upsert_sandbox_with_floors(sandbox, epoch, PathBuf::from(vsock_uds_path), clients, guest, client_floors);
-            }
-            GatewayCommand::ClientFloor { sandbox, client, agent_epoch } => {
-                state.raise_floors(&sandbox, [(client.clone(), agent_epoch)]);
-                write(&mut stream, &GatewayEvent::FloorApplied { sandbox, client, agent_epoch }).await?;
+                state.upsert_sandbox(sandbox, epoch, PathBuf::from(vsock_uds_path), clients, guest);
             }
             GatewayCommand::SandboxRemove { sandbox } => {
                 tracing::debug!(sandbox = %sandbox.0, "sandbox removed");

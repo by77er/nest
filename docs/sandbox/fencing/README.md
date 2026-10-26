@@ -28,7 +28,7 @@ Every STONITH records each sandbox's loss explicitly ("work since generation G a
 
 ## 4. External side effects
 
-- Every sandbox event and commit carries `(sandbox, epoch)`, every hands call carries the sandbox epoch and the agent epoch inside its binding (the gateway refuses an agent epoch below the client's floor), and platform tool calls carry the agent epoch; stale ones are rejected.
+- Every sandbox event and commit carries `(sandbox, epoch)`, every hands call carries the sandbox epoch inside its binding, and platform tool calls carry the agent epoch; stale ones are rejected. A superseded brain is gone before its agent's next brain starts elsewhere ([AgentDO](../../control-plane/durable-objects/agent/)).
 - Brokered actions carry `(agent, epoch, call_id)`, rejected when stale, and use a natural idempotency key for the external effect (e.g. `(repo, head_sha)`).
 - A `PreToolUse` gate blocks, for example, `git push` from a stale sandbox epoch; the runner knows the epoch from its binding.
 - Pushes use `--force-with-lease` (a template convention).

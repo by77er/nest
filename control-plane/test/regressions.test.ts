@@ -620,8 +620,15 @@ describe("docs #8 hello.agents reconciliation", () => {
     again.send(hostHello(s.host.host, s.cell, { agents: [] }));
     await again.next("hello_ack");
     await sleep(50);
-    expect((await agentStub(s.agent).info()).state).toBe("detached");
+    // Gone, at its start's epoch: the agent no longer has a host there.
+    expect(await agentStub(s.agent).info()).toMatchObject({ state: "detached", host: null });
 
+    // A brain AgentDO took for detached that the host does report is kept.
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.host = s.host.host;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
     const third = await Ws.connect("/v1/fleet", s.host.host_token);
     third.send(hostHello(s.host.host, s.cell, { agents: [{ agent: s.agent, state: "idle" }] }));
     await third.next("hello_ack");

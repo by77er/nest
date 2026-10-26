@@ -7,7 +7,7 @@ use nest_protocol::gateway::{
     BindingClaims, BindingParseError, BindingScope, GatewayMessage, GuestInfo, MIN_SUPPORTED_PROTOCOL_VERSION,
     PROTOCOL_VERSION, error_code, parse_binding,
 };
-use nest_protocol::model::{Epoch, ErrorBody};
+use nest_protocol::model::ErrorBody;
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 
 use crate::state::State;
@@ -55,8 +55,7 @@ pub struct Accepted {
 /// Check a `bind` against one snapshot of the state. Precedence (the first failing check wins):
 /// gateway version → token shape → claims version → key id → signature, expiry, scope →
 /// sandbox known (`moved`, or `busy` during a resync) → epoch older (`stale_epoch`) or newer
-/// (`busy`) → client attached → agent epoch below the client's floor (`stale_epoch`) → guest
-/// known (`busy`) → guest version. The attached set is
+/// (`busy`) → client attached → guest known (`busy`) → guest version. The attached set is
 /// checked only once the sandbox and epoch are known, since it belongs to that sandbox.
 pub fn check_bind(
     state: &State,
@@ -104,11 +103,6 @@ pub fn check_bind(
     }
     if !entry.clients.contains(&claims.client) {
         return Err(unauthorized());
-    }
-    // A binding minted for a superseded brain start (or by a control plane that predates the
-    // claim, counting as 0) is below the client's floor once a newer start was announced.
-    if snap.floors.get(&claims.client).is_some_and(|floor| claims.agent_epoch.unwrap_or(Epoch(0)).0 < floor.0) {
-        return Err(Refusal::new(error_code::STALE_EPOCH, "binding is for a superseded brain"));
     }
     let Some(guest) = entry.guest else {
         return Err(Refusal::busy("guest not configured yet"));

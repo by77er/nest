@@ -257,7 +257,6 @@ impl State {
             sandboxes,
             agents,
             capacity,
-            capabilities: nest_protocol::control::host_capabilities::ALL.iter().map(|c| c.to_string()).collect(),
         }));
         let hello_sent = Instant::now();
         let hello_sent_boot = crate::util::boottime();

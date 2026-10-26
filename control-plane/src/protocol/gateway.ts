@@ -51,8 +51,6 @@ export const BindingClaims = z.object({
   client: z.string(),
   scope: BindingScope,
   exp_ms: TimestampMs,
-  /** The agent epoch of the brain it was minted for; the gateway refuses it below the client's floor. */
-  agent_epoch: Epoch.optional(),
 });
 export type BindingClaims = z.output<typeof BindingClaims>;
 

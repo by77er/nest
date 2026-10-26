@@ -69,33 +69,8 @@ struct State {
     /// The host's fenced epochs (shared with the proxy link; the host core writes them): an upsert
     /// at or below one is refused, so a late `gateway_sync` after a fence can't re-add the sandbox.
     tombstones: crate::tombstones::Tombstones,
-    /// Per sandbox, per client, the agent-epoch floor (`client_floor`, `agent_attach.agent_epoch`).
-    /// Only raised; agent epochs only grow, so a floor stays valid across the sandbox's epochs and
-    /// is kept while the sandbox is forgotten (suspended); dropped when the sandbox leaves this host.
-    /// Every upsert carries them, so a gateway (re)connecting gets them with the entry.
-    floors: BTreeMap<SandboxId, BTreeMap<String, Epoch>>,
-    /// Floors the connected gateway confirmed (`floor_applied`); cleared when it goes.
-    confirmed: BTreeMap<(SandboxId, String), Epoch>,
-    /// `apply_floor` calls waiting for the gateway's `floor_applied`.
-    waiters: Vec<(SandboxId, String, Epoch, tokio::sync::oneshot::Sender<()>)>,
     conn: Option<UnboundedSender<GatewayCommand>>,
 }
-
-impl State {
-    fn upsert_cmd(&self, sandbox: &SandboxId, e: &Entry) -> GatewayCommand {
-        GatewayCommand::SandboxUpsert {
-            sandbox: sandbox.clone(),
-            epoch: e.epoch,
-            vsock_uds_path: e.vsock_uds_path.clone(),
-            clients: e.clients.clone(),
-            guest: e.guest.clone(),
-            client_floors: self.floors.get(sandbox).cloned().unwrap_or_default(),
-        }
-    }
-}
-
-/// How long `apply_floor` waits for the gateway to confirm a floor.
-pub const FLOOR_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct GatewayLink {
@@ -169,7 +144,7 @@ impl GatewayLink {
     /// refused (with a warning) for a tombstoned (fenced) epoch: a sync that raced a fence must
     /// not bring the sandbox back.
     pub fn upsert(&self, sandbox: SandboxId, entry: Entry) {
-        let cmd = {
+        {
             let mut st = self.state.lock().expect("gateway state");
             if st.tombstones.refuses(&sandbox, entry.epoch) {
                 tracing::warn!(%sandbox, epoch = entry.epoch.0, "refusing to re-add a fenced epoch to the gateway");
@@ -179,53 +154,8 @@ impl GatewayLink {
                 return;
             }
             st.sandboxes.insert(sandbox.clone(), entry.clone());
-            st.upsert_cmd(&sandbox, &entry)
-        };
-        self.send(cmd);
-    }
-
-    /// Raise a client's agent-epoch floor on a sandbox at `epoch` and return once it is in effect:
-    /// the connected gateway confirmed it (`floor_applied`), or no gateway holds the sandbox now
-    /// (no gateway, or the sandbox suspended), in which case the floor comes with its next upsert,
-    /// under the gateway's lock before the entry is usable. A floor already confirmed returns at
-    /// once (the in-order re-application is a no-op). Refused for a fenced epoch.
-    pub async fn apply_floor(&self, sandbox: &SandboxId, epoch: Epoch, client: &str, agent_epoch: Epoch) -> Result<(), String> {
-        let (cmd, rx) = {
-            let mut st = self.state.lock().expect("gateway state");
-            if st.tombstones.refuses(sandbox, epoch) {
-                return Err(format!("{sandbox}@{} was fenced", epoch.0));
-            }
-            let cur = st.floors.entry(sandbox.clone()).or_default().entry(client.to_string()).or_insert(Epoch(0));
-            if agent_epoch > *cur {
-                *cur = agent_epoch;
-            }
-            if st.confirmed.get(&(sandbox.clone(), client.to_string())).is_some_and(|c| *c >= agent_epoch) {
-                return Ok(());
-            }
-            if st.conn.is_none() || !st.sandboxes.contains_key(sandbox) {
-                return Ok(());
-            }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            st.waiters.push((sandbox.clone(), client.to_string(), agent_epoch, tx));
-            (GatewayCommand::ClientFloor { sandbox: sandbox.clone(), client: client.to_string(), agent_epoch }, rx)
-        };
-        self.send(cmd);
-        match tokio::time::timeout(FLOOR_TIMEOUT, rx).await {
-            Ok(Ok(())) => Ok(()),
-            _ => Err("the gateway did not confirm the floor".into()),
         }
-    }
-
-    /// The sandbox left this host (destroyed, archived, moved): its floors go with it.
-    pub fn drop_floors(&self, sandbox: &SandboxId) {
-        let mut st = self.state.lock().expect("gateway state");
-        st.floors.remove(sandbox);
-        st.confirmed.retain(|(s, _), _| s != sandbox);
-    }
-
-    /// The floors held for a sandbox (tests, health).
-    pub fn floors(&self, sandbox: &SandboxId) -> BTreeMap<String, Epoch> {
-        self.state.lock().expect("gateway state").floors.get(sandbox).cloned().unwrap_or_default()
+        self.send(GatewayCommand::SandboxUpsert { sandbox, epoch: entry.epoch, vsock_uds_path: entry.vsock_uds_path, clients: entry.clients, guest: entry.guest });
     }
 
     /// Drop the sandbox from the gateway (its open calls close). On its own this leaves no
@@ -272,7 +202,13 @@ async fn serve(mut framed: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
         let _ = tx.send(GatewayCommand::HelloAck { protocol_version: PROTOCOL_VERSION, host_id });
         let _ = tx.send(GatewayCommand::KeyUpdate { keys: st.keys.clone() });
         for (sandbox, e) in &st.sandboxes {
-            let _ = tx.send(st.upsert_cmd(sandbox, e));
+            let _ = tx.send(GatewayCommand::SandboxUpsert {
+                sandbox: sandbox.clone(),
+                epoch: e.epoch,
+                vsock_uds_path: e.vsock_uds_path.clone(),
+                clients: e.clients.clone(),
+                guest: e.guest.clone(),
+            });
         }
         let _ = tx.send(GatewayCommand::ResyncDone);
         st.conn = Some(tx.clone());
@@ -309,21 +245,6 @@ async fn serve(mut framed: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
                                 last_rx = Instant::now();
                                 tracing::warn!(code = %error.code, message = %error.message, "gateway error");
                             }
-                            Ok(GatewayEvent::FloorApplied { sandbox, client, agent_epoch }) => {
-                                last_rx = Instant::now();
-                                let mut st = state.lock().expect("gateway state");
-                                let c = st.confirmed.entry((sandbox.clone(), client.clone())).or_insert(Epoch(0));
-                                if agent_epoch > *c {
-                                    *c = agent_epoch;
-                                }
-                                let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut st.waiters)
-                                    .into_iter()
-                                    .partition(|(s, cl, e, _)| *s == sandbox && *cl == client && *e <= agent_epoch);
-                                st.waiters = keep;
-                                for (_, _, _, tx) in done {
-                                    let _ = tx.send(());
-                                }
-                            }
                             Err(e) => tracing::warn!(error = %e, "bad gateway event"),
                         }
                     }
@@ -348,9 +269,6 @@ async fn serve(mut framed: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
         let mut st = state.lock().expect("gateway state");
         if st.conn.as_ref().is_some_and(|c| c.same_channel(&tx)) {
             st.conn = None;
-            // The next gateway gets every floor with the replay; nothing it confirmed carries over.
-            st.confirmed.clear();
-            st.waiters.clear();
         }
     }
     let _ = notices.send(GatewayNotice::Disconnected);
@@ -381,53 +299,6 @@ mod tests {
 
     fn entry(epoch: u64, clients: &[&str], guest: Option<GuestInfo>) -> Entry {
         Entry { epoch: Epoch(epoch), vsock_uds_path: "/run/nest/vm/sbx_1/vsock.sock".into(), clients: clients.iter().map(|c| c.to_string()).collect(), guest }
-    }
-
-    /// A floor is in effect before `apply_floor` returns: the gateway confirmed it, or no gateway
-    /// holds the sandbox (it then comes with the next upsert). Floors are replayed on reconnect,
-    /// kept while the sandbox is forgotten (suspended), dropped when it leaves, refused for a
-    /// fenced epoch; a confirmed one is not sent again.
-    #[tokio::test]
-    async fn floors_wait_for_the_gateway_and_survive_what_they_should() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gateway.sock");
-        let (ntx, _nrx) = mpsc::unbounded_channel();
-        let tombstones = crate::tombstones::Tombstones::default();
-        let link = GatewayLink::start(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), tombstones.clone(), ntx).unwrap();
-        let sbx = SandboxId("sbx_1".into());
-        link.upsert(sbx.clone(), entry(1, &["agt_a"], None));
-        // No gateway yet: in effect at once, carried by the replay.
-        link.apply_floor(&sbx, Epoch(1), "agt_a", Epoch(2)).await.unwrap();
-        let mut f = connect(&path).await;
-        assert!(matches!(read(&mut f).await, GatewayCommand::HelloAck { .. }));
-        assert!(matches!(read(&mut f).await, GatewayCommand::KeyUpdate { .. }));
-        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { client_floors, .. } if client_floors.get("agt_a") == Some(&Epoch(2))));
-        assert!(matches!(read(&mut f).await, GatewayCommand::ResyncDone));
-
-        // Connected and holding the sandbox: returns only after the gateway's `floor_applied`.
-        let l2 = link.clone();
-        let s2 = sbx.clone();
-        let pending = tokio::spawn(async move { l2.apply_floor(&s2, Epoch(1), "agt_a", Epoch(3)).await });
-        assert!(matches!(read(&mut f).await, GatewayCommand::ClientFloor { agent_epoch: Epoch(3), .. }));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!pending.is_finished(), "not in effect until the gateway says so");
-        let applied = GatewayEvent::FloorApplied { sandbox: sbx.clone(), client: "agt_a".into(), agent_epoch: Epoch(3) };
-        f.send(bytes::Bytes::from(serde_json::to_vec(&applied).unwrap())).await.unwrap();
-        pending.await.unwrap().unwrap();
-        // Re-applied in order: a no-op, nothing sent.
-        link.apply_floor(&sbx, Epoch(1), "agt_a", Epoch(3)).await.unwrap();
-
-        // Suspended (forgotten): kept, and back with the next upsert.
-        link.forget(&sbx);
-        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxRemove { .. }));
-        link.upsert(sbx.clone(), entry(1, &["agt_a"], None));
-        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { client_floors, .. } if client_floors.get("agt_a") == Some(&Epoch(3))));
-
-        // Fenced epoch: refused. The sandbox leaves: its floors go.
-        tombstones.fence(&sbx, Epoch(1));
-        assert!(link.apply_floor(&sbx, Epoch(1), "agt_a", Epoch(4)).await.is_err());
-        link.drop_floors(&sbx);
-        assert!(link.floors(&sbx).is_empty());
     }
 
     /// A gateway that connects (or reconnects) gets the whole mirror in order and then

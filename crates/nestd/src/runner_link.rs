@@ -76,6 +76,9 @@ struct State {
     /// Each agent's agent epoch from its latest `agent_start` here, for the exits nestd reports
     /// itself (a lost runner connection, a start never sent): AgentDO ignores an older start's exit.
     epochs: BTreeMap<AgentId, nest_protocol::model::Epoch>,
+    /// Per agent, the highest agent epoch an `agent_stop{mode: kill}` named: a start at or below it
+    /// (queued behind the kill's arrival) is refused. Kept for the process's life (one per agent).
+    killed: BTreeMap<AgentId, nest_protocol::model::Epoch>,
 }
 
 #[derive(Clone)]
@@ -194,6 +197,50 @@ impl RunnerLink {
     pub fn report(&self) -> Vec<AgentReport> {
         let st = self.state.lock().expect("runner state");
         st.brains.iter().filter(|(_, b)| !b.fenced).map(|(id, b)| AgentReport { agent: id.clone(), state: b.state }).collect()
+    }
+
+    /// Kill `agent`'s brain now (`agent_stop{mode: kill}` on arrival) and remember `epoch` as its
+    /// tombstone. Returns whether a running brain at or below `epoch` was told to die (its exit then
+    /// comes from the runner); `false` when none runs here (never started, gone, a start never sent,
+    /// or only a newer start), so the caller reports the exit itself.
+    pub fn kill(&self, agent: &AgentId, epoch: Option<nest_protocol::model::Epoch>, reason: &str) -> bool {
+        let mut st = self.state.lock().expect("runner state");
+        if let Some(e) = epoch {
+            let k = st.killed.entry(agent.clone()).or_insert(e);
+            if e > *k {
+                *k = e;
+            }
+        }
+        let newer = epoch.is_some_and(|e| st.epochs.get(agent).is_some_and(|cur| *cur > e));
+        let sent = match st.brains.get(agent) {
+            Some(b) if !newer && !b.fenced => matches!(b.sent, Sent::On { .. }),
+            _ => false,
+        };
+        if newer {
+            return false;
+        }
+        if !sent {
+            // Never sent (or already fenced): it leaves the table without a runner exit.
+            if st.brains.get(agent).is_some_and(|b| matches!(b.sent, Sent::Pending(_))) {
+                st.brains.remove(agent);
+            }
+            return false;
+        }
+        match &st.conn {
+            Some(c) => {
+                let _ = c.send(RunnerCommand::AgentStop { agent: agent.clone(), mode: StopMode::Kill, reason: reason.into() });
+                true
+            }
+            None => {
+                st.brains.remove(agent);
+                false
+            }
+        }
+    }
+
+    /// Whether a kill at or above `epoch` arrived for `agent` (its tombstone).
+    pub fn killed_at_or_above(&self, agent: &AgentId, epoch: nest_protocol::model::Epoch) -> bool {
+        self.state.lock().expect("runner state").killed.get(agent).is_some_and(|k| *k >= epoch)
     }
 
     /// The agent epoch of `agent`'s latest start here.

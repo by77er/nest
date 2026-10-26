@@ -502,10 +502,6 @@ async fn fake_gateway(path: &Path) -> FakeGateway {
             if matches!(cmd, GatewayCommand::Ping) {
                 let _ = f.send(bytes::Bytes::from(serde_json::to_vec(&GatewayEvent::Pong).unwrap())).await;
             }
-            if let GatewayCommand::ClientFloor { sandbox, client, agent_epoch } = &cmd {
-                let ev = GatewayEvent::FloorApplied { sandbox: sandbox.clone(), client: client.clone(), agent_epoch: *agent_epoch };
-                let _ = f.send(bytes::Bytes::from(serde_json::to_vec(&ev).unwrap())).await;
-            }
             got2.lock().unwrap().push(cmd);
         }
     });
@@ -654,7 +650,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     assert!(!seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. })), "a brain start configures no guest slot");
 
     // 2a. attach: the guest slot (explicit proxy port 3128, the cwd), and the gateway's client set.
-    let attach = |id: &str, epoch: u64, cwd: Option<&str>| cmd(id, CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(epoch), agent: AgentId("agt_w".into()), cwd: cwd.map(Into::into), agent_epoch: None });
+    let attach = |id: &str, epoch: u64, cwd: Option<&str>| cmd(id, CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(epoch), agent: AgentId("agt_w".into()), cwd: cwd.map(Into::into) });
     fleet.commands.send(vec![attach("cmd_attach", 1, Some("/workspace/app"))]).unwrap();
     assert!(matches!(fleet.result("cmd_attach").await, CommandOutcome::Ok { .. }));
     assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { slot } if slot.proxy_port == 3128 && slot.cwd == "/workspace/app")));
@@ -668,12 +664,6 @@ async fn host_lifecycle_commit_and_self_fence() {
     }
     let attaches: Vec<u16> = seen.lock().unwrap().iter().filter_map(|b| match b { ControlBody::AgentAttach { slot } => Some(slot.proxy_port), _ => None }).collect();
     assert_eq!(attaches, vec![3128, 3128], "re-attach reuses the slot; the stale attach never reaches the guest");
-    // A new placement's attach carries the agent's floor: in effect at the gateway with the slot.
-    let floor = cmd("cmd_attach_floor", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None, agent_epoch: Some(Epoch(3)) });
-    fleet.commands.send(vec![floor]).unwrap();
-    assert!(matches!(fleet.result("cmd_attach_floor").await, CommandOutcome::Ok { .. }));
-    assert!(gateway.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::ClientFloor { client, agent_epoch: Epoch(3), .. } if client == "agt_w")),
-        "the floor reached the gateway before the attach's ok");
 
     // 2b. Guest CLI relay: `nest ask` → guest_cli event → guest_cli_result command → cli_result to the guest.
     let request = match fleet.wait_event("guest cli", |b| matches!(b, HostEventBody::GuestCli { .. })).await {
@@ -1158,7 +1148,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
 
     // The guest holds the attach reply; the fence lands meanwhile; then the reply is released.
     latch.held.store(true, Ordering::SeqCst);
-    fleet.commands.send(vec![cmd("cmd_attach", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None, agent_epoch: None })]).unwrap();
+    fleet.commands.send(vec![cmd("cmd_attach", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None })]).unwrap();
     wait_until("guest holds the attach", || seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. }))).await;
     fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
     fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
@@ -1356,7 +1346,7 @@ fn nestd_now_ms() -> i64 {
 // ---------------------------------------------------------------------------------------------
 
 fn attach_cmd(id: &str, sandbox: &str, agent: &str) -> Command {
-    cmd(id, CommandBody::AgentAttach { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), agent: AgentId(agent.into()), cwd: None, agent_epoch: None })
+    cmd(id, CommandBody::AgentAttach { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), agent: AgentId(agent.into()), cwd: None })
 }
 
 fn is_ok(o: &CommandOutcome) -> bool {
@@ -2082,32 +2072,56 @@ fn bound_start(agent: &str, sandbox: &str) -> AgentStart {
     }
 }
 
-/// A gateway floor and a kill take effect on arrival, not behind a slow command in the in-order
-/// executor; their results still come in order, the floor's once the gateway confirmed it.
+/// A kill takes effect on arrival, not behind a slow command in the in-order executor; the in-order
+/// pass doesn't kill again, and the result still comes in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_floor_and_a_kill_apply_on_arrival_behind_slow_commands() {
+async fn a_kill_applies_on_arrival_behind_slow_commands() {
     let h = start_host().await;
     h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
     assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
     h.fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_b", "sbx_a")))]).unwrap();
     assert!(matches!(h.fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
+    wait_until("runner agent_start", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(_)))).await;
     h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2")]).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let t0 = std::time::Instant::now();
-    let floor = CommandBody::ClientFloor { sandbox: SandboxId("sbx_a".into()), epoch: Epoch(1), agent: AgentId("agt_b".into()), agent_epoch: Epoch(2) };
     let stop = CommandBody::AgentStop { agent: AgentId("agt_b".into()), reason: "starting elsewhere".into(), mode: Some(nest_protocol::host::runner::StopMode::Kill), epoch: Some(Epoch(1)) };
-    h.fleet.commands.send(vec![cmd("cmd_floor", floor), cmd("cmd_kill", stop)]).unwrap();
-    wait_until("the gateway gets the floor", || {
-        h.gateway.got.lock().unwrap().iter().any(|c| matches!(c, GatewayCommand::ClientFloor { client, agent_epoch: Epoch(2), .. } if client == "agt_b"))
-    })
-    .await;
+    h.fleet.commands.send(vec![cmd("cmd_kill", stop)]).unwrap();
     wait_until("the runner gets the kill", || {
         h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStop { mode: nest_protocol::host::runner::StopMode::Kill, .. }))
     })
     .await;
     assert!(t0.elapsed() < Duration::from_millis(800), "waited behind the slow create: {:?}", t0.elapsed());
-    assert!(matches!(h.fleet.result("cmd_floor").await, CommandOutcome::Ok { .. }), "confirmed by the gateway");
     assert!(matches!(h.fleet.result("cmd_kill").await, CommandOutcome::Ok { .. }));
     let kills = h._runner.lock().unwrap().iter().filter(|c| matches!(c, RunnerCommand::AgentStop { .. })).count();
     assert_eq!(kills, 1, "the in-order pass does not kill again");
+}
+
+/// The epoch tombstone: a kill that overtakes a start still queued behind a slow command makes that
+/// start never run (its exit is reported, so AgentDO can start the agent elsewhere), and a kill for a
+/// brain that isn't running here is answered with its exit at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_overtaking_a_queued_start_means_it_never_runs() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    // A slow create occupies the executor; the start for agt_q at epoch 1 queues behind it.
+    h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2"), cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_q", "sbx_a")))]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stop = CommandBody::AgentStop { agent: AgentId("agt_q".into()), reason: "starting elsewhere".into(), mode: Some(nest_protocol::host::runner::StopMode::Kill), epoch: Some(Epoch(1)) };
+    h.fleet.commands.send(vec![cmd("cmd_kill", stop)]).unwrap();
+    // Not running here yet: its exit (at the kill's epoch) is reported on arrival.
+    h.fleet.wait_event("the exit of the brain that never ran", |b| matches!(b, HostEventBody::AgentExited { agent, epoch: Some(Epoch(1)), .. } if agent.0 == "agt_q")).await;
+    assert!(h.fleet.results_for("cmd_slow").is_empty(), "the exit came on the kill's arrival, not behind the slow command");
+    // The queued start, reached in order, is refused and never reaches the runner.
+    match h.fleet.result("cmd_agent").await {
+        CommandOutcome::Error { error } => assert_eq!(error.code, "stale_epoch"),
+        other => panic!("the overtaken start ran: {other:?}"),
+    }
+    assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_q")));
+    // A newer start (epoch 2) runs.
+    let mut newer = bound_start("agt_q", "sbx_a");
+    newer.epoch = Some(Epoch(2));
+    h.fleet.commands.send(vec![cmd("cmd_agent2", CommandBody::AgentStart(newer))]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_agent2").await, CommandOutcome::Ok { .. }));
 }

@@ -307,9 +307,6 @@ describe("hands_resolve on the session channel", () => {
   it("answers not-ready with a retry hint while the slot is pending, then a verifying target", async () => {
     const s = await setup();
     const { cmd } = await agentStub(s.agent).start();
-    // Before the start, the sandbox sent the gateway the agent's floor (applied on arrival by nestd).
-    const isFloor = (c: any) => c.type === "client_floor" && c.agent === s.agent && c.agent_epoch === 1;
-    const floor = (await nextCommands(s.host.ws, isFloor)).find(isFloor);
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
     expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 } });
     expect(start.hands.binding, "no binding ever passes through a host command").toBeUndefined();
@@ -324,16 +321,12 @@ describe("hands_resolve on the session channel", () => {
     expect(notReady.error).toEqual(notReady.outcome.error);
     expect(notReady.retry_after_ms).toBe(2000);
     await okResult(s.host.ws, s.attach.cmd);
-    // The slot is confirmed, but the floor isn't yet: still no binding at agent epoch 1.
-    ws.send({ type: "hands_resolve", request: "req_floor" });
-    expect((await ws.next("hands_resolved", (m) => m.request === "req_floor")).outcome.error.message).toMatch(/floor 1 is not confirmed/);
-    await okResult(s.host.ws, floor.cmd);
     ws.send({ type: "hands_resolve", request: "req_2" });
     const ready = await ws.next("hands_resolved", (m) => m.request === "req_2");
     expect(ready.outcome.status).toBe("ok");
     expect(ready.outcome.hands).toMatchObject({ url: GATEWAY_URL });
     const claims = await verified(s.pub, ready.outcome.hands as HandsTarget);
-    expect(claims).toMatchObject({ client: s.agent, sandbox: s.sandbox, epoch: 1, agent_epoch: 1 });
+    expect(claims).toMatchObject({ client: s.agent, sandbox: s.sandbox, epoch: 1 });
     expect(ready.error).toBeUndefined();
     expect(ready.hands).toEqual(ready.outcome.hands);
     // The target went AgentDO → runner and nowhere else: nothing of it rests in AgentDO either.
