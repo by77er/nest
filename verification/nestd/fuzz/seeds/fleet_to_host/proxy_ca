@@ -1,0 +1,1 @@
+{"type":"proxy_ca","cert_pem":"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ0...\n-----END CERTIFICATE-----\n","chain_pem":"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ0...\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBjTCCATOgAwIBAgIUR1...\n-----END CERTIFICATE-----\n","expires_ms":1760875200000}

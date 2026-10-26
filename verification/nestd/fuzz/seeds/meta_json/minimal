@@ -1,0 +1,1 @@
+{"version": 1, "sandbox": "sbx_01jb7m2a4c", "workstream": "ws_01jb7m0000", "epoch": 4, "image": "base", "resources": {"vcpus": 2, "memory_mib": 2048, "disk_gib": 8}}

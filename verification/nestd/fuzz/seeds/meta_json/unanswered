@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "sandbox": "sbx_01jb7m2a4c",
+  "workstream": "ws_01jb7m0000",
+  "epoch": 4,
+  "image": "base",
+  "resources": {
+    "vcpus": 2,
+    "memory_mib": 2048,
+    "disk_gib": 8
+  },
+  "head": {
+    "id": "gen_01jb7p8r3n",
+    "sandbox": "sbx_01jb7m2a4c",
+    "parent": "gen_01jb7p1k2m",
+    "epoch": 4,
+    "kind": "checkpoint",
+    "disk_manifest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mem_manifest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "reason": "suspend",
+    "created_ms": 1760270400000
+  },
+  "clean": false,
+  "unanswered": {
+    "request": "req_01jb7q0a1d",
+    "parent": "gen_01jb7p8r3n",
+    "kind": "disk_only",
+    "disk_manifest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "reason": "turn_end"
+  }
+}
