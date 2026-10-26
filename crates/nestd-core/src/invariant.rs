@@ -49,9 +49,12 @@ mod tests {
         assert!(super::check(true, "holds"));
     }
 
+    /// Counted before the panic, so a release build (which only counts and reports) has the total.
     #[test]
-    #[should_panic(expected = "invariant violated: broken")]
-    fn a_violation_fails_a_debug_build() {
-        super::check(false, "broken");
+    fn a_violation_fails_a_debug_build_and_is_counted() {
+        let before = super::violations();
+        let panic = std::panic::catch_unwind(|| super::check(false, "broken")).expect_err("a debug build panics");
+        assert_eq!(panic.downcast_ref::<String>().map(String::as_str), Some("invariant violated: broken"));
+        assert!(super::violations() > before);
     }
 }
