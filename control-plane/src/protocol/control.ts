@@ -279,6 +279,8 @@ export const HostEventVariants = [
   z.object({
     ...hostEventBase, type: z.literal("sandbox_state"), sandbox: SandboxId, epoch: Epoch, state: SandboxState,
     suspend_mode: SuspendMode.optional(), detail: z.string().optional(), guest: GuestInfo.optional(),
+    // `false` on a later `fenced` for the same epoch: salvaged (or nothing to salvage), disk gone.
+    dirty: z.boolean().optional(),
   }),
   z.object({
     ...hostEventBase, type: z.literal("commit_request"), request: RequestId, sandbox: SandboxId, epoch: Epoch,

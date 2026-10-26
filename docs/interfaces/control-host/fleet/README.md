@@ -68,7 +68,7 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `type` | Purpose |
 |---|---|
 | `command_result` | `outcome: {status: ok, detail?}` or `{status: error, error}` |
-| `sandbox_state` | Every transition (`model::SandboxState`), with `suspend_mode?`, `detail?` and, for `running`, `guest{protocol_version, capabilities}` (nestd caches the guest's hello, so a resume reports it too; a repeated `running` with a new `guest` is an update) |
+| `sandbox_state` | Every transition (`model::SandboxState`), with `suspend_mode?`, `detail?` and, for `running`, `guest{protocol_version, capabilities}` (nestd caches the guest's hello, so a resume reports it too; a repeated `running` with a new `guest` is an update). A repeated `fenced` with `dirty: false` says the fenced incarnation's work is salvaged (or there was none) and its disk is gone: FleetDO marks the stale incarnation clean and may destroy it without waiting out the salvage window |
 | `commit_request` | Chunks and manifest are already uploaded. Asks for a CAS with `request`, epoch, parent, kind, manifests, reason (`salvage` marks the commit as orphaned work) |
 | `workstream` | A host-originated `WorkstreamEvent` (`port_opened`, `port_exposed`, `egress_denied`, `egress_alert`) |
 | `egress_audit` | Batches of `EgressAuditRecord` (no secret values, no query strings), written to R2. `via?` names the nest-proxy entry point: `dns http_transparent https_transparent explicit tcp_exception`; `reason` values are listed in [nestd-proxy](../../host-internal/nestd-proxy/). `count?` marks an aggregated record (how many requests it stands for), used for nest-proxy's per-window suppression summaries |

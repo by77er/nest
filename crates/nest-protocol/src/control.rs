@@ -481,6 +481,12 @@ pub enum HostEventBody {
         /// to clients in `resolve`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guest: Option<GuestInfo>,
+        /// `false` on a later `fenced` report for the same epoch: the fenced incarnation's
+        /// uncommitted work is salvaged (or there was none) and its disk is gone, so FleetDO need
+        /// not wait out the salvage window before destroying it. Absent otherwise, and from an
+        /// older nestd.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dirty: Option<bool>,
     },
     /// Chunks are already uploaded; asks SandboxDO to compare-and-set head. Answered by
     /// `CommandBody::CommitResult`.

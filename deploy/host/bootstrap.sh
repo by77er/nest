@@ -49,6 +49,7 @@ cat >/etc/nest/nestd.json <<EOF
   "enrollment": {"type": "aws_imds"},
   "driver": $DRIVER,
   "network": {"type": "netns", "persist_dir": "/run/nest/netns"},
+  "delegated_cgroup": true,
   "gateway_url": "ws://127.0.0.1:18790",
   "cloudflared_bin": "/opt/nest/bin/cloudflared",
   "cloudflared_user": "nest-cf",

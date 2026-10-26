@@ -259,6 +259,25 @@ describe("stale incarnations are destroyed on their old host", () => {
   });
 });
 
+describe("a salvaged incarnation reported clean", () => {
+  it("is destroyed at its old epoch without waiting out the salvage window", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const b = await hostWithRoom(cell, 4096);
+    // nestd fences it (dirty), the sandbox moves on, then nestd's salvage lands and it says so.
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "fenced", detail: "host lease lapsed" }]);
+    await nextCommands(b.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
+    expect(await a.ws.none("commands", 200, (m) => m.commands.some((c: { type: string }) => c.type === "sandbox_destroy"))).toBe(true);
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "fenced", detail: "salvaged", dirty: false }]);
+    const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
+    expect(destroy).toMatchObject({ sandbox: sbx.sandbox, epoch: 1 });
+    // The clean report changed nothing else: the sandbox stays where it moved.
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: b.host, epoch: 2 });
+  });
+});
+
 describe("preview and share names follow the hostname rule", () => {
   it("first-level labels of the zone, kind as suffix, no underscore (docs/setup/#hostnames)", () => {
     expect(previewHostname("nest.bitcru.sh", 3000, "sbx_01jb7m2a4c")).toBe("3000-01jb7m2a4c-preview-nest.bitcru.sh");

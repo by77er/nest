@@ -124,6 +124,12 @@ impl Netns {
     }
 }
 
+impl AsFd for Netns {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 impl Drop for Netns {
     fn drop(&mut self) {
         if let Some(p) = &self.persisted {

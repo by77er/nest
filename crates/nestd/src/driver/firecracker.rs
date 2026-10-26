@@ -33,6 +33,10 @@ use crate::net::TAP_NAME;
 
 pub struct FirecrackerDriver {
     pub cfg: FirecrackerConfig,
+    /// The jailer's `--parent-cgroup` (relative to the cgroup root): `<nestd's cgroup>/vms` when the
+    /// unit delegates its cgroup (`cgroup.rs`), so the unit's stop kills every VMM. `None`: the
+    /// jailer's default parent, outside the unit.
+    pub parent_cgroup: Option<String>,
 }
 
 #[async_trait]
@@ -53,7 +57,7 @@ impl Driver for FirecrackerDriver {
                 None
             }
         };
-        Ok(Box::new(FirecrackerVm { cfg: self.cfg.clone(), spec, child: None, jail }))
+        Ok(Box::new(FirecrackerVm { cfg: self.cfg.clone(), parent_cgroup: self.parent_cgroup.clone(), spec, child: None, jail }))
     }
 }
 
@@ -102,6 +106,7 @@ pub struct FcPaths {
 
 pub struct FirecrackerVm {
     cfg: FirecrackerConfig,
+    parent_cgroup: Option<String>,
     spec: VmSpec,
     child: Option<std::process::Child>,
     jail: Option<Jail>,
@@ -140,13 +145,19 @@ impl FirecrackerVm {
 
 /// The jailer command line (pure, unit-tested). `memory_mib` is the guest's declared size: the
 /// jailer puts the VMM in its own cgroup v2 with `memory.max` at that plus the configured overhead.
-pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: &Path, memory_mib: u32) -> Vec<String> {
+/// With `parent_cgroup`, the VMM's cgroup goes under it (`--parent-cgroup`), inside nestd's unit.
+pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: &Path, memory_mib: u32, parent_cgroup: Option<&str>) -> Vec<String> {
     let cap_bytes = (u64::from(memory_mib) + u64::from(fc.vm_memory_overhead_mib)) * 1024 * 1024;
     let mut a: Vec<String> = vec![
         "--cgroup-version".into(),
         "2".into(),
         "--cgroup".into(),
         format!("memory.max={cap_bytes}"),
+    ];
+    if let Some(p) = parent_cgroup {
+        a.extend(["--parent-cgroup".into(), p.to_string()]);
+    }
+    a.extend([
         "--id".into(),
         jail.id.clone(),
         "--exec-file".into(),
@@ -159,7 +170,7 @@ pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: 
         jail.cfg.chroot_base_dir.display().to_string(),
         "--netns".into(),
         netns.display().to_string(),
-    ];
+    ]);
     a.extend(["--".into(), "--api-sock".into(), api_sock.display().to_string()]);
     a
 }
@@ -226,7 +237,7 @@ impl Vm for FirecrackerVm {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the jailer needs a persisted netns (network.persist_dir)"))?;
                 jail.populate(&self.cfg, &self.spec)?;
                 let mut c = std::process::Command::new(jailer);
-                c.args(jailer_args(&self.cfg, jail, ns_path, &paths.api_sock, self.spec.resources.memory_mib));
+                c.args(jailer_args(&self.cfg, jail, ns_path, &paths.api_sock, self.spec.resources.memory_mib, self.parent_cgroup.as_deref()));
                 c
             }
             _ => {
@@ -236,13 +247,11 @@ impl Vm for FirecrackerVm {
             }
         };
         cmd.stdin(std::process::Stdio::null());
-        let child = match (&self.jail, &self.spec.netns) {
-            (None, Some(ns)) => {
-                let ns: Arc<_> = ns.clone();
-                ns.run(move || cmd.spawn())?
-            }
-            _ => cmd.spawn()?,
-        };
+        // Dies with nestd (the jailer drops its uid, which clears the death signal: a jailed VMM is
+        // covered by its cgroup instead). Unjailed, it enters the netns itself; the jailer does that.
+        let netns = if self.jail.is_none() { self.spec.netns.clone() } else { None };
+        let child = super::supervise::spawn(cmd, netns)?;
+        super::supervise::write_pidfile(&self.spec.vm_dir, child.id())?;
         self.child = Some(child);
         // Wait for the API socket (the jailer first copies Firecracker into the chroot).
         for _ in 0..500 {
@@ -282,8 +291,8 @@ impl Vm for FirecrackerVm {
     }
 }
 
-/// Remove every jail under `chroot_base` (at nestd start: VMs don't outlive nestd, since systemd
-/// stops its whole cgroup, so any jail left is from a crash or a reboot).
+/// Remove every jail under `chroot_base` (at nestd start, after its leftover VMMs were killed:
+/// any jail left is from a crash or a reboot).
 pub fn remove_stale_jails(fc: &FirecrackerConfig, jail: &JailerConfig) -> io::Result<usize> {
     let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
     let dir = jail.chroot_base_dir.join(exe);
@@ -434,7 +443,7 @@ mod tests {
         let mut fc = cfg();
         fc.jailer_bin = Some("/usr/bin/jailer".into());
         fc.jailer = Some(JailerConfig { uid: 900, gid: 900, chroot_base_dir: "/srv/jailer".into() });
-        let driver = FirecrackerDriver { cfg: fc.clone() };
+        let driver = FirecrackerDriver { cfg: fc.clone(), parent_cgroup: None };
         let dir = tempfile::tempdir().unwrap();
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
@@ -446,10 +455,13 @@ mod tests {
         let jail = Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s);
         assert_ne!(jail.id, Jail::new(&fc, fc.jailer.as_ref().unwrap(), &s).id);
         assert!(jail.id.len() <= 64 && jail.id.chars().all(|c| c == '-' || c.is_ascii_alphanumeric()), "{}", jail.id);
-        let args = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"), s.resources.memory_mib);
+        let args = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"), s.resources.memory_mib, None);
         let joined = args.join(" ");
         // The VMM's cgroup caps memory at the declared size plus the overhead: 2048 + 128 MiB here.
         assert!(joined.starts_with(&format!("--cgroup-version 2 --cgroup memory.max={} --id {} ", 2176u64 * 1024 * 1024, jail.id)), "{joined}");
+        // Under a delegated nestd cgroup, the VMM's cgroup goes inside the unit (its stop kills it).
+        let delegated = jailer_args(&fc, &jail, Path::new("/run/netns/ns-sbx_1"), Path::new("/api.sock"), s.resources.memory_mib, Some("system.slice/nestd.service/vms")).join(" ");
+        assert!(delegated.starts_with(&format!("--cgroup-version 2 --cgroup memory.max={} --parent-cgroup system.slice/nestd.service/vms --id {} ", 2176u64 * 1024 * 1024, jail.id)), "{delegated}");
         assert!(joined.contains("--uid 900 --gid 900 --chroot-base-dir /srv/jailer --netns /run/netns/ns-sbx_1 -- --api-sock /api.sock"), "{joined}");
         let paths = FcPaths { api_sock: "/api.sock".into(), kernel: "/vmlinux".into(), disk: "/disk.img".into(), vsock: "/vsock.sock".into() };
         let reqs = boot_requests(&fc, &s, &paths);
@@ -457,7 +469,7 @@ mod tests {
         assert_eq!(reqs[2].2["path_on_host"], "/disk.img");
         // A jailer without uid/gid/chroot settings is a configuration error.
         fc.jailer = None;
-        assert!(FirecrackerDriver { cfg: fc }.create(s).await.is_err());
+        assert!(FirecrackerDriver { cfg: fc, parent_cgroup: None }.create(s).await.is_err());
     }
 
     /// Stopping a jailed VM removes its jail directory, and only that.

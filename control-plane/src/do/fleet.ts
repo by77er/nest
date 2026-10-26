@@ -939,6 +939,13 @@ export class FleetDO extends DurableObject<Env> {
       case "command_result":
         return this.onCommandResult(host, ev.cmd, ev.outcome);
       case "sandbox_state":
+        // A repeated `fenced` with `dirty: false`: the fenced incarnation is salvaged and its disk is
+        // gone. Only its cleanup changes: it is clean now, so it need not wait out the salvage window.
+        if (ev.state === "fenced" && ev.dirty === false) {
+          this.recordStale(ev.sandbox, host, ev.epoch, true);
+          await this.reapStale();
+          return;
+        }
         // The lease is the one authority for who holds a sandbox: only its holder's reports reach
         // SandboxDO. A stale incarnation's `fenced` (a STONITH fence, a revoked claim) is noted for
         // cleanup on that host.

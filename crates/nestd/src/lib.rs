@@ -1,5 +1,6 @@
 //! nestd: the privileged per-host daemon. See `docs/compute/nestd/` and `crates/nestd/README.md`.
 
+pub mod cgroup;
 pub mod cloudflared;
 pub mod config;
 pub mod credentials;

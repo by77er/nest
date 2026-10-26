@@ -19,12 +19,13 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
 | `net` | Netns with no uplink: `unshare(CLONE_NEWNET)` in a helper thread, tap0 plus the nft ruleset, listeners bound inside the namespace via `setns` on a fresh thread |
 | `proxy_link` | nestd ↔ nest-proxy over SEQPACKET + `SCM_RIGHTS`. A state mirror plus sequence-tagged ops gives a full resync on every reconnect with nothing lost or duplicated. `apply` never blocks: queued ops carry duplicated fds, and sends have a timeout. Also: ping watchdog, resync count check, refusal of tombstoned (fenced) epochs, socket access control |
 | `tombstones` | The host's one map of fenced epochs, written by the host core's fence and consulted by the proxy and gateway links; pruned when a newer epoch runs here or the sandbox is destroyed |
-| `recovery` | `meta.json` beside each disk (sandbox, epoch, head; written atomically once the disk is complete and after every commit), and the start-up scan of what a previous nestd left |
+| `recovery` | Per-incarnation directories (`sandboxes/<id>/<epoch>/`) and their versioned `meta.json` (sandbox, epoch, head, whether the disk equals it, an unanswered commit request; written atomically), and the start-up scan of what a previous nestd left |
+| `cgroup` | The delegated unit cgroup (`<unit>/supervisor`, `<unit>/vms` for the jailer) and the start-up kill of leftover VMM cgroups |
 | `runner_link` | nestd ↔ agent runner, lifecycle only. Keeps the desired set of brains and re-issues `agent_start` on reconnect (the sandbox's id and epoch, never a socket path or a binding). Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
 | `gateway_link` | nestd ↔ sandbox gateway (`gateway.sock`). A mirror of the binding verification keys and, per sandbox, the epoch, the vsock socket, the attached clients and the guest's version; replayed in full on every (re)connection and closed with `resync_done`, then deltas on attach, detach, boot, resume, the guest's hello, fence and teardown. Ping every 5 s, a silent gateway is dropped after 15 s. Socket access control, one gateway at a time |
 | `guest` | Guest control connection (vsock 1024): hello (the guest's version and capabilities are kept and reported with `running`), configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
 | `vsock` | Hybrid-vsock `CONNECT` client and the unix-socket emulator (test transport) |
-| `driver` | `Driver`/`Vm`/`Pauser` traits; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (2M hugepages, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths |
+| `driver` | `Driver`/`Vm`/`Pauser` traits; `supervise` forks every VM process from one long-lived thread with a death signal, records a pidfile, and kills leftovers at start; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (2M hugepages, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths |
 | `storage` | Content-addressed chunks and manifests. Hole-aware disk chunking (`SEEK_DATA`), `LocalFsStore` backend. On restore, chunk names and every chunk's and manifest's hash are verified |
 
 ## Example config
@@ -82,7 +83,8 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
   - **`retryable_fleet_error_resends_the_failed_batch`** (review #7)
   - **`proxy_ca_is_renewed_before_expiry`** (review #10)
   - **`newer_epoch_create_salvages_old_work_first`** (review #17)
-  - **`a_restarted_nestd_reports_salvages_and_deletes_what_it_left`** (nestd review #7): a first process dies (its runtime dropped) with two sandboxes on disk; the next reports both `fenced` in its first hello, salvages only the one written to since its last commit (parent from `meta.json`), deletes both, and removes a directory without `meta.json` and the old VM runtime directories before the hello. The second process runs the process driver and boots nothing.
+  - **`a_restarted_nestd_reports_salvages_and_deletes_what_it_left`** (nestd review #7): three processes on one state directory, each dying with its runtime. The second deletes a suspended (clean) incarnation unreported, removes an incarnation without `meta.json` and the old flat layout, reports the rest `fenced`, skips the salvage of a disk equal to its head (whose head has memory), and dies with a salvage answer lost; the third asks again under the persisted request id. The later processes run the process driver and boot nothing.
+  - **`a_newer_create_races_the_salvage_of_what_a_dead_nestd_left`**, **`a_failed_salvage_is_retried_until_it_lands`**, **`a_fenced_incarnation_is_salvaged_once_even_when_superseded`**
   - **`a_fenced_epoch_stays_stale_until_a_newer_epoch_runs`** (nestd review #12)
   - `a_restarted_nestd_tears_down_leftover_netns_mounts` (in a user namespace): a netns bind mount left under `persist_dir` is gone when `Host::start` returns
   - `netns_listeners_handed_to_proxy` (in a user namespace): real netns, tap0 and nft; five listeners reach the fake proxy, and its copy of `:443` accepts a connection made inside the sandbox netns.
@@ -96,7 +98,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 - **Live forks.** They're disk-only.
 - **Firecracker** runs on EC2 sandbox hosts (the `burst` role) with nested virtualization and is verified there end to end ([driver](../../docs/sandbox/drivers/firecracker/)); this dev environment has no `/dev/kvm`, so locally the driver is unit-tested only.
 - **Jailer path untested against a real jailer.** The chroot hard-links require the disk and kernel on the same filesystem as the chroot base.
-- **systemd supervision** (`BindsTo=nestd` scopes for VMs, `WatchdogSec`) and **per-agent `DynamicUser` ownership** of config dirs.
+- **`WatchdogSec`** on nestd, and **per-agent `DynamicUser` ownership** of config dirs. The delegated cgroup and the start-up VMM kill are built but unverified on a real host.
 - **`capacity.warm`**, `drain` ending with nestd exiting, and the control `health` probe to the guest.
 - **Remaining review items:**
   - **Clock-step heartbeat keys (#14):** handled by construction (keys strictly increase), but not tested.
