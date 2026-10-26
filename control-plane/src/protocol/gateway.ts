@@ -27,8 +27,12 @@ export type EdgeAuth = z.output<typeof EdgeAuth>;
  */
 export const HandsTarget = z.object({
   url: z.string(),
-  sandbox: SandboxId,
-  epoch: Epoch,
+  /**
+   * Deprecated, for one release: unsigned copies of the binding's `sandbox` and `epoch` claims, sent
+   * for clients of the previous release. Current clients read both from the claims.
+   */
+  sandbox: SandboxId.optional(),
+  epoch: Epoch.optional(),
   binding: z.string(),
   guest: GuestInfo,
   edge: EdgeAuth.optional(),

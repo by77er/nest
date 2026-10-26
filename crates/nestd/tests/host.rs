@@ -629,13 +629,14 @@ async fn host_lifecycle_commit_and_self_fence() {
         other => panic!("upsert: {other:?}"),
     }
 
-    // 2. Start a worker: the runner gets the sandbox's id and epoch, never a socket path.
+    // 2. Start a worker: the runner gets the sandbox's id and its agent epoch, never a socket path.
     let start = AgentStart {
         agent: AgentId("agt_w".into()),
         role: AgentRole::Worker,
         workstream: WorkstreamId("ws_1".into()),
+        epoch: Some(Epoch(1)),
         resume: None,
-        hands: Some(HandsBinding { sandbox: sbx.clone(), epoch: Epoch(1) }),
+        hands: Some(HandsBinding { sandbox: sbx.clone(), epoch: None }),
         launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "w".into() } },
         oauth_token: "oauth".into(),
         session_ws_url: "ws://x".into(),
@@ -1443,6 +1444,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
         agent: AgentId("agt_c".into()),
         role: AgentRole::Captain,
         workstream: WorkstreamId("ws_1".into()),
+        epoch: Some(Epoch(1)),
         resume: None,
         hands: None,
         launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "c".into() } },
@@ -1453,12 +1455,13 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(start))]).unwrap();
     assert!(is_ok(&fleet.result("cmd_agent").await));
     assert!(drain(&mut r, Duration::from_millis(300)).await.iter().any(|c| matches!(c, RunnerCommand::AgentStart(_))));
-    let started = RunnerEvent::AgentStarted { agent: AgentId("agt_c".into()), pid: 9, session: SessionId("ses_1".into()), claude_version: "t".into(), capabilities: vec![] };
+    let started = RunnerEvent::AgentStarted { agent: AgentId("agt_c".into()), pid: 9, session: SessionId("ses_1".into()), claude_version: "t".into(), capabilities: vec![], epoch: Some(Epoch(1)) };
     r.send(bytes::Bytes::from(serde_json::to_vec(&started).unwrap())).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     drop(r);
-    fleet.wait_event("the lost brain reported", |b| matches!(b, HostEventBody::AgentExited { agent, reason, .. } if agent.0 == "agt_c" && *reason == AgentExitReason::Crashed)).await;
+    // nestd reports it itself (the runner is gone), with the agent epoch of its start here.
+    fleet.wait_event("the lost brain reported", |b| matches!(b, HostEventBody::AgentExited { agent, reason, epoch, .. } if agent.0 == "agt_c" && *reason == AgentExitReason::Crashed && *epoch == Some(Epoch(1)))).await;
     let mut r = connect().await;
     let got = drain(&mut r, Duration::from_millis(500)).await;
     assert!(got.iter().any(|c| matches!(c, RunnerCommand::HelloAck { .. })));
@@ -2036,4 +2039,112 @@ async fn a_failed_cgroup_delegation_is_reported_in_the_hello() {
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
     let hello = fleet.log.lock().unwrap().hellos[0].clone();
     assert!(hello.cgroup_delegation_error.is_some(), "the failed delegation is not reported");
+}
+
+/// A sandbox fence never fences the brains whose hands act in it: a brain survives its sandbox
+/// moving. Brains are fenced by their own host's lease and their agent epoch; hands by the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandbox_fence_leaves_its_brains_running() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    h.fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_b", "sbx_a")))]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
+    wait_until("runner agent_start", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(_)))).await;
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_a".into())], reason: "moved".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. })), "a sandbox fence fenced a brain");
+    assert!(!h.fleet.log.lock().unwrap().events.iter().any(|e| matches!(e.body, HostEventBody::AgentExited { .. })));
+}
+
+fn bound_start(agent: &str, sandbox: &str) -> AgentStart {
+    AgentStart {
+        agent: AgentId(agent.into()),
+        role: AgentRole::Worker,
+        workstream: WorkstreamId("ws_1".into()),
+        epoch: Some(Epoch(1)),
+        resume: None,
+        hands: Some(HandsBinding { sandbox: SandboxId(sandbox.into()), epoch: None }),
+        launch: LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: "w".into() } },
+        oauth_token: "oauth".into(),
+        session_ws_url: "ws://x".into(),
+    }
+}
+
+/// A kill takes effect on arrival, not behind a slow command in the in-order executor, and its
+/// result goes out on arrival too (AgentDO's escalation reads a kill with a result as "this host
+/// processes commands"); the in-order pass doesn't kill again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_applies_on_arrival_behind_slow_commands() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    h.fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_b", "sbx_a")))]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
+    wait_until("runner agent_start", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(_)))).await;
+    h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2")]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = std::time::Instant::now();
+    let stop = CommandBody::AgentStop { agent: AgentId("agt_b".into()), reason: "starting elsewhere".into(), mode: Some(nest_protocol::host::runner::StopMode::Kill), epoch: Some(Epoch(1)) };
+    h.fleet.commands.send(vec![cmd("cmd_kill", stop)]).unwrap();
+    wait_until("the runner gets the kill", || {
+        h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStop { mode: nest_protocol::host::runner::StopMode::Kill, .. }))
+    })
+    .await;
+    assert!(t0.elapsed() < Duration::from_millis(800), "waited behind the slow create: {:?}", t0.elapsed());
+    assert!(matches!(h.fleet.result("cmd_kill").await, CommandOutcome::Ok { .. }));
+    assert!(h.fleet.results_for("cmd_slow").is_empty(), "the kill's result came on arrival, not behind the slow command");
+    let kills = h._runner.lock().unwrap().iter().filter(|c| matches!(c, RunnerCommand::AgentStop { .. })).count();
+    assert_eq!(kills, 1, "the in-order pass does not kill again");
+}
+
+/// The epoch tombstone: a kill that overtakes a start still queued behind a slow command makes that
+/// start never run (its exit is reported, so AgentDO can start the agent elsewhere), and a kill for a
+/// brain that isn't running here is answered with its exit at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_overtaking_a_queued_start_means_it_never_runs() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    // A slow create occupies the executor; the start for agt_q at epoch 1 queues behind it.
+    h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2"), cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_q", "sbx_a")))]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stop = CommandBody::AgentStop { agent: AgentId("agt_q".into()), reason: "starting elsewhere".into(), mode: Some(nest_protocol::host::runner::StopMode::Kill), epoch: Some(Epoch(1)) };
+    h.fleet.commands.send(vec![cmd("cmd_kill", stop)]).unwrap();
+    // Not running here yet: its exit (at the kill's epoch) is reported on arrival.
+    h.fleet.wait_event("the exit of the brain that never ran", |b| matches!(b, HostEventBody::AgentExited { agent, epoch: Some(Epoch(1)), .. } if agent.0 == "agt_q")).await;
+    assert!(h.fleet.results_for("cmd_slow").is_empty(), "the exit came on the kill's arrival, not behind the slow command");
+    // The queued start, reached in order, is refused and never reaches the runner.
+    match h.fleet.result("cmd_agent").await {
+        CommandOutcome::Error { error } => assert_eq!(error.code, "stale_epoch"),
+        other => panic!("the overtaken start ran: {other:?}"),
+    }
+    assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_q")));
+    // A newer start (epoch 2) runs.
+    let mut newer = bound_start("agt_q", "sbx_a");
+    newer.epoch = Some(Epoch(2));
+    h.fleet.commands.send(vec![cmd("cmd_agent2", CommandBody::AgentStart(newer))]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_agent2").await, CommandOutcome::Ok { .. }));
+}
+
+/// Amendment A3 (a): a start never outlives a lease lapse. One queued behind a slow command when the
+/// lease lapses is refused when the executor reaches it, even after the lease was renewed; its exit
+/// (`fenced`, at its epoch) is reported and it never reaches the runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_held_across_a_lease_lapse_never_runs() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
+    h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2"), cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_l", "sbx_a")))]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.fleet.partition.store(true, Ordering::SeqCst); // the lease lapses while the start waits
+    wait_until("runner fence", || h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. }))).await;
+    h.fleet.partition.store(false, Ordering::SeqCst); // renewed before the executor reaches the start
+    match h.fleet.result("cmd_agent").await {
+        CommandOutcome::Error { error } => assert_eq!(error.code, "stale_epoch"),
+        other => panic!("a start held across a lapse ran: {other:?}"),
+    }
+    h.fleet.wait_event("its exit", |b| matches!(b, HostEventBody::AgentExited { agent, epoch: Some(Epoch(1)), reason: AgentExitReason::Fenced, .. } if agent.0 == "agt_l")).await;
+    assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_l")));
 }

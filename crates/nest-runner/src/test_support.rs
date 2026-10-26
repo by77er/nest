@@ -228,8 +228,10 @@ pub mod gateway {
             };
             HandsTarget {
                 url: self.url.clone(),
-                sandbox: SandboxId(sandbox.into()),
-                epoch: Epoch(epoch),
+                // Only the claims name the sandbox and epoch, as AgentDO's answers will once the
+                // previous release's unsigned copies go.
+                sandbox: None,
+                epoch: None,
                 binding: Secret(self.signer.sign(&claims)),
                 guest: GuestInfo { protocol_version: nest_protocol::guest::PROTOCOL_VERSION, capabilities: vec![] },
                 edge: None,

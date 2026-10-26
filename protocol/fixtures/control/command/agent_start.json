@@ -5,6 +5,7 @@
   "agent": "agt_01jb7n0w1e",
   "role": "worker",
   "workstream": "ws_01jb7j8r2t",
+  "epoch": 5,
   "resume": {
     "session": "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73",
     "segments": [
@@ -25,8 +26,7 @@
     "fork": false
   },
   "hands": {
-    "sandbox": "sbx_01jb7m2a4c",
-    "epoch": 4
+    "sandbox": "sbx_01jb7m2a4c"
   },
   "launch": {
     "model": "opus",

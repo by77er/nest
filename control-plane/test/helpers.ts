@@ -131,6 +131,8 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
     cell,
     versions: { nestd: "0.1.0", nest_proxy: "0.1.0", agent_runner: "0.1.0", claude_code: "2.1.296" },
     gateway_url: GATEWAY_URL,
+    // A current nestd (keys brains by agent epoch); a test of the previous release passes `false`.
+    brain_epochs: true,
     sandboxes: [],
     agents: [],
     capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, hugepages_mib_total: 8192, sandboxes: 0, agents: 0, warm: [] },

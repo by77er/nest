@@ -158,6 +158,11 @@ pub struct HostHello {
     /// (nestd still kills leftovers at start). Absent when delegation works or isn't configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgroup_delegation_error: Option<String>,
+    /// This nestd keys brains by agent epoch, reports every exit with its epoch, answers kills on
+    /// arrival and refuses starts across a lease lapse. Absent (false) from nestd of the previous
+    /// release, which the control plane neither prefers for new brains nor wedges.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub brain_epochs: bool,
     /// Everything this host currently holds; FleetDO reconciles against it.
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,
@@ -351,9 +356,23 @@ pub enum CommandBody {
     /// Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's whole
     /// cgroup first. The gateway then refuses the agent's bindings (`unauthorized`).
     AgentDetach { sandbox: SandboxId, epoch: Epoch, agent: AgentId, #[serde(default)] kill_processes: bool },
-    /// Stop the brain process (end the current turn cleanly if possible).
-    AgentStop { agent: AgentId, reason: String },
-    /// Fence immediately: stop brains bound to these sandboxes, pause VMs, drop listeners/netns.
+    /// Stop the brain process: `graceful` (absent: nestd of the previous release always does so)
+    /// lets the current turn finish, in order; `kill` ends it at once, applied on arrival (AgentDO
+    /// starts the brain elsewhere once its exit is reported). `epoch`: the newest agent epoch this
+    /// stop ends; nestd remembers the highest killed one per agent and refuses a later
+    /// `agent_start` at or below it (a kill overtaking a queued start). A kill for a brain nestd
+    /// doesn't run is answered with its `agent_exited` at once.
+    AgentStop {
+        agent: AgentId,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<crate::host::runner::StopMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<Epoch>,
+    },
+    /// Fence immediately: pause these sandboxes' VMs, drop their listeners/netns. Brains are not
+    /// touched: they are fenced by their own host's lease and their agent epoch, and their hands
+    /// by the gateway.
     Fence { sandboxes: Vec<SandboxId>, reason: String },
     /// Spot reclaim or scale-down: commit/suspend everything by `deadline_ms`, then exit.
     Drain { reason: String, deadline_ms: TimestampMs },
@@ -385,12 +404,17 @@ pub enum CommitOutcome {
     },
 }
 
-/// The sandbox an agent's hands act in, by id and epoch only: no address, no token. The runner
-/// fetches the target (`HandsTarget`) with `hands_resolve` over its own session channel.
+/// The sandbox an agent's hands act in, by id only: no address, no token, no epoch (the sandbox
+/// epoch travels inside the binding). The runner fetches the target (`HandsTarget`) with
+/// `hands_resolve` over its own session channel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandsBinding {
     pub sandbox: SandboxId,
-    pub epoch: Epoch,
+    /// Deprecated, for one release: the control plane still sends a copy of
+    /// [`AgentStart::epoch`] here, because runners of the previous release take their session
+    /// epoch from it (and require the field). Current runners use it only when `epoch` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<Epoch>,
 }
 
 /// Default working directory of an agent's slot (`agent_attach.cwd`).
@@ -401,10 +425,17 @@ pub struct AgentStart {
     pub agent: AgentId,
     pub role: AgentRole,
     pub workstream: WorkstreamId,
+    /// The agent epoch AgentDO issued for this brain start (one per start, never reused). The
+    /// brain presents it in its session `hello`; AgentDO keys platform tool calls and filters
+    /// events by it. Unrelated to the sandbox's epoch: a sandbox move doesn't change it. Absent
+    /// only from a command queued by a control plane of the previous release (see
+    /// [`AgentStart::agent_epoch`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<Epoch>,
     /// Existing session to resume; `None` starts a fresh conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<SessionResume>,
-    /// The sandbox this agent's hands act in, if any. Only the ids: the gateway URL and the
+    /// The sandbox this agent's hands act in, if any. Only its id: the gateway URL and the
     /// binding never pass through FleetDO or nestd; the runner asks AgentDO for them
     /// (`hands_resolve`) before its first hands call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -414,6 +445,14 @@ pub struct AgentStart {
     /// (`CLAUDE_CODE_OAUTH_TOKEN`); never logged, never written to disk, never sent to a VM.
     pub oauth_token: crate::model::Secret,
     pub session_ws_url: String,
+}
+
+impl AgentStart {
+    /// The brain's session epoch: `epoch`, or, in a command from a control plane of the previous
+    /// release, the `hands.epoch` it sent instead (`0` for an agent without hands, as it did).
+    pub fn agent_epoch(&self) -> Epoch {
+        self.epoch.or_else(|| self.hands.as_ref().and_then(|h| h.epoch)).unwrap_or(Epoch(0))
+    }
 }
 
 /// Rebuild the native session file before `claude --resume <path>`.
@@ -537,6 +576,10 @@ pub enum HostEventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<i32>,
         reason: AgentExitReason,
+        /// The agent epoch the brain ran under (absent from the previous release, or for a brain
+        /// the runner never reported): an exit of an older start than AgentDO's is ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<Epoch>,
     },
 }
 
@@ -683,8 +726,8 @@ pub struct RunnerHello {
     /// resets the session channel's seq lineage and event dedup, like FleetDO does for
     /// `HostHello.instance_id`.
     pub instance_id: String,
-    /// Epoch of the bound sandbox's lease (controller-host captains: the host's own epoch
-    /// counter is not used; send `0`).
+    /// The agent epoch of this brain start (`AgentStart::epoch`), never the sandbox's. A brain
+    /// that adopted a newer epoch (a later `agent_start` while it ran) reconnects with that one.
     pub epoch: Epoch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionId>,
@@ -733,12 +776,16 @@ pub enum AgentToRunner {
     CacheUpdate { seq: Seq, cache: AgentCache },
     ToolResult { seq: Seq, call: CallId, outcome: ToolOutcome },
     ToolsList { request: RequestId, tools: Vec<ToolDef> },
-    /// Answer to `hands_resolve`. Exactly one of `hands` and `error` is present: `hands` is a
-    /// fresh binding and the sandbox's current gateway; `error` is `not_bound` (the agent has no
-    /// hands: tell the model), `sandbox_not_ready` with `retry_after_ms` (placing, waking:
-    /// wait and ask again), or another `ErrorBody` the runner surfaces as an MCP error.
+    /// Answer to `hands_resolve`: `outcome` is a fresh target or the reason there is none.
+    ///
+    /// `hands`, `error` and `retry_after_ms` are the previous release's shape of the same answer
+    /// (exactly one of `hands` and `error`). For one release the control plane sends both
+    /// shapes, so runners of either release understand it; a runner reads `outcome` first and
+    /// falls back to them ([`HandsOutcome::from_legacy`]).
     HandsResolved {
         request: RequestId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Box<HandsOutcome>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hands: Option<HandsTarget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -748,6 +795,42 @@ pub enum AgentToRunner {
     },
     Ack { up_to: Seq },
     Error { error: ErrorBody },
+}
+
+/// What `hands_resolve` produced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HandsOutcome {
+    /// A fresh binding and the sandbox's current gateway.
+    Ok { hands: HandsTarget },
+    /// No target now: `not_bound` (the agent has no hands: tell the model), `sandbox_not_ready`
+    /// with `retry_after_ms` (placing, waking: wait and ask again), `stale_epoch` (not the
+    /// current runner process or epoch), or another error the runner surfaces as an MCP error.
+    Error {
+        error: ErrorBody,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
+}
+
+impl HandsOutcome {
+    /// The answer in `hands_resolved`: `outcome`, else the previous release's three-optional
+    /// shape (`hands` wins; neither present is an `invalid_message` error).
+    pub fn from_wire(outcome: Option<Box<HandsOutcome>>, hands: Option<HandsTarget>, error: Option<ErrorBody>, retry_after_ms: Option<u64>) -> Self {
+        match (outcome, hands, error) {
+            (Some(o), _, _) => *o,
+            (None, Some(hands), _) => HandsOutcome::Ok { hands },
+            (None, None, Some(error)) => HandsOutcome::Error { error, retry_after_ms },
+            (None, None, None) => HandsOutcome::Error {
+                error: ErrorBody {
+                    code: crate::model::error_codes::INVALID_MESSAGE.into(),
+                    message: "hands_resolved carried no outcome".into(),
+                    retryable: false,
+                },
+                retry_after_ms: None,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,6 +1162,64 @@ mod tests {
         ] {
             assert!(names.contains(required), "missing platform tool {required}");
         }
+    }
+
+    fn fixture_json<T: serde::de::DeserializeOwned>(rel: &str) -> T {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../protocol/fixtures").join(rel);
+        serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
+    }
+
+    fn hands_outcome(m: AgentToRunner) -> HandsOutcome {
+        match m {
+            AgentToRunner::HandsResolved { outcome, hands, error, retry_after_ms, .. } => {
+                HandsOutcome::from_wire(outcome, hands, error, retry_after_ms)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hands_resolved_reads_the_outcome_and_the_previous_shape() {
+        let ok = hands_outcome(fixture_json("control/agent_to_runner/hands_resolved.json"));
+        let legacy = hands_outcome(fixture_json("control/agent_to_runner/hands_resolved.legacy.json"));
+        let dual = hands_outcome(fixture_json("control/agent_to_runner/hands_resolved.dual.json"));
+        let target = |o: &HandsOutcome| match o {
+            HandsOutcome::Ok { hands } => hands.binding.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(target(&ok), target(&legacy));
+        assert_eq!(target(&dual), target(&ok));
+
+        let not_ready = hands_outcome(fixture_json("control/agent_to_runner/hands_resolved.not_ready.json"));
+        let legacy_not_ready = hands_outcome(fixture_json("control/agent_to_runner/hands_resolved.legacy_not_ready.json"));
+        assert_eq!(not_ready, legacy_not_ready, "retry_after_ms moved into the error arm");
+        assert!(matches!(&not_ready, HandsOutcome::Error { error, retry_after_ms: Some(2000) } if error.code == "sandbox_not_ready"));
+
+        // `outcome` wins over the old fields; nothing at all is an invalid message.
+        let e = ErrorBody { code: "not_bound".into(), message: "m".into(), retryable: false };
+        let o = HandsOutcome::Error { error: e.clone(), retry_after_ms: None };
+        let t: crate::gateway::HandsTarget = fixture_json("gateway/hands_target/hands_target.json");
+        assert_eq!(HandsOutcome::from_wire(Some(Box::new(o.clone())), Some(t), None, None), o);
+        assert!(matches!(
+            HandsOutcome::from_wire(None, None, None, None),
+            HandsOutcome::Error { error, .. } if error.code == crate::model::error_codes::INVALID_MESSAGE
+        ));
+    }
+
+    #[test]
+    fn agent_start_epoch_falls_back_to_the_previous_releases_hands_epoch() {
+        let start = |rel: &str| match fixture_json::<Command>(rel).body {
+            CommandBody::AgentStart(s) => s,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(start("control/command/agent_start.json").agent_epoch(), Epoch(5));
+        assert_eq!(start("control/command/agent_start.captain.json").agent_epoch(), Epoch(2));
+        // A command queued by the previous release: its session epoch was `hands.epoch`.
+        assert_eq!(start("control/command/agent_start.legacy.json").agent_epoch(), Epoch(4));
+        // `epoch` wins over the copy this release still sends in `hands.epoch`.
+        let mut s = start("control/command/agent_start.json");
+        s.hands.as_mut().unwrap().epoch = Some(Epoch(9));
+        assert_eq!(s.agent_epoch(), Epoch(5));
     }
 
     #[test]

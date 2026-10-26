@@ -22,9 +22,9 @@ keywords = ["nht_"]
 # ignore `condition = "AND"`.
 [[allowlists]]
 targetRules = ["github-app-token", "stripe-access-token", "generic-api-key"]
-description = "Example credentials in wire-protocol fixtures: GitHub's documented example token, a Stripe test-key shape, and unsigned host tokens"
+description = "Example credentials in wire-protocol fixtures (and fuzz seeds copied from them): GitHub's documented example token, a Stripe test-key shape, and unsigned host tokens"
 condition = "AND"
-paths = ['''^protocol/fixtures/(control|host)/''']
+paths = ['''^protocol/fixtures/(control|host)/''', '''^verification/nestd/fuzz/seeds/''']
 regexes = ['''^ghs_16C7e42F292c6912E7710c838347Ae178B4a$''', '''^rk_test_51Hx+$''', '''^nht_eyJhbGciOiJFZERTQSJ9\.[A-Za-z0-9_\-]+\.c2ln$''']
 
 [[allowlists]]

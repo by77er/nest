@@ -1,0 +1,7 @@
+{
+  "type": "agent_stop",
+  "agent": "agt_01jb7n0w1e",
+  "mode": "kill",
+  "reason": "starting on hst_01jb7n0w1f",
+  "epoch": 4
+}

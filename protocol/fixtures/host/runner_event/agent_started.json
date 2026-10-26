@@ -7,5 +7,6 @@
   "capabilities": [
     "interrupt_receipt_v1",
     "interrupt_cancel_queued_v1"
-  ]
+  ],
+  "epoch": 5
 }
