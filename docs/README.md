@@ -2,7 +2,7 @@
 
 A personal platform built as two systems with one seam: a **sandbox system** that runs isolated VMs on commodity cloud compute, and an **agent system** that runs long-lived Claude Code agents on my own subscription. Brains run on brain hosts (or, later, inside the control plane) and act on sandboxes only over the network, through each sandbox host's gateway; neither system knows where the other runs. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales sandbox hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Sandboxes run in Firecracker on nested-virtualization hosts (jailed, hugepages, the proxy root CA in KMS): a real Claude Code turn ran in a VM, its disk was committed at turn end, and after a host reboot the sandbox came back with the file (EC2, 2026-10-18; see [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/)). Hosts without `/dev/kvm` fall back to the process driver. The seam between the two systems is built (the [gateway](sandbox/gateway/), bindings, the runner's hands client, each sandbox host's tunnel), proven on the harness with the gateway on loopback and verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13). Designed but not built: [brain hosts](compute/brain-hosts/) and the agent epoch (brains still start on the sandbox's host), the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes) and the Discord bot; `control-plane/README.md` lists the gaps.
+**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales sandbox hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Sandboxes run in Firecracker on nested-virtualization hosts (jailed, hugepages, the proxy root CA in KMS): a real Claude Code turn ran in a VM, its disk was committed at turn end, and after a host reboot the sandbox came back with the file (EC2, 2026-10-18; see [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/)). Hosts without `/dev/kvm` fall back to the process driver. The seam between the two systems is built (the [gateway](sandbox/gateway/), bindings, the runner's hands client, each sandbox host's tunnel), proven on the harness with the gateway on loopback and verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13). Designed but not built: [brain hosts](compute/brain-hosts/) (brains still start on the sandbox's host; the agent epoch is built, so a sandbox move no longer restarts them), the coordination layer (channels, hooks, grants, capabilities, spawn specs, scheduled wakes) and the Discord bot; `control-plane/README.md` lists the gaps.
 
 **Start with [architecture/](architecture/)** for how the pieces fit and how a turn flows. Everything needed to bring nest up (accounts, credentials, where they go) is in [setup/](setup/).
 
@@ -45,6 +45,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `deploy/` | Cells as an inframe stack (OpenTofu): network, bucket, IAM, the host-image pipeline; the sandbox-host install and bootstrap |
 | `images/` | The Firecracker guest image (kernel and `nest-base` rootfs) and its EC2 builder |
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
+| `verification/` | Formal models and proofs of the protocols (TLA+, Lean, Stateright) and their runner ([verification](verification/)) |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
 
 UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`); memory snapshots are deferred by decision until cold boot proves too slow ([memory](sandbox/state/memory/)).
@@ -74,10 +75,11 @@ sandbox         drivers · state · fencing · networking · gateway · guest ag
 compute         cells · sandbox hosts · brain hosts · nestd · autoscaling · provisioning  compute/
 control plane   Cloudflare Workers + Durable Objects · API · activator                 control-plane/
 cross-cutting   security (authority, model access, identity, credentials) · data      security/  data/
+                verification (state-machine inventory, models, proofs)                verification/
 contracts       boundary interfaces (wire protocols, the gateway contract, tool schemas) interfaces/
 ```
 
-See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [interfaces/](interfaces/) and [setup/](setup/).
+See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [verification/](verification/), [interfaces/](interfaces/) and [setup/](setup/).
 
 ## Glossary
 
@@ -159,6 +161,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Every commit, pause and suspend requires a guest `syncfs` | [sandbox/state/disk/](sandbox/state/disk/#flush-before-commit) |
 | Per-sandbox disk I/O is limited (10,000 ops/s, 100 MiB/s, 30 s burst) | [sandbox/state/disk/](sandbox/state/disk/#io-limits) |
 | The AWS burst fleet is the 8i family only | [compute/](compute/) |
+| Everything AWS is per cell, keyed by the cell name: resources, settings (`AWS_CELLS`), the control plane's credentials (`AWS_CELL_CREDENTIALS`), the proxy root CA key and its certificate, which FleetDO derives from the key | [compute/cells/](compute/cells/) |
 | Placement packs by free hugepages | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
 | The harness runs on brain hosts; hands are RPC into the sandbox through the gateway; no credentials in VMs or on sandbox hosts | [agents/](agents/) |
@@ -213,6 +216,9 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Measure:** the edge round trip a hands call pays over the tunnel, in the remote-brain arm of the fidelity eval (spike item 10). A VPC endpoint for same-cell brain hosts waits on this number. See [sandbox/gateway/](sandbox/gateway/).
 - **Measure:** a worker's wall time inside hands calls per turn, before `api-loop` ships: a Durable Object is billed while an outbound WebSocket is open. See [agents/backends/api-loop/](agents/backends/api-loop/).
 - **Access in front of the gateway hostnames is in place** (2026-10-24): the application on `*-gw-nest.bitcru.sh` answers 403 without the service token and admits it with a Service Auth policy (an Allow policy redirects a service token to the login page, which is what the first cross-host run hit). Every brain now depends on the token the control plane hands out as `edge`.
+- **Open:** the long-run spec language for protocol models: TLA+ with TLC (what the pilots used, and found bugs with) or Quint (the survey's pick, for model-based testing). See [verification/](verification/#open-questions).
+- **Decide:** the no-capacity placement rollback reuses an epoch number, contrary to "an epoch is never retried", and makes the old holder's salvage fail for good. Keep it and authorize that salvage, or spend an epoch per attempt? See [verification/sandbox-lease/](verification/sandbox-lease/).
+- **Docs ahead of code (found by the verification study):** hands-call journaling (`call_status`, `executed: false`) and the single `isRestoreSource` predicate are settled here but not built, and nestd's command receiver has no gap check. See [verification/](verification/#real-bugs-found).
 
 ## First spike
 

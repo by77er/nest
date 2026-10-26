@@ -4,6 +4,7 @@
     "agent": "agt_01jb7n5c0p",
     "role": "captain",
     "workstream": "ws_01jb7j8r2t",
+    "epoch": 2,
     "launch": {
       "builtin_tools": [],
       "system_prompt": {

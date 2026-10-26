@@ -51,6 +51,18 @@ async function withSigner<T>(sign: RootCa["sign"], f: (signingKey: CryptoKey) =>
   }
 }
 
+/** A P-256 SubjectPublicKeyInfo re-encoded through WebCrypto, so two encodings of one key compare equal. */
+export async function canonicalSpki(spki: Uint8Array): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey("spki", spki, EC, true, ["verify"]);
+  return new Uint8Array((await crypto.subtle.exportKey("spki", key)) as ArrayBuffer);
+}
+
+/** The certificate's public key, as canonical DER SubjectPublicKeyInfo. */
+export async function certificateSpki(certPem: string): Promise<Uint8Array> {
+  x509.cryptoProvider.set(crypto);
+  return canonicalSpki(new Uint8Array(new x509.X509Certificate(certPem).publicKey.rawData));
+}
+
 /** A self-signed root certificate for a key held elsewhere (KMS): its public key and signer. */
 export async function createRootCertificate(publicKeySpki: Uint8Array, sign: RootCa["sign"], name: string, ttlMs: number, nowMs = Date.now()): Promise<string> {
   const publicKey = await crypto.subtle.importKey("spki", publicKeySpki, EC, true, ["verify"]);

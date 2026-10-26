@@ -308,22 +308,27 @@ describe("hands_resolve on the session channel", () => {
     const s = await setup();
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
-    expect(start).toMatchObject({ type: "agent_start", hands: { sandbox: s.sandbox, epoch: 1 } });
+    expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 } });
     expect(start.hands.binding, "no binding ever passes through a host command").toBeUndefined();
     const ws = await Ws.connect(`/v1/agents/${s.agent}/session`, s.host.host_token);
     ws.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.host.host, instance_id: "rin_hands", epoch: 1 });
     await ws.next("hello_ack");
     ws.send({ type: "hands_resolve", request: "req_1" });
     const notReady = await ws.next("hands_resolved", (m) => m.request === "req_1");
+    expect(notReady.outcome).toMatchObject({ status: "error", error: { code: "sandbox_not_ready", retryable: true }, retry_after_ms: 2000 });
+    // The previous release's shape of the same answer, for its runners.
     expect(notReady.hands).toBeUndefined();
-    expect(notReady.error).toMatchObject({ code: "sandbox_not_ready", retryable: true });
+    expect(notReady.error).toEqual(notReady.outcome.error);
     expect(notReady.retry_after_ms).toBe(2000);
     await okResult(s.host.ws, s.attach.cmd);
     ws.send({ type: "hands_resolve", request: "req_2" });
     const ready = await ws.next("hands_resolved", (m) => m.request === "req_2");
+    expect(ready.outcome.status).toBe("ok");
+    expect(ready.outcome.hands).toMatchObject({ url: GATEWAY_URL });
+    const claims = await verified(s.pub, ready.outcome.hands as HandsTarget);
+    expect(claims).toMatchObject({ client: s.agent, sandbox: s.sandbox, epoch: 1 });
     expect(ready.error).toBeUndefined();
-    expect(ready.hands).toMatchObject({ url: GATEWAY_URL, sandbox: s.sandbox, epoch: 1 });
-    expect((await verified(s.pub, ready.hands as HandsTarget)).client).toBe(s.agent);
+    expect(ready.hands).toEqual(ready.outcome.hands);
     // The target went AgentDO → runner and nowhere else: nothing of it rests in AgentDO either.
     const agentRows = await runInDurableObject(agentStub(s.agent), (_i, st) =>
       st.storage.sql.exec<{ v: string }>("SELECT value AS v FROM kv UNION ALL SELECT body AS v FROM rel_out").toArray().map((r) => r.v).join("\n"));
@@ -341,8 +346,8 @@ describe("hands_resolve on the session channel", () => {
     await ws.next("error", (m) => m.error.code === "stale_epoch");
     ws.send({ type: "hands_resolve", request: "req_stale" });
     const r = await ws.next("hands_resolved", (m) => m.request === "req_stale");
+    expect(r.outcome).toMatchObject({ status: "error", error: { code: "stale_epoch", retryable: false } });
     expect(r.hands).toBeUndefined();
-    expect(r.error).toMatchObject({ code: "stale_epoch", retryable: false });
   });
 
   it("a captain has no hands: not_bound, not retryable", async () => {
@@ -351,13 +356,16 @@ describe("hands_resolve on the session channel", () => {
     const ctl = await connectHost(cell, "controller");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "captain" } }, 201);
     const captain = await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201);
-    await nextCommands(ctl.ws, (c) => c.type === "agent_start" && c.agent === captain.agent);
+    const [start] = await nextCommands(ctl.ws, (c) => c.type === "agent_start" && c.agent === captain.agent);
+    // A captain gets an agent epoch like any agent; no hands, so no `hands` field.
+    expect(start).toMatchObject({ epoch: 1 });
+    expect(start.hands).toBeUndefined();
     const ws = await Ws.connect(`/v1/agents/${captain.agent}/session`, ctl.host_token);
-    ws.send({ type: "hello", protocol_version: 1, agent: captain.agent, host: ctl.host, instance_id: "rin_cap", epoch: 0 });
+    ws.send({ type: "hello", protocol_version: 1, agent: captain.agent, host: ctl.host, instance_id: "rin_cap", epoch: 1 });
     await ws.next("hello_ack");
     ws.send({ type: "hands_resolve", request: "req_c" });
     const r = await ws.next("hands_resolved");
-    expect(r.error).toMatchObject({ code: "not_bound", retryable: false });
+    expect(r.outcome).toEqual({ status: "error", error: expect.objectContaining({ code: "not_bound", retryable: false }) });
     expect(r.retry_after_ms).toBeUndefined();
   });
 });

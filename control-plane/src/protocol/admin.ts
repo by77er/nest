@@ -29,6 +29,19 @@ export type HostStatus = (typeof HOST_STATUSES)[number];
 export const LAUNCH_END_REASONS = ["enroll_timeout", "idle", "drained", "dead"] as const;
 export type LaunchEndReason = (typeof LAUNCH_END_REASONS)[number];
 
+/** lib/cells.ts `AwsSource`: where a cell's AWS setting came from. */
+export const AWS_SOURCES = ["cell", "legacy", "none"] as const;
+export type AwsSource = (typeof AWS_SOURCES)[number];
+
+/**
+ * The fleet view's `aws`: the cell's region and each setting's source (never a value), with `error`
+ * when the cell's own credentials were malformed and passed over; or only `error` when its
+ * `AWS_CELLS` entry is unusable.
+ */
+export type AwsView =
+  | { cell: string | null; region: string | null; sources: { region: AwsSource; credentials: AwsSource; kms_key: AwsSource }; error?: string }
+  | { cell: string | null; error: string };
+
 /** protocol/control.ts `Capacity`, as the host last reported it. */
 export interface CapacityView {
   vcpus_free: number;
@@ -64,7 +77,14 @@ export interface HostView {
   leases: number;
   connected: boolean;
   sandboxes: ResidentView[];
+  /** Agents with a brain indexed on the host (FleetDO's `host_agents`). */
   agents: string[];
+  /** When AgentDO reported a brain here that did not exit after a kill; null: not wedged. */
+  wedged_ms: number | null;
+  /** Its brains are proven gone: lease expired, or death confirmed. */
+  lost: boolean;
+  /** Its nestd keys brains by agent epoch (false: the previous release). */
+  brain_epochs: boolean;
 }
 
 export interface LaunchView {
@@ -97,6 +117,7 @@ export interface FleetView {
   hosts: HostView[];
   launches: LaunchView[];
   sandboxes: SandboxView[];
+  aws: AwsView;
 }
 
 /** lib/ec2.ts `ImageInfo`: a host AMI. `state` is EC2's image state. */

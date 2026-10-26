@@ -7,7 +7,7 @@ export type {
   LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
   TunnelState,
 } from "../../control-plane/src/protocol/admin";
-import type { FleetView, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../control-plane/src/protocol/admin";
+import type { AwsView, FleetView, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../control-plane/src/protocol/admin";
 
 /**
  * A sandbox row as the control plane before the typed view returned it: one `state`, the lease's
@@ -26,16 +26,23 @@ export interface LegacySandboxRow {
 
 /** What `GET /api/fleet` may answer during that release. */
 export interface FleetResponse {
-  hosts: (Omit<HostView, "tunnel_state"> & { tunnel_state: TunnelState | null })[];
+  /** The previous release sends `tunnel_state` null for `none`, and `lost`/`brain_epochs` as 0/1 (or not at all, before them). */
+  hosts: (Omit<HostView, "tunnel_state" | "lost" | "brain_epochs" | "wedged_ms"> & {
+    tunnel_state: TunnelState | null; lost?: boolean | number; brain_epochs?: boolean | number; wedged_ms?: number | null;
+  })[];
   launches: FleetView["launches"];
   sandboxes: (SandboxView | LegacySandboxRow)[];
+  aws?: AwsView;
 }
 
 /** Either shape as the current one. */
 export function normalizeFleet(raw: FleetResponse): FleetView {
   return {
-    hosts: raw.hosts.map((h) => ({ ...h, tunnel_state: h.tunnel_state ?? "none" })),
+    hosts: raw.hosts.map((h) => ({
+      ...h, tunnel_state: h.tunnel_state ?? "none", lost: !!h.lost, brain_epochs: !!h.brain_epochs, wedged_ms: h.wedged_ms ?? null,
+    })),
     launches: raw.launches,
+    aws: raw.aws ?? { cell: null, error: "not reported by this control plane" },
     sandboxes: raw.sandboxes.map((s): SandboxView => {
       if ("lease_state" in s) return s;
       const { state, ...rest } = s;

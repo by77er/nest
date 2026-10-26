@@ -174,13 +174,6 @@ async function route(req: Request, env: Env): Promise<Response> {
     const r = await body(req, z.object({ sandboxes: z.array(z.string().startsWith("sbx_")) }));
     return json({ live: await fleet(env, cell).registerSandboxes(r.sandboxes) });
   }
-  if (req.method === "POST" && path === "/v1/admin/root-ca/kms") {
-    const r = await body(req, z.object({
-      key_id: z.string().min(1), name: z.string().default("CN=nest proxy root CA"), ttl_days: z.number().int().min(1).max(3650).default(3650),
-    }));
-    const pem = await fleet(env, cell).createKmsRootCertificate(r.key_id, r.name, r.ttl_days * 86_400_000);
-    return new Response(pem, { headers: { "content-type": "application/x-pem-file" } });
-  }
   if (req.method === "GET" && path === "/v1/admin/root-ca") {
     return new Response(await fleet(env, cell).rootCertificatePem(), { headers: { "content-type": "application/x-pem-file" } });
   }
@@ -326,7 +319,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (req.method === "POST" && p[2] === "/start") {
       // An optional host: a brain on a chosen enrolled host (hands still reach the sandbox's gateway).
       const text = await req.text();
-      let r: { host?: string } = {};
+      let r: { host?: string; restart?: boolean } = {};
       if (text.trim()) {
         let raw: unknown;
         try {
@@ -334,11 +327,11 @@ async function route(req: Request, env: Env): Promise<Response> {
         } catch {
           throw new NestError(ErrorCodes.INVALID_MESSAGE, "body must be JSON");
         }
-        const parsed = z.object({ host: HostId.optional() }).safeParse(raw);
+        const parsed = z.object({ host: HostId.optional(), restart: z.boolean().optional() }).safeParse(raw);
         if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, parsed.error.message);
         r = parsed.data;
       }
-      return json(await a.start(r.host));
+      return json(await a.start(r.host, undefined, r.restart ?? false));
     }
 
     if (req.method === "POST" && p[2] === "/stop") {

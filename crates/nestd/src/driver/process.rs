@@ -3,7 +3,8 @@
 //! (`--listen unix:<dir>`) and [`crate::vsock::Emulator`] serves `<vm_dir>/vsock.sock`.
 //!
 //! The child starts inside the sandbox netns (when networking is enabled), so its egress hits the
-//! same nft rules and proxy listeners a VM would. Pause/resume are SIGSTOP/SIGCONT.
+//! same nft rules and proxy listeners a VM would, and dies with nestd (`supervise.rs`).
+//! Pause/resume are SIGSTOP/SIGCONT.
 //!
 //! With `mount_disk` (root only), the disk image is formatted ext4 on first use and the guest
 //! runs in a private mount namespace with it loop-mounted at `/workspace`, so what an agent writes
@@ -136,14 +137,12 @@ impl Vm for ProcessVm {
             .arg(format!("unix:{}", guest_dir.display()))
             .env("NEST_DISK_IMAGE", &self.spec.disk_path)
             .stdin(std::process::Stdio::null());
-        let child = match &self.spec.netns {
-            Some(ns) => {
-                let ns: Arc<_> = ns.clone();
-                ns.run(move || cmd.spawn())?
-            }
-            None => cmd.spawn()?,
-        };
+        // Dies with nestd, and starts inside the sandbox netns (`supervise.rs`).
+        let child = super::supervise::spawn(cmd, self.spec.netns.clone())?;
+        let pid = child.id();
+        // Held first: on any error below, stop or drop reaps it.
         self.child = Some(child);
+        super::supervise::write_pidfile(&self.spec.vm_dir, pid)?;
         Ok(())
     }
     async fn pause(&mut self) -> io::Result<()> {

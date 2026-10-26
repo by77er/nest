@@ -40,7 +40,10 @@ export const fleet = {
       ],
       "agents": [
         "agt_01jbx8k2m9qv3t7w5y4n6p0r1s"
-      ]
+      ],
+      "wedged_ms": null,
+      "lost": false,
+      "brain_epochs": true
     }
   ],
   "launches": [
@@ -64,7 +67,12 @@ export const fleet = {
       "workstream": "ws_01m5pv1581hvrmhfbravczqzf3",
       "info_error": false
     }
-  ]
+  ],
+  "aws": {
+    "cell": "use1",
+    "region": "us-east-1",
+    "sources": { "region": "cell", "credentials": "cell", "kms_key": "legacy" }
+  }
 } satisfies Fleet;
 
 export const images = {

@@ -18,7 +18,7 @@ use nest_protocol::gateway::{
     ClientMessage, EdgeAuth, GuestInfo, HandsTarget, PROTOCOL_VERSION, close_code,
 };
 use nest_protocol::guest::frame::{self, MAX_FRAME_LEN};
-use nest_protocol::model::{Epoch, SandboxId, Secret};
+use nest_protocol::model::Secret;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -249,8 +249,8 @@ async fn gateway(mode: Mode) -> Gateway {
 fn target(url: &str, edge: Option<EdgeAuth>) -> HandsTarget {
     HandsTarget {
         url: url.to_string(),
-        sandbox: SandboxId("sbx_01jb7m2a4c".into()),
-        epoch: Epoch(4),
+        sandbox: None,
+        epoch: None,
         binding: Secret("nbd_eyJ2IjoxfQ.c2ln".into()),
         guest: GuestInfo {
             protocol_version: 1,

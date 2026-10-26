@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::control::{AgentCache, HandsBinding, InboxMessage, ToolDef, ToolOutcome, TurnInput};
+use nest_protocol::control::{AgentCache, HandsBinding, HandsOutcome, InboxMessage, ToolDef, ToolOutcome, TurnInput};
 use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
@@ -35,7 +35,9 @@ pub use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 /// Process-wide state.
 pub struct Runtime {
     pub cfg: Config,
-    agents: Mutex<HashMap<AgentId, Arc<Agent>>>,
+    /// Registered brains and the kill tombstones, under one lock: a registration and a kill for
+    /// the same agent are ordered, so a kill can't slip between a start's spawn and its registration.
+    agents: Mutex<Registry>,
     /// Newest host token from nestd (memory only).
     pub host_token: watch::Sender<Option<Secret>>,
     pub host_id: Mutex<Option<HostId>>,
@@ -55,7 +57,7 @@ impl Runtime {
         let (tx, rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             cfg,
-            agents: Mutex::new(HashMap::new()),
+            agents: Mutex::new(Registry::default()),
             host_token: watch::channel(None).0,
             host_id: Mutex::new(None),
             to_nestd: tx,
@@ -66,31 +68,52 @@ impl Runtime {
     }
 
     pub fn agent(&self, id: &AgentId) -> Option<Arc<Agent>> {
-        self.agents.lock().unwrap().get(id).cloned()
+        self.agents.lock().unwrap().agents.get(id).cloned()
     }
 
     pub fn agents(&self) -> Vec<Arc<Agent>> {
-        self.agents.lock().unwrap().values().cloned().collect()
+        self.agents.lock().unwrap().agents.values().cloned().collect()
     }
 
-    /// Register (first thing a start does, before any slow step); returns the agent already
-    /// registered under this id instead, if any.
-    pub fn register(&self, a: Arc<Agent>) -> Result<(), Arc<Agent>> {
-        let mut m = self.agents.lock().unwrap();
-        if let Some(existing) = m.get(&a.id) {
-            return Err(existing.clone());
+    /// Register (first thing a start does, before any slow step). Refused when a kill at or above
+    /// the start's agent epoch arrived first (its tombstone), or when another brain is registered
+    /// under this id.
+    pub fn register(&self, a: Arc<Agent>, fence_gen: u64) -> Result<(), Refused> {
+        let mut r = self.agents.lock().unwrap();
+        // A fence of every brain (lease lapse, nestd gone) since this start arrived: it never runs.
+        if r.fence_gen != fence_gen || r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch().0) {
+            return Err(Refused::Killed);
         }
-        m.insert(a.id.clone(), a);
+        if let Some(existing) = r.agents.get(&a.id) {
+            return Err(Refused::Running(existing.clone()));
+        }
+        r.agents.insert(a.id.clone(), a);
         Ok(())
     }
 
     /// Remove `a` — only if it is still the registered instance (a duplicate start must never
-    /// deregister the live brain).
-    pub fn deregister(&self, a: &Arc<Agent>) {
-        let mut m = self.agents.lock().unwrap();
-        if m.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
-            m.remove(&a.id);
+    /// deregister another brain) — and return the agent epoch its exit reports.
+    pub fn deregister(&self, a: &Arc<Agent>) -> Epoch {
+        let mut r = self.agents.lock().unwrap();
+        if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
+            r.agents.remove(&a.id);
         }
+        a.epoch()
+    }
+
+    /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
+    /// so no start at or below it registers from now on, and return the registered brain if it
+    /// runs at or below it (the caller kills it). A newer brain is left alone.
+    pub fn tombstone(&self, agent: &AgentId, epoch: Epoch) -> Option<Arc<Agent>> {
+        let mut r = self.agents.lock().unwrap();
+        let k = r.tombstones.entry(agent.clone()).or_insert(epoch.0);
+        *k = (*k).max(epoch.0);
+        r.agents.get(agent).filter(|a| a.epoch() <= epoch).cloned()
+    }
+
+    /// Whether a kill at or above `epoch` arrived for `agent`.
+    pub fn tombstoned(&self, agent: &AgentId, epoch: Epoch) -> bool {
+        self.agents.lock().unwrap().tombstones.get(agent).is_some_and(|k| *k >= epoch.0)
     }
 
     pub fn current_gen(&self) -> u64 {
@@ -112,9 +135,21 @@ impl Runtime {
         self.lease.lock().unwrap().is_some_and(|v| now_ms() <= v)
     }
 
-    /// Kill every brain (lease lapse, nestd gone, `fence` with an empty list).
+    /// The fence generation now: a start takes it when it arrives and registers only if no fence
+    /// of every brain came in between ([`Runtime::register`]).
+    pub fn fence_gen(&self) -> u64 {
+        self.agents.lock().unwrap().fence_gen
+    }
+
+    /// Kill every brain (lease lapse, nestd gone, `fence` with an empty list), and every start that
+    /// arrived before this and hasn't registered yet (it never will).
     pub fn kill_all(&self, reason: ExitReason) {
-        for a in self.agents() {
+        let agents: Vec<Arc<Agent>> = {
+            let mut r = self.agents.lock().unwrap();
+            r.fence_gen += 1;
+            r.agents.values().cloned().collect()
+        };
+        for a in agents {
             a.kill_now(reason);
         }
     }
@@ -140,6 +175,24 @@ impl Runtime {
     pub fn host(&self) -> HostId {
         self.host_id.lock().unwrap().clone().unwrap_or_else(|| HostId("hst_unknown".into()))
     }
+}
+
+/// The brains this runner runs, and per agent the highest agent epoch a kill named (kept for the
+/// process's life: one number per agent).
+#[derive(Default)]
+struct Registry {
+    agents: HashMap<AgentId, Arc<Agent>>,
+    tombstones: HashMap<AgentId, u64>,
+    /// Bumped by every fence of all brains (under this lock, so it orders against registrations).
+    fence_gen: u64,
+}
+
+/// Why [`Runtime::register`] refused a brain.
+pub enum Refused {
+    /// A kill at or above its agent epoch, or a fence of every brain, arrived first: it must never run.
+    Killed,
+    /// Another brain is registered under the id.
+    Running(Arc<Agent>),
 }
 
 /// Removes a `hands_resolve` request from the pending map when its waiter goes away.
@@ -188,7 +241,7 @@ pub enum Outbound {
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
     SetSession(SessionId),
-    /// Re-handshake (epoch changed after a rebind).
+    /// Re-handshake (the brain adopted a newer agent epoch).
     Reconnect,
     /// A platform tool call timed out: never (re)send it.
     AbandonCall(CallId),
@@ -203,21 +256,11 @@ pub enum HandsResolveOutcome {
     Error { error: ErrorBody, retry_after_ms: Option<u64> },
 }
 
-impl HandsResolveOutcome {
-    /// From a `hands_resolved` frame: exactly one of `hands` and `error`; neither is a protocol
-    /// error the caller surfaces as `invalid_message`.
-    pub fn from_wire(hands: Option<HandsTarget>, error: Option<ErrorBody>, retry_after_ms: Option<u64>) -> Self {
-        match (hands, error) {
-            (Some(t), _) => HandsResolveOutcome::Target(t),
-            (None, Some(error)) => HandsResolveOutcome::Error { error, retry_after_ms },
-            (None, None) => HandsResolveOutcome::Error {
-                error: ErrorBody {
-                    code: nest_protocol::model::error_codes::INVALID_MESSAGE.into(),
-                    message: "hands_resolved carried neither hands nor error".into(),
-                    retryable: false,
-                },
-                retry_after_ms: None,
-            },
+impl From<HandsOutcome> for HandsResolveOutcome {
+    fn from(o: HandsOutcome) -> Self {
+        match o {
+            HandsOutcome::Ok { hands } => HandsResolveOutcome::Target(hands),
+            HandsOutcome::Error { error, retry_after_ms } => HandsResolveOutcome::Error { error, retry_after_ms },
         }
     }
 }
@@ -229,11 +272,10 @@ pub struct ResolveTimeout;
 /// Mutable per-agent state shared with hooks and the MCP bridge.
 #[derive(Debug, Default)]
 pub struct AgentInner {
-    /// The sandbox this agent's hands act in (ids only, from `agent_start`); `None` = no hands.
-    /// Its `epoch` is the session channel's epoch for this brain and is updated only by a new
-    /// `agent_start`; a target fetched later may name a newer sandbox epoch (the sandbox moved
-    /// while the brain stayed), and hands calls use the target's epoch, not this one. Making
-    /// the brain's own epoch independent of the sandbox's is step 3 of the seam.
+    /// The sandbox this agent's hands act in (its id, from `agent_start`); `None` = no hands.
+    /// Only whether and where: the sandbox's epoch comes from each target's binding claims, and
+    /// the brain's own (agent) epoch is [`Agent::epoch`]. A sandbox move changes neither this
+    /// nor the agent epoch; the next call finds the old target refused and resolves again.
     pub hands: Option<HandsBinding>,
     /// The gateway target for those hands, fetched from AgentDO (`hands_resolve`) and dropped
     /// whenever a gateway refuses it, so the next call asks again.
@@ -265,6 +307,8 @@ pub struct Agent {
     pub pid: AtomicU32,
     /// Cancelled by any kill/stop: aborts startup steps and tells the actor.
     pub cancel: CancellationToken,
+    /// An `agent_stop` reached this brain: it is on its way out, and a later start must not adopt it.
+    pub stopping: std::sync::atomic::AtomicBool,
     kill_reason: Mutex<Option<ExitReason>>,
     pub inner: Mutex<AgentInner>,
     epoch: AtomicU64,
@@ -306,6 +350,7 @@ impl Agent {
             conn_gen,
             pid: AtomicU32::new(0),
             cancel: CancellationToken::new(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             kill_reason: Mutex::new(None),
             inner: Mutex::new(AgentInner { hands, session, ..Default::default() }),
             epoch: AtomicU64::new(epoch.0),
@@ -344,6 +389,11 @@ impl Agent {
         self.command(AgentCmd::Kill(reason));
     }
 
+    /// Told to stop, or being killed: never adopted by a later start (which waits for it instead).
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || self.kill_reason().is_some()
+    }
+
     /// First kill reason recorded by [`Agent::kill_now`].
     pub fn kill_reason(&self) -> Option<ExitReason> {
         *self.kill_reason.lock().unwrap()
@@ -370,24 +420,32 @@ impl Agent {
         self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch(), seq, ts_ms: now_ms(), turn, body }));
     }
 
-    /// Set the hands ids (a duplicate `agent_start` for a live brain). A changed binding drops
-    /// the cached target; a new epoch re-handshakes the session channel; MCP clients are told
-    /// the tool list changed.
+    /// Set the hands (a later `agent_start` for this live brain). Another sandbox drops the
+    /// cached target and bumps its generation, so a resolve in flight for the old sandbox can't
+    /// store its answer over the new one; MCP clients are told the tool list changed.
     pub fn set_hands(&self, hands: Option<HandsBinding>) {
-        let new_epoch = hands.as_ref().map(|h| h.epoch);
         {
             let mut inner = self.inner.lock().unwrap();
-            if inner.hands != hands {
+            if inner.hands.as_ref().map(|h| &h.sandbox) != hands.as_ref().map(|h| &h.sandbox) {
                 inner.target = None;
+                inner.target_gen += 1;
             }
             inner.hands = hands;
         }
-        if let Some(e) = new_epoch
-            && self.epoch.swap(e.0, Ordering::SeqCst) != e.0
-        {
-            self.send_out(Outbound::Reconnect);
-        }
         let _ = self.tools_changed.send(());
+    }
+
+    /// Adopt the agent epoch of a later `agent_start` for this live brain: AgentDO issued a new
+    /// one and fences the old, so the session channel re-handshakes with it. Epochs only grow:
+    /// an older one (a command overtaken by a newer start) changes nothing. Returns whether
+    /// the epoch changed.
+    pub fn adopt_epoch(&self, epoch: Epoch) -> bool {
+        let prev = self.epoch.fetch_max(epoch.0, Ordering::SeqCst);
+        if epoch.0 > prev {
+            self.send_out(Outbound::Reconnect);
+            return true;
+        }
+        false
     }
 
     /// The cached gateway target with its generation, if a `hands_resolve` has answered since
@@ -402,12 +460,22 @@ impl Agent {
         inner.target.clone().map(|t| (t, inner.target_gen))
     }
 
-    /// Cache a target; returns its generation.
-    pub fn set_hands_target(&self, target: HandsTarget) -> u64 {
+    /// Cache a target; returns its generation. `None` (nothing cached) when the hands changed
+    /// since `seen_gen` was read: the answer was for the previous sandbox.
+    pub fn set_hands_target(&self, target: HandsTarget, seen_gen: u64) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.target_gen != seen_gen {
+            return None;
+        }
         inner.target_gen += 1;
         inner.target = Some(target);
-        inner.target_gen
+        Some(inner.target_gen)
+    }
+
+    /// The target generation now (read before a `hands_resolve`, passed to
+    /// [`Agent::set_hands_target`]).
+    pub fn target_gen(&self) -> u64 {
+        self.inner.lock().unwrap().target_gen
     }
 
     /// Forget the target a call was using (a gateway refused it, or the sandbox moved mid-call),
@@ -458,7 +526,8 @@ impl Agent {
         let n = self.call_n.fetch_add(1, Ordering::SeqCst) + 1;
         let stem = match &self.inner.lock().unwrap().turn {
             Some(t) => t.0.replace('_', ""),
-            None => format!("x{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            // 128 random bits: calls are idempotent on their id, so stems must never collide (N9).
+            None => format!("x{}", uuid::Uuid::new_v4().simple()),
         };
         CallId(format!("cal_{stem}-{n}"))
     }
@@ -541,5 +610,26 @@ impl Agent {
             .as_ref()
             .map(|c| c.inbox.iter().filter(|m| !inner.delivered.contains(&m.id)).cloned().collect())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn agent(rt: &Runtime, epoch: u64) -> Arc<Agent> {
+        let (cmd, _crx) = mpsc::unbounded_channel();
+        let (out, _orx) = mpsc::unbounded_channel();
+        Agent::new(AgentId("agt_r".into()), AgentRole::Captain, Epoch(epoch), PathBuf::from("/tmp"), None, None, vec![], rt.current_gen(), cmd, out)
+    }
+
+    /// N9: a call id outside a turn carries 128 random bits.
+    #[test]
+    fn a_call_id_outside_a_turn_has_a_128_bit_stem() {
+        let rt = Runtime::new(Config::default());
+        let a = agent(&rt, 1);
+        let id = a.next_call_id().0;
+        let stem = id.trim_start_matches("cal_x").split('-').next().unwrap().to_string();
+        assert_eq!(stem.len(), 32, "{id}");
     }
 }

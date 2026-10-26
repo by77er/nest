@@ -157,6 +157,7 @@ export class Deadlines {
   async reschedule(): Promise<void> {
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(at) AS at FROM deadlines").toArray()[0]?.at;
     if (next === null || next === undefined) await this.storage.deleteAlarm();
-    else await this.storage.setAlarm(next);
+    // A past time fires at once; the runtime refuses times <= 0 (a test may write `at = 0`).
+    else await this.storage.setAlarm(Math.max(next, 1));
   }
 }

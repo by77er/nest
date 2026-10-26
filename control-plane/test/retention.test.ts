@@ -171,6 +171,20 @@ describe("stored enums", () => {
     expect(error).toHaveBeenCalledWith(expect.stringContaining("events.type"));
   });
 
+  it("AgentDO logs a turn whose status is outside the union", async () => {
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-enum" } });
+    const { workstream } = await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "agent enums" } }, 201);
+    const { agent } = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", workstream, cell: uniqueCell(), start: false } }, 201);
+    await adminJson(`/v1/agents/${agent}/turns`, { body: { text: "hello" } });
+    const stub = env.AGENT.get(env.AGENT.idFromName(agent));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runInDurableObject(stub, (_inst, st) => {
+      st.storage.sql.exec("UPDATE turns SET status = 'paused'");
+    });
+    expect((await stub.turns()).map((t) => t.status)).toEqual(["paused"]);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("turns.status"));
+  });
+
   it("a host row from before `tunnel_state` reads `none`, written once by the migration", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
@@ -379,10 +393,10 @@ describe("a dead host's brains", () => {
           const stub = real.get(id);
           return new Proxy(stub, {
             get: (t, p) => p === "onHostLost"
-              ? async (h: string) => {
+              ? async (h: string, e?: number) => {
                 calls++;
                 if (calls <= 2) throw new Error("AgentDO unavailable");
-                return t.onHostLost(h);
+                return t.onHostLost(h, e);
               }
               : Reflect.get(t, p),
           });
@@ -467,7 +481,31 @@ describe("a dead host's row", () => {
   });
 });
 
+describe("a dead host whose death is not proof", () => {
+  it("is kept: an idle or drained retirement EC2 has not confirmed (`lost` = 0)", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    h.ws.close();
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    await fleetSql(cell, (sql) => sql.exec("UPDATE hosts SET dead_ms = ?, lost = 0 WHERE host = ?", Date.now() - 8 * DAY, h.host));
+    await prune(cell);
+    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT 1 FROM hosts WHERE host = ?", h.host).length)).toBe(1);
+  });
+});
+
 describe("commands for a dead or unknown host", () => {
+  it("a kill for a dead host is stored once: a retried issueKill gets the same command", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    h.ws.close();
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const [first, again] = await fleetSql(cell, async (_sql, inst) => [
+      await inst.issueKill(h.host, "agt_01killdedupe00000000000000", 3, "test"),
+      await inst.issueKill(h.host, "agt_01killdedupe00000000000000", 3, "test"),
+    ]);
+    expect(again).toBe(first);
+  });
+
   it("are answered at once with an error, never queued", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
