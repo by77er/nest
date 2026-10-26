@@ -11,3 +11,28 @@
 - **Cross-cloud traffic is small text:** transcripts from brain hosts to Cloudflare, session files back from R2 when a brain starts on a new host, and hands frames between a brain and its sandbox's gateway over the tunnel. No bulk data crosses.
 - **Bindings are verified, not stored.** SandboxDO signs them with the cell's binding key, which FleetDO holds and pushes to each sandbox host's gateway; nothing records an issued binding. See [../sandbox/gateway/](../sandbox/gateway/).
 - **R2 is the one global store for the control plane.** Each cell has its own S3-compatible store. See [../sandbox/state/object-store/](../sandbox/state/object-store/).
+
+## Retention
+
+Every DO table that would otherwise only grow has one retention rule, a named constant next to the code that applies it. A row something still depends on is never dropped.
+
+| DO | Table | Kept | Why |
+|---|---|---|---|
+| FleetDO | `commands` | 24 h after its result (`COMMAND_RETENTION_MS`). A host's death answers what it never did, with an error and no failure handling. | Results are read back right after they arrive; a dead host never answers. |
+| FleetDO | `hosts` (with its `host_agents`, `commands`, reliable channel and `tunnels_created` rows) | 7 days after it died (`DEAD_HOST_RETENTION_MS`), and only once its tunnel and record are deleted (the row's ids are null) and no lease, stale incarnation, reassignment or eviction names it. | The tunnel sweep retries deletes from the row; operators look at recent deaths. |
+| FleetDO | `tunnels_created` | With its host's row; without one, until a sweep whose two listings both succeeded shows neither the tunnel nor the record, past the hour's grace. A listing is capped at 10 pages of 100 (`lib/cloudflare.ts`), so an account with more than 1,000 tunnels could hide one. | It is what the sweep may delete: forgotten only once nothing is left to delete. |
+| FleetDO | `launched` | 7 days after EC2 confirmed it gone, or after its host's row was pruned (`LAUNCH_RETENTION_MS`); never while a termination is pending or the instance may still enroll. | Dropping one only takes a permission away: the instance can no longer enroll. |
+| FleetDO | `stale_incarnations` | 24 h after its `sandbox_destroy` was issued (`STALE_INCARNATION_RETENTION_MS`). | The destroy is sent once. |
+| FleetDO | `enroll_tokens` | 7 days after use (`ENROLL_TOKEN_RETENTION_MS`). An unused token stays until used. | A used token can't be used again. |
+| FleetDO | `gc_runs` | 30 days after it finished (`GC_RUN_RETENTION_MS`); the latest run, the latest proven run (so the next run isn't dry again) and an unfinished run always. | GC history for the operator. |
+| FleetDO | `sandboxes` | Live rows always; a destroyed one 30 days (`DESTROYED_SANDBOX_RETENTION_MS`). | Its generations stopped being GC roots when it was destroyed. |
+| SandboxDO | `commits` (idempotency records) | 7 days (`COMMIT_RECORD_RETENTION_MS`), longer while the generation it committed is still in the chain. | nestd asks again with an unanswered request's id before its next commit, possibly days later: a committed request finds its record while its generation is kept; any other meets the compare-and-set again, as a new request would. |
+| SandboxDO | `epochs` (which host held which epoch) | The sandbox's life. | Salvage from any older epoch is authorized against it; one small row per placement. |
+| WorkstreamDO | `events`, `user_notifications`, `applied` | The latest 5,000 and 1,000 rows; idempotency keys 7 days. | Bounded history. |
+| AgentDO | `tool_calls`, `asks`, `turns`, `inbox` | Finished rows 7 days; `events` the latest 500. | Bounded history. |
+
+FleetDO prunes at most once an hour, from any alarm (the tick while a host is live, and the daily tunnel sweep). Generations themselves (and so GC roots) aren't thinned yet: generation retention isn't built ([state](../sandbox/state/#retention)).
+
+## Enums
+
+Every status, state, kind and type column has a closed TypeScript union, shared with the wire types where one exists (`SandboxState`, `TunnelState`, `HostRole`, `CommandBody["type"]`); writes go through it, and every read is checked (`control-plane/src/lib/stored.ts`): a value outside the union is logged as an error and returned as read, so one bad row cannot stop a DO. There are no SQLite `CHECK` constraints: SQLite can add one only by rebuilding the table, which on live DO data is a risky migration for a guard the types already give. A column whose null used to mean a value (`hosts.tunnel_state`, null for `none`) is written explicitly and migrated once. The admin views (`GET /v1/admin/fleet`, `/v1/admin/images`) are typed by `control-plane/src/protocol/admin.ts`, which imports nothing, so the dashboard checks its client against it with type-only imports; the control plane asserts at compile time that its enums equal the protocol's.

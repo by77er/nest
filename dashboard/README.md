@@ -26,7 +26,8 @@ The Worker's secret `NEST_ADMIN_TOKEN` comes from the `production` environment's
 name; `NEST_CONTROL_PLANE`, `NEST_CELLS`, `ACCESS_TEAM_DOMAIN` and `DASHBOARD_AUD` are vars in
 `wrangler.jsonc`.
 
-`src/api.ts` mirrors the control plane's two responses. `fixtures/admin.ts` holds responses recorded
-from the control plane's test pool and must satisfy those types (`npm run typecheck`), and
-`test/api.test.ts` compares the mirrored enums with the control plane's sources: re-record the
-fixture when `fleetView` or `images` change. Design: [docs/control-plane/dashboard/](../docs/control-plane/dashboard/README.md).
+`src/api.ts` re-exports the control plane's view types (`control-plane/src/protocol/admin.ts`, a
+module with no imports) as types only, so the build carries no control-plane code;
+`test/api.test.ts` holds that every reference to the control plane stays type-only.
+`fixtures/admin.ts` holds responses recorded from the control plane's test pool and must satisfy
+those types (`npm run typecheck`): re-record it when `fleetView` or `images` change. Design: [docs/control-plane/dashboard/](../docs/control-plane/dashboard/README.md).
