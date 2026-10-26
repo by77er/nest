@@ -178,11 +178,11 @@ async function route(req: Request, env: Env): Promise<Response> {
     const r = await body(req, z.object({
       key_id: z.string().min(1), name: z.string().default("CN=nest proxy root CA"), ttl_days: z.number().int().min(1).max(3650).default(3650),
     }));
-    const pem = await fleet(env, cell).createKmsRootCertificate(r.key_id, r.name, r.ttl_days * 86_400_000);
+    const pem = await fleet(env, cell).createKmsRootCertificate(r.key_id, r.name, r.ttl_days * 86_400_000, cell);
     return new Response(pem, { headers: { "content-type": "application/x-pem-file" } });
   }
   if (req.method === "GET" && path === "/v1/admin/root-ca") {
-    return new Response(await fleet(env, cell).rootCertificatePem(), { headers: { "content-type": "application/x-pem-file" } });
+    return new Response(await fleet(env, cell).rootCertificatePem(cell), { headers: { "content-type": "application/x-pem-file" } });
   }
   if (req.method === "PUT" && (p = m(/^\/v1\/admin\/secrets\/([A-Za-z0-9_:.-]+)$/))) {
     // BrokerDO's own keys (the per-cell binding signing keys) are generated, never provided.

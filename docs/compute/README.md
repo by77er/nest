@@ -1,6 +1,6 @@
 # Compute
 
-Hosts, grouped into **cells**. A cell is compute plus its object store in one provider and region, such as AWS us-east-1 with S3. The control plane is global; sandbox state belongs to one cell.
+Hosts, grouped into **[cells](cells/)**. A cell is compute plus its object store in one provider and region, such as AWS us-east-1 with S3. The control plane is global; sandbox state belongs to one cell, and so does everything AWS: resources, settings, credentials and the proxy root CA.
 
 ## Host kinds
 

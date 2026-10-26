@@ -2,38 +2,8 @@ import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
 import { describe, expect, it } from "vitest";
 import { createRootCertificate, kmsRoot, signIntermediate } from "../src/lib/ca";
-import { derToRawEcdsa, type Kms } from "../src/lib/kms";
-import { csrPem } from "./helpers";
-
-const EC = { name: "ECDSA", namedCurve: "P-256" } as const;
-const SIGN = { name: "ECDSA", hash: "SHA-256" } as const;
-
-/** DER INTEGER for an unsigned big-endian value (a leading 0x00 when the high bit is set). */
-function derInt(v: Uint8Array): number[] {
-  let i = 0;
-  while (i < v.length - 1 && v[i] === 0) i++;
-  const body = [...v.subarray(i)];
-  if (body[0]! & 0x80) body.unshift(0);
-  return [0x02, body.length, ...body];
-}
-
-/** Stands in for KMS: signs with a local key and answers in KMS's format (a DER ECDSA-Sig-Value). */
-class FakeKms implements Kms {
-  calls = 0;
-  constructor(private readonly keys: CryptoKeyPair) {}
-  static async create() {
-    return new FakeKms((await crypto.subtle.generateKey(EC, true, ["sign", "verify"])) as CryptoKeyPair);
-  }
-  async sign(_keyId: string, message: Uint8Array) {
-    this.calls++;
-    const raw = new Uint8Array(await crypto.subtle.sign(SIGN, this.keys.privateKey, message));
-    const seq = [...derInt(raw.subarray(0, 32)), ...derInt(raw.subarray(32))];
-    return new Uint8Array([0x30, seq.length, ...seq]);
-  }
-  async publicKey() {
-    return new Uint8Array((await crypto.subtle.exportKey("spki", this.keys.publicKey)) as ArrayBuffer);
-  }
-}
+import { derToRawEcdsa } from "../src/lib/kms";
+import { csrPem, FakeKms } from "./helpers";
 
 describe("proxy root CA in KMS", () => {
   it("converts KMS's DER signatures to WebCrypto's raw form, padding short and trimming signed integers", () => {

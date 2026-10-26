@@ -3,8 +3,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
 import { commandRefSlots, REF_PURPOSES, type RefPurpose, type RefSlot } from "./broker";
-import { createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
-import { AwsKms } from "../lib/kms";
+import { canonicalSpki, certificateSpki, createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
+import { AwsKms, type Kms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2, type ImageInfo } from "../lib/ec2";
 import { AwsSsm, type Ssm } from "../lib/ssm";
 import { DEFAULT_IMAGE } from "./sandbox";
@@ -12,11 +12,11 @@ import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
-import { awsCell, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig } from "../lib/cells";
+import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
-import { errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
+import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import {
   type Capacity, type CommandBody, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
   type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
@@ -117,6 +117,8 @@ const COMMAND_RETENTION_MS = 24 * 3_600_000;
  */
 const SALVAGE_WINDOW_MS = 11 * 60_000;
 const ENROLL_TOKEN_RETENTION_MS = 7 * 86_400_000;
+/** How long a cell root certificate self-signed through KMS lasts. */
+const ROOT_CA_TTL_MS = 3650 * 86_400_000;
 const ALARM_TICK = "tick";
 /** The daily pass that deletes tunnels and records whose host is gone (docs/sandbox/gateway/). */
 const ALARM_TUNNEL_SWEEP = "tunnel_sweep";
@@ -143,6 +145,9 @@ export interface GcClaim {
   max_deletes: number;
 }
 
+/** The operator view's `aws`: the cell's region and each setting's source, or why they're unusable. */
+export type AwsView = { cell: string | null; region: string | null; sources: CellAws["sources"] } | { cell: string | null; error: string };
+
 export class FleetDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private readonly rel: ReliableChannels;
@@ -155,6 +160,10 @@ export class FleetDO extends DurableObject<Env> {
   cellConfigOverride: AwsCellConfig | null | undefined = undefined;
   /** Override for tests: SSM for the host AMI parameter; `null` = none. */
   ssmOverride: Ssm | null | undefined = undefined;
+  /** Override for tests: the cell's KMS; `null` = no credentials; `undefined` derives it from the cell's AWS access. */
+  kmsOverride: Kms | null | undefined = undefined;
+  /** The cell's KMS root, kept for this instance's life (loading it costs a KMS `GetPublicKey`). */
+  private kmsRoot: { keyId: string; root: RootCa } | null = null;
   /** Override for tests: a fake Cloudflare API and the domain; `null` = no tunnels; `undefined` reads the env. */
   cloudflareOverride: { api: CloudflareApi; domain: string } | null | undefined = undefined;
   /** A launch is in flight (RunInstances awaits); placements meanwhile don't launch another. */
@@ -510,20 +519,31 @@ export class FleetDO extends DurableObject<Env> {
     return counts;
   }
 
-  private kms(): AwsKms {
-    const e = this.env;
-    if (!e.AWS_ACCESS_KEY_ID || !e.AWS_SECRET_ACCESS_KEY) throw new NestError(ErrorCodes.INTERNAL, "AWS credentials not configured", 500);
-    return new AwsKms(e.AWS_ACCESS_KEY_ID, e.AWS_SECRET_ACCESS_KEY, e.AWS_REGION ?? "us-east-1");
+  /** The cell's AWS access (`lib/cells.ts`): its own region, credentials and KMS key, else the legacy globals. */
+  private aws(): CellAws {
+    return cellAws(this.env, this.cellName(), this.cellConfig());
   }
 
-  /** The root CA: its key in KMS (`ROOT_CA_KMS_KEY_ID`), else a PEM key (development, and before KMS). */
-  private async rootCa(): Promise<RootCa> {
-    if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KMS_KEY_ID) {
-      return kmsRoot(this.env.ROOT_CA_CERT_PEM, this.kms(), this.env.ROOT_CA_KMS_KEY_ID);
+  /** The cell's KMS, in the cell's region with the cell's credentials. */
+  private kms(): Kms {
+    if (this.kmsOverride !== undefined) {
+      if (!this.kmsOverride) throw new NestError(ErrorCodes.INTERNAL, "AWS credentials not configured", 500);
+      return this.kmsOverride;
     }
+    const { credentials, region } = this.aws();
+    if (!credentials || !region) {
+      throw new NestError(ErrorCodes.INTERNAL, `AWS credentials or region not configured for cell ${this.cellName() ?? "(unknown)"}`, 500);
+    }
+    return new AwsKms(credentials.access_key_id, credentials.secret_access_key, region);
+  }
+
+  /** The root CA: the cell's KMS key, else a PEM key (development, and before KMS). */
+  private async rootCa(): Promise<RootCa> {
+    const keyId = this.aws().kmsKeyId;
+    if (keyId) return this.kmsRootCa(keyId);
     if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KEY_PEM) return localRoot(this.env.ROOT_CA_CERT_PEM, this.env.ROOT_CA_KEY_PEM);
     if (this.env.ALLOW_DEV_CA !== "1") {
-      throw new NestError(ErrorCodes.INTERNAL, "root CA not configured (ROOT_CA_CERT_PEM / ROOT_CA_KEY_PEM)", 500);
+      throw new NestError(ErrorCodes.INTERNAL, "root CA not configured (no KMS key for the cell, no ROOT_CA_CERT_PEM / ROOT_CA_KEY_PEM)", 500);
     }
     type Dev = { certPem: string; keyPem: string };
     const stored = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'dev_root_ca'").toArray()[0];
@@ -542,16 +562,60 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Operator, once per root: a self-signed root certificate for the KMS key, signed through KMS. The
-   * operator stores it as `ROOT_CA_CERT_PEM` (with `ROOT_CA_KMS_KEY_ID`) and bakes it into images.
+   * The cell's root in KMS. Its certificate follows from the key and isn't configured: FleetDO keeps
+   * one per cell (`kv.root_ca`, beside the key's public key) and self-signs it through KMS the first
+   * time, unless the legacy `ROOT_CA_CERT_PEM` is a certificate for the same key, which it adopts so
+   * the certificate already baked into guest images stays the cell's. A different key (rotation)
+   * gets a new certificate, and the guest image has to be rebuilt with it.
    */
-  async createKmsRootCertificate(keyId: string, name: string, ttlMs: number): Promise<string> {
+  private async kmsRootCa(keyId: string): Promise<RootCa> {
+    if (this.kmsRoot?.keyId === keyId) return this.kmsRoot.root;
+    const kms = this.kms();
+    const spki = await canonicalSpki(await kms.publicKey(keyId));
+    const spkiB64 = bytesToB64(spki);
+    type Stored = { spki: string; cert_pem: string };
+    const load = () => {
+      const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'root_ca'").toArray()[0];
+      return row ? (JSON.parse(row.value) as Stored) : null;
+    };
+    let stored = load();
+    if (stored?.spki !== spkiB64) {
+      const legacy = this.env.ROOT_CA_CERT_PEM;
+      const adopt = !!legacy && bytesToB64(await certificateSpki(legacy)) === spkiB64;
+      const cell = this.cellName();
+      if (legacy && !adopt) console.warn(`FleetDO: cell ${cell}: ROOT_CA_CERT_PEM is not a certificate for the cell's KMS key, so it is not adopted`);
+      const certPem = adopt
+        ? legacy
+        : await createRootCertificate(spki, kmsRoot("", kms, keyId).sign, `CN=nest ${cell ? `${cell} ` : ""}proxy root CA`, ROOT_CA_TTL_MS);
+      // The awaits above yield: another call may have stored this key's certificate meanwhile.
+      const raced = load();
+      if (raced?.spki === spkiB64) {
+        stored = raced;
+      } else {
+        if (raced) console.warn(`FleetDO: cell ${cell}: the proxy root CA key changed; a new root certificate replaces the old one, so rebuild the guest image with it`);
+        console.log(`FleetDO: cell ${cell}: root CA certificate ${adopt ? "adopted from ROOT_CA_CERT_PEM" : "self-signed through KMS"}`);
+        stored = { spki: spkiB64, cert_pem: certPem };
+        this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('root_ca', ?)", JSON.stringify(stored));
+      }
+    }
+    const root = kmsRoot(stored.cert_pem, kms, keyId);
+    this.kmsRoot = { keyId, root };
+    return root;
+  }
+
+  /**
+   * Operator: a self-signed root certificate for any KMS key the cell's credentials may use, signed
+   * through KMS and not kept. The cell's own certificate needs no call: `rootCertificatePem` derives it.
+   */
+  async createKmsRootCertificate(keyId: string, name: string, ttlMs: number, cell?: string): Promise<string> {
+    if (cell) this.rememberCell(cell);
     const kms = this.kms();
     return createRootCertificate(await kms.publicKey(keyId), kmsRoot("", kms, keyId).sign, name, ttlMs);
   }
 
-  /** Root certificate to bake into sandbox images. */
-  async rootCertificatePem(): Promise<string> {
+  /** The cell's root certificate, to bake into its sandbox images. */
+  async rootCertificatePem(cell?: string): Promise<string> {
+    if (cell) this.rememberCell(cell);
     return (await this.rootCa()).certPem;
   }
 
@@ -1331,9 +1395,21 @@ export class FleetDO extends DurableObject<Env> {
 
   private ec2(): Ec2 | null {
     if (this.ec2Override !== undefined) return this.ec2Override;
-    const { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret } = this.env;
-    const region = this.cellConfig()?.region ?? this.env.AWS_REGION;
-    return id && secret && region ? new AwsEc2(id, secret, region) : null;
+    const a = this.awsOrNull();
+    return a?.credentials && a.region ? new AwsEc2(a.credentials.access_key_id, a.credentials.secret_access_key, a.region) : null;
+  }
+
+  /**
+   * The cell's AWS access for EC2 and SSM, whose callers (STONITH, the autoscaler) treat "no AWS" as
+   * waiting for an operator: a malformed setting is logged and counts as none rather than throwing.
+   */
+  private awsOrNull(): CellAws | null {
+    try {
+      return this.aws();
+    } catch (e) {
+      console.error(`FleetDO: AWS settings for cell ${this.cellName() ?? "(unknown)"} are unusable: ${(e as Error).message}`);
+      return null;
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1344,9 +1420,14 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("INSERT OR IGNORE INTO kv (key, value) VALUES ('cell', ?)", cell);
   }
 
+  /** The cell this FleetDO serves, once a host, placement or operator call has named it. */
+  private cellName(): string | null {
+    return this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value ?? null;
+  }
+
   private cellConfig(): AwsCellConfig | null {
     if (this.cellConfigOverride !== undefined) return this.cellConfigOverride;
-    const cell = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value;
+    const cell = this.cellName();
     return cell ? awsCell(this.env.AWS_CELLS, cell) : null;
   }
 
@@ -1591,7 +1672,7 @@ export class FleetDO extends DurableObject<Env> {
    * instances with their outcome; and every live sandbox of the cell (registered, not destroyed)
    * with its lease, so an unplaced one shows too.
    */
-  async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[]; sandboxes: Record<string, unknown>[] }> {
+  async fleetView(): Promise<{ hosts: Record<string, unknown>[]; launches: Record<string, unknown>[]; sandboxes: Record<string, unknown>[]; aws: AwsView }> {
     const hosts = this.sql.exec(`SELECT h.host, h.role, h.instance_id, h.status, h.idle_since, h.enrolled_ms, h.last_rx,
         h.tunnel_hostname, h.tunnel_state, h.capacity,
         (SELECT COUNT(*) FROM leases l WHERE l.host = h.host) AS leases FROM hosts h ORDER BY h.enrolled_ms`).toArray()
@@ -1619,7 +1700,19 @@ export class FleetDO extends DurableObject<Env> {
       hosts,
       launches: this.sql.exec("SELECT instance_id, launched_ms, host, reason, ended_ms FROM launched ORDER BY launched_ms").toArray(),
       sandboxes,
+      aws: this.awsView(),
     };
+  }
+
+  /** Operator view: where the cell's AWS settings come from (its own, legacy globals, none), never their values. */
+  private awsView(): AwsView {
+    const cell = this.cellName();
+    try {
+      const a = this.aws();
+      return { cell, region: a.region, sources: a.sources };
+    } catch (e) {
+      return { cell, error: (e as Error).message };
+    }
   }
 
   /** Operator view: the cell's host AMIs and the one the launch template resolves to. */
@@ -1644,9 +1737,8 @@ export class FleetDO extends DurableObject<Env> {
 
   private ssm(): Ssm | null {
     if (this.ssmOverride !== undefined) return this.ssmOverride;
-    const { AWS_ACCESS_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret } = this.env;
-    const region = this.cellConfig()?.region ?? this.env.AWS_REGION;
-    return id && secret && region ? new AwsSsm(id, secret, region) : null;
+    const a = this.awsOrNull();
+    return a?.credentials && a.region ? new AwsSsm(a.credentials.access_key_id, a.credentials.secret_access_key, a.region) : null;
   }
 
   /** CP-side lease expiry: no sandbox on this host may run anywhere else until STONITH is confirmed. */
