@@ -8,7 +8,9 @@ target=$1
 secs=$2
 shift 2
 case $target in
-  proxy_events) max_len=131072 ;; # past MAX_PACKET_FROM_PROXY, below the default socket buffer
+  # Past MAX_PACKET_FROM_PROXY, below the default socket buffer; without -len_control=0 libFuzzer
+  # grows inputs too slowly to reach the truncation path in a short run.
+  proxy_events) max_len=131072; set -- -len_control=0 "$@" ;;
   vsock_handshake) max_len=256 ;;
   *) max_len=65536 ;;             # one 64 KiB socket read
 esac
@@ -16,4 +18,4 @@ esac
 unset RUSTUP_TOOLCHAIN
 mkdir -p "corpus/$target"
 exec cargo fuzz run --fuzz-dir . "$target" "corpus/$target" "seeds/$target" -- \
-  -max_total_time="$secs" -rss_limit_mb=2048 -malloc_limit_mb=2048 -max_len="$max_len" -timeout=10 -print_final_stats=1 "$@"
+  -max_total_time="$secs" -rss_limit_mb=2048 -malloc_limit_mb=2048 -max_len="$max_len" -timeout=60 -print_final_stats=1 "$@"

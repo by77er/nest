@@ -29,7 +29,7 @@ verification/nestd/fuzz/run.sh guest_stream 600   # target, seconds, extra libFu
 cargo test                                  # from this directory: the seeds still decode
 ```
 
-`run.sh` sets `-rss_limit_mb=2048 -malloc_limit_mb=2048 -timeout=10` and a `-max_len` per target: 64 KiB (one socket read), 128 KiB for `proxy_events` (past the 64 KiB packet limit, below the socket buffer), and 256 B for `vsock_handshake`. The corpus grows in `corpus/<target>/` and crashes land in `artifacts/<target>/` (both gitignored). Reproduce a crash with `cargo fuzz run --fuzz-dir . <target> <artifact>` and minimize it with `cargo fuzz tmin --fuzz-dir . <target> <artifact>`.
+`run.sh` sets `-rss_limit_mb=2048 -malloc_limit_mb=2048 -timeout=60` (generous: every input runs in milliseconds, and on a heavily loaded machine a 10 s limit fired on stalls, not hangs) and a `-max_len` per target: 64 KiB (one socket read), 128 KiB with `-len_control=0` for `proxy_events` (past the 64 KiB packet limit, below the socket buffer, reached early), and 256 B for `vsock_handshake`. The corpus grows in `corpus/<target>/` and crashes land in `artifacts/<target>/` (both gitignored). Reproduce a crash with `cargo fuzz run --fuzz-dir . <target> <artifact>` and minimize it with `cargo fuzz tmin --fuzz-dir . <target> <artifact>`.
 
 ## Seeds
 
