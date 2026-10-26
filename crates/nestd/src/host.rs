@@ -341,11 +341,18 @@ impl FleetReporter for Inner {
 /// A start never outlives a lease lapse (amendment A3): each `agent_start` command is stamped with
 /// the lapse count when it arrives, or as arriving while lapsed, and runs only if neither holds
 /// when the executor reaches it.
+/// One lock over the lapse count, the lapsed flag and the stamps, so a stamp and a lapse are
+/// ordered (N5): a start stamped before a lapse sees it, one stamped after it is stamped as lapsed.
 #[derive(Default)]
 struct LapseGuard {
-    lapses: std::sync::atomic::AtomicU64,
-    lapsed: std::sync::atomic::AtomicBool,
-    seen: Mutex<HashMap<String, u64>>,
+    state: Mutex<LapseState>,
+}
+
+#[derive(Default)]
+struct LapseState {
+    lapses: u64,
+    lapsed: bool,
+    seen: HashMap<String, u64>,
 }
 
 impl LapseGuard {
@@ -353,24 +360,27 @@ impl LapseGuard {
     const WHILE_LAPSED: u64 = u64::MAX;
 
     fn arrived(&self, cmd: &str) {
-        let stamp = if self.lapsed.load(std::sync::atomic::Ordering::SeqCst) { Self::WHILE_LAPSED } else { self.lapses.load(std::sync::atomic::Ordering::SeqCst) };
-        self.seen.lock().expect("lapse guard").entry(cmd.to_owned()).or_insert(stamp);
+        let mut st = self.state.lock().expect("lapse guard");
+        let stamp = if st.lapsed { Self::WHILE_LAPSED } else { st.lapses };
+        st.seen.entry(cmd.to_owned()).or_insert(stamp);
     }
 
     fn lapsed(&self) {
-        self.lapsed.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.lapses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut st = self.state.lock().expect("lapse guard");
+        st.lapsed = true;
+        st.lapses += 1;
     }
 
     fn renewed(&self) {
-        self.lapsed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.state.lock().expect("lapse guard").lapsed = false;
     }
 
     /// Whether this start arrived while lapsed or a lapse came since (forgotten once asked: the
     /// command's result is cached).
     fn outlived(&self, cmd: &str) -> bool {
-        let stamp = self.seen.lock().expect("lapse guard").remove(cmd);
-        stamp.is_some_and(|s| s != self.lapses.load(std::sync::atomic::Ordering::SeqCst))
+        let mut st = self.state.lock().expect("lapse guard");
+        let now = st.lapses;
+        st.seen.remove(cmd).is_some_and(|s| s != now)
     }
 }
 

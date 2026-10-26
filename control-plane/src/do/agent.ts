@@ -600,10 +600,10 @@ export class AgentDO extends DurableObject<Env> {
         if (brain && ((intent.host_hint && intent.host_hint !== brain.host) || intent.avoid === brain.host)) {
           await this.hook("intent:beforeCommit");
           if (!this.unchanged(snap)) continue;
-          await this.condemn(`starting on ${intent.host_hint ?? "another host"}`);
+          await this.condemn(`starting on ${intent.host_hint ?? "another host"}`, brain.epoch);
           return this.startStatus();
         }
-        const host = brain ? brain.host : await this.pickHost(snap, intent);
+        const host = brain ? await this.reissueHost(snap, brain.host) : await this.pickHost(snap, intent);
         const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).oauthTokenRef(snap.role);
         // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
         // resume from up to a flush interval ago.
@@ -626,6 +626,15 @@ export class AgentDO extends DurableObject<Env> {
   private unchanged(snap: AgentInfo): boolean {
     const now = this.load();
     return JSON.stringify(now.brain) === JSON.stringify(snap.brain) && JSON.stringify(now.intent) === JSON.stringify(snap.intent);
+  }
+
+  /** A same-host re-issue needs its host active and connected, like any start (N8); otherwise it waits. */
+  private async reissueHost(info: AgentInfo, host: string): Promise<string> {
+    const st = await this.fleet(info.cell).hostStatus(host);
+    if (!st || st.status !== "active" || !st.connected) {
+      throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, `${host}, where the brain runs, is not active and connected`, 503, true);
+    }
+    return host;
   }
 
   /** Where a start with no brain goes (see `processIntent`). Throws when no host can take it now. */
@@ -658,6 +667,10 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (host && info.prev_host && info.prev_host !== host && info.prev_host !== intent.avoid && (await healthy(info.prev_host))) {
       host = info.prev_host;
+    }
+    // A host of the previous release (no brain epochs) only when no upgraded one can take it (N3).
+    if (host && !(await fleet.hostStatus(host))?.current) {
+      host = (await fleet.currentHost(info.role === "worker" ? null : "controller", intent.avoid)) ?? host;
     }
     if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no host available for this agent", 503, true);
     return host;
@@ -714,7 +727,7 @@ export class AgentDO extends DurableObject<Env> {
         this.update((i) => {
           i.intent = i.intent ?? intent;
         });
-        await this.condemn("its start could not be confirmed sent");
+        await this.condemn("its start could not be confirmed sent", epoch);
       }
       throw e;
     }
@@ -756,10 +769,11 @@ export class AgentDO extends DurableObject<Env> {
    * and epoch) until FleetDO has stored it, whatever happens to this call; escalation takes over
    * once it is stored.
    */
-  private async condemn(why: string): Promise<void> {
+  private async condemn(why: string, epoch: number): Promise<void> {
     let condemned: Brain | null = null;
     this.update((i) => {
-      if (i.brain && i.brain.phase !== "condemned") {
+      // Only the brain at `epoch` (N7): a record replaced meanwhile is not condemned by this call.
+      if (i.brain && i.brain.phase !== "condemned" && i.brain.epoch === epoch) {
         i.brain = { host: i.brain.host, epoch: i.brain.epoch, phase: "condemned", since_ms: Date.now() };
         condemned = i.brain;
       }
@@ -829,7 +843,12 @@ export class AgentDO extends DurableObject<Env> {
     }
     const age = Date.now() - (b.kill_ms ?? b.since_ms);
     const stuck = !p.processed && !p.host_processing && age >= EXIT_WAIT_MS;
-    if (stuck || age >= ESCALATION_CAP_MS) {
+    if ((stuck || age >= ESCALATION_CAP_MS) && !(await this.fleet(info.cell).hostStatus(b.host))?.current) {
+      // A host of the previous release (no brain epochs) is never wedged for it (N3): its kill runs
+      // in order and an epoch-less exit is matched conservatively, so a slow one isn't stuck. The
+      // brain waits, and it is reported.
+      console.error(`agent ${info.agent}: ${b.host}@${b.epoch} (a previous-release host) hasn't exited ${age} ms after its kill; waiting`);
+    } else if (stuck || age >= ESCALATION_CAP_MS) {
       const why = stuck ? `${b.host} processed no command in the ${age} ms since the kill for ${info.agent}@${b.epoch}` : `${info.agent}@${b.epoch} outlived its kill by ${age} ms`;
       await this.fleet(info.cell).hostWedged(b.host, why);
     }
@@ -951,7 +970,7 @@ export class AgentDO extends DurableObject<Env> {
       }
     });
     if (retry) await this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true);
-    await this.condemn(`its start failed (${error.code})`);
+    await this.condemn(`its start failed (${error.code})`, epoch);
   }
 
   /**
@@ -975,7 +994,7 @@ export class AgentDO extends DurableObject<Env> {
         i.exit_restarts = (i.exit_restarts ?? 0) + 1;
       });
     }
-    await this.condemn(`an exit without an agent epoch (${reason})`);
+    await this.condemn(`an exit without an agent epoch (${reason})`, b.epoch);
     if (RESTART_ON_EXIT[reason]) await this.wake(counted);
   }
 
@@ -985,14 +1004,17 @@ export class AgentDO extends DurableObject<Env> {
    * row stored by the previous release) is at or above it, and FleetDO still reports the host lost
    * now. A brain follows its own host, never its sandbox.
    */
-  async onHostLost(host: string, epoch?: number): Promise<void> {
-    if (!this.exists()) return;
+  async onHostLost(host: string, epoch?: number): Promise<boolean> {
+    if (!this.exists()) return true;
     await this.hook("hostLost:enter");
     const info = this.load();
     const b = info.brain;
-    if (!b || b.host !== host || (epoch !== undefined && epoch < b.epoch)) return;
-    if (!(await this.hostGone(info.cell, host))) return;
+    // Moot: no record on that host at or below the notice's epoch.
+    if (!b || b.host !== host || (epoch !== undefined && epoch < b.epoch)) return true;
+    // Declined (N6): the host isn't lost any more; FleetDO keeps the row.
+    if (!(await this.hostGone(info.cell, host))) return false;
     await this.release(host, epoch ?? b.epoch, "host_lost");
+    return true;
   }
 
   /**
@@ -1030,12 +1052,20 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
-  /** The host reported this brain in its hello (e.g. after a nestd restart). */
+  /**
+   * The host reported this brain in its hello (e.g. after a nestd restart). A brain the record
+   * doesn't place on that host is an orphan (N1 backstop: one whose record was released or moved
+   * while it ran): it is killed there, at the highest agent epoch issued, so nothing of the agent
+   * at or below it runs there.
+   */
   async hostReport(host: string, state: AgentState): Promise<void> {
     if (!this.exists()) return;
-    this.update((i) => {
+    const info = this.update((i) => {
       if (i.brain?.host === host && i.brain.phase !== "condemned" && i.state === "detached") i.state = state;
     });
+    if (info.brain?.host === host) return;
+    console.error(`agent ${info.agent}: ${host} reports a brain the record doesn't place there; killing it`);
+    await this.fleet(info.cell).issueKill(host, info.agent, info.agent_epoch, "orphan: not this agent's recorded brain");
   }
 
   /**
@@ -2115,7 +2145,7 @@ export class AgentDO extends DurableObject<Env> {
             i.start_timeouts = (i.start_timeouts ?? 0) + 1;
             i.exit_restarts = (i.exit_restarts ?? 0) + 1;
           });
-          await this.condemn("no hello before the start deadline");
+          await this.condemn("no hello before the start deadline", info.brain.epoch);
           await this.wake(true);
         }
       } else if (key === "no_session") {
@@ -2127,7 +2157,7 @@ export class AgentDO extends DurableObject<Env> {
           this.update((i) => {
             i.exit_restarts = (i.exit_restarts ?? 0) + 1;
           });
-          await this.condemn("no session");
+          await this.condemn("no session", info.brain.epoch);
           await this.wake(true);
         }
       } else if (key === "activity") {

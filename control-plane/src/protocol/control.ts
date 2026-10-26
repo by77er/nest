@@ -122,6 +122,8 @@ export const HostHello = z.object({
   last_command_seq: Seq.optional(),
   /** Set when nestd's VMMs should run in its delegated unit cgroup and that setup failed. */
   cgroup_delegation_error: z.string().optional(),
+  /** This nestd keys brains by agent epoch (absent from nestd of the previous release). */
+  brain_epochs: z.boolean().optional(),
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
   capacity: Capacity,

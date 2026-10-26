@@ -158,6 +158,11 @@ pub struct HostHello {
     /// (nestd still kills leftovers at start). Absent when delegation works or isn't configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cgroup_delegation_error: Option<String>,
+    /// This nestd keys brains by agent epoch, reports every exit with its epoch, answers kills on
+    /// arrival and refuses starts across a lease lapse. Absent (false) from nestd of the previous
+    /// release, which the control plane neither prefers for new brains nor wedges.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub brain_epochs: bool,
     /// Everything this host currently holds; FleetDO reconciles against it.
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,

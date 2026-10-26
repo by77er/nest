@@ -137,12 +137,14 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     tokio::time::sleep(DYING_POLL).await;
                 }
                 Err(Refused::Running(existing)) => {
-                    // AgentDO started this brain again on this host (a same-host restart): the live
+                    // AgentDO started this brain again on this host (a same-host re-issue): the live
                     // brain keeps running, takes the new hands and adopts the newer agent epoch,
-                    // which re-handshakes its session channel. Its exit names that epoch.
+                    // which re-handshakes its session channel. Its exit names that epoch. Atomic
+                    // with its deregistration: one that already went is replaced instead.
+                    if !rt.adopt(&existing, start.start.agent_epoch(), start.start.hands.clone()) {
+                        continue;
+                    }
                     tracing::warn!(agent = %id, "agent_start for a brain that is already running; updating its hands and epoch only");
-                    existing.set_hands(start.start.hands.clone());
-                    existing.adopt_epoch(start.start.agent_epoch());
                     rt.report(RunnerEvent::Error {
                         agent: Some(id),
                         error: ErrorBody { code: "already_running".into(), message: "brain already running".into(), retryable: false },
@@ -164,8 +166,8 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 );
             }
             agent.send_out(Outbound::Close);
-            rt.deregister(&agent);
-            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason, epoch: Some(agent.epoch()) });
+            let epoch = rt.deregister(&agent);
+            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason, epoch: Some(epoch) });
         }
     });
 }
@@ -338,8 +340,8 @@ async fn run(
     let auth = step(&cancel, "claude auth status", AUTH_TIMEOUT, async { Ok(auth_method(&rt, &launch.env).await) }).await?;
     if auth != "oauth_token" {
         rt.report_for(&agent, RunnerEvent::AuthCheck { agent: agent.id.clone(), auth_method: auth, api_key_source: "unknown".into(), ok: false });
-        rt.deregister(&agent);
-        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed, epoch: Some(agent.epoch()) });
+        let epoch = rt.deregister(&agent);
+        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed, epoch: Some(epoch) });
         return Ok(());
     }
     let version = step(&cancel, "claude --version", VERSION_TIMEOUT, async { Ok(claude_version(&rt, &launch.env).await) }).await?;
@@ -845,8 +847,8 @@ impl Actor {
         self.agent.cancel_hands();
         self.agent.emit(AgentEventBody::StateChanged { state: AgentState::Detached, detail: Some(reason.as_str().into()) });
         self.agent.send_out(Outbound::Close);
-        self.rt.deregister(&self.agent);
-        self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason, epoch: Some(self.agent.epoch()) });
+        let epoch = self.rt.deregister(&self.agent);
+        self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason, epoch: Some(epoch) });
         true
     }
 
