@@ -2,6 +2,7 @@
 //! their peers. See `docs/verification/nestd/`.
 
 pub mod fleet;
+pub mod lease;
 
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,7 @@ impl Outcome {
 }
 
 fn threads() -> usize {
-    std::env::var("CHECK_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(8))
+    std::env::var("CHECK_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(4))
 }
 
 /// Explore everything (a violated property doesn't stop the run, so the count is the whole space).

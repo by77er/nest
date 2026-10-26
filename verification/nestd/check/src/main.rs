@@ -5,6 +5,7 @@
 //! Example: `fixed,cmds=2,drops=1`.
 
 use nestd_check::fleet::{Config, FleetModel, describe};
+use nestd_check::lease;
 use nestd_check::{check, counterexample};
 
 fn parse(spec: &str) -> Result<Config, String> {
@@ -41,6 +42,30 @@ fn parse(spec: &str) -> Result<Config, String> {
 fn main() {
     let specs: Vec<String> = std::env::args().skip(1).collect();
     for spec in &specs {
+        if let Some(rest) = spec.strip_prefix("lease") {
+            let mut cfg = lease::Config { unit_ms: 5_000, horizon: 14, max_drops: 1, max_suspends: 1, suspend_steps: 4, max_in_flight: 1 };
+            for p in rest.split(',').filter(|p| !p.is_empty()) {
+                let (k, v) = p.split_once('=').expect("key=value");
+                let n: u64 = v.parse().expect("a number");
+                match k {
+                    "horizon" => cfg.horizon = n,
+                    "unit" => cfg.unit_ms = n,
+                    "suspend" => cfg.suspend_steps = n,
+                    "drops" => cfg.max_drops = n as u8,
+                    "suspends" => cfg.max_suspends = n as u8,
+                    "inflight" => cfg.max_in_flight = n as usize,
+                    _ => panic!("unknown bound {k}"),
+                }
+            }
+            let o = check(lease::LeaseModel { cfg });
+            println!("{spec}: {} states in {:.1?}; violated {:?}; examples {:?}", o.unique_states, o.elapsed, o.violations, o.examples);
+            for v in &o.violations {
+                if let Some(path) = counterexample(&|| lease::LeaseModel { cfg }, v) {
+                    println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| a.clone()).collect::<Vec<_>>());
+                }
+            }
+            continue;
+        }
         let cfg = match parse(spec) {
             Ok(c) => c,
             Err(e) => {
