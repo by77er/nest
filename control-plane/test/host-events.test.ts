@@ -126,6 +126,30 @@ describe("egress audit in R2", () => {
     expect(all).not.toContain("other-at-old-epoch.example");
   });
 
+  it("keeps a host's audit for an incarnation FleetDO recorded as stale there, or destroyed by a command it sent", async () => {
+    const { cell, holder, other, sandbox } = await placed();
+    const exec = (sql: string, ...args: unknown[]) =>
+      runInDurableObject(fleetStub(cell), (_i, st) => {
+        st.storage.sql.exec(sql, ...args);
+      });
+    // The lease moved on and FleetDO no longer has the create command: only the stale row is left.
+    await exec("UPDATE leases SET host = ?, epoch = 2 WHERE sandbox = ?", other.host, sandbox);
+    await exec("DELETE FROM commands WHERE sandbox = ?", sandbox);
+    await audit(holder, day2, [record(sandbox, 1, day2, "nothing-left.example")]);
+    await exec("INSERT INTO stale_incarnations (sandbox, host, epoch, first_seen_ms) VALUES (?, ?, 1, ?)", sandbox, holder.host, Date.now());
+    await audit(holder, day2, [record(sandbox, 1, day2, "stale-row.example")]);
+    // Destroyed: the stale row is gone once reaped; the destroy command it sent remains (24 h).
+    await exec("DELETE FROM stale_incarnations WHERE sandbox = ?", sandbox);
+    await exec(
+      "INSERT INTO commands (cmd, host, type, sandbox, epoch, body, issued_ms) VALUES ('cmd_destroy1', ?, 'sandbox_destroy', ?, 1, '{}', ?)",
+      holder.host, sandbox, Date.now());
+    await audit(holder, day2, [record(sandbox, 1, day2, "after-destroy.example")]);
+    const all = Object.values(await auditUnder(`audit/${sandbox}/`)).join("");
+    expect(all).not.toContain("nothing-left.example");
+    expect(all).toContain("stale-row.example");
+    expect(all).toContain("after-destroy.example");
+  });
+
   it("a resent batch overwrites itself, and a timestamp no Date can hold is still written (never nacked)", async () => {
     const { holder, sandbox } = await placed();
     const batch = [record(sandbox, 1, day2, "twice.example")];

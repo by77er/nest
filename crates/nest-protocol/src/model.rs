@@ -541,7 +541,7 @@ pub enum WorkstreamEventKind {
 }
 
 /// Why nest-proxy raised an egress alert (`WorkstreamEventKind::EgressAlert.reason`): nest-proxy's
-/// `host::proxy::AlertKind`, plus a catch-all. Open: a member this build doesn't know (a newer
+/// `host::proxy::AlertKind`, nestd's `listener_lost`, plus a catch-all. Open: a member this build doesn't know (a newer
 /// sender, or free text from an older one) parses as `unknown` instead of failing the event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
@@ -549,6 +549,10 @@ pub enum EgressAlertReason {
     PlaceholderWrongHost,
     DomainFronting,
     InjectionAfterExpiry,
+    /// nestd's own, not nest-proxy's: a TCP exception or agent's explicit proxy listener failed
+    /// and could not be bound again (`host` names the rule or the address). The next policy update
+    /// that keeps the rule, or the agent's next attach, binds it again.
+    ListenerLost,
     /// Deserialize-only fallback; never sent by this build.
     #[serde(other)]
     Unknown,

@@ -475,6 +475,10 @@ pub enum HostEventBody {
         suspend_mode: Option<SuspendMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Why a `fenced` happened, when it is a cause the control plane acts on (absent from an
+        /// older nestd, and for a lease lapse).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<FenceCause>,
         /// The guest's protocol version and capabilities. Every `running` carries it (nestd
         /// caches the last guest hello, so a resume reports it without a new hello); a repeated
         /// `running` with a different `guest` is an update, not a transition. SandboxDO hands it
@@ -518,6 +522,9 @@ pub enum HostEventBody {
     TunnelState { state: TunnelState },
     /// Spot interruption notice (IMDS): the host is draining by `deadline_ms`.
     SpotNotice { deadline_ms: TimestampMs },
+    /// The host itself is faulty: FleetDO drains it (no new placements, its sandboxes suspended
+    /// and placed elsewhere) instead of placing sandboxes back on it.
+    HostFault { kind: HostFaultKind, detail: String },
     /// Brain process ended (crash, stop, or idle exit). Lifecycle only; turns/state go over the
     /// session channel.
     AgentExited {
@@ -528,6 +535,31 @@ pub enum HostEventBody {
         signal: Option<i32>,
         reason: AgentExitReason,
     },
+}
+
+/// Why nestd fenced a sandbox itself (`HostEventBody::SandboxState.cause` with `fenced`). Open: a
+/// member this build doesn't know parses as `unknown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceCause {
+    /// A DNS or transparent HTTP(S) listener was lost and could not be bound again: the sandbox
+    /// had no egress on this host. FleetDO places it again elsewhere.
+    EgressLost,
+    /// Deserialize-only fallback; never sent by this build.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What kind of host fault (`HostEventBody::HostFault`). Open: unknown members parse as `unknown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "snake_case")]
+pub enum HostFaultKind {
+    /// Egress listeners of several sandboxes failed within a short window: the fault is the
+    /// host's (fds, the kernel, nest-proxy), not one sandbox's.
+    EgressListeners,
+    /// Deserialize-only fallback; never sent by this build.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a brain process ended (`HostEventBody::AgentExited.reason`); AgentDO decides whether to
@@ -796,6 +828,8 @@ impl<'de> Deserialize<'de> for EgressReason {
 pub enum LimitKind {
     /// `limits.max_connections`: a connection was refused before anything was read.
     Connections,
+    /// nest-proxy's host-wide connection budget (fds are shared by every sandbox on the host).
+    HostConnections,
 }
 
 /// What an audit record stands for (`EgressAuditRecord.kind`; absent on the wire = `request`).
@@ -1159,6 +1193,7 @@ mod tests {
             HostEventBody::Capacity { .. } => "capacity",
             HostEventBody::TunnelState { .. } => "tunnel_state",
             HostEventBody::SpotNotice { .. } => "spot_notice",
+            HostEventBody::HostFault { .. } => "host_fault",
             HostEventBody::AgentExited { .. } => "agent_exited",
             HostEventBody::GuestCli { .. } => "guest_cli",
             HostEventBody::TaskExited { .. } => "task_exited",
@@ -1167,7 +1202,7 @@ mod tests {
     const HOST_EVENTS: &[&str] = &[
         "command_result", "sandbox_state", "commit_request", "workstream", "egress_audit", "capacity",
         "tunnel_state",
-        "spot_notice", "agent_exited", "guest_cli", "task_exited",
+        "spot_notice", "host_fault", "agent_exited", "guest_cli", "task_exited",
     ];
 
     fn runner_to_agent(m: &RunnerToAgent) -> &'static str {

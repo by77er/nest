@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use nest_protocol::control::{EgressAuditKind, EgressAuditRecord, EgressReason, EgressVerdict};
+use nest_protocol::control::{EgressAuditKind, EgressAuditRecord, EgressReason, EgressVerdict, LimitKind};
 use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyEvent, RESYNC_FAILURES_BYTES, ResyncFailure};
 use nest_protocol::model::{AgentId, EgressPolicy, Epoch, ErrorBody, InjectionSecret, SandboxId, WorkstreamId};
 
@@ -45,11 +45,15 @@ pub struct Upstream {
     pub allow_private: bool,
     /// Bounds concurrent upstream resolutions (see [`RESOLVE_CONCURRENCY`]).
     pub resolve_slots: Semaphore,
+    /// Proxied connections open across every sandbox and session, and the host-wide budget
+    /// for them: each one holds two fds, which all sandboxes on the host share.
+    pub connections: AtomicU32,
+    pub max_connections: u32,
 }
 
 impl Upstream {
-    pub fn new(resolver: Arc<dyn Resolve>, tls: UpstreamTls, allow_private: bool) -> Self {
-        Upstream { resolver, tls, allow_private, resolve_slots: Semaphore::new(RESOLVE_CONCURRENCY) }
+    pub fn new(resolver: Arc<dyn Resolve>, tls: UpstreamTls, allow_private: bool, max_connections: u32) -> Self {
+        Upstream { resolver, tls, allow_private, resolve_slots: Semaphore::new(RESOLVE_CONCURRENCY), connections: AtomicU32::new(0), max_connections }
     }
 
     /// Resolve through the shared resolver, bounded by the global concurrency limit.
@@ -360,22 +364,30 @@ impl Sandbox {
     }
 
     /// Reserve a connection slot under the policy's `max_connections`.
-    pub fn try_acquire(self: &Arc<Self>) -> Option<ConnGuard> {
+    /// Also under the host-wide budget ([`Upstream::max_connections`]); the error names the limit
+    /// that refused it.
+    pub fn try_acquire(self: &Arc<Self>, upstream: &Arc<Upstream>) -> Result<ConnGuard, LimitKind> {
         let max = self.view().policy.map(|p| p.limits.max_connections).unwrap_or(0);
         let prev = self.active.fetch_add(1, Ordering::AcqRel);
         if max == 0 || prev >= max {
             self.active.fetch_sub(1, Ordering::AcqRel);
-            return None;
+            return Err(LimitKind::Connections);
         }
-        Some(ConnGuard(self.clone()))
+        if upstream.connections.fetch_add(1, Ordering::AcqRel) >= upstream.max_connections {
+            upstream.connections.fetch_sub(1, Ordering::AcqRel);
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            return Err(LimitKind::HostConnections);
+        }
+        Ok(ConnGuard(self.clone(), upstream.clone()))
     }
 }
 
-pub struct ConnGuard(Arc<Sandbox>);
+pub struct ConnGuard(Arc<Sandbox>, Arc<Upstream>);
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::AcqRel);
+        self.1.connections.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -457,7 +469,7 @@ mod tests {
 
     fn session() -> Channels {
         let tls = UpstreamTls::new(false, &[]).unwrap();
-        let upstream = Arc::new(Upstream::new(Arc::new(crate::resolve::StaticResolver::new()), tls, true));
+        let upstream = Arc::new(Upstream::new(Arc::new(crate::resolve::StaticResolver::new()), tls, true, 4));
         let (etx, erx) = mpsc::unbounded_channel();
         let (atx, arx) = mpsc::channel(64);
         (Session::new(upstream, etx, atx), erx, arx)
@@ -503,6 +515,54 @@ mod tests {
         s.listener_failed(&a, 5, err());
         assert!(matches!(events.try_recv().unwrap(), ProxyEvent::ListenerFailed { listener_id: 5, .. }));
         assert!(s.finish_resync().is_empty());
+    }
+
+    fn with_policy(s: &Arc<Session>, id: &str, max_connections: u32) -> Arc<Sandbox> {
+        use nest_protocol::model::EgressLimits;
+        let sbx = s.sandbox_for(&SandboxId(id.into()), Epoch(1)).unwrap();
+        let policy = EgressPolicy {
+            version: 1,
+            allow: vec![],
+            passthrough: vec![],
+            inject: vec![],
+            tcp: vec![],
+            limits: EgressLimits { max_connections, bandwidth_mbps: 10, max_inspected_body_bytes: 1 << 20 },
+        };
+        assert!(sbx.upsert(Epoch(1), None, policy));
+        sbx
+    }
+
+    /// Guest-proxy review (M2): one sandbox can't take the host's fds. The host-wide budget (4
+    /// here) refuses a connection even while the sandbox's own cap has room, and frees up as
+    /// connections close.
+    #[test]
+    fn the_host_wide_connection_budget_holds_across_sandboxes() {
+        let (s, _events, _audit) = session();
+        let (a, b) = (with_policy(&s, "sbx_a", 16), with_policy(&s, "sbx_b", 16));
+        let held: Vec<ConnGuard> = (0..3).map(|_| a.try_acquire(&s.upstream).unwrap()).collect();
+        let _b1 = b.try_acquire(&s.upstream).unwrap();
+        assert!(matches!(b.try_acquire(&s.upstream), Err(LimitKind::HostConnections)));
+        assert_eq!(b.active.load(Ordering::Relaxed), 1, "a refused connection holds no per-sandbox slot");
+        drop(held);
+        assert!(b.try_acquire(&s.upstream).is_ok());
+        let small = with_policy(&s, "sbx_c", 1);
+        let _c = small.try_acquire(&s.upstream).unwrap();
+        assert!(matches!(small.try_acquire(&s.upstream), Err(LimitKind::Connections)), "the sandbox's own cap still applies");
+    }
+
+    /// Guest-proxy review (M2): a `listeners_add` whose fds didn't arrive fails just those
+    /// listeners (reported to nestd); a truncated packet that carries no fds is a protocol error.
+    #[test]
+    fn a_lost_handover_fails_only_its_listeners() {
+        use nest_protocol::host::proxy::{ListenerPurpose, ListenerSpec, ProxyCommand, Transport};
+        let (s, mut events, _audit) = session();
+        let spec = |id| ListenerSpec { id, transport: Transport::Tcp, addr: "172.16.0.1:443".into(), purpose: ListenerPurpose::HttpsTransparent };
+        let cmd = ProxyCommand::ListenersAdd { sandbox: SandboxId("sbx_a".into()), epoch: Epoch(1), listeners: vec![spec(7), spec(8)] };
+        crate::control::handover_lost(&s, cmd).unwrap();
+        for want in [7, 8] {
+            assert!(matches!(events.try_recv().unwrap(), ProxyEvent::ListenerFailed { listener_id, .. } if listener_id == want));
+        }
+        assert!(crate::control::handover_lost(&s, ProxyCommand::Ping { nonce: 1 }).is_err());
     }
 
     /// However many listeners fail in a resync, the ack still fits one packet to nestd.

@@ -25,9 +25,11 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 
 **Aggregation is the proxy's** (per sandbox, see [policy](../../../sandbox/networking/egress/policy/#audit)). nestd only rate-limits per sandbox: it raises an `egress_denied` workstream event for a `request` record denied by policy (`not_allowed`, `dns_nxdomain`, `tcp_exception_not_in_policy`: `EgressAuditRecord::is_policy_denial`), and an `egress_alert` for every `alert`, binding included. Everything else stays in the audit log.
 
-**Listener failures.** The sandbox owns its listeners (its standard listeners, TCP exceptions and agent slots, under the sandbox lock); the proxy mirror follows it. On `listener_failed` nestd waits 200 ms, takes the sandbox lock and acts only if the same incarnation still has that listener (a rule removed by `policy_update`, a slot removed by `agent_detach`, a newer incarnation at the same epoch: nothing happens). It then closes its own copy, binds the same address in the netns again and resends it under the same id. A report from an older proxy connection is ignored: the resync since handed every listener over again. After 3 failures of one listener within 10 minutes, or when 3 binds fail, nestd gives up and forgets the listener:
-- **DNS or transparent HTTP(S):** the incarnation is fenced (with salvage). Without them it has no egress at all; a fence is what the control plane already handles by placing the sandbox again.
-- **A TCP exception or an agent's explicit proxy:** a `blocked` workstream event names what was lost. The next `policy_update` that keeps the rule, or the agent's next `agent_attach`, binds it again.
+**Listener ids** are host-wide and never reused while nestd runs, so a late report about one incarnation's listener can't name a newer one's.
+
+**Listener failures.** The sandbox owns its listeners (its standard listeners, TCP exceptions and agent slots, under the sandbox lock); the proxy mirror follows it. On `listener_failed` nestd waits 200 ms, then under the sandbox lock acts only if the same incarnation still has that listener (a rule removed by `policy_update`, a slot removed by `agent_detach`, a replaced incarnation: nothing happens) and closes its own copy. It binds the same address in the netns again without the lock (up to 3 tries), then, under the lock, hands it over under the same id only if the sandbox still has it. A report from an older proxy connection is ignored: the resync since handed every listener over again. After 3 failures of one listener within 10 minutes, or when the binds fail, nestd gives up and forgets the listener:
+- **DNS or transparent HTTP(S):** without them the incarnation has no egress at all, so it is fenced (with salvage) with `cause: egress_lost`, and FleetDO places it on another host. When 2 sandboxes lose one within 10 minutes the fault is the host's (fds, the kernel, nest-proxy): nestd sends `host_fault{egress_listeners}` (once per window) instead of fencing more, and FleetDO drains the host.
+- **A TCP exception or an agent's explicit proxy:** an `egress_alert` with reason `listener_lost` names it (captains already subscribe to `egress_alert`). The next `policy_update` that keeps the rule, or the agent's next `agent_attach`, binds it again.
 
 **Listener purposes** (`purpose` is flattened into the spec):
 
@@ -38,7 +40,7 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 | `explicit{agent, slot}` | `:3128 + slot` (= `guest::AgentSlot.proxy_port`) | agent |
 | `tcp_exception{rule: "host:port"}` | `:20000 + n` | sandbox; one per `model::TcpException` |
 
-**Ordering.** One connection, processed in order. Each fd belongs to the packet it arrived with, so there's no cross-packet fd bookkeeping. If a packet's fd count ≠ `expected_fds()`, the proxy sends `error{invalid_message}` and closes. nestd resyncs on reconnect.
+**Ordering.** One connection, processed in order. Each fd belongs to the packet it arrived with, so there's no cross-packet fd bookkeeping. If a packet's fd count ≠ `expected_fds()`, the proxy sends `error{invalid_message}` and closes. nestd resyncs on reconnect. A `listeners_add` whose fds didn't arrive (`MSG_CTRUNC`, the proxy out of descriptors) fails only its listeners (`listener_failed`, code `fds_lost`); the session goes on. Both units run with `LimitNOFILE=1048576`, and the proxy keeps a host-wide budget of open connections (65536 by default, `--max-connections`) on top of each sandbox's `limits.max_connections`, so one sandbox can't spend the host's descriptors.
 
 ## Policy acknowledgement
 

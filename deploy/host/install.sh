@@ -79,6 +79,10 @@ OOMScoreAdjust=-900
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=NEST_LOG=info
+# Every proxied connection holds two fds and every sandbox's listeners arrive as fds: the default
+# soft limit (1024) would make handovers lose their fds for the whole host. The proxy's own
+# host-wide connection budget (65536) stays well below this.
+LimitNOFILE=1048576
 ExecStart=/opt/nest/bin/nest-proxy --nestd-sock /run/nest/proxy.sock
 Restart=always
 RestartSec=2
@@ -97,6 +101,9 @@ OOMScoreAdjust=-900
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=RUST_LOG=info
+# nestd holds its own copy of every sandbox listener, the queued handover dups, and per-sandbox
+# guest and VM fds.
+LimitNOFILE=1048576
 # /run is empty after a reboot; nestd resumes with the credentials saved under /var/lib/nest.
 ExecStartPre=/bin/mkdir -p /run/nest/netns /run/nest/runner
 ExecStart=/opt/nest/bin/nestd --config /etc/nest/nestd.json

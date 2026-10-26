@@ -7,8 +7,10 @@ export const PROTOCOL_VERSION = 1;
 const prefixed = (prefix: string) => z.string().startsWith(prefix);
 
 export const HostId = prefixed("hst_");
-/** Strict: `sbx_` and a lowercase alphanumeric suffix (what `newId` makes), since it names R2 keys. */
-export const SandboxId = z.string().regex(/^sbx_[0-9a-z]{1,64}$/);
+/** A sandbox id, unanchored (for routes): `sbx_` and 1-64 lowercase letters or digits, what `newId` makes. */
+export const SANDBOX_ID_PATTERN = "sbx_[0-9a-z]{1,64}";
+/** Strict, since a sandbox id names R2 keys. */
+export const SandboxId = z.string().regex(new RegExp(`^${SANDBOX_ID_PATTERN}$`));
 export const AgentId = prefixed("agt_");
 export const WorkstreamId = prefixed("ws_");
 export const GenerationId = prefixed("gen_");
@@ -264,7 +266,7 @@ const wsEventBase = {
 };
 
 /** Why nest-proxy raised an egress alert; open (an unknown reason parses as `unknown`). */
-export const EGRESS_ALERT_REASONS = ["placeholder_wrong_host", "domain_fronting", "injection_after_expiry", "unknown"] as const;
+export const EGRESS_ALERT_REASONS = ["placeholder_wrong_host", "domain_fronting", "injection_after_expiry", "listener_lost", "unknown"] as const;
 export const EgressAlertReason = openEnum(EGRESS_ALERT_REASONS, "unknown");
 export type EgressAlertReason = z.output<typeof EgressAlertReason>;
 

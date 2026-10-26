@@ -9,13 +9,15 @@
   "CommitReason": [
     "turn_end", "timer", "dirty_threshold", "suspend", "drain", "spot_notice", "checkpoint", "fork", "salvage", "archive"
   ],
-  "EgressAlertReason": ["placeholder_wrong_host", "domain_fronting", "injection_after_expiry", "unknown"],
+  "EgressAlertReason": ["placeholder_wrong_host", "domain_fronting", "injection_after_expiry", "listener_lost", "unknown"],
+  "FenceCause": ["egress_lost", "unknown"],
   "EgressVerdict": ["allow", "passthrough", "deny", "alert"],
   "EgressVia": ["dns", "http_transparent", "https_transparent", "explicit", "tcp_exception"],
   "ForkMode": ["disk_only", "live"],
   "GenerationKind": ["disk_only", "checkpoint"],
+  "HostFaultKind": ["egress_listeners", "unknown"],
   "HostRole": ["burst", "controller"],
-  "LimitKind": ["connections"],
+  "LimitKind": ["connections", "host_connections"],
   "ManifestKind": ["disk", "memory"],
   "PolicyLayer": ["base", "workstream", "sandbox"],
   "RuleDecision": ["allow", "deny", "ask"],

@@ -19,7 +19,7 @@ import { issueHostToken } from "../lib/tokens";
 import { errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import {
   type Capacity, type CommandBody, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
-  type EgressAuditRecord, type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
+  type EgressAuditRecord, type EnrollResponse, type FenceCause, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
   type TunnelState,
 } from "../protocol/control";
 import type { GuestInfo } from "../protocol/gateway";
@@ -111,6 +111,8 @@ type Purpose = "stonith_fence" | null;
 
 const TOKEN_ROTATE_BEFORE_MS = 10 * 60_000;
 const COMMAND_RETENTION_MS = 24 * 3_600_000;
+/** How long a faulty host gets to suspend its sandboxes once it reports a `host_fault`. */
+const HOST_FAULT_DRAIN_MS = 120_000;
 /** Largest |ms| a JS Date can hold. */
 const MAX_DATE_MS = 8.64e15;
 /** A host-supplied timestamp, or `fallback` when it is no date at all: never throws. */
@@ -804,13 +806,15 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * The holder fenced the sandbox itself (nestd self-fences when its host lease lapses): the VM is
-   * paused for good, so the sandbox is placed again (on any host, this one included) from its head,
-   * and the fenced incarnation is destroyed once its salvage is done.
+   * paused for good, so the sandbox is placed again from its head, and the fenced incarnation is
+   * destroyed once its salvage is done. After a lease lapse any host may take it, this one
+   * included; after `egress_lost` (the host could not serve its egress) this host is excluded.
    */
-  private async holderFenced(host: string, sandbox: string, epoch: number, clean: boolean): Promise<void> {
-    console.warn(`FleetDO: ${host} reports ${sandbox}@${epoch} fenced; placing it again`);
+  private async holderFenced(host: string, sandbox: string, epoch: number, clean: boolean, cause?: FenceCause): Promise<void> {
+    console.warn(`FleetDO: ${host} reports ${sandbox}@${epoch} fenced${cause ? ` (${cause})` : ""}; placing it again`);
     this.recordStale(sandbox, host, epoch, clean);
-    await this.queueReassign(host, [sandbox], false);
+    // The queue's `host_dead` flag is what makes SandboxDO exclude the host from the placement.
+    await this.queueReassign(host, [sandbox], cause === "egress_lost");
   }
 
   /** A strictly increasing number: orders capacity reports against leases' first states. */
@@ -1000,7 +1004,7 @@ export class FleetDO extends DurableObject<Env> {
         }
         this.recordState(host, ev.sandbox, ev.epoch, ev.state, ev.guest);
         await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.suspend_mode ?? null, ev.detail ?? null, ev.guest ?? null);
-        if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false);
+        if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false, ev.cause);
         // A draining host's sandboxes leave as soon as they're safely suspended.
         else if (ev.state === "suspended" && this.host(host)?.status === "draining") await this.evict(host, [ev.sandbox]);
         return;
@@ -1025,6 +1029,8 @@ export class FleetDO extends DurableObject<Env> {
         return;
       case "spot_notice":
         return this.drain(host, ev.deadline_ms);
+      case "host_fault":
+        return this.drain(host, Date.now() + HOST_FAULT_DRAIN_MS, `host fault (${ev.kind}): ${ev.detail}`);
       case "agent_exited":
         this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ?", ev.agent, host);
         await this.agentStub(ev.agent).onExited(host, ev.reason);
@@ -1504,13 +1510,14 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Forced drain (spot notice): no new placements; suspended sandboxes leave now, the rest are
-   * suspended to the object store and leave as they report `suspended`. SandboxDO re-places a
-   * sandbox whose agents are mid-turn at once; the others wait until something needs them.
+   * Forced drain (a spot notice, or the host reporting a fault): no new placements; suspended
+   * sandboxes leave now, the rest are suspended to the object store and leave as they report
+   * `suspended`. SandboxDO re-places a sandbox whose agents are mid-turn at once; the others wait
+   * until something needs them.
    */
-  private async drain(host: string, deadlineMs: number): Promise<void> {
+  private async drain(host: string, deadlineMs: number, why = "spot interruption"): Promise<void> {
     this.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ? AND status = 'active'", host);
-    console.warn(`FleetDO: ${host} draining (spot interruption at ${new Date(deadlineMs).toISOString()})`);
+    console.warn(`FleetDO: ${host} draining (${why}, by ${new Date(deadlineMs).toISOString()})`);
     const leases = this.leasesOf(host).filter((l) => !l.expired);
     await this.evict(host, leases.filter((l) => l.state === "suspended").map((l) => l.sandbox));
     const running = leases.filter((l) => l.state !== "suspended");

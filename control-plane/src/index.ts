@@ -6,7 +6,7 @@ import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identit
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
-import { AgentRole, ErrorCodes, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
+import { AgentRole, ErrorCodes, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources, SANDBOX_ID_PATTERN, SandboxId } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
@@ -171,7 +171,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     return json({ ok: true, note: "the next burst host to check in runs it (dry run until one completes)" });
   }
   if (req.method === "POST" && path === "/v1/admin/gc/register") {
-    const r = await body(req, z.object({ sandboxes: z.array(z.string().startsWith("sbx_")) }));
+    const r = await body(req, z.object({ sandboxes: z.array(SandboxId) }));
     return json({ live: await fleet(env, cell).registerSandboxes(r.sandboxes) });
   }
   if (req.method === "POST" && path === "/v1/admin/root-ca/kms") {
@@ -226,7 +226,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
     return json(info, info.host ? 201 : 202);
   }
-  if ((p = m(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)\/ports(?:\/(\d+))?$/))) {
+  if ((p = m(new RegExp(`^/v1/sandboxes/(${SANDBOX_ID_PATTERN})/ports(?:/(\\d+))?$`)))) {
     const s = sandbox(env, p[1]!);
     if (req.method === "POST" && !p[2]) {
       // Operator path: the only place public share links are minted.
@@ -238,7 +238,7 @@ async function route(req: Request, env: Env): Promise<Response> {
       return json({ ok: true });
     }
   }
-  if ((p = m(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)(\/grants|\/policy|\/generations|\/place|\/resolve)?$/))) {
+  if ((p = m(new RegExp(`^/v1/sandboxes/(${SANDBOX_ID_PATTERN})(/grants|/policy|/generations|/place|/resolve)?$`)))) {
     const s = sandbox(env, p[1]!);
     if (req.method === "GET" && !p[2]) return json(await s.info());
     // A person's (or a test harness's) way to a sandbox's hands: the same target an agent gets.
@@ -265,7 +265,7 @@ async function route(req: Request, env: Env): Promise<Response> {
       role: AgentRole,
       // A worker's workstream and cell are its sandbox's: optional, and refused when they differ.
       workstream: z.string().startsWith("ws_").optional(),
-      sandbox: z.string().startsWith("sbx_").optional(),
+      sandbox: SandboxId.optional(),
       captain: z.string().startsWith("agt_").optional(),
       launch: LaunchConfig.optional(),
       grants: z.array(z.string()).optional(),

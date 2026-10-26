@@ -1,4 +1,4 @@
-//! `nest-proxy [--nestd-sock PATH] [--extra-root FILE.pem]... [--no-webpki-roots]`
+//! `nest-proxy [--nestd-sock PATH] [--extra-root FILE.pem]... [--no-webpki-roots] [--max-connections N]`
 //!
 //! Runs unprivileged. All configuration beyond these flags arrives from nestd.
 
@@ -29,8 +29,9 @@ async fn main() -> Result<()> {
                 cfg.extra_roots.extend(certs);
             }
             "--no-webpki-roots" => cfg.webpki_roots = false,
+            "--max-connections" => cfg.max_connections = args.next().context("--max-connections needs a number")?.parse().context("--max-connections")?,
             "-h" | "--help" => {
-                println!("nest-proxy [--nestd-sock PATH] [--extra-root FILE.pem]... [--no-webpki-roots]");
+                println!("nest-proxy [--nestd-sock PATH] [--extra-root FILE.pem]... [--no-webpki-roots] [--max-connections N]");
                 return Ok(());
             }
             other => bail!("unknown argument {other}"),

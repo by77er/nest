@@ -10,7 +10,7 @@ use nix::sys::socket::{SockType, getsockopt, sockopt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
-use nest_protocol::control::{EgressAuditKind, EgressReason, EgressVerdict, LimitKind};
+use nest_protocol::control::{EgressAuditKind, EgressReason, EgressVerdict};
 use nest_protocol::host::proxy::{ListenerPurpose, ListenerSpec, Transport};
 use nest_protocol::model::ErrorBody;
 
@@ -88,11 +88,14 @@ async fn accept_loop(
             ListenerPurpose::Explicit { agent, .. } => Some(agent.clone()),
             _ => None,
         };
-        let Some(guard) = sandbox.try_acquire() else {
-            let mut a = Audit::new("", 0, EgressVerdict::Deny).reason(EgressReason::ConnectionLimit);
-            a.kind = EgressAuditKind::Limit { which: LimitKind::Connections };
-            crate::state::submit_audit(&session, &sandbox, a.into_record(&sandbox.id, sandbox.view().epoch, agent, Some(crate::audit::via(&purpose))));
-            continue;
+        let guard = match sandbox.try_acquire(&session.upstream) {
+            Ok(g) => g,
+            Err(which) => {
+                let mut a = Audit::new("", 0, EgressVerdict::Deny).reason(EgressReason::ConnectionLimit);
+                a.kind = EgressAuditKind::Limit { which };
+                crate::state::submit_audit(&session, &sandbox, a.into_record(&sandbox.id, sandbox.view().epoch, agent, Some(crate::audit::via(&purpose))));
+                continue;
+            }
         };
         let _ = s.set_nodelay(true);
         let ctx = Arc::new(ConnCtx { session: session.clone(), sandbox: sandbox.clone(), agent, via: crate::audit::via(&purpose), _guard: guard });
@@ -109,18 +112,33 @@ async fn accept_loop(
     }
 }
 
+/// Accept errors that leave the listener usable: resource exhaustion (wait and retry) and the
+/// ones accept(2) says to treat like `EAGAIN` (a pending network error on the new connection,
+/// `ECONNABORTED`, a firewall rule refusing it). Anything else ends the listener (`listener_failed`).
 fn transient(e: &io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc_errno::EMFILE | libc_errno::ENFILE | libc_errno::ENOBUFS | libc_errno::ENOMEM | libc_errno::ECONNABORTED | libc_errno::EINTR | libc_errno::EPROTO))
+    use nix::errno::Errno::*;
+    const RETRY: &[nix::errno::Errno] = &[
+        EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED, EINTR, EAGAIN, EPERM,
+        // accept(2), "Error handling": already-pending network errors, to retry like EAGAIN.
+        ENETDOWN, EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP, ENETUNREACH,
+    ];
+    e.raw_os_error().is_some_and(|n| RETRY.iter().any(|r| *r as i32 == n))
         || matches!(e.kind(), io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock)
 }
 
-mod libc_errno {
-    use nix::errno::Errno;
-    pub const EMFILE: i32 = Errno::EMFILE as i32;
-    pub const ENFILE: i32 = Errno::ENFILE as i32;
-    pub const ENOBUFS: i32 = Errno::ENOBUFS as i32;
-    pub const ENOMEM: i32 = Errno::ENOMEM as i32;
-    pub const ECONNABORTED: i32 = Errno::ECONNABORTED as i32;
-    pub const EINTR: i32 = Errno::EINTR as i32;
-    pub const EPROTO: i32 = Errno::EPROTO as i32;
+#[cfg(test)]
+mod tests {
+    use super::transient;
+    use std::io;
+
+    #[test]
+    fn accept_errors_accept2_says_to_retry_are_transient() {
+        use nix::errno::Errno::*;
+        for e in [EMFILE, ECONNABORTED, EPERM, ENETDOWN, EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP, ENETUNREACH] {
+            assert!(transient(&io::Error::from_raw_os_error(e as i32)), "{e:?}");
+        }
+        for e in [EBADF, EINVAL, ENOTSOCK] {
+            assert!(!transient(&io::Error::from_raw_os_error(e as i32)), "{e:?} ends the listener");
+        }
+    }
 }

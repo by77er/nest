@@ -109,6 +109,34 @@ describe("fences never strand a sandbox", () => {
     expect(recreate.sandbox).toBe(sbx.sandbox);
     expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: a.host });
   });
+
+  it("a fence for lost egress (`cause: egress_lost`) places the sandbox on another host, never back on the same one", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const b = await connectHost(cell);
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "fenced", detail: "egress listener lost", cause: "egress_lost" }]);
+    const [recreate] = await nextCommands(b.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
+    expect(recreate.sandbox).toBe(sbx.sandbox);
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+    expect(await a.ws.none("commands", 100, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_create" && c.epoch === 2))).toBe(true);
+  });
+
+  it("a host that reports a fault is drained: its sandboxes are suspended and it takes no new ones", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "running", guest: GUEST }]);
+    await events(a.ws, [{ type: "host_fault", kind: "egress_listeners", detail: "egress listeners of 2 sandboxes lost" }]);
+    const [suspend] = await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    expect(suspend).toMatchObject({ sandbox: sbx.sandbox, mode: "disk_only" });
+    const status = await runInDurableObject(fleetStub(cell), (_i, st) =>
+      st.storage.sql.exec<{ status: string }>("SELECT status FROM hosts WHERE host = ?", a.host).one().status);
+    expect(status).toBe("draining");
+    expect((await createSandbox(cell, 202)).host, "a draining host takes no new sandbox").toBeNull();
+  });
 });
 
 describe("an unfinished placement is reconciled against the lease", () => {

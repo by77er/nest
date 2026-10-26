@@ -284,7 +284,7 @@ export function egressReasonParts(
   return { kind: "other", text: r };
 }
 
-export const LimitKind = z.enum(["connections"]);
+export const LimitKind = z.enum(["connections", "host_connections"]);
 /** What an audit record stands for (absent = `request`), as `EgressAuditKind` in Rust. */
 export const EgressAuditKind = z.discriminatedUnion("type", [
   z.object({ type: z.literal("request") }),
@@ -321,6 +321,14 @@ export type EgressAuditRecord = z.output<typeof EgressAuditRecord>;
  * is the control plane's own (a host reconnected without reporting the brain). Open: a reason this
  * build doesn't know, including an older nestd's free text, parses as `unknown`.
  */
+/** Why nestd fenced a sandbox itself (`sandbox_state.cause`); open, like `FenceCause` in Rust. */
+export const FENCE_CAUSES = ["egress_lost", "unknown"] as const;
+export const FenceCause = openEnum(FENCE_CAUSES, "unknown");
+export type FenceCause = z.output<typeof FenceCause>;
+/** What kind of host fault (`host_fault.kind`); open. */
+export const HOST_FAULT_KINDS = ["egress_listeners", "unknown"] as const;
+export const HostFaultKind = openEnum(HOST_FAULT_KINDS, "unknown");
+
 export const AGENT_EXIT_REASONS = ["idle", "stopped", "fenced", "auth_failed", "crashed", "host_lost", "unknown"] as const;
 export const AgentExitReason = openEnum(AGENT_EXIT_REASONS, "unknown");
 export type AgentExitReason = z.output<typeof AgentExitReason>;
@@ -330,7 +338,7 @@ export const HostEventVariants = [
   z.object({ ...hostEventBase, type: z.literal("command_result"), cmd: CommandId, outcome: CommandOutcome }),
   z.object({
     ...hostEventBase, type: z.literal("sandbox_state"), sandbox: SandboxId, epoch: Epoch, state: SandboxState,
-    suspend_mode: SuspendMode.optional(), detail: z.string().optional(), guest: GuestInfo.optional(),
+    suspend_mode: SuspendMode.optional(), detail: z.string().optional(), cause: FenceCause.optional(), guest: GuestInfo.optional(),
   }),
   z.object({
     ...hostEventBase, type: z.literal("commit_request"), request: RequestId, sandbox: SandboxId, epoch: Epoch,
@@ -343,6 +351,8 @@ export const HostEventVariants = [
   /** Sent on every change of the host's tunnel state. */
   z.object({ ...hostEventBase, type: z.literal("tunnel_state"), state: TunnelState }),
   z.object({ ...hostEventBase, type: z.literal("spot_notice"), deadline_ms: TimestampMs }),
+  /** The host itself is faulty: FleetDO drains it. */
+  z.object({ ...hostEventBase, type: z.literal("host_fault"), kind: HostFaultKind, detail: z.string() }),
   z.object({
     ...hostEventBase, type: z.literal("agent_exited"), agent: AgentId, exit_code: z.number().int().optional(),
     signal: z.number().int().optional(), reason: AgentExitReason,
