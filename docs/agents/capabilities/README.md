@@ -19,6 +19,7 @@ prompt:  |                                  # added to the system prompt
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
 - **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
+- **Built so far:** `builtin` tools only, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)). The seed has `channels` and `messaging-tree` (`messaging{peers: tree}`); parameters (`peers: label:<key>`, `any`) aren't built, so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
 
 ## Sources
 

@@ -5,9 +5,10 @@ import { describe, expect, it } from "vitest";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, intersectTools, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
-  SpawnerOverrides, specFromRole, type Template, templatesUsing,
+  SpawnerOverrides, specFromRole, type Template, templatesUsing, SEED_CATALOG_V1, CHANNEL_CAPABILITIES, seedMigration, SEED_VERSION,
 } from "../src/lib/spec";
 import { Credential, type ToolRule } from "../src/protocol/control";
+import type { ChannelGrant } from "../src/lib/channels";
 
 // What the roles gave (the role-filtered `platform-tools.json` and AgentDO's defaults before templates).
 const WORKER_TOOLS = ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"];
@@ -39,6 +40,7 @@ describe("the seed catalog is what the roles were", () => {
       credential: "claude_oauth_token:worker",
       escalate_to: "workstream",
       subscribe: [],
+      channel_grants: [],
     });
   });
 
@@ -51,6 +53,7 @@ describe("the seed catalog is what the roles were", () => {
       credential: "claude_oauth_token:captain",
       escalate_to: "user",
       subscribe: ["workstream"],
+      channel_grants: [],
     });
   });
 
@@ -72,7 +75,7 @@ describe("the seed catalog is what the roles were", () => {
 describe("records stored with a role read through a frozen table, not the seed", () => {
   it("the seed still expands to what ROLE_SPECS freezes (so a seed edit can't change it unnoticed)", () => {
     for (const role of ["worker", "captain"] as const) {
-      const { launch: _l, rules: _r, subscribe: _s, ...rest } = expand(SEED_CATALOG, role, role === "worker");
+      const { launch: _l, rules: _r, subscribe: _s, channel_grants: _g, ...rest } = expand(SEED_CATALOG, role, role === "worker");
       expect(rest, role).toEqual(ROLE_SPECS[role]);
     }
   });
@@ -133,8 +136,8 @@ describe("expansion refuses what it can't give", () => {
     expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "constructor", hands: false, by: "operator" }).ok).toBe(false);
     const broken: Catalog = { ...SEED_CATALOG, templates: { b: { ...SEED_CATALOG.templates.captain!, capabilities: ["toString"] } } };
     expect(expandSpec(broken, PLATFORM_TOOL_NAMES, { template: "b", hands: false, by: "operator" })).toEqual({ ok: false, error: "template b: unknown capability toString" });
-    expect(checkCapability({ tools: ["nope"], rules: [], prompt: "" }, PLATFORM_TOOL_NAMES).ok).toBe(false);
-    expect(checkCapability({ tools: ["notify", "notify"], rules: [], prompt: "" }, PLATFORM_TOOL_NAMES).ok).toBe(false);
+    expect(checkCapability({ tools: ["nope"], rules: [], prompt: "", grants: [] }, PLATFORM_TOOL_NAMES).ok).toBe(false);
+    expect(checkCapability({ tools: ["notify", "notify"], rules: [], prompt: "", grants: [] }, PLATFORM_TOOL_NAMES).ok).toBe(false);
     expect(checkTemplate({ ...SEED_CATALOG.templates.worker!, capabilities: ["hands", "hands"] }, SEED_CATALOG.capabilities).ok).toBe(false);
     expect(templatesUsing(SEED_CATALOG, "hands")).toEqual(["worker"]);
   });
@@ -165,6 +168,7 @@ function genCatalog(r: () => number): { catalog: Catalog; template: string; hand
   const pick = <T>(xs: readonly T[]) => xs[Math.floor(r() * xs.length)]!;
   const subset = <T>(xs: readonly T[], p: number) => xs.filter(() => r() < p);
   const rulePool: ToolRule[] = [NEST_ALLOW, { pattern: "Agent", decision: "allow" }, { pattern: "Bash", decision: "ask" }, { pattern: "Web*", decision: "deny", reason: "no" }];
+  const grantPool: ChannelGrant[] = [{ action: "post", channel: "user" }, { action: "read", channel: "team/*" }, { action: "post", channel: "{owner}/inbox" }];
   const capabilities: Record<string, Capability> = {};
   const n = 1 + Math.floor(r() * 6);
   for (let i = 0; i < n; i++) {
@@ -172,6 +176,7 @@ function genCatalog(r: () => number): { catalog: Catalog; template: string; hand
       tools: [...new Set(subset(PLATFORM_TOOL_NAMES, 0.2))].sort(() => r() - 0.5),
       rules: subset(rulePool, 0.4),
       prompt: r() < 0.5 ? `prompt ${i}` : "",
+      grants: subset(grantPool, 0.3),
     };
   }
   const capNames = Object.keys(capabilities);
@@ -225,6 +230,10 @@ describe("expansion properties (500 generated catalogs)", () => {
       const parts = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter(Boolean);
       expect(spec.launch.system_prompt, ctx).toEqual({ mode: tpl.launch.system_prompt.mode, text: parts.join("\n\n") });
       expect([spec.credential, spec.escalate_to, spec.subscribe], ctx).toEqual([tpl.credential, tpl.escalate_to, tpl.subscribe]);
+      // Channel grants: every capability grant once, whatever the overrides (an operator's narrow only tools).
+      const gk = (x: ChannelGrant) => `${x.action} ${x.channel}`;
+      expect(new Set(spec.channel_grants.map(gk)).size, ctx).toBe(spec.channel_grants.length);
+      expect(new Set(spec.channel_grants.map(gk)), ctx).toEqual(new Set(caps.flatMap((c) => c.grants).map(gk)));
       // Hands: the template's rule decides.
       if (tpl.hands === "required") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: false, by: "operator" }).ok, ctx).toBe(false);
       if (tpl.hands === "forbidden") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: true, by: "operator" }).ok, ctx).toBe(false);
@@ -254,6 +263,8 @@ describe("expansion properties (500 generated catalogs)", () => {
       const baseKeys = new Set(base.value.rules.map(key));
       expect(res.value.rules.filter((x) => !baseKeys.has(key(x))).every((x) => x.decision !== "allow"), ctx).toBe(true);
       expect([res.value.launch, res.value.credential, res.value.escalate_to], ctx).toEqual([base.value.launch, base.value.credential, base.value.escalate_to]);
+      // A spawner never widens channel grants either.
+      expect(res.value.channel_grants, ctx).toEqual(base.value.channel_grants);
     }
   });
 
@@ -266,5 +277,21 @@ describe("expansion properties (500 generated catalogs)", () => {
         if (b.ok) expect(b, `seed ${seed}`).toEqual(a);
       }
     }
+  });
+});
+
+describe("seed migration (pure)", () => {
+  it("a version-1 catalog gains each later step's entries whose names are free; a current one gains nothing", () => {
+    const all = { capabilities: Object.keys(SEED_CATALOG_V1.capabilities), templates: Object.keys(SEED_CATALOG_V1.templates) };
+    const m = seedMigration(all, 1);
+    expect(Object.keys(m.capabilities).sort()).toEqual(Object.keys(CHANNEL_CAPABILITIES).sort());
+    expect(m.templates).toEqual({});
+    expect(m.version).toBe(SEED_VERSION);
+    // A name the operator already uses is left alone (never overwritten).
+    expect(Object.keys(seedMigration({ ...all, capabilities: [...all.capabilities, "channels"] }, 1).capabilities)).toEqual(["messaging-tree"]);
+    // Nothing for a catalog at the current version, so a deleted entry never comes back.
+    expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION)).toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION });
+    // The version never goes back.
+    expect(seedMigration(all, SEED_VERSION + 5).version).toBe(SEED_VERSION + 5);
   });
 });

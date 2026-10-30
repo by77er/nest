@@ -16,9 +16,11 @@
 | `checkpoint` | worker | Commit the bound sandbox now |
 | `expose_port` | worker | Preview URL, optionally with a share link |
 | `brokered` | worker, captain | `{action, args}`, run outside the sandbox. The available actions depend on grants, and AgentDO's `tools_list` may also expose them as dedicated tools (e.g. `github_create_pr`) |
+| `channel_create`, `post`, `read`, `subscribe`, `unsubscribe` | the `channels` capability (no seed template) | [Channels](../../../channels/): create a channel (owned), post (`kind`, `data`, `reply_to`, `key` with `if_seq` compare-and-set, `mentions`), read (`since`/`limit`, or the keyed view), subscribe (filter fields flattened: `kinds`, `from`, `keys`, `mentions_me`, `reply_to`; `delivery`, `batch_ms`, `once`). `from` and `taint` are never arguments |
+| `message` | the `messaging-tree` capability (no seed template) | `post` to `<agent>/inbox`, within the agent's channel grants |
 | `spawn_workstream`, `send`, `list_workstreams`, `get_status`, `wait_events` (≤120 s), `approve`, `deny`, `merge` (approval), `kill`, `delegate`, `memory_read`, `memory_write`, `notify_user` | captain | Return `not_implemented`; the design replaces them with capability tools ([pending contract changes](../../README.md#pending-contract-changes)) |
 
-Only `notify`, `emit`, `ask`, `read_transcript` and `expose_port` run; the rest return `not_implemented`.
+Only `notify`, `emit`, `ask`, `read_transcript`, `expose_port` and the channel tools run; the rest return `not_implemented`.
 
 **Grants:**
 - AgentDO lists exactly the tools in the agent's expanded spec, and checks every `tool_call` against it again.

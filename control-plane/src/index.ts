@@ -6,12 +6,15 @@ import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identit
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
+import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
 import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
+import { DIRECTORY } from "./do/channel";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
 export { CatalogDO } from "./do/catalog";
+export { ChannelDO } from "./do/channel";
 export { FleetDO } from "./do/fleet";
 export { SandboxDO } from "./do/sandbox";
 export { WorkstreamDO } from "./do/workstream";
@@ -42,6 +45,9 @@ const agent = (env: Env, id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const workstream = (env: Env, id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
 const broker = (env: Env) => env.BROKER.get(env.BROKER.idFromName("broker"));
 const catalog = (env: Env) => env.CATALOG.get(env.CATALOG.idFromName("catalog"));
+const channel = (env: Env, name: string) => env.CHANNEL.get(env.CHANNEL.idFromName(name));
+/** The operator, as a channel caller: `user`, the root. */
+const USER: Caller = { principal: "user" };
 
 /** An agent id that names an agent (404 otherwise): the subscriber or owner a route records. */
 async function existingAgent(env: Env, id: string): Promise<{ workstream: string }> {
@@ -207,6 +213,59 @@ async function route(req: Request, env: Env): Promise<Response> {
     }
   }
 
+  // Channels (docs/channels/): the operator is `user`, the root. A channel's name is one path segment,
+  // URL-encoded (`agt_…%2Finbox`).
+  if (req.method === "POST" && path === "/v1/admin/channels") {
+    const r = await body(req, z.object({ name: ChannelName, retention_days: z.number().int().min(1).max(MAX_RETENTION_DAYS).optional() }));
+    return json(await channel(env, r.name).create(r.name, USER, r.retention_days), 201);
+  }
+  if (req.method === "GET" && path === "/v1/admin/channels") {
+    return json(await channel(env, DIRECTORY).dirList(url.searchParams.get("prefix") ?? "", url.searchParams.get("after") ?? "",
+      num(url.searchParams.get("limit") ?? undefined, 200)));
+  }
+  if ((p = m(/^\/v1\/admin\/channels\/([^/]+)(\/messages|\/subscriptions|\/acl)?(?:\/(sub_[a-z0-9_]+))?$/))) {
+    let name: string;
+    try {
+      name = decodeURIComponent(p[1]!);
+    } catch {
+      throw new NestError(ErrorCodes.INVALID_MESSAGE, "bad channel name encoding");
+    }
+    const kind = parseChannel(name);
+    if (!kind.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, kind.error);
+    // An agent's built-in channel exists with its agent: 404 for one that never existed.
+    if (kind.value.kind === "inbox" || kind.value.kind === "events") await existingAgent(env, kind.value.agent);
+    const c = channel(env, name);
+    if (req.method === "GET" && !p[2]) return json(await c.info(name));
+    if (req.method === "GET" && p[2] === "/messages") {
+      const q = url.searchParams;
+      const flag = (k: string) => q.get(k) === "true" || q.get(k) === "1";
+      const int = (k: string) => (q.has(k) ? num(q.get(k) ?? undefined, 0) : undefined);
+      const since = int("since");
+      const limit = int("limit");
+      return json(await c.read(name, USER, {
+        ...(since !== undefined ? { since } : {}), ...(limit !== undefined ? { limit } : {}),
+        ...(flag("latest_by_key") ? { latest_by_key: true } : {}), ...(q.has("prefix") ? { prefix: q.get("prefix")! } : {}),
+        ...(flag("keys_only") ? { keys_only: true } : {}), ...(q.has("after_key") ? { after_key: q.get("after_key")! } : {}),
+      }));
+    }
+    if (req.method === "POST" && p[2] === "/messages") {
+      const r = await c.post(name, USER, await body(req, z.unknown()));
+      return json(r, r.status === "conflict" ? 409 : r.status === "posted" ? 201 : 200);
+    }
+    if (req.method === "GET" && p[2] === "/subscriptions" && !p[3]) return json(await c.subscriptions(name));
+    if (req.method === "POST" && p[2] === "/subscriptions" && !p[3]) {
+      // On an agent's behalf (a spawner subscribing its child is the operator here until agent_spawn exists).
+      const r = await body(req, z.object({ agent: z.string().regex(/^agt_[a-z0-9]+$/) }).passthrough());
+      await existingAgent(env, r.agent);
+      const { agent: who, ...rest } = r;
+      const input = SubscribeInput.safeParse(rest);
+      if (!input.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, input.error.message);
+      return json(await c.subscribe(name, USER, who, input.data), 201);
+    }
+    if (req.method === "DELETE" && p[2] === "/subscriptions" && p[3]) return json(await c.unsubscribe(name, USER, p[3]));
+    if (req.method === "PUT" && p[2] === "/acl") return json(await c.setAcl(name, await body(req, z.array(AclEntry))));
+  }
+
   // Workstreams: the interim workstream channel (docs/orchestration/workstreams/). `captain` is the
   // previous release's name for `subscriber`, accepted for one release.
   if (req.method === "POST" && path === "/v1/workstreams") {
@@ -351,10 +410,11 @@ async function route(req: Request, env: Env): Promise<Response> {
     }
     return json({ ...(await a.info()), started, ...(start_waiting ? { start_waiting } : {}) }, 201);
   }
-  if ((p = m(/^\/v1\/agents\/(agt_[A-Za-z0-9]+)(\/turns|\/inbox|\/interrupt|\/start|\/stop|\/transcript|\/rules|\/asks\/(ask_[A-Za-z0-9]+)\/answer)?$/))) {
+  if ((p = m(/^\/v1\/agents\/(agt_[A-Za-z0-9]+)(\/turns|\/inbox|\/interrupt|\/start|\/stop|\/transcript|\/rules|\/subscriptions|\/asks\/(ask_[A-Za-z0-9]+)\/answer)?$/))) {
     const a = agent(env, p[1]!);
     if (req.method === "GET" && !p[2]) return json(await a.info());
     if (req.method === "GET" && p[2] === "/turns") return json(await a.turns());
+    if (req.method === "GET" && p[2] === "/subscriptions") return json(await a.channelSubscriptions());
     if (req.method === "GET" && p[2] === "/transcript" && url.searchParams.has("since")) {
       const base = url.searchParams.get("base");
       return json(await a.readTranscript(num(url.searchParams.get("since") ?? undefined, 0), num(url.searchParams.get("limit") ?? undefined, 200),
@@ -369,7 +429,8 @@ async function route(req: Request, env: Env): Promise<Response> {
       const r = await body(req, z.object({
         text: z.string(), from: z.string().default("user"), interrupt: z.boolean().default(false), request_id: RequestIdField,
       }));
-      return json({ message: await a.postInbox(r.from, r.text, r.interrupt, requestId(req, r.request_id)) }, 201);
+      // The operator speaking as `user` is trusted; text it relays under another name may not be (it taints).
+      return json({ message: await a.postInbox(r.from, r.text, r.interrupt, requestId(req, r.request_id), r.from !== "user") }, 201);
     }
     if (req.method === "POST" && p[2] === "/interrupt") {
       await a.interrupt();
