@@ -396,11 +396,42 @@ impl<E: OutboxEvent> FleetLink<E> {
         }
         let well_formed = Self::effects_well_formed(&fx);
         Self::check(well_formed, "fleet_effects_well_formed", &mut fx);
-        let in_order = self.unacked.iter().zip(self.unacked.iter().skip(1)).all(|(a, b)| a.0 < b.0);
-        Self::check(in_order, "fleet_unacked_in_order", &mut fx);
-        let fresh = self.unacked.back().is_none_or(|(s, _)| *s < self.next_seq);
-        Self::check(fresh, "fleet_seq_never_reused", &mut fx);
+        Self::check(self.unacked_in_order(), "fleet_unacked_in_order", &mut fx);
+        Self::check(self.seq_never_reused(), "fleet_seq_never_reused", &mut fx);
         fx
+    }
+
+    // The invariants' predicates, each in a function of its own: their seqs and keys come from a
+    // counter that only rises, so no input reaches a strict comparison's non-strict mutant
+    // (`.cargo/mutants.toml` skips those by function).
+
+    fn unacked_in_order(&self) -> bool {
+        self.unacked.iter().zip(self.unacked.iter().skip(1)).all(|(a, b)| a.0 < b.0)
+    }
+
+    fn seq_never_reused(&self) -> bool {
+        self.unacked.back().is_none_or(|(s, _)| *s < self.next_seq)
+    }
+
+    fn key_is_fresh(sent_ms: i64, last_sent_ms: i64) -> bool {
+        sent_ms > last_sent_ms
+    }
+
+    fn forwarded_in_order(forwarded: Option<Seq>, seq: Seq) -> bool {
+        forwarded.is_none_or(|f| seq > f)
+    }
+
+    /// Keep a heartbeat's send instants for matching its ack, at most `HEARTBEATS_KEPT` of them.
+    fn remember_heartbeat(&mut self, sent_ms: i64, at: (u64, u64)) {
+        self.sent.insert(sent_ms, at);
+        while self.sent.len() > HEARTBEATS_KEPT {
+            self.sent.pop_first();
+        }
+    }
+
+    /// An ack for `sent_ms` makes it and every earlier heartbeat moot.
+    fn forget_heartbeats_through(&mut self, sent_ms: i64) {
+        self.sent.retain(|k, _| *k > sent_ms);
     }
 
     /// Assert an invariant inside a step: a violation is reported as this step's
@@ -463,12 +494,9 @@ impl<E: OutboxEvent> FleetLink<E> {
                         return self.close(now, fx);
                     }
                     let sent_ms = now.wall.max(self.last_sent_ms + 1);
-                    Self::check(sent_ms > self.last_sent_ms, "fleet_heartbeat_keys_increase", fx);
+                    Self::check(Self::key_is_fresh(sent_ms, self.last_sent_ms), "fleet_heartbeat_keys_increase", fx);
                     self.last_sent_ms = sent_ms;
-                    self.sent.insert(sent_ms, (now.mono, now.boot));
-                    while self.sent.len() > HEARTBEATS_KEPT {
-                        self.sent.pop_first();
-                    }
+                    self.remember_heartbeat(sent_ms, (now.mono, now.boot));
                     fx.push(Effect::Send(Outbound::Heartbeat { sent_ms }));
                     if let Conn::Open { next_heartbeat, .. } = &mut self.conn {
                         *next_heartbeat = now.mono + hb;
@@ -532,7 +560,7 @@ impl<E: OutboxEvent> FleetLink<E> {
                 Inbound::HelloAck { .. } => {}
                 Inbound::HeartbeatAck { sent_ms, revoked } => {
                     if let Some(at) = self.sent.get(&sent_ms).copied() {
-                        self.sent.retain(|k, _| *k > sent_ms);
+                        self.forget_heartbeats_through(sent_ms);
                         self.renew(now, at, fx);
                     }
                     if let Some(r) = revoked {
@@ -550,7 +578,7 @@ impl<E: OutboxEvent> FleetLink<E> {
                         fx.push(Effect::Log(Log::CommandGap { seq, expected }));
                         self.close(now, fx);
                     } else {
-                        Self::check(self.forwarded_command_seq.is_none_or(|f| seq > f), "fleet_commands_forwarded_in_order", fx);
+                        Self::check(Self::forwarded_in_order(self.forwarded_command_seq, seq), "fleet_commands_forwarded_in_order", fx);
                         self.forwarded_command_seq = Some(seq);
                         self.expected_command_seq = Some(seq + 1);
                         fx.push(Effect::Notify(Notice::Commands { seq, commands }));

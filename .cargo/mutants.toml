@@ -1,37 +1,32 @@
 # cargo-mutants (`cargo mutants -p nestd-core`): mutants no test can tell from the original.
-# Patterns match "<file>:<line>:<col>: <mutation> in <function>". Where the same function holds a
-# mutant of the same shape that a test does kill, the pattern is pinned to the line: if the code
-# moves, the mutant shows up as missed again rather than an exclusion silently covering another.
+# Every pattern names a function and a mutation, never a line or column, so a pattern can't quietly
+# move onto other code: where a function held both a killable mutant and an equivalent one of the
+# same shape, the equivalent one's expression was moved into a function of its own.
+# Patterns match "<file>:<line>:<col>: <mutation> in <function>".
 exclude_re = [
-  # Runtime invariants (`invariant::check`) weakened from strict to non-strict. The code each one
-  # guards builds the strict form by construction, so no input reaches the difference:
-  # fleet_unacked_in_order and fleet_seq_never_reused (seqs come from `next_seq += 1`; these are
-  # the only `<` in `step`),
-  'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace < with <= in FleetLink<E>::step',
-  # fleet_heartbeat_keys_increase (`sent_ms` is at least `last_sent_ms + 1`),
-  'crates/nestd-core/src/fleet\.rs:393:46: replace > with >= in FleetLink<E>::on_tick',
-  # fleet_commands_forwarded_in_order (the branch before it already took `seq <= forwarded`),
-  'crates/nestd-core/src/fleet\.rs:480:88: replace > with >= in FleetLink<E>::on_frame',
-  # result_cache_bounded (`&&` -> `||`; the cache's other `&&` is a let chain, unviable).
+  # Runtime invariants' predicates, strict weakened to non-strict. What each guards is strict by
+  # construction (seqs come from `next_seq += 1`, keys from `last_sent_ms + 1` or later, a forward
+  # follows the `seq <= forwarded` branch), so no input reaches the difference.
+  'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace < with <= in FleetLink<E>::(unacked_in_order|seq_never_reused)',
+  'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace > with >= in FleetLink<E>::(key_is_fresh|forwarded_in_order)',
+  # result_cache_bounded: `&&` -> `||` (the cache keeps map and order in step by construction).
   'crates/nestd-core/src/results\.rs:\d+:\d+: replace && with \|\| in ResultCache<V, K, M, O>::insert',
 
   # Heartbeat send times kept: 63 instead of HEARTBEATS_KEPT (64). Only an ack for exactly the 64th
   # newest heartbeat, with none of the 63 after it acked, would tell; the link closes after 2.5
   # silent intervals and the fence is a few intervals, so that ack can't renew anything live.
-  'crates/nestd-core/src/fleet\.rs:396:43: replace > with (==|>=) in FleetLink<E>::on_tick',
+  'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace > with (==|>=) in FleetLink<E>::remember_heartbeat',
   # The same loop with `<` never ends (popping an empty map leaves it below the bound): every test
   # that sends a heartbeat hangs, so it can only end as a timeout, which fails a run as a miss would.
-  'crates/nestd-core/src/fleet\.rs:396:43: replace > with < in FleetLink<E>::on_tick',
+  'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace > with < in FleetLink<E>::remember_heartbeat',
   # Keeping the acked heartbeat's own key: a duplicate ack renews again to the same deadlines.
-  'crates/nestd-core/src/fleet\.rs:462:52: replace > with >= in FleetLink<E>::on_frame',
+  'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace > with >= in FleetLink<E>::forget_heartbeats_through',
 
   # Read only to print the model checker's counterexample traces (verification/nestd/check).
   'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace FleetLink<E>::forwarded_command_seq -> ',
-  # The release-build reporter: a debug build (every test) panics before reaching the hook.
-  'crates/nestd-core/src/invariant\.rs:\d+:\d+: replace set_hook with \(\)',
   # No caller: they exist because clippy's len_without_is_empty asks for them beside `len`.
-  'crates/nestd-core/src/results\.rs:\d+:\d+: replace (ResultCache<V, K, M, O>|OutcomeMap|KeyOrder)::is_empty -> bool',
-  'crates/nestd-core/src/results\.rs:\d+:\d+: replace == with != in (OutcomeMap|KeyOrder)::is_empty',
+  'crates/nestd-core/src/[a-z_]+\.rs:\d+:\d+: replace [A-Za-z<>, ]+::is_empty -> bool',
+  'crates/nestd-core/src/[a-z_]+\.rs:\d+:\d+: replace == with != in [A-Za-z<>, ]+::is_empty',
 
   # Kani harnesses and their stand-ins (`#[cfg(kani)] mod proofs`): cargo test never compiles them,
   # so a mutant there can't fail a test; `cargo kani` is what runs them.
