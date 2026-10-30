@@ -3,9 +3,11 @@
 // subscriber, woken with batches of decision events, and the user-notification queue. It knows no
 // roles: its subscriber is whichever agent subscribed.
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import { num, type Env } from "../env";
+import { storedEnum, typeEnum } from "../lib/stored";
 import { asNestError, NestError } from "../lib/util";
-import { ErrorCodes, isDecisionEvent, type WorkstreamEvent } from "../protocol/model";
+import { ErrorCodes, isDecisionEvent, type WorkstreamEvent, WorkstreamEventVariants } from "../protocol/model";
 
 export interface WorkstreamInfo {
   workstream: string;
@@ -21,8 +23,15 @@ interface PreviousReleaseFields {
 }
 
 const DIGEST_PROGRESS = 5;
+// Retention (docs/data/#retention): `events` and `user_notifications` keep their most recent rows.
 const EVENT_RETENTION = 5_000;
 const NOTIFICATION_RETENTION = 1_000;
+
+/** `user_notifications.urgency`. */
+const NotificationUrgency = z.enum(["normal", "high"]);
+type NotificationUrgency = z.output<typeof NotificationUrgency>;
+/** `events.type`: the event's own `type`. */
+const EventType = typeEnum<WorkstreamEvent["type"]>(WorkstreamEventVariants);
 
 /** Idempotency keys are kept a week, as long as a call's outcome. */
 const APPLIED_RETENTION_MS = 7 * 86_400_000;
@@ -87,8 +96,9 @@ export class WorkstreamDO extends DurableObject<Env> {
   async ingest(event: WorkstreamEvent, key?: string): Promise<void> {
     if (!this.firstTime(key)) return;
     const decision = isDecisionEvent(event);
+    const type: WorkstreamEvent["type"] = event.type;
     this.sql.exec("INSERT INTO events (ts_ms, type, decision, body) VALUES (?, ?, ?, ?)",
-      event.ts_ms, event.type, decision ? 1 : 0, JSON.stringify(event));
+      event.ts_ms, type, decision ? 1 : 0, JSON.stringify(event));
     // Bounded history: keep the most recent events only.
     this.sql.exec("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?", EVENT_RETENTION);
     if (decision && this.info_()?.subscriber && (await this.ctx.storage.getAlarm()) === null) {
@@ -98,22 +108,26 @@ export class WorkstreamDO extends DurableObject<Env> {
 
   async events(limit = 100): Promise<WorkstreamEvent[]> {
     return this.sql
-      .exec<{ body: string }>("SELECT body FROM events ORDER BY id DESC LIMIT ?", limit)
+      .exec<{ type: string; body: string }>("SELECT type, body FROM events ORDER BY id DESC LIMIT ?", limit)
       .toArray()
-      .map((r) => JSON.parse(r.body) as WorkstreamEvent)
+      .map((r) => {
+        storedEnum(EventType, r.type, "events.type");
+        return JSON.parse(r.body) as WorkstreamEvent;
+      })
       .reverse();
   }
 
-  async notifyUser(text: string, urgency: "normal" | "high" = "normal", key?: string): Promise<void> {
+  async notifyUser(text: string, urgency: NotificationUrgency = "normal", key?: string): Promise<void> {
     if (!this.firstTime(key)) return;
     // Delivered by the Discord integration (out of scope here); kept as a durable queue.
     this.sql.exec("INSERT INTO user_notifications (ts_ms, urgency, text) VALUES (?, ?, ?)", Date.now(), urgency, text);
     this.sql.exec("DELETE FROM user_notifications WHERE id <= (SELECT MAX(id) FROM user_notifications) - ?", NOTIFICATION_RETENTION);
   }
 
-  async userNotifications(): Promise<{ ts_ms: number; urgency: string; text: string }[]> {
+  async userNotifications(): Promise<{ ts_ms: number; urgency: NotificationUrgency; text: string }[]> {
     return this.sql.exec<{ ts_ms: number; urgency: string; text: string }>(
-      "SELECT ts_ms, urgency, text FROM user_notifications ORDER BY id").toArray();
+      "SELECT ts_ms, urgency, text FROM user_notifications ORDER BY id").toArray()
+      .map((n) => ({ ...n, urgency: storedEnum(NotificationUrgency, n.urgency, "user_notifications.urgency") }));
   }
 
   /** Batch window elapsed: wake the subscriber with one `event_batch` turn (decisions + recent progress). */

@@ -4,7 +4,8 @@ name: deploy-dashboard
 on:
   push:
     branches: [main]
-    paths: [dashboard/**, .github/workflows/deploy-dashboard.yml]
+    # The view types it is checked against (type-only imports) are the contract in protocol/admin/.
+    paths: [dashboard/**, protocol/admin/**, .github/workflows/deploy-dashboard.yml]
   workflow_dispatch:
 permissions:
   contents: read

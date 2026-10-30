@@ -1,6 +1,6 @@
 # Interfaces
 
-Boundary contracts between components. Each boundary has a spec here and Rust types in `crates/nest-protocol`. **JSON fixtures in `protocol/fixtures/` are the cross-language source of truth:** the Rust tests and the control plane's TypeScript tests both round-trip them. Two shared lists sit beside them, asserted equal on both sides: `codes.json` (error codes) and `enums.json` (the members of every string enum both sides define).
+Boundary contracts between components. Each boundary has a spec here and Rust types in `crates/nest-protocol`. **JSON fixtures in `protocol/fixtures/` are the cross-language source of truth:** the Rust tests and the control plane's TypeScript tests both round-trip them. Two shared lists sit beside them, asserted equal on both sides: `codes.json` (error codes) and `enums.json` (the members of every string enum both sides define). The admin API's read views (control plane to dashboard) are TypeScript types in `protocol/admin/view.ts`, imported by both.
 
 | Boundary | Spec | Rust module |
 |---|---|---|

@@ -97,7 +97,8 @@ CONSTANTS
   Hosts, NoHost,
   MaxEpoch, MaxFaults, MaxTurns, F, E,
   RECORD, FIX_H1, FIX_H3, FIX_H4, FIX_DRAIN, A1, A2, LOSS_EPOCH, A3, REFUSED_WAITS,
-  START_FAIL, A5, A6, SPLIT_EXPIRE, EXPIRE_RECHECK, NO_REISSUE,
+  START_FAIL, A5, A6, SPLIT_EXPIRE, EXPIRE_RECHECK, NO_REISSUE, NO_ADOPT,
+  OLD_HOST,            \* NoHost, or the one host running the previous release
   WAIT, TOMBSTONE, ACK_DELAY,
   ALLOW_CRASH, ALLOW_PART, ALLOW_LOST, ALLOW_RESET, ALLOW_WEDGE,
   ALLOW_DRAIN, ALLOW_IDLE, ALLOW_STOP
@@ -191,7 +192,8 @@ THostLost(a, h) ==
   ELSE a
 \* Rule 3: the only release.
 RRelease(a) == [a EXCEPT !.bh = NoHost, !.be = 0, !.ph = "none", !.wake = TRUE]
-RExited(a, h, e) == IF a.bh = h /\ e >= a.be THEN RRelease(a) ELSE a
+\* A previous-release host's brain is released only by its loss (OLD_HOST).
+RExited(a, h, e) == IF a.bh = h /\ e >= a.be /\ h # OLD_HOST THEN RRelease(a) ELSE a
 RHostLost(a, h, e) == IF a.bh = h /\ (LOSS_EPOCH => e >= a.be) THEN RRelease(a) ELSE a
 
 Exited(a, h, e, r) == IF RECORD THEN RExited(a, h, e) ELSE TExited(a, h, e, r)
@@ -200,27 +202,36 @@ HostLost(a, h, e) == IF RECORD THEN RHostLost(a, h, e) ELSE THostLost(a, h)
 Lost(s) == s \in {"dead", "expired"}
 
 -----------------------------------------------------------------------------
+\* OLD_HOST # NoHost: that host runs the previous release (mixed-version
+\* closure, 82396b3).  It starts with a live brain at epoch 1 (with a binding
+\* and the current session), FleetDO drains it on sight (it never gets a
+\* start), and its brain is released only when the host is lost.
+Old(h) == h = OLD_HOST
 Init ==
   /\ up = [h \in Hosts |-> TRUE] /\ link = [h \in Hosts |-> TRUE]
   /\ conn = [h \in Hosts |-> TRUE] /\ sinceAck = [h \in Hosts |-> 0]
   /\ ackAge = [h \in Hosts |-> -1] /\ lapsed = [h \in Hosts |-> FALSE]
-  /\ bTag = [h \in Hosts |-> 0] /\ bBorn = [h \in Hosts |-> 0]
-  /\ bBind = [h \in Hosts |-> 0] /\ bStop = [h \in Hosts |-> FALSE]
+  /\ bTag = [h \in Hosts |-> IF Old(h) THEN 1 ELSE 0] /\ bBorn = [h \in Hosts |-> IF Old(h) THEN 1 ELSE 0]
+  /\ bBind = [h \in Hosts |-> IF Old(h) THEN 1 ELSE 0] /\ bStop = [h \in Hosts |-> FALSE]
   /\ bPend = [h \in Hosts |-> 0] /\ rTomb = [h \in Hosts |-> 0]
-  /\ nSet = [h \in Hosts |-> {}] /\ nSt = [h \in Hosts |-> "none"]
-  /\ nEpoch = [h \in Hosts |-> 0] /\ kills = [h \in Hosts |-> 0]
+  /\ nSet = [h \in Hosts |-> IF Old(h) THEN {1} ELSE {}]
+  /\ nSt = [h \in Hosts |-> IF Old(h) THEN "started" ELSE "none"]
+  /\ nEpoch = [h \in Hosts |-> IF Old(h) THEN 1 ELSE 0] /\ kills = [h \in Hosts |-> 0]
   /\ nIn = [h \in Hosts |-> <<>>] /\ hOut = [h \in Hosts |-> <<>>]
   /\ nOwed = [h \in Hosts |-> 0]
-  /\ fStatus = [h \in Hosts |-> "active"] /\ fWedged = [h \in Hosts |-> FALSE]
+  /\ fStatus = [h \in Hosts |-> IF Old(h) THEN "draining" ELSE "active"] /\ fWedged = [h \in Hosts |-> FALSE]
   /\ sinceRx = [h \in Hosts |-> 0] /\ fQ = [h \in Hosts |-> <<>>]
-  /\ fRow = [h \in Hosts |-> 0] /\ fKillDone = [h \in Hosts |-> 0]
+  /\ fRow = [h \in Hosts |-> IF Old(h) THEN 1 ELSE 0] /\ fKillDone = [h \in Hosts |-> 0]
   /\ fRpc = [h \in Hosts |-> 0] /\ fExp = [h \in Hosts |-> FALSE]
-  /\ ag = [epoch |-> 0, wake |-> FALSE, pc |-> "idle", target |-> NoHost, ie |-> 0,
-           sess |-> NoHost, sessE |-> 0, lin |-> <<NoHost, 0>>, res |-> NoHost, resE |-> 0,
+  /\ LET o == OLD_HOST /= NoHost IN
+     ag = [epoch |-> IF o THEN 1 ELSE 0, wake |-> FALSE, pc |-> "idle", target |-> NoHost, ie |-> 0,
+           sess |-> IF o THEN OLD_HOST ELSE NoHost, sessE |-> IF o THEN 1 ELSE 0,
+           lin |-> IF o THEN <<OLD_HOST, 1>> ELSE <<NoHost, 0>>, res |-> NoHost, resE |-> 0,
            host |-> NoHost, state |-> "detached", awaitH |-> NoHost, awaitE |-> 0,
            pending |-> FALSE, pendAlarm |-> FALSE, drain |-> NoHost, stopReq |-> 0,
            prev |-> NoHost, op |-> FALSE,
-           bh |-> NoHost, be |-> 0, ph |-> "none", intent |-> FALSE, avoid |-> NoHost,
+           bh |-> IF o THEN OLD_HOST ELSE NoHost, be |-> IF o THEN 1 ELSE 0,
+           ph |-> IF o THEN "live" ELSE "none", intent |-> o, avoid |-> IF o THEN OLD_HOST ELSE NoHost,
            killq |-> FALSE]
   /\ tn = [q |-> 0, cur |-> "none", arrived |-> 0]
   /\ faults = 0 /\ hBad = [h \in Hosts |-> FALSE] /\ startAfterKill = FALSE
@@ -434,6 +445,7 @@ REscalate ==
   /\ RECORD /\ ag.ph = "condemned" /\ ag.pc = "idle" /\ Quiet(ag.bh)
   /\ ~ag.killq
   /\ A2 => ~Lost(fStatus[ag.bh])                 \* RStatusRelease first
+  /\ ag.bh # OLD_HOST                            \* never wedges or releases a previous-release host
   /\ LET h == ag.bh
          processed == fKillDone[h] >= ag.be
          row == fRow[h] # 0 /\ fRow[h] <= ag.be
@@ -445,6 +457,16 @@ REscalate ==
         ELSE /\ fStatus[h] \in {"active", "draining"} /\ ~fWedged[h]
              /\ fWedged' = [fWedged EXCEPT ![h] = TRUE] /\ ag' = ag
   /\ UNCHANGED <<hostV, brainV, nestdV, fStatus, sinceRx, fQ, fRow, fKillDone, fExp, fRpc, tn, ghostV>>
+
+\* 36b60d5 (N21): a condemned brain on a previous-release host is waited on
+\* for its host's loss; at the 15 min cap the host is wedged (so its lease
+\* lapses and it is expired, which releases the brain).
+ROldCap ==
+  /\ RECORD /\ OLD_HOST # NoHost /\ ag.bh = OLD_HOST /\ ag.ph = "condemned" /\ ag.pc = "idle"
+  /\ ~ag.killq /\ Quiet(OLD_HOST)
+  /\ fStatus[OLD_HOST] \in {"active", "draining"} /\ ~fWedged[OLD_HOST]
+  /\ fWedged' = [fWedged EXCEPT ![OLD_HOST] = TRUE]
+  /\ UNCHANGED <<hostV, brainV, nestdV, fStatus, sinceRx, fQ, fRow, fKillDone, fRpc, fExp, ag, tn, ghostV>>
 
 RHelloOK(h) == ag.bh = h /\ bTag[h] = ag.be /\ (FIX_H3 => ag.ph # "condemned")
 
@@ -598,12 +620,14 @@ RunnerStart(h, e, S0) ==
        /\ nSet' = [nSet EXCEPT ![h] = S0] /\ nSt' = [nSt EXCEPT ![h] = "started"]
        /\ startAfterKill' = (startAfterKill \/ kills[h] >= e)
        /\ UNCHANGED <<bPend, hOut, nOwed, ag>>
-  ELSE IF Alive(h) /\ bStop[h]
-  THEN \* never adopt a brain on its way out (stopping or killed): it is ended
+  ELSE IF Alive(h) /\ (bStop[h] \/ NO_ADOPT)
+  THEN \* never adopt a brain on its way out (stopping or killed) - with
+       \* NO_ADOPT (82396b3) never adopt at all: the registered brain is ended
        \* (kill_now) and the new one registers once it is gone (Register).
        /\ bPend' = [bPend EXCEPT ![h] = e]
+       /\ bStop' = [bStop EXCEPT ![h] = TRUE]
        /\ nSet' = [nSet EXCEPT ![h] = S0] /\ nSt' = [nSt EXCEPT ![h] = "starting"]
-       /\ UNCHANGED <<bTag, bBorn, bBind, bStop, hOut, nOwed, ag, startAfterKill>>
+       /\ UNCHANGED <<bTag, bBorn, bBind, hOut, nOwed, ag, startAfterKill>>
   ELSE IF Alive(h) /\ e > bTag[h]
   THEN \* adopt the newer epoch, take the new hands, re-handshake the session
        /\ bTag' = [bTag EXCEPT ![h] = e] /\ bBind' = [bBind EXCEPT ![h] = 0]
@@ -910,7 +934,7 @@ DrainRetire(h) ==
 TStep == TWakeDrop \/ TPendDrop \/ TDrainDrop \/ (\E h \in Hosts : TChoose(h))
          \/ TStatus \/ TKill \/ TKillAwait \/ TBump \/ TDeadline \/ TExitWait \/ TOpStop \/ TOpStart
 RStep == RWake \/ (\E h \in Hosts : RStart(h)) \/ RKill \/ RKillFail \/ RDeadline \/ REscalate
-         \/ RKillAlarm \/ RStatusRelease \/ ROpRestart
+         \/ RKillAlarm \/ RStatusRelease \/ ROpRestart \/ ROldCap
 
 Next ==
   \/ Enqueue \/ Pump \/ TurnDone
@@ -934,6 +958,7 @@ Fairness ==
   /\ WF_vars(TBump) /\ WF_vars(TDeadline) /\ WF_vars(TExitWait)
   /\ WF_vars(RWake) /\ WF_vars(\E h \in Hosts : RStart(h)) /\ WF_vars(RKill)
   /\ WF_vars(RDeadline) /\ WF_vars(REscalate) /\ WF_vars(RKillAlarm) /\ WF_vars(RStatusRelease)
+  /\ WF_vars(ROldCap)
   /\ \A h \in Hosts : WF_vars(LostSend(h)) /\ WF_vars(LostDeliver(h))
   /\ WF_vars(Issue) /\ WF_vars(ResolveResp) /\ WF_vars(Tick)
   /\ \A h \in Hosts :
@@ -979,7 +1004,8 @@ AwaitConsistent == ~RECORD => (ag.awaitH # NoHost => (ag.awaitH = ag.host /\ ag.
 
 \* L, part 3: a healthy host (never partitioned, crashed, or with a runner that
 \* ignored a kill) is never wedged.
-NoHealthyWedge == \A h \in Hosts : fWedged[h] => hBad[h]
+NoHealthyWedge == \A h \in Hosts : (fWedged[h] /\ h # OLD_HOST) => hBad[h]
+\* (A previous-release host is wedged at the cap by design: excluded.)
 
 \* Epochs never regress: AgentDO's counter, nestd's tombstone and latest start,
 \* the runner's tombstone, and a running process's adopted epoch.

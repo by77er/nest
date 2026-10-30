@@ -4,7 +4,7 @@ The authority for one sandbox.
 
 ## State
 
-- Epoch and placement (below); the epoch→host history (which host held which epoch)
+- Epoch and placement (below); the epoch→host history (which host held which epoch, every one, in the `epochs` table; `info().history` shows the last 50)
 - The generation chain: head, retained generations, orphaned salvage generations, pins and loss records ([state](../../../sandbox/state/))
 - Attached clients (agents and people) and their slots, the idle refcount, ingress guards and holds
 - Resources: vCPUs, memory, disk I/O limits ([I/O limits](../../../sandbox/state/disk/#io-limits))
@@ -57,7 +57,7 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 ## Commits and generations
 
 - `commit(epoch, parent, manifest)` is a compare-and-set, accepted only from the lease holder at the current epoch with the head as parent, for a manifest the host has [verified](../../../sandbox/state/#generations). It's idempotent per request.
-- A **salvage** commit from an older epoch becomes an orphaned sibling generation (raising `orphaned_work`), but only from the host that held that epoch.
+- A **salvage** commit from an older epoch becomes an orphaned sibling generation (raising `orphaned_work`), but only from the host that held that epoch, however many placements ago. The idempotency records of commit requests are kept 7 days, or as long as the generation they committed ([retention](../../../data/#retention)).
 - A commit whose `kind` disagrees with its memory manifest (`checkpoint` without `mem_manifest`, or `disk_only` with one) is rejected (`invalid_message`): the chain is immutable, and a checkpoint without memory would restore without it.
 - **Pins:** a claim pins the generation it restores, and a fork pins its source, by id, until completion or abandon (for a fork, until the child has recorded it as its head).
 - **`isRestoreSource`** lives here and is the only answer to "may this be loaded or deleted" for resume selection, the drain gate and GC ([restore sources](../../../sandbox/state/#restore-sources)).

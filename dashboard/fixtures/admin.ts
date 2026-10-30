@@ -1,5 +1,6 @@
-// Recorded responses of the control plane's two read routes, held to the dashboard's types
-// (src/api.ts): `npm run typecheck` fails when a field is missing, extra or of another type.
+// Recorded responses of the control plane's two read routes, held to the control plane's view
+// types (src/api.ts re-exports them): `npm run typecheck` fails when a field is missing, extra or of
+// another type.
 // Recorded once from the control plane's test pool (a throwaway vitest case in control-plane/test
 // against FleetDO: one connected burst host with a running sandbox, an agent and a launch, then
 // GET /v1/admin/fleet and GET /v1/admin/images); re-record when fleetView or images change.
@@ -39,7 +40,10 @@ export const fleet = {
       ],
       "agents": [
         "agt_01jbx8k2m9qv3t7w5y4n6p0r1s"
-      ]
+      ],
+      "wedged_ms": null,
+      "lost": false,
+      "brain_epochs": true
     }
   ],
   "launches": [
@@ -57,11 +61,18 @@ export const fleet = {
       "registered_ms": 1792841651465,
       "host": "hst_01m5pv156anzgr2gqs5stpewgt",
       "epoch": 1,
-      "state": "running",
+      "lease_state": "running",
+      "sandbox_state": "running",
       "image": "nest-base:latest",
-      "workstream": "ws_01m5pv1581hvrmhfbravczqzf3"
+      "workstream": "ws_01m5pv1581hvrmhfbravczqzf3",
+      "info_error": false
     }
-  ]
+  ],
+  "aws": {
+    "cell": "use1",
+    "region": "us-east-1",
+    "sources": { "region": "cell", "credentials": "cell", "kms_key": "legacy" }
+  }
 } satisfies Fleet;
 
 export const images = {

@@ -1,6 +1,6 @@
 # Conformance: the brain-record code against the model
 
-**Head checked:** `origin/deferred/brain-record` at **6073da7** (6073da7b2069792f56b5cc57ea7768b6f8d115b0, fetched 2026-10-25). **Design:** `BRAIN-RECORD-DESIGN.md`: invariant S, liveness L, rules 1-6, amendments A1-A6. **Model:** `verification/tla/agent-brain/AgentBrain.tla` as it stood when this was written (another agent is still editing it). Background: [../README.md](../README.md), [../pilot/](../pilot/README.md).
+**Head checked:** `origin/deferred/brain-record` at **82396b3** (82396b304eaf8524a69999a4fdee8d11aecb9479, fetched 2026-10-26). **Design:** `BRAIN-RECORD-DESIGN.md`: invariant S, liveness L, rules 1-6, amendments A1-A6, plus the owner's as-built choices for 82396b3 (no same-host re-issue, one outstanding start per agent and host, no adopt, `brain_epochs` gating, the two-step wedge, the N1 re-check and orphan kill). **Model:** `verification/tla/agent-brain/AgentBrain.tla` as it stood on 2026-10-26 (`NO_REISSUE`, `SPLIT_EXPIRE`/`EXPIRE_RECHECK`, the `MC_nr_*` configs; another agent is still editing it). Background: [../README.md](../README.md), [../pilot/](../pilot/README.md).
 
 **History.**
 
@@ -8,146 +8,259 @@
 |---|---|
 | a38d3c0 | First check: D1-D13 (D1-D5 high). A3 not implemented. |
 | 4bc2c3f | A3: nestd `LapseGuard`, the runner's fence generation, FleetDO `failStarts`, no resend of an answered start, `issueCommands` refuses starts to expired or dead hosts. |
-| 6073da7 | A4', A5, A6 (`hosts.lost`), D1-D13 fixes, the fifth review's fixes, call-id idempotency, adopt on a same-host re-issue. This check. |
+| 6073da7 | A4', A5, A6, D1-D13 fixes, adopt on a same-host re-issue. Second check: N1-N10 (N1 high: tick expiry from a stale snapshot). |
+| b3f7f68 | N1-N10 round: per-host re-read in the tick, orphan kill, `brain_epochs`, LapseGuard under one lock, declined loss notices keep their row. |
+| 82396b3 | No same-host re-issue, no adopt, `min_epoch` removed, NULL rows not indexed (M2), two-step wedge (M1), crash-loop count (L1). Third check: the body below (N11-N19). |
+| fb9b836 | Merge gate: Gates 1-3 for previous-release hosts, N13-N19 fixes. Merge-gate check: [fb9b836 (merge gate)](#fb9b836-merge-gate) (N20-N24). |
+| 36b60d5 | N21 (a): old hosts wedged at the cap, re-drained after STONITH by fence; brains-only drain before reconcile; `drain_told` retries; retirement guards; N20, N22-N24. Final check: [36b60d5 (final merge gate)](#36b60d5-final-merge-gate) (N25 new, medium). |
 
-**Method.** I read the branch without checking it out (`git show`, `git diff a38d3c0 6073da7`). Each model action, design rule, amendment and implementer choice was mapped to code and checked for awaits that skip a re-check, write groups a DO reset can split, stale reads, and transitions the model lacks. I ran no tests and no TLC. Every scenario below comes from reading the code and is **unverified by execution**. Citations are `brain-record@6073da7:path:line`. In the tables the prefix is left out and paths are short: `agent.ts`/`fleet.ts` = `control-plane/src/do/`, `host.rs`/`runner_link.rs` = `crates/nestd/src/`, `agent.rs`/`runtime.rs`/`supervisor.rs` = `crates/nest-runner/src/`, `seams` = `control-plane/test/agent-seams.test.ts`.
+**Method.** I read the branch without checking it out (`git show`, `git diff 6073da7 82396b3`). Each model action, rule, amendment and as-built choice was mapped to code, and every changed AgentDO/FleetDO handler was read for awaits that skip a re-check, write groups a DO reset can split, and stale reads. I ran no tests and no TLC. Every scenario below comes from reading the code and is **unverified by execution**. Citations are `brain-record@82396b3:path:line`; in tables the prefix is left out: `agent.ts`/`fleet.ts` = `control-plane/src/do/`, `host.rs`/`runner_link.rs` = `crates/nestd/src/`, `ragent.rs`/`runtime.rs`/`supervisor.rs` = `crates/nest-runner/src/{agent,runtime,supervisor}.rs`, `seams` = `control-plane/test/agent-seams.test.ts`, `tla` = `AgentBrain.tla`.
 
 ## Table
 
-| Model action | Rule | Code at 6073da7 | Conforms | Detail |
+| Model action / choice | Rule | Code at 82396b3 | Conforms | Detail |
 |---|---|---|---|---|
-| `SessOK`, `Hello` | 1 | agent.ts:426-429, 1274-1277, 1285-1300 | yes | The epoch-0 exception for a hands-less previous-release runner remains (428) |
-| `ResolveReq`/`ResolveResp` | 1 | agent.ts:1182-1199 | yes | `current()` before and after the await. sandbox.ts is unchanged since a38d3c0 |
-| (platform calls) | 1 | agent.ts:1764, 1865-1868 | yes | `assertEpoch(fence)` before every write |
-| (events) | 1 | agent.ts:1556-1563 | yes | Re-checked before each event and before the ack (D7 fixed) |
-| `RWake` | 2 | agent.ts:1005-1031, 2121-2132 | partly | A live brain with no session isn't re-issued in place (model); it is condemned after 10 min and restarted (D9 fix). Same end, slower |
-| `RStart` no brain | 2 | agent.ts:606-614, 632-664 | yes | Health is checked before the awaits. A host that expired meanwhile is refused by `issueCommands` (fleet.ts:1263-1267), condemned, then released by `hostGone` |
-| `RStart` same host | 2 | agent.ts:600, 606 | partly | Still no `Healthy(bh)` check. Expired or dead hosts are now refused (A3c), but draining or disconnected ones are not (low) |
-| `RStart` condemn | 2 | agent.ts:600-605, 759-772 | yes | `unchanged()` and the condemn's write are in one synchronous step |
-| `Issue` / `IssueFail` | 2 | agent.ts:678-722 | yes | Record, intent and `starting` deadline are written in one step (D3 fixed). A failed send condemns and keeps the intent |
-| `RKill`/`RKillFail`/`RKillAlarm` | A1 | agent.ts:759-796, 818-821; fleet.ts:1404-1411 | yes | The kill is owed by the record. The alarm is armed with the condemn, and FleetDO deduplicates by (host, agent, epoch) |
-| `RDeadline` | (assumed) | agent.ts:41-42, 667-669, 2106-2120 | partly | 4 min, doubling to 16 min (D10 fixed). Still fires whether or not the host is `Quiet` |
-| `REscalate` | rule 4 | agent.ts:810-837; fleet.ts:1421-1448 | yes | A wedge only when nothing has been processed since the kill and nothing older is pending, or at the 15 min cap. Re-checked after `killProgress` (825) |
-| `RStatusRelease` | A2, A6 | agent.ts:592-595, 814-817, 844-847 | yes | `hostGone` = the `lost` flag, or no host row |
-| `RExited` | rule 3 | agent.ts:963-980; fleet.ts:1148-1156, 985-1003 | partly | An exit without an epoch maps to `min_epoch` (the oldest outstanding start); a row with a NULL epoch condemns. See N3 |
-| `RHostLost`, `LostSend/Deliver/Drop` | A2, A5 | agent.ts:988-996; fleet.ts:2016-2031, 1508 | yes | Carries the row's epoch and re-checks `lost` at delivery. The ack deletes by `cmd`. See N6 |
-| `StartResult` (code only) | D1 | fleet.ts:1238-1245; agent.ts:938-955 | yes | Condemns that epoch and records a retry. Never releases, and the row stays |
-| `Deliver` (kill on arrival) | rule 6 | host.rs:852-859 | yes | As before |
-| `Deliver` (A3, start while lapsed) | A3a | host.rs:345-375, 824-826, 1149, 1393-1396 | partly | Stamped on arrival and refused at exec. The stamp is not atomic with the lapse (N5) |
-| `Exec` (start, tombstone) | rule 6, A4 | host.rs:1980-1996; runner_link.rs:303-310 | yes | The exit is owed. The `Err` result now only condemns |
-| `RunnerStart` lease/tombstone/register | A3a, A4' | agent.rs:72-138, 177-186; runtime.rs:81-93, 145-155 | yes | Refusals for a forbidden built-in or no lease supersede the older brain and report only once it is gone (D8 fixed). The fence generation drops a waiting start |
-| `RunnerStart` adopt | choice 3 | agent.rs:139-151; runtime.rs:441-448 | **no** | Not atomic with the brain's deregistration (agent.rs:848-849): N2 |
-| `ApplyKill`, `AccOut`/`AccSet`, `OwedExit` | rule 6, A4 | runner_link.rs:272-310, 395-466 | yes | A runner exit without an epoch maps to the oldest entry (431) |
-| `LeaseLapse` | rule 5, A3 | host.rs:1145-1155; supervisor.rs:133-152 | yes | |
-| `HostHello` | rule 5 | fleet.ts:753-826, 1019-1040 | partly | Clears `lost` (811). Answered starts are not resent (718-724). Reconcile marks rows `gone` and retries delivery (D4 fixed) |
-| `Expire` | rule 5, A3b | fleet.ts:1485-1496, 1962-2007 | **no** | Decides on a host-row snapshot read before awaits (N1). Wedged hosts or hosts with leases go to `stonith_pending`, which the model doesn't have |
-| `ConfirmDead` | A6 | fleet.ts:2080-2093, 1728-1732 | yes | Sets `lost` |
-| `Drain`, `DrainRetire` | rule 5 | fleet.ts:1745-1767, 1711-1720 | yes | A retirement marks the host `dead`, not `lost` |
-| `ResetAgentDO` | durability | agent.ts:333-335, 685-689, 768, 869-875, 945-953 | yes | Every transition writes its deadline row before its first await (`Deadlines.set` writes synchronously) |
-| Choice 1: release on a lost host ignores the epoch | A3+A6 | agent.ts:592-595, 814-817 | partly | Sound only while "lost" implies nothing runs. N1, N5 and N4 break that |
-| Choice 2: an exit without an epoch condemns; `min_epoch` | rule 3 | fleet.ts:985-1003, 1278-1285; agent.ts:970-979 | partly | Safe, but a single legacy exit strands a newer start (N3) |
-| Choice 3: adopt on a same-host re-issue | rule 2 | agent.rs:139-151 | partly | N2 |
-| Choice 4: tool calls keyed by call id | — | agent.ts:1772-1775, 1821-1824, 1862 | yes | Tested (seams:1094). Low residual: N9 |
+| `SessOK`, `Hello` | 1 | agent.ts:426-429, 1308-1311, 1320-1327 | yes | Epoch-0 exception for a hands-less previous-release runner remains (428) |
+| `ResolveReq`/`ResolveResp` | 1 | agent.ts:1216-1232 | yes | `current()` before and after the await; sandbox.ts unchanged since a38d3c0 |
+| (platform calls, events) | 1 | agent.ts:920-924, 1901, 2014, 1590-1597 | yes | Unchanged |
+| `RWake` | 2 | agent.ts:1031-1057, 2155-2166 | partly | As at 6073da7: a live brain without a session is condemned after 10 min |
+| `RStart`, no brain | 2 | agent.ts:618-626, 644-680; fleet.ts:1273-1275 | yes | New: an old (`brain_epochs = 0`) target yields to a current host (674-677) |
+| `RStart`, live brain (`NO_REISSUE`) | choice | agent.ts:600-616 | partly | `none` and the intent cleared, unless hint elsewhere, `avoid`, or `restart`. The model condemns when `~Healthy(ag.bh)` (tla:361, 374); the code waits for expiry or STONITH (N19) |
+| `ROpRestart` | choice | agent.ts:504-517, 605-610; index.ts `POST /start {restart}` | partly | Condemn, keep the intent (seams:221). A concurrent plain start overwrites `reason` (N15) |
+| condemn (move) | 2, N7 | agent.ts:605-610, 775-789 | yes | `unchanged()` and the condemn's write in one step; condemn names its epoch (779) |
+| `Issue` / `IssueFail` | 2 | agent.ts:694-738 | yes | Record, intent and deadline in one step |
+| `RKill`/`RKillFail`/`RKillAlarm` | A1 | agent.ts:775-813; fleet.ts:1409-1416 | yes | Dedupe by (host, agent, epoch) |
+| `RDeadline` | assumed | agent.ts:2140-2154 | partly | Unchanged: fires whether or not the host is `Quiet` |
+| `REscalate` | 4 | agent.ts:827-859; fleet.ts:1426-1437 | **no** | NULL rows release on a processed kill (N11); previous-release hosts never wedged and nothing ends the wait (N12); an await between the re-check and `hostWedged` (N13) |
+| `RStatusRelease` | A2, A6 | agent.ts:592-595, 831-834, 866-869 | yes | `hostGone` = `lost` or no row |
+| `RExited` | 3 | agent.ts:986-1003; fleet.ts:997-1009, 1154-1163 | partly | Epoch-less exit = the row's epoch; with no row, ignored (1160). Old nestd: a buffered exit can land on the next start's row (N4) |
+| `RHostLost`, `LostSend/Deliver/Drop` | A2, A5 | agent.ts:1011-1022; fleet.ts:2045-2060 | yes | Declined notices keep the row (N6 fixed) |
+| `StartResult` (code only) | D1 | fleet.ts:1246-1252; agent.ts:961-978 | yes | Condemns that epoch; row stays |
+| `Deliver`/`Exec` kill | 6 | host.rs:862-869; runner_link.rs:279-316 | yes | Nothing at or below: nestd reports the exit itself (864) |
+| `Deliver` (A3) | A3a | host.rs:347-385, 835, 876, 1159, 1404 | yes | One mutex over stamps and lapses (N5 fixed) |
+| `RunnerStart` lease/tombstone | A3a, A4' | ragent.rs:77-126; runtime.rs:81-92 | yes | |
+| `RunnerStart` running brain, `Register` | choice | ragent.rs:113-140 | yes | Ends the registered brain, registers after it; exit epoch fixed (runtime.rs:96-102). The model still adopts (tla:607-613): model lags (N18) |
+| `ApplyKill`, `AccOut`, `OwedExit` | 6, A4 | runner_link.rs:279-338, 454-497 | yes | |
+| (none) kill without exit drops the runner | M1 | runner_link.rs:295-310, 401, 426-445; host.rs:995-998 | not modelled | Every brain on the connection reported exited at once (N17) |
+| `LeaseLapse` | 5, A3 | host.rs:1159; supervisor.rs:132-149 | yes | |
+| `HostHello` | 5 | fleet.ts:753-829, 1025-1046; agent.ts:1065-1073 | partly | Renewal (793) before `expired → active, lost = 0` (814), which uses the pre-await `prior` (762) (N16). Orphan kill added |
+| `ExpireRead`/`ExpireCommit` (`EXPIRE_RECHECK`) | 5, A3b | fleet.ts:1510-1520, 1991-2025 | yes | Re-read and write in one synchronous step (N1 fixed) |
+| `ConfirmDead` | A6 | fleet.ts:2062-2074, 2109-2122, 1760 | yes | |
+| `Drain`, `DrainRetire` | 5 | fleet.ts:1774-1796, 1704-1749 | yes | Retirement marks `dead`, never `lost`; the idle loop re-reads (1718) |
+| wedge (`fWedged`) | 4, M1 | fleet.ts:1449-1457, 769-772, 1052, 1352, 1401, 1461, 1479 | yes | Socket closed, excluded from placement, STONITH only |
+| `ResetAgentDO` | durability | agent.ts:612-615, 695-707, 777-787, 880-900 | yes | No new split in AgentDO |
+| Version gating `brain_epochs` | choice | fleet.ts:785-786, 1467-1482; agent.ts:674-677, 849-853 | partly | Preference only: an old host is still used when no current one is free (N4, N12) |
+| Release on `lost` ignores the epoch (`LOSS_EPOCH = FALSE`) | A3+A6 | agent.ts:592-595, 831-834 | yes | Sound while lost implies nothing runs; not on old nestd (N4) |
+| Tool calls keyed by call id | — | runtime.rs:526-531 | yes | 128-bit stems (N9 fixed) |
 
-## Status of D1-D13 at 6073da7
+## Status of N1-N10 (and the D items left partly)
 
-| D | Status | Where now |
+| Item | Status at 82396b3 | Where |
 |---|---|---|
-| D1 a refused start's error releases | fixed | agent.ts:938-955 condemns; fleet.ts:1240-1244 keeps the row; seams:869-891 |
-| D2 host loss without an epoch; delete by (agent, host) | fixed | agent.ts:988-996; fleet.ts:2016-2031. N1 reopens the trace by another route |
-| D3 deadline armed after an await | fixed | agent.ts:679-689; seams:923 |
-| D4 reconcile deletes before calling | fixed | fleet.ts:1036, 1006-1016, 1509; seams:961 |
-| D5 wedged host released on its own watchdog | fixed for a host AgentDO declared wedged | fleet.ts:1493-1494, 2076, 1980-1982. A silent, un-wedged host without leases is still released on lease expiry (A6 allows this) |
-| D6 a redelivered epoch-less exit finds no row | fixed | fleet.ts:1152-1154 (AgentDO is told first); seams:986 |
-| D7 events not re-checked mid-batch | fixed | agent.ts:1559, 1563; seams:1013 |
-| D8 exits before an older brain has gone | fixed in new binaries (partly: N3) | agent.rs:177-186; runner_link.rs:431; fleet.ts:985-990 |
-| D9 no watchdog for a live brain without a session | fixed | agent.ts:1239-1242, 2121-2132; seams:1031 |
-| D10 2 min start deadline | fixed | agent.ts:41-42, 667-669; seams:1048 |
-| D11 a graceful stop has no epoch | fixed | agent.ts:893; runner_link.rs:219-226; supervisor.rs:104 |
-| D12 follow-up alarms after awaits | fixed | agent.ts:869-875, 945-953; seams:944 |
-| D13 migrated record without an alarm | fixed | agent.ts:328-336; seams:257 |
+| N1 tick expiry from a stale snapshot | fixed | fleet.ts:1513-1520; expireSilent/expireHost write before their first await (2021, 1992-1995). Backstop agent.ts:1065-1073. seams:1371, 1397 |
+| N2 adopt races the exit | fixed (moot) | No adopt: ragent.rs:127-138; runtime.rs:96-102 |
+| N3 legacy exit strands a newer start | fixed for new nestd; partly for old | One start per (agent, host); epoch-less exit without a row ignored (fleet.ts:1160). New L gap on old hosts: N12 |
+| N4 old nestd has no A3a | open (mixed window) | Only a placement preference (agent.ts:674-677). Plus a second trace below |
+| N5 LapseGuard not atomic | fixed | host.rs:347-385 (unit test still sequential) |
+| N6 declined loss notice deletes the row | fixed | agent.ts:1019; fleet.ts:2052-2055; seams:1456 |
+| N7 condemn without an epoch | fixed | agent.ts:775-779; seams:1487 |
+| N8 same-host re-issue unchecked | moot | No re-issue |
+| N9 short call-id stems | fixed | runtime.rs:529 |
+| N10 `lost` backfill | fixed | fleet.ts:976-981; seams:1496 |
+| D5 wedged host released on its own watchdog | fixed | Wedged hosts reach `stonith_pending` only (fleet.ts:1518-1519, 2105) |
+| D8 exits before an older brain has gone | fixed | runner_link.rs:331-338; ragent.rs:113-126 |
 
 ## New and remaining divergences, ranked
 
-**High (break S or L)**
+**Medium: mixed-version window only (a host still on the previous nestd, or rows it left)**
 
-- **N1. Tick expiry from a stale snapshot (breaks S; reopens the A3 trace).** `brain-record@6073da7:control-plane/src/do/fleet.ts:1488-1495` reads every active host once, then awaits `expireHost`/`expireSilent` (and their `brainsLost` RPCs) host by host. `expireSilent` (1991-1996) writes `expired, lost = 1` without re-reading `last_rx` or status.
-  - Interleaving: h1 and h2 go silent together. `start{e}` sits unanswered for h2. The tick snapshots both. While it awaits h1's `brainsLost`, h2 says hello (785 refreshes `last_rx`; the `hello_ack` renews its lease). `start{e}` is resent (807, still unanswered) and is stamped after the renewal, so it runs (host.rs:1394 passes). Brain e helloes and resolves hands.
-  - The tick resumes with h2's stale row: `expireSilent(h2)` sets it lost and `brainsLost` → `onHostLost(h2, e)` → `hostGone` is true → release. Brain e+1 starts elsewhere.
-  - h2 reconnects. Its hello sets `lost = 0` and renews the lease. Nothing ever kills brain e: its row was deleted on the ack, and `hostReport` ignores an agent recorded elsewhere (agent.ts:1034-1039). Two brains: e acts through its cached hands target until the binding ages out (TTL unverified), and its process lives on.
-  - Fix: re-check `status` and `now - last_rx >= expiry` in the same synchronous step as the write. Also kill any agent a hello reports that the record doesn't name (`reconcileAgents`).
-
-**Medium**
-
-- **N2. The adopt races the brain's own exit (breaks L: a healthy host is wedged).** The start task finds the brain registered (`brain-record@6073da7:crates/nest-runner/src/agent.rs:115`, `Refused::Running`) and adopts outside the registry lock (139-151). Meanwhile the actor deregisters, reads the epoch and reports `exit{N}` (848-849).
-  - If the report reads N before `adopt_epoch(N+1)` runs, AgentDO ignores exit N. nestd's entry N+1 is never cleared (runner_link.rs:450-457), so FleetDO's row N+1 stays.
-  - After 4 min the start deadline condemns N+1. The kill is processed but the row is still indexed, so at 15 min `hostWedged` sends a healthy host to STONITH: every brain restarts and every sandbox is re-placed.
-  - The window is microseconds, but the trigger is any same-host re-issue racing a crash or an exit. Fix: adopt under the registry lock, refusing a deregistered brain, or read the exit epoch under that lock.
-- **N3. Mixed version: a single legacy exit strands a newer start (breaks L).** An old runner doesn't adopt; it reports `already_running` and one epoch-less exit per process. nestd maps that exit to the oldest entry (`brain-record@6073da7:crates/nestd/src/runner_link.rs:431`), and FleetDO does the same with an old nestd (`control-plane/src/do/fleet.ts:985-990`). After a same-host re-issue N→N+1, the one exit clears N only. Then: start deadline, kill, row N+1 still indexed, 15-min cap, wedge. a38d3c0 released here (but unsafely, by the newest mapping). Also, a spurious epoch-less exit with no row condemns whatever brain is on that host (agent.ts:970-979).
-- **N4. Mixed version: an old nestd has no A3a (breaks S).** Main's nestd has no `LapseGuard` (none existed at a38d3c0 either). A start it held across a lapse runs after the renewal. FleetDO meanwhile failed that start and released the record through `brainsLost`: the pilot's TLC trace. Old runners also lack the fence generation. Gate: treat the expiry of a host whose hello reports an old nestd as non-proof (STONITH path), or deploy hosts first. Unverified: the exact main-branch behaviour.
+- **N11. M2 releases on a processed kill when the only row has no epoch (breaks S).** `brain-record@82396b3:control-plane/src/do/fleet.ts:1434` drops NULL rows from `indexed`, so `agent.ts:843-845` releases as soon as the kill has a result. Rule 4 releases only when no row is left, and the code's own comment says a NULL row "proves nothing either way; the host's next hello resolves it".
+  - Interleaving: a brain started by the previous release (NULL row) runs on an old host H. A drain, a hinted start or a restart condemns it, and the kill goes out. Main's nestd treats every `agent_stop` as graceful (`main:crates/nestd/src/host.rs:1388-1389`) and answers at once. At kill + 60 s, escalation sees `processed && !indexed` and releases. The new brain starts on a current host while the old one finishes its turn. It is fenced on AgentDO, but it acts through its cached hands binding until that ages out (TTL unverified).
+  - Fix: count NULL rows as indexed and accept the wait until the hello (or upgrade) resolves it, as the comment intends.
+- **N4 (open). Old nestd keeps two S holes.**
+  - (a) No A3a: as at 6073da7.
+  - (b) New trace: a buffered epoch-less exit lands on the next start's row. `exitEpoch` (fleet.ts:997-1000) maps it to the row now there.
+    - Interleaving: old host H (no live leases) is partitioned. Its lease lapses, and brain e dies with its exit buffered. FleetDO expires H and releases e. H reconnects; at 814 it is active, and AgentDO picks it (prev_host, no current controller free) and issues e+1.
+    - The buffered exit then arrives (events wait behind the hello in the host queue) and is mapped to e+1. AgentDO releases the running e+1 and starts e+2 elsewhere. Nothing kills e+1 (brainGone deleted its row), so it acts through its hands binding until H's next hello.
+    - Unverified: that main's nestd buffers and replays that exit.
+  - Gate: no previous-release host may hold or receive brains, or deploy hosts first (unverified that main's control plane accepts the new nestd's fields).
+- **N12. A condemned brain on a previous-release host can wait forever (breaks L).** `agent.ts:849-853` never wedges a host whose `brain_epochs` is 0; it logs and re-arms. "The host's next hello" never comes while the host stays connected. Reachable when the old nestd never reports an exit for that start, e.g. a start it answered with an error (rows stay on error, fleet.ts:1248-1252; which errors owe no exit is unverified). The same holds for a new nestd that has not said hello since the column was added (default 0). At 6073da7 this ended in a wedge at 15 min.
 
 **Low**
 
-- **N5. `LapseGuard` stamps are not atomic with a lapse.** `brain-record@6073da7:crates/nestd/src/host.rs:355-363`: `arrived` loads `lapsed` (false), then `lapsed()` sets the flag and bumps the count, then `arrived` loads the new count. A start arriving at the lapse instant is stamped as post-lapse. If FleetDO expires the host and the hello renews the lease before exec, the N1 outcome follows (S). Fix: one atomic word, or a mutex.
-- **N6. `lost` is cleared on hello (`fleet.ts:811`).** Every release re-checks `lost` at delivery (agent.ts:994, 592, 814), so a stale notice alone doesn't break S. But `brainsLost` deletes the row after AgentDO declined because the host came back (2023-2026). The record then waits for the start deadline, `no_session` (10 min) or a kill's exit (L delay only).
-- **N7.** `startFailed` condemns whatever brain is current after an await (`agent.ts:953-954`; `condemn()` takes no epoch). Safe today only because that await is a storage operation, which doesn't open the input gate.
-- **N8.** A same-host re-issue has no health check (`agent.ts:606`), carried over from a38d3c0.
-- **N9.** A call id outside a turn is `cal_x<8 hex>-<n>`, with `n` per brain (`runtime.rs:524-531`). With call-id keying, a collision across brains returns another call's stored outcome (rows are kept 7 days).
-- **N10.** The `lost` migration marks every previous-release `dead` host lost (`fleet.ts:222-226`), including drain and idle retirements that A6 says prove nothing. Mixed version only.
+- **N13. An await between escalation's re-check and the wedge (L: healthy host wedged).** The record is re-checked at `agent.ts:842`; then `hostStatus` is awaited (849) before `hostWedged` (856). If the kill is processed and the exit released the record during that RPC, a host that just proved it works is wedged, and every brain and sandbox on it restarts. Fix: return `current` from `killProgress`, or re-check after.
+- **N14. A start during a graceful stop is dropped (L, operator-visible).** `stop()` keeps the record live (agent.ts:912-917). A start then answers `none` (612-616), and the brain exits `stopped`, which never restarts (`RESTART_ON_EXIT.stopped = false`, 58). Turns queued meanwhile wait for new input. The model restarts on any exit with work (`RRelease` sets `wake`, tla:193). Doc comments still describe re-issue (agent.ts:486-487, 573-577, 688-689, 909-911; fleet.ts:1155).
+- **N15.** A `restart` intent merged with a concurrent plain start loses `reason: "restart"` (`setIntent`, agent.ts:532-538, newer wins). The run then answers `none` and the restart is gone.
+- **N16. Hello writes split by awaits.** `fleet.ts:814` decides from `prior` (read at 762) and its `UPDATE` isn't guarded by `status = 'expired'`. An idle retirement (1729) or `confirmHostDead` (2113) during the hello's awaits is overwritten to `active, lost = 0`. A DO reset between the `hello_ack` (793, which renews the lease) and 814 leaves an expired, lost host with a renewed lease, and `onHeartbeat` keeps acking it (1053-1058). No S trace found: starts are refused there, and it holds no record.
+- **N17. Wedge step 1 reports exits on nestd's word.** After 60 s without the exit, nestd drops the runner connection and reports every brain on it exited (`runner_link.rs:426-445`). AgentDO releases them all. A4's meaning ("nothing at or below e runs here") then rests on the runner's `kill_all` on disconnect (supervisor.rs:24), in exactly the case where its kill didn't take. It is safe if a brain can't act without its runner. That holds for sessions and hands RPC; unverified for a hung runner.
+- **N18.** The runner's running-brain branch ends any registered brain without comparing epochs (ragent.rs:127-138), a same-epoch or newer one included. That is safe only because no stale or duplicate start reaches it (nestd caches results; FleetDO never resends an answered start). The model still adopts.
+- **N19.** A start with no hint while the brain's host is unhealthy but not lost answers `none` (agent.ts:600-616). The model condemns and moves (tla:361, 374). This is L delay only: the turn waits for expiry (30 s) or STONITH.
+
+**Checked and clean.** No orphan kill can hit the current brain. `hostReport` reads `agent_epoch` and the record in one synchronous step (agent.ts:1067-1072), and `issueStart` bumps the epoch and writes the record before its send (695-700). So a racing kill is always below any later start's epoch, and its synthesized exit (host.rs:864) releases nothing newer (rule 3). A hello reporting a dying brain on the record's own host is left to the runner's end-then-register. Other paths checked:
+- `lost` cleared on hello vs. in-flight releases: every release passes its pre-await epoch, and `release` refuses a newer record (881).
+- The `none` path's durability (612-615).
+- `onHostLost`'s boolean.
+- The idle loop's re-read.
 
 ## Transitions the code has and the model lacks
 
 | Transition | Code | Risk |
 |---|---|---|
-| Tick expiry on a stale snapshot | fleet.ts:1488-1495 | S (N1) |
-| A brain a hello reports but no record names is never killed | agent.ts:1034-1039; fleet.ts:1019-1040 | S (N1's orphan) |
-| Adopt is not atomic with deregistration | agent.rs:139-151, 848-849 | L (N2) |
-| A start error condemns (the model's `START_FAIL` releases) | fleet.ts:1238-1245; agent.ts:938-955 | The fix: check that it neither wedges nor releases early |
-| `stonith_pending`: a wedged host, or one with leases; `lost` only on confirmed death | fleet.ts:1962-1983, 2073-2093 | L waits for EC2 or an operator (by design) |
-| `lost` flag separate from status, cleared on hello | fleet.ts:219-226, 811, 1463-1466 | N1, N6 |
-| `gone` rows and delivery retried by the tick | fleet.ts:1006-1016, 1509 | none found |
-| `min_epoch` mapping for epoch-less exits | fleet.ts:985-1003, 1278-1285 | L in the mixed window (N3) |
-| `no_session` condemn | agent.ts:1239-1242, 2121-2132 | none found |
-| New nestd process: unanswered commands fail and become `startFailed` (condemn) | fleet.ts:816-821 | as before: relies on the runner killing on disconnect (supervisor.rs:24) |
-| Legacy record migration | agent.ts:302-336 | none found |
+| NULL rows not indexed (release on kill result) | fleet.ts:1434 | S, mixed window (N11) |
+| Previous-release hosts never wedged | agent.ts:849-853 | L, mixed window (N12) |
+| Epoch-less exit mapped to the row present now | fleet.ts:997-1000, 1158-1161 | S on old nestd (N4b) |
+| Orphan kill at `agent_epoch` on a hello | agent.ts:1065-1073 | none found |
+| nestd drops the runner connection 60 s after a kill | runner_link.rs:295-310 | N17 |
+| Runner ends any registered brain, then registers | ragent.rs:127-138 | model adopts instead (N18) |
+| `none` without a health check of the brain host | agent.ts:600-616 | L delay (N19) |
+| Stopped exit never restarts | agent.ts:58, 897, 904 | L (N14) |
+| Hello: renewal and `lost` clear split by awaits | fleet.ts:785-814 | N16 |
+| `stonith_pending`, `lost` as a flag, `gone` rows | as at 6073da7 | none new |
 
 ## Untested load-bearing lines
 
-By my reading, removing or breaking each of these fails no test on the branch (unverified; I ran nothing). The commit says every *listed* mutation fails a test; these lines are not on its list.
+By my reading, breaking these fails no test on the branch (unverified; I ran nothing).
 
-- fleet.ts:811 `lost = 0` on hello. Without it, a host that came back stays lost, so a brain later started there is released while it runs (S). The A3 test (seams:804-850) never starts a brain on the returned host.
-- fleet.ts:1488-1495: no test lets a hello interleave the tick (N1).
-- fleet.ts:2021: the per-agent `hostLost` check in `brainsLost`. The A5 test (seams:1200) keeps `lost = 1` throughout.
-- fleet.ts:1731: an EC2-confirmed retirement sets `lost`. The A6 test (seams:1223) uses `confirmHostDead`.
-- fleet.ts:1966: `failStarts` in `expireHost` (L only). The tests expire hosts without leases.
-- host.rs:355-363 ordering: the unit test (host.rs, `a_start_never_outlives_a_lease_lapse`) is sequential.
-- agent.rs:139-151 against 848-849: lifecycle.rs `a_live_brain_adopts_a_reissued_epoch` adopts only a healthy brain.
-- fleet.ts:2076 `wedged_ms IS NULL`: defensive. A wedged host's hello is refused, so it has no socket.
+- agent.ts:1019 `return false`. seams:917 checks only the record, and seams:1456 stubs AgentDO. Returning `true` deletes the row (N6 reopens).
+- agent.ts:842-856: no test puts an exit inside escalation's `hostStatus` await (N13).
+- agent.ts:1070-1072 with the record null (only the moved-record case is tested, seams:1397), and the orphan kill racing a start.
+- fleet.ts:1718-1720: the idle loop's re-read. No hello is interleaved there.
+- fleet.ts:1454: the close in `hostWedged`. seams:432 sees a 4408, which the expiry also sends.
+- fleet.ts:1401, 1461: `wedged_ms IS NULL` in `otherHost`/`controllerHost`. Only `place` is tested (seams:1556).
+- fleet.ts:814 guard: no retirement or confirm during a hello.
+- runner_link.rs:304 `conn_gen` check: a stale timer after a reconnect.
+- host.rs:358-385 under concurrency (the test is sequential; a mutex makes this low).
 
-These are tested: agent.ts:592, 685-689, 825, 870-875, 942, 994, 1559, 1772-1775; fleet.ts:718-724, 1001, 1153-1154, 1263-1267, 1424-1426, 1494, 2026; host.rs:1394; runtime.rs:84; supervisor.rs:104.
+These are tested: agent.ts:605, 612-615, 674-677, 779, 849, 884; fleet.ts:814, 1160, 1434, 1513-1514, 2055; runner_link.rs:298-310; ragent.rs:127-138; runtime.rs:529.
 
-## Inventory issues on brain-record
+## Verdict
 
-| Issue | Status at 6073da7 |
-|---|---|
-| A-1 drained host made dead with a brain on it | Fixed (fleet.ts:1714) |
-| A-2 the runner keeps no tombstone | Fixed (runtime.rs:81-110; supervisor.rs:92-99) |
-| A-3 a killed brain is still current | Fixed (agent.ts:428) |
-| A-4 stale `awaiting_exit` | Fixed (record, `unchanged()`) |
-| A-5 a silent host without a lease is never expired | Fixed (fleet.ts:1488-1495; but see N1) |
-| A-6 wedged host released without STONITH | Fixed for declared wedges (D5) |
-| M-1 a hinted start sends no stop | Fixed (condemn) |
-| M-2 the stop's `ok` drops the row | Fixed (fleet.ts:1232-1233) |
-| M-3 rows deleted before AgentDO is called | Fixed (D4) |
-| M-4 two `agent_start`s | Fixed |
-| M-5 no watchdog for a vanished brain | Fixed (D9) |
+**For S and L with every host on this nestd: yes, with low items** (N13, N14, N15, N16, N17, N18, N19). N1-N3 and N5-N10 are closed, and no orphan-kill or `none` path breaks S. **For a rollout with any previous-release host holding or receiving brains: no.** N11 (new, from M2) and N4 break S, and N12 breaks L. Blocking unless one of these holds:
+- (a) M2 is reverted to count NULL rows until the hello or upgrade.
+- (b) The deploy is gated so no previous-release nestd holds or receives brains.
 
 ## What the model should add
 
-1. Split `Expire` into a read and a commit, with `HostHello` (and a resent start) enabled between them. This should reproduce N1 as a `OneActingBrain` violation. The fix to check: re-check silence at the commit.
-2. A host's report of an agent the record doesn't name, and a kill for it. Without one, any lost-release race leaves an orphan.
-3. A non-atomic adopt: split `Die` into deregister and report, with `RunnerStart`'s adopt between them. Expect `NoHealthyWedge` (N2).
-4. Replace `START_FAIL`'s release with a condemn (`StartResult`), and check S and L for the code as it is.
-5. `stonith_pending` distinct from `expired`. A wedged host always goes through STONITH, and `lost` is a flag cleared by `HostHello`.
-6. The mixed window per host: a runner or nestd that sends one exit without an epoch and doesn't adopt (N3, `NoHealthyWedge`), and a nestd without A3a (N4, `OneActingBrain`).
-7. Optionally, `Deliver` reading the lapse flag and the lapse count in two steps (N5).
+1. Per-host version (`brain_epochs`): no wedge, epoch-less exits mapped to the current row, and kill = graceful on old hosts. Expect `OneActingBrain` (N11, N4b) and `NoWedge` (N12).
+2. Replace `RunnerStart`'s adopt branch (tla:607-613) with end-then-register, as built.
+3. `REscalate` with its `hostStatus` read split from `hostWedged` (N13, `NoHealthyWedge`).
+4. A stopped exit that doesn't wake (N14), and `RStart` answering `none` without a health check (N19).
+5. The orphan kill on `HostHello` and nestd's runner drop with exits for every brain (N17).
+
+## fb9b836 (merge gate)
+
+**Head:** fb9b83666e349951dd546c724aa4cdd7bca74fec, one commit on 82396b3 (fetched 2026-10-26). I read only `git diff 82396b3 fb9b836` and ran nothing. Citations are `brain-record@fb9b836:path:line`, with the prefix and file abbreviations as above; `main:` marks the previous release.
+
+| Item | Status | Where |
+|---|---|---|
+| N11 | closed | On an old host, escalation waits for the host's loss before `killProgress` (agent.ts:858-864). A NULL row on a host that later says `brain_epochs` is still not indexed (fleet.ts:1438). Its brain died with the nestd restart that upgraded the host: main's runner kills every brain when nestd goes (`main:crates/nest-runner/src/runtime.rs:115`) |
+| N4a | closed, except a downgrade race (N23) | No start goes to an old host: agent.ts:513, 660-663, 688-692 |
+| N4b | closed | An exit on an old host never releases: agent.ts:1011-1014 |
+| N12 | partly | The wait ends only with the old host's loss: retired (fleet.ts:1745-1754) and then terminated per EC2 (1765), expired, or confirmed by an operator. Unbounded otherwise (N21) |
+| N13 | closed | Re-checked after `hostStatus` (agent.ts:854-857) and `killProgress` (869); no await between 869 and `hostWedged` (878) |
+| N14 | closed, side effect N20 | agent.ts:623-628 |
+| N15 | closed | agent.ts:539 |
+| N16 | partly | The guard is fixed (fleet.ts:814). A DO reset between `hello_ack` (793) and 814 still leaves an expired, lost host with a renewed lease. No S trace, as before |
+| N17 | accepted (documented) | runner_link.rs:297-301. Behaviour unchanged; unverified for a hung runner |
+| N18 | closed | ragent.rs:127. The equal-epoch case is still latent (N22) |
+| N19 | closed, side effect N24 | agent.ts:613-616 |
+
+**The gates.**
+- **Gate 1 holds.** Every hello rewrites `brain_epochs` in its first synchronous step (fleet.ts:785-786), before any event from that process. A new process of another version, a rollback included, therefore resets it. Before its first hello a host keeps its last value, or 0 if it hasn't said hello since b3f7f68 (fleet.ts:226). Every placement path ends in a `current` check (agent.ts:513, 662, 690-691). Neither the commit nor FleetDO checks it again (N23).
+- **Gate 2 is safe for S, not sufficient for L.**
+  - Release needs `lost` (agent.ts:888-891). A retired host is only `dead`, and becomes `lost` once EC2 reports the instance terminated (fleet.ts:1765). So a brain still alive there, indexed or not, dies before any release.
+  - Sandboxes leave by the forced-drain path (`sandbox_suspend` disk_only, fleet.ts:1783-1788), and retirement waits until no lease is left (1747).
+  - Like the spot path, retirement checks neither pending uploads nor unsalvaged stale incarnations: the documented all-or-nothing gate is not in this loop. That gap predates this commit for burst drains; the commit extends it to every role.
+- **Gate 3 has no bound of its own.** A brain on an old host ends only with the host's loss. That takes one of three things:
+  - The host empties (every exit comes; main's kill is a graceful stop with no timeout, `main:crates/nest-runner/src/agent.rs:572-575`), and it has an `instance_id` and EC2 access.
+  - It goes silent.
+  - An operator confirms it dead.
+- **Hello and the orphan kill.**
+  - `reconcileAgents` (fleet.ts:825) runs before the drain (829). AgentDO ignores an old host's gone exits (agent.ts:1014), and FleetDO then deletes the rows (fleet.ts:1021), so the drain misses those agents. Their records wait for the no-session condemn (10 min), then the loss: L delay only.
+  - The orphan kill (agent.ts:1091-1098) reaches an old host as a graceful stop. No S issue: AgentDO already fences that brain.
+
+**New findings.**
+- **N21 (L, mixed window, medium).** Gate 3 never ends when the old host never becomes lost:
+  - (a) It was enrolled by token, so it has no `instance_id` and is never retired (fleet.ts:1746), or its cell has no EC2, so `lost` is never set (1756-1765).
+  - (b) Its hello came while `stonith_pending`. `drain` writes nothing and returns (fleet.ts:1780-1781), and `stonithDoneIfClear` later makes the host `active` (2111), undrained until its next hello.
+  - (c) A condemned brain whose graceful stop never ends keeps its row, so the host never empties.
+  - Also, a drained host never returns to `active`, even after an in-place upgrade. With an `instance_id` it is retired anyway.
+  - Fix: wedge an old host at `ESCALATION_CAP_MS`, as a current one. That is now safe: no start reaches an old host, so its lease lapse (main kills every brain on lapse, `main:crates/nestd/src/host.rs:1085`) and the expiry prove its brains gone. Also drain an old host when STONITH clears it.
+- **N20 (low).** An operator's plain start on a healthy live brain leaves a dormant intent (agent.ts:623-628) that nothing clears; `stop()` doesn't (934-939). The next release runs it (918), so a later stop or an idle exit is followed by a fresh start.
+- **N22 (low, latent).** The runner refuses an equal-epoch start and at once reports an exit at that epoch (ragent.rs:127-133). The registered brain of that epoch still runs, but nestd and AgentDO take the exit to mean nothing at or below it does. It is unreachable while each start reaches the runner once: a new nestd process gets no unacked resend (`control-plane/src/lib/reliable.ts:68-72`), and nestd dedups by seq. A strict `>`, or waiting for `older_gone`, is safe.
+- **N23 (low, downgrade only).** Awaits separate `pickHost`'s `current` check (agent.ts:690) from the send (740), and `issueCommands` doesn't refuse an `agent_start` to a `brain_epochs = 0` host (fleet.ts:1277). A nestd rolled back in that gap gets the start, and the drain at its hello may not condemn it. That reopens N4a only if a lease lapse during a partition follows. Fix: refuse the start in FleetDO.
+- **N24 (low).** N19 condemns a live brain on an operator's plain start whenever the host's socket is briefly gone (agent.ts:614-616), e.g. across a nestd or Worker restart: a restart nobody asked for.
+- **Pre-existing, now on more paths.** A reset between drain's status write (fleet.ts:1780) and the `onHostDraining` calls (1793-1799: `waitUntil`, not retried) leaves those brains uncondemned, and no later hello redoes it (1780-1781).
+
+**Untested load-bearing lines** (by reading):
+- fleet.ts:1780-1781 (no drain unless `active`), and the 825-before-829 order.
+- agent.ts:623 followed by a `stop` (N20). The N14 run after a `stopped` exit (seams:227 checks only that the intent stays).
+- ragent.rs:127 with equal epochs (lifecycle tests only an older start).
+- Retire → EC2 → release end to end for an old host (the gate-3 test calls `confirmHostDead` directly).
+
+**Verdict at fb9b836.**
+- **S: yes**, for an all-new fleet and in the mixed window (residual: N23, downgrade only).
+- **L: yes with low items for an all-new fleet; no in the mixed window** without an operator, since N21 can strand an agent until someone confirms its old host dead or upgrades it.
+- Blocking for L only. It is cleared by any of:
+  - upgrading every host before the Worker deploy (unverified that main's control plane accepts the new hello);
+  - the N21 wedge-at-cap fix;
+  - a runbook step that runs `confirmHostDead` for every old host left draining.
+
+## 36b60d5 (final merge gate)
+
+**Head:** 36b60d517ab64ab65f72538c50cb19536dbb5a63, one commit on fb9b836 (fetched 2026-10-26). I read only `git diff fb9b836 36b60d5`, plus main's nestd and runner, and ran nothing. Citations are `brain-record@36b60d5:path:line`, abbreviated as above.
+
+| Item | Status | Where |
+|---|---|---|
+| N21 | closed where EC2 can terminate the host; elsewhere an operator's confirm-dead, as for any wedge | Cap wedge agent.ts:860-871; hello order fleet.ts:829-830; re-drain after STONITH by fence fleet.ts:2154-2158; no-EC2 fleet.ts:2058-2059, 1767-1774 |
+| N16 | partly, unchanged | fleet.ts:793 (`hello_ack` renews), 814 |
+| N17 | documented only, unchanged | runner_link.rs:297-301 |
+| N20 | partly | An idle or crash end drops the intent (agent.ts:915-919). A kept plain start still runs after any later graceful stop, however late |
+| N22 | closed | ragent.rs:127-131. Residual: a same-epoch start that finds that epoch's brain of an earlier connection reports nothing; unreachable (nestd never replays a start) |
+| N23 | closed | fleet.ts:1281-1286; a rolled-back process gets no resend (`rel.reset`, 784) |
+| N24 | closed | agent.ts:615-616 |
+| Hello-order delay | closed | `tellDraining` reads its rows synchronously (1836) before `reconcileAgents` (830). After a reset, a reconnect before the tick can delete untold gone rows: the 10-min no-session path, low |
+| Drain notice lost on reset | closed | `drain_told` (995), retried by the tick (1549-1552), which stays armed while a host drains (1558) |
+| Retirement guards | done | fleet.ts:1764-1766. The stale check matches `reapStale`'s (930, `cmd IS NULL`) by host |
+| Drained host never active again | open, low | An in-place upgrade stays `draining`; a token-enrolled one only gets logged (1770-1773) |
+
+**Checks.**
+- **The wedge is S-safe.** It is the same sequence for an old host as for a current one: `hostWedged` accepts `draining` (1462); the socket is closed (1465); hellos are refused (769-772) and heartbeats too (1059); placement is excluded (status, and `wedged_ms IS NULL`). Its expiry always goes through STONITH (1532-1533, 2040-2060), so its brains are released only on a confirmed death. Main kills every brain on lapse twice: nestd's `self_fence` (`main:crates/nestd/src/host.rs:1085-1094`, verified) and the runner's own watchdog (`main:crates/nest-runner/src/supervisor.rs:122-138`).
+- **The re-drain is clean.** The `active` write (2154) and `drainBrains`'s guarded `draining` write (1828) happen in one synchronous step, since an async function runs to its first await. Hellos are serialized per host (668).
+- **`drain_told` is idempotent.** `onHostDraining` returns for a condemned brain or one elsewhere (agent.ts:977-981), and `setIntent` merges. The flag lives on the index row, so it goes when the row goes (`brainGone` 1010-1016, `brainsLost` 2104). Latent: the start upsert (1298-1300) doesn't reset it, and the update after the await (1840) is keyed by (agent, host), not `cmd`.
+- **Awaits.**
+  - Re-checked after: agent.ts:620 (`unchanged`) and 859, with no await between 859 and 867.
+  - Guarded in SQL: fleet.ts:1828.
+  - The retirement loop has no await.
+  - Write order under a reset: `setIntent` writes before it arms (agent.ts:536-544). A reset there fails the call, so `drain_told` stays 0 and the tick retries.
+
+**New finding.**
+- **N25 (medium, mixed window: L, availability; not S). Every old host that holds a lease and had a brain is wedged and STONITHed at the cap.** The cause is three facts together:
+  - An old host's exits never release a brain (agent.ts:1027), but they do delete its row (fleet.ts:1168-1169).
+  - The drain no longer moves sandboxes (1827-1832), and only a spot notice calls `drain` (1160).
+  - A host with any lease never retires (1764).
+
+  So the condemned record waits until `kill.ms + 15 min` and then wedges the host (agent.ts:866-867), even when its brain exited cleanly in seconds. This is the previous release's usual placement (a worker beside its sandbox, as in seams `setup()`). Consequences:
+  - Every sandbox there is placed again from its head (what wasn't committed is lost; whether main's salvage finishes in the ~10 s between the host's lapse and TerminateInstances is unverified).
+  - Without EC2 or an instance, those sandboxes and agents wait for an operator.
+  - It breaks L's "no healthy host wedges", by construction.
+  - The doc's "sandboxes ... leave as they otherwise would" (`docs/control-plane/durable-objects/fleet/README.md:11`) is wrong.
+
+  Fix, any one of:
+  - Suspend an old host's sandboxes at its drain (fb9b836's full drain, now with the stale guard), so it retires before the cap.
+  - At the cap, suspend its sandboxes before wedging.
+  - Upgrade sandbox hosts before the Worker deploy.
+
+**Untested load-bearing lines** (by reading):
+- agent.ts:917 `phase !== "condemned"` and `!host_hint && !avoid` (the N20 test covers only `idle` and `stopped`).
+- agent.ts:616 `!st.lost`, `!st.wedged` (the test sets only `draining`).
+- fleet.ts:1828 `AND status = 'active'`, and an old host's hello while `stonith_pending` end to end (the test calls `stonithDoneIfClear` directly).
+- fleet.ts:1298-1300 (`drain_told` on upsert).
+- An old host's wedge past `wedged_ms`, with leases (N25).
+
+Spot-checked claims that hold: reverting N24 fails the N19/N24 test, and dropping the stale guard fails the retirement test. The commit's "every mutation fails a test" doesn't hold for the agent.ts:917 sub-conditions.
+
+**Verdict at 36b60d5.**
+- **S: yes**, for an all-new fleet and in the mixed window.
+- **L, all-new fleet: yes with low items:** N16, N17, N20 residual, the latent `drain_told` keying, and wedges needing an operator without EC2, as before.
+- **L, mixed window: no, by N25:** agents end (with EC2), but healthy old sandbox hosts are wedged and STONITHed by design. N25 blocks a Worker deploy that precedes host upgrades. It doesn't block S. Cleared by any N25 fix above, or by the owner accepting the forced STONITH with a runbook.

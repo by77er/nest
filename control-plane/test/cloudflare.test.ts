@@ -4,7 +4,7 @@
 // developers.cloudflare.com/api/.
 import { describe, expect, it } from "vitest";
 import {
-  CloudflareHttp, gatewayHostname, HOST_ID_BODY, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
+  CloudflareHttp, gatewayHostname, HOST_ID_BODY, hostOfHostname, hostOfTunnelName, hostnameSuffix, LIST_MAX_PAGES, splitDomain, tunnelConfig, tunnelName,
 } from "../src/lib/cloudflare";
 import { NestError, newId } from "../src/lib/util";
 
@@ -134,17 +134,24 @@ describe("requests", () => {
       ok([{ id: "a", name: "nest-01abc" }, { id: "b", name: "bitty" }, { id: "c", name: "nest-01def" }]),
       ok([{ id: "x", name: "01abc-gw-nest.bitcru.sh", type: "CNAME" }, { id: "y", name: "bitty.bitcru.sh", type: "CNAME" }]),
     ]);
-    expect(await r.api.listTunnels("nest-")).toEqual([{ id: "a", name: "nest-01abc" }, { id: "c", name: "nest-01def" }]);
+    expect(await r.api.listTunnels("nest-")).toEqual({ items: [{ id: "a", name: "nest-01abc" }, { id: "c", name: "nest-01def" }], complete: true });
     expect(r.calls[0]!.url).toBe("https://cf.test/v4/accounts/acc123/cfd_tunnel?is_deleted=false&per_page=100&page=1");
-    expect(await r.api.listRecords("z1", "-gw-nest.bitcru.sh")).toEqual([{ id: "x", name: "01abc-gw-nest.bitcru.sh" }]);
+    expect(await r.api.listRecords("z1", "-gw-nest.bitcru.sh")).toEqual({ items: [{ id: "x", name: "01abc-gw-nest.bitcru.sh" }], complete: true });
     expect(r.calls[1]!.url).toBe("https://cf.test/v4/zones/z1/dns_records?type=CNAME&name.endswith=-gw-nest.bitcru.sh&per_page=100&page=1");
   });
 
   it("follows pages while a page is full", async () => {
     const full = Array.from({ length: 100 }, (_, i) => ({ id: `t${i}`, name: `nest-${i.toString(36).padStart(5, "0")}` }));
     const r = recorder([ok(full), ok([{ id: "last", name: "nest-zzzzz" }])]);
-    expect((await r.api.listTunnels("nest-")).length).toBe(101);
+    expect(await r.api.listTunnels("nest-")).toMatchObject({ complete: true, items: { length: 101 } });
     expect(r.calls.map((c) => c.url.slice(-6))).toEqual(["page=1", "page=2"]);
+  });
+
+  it("says a listing is incomplete when it stops at the page limit with pages left", async () => {
+    const full = Array.from({ length: 100 }, (_, i) => ({ id: `t${i}`, name: `nest-${i.toString(36).padStart(5, "0")}` }));
+    const r = recorder(Array.from({ length: LIST_MAX_PAGES }, () => ok(full)));
+    expect(await r.api.listTunnels("nest-")).toMatchObject({ complete: false, items: { length: 100 * LIST_MAX_PAGES } });
+    expect(r.calls).toHaveLength(LIST_MAX_PAGES);
   });
 });
 

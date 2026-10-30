@@ -7,12 +7,14 @@
 // saved from a copy loaded before an await (`update()` loads, mutates and saves synchronously), and
 // inbound session messages are processed one at a time, in order (`SerialQueue`).
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import { num, type Env } from "../env";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, type RoleRecord, specFromRole } from "../lib/spec";
 import { signBlobUrl } from "../lib/tokens";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
+import { storedEnum, storedEnumOrNull } from "../lib/stored";
 import {
   type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage,
   RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
@@ -61,6 +63,25 @@ const RESTART_ON_EXIT: Record<AgentExitReason, boolean> = {
 /** Restarts after an exit without a turn completing in between, before giving up (`errored`). */
 const MAX_EXIT_RESTARTS = 3;
 const RETENTION_MS = 7 * 86_400_000;
+
+// Closed unions for the status columns (docs/data/#enums): SQL names them through these constants,
+// and every status read back is checked (`storedEnum`: a value outside the union is logged).
+/** `turns.status`: waiting to run, running, finished, or cut short. */
+const TurnStatusEnum = z.enum(["queued", "active", "done", "interrupted"]);
+export type TurnStatus = z.output<typeof TurnStatusEnum>;
+/** `inbox.status`: mirrored to the running turn, or consumed (by a turn, or as its own turn). */
+const InboxStatusEnum = z.enum(["delivered", "consumed"]);
+export type InboxStatus = z.output<typeof InboxStatusEnum>;
+/** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
+const CallStatusEnum = z.enum(["dispatching", "waiting", "done"]);
+export type CallStatus = z.output<typeof CallStatusEnum>;
+/** `asks.status`: inside its sync window, a guest CLI's, answered as a turn later, or answered. */
+const AskStatusEnum = z.enum(["sync", "cli", "async", "answered"]);
+export type AskStatus = z.output<typeof AskStatusEnum>;
+const TURN = TurnStatusEnum.enum;
+const INBOX = InboxStatusEnum.enum;
+const CALL = CallStatusEnum.enum;
+const ASK = AskStatusEnum.enum;
 const PRUNE_EVERY_MS = 3_600_000;
 /** read_transcript: entries per call by default / at most, and a response size cap. */
 const TRANSCRIPT_DEFAULT_LIMIT = 200;
@@ -946,7 +967,7 @@ export class AgentDO extends DurableObject<Env> {
       released = true;
     });
     if (!released) return false;
-    const work = !!info.current_turn || this.sql.exec("SELECT 1 FROM turns WHERE status = 'queued' LIMIT 1").toArray().length > 0;
+    const work = !!info.current_turn || this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
     const armed = Promise.all([
       this.deadlines.clear("condemned"),
       this.deadlines.clear("starting"),
@@ -1097,7 +1118,7 @@ export class AgentDO extends DurableObject<Env> {
   private async wake(afterExit = false): Promise<void> {
     const info = this.load();
     if (info.brain && info.brain.phase !== "condemned") return;
-    const queued = this.sql.exec("SELECT 1 FROM turns WHERE status = 'queued' LIMIT 1").toArray().length > 0;
+    const queued = this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
     if (!info.current_turn && !queued) return;
     if (afterExit && (info.exit_restarts ?? 0) > MAX_EXIT_RESTARTS) {
       this.update((i) => {
@@ -1460,7 +1481,7 @@ export class AgentDO extends DurableObject<Env> {
   private async requeueAsRecovery(turn: string): Promise<void> {
     const row = this.sql.exec<{ input: string; started_ms: number | null; created_ms: number; hands_epoch: number | null }>(
       "SELECT input, started_ms, created_ms, hands_epoch FROM turns WHERE turn = ?", turn).toArray()[0];
-    this.sql.exec("UPDATE turns SET status = 'interrupted' WHERE turn = ?", turn);
+    this.sql.exec(`UPDATE turns SET status = '${TURN.interrupted}' WHERE turn = ?`, turn);
     if (!row) return;
     const orig = JSON.parse(row.input) as TurnInput;
     // A recovery turn that is itself interrupted keeps the original turn's text.
@@ -1486,7 +1507,7 @@ export class AgentDO extends DurableObject<Env> {
     if (info.hands && moved) notes.push(await this.movedNote(info));
     notes.push("If the turn isn't finished, continue it.");
     const ord = (this.sql.exec<{ m: number | null }>("SELECT MIN(ord) AS m FROM turns").toArray()[0]?.m ?? 0) - 1;
-    this.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES (?, ?, ?, 'queued', ?)",
+    this.sql.exec(`INSERT INTO turns (turn, ord, input, status, created_ms) VALUES (?, ?, ?, '${TURN.queued}', ?)`,
       newId("trn_"), ord, JSON.stringify({ kind: "recovery", text: `${notes.join(" ")}${RECOVERY_MARK}${original}` } satisfies TurnInput), Date.now());
   }
 
@@ -1691,8 +1712,8 @@ export class AgentDO extends DurableObject<Env> {
           break;
         case "turn_completed":
           if (completed && i.current_turn === ev.turn) {
-            this.sql.exec("UPDATE turns SET status = 'done' WHERE turn = ?", ev.turn);
-            this.sql.exec("UPDATE inbox SET status = 'consumed' WHERE status = 'delivered'");
+            this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, ev.turn);
+            this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
             i.current_turn = null;
             i.state = "idle";
             i.exit_restarts = 0;
@@ -1708,7 +1729,7 @@ export class AgentDO extends DurableObject<Env> {
         ...(ev.retry_after_ms !== undefined ? { retry_after_ms: ev.retry_after_ms } : {}),
       }, `${info.agent}/${info.runner_instance ?? ""}/ev${ev.seq}`);
     } else if (ev.type === "inbox_delivered") {
-      const n = this.sql.exec("UPDATE inbox SET status = 'consumed' WHERE id = ? AND status = 'delivered'", ev.message).rowsWritten;
+      const n = this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE id = ? AND status = '${INBOX.delivered}'`, ev.message).rowsWritten;
       if (n > 0) this.pushCache();
     } else if (ev.type === "escalation") {
       // The runner already denied the call with "pending approval (request <call>)": record an
@@ -1740,7 +1761,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     const turn = newId("trn_");
     const ord = (this.sql.exec<{ m: number | null }>("SELECT MAX(ord) AS m FROM turns").toArray()[0]?.m ?? 0) + 1;
-    this.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, 'queued', ?, ?)",
+    this.sql.exec(`INSERT INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, '${TURN.queued}', ?, ?)`,
       turn, ord, JSON.stringify(input), Date.now(), requestId ?? null);
     await this.pump();
     await this.wake();
@@ -1751,11 +1772,11 @@ export class AgentDO extends DurableObject<Env> {
   private async pump(): Promise<void> {
     if (!this.socket() || this.load().current_turn) return;
     const next = this.sql
-      .exec<{ turn: string; input: string }>("SELECT turn, input FROM turns WHERE status = 'queued' ORDER BY ord LIMIT 1")
+      .exec<{ turn: string; input: string }>(`SELECT turn, input FROM turns WHERE status = '${TURN.queued}' ORDER BY ord LIMIT 1`)
       .toArray()[0];
     if (!next) return;
     // Synchronous from the check above: no other pump can claim a turn in between.
-    this.sql.exec("UPDATE turns SET status = 'active', started_ms = ? WHERE turn = ?", Date.now(), next.turn);
+    this.sql.exec(`UPDATE turns SET status = '${TURN.active}', started_ms = ? WHERE turn = ?`, Date.now(), next.turn);
     const info = this.update((i) => {
       i.current_turn = next.turn;
       i.state = "working";
@@ -1785,11 +1806,11 @@ export class AgentDO extends DurableObject<Env> {
     await this.syncActivity();
   }
 
-  async turns(): Promise<{ turn: string; status: string; input: TurnInput }[]> {
+  async turns(): Promise<{ turn: string; status: TurnStatus; input: TurnInput }[]> {
     return this.sql
       .exec<{ turn: string; status: string; input: string }>("SELECT turn, status, input FROM turns ORDER BY ord")
       .toArray()
-      .map((r) => ({ turn: r.turn, status: r.status, input: JSON.parse(r.input) as TurnInput }));
+      .map((r) => ({ turn: r.turn, status: storedEnum(TurnStatusEnum, r.status, "turns.status"), input: JSON.parse(r.input) as TurnInput }));
   }
 
   /**
@@ -1805,12 +1826,12 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     const message: InboxMessage = { id: newId("msg_"), from, text, interrupt, ts_ms: Date.now() };
     if (info.current_turn) {
-      this.sql.exec("INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, 'delivered', ?, ?)",
+      this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, '${INBOX.delivered}', ?, ?)`,
         message.id, JSON.stringify(message), info.current_turn, Date.now(), requestId ?? null);
       this.pushReliable((seq) => ({ type: "inbox", seq, message }));
       this.pushCache();
     } else {
-      this.sql.exec("INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, NULL, 'consumed', ?, ?)",
+      this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, NULL, '${INBOX.consumed}', ?, ?)`,
         message.id, JSON.stringify(message), Date.now(), requestId ?? null);
       await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`);
     }
@@ -1831,7 +1852,7 @@ export class AgentDO extends DurableObject<Env> {
 
   private currentCache(info: AgentInfo): AgentCache {
     const inbox = this.sql
-      .exec<{ message: string }>("SELECT message FROM inbox WHERE status = 'delivered' ORDER BY rowid")
+      .exec<{ message: string }>(`SELECT message FROM inbox WHERE status = '${INBOX.delivered}' ORDER BY rowid`)
       .toArray()
       .map((r) => JSON.parse(r.message) as InboxMessage);
     return { version: info.cache_version, rules: info.rules, inbox, max_stop_continuations: 5 };
@@ -1869,9 +1890,10 @@ export class AgentDO extends DurableObject<Env> {
     // Keyed by the call's own id: a call first seen at an earlier epoch (redelivered after its brain
     // adopted a newer epoch) keeps that epoch's row and idempotency key, so its writes never run
     // twice; it is still fenced by this session's epoch.
-    const prior = this.sql
+    const stored = this.sql
       .exec<{ epoch: number; status: string; outcome: string | null }>("SELECT epoch, status, outcome FROM tool_calls WHERE call = ? ORDER BY epoch LIMIT 1", call.call)
       .toArray()[0];
+    const prior = stored && { ...stored, status: storedEnum(CallStatusEnum, stored.status, "tool_calls.status") };
     const epoch = prior?.epoch ?? att.epoch;
     if (verdict === "duplicate") {
       this.send(ws, { type: "ack", up_to: this.rel.lastIn(CHAN)! });
@@ -1883,7 +1905,7 @@ export class AgentDO extends DurableObject<Env> {
       this.pushReliable((seq) => ({ type: "tool_result", seq, call: call.call, outcome: JSON.parse(prior.outcome!) as ToolOutcome }));
     } else if (prior?.status !== "waiting") {
       if (!prior) {
-        this.sql.exec("INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, ?, 'dispatching', NULL, ?)",
+        this.sql.exec(`INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, ?, '${CALL.dispatching}', NULL, ?)`,
           epoch, call.call, call.name, Date.now());
       }
       let result: DispatchResult;
@@ -1894,7 +1916,7 @@ export class AgentDO extends DurableObject<Env> {
         if (!ne) console.error(`AgentDO: tool ${call.name} failed`, e);
         result = { status: "error", error: ne ? ne.body() : errorBody(ErrorCodes.INTERNAL, `${call.name} failed`, true) };
       }
-      if (result === "wait") this.sql.exec("UPDATE tool_calls SET status = 'waiting' WHERE epoch = ? AND call = ?", epoch, call.call);
+      if (result === "wait") this.sql.exec(`UPDATE tool_calls SET status = '${CALL.waiting}' WHERE epoch = ? AND call = ?`, epoch, call.call);
       else this.finishCall(epoch, call.call, result);
     }
     this.rel.markProcessed(CHAN, call.seq);
@@ -1918,17 +1940,18 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (verdict === "process") {
       const outcome: ToolOutcome = { status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, `cancelled by the runner: ${m.reason}`) };
-      const prior = this.sql
+      const stored = this.sql
         .exec<{ epoch: number; status: string }>("SELECT epoch, status FROM tool_calls WHERE call = ? ORDER BY epoch LIMIT 1", m.call)
         .toArray()[0];
+      const prior = stored && { ...stored, status: storedEnum(CallStatusEnum, stored.status, "tool_calls.status") };
       const epoch = prior?.epoch ?? att.epoch;
       if (!prior) {
-        this.sql.exec("INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, '', 'done', ?, ?)",
+        this.sql.exec(`INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, '', '${CALL.done}', ?, ?)`,
           epoch, m.call, JSON.stringify(outcome), Date.now());
       } else if (prior.status !== "done") {
-        this.sql.exec("UPDATE tool_calls SET status = 'done', outcome = ? WHERE epoch = ? AND call = ?", JSON.stringify(outcome), epoch, m.call);
+        this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), epoch, m.call);
         // A pending ask keeps its question open, but any answer now arrives as a turn.
-        this.sql.exec("UPDATE asks SET status = 'async' WHERE call = ? AND epoch = ? AND status = 'sync'", m.call, epoch);
+        this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE call = ? AND epoch = ? AND status = '${ASK.sync}'`, m.call, epoch);
       }
       this.rel.markProcessed(CHAN, m.seq);
     }
@@ -1936,7 +1959,7 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   private finishCall(epoch: number, call: string, outcome: ToolOutcome): void {
-    this.sql.exec("UPDATE tool_calls SET status = 'done', outcome = ? WHERE epoch = ? AND call = ?", JSON.stringify(outcome), epoch, call);
+    this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), epoch, call);
     this.pushReliable((seq) => ({ type: "tool_result", seq, call, outcome }));
   }
 
@@ -2075,8 +2098,9 @@ export class AgentDO extends DurableObject<Env> {
   ): Promise<string> {
     // Re-run for the same call (after an eviction, or an event resent because routing failed): the
     // same ask, routed again under the same key, which the workstream applies once.
-    const prior = this.sql.exec<{ ask: string; question: string; status: string; deadline: number }>(
+    const stored = this.sql.exec<{ ask: string; question: string; status: string; deadline: number }>(
       "SELECT ask, question, status, deadline FROM asks WHERE call = ? AND epoch = ?", call, epoch).toArray()[0];
+    const prior = stored && { ...stored, status: storedEnum(AskStatusEnum, stored.status, "asks.status") };
     if (prior?.status === "answered") return prior.ask;
     const ask = prior?.ask ?? newId("ask_");
     const deadline = prior?.deadline ?? Date.now() + num(this.env.ASK_SYNC_WINDOW_MS, 120_000);
@@ -2155,7 +2179,7 @@ export class AgentDO extends DurableObject<Env> {
             this.cliWaiters.set(ask, (a) => { clearTimeout(timer); resolve(a); });
           });
           if (answer !== null) return { status: "answered", answer };
-          this.sql.exec("UPDATE asks SET status = 'async' WHERE ask = ? AND status = 'cli'", ask);
+          this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE ask = ? AND status = '${ASK.cli}'`, ask);
           return { status: "pending", question_id: ask };
         }
         case "whoami":
@@ -2187,8 +2211,9 @@ export class AgentDO extends DurableObject<Env> {
       .exec<{ call: string; epoch: number; status: string }>("SELECT call, epoch, status FROM asks WHERE ask = ?", ask)
       .toArray()[0];
     if (!row) throw new NestError(ErrorCodes.INVALID_MESSAGE, "unknown ask", 404);
+    row.status = storedEnum(AskStatusEnum, row.status, "asks.status");
     if (row.status === "answered") return "already_answered";
-    this.sql.exec("UPDATE asks SET status = 'answered', answer = ? WHERE ask = ?", answer, ask);
+    this.sql.exec(`UPDATE asks SET status = '${ASK.answered}', answer = ? WHERE ask = ?`, answer, ask);
     if (row.status === "cli") {
       const waiter = this.cliWaiters.get(ask);
       this.cliWaiters.delete(ask);
@@ -2263,8 +2288,8 @@ export class AgentDO extends DurableObject<Env> {
       } else if (key.startsWith("ask:")) {
         const ask = key.slice(4);
         const row = this.sql.exec<{ call: string; epoch: number; status: string }>("SELECT call, epoch, status FROM asks WHERE ask = ?", ask).toArray()[0];
-        if (row?.status === "sync") {
-          this.sql.exec("UPDATE asks SET status = 'async' WHERE ask = ?", ask);
+        if (storedEnumOrNull(AskStatusEnum, row?.status, "asks.status") === "sync" && row) {
+          this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE ask = ?`, ask);
           this.finishCall(row.epoch, row.call, {
             status: "pending",
             ask,
@@ -2278,10 +2303,10 @@ export class AgentDO extends DurableObject<Env> {
   /** Bounded growth: finished calls, asks, turns and inbox messages older than a week go away. */
   private prune(): void {
     const cutoff = Date.now() - RETENTION_MS;
-    this.sql.exec("DELETE FROM tool_calls WHERE status = 'done' AND created_ms < ?", cutoff);
-    this.sql.exec("DELETE FROM asks WHERE status = 'answered' AND created_ms < ?", cutoff);
-    this.sql.exec("DELETE FROM turns WHERE status IN ('done', 'interrupted') AND created_ms < ?", cutoff);
-    this.sql.exec("DELETE FROM inbox WHERE status = 'consumed' AND created_ms < ?", cutoff);
+    this.sql.exec(`DELETE FROM tool_calls WHERE status = '${CALL.done}' AND created_ms < ?`, cutoff);
+    this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
+    this.sql.exec(`DELETE FROM turns WHERE status IN ('${TURN.done}', '${TURN.interrupted}') AND created_ms < ?`, cutoff);
+    this.sql.exec(`DELETE FROM inbox WHERE status = '${INBOX.consumed}' AND created_ms < ?`, cutoff);
   }
 }
 

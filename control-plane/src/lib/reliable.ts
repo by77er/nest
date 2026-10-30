@@ -71,6 +71,12 @@ export class ReliableChannels {
     this.sql.exec("UPDATE rel_state SET last_in = NULL WHERE chan = ?", chan);
   }
 
+  /** Drop the channel entirely (its peer is gone for good and will never reconnect under this name). */
+  forget(chan: string): void {
+    this.sql.exec("DELETE FROM rel_out WHERE chan = ?", chan);
+    this.sql.exec("DELETE FROM rel_state WHERE chan = ?", chan);
+  }
+
   /** Record that inbound `seq` (the next one in order) has been fully processed. */
   markProcessed(chan: string, seq: number): void {
     this.state(chan);
