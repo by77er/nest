@@ -1,6 +1,7 @@
 // Everything AWS is per cell, keyed by the cell name (docs/compute/cells/):
 // - `AWS_CELLS` (a var the cell stacks write to SSM): JSON object of cell → that cell's region,
-//   launch template, subnets, autoscaler settings and proxy root CA key. A cell without an entry
+//   sandbox-host launch template, subnets, autoscaler settings, proxy root CA key and brain-host
+//   section (`brain`: its own template, instance types and cap). A cell without an entry
 //   has no autoscaling: its hosts are added by hand and never retired.
 // - `AWS_CELL_CREDENTIALS` (a secret): JSON object of cell → the access key of that cell's
 //   `nest-<cell>-control-plane` IAM user.
@@ -12,6 +13,24 @@ import type { Env } from "../env";
 /** `arn:<partition>:kms:<region>:<account>:key/<id>`, capturing the region. */
 const KMS_KEY_ARN = /^arn:aws[a-z-]*:kms:([a-z0-9-]+):\d{12}:key\/(?:mrk-)?[0-9a-f-]+$/;
 
+/**
+ * The cell's brain hosts (docs/compute/brain-hosts/): their own launch template, instance types and
+ * cap; they launch into the cell's subnets. A cell without it launches no brain host (its brain
+ * hosts, if any, are added by hand and never retired).
+ */
+const BrainHosts = z.object({
+  launch_template_id: z.string().regex(/^lt-[0-9a-f]+$/),
+  /** In preference order; the first is also the on-demand fallback. */
+  instance_types: z.array(z.string().min(1)).min(1),
+  spot: z.boolean().default(true),
+  /** 3 two-vCPU hosts hold about 12 brains at the default capacity (the cell stack writes its own value). */
+  max_hosts: z.number().int().positive().default(3),
+  /** How long a brain host holding no brain stays before it's terminated. */
+  idle_grace_ms: z.number().int().nonnegative().default(1_800_000),
+  /** Brains per host; 0 derives it from the instance's size (`maxBrains` in lib/placement.ts). */
+  max_brains_per_host: z.number().int().nonnegative().default(0),
+});
+
 const AwsCell = z.object({
   region: z.string().min(1),
   launch_template_id: z.string().regex(/^lt-[0-9a-f]+$/),
@@ -20,7 +39,7 @@ const AwsCell = z.object({
   instance_types: z.array(z.string().min(1)).min(1),
   spot: z.boolean().default(true),
   max_hosts: z.number().int().positive().default(1),
-  /** How long a burst host holding no sandbox and no agent stays before it's terminated. */
+  /** How long a sandbox host holding no running sandbox stays before it's terminated. */
   idle_grace_ms: z.number().int().nonnegative().default(600_000),
   /** A launched instance that hasn't enrolled by then is terminated. */
   enroll_timeout_ms: z.number().int().positive().default(600_000),
@@ -36,6 +55,8 @@ const AwsCell = z.object({
    * release: an entry written before the stack carried it falls back to `ROOT_CA_KMS_KEY_ID`.
    */
   proxy_root_key_arn: z.string().regex(KMS_KEY_ARN).optional(),
+  /** Optional for one release: an entry written before brain hosts has none. */
+  brain: BrainHosts.optional(),
 }).refine((c) => c.proxy_root_key_arn === undefined || KMS_KEY_ARN.exec(c.proxy_root_key_arn)?.[1] === c.region, {
   message: "proxy_root_key_arn must be a key in the cell's region",
   path: ["proxy_root_key_arn"],

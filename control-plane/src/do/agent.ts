@@ -152,6 +152,11 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
   exit_restarts?: number;
   /** Consecutive starts condemned for want of a hello (backs off the `starting` deadline). */
   start_timeouts?: number;
+  /**
+   * Consecutive runs of the intent that found no brain host with room (backs off their retry:
+   * `capacityRetryMs`). Not the crash-loop guard's: waiting for capacity is not a crash.
+   */
+  capacity_waits?: number;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
   capabilities?: string[];
   /** When the transcript was last made durable (a recovery turn says where it ends). */
@@ -255,6 +260,17 @@ export interface TranscriptPage {
   base: number;
   /** The caller's cursor was for another base: this page starts again from entry 1. */
   reset?: boolean;
+}
+
+/** The retry of the `n`th consecutive start that found no brain host with room: 30 s doubling to 5 min. */
+export function capacityRetryMs(n: number): number {
+  return Math.min(WAKE_RETRY_MS * 2 ** Math.max(0, n - 1), CAPACITY_RETRY_MAX_MS);
+}
+const CAPACITY_RETRY_MAX_MS = 5 * 60_000;
+
+/** A host a brain may start on: an active, connected brain host of this release (docs/compute/brain-hosts/). */
+function brainHostUsable(st: { status: string; connected: boolean; current: boolean; role: string } | null): boolean {
+  return !!st && st.status === "active" && st.connected && st.current && st.role === "brain";
 }
 
 export class AgentDO extends DurableObject<Env> {
@@ -548,16 +564,27 @@ export class AgentDO extends DurableObject<Env> {
   async start(hostHint?: string, avoid?: string, restart = false): Promise<StartResult> {
     const info = this.load();
     if (hostHint) {
-      // An active, connected host of this cell, like `controllerHost` picks. Hands still go
-      // through the sandbox's gateway.
+      // An active, connected brain host of this cell and release. Hands still go through the
+      // sandbox's gateway.
       const st = await this.fleet(info.cell).hostStatus(hostHint);
-      if (!st || st.status !== "active" || !st.connected || !st.current) {
-        throw new NestError(ErrorCodes.FORBIDDEN, `${hostHint} is not an active, connected host of this release in ${info.cell}`, 409);
+      if (!brainHostUsable(st)) {
+        throw new NestError(ErrorCodes.FORBIDDEN, `${hostHint} is not an active, connected brain host of this release in ${info.cell}`, 409);
       }
     }
     await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), ...(avoid ? { avoid } : {}), reason: restart ? "restart" : "operator" });
     const r = await this.runIntent(true);
     return r ?? this.startStatus();
+  }
+
+  /**
+   * FleetDO saw room for brains appear (a brain host said hello, a brain's slot freed) while this
+   * agent waited for one: run the kept intent now instead of at its backed-off retry. Nothing to do
+   * without an intent. Returns whether one was waiting.
+   */
+  async pokeIntent(): Promise<boolean> {
+    if (!this.load().intent) return false;
+    await this.deadlines.set("intent", Date.now(), true);
+    return true;
   }
 
   /** What a start that issued nothing answers: where the brain is, and what it waits for. */
@@ -666,6 +693,7 @@ export class AgentDO extends DurableObject<Env> {
           if (intent.reason !== "operator") {
             this.update((i) => {
               i.intent = null;
+              delete i.capacity_waits;
             });
             await this.deadlines.clear("intent");
           }
@@ -697,46 +725,35 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * Where a start with no brain goes (see `processIntent`). Throws when no host can take it now. An
-   * agent with hands starts on its sandbox's host; one without on a `controller` host (until brain
-   * hosts replace both).
+   * Where a start with no brain goes (see `processIntent`): a brain host, never a sandbox host, and
+   * never one of the previous release (its hello didn't say `brain_epochs`). The hint if it names
+   * such a host; else FleetDO's `placeBrain` (the last brain host if it has room, for a warm session,
+   * else the fullest with room; never `avoid`). Where the agent's sandbox runs plays no part. Throws
+   * when no host can take it now (retryable: the intent stays, and FleetDO launches a brain host).
    */
   private async pickHost(info: AgentInfo, intent: StartIntent): Promise<string> {
     const fleet = this.fleet(info.cell);
-    // Only a host of this release (its hello said `brain_epochs`) ever gets a brain.
-    const healthy = async (h: string) => {
-      const st = await fleet.hostStatus(h);
-      return !!st && st.status === "active" && st.connected && st.current;
-    };
-    if (intent.host_hint) {
-      if (!(await healthy(intent.host_hint))) {
-        throw new NestError(ErrorCodes.FORBIDDEN, `${intent.host_hint} is not an active, connected host of this release in ${info.cell}`, 409);
-      }
-      if (info.hands) await this.sandboxStub(info.hands.sandbox).wake();
-      return intent.host_hint;
-    }
     let host: string | null;
-    if (intent.avoid) {
-      // Moving off a host that is going away: any other active, connected host (the sandbox, which
-      // is leaving that host too, is not woken there).
-      host = info.hands ? await fleet.otherHost(intent.avoid) : await fleet.controllerHost();
-      if (host === intent.avoid) host = null;
-    } else if (info.hands) {
-      // Lazy start: a suspended sandbox resumes, an unplaced one is placed (maybe on a new host).
-      // Without a host yet this fails retryably; the placement then wakes the agent.
-      host = (await this.sandboxStub(info.hands.sandbox).wake()).host;
+    if (intent.host_hint) {
+      if (!brainHostUsable(await fleet.hostStatus(intent.host_hint))) {
+        throw new NestError(ErrorCodes.FORBIDDEN, `${intent.host_hint} is not an active, connected brain host of this release in ${info.cell}`, 409);
+      }
+      host = intent.host_hint;
     } else {
-      host = await fleet.controllerHost();
+      host = await fleet.placeBrain({ prev: info.prev_host ?? null, avoid: intent.avoid ?? null, agent: info.agent });
+      if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no brain host available for this agent", 503, true);
     }
-    if (host && info.prev_host && info.prev_host !== host && info.prev_host !== intent.avoid && (await healthy(info.prev_host))) {
-      host = info.prev_host;
+    // The sandbox wakes alongside (a suspended one resumes, an unplaced one is placed), so hands are
+    // ready sooner; the brain never waits for it (`hands_resolve` answers not-ready until it runs).
+    // Only a sandbox that can never run again (destroyed, archived) stops the start.
+    if (info.hands) {
+      try {
+        await this.sandboxStub(info.hands.sandbox).wake();
+      } catch (e) {
+        if (!(asNestError(e)?.retryable ?? true)) throw e;
+        console.warn(`agent ${info.agent}: waking ${info.hands.sandbox} alongside its brain failed; hands_resolve retries`, e);
+      }
     }
-    // Never a host of the previous release (no brain epochs): another of this release, or none yet
-    // (the start waits, like no capacity).
-    if (host && !(await fleet.hostStatus(host))?.current) {
-      host = await fleet.currentHost(info.hands ? null : "controller", intent.avoid);
-    }
-    if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no host available for this agent", 503, true);
     return host;
   }
 
@@ -757,6 +774,7 @@ export class AgentDO extends DurableObject<Env> {
       i.agent_epoch += 1;
       i.brain = { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() };
       i.intent = null;
+      delete i.capacity_waits;
       i.state = "starting";
     });
     const armed = Promise.all([
@@ -807,7 +825,17 @@ export class AgentDO extends DurableObject<Env> {
   private async intentFailed(intent: StartIntent, e: unknown): Promise<void> {
     const ne = asNestError(e);
     if (ne?.retryable ?? true) {
-      await this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true);
+      // No brain host with room (FleetDO launches one): the wait backs off, 30 s doubling to 5 min,
+      // so a cell at its cap isn't asked twice a minute by every waiting agent. New input sets the
+      // intent's alarm again at 30 s (`setIntent` keeps the earlier deadline).
+      let delay = WAKE_RETRY_MS;
+      if (ne?.code === ErrorCodes.CAPACITY_EXHAUSTED) {
+        const n = this.update((i) => {
+          i.capacity_waits = (i.capacity_waits ?? 0) + 1;
+        }).capacity_waits ?? 1;
+        delay = capacityRetryMs(n);
+      }
+      await this.deadlines.set("intent", Date.now() + delay, true);
       return;
     }
     if (intent.host_hint) {
@@ -819,6 +847,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     this.update((i) => {
       i.intent = null;
+      delete i.capacity_waits;
       if (!i.brain && (i.state === "starting" || i.state === "detached")) i.state = "errored";
     });
     await this.deadlines.clear("intent");
@@ -963,6 +992,7 @@ export class AgentDO extends DurableObject<Env> {
       // brain) and a condemned brain's intent always run.
       if (i.intent?.reason === "operator" && i.brain.phase !== "condemned" && reason !== "stopped" && !moves(i.intent, i.brain.host)) {
         i.intent = null;
+        delete i.capacity_waits;
       }
       i.prev_host = i.brain.host;
       i.brain = null;
@@ -995,7 +1025,10 @@ export class AgentDO extends DurableObject<Env> {
     // An operator's start kept from before this stop is for the brain this stop ends: dropped, so
     // only a start made after the stop runs after its exit (N20).
     const info = this.update((i) => {
-      if (i.intent?.reason === "operator" && i.brain && i.brain.phase !== "condemned" && !moves(i.intent, i.brain.host)) i.intent = null;
+      if (i.intent?.reason === "operator" && i.brain && i.brain.phase !== "condemned" && !moves(i.intent, i.brain.host)) {
+        i.intent = null;
+        delete i.capacity_waits;
+      }
     });
     const b = info.brain;
     if (!b || b.phase === "condemned") return;

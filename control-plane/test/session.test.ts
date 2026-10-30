@@ -9,19 +9,18 @@ const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 async function setup(opts: { captain?: boolean } = {}) {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
-  const host = await connectHost(cell);
+  const sbxHost = await connectHost(cell);
+  const host = await connectHost(cell, "brain");
   const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "ship it" } }, 201);
   let captain: string | undefined;
-  let controller: Awaited<ReturnType<typeof connectHost>> | undefined;
   if (opts.captain) {
-    controller = await connectHost(cell, "controller");
     captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
   }
   const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
-  await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+  await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, ...(captain ? { captain } : {}) } }, 201);
   const [start] = await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { cell, host, workstream, sandbox: sbx.sandbox, agent: worker.agent as string, start, captain, controller };
+  return { cell, host, sbxHost, workstream, sandbox: sbx.sandbox, agent: worker.agent as string, start, captain };
 }
 
 async function connectRunner(agent: string, hostId: string, token: string, epoch = 1, extra: Record<string, unknown> = {}) {
@@ -39,7 +38,7 @@ let runnerSeq = 0;
 const toolCall = (call: string, name: string, args: unknown, seq = ++runnerSeq) => ({ type: "tool_call", seq, call, turn: "trn_x", name, arguments: args });
 
 describe("agent start", () => {
-  it("sends agent_start to the sandbox's host with the setup token, hands and session URL", async () => {
+  it("sends agent_start to a brain host (never the sandbox's) with the setup token, hands and session URL", async () => {
     const s = await setup();
     expect(s.start).toMatchObject({
       agent: s.agent, role: "worker", workstream: s.workstream, epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 },
@@ -246,7 +245,7 @@ describe("platform tool relay", () => {
     const ex = await ws.next("tool_result", (m) => m.call === "cal_t4-3");
     // Named by the hostname rule (a first-level label, kind as suffix, no `_`), without NEST_DOMAIN under `nest.localhost`.
     expect(ex.outcome.content[1].value.url).toBe(`https://3000-${s.sandbox.slice("sbx_".length)}-preview-nest.localhost`);
-    const [expose] = await nextCommands(s.host.ws, (c) => c.type === "port_expose");
+    const [expose] = await nextCommands(s.sbxHost.ws, (c) => c.type === "port_expose");
     expect(expose).toMatchObject({ sandbox: s.sandbox, epoch: 1, port: 3000, host_header: { mode: "localhost" } });
 
     // Agents can't mint public share links (they bypass Access); the operator API can.

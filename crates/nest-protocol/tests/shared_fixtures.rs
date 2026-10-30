@@ -93,6 +93,18 @@ fn enum_members_match_enums_json() {
     assert_eq!(listed, seen, "enums.json lists an enum this test doesn't check");
 }
 
+/// Host roles, expand/contract: the next release's names (`sandbox`, `brain`) parse now, and this
+/// release still writes the previous release's (`burst`, `controller`), which its control plane reads.
+#[test]
+fn host_role_reads_both_names_and_writes_the_previous_ones() {
+    for (old, new, kind) in [("burst", "sandbox", HostRole::Sandbox), ("controller", "brain", HostRole::Brain)] {
+        assert_eq!(serde_json::from_value::<HostRole>(json!(old)).unwrap(), kind);
+        assert_eq!(serde_json::from_value::<HostRole>(json!(new)).unwrap(), kind);
+        assert_eq!(wire(kind), old);
+    }
+    assert!(serde_json::from_value::<HostRole>(json!("worker")).is_err());
+}
+
 #[test]
 fn ids_check_their_prefix_when_parsed() {
     fn rejects<T: DeserializeOwned + Debug>(bad: &str) {

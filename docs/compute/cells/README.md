@@ -4,8 +4,8 @@ A cell is compute plus its object store in one provider and region (AWS today). 
 
 | Per cell | Made by | Reaches the control plane as |
 |---|---|---|
-| VPC, subnets, security group, bucket, host role, launch template, host image pipeline | The cell's stack | `AWS_CELLS.<cell>`: template and subnets |
-| Region and autoscaler settings | The cell's stack spec | `AWS_CELLS.<cell>` |
+| VPC, subnets, bucket, host image pipeline; per host kind a security group, an instance role and a launch template | The cell's stack | `AWS_CELLS.<cell>`: the sandbox template, subnets, and `brain.launch_template_id` |
+| Region and autoscaler settings, per host kind | The cell's stack spec | `AWS_CELLS.<cell>` (sandbox hosts) and `AWS_CELLS.<cell>.brain` (brain hosts; optional for one release: a cell without it launches none) |
 | Proxy root CA key (`alias/nest-<cell>-proxy-root`) | The cell's stack | `AWS_CELLS.<cell>.proxy_root_key_arn` |
 | Root CA certificate | FleetDO, from the key ([tls](../../sandbox/networking/egress/tls/)) | FleetDO's storage; `GET /v1/admin/root-ca?cell=<cell>` |
 | IAM user `nest-<cell>-control-plane`; its policy names only this cell's template, host role, AMI parameter and key | The cell's stack; its access key by hand | `AWS_CELL_CREDENTIALS.<cell>` (a Worker secret) |

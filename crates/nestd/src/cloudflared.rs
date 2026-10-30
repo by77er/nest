@@ -497,7 +497,7 @@ mod tests {
 
     fn config(json: serde_json::Value) -> Config {
         let mut base = serde_json::json!({
-            "role": "burst", "cell": "c", "enrollment": {"type": "aws_imds"},
+            "role": "sandbox", "cell": "c", "enrollment": {"type": "aws_imds"},
             "driver": {"type": "process", "guest_command": ["x"]}, "state_dir": "/var/lib/nest-test",
         });
         base.as_object_mut().unwrap().extend(json.as_object().unwrap().clone());

@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "role": "controller",
+  "cell": "hetzner-fsn1",
+  "proof": {
+    "type": "enrollment_token",
+    "token": "net_7r2k9d4w1z6m3p8q0s5t"
+  }
+}

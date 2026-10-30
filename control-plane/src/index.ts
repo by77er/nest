@@ -103,7 +103,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "GET" && path === "/v1/health") return json({ ok: true, protocol_version: PROTOCOL_VERSION });
   if (req.method === "POST" && path === "/v1/hosts/enroll") return enroll(req, env);
 
-  // Host-authenticated HTTP: object-store GC (a burst host runs it; FleetDO says when and from what).
+  // Host-authenticated HTTP: object-store GC (a sandbox host runs it; FleetDO says when and from what).
   if (req.method === "POST" && (path === "/v1/hosts/gc/claim" || path === "/v1/hosts/gc/report")) {
     const token = bearer(req);
     if (!token) throw new NestError(ErrorCodes.UNAUTHORIZED, "host token required", 401);
@@ -176,7 +176,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "GET" && path === "/v1/admin/gc") return json(await fleet(env, cell).gcStatus());
   if (req.method === "POST" && path === "/v1/admin/gc/run") {
     await fleet(env, cell).gcRequest();
-    return json({ ok: true, note: "the next burst host to check in runs it (dry run until one completes)" });
+    return json({ ok: true, note: "the next sandbox host to check in runs it (dry run until one completes)" });
   }
   if (req.method === "POST" && path === "/v1/admin/gc/register") {
     const r = await body(req, z.object({ sandboxes: z.array(z.string().startsWith("sbx_")) }));

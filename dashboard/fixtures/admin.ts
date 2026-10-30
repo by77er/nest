@@ -2,7 +2,7 @@
 // types (src/api.ts re-exports them): `npm run typecheck` fails when a field is missing, extra or of
 // another type.
 // Recorded once from the control plane's test pool (a throwaway vitest case in control-plane/test
-// against FleetDO: one connected burst host with a running sandbox, an agent and a launch, then
+// against FleetDO: one connected sandbox host with a running sandbox, an agent and a launch, then
 // GET /v1/admin/fleet and GET /v1/admin/images); re-record when fleetView or images change.
 import type { Fleet, Images } from "../src/api";
 
@@ -10,7 +10,7 @@ export const fleet = {
   "hosts": [
     {
       "host": "hst_01m5pv156anzgr2gqs5stpewgt",
-      "role": "burst",
+      "role": "sandbox",
       "instance_id": "i-0f1e2d3c4b5a69788",
       "status": "active",
       "idle_since": null,
@@ -43,7 +43,8 @@ export const fleet = {
       ],
       "wedged_ms": null,
       "lost": false,
-      "brain_epochs": true
+      "brain_epochs": true,
+      "max_brains": null
     }
   ],
   "launches": [

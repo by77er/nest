@@ -88,7 +88,7 @@ The provisioning key creates the narrow credentials nest actually runs with:
 
 **Unlocks:** brains off the sandbox hosts: spike item 13's second half, and the two host kinds scaling apart.
 
-Nothing new to provide. Brain hosts live in the same account and cell, launched by FleetDO from a second launch template (no KVM, no hugepages, no S3 access; the class from the decisions above). They get the Claude Code baseline and the setup token from BrokerDO, like any host. The tunnel below is what lets them reach sandboxes, so stage 4 needs the domain and the tunnel credentials from the table below first.
+Nothing new to provide. Brain hosts live in the same account and cell, launched by FleetDO from a second launch template (no KVM, no hugepages; in S3 it may read the release, `releases/*`, only; the class from the decisions above). They get the Claude Code baseline and the setup token from BrokerDO, like any host. The tunnel below is what lets them reach sandboxes, so stage 4 needs the domain and the tunnel credentials from the table below first.
 
 ## Later (not needed to start testing)
 

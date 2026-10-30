@@ -28,12 +28,13 @@ async function toolNames(ws: Ws): Promise<{ name: string; roles?: unknown }[]> {
 async function cellWithSandbox() {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-default" } });
-  const burst = await connectHost(cell);
-  const controller = await connectHost(cell, "controller");
+  const sandboxHost = await connectHost(cell);
+  // Every brain, with hands or without, runs on a brain host.
+  const brain = await connectHost(cell, "brain");
   const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "templates" } }, 201);
   const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
-  await nextCommands(burst.ws, (c) => c.type === "sandbox_create");
-  return { cell, burst, controller, workstream: workstream as string, sandbox: sbx.sandbox as string };
+  await nextCommands(sandboxHost.ws, (c) => c.type === "sandbox_create");
+  return { cell, brain, workstream: workstream as string, sandbox: sbx.sandbox as string };
 }
 
 /** Edit AgentInfo in place (a record as an earlier release, or a bad edit, left it). */
@@ -89,7 +90,7 @@ describe("an agent is its expanded spec", () => {
     expect(a).not.toHaveProperty("role");
 
     // An agent with hands starts where its sandbox is, whatever its template is called.
-    const [start] = await nextCommands(s.burst.ws, isStartOf(a.agent));
+    const [start] = await nextCommands(s.brain.ws, isStartOf(a.agent));
     expect(start).toMatchObject({
       oauth_token: "sk-reviewer",
       launch: { builtin_tools: ["TodoWrite"], system_prompt: { mode: "append", text: "You review.\n\nReview carefully." } },
@@ -97,7 +98,7 @@ describe("an agent is its expanded spec", () => {
       role: "worker", // deprecated, for runners of the previous release
     });
 
-    const ws = await runner(a.agent, s.burst.host, s.burst.host_token);
+    const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     const tools = await toolNames(ws);
     expect(tools.map((t) => t.name)).toEqual(["notify", "read_transcript"]);
     // `roles: []` on every definition, for runners of the previous release (they require the field).
@@ -116,7 +117,7 @@ describe("an agent is its expanded spec", () => {
         hands: "optional", credential: "claude_oauth_token", escalate_to: "user" },
     });
     const a = await adminJson("/v1/agents", { body: { template: name, workstream: s.workstream, cell: s.cell } }, 201);
-    const [start] = await nextCommands(s.controller.ws, isStartOf(a.agent));
+    const [start] = await nextCommands(s.brain.ws, isStartOf(a.agent));
     expect(start).toMatchObject({ oauth_token: "sk-default", role: "captain" });
     expect(start).not.toHaveProperty("hands");
     // Nothing subscribed it to the workstream: only a template that says so does (the captain's).
@@ -149,8 +150,8 @@ describe("an agent is its expanded spec", () => {
     expect((await adminJson("/v1/agents", { body: { template: "worker", workstream: s.workstream, cell: s.cell } }, 400)).error.message)
       .toContain("needs a sandbox");
 
-    await nextCommands(s.burst.ws, isStartOf(a.agent));
-    const ws = await runner(a.agent, s.burst.host, s.burst.host_token);
+    await nextCommands(s.brain.ws, isStartOf(a.agent));
+    const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     ws.send({ type: "tool_call", seq: 1, call: "cal_esc-1", turn: "trn_x", name: "ask", arguments: { question: "Which colour?" } });
     for (let i = 0; i < 50 && !(await wsStub(s.workstream).userNotifications()).some((n) => n.text.includes("Which colour?")); i++) {
       await new Promise((r) => setTimeout(r, 10));
@@ -165,8 +166,8 @@ describe("escalation and the workstream channel's subscriber", () => {
     const s = await cellWithSandbox();
     const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell } }, 201);
     expect((await wsStub(s.workstream).info()).subscriber).toBe(c.agent);
-    await nextCommands(s.controller.ws, isStartOf(c.agent));
-    const ws = await runner(c.agent, s.controller.host, s.controller.host_token);
+    await nextCommands(s.brain.ws, isStartOf(c.agent));
+    const ws = await runner(c.agent, s.brain.host, s.brain.host_token);
     ws.send({ type: "tool_call", seq: 1, call: "cal_cq-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "to whom?" } });
     expect((await ws.next("tool_result", (m) => m.call === "cal_cq-1")).outcome.status).toBe("ok");
     expect((await wsStub(s.workstream).userNotifications()).map((n) => n.text)).toContain("to whom?");
@@ -179,8 +180,8 @@ describe("escalation and the workstream channel's subscriber", () => {
     const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell, start: false } }, 201);
     const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
     expect(w.owner).toBeNull();
-    await nextCommands(s.burst.ws, isStartOf(w.agent));
-    const ws = await runner(w.agent, s.burst.host, s.burst.host_token);
+    await nextCommands(s.brain.ws, isStartOf(w.agent));
+    const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
     ws.send({ type: "tool_call", seq: 1, call: "cal_ws-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "done" } });
     expect((await ws.next("tool_result", (m) => m.call === "cal_ws-1")).outcome.status).toBe("ok");
     const turns = await agentStub(c.agent).turns();
@@ -221,8 +222,8 @@ describe("records stored with a role (the previous release)", () => {
     expect(stored).toMatchObject({ role: "worker", grants: ["notify", "emit"], captain: c.agent });
     for (const k of ["role", "grants", "captain"]) expect(info).not.toHaveProperty(k);
 
-    await nextCommands(s.burst.ws, isStartOf(w.agent));
-    const ws = await runner(w.agent, s.burst.host, s.burst.host_token);
+    await nextCommands(s.brain.ws, isStartOf(w.agent));
+    const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
     expect((await toolNames(ws)).map((t) => t.name)).toEqual(["notify", "emit"]);
   });
 });
@@ -268,8 +269,8 @@ describe("one release of compatibility, and the review's edge cases", () => {
     await editAgent(w.agent, (i) => {
       i.owner = c.agent;
     });
-    await nextCommands(s.burst.ws, isStartOf(w.agent));
-    const ws = await runner(w.agent, s.burst.host, s.burst.host_token);
+    await nextCommands(s.brain.ws, isStartOf(w.agent));
+    const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
     ws.send({ type: "tool_call", seq: 1, call: "cal_own-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "hi" } });
     expect((await ws.next("tool_result", (m) => m.call === "cal_own-1")).outcome.error.code).toBe("forbidden");
     expect(await agentStub(c.agent).turns()).toEqual([]);
@@ -278,8 +279,8 @@ describe("one release of compatibility, and the review's edge cases", () => {
   it("an ask re-run after its escalation changed is applied once, where it first went", async () => {
     const s = await cellWithSandbox();
     const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
-    await nextCommands(s.burst.ws, isStartOf(w.agent));
-    const ws = await runner(w.agent, s.burst.host, s.burst.host_token);
+    await nextCommands(s.brain.ws, isStartOf(w.agent));
+    const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
     const ask = { type: "tool_call", call: "cal_rr-1", turn: "trn_x", name: "ask", arguments: { question: "Rerouted?" } };
     ws.send({ ...ask, seq: 1 });
     await ws.next("ack", (m) => m.up_to >= 1);

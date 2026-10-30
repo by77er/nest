@@ -52,7 +52,7 @@ describe("egress policy layers", () => {
 describe("workstreams and captain wakes", () => {
   it("batches decision events into one event_batch turn for the captain; progress alone doesn't wake", async () => {
     const cell = uniqueCell();
-    await connectHost(cell, "controller");
+    await connectHost(cell, "brain");
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk" } });
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "dark mode" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;

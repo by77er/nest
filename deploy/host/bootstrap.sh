@@ -1,12 +1,19 @@
 #!/bin/bash
-# Burst-host bootstrap (EC2 user-data, rendered by the cell stack in deploy/). It holds no secrets:
-# the host proves itself with its signed instance identity document, reads its binaries from the
-# cell's bucket through the instance role, and gets the Claude setup token per brain from the
-# control plane. The host AMI (EC2 Image Builder) has install.sh's work baked in; install.sh runs
-# here too, so a host on an AMI behind the release, or on stock Amazon Linux 2023, catches up.
+# Host bootstrap (EC2 user-data, rendered by the cell stack in deploy/, one per launch template).
+# It holds no secrets: the host proves itself with its signed instance identity document and gets
+# the Claude setup token per brain from the control plane. Both kinds boot the one host AMI (EC2
+# Image Builder bakes install.sh's work) and run install.sh here too, reading the release from the
+# cell's bucket (a brain host's role may read `releases/` only), so a host on an AMI behind the
+# release, or on stock Amazon Linux 2023, catches up and every host runs the current release.
+#
+# ROLE is the template's, in the previous release's names this release (`burst` for a sandbox
+# host, `controller` for a brain host; nestd reads both, and a control plane rolled back to the
+# previous release accepts them; expand/contract, dev/deploy.md). Each kind enables only its own
+# units; install.sh writes every unit and enables none.
 set -euo pipefail
 exec > >(tee -a /var/log/nest-bootstrap.log) 2>&1
 
+ROLE="@ROLE@"
 CELL="@CELL@"
 BUCKET="@BUCKET@"
 REGION="@REGION@"
@@ -18,6 +25,25 @@ cat >/opt/nest/install.sh <<'NEST_INSTALL'
 NEST_INSTALL
 bash /opt/nest/install.sh
 install -d -m 0755 /run/nest /run/nest/runner
+VERSION=$(cat /opt/nest/release/VERSION)
+
+# A brain host: nestd's supervisor duties and the agent runner, nothing that serves a sandbox (no
+# driver, netns, proxy, gateway, tunnel or S3 store; nestd refuses those settings).
+if [ "$ROLE" = controller ]; then
+  cat >/etc/nest/nestd.json <<EOF
+{
+  "role": "$ROLE",
+  "cell": "$CELL",
+  "control_url": "$CONTROL_URL",
+  "enrollment": {"type": "aws_imds"},
+  "versions": {"nest_proxy": "none", "agent_runner": "$VERSION", "claude_code": "$(cat /etc/nest/claude-version)"}
+}
+EOF
+  # Never the sandbox units (nothing enabled them: install.sh enables nothing, and nestd.service
+  # doesn't want nest-proxy).
+  systemctl enable --now nestd.service nest-runner.service
+  exit 0
+fi
 
 # Sandboxes run in Firecracker when the instance has KVM (nested virtualization, set in the launch
 # template); otherwise in the process driver, so a host never comes up unusable.
@@ -40,10 +66,9 @@ else
     "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none"], "mount_disk": true}'
 fi
 
-VERSION=$(cat /opt/nest/release/VERSION)
 cat >/etc/nest/nestd.json <<EOF
 {
-  "role": "burst",
+  "role": "$ROLE",
   "cell": "$CELL",
   "control_url": "$CONTROL_URL",
   "enrollment": {"type": "aws_imds"},
@@ -58,4 +83,7 @@ cat >/etc/nest/nestd.json <<EOF
 }
 EOF
 
+# A sandbox host: nest-proxy, nestd and the gateway. The agent runner stays enabled this release
+# only (expand/contract): this Worker never sends a sandbox host a brain, but a Worker rolled back
+# to the previous release starts workers' brains on their sandbox's host. The next release drops it.
 systemctl enable --now nest-proxy.service nestd.service nest-gateway.service nest-runner.service

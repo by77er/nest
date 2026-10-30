@@ -40,10 +40,12 @@ import Cell.Iam
 
 /-!
 One nest cell on AWS (docs/compute/provisioning/): public subnets with no NAT and an S3 gateway
-endpoint, an egress-only host security group, the cell's bucket, the burst hosts' role and launch
-template, the host-image pipeline, the proxy root CA key, the control plane's IAM user and its
-settings for this cell (its `AWS_CELLS` entry in SSM), and the deploy role GitHub Actions assumes
-over OIDC. It creates no instances: FleetDO launches them.
+endpoint, the cell's bucket, the sandbox hosts' egress-only security group, role and launch
+template, the brain hosts' own (egress 443 only, a role that may only read the release, cheap
+instance types; docs/compute/brain-hosts/), the host-image pipeline (one AMI for both kinds), the proxy
+root CA key, the control plane's IAM user and its settings for this cell (its `AWS_CELLS` entry in
+SSM), and the deploy role GitHub Actions assumes over OIDC. It creates no instances: FleetDO
+launches them.
 -/
 
 open Inframe
@@ -68,7 +70,7 @@ structure CellSpec where
   /-- The autoscaler's settings (control-plane/src/lib/cells.ts, `AWS_CELLS`); the defaults are its own. -/
   spot : Bool := true
   maxHosts : Nat := 1
-  /-- How long a burst host holding no sandbox and no agent stays before it's terminated. -/
+  /-- How long a sandbox host holding no running sandbox stays before it's terminated. -/
   idleGraceMs : Nat := 600000
   /-- A launched instance that hasn't enrolled by then is terminated. -/
   enrollTimeoutMs : Nat := 600000
@@ -76,14 +78,33 @@ structure CellSpec where
   sandboxReserveMib : Nat := 768
   /-- At most this many sandboxes per host on regular pages; 0 is no cap. -/
   maxSandboxesPerHost : Nat := 0
+  /-- Brain hosts (docs/compute/brain-hosts/): the instance families the control plane may launch
+  from the brain template (IAM allows `<family>*.*`). Cheap x86 types, since both kinds boot the
+  one host AMI (x86_64). -/
+  brainInstanceFamilies : List String := ["t3a", "t3"]
+  /-- The brain instance types FleetDO launches, in preference order; the first is also the
+  on-demand fallback. About 2 vCPU / 4 GiB. Each must fall within `brainInstanceFamilies`. -/
+  brainLaunchTypes : List String := ["t3a.medium", "t3.medium"]
+  brainSpot : Bool := true
+  /-- At most this many brain hosts: 3 `t3a.medium`s hold about 12 brains at the default 2 per
+  vCPU, room for today's agents with one host's worth to spare; one host would cap a cell at ~4. -/
+  brainMaxHosts : Nat := 3
+  /-- How long a brain host holding no brain stays before it's terminated. -/
+  brainIdleGraceMs : Nat := 1800000
+  /-- Brains per brain host; 0 derives it from the instance's vCPUs (control-plane/src/lib/placement.ts). -/
+  maxBrainsPerHost : Nat := 0
   /-- The GitHub repository that may assume the deploy role (dev/deploy.md), in GitHub's immutable
   OIDC subject form `OWNER@OWNER-ID/REPO@REPO-ID`: repositories created after 2026-07-15 put the
   owner and repository ids in the `sub` claim, and they can't be removed. -/
   deployRepo : String := "by77er@39721110/nest@1416068100"
   deployEnvironment : String := "production"
 
-/-- Outbound from burst hosts: HTTPS, plus cloudflared's 7844 over TCP and UDP. Nothing inbound. -/
+/-- Outbound from sandbox hosts: HTTPS, plus cloudflared's 7844 over TCP and UDP. Nothing inbound. -/
 def hostEgress : List (String × Nat) := [("tcp", 443), ("tcp", 7844), ("udp", 7844)]
+
+/-- Outbound from brain hosts: HTTPS only (Anthropic, the control plane, the sandbox gateways'
+hostnames, WebFetch). No tunnel, so no 7844. Nothing inbound. -/
+def brainEgress : List (String × Nat) := [("tcp", 443)]
 
 def bucketName (spec : CellSpec) : String := s!"nest-{spec.name}-{spec.accountId}"
 
@@ -99,6 +120,13 @@ def matchesFamily (family type : String) : Bool :=
 def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=
   spec.launchTypes.all fun t => spec.instanceFamilies.any (matchesFamily · t)
 
+/-- The `ec2:InstanceType` patterns IAM allows from the brain template (`BrainTypesOnly`). -/
+def brainInstancePatterns (spec : CellSpec) : List String := spec.brainInstanceFamilies.map (· ++ "*.*")
+
+/-- Every brain type the autoscaler may pick is one IAM lets it launch from the brain template. -/
+def CellSpec.brainLaunchTypesAllowed (spec : CellSpec) : Bool :=
+  spec.brainLaunchTypes.all fun t => spec.brainInstanceFamilies.any (matchesFamily · t)
+
 /-- The prefix under which each cell stack writes its own `AWS_CELLS` entry; the control plane's
 deploy merges every parameter under it (dev/deploy-use1.sh). -/
 def awsCellsPrefix : String := "/nest/control-plane/aws-cells/"
@@ -106,10 +134,11 @@ def awsCellsPrefix : String := "/nest/control-plane/aws-cells/"
 /-- This cell's `AWS_CELLS` parameter: one per cell, so no cell stack overwrites another's entry. -/
 def awsCellsParameter (spec : CellSpec) : String := awsCellsPrefix ++ spec.name
 
-/-- `AWS_CELLS` (control-plane/src/lib/cells.ts): this cell's settings, keyed by its name, from a
-launch template id, subnet ids, the proxy root CA key's ARN and the spec. Generic over the string
-type, so `Cell.Test` can render it with plain strings and parse the JSON; no value needs escaping. -/
-def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : CellSpec) (launchTemplateId : α)
+/-- `AWS_CELLS` (control-plane/src/lib/cells.ts): this cell's settings, keyed by its name, from the
+two launch template ids, subnet ids, the proxy root CA key's ARN and the spec. Generic over the
+string type, so `Cell.Test` can render it with plain strings and parse the JSON; no value needs
+escaping. -/
+def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : CellSpec) (launchTemplateId brainTemplateId : α)
     (subnetIds : List α) (proxyRootKeyArn : α) : α :=
   let quote (v : α) : α := str "\"" ++ v ++ str "\""
   let join : List α → α
@@ -129,13 +158,21 @@ def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : Ce
     , field "enroll_timeout_ms" (number spec.enrollTimeoutMs)
     , field "sandbox_reserve_mib" (number spec.sandboxReserveMib)
     , field "max_sandboxes_per_host" (number spec.maxSandboxesPerHost)
-    , field "proxy_root_key_arn" (quote proxyRootKeyArn) ]
+    , field "proxy_root_key_arn" (quote proxyRootKeyArn)
+    , field "brain" (str "{" ++ join
+        [ field "launch_template_id" (quote brainTemplateId)
+        , field "instance_types" (strings (spec.brainLaunchTypes.map str))
+        , field "spot" (str (if spec.brainSpot then "true" else "false"))
+        , field "max_hosts" (number spec.brainMaxHosts)
+        , field "idle_grace_ms" (number spec.brainIdleGraceMs)
+        , field "max_brains_per_host" (number spec.maxBrainsPerHost) ]
+        ++ str "}") ]
     ++ str "}}"
 
-/-- `AWS_CELLS` from the stack's own launch template, subnets and proxy root CA key. -/
-def awsCells (spec : CellSpec) (launchTemplateId : Input String) (subnetIds : List (Input String))
+/-- `AWS_CELLS` from the stack's own launch templates, subnets and proxy root CA key. -/
+def awsCells (spec : CellSpec) (launchTemplateId brainTemplateId : Input String) (subnetIds : List (Input String))
     (proxyRootKeyArn : Input String) : Input String :=
-  awsCellsWith lit spec launchTemplateId subnetIds proxyRootKeyArn
+  awsCellsWith lit spec launchTemplateId brainTemplateId subnetIds proxyRootKeyArn
 
 def bootstrapTemplate : String := include_str "../../host/bootstrap.sh"
 def installTemplate : String := include_str "../../host/install.sh"
@@ -144,11 +181,28 @@ def installTemplate : String := include_str "../../host/install.sh"
 def install (spec : CellSpec) : String :=
   (installTemplate.replace "@BUCKET@" (bucketName spec)).replace "@REGION@" spec.region
 
-/-- The bootstrap script (user-data) with this cell's values; it carries no secrets. -/
-def bootstrap (spec : CellSpec) : String :=
+/-- A host's kind, written into its nestd config by its launch template's user data: the role
+comes from which template FleetDO launched (and FleetDO's launch record binds the enrollment to
+it), not from anything the instance could change. -/
+inductive HostKind where
+  | sandbox
+  | brain
+  deriving DecidableEq
+
+/-- The role name the user data writes into nestd's config: this release still writes the
+previous release's names (`burst`, `controller`; nestd reads both), so a control plane rolled back
+to the previous release accepts every host these templates launch. The next release writes
+`sandbox` and `brain` (expand/contract, dev/deploy.md). -/
+def HostKind.roleName : HostKind → String
+  | .sandbox => "burst"
+  | .brain => "controller"
+
+/-- The bootstrap script (user-data) for one host kind, with this cell's values; it carries no
+secrets. -/
+def bootstrap (spec : CellSpec) (kind : HostKind) : String :=
   let withCell := (bootstrapTemplate.replace "@BUCKET@" (bucketName spec)).replace "@CELL@" spec.name
   let withInstall := withCell.replace "@INSTALL@\n" (install spec)
-  (withInstall.replace "@REGION@" spec.region).replace "@CONTROL_URL@" spec.controlUrl
+  ((withInstall.replace "@REGION@" spec.region).replace "@CONTROL_URL@" spec.controlUrl).replace "@ROLE@" kind.roleName
 
 /-- The SSM parameter holding the newest host AMI. The launch template resolves it at each launch;
 the pipeline rewrites it after each build (Image Builder's service role may write only under
@@ -159,7 +213,20 @@ def hostAmiParameter (spec : CellSpec) : String := s!"/imagebuilder/nest-{spec.n
 new install script gets a new version (from its hash) and replaces the old one. -/
 def imageVersion (spec : CellSpec) : String := s!"1.0.{(hash (install spec)).toNat % 1000000000}"
 
-/-- The burst hosts' permissions: the cell's bucket, nothing else. -/
+/-- Read the release (host binaries, install inputs) and nothing else in the bucket: list under
+`releases/`, get objects under `releases/`. -/
+def releaseReadStatements (spec : CellSpec) : List Statement :=
+  [ { sid := "ListReleases", actions := ["s3:ListBucket"], resources := [lit s!"arn:aws:s3:::{bucketName spec}"]
+      conditions := [{ op := "StringLike", entries := [("s3:prefix", [lit "releases/*"])] }] }
+  , { sid := "ReadReleases", actions := ["s3:GetObject"], resources := [lit s!"arn:aws:s3:::{bucketName spec}/releases/*"] } ]
+
+/-- The brain hosts' permissions: read the release, so a brain host installs it at boot like a
+sandbox host and runs every release, not the one its AMI baked. No sandbox state (no chunk,
+manifest or audit object), no writes. It authenticates to the control plane with its signed
+identity document, which needs no IAM permission. -/
+def brainHostStatements (spec : CellSpec) : List Statement := releaseReadStatements spec
+
+/-- The sandbox hosts' permissions: the cell's bucket, nothing else. -/
 def hostStatements (spec : CellSpec) : List Statement :=
   [ { sid := "CellBucket", actions := ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketLocation"]
       resources := [lit s!"arn:aws:s3:::{bucketName spec}"] }
@@ -170,19 +237,25 @@ def hostStatements (spec : CellSpec) : List Statement :=
 
 /-- The image builder's permissions, beside Image Builder's managed instance policies: read the
 release it bakes. -/
-def builderStatements (spec : CellSpec) : List Statement :=
-  [ { sid := "ListReleases", actions := ["s3:ListBucket"], resources := [lit s!"arn:aws:s3:::{bucketName spec}"]
-      conditions := [{ op := "StringLike", entries := [("s3:prefix", [lit "releases/*"])] }] }
-  , { sid := "ReadReleases", actions := ["s3:GetObject"], resources := [lit s!"arn:aws:s3:::{bucketName spec}/releases/*"] } ]
+def builderStatements (spec : CellSpec) : List Statement := releaseReadStatements spec
 
-/-- The control plane's permissions (FleetDO): launch only from the cell's template, only 8i;
-stop and terminate only instances tagged `nest=true`; describe instances and images (the operator
-view of host AMIs); resolve the host AMI parameter;
-sign with the proxy root CA key. -/
-def controlPlaneStatements (spec : CellSpec) (template hostRole rootKey : Input String) : List Statement :=
-  let fromTemplate : Condition := { op := "ArnLike", entries := [("ec2:LaunchTemplate", [template])] }
+/-- The control plane's permissions (FleetDO): launch only from the cell's two templates, sandbox
+hosts only as 8i with the sandbox hosts' instance profile and brain hosts only as the brain
+families with theirs, each from its own template; pass only the two host roles; stop and terminate
+only instances tagged `nest=true`; describe instances and images (the operator view of host AMIs);
+resolve the host AMI parameter; sign with the proxy root CA key.
+
+The profile conditions are `ArnEqualsIfExists` on `ec2:InstanceProfile`: a request (or template)
+naming another profile is refused, and should IAM not populate the key from a launch template's
+profile (unverified on AWS), launches still work rather than all failing; the graph policy
+`template-profiles` checks each template names its own profile. -/
+def controlPlaneStatements (spec : CellSpec) (template brainTemplate hostRole brainRole hostProfile brainProfile rootKey : Input String) :
+    List Statement :=
+  let fromTemplate : Condition := { op := "ArnLike", entries := [("ec2:LaunchTemplate", [template, brainTemplate])] }
+  let fromSandboxTemplate : Condition := { op := "ArnLike", entries := [("ec2:LaunchTemplate", [template])] }
+  let fromBrainTemplate : Condition := { op := "ArnLike", entries := [("ec2:LaunchTemplate", [brainTemplate])] }
   let ec2 (kind : String) : Input String := lit s!"arn:aws:ec2:{spec.region}:{spec.accountId}:{kind}"
-  [ { sid := "LaunchFromTemplateOnly", actions := ["ec2:RunInstances"], resources := [template]
+  [ { sid := "LaunchFromTemplateOnly", actions := ["ec2:RunInstances"], resources := [template, brainTemplate]
       conditions := [fromTemplate] }
   , { sid := "LaunchedResources", actions := ["ec2:RunInstances"]
       resources := [lit s!"arn:aws:ec2:{spec.region}::image/*", ec2 "subnet/*", ec2 "network-interface/*", ec2 "volume/*",
@@ -191,10 +264,14 @@ def controlPlaneStatements (spec : CellSpec) (template hostRole rootKey : Input 
   , { sid := "SecurityGroupFromTemplate", actions := ["ec2:RunInstances"], resources := [ec2 "security-group/*"]
       conditions := [fromTemplate, { op := "Bool", entries := [("ec2:IsLaunchTemplateResource", ["true"])] }] }
   , { sid := "EightIOnly", actions := ["ec2:RunInstances"], resources := [ec2 "instance/*"]
-      conditions := [fromTemplate, { op := "StringLike", entries := [("ec2:InstanceType", (instancePatterns spec).map lit)] }] }
+      conditions := [fromSandboxTemplate, { op := "StringLike", entries := [("ec2:InstanceType", (instancePatterns spec).map lit)] },
+        { op := "ArnEqualsIfExists", entries := [("ec2:InstanceProfile", [hostProfile])] }] }
+  , { sid := "BrainTypesOnly", actions := ["ec2:RunInstances"], resources := [ec2 "instance/*"]
+      conditions := [fromBrainTemplate, { op := "StringLike", entries := [("ec2:InstanceType", (brainInstancePatterns spec).map lit)] },
+        { op := "ArnEqualsIfExists", entries := [("ec2:InstanceProfile", [brainProfile])] }] }
   , { sid := "TagAtLaunch", actions := ["ec2:CreateTags"], resources := [lit "*"]
       conditions := [{ op := "StringEquals", entries := [("ec2:CreateAction", ["RunInstances"])] }] }
-  , { sid := "PassHostRole", actions := ["iam:PassRole"], resources := [hostRole]
+  , { sid := "PassHostRoles", actions := ["iam:PassRole"], resources := [hostRole, brainRole]
       conditions := [{ op := "StringEquals", entries := [("iam:PassedToService", ["ec2.amazonaws.com"])] }] }
   , { sid := "StonithNestOnly", actions := ["ec2:TerminateInstances", "ec2:StopInstances"], resources := [ec2 "instance/*"]
       conditions := [{ op := "StringEquals", entries := [("aws:ResourceTag/nest", ["true"])] }] }
@@ -239,7 +316,8 @@ def cell (spec : CellSpec) : Infra Unit := do
     { vpcId := vpc.id, serviceName := lit s!"com.amazonaws.{spec.region}.s3", vpcEndpointType := "Gateway"
       routeTableIds := some (array [routes.id]) }
 
-  -- The host security group. The provider removes AWS's default allow-all egress rule.
+  -- The sandbox host security group. The provider removes AWS's default allow-all egress rule.
+  -- (Its description is the previous release's: changing it would replace the group.)
   let sg ← SecurityGroup.create "host"
     { name := lit s!"nest-{spec.name}-host", description := "nest burst hosts: egress 443 and 7844 only, no ingress"
       vpcId := vpc.id, revokeRulesOnDelete := true }
@@ -249,6 +327,12 @@ def cell (spec : CellSpec) : Infra Unit := do
     { securityGroupId := sg.id, ipProtocol := "tcp", fromPort := 7844, toPort := 7844, cidrIpv4 := "0.0.0.0/0" }
   let _ ← VpcSecurityGroupEgressRule.create "cloudflared_udp"
     { securityGroupId := sg.id, ipProtocol := "udp", fromPort := 7844, toPort := 7844, cidrIpv4 := "0.0.0.0/0" }
+  -- The brain host security group: HTTPS out, nothing else, nothing in (no tunnel on a brain host).
+  let brainSg ← SecurityGroup.create "brain"
+    { name := lit s!"nest-{spec.name}-brain", description := "nest brain hosts: egress 443 only, no ingress"
+      vpcId := vpc.id, revokeRulesOnDelete := true }
+  let _ ← VpcSecurityGroupEgressRule.create "brain_https"
+    { securityGroupId := brainSg.id, ipProtocol := "tcp", fromPort := 443, toPort := 443, cidrIpv4 := "0.0.0.0/0" }
 
   -- The cell's bucket: versioned Standard; noncurrent versions expire after a day.
   let bucket ← S3Bucket.createWith "cell" { bucket := lit (bucketName spec) }
@@ -266,21 +350,29 @@ def cell (spec : CellSpec) : Infra Unit := do
                  noncurrentVersionExpiration := [{ noncurrentDays := 1 }]
                  abortIncompleteMultipartUpload := [{ daysAfterInitiation := 1 }] }] }
 
-  -- Burst hosts: the cell's bucket only, and only through the endpoint (the bucket policy).
+  -- Sandbox hosts: the cell's bucket only, and only through the endpoint (the bucket policy).
   let hostRole ← IamRole.create "host"
     { name := lit s!"nest-{spec.name}-host"
       assumeRolePolicy := "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}" }
   let _ ← IamRolePolicy.create "host_cell_bucket"
     { name := "cell-bucket", role := hostRole.id, policy := document (hostStatements spec) }
   let profile ← IamInstanceProfile.create "host" { name := lit s!"nest-{spec.name}-host", role := hostRole.name }
+  -- Brain hosts: read the release, nothing else (`brainHostStatements`; the `brain-role-exact`
+  -- policy checks that this inline policy is the only way any permission reaches the role).
+  let brainRole ← IamRole.create "brain"
+    { name := lit s!"nest-{spec.name}-brain"
+      assumeRolePolicy := "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}" }
+  let _ ← IamRolePolicy.create "brain_releases"
+    { name := "read-releases", role := brainRole.id, policy := document (brainHostStatements spec) }
+  let brainProfile ← IamInstanceProfile.create "brain" { name := lit s!"nest-{spec.name}-brain", role := brainRole.name }
   let _ ← S3BucketPolicy.create "cell"
     { bucket := bucket.id
       policy := "{\"Version\":\"2012-10-17\",\"Statement\":["
         ++ "{\"Sid\":\"TlsOnly\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"" ++ bucket.arn ++ "\",\""
         ++ bucket.arn ++ "/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}},"
         ++ "{\"Sid\":\"HostsOnlyThroughEndpoint\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\""
-        ++ bucket.arn ++ "\",\"" ++ bucket.arn ++ "/*\"],\"Condition\":{\"ArnEquals\":{\"aws:PrincipalArn\":\"" ++ hostRole.arn
-        ++ "\"},\"StringNotEquals\":{\"aws:SourceVpce\":\"" ++ s3.id ++ "\"}}}]}" }
+        ++ bucket.arn ++ "\",\"" ++ bucket.arn ++ "/*\"],\"Condition\":{\"ArnEquals\":{\"aws:PrincipalArn\":[\"" ++ hostRole.arn
+        ++ "\",\"" ++ brainRole.arn ++ "\"]},\"StringNotEquals\":{\"aws:SourceVpce\":\"" ++ s3.id ++ "\"}}}]}" }
 
   -- The host AMI: Amazon Linux 2023 with install.sh baked in, built by EC2 Image Builder in the
   -- cell's subnet (so it reads the release like a host). Builds run on demand:
@@ -372,7 +464,26 @@ def cell (spec : CellSpec) : Infra Unit := do
                                 ebs := some { volumeSize := 30, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
       tagSpecifications := [{ resourceType := "instance", tags := some (nestTags spec) },
                             { resourceType := "volume", tags := some (nestTags spec) }]
-      userData := some (unsafeCall "base64encode" [unsafeArgument (lit (bootstrap spec))] : Input String)
+      userData := some (unsafeCall "base64encode" [unsafeArgument (lit (bootstrap spec .sandbox))] : Input String)
+      updateDefaultVersion := true }
+
+  -- The brain launch template: the same AMI, cheap instances without nested virtualization, the
+  -- brain security group and role, IMDSv2 with hop limit 1, tagged `nest=true`, standard CPU
+  -- credits (a burstable type never bills for surplus). Its user data writes `role: brain`.
+  let brainTemplate ← LaunchTemplate.create "brain"
+    { name := lit s!"nest-{spec.name}-brain"
+      imageId := lit "resolve:ssm:" ++ hostAmi.name
+      iamInstanceProfile := some { arn := brainProfile.arn }
+      vpcSecurityGroupIds := some (array [brainSg.id])
+      creditSpecification := some { cpuCredits := "standard" }
+      metadataOptions := some { httpEndpoint := "enabled", httpTokens := "required", httpPutResponseHopLimit := 1
+                                instanceMetadataTags := "disabled" }
+      instanceInitiatedShutdownBehavior := "terminate"
+      blockDeviceMappings := [{ deviceName := "/dev/xvda"
+                                ebs := some { volumeSize := 30, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
+      tagSpecifications := [{ resourceType := "instance", tags := some (nestTags spec) },
+                            { resourceType := "volume", tags := some (nestTags spec) }]
+      userData := some (unsafeCall "base64encode" [unsafeArgument (lit (bootstrap spec .brain))] : Input String)
       updateDefaultVersion := true }
 
   -- The proxy root CA: a non-exportable P-256 signing key. FleetDO signs each host's intermediate
@@ -389,14 +500,16 @@ def cell (spec : CellSpec) : Infra Unit := do
   let templateArn : Input String := template.arn
   -- A managed policy: the document is over IAM's 2,048-byte limit for inline user policies.
   let fleet ← IamPolicy.create "control_plane_fleet"
-    { name := lit s!"nest-{spec.name}-fleet", policy := document (controlPlaneStatements spec templateArn hostRole.arn rootKey.arn) }
+    { name := lit s!"nest-{spec.name}-fleet"
+      policy := document (controlPlaneStatements spec templateArn brainTemplate.arn hostRole.arn brainRole.arn profile.arn brainProfile.arn
+        rootKey.arn) }
   let _ ← IamUserPolicyAttachment.create "control_plane_fleet" { user := cp.name, policyArn := fleet.arn }
   -- This cell's settings, from the template, subnets and root key above: a replaced template,
   -- subnet or key reaches the Worker on the deploy that follows the apply (dev/deploy-use1.sh
   -- merges every cell's parameter into `AWS_CELLS`).
   let _ ← SsmParameter.create "aws_cells"
     { name := lit (awsCellsParameter spec), type := "String"
-      insecureValue := awsCells spec template.id [subnetA.id, subnetB.id, subnetC.id] rootKey.arn
+      insecureValue := awsCells spec template.id brainTemplate.id [subnetA.id, subnetB.id, subnetC.id] rootKey.arn
       description := lit s!"nest: the {spec.name} cell's AWS_CELLS entry for the control plane (written by its cell stack)" }
 
   -- Spot interruption drill: `aws fis start-experiment --experiment-template-id <output>` sends a
@@ -434,6 +547,8 @@ def cell (spec : CellSpec) : Infra Unit := do
 
   output "bucket" bucket.id
   output "launch_template_id" template.id
+  output "brain_launch_template_id" brainTemplate.id
+  output "brain_security_group_id" brainSg.id
   output "subnet_ids" (array [subnetA.id, subnetB.id, subnetC.id])
   output "security_group_id" sg.id
   output "s3_endpoint_id" s3.id

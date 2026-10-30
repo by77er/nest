@@ -51,7 +51,9 @@ async function setup(opts: { guest?: unknown } = {}) {
   // nestd reports `running` once the guest is up, before any attach result; resolve needs it.
   await running(host.ws, sbx.sandbox, 1, "running", "guest" in opts ? opts.guest : GUEST);
   const pub = b64urlToBytes(host.keys[0]!.public_key);
-  return { cell, host, workstream, sandbox: sbx.sandbox as string, agent: worker.agent as string, attach, pub };
+  // Where the worker's brain runs: a brain host, never the sandbox's.
+  const brain = await connectHost(cell, "brain");
+  return { cell, host, brain, workstream, sandbox: sbx.sandbox as string, agent: worker.agent as string, attach, pub };
 }
 
 async function verified(pub: Uint8Array, target: HandsTarget) {
@@ -69,7 +71,7 @@ describe("binding keys", () => {
     expect(pub.length).toBe(65);
     expect(a.keys[0]!.kid).toBe(await kidOf(pub));
     // A second host in the same cell gets the same key; another cell gets its own.
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     expect(b.keys).toEqual(a.keys);
     const other = await connectHost(uniqueCell());
     expect(other.keys[0]!.kid).not.toBe(a.keys[0]!.kid);
@@ -307,11 +309,11 @@ describe("hands_resolve on the session channel", () => {
   it("answers not-ready with a retry hint while the slot is pending, then a verifying target", async () => {
     const s = await setup();
     const { cmd } = await agentStub(s.agent).start();
-    const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
+    const [start] = await nextCommands(s.brain.ws, (c) => c.cmd === cmd);
     expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 } });
     expect(start.hands.binding, "no binding ever passes through a host command").toBeUndefined();
-    const ws = await Ws.connect(`/v1/agents/${s.agent}/session`, s.host.host_token);
-    ws.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.host.host, instance_id: "rin_hands", epoch: 1 });
+    const ws = await Ws.connect(`/v1/agents/${s.agent}/session`, s.brain.host_token);
+    ws.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.brain.host, instance_id: "rin_hands", epoch: 1 });
     await ws.next("hello_ack");
     ws.send({ type: "hands_resolve", request: "req_1" });
     const notReady = await ws.next("hands_resolved", (m) => m.request === "req_1");
@@ -339,9 +341,9 @@ describe("hands_resolve on the session channel", () => {
     const s = await setup();
     await okResult(s.host.ws, s.attach.cmd);
     const { cmd } = await agentStub(s.agent).start();
-    await nextCommands(s.host.ws, (c) => c.cmd === cmd);
-    const ws = await Ws.connect(`/v1/agents/${s.agent}/session`, s.host.host_token);
-    ws.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.host.host, instance_id: "rin_old", epoch: 0 });
+    await nextCommands(s.brain.ws, (c) => c.cmd === cmd);
+    const ws = await Ws.connect(`/v1/agents/${s.agent}/session`, s.brain.host_token);
+    ws.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.brain.host, instance_id: "rin_old", epoch: 0 });
     await ws.next("hello_ack");
     await ws.next("error", (m) => m.error.code === "stale_epoch");
     ws.send({ type: "hands_resolve", request: "req_stale" });
@@ -353,7 +355,7 @@ describe("hands_resolve on the session channel", () => {
   it("a captain has no hands: not_bound, not retryable", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-hands" } });
-    const ctl = await connectHost(cell, "controller");
+    const ctl = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "captain" } }, 201);
     const captain = await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201);
     const [start] = await nextCommands(ctl.ws, (c) => c.type === "agent_start" && c.agent === captain.agent);

@@ -1,5 +1,5 @@
-// Burst-host launches and STONITH through the EC2 Query API. Scoped IAM: RunInstances only from the
-// cell's launch template; terminate/stop only instances tagged nest=true.
+// Host launches and STONITH through the EC2 Query API. Scoped IAM: RunInstances only from the
+// cell's two launch templates (sandbox hosts, brain hosts); terminate/stop only instances tagged nest=true.
 import { AwsClient } from "aws4fetch";
 
 export type InstanceState = "pending" | "running" | "shutting-down" | "terminated" | "stopping" | "stopped" | "unknown";

@@ -7,7 +7,7 @@ nest is two systems with one seam between them:
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
-> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13)). **Not built:** brain hosts (today every brain starts on its sandbox's host, stays there when the sandbox moves, and reaches the guest only through its gateway; FleetDO has `burst` and `controller` host roles, and AgentDO starts captains on a `controller` host), and the coordination layer (ChannelDO, HookDO, grants, taint, `wake_at`). Templates and capabilities are data in CatalogDO, and nothing decides on an agent role; WorkstreamDO stands in for the workstream channel until ChannelDO exists. `control-plane/README.md` lists the gaps.
+> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13)). Brain hosts are built: every brain starts on a brain host, never on its sandbox's, and reaches the guest only through its gateway (not yet run on AWS). **Not built:** the coordination layer (ChannelDO, HookDO, grants, taint, `wake_at`). Templates and capabilities are data in CatalogDO, and nothing decides on an agent role; WorkstreamDO stands in for the workstream channel until ChannelDO exists. `control-plane/README.md` lists the gaps.
 
 ## At a glance
 
@@ -115,7 +115,7 @@ Bindings themselves are verified, never stored. Hosts hold only caches: page cac
 | Gateway | The binding key | The only way into a guest's hands or ingress ports. Nothing is admitted without a binding SandboxDO issued, and the guest checks the epoch again |
 | Sandbox host | nestd, nest-proxy, cloudflared, the gateway, VMs | Trusted but fenced by leases, epochs and STONITH. Holds no subscription token and runs no brain |
 | Brain | The subscription token, in its process environment | No local exec or file tools; repo config never loads. It acts only through `nest` tools and the web built-ins (host-allowlisted, tainting) |
-| Brain host | Brains, session file caches | Trusted but fenced by its lease and the agent epoch. No KVM, no S3 access, no sandbox state |
+| Brain host | Brains, session file caches | Trusted but fenced by its lease and the agent epoch. No KVM, no sandbox state; in S3 it may read the release (`releases/*`) only |
 | Control plane | All authority | Every platform tool call is checked against grants and taint here; hands calls are gated by the runner's local policy cache, pushed from AgentDO, and by the binding |
 | External input | Webhooks, web pages, other agents' posts | Tainted; its content reaches models only as tool results |
 

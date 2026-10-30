@@ -34,7 +34,7 @@ use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, ExitReason, Ru
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
     error_codes, AgentId, CommitReason, EgressPolicy, Epoch, ErrorBody, ForkMode, GenerationId, GenerationKind,
-    GenerationRecord, HostId, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, WorkstreamEvent,
+    GenerationRecord, HostId, HostRole, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, WorkstreamEvent,
     WorkstreamEventKind, WorkstreamId,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -251,7 +251,7 @@ pub struct Inner {
     host_id: HostId,
     driver: Arc<dyn Driver>,
     store: Arc<dyn ObjectStore>,
-    /// The same store when it's S3: burst hosts run its GC.
+    /// The same store when it's S3: sandbox hosts run its GC.
     s3: Option<Arc<S3Store>>,
     /// The current host token (rotated over the fleet channel), for HTTP calls to the control plane.
     host_token: Mutex<Secret>,
@@ -391,6 +391,12 @@ fn holds_lease(s: SandboxState) -> bool {
 impl Host {
     /// Start every subsystem. `driver` overrides the configured driver (tests).
     pub async fn start(cfg: Config, enrolled: Enrolled, driver: Option<Arc<dyn Driver>>) -> anyhow::Result<Host> {
+        cfg.validate()?;
+        // A brain host runs nestd's supervisor duties only: no VMs, netns, proxy, gateway, tunnel
+        // or object store of its own (`Config::validate` refused their settings), and it refuses
+        // sandbox commands (`host_kind_refusal`). The fleet channel, the lease, self-fencing and the
+        // runner link are the same on both kinds.
+        let sandbox_host = cfg.role == HostRole::Sandbox;
         // The host's tunnel, when the control plane gave it one and cloudflared is installed.
         // Decided here, started last, so a failure below leaves no child behind.
         let tunnel = crate::cloudflared::plan(&cfg, &enrolled)?;
@@ -419,7 +425,7 @@ impl Host {
         } else {
             (None, None)
         };
-        if let DriverConfig::Firecracker(fc) = &cfg.driver
+        if let Some(DriverConfig::Firecracker(fc)) = &cfg.driver
             && fc.jailer_bin.is_some()
         {
             let exe = fc.firecracker_bin.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "firecracker".into());
@@ -430,7 +436,7 @@ impl Host {
                 }
             }
         }
-        let n = crate::driver::supervise::kill_leftovers(&cfg.vms_dir());
+        let n = if sandbox_host { crate::driver::supervise::kill_leftovers(&cfg.vms_dir()) } else { 0 };
         if n > 0 {
             tracing::warn!(n, "killed VM processes left by a previous nestd");
         }
@@ -441,14 +447,15 @@ impl Host {
                 tracing::info!(n, "removed netns bind mounts left by a previous nestd");
             }
         }
-        let n = recovery::sweep_vm_dirs(&cfg.vms_dir());
+        let n = if sandbox_host { recovery::sweep_vm_dirs(&cfg.vms_dir()) } else { 0 };
         if n > 0 {
             tracing::info!(n, "removed VM runtime directories left by a previous nestd");
         }
         // Then their disks: a clean one (it equals its head) goes at once, unreported (a suspended
         // sandbox wakes from its head anyway); the others are reported fenced, salvaged, deleted.
         let mut found = vec![];
-        for f in recovery::scan(&cfg.sandboxes_dir()) {
+        let scanned = if sandbox_host { recovery::scan(&cfg.sandboxes_dir()) } else { vec![] };
+        for f in scanned {
             if f.meta.clean && f.meta.unanswered.is_none() {
                 tracing::info!(sandbox = %f.meta.sandbox, epoch = f.meta.epoch.0, "deleting a clean incarnation left by a previous nestd");
                 recovery::remove_incarnation(&f.state_dir);
@@ -462,10 +469,11 @@ impl Host {
         let driver: Arc<dyn Driver> = match driver {
             Some(d) => d,
             None => match &cfg.driver {
-                DriverConfig::Process { guest_command, mount_disk } => {
+                None => Arc::new(crate::driver::NoDriver),
+                Some(DriverConfig::Process { guest_command, mount_disk }) => {
                     Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk })
                 }
-                DriverConfig::Firecracker(fc) => {
+                Some(DriverConfig::Firecracker(fc)) => {
                     if let (Some(_), Some(j)) = (&fc.jailer_bin, &fc.jailer) {
                         match crate::driver::firecracker::remove_stale_jails(fc, j) {
                             Ok(0) => {}
@@ -492,13 +500,21 @@ impl Host {
         let tombstones = Tombstones::default();
         let (proxy_tx, mut proxy_rx) = mpsc::unbounded_channel();
         let proxy_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.proxy_uids.clone() };
-        let proxy = ProxyLink::start(&cfg.proxy_sock(), enrolled.host.clone(), instance_id.clone(), proxy_access, tombstones.clone(), proxy_tx)?;
+        let proxy = if sandbox_host {
+            ProxyLink::start(&cfg.proxy_sock(), enrolled.host.clone(), instance_id.clone(), proxy_access, tombstones.clone(), proxy_tx)?
+        } else {
+            ProxyLink::disabled(tombstones.clone())
+        };
         let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
         let runner_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.runner_uids.clone() };
         let runner = RunnerLink::start(&cfg.runner_sock(), enrolled.host.clone(), cfg.role, runner_access, runner_tx)?;
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
         let gateway_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.gateway_uids.clone() };
-        let gateway = GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, tombstones.clone(), gateway_tx)?;
+        let gateway = if sandbox_host {
+            GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, tombstones.clone(), gateway_tx)?
+        } else {
+            GatewayLink::disabled(tombstones.clone())
+        };
         let (fleet_tx, fleet_rx) = mpsc::unbounded_channel();
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
         let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
@@ -662,8 +678,8 @@ impl Host {
             let (inner, url) = (inner.clone(), imds_url.clone());
             tokio::spawn(async move { inner.spot_watch(url).await });
         }
-        // Object-store GC: burst hosts offer to run it; the control plane says when.
-        if inner.cfg.role == nest_protocol::model::HostRole::Burst && inner.s3.is_some() {
+        // Object-store GC: sandbox hosts offer to run it; the control plane says when.
+        if inner.cfg.role == HostRole::Sandbox && inner.s3.is_some() {
             let inner = inner.clone();
             tokio::spawn(async move { inner.gc_loop().await });
         }
@@ -1400,9 +1416,13 @@ impl Inner {
             return;
         }
         let kind = command_kind(&cmd.body);
-        let result = match cmd.body {
-            CommandBody::AgentStart(start) if self.lapse_guard.outlived(&cmd.cmd.0) => self.refuse_start(&start, "the host lease lapsed since this start arrived"),
-            body => self.dispatch(body).await,
+        let refusal = host_kind_refusal(self.cfg.role, &cmd.body);
+        let result = match (cmd.body, refusal) {
+            (_, Some(why)) => Err(error(error_codes::FORBIDDEN, why, false)),
+            (CommandBody::AgentStart(start), None) if self.lapse_guard.outlived(&cmd.cmd.0) => {
+                self.refuse_start(&start, "the host lease lapsed since this start arrived")
+            }
+            (body, None) => self.dispatch(body).await,
         };
         let outcome = match result {
             Ok(detail) => CommandOutcome::Ok { detail },
@@ -1578,8 +1598,8 @@ impl Inner {
         let store = self.store.clone();
         let disk_gib = sbx.resources.disk_gib as u64;
         let base_image = match &self.cfg.driver {
-            DriverConfig::Firecracker(fc) => Some(fc.images_dir.join(format!("{}.ext4", sbx.image))),
-            DriverConfig::Process { .. } => None,
+            Some(DriverConfig::Firecracker(fc)) => Some(fc.images_dir.join(format!("{}.ext4", sbx.image))),
+            Some(DriverConfig::Process { .. }) | None => None,
         };
         let from_manifest = from.map(|g| g.disk_manifest.clone());
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -1661,7 +1681,7 @@ impl Inner {
             let ns = Arc::new(Netns::create(persist.as_deref()).context("create netns")?);
             // A jailed Firecracker runs as the jail's user, which must be able to attach to the tap.
             let tap_owner = match &self.cfg.driver {
-                DriverConfig::Firecracker(fc) if fc.jailer_bin.is_some() => fc.jailer.as_ref().map(|j| (j.uid, j.gid)),
+                Some(DriverConfig::Firecracker(fc)) if fc.jailer_bin.is_some() => fc.jailer.as_ref().map(|j| (j.uid, j.gid)),
                 _ => None,
             };
             ns.configure(tap_owner).context("configure netns")?;
@@ -2321,6 +2341,41 @@ fn cli_name(c: &nest_protocol::guest::CliCommand) -> &'static str {
     }
 }
 
+/// Why a host of `role` refuses a command of `kind` (`command_kind`), if it does: a brain host has no
+/// driver, netns, proxy or gateway, so every command about a sandbox is refused. Brain commands are
+/// the same on both kinds (the runner link is kind-independent): that a sandbox host never gets a
+/// brain is FleetDO's rule (`issueCommands` refuses an `agent_start` there), and a sandbox host runs
+/// no agent runner, so a start that reached one would never run. Pure, so the rule is tested apart
+/// from the executor that applies it.
+pub(crate) fn host_kind_refusal(role: HostRole, body: &CommandBody) -> Option<&'static str> {
+    // Exhaustive on purpose: a new command must be placed on one side or the other.
+    let about_a_sandbox = match body {
+        CommandBody::SandboxCreate { .. }
+        | CommandBody::SandboxSuspend { .. }
+        | CommandBody::SandboxResume { .. }
+        | CommandBody::SandboxArchive { .. }
+        | CommandBody::SandboxCheckpoint { .. }
+        | CommandBody::SandboxFork { .. }
+        | CommandBody::SandboxDestroy { .. }
+        | CommandBody::PolicyUpdate { .. }
+        | CommandBody::SecretsUpdate { .. }
+        | CommandBody::PortExpose { .. }
+        | CommandBody::PortUnexpose { .. }
+        | CommandBody::AgentAttach { .. }
+        | CommandBody::AgentDetach { .. } => true,
+        CommandBody::CommitResult { .. }
+        | CommandBody::GuestCliResult { .. }
+        | CommandBody::AgentStart(_)
+        | CommandBody::AgentStop { .. }
+        | CommandBody::Fence { .. }
+        | CommandBody::Drain { .. } => false,
+    };
+    match role {
+        HostRole::Brain if about_a_sandbox => Some("this is a brain host: it runs no sandboxes"),
+        HostRole::Brain | HostRole::Sandbox => None,
+    }
+}
+
 fn command_kind(b: &CommandBody) -> &'static str {
     match b {
         CommandBody::SandboxCreate { .. } => "sandbox_create",
@@ -2391,6 +2446,31 @@ mod tests {
     }
 
     /// Which salvage failures are retried and which end the retire.
+    /// A brain host refuses every sandbox command and nothing else; a sandbox host refuses nothing
+    /// (FleetDO keeps brains off it). Checked on every command fixture (the fixtures cover every
+    /// variant: `nest-protocol`'s round-trip test), by kind.
+    #[test]
+    fn a_brain_host_refuses_every_sandbox_command_and_nothing_else() {
+        use super::{command_kind, host_kind_refusal};
+        use nest_protocol::control::Command;
+        use nest_protocol::model::HostRole;
+        let sandbox_only = [
+            "sandbox_create", "sandbox_suspend", "sandbox_resume", "sandbox_archive", "sandbox_checkpoint", "sandbox_fork",
+            "sandbox_destroy", "policy_update", "secrets_update", "port_expose", "port_unexpose", "agent_attach", "agent_detach",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/fixtures/control/command");
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let cmd: Command = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let kind = command_kind(&cmd.body);
+            seen.insert(kind);
+            assert_eq!(host_kind_refusal(HostRole::Brain, &cmd.body).is_some(), sandbox_only.contains(&kind), "{}", path.display());
+            assert!(host_kind_refusal(HostRole::Sandbox, &cmd.body).is_none(), "{}", path.display());
+        }
+        assert_eq!(seen.len(), 19, "a fixture per command kind: {seen:?}");
+    }
+
     /// Amendment A3 (a): a start that arrived before a lapse, or while lapsed, never runs, even
     /// once the lease is renewed; one that arrived after the renewal runs.
     #[test]

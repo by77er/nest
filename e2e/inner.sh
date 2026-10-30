@@ -27,8 +27,12 @@ fi
 NEST_LOG=info "$BIN/nest-proxy" --nestd-sock "$WORK/run/proxy.sock" >"$WORK/logs/proxy.log" 2>&1 &
 echo $! >"$WORK/proxy.pid"
 
+# The sandbox host's nestd (run/, state/) and the brain host's (brun/, bstate/): two hosts that
+# share this machine but nothing else; the runner reaches the guest only through the gateway.
 RUST_LOG=info,nestd=debug "$BIN/nestd" --config "$WORK/nestd.json" >"$WORK/logs/nestd.log" 2>&1 &
 echo $! >"$WORK/nestd.pid"
+RUST_LOG=info,nestd=debug "$BIN/nestd" --config "$WORK/nestd-brain.json" >"$WORK/logs/nestd-brain.log" 2>&1 &
+echo $! >"$WORK/nestd-brain.pid"
 
 # The sandbox gateway: the only way the runner's hands reach the guest. It connects to nestd's
 # gateway socket and listens on loopback; the runner learns its URL from the control plane.
@@ -42,10 +46,10 @@ for _ in $(seq 100); do
     sleep 0.1
 done
 
-# Wait for nestd's runner socket before starting the runner.
-for _ in $(seq 100); do [ -S "$WORK/run/runner.sock" ] && break; sleep 0.1; done
+# Wait for the brain host's runner socket before starting the runner there.
+for _ in $(seq 100); do [ -S "$WORK/brun/runner.sock" ] && break; sleep 0.1; done
 
-env NEST_RUNNER_NESTD_SOCK="$WORK/run/runner.sock" \
+env NEST_RUNNER_NESTD_SOCK="$WORK/brun/runner.sock" \
     NEST_RUNNER_HOOK_DGRAM="$WORK/runner/hook.dgram" \
     NEST_RUNNER_HOOK_SOCK="$WORK/runner/hook.sock" \
     NEST_RUNNER_MCP_SOCK="$WORK/runner/mcp.sock" \

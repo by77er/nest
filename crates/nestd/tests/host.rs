@@ -552,7 +552,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst",
+        "role": "sandbox",
         "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"),
@@ -810,7 +810,7 @@ fn netns_listeners_handed_to_proxy() {
         let dir = tempfile::tempdir().unwrap();
         let fleet = mock_fleet().await;
         let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "c",
+            "role": "sandbox", "cell": "c",
             "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
             "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
             "driver": {"type": "process", "guest_command": ["unused"]},
@@ -914,7 +914,7 @@ async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -976,7 +976,7 @@ fn tunnel_config(dir: &Path, fleet_url: &str, bin: &Path, user: Option<String>) 
 
 fn tunnel_config_with_metrics(dir: &Path, fleet_url: &str, bin: &Path, user: Option<String>, metrics: &str) -> Config {
     serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet_url},
         "run_dir": dir.join("run"), "state_dir": dir.join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1128,7 +1128,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1176,7 +1176,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1415,7 +1415,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1568,7 +1568,7 @@ fn an_attach_without_a_guest_binds_no_listener() {
         let dir = tempfile::tempdir().unwrap();
         let fleet = mock_fleet().await;
         let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "c",
+            "role": "sandbox", "cell": "c",
             "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
             "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
             "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1601,7 +1601,7 @@ fn an_attach_without_a_guest_binds_no_listener() {
 
 fn harness_config(dir: &Path, fleet_url: &str, commit_timeout_ms: u64) -> Config {
     serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet_url},
         "run_dir": dir.join("run"), "state_dir": dir.join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1980,7 +1980,7 @@ fn a_restarted_nestd_tears_down_leftover_netns_mounts() {
         assert!(mounted());
         let fleet = mock_fleet().await;
         let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "c",
+            "role": "sandbox", "cell": "c",
             "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
             "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
             "driver": {"type": "process", "guest_command": ["unused"]},
@@ -2150,4 +2150,50 @@ async fn a_start_held_across_a_lease_lapse_never_runs() {
     }
     h.fleet.wait_event("its exit", |b| matches!(b, HostEventBody::AgentExited { agent, epoch: Some(Epoch(1)), reason: AgentExitReason::Fenced, .. } if agent.0 == "agt_l")).await;
     assert!(!h._runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_l")));
+}
+
+/// A brain host runs nestd's supervisor duties only: no proxy or gateway socket, no driver; it
+/// says hello with no gateway URL and no tunnel, refuses every sandbox command with a clear error,
+/// starts brains through the runner, and self-fences them when its lease lapses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brain_host_runs_brains_and_refuses_sandboxes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "role": "brain", "cell": "test-cell",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+        "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"), "flush_interval_ms": 20,
+    }))
+    .unwrap();
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
+    let _host = Host::start(cfg, enrolled, None).await.unwrap();
+    let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    let hello = fleet.log.lock().unwrap().hellos[0].clone();
+    assert_eq!(hello.role, HostRole::Brain);
+    assert_eq!(hello.gateway_url, None);
+    assert_eq!(hello.tunnel, TunnelState::None);
+    // All its vCPUs are free (no sandbox holds any): FleetDO's default brain capacity counts them.
+    let vcpus = std::thread::available_parallelism().unwrap().get() as u32;
+    assert_eq!((hello.capacity.vcpus_free, hello.capacity.sandboxes), (vcpus, 0));
+    assert!(!dir.path().join("run/proxy.sock").exists(), "a brain host binds no proxy socket");
+    assert!(!dir.path().join("run/gateway.sock").exists(), "a brain host binds no gateway socket");
+
+    fleet.commands.send(vec![create("cmd_sbx", "sbx_b")]).unwrap();
+    match fleet.result("cmd_sbx").await {
+        CommandOutcome::Error { error } => {
+            assert_eq!(error.code, "forbidden");
+            assert!(error.message.contains("brain host"), "{}", error.message);
+            assert!(!error.retryable);
+        }
+        other => panic!("a brain host took a sandbox: {other:?}"),
+    }
+    assert!(!dir.path().join("state/sandboxes/sbx_b").exists());
+
+    fleet.commands.send(vec![cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_b", "sbx_elsewhere")))]).unwrap();
+    assert!(matches!(fleet.result("cmd_agent").await, CommandOutcome::Ok { .. }));
+    wait_until("runner agent_start", || runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::AgentStart(s) if s.start.agent.0 == "agt_b"))).await;
+
+    fleet.partition.store(true, Ordering::SeqCst);
+    wait_until("the brains fenced at the lease lapse", || runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. }))).await;
 }
