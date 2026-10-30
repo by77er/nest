@@ -106,8 +106,8 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Generation | Immutable manifest of a sandbox's disk (and optionally memory) chunks |
 | Epoch | Fencing token. A new one is issued with each placement claim, and only a host holding the newest epoch's lease may act for the sandbox. |
 | Cell | A unit of compute plus its object store (e.g. AWS us-east-1 with S3) |
-| Sandbox host | A spot VM with nested virtualization running Firecracker sandboxes, nestd, nest-proxy, cloudflared and the gateway. Every sandbox lives here; no brain does. `role: sandbox`. |
-| Brain host | A cheap host with no KVM running nestd (supervisor duties only), the agent runner and Claude Code processes. Every brain lives here; no sandbox does. Capacity is counted in brains; scales to zero. `role: brain`. |
+| Sandbox host | A spot VM with nested virtualization running Firecracker sandboxes, nestd, nest-proxy, cloudflared and the gateway. Every sandbox lives here; no brain does. |
+| Brain host | A cheap host with no KVM running nestd (supervisor duties only), the agent runner and Claude Code processes. Every brain lives here; no sandbox does. Capacity is counted in brains; scales to zero. |
 | Captain | A pattern, not a platform concept: an agent without hands, spawned from the `captain` template, that manages other agents and escalates to me |
 | Workstream | A pattern, not a platform concept: a goal plus the channel, sandboxes and agents set up for it, grouped by a label |
 | nestd | Per-host daemon |

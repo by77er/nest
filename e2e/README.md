@@ -1,17 +1,17 @@
 # End-to-end harness
 
-`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built. One machine runs two hosts: a sandbox host (nestd, nest-proxy, the gateway, the guest) and a brain host (a second nestd with `role: brain`, the runner), each enrolled with its own token, with its own run and state directories, and each self-fencing on its own. The brain starts on the brain host, never the sandbox's, and the runner reaches the guest only the way a brain on another machine would: through the sandbox [gateway](../docs/sandbox/gateway/) on a loopback port, with a binding the control plane minted. What the harness cannot show is the tunnel, Cloudflare Access, and the two hosts on different machines.
+`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built. One machine runs two hosts: a sandbox host (nestd, nest-proxy, the gateway, the guest) and a brain host (a second nestd with the brain role, the runner), each enrolled with its own token, with its own run and state directories, and each self-fencing on its own. The brain starts on the brain host, never the sandbox's, and the runner reaches the guest only the way a brain on another machine would: through the sandbox [gateway](../docs/sandbox/gateway/) on a loopback port, with a binding the control plane minted. What the harness cannot show is the tunnel, Cloudflare Access, and the two hosts on different machines.
 
 ```
 wrangler dev --local (control plane, :18787)          ← outside any namespace
 unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
   ├─ sandbox host (run/, state/)
   │    ├─ nest-proxy    (unprivileged; listeners handed over by nestd)
-  │    ├─ nestd         (role: sandbox; enrolls with a one-time token; `process` driver; one netns per sandbox; advertises gateway_url)
+  │    ├─ nestd         (role `burst`, a sandbox host; enrolls with a one-time token; `process` driver; one netns per sandbox; advertises gateway_url)
   │    │    └─ nest-guest   (in the sandbox netns, behind the unix-socket vsock emulator)
   │    └─ nest-gateway  (ws://127.0.0.1:18790; fed by nestd over gateway.sock; forwards hands calls to the guest's vsock port)
   └─ brain host (brun/, bstate/)
-       ├─ nestd         (role: brain; its own token; no driver, proxy, gateway or netns)
+       ├─ nestd         (role `controller`, a brain host; its own token; no driver, proxy, gateway or netns)
        └─ nest-runner   (brains = e2e/fake_claude.py, or real `claude`; hands through the real `nest mcp` bridge and the hands client)
 ```
 

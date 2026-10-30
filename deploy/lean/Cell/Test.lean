@@ -5,11 +5,11 @@ What the cell may never do, checked while this module compiles: `inframe test`, 
 `apply` refuse to run if any of it fails.
 
 * **Theorems** about the IAM statements, for every cell (any name, region, account and URL) and
-  for any launch templates and host roles: what the control plane and the hosts can be granted
-  doesn't depend on a cell's settings.
+  for any launch templates, host roles and instance profiles: what the control plane and the
+  hosts can be granted doesn't depend on a cell's settings.
 * **Policies** over the `use1` graph, evaluated by `#assert_policy`: no ingress, each security
-  group's egress allow-list (brain hosts: 443 only), IMDSv2 with hop limit 1, and a brain role
-  with no permissions.
+  group's egress allow-list (brain hosts: 443 only), IMDSv2 with hop limit 1, each template's own
+  instance profile, and a brain role whose only permission is reading the release.
 -/
 
 open Inframe
@@ -22,14 +22,14 @@ namespace Cell.Test
 
 /-- STONITH can only reach instances tagged `nest=true` (both launch templates tag theirs; the
 image builder's are not). -/
-theorem terminate_only_tagged (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole key,
+theorem terminate_only_tagged (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
       s.Grants "ec2:TerminateInstances" → s.Requires "StringEquals" "aws:ResourceTag/nest" [lit "true"] := by
   simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
 
 /-- Every launch goes through one of the cell's two launch templates. -/
-theorem launch_only_from_the_templates (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole key,
+theorem launch_only_from_the_templates (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
       s.Grants "ec2:RunInstances" →
         s.Requires "ArnLike" "ec2:LaunchTemplate" [template, brainTemplate]
           ∨ s.Requires "ArnLike" "ec2:LaunchTemplate" [template]
@@ -39,8 +39,8 @@ theorem launch_only_from_the_templates (spec : CellSpec) (template brainTemplate
 /-- An instance's type is tied to the template it is launched from: the sandbox template only
 launches the cell's 8i families, the brain template only the brain families. These are the only
 statements that grant `RunInstances` on `instance/*`. -/
-theorem instance_types_follow_their_template (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole key,
+theorem instance_types_follow_their_template (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
       s.Grants "ec2:RunInstances" → (s.sid = "EightIOnly" ∨ s.sid = "BrainTypesOnly") →
         (s.sid = "EightIOnly" ∧ s.Requires "ArnLike" "ec2:LaunchTemplate" [template]
             ∧ s.Requires "StringLike" "ec2:InstanceType" ((instancePatterns spec).map lit))
@@ -49,43 +49,59 @@ theorem instance_types_follow_their_template (spec : CellSpec) (template brainTe
   simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
 
 /-- The only IAM action is passing the two host roles, to EC2. -/
-theorem passes_only_the_host_roles (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole key, ∀ a ∈ s.actions,
+theorem passes_only_the_host_roles (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key, ∀ a ∈ s.actions,
       a.startsWith "iam:" → a = "iam:PassRole" ∧ s.resources = [role, brainRole] := by
   simp [controlPlaneStatements]
 
 /-- KMS only signs with (and reads the public key of) the proxy root CA key: no other key, no
 decrypt, no key management. -/
-theorem kms_only_the_root_key (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole key, ∀ a ∈ s.actions,
+theorem kms_only_the_root_key (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key, ∀ a ∈ s.actions,
       a.startsWith "kms:" → (a = "kms:Sign" ∨ a = "kms:GetPublicKey") ∧ s.resources = [key] := by
   simp [controlPlaneStatements]
 
 /-- SSM only reads the host AMI parameter (both launch templates' `resolve:ssm:` image). -/
-theorem ssm_only_the_host_ami (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole key, ∀ a ∈ s.actions,
+theorem ssm_only_the_host_ami (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key, ∀ a ∈ s.actions,
       a.startsWith "ssm:" → a = "ssm:GetParameters" ∧
         s.resources = [lit s!"arn:aws:ssm:{spec.region}:{spec.accountId}:parameter{hostAmiParameter spec}"] := by
   simp [controlPlaneStatements]
 
 /-- The control plane's actions, whatever the cell: EC2, passing the host roles, resolving the host
 AMI and signing with the root key, named exactly. -/
-theorem control_plane_actions (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ((controlPlaneStatements spec template brainTemplate role brainRole key).map (·.actions)).flatten =
+theorem control_plane_actions (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ((controlPlaneStatements spec template brainTemplate role brainRole hp bp key).map (·.actions)).flatten =
       ["ec2:RunInstances", "ec2:RunInstances", "ec2:RunInstances", "ec2:RunInstances", "ec2:RunInstances", "ec2:CreateTags",
        "iam:PassRole", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:DescribeInstances", "ec2:DescribeImages",
        "ssm:GetParameters", "kms:Sign", "kms:GetPublicKey"] := by
   simp [controlPlaneStatements]
 
 /-- The instance-type condition is the cell's families as `<family>*.*`, and nothing else. -/
-theorem launch_only_listed_families (spec : CellSpec) (template brainTemplate role brainRole key : Input String) :
-    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole key,
+theorem launch_only_listed_families (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
       s.Grants "ec2:RunInstances" → s.sid = "EightIOnly" →
         s.Requires "StringLike" "ec2:InstanceType" ((instancePatterns spec).map lit) := by
   simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
 
-/-- Brain hosts get no permission at all: their role has no statements. -/
-theorem brain_hosts_have_no_permissions (spec : CellSpec) : brainHostStatements spec = [] := rfl
+/-- Each template's instances get only that template's profile: the instance-type statements
+require it (when IAM sees one), so the brain template can't launch with the sandbox hosts' role. -/
+theorem instance_profile_follows_its_template (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
+    ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
+      (s.sid = "EightIOnly" → s.Requires "ArnEqualsIfExists" "ec2:InstanceProfile" [hp])
+        ∧ (s.sid = "BrainTypesOnly" → s.Requires "ArnEqualsIfExists" "ec2:InstanceProfile" [bp]) := by
+  simp [controlPlaneStatements, Statement.Requires]
+
+/-- The brain hosts' actions, whatever the cell: list and read under `releases/`, nothing else:
+no sandbox state, no writes. (The graph policy `brain-role-exact` checks the stack gives the
+role these statements and no other.) -/
+theorem brain_host_reads_only_releases (spec : CellSpec) :
+    ((brainHostStatements spec).map (·.actions)).flatten = ["s3:ListBucket", "s3:GetObject"] ∧
+      (∀ s ∈ brainHostStatements spec, s.Grants "s3:GetObject" →
+        s.resources = [lit s!"arn:aws:s3:::{bucketName spec}/releases/*"]) ∧
+      (∀ s ∈ brainHostStatements spec, s.Grants "s3:ListBucket" →
+        s.Requires "StringLike" "s3:prefix" [lit "releases/*"]) := by
+  simp [brainHostStatements, releaseReadStatements, Statement.Grants, Statement.Requires]
 
 /-- `matchesFamily` is IAM's `StringLike` on `<family>*.*`: another family, or no `.`, is refused. -/
 example : matchesFamily "c8i" "c8i-flex.large" ∧ !matchesFamily "c8i" "c7i.large" ∧ !matchesFamily "c8i" "c8i"
@@ -154,7 +170,7 @@ theorem builder_only_reads_releases (spec : CellSpec) :
     ((builderStatements spec).map (·.actions)).flatten = ["s3:ListBucket", "s3:GetObject"] ∧
       ∀ s ∈ builderStatements spec, s.Grants "s3:GetObject" →
         s.resources = [lit s!"arn:aws:s3:::{bucketName spec}/releases/*"] := by
-  simp [builderStatements, Statement.Grants]
+  simp [builderStatements, releaseReadStatements, Statement.Grants]
 
 /-- No action in any list is a wildcard, so `Grants` (exact membership) is what IAM grants. -/
 theorem no_wildcards : ∀ a ∈ ["ec2:RunInstances", "ec2:CreateTags", "iam:PassRole", "ec2:TerminateInstances",
@@ -197,14 +213,60 @@ def egressAllowList : Policy :=
       else some s!"egress {p} {f}-{t} is not in the {if brain then "brain" else "sandbox"} hosts' allow-list"
     | _, _, _ => some "egress rules need literal protocol and ports"
 
-/-- The brain role stays bare: no inline policy, attachment or bucket statement names it (its
-permissions are `brainHostStatements`, empty). -/
-def brainRoleBare : Policy :=
-  Policy.resources "brain-role-bare" fun r =>
-    let refersToBrain (arg : String) := ((r.argument? arg).bind ExprNode.referencedAddress?) == some (.resource "aws_iam_role" "brain")
-    if (r.resourceType == "aws_iam_role_policy" || r.resourceType == "aws_iam_role_policy_attachment") && refersToBrain "role" then
-      some "the brain hosts' role must have no permissions"
+/-- Every resource an expression refers to, however deeply nested. -/
+partial def references : ExprNode → List Address
+  | .literal _ => []
+  | .resourceAttribute a _ => [a]
+  | .dataSourceAttribute a _ => [a]
+  | .array items => items.flatMap references
+  | .object fields => fields.flatMap (references ·.2)
+  | .index c k => references c ++ references k
+  | .attribute o _ => references o
+  | .splat o => references o
+  | .conditional c t f => references c ++ references t ++ references f
+  | .function _ args => args.flatMap references
+  | .template parts => parts.flatMap fun
+      | .text _ => []
+      | .interpolation e => references e
+  | .secretEnvironment _ => []
+
+def brainRole : Address := .resource "aws_iam_role" "brain"
+
+/-- IAM resource types that put a policy on a role. -/
+def rolePolicyTypes : List String :=
+  ["aws_iam_role_policy", "aws_iam_role_policy_attachment", "aws_iam_policy_attachment", "aws_iam_role_policies_exclusive",
+   "aws_iam_role_policy_attachments_exclusive"]
+
+/-- The brain role gets exactly `brainHostStatements` (reading the release): its one inline policy
+`aws_iam_role_policy.brain_releases` renders exactly that document, no other resource that can
+put a policy on a role refers to it (inline, managed, attachment, exclusive sets), and the role
+itself declares no `inline_policy` or `managed_policy_arns`. -/
+def brainRoleExact (spec : CellSpec) : Policy :=
+  Policy.resources "brain-role-exact" fun r =>
+    let refersToBrain := r.arguments.any fun (_, e) => (references e).contains brainRole
+    if r.resourceType == "aws_iam_role" && r.name == "brain" then
+      if (r.argument? "inline_policy").isSome || (r.argument? "managed_policy_arns").isSome then
+        some "the brain role declares its own policies"
+      else none
+    else if rolePolicyTypes.contains r.resourceType && refersToBrain then
+      if r.resourceType == "aws_iam_role_policy" && r.name == "brain_releases" then
+        if (r.argument? "policy").map toString == some (toString (inputNode (document (brainHostStatements spec)))) then none
+        else some "the brain role's policy is not brainHostStatements"
+      else some s!"{r.resourceType}.{r.name} puts another policy on the brain role"
     else none
+
+/-- A launch template's instance profile (`iam_instance_profile[0].arn`), as the address it refers to. -/
+def templateProfile? (r : ResourceSpec) : Option Address :=
+  match r.argument? "iam_instance_profile" with
+  | some (.array [.object fields]) => (fields.lookup "arn").bind ExprNode.referencedAddress?
+  | _ => none
+
+/-- Each launch template names its own kind's instance profile: the sandbox template the hosts'
+(`host`, bucket access), the brain template the brain hosts' (`brain`, the release only). -/
+def templateProfiles : Policy :=
+  Policy.resourcesOfType "template-profiles" "aws_launch_template" fun r =>
+    let want : Address := .resource "aws_iam_instance_profile" (if r.name == "brain" then "brain" else "host")
+    if templateProfile? r == some want then none else some s!"launch template {r.name} must use the {want} profile"
 
 /-- The brain launch template runs no VM: no nested virtualization, and the brain security group only. -/
 def brainTemplateShape : Policy :=
@@ -241,7 +303,8 @@ def amiPruning : Policy :=
     | _, _, _ => some "the lifecycle policy must delete by count with literal values"
 
 def policies : Policy :=
-  Policy.all "cell" [Policy.validGraph, noIngress, egressAllowList, imdsV2, amiPruning, brainRoleBare, brainTemplateShape]
+  Policy.all "cell" [Policy.validGraph, noIngress, egressAllowList, imdsV2, amiPruning, brainRoleExact use1, brainTemplateShape,
+    templateProfiles]
 
 #assert_policy policies (buildGraph (cell use1))
 

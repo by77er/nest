@@ -91,8 +91,9 @@ EOF
 cat >/etc/systemd/system/nestd.service <<'EOF'
 [Unit]
 Description=nest host daemon
+# Ordered after nest-proxy where it runs, but never pulls it in: a brain host has none.
 After=network-online.target nest-proxy.service
-Wants=network-online.target nest-proxy.service
+Wants=network-online.target
 [Service]
 # Under memory pressure the kernel kills a guest VMM (score 0), never nest's own services.
 OOMScoreAdjust=-900

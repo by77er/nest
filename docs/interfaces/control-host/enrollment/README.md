@@ -4,7 +4,7 @@
 
 | Field | Meaning |
 |---|---|
-| `role` | `sandbox` or `brain` (`burst` and `controller`, the previous release's names, are read as these for one release) |
+| `role` | `burst` (a sandbox host) or `controller` (a brain host); `sandbox` and `brain` are read too, and are what the next release sends ([deploy](../../../../dev/deploy.md#host-role-names-expandcontract)) |
 | `cell` | e.g. `aws-us-east-1`. Determines the object store and placement |
 | `proof.type = aws_identity_document` | The IMDSv2 instance identity document and its **`rsa2048` signature** (`/latest/dynamic/instance-identity/rsa2048`: RSA-2048 / SHA-256 CMS, with or without PEM armor), both base64. The signature goes in `pkcs7_b64`; the DSA `/pkcs7` signature isn't accepted. FleetDO checks the AWS signature, that **it launched this instance ID** (matching account and region), and that the instance hasn't enrolled before |
 | `proof.type = enrollment_token` | A single-use token I mint, for hosts outside AWS |

@@ -1,5 +1,7 @@
 # Conformance: the brain-record code against the model
 
+> **As of 36b60d5** (2026-10-29): the code checked below has moved on since (brain hosts: `agent_start` goes only to brain hosts, `pickHost` asks FleetDO's `placeBrain`, and the brain cap is enforced in `issueCommands`). A conformance check of that AgentDO delta found the one-brain invariants unchanged; this study will be refreshed.
+
 **Head checked:** `origin/deferred/brain-record` at **82396b3** (82396b304eaf8524a69999a4fdee8d11aecb9479, fetched 2026-10-26). **Design:** `BRAIN-RECORD-DESIGN.md`: invariant S, liveness L, rules 1-6, amendments A1-A6, plus the owner's as-built choices for 82396b3 (no same-host re-issue, one outstanding start per agent and host, no adopt, `brain_epochs` gating, the two-step wedge, the N1 re-check and orphan kill). **Model:** `verification/tla/agent-brain/AgentBrain.tla` as it stood on 2026-10-26 (`NO_REISSUE`, `SPLIT_EXPIRE`/`EXPIRE_RECHECK`, the `MC_nr_*` configs; another agent is still editing it). Background: [../README.md](../README.md), [../pilot/](../pilot/README.md).
 
 **History.**
