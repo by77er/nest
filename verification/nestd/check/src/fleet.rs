@@ -68,6 +68,8 @@ pub struct Config {
     /// One per-host send chain for issueCommands and the hello's resend (main: each sends on its
     /// own, after its own BrokerDO await, so a later batch can overtake an earlier one).
     pub send_chain: bool,
+    /// The alarm tick starts a run for a connected host whose socket is behind the outbox.
+    pub tick_flush: bool,
     /// `onEvents` processes a batch only if its socket is still the host's helloed one (main: the
     /// attachment read at arrival, so a dead process's batch can become the new lineage's baseline).
     pub events_socket_guard: bool,
@@ -89,6 +91,7 @@ impl Config {
             close_on_broker_fail: false,
             stale_hello_guard: false,
             send_chain: false,
+            tick_flush: false,
             events_socket_guard: false,
             max_cmds: 3,
             secrets: true,
@@ -100,7 +103,7 @@ impl Config {
     }
     /// FleetDO with this branch's fixes.
     pub fn fixed() -> Self {
-        Config { capture_at_reset: true, durable_capture: true, send_baseline: true, close_on_broker_fail: true, stale_hello_guard: true, send_chain: true, events_socket_guard: true, ..Self::main() }
+        Config { capture_at_reset: true, durable_capture: true, send_baseline: true, close_on_broker_fail: true, stale_hello_guard: true, send_chain: true, tick_flush: true, events_socket_guard: true, ..Self::main() }
     }
     pub fn faults(self, drops: u8, restarts: u8, resets: u8, broker_fails: u8) -> Self {
         Config { max_drops: drops, max_restarts: restarts, max_fleet_resets: resets, max_broker_fails: broker_fails, ..self }
@@ -236,6 +239,8 @@ pub enum Action {
     BrokerFail(usize),
     /// The send chain's next run starts (sends at once, or awaits BrokerDO for its secrets).
     ChainRun,
+    /// FleetDO's alarm tick finds the host's socket behind the outbox and enqueues a run.
+    FleetTick,
     ChainBrokerOk,
     ChainBrokerFail,
     /// Resume the hello at the head of the queue after its BrokerDO await.
@@ -279,6 +284,16 @@ impl State {
             w.helloed = false;
             w.up.clear();
             w.down.push_back(Down::Close);
+        }
+    }
+
+    /// Send `msgs` from the front up to the first batch with secrets; that one (with the rest)
+    /// waits for BrokerDO.
+    fn chain_continue(&mut self, w: u8, msgs: Vec<u64>) {
+        let plain = msgs.iter().take_while(|q| !self.fleet.secret.contains(q)).count();
+        self.chain_send(w, msgs[..plain].to_vec());
+        if plain < msgs.len() {
+            self.fleet.chain_resolving = Some((w, msgs[plain..].to_vec()));
         }
     }
 
@@ -526,6 +541,12 @@ impl Model for FleetModel {
             }
         } else if s.fleet.chain_runs > 0 {
             a.push(Action::ChainRun);
+        } else if c.send_chain
+            && c.tick_flush
+            && let Some(w) = s.socket_for().and_then(|id| s.wires.iter().find(|x| x.id == id))
+            && s.fleet.rel_out.iter().any(|q| *q > w.sent_up_to)
+        {
+            a.push(Action::FleetTick);
         }
         let can_fail = s.broker_fails < c.max_broker_fails;
         match s.fleet.queue.front() {
@@ -595,25 +616,32 @@ impl Model for FleetModel {
             }
             // One run of the send chain: everything not yet sent on the current socket, in order,
             // secrets resolved for the whole run before any of it goes out.
+            // A run sends batch by batch in seq order: one without secrets at once, one with
+            // secrets after its own BrokerDO answer (the run awaits it). The first failure stops
+            // the run and closes; what went before stays sent.
             Action::ChainRun => {
                 s.fleet.chain_runs -= 1;
                 if let Some(w) = s.socket_for() {
                     let from = s.wires.iter().find(|x| x.id == w).map_or(0, |x| x.sent_up_to);
                     let msgs: Vec<u64> = s.fleet.rel_out.iter().copied().filter(|q| *q > from).collect();
-                    if msgs.iter().any(|q| s.fleet.secret.contains(q)) {
-                        s.fleet.chain_resolving = Some((w, msgs));
-                    } else {
-                        s.chain_send(w, msgs);
-                    }
+                    s.chain_continue(w, msgs);
                 }
             }
             Action::ChainBrokerOk => {
                 let (w, msgs) = s.fleet.chain_resolving.take()?;
-                s.chain_send(w, msgs);
+                // Its batch is resolved: sent if the socket is still the host's, then on.
+                if s.socket_for() == Some(w) {
+                    s.chain_send(w, msgs[..1].to_vec());
+                    s.chain_continue(w, msgs[1..].to_vec());
+                }
             }
             Action::ChainBrokerFail => {
                 let (w, _) = s.fleet.chain_resolving.take()?;
                 self.broker_failed(&mut s, w);
+            }
+            // The alarm tick: a connected host whose socket is behind the outbox gets a run.
+            Action::FleetTick => {
+                s.fleet.chain_runs += 1;
             }
             Action::FleetRecv(id) => {
                 let w = s.wire(id)?;

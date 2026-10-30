@@ -95,7 +95,10 @@ The executor still branches on the cache lookup itself; it moves into a core wit
 - **Handlers.**
   - **`webSocketMessage`:** reads the attachment on arrival; the first frame must be a hello.
   - **`onHello`:** split at each `await`. Its synchronous start does the following: the stale-socket guard, superseding other sockets, the reset and capture on a new instance, the ack of `last_command_seq`, the socket's `sent` mark, `helloed`, `hello_ack`, and enqueuing the resend on the send chain. The reconcile that fails the old lineage comes after the awaits.
-  - **The send chain (`flush`):** one per host. A run takes `socketFor(host)` (the first helloed socket), resolves secrets for everything above that socket's `sent` mark, and only then sends it all in seq order and advances `sent`. A BrokerDO failure sends nothing and closes.
+  - **The send chain (`flush`):** one per host, never awaited by issuers.
+    - A run takes `socketFor(host)` (the first socket that is helloed and open) and sends everything above that socket's `sent` mark, batch by batch in seq order. A batch without secrets goes at once; one with secrets goes after its own BrokerDO answer, if the socket is still the host's.
+    - The first BrokerDO failure stops the run and closes the socket; what went before stays sent.
+    - The alarm tick starts a run for a connected host whose socket is behind the outbox.
   - **`onEvents`:** the socket must still be the host's helloed one; then classify, `markProcessed` and ack, or on a gap an error and a close.
   - **`issueCommands`:** push, then enqueue a run.
   - **`ack`:** cumulative.
@@ -138,19 +141,20 @@ Each spec is FleetDO's variant, the number of commands (each with or without a s
 
 | Spec | Unique states | Time | Outcome |
 |---|---|---|---|
-| fixed, 2 cmds, 1 of each fault | 7,991,292 | 51 s | holds; both recovery examples found |
-| fixed, 4 cmds, no fault | 58,516 | 0.3 s | holds |
-| fixed, 3 cmds, 1 drop | 491,254 | 2.6 s | holds |
-| fixed, 2 cmds, 2 drops | 419,279 | 2.3 s | holds |
-| fixed, 2 cmds, 1 drop, 1 restart | 450,388 | 1.7 s | holds |
-| fixed, 2 cmds, 1 restart, 1 reset, 1 broker failure | 568,906 | 1.9 s | holds |
-| an in-order FleetDO without the baseline, 2 cmds, 1 drop, 1 restart | 449,644 | 1.7 s | holds |
+| fixed, 2 cmds, 1 of each fault | 12,341,939 | 54 s | holds; both recovery examples found |
+| fixed, 3 cmds, 1 drop, 1 broker failure | 6,556,034 | 41 s | holds |
+| fixed, 4 cmds, no fault | 62,580 | 0.3 s | holds |
+| fixed, 3 cmds, 1 drop | 606,844 | 2.8 s | holds |
+| fixed, 2 cmds, 2 drops | 468,204 | 2.0 s | holds |
+| fixed, 2 cmds, 1 drop, 1 restart | 477,070 | 1.6 s | holds |
+| fixed, 2 cmds, 1 restart, 1 reset, 1 broker failure | 769,847 | 2.7 s | holds |
+| an in-order FleetDO without the baseline, 2 cmds, 1 drop, 1 restart | 477,070 | 1.6 s | holds |
 | main FleetDO + the extracted (pre-fix) nestd core, 3 cmds, no fault (the first model, before its reductions) | 455,821 | 1.5 s | B1: `no_ack_without_execution` (11 steps), `in_order_per_lineage` (9), `every_command_answered` (19) |
 | main FleetDO, 2 cmds, no fault | 2,466 | <0.1 s | `no_ack` (11), `in_order` (9), liveness (14) |
 | no send chain (H1), 2 cmds, no fault | 2,721 | <0.1 s | `never_a_gap` (8), `reconnects_bounded` (8) |
 | capture after the awaits (F2), 1 cmd, 1 restart | 3,800 | <0.1 s | `failed_never_executed` (17) |
 | capture kept in memory only (F3), 1 cmd, 1 restart, 1 reset | 17,039 | <0.1 s | liveness (21) |
-| quiet BrokerDO failure (F4), 1 cmd, 1 broker failure | 144 | <0.1 s | liveness (10) |
+| quiet BrokerDO failure (F4) and no tick, 1 cmd, 1 broker failure | 144 | <0.1 s | liveness (10). Either the close or the tick alone recovers it |
 | no stale-hello guard, 1 cmd, 1 drop | 3,814 | <0.1 s | `reconnects_bounded` (25), liveness (37) |
 | no stale-events guard (B3), 2 cmds, 1 restart | 30,704 | 0.1 s | liveness (30) |
 
@@ -178,7 +182,11 @@ Each spec is FleetDO's variant, the number of commands (each with or without a s
     3. two `agent_start`s resolved in either order.
   - **Consequences:** against the new nestd, a reconnect per overtaking batch (a storm risk); against an old nestd, B1.
   - **Evidence:** the checker without the chain fails `never_a_gap` and `reconnects_bounded` in 8 steps with no fault.
-  - **Fix (at the source):** one per-host send chain (`flush`) for `issueCommands` and the hello's resend. Each run sends everything above its socket's `sent` mark, in seq order, with secrets resolved for the whole run before any of it goes out. Rows and seqs are still written synchronously; only the send moved.
+  - **Fix (at the source):** one per-host send chain (`flush`) for `issueCommands` and the hello's resend.
+    - Each run sends everything above its socket's `sent` mark, batch by batch in seq order. A batch waits only for its own secrets, so a kill ahead of a secret batch is never held back by BrokerDO.
+    - Rows and seqs are still written synchronously; only the send moved, and issuers don't wait for it.
+    - A run that fails closes its socket.
+    - The alarm tick re-runs a host whose socket is behind the outbox.
   - **Tests:** vitest on all three orderings, plus a BrokerDO failure mid-run.
 - **The expected seq stayed behind a batch that finished after the hello (nestd; found by the checker once FleetDO sent in order).**
   - **Mechanism:** with one dropped connection, a batch still running at the reconnect finished after the hello, and its ack deleted it from FleetDO's outbox. The resend then started one past it while nestd still expected it: a gap, so a reconnect.

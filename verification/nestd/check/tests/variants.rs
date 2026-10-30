@@ -94,10 +94,12 @@ fn a_volatile_capture_leaves_commands_unanswered() {
     violates(spec(Config { durable_capture: false, ..Config::fixed() }, 1, 0, 1, 1, 0), &[LIVENESS]);
 }
 
-/// F4: a quiet BrokerDO failure strands its batch.
+/// F4: a quiet BrokerDO failure strands its batch, unless the alarm tick's run rescues it (both
+/// are on in the fixed system: either alone suffices here).
 #[test]
 fn a_quiet_broker_failure_strands_a_batch() {
-    violates(spec(Config { close_on_broker_fail: false, ..Config::fixed() }, 1, 0, 0, 0, 1), &[LIVENESS]);
+    violates(spec(Config { close_on_broker_fail: false, tick_flush: false, ..Config::fixed() }, 1, 0, 0, 0, 1), &[LIVENESS]);
+    holds(spec(Config { close_on_broker_fail: false, ..Config::fixed() }, 1, 0, 0, 0, 1), &[BROKER]);
 }
 
 /// A hello that outlives its socket supersedes the live one, round after round.
