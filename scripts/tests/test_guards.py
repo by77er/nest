@@ -119,13 +119,15 @@ class SchemaExpandOnlyFence(unittest.TestCase):
     def test_renames_and_drops_fail(self):
         for line in ('sql.exec("ALTER TABLE t RENAME TO u")', 'sql.exec("ALTER TABLE t RENAME COLUMN a TO b")',
                      'sql.exec("ALTER TABLE t RENAME a TO b")', 'sql.exec("alter table t drop column a")',
-                     'sql.exec("DROP TABLE t")', 'sql.exec("DROP INDEX i")', 'sql.exec("DROP VIEW v")', 'sql.exec("DROP TRIGGER g")'):
+                     'sql.exec("DROP TABLE t")', 'sql.exec("DROP INDEX i")', 'sql.exec("DROP VIEW v")', 'sql.exec("DROP TRIGGER g")',
+                     'sql.exec(`ALTER TABLE t\n  RENAME TO u`)', 'sql.exec(`ALTER TABLE t\n  RENAME COLUMN a TO b`)',
+                     'sql.exec(`ALTER TABLE t\n  RENAME a TO b`)', 'sql.exec(`ALTER TABLE t\n  DROP COLUMN a`)'):
             with self.subTest(line=line):
                 self.assertEqual(self.check(line)[0], 1, line)
 
     def test_expanding_passes(self):
         for line in ('sql.exec("ALTER TABLE t ADD COLUMN a INTEGER")', 'sql.exec("CREATE INDEX IF NOT EXISTS i ON t (a)")',
-                     'sql.exec("DELETE FROM t WHERE a = 1")', '// rename the helper; never rename or drop a column in place'):
+                     'sql.exec("DELETE FROM t WHERE a = 1")', '// rename the helper; never rename or drop a column in place', ' * rename x to y, then remove the old names'):
             with self.subTest(line=line):
                 self.assertEqual(self.check(line)[0], 0, line)
 

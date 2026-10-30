@@ -181,10 +181,12 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
    */
   stop_epoch?: number;
   /**
-   * Set by an operator's stop, cleared by the next input (a turn, an inbox message, a delivery merged
-   * into a queued turn) or the next start issued: while set, nothing that predates the stop wakes the
-   * agent (a release, a sandbox move, a wake alarm). Input after the stop clears it, so a stopped
-   * brain's end then wakes the agent for it (`wake`, `release`).
+   * Set by an operator's stop, cleared by the next input from outside the agent (a turn, an inbox
+   * message, a delivery merged into a queued turn; never the platform's own `system` notes). It
+   * quiets wakes only while no start has been issued since the stop (`quietSinceStop`): then
+   * nothing that predates the stop wakes the agent (a release, a sandbox move, a wake alarm), and a
+   * stopped brain's end wakes it only for input that came after the stop (`wake`, `release`).
+   * Derived from the epochs too, so a flag a previous release left set after its own start heals.
    */
   stop_quiet?: boolean;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
@@ -215,6 +217,11 @@ export type Brain =
 export type IntentReason = "operator" | "restart" | "wake" | "drain" | "retry";
 /** Whether an intent moves a brain off `host` (another host named, or `host` avoided). */
 const moves = (intent: StartIntent, host: string) => (intent.host_hint !== undefined && intent.host_hint !== host) || intent.avoid === host;
+/** The sender of the platform's own notes about an agent's work (not input: see `AgentInfo.stop_quiet`). */
+const SYSTEM_SENDER = "system";
+/** Stopped with no outside input and no start since (see `AgentInfo.stop_quiet`). */
+const quietSinceStop = (info: Pick<AgentInfo, "stop_quiet" | "stop_epoch" | "agent_epoch">) =>
+  !!info.stop_quiet && (info.stop_epoch ?? -1) >= info.agent_epoch;
 /** Whether the brain at agent epoch `epoch` is one an operator stopped (see `AgentInfo.stop_epoch`). */
 const stoppedBrain = (info: Pick<AgentInfo, "stop_epoch">, epoch: number) => (info.stop_epoch ?? -1) >= epoch;
 /** Which reason wins when two starts merge into one intent. */
@@ -830,7 +837,6 @@ export class AgentDO extends DurableObject<Env> {
   private async issueStart(host: string, oauthRef: string, resume: AgentStartBody["resume"], intent: StartIntent): Promise<StartResult> {
     const started = this.update((i) => {
       i.agent_epoch += 1;
-      delete i.stop_quiet;
       i.brain = { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() };
       i.intent = null;
       delete i.capacity_waits;
@@ -1067,7 +1073,7 @@ export class AgentDO extends DurableObject<Env> {
       if (!i.brain || i.brain.host !== host || epoch < i.brain.epoch) return;
       if (stoppedBrain(i, i.brain.epoch)) ended = "stopped";
       restarts = RESTART_ON_EXIT[ended] && ended !== "idle";
-      wakes = RESTART_ON_EXIT[ended] || (stoppedBrain(i, i.brain.epoch) && !i.stop_quiet);
+      wakes = RESTART_ON_EXIT[ended] || (stoppedBrain(i, i.brain.epoch) && !quietSinceStop(i));
       // Counted once, where it happens (the crash-loop guard): here for a brain that ended on its
       // own; a condemned brain's exit is the condemn's outcome, counted by its cause if at all.
       if (restarts && i.brain.phase !== "condemned") i.exit_restarts = (i.exit_restarts ?? 0) + 1;
@@ -1259,7 +1265,11 @@ export class AgentDO extends DurableObject<Env> {
     return true;
   }
 
-  /** Input arrived (a turn, an inbox message, a merged delivery): a stop before it no longer quiets wakes. */
+  /**
+   * Input from outside the agent arrived (a turn, an inbox message, a merged delivery): a stop before
+   * it no longer quiets wakes. Not called for the platform's `system` notes about the agent's own
+   * work (a sandbox move, a background task's exit): they are not new work.
+   */
   private inputArrived(): void {
     if (this.load().stop_quiet) {
       this.update((i) => {
@@ -1279,7 +1289,7 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     if (info.brain && info.brain.phase !== "condemned") return;
     // Stopped, with no input since: the work waiting predates the stop, which ended it.
-    if (info.stop_quiet) return;
+    if (quietSinceStop(info)) return;
     const queued = this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
     if (!info.current_turn && !queued) return;
     if (afterExit && (info.exit_restarts ?? 0) > MAX_EXIT_RESTARTS) {
@@ -1344,7 +1354,7 @@ export class AgentDO extends DurableObject<Env> {
       this.update((i) => {
         i.told_sandbox_epoch = epoch;
       });
-      await this.postInbox("system", note);
+      await this.postInbox(SYSTEM_SENDER, note);
     }
     // Never a start from here: this may run inside a start that placed the sandbox. The alarm wakes
     // a stopped brain with work waiting, now that its sandbox has a host.
@@ -1919,7 +1929,7 @@ export class AgentDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------------
 
   /** Queue a turn. A retried submission with the same `requestId` gets the same turn, queued once. */
-  async enqueueTurn(input: TurnInput, requestId?: string, tainted = false): Promise<string> {
+  async enqueueTurn(input: TurnInput, requestId?: string, tainted = false, external = true): Promise<string> {
     // Never write a turn into an AgentDO that was never created (e.g. a subscriber id that names nobody).
     if (!this.exists()) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
     if (requestId) {
@@ -1932,7 +1942,7 @@ export class AgentDO extends DurableObject<Env> {
       turn, ord, JSON.stringify(input), Date.now(), requestId ?? null);
     // Another agent's text (a workstream batch) reaches the model inline: the session is tainted.
     if (tainted) this.kvPut("read_tainted", true);
-    this.inputArrived();
+    if (external) this.inputArrived();
     await this.pump();
     await this.wake();
     return turn;
@@ -1998,7 +2008,8 @@ export class AgentDO extends DurableObject<Env> {
     // Another agent's text reaches the model inline (stdin, the Stop hook, or a turn): when it may be
     // tainted, so is this session from now on (written with the message, in this step).
     if (tainted) this.kvPut("read_tainted", true);
-    this.inputArrived();
+    const external = from !== SYSTEM_SENDER;
+    if (external) this.inputArrived();
     if (info.current_turn) {
       this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, '${INBOX.delivered}', ?, ?)`,
         message.id, JSON.stringify(message), info.current_turn, Date.now(), requestId ?? null);
@@ -2007,7 +2018,7 @@ export class AgentDO extends DurableObject<Env> {
     } else {
       this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, NULL, '${INBOX.consumed}', ?, ?)`,
         message.id, JSON.stringify(message), Date.now(), requestId ?? null);
-      await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`);
+      await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`, false, external);
     }
     return message.id;
   }
@@ -2790,7 +2801,7 @@ export class AgentDO extends DurableObject<Env> {
     const how = task.status === "exited" ? `exited with code ${task.exit_code ?? "?"}` : task.status.replace("_", " ");
     const what = task.description ? `${task.task_id} (${task.description})` : task.task_id;
     // Only interesting while the agent is working; otherwise it reads TaskOutput when it next looks.
-    if (info.current_turn) await this.postInbox("system", `Background task ${what} ${how}.`);
+    if (info.current_turn) await this.postInbox(SYSTEM_SENDER, `Background task ${what} ${how}.`);
   }
 
   /** Answer a pending `ask`: inside the sync window it completes the tool call; afterwards it becomes a turn. */
