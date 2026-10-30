@@ -1,16 +1,44 @@
 #!/bin/bash
-# Burst-host bootstrap (EC2 user-data, rendered by the cell stack in deploy/). It holds no secrets:
-# the host proves itself with its signed instance identity document, reads its binaries from the
-# cell's bucket through the instance role, and gets the Claude setup token per brain from the
-# control plane. The host AMI (EC2 Image Builder) has install.sh's work baked in; install.sh runs
-# here too, so a host on an AMI behind the release, or on stock Amazon Linux 2023, catches up.
+# Host bootstrap (EC2 user-data, rendered by the cell stack in deploy/, one per launch template).
+# It holds no secrets: the host proves itself with its signed instance identity document and gets
+# the Claude setup token per brain from the control plane. ROLE is the template's: `sandbox` hosts
+# read their binaries from the cell's bucket through the instance role; `brain` hosts have no
+# bucket access and run what the host AMI (EC2 Image Builder) baked in. Both kinds boot that one
+# AMI; on a sandbox host install.sh runs here too, so one on an AMI behind the release, or on stock
+# Amazon Linux 2023, catches up.
 set -euo pipefail
 exec > >(tee -a /var/log/nest-bootstrap.log) 2>&1
 
+ROLE="@ROLE@"
 CELL="@CELL@"
 BUCKET="@BUCKET@"
 REGION="@REGION@"
 CONTROL_URL="@CONTROL_URL@"
+
+# A brain host: nestd's supervisor duties and the agent runner, nothing that serves a sandbox (no
+# driver, netns, proxy, gateway, tunnel or S3; nestd refuses those settings). Its role has no
+# bucket access, so it can't run install.sh: an AMI without the release can't make a brain host
+# (it never enrolls, and FleetDO terminates it at the enroll timeout).
+if [ "$ROLE" = brain ]; then
+  for b in nestd nest-runner nest; do
+    [ -x "/opt/nest/bin/$b" ] || { echo "brain host: /opt/nest/bin/$b is not on this AMI (brain hosts have no bucket access)"; exit 1; }
+  done
+  install -d -m 0755 /run/nest /run/nest/runner /etc/nest
+  VERSION=$(cat /opt/nest/release/VERSION)
+  cat >/etc/nest/nestd.json <<EOF
+{
+  "role": "brain",
+  "cell": "$CELL",
+  "control_url": "$CONTROL_URL",
+  "enrollment": {"type": "aws_imds"},
+  "versions": {"nest_proxy": "none", "agent_runner": "$VERSION", "claude_code": "$(cat /etc/nest/claude-version)"}
+}
+EOF
+  # The sandbox services stay off (nestd.service wants nest-proxy: masked, it is never started).
+  systemctl mask nest-proxy.service nest-gateway.service
+  systemctl enable --now nestd.service nest-runner.service
+  exit 0
+fi
 
 install -d -m 0755 /opt/nest
 cat >/opt/nest/install.sh <<'NEST_INSTALL'
@@ -43,7 +71,7 @@ fi
 VERSION=$(cat /opt/nest/release/VERSION)
 cat >/etc/nest/nestd.json <<EOF
 {
-  "role": "burst",
+  "role": "sandbox",
   "cell": "$CELL",
   "control_url": "$CONTROL_URL",
   "enrollment": {"type": "aws_imds"},
@@ -58,4 +86,6 @@ cat >/etc/nest/nestd.json <<EOF
 }
 EOF
 
-systemctl enable --now nest-proxy.service nestd.service nest-gateway.service nest-runner.service
+# A sandbox host runs no brain: the runner (installed from the same AMI) stays off.
+systemctl mask nest-runner.service
+systemctl enable --now nest-proxy.service nestd.service nest-gateway.service
