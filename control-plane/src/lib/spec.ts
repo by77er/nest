@@ -5,6 +5,7 @@
 // is passed in, nothing is awaited, and errors are returned, not thrown.
 import { z } from "zod";
 import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
+import { LedgerName, TASK_ADMIN_TOOLS, TASK_TOOLS } from "./tasks";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -18,6 +19,16 @@ export type EscalateTo = z.output<typeof EscalateTo>;
 export const HandsRule = z.enum(["required", "forbidden", "optional"]);
 export const Subscription = z.enum(["workstream"]);
 
+/**
+ * Capability parameters (docs/agents/capabilities/): values a spawn gives the capabilities that
+ * declare them, recorded in the agent's spec. `ledger`: the one task ledger the `tasks` and
+ * `tasks-admin` tools act on.
+ */
+export const ParamName = z.enum(["ledger"]);
+export type ParamName = z.output<typeof ParamName>;
+export const SpecParams = z.strictObject({ ledger: LedgerName.optional() });
+export type SpecParams = z.output<typeof SpecParams>;
+
 export const Capability = z.object({
   /** Platform tools (from `platform-tools.json`). */
   tools: z.array(z.string()).default([]),
@@ -25,6 +36,8 @@ export const Capability = z.object({
   rules: z.array(ToolRule).default([]),
   /** Added to the system prompt (after the template's own text). */
   prompt: z.string().default(""),
+  /** The spawn parameters its tools read (given by the template or the operator at spawn). */
+  params: z.array(ParamName).default([]),
 });
 export type Capability = z.output<typeof Capability>;
 
@@ -38,6 +51,8 @@ export const Template = z.object({
   escalate_to: EscalateTo,
   /** Channels the new agent subscribes to at spawn: `workstream` is its workstream's. */
   subscribe: z.array(Subscription).default([]),
+  /** Default capability parameters (a spawn's operator overrides replace each one it names). */
+  params: SpecParams.default({}),
 });
 export type Template = z.output<typeof Template>;
 
@@ -51,6 +66,8 @@ export const OperatorOverrides = z.object({
   tools: z.array(z.string()).optional(),
   escalate_to: EscalateTo.optional(),
   credential: Credential.optional(),
+  /** Capability parameters, each replacing the template's (e.g. the agent's task `ledger`). */
+  params: SpecParams.optional(),
 });
 export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 
@@ -58,7 +75,8 @@ export type OperatorOverrides = z.output<typeof OperatorOverrides>;
  * What an agent spawning another may change: it can only narrow. `tools` is a subset of the
  * template's, and `rules` only `deny` or `ask`, placed before the template's (first match wins), so
  * they can only take permissions away. No launch, built-in tools, credential or escalation: those
- * stay the template's. Anything else is refused (`strict`).
+ * stay the template's, and so do capability parameters (giving a child a ledger the spawner holds
+ * waits for `agent_spawn`). Anything else is refused (`strict`).
  */
 export const SpawnerOverrides = z.strictObject({
   tools: z.array(z.string()).optional(),
@@ -77,6 +95,8 @@ export interface AgentSpec {
   credential: string;
   escalate_to: EscalateTo;
   subscribe: "workstream"[];
+  /** Capability parameters, only those a capability of the template declares. */
+  params: SpecParams;
 }
 
 export interface Catalog {
@@ -90,30 +110,25 @@ const err = <T>(error: string): Result<T> => ({ ok: false, error });
 
 // --- The seed catalog ---------------------------------------------------------------------------------
 
-/** Seeded into an empty catalog: what the `worker` and `captain` roles gave. */
-export const SEED_CATALOG: Catalog = {
+const cap = (tools: readonly string[], rules: ToolRule[] = [], prompt = "", params: ParamName[] = []): Capability => ({ tools: [...tools], rules, prompt, params });
+
+/** The first seed (version 1): what the `worker` and `captain` roles gave. Frozen: catalogs seeded with it are migrated from it. */
+export const SEED_CATALOG_V1: Catalog = {
   capabilities: {
     // Every agent's nest MCP tools run without a prompt: the platform checks each call itself.
-    nest: { tools: [], rules: [{ pattern: "mcp__nest__*", decision: "allow" }], prompt: "" },
-    hands: {
-      tools: ["checkpoint", "expose_port"],
-      rules: [],
-      prompt: "You work in a remote sandbox through the mcp__nest__* tools; they behave like Claude Code's built-ins.",
-    },
+    nest: cap([], [{ pattern: "mcp__nest__*", decision: "allow" }]),
+    hands: cap(["checkpoint", "expose_port"], [],
+      "You work in a remote sandbox through the mcp__nest__* tools; they behave like Claude Code's built-ins."),
     // Claude Code's subagents (`Agent`, `Task` before 2.1) without an approval.
-    subagents: { tools: [], rules: [{ pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }], prompt: "" },
-    messaging: { tools: ["notify", "ask"], rules: [], prompt: "" },
-    transcripts: { tools: ["read_transcript"], rules: [], prompt: "" },
-    events: { tools: ["emit"], rules: [], prompt: "" },
-    sandboxes: { tools: ["fork_sandbox"], rules: [], prompt: "" },
-    brokered: { tools: ["brokered"], rules: [], prompt: "" },
-    management: {
-      tools: ["spawn_agent", "attach", "spawn_workstream", "send", "list_workstreams", "get_status", "wait_events", "approve", "deny",
-        "merge", "kill", "delegate", "notify_user"],
-      rules: [],
-      prompt: "",
-    },
-    memory: { tools: ["memory_read", "memory_write"], rules: [], prompt: "" },
+    subagents: cap([], [{ pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }]),
+    messaging: cap(["notify", "ask"]),
+    transcripts: cap(["read_transcript"]),
+    events: cap(["emit"]),
+    sandboxes: cap(["fork_sandbox"]),
+    brokered: cap(["brokered"]),
+    management: cap(["spawn_agent", "attach", "spawn_workstream", "send", "list_workstreams", "get_status", "wait_events", "approve", "deny",
+      "merge", "kill", "delegate", "notify_user"]),
+    memory: cap(["memory_read", "memory_write"]),
   },
   templates: {
     worker: {
@@ -123,6 +138,7 @@ export const SEED_CATALOG: Catalog = {
       credential: setupTokenSecret("worker"),
       escalate_to: "workstream",
       subscribe: [],
+      params: {},
     },
     captain: {
       capabilities: ["nest", "messaging", "transcripts", "sandboxes", "brokered", "management", "memory"],
@@ -134,9 +150,61 @@ export const SEED_CATALOG: Catalog = {
       credential: setupTokenSecret("captain"),
       escalate_to: "user",
       subscribe: ["workstream"],
+      params: {},
     },
   },
 };
+
+/** Version 2: the task ledger's capabilities (docs/control-plane/durable-objects/tasks/). */
+const TASK_CAPABILITIES: Record<string, Capability> = {
+  tasks: cap(TASK_TOOLS, [], [
+    "Your task ledger (mcp__nest__task_*): list and read its tasks, create tasks, update the ones assigned to or created by you",
+    "(backlog -> todo -> in_progress -> in_review -> done), and comment on any. Pass expected_version from your last read so you",
+    "never overwrite a change you haven't seen.",
+  ].join(" "), ["ledger"]),
+  "tasks-admin": cap(TASK_ADMIN_TOOLS, [], [
+    "You administer the task ledger: assign tasks (the assignee is told in its inbox), change any field of any task, cancel",
+    "tasks, and set the ledger's watcher (told when a task reaches in_review, done or canceled).",
+  ].join(" "), ["ledger"]),
+};
+
+/** The seed of an empty catalog (the current version). */
+export const SEED_CATALOG: Catalog = {
+  capabilities: { ...SEED_CATALOG_V1.capabilities, ...TASK_CAPABILITIES },
+  templates: {
+    worker: { ...SEED_CATALOG_V1.templates.worker!, capabilities: [...SEED_CATALOG_V1.templates.worker!.capabilities, "tasks"] },
+    captain: { ...SEED_CATALOG_V1.templates.captain!, capabilities: [...SEED_CATALOG_V1.templates.captain!.capabilities, "tasks", "tasks-admin"] },
+  },
+};
+
+/**
+ * The entries each seed version introduced, for a catalog seeded with an earlier one. A step adds
+ * an entry only if the name is free, and runs once (CatalogDO records the version it reached), so
+ * an entry the operator deletes later stays deleted. It never edits an existing entry: version 2's
+ * templates (`tasks` in `worker`, `tasks` and `tasks-admin` in `captain`) are the operator's step
+ * on an existing catalog (docs/control-plane/durable-objects/catalog/).
+ */
+export const SEED_STEPS: readonly { version: number; capabilities: Readonly<Record<string, Capability>>; templates: Readonly<Record<string, Template>> }[] = [
+  { version: 2, capabilities: TASK_CAPABILITIES, templates: {} },
+];
+export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
+
+/**
+ * What a catalog seeded at version `from`, holding entries named `have`, gains: the entries of every
+ * later step whose names are free. Pure: CatalogDO writes the result and the new version together.
+ */
+export function seedMigration(have: { capabilities: readonly string[]; templates: readonly string[] }, from: number): {
+  capabilities: Record<string, Capability>; templates: Record<string, Template>; version: number;
+} {
+  const capabilities: Record<string, Capability> = {};
+  const templates: Record<string, Template> = {};
+  for (const step of SEED_STEPS) {
+    if (step.version <= from) continue;
+    for (const [name, c] of Object.entries(step.capabilities)) if (!have.capabilities.includes(name)) capabilities[name] = c;
+    for (const [name, t] of Object.entries(step.templates)) if (!have.templates.includes(name)) templates[name] = t;
+  }
+  return { capabilities, templates, version: Math.max(from, SEED_VERSION) };
+}
 
 // --- Validation of catalog entries -------------------------------------------------------------------
 
@@ -194,6 +262,8 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     caps.push(cap);
   }
   const given = new Set(caps.flatMap((c) => c.tools));
+  const params = checkParams(name, caps, tpl.params ?? {});
+  if (!params.ok) return params;
   const prompt = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter((t) => t.length > 0).join("\n\n");
   return ok({
     template: name,
@@ -204,8 +274,26 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     credential: tpl.credential,
     escalate_to: tpl.escalate_to,
     subscribe: [...tpl.subscribe],
+    params: params.value,
   });
 }
+
+/** `params`, each of which a capability in `caps` must declare. */
+function checkParams(template: string, caps: readonly Capability[], params: SpecParams): Result<SpecParams> {
+  const declared = new Set(caps.flatMap((c) => c.params ?? []));
+  const parsed = SpecParams.safeParse(params);
+  if (!parsed.success) return err(`params: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
+  const out: SpecParams = {};
+  for (const [k, v] of Object.entries(parsed.data) as [ParamName, string | undefined][]) {
+    if (v === undefined) continue;
+    if (!declared.has(k)) return err(`no capability of template ${template} takes ${k}`);
+    out[k] = v;
+  }
+  return ok(out);
+}
+
+/** The capabilities template `name` lists (it expanded, so they exist). */
+const capsOf = (catalog: Catalog, name: string): Capability[] => catalog.templates[name]!.capabilities.map((c) => catalog.capabilities[c]!);
 
 /** `tools` narrowed to `subset`, which must not name a tool `tools` lacks. */
 function narrowTools(name: string, tools: string[], subset: readonly string[] | undefined): Result<string[]> {
@@ -242,9 +330,12 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value.tools, o.tools);
   if (!tools.ok) return tools;
+  const params = checkParams(spec.template, capsOf(catalog, spec.template), { ...base.value.params, ...o.params });
+  if (!params.ok) return params;
   return ok({
     ...base.value,
     tools: tools.value,
+    params: params.value,
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,
     credential: o.credential ?? base.value.credential,
@@ -261,9 +352,9 @@ export function intersectTools(spec: AgentSpec, grants: readonly string[]): Agen
 
 /**
  * What each role meant when records were stored with one, frozen here so editing the seed (or the
- * catalog) never changes how an old record is read. (A test checks the seed still expands to it.)
+ * catalog) never changes how an old record is read. (A test checks the first seed still expands to it.)
  */
-export const ROLE_SPECS: Readonly<Record<"worker" | "captain", Omit<AgentSpec, "launch" | "rules" | "subscribe">>> = {
+export const ROLE_SPECS: Readonly<Record<"worker" | "captain", Omit<AgentSpec, "launch" | "rules" | "subscribe" | "params">>> = {
   worker: {
     template: "worker",
     tools: ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"],
@@ -296,5 +387,5 @@ export interface RoleRecord {
 export function specFromRole(rec: RoleRecord): Omit<AgentSpec, "subscribe"> {
   const r = ROLE_SPECS[rec.role];
   const grants = rec.grants;
-  return { ...r, tools: grants ? r.tools.filter((t) => grants.includes(t)) : [...r.tools], launch: rec.launch, rules: rec.rules };
+  return { ...r, tools: grants ? r.tools.filter((t) => grants.includes(t)) : [...r.tools], launch: rec.launch, rules: rec.rules, params: {} };
 }

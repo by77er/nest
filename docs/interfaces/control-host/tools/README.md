@@ -17,8 +17,10 @@
 | `expose_port` | worker | Preview URL, optionally with a share link |
 | `brokered` | worker, captain | `{action, args}`, run outside the sandbox. The available actions depend on grants, and AgentDO's `tools_list` may also expose them as dedicated tools (e.g. `github_create_pr`) |
 | `spawn_workstream`, `send`, `list_workstreams`, `get_status`, `wait_events` (≤120 s), `approve`, `deny`, `merge` (approval), `kill`, `delegate`, `memory_read`, `memory_write`, `notify_user` | captain | Return `not_implemented`; the design replaces them with capability tools ([pending contract changes](../../README.md#pending-contract-changes)) |
+| `task_list {ledger?, status?, assignee? (me, none, agt_…), label?, text?, parent?, cursor?, limit? ≤200}`, `task_get {ledger?, task}`, `task_create {ledger?, title, description?, status? (backlog, todo), labels?, parent?}`, `task_update {ledger?, task, expected_version?, title?, description?, status?, labels?}`, `task_comment {ledger?, task, body}` | worker, captain (`tasks`) | The [task ledger](../../../control-plane/durable-objects/tasks/) named by the agent's `ledger` param; `task` is `T-<n>` or `tsk_…`. Results carry a text line and the JSON |
+| `task_assign {ledger?, task, assignee (agt_… or none), expected_version?}`, `task_update_any {ledger?, task, expected_version?, title?, description?, status?, priority?, labels?, parent? (or none)}`, `task_cancel {ledger?, task, reason?, expected_version?}`, `task_set_watcher {ledger?, watcher (agt_… or none)}` | captain (`tasks-admin`) | A stale `expected_version` is refused with `conflict` |
 
-Only `notify`, `emit`, `ask`, `read_transcript` and `expose_port` run; the rest return `not_implemented`.
+Only `notify`, `emit`, `ask`, `read_transcript`, `expose_port` and the `task_*` tools run; the rest return `not_implemented`. The seed column is a new catalog's: an existing catalog's `worker` and `captain` get the task capabilities by my edit ([CatalogDO](../../../control-plane/durable-objects/catalog/)).
 
 **Grants:**
 - AgentDO lists exactly the tools in the agent's expanded spec, and checks every `tool_call` against it again.

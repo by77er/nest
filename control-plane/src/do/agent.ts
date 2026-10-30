@@ -12,7 +12,11 @@ import { num, type Env } from "../env";
 import { toolDef, toolDefs } from "../lib/registry";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
+import {
+  type Actor, ALL_TASK_TOOLS, type SpecGrant, TASK_ADMIN_TOOLS, type TaskFilter, type TaskOp, type TaskPriority, type TaskStatus,
+} from "../lib/tasks";
 import { signBlobUrl } from "../lib/tokens";
+import { ledgerStub, type TaskView } from "./tasks";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
 import { storedEnum, storedEnumOrNull } from "../lib/stored";
 import {
@@ -358,6 +362,8 @@ export class AgentDO extends DurableObject<Env> {
       ...rest,
       ...spec,
       escalate_to: storedEnum(EscalateTo, (spec ?? rest).escalate_to, "kv.info.escalate_to"),
+      // Stored before capability parameters: none.
+      params: (spec ?? rest).params ?? {},
       owner: info.owner !== undefined ? info.owner : captain ?? null,
       brain,
       intent: info.intent ?? null,
@@ -2026,6 +2032,8 @@ export class AgentDO extends DurableObject<Env> {
       if (!guest) this.assertEpoch(fence);
     };
 
+    if (ALL_TASK_TOOLS.includes(name)) return await this.taskTool(info, name, a, key, live);
+
     switch (name) {
       case "notify": {
         const to = String(a.to);
@@ -2106,6 +2114,98 @@ export class AgentDO extends DurableObject<Env> {
         const r = await this.sandboxStub(info.hands.sandbox).exposePort(
           Number(a.port), false, a.host_header === "preserve" ? "preserve" : "localhost");
         return { status: "ok", content: [{ type: "text", text: r.url }, { type: "json", value: r }] };
+      }
+      default:
+        throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${name} is not implemented yet`, 501);
+    }
+  }
+
+  /**
+   * The task ledger tools (docs/control-plane/durable-objects/tasks/). They act on the one ledger the
+   * agent's spec names (its `ledger` param); a `ledger` argument must name that one. The tool itself
+   * was checked against the spec: a `tasks-admin` tool makes the actor an admin. Lookups of other
+   * agents' specs (an assignee, a watcher) happen here, before the ledger is called: the ledger never
+   * calls back into an AgentDO that is awaiting it.
+   */
+  private async taskTool(info: AgentInfo, name: string, a: Record<string, unknown>, key: string, live: () => Promise<void>): Promise<ToolOutcome> {
+    const ledger = info.params.ledger;
+    if (!ledger) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `${name}: this agent has no task ledger (it was spawned without its tasks capability's \`ledger\` param)`, 403);
+    }
+    if (a.ledger !== undefined && a.ledger !== ledger) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `this agent may use only ledger ${ledger}, not ${String(a.ledger)}`, 403);
+    }
+    const actor: Actor = { kind: "agent", agent: info.agent, ledger, admin: (TASK_ADMIN_TOOLS as readonly string[]).includes(name) };
+    const stub = ledgerStub(this.env, ledger);
+    const str = (k: string) => (typeof a[k] === "string" ? (a[k] as string) : undefined);
+    const int = (k: string) => (typeof a[k] === "number" ? (a[k] as number) : undefined);
+    const task = () => String(a.task);
+    const out = (line: string, value: unknown): ToolOutcome => ({ status: "ok", content: [{ type: "text", text: line }, { type: "json", value }] });
+    const line = (t: TaskView) => `${t.key} [${t.status}${t.priority === "none" ? "" : `, ${t.priority}`}] ${t.title}` +
+      `${t.assignee ? ` (${t.assignee})` : ""} v${t.version}`;
+    /** An agent's grant as its spec states it (`none`: null). */
+    const grantOf = async (id: string): Promise<SpecGrant | null> => {
+      if (id === "none") return null;
+      if (!id.startsWith("agt_")) throw new NestError(ErrorCodes.INVALID_MESSAGE, `expected an agent id (agt_...) or 'none', not ${id}`);
+      const other = id === info.agent ? info : await this.env.AGENT.get(this.env.AGENT.idFromName(id)).info();
+      return { agent: id, ledger: other.params?.ledger ?? null, tools: other.tools };
+    };
+    const write = async (op: TaskOp) => {
+      await live();
+      return stub.apply(ledger, actor, op, key);
+    };
+    const edits = {
+      title: str("title"), description: str("description"), status: str("status") as TaskStatus | undefined,
+      labels: Array.isArray(a.labels) ? (a.labels as string[]) : undefined,
+    };
+    switch (name) {
+      case "task_list": {
+        const assignee = str("assignee");
+        const filter: TaskFilter = {
+          status: str("status") as TaskStatus | undefined, label: str("label"), text: str("text"), parent: str("parent"),
+          assignee: assignee === "me" ? info.agent : assignee,
+        };
+        const page = await stub.list(ledger, actor, filter, int("cursor") ?? 0, int("limit"));
+        const text = page.tasks.length ? page.tasks.map(line).join("\n") : "No tasks match.";
+        return out(page.next_cursor === null ? text : `${text}\n(more: cursor ${page.next_cursor})`, page);
+      }
+      case "task_get": {
+        const d = await stub.get(ledger, actor, task());
+        return out(`${line(d.task)}\n\n${d.task.description}`, d);
+      }
+      case "task_create": {
+        const r = await write({ kind: "create", ...edits, title: String(a.title), parent: str("parent") });
+        return out(`Created ${line(r.task!)}`, r.task);
+      }
+      case "task_update": {
+        const r = await write({ kind: "update", task: task(), expected_version: int("expected_version"), ...edits });
+        return out(`Updated ${line(r.task!)}`, r.task);
+      }
+      case "task_comment": {
+        const r = await write({ kind: "comment", task: task(), body: String(a.body) });
+        return out(`Commented on ${r.task!.key}`, r);
+      }
+      case "task_assign": {
+        const assignee = await grantOf(String(a.assignee));
+        const r = await write({ kind: "assign", task: task(), expected_version: int("expected_version"), assignee });
+        return out(`${r.task!.assignee ? "Assigned" : "Unassigned"} ${line(r.task!)}`, r.task);
+      }
+      case "task_update_any": {
+        const parent = str("parent");
+        const r = await write({
+          kind: "update_any", task: task(), expected_version: int("expected_version"), ...edits,
+          priority: str("priority") as TaskPriority | undefined, parent: parent === "none" ? null : parent,
+        });
+        return out(`Updated ${line(r.task!)}`, r.task);
+      }
+      case "task_cancel": {
+        const r = await write({ kind: "cancel", task: task(), expected_version: int("expected_version"), reason: str("reason") });
+        return out(`Canceled ${line(r.task!)}`, r.task);
+      }
+      case "task_set_watcher": {
+        const watcher = await grantOf(String(a.watcher));
+        const r = await write({ kind: "set_watcher", watcher });
+        return out(r.watcher ? `${r.watcher} watches ledger ${ledger}` : `Ledger ${ledger} has no watcher`, { ledger, watcher: r.watcher ?? null });
       }
       default:
         throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${name} is not implemented yet`, 501);

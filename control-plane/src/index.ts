@@ -7,6 +7,8 @@ import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
+import { type Actor, LedgerName, type SpecGrant, type TaskOp, TaskPriority, TaskStatus } from "./lib/tasks";
+import { LIST_DEFAULT_LIMIT, ledgerStub } from "./do/tasks";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
@@ -14,6 +16,7 @@ export { BrokerDO } from "./do/broker";
 export { CatalogDO } from "./do/catalog";
 export { FleetDO } from "./do/fleet";
 export { SandboxDO } from "./do/sandbox";
+export { TaskLedgerDO } from "./do/tasks";
 export { WorkstreamDO } from "./do/workstream";
 
 const DEFAULT_CELL = "local";
@@ -241,6 +244,61 @@ async function route(req: Request, env: Env): Promise<Response> {
     }
   }
 
+  // Task ledgers (docs/control-plane/durable-objects/tasks/): named, with the operator as the root.
+  if ((p = m(/^\/v1\/ledgers\/([^/]+)(\/watcher|\/tasks(?:\/([^/]+)(\/assign|\/comments)?)?)?$/))) {
+    const parsed = LedgerName.safeParse(p[1]);
+    if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, parsed.error.issues[0]!.message);
+    const name = parsed.data;
+    const l = ledgerStub(env, name);
+    const operator: Actor = { kind: "operator" };
+    const [, , sub, ref, action] = p;
+    /** An agent's grant as its spec states it (null: unassign / no watcher). */
+    const grantOf = async (id: string | null): Promise<SpecGrant | null> => {
+      if (id === null) return null;
+      const a = await agent(env, id).info();
+      return { agent: id, ledger: a.params?.ledger ?? null, tools: a.tools };
+    };
+    const AgentOrNull = z.string().startsWith("agt_").nullable();
+    if (req.method === "GET" && !sub) return json(await l.info(name, operator));
+    if (req.method === "PUT" && sub === "/watcher") {
+      const r = await body(req, z.object({ watcher: AgentOrNull, request_id: RequestIdField }));
+      return json(await l.apply(name, operator, { kind: "set_watcher", watcher: await grantOf(r.watcher) }, requestId(req, r.request_id)));
+    }
+    if (sub?.startsWith("/tasks") && !ref) {
+      if (req.method === "GET") {
+        const q = (k: string) => url.searchParams.get(k) ?? undefined;
+        const status = q("status");
+        if (status !== undefined && !TaskStatus.safeParse(status).success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown status ${status}`);
+        return json(await l.list(name, operator, {
+          status: status as TaskStatus | undefined, assignee: q("assignee"), label: q("label"), text: q("text"), parent: q("parent"),
+        }, num(q("cursor"), 0), num(q("limit"), LIST_DEFAULT_LIMIT)));
+      }
+      if (req.method === "POST") {
+        const r = await body(req, TaskEditsBody.extend({ title: z.string(), assignee: AgentOrNull.optional(), request_id: RequestIdField }));
+        const { assignee, request_id, ...edits } = r;
+        const op: TaskOp = { kind: "create", ...edits, parent: edits.parent ?? undefined, assignee: await grantOf(assignee ?? null) };
+        return json((await l.apply(name, operator, op, requestId(req, request_id))).task, 201);
+      }
+    }
+    if (ref && !action) {
+      if (req.method === "GET") return json(await l.get(name, operator, ref));
+      if (req.method === "PATCH") {
+        const r = await body(req, TaskEditsBody.extend({ expected_version: z.number().int().optional(), request_id: RequestIdField }));
+        const { request_id, ...edits } = r;
+        return json((await l.apply(name, operator, { kind: "update_any", task: ref, ...edits }, requestId(req, request_id))).task);
+      }
+    }
+    if (req.method === "POST" && ref && action === "/assign") {
+      const r = await body(req, z.object({ assignee: AgentOrNull, expected_version: z.number().int().optional(), request_id: RequestIdField }));
+      const op: TaskOp = { kind: "assign", task: ref, expected_version: r.expected_version, assignee: await grantOf(r.assignee) };
+      return json((await l.apply(name, operator, op, requestId(req, r.request_id))).task);
+    }
+    if (req.method === "POST" && ref && action === "/comments") {
+      const r = await body(req, z.object({ body: z.string(), request_id: RequestIdField }));
+      return json((await l.apply(name, operator, { kind: "comment", task: ref, body: r.body }, requestId(req, r.request_id))).comment, 201);
+    }
+  }
+
   if (req.method === "POST" && path === "/v1/sandboxes") {
     const r = await body(req, z.object({
       workstream: z.string().startsWith("ws_"),
@@ -412,6 +470,16 @@ async function route(req: Request, env: Env): Promise<Response> {
 
 /** A client's id for a submission (body `request_id` or `Idempotency-Key`): a retry with it is applied once. */
 const RequestIdField = z.string().min(1).max(128).optional();
+
+/** Task fields the operator may set (the core checks their bounds); `parent: null` clears it. */
+const TaskEditsBody = z.strictObject({
+  title: z.string().optional(),
+  description: z.string().optional(),
+  status: TaskStatus.optional(),
+  priority: TaskPriority.optional(),
+  labels: z.array(z.string()).optional(),
+  parent: z.string().nullable().optional(),
+});
 function requestId(req: Request, fromBody: string | undefined): string | undefined {
   const header = req.headers.get("idempotency-key") ?? undefined;
   const id = fromBody ?? header;

@@ -111,6 +111,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Brain host | A cheap host with no KVM running nestd (supervisor duties only), the agent runner and Claude Code processes. Every brain lives here; no sandbox does. Capacity is counted in brains; scales to zero. |
 | Captain | A pattern, not a platform concept: an agent without hands, spawned from the `captain` template, that manages other agents and escalates to me |
 | Workstream | A pattern, not a platform concept: a goal plus the channel, sandboxes and agents set up for it, grouped by a label |
+| Task ledger | A named issue tracker in the control plane (TaskLedgerDO): tasks with status, priority, assignee, labels, sub-tasks, comments and history. Agents reach the one their spec names through the `tasks` and `tasks-admin` capabilities |
 | nestd | Per-host daemon |
 | nest-proxy | Per-host egress proxy |
 | Guest agent | Hands server inside each sandbox VM. Holds no credentials. |
@@ -194,6 +195,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Every brain runs on a brain host: the cheapest instance class that runs Claude Code, no KVM, idle 30 min then terminated. An agent without hands is a brain like any other, and the Discord gateway client is a singleton placed on one brain host; no host kind is reserved for brains without sandboxes | [compute/brain-hosts/](compute/brain-hosts/) |
 | A release rolls out control plane, then brain hosts, then sandbox hosts, one canary and a probe gate each; FleetDO holds three desired versions per cell (brain host, sandbox host, guest image), and rollback sets a version back | [compute/provisioning/](compute/provisioning/#upgrades) |
 | `api-loop` can hold hands through the gateway (a Durable Object opens one WebSocket per call) and is deferred until the API credits are picked up | [agents/backends/api-loop/](agents/backends/api-loop/) |
+| Task ledgers are named objects, not per workstream: an agent reaches one ledger, named by its `tasks{ledger}` capability parameter; decisions are a pure core, notices go to inboxes from the ledger's alarm | [control-plane/durable-objects/tasks/](control-plane/durable-objects/tasks/) |
 
 ## Open questions and watch items
 
@@ -221,6 +223,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Access in front of the gateway hostnames is in place** (2026-10-24): the application on `*-gw-nest.bitcru.sh` answers 403 without the service token and admits it with a Service Auth policy (an Allow policy redirects a service token to the login page, which is what the first cross-host run hit). Every brain now depends on the token the control plane hands out as `edge`.
 - **Open:** the long-run spec language for protocol models: TLA+ with TLC (what the pilots used, and found bugs with) or Quint (the survey's pick, for model-based testing). See [verification/](verification/#open-questions).
 - **Decide:** the no-capacity placement rollback reuses an epoch number, contrary to "an epoch is never retried", and makes the old holder's salvage fail for good. Keep it and authorize that salvage, or spend an epoch per attempt? See [verification/sandbox-lease/](verification/sandbox-lease/).
+- **Open:** capability parameters granting more than one ledger (`tasks{ledgers}`), and a spawner passing on a ledger it holds (waits for `agent_spawn` and grants). See [control-plane/durable-objects/tasks/](control-plane/durable-objects/tasks/).
 - **Interim:** WorkstreamDO stands in for the workstream channel (a log, one subscriber woken with batches, the user-notification queue) until ChannelDO exists; then it goes. See [orchestration/workstreams/](orchestration/workstreams/#the-interim-workstream-channel).
 - **Docs ahead of code (found by the verification study):** hands-call journaling (`call_status`, `executed: false`) and the single `isRestoreSource` predicate are settled here but not built, and nestd's command receiver has no gap check. See [verification/](verification/#real-bugs-found).
 

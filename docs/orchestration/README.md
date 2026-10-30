@@ -13,7 +13,7 @@
 | Captain running workstreams | An agent without hands (`captain` template). Per workstream: a channel, sandboxes, and workers labeled `workstream=<name>` whose events it subscribes to |
 | Reviewer watching an implementer | Two agents attached to one sandbox; the reviewer subscribes to the implementer's `events` |
 | Pipeline | Agent A posts results to `stage-1`, which agent B subscribes to |
-| Swarm | N workers on forks of one sandbox, claiming tasks on a shared board (a channel read by key, with compare-and-set claims). Without an oracle splitting the work, swarms pile onto the same problem ([Anthropic's C compiler, 2026-02](https://www.anthropic.com/engineering/building-c-compiler)) |
+| Swarm | N workers on forks of one sandbox, taking tasks from a shared board: a [task ledger](../control-plane/durable-objects/tasks/) they all hold (`tasks{ledger}`), where a captain with `tasks-admin` assigns and each worker moves its own tasks (writes carry `expected_version`, so none overwrites another's). Without an oracle splitting the work, swarms pile onto the same problem ([Anthropic's C compiler, 2026-02](https://www.anthropic.com/engineering/building-c-compiler)) |
 | Me pairing with an agent | Its inbox (from Discord), and `nest attach` to its sandbox |
 | Triage in front of an expensive agent | A cheap agent subscribed to a busy channel, posting only what matters to the other's inbox |
 | Monitor | A long-lived agent with memory, subscribed to the channels or events it watches (CI hooks, a sandbox's ports), or polling a feed with `wake_at`, posting to `user` or a captain when something needs attention |

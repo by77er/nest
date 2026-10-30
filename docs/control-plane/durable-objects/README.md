@@ -11,6 +11,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [hook/](hook/) | One webhook: verification (through BrokerDO), mapping, dedup, posting to its channel |
 | [broker/](broker/) | Claude setup tokens, injected secrets, hook secrets, capability credentials, GitHub App token minting |
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
+| [tasks/](tasks/) | One named task ledger: tasks, comments, history, its watcher, and the inbox notices its changes owe |
 
 ## Conventions
 

@@ -3,6 +3,7 @@ import type { BrokerDO } from "./do/broker";
 import type { CatalogDO } from "./do/catalog";
 import type { FleetDO } from "./do/fleet";
 import type { SandboxDO } from "./do/sandbox";
+import type { TaskLedgerDO } from "./do/tasks";
 import type { WorkstreamDO } from "./do/workstream";
 
 export interface Env {
@@ -12,6 +13,8 @@ export interface Env {
   WORKSTREAM: DurableObjectNamespace<WorkstreamDO>;
   BROKER: DurableObjectNamespace<BrokerDO>;
   CATALOG: DurableObjectNamespace<CatalogDO>;
+  /** Task ledgers, one per name (`ledger/<name>`). */
+  TASKS: DurableObjectNamespace<TaskLedgerDO>;
   BUCKET: R2Bucket;
 
   /** Bearer token for the admin API (Cloudflare Access replaces this later). */

@@ -1174,6 +1174,8 @@ mod tests {
             "notify", "emit", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "checkpoint",
             "expose_port", "brokered", "spawn_workstream", "send", "list_workstreams", "get_status", "wait_events",
             "approve", "deny", "merge", "kill", "delegate", "memory_read", "memory_write", "notify_user",
+            "task_list", "task_get", "task_create", "task_update", "task_comment", "task_assign", "task_update_any",
+            "task_cancel", "task_set_watcher",
         ] {
             assert!(names.contains(required), "missing platform tool {required}");
         }
