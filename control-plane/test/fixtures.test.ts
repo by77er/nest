@@ -186,11 +186,14 @@ describe("shared lists (the Rust crate asserts the same files)", () => {
     });
   }
 
-  it("the previous release's host roles parse as the new ones, for one release", () => {
-    expect(M.HostRole.parse("burst")).toBe("sandbox");
-    expect(M.HostRole.parse("controller")).toBe("brain");
+  it("host roles: the next release's names are read now, the previous release's are what this one writes", () => {
+    expect(M.hostKind(M.HostRole.parse("burst"))).toBe("sandbox");
+    expect(M.hostKind(M.HostRole.parse("sandbox"))).toBe("sandbox");
+    expect(M.hostKind(M.HostRole.parse("controller"))).toBe("brain");
+    expect(M.hostKind(M.HostRole.parse("brain"))).toBe("brain");
+    expect(M.roleName("sandbox")).toBe("burst");
+    expect(M.roleName("brain")).toBe("controller");
     expect(M.HostRole.safeParse("worker").success).toBe(false);
-    expect(M.HostRole.safeParse("toString").success).toBe(false);
   });
 
   it("open enums parse a member they don't know (an older sender's free text) as `unknown`", () => {

@@ -163,17 +163,20 @@ pub mod error_codes {
     }
 }
 
-/// What a host is for. See docs/compute/.
+/// What a host is for: it runs sandboxes or brains, never both. See docs/compute/.
+///
+/// Renamed by expand/contract over two releases (dev/deploy.md): this release reads `sandbox` and
+/// `brain` but still writes the previous release's names, `burst` and `controller`, so a control
+/// plane rolled back to the previous release accepts every host of this one; the next release
+/// writes the new names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRole {
-    /// Runs sandboxes (Firecracker, the gateway, nest-proxy, the tunnel); never a brain. `burst`,
-    /// the previous release's name, is accepted as input for one release.
-    #[serde(alias = "burst")]
+    /// Runs sandboxes (Firecracker, the gateway, nest-proxy, the tunnel); never a brain.
+    #[serde(rename = "burst", alias = "sandbox")]
     Sandbox,
-    /// Runs brains (the agent runner and Claude Code); never a sandbox. `controller`, the previous
-    /// release's name, is accepted as input for one release.
-    #[serde(alias = "controller")]
+    /// Runs brains (the agent runner and Claude Code); never a sandbox.
+    #[serde(rename = "controller", alias = "brain")]
     Brain,
 }
 

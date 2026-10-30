@@ -14,7 +14,7 @@ import {
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
 import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, valueOf, type AwsCellConfig, type AwsSource, type CellAws } from "../lib/cells";
-import { idleStep, maxBrains, pickBrainHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
+import { brainHostNeeded, idleStep, maxBrains, pickBrainHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
@@ -27,8 +27,8 @@ import {
 } from "../protocol/control";
 import type { GuestInfo } from "../protocol/gateway";
 import {
-  type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, HostRole, LEGACY_HOST_ROLES, PROTOCOL_VERSION, type Resources,
-  SandboxState,
+  type CliResult, ErrorCodes, type EgressPolicy, type GenerationRecord, type HostKind, HostRole, hostKind, PROTOCOL_VERSION, type Resources,
+  roleName, SandboxState,
 } from "../protocol/model";
 import {
   type CapacityView, type FleetView, HOST_STATUSES, type HostStatus, type HostView, type ImagesView, LAUNCH_END_REASONS, type LaunchEndReason,
@@ -52,8 +52,8 @@ type AnsweredBy = z.output<typeof AnsweredByEnum>;
 type CommandType = CommandBody["type"];
 const CommandTypeEnum = typeEnum<CommandType>(CommandBodyVariants);
 /** The host kind that holds sandbox leases, and the one that runs brains: never both (docs/compute/). */
-const SANDBOX_ROLE: HostRole = "sandbox";
-const BRAIN_ROLE: HostRole = "brain";
+const SANDBOX_ROLE: HostKind = "sandbox";
+const BRAIN_ROLE: HostKind = "brain";
 /** Statuses in which a host is (or may be) running: it is ticked, polled and counted. */
 const LIVE_STATUSES = ["active", "draining", "stonith_pending"] as const satisfies readonly HostStatus[];
 
@@ -61,7 +61,7 @@ const LIVE_STATUSES = ["active", "draining", "stonith_pending"] as const satisfi
 // without zod; they must be the same sets.
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 export const ADMIN_ENUMS_AGREE: [
-  Same<AdminSandboxState, SandboxState>, Same<AdminHostRole, HostRole>, Same<AdminTunnelState, TunnelState>, Same<AdminAwsSource, AwsSource>,
+  Same<AdminSandboxState, SandboxState>, Same<AdminHostRole, HostKind>, Same<AdminTunnelState, TunnelState>, Same<AdminAwsSource, AwsSource>,
 ] = [true, true, true, true];
 
 /**
@@ -79,7 +79,8 @@ export type HostGateway =
 interface HostRow {
   host: string;
   cell: string;
-  role: HostRole;
+  /** Stored as the role's name this release writes (`roleName`), read back as its kind. */
+  role: HostKind;
   instance_id: string | null;
   status: HostStatus;
   last_rx: number | null;
@@ -234,7 +235,7 @@ export class FleetDO extends DurableObject<Env> {
   /** Override for tests: a fake Cloudflare API and the domain; `null` = no tunnels; `undefined` reads the env. */
   cloudflareOverride: { api: CloudflareApi; domain: string } | null | undefined = undefined;
   /** Host kinds with a launch in flight (RunInstances awaits); placements meanwhile don't launch another. */
-  private readonly launching = new Set<HostRole>();
+  private readonly launching = new Set<HostKind>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -297,12 +298,8 @@ export class FleetDO extends DurableObject<Env> {
     // unknown when it was issued); null for the host's own result (and the answers older releases
     // already wrote). Only a host's answer means the host ran it (`killProgress`).
     this.addColumn("commands", "answered_by", "TEXT");
-    // Host kinds: the previous release's role names (`burst`, `controller`) become `sandbox` and
-    // `brain` in every table that stores one, once (a row written by an old host's enrollment later
-    // goes through the zod alias, which writes the new name).
-    for (const [old, kind] of Object.entries(LEGACY_HOST_ROLES)) {
-      for (const table of ["hosts", "enroll_tokens", "launched"]) this.sql.exec(`UPDATE ${table} SET role = ? WHERE role = ?`, kind, old);
-    }
+    // Host kinds: `role` columns keep the previous release's names (`burst`, `controller`) this
+    // release, and are read as either name (`hostKind`), so a rolled-back Worker reads every row.
     // `tunnel_state` null meant `none` (a row from before the field): made explicit, once.
     this.sql.exec("UPDATE hosts SET tunnel_state = 'none' WHERE tunnel_state IS NULL");
     // Retention: when a host died. A row that was dead before the column counts from now.
@@ -347,7 +344,7 @@ export class FleetDO extends DurableObject<Env> {
 
   async mintEnrollmentToken(role: HostRole): Promise<string> {
     const token = `net_${newId("")}${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
-    this.sql.exec("INSERT INTO enroll_tokens (hash, role, created_ms) VALUES (?, ?, ?)", hex(await sha256(token)), role, Date.now());
+    this.sql.exec("INSERT INTO enroll_tokens (hash, role, created_ms) VALUES (?, ?, ?)", hex(await sha256(token)), roleName(hostKind(role)), Date.now());
     return token;
   }
 
@@ -360,7 +357,7 @@ export class FleetDO extends DurableObject<Env> {
       `INSERT INTO launched (instance_id, launched_ms, role, account_id, region) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(instance_id) DO UPDATE SET role = excluded.role, account_id = excluded.account_id, region = excluded.region
        WHERE launched.host IS NULL`,
-      l.instance_id, Date.now(), l.role ?? null, l.account_id ?? null, l.region ?? null,
+      l.instance_id, Date.now(), l.role ? roleName(hostKind(l.role)) : null, l.account_id ?? null, l.region ?? null,
     );
   }
 
@@ -372,7 +369,7 @@ export class FleetDO extends DurableObject<Env> {
     // Only a sandbox host runs nest-proxy, so only it needs (and must ask for) the intermediate CA.
     // A brain host sends no CSR; one of the previous release still does, and is answered with a CA
     // for that release.
-    if (req.role === SANDBOX_ROLE && !req.proxy_ca_csr_pem) {
+    if (hostKind(req.role) === SANDBOX_ROLE && !req.proxy_ca_csr_pem) {
       throw new NestError(ErrorCodes.INVALID_MESSAGE, "a sandbox host must send proxy_ca_csr_pem", 400);
     }
     const proxyCa = req.proxy_ca_csr_pem ? await this.signProxyCa(req.proxy_ca_csr_pem) : undefined;
@@ -382,7 +379,7 @@ export class FleetDO extends DurableObject<Env> {
     // and once more when it is consumed atomically with the row. A failure in between fails the
     // enrollment (the host retries with the same proof) and the tunnel just created is deleted.
     this.checkProof(req, identity, hash);
-    const tunnel = req.role === SANDBOX_ROLE ? await this.createTunnel(host) : null;
+    const tunnel = hostKind(req.role) === SANDBOX_ROLE ? await this.createTunnel(host) : null;
     try {
       return await this.enrollRecord(req, cell, identity, hash, host, proxyCa, tunnel);
     } catch (e) {
@@ -399,7 +396,9 @@ export class FleetDO extends DurableObject<Env> {
         .toArray()[0];
       if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "unknown enrollment token", 401);
       if (row.used_ms !== null && !this.neverConnected(row.host)) throw new NestError(ErrorCodes.FORBIDDEN, "enrollment token already used", 409);
-      if (storedEnum(HostRole, row.role, "enroll_tokens.role") !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, "enrollment token minted for another role", 401);
+      if (hostKind(storedEnum(HostRole, row.role, "enroll_tokens.role")) !== hostKind(req.role)) {
+        throw new NestError(ErrorCodes.UNAUTHORIZED, "enrollment token minted for another role", 401);
+      }
       if (consume) {
         if (row.host) this.retireNeverConnected(row.host, consume.host);
         this.sql.exec("UPDATE enroll_tokens SET used_ms = ?, host = ? WHERE hash = ?", consume.now, consume.host, hash);
@@ -413,8 +412,9 @@ export class FleetDO extends DurableObject<Env> {
       .toArray()[0];
     if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance was not launched by this control plane (in this cell)", 401);
     if (row.host && !this.neverConnected(row.host)) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
-    const launchedAs = storedEnumOrNull(HostRole, row.role, "launched.role");
-    if (launchedAs && launchedAs !== req.role) throw new NestError(ErrorCodes.UNAUTHORIZED, `instance was launched as ${launchedAs}`, 401);
+    const stored = storedEnumOrNull(HostRole, row.role, "launched.role");
+    const launchedAs = stored ? hostKind(stored) : null;
+    if (launchedAs && launchedAs !== hostKind(req.role)) throw new NestError(ErrorCodes.UNAUTHORIZED, `instance was launched as ${launchedAs}`, 401);
     if (row.account_id && row.account_id !== identity.accountId) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS account", 401);
     if (row.region && row.region !== identity.region) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance is in another AWS region", 401);
     if (consume) {
@@ -461,10 +461,10 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec(
       `INSERT INTO hosts (host, cell, role, instance_id, status, last_rx, token_exp, enrolled_ms, tunnel_id, tunnel_hostname, dns_record_id, tunnel_state)
        VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
-      host, cell, req.role, instanceId, "active" satisfies HostStatus, tokenExp, now, tunnel?.id ?? null, tunnel?.hostname ?? null, tunnel?.record ?? null,
+      host, cell, roleName(hostKind(req.role)), instanceId, "active" satisfies HostStatus, tokenExp, now, tunnel?.id ?? null, tunnel?.hostname ?? null, tunnel?.record ?? null,
       "none" satisfies TunnelState,
     );
-    const hostToken = await issueHostToken(this.env.HOST_TOKEN_SECRET, { host, cell, role: req.role, exp: tokenExp });
+    const hostToken = await issueHostToken(this.env.HOST_TOKEN_SECRET, { host, cell, role: roleName(hostKind(req.role)), exp: tokenExp });
     return {
       host,
       host_token: hostToken,
@@ -1404,6 +1404,18 @@ export class FleetDO extends DurableObject<Env> {
       if (target.role !== BRAIN_ROLE) {
         throw new NestError(ErrorCodes.FORBIDDEN, `host ${host} is a ${target.role} host: brains run only on brain hosts`, 409, true);
       }
+      // The cap is enforced here, where the index row is written, not only at the pick: starts that
+      // picked the same host concurrently (each between `placeBrain` and this send) can't overfill
+      // it. Nothing is stored or sent for a refused start; AgentDO condemns it as an unconfirmed send
+      // (its kill finds nothing there) and keeps the intent, whose next pick sees this host full.
+      const max = this.maxBrainsOf(target, this.cellConfig()?.brain?.max_brains_per_host);
+      for (const b of bodies) {
+        if (b.type !== "agent_start") continue;
+        const others = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM host_agents WHERE host = ? AND agent <> ?", host, b.agent).one().n;
+        if (others >= max) {
+          throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, `brain host ${host} is full (${others} of ${max} brains)`, 503, true);
+        }
+      }
     }
     const commands = bodies.map((body) => ({ cmd: newId("cmd_"), issued_ms: now, ...body }));
     // Nothing will ever deliver a command to a dead or unknown host: answered at once (like a dead
@@ -1607,7 +1619,7 @@ export class FleetDO extends DurableObject<Env> {
   /** `current`: its nestd keys brains by agent epoch (not the previous release's). */
   /** `role`: its kind; only a `brain` host ever gets a brain. */
   async hostStatus(host: string): Promise<{
-    status: HostStatus; connected: boolean; last_rx: number | null; lost: boolean; current: boolean; wedged: boolean; role: HostRole;
+    status: HostStatus; connected: boolean; last_rx: number | null; lost: boolean; current: boolean; wedged: boolean; role: HostKind;
   } | null> {
     const h = this.host(host);
     if (!h) return null;
@@ -1627,15 +1639,25 @@ export class FleetDO extends DurableObject<Env> {
    */
   async placeBrain(req: { prev?: string | null; avoid?: string | null }): Promise<string | null> {
     const configured = this.cellConfig()?.brain?.max_brains_per_host;
-    const facts = this.hostsBy({ role: BRAIN_ROLE, status: "active" }).map((h): BrainHostFacts => ({
-      host: h.host,
-      healthy: !!this.socketFor(h.host) && h.brain_epochs === 1 && (h.wedged_ms === null || h.wedged_ms === undefined),
-      brains: this.brainsOn(h.host),
-      max_brains: this.maxBrainsOf(h, configured),
-    }));
+    const facts = this.hostsBy({ role: BRAIN_ROLE, status: "active" }).map((h): BrainHostFacts => {
+      const unwedged = h.wedged_ms === null || h.wedged_ms === undefined;
+      const connected = !!this.socketFor(h.host);
+      return {
+        host: h.host,
+        healthy: connected && h.brain_epochs === 1 && unwedged,
+        reconnecting: !connected && unwedged && (h.brain_epochs === 1 || h.last_rx === null),
+        brains: this.brainsOn(h.host),
+        max_brains: this.maxBrainsOf(h, configured),
+      };
+    });
     const pick = pickBrainHost(facts, req.prev, req.avoid);
-    if (pick.host) return pick.host;
-    await this.scaleUp(BRAIN_ROLE);
+    if (pick.host) {
+      // Not idle any more: the idle sweep can't retire it while AgentDO is between this pick and
+      // its send (the clock starts again, from zero, if the start never lands).
+      this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", pick.host);
+      return pick.host;
+    }
+    if (brainHostNeeded(facts, req.avoid)) await this.scaleUp(BRAIN_ROLE);
     return null;
   }
 
@@ -1832,7 +1854,7 @@ export class FleetDO extends DurableObject<Env> {
     const h = this.host(host);
     if (!h) return;
     const exp = Date.now() + num(this.env.HOST_TOKEN_TTL_MS, 3_600_000);
-    const token = await issueHostToken(this.env.HOST_TOKEN_SECRET, { host, cell: h.cell, role: h.role, exp });
+    const token = await issueHostToken(this.env.HOST_TOKEN_SECRET, { host, cell: h.cell, role: roleName(h.role), exp });
     this.sql.exec("UPDATE hosts SET token_exp = ? WHERE host = ?", exp, host);
     this.send(ws, { type: "host_token", token, expires_ms: exp });
   }
@@ -1877,7 +1899,7 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** A host kind's autoscaler settings: the cell's entry for sandbox hosts, its `brain` section for brain hosts. */
-  private scaleSettings(cfg: AwsCellConfig, role: HostRole): (ScaleSettings & { launch_template_id: string; idle_grace_ms: number }) | null {
+  private scaleSettings(cfg: AwsCellConfig, role: HostKind): (ScaleSettings & { launch_template_id: string; idle_grace_ms: number }) | null {
     if (role === SANDBOX_ROLE) return cfg;
     return cfg.brain ? { ...cfg.brain, subnet_ids: cfg.subnet_ids } : null;
   }
@@ -1888,13 +1910,16 @@ export class FleetDO extends DurableObject<Env> {
    * not yet enrolled, nor at the kind's `max_hosts`). The instance may enroll only as that kind, in
    * this cell, from this region. A cell with no settings for the kind launches nothing.
    */
-  private async scaleUp(role: HostRole = SANDBOX_ROLE): Promise<void> {
+  private async scaleUp(role: HostKind = SANDBOX_ROLE): Promise<void> {
     const cfg = this.cellConfig();
     const ec2 = this.ec2();
     const s = cfg ? this.scaleSettings(cfg, role) : null;
     if (!cfg || !s || !ec2) return;
-    const pending = this.sql.exec("SELECT 1 FROM launched WHERE host IS NULL AND reason IS NULL AND role = ?", role).toArray().length;
-    const live = this.hostsBy({ role, status: ["active", "stonith_pending"] }).length;
+    const pending = this.sql.exec(`SELECT 1 FROM launched WHERE host IS NULL AND reason IS NULL AND role IN (${sqlIn([roleName(role), role])})`).toArray().length;
+    // A brain host of the previous release (its hello lacked `brain_epochs`) never gets a brain and
+    // is drained on sight: it isn't capacity, so it doesn't count toward the cap.
+    const live = this.hostsBy({ role, status: ["active", "stonith_pending"] })
+      .filter((h) => role !== BRAIN_ROLE || h.brain_epochs === 1 || h.last_rx === null).length;
     const now = Date.now();
     const plan = scaleUpPlan(s, live, pending, this.launching.has(role), now);
     if (!plan.launch) return;
@@ -1909,7 +1934,7 @@ export class FleetDO extends DurableObject<Env> {
           });
           this.sql.exec(
             "INSERT INTO launched (instance_id, launched_ms, role, region, cell) VALUES (?, ?, ?, ?, ?)",
-            id, Date.now(), role, cfg.region, cell,
+            id, Date.now(), roleName(role), cfg.region, cell,
           );
           console.log(`FleetDO: launched ${role} host ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
           if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
@@ -2080,11 +2105,11 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** Mark an instance for termination (retried from the alarm until EC2 reports it gone). */
-  private endInstance(instanceId: string, reason: LaunchEndReason, role: HostRole): void {
+  private endInstance(instanceId: string, reason: LaunchEndReason, role: HostKind): void {
     this.sql.exec(
       `INSERT INTO launched (instance_id, launched_ms, role, reason) VALUES (?, ?, ?, ?)
        ON CONFLICT(instance_id) DO UPDATE SET reason = COALESCE(launched.reason, excluded.reason)`,
-      instanceId, Date.now(), role, reason,
+      instanceId, Date.now(), roleName(role), reason,
     );
   }
 
@@ -2493,11 +2518,12 @@ export class FleetDO extends DurableObject<Env> {
 
   /** Host rows matching typed filters (and an optional extra SQL condition), their enums checked. */
   private hostsBy(
-    f: { status?: HostStatus | readonly HostStatus[]; role?: HostRole; where?: string; order?: "role" | "enrolled_ms" }, ...args: SqlStorageValue[]
+    f: { status?: HostStatus | readonly HostStatus[]; role?: HostKind; where?: string; order?: "role" | "enrolled_ms" }, ...args: SqlStorageValue[]
   ): HostRow[] {
     const conds: string[] = [];
     if (f.status !== undefined) conds.push(`status IN (${sqlIn(typeof f.status === "string" ? [f.status] : f.status)})`);
-    if (f.role !== undefined) conds.push(`role IN (${sqlIn([f.role])})`);
+    // Either name of the kind (this release writes the previous release's; dev/deploy.md).
+    if (f.role !== undefined) conds.push(`role IN (${sqlIn([roleName(f.role), f.role])})`);
     if (f.where) conds.push(f.where);
     return this.sql.exec<HostRow>(`SELECT * FROM hosts${conds.length ? ` WHERE ${conds.join(" AND ")}` : ""} ORDER BY ${f.order ?? "enrolled_ms"}`, ...args)
       .toArray().map((h) => this.checkHost(h));
@@ -2506,7 +2532,7 @@ export class FleetDO extends DurableObject<Env> {
   private checkHost(h: HostRow): HostRow {
     return {
       ...h,
-      role: storedEnum(HostRole, h.role, "hosts.role"),
+      role: hostKind(storedEnum(HostRole, h.role, "hosts.role")),
       status: storedEnum(HostStatus, h.status, "hosts.status"),
       tunnel_state: storedEnum(TunnelState, h.tunnel_state, "hosts.tunnel_state"),
     };

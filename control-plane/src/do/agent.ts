@@ -152,6 +152,11 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
   exit_restarts?: number;
   /** Consecutive starts condemned for want of a hello (backs off the `starting` deadline). */
   start_timeouts?: number;
+  /**
+   * Consecutive runs of the intent that found no brain host with room (backs off their retry:
+   * `capacityRetryMs`). Not the crash-loop guard's: waiting for capacity is not a crash.
+   */
+  capacity_waits?: number;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
   capabilities?: string[];
   /** When the transcript was last made durable (a recovery turn says where it ends). */
@@ -256,6 +261,12 @@ export interface TranscriptPage {
   /** The caller's cursor was for another base: this page starts again from entry 1. */
   reset?: boolean;
 }
+
+/** The retry of the `n`th consecutive start that found no brain host with room: 30 s doubling to 5 min. */
+export function capacityRetryMs(n: number): number {
+  return Math.min(WAKE_RETRY_MS * 2 ** Math.max(0, n - 1), CAPACITY_RETRY_MAX_MS);
+}
+const CAPACITY_RETRY_MAX_MS = 5 * 60_000;
 
 /** A host a brain may start on: an active, connected brain host of this release (docs/compute/brain-hosts/). */
 function brainHostUsable(st: { status: string; connected: boolean; current: boolean; role: string } | null): boolean {
@@ -752,6 +763,7 @@ export class AgentDO extends DurableObject<Env> {
       i.brain = { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() };
       i.intent = null;
       i.state = "starting";
+      delete i.capacity_waits;
     });
     const armed = Promise.all([
       this.deadlines.clear("intent"),
@@ -801,7 +813,17 @@ export class AgentDO extends DurableObject<Env> {
   private async intentFailed(intent: StartIntent, e: unknown): Promise<void> {
     const ne = asNestError(e);
     if (ne?.retryable ?? true) {
-      await this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true);
+      // No brain host with room (FleetDO launches one): the wait backs off, 30 s doubling to 5 min,
+      // so a cell at its cap isn't asked twice a minute by every waiting agent. New input sets the
+      // intent's alarm again at 30 s (`setIntent` keeps the earlier deadline).
+      let delay = WAKE_RETRY_MS;
+      if (ne?.code === ErrorCodes.CAPACITY_EXHAUSTED) {
+        const n = this.update((i) => {
+          i.capacity_waits = (i.capacity_waits ?? 0) + 1;
+        }).capacity_waits ?? 1;
+        delay = capacityRetryMs(n);
+      }
+      await this.deadlines.set("intent", Date.now() + delay, true);
       return;
     }
     if (intent.host_hint) {

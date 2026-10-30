@@ -1267,22 +1267,40 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect((await agentStub(s.agent).info()).brain).not.toMatchObject({ host: s.host.host });
   });
 
-  it("an idle host with a brain recorded is never retired", async () => {
+  it("an idle host with a brain recorded is never retired: a brain host, and a sandbox host a previous release left one on", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
-    await runInDurableObject(fleet, (inst: FleetDO, st) => {
+    const tick = async () => {
+      await runInDurableObject(fleet, (inst: FleetDO, st) => {
+        inst.cellConfigOverride = {
+          region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
+          max_hosts: 1, idle_grace_ms: 0, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
+          brain: { launch_template_id: "lt-0b", instance_types: ["t3a.medium"], spot: true, max_hosts: 1, idle_grace_ms: 0, max_brains_per_host: 0 },
+        };
+        inst.ec2Override = null;
+        st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+      });
+      await runDurableObjectAlarm(fleet);
+    };
+    // The sandbox host: no running sandbox, but a brain indexed there (the previous release ran
+    // workers' brains on their sandbox's host; the upgrade leaves them until they exit).
+    await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("DELETE FROM leases WHERE sandbox = ?", s.sandbox);
-      st.storage.sql.exec("UPDATE hosts SET instance_id = 'i-0idle', idle_since = 1 WHERE host = ?", s.host.host);
-      inst.cellConfigOverride = {
-        region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
-        max_hosts: 1, idle_grace_ms: 0, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
-      };
-      inst.ec2Override = null;
-      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+      st.storage.sql.exec("UPDATE hosts SET instance_id = 'i-0' || host, idle_since = 1 WHERE host IN (?, ?)", s.host.host, s.sbxHost.host);
+      st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone, drain_told) VALUES ('agt_oldworker', ?, 'cmd_old', 1, 0, 0)", s.sbxHost.host);
     });
-    await runDurableObjectAlarm(fleet);
+    await tick();
     expect((await fleet.hostStatus(s.host.host))!.status).toBe("active");
+    expect((await fleet.hostStatus(s.sbxHost.host))!.status).toBe("active");
+    // Without their brains both go at once (grace 0): the checks above were not vacuous.
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("DELETE FROM host_agents");
+    });
+    await tick();
+    await tick();
+    expect((await fleet.hostStatus(s.host.host))!.status).toBe("dead");
+    expect((await fleet.hostStatus(s.sbxHost.host))!.status).toBe("dead");
   });
 
   it("a start re-reads its intent before committing: one changed meanwhile is the one started", async () => {

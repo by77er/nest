@@ -44,7 +44,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/workstreams {goal}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent of that
      workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
      (it no longer answers `captain`)
-   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (`role: sandbox`; 201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
+   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
@@ -124,11 +124,12 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   first Cloudflare call, for a host that is dead or never got a row within an hour; every other nest-shaped name
   is counted as `unknown` and logged. `resolve` carries the Access service token only when the host has a tunnel,
   never because a URL happens to be `wss://`. A sandbox host enrolled before this change has no tunnel until it
-  re-enrolls (a new instance). Host kinds: `HostRole` is `sandbox | brain` (`burst` and `controller` read for
-  one release; stored rows rewritten once). Every brain starts on a brain host with room (`FleetDO.placeBrain`,
+  re-enrolls (a new instance). Host kinds: `HostKind` is `sandbox | brain`; `HostRole` names on the wire and in
+  storage stay `burst | controller` this release, with the new names read too (`hostKind`, `roleName`;
+  expand/contract, `dev/deploy.md`). Every brain starts on a brain host with room (`FleetDO.placeBrain`,
   deciding through the pure `pickBrainHost` in `src/lib/placement.ts`: the agent's previous brain host, else the
-  fullest; capacity in brains, `brain.max_brains_per_host` or 2 per vCPU), never on a sandbox host
-  (`issueCommands` refuses one there); with none the start waits and FleetDO launches a brain host from the
+  fullest; capacity in brains, `brain.max_brains_per_host` or 2 per vCPU, enforced by `issueCommands`),
+  never on a sandbox host (`issueCommands` refuses one there); with none the start waits and FleetDO launches a brain host from the
   cell's `brain` section of `AWS_CELLS`, retiring one after `brain.idle_grace_ms` with no brain (`scaleUpPlan`,
   `idleStep`; `test/brain-hosts.test.ts`). A brain host enrolls without a proxy CA. AgentDO issues an agent
   epoch per start (a sandbox move doesn't restart a brain), and `agent_start.hands` carries the sandbox id only

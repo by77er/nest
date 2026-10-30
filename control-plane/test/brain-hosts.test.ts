@@ -7,7 +7,8 @@ import type { FleetDO } from "../src/do/fleet";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { awsCell } from "../src/lib/cells";
 import { CapacityError, type Ec2, type ImageInfo, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
-import { BRAINS_PER_VCPU, idleStep, maxBrains, pickBrainHost, scaleUpPlan, type BrainHostFacts } from "../src/lib/placement";
+import { BRAINS_PER_VCPU, brainHostNeeded, idleStep, maxBrains, pickBrainHost, scaleUpPlan, type BrainHostFacts } from "../src/lib/placement";
+import { capacityRetryMs, type AgentDO } from "../src/do/agent";
 import { adminJson, connectHost, csrPem, enrollHost, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
@@ -113,6 +114,32 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
       expect(p.launch.length, `seed ${seed}`).toBe(s.spot ? types.length + 1 : 1);
       for (const a of p.launch) expect(subnets, `seed ${seed}`).toContain(a.subnet);
     }
+  });
+
+  it("brainHostNeeded: only for a real lack of capacity, never for a host merely reconnecting", () => {
+    const h = (host: string, brains: number, healthy: boolean, reconnecting = false): BrainHostFacts => ({ host, brains, max_brains: 2, healthy, reconnecting });
+    expect(brainHostNeeded([])).toBe(true);
+    expect(brainHostNeeded([h("hst_a", 2, true)])).toBe(true);
+    expect(brainHostNeeded([h("hst_a", 1, true)])).toBe(false);
+    expect(brainHostNeeded([h("hst_a", 1, false, true)])).toBe(false);
+    expect(brainHostNeeded([h("hst_a", 2, false, true)])).toBe(true);
+    // A previous-release or wedged host is neither: it never stops a launch.
+    expect(brainHostNeeded([h("hst_old", 0, false, false)])).toBe(true);
+    expect(brainHostNeeded([h("hst_a", 0, true)], "hst_a")).toBe(true);
+    for (let seed = 1; seed <= 500; seed++) {
+      const r = rng(seed);
+      const hosts = Array.from({ length: Math.floor(r() * 5) }, (_, i) => h(`hst_${i}`, Math.floor(r() * 3), r() < 0.5, r() < 0.5));
+      const avoid = r() < 0.3 && hosts.length ? hosts[0]!.host : null;
+      // Never both a pick and a launch, and never neither: a start either gets a host or a reason to wait.
+      const picked = pickBrainHost(hosts, null, avoid).host !== null;
+      const reconnectingRoom = hosts.some((x) => x.reconnecting && !x.healthy && x.host !== avoid && x.brains < x.max_brains);
+      expect(picked && brainHostNeeded(hosts, avoid), `seed ${seed}`).toBe(false);
+      if (!picked) expect(brainHostNeeded(hosts, avoid), `seed ${seed}`).toBe(!reconnectingRoom);
+    }
+  });
+
+  it("capacityRetryMs: 30 s doubling to 5 min", () => {
+    expect([1, 2, 3, 4, 5, 6, 50].map(capacityRetryMs)).toEqual([30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000]);
   });
 
   it("idleStep: busy clears, idle starts the clock, the grace retires", () => {
@@ -239,30 +266,84 @@ describe("FleetDO: host kinds", () => {
     expect(view.hosts.find((h) => h.host === enrolled.host)?.max_brains).toBe(BRAINS_PER_VCPU);
   });
 
-  it("previous-release role names in stored rows are migrated once", async () => {
+  it("role names (expand/contract): rows, tokens and launches keep the previous release's names; either name reads as its kind", async () => {
     const cell = uniqueCell();
+    // Enrolled as `sandbox` and `brain` (the next release's names, accepted now) ...
     const a = await connectHost(cell);
     const b = await connectHost(cell, "brain");
-    const roles = await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
-      st.storage.sql.exec("UPDATE hosts SET role = 'burst' WHERE host = ?", a.host);
-      st.storage.sql.exec("UPDATE hosts SET role = 'controller' WHERE host = ?", b.host);
-      st.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role) VALUES ('i-0old', 1, 'controller')");
-      st.storage.sql.exec("INSERT INTO enroll_tokens (hash, role, created_ms) VALUES ('h-old', 'burst', 1)");
-      return null;
-    });
-    expect(roles).toBeNull();
-    // A new instance of the object (an upgrade's first start) runs the constructor's migration.
-    const after = await runInDurableObject(fleetStub(cell), (inst: FleetDO, st) => {
+    const fleet = fleetStub(cell);
+    await fleet.registerLaunched({ instance_id: "i-0new", role: "brain" });
+    await fleet.mintEnrollmentToken("sandbox");
+    // ... stored under the previous release's, which a rolled-back Worker reads; no row is rewritten.
+    const rows = await runInDurableObject(fleet, (inst: FleetDO, st) => {
+      st.storage.sql.exec("INSERT INTO hosts (host, cell, role, status, token_exp, enrolled_ms, tunnel_state) VALUES ('hst_newname', ?, 'brain', 'active', 1, 1, 'none')", cell);
       new (inst.constructor as new (s: unknown, e: unknown) => FleetDO)(st, env);
       return {
-        hosts: st.storage.sql.exec<{ host: string; role: string }>("SELECT host, role FROM hosts").toArray(),
-        launched: st.storage.sql.exec<{ role: string }>("SELECT role FROM launched WHERE instance_id = 'i-0old'").one().role,
-        token: st.storage.sql.exec<{ role: string }>("SELECT role FROM enroll_tokens WHERE hash = 'h-old'").one().role,
+        hosts: Object.fromEntries(st.storage.sql.exec<{ host: string; role: string }>("SELECT host, role FROM hosts").toArray().map((h) => [h.host, h.role])),
+        launched: st.storage.sql.exec<{ role: string }>("SELECT role FROM launched WHERE instance_id = 'i-0new'").one().role,
+        tokens: st.storage.sql.exec<{ role: string }>("SELECT DISTINCT role FROM enroll_tokens ORDER BY role").toArray().map((r) => r.role),
       };
     });
-    expect(Object.fromEntries(after.hosts.map((h) => [h.host, h.role]))).toEqual({ [a.host]: "sandbox", [b.host]: "brain" });
-    expect(after.launched).toBe("brain");
-    expect(after.token).toBe("sandbox");
+    expect(rows.hosts).toMatchObject({ [a.host]: "burst", [b.host]: "controller", hst_newname: "brain" });
+    expect(rows.launched).toBe("controller");
+    expect(rows.tokens).toEqual(["burst", "controller"]);
+    // Either name is read as the kind (a row a future release wrote, too).
+    const view = await fleet.fleetView();
+    const kind = Object.fromEntries(view.hosts.map((h) => [h.host, h.role]));
+    expect([kind[a.host], kind[b.host], kind.hst_newname]).toEqual(["sandbox", "brain", "brain"]);
+    expect((await fleet.hostStatus("hst_newname"))!.role).toBe("brain");
+  });
+});
+
+describe("the brain cap is enforced where the index row is written", () => {
+  it("issueCommands refuses a start past the host's cap (retryably), but not a restart of an agent already counted there", async () => {
+    const cell = uniqueCell();
+    await configure(cell, null, { ...CONFIG, brain: { ...CONFIG.brain!, max_brains_per_host: 1 } });
+    const a = await connectHost(cell, "brain");
+    const fleet = fleetStub(cell);
+    const start = (agent: string, epoch = 1) => fleet.issueCommands(a.host, [{
+      type: "agent_start", agent, role: "captain", workstream: "ws_x", epoch, launch: { builtin_tools: [], system_prompt: { mode: "append" } },
+      oauth_token: "ref", session_ws_url: "ws://x",
+    } as never]).then(() => "sent", (e: Error & { code?: string; retryable?: boolean }) => `${e.message}`);
+    expect(await start("agt_one")).toBe("sent");
+    expect(await start("agt_two")).toMatch(/capacity_exhausted.*full \(1 of 1 brains\)/);
+    expect(await start("agt_one", 2)).toBe("sent");
+    const rows = await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec<{ agent: string }>("SELECT agent FROM host_agents").toArray().map((r) => r.agent));
+    expect(rows).toEqual(["agt_one"]);
+  });
+
+  it("two starts that picked the same last slot: the second is refused, condemned without a crash count, and waits with its intent", async () => {
+    const cell = uniqueCell();
+    await configure(cell, null, { ...CONFIG, brain: { ...CONFIG.brain!, max_brains_per_host: 1 } });
+    const a = await connectHost(cell, "brain");
+    const first = await captain(cell, false);
+    const second = await captain(cell, false);
+    // The second start picks `a` (room for one), and the first start takes the slot before it sends.
+    await runInDurableObject(agentStub(second), (inst: AgentDO) => {
+      inst.testHooks["intent:beforeCommit"] = async () => {
+        delete inst.testHooks["intent:beforeCommit"];
+        await agentStub(first).start();
+      };
+    });
+    await expect(agentStub(second).start()).rejects.toThrow(/full/);
+    const [s1] = await nextCommands(a.ws, isStartOf(first));
+    expect(s1).toMatchObject({ epoch: 1 });
+    // Refused before anything was stored or sent: condemned as an unconfirmed send, intent kept.
+    const info = await agentStub(second).info();
+    expect(info).toMatchObject({ brain: { host: a.host, phase: "condemned" }, intent: { reason: "operator" }, capacity_waits: 1 });
+    expect(info.exit_restarts ?? 0).toBe(0);
+    // Its kill reaches a host that never had the start: the exit at once, which releases it, uncounted.
+    const [kill] = await nextCommands(a.ws, (c: any) => c.type === "agent_stop" && c.agent === second);
+    const seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: second, reason: "fenced", epoch: kill.epoch }]);
+    await a.ws.next("ack", (m) => m.up_to >= seq);
+    await okResult(a.ws, kill.cmd);
+    for (let n = 0; n < 40 && (await agentStub(second).info()).brain !== null; n++) await new Promise((r) => setTimeout(r, 25));
+    const after = await agentStub(second).info();
+    expect(after).toMatchObject({ brain: null, intent: { reason: "operator" } });
+    expect(after.exit_restarts ?? 0).toBe(0);
+    // The host is full for it: the next run of the intent waits (backing off), nothing more is sent.
+    await expect(agentStub(second).start()).rejects.toThrow(/no brain host available/);
+    expect(await a.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(second)))).toBe(true);
   });
 });
 
@@ -315,6 +396,63 @@ describe("brain hosts scale with brains", () => {
     expect(ec2.terminated).toContain("i-0b0000001");
     const view = await fleetStub(cell).fleetView();
     expect(view.launches.find((l) => l.instance_id === "i-0b0000001")).toMatchObject({ reason: "idle" });
+  });
+
+  it("no launch for a host that is only reconnecting, or while a brain host of the previous release fills the cap", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2();
+    // Room under the cap for another host: only the rule stops a launch here.
+    await configure(cell, ec2, { ...CONFIG, brain: { ...CONFIG.brain!, max_hosts: 2 } });
+    // A brain host of this release whose socket dropped: expected back (or expired at 30 s).
+    const a = await connectHost(cell, "brain");
+    a.ws.close();
+    for (let n = 0; n < 40 && (await fleetStub(cell).hostStatus(a.host))!.connected; n++) await new Promise((r) => setTimeout(r, 25));
+    expect(await fleetStub(cell).placeBrain({})).toBeNull();
+    expect(ec2.launched).toEqual([]);
+    // Of the previous release instead (its hello lacked brain_epochs; still active here): no
+    // capacity, and not counted toward max_hosts (1), so a brain host launches.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0, last_rx = ? WHERE host = ?", Date.now(), a.host);
+    });
+    await configure(cell, ec2);
+    expect(await fleetStub(cell).placeBrain({})).toBeNull();
+    expect(ec2.launched).toEqual([expect.objectContaining({ launchTemplateId: "lt-0b" })]);
+  });
+
+  it("a picked host's idle clock is cleared, so the idle sweep can't retire it before the start lands", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell, "brain");
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET instance_id = 'i-0pick', idle_since = 1 WHERE host = ?", a.host);
+    });
+    expect(await fleetStub(cell).placeBrain({})).toBe(a.host);
+    await tickAt(cell, null);
+    expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("active");
+    const idle = await runInDurableObject(fleetStub(cell), (_i, st) => st.storage.sql.exec<{ i: number | null }>("SELECT idle_since AS i FROM hosts WHERE host = ?", a.host).one().i);
+    expect(idle).toBeGreaterThan(1);
+  });
+
+  it("a kept intent that finds no room backs off, without counting toward the crash-loop guard", async () => {
+    const cell = uniqueCell();
+    await configure(cell, null, { ...CONFIG, brain: undefined });
+    const agent = await captain(cell, false);
+    await agentStub(agent).start().catch(() => undefined);
+    // Two more runs of the kept intent from its alarm (no new input meanwhile).
+    for (let n = 0; n < 2; n++) {
+      await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => {
+        s.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'intent'");
+      });
+      await runDurableObjectAlarm(agentStub(agent));
+    }
+    const st = await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => ({
+      info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
+      at: s.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'intent'").one().at,
+    }));
+    expect(st.info.capacity_waits).toBe(3);
+    expect(st.info.exit_restarts ?? 0).toBe(0);
+    // The third wait is 2 min out.
+    expect(st.at - Date.now()).toBeGreaterThan(100_000);
+    expect(st.at - Date.now()).toBeLessThanOrEqual(120_000);
   });
 
   it("a cell without a brain section launches no brain host; the start waits", async () => {

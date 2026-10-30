@@ -8,6 +8,12 @@ export interface BrainHostFacts {
   host: string;
   /** Active, connected, not wedged, and of this release (its hello said `brain_epochs`). */
   healthy: boolean;
+  /**
+   * Active and not wedged, but not connected now, and not known to be of the previous release (its
+   * last hello said `brain_epochs`, or it hasn't said hello yet): it is expected back (or expired at
+   * 30 s), so it is no reason to launch another host.
+   */
+  reconnecting?: boolean;
   /** Brains indexed there (FleetDO's `host_agents`: started and not yet proven exited). */
   brains: number;
   /** What it may hold (`maxBrains`). */
@@ -35,7 +41,17 @@ export function pickBrainHost(hosts: readonly BrainHostFacts[], prev?: string | 
   return { host: best.host, why: "packed" };
 }
 
-/** Brains per vCPU when the cell sets no `brain.max_brains_per_host`: a Claude Code brain mostly waits on the API. */
+/**
+ * Whether the cell needs another brain host for a start that avoids `avoid`: only for a real lack of
+ * capacity. No host with room is healthy, and none with room is merely reconnecting (a brief drop,
+ * or a host that just enrolled): those are not capacity to buy. A host of the previous release is
+ * neither, so it never stops a launch.
+ */
+export function brainHostNeeded(hosts: readonly BrainHostFacts[], avoid?: string | null): boolean {
+  return !hosts.some((h) => h.host !== avoid && (h.healthy || h.reconnecting) && h.brains < h.max_brains);
+}
+
+/** Brains per vCPU when the cell sets no `brain.max_brains_per_host`: a Claude Code brain mostly waits on the API. Unverified: no measurement on a brain host yet. */
 export const BRAINS_PER_VCPU = 2;
 
 /**

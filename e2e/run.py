@@ -191,7 +191,9 @@ def configure_host():
     guest = [os.path.join(BIN, "nest-guest"), "--state-dir", os.path.join(WORK, "guest-state"),
              "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none", "--port-poll-ms", "500"]
     cfg = {
-        "role": "sandbox", "cell": "local", "control_url": BASE,
+        # The previous release's role names, as the cell's bootstrap writes them this release
+        # (expand/contract; dev/deploy.md): nestd reads both.
+        "role": "burst", "cell": "local", "control_url": BASE,
         "enrollment": {"type": "token_file", "path": os.path.join(WORK, "enroll.token")},
         "run_dir": os.path.join(WORK, "run"), "state_dir": os.path.join(WORK, "state"),
         "driver": {"type": "process", "guest_command": guest},
@@ -204,7 +206,7 @@ def configure_host():
         json.dump(cfg, f, indent=2)
     # The brain host: supervisor duties only (no driver, netns, proxy, gateway or tunnel).
     brain = {
-        "role": "brain", "cell": "local", "control_url": BASE,
+        "role": "controller", "cell": "local", "control_url": BASE,
         "enrollment": {"type": "token_file", "path": os.path.join(WORK, "enroll-brain.token")},
         "run_dir": os.path.join(WORK, "brun"), "state_dir": os.path.join(WORK, "bstate"),
         "flush_interval_ms": 500,

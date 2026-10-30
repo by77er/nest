@@ -154,7 +154,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   }
   if (req.method === "POST" && path === "/v1/admin/launched") {
     const r = await body(req, z.object({
-      instance_id: z.string(), role: HostRole.default("sandbox"), account_id: z.string().optional(), region: z.string().optional(),
+      instance_id: z.string(), role: HostRole.default("burst"), account_id: z.string().optional(), region: z.string().optional(),
       cell: z.string().default(DEFAULT_CELL),
     }));
     await fleet(env, checkCell(env, r.cell)).registerLaunched({

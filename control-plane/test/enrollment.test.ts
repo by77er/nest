@@ -127,7 +127,7 @@ describe("enrollment", () => {
     const r = await enrollHost(cell);
     expect(r.host).toMatch(/^hst_/);
     const claims = await verifyHostToken(env.HOST_TOKEN_SECRET, r.host_token);
-    expect(claims).toMatchObject({ host: r.host, cell, role: "sandbox" });
+    expect(claims).toMatchObject({ host: r.host, cell, role: "burst" }); // the name the previous release reads (expand/contract)
     expect(r.fleet_ws_url).toMatch(/^ws.*\/v1\/fleet$/);
 
     // The intermediate is a CA limited to signing leaves, signed by the root baked into images.
@@ -157,7 +157,7 @@ describe("enrollment", () => {
     const b = (await brain.json()) as Record<string, unknown>;
     expect(b.proxy_ca).toBeUndefined();
     expect(b.tunnel_token).toBeUndefined();
-    expect(await verifyHostToken(env.HOST_TOKEN_SECRET, b.host_token as string)).toMatchObject({ role: "brain" });
+    expect(await verifyHostToken(env.HOST_TOKEN_SECRET, b.host_token as string)).toMatchObject({ role: "controller" });
     // A sandbox host runs nest-proxy: without a CSR it is refused (and its token is not spent).
     expect((await post("sandbox", false)).status).toBe(400);
     // A brain host of the previous release (`controller`, with a CSR) still enrolls, as a brain host.
@@ -165,7 +165,7 @@ describe("enrollment", () => {
     expect(old.status).toBe(200);
     const o = (await old.json()) as { host: string; host_token: string; proxy_ca?: unknown };
     expect(o.proxy_ca).toBeDefined();
-    expect(await verifyHostToken(env.HOST_TOKEN_SECRET, o.host_token)).toMatchObject({ role: "brain" });
+    expect(await verifyHostToken(env.HOST_TOKEN_SECRET, o.host_token)).toMatchObject({ role: "controller" });
     const view = await adminJson<{ hosts: { host: string; role: string }[] }>(`/v1/admin/fleet?cell=${cell}`);
     expect(view.hosts.find((h) => h.host === o.host)?.role).toBe("brain");
   });

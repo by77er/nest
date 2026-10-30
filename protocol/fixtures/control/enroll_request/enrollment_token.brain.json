@@ -1,6 +1,6 @@
 {
   "protocol_version": 1,
-  "role": "brain",
+  "role": "controller",
   "cell": "hetzner-fsn1",
   "proof": {
     "type": "enrollment_token",

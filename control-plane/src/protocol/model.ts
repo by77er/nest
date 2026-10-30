@@ -70,14 +70,21 @@ export function openEnum<const T extends readonly [string, ...string[]]>(members
 }
 
 /** What a host is for: it runs sandboxes, or brains, never both (docs/compute/). */
-export const HOST_ROLES = ["sandbox", "brain"] as const;
-/** The previous release's names, read as input for one release (old hosts, tokens and stored rows); never sent. */
-export const LEGACY_HOST_ROLES: Readonly<Record<string, (typeof HOST_ROLES)[number]>> = { burst: "sandbox", controller: "brain" };
-export const HostRole = z.preprocess(
-  (v) => (typeof v === "string" && Object.hasOwn(LEGACY_HOST_ROLES, v) ? LEGACY_HOST_ROLES[v] : v),
-  z.enum(HOST_ROLES),
-);
+export const HOST_KINDS = ["sandbox", "brain"] as const;
+export type HostKind = (typeof HOST_KINDS)[number];
+/**
+ * The names a host kind goes by on the wire and in storage. Renamed by expand/contract over two
+ * releases (dev/deploy.md): this release reads both `burst`/`controller` and `sandbox`/`brain`
+ * but writes only the old names (stored rows, host tokens, launch records), so a Worker rolled back
+ * to the previous release reads everything this one wrote; the next release writes the new names.
+ */
+export const HOST_ROLES = ["burst", "controller"] as const;
+export const HostRole = z.enum(["burst", "controller", "sandbox", "brain"]);
 export type HostRole = z.output<typeof HostRole>;
+/** The kind a role name means (either name). */
+export const hostKind = (role: HostRole): HostKind => (role === "burst" || role === "sandbox" ? "sandbox" : "brain");
+/** The name this release writes for a kind (the previous release's). */
+export const roleName = (kind: HostKind): (typeof HOST_ROLES)[number] => (kind === "sandbox" ? "burst" : "controller");
 /** Deprecated wire value, for one release only (`agent_start.role`, `ToolDef.roles`); nothing decides on it. */
 export const AgentRole = z.enum(["worker", "captain"]);
 export type AgentRole = z.output<typeof AgentRole>;
