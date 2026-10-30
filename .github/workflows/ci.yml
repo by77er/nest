@@ -187,7 +187,12 @@ jobs:
       - run: python3 -I scripts/check-doc-links.py
       - run: python3 -I scripts/check-fences.py
       - run: python3 -I scripts/check-core-manifest.py
-      - run: python3 -m unittest discover -s scripts/tests
+      # PyYAML, pinned by hash, in a venv (the runner's Python is externally managed).
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/guards"
+          "$RUNNER_TEMP/guards/bin/pip" install --require-hashes --only-binary :all: -r scripts/requirements-guards.txt
+      - run: '"$RUNNER_TEMP/guards/bin/python" -I scripts/check-workflows.py'
+      - run: '"$RUNNER_TEMP/guards/bin/python" -m unittest discover -s scripts/tests'
 
   deny:
     runs-on: ubuntu-24.04
