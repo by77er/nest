@@ -6,7 +6,7 @@ How this repo is built, tested and shipped, and how nest's own agents will maint
 > - CI (`.github/workflows/ci.yml`), `.github/CODEOWNERS`, branch protection on `main` (`ci-ok`) and the `production` environment;
 > - the repo guards (`scripts/`);
 > - the agent skills (`.claude/skills/`);
-> - the first cut of the deploy (`deploy.yml`: infra, the Worker with a smoke check and rollback, the host release; `deploy-dashboard.yml`) and nightly fuzzing (`fuzz.yml`).
+> - the first cut of the deploy (`deploy.yml`: infra, the Worker with a smoke check and rollback, the host release; `deploy-dashboard.yml`) and weekly fuzzing (`fuzz.yml`).
 >
 > The rest (the reviewer's `nest/review` check, the health window, `rollback.yml`, nest's own agents on this repo) is a plan.
 

@@ -50,7 +50,7 @@ nestd's checks run the real cores, so they need no conformance step. The TLA+, L
 
 ## CI
 
-- **Built:** nestd's checks run on every PR (`verify-nestd`, `kani-nestd`, `fuzz-nestd`) and fuzzing runs nightly ([dev/ci.md](../../../dev/ci.md#verification)).
+- **Built:** nestd's checks run on every PR (`verify-nestd`, `kani-nestd`, `fuzz-nestd`) and fuzzing runs weekly ([dev/ci.md](../../../dev/ci.md#verification)).
 - **Proposed** ([dev/verification.md](../../../dev/verification.md)): one `verification` job for the pilots, running `verification/run.sh` (TLC configurations that finish in minutes, expected outcomes asserted; `lake build` in `verification/lean`; `cargo test --release` in `verification/stateright`). Larger TLC bounds run nightly or by hand. The job joins `ci-ok`, so a red model blocks a merge like a red test.
 
 ## Open questions
