@@ -43,7 +43,7 @@ async function tick(cell: string, ec2: Ec2 | null) {
   await runDurableObjectAlarm(fleetStub(cell));
 }
 
-/** A burst host whose hello reports this much hugepage room (placement prefers the fullest host). */
+/** A sandbox host whose hello reports this much hugepage room (placement prefers the fullest host). */
 async function hostWithRoom(cell: string, hugepagesFree: number) {
   const enrolled = await enrollHost(cell, "sandbox");
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);

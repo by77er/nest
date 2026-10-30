@@ -1,7 +1,7 @@
 //! Object-store GC, one pass (`docs/sandbox/state/object-store/#garbage-collection`).
 //!
 //! FleetDO decides when a pass runs and snapshots the roots (every live sandbox's generations'
-//! manifests) at the mark; a burst host runs it because only hosts hold S3 credentials. The pass
+//! manifests) at the mark; a sandbox host runs it because only sandbox hosts hold S3 credentials. The pass
 //! marks every chunk those manifests name, lists the store's versions, and deletes the versions
 //! of unmarked objects last uploaded more than the grace (24 h) before the mark, each by version
 //! id so a racing re-upload survives. Commits reuse an object only if it was uploaded under 12 h

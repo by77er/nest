@@ -7,7 +7,7 @@ nest is two systems with one seam between them:
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
-> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13)). **Not built:** brain hosts (today every brain starts on its sandbox's host, stays there when the sandbox moves, and reaches the guest only through its gateway; FleetDO has `burst` and `controller` host roles, and AgentDO starts captains on a `controller` host), and the coordination layer (ChannelDO, HookDO, grants, taint, `wake_at`). Templates and capabilities are data in CatalogDO, and nothing decides on an agent role; WorkstreamDO stands in for the workstream channel until ChannelDO exists. `control-plane/README.md` lists the gaps.
+> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13)). Brain hosts are built: every brain starts on a brain host, never on its sandbox's, and reaches the guest only through its gateway (not yet run on AWS). **Not built:** the coordination layer (ChannelDO, HookDO, grants, taint, `wake_at`). Templates and capabilities are data in CatalogDO, and nothing decides on an agent role; WorkstreamDO stands in for the workstream channel until ChannelDO exists. `control-plane/README.md` lists the gaps.
 
 ## At a glance
 

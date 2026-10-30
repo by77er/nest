@@ -29,8 +29,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 
 1. `cp .dev.vars.example .dev.vars`, then `npm run dev`. It serves `http://127.0.0.1:8787`, with
    `ALLOW_DEV_CA=1` so FleetDO mints a development root CA.
-2. Mint an enrollment token:
-   `curl -s -XPOST localhost:8787/v1/admin/enrollment-tokens -H 'authorization: Bearer dev-admin-token' -d '{"role":"burst","cell":"local"}'`.
+2. Mint an enrollment token per host, `sandbox` for the host that runs sandboxes and `brain` for the one that
+   runs brains (every brain starts on a brain host):
+   `curl -s -XPOST localhost:8787/v1/admin/enrollment-tokens -H 'authorization: Bearer dev-admin-token' -d '{"role":"sandbox","cell":"local"}'`.
    The host then enrolls with `POST /v1/hosts/enroll` (proof `enrollment_token`) and dials
    `ws://127.0.0.1:8787/v1/fleet` with the returned host token.
 3. Fetch the root certificate to trust in test sandboxes: `GET /v1/admin/root-ca`.
@@ -43,7 +44,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/workstreams {goal}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent of that
      workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
      (it no longer answers `captain`)
-   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (the `burst` role; 201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
+   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (`role: sandbox`; 201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
@@ -112,7 +113,7 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   else), is the authority for the name but advertises `wss://<tunnel_hostname>` only while the host reports its
   tunnel `connected` (`hello.tunnel` and the `tunnel_state` event, kept in `tunnel_state`): `connecting` makes
   `resolve` answer `sandbox_not_ready` (the runner retries), and `none` (an old nestd, no cloudflared) falls back
-  to the hello URL with an error logged, which works while every brain starts on its sandbox's host. A tunnel
+  to the hello URL with an error logged (reachable only from the same machine, as on the harness). A tunnel
   target without `access:gateway` is refused (500, not retryable) rather than minted for the edge to reject.
   FleetDO deletes the tunnel and record on every path that marks a host dead, and a daily `tunnel_sweep` alarm
   deletes leaks. A proof (enrollment token or instance identity) already used by a host that never said hello
@@ -123,11 +124,15 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   first Cloudflare call, for a host that is dead or never got a row within an hour; every other nest-shaped name
   is counted as `unknown` and logged. `resolve` carries the Access service token only when the host has a tunnel,
   never because a URL happens to be `wss://`. A sandbox host enrolled before this change has no tunnel until it
-  re-enrolls (a new instance). Not built: host kinds with brain placement by capacity, key
-  rotation and the three desired versions. The code has `burst` and `controller` host roles
-  (`HostRole`), `FleetDO.controllerHost()` starts agents without hands on a `controller` host, others start on
-  the sandbox's host when they start (AgentDO issues an agent epoch per start; a sandbox move doesn't restart them),
-  and `agent_start.hands` carries the sandbox id only (the runner fetches its target).
+  re-enrolls (a new instance). Host kinds: `HostRole` is `sandbox | brain` (`burst` and `controller` read for
+  one release; stored rows rewritten once). Every brain starts on a brain host with room (`FleetDO.placeBrain`,
+  deciding through the pure `pickBrainHost` in `src/lib/placement.ts`: the agent's previous brain host, else the
+  fullest; capacity in brains, `brain.max_brains_per_host` or 2 per vCPU), never on a sandbox host
+  (`issueCommands` refuses one there); with none the start waits and FleetDO launches a brain host from the
+  cell's `brain` section of `AWS_CELLS`, retiring one after `brain.idle_grace_ms` with no brain (`scaleUpPlan`,
+  `idleStep`; `test/brain-hosts.test.ts`). A brain host enrolls without a proxy CA. AgentDO issues an agent
+  epoch per start (a sandbox move doesn't restart a brain), and `agent_start.hands` carries the sandbox id only
+  (the runner fetches its target). Not built: key rotation, the three desired versions, and gentle drains.
 - **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
   with attenuation, capability sources (`mcp`, `api`) and parameters, `agent_spawn`, and labels aren't built.
   Templates and capabilities are data (CatalogDO), an agent stores its expanded spec and `owner`, and nothing

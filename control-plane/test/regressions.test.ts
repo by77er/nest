@@ -571,8 +571,8 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
   });
 });
 
-describe("#23 captains move off a silent controller host", () => {
-  it("a captain mid-turn restarts on another controller host", async () => {
+describe("#23 captains move off a silent brain host", () => {
+  it("a captain mid-turn restarts on another brain host", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-regress" } });
     const a = await connectHost(cell, "brain");

@@ -12,7 +12,7 @@ nest's cells as an [inframe](https://github.com/by77er/inframe) project: Lean st
 | `lean/Cell/Iam.lean` | IAM policies as data, rendered to JSON |
 | `lean/Cell/Test.lean` | Theorems about what the control plane and hosts may do, for every cell; that `use1`'s autoscaler instance types fall inside IAM's 8i patterns, and that its `AWS_CELLS` entry parses with the key's ARN; policies over the `use1` graph (no ingress, egress allow-list, IMDSv2) |
 | `host/install.sh` | Installs a host's software (packages, the release, Claude Code, systemd units): baked into the host AMI, and rerun at boot to catch up |
-| `host/bootstrap.sh` | Burst-host user-data: runs `install.sh`, writes the per-host config and starts nestd (no secrets) |
+| `host/bootstrap.sh` | Host user-data, rendered once per launch template with its `role`: a sandbox host runs `install.sh`, writes its config and starts nestd, nest-proxy and the gateway; a brain host (no bucket access) writes `role: brain` and starts nestd and the runner from the AMI (no secrets) |
 
 ## Use
 

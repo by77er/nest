@@ -52,7 +52,7 @@ describe("the fleet response", () => {
 
   it("takes the previous release's shape for one release", () => {
     const old: FleetResponse = {
-      hosts: [{ ...fleet.hosts[0]!, tunnel_state: null }],
+      hosts: [{ ...fleet.hosts[0]!, tunnel_state: null, role: "burst", max_brains: undefined }],
       launches: [],
       sandboxes: [
         { sandbox: "sbx_on", registered_ms: 1, host: "hst_a", epoch: 1, state: "running", image: "nest-base:latest", workstream: "ws_a" },
@@ -62,6 +62,7 @@ describe("the fleet response", () => {
     };
     const v = normalizeFleet(old);
     expect(v.hosts[0]!.tunnel_state).toBe("none");
+    expect(v.hosts[0]!).toMatchObject({ role: "sandbox", max_brains: null });
     expect(v.sandboxes).toEqual([
       { sandbox: "sbx_on", registered_ms: 1, host: "hst_a", epoch: 1, lease_state: "running", sandbox_state: null, image: "nest-base:latest", workstream: "ws_a", info_error: false },
       { sandbox: "sbx_parked", registered_ms: 2, host: null, epoch: 3, lease_state: null, sandbox_state: "suspended", image: "nest-base:latest", workstream: "ws_a", info_error: false },

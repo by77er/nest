@@ -394,7 +394,7 @@ describe("autoscaling", () => {
     await createSandbox(cell, 202);
     expect(ec2.launched).toHaveLength(1);
 
-    // The instance enrolls (only as a burst host of this cell, from the launch record) and connects.
+    // The instance enrolls (only as a sandbox host of this cell, from the launch record) and connects.
     const enrolled = await enrollLaunched(cell, "i-000000001");
     const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
     ws.send(hostHello(enrolled.host, cell));
@@ -660,7 +660,7 @@ describe("object-store GC", () => {
   const report = (token: string, run: string, rep: Record<string, unknown>) => SELF.fetch("http://cp.test/v1/hosts/gc/report", {
     method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ run, report: rep }) });
 
-  it("hands one burst host the live sandboxes' generations as roots, dry run first, then daily", async () => {
+  it("hands one sandbox host the live sandboxes' generations as roots, dry run first, then daily", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
     const keep = await createSandbox(cell);
@@ -674,7 +674,7 @@ describe("object-store GC", () => {
     await nextCommands(h.ws, (c) => c.type === "commit_result" && c.request === "req_g");
     await adminJson(`/v1/sandboxes/${gone.sandbox}`, { method: "DELETE" }, 200);
 
-    // Without a token: refused. A controller host never runs it.
+    // Without a token: refused. A brain host never runs it.
     expect((await SELF.fetch("http://cp.test/v1/hosts/gc/claim", { method: "POST" })).status).toBe(401);
     const ctl = await connectHost(cell, "brain");
     expect((await claim(ctl.host_token)).status).toBe(204);

@@ -1,16 +1,16 @@
 # Provisioning
 
-Two host images, one per [host kind](../). Neither contains a secret ([identity](../../security/identity/)).
+One host image for both [host kinds](../), and one launch template per kind; a host's kind is its launch template's ([host kind](#host-kind)). The image contains no secret ([identity](../../security/identity/)).
 
-**Sandbox host image (EC2 Image Builder):**
+**Host image (EC2 Image Builder):**
 - Amazon Linux 2023 with kernel 6.18 (or 6.1), the host kernels Firecracker supports on 8i ([README](https://github.com/firecracker-microvm/firecracker/blob/main/README.md)); Ubuntu 24.04's 6.8 isn't one of them. Hugetlb needs 5.18+ and ublk needs 6.0+; whether AL2023 ships ublk is unverified.
 - Firecracker from the 1.17 line, pinned by binary digest, patch level included ([driver](../../sandbox/drivers/firecracker/)).
-- Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, the [gateway](../../sandbox/gateway/), and the guest kernel and `nest-base` image. The target has no Claude Code, no agent runner and no bubblewrap: nothing on a sandbox host runs a brain. **Today,** until [brain hosts](../brain-hosts/) exist, `deploy/host/install.sh` installs Claude Code, the runner and bubblewrap on every host too, and a burst host runs brains beside its sandboxes; the subscription token is in the brain's process environment on the host, never in a VM.
+- Firecracker and jailer, gVisor (`runsc`), nestd, nest-proxy, cloudflared, the [gateway](../../sandbox/gateway/), and the guest kernel and `nest-base` image for sandbox hosts; Claude Code (pinned, checked by SHA-256), the agent runner, the `nest` binary and bubblewrap (Claude Code needs it for the subprocess environment scrub nest relies on; see [runner-claude](../../interfaces/host-internal/runner-claude/)) for brain hosts. Each kind's bootstrap starts only its own services and masks the other's: a sandbox host runs no agent runner, a brain host no proxy or gateway. The subscription token is only ever in a brain's process environment on a brain host, never on a sandbox host or in a VM.
 - **Built by the cell's Image Builder pipeline,** managed in the cell stack: AWS-native, no build host of ours. One install script runs in two places:
   - at build time, baked into the AMI;
-  - at every boot, where it only fills what the AMI lacks.
+  - at every sandbox host's boot, where it only fills what the AMI lacks.
 
-  Booting a stale AMI, or stock AL2023, therefore still works. It is only slower.
+  A sandbox host booting a stale AMI, or stock AL2023, therefore still works. It is only slower. A brain host has no bucket access, so it runs what the AMI baked: on an AMI without the release it never enrolls, and FleetDO terminates it at the enroll timeout.
 - **The guest image is baked compressed and expanded on first boot.** EBS loads an AMI's blocks from its snapshot on first read. Sandbox disks are reflinked copies of the base image (XFS), so with a baked, expanded base every first commit read cold blocks: on EC2 the first turn-end commit hit its 60 s timeout.
 - **Builds run on demand.** The pipeline writes the new AMI's ID to an SSM parameter, and the launch template resolves that parameter at each launch (`resolve:ssm:`). A new image therefore needs no stack change.
 - **The builder runs in the cell's subnet.** Its role can only read the release, and it is not tagged `nest=true`, so STONITH can't reach it.
@@ -18,21 +18,19 @@ Two host images, one per [host kind](../). Neither contains a secret ([identity]
 - **Old images are pruned by an Image Builder lifecycle policy** (in the cell stack): the two newest images of the host recipe stay, the rest are deleted with their AMIs and snapshots, except an AMI that launched an instance in the last seven days, so failed builds cannot remove the AMI the launch template resolves to. Image Builder evaluates it on its own daily schedule.
 - **Not built:** gVisor.
 
-**Brain host image:** nestd, Claude Code, the agent runner and the `nest` binary, `bubblewrap` (Claude Code needs it for the subprocess environment scrub nest relies on; see [runner-claude](../../interfaces/host-internal/runner-claude/)) and the Discord gateway client. The image carries the runner's pinned Claude Code version, checked by SHA-256 ([runner](../../agents/runner/)). No hypervisor, no hugepages, no S3 access, no cloudflared. Built by the same pipeline from an ARM-capable AL2023 base, for the cheapest class that runs Claude Code ([brain hosts](../brain-hosts/)). **Not built.**
-
-**Launch templates,** one per host kind:
+**Launch templates,** one per host kind, both resolving the host AMI and requiring IMDSv2 with hop limit 1:
 - **Sandbox hosts:** nested virtualization enabled, restricted to the 8i family (the IAM policy allows `c8i*.*`, `m8i*.*`, `r8i*.*`; the instance types the autoscaler picks are a list in the cell stack, proved to fall inside those patterns, and written with the rest of `AWS_CELLS`). Prefer `d` variants for local NVMe. No hugepage pool: guest memory is regular pages, and bootstrap clears any pool an older AMI reserved ([memory](../../sandbox/state/memory/)).
-- **Brain hosts:** the brain-host AMI, the cheapest class that runs Claude Code (`t4g.medium`-class), no hugepages, no nested virtualization. **Not built.**
+- **Brain hosts:** the cheapest x86 class that runs Claude Code, `t3a.medium` then `t3.medium` (x86 because the one AMI is x86_64; IAM allows `t3a*.*` and `t3*.*` from this template only, and the cell stack proves its list falls inside), standard CPU credits, no nested virtualization, no hugepages ([brain hosts](../brain-hosts/)). Its section of `AWS_CELLS` (`brain`: template, instance types, spot, `max_hosts`, `idle_grace_ms`, `max_brains_per_host`) drives FleetDO's brain-host autoscaler.
 
 **Network:**
 - Public subnet with public IPv4, no NAT.
 - **S3 gateway endpoint.** It's free, and it lets the bucket policy require `aws:SourceVpce`.
-- Security group: outbound 443, plus 7844 TCP and UDP for cloudflared on sandbox hosts ([tunnel ports](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/configure-tunnels/tunnel-with-firewall/)). No inbound rules on either kind: brains reach sandboxes through each sandbox host's tunnel, and hosts dial the control plane out ([gateway](../../sandbox/gateway/)).
+- Security groups, one per kind: sandbox hosts get outbound 443 plus 7844 TCP and UDP for cloudflared ([tunnel ports](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/configure-tunnels/tunnel-with-firewall/)); brain hosts outbound 443 only. No inbound rules on either kind: brains reach sandboxes through each sandbox host's tunnel, and hosts dial the control plane out ([gateway](../../sandbox/gateway/)). The cell stack's graph policies check each group's rules against its own list.
 
 **IAM:**
 - **Sandbox host instance role:** S3 access scoped to the cell's bucket.
-- **Brain host instance role:** nothing. A brain host holds no S3 access; enrollment needs only IMDS, which is local.
-- **Control-plane IAM user, one per cell ([cells](../cells/)):** `RunInstances` with the cell's launch template only; `Terminate` and `Stop` only on instances tagged `nest=true`; `Describe*`; `kms:Sign` and `kms:GetPublicKey` on the cell's proxy root CA key only ([TLS](../../sandbox/networking/egress/tls/)).
+- **Brain host instance role:** nothing (a role with no policy; a graph policy checks none is ever attached). A brain host holds no S3 access; enrollment needs only IMDS, which is local.
+- **Control-plane IAM user, one per cell ([cells](../cells/)):** `RunInstances` from the cell's two launch templates only, each with its own instance families (8i from the sandbox template, the brain families from the brain template); `PassRole` on the two host roles only; `Terminate` and `Stop` only on instances tagged `nest=true` (both templates tag theirs); `Describe*`; `kms:Sign` and `kms:GetPublicKey` on the cell's proxy root CA key only ([TLS](../../sandbox/networking/egress/tls/)). These are theorems in `deploy/lean/Cell/Test.lean`, for every cell.
 - **Deploy role** (`nest-<cell>-deploy`): assumed from GitHub Actions over OIDC, only by the repo's `production` environment; administrator-equivalent, because applying the stack manages IAM ([deploys](../../../dev/deploy.md)).
 
 **Host authentication:**
@@ -42,6 +40,10 @@ Two host images, one per [host kind](../). Neither contains a secret ([identity]
 4. For a sandbox host, the Worker also creates the host's Cloudflare Tunnel and its DNS record through the Cloudflare API ([remote tunnel API](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel-api/); an API token with Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit, a Worker secret) and returns the tunnel token with the host token and the `wss://` URL clients will use. nestd keeps the token in its credentials file and runs cloudflared with it in the environment. A brain host gets none, and so does a cell missing any of the three Cloudflare inputs [FleetDO](../../control-plane/durable-objects/fleet/) names ([gateway](../../sandbox/gateway/)). FleetDO deletes the tunnel and record when the host dies and sweeps leaks daily ([FleetDO](../../control-plane/durable-objects/fleet/)).
 
 No secrets go in user-data.
+
+## Host kind
+
+A host's kind (`role: sandbox | brain` in nestd's config) is written by its launch template's user data, so it is decided by which template FleetDO launched the instance from; FleetDO's launch record names that kind, and enrollment as any other kind is refused. Not an instance tag: tags in instance metadata stay off in both templates, reading them otherwise needs an IAM permission the brain role must not have, and a tag is something an instance's role could be allowed to change; the template's user data is fixed per template, and IAM lets the control plane launch from only the two. A brain host's nestd refuses any sandbox setting in its config (driver, netns, S3, cloudflared, gateway URL) and sends no proxy CA request at enrollment ([nestd](../nestd/)). A host enrolled with a token takes the kind the token was minted for.
 
 **Restarts resume, they don't re-enroll:** an instance enrolls once (its identity document is never replayable), so nestd keeps what enrollment gave it (host id, host token, fleet URL, proxy intermediate) root-only in `<state_dir>/host-credentials.json`, rewritten on every token rotation and CA renewal. A restarted nestd reconnects with it while the token is less than 23 h past expiry (the fleet channel's grace is 24 h; it rotates the token at hello); after that the host is replaced. The new process deletes a sandbox whose disk equals its head without reporting it, reports any other it finds on disk as `fenced` (salvaging its uncommitted work, then deleting it; [nestd](../nestd/)), and the control plane treats leases it doesn't report as gone with the old one: suspended sandboxes are evicted, the rest placed again from head. Verified on EC2 by rebooting a host: the same host reconnected 20 s later with no new enrollment and took new work. A host down longer than the 30 s lease expiry while holding leases is fenced by STONITH as before. A host outside AWS (a brain host on a VPS, for example) enrolls once with a one-time token I mint myself.
 

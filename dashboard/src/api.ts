@@ -7,7 +7,7 @@ export type {
   LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
   TunnelState,
 } from "../../protocol/admin/view";
-import type { AwsView, FleetView, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../protocol/admin/view";
+import type { AwsView, FleetView, HostRole, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../protocol/admin/view";
 
 /**
  * A sandbox row as the control plane before the typed view returned it: one `state`, the lease's
@@ -26,9 +26,13 @@ export interface LegacySandboxRow {
 
 /** What `GET /api/fleet` may answer during that release. */
 export interface FleetResponse {
-  /** The previous release sends `tunnel_state` null for `none`, and `lost`/`brain_epochs` as 0/1 (or not at all, before them). */
-  hosts: (Omit<HostView, "tunnel_state" | "lost" | "brain_epochs" | "wedged_ms"> & {
+  /**
+   * The previous release sends `tunnel_state` null for `none`, `lost`/`brain_epochs` as 0/1 (or not at all,
+   * before them), the host roles `burst`/`controller`, and no `max_brains`.
+   */
+  hosts: (Omit<HostView, "tunnel_state" | "lost" | "brain_epochs" | "wedged_ms" | "role" | "max_brains"> & {
     tunnel_state: TunnelState | null; lost?: boolean | number; brain_epochs?: boolean | number; wedged_ms?: number | null;
+    role: HostRole | "burst" | "controller"; max_brains?: number | null;
   })[];
   launches: FleetView["launches"];
   sandboxes: (SandboxView | LegacySandboxRow)[];
@@ -40,6 +44,7 @@ export function normalizeFleet(raw: FleetResponse): FleetView {
   return {
     hosts: raw.hosts.map((h) => ({
       ...h, tunnel_state: h.tunnel_state ?? "none", lost: !!h.lost, brain_epochs: !!h.brain_epochs, wedged_ms: h.wedged_ms ?? null,
+      role: h.role === "burst" ? "sandbox" : h.role === "controller" ? "brain" : h.role, max_brains: h.max_brains ?? null,
     })),
     launches: raw.launches,
     aws: raw.aws ?? { cell: null, error: "not reported by this control plane" },

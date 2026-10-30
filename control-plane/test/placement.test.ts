@@ -22,7 +22,7 @@ async function place(cell: string, ws: string, status = 201) {
   return adminJson<{ sandbox: string; host: string | null }>("/v1/sandboxes", { body: { workstream: ws, cell } }, status);
 }
 
-/** A connected burst host whose hello reports the given capacity. */
+/** A connected sandbox host whose hello reports the given capacity. */
 async function hostWithCapacity(cell: string, capacity: Record<string, unknown>) {
   const enrolled = await enrollHost(cell, "sandbox");
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
@@ -93,7 +93,7 @@ describe("placement on regular pages", () => {
     expect((await place(cell, ws, 202)).host, "the fourth would leave less than a reserve").toBeNull();
   });
 
-  it("a burst keeps its reservations until a capacity report made after the sandboxes reported", async () => {
+  it("a burst of placements keeps its reservations until a capacity report made after the sandboxes reported", async () => {
     const cell = uniqueCell();
     // Room for two reserves (2000 - 768 = 1232 >= 768), not three (2000 - 2*768 = 464).
     const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 2000, vcpus_free: 2 });

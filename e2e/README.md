@@ -1,22 +1,25 @@
 # End-to-end harness
 
-`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built. One machine plays both host kinds, but the runner reaches the guest only the way a brain on another machine would: through the sandbox [gateway](../docs/sandbox/gateway/) on a loopback port, with a binding the control plane minted. What the harness cannot show is the tunnel, Cloudflare Access, and a brain and a sandbox on different machines.
+`./run.sh` runs the **real** components together on one machine, without root or KVM, and checks a scenario end to end. A full run takes about 35 s once binaries are built. One machine runs two hosts: a sandbox host (nestd, nest-proxy, the gateway, the guest) and a brain host (a second nestd with `role: brain`, the runner), each enrolled with its own token, with its own run and state directories, and each self-fencing on its own. The brain starts on the brain host, never the sandbox's, and the runner reaches the guest only the way a brain on another machine would: through the sandbox [gateway](../docs/sandbox/gateway/) on a loopback port, with a binding the control plane minted. What the harness cannot show is the tunnel, Cloudflare Access, and the two hosts on different machines.
 
 ```
 wrangler dev --local (control plane, :18787)          ← outside any namespace
 unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
-  ├─ nest-proxy    (unprivileged; listeners handed over by nestd)
-  ├─ nestd         (enrolls with a one-time token; `process` driver; creates one netns per sandbox; advertises gateway_url)
-  │    └─ nest-guest   (in the sandbox netns, behind the unix-socket vsock emulator)
-  ├─ nest-gateway  (ws://127.0.0.1:18790; fed by nestd over gateway.sock; forwards hands calls to the guest's vsock port)
-  └─ nest-runner   (brains = e2e/fake_claude.py, or real `claude`; hands through the real `nest mcp` bridge and the hands client)
+  ├─ sandbox host (run/, state/)
+  │    ├─ nest-proxy    (unprivileged; listeners handed over by nestd)
+  │    ├─ nestd         (role: sandbox; enrolls with a one-time token; `process` driver; one netns per sandbox; advertises gateway_url)
+  │    │    └─ nest-guest   (in the sandbox netns, behind the unix-socket vsock emulator)
+  │    └─ nest-gateway  (ws://127.0.0.1:18790; fed by nestd over gateway.sock; forwards hands calls to the guest's vsock port)
+  └─ brain host (brun/, bstate/)
+       ├─ nestd         (role: brain; its own token; no driver, proxy, gateway or netns)
+       └─ nest-runner   (brains = e2e/fake_claude.py, or real `claude`; hands through the real `nest mcp` bridge and the hands client)
 ```
 
 **By default the real `claude` binary is never invoked.** `fake_claude.py`, adapted from `crates/nest-cli/tests/fake_claude.py`, speaks stream-json, runs hooks through `nest hook`, and drives `nest mcp`. A turn whose text is `E2E <scenario.json>` runs scripted tool calls and appends each result to a JSONL file immediately. The real binary is used only by [real-Claude mode](#real-claude-code) and `claude-verify/`.
 
 ## What it checks
 
-1. **Startup:** enrollment and fleet connection; a sandbox is placed on the host; a worker agent is created and its brain starts.
+1. **Startup:** both hosts enroll and connect; a sandbox is placed on the sandbox host; a worker agent is created and its brain starts on the brain host (the fleet view names each host's role).
 2. **Hands, through MCP → runner → hands client → gateway → vsock emulator → nest-guest:**
    - `Bash`: `pwd`; cwd persists across calls; exported variables don't (Claude Code's semantics); the exec env carries `NEST_AGENT_ID` and `HTTPS_PROXY`
    - `Write`, `Read`, `Edit`, `Read`
@@ -32,7 +35,7 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
    - the session transcript is in R2 (read through `GET /v1/agents/<id>/transcript`)
    - the turn is `done`; workstream events are visible
    - the egress audit (allowed and denied records) is in R2 under `audit/…`
-7. **Fencing:** the control plane is stopped. nestd self-fences within about 20 s; runner brains are killed; the guest is paused (SIGSTOP); proxy listeners are dropped; the gateway refuses the sandbox's still-valid binding as `moved`.
+7. **Fencing:** the control plane is stopped. Each host's nestd self-fences within about 20 s; the brain host's runner brains are killed; the guest is paused (SIGSTOP); proxy listeners are dropped; the gateway refuses the sandbox's still-valid binding as `moved`.
 
 **Skipped, with the reason printed:**
 - **Transparent `:443` interception.** The process driver runs the guest in the netns itself, with no tap0 peer, so nft's tap0 redirect can't apply. nestd's `netns_redirect_reaches_listener` test covers it.

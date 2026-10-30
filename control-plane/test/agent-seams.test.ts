@@ -734,7 +734,7 @@ describe("one brain per agent: the brain record", () => {
     expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isKillOf(s.agent)))).toBe(true);
   });
 
-  it("probe 3 (H4) / rule 5: a silent burst host with a brain and no lease is expired, releasing the brain", async () => {
+  it("probe 3 (H4) / rule 5: a silent brain host with a brain and no lease is expired, releasing the brain", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
@@ -1267,7 +1267,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect((await agentStub(s.agent).info()).brain).not.toMatchObject({ host: s.host.host });
   });
 
-  it("an idle burst host with a brain recorded is never retired", async () => {
+  it("an idle host with a brain recorded is never retired", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
@@ -1641,7 +1641,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect(kill).toMatchObject({ epoch: 1 });
   });
 
-  it("merge gate 2: a drained controller host is retired when empty", async () => {
+  it("merge gate 2: a drained brain host is retired when empty", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));

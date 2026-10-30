@@ -8,10 +8,10 @@ Two kinds, placed and scaled independently. A brain never runs on a sandbox host
 
 | Kind | Runs | Lifecycle |
 |---|---|---|
-| **Sandbox host** (`kind: sandbox`; the `burst` role in code) | **Every sandbox** (Firecracker), nestd, nest-proxy, cloudflared and the gateway. No brains. | Spot with nested virtualization, scales to zero |
-| **[Brain host](brain-hosts/)** (`kind: brain`) | nestd (enrollment, lease, runner supervision), the agent runner with one Claude Code process per active agent, `nest mcp`, and the Discord gateway client when FleetDO places it here. No sandboxes, no KVM, no S3 access. | The cheapest instance class that runs Claude Code, spot or on-demand; idle for 30 min, then terminated; scales to zero |
+| **Sandbox host** (`role: sandbox`) | **Every sandbox** (Firecracker), nestd, nest-proxy, cloudflared and the gateway. No brains. | Spot with nested virtualization, scales to zero |
+| **[Brain host](brain-hosts/)** (`role: brain`) | nestd (enrollment, lease, runner supervision), the agent runner with one Claude Code process per active agent, `nest mcp`, and the Discord gateway client when FleetDO places it here. No sandboxes, no KVM, no S3 access. | The cheapest instance class that runs Claude Code, spot or on-demand; idle for 30 min, then terminated; scales to zero |
 
-**Not built:** brain hosts. The code has `burst` and `controller` host roles, and `control-plane/README.md` lists the gaps.
+Both kinds boot one host AMI; a host's kind is its nestd config's `role`, written by the user data of the launch template FleetDO launched it from ([provisioning](provisioning/)). `burst` and `controller`, the previous release's names, are read as `sandbox` and `brain` for one release. Brain hosts are not yet run on AWS.
 
 ## Choice of provider
 
