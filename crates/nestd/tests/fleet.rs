@@ -156,7 +156,7 @@ impl Link {
             url: url.to_string(),
             token: "tok".into(),
             host: HostId("hst_t".into()),
-            role: HostRole::Burst,
+            role: HostRole::Sandbox,
             cell: "c1".into(),
             gateway_url: None,
             tunnel,

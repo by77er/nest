@@ -30,7 +30,7 @@ nestd's cores are checked as shipped ([docs/verification/nestd/](../docs/verific
 | Check | On every PR | Longer |
 |---|---|---|
 | Model checks | the specs in `verification/nestd/check/tests/variants.rs`: about 10 s on 4 threads locally | by hand: `cargo test --release -- --include-ignored` adds every fault at once; `cargo run --release -- <spec>` explores other bounds and prints shortest counterexamples |
-| Mutation testing | `cargo mutants -p nestd-core --in-place --timeout 60` (in place, so the cached `target/` is the one it builds in): 231 mutants, about 5 min at one job locally | — |
+| Mutation testing | `cargo mutants -p nestd-core --in-place --timeout 60` (in place, so the cached `target/` is the one it builds in): 233 mutants, about 4 min at one job locally | — |
 | Kani | every harness (kani-verifier 0.68.0): about 2 min locally, under 1.5 GB | — |
 | Fuzzing | the seeds decode, and every target replays the seeds and the cached corpus once (`run.sh <target> replay`) | nightly in `fuzz.yml`: 10 min for the guest targets, 3 min for the rest; it saves the corpus the PR job replays |
 

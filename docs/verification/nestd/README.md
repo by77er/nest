@@ -320,7 +320,7 @@ The seeds are built from `protocol/fixtures/` at every run and never committed, 
   - a mutant that only hangs.
 - **Final run:** 145 mutants, **0 missed** (140 caught, 5 unviable).
 - **After the incarnation module joined** (exclusions also cover the `#[cfg(kani)]` proof code, which `cargo test` never compiles): 192 mutants, **0 missed** (181 caught, 11 unviable), about 2 min.
-- **Round 2** (no_std core, the moved decisions, the tombstone map, the expected-seq fix): 231 mutants, **0 missed** (219 caught, 12 unviable), about 5 min at `-j 1`.
+- **Round 2** (no_std core, the moved decisions, the tombstone map, the expected-seq fix): 233 mutants, **0 missed** (220 caught, 13 unviable), about 4 min at `-j 1`.
 - **Exclusions name a function and a mutation, never a line.** Where a function held both a killable mutant and an equivalent one of the same shape, the equivalent one's expression moved into a function of its own (the invariants' predicates, the heartbeat bookkeeping).
 
 ## CI
