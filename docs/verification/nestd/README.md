@@ -16,7 +16,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 ## The core/shell split
 
 - **A core** is `step(&mut state, now, input) -> Vec<Effect>`. It lives in `crates/nestd-core`, which has no dependencies at all. What is enforced, and where:
-  - **The compiler, in CI.** The `rust` job builds the library for `x86_64-unknown-none`, a target with no `std` at all, so any use of `std` fails to build, whatever its spelling. That includes a clock, the filesystem, the network, processes, threads, the environment, stdio and an OS-seeded hasher, and covers `extern crate std as s` split over lines and a `#[path]` module that uses `std`.
+  - **The compiler, in CI.** The `rust` job builds the library for `x86_64-unknown-none`, a target with no `std`, so code that uses `std` there fails to build: a clock, the filesystem, the network, processes, threads, the environment, stdio, an OS-seeded hasher. That covers `extern crate std as s` split over lines and a `#[path]` module that uses `std`. Code compiled only off that target would escape it; the source check below rejects the `cfg` that would do that.
     - The crate is `#![cfg_attr(not(test), no_std)]` with `extern crate alloc`. On the host, `no_std` alone doesn't forbid an explicit `extern crate std`; the no-std target does.
     - It is `#![forbid(unsafe_code)]`.
     - Its unit tests are built with `std`, on the host only.
@@ -24,9 +24,9 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
     - any dependency table or key in `crates/nestd-core/Cargo.toml` (parsed as TOML: dotted, inline or per target);
     - any build key, `[patch]` or `[replace]`, or a `build.rs`;
     - a `lib.rs` without the `no_std` line;
-    - in any source file, an `extern crate` other than `alloc`, a `#[path]` module or `include!`.
+    - in any source file, an `extern crate` other than `alloc`, a `#[path]` module, `include!`, or a `cfg`, `cfg_attr` or `cfg!` predicate on any `target_*` key.
 
-    It checks the sources with comments stripped, so a commented-out line neither satisfies it nor trips it. Tests prove each case fails.
+    It checks the sources with comments stripped and string, byte-string, raw-string and char literals emptied, so neither a commented-out line nor a comment marker inside a literal changes what it sees. Tests prove each case fails, the reviewer's two repros among them.
   - **A text fence**, `nestd-core-purity` ([scripts/fences.toml](../../../scripts/fences.toml)): a line-based third layer over the same names.
   - **Not enforced:** a core could still loop forever, or allocate without bound. Model checking and tests find those, not the build.
 - **The shell makes no decisions.** It only does five things:

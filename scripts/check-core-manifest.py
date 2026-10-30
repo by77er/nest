@@ -10,7 +10,8 @@ next to the manifest (cargo runs it without being told); `[patch]` or `[replace]
 without the `no_std` attribute (comments don't count); and, in any source file with comments
 stripped, `extern crate` of anything but `alloc` (whatever whitespace or lines it spans: `std` would
 undo `no_std`), a `#[path = ...]` module (code from outside the crate) or `include!`.
-`dev-dependencies` are fine: they never reach the shipped library.
+A `cfg` predicate on any `target_*` key is rejected too: code compiled only off the no-std target
+would escape that build. `dev-dependencies` are fine: they never reach the shipped library.
 
 The compiler is the first layer: CI builds the crate for a target with no `std` at all
 (`x86_64-unknown-none`), where naming `std` in any way fails. This and the text fence are the
@@ -34,23 +35,59 @@ FORBIDDEN = {
 }
 
 
+# A char literal ('a', '\n', '\'', '\u{1F600}'); a `'` that doesn't start one is a lifetime.
+CHAR = re.compile(r"'(?:\\u\{[0-9a-fA-F_]{1,8}\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'")
+RAW = re.compile(r'b?r(#*)"')
+
+
 def strip_comments(src: str) -> str:
-    """Rust source without `//` and (nested) `/* */` comments. String literals aren't parsed: a
-    comment marker inside one only makes this stricter (more text is dropped, or kept)."""
-    out, i, depth = [], 0, 0
-    while i < len(src):
-        if depth == 0 and src.startswith("//", i):
+    """Rust source without comments (`//`, and nested `/* */`) and with every string, byte-string,
+    raw-string and char literal emptied (`""`, `''`), so neither a comment marker nor code-like text
+    inside a literal changes what the checks see."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        if src.startswith("//", i):
             j = src.find("\n", i)
-            i = len(src) if j < 0 else j
+            i = n if j < 0 else j
         elif src.startswith("/*", i):
-            depth, i = depth + 1, i + 2
-        elif depth and src.startswith("*/", i):
-            depth, i = depth - 1, i + 2
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if src.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif src.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif (m := RAW.match(src, i)) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            end = src.find('"' + m.group(1), m.end())
+            out.append('""')
+            i = n if end < 0 else end + 1 + len(m.group(1))
+        elif src[i] == '"' or (src.startswith('b"', i) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))):
+            i += 2 if src[i] == "b" else 1
+            while i < n and src[i] != '"':
+                i += 2 if src[i] == "\\" else 1
+            out.append('""')
+            i += 1
+        elif src[i] == "'" and (m := CHAR.match(src, i)):
+            out.append("''")
+            i = m.end()
         else:
-            if depth == 0:
-                out.append(src[i])
+            out.append(src[i])
             i += 1
     return "".join(out)
+
+
+def cfg_on_target(code: str) -> bool:
+    """Whether any `cfg(...)`, `cfg_attr(...)` or `cfg!(...)` predicate names a `target_*` key: code
+    that compiles only off the no-std target would escape the build CI checks purity with."""
+    for m in re.finditer(r"\bcfg(?:_attr)?\s*!?\s*\(", code):
+        depth, j = 1, m.end()
+        while j < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[j], 0)
+            j += 1
+        if re.search(r"\btarget_\w+", code[m.end():j]):
+            return True
+    return False
 
 
 def problems(crate: Path) -> list[str]:
@@ -92,6 +129,8 @@ def problems(crate: Path) -> list[str]:
         for what, pattern in FORBIDDEN.items():
             if pattern.search(code):
                 out.append(f"{src}: {what}")
+        if cfg_on_target(code):
+            out.append(f"{src}: a cfg on target_* (code the no-std build wouldn't compile)")
     return out
 
 

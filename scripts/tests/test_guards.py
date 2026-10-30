@@ -210,6 +210,52 @@ class CoreManifest(unittest.TestCase):
             lib.write_text(text.replace("extern crate alloc;", "extern\ncrate alloc;"), encoding="utf-8")
             self.assertEqual(self.check()[0], 0)
 
+    def test_literals_neither_hide_nor_fake_code(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        hidden = {
+            # The reviewer's repro: a comment opener and closer inside string literals.
+            "comment markers in strings": 'const A: &str = "/*";\nextern\ncrate std as s;\nconst B: &str = "*/";',
+            "escaped quote": 'const A: &str = "\\"/*";\nextern crate std;\nconst B: &str = "*/";',
+            "raw string": 'const A: &str = r#"/*"#;\nextern crate std;\nconst B: &str = r#"*/"#;',
+            "byte string": 'const A: &[u8] = b"/*";\nextern crate std;\nconst B: &[u8] = b"*/";',
+            "char literal": "const A: char = '\"';\nextern crate std;\nconst B: char = '\"';",
+        }
+        for name, code in hidden.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + code + "\n", encoding="utf-8")
+                code_, out = self.check()
+                self.assertEqual(code_, 1, out)
+                self.assertIn("extern crate", out)
+        harmless = {
+            "code-like text in a string": 'const A: &str = "extern crate std; #[path = \\"x\\"] include!(y)";',
+            "raw string with a quote": 'const A: &str = r#"extern crate std; " still"#;',
+            "lifetimes": "fn f<'a>(x: &'a str) -> &'a str { x }",
+        }
+        for name, code in harmless.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + code + "\n", encoding="utf-8")
+                self.assertEqual(self.check()[0], 0, name)
+
+    def test_a_cfg_on_the_target_fails(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        for name, code in {
+            "cfg": '#[cfg(not(target_os = "none"))]\nmod m {}',
+            "cfg_attr": '#[cfg_attr(target_arch = "x86_64", allow(dead_code))]\nmod m {}',
+            "nested": '#[cfg(any(test, all(unix, target_family = "unix")))]\nmod m {}',
+            "cfg!": "pub fn f() -> bool { cfg!(target_has_atomic = \"64\") }",
+            "spaced": '# [ cfg ( target_os = "linux" ) ] mod m {}',
+        }.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + code + "\n", encoding="utf-8")
+                code_, out = self.check()
+                self.assertEqual(code_, 1, out)
+                self.assertIn("target_", out)
+        with self.subTest("cfg(test) and cfg!(debug_assertions)"):
+            lib.write_text(text + "\n#[cfg(test)]\nmod t {}\npub fn d() -> bool { cfg!(debug_assertions) }\n", encoding="utf-8")
+            self.assertEqual(self.check()[0], 0)
+
 
 class DocLinks(unittest.TestCase):
     def setUp(self):
