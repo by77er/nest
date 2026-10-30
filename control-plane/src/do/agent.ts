@@ -330,6 +330,9 @@ export class AgentDO extends DurableObject<Env> {
     // Notices taken without delivery (no `read` tool): how many, and up to which seq.
     this.addColumn("channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
     this.addColumn("channel_subs", "skipped_to", "INTEGER");
+    // Wakes from notices merged into a waiting turn (no turn of their own): they count toward the
+    // hourly cap like subscription-started turns. Rows older than an hour are dropped as they're counted.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS chan_wakes (ts_ms INTEGER NOT NULL)");
     this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
@@ -2098,14 +2101,16 @@ export class AgentDO extends DurableObject<Env> {
       return ack;
     }
     if (!info.current_turn) {
+      this.sql.exec("DELETE FROM chan_wakes WHERE ts_ms <= ?", now - 3_600_000);
       const hour = this.sql.exec<{ n: number; oldest: number | null }>(
-        "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM turns WHERE request_id LIKE 'chan/%' AND created_ms > ?", now - 3_600_000).one();
+        `SELECT COUNT(*) AS n, MIN(t) AS oldest FROM (SELECT created_ms AS t FROM turns WHERE request_id LIKE 'chan/%' AND created_ms > ?
+          UNION ALL SELECT ts_ms AS t FROM chan_wakes)`, now - 3_600_000).one();
       if (hour.n >= WAKE_CAP_PER_HOUR) return { status: "defer", retry_after_ms: Math.max(1_000, (hour.oldest ?? now) + 3_600_000 - now) };
       const waiting = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM turns WHERE request_id LIKE 'chan/%' AND status = '${TURN.queued}'`).one().n;
       if (waiting >= MAX_WAITING_DELIVERIES) return { status: "defer", retry_after_ms: WAKE_RETRY_MS };
     }
     const last = this.sql.exec<{ t: number | null }>("SELECT MAX(COALESCE(started_ms, created_ms)) AS t FROM turns").one().t;
-    const text = envelopeText(shown, now, last);
+    const text = envelopeText(shown, now, last, reads);
     const requestId = `chan/${d.channel}/${d.subscription}/${upTo}`;
     // Both admit synchronously before their first await (the row is written in this step).
     if (info.current_turn) {
@@ -2125,6 +2130,7 @@ export class AgentDO extends DurableObject<Env> {
       if (new TextEncoder().encode(merged).length > MERGED_TURN_BYTES) return { status: "defer", retry_after_ms: WAKE_RETRY_MS };
       take();
       this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ ...prior, text: merged } satisfies TurnInput), waiting.turn);
+      this.sql.exec("INSERT INTO chan_wakes (ts_ms) VALUES (?)", now);
       await this.wake();
       return ack;
     }

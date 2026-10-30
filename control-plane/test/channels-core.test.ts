@@ -339,6 +339,77 @@ describe("filters and batching", () => {
    * ticks and delivery outcomes (taken, deferred, failed before or after the agent took it: an ack
    * lost), then drained. Every match is admitted exactly once, in order; nothing else is.
    */
+  /**
+   * The same channel and AgentDO model for an agent without `read`: it takes each batch only up to
+   * `inline_to` (a partial ack) and is shown only the user's messages. Every user message that
+   * matches reaches it exactly once, in order, under retries, defers and lost (partial) acks.
+   */
+  it("property: an agent without read gets every matching user message exactly once, in order, through partial acks", () => {
+    for (let seed = 1; seed <= 400; seed++) {
+      const r = rng(seed);
+      const senders = ["user", "user", "user", B, "platform"];
+      const filter: Filter = r() < 0.3 ? { from: [B, "user"] } : {};
+      let s: Subscription | null = {
+        id: "sub_q", agent: A, filter, delivery: "turn", batch_ms: Math.floor(r() * 50), once: false, cursor: 0, due_ms: null, inflight: null, attempts: 0,
+      };
+      const log: (MessageMeta & { text?: string })[] = [];
+      let hw = 0;
+      const shown: number[] = [];
+      let now = 0;
+      let lastCursor = 0;
+      const tick = (outcomeOf: () => "ok" | "defer" | "error_before" | "error_after") => {
+        if (!s || s.due_ms === null || s.due_ms > now) return;
+        let batch = s.inflight;
+        if (!batch) {
+          const p = planBatch(s, log.filter((x) => x.seq > s!.cursor));
+          if (p.kind === "idle") { s = { ...s, due_ms: null }; return; }
+          if (p.kind === "advance") { s = { ...s, cursor: p.to_seq, due_ms: null }; return; }
+          batch = p.batch;
+          s = { ...s, inflight: batch, due_ms: now + 1000 };
+        }
+        // AgentDO without `read`: up to `inline_to`, deduplicated against that.
+        const upTo = Math.min(batch.inline_to ?? batch.to_seq, batch.to_seq);
+        expect(upTo > batch.after_seq, `seed ${seed}: no progress`).toBe(true);
+        const o = upTo <= hw ? (r() < 0.5 ? "ok" : "error_before") : outcomeOf();
+        if ((o === "ok" || o === "error_after") && upTo > hw) {
+          hw = upTo;
+          for (const m of batch.inline) {
+            expect(m.seq <= upTo, `seed ${seed}: shown past up_to`).toBe(true);
+            shown.push(m.seq);
+          }
+        }
+        const outcome = o === "ok" ? { status: "ok" as const, ...(upTo < batch.to_seq ? { up_to: upTo } : {}) }
+          : o === "defer" ? { status: "defer" as const, retry_after_ms: 5 } : { status: "error" as const };
+        s = afterDelivery(s, batch, outcome, now);
+        if (s && s.inflight === null && s.due_ms === null) {
+          const p = planBatch(s, log.filter((x) => x.seq > s!.cursor));
+          if (p.kind !== "idle") s = { ...s, due_ms: now + (p.kind === "deliver" ? s.batch_ms : 0) };
+        }
+        if (s) {
+          expect(s.cursor >= lastCursor, `seed ${seed}: cursor went back`).toBe(true);
+          lastCursor = s.cursor;
+        }
+      };
+      for (let step = 0; step < 80; step++) {
+        now += Math.floor(r() * 30);
+        if (r() < 0.6) {
+          const from = senders[Math.floor(r() * senders.length)]!;
+          const msg = { seq: log.length + 1, ts_ms: now, from, taint: false, ...(from === "user" ? { text: "x".repeat(1 + Math.floor(r() * 3000)) } : {}) } as MessageMeta & { text?: string };
+          log.push(msg);
+          if (s) s = { ...s, due_ms: onAppend(s, msg, now) };
+        } else {
+          tick(() => (["ok", "defer", "error_before", "error_after"] as const)[Math.floor(r() * 4)]!);
+        }
+      }
+      for (let i = 0; i < 400 && s && (s.due_ms !== null || s.inflight); i++) {
+        now = Math.max(now + 1, s.due_ms ?? now);
+        tick(() => "ok");
+      }
+      const want = log.filter((x) => x.from === "user" && matches(filter, x, A)).map((x) => x.seq);
+      expect(shown, `seed ${seed}`).toEqual(want);
+    }
+  });
+
   it("property: delivery is exactly-once per match at the agent, in order, under retries, defers and lost acks", () => {
     for (let seed = 1; seed <= 400; seed++) {
       const r = rng(seed);
@@ -444,6 +515,10 @@ describe("envelope and taint", () => {
     expect(t).toContain('channel "team/x", since 3');
     expect(t).toContain("Message from user (seq 6): from the user");
     expect(t).toContain("last turn started 5 min ago");
+    // For an agent without `read`: never pointed at the tool.
+    const blind = envelopeText({ channel: "team/x", subscription: "sub_1", batch: { ...b, inline: [{ seq: 6, text: "hi" }, { seq: 7, text: "", cut: true }] } }, Date.UTC(2026, 9, 29), null, false);
+    expect(blind).not.toContain("`read`");
+    expect(blind).toContain("Message from user (seq 7, too long to show here)");
   });
 
   it("taint: hands, a web built-in or a tainted read; clip keeps at most the byte budget", () => {

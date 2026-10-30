@@ -908,7 +908,55 @@ describe("review round 2", () => {
     // One too big to keep inline (its body is in R2) arrives as a note that it needs `read`, never silently.
     await postAs(inbox, { text: "z".repeat(40 * 1024) }, 201);
     const more = await until(() => notices(agent), (n) => n.length === 3, 15_000, "the note");
-    expect(more[2]).toContain("Message from user (seq 3, not shown in full; the rest needs `read`)");
+    expect(more[2]).toContain("Message from user (seq 3, too long to show here)");
+    expect(more.join("\n")).not.toContain("`read`");
+  });
+
+  it("a lost partial ack (P10): the retry settles the cursor at up_to, and every message arrives exactly once", async () => {
+    const { agent } = await captain();
+    const inbox = `${agent}/inbox`;
+    await postAs(inbox, { text: "message 1" }, 201);
+    await until(() => notices(agent), (n) => n.join("").includes("message 1"), 10_000, "message 1");
+    // The settle after AgentDO took the next batch fails (as a reset there would).
+    await runInDurableObject(chStub(inbox), (inst: ChannelDO) => {
+      inst.testHooks["fanout:afterDeliver"] = async () => {
+        delete inst.testHooks["fanout:afterDeliver"];
+        throw new Error("reset after the agent took part of the batch");
+      };
+    });
+    for (let i = 2; i <= 8; i++) await postAs(inbox, { text: `message ${i}` }, 201);
+    const want = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => `message ${i}`);
+    const end = Date.now() + 20_000;
+    for (;;) {
+      const all = (await notices(agent)).join("\n");
+      if (want.every((w) => all.includes(w)) && (await chStub(inbox).subscriptions(inbox))[0]?.cursor === 8) break;
+      if (Date.now() > end) throw new Error(`not all delivered: ${all.slice(0, 400)}`);
+      await fanoutNow(inbox);
+    }
+    const all = (await notices(agent)).join("\n");
+    for (const w of want) expect(all.split(new RegExp(`${w}\\b`)).length - 1, w).toBe(1);
+  }, 30_000);
+
+  it("merges that wake count toward the hourly wake cap", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    await postAs(name, { text: "one" }, 201);
+    await fanoutNow(name);
+    await postAs(name, { text: "two" }, 201);
+    await fanoutNow(name);
+    expect((await notices(agent)).length).toBe(2);
+    // One channel turn and one merge so far: 58 more merges' worth reaches the cap of 60.
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      expect(st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM chan_wakes").one().n).toBe(1);
+      for (let i = 0; i < 58; i++) st.storage.sql.exec("INSERT INTO chan_wakes (ts_ms) VALUES (?)", Date.now() - 1000);
+    });
+    await postAs(name, { text: "three" }, 201);
+    await fanoutNow(name);
+    expect((await notices(agent)).length).toBe(2);
+    const s = (await chStub(name).subscriptions(name))[0]!;
+    expect(s).toMatchObject({ cursor: 2, inflight: null });
+    expect(s.due_ms! - Date.now()).toBeGreaterThan(30 * 60_000);
   });
 
   it("a notice merged into a waiting turn wakes the agent (Q1's wake), and the merged text is capped", async () => {
