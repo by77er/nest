@@ -576,6 +576,17 @@ export class AgentDO extends DurableObject<Env> {
     return r ?? this.startStatus();
   }
 
+  /**
+   * FleetDO saw room for brains appear (a brain host said hello, a brain's slot freed) while this
+   * agent waited for one: run the kept intent now instead of at its backed-off retry. Nothing to do
+   * without an intent. Returns whether one was waiting.
+   */
+  async pokeIntent(): Promise<boolean> {
+    if (!this.load().intent) return false;
+    await this.deadlines.set("intent", Date.now(), true);
+    return true;
+  }
+
   /** What a start that issued nothing answers: where the brain is, and what it waits for. */
   private startStatus(): StartResult {
     const info = this.load();
@@ -682,6 +693,7 @@ export class AgentDO extends DurableObject<Env> {
           if (intent.reason !== "operator") {
             this.update((i) => {
               i.intent = null;
+              delete i.capacity_waits;
             });
             await this.deadlines.clear("intent");
           }
@@ -728,7 +740,7 @@ export class AgentDO extends DurableObject<Env> {
       }
       host = intent.host_hint;
     } else {
-      host = await fleet.placeBrain({ prev: info.prev_host ?? null, avoid: intent.avoid ?? null });
+      host = await fleet.placeBrain({ prev: info.prev_host ?? null, avoid: intent.avoid ?? null, agent: info.agent });
       if (!host) throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no brain host available for this agent", 503, true);
     }
     // The sandbox wakes alongside (a suspended one resumes, an unplaced one is placed), so hands are
@@ -762,8 +774,8 @@ export class AgentDO extends DurableObject<Env> {
       i.agent_epoch += 1;
       i.brain = { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() };
       i.intent = null;
-      i.state = "starting";
       delete i.capacity_waits;
+      i.state = "starting";
     });
     const armed = Promise.all([
       this.deadlines.clear("intent"),
@@ -835,6 +847,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     this.update((i) => {
       i.intent = null;
+      delete i.capacity_waits;
       if (!i.brain && (i.state === "starting" || i.state === "detached")) i.state = "errored";
     });
     await this.deadlines.clear("intent");
@@ -979,6 +992,7 @@ export class AgentDO extends DurableObject<Env> {
       // brain) and a condemned brain's intent always run.
       if (i.intent?.reason === "operator" && i.brain.phase !== "condemned" && reason !== "stopped" && !moves(i.intent, i.brain.host)) {
         i.intent = null;
+        delete i.capacity_waits;
       }
       i.prev_host = i.brain.host;
       i.brain = null;
@@ -1011,7 +1025,10 @@ export class AgentDO extends DurableObject<Env> {
     // An operator's start kept from before this stop is for the brain this stop ends: dropped, so
     // only a start made after the stop runs after its exit (N20).
     const info = this.update((i) => {
-      if (i.intent?.reason === "operator" && i.brain && i.brain.phase !== "condemned" && !moves(i.intent, i.brain.host)) i.intent = null;
+      if (i.intent?.reason === "operator" && i.brain && i.brain.phase !== "condemned" && !moves(i.intent, i.brain.host)) {
+        i.intent = null;
+        delete i.capacity_waits;
+      }
     });
     const b = info.brain;
     if (!b || b.phase === "condemned") return;

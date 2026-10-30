@@ -255,6 +255,39 @@ def brainRoleExact (spec : CellSpec) : Policy :=
       else some s!"{r.resourceType}.{r.name} puts another policy on the brain role"
     else none
 
+/-- The `Effect` a policy text sets last (`"Effect":"…"`), if any. -/
+def lastEffect (s : String) : Option String :=
+  match s.splitOn "\"Effect\":\"" with
+  | [] | [_] => none
+  | pieces => some (String.mk ((pieces.getLast!).toList.takeWhile (· != '"')))
+
+/-- In a policy document built as one flat template (literal text with interpolated ARNs), the
+`Effect` of the statement around each interpolation that refers to `target`. -/
+def effectsAround (parts : List TemplatePart) (target : Address) : List String :=
+  (parts.foldl (init := ("", ([] : List String))) fun (effect, found) part =>
+    match part with
+    | .text s => ((lastEffect s).getD effect, found)
+    | .interpolation e => (effect, if (references e).contains target then found ++ [effect] else found)).2
+
+/-- Nothing else grants the brain role anything: the only resources that name it are its instance
+profile, its one inline policy (`brain-role-exact` checks the content), the control plane's policy
+(which may only pass it: `passes_only_the_host_roles`) and the cell bucket's policy, where it may
+appear only in a `Deny` statement (the endpoint-only rule). A KMS key policy, a grant, another
+bucket policy or any other resource that names it is refused. -/
+def brainRoleNowhereElse : Policy :=
+  Policy.resources "brain-role-nowhere-else" fun r =>
+    if !(r.arguments.any fun (_, e) => (references e).contains brainRole) then none
+    else if r.resourceType == "aws_iam_instance_profile" && r.name == "brain" then none
+    else if r.resourceType == "aws_iam_role_policy" && r.name == "brain_releases" then none
+    else if r.resourceType == "aws_iam_policy" && r.name == "control_plane_fleet" then none
+    else if r.resourceType == "aws_s3_bucket_policy" && r.name == "cell" then
+      match r.argument? "policy" with
+      | some (.template parts) =>
+        if (effectsAround parts brainRole).all (· == "Deny") then none
+        else some "the bucket policy may name the brain role only to deny it"
+      | _ => some "the bucket policy naming the brain role must be a readable template"
+    else some s!"{r.resourceType}.{r.name} names the brain role"
+
 /-- A launch template's instance profile (`iam_instance_profile[0].arn`), as the address it refers to. -/
 def templateProfile? (r : ResourceSpec) : Option Address :=
   match r.argument? "iam_instance_profile" with
@@ -303,8 +336,8 @@ def amiPruning : Policy :=
     | _, _, _ => some "the lifecycle policy must delete by count with literal values"
 
 def policies : Policy :=
-  Policy.all "cell" [Policy.validGraph, noIngress, egressAllowList, imdsV2, amiPruning, brainRoleExact use1, brainTemplateShape,
-    templateProfiles]
+  Policy.all "cell" [Policy.validGraph, noIngress, egressAllowList, imdsV2, amiPruning, brainRoleExact use1, brainRoleNowhereElse,
+    brainTemplateShape, templateProfiles]
 
 #assert_policy policies (buildGraph (cell use1))
 

@@ -2,10 +2,10 @@
 # Installs a host's software, for both kinds (one AMI): packages, the release from the cell's bucket
 # (host binaries, Firecracker, the guest kernel and image), the jail user, Claude Code and the
 # systemd units. Run by the host-image pipeline (EC2 Image Builder, see docs/compute/provisioning/),
-# which bakes it into the host AMI, and by every sandbox host's bootstrap, where it only fills in
-# what the AMI lacks (everything, on stock Amazon Linux 2023); a brain host has no bucket access
-# and runs what the AMI baked. It enables nothing (bootstrap enables each kind's services) and
-# holds no secrets.
+# which bakes it into the host AMI, and by every host's bootstrap, both kinds, where it only fills
+# in what the AMI lacks (everything, on stock Amazon Linux 2023); a brain host's role may read the
+# release (`releases/*`) and nothing else in the bucket. It enables nothing (bootstrap enables each
+# kind's units) and holds no secrets.
 set -euo pipefail
 
 BUCKET="@BUCKET@"

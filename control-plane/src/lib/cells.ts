@@ -23,7 +23,8 @@ const BrainHosts = z.object({
   /** In preference order; the first is also the on-demand fallback. */
   instance_types: z.array(z.string().min(1)).min(1),
   spot: z.boolean().default(true),
-  max_hosts: z.number().int().positive().default(1),
+  /** 3 two-vCPU hosts hold about 12 brains at the default capacity (the cell stack writes its own value). */
+  max_hosts: z.number().int().positive().default(3),
   /** How long a brain host holding no brain stays before it's terminated. */
   idle_grace_ms: z.number().int().nonnegative().default(1_800_000),
   /** Brains per host; 0 derives it from the instance's size (`maxBrains` in lib/placement.ts). */

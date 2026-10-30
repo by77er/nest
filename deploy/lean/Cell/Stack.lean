@@ -86,7 +86,9 @@ structure CellSpec where
   on-demand fallback. About 2 vCPU / 4 GiB. Each must fall within `brainInstanceFamilies`. -/
   brainLaunchTypes : List String := ["t3a.medium", "t3.medium"]
   brainSpot : Bool := true
-  brainMaxHosts : Nat := 1
+  /-- At most this many brain hosts: 3 `t3a.medium`s hold about 12 brains at the default 2 per
+  vCPU, room for today's agents with one host's worth to spare; one host would cap a cell at ~4. -/
+  brainMaxHosts : Nat := 3
   /-- How long a brain host holding no brain stays before it's terminated. -/
   brainIdleGraceMs : Nat := 1800000
   /-- Brains per brain host; 0 derives it from the instance's vCPUs (control-plane/src/lib/placement.ts). -/

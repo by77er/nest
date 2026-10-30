@@ -176,6 +176,8 @@ const PRUNE_INTERVAL_MS = 3_600_000;
 /** Its own deadline, so a quiet cell (no tick, no tunnels) still prunes: armed on every start. */
 const ALARM_PRUNE = "prune";
 const PRUNE_DAILY_MS = 24 * 3_600_000;
+/** A brain waiter not seen again for this long has stopped waiting (it retries at least every 5 min). */
+const BRAIN_WAIT_TTL_MS = 12 * 60_000;
 /** Lost hosts (expired or dead) whose brains' agents haven't all acknowledged the loss yet. */
 const LOST_WITH_BRAINS = "SELECT host FROM hosts WHERE lost = 1 AND host IN (SELECT host FROM host_agents)";
 /**
@@ -316,6 +318,11 @@ export class FleetDO extends DurableObject<Env> {
       destroyed_ms INTEGER)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS gc_runs (run TEXT PRIMARY KEY, host TEXT NOT NULL, marked_ms INTEGER NOT NULL,
       dry_run INTEGER NOT NULL, mark_version INTEGER NOT NULL, roots INTEGER NOT NULL, finished_ms INTEGER, report TEXT)`);
+    // Agents whose last start found no brain host with room (`placeBrain` answered none): poked when
+    // room appears (a brain host's hello, a brain's index row going), and the tick launches a brain
+    // host while any wait. A row goes when its agent is poked or gets a host, or after
+    // `BRAIN_WAIT_TTL_MS` without a retry (its intent ended; a waiting agent retries at least every 5 min).
+    this.sql.exec("CREATE TABLE IF NOT EXISTS brain_waiters (agent TEXT PRIMARY KEY, since_ms INTEGER NOT NULL)");
     // Suspended sandboxes leaving a host that is going away; SandboxDO is told, with retries.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS evictions (sandbox TEXT NOT NULL, host TEXT NOT NULL, epoch INTEGER NOT NULL,
       PRIMARY KEY (sandbox, host, epoch))`);
@@ -940,6 +947,8 @@ export class FleetDO extends DurableObject<Env> {
     // (AgentDO starts brains only on hosts of this release, and `issueCommands` refuses one).
     if (!hello.brain_epochs) await this.drainBrains(att.host, "a previous-release nestd");
     await this.reconcileAgents(att.host, hello.agents);
+    // A brain host of this release is (back) up: agents waiting for room try it now.
+    if (prior.role === BRAIN_ROLE && hello.brain_epochs) this.pokeBrainWaitersLater();
     // A host whose leases we expired came back: it must fence them before we reassign (STONITH by fence).
     await this.ensureStonithFence(att.host);
     await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
@@ -1122,9 +1131,11 @@ export class FleetDO extends DurableObject<Env> {
   private brainGone(agent: string, host: string, epoch: number | undefined): void {
     if (epoch === undefined) {
       this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND epoch IS NULL", agent, host);
-      return;
+    } else {
+      this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND (epoch IS NULL OR epoch <= ?)", agent, host, epoch);
     }
-    this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND (epoch IS NULL OR epoch <= ?)", agent, host, epoch);
+    // A slot may have freed: an agent waiting for room tries now rather than at its backoff.
+    this.pokeBrainWaitersLater();
   }
 
   /** Owed exits of brains a host's hello no longer reports: told to AgentDO, the row going only once it took it. */
@@ -1134,6 +1145,7 @@ export class FleetDO extends DurableObject<Env> {
         await this.agentStub(k.agent).onExited(host, "host_lost", k.epoch ?? undefined);
         // Only the row that notice was for (A5).
         this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND gone = 1 AND cmd = ?", k.agent, host, k.cmd);
+        this.pokeBrainWaitersLater();
       } catch (e) {
         console.error(`FleetDO: marking ${k.agent} exited on ${host} failed; will retry`, e);
       }
@@ -1637,9 +1649,29 @@ export class FleetDO extends DurableObject<Env> {
    * now: a brain host is launched (`scaleUp`), and AgentDO keeps the start's intent and retries.
    * A query, not a reservation: two starts racing may both land on a host's last slot.
    */
-  async placeBrain(req: { prev?: string | null; avoid?: string | null }): Promise<string | null> {
+  async placeBrain(req: { prev?: string | null; avoid?: string | null; agent?: string }): Promise<string | null> {
+    const facts = this.brainFacts();
+    const pick = pickBrainHost(facts, req.prev, req.avoid);
+    if (pick.host) {
+      // Not idle any more: the idle sweep can't retire it while AgentDO is between this pick and
+      // its send (the clock starts again, from zero, if the start never lands).
+      this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", pick.host);
+      if (req.agent) this.sql.exec("DELETE FROM brain_waiters WHERE agent = ?", req.agent);
+      return pick.host;
+    }
+    if (req.agent) {
+      // Waiting for room: poked when it appears, and the tick keeps launching while anyone waits.
+      this.sql.exec("INSERT OR REPLACE INTO brain_waiters (agent, since_ms) VALUES (?, ?)", req.agent, Date.now());
+      if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+    }
+    if (brainHostNeeded(facts, req.avoid)) await this.scaleUp(BRAIN_ROLE);
+    return null;
+  }
+
+  /** Every active brain host as brain placement sees it (`pickBrainHost`, `brainHostNeeded`). */
+  private brainFacts(): BrainHostFacts[] {
     const configured = this.cellConfig()?.brain?.max_brains_per_host;
-    const facts = this.hostsBy({ role: BRAIN_ROLE, status: "active" }).map((h): BrainHostFacts => {
+    return this.hostsBy({ role: BRAIN_ROLE, status: "active" }).map((h): BrainHostFacts => {
       const unwedged = h.wedged_ms === null || h.wedged_ms === undefined;
       const connected = !!this.socketFor(h.host);
       return {
@@ -1650,15 +1682,28 @@ export class FleetDO extends DurableObject<Env> {
         max_brains: this.maxBrainsOf(h, configured),
       };
     });
-    const pick = pickBrainHost(facts, req.prev, req.avoid);
-    if (pick.host) {
-      // Not idle any more: the idle sweep can't retire it while AgentDO is between this pick and
-      // its send (the clock starts again, from zero, if the start never lands).
-      this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", pick.host);
-      return pick.host;
-    }
-    if (brainHostNeeded(facts, req.avoid)) await this.scaleUp(BRAIN_ROLE);
-    return null;
+  }
+
+  /** Poke the waiting agents in the background (a slot freed, a brain host said hello). */
+  private pokeBrainWaitersLater(): void {
+    if (this.sql.exec("SELECT 1 FROM brain_waiters LIMIT 1").toArray().length) this.ctx.waitUntil(this.pokeBrainWaiters());
+  }
+
+  /**
+   * Run each waiting agent's kept intent now (`pokeIntent`): room may have appeared. A row goes
+   * once its agent took the poke, unless the agent waited again meanwhile (a newer `since_ms`);
+   * a failed poke stays for the next one, or the TTL.
+   */
+  private async pokeBrainWaiters(): Promise<void> {
+    const waiters = this.sql.exec<{ agent: string; since_ms: number }>("SELECT agent, since_ms FROM brain_waiters").toArray();
+    await Promise.all(waiters.map(async (w) => {
+      try {
+        await this.agentStub(w.agent).pokeIntent();
+        this.sql.exec("DELETE FROM brain_waiters WHERE agent = ? AND since_ms <= ?", w.agent, w.since_ms);
+      } catch (e) {
+        console.error(`FleetDO: poking ${w.agent} (waiting for a brain host) failed`, e);
+      }
+    }));
   }
 
   /** Brains indexed on `host` (started there, not yet proven exited). */
@@ -1729,6 +1774,12 @@ export class FleetDO extends DurableObject<Env> {
       await this.tellDraining(h.host);
     }
     await this.reapStale();
+    // Agents waiting for a brain host: launches happen here too, not only inside a start, so the
+    // next launch after an enroll timeout doesn't wait for some agent's backed-off retry.
+    this.sql.exec("DELETE FROM brain_waiters WHERE since_ms < ?", now - BRAIN_WAIT_TTL_MS);
+    if (this.sql.exec("SELECT 1 FROM brain_waiters LIMIT 1").toArray().length && brainHostNeeded(this.brainFacts())) {
+      await this.scaleUp(BRAIN_ROLE);
+    }
     await this.scaleDown(now);
     await this.confirmTerminations();
     const busy = this.hostsBy({ status: LIVE_STATUSES }).length
@@ -1739,6 +1790,7 @@ export class FleetDO extends DurableObject<Env> {
       || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND host IS NULL AND reason IS NULL").toArray().length
       || (this.ec2() && this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND reason IS NOT NULL").toArray().length)
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length
+      || this.sql.exec("SELECT 1 FROM brain_waiters").toArray().length
       || this.sql.exec("SELECT 1 FROM stale_incarnations WHERE cmd IS NULL").toArray().length;
     if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
@@ -2384,7 +2436,10 @@ export class FleetDO extends DurableObject<Env> {
         const taken = await this.agentStub(agent).onHostLost(host, epoch ?? undefined);
         // Forgotten only once the agent took it (A2; kept if it declined, N6), and only the row that
         // notice was for (A5): a newer start's row recorded meanwhile stays.
-        if (taken) this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND cmd = ?", agent, host, cmd);
+        if (taken) {
+          this.sql.exec("DELETE FROM host_agents WHERE agent = ? AND host = ? AND cmd = ?", agent, host, cmd);
+          this.pokeBrainWaitersLater();
+        }
       } catch (e) {
         console.error(`FleetDO: telling ${agent} that ${host} is lost failed; will retry`, e);
       }

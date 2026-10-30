@@ -157,7 +157,7 @@ describe("the cell's brain section", () => {
     expect(awsCell(JSON.stringify({ c: base }), "c")!.brain).toBeUndefined();
     const cfg = awsCell(JSON.stringify({ c: { ...base, brain: { launch_template_id: "lt-0b", instance_types: ["t3a.medium"] } } }), "c")!;
     expect(cfg.brain).toEqual({
-      launch_template_id: "lt-0b", instance_types: ["t3a.medium"], spot: true, max_hosts: 1, idle_grace_ms: 1_800_000, max_brains_per_host: 0,
+      launch_template_id: "lt-0b", instance_types: ["t3a.medium"], spot: true, max_hosts: 3, idle_grace_ms: 1_800_000, max_brains_per_host: 0,
     });
     expect(() => awsCell(JSON.stringify({ c: { ...base, brain: { launch_template_id: "x", instance_types: ["t3a.medium"] } } }), "c")).toThrow();
   });
@@ -325,7 +325,7 @@ describe("the brain cap is enforced where the index row is written", () => {
         await agentStub(first).start();
       };
     });
-    await expect(agentStub(second).start()).rejects.toThrow(/full/);
+    await expect(Promise.resolve().then(async () => { await agentStub(second).start(); })).rejects.toThrow(/full/);
     const [s1] = await nextCommands(a.ws, isStartOf(first));
     expect(s1).toMatchObject({ epoch: 1 });
     // Refused before anything was stored or sent: condemned as an unconfirmed send, intent kept.
@@ -342,7 +342,7 @@ describe("the brain cap is enforced where the index row is written", () => {
     expect(after).toMatchObject({ brain: null, intent: { reason: "operator" } });
     expect(after.exit_restarts ?? 0).toBe(0);
     // The host is full for it: the next run of the intent waits (backing off), nothing more is sent.
-    await expect(agentStub(second).start()).rejects.toThrow(/no brain host available/);
+    await expect(Promise.resolve().then(async () => { await agentStub(second).start(); })).rejects.toThrow(/no brain host available/);
     expect(await a.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(second)))).toBe(true);
   });
 });
@@ -453,6 +453,55 @@ describe("brain hosts scale with brains", () => {
     // The third wait is 2 min out.
     expect(st.at - Date.now()).toBeGreaterThan(100_000);
     expect(st.at - Date.now()).toBeLessThanOrEqual(120_000);
+  });
+
+  it("a waiting agent is poked, not left to its backoff, when a brain host says hello", async () => {
+    const cell = uniqueCell();
+    await configure(cell, null, { ...CONFIG, brain: undefined });
+    const agent = await captain(cell);
+    const waiters = () => runInDurableObject(fleetStub(cell), (_i, st) => st.storage.sql.exec<{ agent: string }>("SELECT agent FROM brain_waiters").toArray().map((r) => r.agent));
+    expect(await waiters()).toEqual([agent]);
+    // Its retry is 30 s out; the host's hello runs it now.
+    const a = await connectHost(cell, "brain");
+    const [start] = await nextCommands(a.ws, isStartOf(agent));
+    expect(start).toMatchObject({ epoch: 1 });
+    expect(await waiters()).toEqual([]);
+  });
+
+  it("a waiting agent is poked when a full host's brain exits and frees its slot", async () => {
+    const cell = uniqueCell();
+    await configure(cell, null, { ...CONFIG, brain: { ...CONFIG.brain!, max_brains_per_host: 1 } });
+    const a = await connectHost(cell, "brain");
+    const first = await captain(cell);
+    const [s1] = await nextCommands(a.ws, isStartOf(first));
+    await okResult(a.ws, s1.cmd);
+    const second = await captain(cell);
+    expect((await agentStub(second).info()).brain).toBeNull();
+    const seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: first, reason: "idle", epoch: s1.epoch }]);
+    await a.ws.next("ack", (m) => m.up_to >= seq);
+    const [s2] = await nextCommands(a.ws, isStartOf(second));
+    expect(s2).toMatchObject({ agent: second, epoch: 1 });
+  });
+
+  it("while agents wait, the tick launches the next brain host itself (after an enroll timeout ended the last)", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2();
+    await configure(cell, ec2);
+    await captain(cell);
+    expect(ec2.launched).toHaveLength(1);
+    // That launch never enrolled and was ended; nobody retries for up to 5 min, but the tick launches.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE launched SET reason = 'enroll_timeout', ended_ms = ?", Date.now());
+    });
+    await tickAt(cell, ec2);
+    expect(ec2.launched).toHaveLength(2);
+    // Nobody waiting (the TTL passed): no launch.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE launched SET reason = 'enroll_timeout', ended_ms = ?", Date.now());
+      st.storage.sql.exec("UPDATE brain_waiters SET since_ms = 0");
+    });
+    await tickAt(cell, ec2);
+    expect(ec2.launched).toHaveLength(2);
   });
 
   it("a cell without a brain section launches no brain host; the start waits", async () => {

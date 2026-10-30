@@ -4,7 +4,9 @@ absolute path the scripts touch is moved under a scratch directory, the package 
 CLI and the downloads are stubs, and `systemctl` is the real one with `--root` (so `enable` and
 `mask` behave as on a host: a `mask` of a unit install.sh wrote fails, as systemd 257 does). Checks
 that the script finishes, enables exactly its kind's units, and writes the role and config nestd
-reads. shellcheck runs on both scripts when it is installed (it is on CI's runners)."""
+reads, and that no unit of the other kind is reachable from what is enabled (Wants=/Requires=,
+followed transitively). shellcheck runs on both scripts; on CI (`CI=true`) a missing shellcheck is a
+failure, not a skip."""
 
 import json
 import os
@@ -22,6 +24,26 @@ SYSTEMCTL = shutil.which("systemctl")
 
 # Absolute prefixes the scripts write under (never /dev, /proc or /sys, which they only read).
 PREFIXES = r"(?<![\w.:/$-])/(opt|etc|run|var|usr/lib/nest|root|srv)(?=[/\s\"'.]|$)"
+
+# Units only a sandbox host may run (none reachable on a brain host).
+SANDBOX_ONLY = {"nest-proxy.service", "nest-gateway.service"}
+DEPENDENCY = re.compile(r"^(Wants|Requires|BindsTo|Requisite|Upholds)=(.*)$", re.M)
+
+
+def reachable(units_dir: Path, start: set) -> set:
+    """Every unit `start` pulls in through Wants=/Requires=/BindsTo=/Requisite=/Upholds=, transitively."""
+    seen, todo = set(), list(start)
+    while todo:
+        unit = todo.pop()
+        if unit in seen:
+            continue
+        seen.add(unit)
+        path = units_dir / unit
+        if path.is_file():
+            for _, deps in DEPENDENCY.findall(path.read_text()):
+                todo.extend(deps.split())
+    return seen
+
 
 # What each launch template's user data must enable, and nothing else (the agent runner stays on
 # sandbox hosts for this release only: expand/contract, dev/deploy.md).
@@ -86,6 +108,9 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         wants = fake / "etc/systemd/system/multi-user.target.wants"
         enabled = {p.name for p in wants.iterdir()} if wants.exists() else set()
         self.assertEqual(enabled, ENABLED[role], f"{role}: enabled units")
+        pulled = reachable(fake / "etc/systemd/system", enabled)
+        if role == "controller":
+            self.assertFalse(pulled & SANDBOX_ONLY, f"a brain host would start {pulled & SANDBOX_ONLY}")
         self.assertNotIn("mask", calls, "a unit install.sh wrote can't be masked")
         cfg = json.loads((fake / "etc/nest/nestd.json").read_text())
         self.assertEqual(cfg["role"], role)
@@ -114,9 +139,10 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
-@unittest.skipUnless(shutil.which("shellcheck"), "shellcheck is not installed")
+@unittest.skipUnless(shutil.which("shellcheck") or os.environ.get("CI") == "true", "shellcheck is not installed (required on CI)")
 class Shellcheck(unittest.TestCase):
     def test_host_scripts(self):
+        self.assertIsNotNone(shutil.which("shellcheck"), "CI must run shellcheck: a skip is not a pass")
         r = subprocess.run(["shellcheck", "-S", "warning", str(HOST / "bootstrap.sh"), str(HOST / "install.sh")],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
