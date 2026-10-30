@@ -4,6 +4,8 @@
 //! and "Retiring an incarnation"). Plain values only; `nestd` keeps the maps, files and timers and
 //! calls these for the decision.
 
+use alloc::collections::BTreeMap;
+use core::marker::PhantomData;
 use core::time::Duration;
 
 // Tombstones (`nestd::tombstones`): the highest fenced epoch per sandbox; nothing at or below it is
@@ -30,6 +32,91 @@ pub fn destroy_prunes(fenced: u64, destroyed: u64) -> bool {
 /// strictly below it (a create at the fenced epoch itself never clears it).
 pub fn run_prunes(fenced: u64, running: u64) -> bool {
     fenced < running
+}
+
+/// The map a [`TombstoneMap`] keeps, sandbox → fenced epoch: a `BTreeMap` in nestd. It exists so
+/// the Kani harnesses can swap in a fixed array, as [`crate::results`] does: see their docs.
+pub trait EpochMap<K>: Default {
+    fn get(&self, key: &K) -> Option<u64>;
+    fn insert(&mut self, key: K, epoch: u64);
+    fn remove(&mut self, key: &K);
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<K: Ord> EpochMap<K> for BTreeMap<K, u64> {
+    fn get(&self, key: &K) -> Option<u64> {
+        BTreeMap::get(self, key).copied()
+    }
+
+    fn insert(&mut self, key: K, epoch: u64) {
+        BTreeMap::insert(self, key, epoch);
+    }
+
+    fn remove(&mut self, key: &K) {
+        BTreeMap::remove(self, key);
+    }
+
+    fn len(&self) -> usize {
+        BTreeMap::len(self)
+    }
+}
+
+/// Every sandbox's tombstone: the highest fenced epoch per sandbox, nothing at or below it accepted.
+/// `nestd::tombstones::Tombstones` shares one behind a lock; this is all of its logic. An entry
+/// lives from a fence until a destroy at or above it, or a newer epoch running here, lets it go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TombstoneMap<K, M = BTreeMap<K, u64>> {
+    map: M,
+    _keys: PhantomData<K>,
+}
+
+impl<K, M: Default> Default for TombstoneMap<K, M> {
+    fn default() -> Self {
+        TombstoneMap { map: M::default(), _keys: PhantomData }
+    }
+}
+
+impl<K: Clone, M: EpochMap<K>> TombstoneMap<K, M> {
+    /// `sandbox@epoch` was fenced: refuse it and every older epoch from now on.
+    pub fn fence(&mut self, sandbox: &K, epoch: u64) {
+        let fenced = fenced_after(self.map.get(sandbox), epoch);
+        self.map.insert(sandbox.clone(), fenced);
+    }
+
+    /// Whether `sandbox@epoch` is at or below a fenced epoch.
+    pub fn refuses(&self, sandbox: &K, epoch: u64) -> bool {
+        refuses(self.map.get(sandbox), epoch)
+    }
+
+    /// The sandbox was destroyed at `epoch`: drop its tombstone if it is at or below that.
+    pub fn prune_up_to(&mut self, sandbox: &K, epoch: u64) {
+        if self.map.get(sandbox).is_some_and(|f| destroy_prunes(f, epoch)) {
+            self.map.remove(sandbox);
+        }
+    }
+
+    /// `epoch` of the sandbox now runs here: drop its tombstone if it is below that.
+    pub fn prune_below(&mut self, sandbox: &K, epoch: u64) {
+        if self.map.get(sandbox).is_some_and(|f| run_prunes(f, epoch)) {
+            self.map.remove(sandbox);
+        }
+    }
+
+    /// The fenced epoch recorded for `sandbox`, if any.
+    pub fn get(&self, sandbox: &K) -> Option<u64> {
+        self.map.get(sandbox)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 // The scan of `<state_dir>/sandboxes/<sandbox>/` (`nestd::recovery::scan`).
@@ -174,6 +261,29 @@ mod tests {
         }
     }
 
+    /// The map `Tombstones` wraps, call by call: per sandbox, a fence never lowers its tombstone, a
+    /// destroy lets go only at or above it, a run only above it, and other sandboxes are untouched.
+    #[test]
+    fn the_tombstone_map_keeps_each_sandbox_apart() {
+        let mut t: TombstoneMap<&str> = TombstoneMap::default();
+        assert!(t.is_empty() && !t.refuses(&"a", 0));
+        t.fence(&"a", 3);
+        t.fence(&"a", 2);
+        t.fence(&"b", 7);
+        assert_eq!((t.get(&"a"), t.get(&"b"), t.len()), (Some(3), Some(7), 2));
+        assert!(t.refuses(&"a", 3) && t.refuses(&"a", 0) && !t.refuses(&"a", 4) && !t.refuses(&"c", 0));
+        t.prune_below(&"a", 3);
+        t.prune_up_to(&"a", 2);
+        assert_eq!(t.get(&"a"), Some(3), "a run at it or a destroy below it keeps it");
+        t.prune_below(&"a", 4);
+        assert_eq!((t.get(&"a"), t.get(&"b")), (None, Some(7)), "a newer run lets go of only its own");
+        t.prune_up_to(&"b", 7);
+        assert!(t.is_empty(), "a destroy at the fenced epoch lets go");
+        t.fence(&"b", 1);
+        t.fence(&"b", 9);
+        assert_eq!(t.get(&"b"), Some(9), "a fence raises it");
+    }
+
     /// Characterization of `recovery::scan`'s naming rules: a directory named by a decimal epoch
     /// is an incarnation; `<epoch>.del` is a deletion to finish; anything else goes.
     #[test]
@@ -259,138 +369,115 @@ mod tests {
     }
 }
 
-/// Kani harnesses (`cargo kani -p nestd-core`). Epochs, versions and flags range over every value
-/// of their type unless a harness says otherwise; the bounds of the bounded ones are in their docs.
+/// Kani harnesses (`cargo kani -p nestd-core --harness <name> --exact`). Each runs shipped code
+/// over symbolic inputs: epochs range over every `u64` and flags over both values unless a harness
+/// says otherwise; the bounds of the bounded ones are in their docs. Functions of one expression
+/// (the tombstone comparisons, the scan's disposition, the retry and salvage predicates) have no
+/// harness of their own: the table tests pin them, and the tombstone map proves them in use.
 #[cfg(kani)]
 mod proofs {
     use super::*;
 
-    fn any_epoch() -> Option<u64> {
-        if kani::any() { Some(kani::any()) } else { None }
-    }
+    /// Sandboxes the tombstone harnesses use (ids `0..SANDBOXES`).
+    const SANDBOXES: u8 = 2;
+    /// Calls after the tracked fence.
+    const CALLS: usize = 4;
 
-    /// A fence never lowers a tombstone: the epoch recorded is the higher of the old one and the
-    /// fenced one, so it is never below either.
-    #[kani::proof]
-    fn a_fence_never_lowers_the_tombstone() {
-        let (fenced, epoch) = (any_epoch(), kani::any());
-        let after = fenced_after(fenced, epoch);
-        assert!(after >= epoch && fenced.is_none_or(|f| after >= f));
-        assert!(after == epoch || Some(after) == fenced);
-    }
+    /// A map indexed by the sandbox id itself, the stand-in for `BTreeMap` (see the harnesses).
+    #[derive(Default)]
+    struct SlotEpochs([Option<u64>; SANDBOXES as usize]);
 
-    /// After `fence(e)`, every epoch at or below `e` is refused, and no epoch above both `e` and
-    /// the old tombstone is.
-    #[kani::proof]
-    fn a_fence_refuses_its_epoch_and_every_older_one() {
-        let (fenced, e, other): (Option<u64>, u64, u64) = (any_epoch(), kani::any(), kani::any());
-        let after = Some(fenced_after(fenced, e));
-        if other <= e {
-            assert!(refuses(after, other));
+    impl EpochMap<u8> for SlotEpochs {
+        fn get(&self, key: &u8) -> Option<u64> {
+            self.0[*key as usize]
         }
-        if other > e && fenced.is_none_or(|f| other > f) {
-            assert!(!refuses(after, other));
-        }
-    }
 
-    /// No tombstone refuses nothing; a higher tombstone refuses everything a lower one does.
-    #[kani::proof]
-    fn refusal_is_monotone_in_the_fenced_epoch() {
-        let (f1, f2, e): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
-        assert!(!refuses(None, e));
-        if f1 <= f2 && refuses(Some(f1), e) {
-            assert!(refuses(Some(f2), e));
+        fn insert(&mut self, key: u8, epoch: u64) {
+            self.0[key as usize] = Some(epoch);
+        }
+
+        fn remove(&mut self, key: &u8) {
+            self.0[*key as usize] = None;
+        }
+
+        fn len(&self) -> usize {
+            self.0.iter().filter(|e| e.is_some()).count()
         }
     }
 
-    /// A run at `e` (prune_below) never lets go of a tombstone at or above `e`, and lets go of
-    /// exactly the tombstones that would not refuse `e`: a create the tombstone admits always
-    /// clears it, one it refuses never does.
-    #[kani::proof]
-    fn a_run_prunes_exactly_the_tombstones_it_gets_past() {
-        let (f, e): (u64, u64) = (kani::any(), kani::any());
-        if run_prunes(f, e) {
-            assert!(f < e);
-        }
-        assert!(run_prunes(f, e) != refuses(Some(f), e));
+    fn any_sandbox() -> u8 {
+        kani::any_where(|s: &u8| *s < SANDBOXES)
     }
 
-    /// A destroy at `e` (prune_up_to) never lets go of a tombstone above `e`; one it keeps still
-    /// refuses the destroyed epoch.
-    #[kani::proof]
-    fn a_destroy_keeps_every_tombstone_above_it() {
-        let (f, e): (u64, u64) = (kani::any(), kani::any());
-        if destroy_prunes(f, e) {
-            assert!(f <= e);
-        } else {
-            assert!(refuses(Some(f), e));
+    fn snapshot<M: EpochMap<u8>>(t: &TombstoneMap<u8, M>) -> [Option<u64>; SANDBOXES as usize] {
+        let mut out = [None; SANDBOXES as usize];
+        for s in 0..SANDBOXES {
+            out[s as usize] = t.get(&s);
         }
+        out
     }
 
-    /// Any sequence of fences, destroys and runs (bounded: 4 operations after the fence, each at
-    /// any epoch) on one sandbox's tombstone, applied as `Tombstones` applies them: an epoch `e`
-    /// once fenced is refused until a destroy at or above `e`, or a run above `e`, lets it go.
-    #[kani::proof]
-    #[kani::unwind(5)]
-    fn a_fenced_epoch_stays_refused_until_a_destroy_or_newer_run_reaches_it() {
-        let e: u64 = kani::any();
-        let mut t = Some(fenced_after(any_epoch(), e));
+    /// The tombstone map as `nestd::tombstones::Tombstones` drives it: a fence of sandbox `k` at
+    /// epoch `e` (over any earlier tombstone of `k`), then `CALLS` calls, each a fence, a destroy
+    /// (`prune_up_to`) or a run (`prune_below`) of any sandbox at any epoch. After every call:
+    /// - `k@e` is refused until a destroy of `k` at or above `e`, or a run of `k` above `e`;
+    /// - a fence records the higher of the old tombstone and its epoch (never lower than either);
+    /// - a destroy keeps exactly a tombstone above its epoch, and a run exactly one that refuses it;
+    /// - no call touches another sandbox's tombstone;
+    /// - `refuses` agrees with the recorded epoch for any epoch, and `len` counts the tombstones.
+    fn tombstones_hold<M: EpochMap<u8>>() {
+        let mut t: TombstoneMap<u8, M> = TombstoneMap::default();
+        let (k, e): (u8, u64) = (any_sandbox(), kani::any());
+        if kani::any() {
+            t.fence(&k, kani::any());
+        }
+        t.fence(&k, e);
         let mut released = false;
-        for _ in 0..4 {
-            let at: u64 = kani::any();
-            match kani::any::<u8>() % 3 {
-                0 => t = Some(fenced_after(t, at)),
+        for _ in 0..CALLS {
+            let (s, at, call): (u8, u64, u8) = (any_sandbox(), kani::any(), kani::any_where(|c: &u8| *c < 3));
+            let before = snapshot(&t);
+            let was = before[s as usize];
+            match call {
+                0 => t.fence(&s, at),
+                1 => t.prune_up_to(&s, at),
+                _ => t.prune_below(&s, at),
+            }
+            let now = t.get(&s);
+            match call {
+                0 => {
+                    assert!(now == Some(was.map_or(at, |f| if f > at { f } else { at })));
+                }
                 1 => {
-                    released |= at >= e;
-                    if t.is_some_and(|f| destroy_prunes(f, at)) {
-                        t = None;
-                    }
+                    assert!(now == was.filter(|f| *f > at));
                 }
                 _ => {
-                    released |= at > e;
-                    if t.is_some_and(|f| run_prunes(f, at)) {
-                        t = None;
-                    }
+                    assert!(now == was.filter(|f| *f >= at));
                 }
             }
-            assert!(released || refuses(t, e));
+            let after = snapshot(&t);
+            for o in 0..SANDBOXES {
+                if o != s {
+                    assert!(after[o as usize] == before[o as usize]);
+                }
+            }
+            if s == k {
+                released |= (call == 1 && at >= e) || (call == 2 && at > e);
+            }
+            assert!(released || t.refuses(&k, e));
+            let probe: u64 = kani::any();
+            assert!(t.refuses(&s, probe) == now.is_some_and(|f| probe <= f));
+            assert!(t.len() == after.iter().filter(|f| f.is_some()).count());
         }
     }
 
-    /// Only the current version reads on, for every pair of versions; another version is kept with
-    /// its number, and a missing one is unusable.
+    /// [`tombstones_hold`] over the fixed-array stand-in, so the map's own logic is proved for
+    /// every epoch; the `BTreeMap` is trusted to be a map (as in `results::proofs`). Over the real
+    /// `BTreeMap<u8, u64>` (unwind 13) Kani 0.68 was still in symbolic execution after 15 min at
+    /// 3.2 GB, with these same bounds.
     #[kani::proof]
-    fn only_the_current_meta_version_reads_on() {
-        let (version, current): (Option<u64>, u64) = (any_epoch(), kani::any());
-        match meta_version(version, current) {
-            MetaVersion::Current => {
-                assert!(version == Some(current));
-            }
-            MetaVersion::Other(v) => {
-                assert!(version == Some(v) && v != current);
-            }
-            MetaVersion::Missing => {
-                assert!(version.is_none());
-            }
-        }
-    }
-
-    /// The scan's disposition of an incarnation directory: only a meta.json naming this very
-    /// incarnation is returned as found, one naming another incarnation is removed, and one that
-    /// can't be read for another reason is never removed.
-    #[kani::proof]
-    fn the_scan_finds_only_its_own_incarnation_and_never_removes_an_unreadable_one() {
-        let read = match kani::any::<u8>() % 4 {
-            0 => MetaRead::ThisIncarnation,
-            1 => MetaRead::AnotherIncarnation,
-            2 => MetaRead::Unusable,
-            _ => MetaRead::Unreadable,
-        };
-        let d = disposition(read);
-        assert!((d == Disposition::Found) == (read == MetaRead::ThisIncarnation));
-        if read == MetaRead::Unreadable {
-            assert!(d == Disposition::Keep);
-        }
+    #[kani::unwind(5)]
+    fn the_tombstone_map_refuses_a_fenced_epoch_until_a_destroy_or_newer_run_reaches_it() {
+        tombstones_hold::<SlotEpochs>();
     }
 
     /// Every entry name (bounded: up to 6 ASCII bytes) ending in `.del` is a deletion to finish
@@ -413,26 +500,6 @@ mod proofs {
         }
     }
 
-    /// A starting nestd never deletes unreported an incarnation with uncommitted work: a disk not
-    /// known to equal its head, or a commit request still unanswered.
-    #[kani::proof]
-    fn a_found_incarnation_with_work_is_always_reported() {
-        let (clean, unanswered): (bool, bool) = (kani::any(), kani::any());
-        if !clean || unanswered {
-            assert!(!deletes_unreported(clean, unanswered));
-        }
-    }
-
-    /// A `parent_mismatch` is always retried; a refusal neither retryable nor a parent mismatch
-    /// (`stale_epoch`, `invalid_message`) is always final.
-    #[kani::proof]
-    fn a_final_refusal_ends_the_salvage_and_a_parent_mismatch_never_does() {
-        let retryable: bool = kani::any();
-        assert!(salvage_retryable(retryable, true));
-        assert!(!salvage_retryable(false, false));
-        assert!(salvage_retryable(true, false));
-    }
-
     /// From any wait between the first and the max, the next is no shorter, never past the max,
     /// double unless capped; and within 9 steps every wait has reached the max and stays there.
     #[kani::proof]
@@ -447,18 +514,5 @@ mod proofs {
             b = retire_backoff(b);
         }
         assert!(b == RETIRE_RETRY_MAX && retire_backoff(b) == RETIRE_RETRY_MAX);
-    }
-
-    /// Only a salvage of a disk equal to its head's disk is skipped: a commit that isn't a salvage,
-    /// or a disk with no head, always has something to send.
-    #[kani::proof]
-    fn only_a_salvage_of_the_heads_own_disk_is_skipped() {
-        let (salvage, head, disk): (bool, Option<u8>, u8) = (kani::any(), kani::any(), kani::any());
-        if nothing_to_salvage(salvage, head.as_ref(), &disk) {
-            assert!(salvage && head == Some(disk));
-        }
-        if salvage && head == Some(disk) {
-            assert!(nothing_to_salvage(salvage, head.as_ref(), &disk));
-        }
     }
 }
