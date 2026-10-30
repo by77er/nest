@@ -773,8 +773,12 @@ describe("#27 a turn is work until it completes", () => {
 });
 
 // FleetDO's two BrokerDO calls, routed through hooks that run first (a gate, a failure). Gates are
-// module state polled on a timer, not promises: the hooks run in FleetDO's request context.
-type BrokerHooks = { bindingPublicKeys?: () => Promise<void>; resolveRefs?: () => Promise<void> };
+// module state polled on a timer, not promises: the hooks run in FleetDO's request context. A
+// `resolveRefs` hook that returns values answers for BrokerDO (no call to it, so no I/O).
+type BrokerHooks = {
+  bindingPublicKeys?: () => Promise<void>;
+  resolveRefs?: (refs: string[]) => Promise<void | Record<string, string | null>>;
+};
 async function hookBroker(cell: string, hooks: BrokerHooks): Promise<void> {
   await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
     const self = inst as unknown as { env: Cloudflare.Env };
@@ -786,8 +790,7 @@ async function hookBroker(cell: string, hooks: BrokerHooks): Promise<void> {
         return stub().bindingPublicKeys(c);
       },
       resolveRefs: async (refs: string[], allow: readonly string[]) => {
-        await hooks.resolveRefs?.();
-        return stub().resolveRefs(refs, allow);
+        return (await hooks.resolveRefs?.(refs)) ?? stub().resolveRefs(refs, allow);
       },
     };
     self.env = Object.create(real, { BROKER: { value: { idFromName: () => undefined, get: () => broker } } }) as Cloudflare.Env;
@@ -1089,6 +1092,39 @@ describe("#29 command batches go on the wire in seq order", () => {
     await until("the socket to close", () => ws2.closed !== null);
     expect(ws2.closed?.code).toBe(4503);
     expect(ws2.received.filter((m) => m.type === "commands")).toEqual([]);
+  });
+
+  it("a run whose socket was superseded while it resolved sends nothing there and doesn't revive it", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell); // socket A
+    // A superseded socket stays listed (CLOSING) until its peer answers the close, an I/O event. So
+    // A's run is released from inside B's hello, right after it superseded A, and resolves without
+    // I/O: it resumes while A is still listed.
+    const held: { entered: boolean; release?: () => void } = { entered: false };
+    let calls = 0;
+    await hookBroker(cell, {
+      resolveRefs: async (refs) => {
+        if (calls++ === 0) {
+          held.entered = true;
+          await new Promise<void>((r) => { held.release = r; });
+        }
+        return Object.fromEntries(refs.map((r) => [r, null]));
+      },
+      bindingPublicKeys: async () => held.release?.(), // B's hello, after superseding A
+    });
+    const issued = fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+    await until("the run on A to await BrokerDO", () => held.entered);
+    const b = await Ws.connect("/v1/fleet", h.host_token);
+    b.send(hostHello(h.host, cell));
+    await b.next("hello_ack");
+    const [cmd] = await issued;
+
+    // B's own run sends it, once; A gets nothing; and B stays the host's socket.
+    expect(await wireOrder(b, [cmd!])).toHaveLength(1);
+    const onA = (c: string) => h.ws.received.filter((m) => m.type === "commands" && (m.commands as { cmd: string }[]).some((x) => x.cmd === c));
+    expect(onA(cmd!)).toEqual([]);
+    const [after] = await fleetStub(cell).issueCommands(h.host, [fence("after")]);
+    expect(await wireOrder(b, [after!])).toHaveLength(1);
   });
 });
 
