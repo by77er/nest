@@ -516,19 +516,67 @@ describe("brain hosts scale with brains", () => {
     }
     expect(await a.ws.none("commands", 300, (m) => (m.commands as any[]).some(isStartOf(agent)))).toBe(true);
     expect(await agentStub(agent).info()).toMatchObject({ brain: null, intent: null, agent_epoch: 0 });
-    // A run that fails after the stop ended its intent (no room after all) keeps nothing and arms nothing.
+    // A run that fails after the stop ended its intent (no room after all) keeps nothing and arms
+    // nothing, and drops the wait it recorded at FleetDO after the stop's notice (its row is newer).
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO brain_waiters (agent, since_ms) VALUES (?, ?)", agent, Date.now() + 60_000);
+    });
+    const info = (s: DurableObjectState) => JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
     const failed = await runInDurableObject(agentStub(agent), async (inst: AgentDO, s) => {
       const fail = (inst as unknown as { intentFailed(i: unknown, e: unknown): Promise<void> }).intentFailed.bind(inst);
       await fail({ reason: "operator" }, new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no brain host available", 503, true));
       await fail({ reason: "operator" }, new NestError(ErrorCodes.FORBIDDEN, "for good", 403));
-      return {
-        info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
-        intentAlarm: s.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'intent'").toArray().length,
-      };
+      return { info: info(s), intentAlarm: s.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'intent'").toArray().length };
     });
     expect(failed.intentAlarm).toBe(0);
     expect(failed.info.capacity_waits).toBeUndefined();
     expect(failed.info.state).not.toBe("errored");
+    expect(await runInDurableObject(fleetStub(cell), (_i, st) => st.storage.sql.exec("SELECT 1 FROM brain_waiters").toArray().length)).toBe(0);
+    // A start made after the stop merged into the intent while the old run awaited: the old run's
+    // failure doesn't end it (the new start's own run decides).
+    const kept = await runInDurableObject(agentStub(agent), async (inst: AgentDO, s) => {
+      const i = info(s);
+      i.intent = { reason: "operator", host_hint: a.host };
+      s.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(i));
+      await (inst as unknown as { intentFailed(i: unknown, e: unknown): Promise<void> }).intentFailed({ reason: "operator" }, new NestError(ErrorCodes.FORBIDDEN, "for good", 403));
+      return info(s);
+    });
+    expect(kept.intent).toEqual({ reason: "operator", host_hint: a.host });
+    expect(kept.state).not.toBe("errored");
+  });
+
+  it("a start committed before a stop is never retried: not after its send fails, nor after its host refuses it", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell, "brain");
+    const intentOf = (agent: string) => runInDurableObject(agentStub(agent), (_i: AgentDO, s) => ({
+      info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
+      intentAlarm: s.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'intent'").toArray().length,
+    }));
+    // The stop lands between the start's commit and its send, and the send then fails.
+    const sent = await captain(cell, false);
+    await runInDurableObject(agentStub(sent), (inst: AgentDO) => {
+      inst.testHooks["start:afterCommit"] = async () => {
+        delete inst.testHooks["start:afterCommit"];
+        await inst.stop("requested");
+        await runInDurableObject(fleetStub(cell), (_i, st) => {
+          st.storage.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", a.host);
+        });
+      };
+    });
+    await agentStub(sent).start().catch(() => undefined);
+    const s1 = await intentOf(sent);
+    expect(s1.info).toMatchObject({ intent: null, brain: { phase: "condemned", epoch: 1 } });
+    expect(s1.intentAlarm).toBe(0);
+    // The host refuses a start the operator stopped meanwhile: condemned, not retried, not an error.
+    const b = await connectHost(cell, "brain");
+    const refused = await captain(cell, false);
+    expect(await agentStub(refused).start()).toMatchObject({ kind: "started", host: b.host });
+    await agentStub(refused).stop("requested");
+    await agentStub(refused).startFailed(b.host, { code: "spawn_failed", message: "x", retryable: true }, 1);
+    const s2 = await intentOf(refused);
+    expect(s2.info).toMatchObject({ intent: null, brain: { phase: "condemned", epoch: 1 } });
+    expect(s2.info.state).not.toBe("errored");
+    expect(s2.intentAlarm).toBe(0);
   });
 
   it("a waiting agent is poked when a full host's brain exits and frees its slot", async () => {

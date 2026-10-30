@@ -172,6 +172,12 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
    * `capacityRetryMs`). Not the crash-loop guard's: waiting for capacity is not a crash.
    */
   capacity_waits?: number;
+  /**
+   * The agent epoch when an operator last stopped it: a start at or below it that fails (its send,
+   * or the host's refusal) is not retried, since the stop ended it. Absent: never stopped (or stored
+   * by a release before it, which reads and drops it).
+   */
+  stop_epoch?: number;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
   capabilities?: string[];
   /** When the transcript was last made durable (a recovery turn says where it ends). */
@@ -847,9 +853,10 @@ export class AgentDO extends DurableObject<Env> {
     } catch (e) {
       console.warn(`agent ${started.agent}: sending agent_start@${epoch} to ${host} failed; condemning it`, e);
       if (this.load().brain?.epoch === epoch) {
-        // The start is still wanted: it runs again once this one is released.
+        // The start is still wanted (unless a stop ended it while it was being sent): it runs again
+        // once this one is released.
         this.update((i) => {
-          i.intent = i.intent ?? intent;
+          if ((i.stop_epoch ?? -1) < epoch) i.intent = i.intent ?? intent;
         });
         await this.condemn("its start could not be confirmed sent", epoch);
       }
@@ -864,9 +871,23 @@ export class AgentDO extends DurableObject<Env> {
    * of the intent retries), and anything else ends the intent (`errored` if no brain is left).
    */
   private async intentFailed(intent: StartIntent, e: unknown): Promise<void> {
-    // No intent any more (a stop ended it while this run awaited): nothing to keep, retry or fail.
-    if (!this.load().intent) return;
+    const now = this.load();
     const ne = asNestError(e);
+    if (!now.intent) {
+      // A stop ended the intent while this run awaited: nothing to keep, retry or fail. A wait for
+      // capacity this run recorded at FleetDO after the stop's notice goes too (no start wants it).
+      if (ne?.code === ErrorCodes.CAPACITY_EXHAUSTED) {
+        try {
+          await this.fleet(now.cell).brainWaitEnded(now.agent, Number.MAX_SAFE_INTEGER);
+        } catch (err) {
+          console.warn(`agent ${now.agent}: telling FleetDO its wait for a brain host ended failed`, err);
+        }
+      }
+      return;
+    }
+    // A newer start merged into the intent while this run awaited: its own run (queued behind this
+    // one, `intentDirty`) decides; this failure says nothing about it.
+    if (JSON.stringify(now.intent) !== JSON.stringify(intent)) return;
     if (ne?.retryable ?? true) {
       // No brain host with room (FleetDO launches one): the wait backs off, 30 s doubling to 5 min,
       // so a cell at its cap isn't asked twice a minute by every waiting agent. New input sets the
@@ -1072,12 +1093,15 @@ export class AgentDO extends DurableObject<Env> {
     // brain's release, and a start still waiting for a brain host, which its capacity retry or
     // FleetDO's poke would otherwise run, launching a host and a brain for a stopped agent. The intent
     // and its alarm go in this synchronous step; a run already in flight finds the intent changed at
-    // its re-check before committing (`unchanged`), and `intentFailed` arms nothing for it.
+    // its re-check before committing (`unchanged`), and `intentFailed` arms nothing for it. A start
+    // already committed (its brain at the current epoch) that then fails is not retried either
+    // (`stop_epoch`: `issueStart`'s failed send, `startFailed`).
     const waited = this.load().intent !== null;
     const stoppedMs = Date.now();
     const info = this.update((i) => {
       i.intent = null;
       delete i.capacity_waits;
+      i.stop_epoch = i.agent_epoch;
     });
     await this.deadlines.clear("intent");
     if (waited) {
@@ -1141,12 +1165,14 @@ export class AgentDO extends DurableObject<Env> {
     const b = info.brain;
     if (!b || b.host !== host || epoch === undefined || epoch !== b.epoch) return;
     console.warn(`agent ${info.agent}: start on ${host}@${epoch} failed: ${error.code} ${error.message}`);
-    const retry = !info.intent && error.retryable && info.start_attempts < MAX_START_ATTEMPTS;
+    // A stop since this start ended it: condemned, never retried, and not an error.
+    const stopped = (info.stop_epoch ?? -1) >= epoch;
+    const retry = !stopped && !info.intent && error.retryable && info.start_attempts < MAX_START_ATTEMPTS;
     this.update((i) => {
       if (retry) {
         i.start_attempts += 1;
         i.intent = { reason: "retry" };
-      } else if (!i.intent) {
+      } else if (!i.intent && !stopped) {
         i.state = "errored";
       }
     });
@@ -2441,6 +2467,7 @@ export class AgentDO extends DurableObject<Env> {
       }
       case "read_transcript": {
         const target = String(a.agent);
+        if (!/^agt_[a-z0-9]+$/.test(target)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${target} is not an agent id`);
         const since = typeof a.since_seq === "number" ? Math.max(0, a.since_seq) : 0;
         const limit = typeof a.limit === "number" ? a.limit : TRANSCRIPT_DEFAULT_LIMIT;
         const base = typeof a.base === "number" ? a.base : undefined;

@@ -24,6 +24,16 @@ export { TaskLedgerDO } from "./do/tasks";
 export { WorkstreamDO } from "./do/workstream";
 
 const DEFAULT_CELL = "local";
+
+/** The last health check this isolate ran (or is running), reused for `HEALTH_REUSE_MS`. */
+let lastHealth: { at: number; result: ReturnType<typeof checkHealth> } | null = null;
+const HEALTH_REUSE_MS = 3_000;
+
+function sharedHealth(env: Env): ReturnType<typeof checkHealth> {
+  const now = Date.now();
+  if (!lastHealth || now - lastHealth.at > HEALTH_REUSE_MS) lastHealth = { at: now, result: checkHealth(healthProbes(env)) };
+  return lastHealth.result;
+}
 /** A host may reconnect its fleet channel this long after its token expired (and gets a fresh one). */
 const FLEET_TOKEN_GRACE_MS = 24 * 3_600_000;
 
@@ -111,8 +121,9 @@ async function route(req: Request, env: Env): Promise<Response> {
   let p: RegExpExecArray | null = null;
 
   if (req.method === "GET" && path === "/v1/health") {
-    // Unauthenticated: one read-only round trip to each DO class's own health instance, nothing else.
-    const h = await checkHealth(healthProbes(env));
+    // Unauthenticated: one read-only round trip to each DO class's own health instance, nothing else,
+    // shared by this isolate's requests for a few seconds so a flood can't multiply it.
+    const h = await sharedHealth(env);
     return json({ ok: h.ok, protocol_version: PROTOCOL_VERSION, durable_objects: h.durable_objects }, h.ok ? 200 : 503);
   }
   if (req.method === "POST" && path === "/v1/hosts/enroll") return enroll(req, env);

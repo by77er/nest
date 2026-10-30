@@ -32,8 +32,9 @@ describe("GET /v1/health", () => {
         tables: state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")
           .toArray().map((r) => r.name),
         alarm: await state.storage.getAlarm(),
+        keys: [...(await state.storage.list()).keys()],
       }));
-      expect(found, name).toEqual({ tables: [], alarm: null });
+      expect(found, name).toEqual({ tables: [], alarm: null, keys: [] });
     }
   });
 

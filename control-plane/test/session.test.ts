@@ -238,6 +238,9 @@ describe("platform tool relay", () => {
     ws.send(toolCall("cal_t4-2", "read_transcript", { agent: s.agent, since_seq: 1 }));
     const tr = await ws.next("tool_result", (m) => m.call === "cal_t4-2");
     expect(tr.outcome.content[0].text).toBe("line two");
+    // Only an agent id names an agent: never another DO instance (`~health`, lib/health.ts).
+    ws.send(toolCall("cal_t4-2b", "read_transcript", { agent: "~health" }));
+    expect((await ws.next("tool_result", (m) => m.call === "cal_t4-2b")).outcome.error.code).toBe("invalid_message");
 
     ws.send(toolCall("cal_t4-3", "expose_port", { port: 3000 }));
     const ex = await ws.next("tool_result", (m) => m.call === "cal_t4-3");
