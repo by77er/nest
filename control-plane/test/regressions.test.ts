@@ -1077,15 +1077,17 @@ describe("#29 command batches go on the wire in seq order", () => {
     expect(increasing(await wireOrder(s.host.ws, [ca!, cb!]))).toBe(true);
   });
 
-  it("a BrokerDO failure sends nothing of the run, not even its plain batches, and closes", async () => {
+  it("a BrokerDO failure holds back its batch and what follows, not a kill ahead of it, and closes", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
     await fleetStub(cell).issueCommands(h.host, [fence("a")]);
     const last = (await h.ws.next("commands")).seq as number;
     h.ws.close();
     await until("FleetDO to see the close", () => h.ws.closed !== null);
-    await fleetStub(cell).issueCommands(h.host, [fence("plain")]);
-    await fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+    const kill = { type: "agent_stop" as const, agent: "agt_01killaheadofsecret0000000", reason: "t", mode: "kill" as const, epoch: 1 };
+    await fleetStub(cell).issueCommands(h.host, [kill]); // last + 1
+    await fleetStub(cell).issueCommands(h.host, [secretBatch()]); // last + 2
+    await fleetStub(cell).issueCommands(h.host, [fence("after")]); // last + 3
 
     await hookBroker(cell, { resolveRefs: async () => { throw new Error("BrokerDO unavailable"); } });
     const ws2 = await Ws.connect("/v1/fleet", h.host_token);
@@ -1094,7 +1096,72 @@ describe("#29 command batches go on the wire in seq order", () => {
     expect((await ws2.next("error")).error).toMatchObject({ code: "internal", retryable: true });
     await until("the socket to close", () => ws2.closed !== null);
     expect(ws2.closed?.code).toBe(4503);
-    expect(ws2.received.filter((m) => m.type === "commands")).toEqual([]);
+    expect(ws2.received.filter((m) => m.type === "commands").map((m) => [m.seq, m.commands[0].type])).toEqual([[last + 1, "agent_stop"]]);
+    // The next connection starts after it: the kill isn't sent twice.
+    const ws3 = await Ws.connect("/v1/fleet", h.host_token);
+    ws3.send(hostHello(h.host, cell, { last_command_seq: last + 1 }));
+    expect((await ws3.next("hello_ack")).next_command_seq).toBe(last + 2);
+  });
+
+  it("issuing doesn't wait for the send: a kill is stored at once while an earlier batch awaits BrokerDO", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const refs = gate();
+    await hookBroker(cell, { resolveRefs: refs.hook });
+    const [secret] = await fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+    await until("the secret batch to await BrokerDO", () => refs.entered);
+    // AgentDO's escalation issues kills by RPC: it gets the id back while the chain is held.
+    const kill = await Promise.race([
+      fleetStub(cell).issueKill(h.host, "agt_01killwhilechainheld00000", 1, "t"),
+      sleep(1000).then(() => "held"),
+    ]);
+    expect(kill).toMatch(/^cmd_/);
+    refs.released = true;
+    expect(increasing(await wireOrder(h.ws, [secret!, kill]))).toBe(true);
+  });
+
+  it("a run that throws closes its socket, so the hello resends what it didn't send", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    // An outbox row nothing can parse: the run that reaches it throws.
+    await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
+      const next = st.storage.sql.exec<{ next_out: number }>("SELECT next_out FROM rel_state WHERE chan = ?", h.host).toArray()[0]?.next_out ?? 1;
+      st.storage.sql.exec("INSERT OR REPLACE INTO rel_state (chan, next_out, last_in) VALUES (?, ?, (SELECT last_in FROM rel_state WHERE chan = ?))", h.host, next + 1, h.host);
+      st.storage.sql.exec("INSERT INTO rel_out (chan, seq, body) VALUES (?, ?, 'not json')", h.host, next);
+    });
+    await fleetStub(cell).issueCommands(h.host, [fence("behind it")]);
+    expect((await h.ws.next("error")).error).toMatchObject({ code: "internal", retryable: true });
+    await until("the socket to close", () => h.ws.closed !== null);
+    expect(h.ws.closed?.code).toBe(4503);
+  });
+
+  it("the tick sends batches above what the socket was sent that no run carried", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    // Pushed without a run (as if the run was lost with a reset of this object).
+    const seq = await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      const rel = (inst as unknown as { rel: { push(chan: string, make: (seq: number) => { seq: number }): { seq: number } } }).rel;
+      return rel.push(h.host, (s) => ({ type: "commands", seq: s, commands: [{ cmd: "cmd_01tickcarried000000000000", issued_ms: Date.now(), ...fence("tick") }] })).seq;
+    });
+    expect(await h.ws.none("commands", 150)).toBe(true);
+    await runInDurableObject(fleetStub(cell), async (_i: FleetDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+      await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
+    });
+    await runDurableObjectAlarm(fleetStub(cell));
+    expect((await h.ws.next("commands", (m) => m.seq === seq)).commands[0].cmd).toBe("cmd_01tickcarried000000000000");
+  });
+
+  it("a socket being closed is not the host's: nothing more is sent on it", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    // Closed by FleetDO (a send failure, say): listed, CLOSING, until the peer answers.
+    const current = await runInDurableObject(fleetStub(cell), (inst: FleetDO, st) => {
+      const [ws] = st.getWebSockets(h.host);
+      ws!.close(4503, "test");
+      return (inst as unknown as { socketFor(host: string): WebSocket | undefined }).socketFor(h.host) ?? null;
+    });
+    expect(current).toBeNull();
   });
 
   it("a run whose socket was superseded while it resolved sends nothing there and doesn't revive it", async () => {

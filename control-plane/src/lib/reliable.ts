@@ -44,6 +44,11 @@ export class ReliableChannels {
       .map((r) => JSON.parse(r.body) as unknown);
   }
 
+  /** Whether any unacked message has seq > `after`. */
+  hasPendingAfter(chan: string, after: number | undefined): boolean {
+    return this.sql.exec("SELECT 1 FROM rel_out WHERE chan = ? AND seq > ? LIMIT 1", chan, after ?? 0).toArray().length > 0;
+  }
+
   /**
    * The lowest seq a resend after `after` or any later push can carry: the first unacked message
    * above `after`, else the next seq to assign. The peer's in-order baseline for a new connection.
