@@ -8,8 +8,11 @@ description: Use before claiming that a nest change works, is safe, or is verifi
 1. **Run the fast checks for what you touched:**
    - Rust: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test -p <crate>`;
    - control plane: `cd control-plane && npm run typecheck && npm test`;
-   - repo guards: `python3 -I scripts/check-doc-links.py`, `python3 -I scripts/check-fences.py`, and `python3 -m unittest discover -s scripts/tests`.
-2. **Run `e2e/run.sh`** when a change crosses components (runner, nestd, proxy, guest, control plane).
+   - repo guards: `python3 -I scripts/check-doc-links.py`, `python3 -I scripts/check-fences.py`, and `python3 -m unittest discover -s scripts/tests`;
+   - the subsystem's own checks (model checks, Kani, mutants, fuzz replay, `inframe test`, the bootstrap test): the `nest-control-plane`, `nest-host`, `nest-wire`, `nest-infra` and `nest-verification` skills.
+
+   Read each command's exit code, not its counts: a vitest run can report every test passed and still exit 1.
+2. **Run `e2e/run.sh`** when a change crosses components (runner, nestd, proxy, guest, control plane), with a short `NEST_E2E_WORK` such as `/var/tmp/nest-e2e-<tag>` (unix-socket paths are limited to 108 bytes).
 3. **Name the evidence tier in every claim.** The tiers and what each can't prove are in `dev/practices.md#evidence-tiers`. Never:
    - claim Firecracker, snapshot, real-vsock, tunnel or Access behaviour from the process driver (it does prove the gateway's WebSocket-to-vsock path on one host, not across machines);
    - claim real Claude Code behaviour from `fake_claude.py`.

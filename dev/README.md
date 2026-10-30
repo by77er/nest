@@ -50,6 +50,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | [practices.md](practices.md) | Guards, test rules, evidence tiers, review and supply chain: what keeps agent-written changes safe |
 | [review-lessons.md](review-lessons.md) | Standalone lessons from real findings, checked on every review |
 | [verification.md](verification.md) | The formal models in `verification/` and their CI jobs |
+| [cloud-checks/](cloud-checks/) | Scripted checks against the live control plane after a deploy, run by hand |
 
 ## Path to self-maintenance
 
