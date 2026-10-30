@@ -2,6 +2,8 @@
 
 The protocol between SandboxDO, FleetDO and nestd that decides which host runs a sandbox, at which epoch, and whose commits move its head. Written as a reference for a model (TLA+ or similar). Every claim about code cites `file:line` on main (`edf6829`); `sandbox.ts` is `control-plane/src/do/sandbox.ts`, `fleet.ts` is `control-plane/src/do/fleet.ts`, `host.rs` is `crates/nestd/src/host.rs`. Design intent is in [fencing](../../sandbox/fencing/), [SandboxDO](../../control-plane/durable-objects/sandbox/), [FleetDO](../../control-plane/durable-objects/fleet/) and [nestd](../../compute/nestd/).
 
+> **Since** (checked on `main` at b63c0a3): the bugs in §8 that the pilot confirmed (the no-capacity epoch rollback, destroy during placement, the double run after a lapse, L1 and L2) are still in the code. Salvage is now authorized against SandboxDO's full `epochs` table (#32), which doesn't change the rollback case: the rolled-back epoch is the current one.
+
 ## 1. Scope and actors
 
 | Actor | Instances | State it holds (modelled variables) | Code |

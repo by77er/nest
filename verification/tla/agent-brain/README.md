@@ -1,6 +1,6 @@
 # agent-brain TLA+ model
 
-`AgentBrain.tla` models the one-brain rule across AgentDO, FleetDO, nestd and the agent runner. It covers the single-record design (`RECORD = TRUE`, `BRAIN-RECORD-DESIGN.md` with amendments A1-A6) and `origin/deferred/agent-epoch` at 65bf6ef (`RECORD = FALSE`, every fix off). Each fix and amendment is a toggle, so turning one off reproduces its counterexample. The report is [docs/verification/agent-brain/pilot/](../../../docs/verification/agent-brain/pilot/README.md).
+`AgentBrain.tla` models the one-brain rule across AgentDO, FleetDO, nestd and the agent runner. It covers the single-record design (`RECORD = TRUE`, [the design](../../../docs/verification/agent-brain/design/) with amendments A1-A6) and `origin/deferred/agent-epoch` at 65bf6ef (`RECORD = FALSE`, every fix off). Each fix and amendment is a toggle, so turning one off reproduces its counterexample. The report is [docs/verification/agent-brain/pilot/](../../../docs/verification/agent-brain/pilot/README.md).
 
 | Toggle | Meaning |
 |---|---|
@@ -15,8 +15,8 @@
 | `REFUSED_WAITS` | A4: a refused start's exit waits until older brains have deregistered |
 | `A5` | the `onHostLost` ack deletes the row only at the epoch it was sent for |
 | `A6` | "lost" means expired or confirmed dead, never a drain's "dead" |
-| `LOSS_EPOCH` | host loss releases only a record at or below its epoch (main@b2b9219 `agent.ts`:1085); a previous-release host's epoch-less row is exempt |
-| `LOST_RECHECK` | host loss releases only while FleetDO still reports the host lost, else the row stays (`agent.ts`:1087 `hostGone`). Both guards are on in the current design; with both off: C6 (`MC_c6`) |
+| `LOSS_EPOCH` | host loss releases only a record at or below its epoch (`AgentDO.onHostLost`); a previous-release host's epoch-less row is exempt |
+| `LOST_RECHECK` | host loss releases only while FleetDO still reports the host lost, else the row stays (`onHostLost` re-checks `hostGone`). Both guards are on in the current design; with both off: C6 (`MC_c6`) |
 | `START_FAIL` | a refused start's command error releases via `startFailed` (a38d3c0, D1) |
 | `SPLIT_EXPIRE`, `EXPIRE_RECHECK` | the tick's expiry split at its await (N1, 6073da7), and its fix |
 | `NO_REISSUE` | 82396b3: a start while a non-condemned brain exists answers `none`; an operator restart (`ROpRestart`, under `ALLOW_STOP`) condemns and keeps the intent |

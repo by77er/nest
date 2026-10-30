@@ -41,6 +41,8 @@ Its users:
 
 If these drifted apart, GC could delete exactly what a resume would load. It compares generation ids, never timestamps: an upload that lands late is still a different generation.
 
+**Not built:** there is no single predicate in code yet. Nothing is deleted, so nothing can drift: retention isn't built, SandboxDO's `gcRoots` returns every generation it records, and placement restores the head.
+
 ## Restore rule
 
 A memory snapshot is valid **only when it belongs to the head generation**. Restoring older memory over a newer disk corrupts the filesystem.
@@ -61,9 +63,11 @@ Restore sources and turn ends are kept; everything else is thinned by age.
 | Everything else | Newest 5 at 1-min spacing, then 1 at 5 min, 6 at 10 min, 6 hourly and 4 six-hourly; older ones go (about 24 h). SPACE uses the same tiers ([snapshot_scheduler.rs](https://github.com/perplexityai/space/blob/main/crates/libs/sbx/mgr/server/src/snapshot_scheduler.rs)) |
 | The memory of a checkpoint that's no longer a restore source | Not kept: the restore rule never loads it, so it stops being a GC root |
 
-SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting.
+SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting. **Not built:** every generation is kept.
 
 ## Spot notice (2 minutes)
+
+**Built:** the notice suspends every running sandbox, in no order ([autoscaling](../../compute/autoscaling/)). **Designed, not built:** the order below.
 
 1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then flip every disk epoch (milliseconds each) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
 2. Then, in order of recent activity: pause, write a full memory snapshot to NVMe (`sync_snapshot_files=false`), upload with zstd compression, commit.

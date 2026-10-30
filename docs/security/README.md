@@ -12,14 +12,14 @@
 | Gateway (on each sandbox host) | The only way into a sandbox's hands, terminals and ports. Admits a connection only with a binding SandboxDO signed for that sandbox, epoch, client and scope, behind an Access service token at the edge; the guest checks the epoch again. |
 | Sandbox hosts (nestd, proxy, gateway, cloudflared) | Trusted, but fenced by lease and STONITH. S3 for their whole cell through the instance role; no R2 credentials; no subscription token; no brain. nest-proxy can't reach IMDS or other non-public addresses (kernel rule on its uid). The gateway, which parses input from the internet, runs as its own user with no capabilities and no IP beyond loopback (so not IMDS); beyond what any local user reaches (loopback services, world-connectable unix sockets, world-readable files) it gets only nestd's gateway socket and the guests' vsock sockets ([gateway](../sandbox/gateway/)); cloudflared runs as its own user too. |
 | Brain hosts (nestd, runner) | Trusted, but fenced by lease and the agent epoch. No KVM, no sandbox state; in S3 it may read the release (`releases/*`) only. |
-| Control plane | Authoritative. No S3 credentials; AWS permissions scoped to EC2 and to KMS `Sign` with the proxy root key. Operator access is by scoped token. |
+| Control plane | Authoritative. No S3 credentials; AWS permissions scoped to EC2 and to KMS `Sign` with the proxy root key. Operator access is by scoped token (built: one admin token). |
 
 ## Defense layers
 
 - Credentials stay outside VMs: [identity/](identity/)
 - Egress allowlist, hard deny of non-public addresses (in the proxy and the kernel), request sanitizing, live policy re-checks, scoped credential injection, reflected-secret masking, no raw ssh: [../sandbox/networking/egress/](../sandbox/networking/egress/)
 - Short-lived CA chain under a KMS root, since guests check no revocation: [../sandbox/networking/egress/tls/](../sandbox/networking/egress/tls/)
-- Every credential issuance, push and refusal is audited by BrokerDO: [../control-plane/durable-objects/broker/](../control-plane/durable-objects/broker/)
+- Every credential issuance, push and refusal is audited by BrokerDO (not built): [../control-plane/durable-objects/broker/](../control-plane/durable-objects/broker/)
 - The harness runs on brain hosts, with a clean environment, restricted mode and managed settings: [../agents/runner/](../agents/runner/)
 - One door into every sandbox, with a signed binding per client and an edge check: [../sandbox/gateway/](../sandbox/gateway/)
 - Grants, attenuated from me (an agent passes on only what it holds), taint tracking with approval on sinks, brokered actions and approval gates: [../agents/tools/](../agents/tools/)

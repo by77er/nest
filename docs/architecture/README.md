@@ -7,7 +7,7 @@ nest is two systems with one seam between them:
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
-> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13)). Brain hosts are built: every brain starts on a brain host, never on its sandbox's, and reaches the guest only through its gateway (not yet run on AWS). **Not built:** the coordination layer (ChannelDO, HookDO, grants, taint, `wake_at`). Templates and capabilities are data in CatalogDO, and nothing decides on an agent role; WorkstreamDO stands in for the workstream channel until ChannelDO exists. `control-plane/README.md` lists the gaps.
+> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23, with Access in front on 2026-10-24: spike item 13); brain hosts, so every brain starts on a brain host, never on a sandbox host, and reaches the guest only through its gateway (on AWS since 2026-10-29); templates and capabilities as data in CatalogDO, with nothing deciding on an agent role. **Not built:** the coordination layer (ChannelDO, HookDO, grants, taint, `wake_at`; WorkstreamDO stands in for the workstream channel), the Discord bot, memory snapshots, the hands journal's `call_status`, the 60 s dirty-disk commit and desired host versions. `control-plane/README.md` lists the gaps.
 
 ## At a glance
 
@@ -40,7 +40,7 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 | Component | Runs on | Does | Doc |
 |---|---|---|---|
 | **Worker** | Cloudflare | HTTP API, webhook route, Discord interactions, signed blob URLs, tunnel and DNS records per sandbox host. Stateless; routes to DOs. | [control-plane/api/](../control-plane/api/) |
-| **FleetDO** | Cloudflare, one per cell | Hosts of both kinds, enrollment, leases, placement, STONITH, three desired versions, the binding key, ordered command delivery | [fleet/](../control-plane/durable-objects/fleet/) |
+| **FleetDO** | Cloudflare, one per cell | Hosts of both kinds, enrollment, leases, placement and autoscaling, STONITH, ordered command delivery, the binding public keys pushed to gateways; three desired versions per cell (designed) | [fleet/](../control-plane/durable-objects/fleet/) |
 | **SandboxDO** | Cloudflare, one per sandbox | Epoch, generation head (compare-and-set commits), egress policy, attached clients; issues bindings and answers `resolve` | [sandbox/](../control-plane/durable-objects/sandbox/) |
 | **AgentDO** | Cloudflare, one per agent | Spawn spec (capabilities, grants, budget), turn queue, session stream, taint, scheduled wakes, tool relay, the agent epoch, brain placement | [agent/](../control-plane/durable-objects/agent/) |
 | **ChannelDO** | Cloudflare, one per channel | Message log, keyed view, subscriptions, fan-out | [channel/](../control-plane/durable-objects/channel/) |
@@ -102,7 +102,7 @@ Details: [sandbox/fencing/](../sandbox/fencing/), [sandbox/gateway/](../sandbox/
 | Large and older channel bodies, audit logs | R2 | ChannelDO, FleetDO |
 | Sandbox disk and memory chunks, manifests | S3, per cell | nestd; the head moves only through SandboxDO |
 | Secrets | BrokerDO (platform keys: Worker secrets) | Me, or minted by BrokerDO |
-| The binding key | FleetDO, pushed to each sandbox host's gateway over the fleet channel | FleetDO |
+| The binding key | BrokerDO (private, per cell; it signs); FleetDO pushes the public keys to each sandbox host's gateway over the fleet channel | BrokerDO |
 | Runtime metrics | Workers Analytics Engine | The Worker and DOs; hosts' through FleetDO ([metrics](../control-plane/metrics/)) |
 
 Bindings themselves are verified, never stored. Hosts hold only caches: page cache, NVMe chunk caches, local session files on brain hosts. See [data/](../data/).

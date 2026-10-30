@@ -18,7 +18,7 @@ nest runs many long-lived Claude Code agents at once. Each agent's brain is an u
 
 ## Status
 
-Early implementation. The runtime (control plane, host daemon, egress proxy, guest agent, agent runner) exists, is tested locally, and has run on EC2 with Firecracker. The seam of the split into a sandbox system and an agent system (the gateway, bindings, per-host tunnels) is built and verified on AWS (2026-10-23, with Cloudflare Access in front since 2026-10-24); brain hosts and the coordination layer (channels, hooks, grants, capabilities, scheduled wakes) are designed but not built.
+Early implementation. The runtime (control plane, host daemon, egress proxy, guest agent, agent runner) exists, is tested locally, and has run on EC2 with Firecracker. The seam of the split into a sandbox system and an agent system (the gateway, bindings, per-host tunnels) is built and verified on AWS (2026-10-23, with Cloudflare Access in front since 2026-10-24), and every brain runs on a brain host (on AWS since 2026-10-29). Templates and capabilities are data; the coordination layer (channels, hooks, grants, scheduled wakes) is designed but not built. The one-brain rule and several other protocols are model-checked, and nestd's fleet link is checked as the shipped code ([verification](docs/verification/README.md)).
 
 ## Learn more
 
@@ -33,7 +33,7 @@ Rust on hosts and in guests; TypeScript on Cloudflare Workers.
 
 ```bash
 cargo test --workspace
-cd control-plane && npm install && npm test
+cd control-plane && npm ci && npm test
 e2e/run.sh
 ```
 

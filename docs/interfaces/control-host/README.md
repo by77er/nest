@@ -26,20 +26,21 @@ Also: [tools/](tools/) (the platform tool catalog and call semantics) and [model
 ## End-to-end: create a sandbox and run a turn
 
 ```
-Captain/UI        WorkstreamDO/AgentDO        FleetDO                 host (nestd + runner)          SandboxDO
-   │ spawn ────────────►│ place ────────────────►│                              │                           │
-   │                    │                        │◄── epoch=1 granted ───────────┼───────────────────────────│
-   │                    │                        │ commands[sandbox_create{e1}] ►│ netns+proxy+VM boot       │
-   │                    │                        │◄ events[sandbox_state running, command_result ok]          │
-   │                    │                        │ commands[agent_start{hands=(sbx,e1), oauth_token}] ►│      │
-   │                    │◄─────────────── session WS: hello{agent, epoch 1} ─────────────│ spawn claude      │
-   │                    │── hello_ack{durable_bytes}, cache_update, run_turn{trn} ──────►│ stdin user msg    │
-   │                    │◄── segment… / events[turn_started, tool_call…] / tool_call ───│                   │
-   │                    │── segment_ack / tool_result / ack ───────────────────────────►│                   │
-   │                    │◄── events[turn_completed, state_changed idle] ────────────────│ Stop hook         │
-   │                    │                        │◄ events[commit_request{turn_end}] ── │ disk writeback    │
-   │                    │                        │── CAS ───────────────────────────────┼──────────────────►│
-   │                    │                        │ commands[commit_result committed] ──►│                   │
+Operator/UI     AgentDO               FleetDO               sandbox host (nestd)       brain host (nestd + runner)    SandboxDO
+   │ create ──────►│ place sandbox ─────────────────────────────────────────────────────────────────────────────────►│ claim, epoch=1
+   │               │                     │◄── place{e1} ───────────────────────────────────────────────────────────│
+   │               │                     │ commands[sandbox_create{e1}] ►│ netns+proxy+VM boot  │                       │
+   │               │                     │◄ events[sandbox_state running, command_result ok]    │                       │
+   │               │ start brain ───────►│ commands[agent_start{agent epoch 1, hands{sbx}, oauth_token}] ──────────────►│ spawn claude
+   │               │◄─────────────── session WS: hello{agent, epoch 1} ─────────────────────────│                       │
+   │               │── hello_ack, cache_update, run_turn{trn} ────────────────────────────────►│ stdin user msg        │
+   │               │◄── hands_resolve / hands_resolved{url, binding} ─────────────────────────►│ hands → gateway (sandbox host)
+   │               │◄── segment… / events[turn_started, tool_call…] / tool_call ──────────────│                       │
+   │               │◄── events[turn_completed, state_changed idle] ───────────────────────────│ Stop hook             │
+   │               │ turn_end ────────────────────────────────────────────────────────────────────────────────────►│ checkpoint
+   │               │                     │◄ events[commit_request{turn_end}] ── │ disk writeback      │                       │
+   │               │                     │── CAS ───────────────────────────────────────────────────────────────────►│
+   │               │                     │ commands[commit_result committed] ──►│                     │                       │
 ```
 
-`agent_start` names the sandbox only (and the agent epoch of the start); the runner fetches the gateway target over its session channel and its hands calls cross the network to the sandbox's host ([gateway](../gateway/)). In the design `agent_start` goes to a brain host chosen by capacity; the sequence above is the implemented placement, where both commands go to one host.
+The brain and the sandbox are on different hosts, chosen independently. `agent_start` names the sandbox only (and the agent epoch of the start); the runner fetches the gateway target over its session channel, and its hands calls cross the network to the sandbox's host ([gateway](../gateway/)).

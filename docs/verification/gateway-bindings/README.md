@@ -2,6 +2,8 @@
 
 > **Study, not a decision.** Code on `main` (edf6829); every claim cites `file:line`. Contracts: [gateway](../../interfaces/gateway/), [nestd-gateway](../../interfaces/host-internal/nestd-gateway/), [host-guest](../../interfaces/host-guest/); design: [sandbox gateway](../../sandbox/gateway/), [hands](../../agents/hands/), [SandboxDO attach and bindings](../../control-plane/durable-objects/sandbox/#attach-and-bindings). Channel delivery underneath: [reliable-channels](../reliable-channels/).
 
+> **Since:** not re-checked after `edf6829`. #30 changed the hands path: the agent epoch fences the brain, `hands_resolved` is a tagged union, and the hands client takes sandbox and epoch from the binding's claims.
+
 ## Scope and actors
 
 A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindings are verified, never stored; revocation is the gateway's attached-client set and the sandbox epoch.

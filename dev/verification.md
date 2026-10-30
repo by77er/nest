@@ -1,6 +1,6 @@
-# Verification in CI (proposal)
+# Verification in CI: the pilots (proposal)
 
-How the formal models in [`verification/`](../verification/README.md) would run on every pull request. Why they exist and what they found: [docs/verification/](../docs/verification/README.md). Nothing here is wired yet: adding a job changes `.github/`, which needs my review.
+How the study's formal models in [`verification/`](../verification/README.md) (TLA+, Lean and the command-delivery Stateright pilot) would run on every pull request. Why they exist and what they found: [docs/verification/](../docs/verification/README.md). nestd's checks over its real cores are already wired; they are in [ci.md](ci.md#verification). Nothing here is wired yet: adding a job changes `.github/`, which needs my review.
 
 ## The job
 
@@ -24,7 +24,7 @@ A `verification` job in `ci.yml`, added to `ci-ok`'s `needs`:
 
 ## Keeping models honest
 
-- **A model is a hand translation.** Each spec's header and its pilot doc map actions to file:line. A PR that changes a modelled handler updates the spec or that table in the same PR.
+- **A model is a hand translation** (nestd's checks aren't: they run the real cores). Each spec's header and its pilot doc map actions to file:line. A PR that changes a modelled handler updates the spec or that table in the same PR.
 - **Proposed guard** (`scripts/`): for each spec, a list of the source files its action table cites. A diff that touches one of them must also touch the spec, its conformance doc, or a `verification-reviewed:` line in the PR body. This is not built.
 - **The reviewer skill** ([.claude/skills/](../.claude/skills/)) would add one check: for a PR touching a modelled handler, re-run the conformance table for the changed actions.
 - **Evidence tiers** ([practices.md](practices.md)):
