@@ -1,6 +1,6 @@
 # agent-brain TLA+ model
 
-`AgentBrain.tla` models the one-brain rule across AgentDO, FleetDO, nestd and the agent runner. It covers the single-record design (`RECORD = TRUE`, `BRAIN-RECORD-DESIGN.md` with amendments A1-A6) and `origin/deferred/agent-epoch` at 65bf6ef (`RECORD = FALSE`, every fix off). Each fix and amendment is a toggle, so turning one off reproduces its counterexample. The report is [docs/verification/agent-brain/pilot/](../../../docs/verification/agent-brain/pilot/README.md).
+`AgentBrain.tla` models the one-brain rule across AgentDO, FleetDO, nestd and the agent runner. It covers the single-record design (`RECORD = TRUE`, [the design](../../../docs/verification/agent-brain/design/) with amendments A1-A6) and `origin/deferred/agent-epoch` at 65bf6ef (`RECORD = FALSE`, every fix off). Each fix and amendment is a toggle, so turning one off reproduces its counterexample. The report is [docs/verification/agent-brain/pilot/](../../../docs/verification/agent-brain/pilot/README.md).
 
 | Toggle | Meaning |
 |---|---|

@@ -34,7 +34,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `control-plane/` | Worker and Durable Objects |
 | `crates/nest-protocol` | Wire types for every boundary |
 | `crates/nestd` | Host daemon |
-| `crates/nestd-core` | nestd's pure state-machine cores, checked as shipped ([verification](verification/nestd/)) |
+| `crates/nestd-core` | nestd's pure state-machine cores, checked as shipped ([verification](verification/nestd/); [README](../crates/nestd-core/README.md)) |
 | `crates/nest-proxy` | Egress proxy |
 | `crates/nest-guest` | Guest agent (hands server) |
 | `crates/nest-runner` | Agent runner |

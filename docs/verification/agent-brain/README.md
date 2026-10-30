@@ -5,7 +5,7 @@ The agent/brain lifecycle, the one-brain rule and the turn queue, across AgentDO
 - **main** (`edf6829`): as built. Cited as `path:line`.
 - **AE**: `origin/deferred/agent-epoch` at `65bf6ef`, the redesign in flux. Cited as `AE:path:line` (`git show origin/deferred/agent-epoch:<path>`). Earlier AE commits are cited by hash.
 
-> **Since:** both versions predate the single-record design, which merged as #30 (with brain hosts in #36). The as-built model is in [pilot/](pilot/) and its check against the code in [conformance/](conformance/).
+> **Since:** both versions predate the single-record design, which merged as #30 (with brain hosts in #36). The design is recorded in [design/](design/), the as-built model is in [pilot/](pilot/) and its check against the code in [conformance/](conformance/).
 
 The intended rule (owner): *AgentDO starts a brain at agent epoch N+1 on another host only once the previous brain is confirmed gone (its `agent_exited` with epoch >= N, or its host dead/expired; the host lease self-fences brains at 20 s, the DO expires the host at 30 s); kills carry an epoch tombstone, so a queued start at or below a killed epoch is refused.*
 
