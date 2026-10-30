@@ -14,8 +14,12 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 nest-protocol = { path = "../../../crates/nest-protocol" }
-# Only for `recovery::read_meta` / `write_meta` (the meta_json target).
+# `recovery::read_meta` / `write_meta` (meta_json) and `fleet::decode` (fleet_to_host).
 nestd = { path = "../../../crates/nestd" }
+# The fleet core's input type, which `fleet::decode` returns.
+nestd-core = { path = "../../../crates/nestd-core" }
+# The WebSocket message `fleet::decode` takes (nestd's version, so the lockfile holds one).
+tokio-tungstenite = "0.30.0"
 bytes = "1.12.1"
 nix = { version = "0.31", features = ["socket", "uio"] }
 serde = "1"

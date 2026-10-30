@@ -35,12 +35,66 @@ pub struct Now {
     pub wall: i64,
 }
 
-/// What the core needs to know about an event it queues.
+/// What the core needs to know about an event it queues: what kind it is. The shell reads it off
+/// the event (a decode, no decision); the core decides what to shed ([`shed_rank`]) and what to
+/// coalesce ([`absorbs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    /// An `egress_audit` batch of this many records.
+    Audit { records: usize },
+    /// A `capacity` report.
+    Capacity,
+    /// A workstream `egress_denied` event.
+    EgressDenied,
+    /// A workstream `port_opened` event.
+    PortOpened,
+    /// Anything else: never shed, never merged.
+    Other,
+}
+
+/// An event the core queues.
 pub trait OutboxEvent: Clone {
-    /// Shedding order when the outbox overflows (lower first); `None`: never shed.
-    fn shed_rank(&self) -> Option<u8>;
-    /// Merge `next` into `self` if both are mergeable (audit records, within their bound).
-    fn absorb(&mut self, next: &Self) -> bool;
+    fn kind(&self) -> EventKind;
+    /// Append `next`'s audit records to `self`'s. The core calls it only when [`absorbs`] said so
+    /// (both are [`EventKind::Audit`]), and checks the merged kind.
+    fn merge(&mut self, next: Self);
+}
+
+/// Audit records merged into one `egress_audit` event at most.
+pub const MAX_AUDIT_RECORDS_PER_EVENT: usize = 512;
+
+/// Shedding order when the outbox overflows (lower first); `None`: never shed. Audit and capacity
+/// reports are superseded by later ones; denied and opened ports are worth more but still optional.
+pub fn shed_rank(kind: EventKind) -> Option<u8> {
+    match kind {
+        EventKind::Audit { .. } | EventKind::Capacity => Some(0),
+        EventKind::EgressDenied | EventKind::PortOpened => Some(1),
+        EventKind::Other => None,
+    }
+}
+
+/// Whether an event of kind `next` is merged into the queued one of kind `last`: two audit batches
+/// whose records fit in one event.
+pub fn absorbs(last: EventKind, next: EventKind) -> bool {
+    match (last, next) {
+        (EventKind::Audit { records: a }, EventKind::Audit { records: b }) => a.saturating_add(b) <= MAX_AUDIT_RECORDS_PER_EVENT,
+        _ => false,
+    }
+}
+
+/// Whether an `error` frame with this code means the peer will never accept this host as it is, so
+/// the connection ends: unauthorized, or another protocol version (under either name). Mirrors
+/// `nest_protocol::model::error_codes` (nestd cross-checks every code).
+pub fn error_is_fatal(code: &str) -> bool {
+    matches!(code, error_codes::UNAUTHORIZED | error_codes::UNSUPPORTED_VERSION | error_codes::LEGACY_UNSUPPORTED_VERSION)
+}
+
+/// The wire's error codes this core decides on (`nest_protocol::model::error_codes`).
+pub mod error_codes {
+    pub const UNAUTHORIZED: &str = "unauthorized";
+    pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
+    /// The control-host channels' name for [`UNSUPPORTED_VERSION`] before the names merged.
+    pub const LEGACY_UNSUPPORTED_VERSION: &str = "unsupported_protocol_version";
 }
 
 /// The lease timing FleetDO hands out in `hello_ack`.
@@ -78,8 +132,8 @@ pub enum Inbound<C, R, O> {
     Commands { seq: Seq, commands: C },
     Ack { up_to: Seq },
     HostToken { token: String, expires_ms: i64 },
-    /// `fatal`: the peer will never accept this host as it is (unauthorized, another version).
-    Error { fatal: bool, retryable: bool, error: O },
+    /// `code`: the error's code ([`error_is_fatal`] decides whether it ends the connection).
+    Error { code: String, retryable: bool, error: O },
     /// Passed to the host as is (proxy CA, binding keys).
     Other(O),
 }
@@ -505,11 +559,11 @@ impl<E: OutboxEvent> FleetLink<E> {
                     fx.push(Effect::Notify(Notice::HostToken { token, expires_ms }));
                 }
                 Inbound::Other(o) => fx.push(Effect::Notify(Notice::Other(o))),
-                Inbound::Error { fatal, retryable, error } => {
+                Inbound::Error { code, retryable, error } => {
                     // A retryable error means FleetDO failed to process something we sent (it did
                     // not ack it). Reconnect so everything unacked is resent in order; carrying on
                     // would let a later batch's cumulative ack cover the failed one.
-                    let reconnect = fatal || retryable;
+                    let reconnect = error_is_fatal(&code) || retryable;
                     fx.push(Effect::Log(Log::PeerError { reconnect }));
                     fx.push(Effect::Notify(Notice::Error(error)));
                     if reconnect {
@@ -546,10 +600,18 @@ impl<E: OutboxEvent> FleetLink<E> {
 
     /// Queue an event: coalesce audit batches, and shed low-value events past the bound.
     fn push_event<C, R, O>(&mut self, e: E, fx: &mut Effects<E, C, R, O>) {
-        if let Some(last) = self.pending.last_mut()
-            && last.absorb(&e)
-        {
-            return;
+        if let Some(last) = self.pending.last_mut() {
+            let (was, next) = (last.kind(), e.kind());
+            if absorbs(was, next) {
+                last.merge(e);
+                // The shell only performs the merge: it holds every record of both, and is still an audit.
+                let merged = matches!(
+                    (was, next, last.kind()),
+                    (EventKind::Audit { records: a }, EventKind::Audit { records: b }, EventKind::Audit { records: m }) if m == a + b
+                );
+                Self::check(merged, "fleet_audit_merged", fx);
+                return;
+            }
         }
         self.pending.push(e);
         let total = self.outbox_len();
@@ -559,7 +621,7 @@ impl<E: OutboxEvent> FleetLink<E> {
                 let before = self.pending.len();
                 let mut excess = self.outbox_len().saturating_sub(target);
                 self.pending.retain(|e| {
-                    if excess > 0 && e.shed_rank() == Some(rank) {
+                    if excess > 0 && shed_rank(e.kind()) == Some(rank) {
                         excess -= 1;
                         false
                     } else {
@@ -584,11 +646,38 @@ mod tests {
     struct E;
 
     impl OutboxEvent for E {
-        fn shed_rank(&self) -> Option<u8> {
-            None
+        fn kind(&self) -> EventKind {
+            EventKind::Other
         }
-        fn absorb(&mut self, _: &Self) -> bool {
-            false
+        fn merge(&mut self, _: Self) {}
+    }
+
+    /// The shedding order and the coalescing rule, for every kind (the shell used to decide both).
+    #[test]
+    fn audits_and_capacity_shed_first_ports_next_and_only_audits_merge_within_their_bound() {
+        use EventKind::*;
+        let kinds = [Audit { records: 1 }, Capacity, EgressDenied, PortOpened, Other];
+        assert_eq!(kinds.map(shed_rank), [Some(0), Some(0), Some(1), Some(1), None]);
+        for last in kinds {
+            for next in kinds {
+                assert_eq!(absorbs(last, next), matches!((last, next), (Audit { .. }, Audit { .. })), "{last:?} then {next:?}");
+            }
+        }
+        let audit = |records| Audit { records };
+        assert!(absorbs(audit(MAX_AUDIT_RECORDS_PER_EVENT - 1), audit(1)), "exactly the bound merges");
+        assert!(!absorbs(audit(MAX_AUDIT_RECORDS_PER_EVENT), audit(1)));
+        assert!(!absorbs(audit(1), audit(usize::MAX)), "no overflow");
+    }
+
+    /// Only an unauthorized host or another protocol version (under either name) ends the
+    /// connection on an error; nestd cross-checks this against nest-protocol's code list.
+    #[test]
+    fn only_unauthorized_and_unsupported_version_are_fatal() {
+        for code in ["unauthorized", "unsupported_version", "unsupported_protocol_version"] {
+            assert!(error_is_fatal(code), "{code}");
+        }
+        for code in ["internal", "forbidden", "rate_limited", "invalid_message", "", "Unauthorized"] {
+            assert!(!error_is_fatal(code), "{code}");
         }
     }
 

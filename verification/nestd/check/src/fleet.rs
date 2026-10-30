@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use nestd_core::fleet::{Effect, FleetLink, Inbound, Input, Lease, Notice, Now, Outbound, OutboxEvent, Phase};
+use nestd_core::fleet::{Effect, EventKind, FleetLink, Inbound, Input, Lease, Notice, Now, Outbound, OutboxEvent, Phase};
 use nestd_core::results::ResultCache;
 use stateright::{Model, Property};
 
@@ -26,12 +26,10 @@ use stateright::{Model, Property};
 pub struct Ev(pub u8);
 
 impl OutboxEvent for Ev {
-    fn shed_rank(&self) -> Option<u8> {
-        None
+    fn kind(&self) -> EventKind {
+        EventKind::Other
     }
-    fn absorb(&mut self, _: &Self) -> bool {
-        false
-    }
+    fn merge(&mut self, _: Self) {}
 }
 
 /// Which FleetDO is modelled, and the bounds.
@@ -626,7 +624,7 @@ impl Model for FleetModel {
                     Down::Commands(q) => Input::Frame(Inbound::Commands { seq: q, commands: (q - 1) as u8 }),
                     Down::Ack(u) => Input::Frame(Inbound::Ack { up_to: u }),
                     Down::HeartbeatAck(ms) => Input::Frame(Inbound::HeartbeatAck { sent_ms: ms, revoked: None }),
-                    Down::Error => Input::Frame(Inbound::Error { fatal: false, retryable: true, error: () }),
+                    Down::Error => Input::Frame(Inbound::Error { code: "internal".into(), retryable: true, error: () }),
                     Down::Close => {
                         let w = s.wire(id)?;
                         w.host_reading = false;

@@ -17,8 +17,8 @@ use nest_protocol::control::{
     LeaseClaim, LeaseTiming, SandboxReport, TunnelState,
 };
 use nest_protocol::gateway::BindingKey;
-use nest_protocol::model::{ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Seq, TimestampMs, error_codes};
-use nestd_core::fleet::{self as core, Effect, FleetLink, Inbound, Input, Log, Notice, Now, Outbound};
+use nest_protocol::model::{ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Seq, TimestampMs};
+use nestd_core::fleet::{self as core, Effect, EventKind, FleetLink, Inbound, Input, Log, Notice, Now, Outbound};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -73,46 +73,43 @@ pub struct FleetParams {
     pub cgroup_delegation_error: Option<String>,
 }
 
-/// A host event as the core queues it (the core sheds and coalesces through [`core::OutboxEvent`]).
-#[derive(Clone, Debug)]
+/// A host event as the core queues it. The core decides what to shed and what to coalesce from its
+/// [`EventKind`]; this only reads the kind off the event and performs a merge the core asks for.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Ev(pub HostEvent);
 
-/// Audit records merged into one `egress_audit` event at most.
-const MAX_AUDIT_RECORDS_PER_EVENT: usize = 512;
-
 impl core::OutboxEvent for Ev {
-    /// Events that may be shed when the outbox overflows, in shedding order (lower first).
-    fn shed_rank(&self) -> Option<u8> {
+    fn kind(&self) -> EventKind {
         use nest_protocol::model::WorkstreamEventKind as K;
         match &self.0.body {
-            HostEventBody::EgressAudit { .. } | HostEventBody::Capacity { .. } => Some(0),
-            HostEventBody::Workstream { event } => matches!(event.kind, K::EgressDenied { .. } | K::PortOpened { .. }).then_some(1),
-            _ => None,
+            HostEventBody::EgressAudit { records } => EventKind::Audit { records: records.len() },
+            HostEventBody::Capacity { .. } => EventKind::Capacity,
+            HostEventBody::Workstream { event } => match event.kind {
+                K::EgressDenied { .. } => EventKind::EgressDenied,
+                K::PortOpened { .. } => EventKind::PortOpened,
+                _ => EventKind::Other,
+            },
+            _ => EventKind::Other,
         }
     }
 
-    fn absorb(&mut self, next: &Self) -> bool {
-        match (&mut self.0.body, &next.0.body) {
-            (HostEventBody::EgressAudit { records: last }, HostEventBody::EgressAudit { records })
-                if last.len() + records.len() <= MAX_AUDIT_RECORDS_PER_EVENT =>
-            {
-                last.extend(records.iter().cloned());
-                true
-            }
-            _ => false,
+    fn merge(&mut self, next: Self) {
+        if let (HostEventBody::EgressAudit { records: last }, HostEventBody::EgressAudit { records }) = (&mut self.0.body, next.0.body) {
+            last.extend(records);
         }
     }
 }
 
 /// Frames the core passes through to the host untouched.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Other {
     ProxyCa(CaCertificate),
     BindingKey(Vec<BindingKey>),
     Error(ErrorBody),
 }
 
-type CoreInput = Input<Ev, Vec<Command>, Vec<LeaseClaim>, Other>;
+/// The fleet core's input, as this shell instantiates it.
+pub type CoreInput = Input<Ev, Vec<Command>, Vec<LeaseClaim>, Other>;
 type CoreEffect = Effect<Ev, Vec<Command>, Vec<LeaseClaim>, Other>;
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -151,7 +148,13 @@ impl Shell {
                     Some(FleetInput::CaRenew { csr_pem }) => Input::CaRenew(csr_pem),
                     None => return,
                 },
-                m = recv(&mut self.ws) => self.decode(m),
+                m = recv(&mut self.ws) => {
+                    let i = decode(m);
+                    if matches!(i, Input::Closed) {
+                        self.ws = None; // transport state: the socket is done
+                    }
+                    i
+                }
                 _ = sleep_until(wake) => Input::Tick,
             };
             queue.push_back(next);
@@ -228,25 +231,6 @@ impl Shell {
         }
     }
 
-    /// What arrived on the WebSocket, as the core's input. The connection ends on a close, an
-    /// error, or the end of the stream.
-    fn decode(&mut self, m: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>) -> CoreInput {
-        let text = match &m {
-            Some(Ok(Message::Text(t))) => Some(t.as_str()),
-            Some(Ok(Message::Binary(b))) => std::str::from_utf8(b).ok(),
-            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => return Input::Noise { unparseable: None },
-            Some(Ok(Message::Close(_)) | Err(_)) | None => {
-                self.ws = None;
-                return Input::Closed;
-            }
-        };
-        match text.map(serde_json::from_str::<FleetToHost>) {
-            Some(Ok(f)) => Input::Frame(inbound(f)),
-            Some(Err(e)) => Input::Noise { unparseable: Some(e.to_string()) },
-            None => Input::Noise { unparseable: Some("binary frame is not UTF-8".into()) },
-        }
-    }
-
     fn notice(&self, n: Notice<Vec<Command>, Vec<LeaseClaim>, Other>) -> FleetNotice {
         match n {
             Notice::Connected { lease } => {
@@ -270,6 +254,23 @@ impl Shell {
     }
 }
 
+/// What arrived on the WebSocket (the next item of its stream), as the core's input: a pure decode,
+/// no I/O. The connection ends on a close, an error, or the end of the stream ([`Input::Closed`]).
+/// Public so the `fleet_to_host` fuzz target (`verification/nestd/fuzz/`) drives this very code.
+pub fn decode(m: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>) -> CoreInput {
+    let text = match &m {
+        Some(Ok(Message::Text(t))) => Some(t.as_str()),
+        Some(Ok(Message::Binary(b))) => std::str::from_utf8(b).ok(),
+        Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => return Input::Noise { unparseable: None },
+        Some(Ok(Message::Close(_)) | Err(_)) | None => return Input::Closed,
+    };
+    match text.map(serde_json::from_str::<FleetToHost>) {
+        Some(Ok(f)) => Input::Frame(inbound(f)),
+        Some(Err(e)) => Input::Noise { unparseable: Some(e.to_string()) },
+        None => Input::Noise { unparseable: Some("binary frame is not UTF-8".into()) },
+    }
+}
+
 /// A FleetDO frame in the core's vocabulary.
 fn inbound(f: FleetToHost) -> Inbound<Vec<Command>, Vec<LeaseClaim>, Other> {
     match f {
@@ -285,11 +286,7 @@ fn inbound(f: FleetToHost) -> Inbound<Vec<Command>, Vec<LeaseClaim>, Other> {
         FleetToHost::HostToken { token, expires_ms } => Inbound::HostToken { token, expires_ms },
         FleetToHost::BindingKey { keys } => Inbound::Other(Other::BindingKey(keys)),
         FleetToHost::ProxyCa(ca) => Inbound::Other(Other::ProxyCa(ca)),
-        FleetToHost::Error { error } => Inbound::Error {
-            fatal: error.code == error_codes::UNAUTHORIZED || error_codes::is_unsupported_version(&error.code),
-            retryable: error.retryable,
-            error: Other::Error(error),
-        },
+        FleetToHost::Error { error } => Inbound::Error { code: error.code.clone(), retryable: error.retryable, error: Other::Error(error) },
     }
 }
 
@@ -325,5 +322,115 @@ async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at.into()).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use nest_protocol::model::error_codes;
+    use nestd_core::fleet::{OutboxEvent, absorbs, error_is_fatal, shed_rank};
+
+    use super::*;
+
+    fn fixtures(dir: &str) -> Vec<(String, serde_json::Value)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/fixtures/control").join(dir);
+        let mut out: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn fixture(dir: &str, name: &str) -> serde_json::Value {
+        fixtures(dir).into_iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("{dir}/{name}")).1
+    }
+
+    fn event(v: serde_json::Value) -> Ev {
+        Ev(serde_json::from_value(v).expect("a host event"))
+    }
+
+    /// The core's fatal classification (it has no dependencies, so it mirrors the code names) agrees
+    /// with what this shell decided from nest-protocol's list before the decision moved: for every
+    /// code sent, plus the legacy name for another version.
+    #[test]
+    fn the_cores_fatal_codes_are_nest_protocols() {
+        for code in error_codes::ALL.iter().chain([&error_codes::LEGACY_UNSUPPORTED_VERSION]) {
+            let protocol = *code == error_codes::UNAUTHORIZED || error_codes::is_unsupported_version(code);
+            assert_eq!(error_is_fatal(code), protocol, "{code}");
+        }
+        assert_eq!(core::error_codes::UNAUTHORIZED, error_codes::UNAUTHORIZED);
+        assert_eq!(core::error_codes::UNSUPPORTED_VERSION, error_codes::UNSUPPORTED_VERSION);
+        assert_eq!(core::error_codes::LEGACY_UNSUPPORTED_VERSION, error_codes::LEGACY_UNSUPPORTED_VERSION);
+    }
+
+    /// Every host event fixture reads as the kind, and so sheds at the rank, this shell gave it
+    /// before the decision moved into the core: audits and capacity first, denied and opened ports
+    /// next, anything else never.
+    #[test]
+    fn every_host_event_reads_as_its_kind() {
+        let all = fixtures("host_event");
+        assert!(all.len() >= 10, "the fixtures are there");
+        for (name, v) in all {
+            let (kind, rank) = match name.as_str() {
+                "egress_audit" => (EventKind::Audit { records: 4 }, Some(0)),
+                "capacity" => (EventKind::Capacity, Some(0)),
+                "workstream" => (EventKind::PortOpened, Some(1)),
+                _ => (EventKind::Other, None),
+            };
+            let e = event(v);
+            assert_eq!((e.kind(), shed_rank(e.kind())), (kind, rank), "{name}");
+        }
+        let host_event = fixture("host_event", "workstream");
+        for (name, w) in fixtures("workstream_event") {
+            let mut v = host_event.clone();
+            v["event"] = w;
+            let (kind, rank) = match name.as_str() {
+                "egress_denied" => (EventKind::EgressDenied, Some(1)),
+                "port_opened" => (EventKind::PortOpened, Some(1)),
+                _ => (EventKind::Other, None),
+            };
+            let e = event(v);
+            assert_eq!((e.kind(), shed_rank(e.kind())), (kind, rank), "workstream {name}");
+        }
+    }
+
+    /// A merge the core asks for appends the next batch's records, in order.
+    #[test]
+    fn a_merge_appends_the_audit_records() {
+        let (mut a, b) = (event(fixture("host_event", "egress_audit")), event(fixture("host_event", "egress_audit")));
+        assert!(absorbs(a.kind(), b.kind()));
+        let HostEventBody::EgressAudit { records } = &b.0.body else { unreachable!() };
+        let want: Vec<_> = records.iter().chain(records).cloned().collect();
+        a.merge(b);
+        assert!(matches!(&a.0.body, HostEventBody::EgressAudit { records } if *records == want));
+    }
+
+    /// The decode the shell runs on each WebSocket item: frames (text or binary) become the core's
+    /// frames, error codes pass through for the core to judge, control messages are noise, and a
+    /// close, an error or the end of the stream ends the connection.
+    #[test]
+    fn websocket_items_decode_to_core_inputs() {
+        for (name, v) in fixtures("fleet_to_host") {
+            let text = v.to_string();
+            let from_text = decode(Some(Ok(Message::Text(text.clone().into()))));
+            assert!(matches!(from_text, Input::Frame(_)), "{name}: {from_text:?}");
+            assert_eq!(decode(Some(Ok(Message::Binary(text.into_bytes().into())))), from_text, "{name}");
+            if name == "error" {
+                let Input::Frame(Inbound::Error { code, error: Other::Error(e), .. }) = &from_text else { panic!("{from_text:?}") };
+                assert_eq!(*code, e.code);
+            }
+        }
+        let not_utf8 = decode(Some(Ok(Message::Binary(vec![0xff].into()))));
+        assert_eq!(not_utf8, Input::Noise { unparseable: Some("binary frame is not UTF-8".into()) });
+        assert!(matches!(decode(Some(Ok(Message::Text("{".into())))), Input::Noise { unparseable: Some(_) }));
+        assert_eq!(decode(Some(Ok(Message::Ping(vec![1].into())))), Input::Noise { unparseable: None });
+        assert_eq!(decode(Some(Ok(Message::Pong(vec![].into())))), Input::Noise { unparseable: None });
+        assert_eq!(decode(Some(Ok(Message::Close(None)))), Input::Closed);
+        assert_eq!(decode(Some(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed))), Input::Closed);
+        assert_eq!(decode(None), Input::Closed);
     }
 }
