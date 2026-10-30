@@ -21,19 +21,23 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
 | `tombstones` | The host's one map of fenced epochs, written by the host core's fence and consulted by the proxy and gateway links; pruned when a newer epoch runs here or the sandbox is destroyed |
 | `recovery` | Per-incarnation directories (`sandboxes/<id>/<epoch>/`) and their versioned `meta.json` (sandbox, epoch, head, whether the disk equals it, an unanswered commit request; written atomically), and the start-up scan of what a previous nestd left |
 | `cgroup` | The delegated unit cgroup (`<unit>/supervisor`, `<unit>/vms` for the jailer) and the start-up kill of leftover VMM cgroups |
-| `runner_link` | nestd ↔ agent runner, lifecycle only. Keeps the desired set of brains and re-issues `agent_start` on reconnect (the sandbox's id and epoch, never a socket path or a binding). Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
+| `runner_link` | nestd ↔ agent runner, lifecycle only. One brain table keyed by (agent, agent epoch); never replays a start: when the runner connection drops, each start sent on it is reported `agent_exited{crashed}` (or `fenced`) and AgentDO restarts it. Drops stale `agent_exited{fenced}` from an earlier connection. Socket access control, one runner at a time |
 | `gateway_link` | nestd ↔ sandbox gateway (`gateway.sock`). A mirror of the binding verification keys and, per sandbox, the epoch, the vsock socket, the attached clients and the guest's version; replayed in full on every (re)connection and closed with `resync_done`, then deltas on attach, detach, boot, resume, the guest's hello, fence and teardown. Ping every 5 s, a silent gateway is dropped after 15 s. Socket access control, one gateway at a time |
 | `guest` | Guest control connection (vsock 1024): hello (the guest's version and capabilities are kept and reported with `running`), configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
 | `vsock` | Hybrid-vsock `CONNECT` client and the unix-socket emulator (test transport) |
-| `driver` | `Driver`/`Vm`/`Pauser` traits; `supervise` forks every VM process from one long-lived thread with a death signal, records a pidfile, and kills leftovers at start; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (2M hugepages, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths |
+| `driver` | `Driver`/`Vm`/`Pauser` traits; `supervise` forks every VM process from one long-lived thread with a death signal, records a pidfile, and kills leftovers at start; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (regular pages unless `huge_pages` is set, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths |
 | `storage` | Content-addressed chunks and manifests. Hole-aware disk chunking (`SEEK_DATA`), `LocalFsStore` backend. On restore, chunk names and every chunk's and manifest's hash are verified |
+| `s3` | The cell's S3 store: SigV4 with the instance role, a capped write-through cache, parallel transfers, retries, multipart, and the 12 h reuse rule (`REUSE_MS`) |
+| `gc` | One object-store GC pass for FleetDO: mark from the roots it snapshots, sweep unmarked versions past the 24 h grace, fail closed |
+| `credentials` | What enrollment gave the host (host id, token, fleet URL, proxy intermediate, tunnel token), kept root-only so a restart reconnects without re-enrolling |
+| `cloudflared` | The host's Cloudflare Tunnel as nestd's child, and its `/ready` poll (`none`, `connecting`, `connected`) |
 
 ## Example config
 
 ```json
 {
   "role": "sandbox",
-  "cell": "aws-us-east-1",
+  "cell": "use1",
   "control_url": "https://nest.example.com",
   "enrollment": {"type": "aws_imds"},
   "driver": {"type": "process", "guest_command": ["/usr/lib/nest/nest-guest"]},
@@ -96,11 +100,11 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 
 - **ublk lazy disk and the copy-on-write epoch flip.** Checkpoints currently pause the VM while chunking.
 - **UFFD memory restore.** Restores from `checkpoint` generations cold-boot from the disk.
-- **Garbage collection** of the object store, and the 12 h chunk-reuse rule it depends on. (Built: the S3 `ObjectStore` with parallel transfers, retries, multipart and a capped cache; spot notices from IMDS; resuming with saved host credentials after a restart.)
+- **S3 Inventory** for the GC sweep (it lists object versions), and generation retention (every generation is a GC root).
 - **Gateway features** beyond hands (`docs/sandbox/gateway/`): `port_expose` is recorded only; nothing on the host uses ingress port 10000 yet: no terminal attach, no `nest port-forward`. (Built: the gateway and `gateway.sock`, and cloudflared as nestd's child when configured, with its `/ready` polled so the fleet hello and `tunnel_state` events say whether the tunnel is `none`, `connecting` or `connected`.)
 - **Live forks.** They're disk-only.
 - **Firecracker** runs on EC2 sandbox hosts with nested virtualization and is verified there end to end ([driver](../../docs/sandbox/drivers/firecracker/)); this dev environment has no `/dev/kvm`, so locally the driver is unit-tested only.
-- **Jailer path untested against a real jailer.** The chroot hard-links require the disk and kernel on the same filesystem as the chroot base.
+- **The jailer's chroot hard-links** require the disk and kernel on the same filesystem as the chroot base.
 - **`WatchdogSec`** on nestd, and **per-agent `DynamicUser` ownership** of config dirs. The delegated cgroup and the start-up VMM kill are built but unverified on a real host.
 - **`capacity.warm`**, `drain` ending with nestd exiting, and the control `health` probe to the guest.
 - **Remaining review items:**

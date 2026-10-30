@@ -12,7 +12,7 @@ What makes this repo safe for agents to change and to review. The checks are the
   - TLS interception;
   - metrics writes.
 - **Fence lists only shrink:** an allow entry whose files no longer match is stale and fails.
-- **Every guard can fail.** Each fence carries an example line, which `scripts/tests/` plants outside the allowed files and expects to be rejected. The doc-link checker gets the same treatment. A guard that only ever passes can't be told apart from one that never looks.
+- **Every guard can fail.** Each fence carries an example line, which `scripts/tests/` plants outside the allowed files and expects to be rejected. The doc-link, core-manifest and workflow checkers get the same treatment. A guard that only ever passes can't be told apart from one that never looks.
 - **Loosening a guard is invisible to the guard,** so `scripts/` is in `CODEOWNERS`.
 
 ## Tests
@@ -34,9 +34,9 @@ What each kind of run can prove (the `nest-validation` skill). Claims in PRs and
 | Tier | Proves | Doesn't prove |
 |---|---|---|
 | Unit and integration tests | Logic; wire formats against `protocol/fixtures/` | Real processes, namespaces or VMs |
-| `e2e/run.sh` (process driver) | The real components together on one machine: hands through the gateway's WebSocket-to-vsock path (emulated vsock), bindings minted by the control plane and refused when tampered or fenced, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code, the tunnel and Cloudflare Access (nothing leaves the machine), a brain and a sandbox on different hosts |
+| `e2e/run.sh` (process driver) | The real components together on one machine, as a sandbox host and a brain host: hands through the gateway's WebSocket-to-vsock path (emulated vsock), bindings minted by the control plane and refused when tampered or fenced, netns egress, injection, fencing | Firecracker, real vsock, snapshots, real Claude Code, the tunnel and Cloudflare Access (nothing leaves the machine), the two hosts on different machines |
 | `e2e/claude-verify`, `NEST_E2E_CLAUDE=real` | Real Claude Code's behaviour under nest's flags | Firecracker, scale |
-| The [first spike](../docs/README.md#first-spike) on AWS | Firecracker, snapshots and restore, fencing under partition, the seam (a brain on a cell host reaching its own sandbox out through Cloudflare's edge and Access and back down the tunnel into the gateway, shown by the runner's `wss://` target and the gateway logging each call `bound … via=edge`) | — |
+| The [first spike](../docs/README.md#first-spike) and cloud checks on AWS | Firecracker, restore, fencing under partition, the seam (a brain on one host reaching a sandbox on another through Cloudflare's edge and Access and down the tunnel into the gateway, shown by the runner's `wss://` target and the gateway logging each call `bound … via=edge`), brain hosts and autoscaling | Only what a run exercised: name the run and its date |
 
 ## Review
 

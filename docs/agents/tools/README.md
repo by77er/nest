@@ -13,6 +13,8 @@
 | **Brokered actions** | `github.create_pr`, `github.review_check`, `github.review_comment`, `github.comment`, `github.create_issue`, `github.dispatch_workflow`, `github.create_webhook`, `email.send`, `http.request(profile)` | Control plane, with secrets that never reach a sandbox |
 | **Metrics** | `metrics_query` (see [metrics](../../control-plane/metrics/)) | Control plane → Analytics Engine |
 
+**Built:** the table is the design. The registry (`protocol/schemas/control/platform-tools.json`) holds interim tools that predate channels and grants: `notify`, `ask`, `emit`, `read_transcript` and `expose_port` work; `fork_sandbox`, `spawn_agent`, `attach`, `checkpoint`, `brokered` and the seeded `management` and `memory` capabilities' tools answer `not_implemented`. Hands are built ([hands](../hands/)).
+
 **Messaging and memory are channel operations.** Messaging an agent is `message` (a `post` to its inbox, through the [messaging capability](../capabilities/#messaging)); notifying me is `post` to `user`. An event is a `post` with a `kind`. Asking is `post` with `await_reply_s`. Waiting for events is `subscribe`, or `read` with a wait. Memory is a private channel read by key.
 
 ## Grants

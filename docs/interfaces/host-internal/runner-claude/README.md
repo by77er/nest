@@ -9,13 +9,13 @@ Unmodified Claude Code, documented flags only. Reference artifacts in `protocol/
 
 ```bash
 cd /var/lib/nest/empty && exec claude -p --input-format stream-json --output-format stream-json --verbose \
-  --restricted --tools "<launch.builtin_tools, comma-joined; empty for captains>" \
+  --restricted --tools "<launch.builtin_tools, comma-joined; empty in the captain template>" \
   --strict-mcp-config --mcp-config <config_dir>/nest-mcp.json \
   --permission-mode dontAsk --permission-prompts none \
   --allowedTools "mcp__nest__*,<builtin_tools…>" \
   --disable-slash-commands \
-  --append-system-prompt-file <config_dir>/nest-system-prompt.md   # workers (launch.system_prompt.mode=append)
-  # --system-prompt-file <config_dir>/nest-system-prompt.md        # captains (mode=replace)
+  --append-system-prompt-file <config_dir>/nest-system-prompt.md   # launch.system_prompt.mode=append (the worker template)
+  # --system-prompt-file <config_dir>/nest-system-prompt.md        # mode=replace (the captain template)
   [--model <m>] [--effort <e>] \
   (--session-id <uuid> | --resume <transcript path> [--fork-session])
 ```

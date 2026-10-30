@@ -15,7 +15,7 @@ If your default elan toolchain differs and you run lake from outside this direct
 
 ## Theorems
 
-`Nest/CommitChain.lean` models `SandboxDO.commit` (`control-plane/src/do/sandbox.ts:552-613`) plus an arbitrary placement step. For every reachable state:
+`Nest/CommitChain.lean` models `SandboxDO.commit` (`control-plane/src/do/sandbox.ts:552-613` at `edf6829`) plus an arbitrary placement step. For every reachable state:
 
 | Theorem | Says |
 |---|---|

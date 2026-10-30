@@ -1,21 +1,21 @@
 # API and surfaces
 
-- **Worker HTTP API and a static dashboard,** with my access gated by Cloudflare Access.
+- **Worker HTTP API,** authenticated by [operator tokens](#operator-tokens). The read-only [dashboard](../dashboard/) is a Worker of its own behind Cloudflare Access.
 - **External events:** webhooks at `POST /v1/hooks/<hk_…>` and Email Routing to an Email Worker, both turned into channel posts (see [sources](../../channels/sources/)). Agents schedule their own wakes with `wake_at`.
 - **Live views:** live tails and agents' waiting `read`s follow channels (ChannelDO), including each agent's and sandbox's `events`.
-- **Approvals and escalations** go through the **[Discord bot](discord/)**, and can also be answered in the dashboard.
-- **`nest` CLI on my machine:** `login` (the Access service token, and a binding per sandbox from SandboxDO's `attach`), `attach` (a terminal: a WebSocket to the sandbox host's [gateway](../../sandbox/gateway/), then vsock), `logs -f`, `port-forward` (TCP over the same path), `diff <a> <b>`. The CLI reaches a sandbox the way a brain does, by hostname and binding.
+- **Approvals and escalations** go through the **[Discord bot](discord/)**.
+- **`nest` CLI on my machine:** `login` (the Access service token, and a binding per sandbox from SandboxDO's `resolve`), `attach` (a terminal: a WebSocket to the sandbox host's [gateway](../../sandbox/gateway/), then vsock), `logs -f`, `port-forward` (TCP over the same path), `diff <a> <b>`. The CLI reaches a sandbox the way a brain does, by hostname and binding. Not built: these commands (the CLI has only `hook`, `mcp` and the in-sandbox commands).
 - **Host authentication:**
   - A signed instance identity document (or a one-time enrollment token) is exchanged for a rotating host token. See [../../compute/provisioning/](../../compute/provisioning/).
   - The fleet channel accepts a token up to 24 h past expiry, so a reconnecting host can get a fresh one. The session channel accepts no grace period.
 - **Operator API:** endpoints are listed in `control-plane/README.md`.
   - **Includes:** egress policy layers (`PUT /v1/sandboxes/<id>/policy`), ports and public share links (operator-only), paged transcripts, a sandbox's hands target for a person or a harness (`POST /v1/sandboxes/<id>/resolve`), starting a brain on a named host (`POST /v1/agents/<id>/start {host}`), and the Access service token for the gateways (`PUT /v1/admin/secrets/access:gateway`).
   - **Cells:** must be well-formed names, and must be in `CELLS` when that's set.
-  - **Workers:** `POST /v1/agents` takes a worker's workstream and cell from its sandbox; both are optional, and a value that differs from the sandbox's is refused (409).
+  - **Agents:** `POST /v1/agents` takes an agent's workstream and cell from its sandbox when it has one; both are optional, and a value that differs from the sandbox's is refused (409).
 
 ## Operator tokens
 
-The operator API takes scoped bearer tokens; Cloudflare Access fronts the dashboard once there's a domain. Built: one `ADMIN_TOKEN` with every scope.
+The operator API takes scoped bearer tokens. Built: one `ADMIN_TOKEN` with every scope; the scopes, hashing and the revocation counter below aren't built.
 
 | Scope | Allows |
 |---|---|

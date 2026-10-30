@@ -9,7 +9,7 @@ turn for agent A → AgentDO: no brain running → agent_start on a brain host w
   paused on H           → unpause on H (milliseconds)
   suspended on H        → resume on H (memory or disk-only)
   unplaced (archived)   → claim (new epoch) → FleetDO places it (memory only on a host that loads its restore ABI) → restore from S3
-  no capacity           → stays unplaced; its alarm claims again every 30 s (the autoscaler that would launch a host isn't built)
+  no capacity           → stays unplaced while FleetDO launches a sandbox host; its alarm claims again every 30 s
 ```
 
 **External events:** a webhook posts to a channel, and a subscriber's wake starts its brain, which resumes its sandbox if it has one. Nothing runs between events. See [sources](../../channels/sources/).

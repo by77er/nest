@@ -1,6 +1,6 @@
 # GitHub
 
-How nest's agents reach this repo, and the repo settings that bound what they can merge. **Decided:** a GitHub App from the start, with tokens minted by [BrokerDO](../docs/control-plane/durable-objects/broker/); low-risk changes auto-merge, and `CODEOWNERS` paths need me. Built: `CODEOWNERS` only.
+How nest's agents reach this repo, and the repo settings that bound what they can merge. **Decided:** a GitHub App from the start, with tokens minted by [BrokerDO](../docs/control-plane/durable-objects/broker/); low-risk changes auto-merge, and `CODEOWNERS` paths need me. Built: `CODEOWNERS`, the repo settings and branch protection below (with `ci-ok` the only required check until the reviewer exists), the `production` environment, and the App, installed on `by77er/nest`. Not built: BrokerDO's token minting (`GitHubAppMinter` throws `not_implemented`) and so the bindings and the webhook.
 
 ## The App
 
@@ -37,7 +37,7 @@ One App, owned by me and installed only on `by77er/nest`.
 | Branch protection on `main` | Require a pull request, 0 approvals, review from Code Owners. Required checks: `ci-ok` (from GitHub Actions; it aggregates every CI job) and `nest/review` (pinned to the App as its source, so a same-named check from anything else doesn't count). Not "up to date before merging": PR CI already runs on the merge with `main`, and deploys wait for CI on `main`. No force pushes or deletions. Administrators (me) may bypass |
 | Merging | Allow auto-merge; squash only; delete head branches |
 | Actions | Workflow permissions read-only; Actions may not create or approve pull requests |
-| Environment `production` | Deployment branches: `main` only. Secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ANALYTICS_TOKEN`, `CLOUDFLARE_TUNNEL_API_TOKEN` (the Worker secret the deploy writes; [setup](../docs/setup/)), `NEST_ADMIN_TOKEN` (the dashboard Worker's secret, written by `deploy-dashboard.yml`) |
+| Environment `production` | Deployment branches: `main` only. Secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ANALYTICS_TOKEN`, `CLOUDFLARE_TUNNEL_API_TOKEN` (the Worker secret the deploy writes; [setup](../docs/setup/)), `CLOUDFLARE_ACCESS_API_TOKEN` (the `edge` stack's apply), `NEST_ADMIN_TOKEN` (the dashboard Worker's secret, written by `deploy-dashboard.yml`) |
 
 - **A branch's workflow can't reach deploy secrets.** Same-repo PRs run their own workflow files, but the environment refuses any ref but `main`, and CI itself holds no secrets.
 - **Workflow tokens can't fake the review:** a `GITHUB_TOKEN` check comes from GitHub Actions, not the App, so it fails the source pin.

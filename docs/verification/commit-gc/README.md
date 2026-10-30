@@ -2,6 +2,8 @@
 
 Inventory for modelling: the generation chain in SandboxDO, FleetDO's GC registry and runs, and nestd's chunk upload and mark/sweep. Code is cited at main `edf6829`; design at [sandbox/state](../../sandbox/state/README.md) and [object-store](../../sandbox/state/object-store/README.md).
 
+> **Since** (checked on `main` at b63c0a3): the retention branch in the table below merged as #32. The GC-root registry is written at `create`, a destroyed sandbox is never re-registered, salvage is authorized against SandboxDO's full `epochs` table, and commit records are pruned by age unless their generation is still in the chain. B1 and B2 are still open.
+
 ## Scope and actors
 
 | Actor | State (exact) | Code |

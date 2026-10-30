@@ -10,7 +10,7 @@ How any client of a sandbox (the agent runner's hands client today; AgentDO's `a
 
 | Route | Guest port | Carries | Status |
 |---|---|---|---|
-| `/hands` | 1025 | `HandsRequest` → `started`, `heartbeat`, `result` \| `error`; or a read-only `call_status` | Built |
+| `/hands` | 1025 | `HandsRequest` → `started`, `heartbeat`, `result` \| `error`; or a read-only `call_status` | Built (`call_status` and `heartbeat` wait for guest protocol v2) |
 | `/pty` | 10000 | `{"mode":"pty"}` or `pty_attach`, then framed PTY bytes | 501 |
 | `/ingress/<port>` | 10000 | `{"mode":"tcp","port"}`, then raw bytes | 501 |
 
