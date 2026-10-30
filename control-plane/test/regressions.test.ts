@@ -812,7 +812,46 @@ async function until(what: string, pred: () => boolean, ms = 3000) {
   }
 }
 
+async function untilAsync(what: string, pred: () => Promise<boolean>, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!(await pred())) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(5);
+  }
+}
+
+/** Inbound items (hellos, event batches) submitted for `host` and not finished, the running one included. */
+const inboundPending = (cell: string, host: string) => runInDurableObject(fleetStub(cell), (inst: FleetDO) =>
+  (inst as unknown as { inbound: Map<string, { pending: number }> }).inbound.get(host)?.pending ?? 0);
+
+const fleetRows = <T,>(cell: string, q: string, ...args: SqlStorageValue[]) =>
+  runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => st.storage.sql.exec(q, ...args).toArray() as T[]);
+
 const fence = (reason: string) => ({ type: "fence" as const, sandboxes: [], reason });
+
+/**
+ * The seqs of the `commands` frames carrying `cmds`, in the order they reached the host, and any
+ * repeat of one of them that follows within 150 ms (a batch sent twice on one connection).
+ */
+async function wireOrder(ws: Ws, cmds: string[]): Promise<number[]> {
+  const want = new Set(cmds);
+  const carries = (f: Record<string, any>) => (f.commands as { cmd: string }[]).some((c) => cmds.includes(c.cmd));
+  const seqs: number[] = [];
+  while (want.size) {
+    const m = await ws.next("commands", (f) => (f.commands as { cmd: string }[]).some((c) => want.has(c.cmd)));
+    for (const c of m.commands as { cmd: string }[]) want.delete(c.cmd);
+    seqs.push(m.seq as number);
+  }
+  for (;;) {
+    try {
+      seqs.push((await ws.next("commands", carries, 150)).seq as number);
+    } catch {
+      return seqs;
+    }
+  }
+}
+
+const increasing = (seqs: number[]) => seqs.every((s, i) => i === 0 || s > seqs[i - 1]!);
 
 describe("#28 command delivery across nestd reconnects", () => {
   it("a command issued to a new nestd process during its hello is not failed with the old process's", async () => {
@@ -957,8 +996,9 @@ describe("#28 command delivery across nestd reconnects", () => {
     // is still the helloed one, and queues behind it.
     const fresh = await Ws.connect("/v1/fleet", h.host_token);
     fresh.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
-    await sleep(50); // the frames come over different sockets: let the hello be queued first
+    await untilAsync("the new hello to wait in the queue", async () => (await inboundPending(cell, h.host)) === 2);
     sendEvents(old, [], 1);
+    await untilAsync("the old batch to wait behind it", async () => (await inboundPending(cell, h.host)) === 3);
     keys.released = true;
     await fresh.next("hello_ack");
 
@@ -968,5 +1008,126 @@ describe("#28 command delivery across nestd reconnects", () => {
     sendEvents(fresh, [{ ts_ms: Date.now(), type: "command_result", cmd, outcome: { status: "ok" } }], 1);
     await fresh.next("ack", (m) => m.up_to === 1);
     expect(await fleetStub(cell).commandResult(cmd!)).toEqual({ status: "ok" });
+  });
+});
+
+/** A batch whose one secret reference FleetDO must resolve in BrokerDO before sending it. */
+const secretBatch = () => ({
+  type: "secrets_update" as const, sandbox: "sbx_nope0000000000000000000000", epoch: 1,
+  secrets: [{ binding: "github", value: "$nest-secret:inject:github" }],
+});
+
+describe("#29 command batches go on the wire in seq order", () => {
+  it("a batch issued while a hello awaits BrokerDO goes out after the hello's resend of a lower one", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    await fleetStub(cell).issueCommands(h.host, [fence("a")]);
+    const last = (await h.ws.next("commands")).seq as number;
+    h.ws.close();
+    await until("FleetDO to see the close", () => h.ws.closed !== null);
+    const [resent] = await fleetStub(cell).issueCommands(h.host, [fence("b")]); // unacked while offline
+
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    const ws2 = await Ws.connect("/v1/fleet", h.host_token);
+    ws2.send(hostHello(h.host, cell, { last_command_seq: last }));
+    await ws2.next("hello_ack");
+    await until("onHello to await BrokerDO", () => keys.entered);
+    const [fresh] = await fleetStub(cell).issueCommands(h.host, [fence("c")]);
+    keys.released = true;
+    expect(await wireOrder(ws2, [resent!, fresh!])).toEqual([last + 1, last + 2]);
+  });
+
+  it("a plain batch doesn't overtake a lower one awaiting BrokerDO for its secrets, and neither goes out twice", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const refs = gate();
+    await hookBroker(cell, { resolveRefs: refs.hook });
+    const secret = fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+    await until("the secret batch to await BrokerDO", () => refs.entered);
+    const plain = fleetStub(cell).issueCommands(h.host, [fence("plain")]);
+    await untilAsync("the plain batch to be stored", async () =>
+      (await fleetRows(cell, "SELECT 1 FROM commands WHERE host = ? AND type = 'fence'", h.host)).length === 1);
+    refs.released = true;
+    const [[s], [p]] = await Promise.all([secret, plain]);
+    expect(increasing(await wireOrder(h.ws, [s!, p!]))).toBe(true);
+  });
+
+  it("two agent_starts go out in seq order, once each, when their secrets resolve in reverse", async () => {
+    const s = await setup({ start: false });
+    const second = await adminJson("/v1/agents", { body: { role: "worker", workstream: s.workstream, sandbox: s.sandbox, cell: s.cell, start: false } }, 201);
+    const first = gate();
+    let calls = 0;
+    await hookBroker(s.cell, { resolveRefs: async () => {
+      if (calls++ === 0) await first.hook(); // the first start's secrets resolve last
+    } });
+    const a = agentStub(s.agent).start();
+    await until("the first start to await BrokerDO", () => first.entered);
+    const b = agentStub(second.agent).start();
+    await untilAsync("the second start to be stored", async () =>
+      (await fleetRows(s.cell, "SELECT 1 FROM commands WHERE agent = ? AND type = 'agent_start'", second.agent)).length === 1);
+    first.released = true;
+    const [{ cmd: ca }, { cmd: cb }] = await Promise.all([a, b]);
+    expect(increasing(await wireOrder(s.host.ws, [ca!, cb!]))).toBe(true);
+  });
+
+  it("a BrokerDO failure sends nothing of the run, not even its plain batches, and closes", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    await fleetStub(cell).issueCommands(h.host, [fence("a")]);
+    const last = (await h.ws.next("commands")).seq as number;
+    h.ws.close();
+    await until("FleetDO to see the close", () => h.ws.closed !== null);
+    await fleetStub(cell).issueCommands(h.host, [fence("plain")]);
+    await fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+
+    await hookBroker(cell, { resolveRefs: async () => { throw new Error("BrokerDO unavailable"); } });
+    const ws2 = await Ws.connect("/v1/fleet", h.host_token);
+    ws2.send(hostHello(h.host, cell, { last_command_seq: last }));
+    await ws2.next("hello_ack");
+    expect((await ws2.next("error")).error).toMatchObject({ code: "internal", retryable: true });
+    await until("the socket to close", () => ws2.closed !== null);
+    expect(ws2.closed?.code).toBe(4503);
+    expect(ws2.received.filter((m) => m.type === "commands")).toEqual([]);
+  });
+});
+
+/** Hold a new nestd process's hello on BrokerDO, then restart FleetDO: after the reset, before anything else. */
+async function restartMidHello(cell: string, host: string, token: string, instance: string) {
+  const keys = gate();
+  await hookBroker(cell, { bindingPublicKeys: keys.hook });
+  const ws = await Ws.connect("/v1/fleet", token);
+  ws.send(hostHello(host, cell, { instance_id: instance }));
+  await ws.next("hello_ack");
+  await until("onHello to await BrokerDO", () => keys.entered);
+  await runInDurableObject(fleetStub(cell), (_i, st) => st.abort("restart mid-hello")).catch(() => undefined);
+  keys.released = true;
+}
+
+describe("#30 a nestd restart's capture outlives a FleetDO restart, not its host", () => {
+  it("leases the old process held and the new one doesn't report are dropped by the next hello", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: await workstream(), cell } }, 201);
+    const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
+    await okResult(h.ws, create.cmd);
+    await restartMidHello(cell, h.host, h.host_token, "nestdtest0000002");
+
+    const ws = await Ws.connect("/v1/fleet", h.host_token);
+    ws.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    // Placed again under a new epoch (here: the one host there is).
+    const [again] = await nextCommands(ws, (c) => c.type === "sandbox_create");
+    expect(again).toMatchObject({ sandbox: sbx.sandbox, epoch: 2 });
+  });
+
+  it("is deleted when the host dies", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    await fleetStub(cell).issueCommands(h.host, [fence("old")]);
+    await restartMidHello(cell, h.host, h.host_token, "nestdtest0000002");
+    const key = `orphaned_commands:${h.host}`;
+    expect(await fleetRows(cell, "SELECT 1 FROM kv WHERE key = ?", key)).toHaveLength(1);
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    expect(await fleetRows(cell, "SELECT 1 FROM kv WHERE key = ?", key)).toHaveLength(0);
   });
 });

@@ -97,14 +97,23 @@ export class ReliableChannels {
 
 /**
  * Runs async work one item at a time, in submission order, within one Durable Object instance.
- * Inbound reliable messages go through it so a batch never overtakes an earlier one that is still
- * awaiting other Durable Objects (the input gate opens across those awaits).
+ * Reliable messages go through it, inbound and outbound, so one never overtakes an earlier one that
+ * is still awaiting other Durable Objects (the input gate opens across those awaits).
  */
 export class SerialQueue {
   private tail: Promise<unknown> = Promise.resolve();
+  private count = 0;
+
+  /** Items submitted and not yet finished (the running one included). */
+  get pending(): number {
+    return this.count;
+  }
 
   run<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(fn, fn);
+    this.count++;
+    const next = this.tail.then(fn, fn).finally(() => {
+      this.count--;
+    });
     this.tail = next.catch(() => undefined);
     return next;
   }

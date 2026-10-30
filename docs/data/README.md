@@ -41,7 +41,7 @@ Every DO table that would otherwise only grow has one retention rule, a named co
 | SandboxDO | `grants` | Until each expires (the `grants` deadline deletes it). | Bounded by live grants. |
 | SandboxDO | `generations` | All of them: generation retention isn't built. | Every generation is a GC root. |
 
-FleetDO prunes at most once an hour, from any alarm: the tick while a host is live, the daily tunnel sweep, and its own daily `prune` deadline (armed on every start, so a quiet cell without tunnels still prunes). A dead host left at `lost` = 0 (an idle or drained retirement whose termination EC2 never confirmed, e.g. a cell without EC2 access) is never pruned, nor are the commands FleetDO answered for it: its death isn't proof (A6), and AgentDO reads a missing kill command as processed. Generations themselves (and so GC roots) aren't thinned yet: generation retention isn't built ([state](../sandbox/state/#retention)).
+FleetDO prunes at most once an hour, from any alarm: the tick while a host is live, the daily tunnel sweep, and its own daily `prune` deadline (armed on every start, so a quiet cell without tunnels still prunes). A dead host left at `lost` = 0 (an idle or drained retirement whose termination EC2 never confirmed, e.g. a cell without EC2 access) is never pruned, nor are the kill commands FleetDO answered for a host at `lost` = 0 (dead or alive): its death isn't proof (A6), and AgentDO reads a missing kill command as processed. FleetDO's other answers go after their retention. Generations themselves (and so GC roots) aren't thinned yet: generation retention isn't built ([state](../sandbox/state/#retention)).
 
 ## Enums
 
