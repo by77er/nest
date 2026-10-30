@@ -16,18 +16,24 @@ import { asNestError, NestError, newId } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
 
 /** A task as the API and the tools show it: with its key and its parent's. */
-export type TaskView = Task & { key: string; parent_key: string | null };
-export type CommentView = { id: number; author: string; body: string; ms: number };
+export type TaskView = Task & { key: string; parent_key: string | null; tainted: boolean };
+export type CommentView = { id: number; author: string; body: string; ms: number; tainted: boolean };
 export type HistoryView = Omit<HistoryEntry, "task">;
+/**
+ * Every result carries `tainted`: whether it holds text a tainted session wrote. The caller (AgentDO)
+ * taints the reading session when it is true.
+ */
 export interface ApplyOutcome {
   task: TaskView | null;
   comment?: CommentView;
   watcher?: string | null;
+  tainted: boolean;
 }
 export interface TaskPage {
   tasks: TaskView[];
   /** Pass as `cursor` for the next page; null on the last. */
   next_cursor: number | null;
+  tainted: boolean;
 }
 export interface TaskDetail {
   task: TaskView;
@@ -36,6 +42,7 @@ export interface TaskDetail {
   comment_count: number;
   /** The latest changes, oldest first. */
   history: HistoryView[];
+  tainted: boolean;
 }
 export interface LedgerInfo {
   ledger: string;
@@ -115,7 +122,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
     this.sql.exec("CREATE INDEX IF NOT EXISTS tasks_assignee ON tasks (assignee, number)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS tasks_parent ON tasks (parent, number)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, author TEXT NOT NULL,
-      body TEXT NOT NULL, ms INTEGER NOT NULL)`);
+      body TEXT NOT NULL, ms INTEGER NOT NULL, tainted INTEGER NOT NULL DEFAULT 0)`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS comments_task ON comments (task, id)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, actor TEXT NOT NULL,
       field TEXT NOT NULL, from_v TEXT NOT NULL, to_v TEXT NOT NULL, ms INTEGER NOT NULL)`);
@@ -178,7 +185,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
 
   private view(t: Task): TaskView {
     const parent = t.parent === null ? undefined : this.task(t.parent);
-    return { ...t, key: taskKey(t), parent_key: parent ? taskKey(parent) : null };
+    return { ...t, key: taskKey(t), parent_key: parent ? taskKey(parent) : null, tainted: t.tainted === true };
   }
 
   /** Persist what the core decided: all of it, synchronously. Returns the comment's id. */
@@ -203,8 +210,8 @@ export class TaskLedgerDO extends DurableObject<Env> {
     }
     let comment: number | undefined;
     if (a.comment) {
-      comment = this.sql.exec<{ id: number }>("INSERT INTO comments (task, author, body, ms) VALUES (?, ?, ?, ?) RETURNING id",
-        a.comment.task, a.comment.author, a.comment.body, a.comment.ms).one().id;
+      comment = this.sql.exec<{ id: number }>("INSERT INTO comments (task, author, body, ms, tainted) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        a.comment.task, a.comment.author, a.comment.body, a.comment.ms, a.comment.tainted ? 1 : 0).one().id;
     }
     if (a.watcher !== undefined) this.setKv("watcher", a.watcher);
     for (const n of a.notices) this.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES (?, ?, ?)", n.channel, JSON.stringify(n.post), now);
@@ -243,10 +250,14 @@ export class TaskLedgerDO extends DurableObject<Env> {
     // From here to the alarm call: one synchronous step.
     this.checkName(name, true);
     const commentId = this.persist(r.value, now);
+    const task = r.value.task && this.view(r.value.put ?? r.value.task);
+    const c = r.value.comment;
     const outcome: ApplyOutcome = {
-      task: r.value.task && this.view(r.value.put ?? r.value.task),
-      ...(r.value.comment && commentId !== undefined ? { comment: { id: commentId, author: r.value.comment.author, body: r.value.comment.body, ms: r.value.comment.ms } } : {}),
+      task,
+      ...(c && commentId !== undefined ? { comment: { id: commentId, author: c.author, body: c.body, ms: c.ms, tainted: c.tainted } } : {}),
       ...(r.value.watcher !== undefined ? { watcher: r.value.watcher } : {}),
+      // The task comes back whole (others' text too); a comment is the caller's own.
+      tainted: task?.tainted === true,
     };
     if (key) this.sql.exec("INSERT INTO applied (key, outcome, ts_ms) VALUES (?, ?, ?)", key, JSON.stringify(outcome), now);
     await this.arm();
@@ -266,7 +277,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
 
   /** Tasks matching `filter` (the same rule as the core's `matches`), by key, after `cursor`. */
   async list(name: string, actor: Actor, filter: TaskFilter, cursor = 0, limit = LIST_DEFAULT_LIMIT): Promise<TaskPage> {
-    if (!this.read(name, actor)) return { tasks: [], next_cursor: null };
+    if (!this.read(name, actor)) return { tasks: [], next_cursor: null, tainted: false };
     const n = Math.min(Math.max(1, Math.floor(limit)), LIST_MAX_LIMIT);
     const where = ["number > ?"];
     const args: (string | number)[] = [Math.max(0, Math.floor(cursor))];
@@ -295,19 +306,22 @@ export class TaskLedgerDO extends DurableObject<Env> {
     }
     const rows = this.sql.exec<{ body: string }>(`SELECT body FROM tasks WHERE ${where.join(" AND ")} ORDER BY number LIMIT ?`, ...args, n + 1).toArray();
     const tasks = rows.slice(0, n).map((r) => this.view(this.parseTask(r.body)));
-    return { tasks, next_cursor: rows.length > n ? tasks[tasks.length - 1]!.number : null };
+    return { tasks, next_cursor: rows.length > n ? tasks[tasks.length - 1]!.number : null, tainted: tasks.some((t) => t.tainted) };
   }
 
   async get(name: string, actor: Actor, ref: string): Promise<TaskDetail> {
     const t = this.read(name, actor) ? this.task(ref) : undefined;
     if (!t) throw new NestError(ErrorCodes.NOT_FOUND, `no task ${ref} in ledger ${name}`, 404);
-    const comments = this.sql.exec<CommentView>("SELECT id, author, body, ms FROM comments WHERE task = ? ORDER BY id DESC LIMIT ?", t.id, GET_COMMENTS)
-      .toArray().reverse();
+    const comments = this.sql.exec<Omit<CommentView, "tainted"> & { tainted: number }>(
+      "SELECT id, author, body, ms, tainted FROM comments WHERE task = ? ORDER BY id DESC LIMIT ?", t.id, GET_COMMENTS)
+      .toArray().reverse().map((c) => ({ ...c, tainted: c.tainted === 1 }));
     const history = this.sql.exec<{ actor: string; field: HistoryEntry["field"]; from_v: string; to_v: string; ms: number }>(
       "SELECT actor, field, from_v, to_v, ms FROM history WHERE task = ? ORDER BY id DESC LIMIT ?", t.id, GET_HISTORY).toArray().reverse()
       .map((h) => ({ actor: h.actor, field: h.field, from: JSON.parse(h.from_v) as HistoryValue, to: JSON.parse(h.to_v) as HistoryValue, ms: h.ms }));
     const comment_count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM comments WHERE task = ?", t.id).one().n;
-    return { task: this.view(t), comments, comment_count, history };
+    const task = this.view(t);
+    // History holds old text too, but a tainted text write made the task tainted for good.
+    return { task, comments, comment_count, history, tainted: task.tainted || comments.some((c) => c.tainted) };
   }
 
   /** Deliver due notices (each deleted only once its channel took it, or never can), and prune daily. */

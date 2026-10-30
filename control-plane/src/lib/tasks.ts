@@ -94,6 +94,12 @@ export interface Task {
   updated_ms: number;
   /** Bumped by every change; a write may name the version it read (`expected_version`). */
   version: number;
+  /**
+   * Its text (title, description, labels) was written, at least once, by a tainted session: sticky.
+   * Reading the task taints the reader (docs/agents/tools/#taint-and-sinks). Absent on a task stored
+   * before taint was tracked: untainted.
+   */
+  tainted?: boolean;
 }
 
 export const taskKey = (t: Pick<Task, "number">) => `T-${t.number}`;
@@ -103,6 +109,8 @@ export interface Comment {
   author: string;
   body: string;
   ms: number;
+  /** Written by a tainted session. */
+  tainted: boolean;
 }
 
 /** A history entry's old or new value: a string field, null, or the label list. */
@@ -139,8 +147,15 @@ export const inboxChannel = (agent: string) => `${agent}/inbox`;
 /** The agent an inbox channel belongs to (null: not an inbox). */
 export const inboxOwner = (channel: string): string | null => (/^(agt_[^/]+)\/inbox$/.exec(channel)?.[1] ?? null);
 
-/** Who acts: an agent, on the one ledger its spec grants (`ledger`), or the operator (the root). */
-export type Actor = { kind: "agent"; agent: string; ledger: string } | { kind: "operator" };
+/**
+ * Who acts: an agent, on the one ledger its spec grants (`ledger`), with its session's taint as
+ * AgentDO tracks it; or the operator (the root, whose text never taints).
+ */
+export type Actor = { kind: "agent"; agent: string; ledger: string; tainted: boolean } | { kind: "operator" };
+/** Whether what `a` writes is tainted text. */
+const writesTainted = (a: Actor) => a.kind === "agent" && a.tainted;
+/** The fields that hold agent-written text: a tainted write to any of them taints the task. */
+const TEXT_FIELDS: readonly HistoryField[] = ["title", "description", "labels"];
 export const actorLabel = (a: Actor) => (a.kind === "operator" ? "operator" : a.agent);
 
 /**
@@ -282,7 +297,7 @@ const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.
  * Apply `edits` to `before`: the new task (version + 1) and one history entry per changed field, or
  * null when nothing changes. Edits are already validated.
  */
-function change(before: Task, edits: Omit<TaskEdits, "parent"> & { parent?: string | null; assignee?: string | null }, actor: string, now: number) {
+function change(before: Task, edits: Omit<TaskEdits, "parent"> & { parent?: string | null; assignee?: string | null }, actor: string, now: number, tainted = false) {
   const after: Task = { ...before };
   const history: HistoryEntry[] = [];
   const set = <K extends TaskField>(field: K, to: Task[K] | undefined, same = (a: Task[K], b: Task[K]) => a === b) => {
@@ -298,6 +313,7 @@ function change(before: Task, edits: Omit<TaskEdits, "parent"> & { parent?: stri
   set("parent", edits.parent);
   set("assignee", edits.assignee);
   if (!history.length) return null;
+  if (tainted && history.some((h) => TEXT_FIELDS.includes(h.field))) after.tainted = true;
   after.version = before.version + 1;
   after.updated_ms = Math.max(before.updated_ms, now);
   return { after, history };
@@ -400,6 +416,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
         created_ms: ctx.now,
         updated_ms: ctx.now,
         version: 1,
+        tainted: writesTainted(actor),
       };
       const unassigned: Task = { ...task, assignee: null };
       return {
@@ -427,7 +444,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
       if (op.status !== undefined && op.status !== before.status && !WORKER_TRANSITIONS[before.status].includes(op.status)) {
         return refuse("forbidden", `${taskKey(before)} can't move from ${before.status} to ${op.status} (allowed: ${WORKER_TRANSITIONS[before.status].join(", ") || "none"})`);
       }
-      const c = change(before, { title: op.title, description: op.description, status: op.status, labels: op.labels }, who, ctx.now);
+      const c = change(before, { title: op.title, description: op.description, status: op.status, labels: op.labels }, who, ctx.now, writesTainted(actor));
       return c ? done(before, c, statusNotices(ledger, before, c.after, who)) : unchanged(before);
     }
 
@@ -467,7 +484,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
       }
       const c = change(before, {
         title: op.title, description: op.description, status: op.status, labels: op.labels, parent, priority: op.priority,
-      }, who, ctx.now);
+      }, who, ctx.now, writesTainted(actor));
       return c ? done(before, c, statusNotices(ledger, before, c.after, who)) : unchanged(before);
     }
 
@@ -495,7 +512,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
       }
       const c = change(before, { status: "canceled" }, who, ctx.now)!;
       return done(before, c, statusNotices(ledger, before, c.after, who),
-        reason ? { task: before.id, author: who, body: `Canceled: ${reason}`, ms: ctx.now } : undefined);
+        reason ? { task: before.id, author: who, body: `Canceled: ${reason}`, ms: ctx.now, tainted: writesTainted(actor) } : undefined);
     }
 
     case "comment": {
@@ -504,7 +521,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
       if (op.body.trim().length === 0) return refuse("invalid_message", "comment is empty");
       if (op.body.length > LIMITS.comment) return refuse("invalid_message", `comment is longer than ${LIMITS.comment}`);
       if (ledger.commentCount(r.task.id) >= LIMITS.comments) return refuse("invalid_message", `${taskKey(r.task)} has ${LIMITS.comments} comments, its limit`);
-      return { ok: true, value: { task: r.task, next: ledger.next, history: [], comment: { task: r.task.id, author: who, body: op.body, ms: ctx.now }, notices: [] } };
+      return { ok: true, value: { task: r.task, next: ledger.next, history: [], comment: { task: r.task.id, author: who, body: op.body, ms: ctx.now, tainted: writesTainted(actor) }, notices: [] } };
     }
 
     case "set_watcher": {

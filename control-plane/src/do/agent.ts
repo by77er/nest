@@ -2479,8 +2479,14 @@ export class AgentDO extends DurableObject<Env> {
       throw new NestError(ErrorCodes.FORBIDDEN, `this agent may use only ledger ${ledger}, not ${String(a.ledger)}`, 403);
     }
     const tool = name as TaskTool;
-    const actor: Actor = { kind: "agent", agent: info.agent, ledger };
+    /** The caller, with its session's taint read now (after any await: a read that tainted it meanwhile counts). */
+    const actor = (): Actor => ({ kind: "agent", agent: info.agent, ledger, tainted: this.tainted(this.load()) });
     const stub = ledgerStub(this.env, ledger);
+    /** A result holding text a tainted session wrote taints this session (sticky; docs/agents/tools/#taint-and-sinks). */
+    const seen = <T extends { tainted: boolean }>(r: T): T => {
+      if (r.tainted) this.kvPut("read_tainted", true);
+      return r;
+    };
     const str = (k: string) => (typeof a[k] === "string" ? (a[k] as string) : undefined);
     /** A nullable argument: a string, null, or absent (undefined). */
     const strOrNull = (k: string) => (a[k] === null ? null : str(k));
@@ -2499,7 +2505,7 @@ export class AgentDO extends DurableObject<Env> {
     const write = async (op: TaskOp) => {
       if (TOOL_OPS[tool] !== op.kind) throw new NestError(ErrorCodes.INTERNAL, `${name} asks for ${TOOL_OPS[tool]}, not ${op.kind}`, 500);
       await live();
-      return stub.apply(ledger, actor, op, key);
+      return seen(await stub.apply(ledger, actor(), op, key));
     };
     const edits = {
       title: str("title"), description: str("description"), status: str("status") as TaskStatus | undefined,
@@ -2512,12 +2518,12 @@ export class AgentDO extends DurableObject<Env> {
           status: str("status") as TaskStatus | undefined, label: str("label"), text: str("text"), parent: str("parent"),
           assignee: assignee === "me" ? info.agent : assignee,
         };
-        const page = await stub.list(ledger, actor, filter, int("cursor") ?? 0, int("limit"));
+        const page = seen(await stub.list(ledger, actor(), filter, int("cursor") ?? 0, int("limit")));
         const text = page.tasks.length ? page.tasks.map(line).join("\n") : "No tasks match.";
         return out(page.next_cursor === null ? text : `${text}\n(more: cursor ${page.next_cursor})`, page);
       }
       case "task_get": {
-        const d = await stub.get(ledger, actor, task());
+        const d = seen(await stub.get(ledger, actor(), task()));
         return out(`${line(d.task)}\n\n${d.task.description}`, d);
       }
       case "task_create": {

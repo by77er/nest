@@ -50,7 +50,7 @@ class Mem implements LedgerView {
   }
 }
 
-const agent = (id: string, ledger = L): Actor => ({ kind: "agent", agent: id, ledger });
+const agent = (id: string, ledger = L, tainted = false): Actor => ({ kind: "agent", agent: id, ledger, tainted });
 const operator: Actor = { kind: "operator" };
 const grant = (id: string, ledger: string | null = L, tools: readonly string[] = TASK_TOOLS): SpecGrant => ({ agent: id, ledger, tools });
 const W1 = "agt_w1";
@@ -354,6 +354,34 @@ describe("notices and comments", () => {
   });
 });
 
+describe("taint", () => {
+  it("a tainted session's text taints the task, for good; the operator's and a clean session's don't; claims and status moves carry no text", () => {
+    const m = new Mem();
+    const dirty = agent(W1, L, true);
+    expect(create(m, dirty).tainted).toBe(true);
+    expect(create(m, agent(W2)).tainted).toBe(false);
+    expect(create(m, operator).tainted).toBe(false);
+    // Sticky: a clean rewrite doesn't clean it.
+    expect(ok(m.run(agent(W1), { kind: "update", task: "T-1", title: "clean now" })).task!.tainted).toBe(true);
+    // No text from the tainted session: no taint (status, claim, assign, priority, parent).
+    expect(ok(m.run(dirty, { kind: "claim", task: "T-3" })).task!.tainted).toBe(false);
+    expect(ok(m.run(dirty, { kind: "update", task: "T-3", status: "in_review" })).task!.tainted).toBe(false);
+    expect(ok(m.run(dirty, { kind: "assign", task: "T-2", assignee: grant(W1) })).task!.tainted).toBe(false);
+    expect(ok(m.run(dirty, { kind: "update_any", task: "T-2", priority: "high", parent: "T-3" })).task!.tainted).toBe(false);
+    // Any text field does: labels, description, title.
+    expect(ok(m.run(dirty, { kind: "update", task: "T-3", labels: ["x"] })).task!.tainted).toBe(true);
+    expect(ok(m.run(dirty, { kind: "update_any", task: "T-2", description: "d" })).task!.tainted).toBe(true);
+    // An unchanged write changes nothing, taint included.
+    create(m, operator);
+    expect(ok(m.run(dirty, { kind: "update_any", task: "T-4", title: "Fix the build" })).task!.tainted).toBe(false);
+    // Comments, and a cancel's reason, carry their writer's taint.
+    expect(ok(m.run(dirty, { kind: "comment", task: "T-4", body: "x" })).comment!.tainted).toBe(true);
+    expect(ok(m.run(agent(W2), { kind: "comment", task: "T-4", body: "x" })).comment!.tainted).toBe(false);
+    expect(ok(m.run(dirty, { kind: "cancel", task: "T-4", reason: "dup" })).comment!.tainted).toBe(true);
+    expect(m.get("T-4")!.tainted).toBe(false);
+  });
+});
+
 describe("ledger access", () => {
   it("an agent whose ledger is another is refused every operation", () => {
     const m = new Mem();
@@ -400,7 +428,8 @@ function rng(seed: number) {
 const AGENTS = ["agt_a", "agt_b", "agt_c"];
 /** Who may ask for what: agents with only `tasks` ask for its kinds; an admin agent and the operator for any. */
 const ACTORS: { actor: Actor; admin: boolean }[] = [
-  ...AGENTS.map((a) => ({ actor: agent(a), admin: false })), { actor: agent("agt_boss"), admin: true }, { actor: operator, admin: true },
+  ...AGENTS.map((a) => ({ actor: agent(a, L, a === "agt_b"), admin: false })), { actor: agent("agt_boss"), admin: true },
+  { actor: agent("agt_dirtyboss", L, true), admin: true }, { actor: operator, admin: true },
   { actor: agent("agt_out", "proj-b"), admin: false }, { actor: agent("agt_outboss", "proj-b"), admin: true },
 ];
 
@@ -476,10 +505,13 @@ describe("random operation sequences (400 seeds x 80 ops)", () => {
     let accepted = 0;
     const seenRefusals = new Set<string>();
     const seenKinds = new Set<string>();
+    let sawTainted = false;
     for (let seed = 1; seed <= 400; seed++) {
       const r = rng(seed);
       const m = new Mem();
       const created = new Map<string, Task>();
+      /** The oracle for taint: a task is tainted once a tainted session created it or changed its text. */
+      const dirty = new Set<string>();
       for (let step = 0; step < 80; step++) {
         const { actor, admin } = ACTORS[Math.floor(r() * ACTORS.length)]!;
         const op = genOp(r, m, admin);
@@ -539,6 +571,11 @@ describe("random operation sequences (400 seeds x 80 ops)", () => {
         }
         if (a.watcher !== undefined) expect(op.kind, ctx).toBe("set_watcher");
         if (op.kind === "assign" && a.put?.assignee) expect(a.notices.some((n) => to(n) === a.put!.assignee) || a.put.assignee === who, ctx).toBe(true);
+        const textWrite = !!a.put && (a.history.some((h) => ["created", "title", "description", "labels"].includes(h.field)));
+        if (textWrite && actor.kind === "agent" && actor.tainted) dirty.add(a.put!.id);
+        if (a.put) expect(a.put.tainted === true, ctx).toBe(dirty.has(a.put.id));
+        if (a.put?.tainted) sawTainted = true;
+        if (a.comment) expect(a.comment.tainted, ctx).toBe(actor.kind === "agent" && actor.tainted);
         m.commit(a);
         expect(acyclic(m), ctx).toBe(true);
         expect(m.notices.length - noticesBefore, ctx).toBe(a.notices.length);
@@ -560,6 +597,7 @@ describe("random operation sequences (400 seeds x 80 ops)", () => {
     // The generator reaches both outcomes, every op kind and every refusal kind (the run isn't vacuous).
     expect(accepted).toBeGreaterThan(5_000);
     expect([...seenKinds].sort()).toEqual(["assign", "cancel", "claim", "comment", "create", "set_watcher", "update", "update_any"]);
+    expect(sawTainted).toBe(true);
     expect([...seenRefusals].sort()).toEqual(["conflict", "forbidden", "invalid_message", "not_found"]);
   });
 });

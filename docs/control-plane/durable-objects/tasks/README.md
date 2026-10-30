@@ -11,10 +11,10 @@ A **task ledger**: a small issue tracker (a simple Linear) that agents read and 
 
 ## Data
 
-- **Task:** `id` (`tsk_…`), `number` (the key is `T-<n>`, dense per ledger), `title` (1–200), `description` (markdown, ≤ 20,000), `status` (`backlog`, `todo`, `in_progress`, `in_review`, `done`, `canceled`), `priority` (`none`, `urgent`, `high`, `medium`, `low`), `assignee` (agent id or null), `labels` (≤ 10, `[A-Za-z0-9][A-Za-z0-9_.:/-]{0,39}`), `parent` (a task of the same ledger; never a cycle), `created_by` (agent id or `operator`), `created_ms`, `updated_ms`, `version`.
+- **Task:** `id` (`tsk_…`), `number` (the key is `T-<n>`, dense per ledger), `title` (1–200), `description` (markdown, ≤ 20,000), `status` (`backlog`, `todo`, `in_progress`, `in_review`, `done`, `canceled`), `priority` (`none`, `urgent`, `high`, `medium`, `low`), `assignee` (agent id or null), `labels` (≤ 10, `[A-Za-z0-9][A-Za-z0-9_.:/-]{0,39}`), `parent` (a task of the same ledger; never a cycle), `created_by` (agent id or `operator`), `created_ms`, `updated_ms`, `version`, `tainted` ([taint](#taint)).
 - **`version`** starts at 1 and is bumped by every change (a comment isn't one). Writes may pass `expected_version`; a stale one is refused with `conflict` (409). An update that changes nothing is a no-op. A missing task is `not_found` (404).
 - **History:** one row per changed field (`actor`, `field`: a task field or `created`, `from`, `to`, `ms`). Until it is pruned (below), replaying it over the task as created gives the task as it is (property-tested).
-- **Comments:** `author`, `body` (≤ 10,000), `ms`; at most 1,000 per task, after which a comment, or a cancel with a reason, is refused, never dropped.
+- **Comments:** `author`, `body` (≤ 10,000), `ms`, `tainted`; at most 1,000 per task, after which a comment, or a cancel with a reason, is refused, never dropped.
 - **The watcher:** one agent per ledger, told when a task reaches `in_review`, `done` or `canceled`. Interim: it becomes a subscription to the ledger's channel when ledgers post to channels.
 - **Stored values:** a status or priority outside its enum (a hand edit, a later release's value) is logged and listed as read; `update` and `claim`, which need it, refuse it cleanly, and an admin's `task_update_any` repairs it.
 - **Storage:** `tasks` (the JSON body, plus copies of `status`, `assignee`, `parent`, `labels` and a lower-cased `title + description` for filtering), `comments`, `history`, `outbox`, `applied`, `kv` (`name`, `next`, `watcher`, `last_prune`). At most 10,000 open tasks per ledger.
@@ -42,7 +42,7 @@ A **task ledger**: a small issue tracker (a simple Linear) that agents read and 
 - **Assignment** (by `task_assign`, or an operator's create) posts to the assignee's inbox, and to a previous assignee that it moved away.
 - **Reaching `in_review`, `done` or `canceled`** posts to the task's creator, its assignee and the ledger's watcher, each once and never the actor (the assignee too, so a task an admin cancels reaches the agent working on it). No workstream event.
 - **No agent-written text in a notice:** only the key, the status, the agent ids and the ledger (`T-12 is done (by agt_…, ledger <name>); task_get reads it`), so a notice can't carry a tainted title past its reader. The recipient reads the task with `task_get`.
-- **Channel-shaped:** a notice is `{channel: "<agt>/inbox", post: {kind: task_assigned | task_status, text, data: {ledger, key, status, assignee}}}`, and an `outbox` row is `(id, channel, body)`, the shape a channel outbox keeps. One function, `deliverNotice`, knows where a channel's post goes: today `<agt>/inbox` is AgentDO's `postInbox`, keyed `ledger/<name>/<row>` so a retry is applied once; when inboxes are channels it becomes that channel's post.
+- **Channel-shaped, delivered through the inbox for now:** a notice is `{channel: "<agt>/inbox", post: {kind: task_assigned | task_status, text, data: {ledger, key, status, assignee}}}`, and an `outbox` row is `(id, channel, body)`, the shape a channel outbox keeps. One function, `deliverNotice`, knows where a channel's post goes: today `<agt>/inbox` is AgentDO's `postInbox` (untainted: the text is the platform's), keyed `ledger/<name>/<row>` so a retry is applied once. Not a channel post yet: an agent on a seeded template has no `read`, so a [ChannelDO](../channel/) notice would be taken but not shown to it. In channels' stage 2 (every agent can read its own inbox) `deliverNotice` becomes a `post` to `<agt>/inbox` from the principal `platform`, idempotent on the same key, and the outbox table may become the shared channel outbox (`lib/outbox.ts`); nothing else in the ledger changes. The watcher becomes a subscription to the ledger's channel, `ledger/<name>`, a name channels already reserve.
 - **Delivery is from the ledger's alarm only,** never inside a write: an AgentDO calling the ledger has its input gate open at that await, so a callback would interleave with the call that caused it. A row is written with the change and deleted once `deliverNotice` returned; a failure is retried after 1 s doubling to 5 min; a notice to an agent that doesn't exist is dropped and logged. A notice wakes an idle agent like any inbox post.
 
 ## Idempotency and concurrency
@@ -59,10 +59,17 @@ Admin auth. `GET /v1/ledgers/<name>` (`{ledger, watcher, tasks}`) · `PUT /v1/le
 
 At most 10,000 open tasks per ledger: a create (or a reopen) beyond it is refused, and closing tasks makes room. Closed tasks are kept (the ledger is the record). Comments and history of a task `done` or `canceled` more than 30 days ago are deleted; history keeps the latest 500 rows per task; `applied` keys 7 days; `outbox` rows until delivered. The prune runs daily from the alarm ([data](../../../data/#retention)).
 
+## Taint
+
+The ledger keeps the [taint](../../../agents/tools/#taint-and-sinks) of what it holds, from the stand-in AgentDO tracks today (`sessionTaint`: hands, a tainting built-in, or a tainted read, sticky). AgentDO reads the caller's taint just before each write, after any await.
+- **A task is tainted** once a tainted session created it or changed its text (title, description, labels), and stays so. Status moves, claims, assignment, priority and parent carry no agent text and don't taint it. The operator's writes never taint.
+- **A comment** carries its writer's taint (a cancel's reason too).
+- **Reads taint the reader:** every result says `tainted`, and AgentDO taints the session when it is true: `task_list` when a listed task is tainted, `task_get` when the task or a returned comment is, and a write's result when the task it returns whole is.
+- **Notices never taint:** they carry no agent text.
+- **It over-taints the way the stand-in does:** every hands agent is tainted, so a worker's tasks taint a captain that reads them. Quarantined reports are the designed way back ([taint](../../../agents/tools/#taint-and-sinks)).
+
 ## Deploying it
 
 Adding the class is a **one-way deploy** ([deploy](../../../../dev/deploy.md)). A forward revert to the previous release leaves ledgers unreachable but intact, keeps spawning working (the seed migration edits no template), and the previous code ignores a stored spec's `params` and lists no `task_*` tool.
 
-**Open:** taint. Task text written by a tainted session reaches whoever reads it with `task_get` or `task_list`, and those reads don't taint the reader yet; notices carry no agent text, so they don't. The ledger's channel name `ledger/<name>` should be reserved before agents can create channels.
-
-**Not built:** capability params granting more than one ledger, or a different one per capability (`tasks{ledgers: [...]}`, the extension point); a spawner passing on a ledger it holds (waits for `agent_spawn` and grants); posting notices to channels; archiving closed tasks; deleting a task or a ledger; a cap on retries (a notice to an agent that keeps failing retries every 5 minutes, and per-agent order isn't kept after a failure).
+**Not built:** capability params granting more than one ledger, or a different one per capability (`tasks{ledgers: [...]}`, the extension point); a spawner passing on a ledger it holds (waits for `agent_spawn` and grants); posting notices to channels (stage 2, above); archiving closed tasks; deleting a task or a ledger; a cap on retries (a notice to an agent that keeps failing retries every 5 minutes, and per-agent order isn't kept after a failure).
