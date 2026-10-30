@@ -56,7 +56,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      spawn will take only `SpawnerOverrides`, which narrow) and sends `agent_start` to
      the host; an agent with a sandbox takes its workstream and cell (a mismatch is refused with 409), and an
      `owner` must be an agent of the same workstream. For one release `role` is read as the same-named template,
-     `captain` as `owner`, top-level `launch` and `rules` as overrides, and `grants` intersects the tools silently
+     `captain` as `owner`, top-level `launch` and `rules` as overrides, and `grants` intersects the tools silently.
+     Answers 201 with the agent and `started`; a start that can't run yet (no brain host, a cold cell) keeps its
+     intent and runs when room appears, and the answer says why in `start_waiting` (an error body) with `started: null`
    - `POST /v1/agents/<id>/start {host?, restart?}`: start (or restart) the brain; `host` puts it on a chosen active,
      connected host of the cell (for a test); hands still go through the sandbox's gateway. Answers `{host, cmd}`;
      `kind: none` when the brain already runs (nothing sent; `{restart: true}` restarts it: condemned, then started

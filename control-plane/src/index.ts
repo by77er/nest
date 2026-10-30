@@ -7,7 +7,7 @@ import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
-import { AgentRole, ErrorCodes, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
+import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
@@ -336,8 +336,20 @@ async function route(req: Request, env: Env): Promise<Response> {
     const a = agent(env, id);
     await a.create({ agent: id, workstream: wsId, cell: cellName, spec, owner: r.owner ?? r.captain ?? null, sandbox: r.sandbox ?? null });
     if (spec.subscribe.includes("workstream")) await workstream(env, wsId).setSubscriber(id);
-    const started = r.start ? await a.start() : null;
-    return json({ ...(await a.info()), started }, 201);
+    // The agent exists now: a start that can't run yet (no brain host, a cold cell) keeps its intent and
+    // runs when room appears, so the create still answers 201 with the agent and why its start waits.
+    let started: Awaited<ReturnType<typeof a.start>> | null = null;
+    let start_waiting: ErrorBody | null = null;
+    if (r.start) {
+      try {
+        started = await a.start();
+      } catch (e) {
+        const ne = asNestError(e);
+        if (!ne?.retryable) throw e;
+        start_waiting = ne.body();
+      }
+    }
+    return json({ ...(await a.info()), started, ...(start_waiting ? { start_waiting } : {}) }, 201);
   }
   if ((p = m(/^\/v1\/agents\/(agt_[A-Za-z0-9]+)(\/turns|\/inbox|\/interrupt|\/start|\/stop|\/transcript|\/rules|\/asks\/(ask_[A-Za-z0-9]+)\/answer)?$/))) {
     const a = agent(env, p[1]!);

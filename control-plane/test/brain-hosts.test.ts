@@ -537,3 +537,18 @@ describe("AgentDO: where a brain starts", () => {
     expect(await agentStub(worker).start()).toMatchObject({ kind: "started", host: a.host });
   });
 });
+
+describe("creating an agent on a cell with no brain host", () => {
+  it("answers 201 with the agent and why its start waits, and keeps the start's intent", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-cold" } });
+    const { workstream } = await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "cold cell" } }, 201);
+    const created = await adminJson<{ agent: string; started: unknown; start_waiting?: { code: string; retryable: boolean } }>(
+      "/v1/agents", { body: { template: "captain", workstream, cell, start: true } }, 201);
+    expect(created.agent).toMatch(/^agt_/);
+    expect(created.started).toBeNull();
+    expect(created.start_waiting).toMatchObject({ code: "capacity_exhausted", retryable: true });
+    const intent = await runInDurableObject(env.AGENT.get(env.AGENT.idFromName(created.agent)), (inst: AgentDO) => (inst as unknown as { load(): { intent: unknown } }).load().intent);
+    expect(intent).toBeTruthy();
+  });
+});
