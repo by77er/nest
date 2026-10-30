@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use nestd_core::fleet::{Effect, FleetLink, Inbound, Input, Lease, Notice, Now, Outbound, OutboxEvent, Phase};
+use nestd_core::fleet::{Effect, FleetLink, Inbound, Input, Lease, Log, Notice, Now, Outbound, OutboxEvent, Phase};
 use nestd_core::results::ResultCache;
 use stateright::{Model, Property};
 
@@ -49,6 +49,9 @@ pub struct Config {
     /// A hello whose socket closed while it waited in the queue does nothing (main: it runs, and
     /// supersedes, so closes, the newer socket the host reconnected on).
     pub stale_hello_guard: bool,
+    /// One per-host send chain for issueCommands and the hello's resend (main: each sends on its
+    /// own, after its own BrokerDO await, so a later batch can overtake an earlier one).
+    pub send_chain: bool,
     /// `onEvents` processes a batch only if its socket is still the host's helloed one (main: the
     /// attachment read at arrival, so a dead process's batch can become the new lineage's baseline).
     pub events_socket_guard: bool,
@@ -69,6 +72,7 @@ impl Config {
             send_baseline: false,
             close_on_broker_fail: false,
             stale_hello_guard: false,
+            send_chain: false,
             events_socket_guard: false,
             max_cmds: 3,
             secrets: true,
@@ -80,7 +84,7 @@ impl Config {
     }
     /// FleetDO with this branch's fixes.
     pub fn fixed() -> Self {
-        Config { capture_at_reset: true, durable_capture: true, send_baseline: true, close_on_broker_fail: true, stale_hello_guard: true, events_socket_guard: true, ..Self::main() }
+        Config { capture_at_reset: true, durable_capture: true, send_baseline: true, close_on_broker_fail: true, stale_hello_guard: true, send_chain: true, events_socket_guard: true, ..Self::main() }
     }
     pub fn faults(self, drops: u8, restarts: u8, resets: u8, broker_fails: u8) -> Self {
         Config { max_drops: drops, max_restarts: restarts, max_fleet_resets: resets, max_broker_fails: broker_fails, ..self }
@@ -120,6 +124,8 @@ pub struct Wire {
     pub fleet_open: bool,
     /// The socket attachment's `helloed`.
     pub helloed: bool,
+    /// The send chain's high-water mark on this socket: the last seq it put on the wire.
+    pub sent_up_to: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -159,8 +165,11 @@ pub struct Fleet {
     pub orphans: Option<Vec<u8>>,
     // Volatile.
     pub queue: VecDeque<Job>,
-    /// `issueCommands` → `sendResolved` awaiting BrokerDO: (wire, seqs).
+    /// `issueCommands` → `sendResolved` awaiting BrokerDO: (wire, seqs). Without the send chain.
     pub resolving: Vec<(u8, Vec<u64>)>,
+    /// The per-host send chain: runs queued, and the run awaiting BrokerDO (wire, seqs).
+    pub chain_runs: u8,
+    pub chain_resolving: Option<(u8, Vec<u64>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -188,6 +197,11 @@ pub struct State {
     pub out_of_order: bool,
     pub ack_unexecuted: bool,
     pub closes: u8,
+    /// Command gaps nestd met (each one closes the connection).
+    pub gaps: u8,
+    /// Seqs this process has finished (`CommandsDone`), and whether it forwarded one again.
+    pub completed: BTreeSet<u64>,
+    pub reforwarded: bool,
     pub drops: u8,
     pub restarts: u8,
     pub resets: u8,
@@ -204,6 +218,10 @@ pub enum Action {
     FleetJob,
     BrokerOk(usize),
     BrokerFail(usize),
+    /// The send chain's next run starts (sends at once, or awaits BrokerDO for its secrets).
+    ChainRun,
+    ChainBrokerOk,
+    ChainBrokerFail,
     /// Resume the hello at the head of the queue after its BrokerDO await.
     HelloBrokerOk,
     HelloBrokerFail,
@@ -248,8 +266,19 @@ impl State {
         }
     }
 
+    /// The chain's send of `msgs` (in seq order) on socket `w`.
+    fn chain_send(&mut self, w: u8, msgs: Vec<u64>) {
+        for q in &msgs {
+            self.send_down(w, Down::Commands(*q));
+        }
+        if let (Some(last), Some(x)) = (msgs.last(), self.wire(w)) {
+            x.sent_up_to = x.sent_up_to.max(*last);
+        }
+    }
+
+    /// `socketFor`: the first helloed socket of the host (`getWebSockets(host).find(helloed)`).
     fn socket_for(&self) -> Option<u8> {
-        self.wires.iter().rev().find(|w| w.fleet_open && w.helloed).map(|w| w.id)
+        self.wires.iter().find(|w| w.fleet_open && w.helloed).map(|w| w.id)
     }
 
     /// `rel.ack`: a seq leaves the outbox; it must have run somewhere.
@@ -317,7 +346,13 @@ impl FleetModel {
                             }
                         }
                     }
-                    Effect::Notify(Notice::Commands { seq, commands }) => s.nestd.exec.push_back((seq, commands)),
+                    Effect::Notify(Notice::Commands { seq, commands }) => {
+                        if s.completed.contains(&seq) {
+                            s.reforwarded = true;
+                        }
+                        s.nestd.exec.push_back((seq, commands));
+                    }
+                    Effect::Log(Log::CommandGap { .. }) => s.gaps += 1,
                     Effect::Notify(_) | Effect::Log(_) => {}
                 }
             }
@@ -366,9 +401,16 @@ impl FleetModel {
         s.fleet.nestd_instance = Some(inst);
         if let Some(w) = s.wire(wire).filter(|w| w.fleet_open) {
             w.helloed = true;
+            // The chain sends this socket everything above what the host has processed.
+            w.sent_up_to = last.unwrap_or(0);
         }
         let next_command_seq = c.send_baseline.then(|| s.fleet.rel_out.iter().copied().find(|q| *q > last.unwrap_or(0)).unwrap_or(s.fleet.next_out));
         s.send_down(wire, Down::HelloAck { last_event_seq: s.fleet.last_in, next_command_seq });
+        if c.send_chain {
+            // The resend joins the chain in the step that sets `helloed`: whatever is issued later
+            // queues behind it.
+            s.fleet.chain_runs += 1;
+        }
     }
 
     /// After a hello's resend: fail the old lineage (new process), then the job ends. A hello with
@@ -393,9 +435,10 @@ impl FleetModel {
         }
     }
 
-    /// Closes the faults so far can explain: 3 each, plus 2.
+    /// Closes the faults so far can explain: 3 each (a BrokerDO failure closes both ends; a
+    /// restart's hello supersedes). With no fault, none.
     fn close_allowance(&self, s: &State) -> u8 {
-        3 * (s.drops + s.restarts + s.resets + s.broker_fails) + 2
+        3 * (s.drops + s.restarts + s.resets + s.broker_fails)
     }
 
     fn issued(s: &State) -> u8 {
@@ -419,6 +462,8 @@ impl Model for FleetModel {
                 orphans: None,
                 queue: VecDeque::new(),
                 resolving: vec![],
+                chain_runs: 0,
+                chain_resolving: None,
             },
             nestd: Nestd { inst: 0, link: new_link(), t: 0, conn: None, connecting: false, exec: VecDeque::new(), done: ResultCache::default() },
             wires: vec![],
@@ -429,6 +474,9 @@ impl Model for FleetModel {
             out_of_order: false,
             ack_unexecuted: false,
             closes: 0,
+            gaps: 0,
+            completed: BTreeSet::new(),
+            reforwarded: false,
             drops: 0,
             restarts: 0,
             resets: 0,
@@ -448,6 +496,14 @@ impl Model for FleetModel {
             if w.fleet_open && !w.up.is_empty() {
                 a.push(Action::FleetRecv(w.id));
             }
+        }
+        if s.fleet.chain_resolving.is_some() {
+            a.push(Action::ChainBrokerOk);
+            if s.broker_fails < c.max_broker_fails {
+                a.push(Action::ChainBrokerFail);
+            }
+        } else if s.fleet.chain_runs > 0 {
+            a.push(Action::ChainRun);
         }
         let can_fail = s.broker_fails < c.max_broker_fails;
         match s.fleet.queue.front() {
@@ -504,13 +560,38 @@ impl Model for FleetModel {
                 if secret {
                     s.fleet.secret.insert(seq);
                 }
-                if let Some(w) = s.socket_for() {
+                if c.send_chain {
+                    // Rows and seq now; the send joins the host's chain.
+                    s.fleet.chain_runs += 1;
+                } else if let Some(w) = s.socket_for() {
                     if secret {
                         s.fleet.resolving.push((w, vec![seq]));
                     } else {
                         s.send_down(w, Down::Commands(seq));
                     }
                 }
+            }
+            // One run of the send chain: everything not yet sent on the current socket, in order,
+            // secrets resolved for the whole run before any of it goes out.
+            Action::ChainRun => {
+                s.fleet.chain_runs -= 1;
+                if let Some(w) = s.socket_for() {
+                    let from = s.wires.iter().find(|x| x.id == w).map_or(0, |x| x.sent_up_to);
+                    let msgs: Vec<u64> = s.fleet.rel_out.iter().copied().filter(|q| *q > from).collect();
+                    if msgs.iter().any(|q| s.fleet.secret.contains(q)) {
+                        s.fleet.chain_resolving = Some((w, msgs));
+                    } else {
+                        s.chain_send(w, msgs);
+                    }
+                }
+            }
+            Action::ChainBrokerOk => {
+                let (w, msgs) = s.fleet.chain_resolving.take()?;
+                s.chain_send(w, msgs);
+            }
+            Action::ChainBrokerFail => {
+                let (w, _) = s.fleet.chain_resolving.take()?;
+                self.broker_failed(&mut s, w);
             }
             Action::FleetRecv(id) => {
                 let w = s.wire(id)?;
@@ -545,7 +626,10 @@ impl Model for FleetModel {
                         s.rel_ack(l);
                     }
                     let pending: Vec<u64> = s.fleet.rel_out.iter().copied().filter(|q| *q > last.unwrap_or(0)).collect();
-                    if pending.iter().any(|q| s.fleet.secret.contains(q)) {
+                    if c.send_chain {
+                        // The resend was queued on the chain at the hello's start.
+                        self.hello_after_resend(&mut s);
+                    } else if pending.iter().any(|q| s.fleet.secret.contains(q)) {
                         if let Some(Job::Hello { stage, .. }) = s.fleet.queue.front_mut() {
                             *stage = HelloStage::Resolving(pending);
                         }
@@ -650,7 +734,7 @@ impl Model for FleetModel {
             Action::NestdConnectOk => {
                 let id = s.next_wire;
                 s.next_wire += 1;
-                s.wires.push(Wire { id, down: VecDeque::new(), up: VecDeque::new(), host_reading: true, fleet_open: true, helloed: false });
+                s.wires.push(Wire { id, down: VecDeque::new(), up: VecDeque::new(), host_reading: true, fleet_open: true, helloed: false, sent_up_to: 0 });
                 s.nestd.conn = Some(id);
                 s.nestd.connecting = false;
                 self.run_nestd(&mut s, Input::Connected);
@@ -670,6 +754,7 @@ impl Model for FleetModel {
                     s.nestd.done.insert(&key, ());
                 }
                 self.run_nestd(&mut s, Input::Event(Ev(cmd)));
+                s.completed.insert(seq);
                 self.run_nestd(&mut s, Input::CommandsDone(seq));
             }
             Action::Drop => {
@@ -695,6 +780,7 @@ impl Model for FleetModel {
                 }
                 s.nestd = Nestd { inst: s.nestd.inst + 1, link: new_link(), t: s.nestd.t, conn: None, connecting: false, exec: VecDeque::new(), done: ResultCache::default() };
                 s.exec_last = None;
+                s.completed.clear();
                 s.gc_wires();
             }
             // FleetDO restarts (deploy, eviction): SQLite kept; the queue, awaits and sockets lost.
@@ -702,6 +788,8 @@ impl Model for FleetModel {
                 s.resets += 1;
                 s.fleet.queue.clear();
                 s.fleet.resolving.clear();
+                s.fleet.chain_runs = 0;
+                s.fleet.chain_resolving = None;
                 for id in s.wires.iter().map(|w| w.id).collect::<Vec<_>>() {
                     s.fleet_close(id);
                 }
@@ -728,6 +816,12 @@ impl Model for FleetModel {
             }),
             // A fault can cause a few closes (a BrokerDO failure closes both ends; a restart's hello
             // supersedes); a close/reconnect loop causes them with no fault at all.
+            // FleetDO sends in seq order on a socket (the send chain), so nestd never meets a gap:
+            // a gap close would mean a reconnect per overtaking batch.
+            Property::always("never_a_gap", |_, s: &State| s.gaps == 0),
+            // A batch this process finished is never handed to its executor again (its replay would
+            // only come from a cache, but a `last_command_seq` that went backwards asks for it).
+            Property::always("finished_never_reforwarded", |_, s: &State| !s.reforwarded),
             Property::always("reconnects_bounded", |m: &FleetModel, s: &State| s.closes <= m.close_allowance(s)),
             // Monotone once true (every command issued; results are never cleared), and faults are
             // bounded, so a terminal state has the link up with nothing left to do.
@@ -744,7 +838,7 @@ impl Model for FleetModel {
     }
 }
 
-pub const SAFETY: [&str; 4] = ["no_ack_without_execution", "in_order_per_lineage", "failed_never_executed", "reconnects_bounded"];
+pub const SAFETY: [&str; 6] = ["no_ack_without_execution", "in_order_per_lineage", "failed_never_executed", "never_a_gap", "finished_never_reforwarded", "reconnects_bounded"];
 pub const LIVENESS: &str = "every_command_answered";
 
 /// One line per step: the action and what it left.

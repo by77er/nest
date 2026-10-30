@@ -375,3 +375,25 @@ fn the_outbox_bound_counts_unacknowledged_events_and_logs_what_it_sheds() {
     assert_eq!(h.link.unacked_seqs().collect::<Vec<_>>(), vec![1], "sent events are never shed");
     assert!(fx.contains(&Effect::Log(Log::OutboxShed { shed: (MAX_OUTBOX_EVENTS / 4 + 1) as u64 })), "{fx:?}");
 }
+
+/// Model-checker counterexample (verification/nestd/check, `never_a_gap`, 20 steps with one drop):
+/// batch 1 is still running when the link reconnects, so the hello's baseline is 1; it finishes,
+/// its ack deletes it from FleetDO's outbox, and FleetDO's resend starts at 2. That is the next
+/// batch in order, not a gap.
+#[test]
+fn a_batch_finished_after_the_hello_moves_the_expected_seq_past_it() {
+    let mut h = H::new();
+    assert_eq!(h.step(Input::Tick), vec![Effect::Connect { token: "tok".into() }]);
+    h.step(Input::Connected);
+    h.step(H::ack(None, Some(1)));
+    assert_eq!(forwarded(&h.commands(1)), vec![1]);
+    h.step(Input::Closed);
+    h.at(200).step(Input::Tick);
+    h.step(Input::Connected);
+    h.step(H::ack(None, Some(1)));
+    let fx = h.step(Input::CommandsDone(1));
+    assert!(sent(&fx).contains(&Outbound::Ack { up_to: 1 }));
+    let fx = h.commands(2);
+    assert_eq!(forwarded(&fx), vec![2], "{fx:?}");
+    assert!(!fx.contains(&Effect::Close));
+}

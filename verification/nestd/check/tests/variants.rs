@@ -1,17 +1,24 @@
-//! The expected outcome of each check at CI bounds: the fixed system holds; each fix, removed,
-//! fails the property it is there for (so a pass isn't vacuous). `--include-ignored` adds the
-//! largest run. Bounds: see each spec; times are on 4 threads.
+//! The expected outcome of each check at CI bounds: the fixed system holds (and reaches the
+//! recovery examples its faults allow, so a pass isn't vacuous); each fix, removed, fails the
+//! property it is there for. `--include-ignored` adds the largest run. Times are on 4 threads.
 
 use nestd_check::fleet::{Config, FleetModel, LIVENESS, SAFETY};
 use nestd_check::{check, lease};
+
+const RESTART: &str = "answered_after_a_restart";
+const BROKER: &str = "answered_after_a_broker_failure";
 
 fn spec(base: Config, cmds: u8, drops: u8, restarts: u8, resets: u8, broker: u8) -> FleetModel {
     FleetModel { cfg: Config { max_cmds: cmds, ..base.faults(drops, restarts, resets, broker) } }
 }
 
-fn holds(m: FleetModel) {
+/// No property violated, and every example in `examples` found.
+fn holds(m: FleetModel, examples: &[&str]) {
     let o = check(m);
     assert!(o.violations.is_empty(), "violated {:?} ({} states)", o.violations, o.unique_states);
+    for e in examples {
+        assert!(o.examples.contains(e), "no example of {e}: the recovery path it names is never reached ({:?})", o.examples);
+    }
 }
 
 fn violates(m: FleetModel, props: &[&str]) {
@@ -22,35 +29,54 @@ fn violates(m: FleetModel, props: &[&str]) {
 }
 
 #[test]
+fn fixed_holds_with_four_commands_and_no_fault() {
+    holds(spec(Config::fixed(), 4, 0, 0, 0, 0), &[]);
+}
+
+#[test]
 fn fixed_holds_with_three_commands_and_a_drop() {
-    holds(spec(Config::fixed(), 3, 1, 0, 0, 0));
+    holds(spec(Config::fixed(), 3, 1, 0, 0, 0), &[]);
+}
+
+/// Two drops: a batch replayed at one reconnect finishes after a later one while the second
+/// connection is down (what an offline `last_command_seq` that went backwards turns into a
+/// re-forward of a finished batch).
+#[test]
+fn fixed_holds_with_two_commands_and_two_drops() {
+    holds(spec(Config::fixed(), 2, 2, 0, 0, 0), &[]);
 }
 
 #[test]
 fn fixed_holds_with_two_commands_a_drop_and_a_restart() {
-    holds(spec(Config::fixed(), 2, 1, 1, 0, 0));
+    holds(spec(Config::fixed(), 2, 1, 1, 0, 0), &[RESTART]);
 }
 
 #[test]
 fn fixed_holds_with_two_commands_a_restart_a_fleetdo_reset_and_a_broker_failure() {
-    holds(spec(Config::fixed(), 2, 0, 1, 1, 1));
+    holds(spec(Config::fixed(), 2, 0, 1, 1, 1), &[RESTART, BROKER]);
 }
 
-/// Every fault at once (about 21M states; a minute or two).
+/// Every fault at once (a minute or two).
 #[test]
 #[ignore]
 fn fixed_holds_with_two_commands_and_every_fault() {
-    holds(spec(Config::fixed(), 2, 1, 1, 1, 1));
+    holds(spec(Config::fixed(), 2, 1, 1, 1, 1), &[RESTART, BROKER]);
 }
 
-/// B1: main's FleetDO sends out of order and main's nestd covered a lower batch with a higher
-/// one's ack; with this branch's nestd and an older FleetDO (no baseline), the first batch after a
-/// hello can still overtake: the fallback is no better than before.
+/// H1: without the per-host send chain, a batch issued during the hello's BrokerDO await (or a
+/// plain batch behind a secret one) overtakes a lower one with no fault: a reconnect each time.
 #[test]
-fn without_a_baseline_a_batch_can_still_be_overtaken() {
-    violates(spec(Config { send_baseline: false, ..Config::fixed() }, 2, 0, 0, 0, 0), &["no_ack_without_execution", "in_order_per_lineage", LIVENESS]);
+fn without_the_send_chain_batches_overtake_with_no_fault() {
+    violates(spec(Config { send_chain: false, ..Config::fixed() }, 2, 0, 0, 0, 0), &["never_a_gap", "reconnects_bounded"]);
 }
 
+/// A FleetDO that sends no baseline but sends in order is fine for this nestd.
+#[test]
+fn an_in_order_fleetdo_without_a_baseline_holds() {
+    holds(spec(Config { send_baseline: false, ..Config::fixed() }, 2, 1, 1, 0, 0), &[RESTART]);
+}
+
+/// B1 against main's FleetDO: commands acked and never run, with no fault.
 #[test]
 fn main_fleetdo_loses_commands_with_no_fault() {
     violates(spec(Config::main(), 2, 0, 0, 0, 0), &["no_ack_without_execution", "in_order_per_lineage", LIVENESS]);
@@ -77,7 +103,7 @@ fn a_quiet_broker_failure_strands_a_batch() {
 /// A hello that outlives its socket supersedes the live one, round after round.
 #[test]
 fn a_stale_hello_loops_reconnects() {
-    violates(spec(Config { stale_hello_guard: false, ..Config::fixed() }, 1, 1, 0, 0, 0), &["reconnects_bounded"]);
+    violates(spec(Config { stale_hello_guard: false, ..Config::fixed() }, 1, 1, 0, 0, 0), &["reconnects_bounded", LIVENESS]);
 }
 
 /// B3: a dead process's event batch becomes the new lineage's baseline.
@@ -89,8 +115,8 @@ fn a_stale_event_batch_loses_a_result() {
 #[test]
 fn safety_names_are_checked() {
     let names: Vec<_> = <FleetModel as stateright::Model>::properties(&FleetModel { cfg: Config::fixed() }).iter().map(|p| p.name).collect();
-    for p in SAFETY {
-        assert!(names.contains(&p));
+    for p in SAFETY.iter().chain([&LIVENESS, &RESTART, &BROKER]) {
+        assert!(names.contains(p), "{p}");
     }
 }
 
@@ -98,5 +124,7 @@ fn safety_names_are_checked() {
 fn the_lease_never_outlives_fleetdos_view() {
     let o = check(lease::LeaseModel { cfg: lease::Config { unit_ms: 5_000, horizon: 14, max_drops: 1, max_suspends: 1, suspend_steps: 4, max_in_flight: 1 } });
     assert!(o.violations.is_empty(), "{:?}", o.violations);
-    assert!(o.examples.contains(&"expired_and_fenced"), "the property is reachable, not vacuous");
+    for e in ["expired_and_fenced", "renewed_after_a_suspend"] {
+        assert!(o.examples.contains(&e), "no example of {e}: the property would be vacuous");
+    }
 }

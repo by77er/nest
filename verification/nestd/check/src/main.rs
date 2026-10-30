@@ -21,6 +21,7 @@ fn parse(spec: &str) -> Result<Config, String> {
         "broker-quiet" => Config { close_on_broker_fail: false, ..fixed },
         "stale-hello" => Config { stale_hello_guard: false, ..fixed },
         "stale-events" => Config { events_socket_guard: false, ..fixed },
+        "no-chain" => Config { send_chain: false, ..fixed },
         other => return Err(format!("unknown variant {other}")),
     };
     for p in parts {

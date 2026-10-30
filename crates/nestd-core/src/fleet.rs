@@ -293,6 +293,9 @@ impl<E: OutboxEvent> FleetLink<E> {
                     // hello ask for batches already processed (and acked).
                     self.last_command_seq = Some(self.last_command_seq.map_or(seq, |s| s.max(seq)));
                 }
+                // A batch still running at the hello that finishes now is acked, and FleetDO won't
+                // send it again: the next one in order is the one after it.
+                self.expected_command_seq = self.expected_command_seq.map(|x| x.max(seq + 1));
             }
             Input::CaRenew(csr_pem) => {
                 if self.is_open() {
