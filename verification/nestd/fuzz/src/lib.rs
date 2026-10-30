@@ -14,8 +14,10 @@ use nest_protocol::guest::ControlFrame;
 use nest_protocol::guest::frame::{self, Decoder, Frame, FrameError, Kind};
 use nest_protocol::host::fdpass;
 use nest_protocol::host::proxy::ProxyEvent;
+use nestd::fleet::CoreInput;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::codec::{Decoder as _, Encoder as _, LengthDelimitedCodec};
 
 /// Split `data` into the chunks a reader might see. `ctl == 0` is one chunk; any other value seeds
@@ -191,15 +193,20 @@ pub fn proxy_recv(packet: &[u8]) -> Option<io::Result<Option<(ProxyEvent, Vec<Ow
 
 // --- FleetDO → nestd (WebSocket) ----------------------------------------------------------------
 
-/// crates/nestd/src/fleet.rs `parse` for a text message: `serde_json::from_str::<FleetToHost>`.
-/// (`parse` is private and fleet.rs is not ours to change, so its two lines are mirrored here.)
-pub fn fleet_parse_text(text: &str) -> Option<FleetToHost> {
-    serde_json::from_str(text).ok()
+/// A text message from FleetDO through nestd's own decode (`nestd::fleet::decode`: the WebSocket
+/// item to the fleet core's input), exactly as the shell calls it.
+pub fn fleet_decode_text(text: &str) -> CoreInput {
+    nestd::fleet::decode(Some(Ok(Message::Text(text.into()))))
 }
 
-/// fleet.rs `parse` for a binary message: UTF-8 first, then the same as text.
-pub fn fleet_parse_binary(b: &[u8]) -> Option<FleetToHost> {
-    fleet_parse_text(std::str::from_utf8(b).ok()?)
+/// The same bytes as a binary message (the decode checks UTF-8 first).
+pub fn fleet_decode_binary(b: &[u8]) -> CoreInput {
+    nestd::fleet::decode(Some(Ok(Message::Binary(Bytes::copy_from_slice(b)))))
+}
+
+/// The wire message the bytes are, if any: the oracle for which inputs decode to a frame.
+pub fn fleet_message(b: &[u8]) -> Option<FleetToHost> {
+    serde_json::from_slice(b).ok()
 }
 
 // --- meta.json ----------------------------------------------------------------------------------
@@ -289,7 +296,7 @@ mod tests {
     #[test]
     fn fleet_seeds_parse() {
         for (name, s) in seeds("fleet_to_host") {
-            assert!(fleet_parse_binary(&s).is_some(), "{name}");
+            assert!(matches!(fleet_decode_binary(&s), nestd_core::fleet::Input::Frame(_)), "{name}");
         }
     }
 

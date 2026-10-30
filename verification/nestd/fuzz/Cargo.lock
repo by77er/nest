@@ -984,9 +984,11 @@ dependencies = [
  "libfuzzer-sys",
  "nest-protocol",
  "nestd",
+ "nestd-core",
  "nix",
  "serde",
  "serde_json",
+ "tokio-tungstenite",
  "tokio-util",
 ]
 

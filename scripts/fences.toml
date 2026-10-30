@@ -77,14 +77,14 @@ allow = ["control-plane/src/lib/metrics.ts"]
 [[fence]]
 name = "nestd-core-purity"
 example = 'let now = std::time::Instant::now();'
-why = "nestd's cores are pure state machines (docs/verification/nestd/): the shell reads the clock, the disk, the network and randomness and passes what it read in as an input. A core that does I/O, reads a clock, seeds a hasher from the OS, awaits, or pulls in a runtime dependency can't be model checked, proved or mutation-tested as the code that ships."
+why = "nestd's cores are pure state machines (docs/verification/nestd/): the shell reads the clock, the disk, the network and randomness and passes what it read in as an input. A core that does I/O, reads a clock, seeds a hasher from the OS, awaits, or pulls in a runtime dependency can't be model checked, proved or mutation-tested as the code that ships. A second layer: the compiler enforces the first (the crate is no_std outside its tests, and scripts/check-core-manifest.py rejects any dependency or build script); this catches what slips past, in test code and the manifest."
 patterns = [
   '\bstd::(fs|net|process|thread|env|io)\b',
   '\b(Instant|SystemTime|UNIX_EPOCH)\b',
   '\b(tokio|rand|getrandom|libc|nix|mio|futures)\b',
   '\b(HashMap|HashSet|RandomState)\b',
   '\basync\s+(fn|move|\{)|\.await\b',
-  '\bunsafe\b|\bstatic\s+mut\b|\bextern\s+crate\b',
+  '\bunsafe\b|\bstatic\s+mut\b|\bextern\s+crate\s+(?!alloc\s*;)',  # alloc only: std would undo no_std
   '^\s*\[(target\.[^\]]*\.)?(build-)?dependencies[\].]',
 ]
 files = ["crates/nestd-core/**"]

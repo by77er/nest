@@ -3,30 +3,36 @@
 
 use nestd_core::fleet::*;
 
-/// A test event: `rank` is its shedding rank; `audit` events absorb each other up to 3 records.
+/// A test event of a kind; merging audit events adds their record counts, as the shell's
+/// concatenation of record vectors does.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Ev {
     id: u32,
-    rank: Option<u8>,
-    audit: u32,
+    kind: EventKind,
 }
 
 impl OutboxEvent for Ev {
-    fn shed_rank(&self) -> Option<u8> {
-        self.rank
+    fn kind(&self) -> EventKind {
+        self.kind
     }
-    fn absorb(&mut self, next: &Self) -> bool {
-        if self.audit > 0 && next.audit > 0 && self.audit + next.audit <= 3 {
-            self.audit += next.audit;
-            true
-        } else {
-            false
+    fn merge(&mut self, next: Self) {
+        if let (EventKind::Audit { records }, EventKind::Audit { records: more }) = (&mut self.kind, next.kind) {
+            *records += more;
         }
     }
 }
 
 fn ev(id: u32) -> Ev {
-    Ev { id, rank: None, audit: 0 }
+    Ev { id, kind: EventKind::Other }
+}
+
+/// An event shed at `rank` (0: capacity, 1: egress denied).
+fn ranked(id: u32, rank: u8) -> Ev {
+    Ev { id, kind: if rank == 0 { EventKind::Capacity } else { EventKind::EgressDenied } }
+}
+
+fn audit(id: u32, records: usize) -> Ev {
+    Ev { id, kind: EventKind::Audit { records } }
 }
 
 type In = Input<Ev, &'static str, u8, u8>;
@@ -155,10 +161,13 @@ fn heartbeat_keys_increase_when_the_wall_clock_steps_back_and_silence_closes() {
 fn a_retryable_or_fatal_peer_error_reconnects_and_others_do_not() {
     let mut h = H::new();
     h.open();
-    let fx = h.step(Input::Frame(Inbound::Error { fatal: false, retryable: false, error: 9 }));
+    let fx = h.step(Input::Frame(Inbound::Error { code: "forbidden".into(), retryable: false, error: 9 }));
     assert!(!fx.contains(&Effect::Close) && fx.contains(&Effect::Notify(Notice::Error(9))));
-    let fx = h.step(Input::Frame(Inbound::Error { fatal: false, retryable: true, error: 9 }));
+    let fx = h.step(Input::Frame(Inbound::Error { code: "internal".into(), retryable: true, error: 9 }));
     assert!(fx.contains(&Effect::Close));
+    h.at(BACKOFF_FIRST_MS).open();
+    let fx = h.step(Input::Frame(Inbound::Error { code: "unsupported_protocol_version".into(), retryable: false, error: 9 }));
+    assert!(fx.contains(&Effect::Close), "a fatal code reconnects even when not retryable: {fx:?}");
 }
 
 #[test]
@@ -168,24 +177,52 @@ fn an_offline_outbox_sheds_rank_zero_first_and_never_unranked_events() {
         h.step(Input::Event(ev(i)));
     }
     for i in 0..(MAX_OUTBOX_EVENTS as u32) {
-        h.step(Input::Event(Ev { id: 100 + i, rank: Some(0), audit: 0 }));
+        h.step(Input::Event(ranked(100 + i, 0)));
     }
     // Shed to 3072 at the 4097th, then 9 more arrive.
     assert_eq!(h.link.pending_len(), MAX_OUTBOX_EVENTS * 3 / 4 + 9);
     h.open();
     let fx = h.at(0).step(Input::Tick);
     let Some(Outbound::Events { events, .. }) = sent(&fx).into_iter().find(|o| matches!(o, Outbound::Events { .. })) else { panic!("{fx:?}") };
-    assert_eq!(events.iter().filter(|e| e.rank.is_none()).count(), 10);
+    assert_eq!(events.iter().filter(|e| e.kind == EventKind::Other).count(), 10);
 }
 
 #[test]
 fn audit_events_coalesce_within_their_bound() {
     let mut h = H::new();
-    let audit = |id| Ev { id, rank: Some(0), audit: 1 };
-    for i in 0..4 {
-        h.step(Input::Event(audit(i)));
+    h.step(Input::Event(audit(0, 300)));
+    h.step(Input::Event(audit(1, MAX_AUDIT_RECORDS_PER_EVENT - 300)));
+    assert_eq!(h.link.pending_len(), 1, "records up to the bound merge into one event");
+    h.step(Input::Event(audit(2, 1)));
+    assert_eq!(h.link.pending_len(), 2, "one more starts another");
+    h.step(Input::Event(ev(3)));
+    h.step(Input::Event(audit(4, 1)));
+    assert_eq!(h.link.pending_len(), 4, "only consecutive audits merge");
+    h.open();
+    let fx = h.at(0).step(Input::Tick);
+    let Some(Outbound::Events { events, .. }) = sent(&fx).into_iter().find(|o| matches!(o, Outbound::Events { .. })) else { panic!("{fx:?}") };
+    let kinds: Vec<_> = events.iter().map(|e| (e.id, e.kind)).collect();
+    let a = |records| EventKind::Audit { records };
+    assert_eq!(kinds, vec![(0, a(MAX_AUDIT_RECORDS_PER_EVENT)), (2, a(1)), (3, EventKind::Other), (4, a(1))]);
+}
+
+/// The core checks that the shell's merge holds every record: one that drops some is a violated
+/// invariant, which panics a debug build (and is a logged effect in release).
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "invariant violated: fleet_audit_merged"))]
+fn a_merge_that_loses_records_is_an_invariant_violation() {
+    #[derive(Clone, Debug, PartialEq)]
+    struct Lossy(usize);
+    impl OutboxEvent for Lossy {
+        fn kind(&self) -> EventKind {
+            EventKind::Audit { records: self.0 }
+        }
+        fn merge(&mut self, _: Self) {}
     }
-    assert_eq!(h.link.pending_len(), 2, "3 records merge into one event, the 4th starts another");
+    let mut link = FleetLink::new(Config { protocol_version: 1, flush_interval_ms: 50 }, "tok".into());
+    link.step::<(), (), ()>(Now::default(), Input::Event(Lossy(2)));
+    let fx = link.step::<(), (), ()>(Now::default(), Input::Event(Lossy(3)));
+    assert_eq!(fx, vec![Effect::Log(Log::InvariantViolated { name: "fleet_audit_merged" })]);
 }
 
 /// Model-checker counterexample (verification/nestd/check, `no_ack_without_execution`, 11 steps on
@@ -248,7 +285,6 @@ fn last_processed_never_moves_back_while_offline() {
 #[test]
 fn shedding_rank_one_takes_only_the_remaining_excess() {
     let mut h = H::new();
-    let ranked = |id, r| Ev { id, rank: Some(r), audit: 0 };
     for i in 0..100 {
         h.step(Input::Event(ranked(i, 0)));
     }
@@ -302,7 +338,7 @@ fn a_refused_hello_closes_at_once_and_reports_the_error() {
     let mut h = H::new();
     h.step(Input::Tick);
     h.step(Input::Connected);
-    let fx = h.step(Input::Frame(Inbound::Error { fatal: true, retryable: false, error: 7 }));
+    let fx = h.step(Input::Frame(Inbound::Error { code: "unauthorized".into(), retryable: false, error: 7 }));
     assert!(fx.contains(&Effect::Notify(Notice::Error(7))) && fx.contains(&Effect::Close), "{fx:?}");
     assert_eq!(h.link.phase(), Phase::Idle);
 }
@@ -365,7 +401,7 @@ fn the_outbox_bound_counts_unacknowledged_events_and_logs_what_it_sheds() {
     }
     assert_eq!((h.link.pending_len(), h.link.unacked_seqs().collect::<Vec<_>>()), (0, vec![1]), "flushed as batch 1");
     h.step(Input::Closed);
-    let low = |id| Ev { id, rank: Some(0), audit: 0 };
+    let low = |id| ranked(id, 0);
     for i in 0..(MAX_OUTBOX_EVENTS - FLUSH_AT_EVENTS) as u32 {
         h.step(Input::Event(low(1_000 + i)));
     }

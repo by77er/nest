@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 
-use nestd_core::fleet::{Effect, FleetLink, Inbound, Input, Lease, Notice, Now, Outbound, OutboxEvent};
+use nestd_core::fleet::{Effect, EventKind, FleetLink, Inbound, Input, Lease, Notice, Now, Outbound, OutboxEvent};
 use nestd_core::lease::{LeaseCheck, check};
 use stateright::{Model, Property};
 
@@ -21,12 +21,10 @@ use stateright::{Model, Property};
 pub struct NoEvent;
 
 impl OutboxEvent for NoEvent {
-    fn shed_rank(&self) -> Option<u8> {
-        None
+    fn kind(&self) -> EventKind {
+        EventKind::Other
     }
-    fn absorb(&mut self, _: &Self) -> bool {
-        false
-    }
+    fn merge(&mut self, _: Self) {}
 }
 
 /// `DEFAULT_LEASE_TIMING` (control-plane/src/protocol/control.ts).
