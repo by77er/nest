@@ -35,7 +35,7 @@ They are cheap and catch drift that the models can't see. Each throws in tests a
 
 | # | What | Tool | Why now |
 |---|---|---|---|
-| 1 | Finish the brain record's follow-up assurance: the epochs ≤ 3 sweep, liveness on the final design, the previous-release host (`OLD_HOST`) runs, and the drain run to exhaustion; re-run the conformance check at any later change | TLA+/TLC (pilot) | Every counterexample found needed 3 epochs; the gate ran at 2 |
+| 1 | Finish the brain record's follow-up assurance on a dedicated machine: the epochs ≤ 3 sweep and the drain run to exhaustion (both stalled at 15-min cuts on a shared box), liveness with faults, and more than 2 hosts. Re-run the conformance check for code merged after fe7b0d0 | TLA+/TLC (pilot) | The sweep is depth-bounded at 34-44; C6 shows epochs ≤ 3 still finds things |
 | 2 | Extend the sandbox lease model with host lifecycle and STONITH by fence (stonith_pending, re-activation, drain) | TLA+/TLC | Most of the hosts inventory's suspected bugs sit on that boundary |
 | 3 | Port the command-channel model's fixed variant to whichever fix lands, then run it as a regression | Stateright (pilot) | Already written; it checks the fix's pieces, not just the idea |
 | 4 | Gateway bindings: detach window, attach/detach ordering, the ghost fenced epoch | TLA+ | Bounded windows of a second binding are the remaining one-brain gap for hands |

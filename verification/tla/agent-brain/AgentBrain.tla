@@ -50,8 +50,11 @@
 (*           instance is gone), or on expiry; not on a drain or idle       *)
 (*           retire's "dead".                                              *)
 (*   LOSS_EPOCH host loss carries the index row's epoch and releases only  *)
-(*           at or above brain.epoch (rule 3's wording; onHostLost(host)   *)
-(*           carries no epoch in the code).                                *)
+(*           a record at or below it (main@b2b9219 agent.ts:1085; a        *)
+(*           previous-release host's epoch-less row is exempt).            *)
+(*   LOST_RECHECK host loss releases only while FleetDO still reports the  *)
+(*           host lost (agent.ts:1087 `hostGone`); otherwise the row stays. *)
+(*           The current design has both; with both off, C6 (MC_c6).       *)
 (* Mutations: WAIT = FALSE (kill and start elsewhere at once), TOMBSTONE = *)
 (* FALSE (nestd's), F >= E.                                                *)
 (*                                                                         *)
@@ -99,6 +102,7 @@ CONSTANTS
   RECORD, FIX_H1, FIX_H3, FIX_H4, FIX_DRAIN, A1, A2, LOSS_EPOCH, A3, REFUSED_WAITS,
   START_FAIL, A5, A6, SPLIT_EXPIRE, EXPIRE_RECHECK, NO_REISSUE, NO_ADOPT,
   OLD_HOST,            \* NoHost, or the one host running the previous release
+  LOST_RECHECK,        \* host loss re-checks FleetDO's lost flag at delivery
   WAIT, TOMBSTONE, ACK_DELAY,
   ALLOW_CRASH, ALLOW_PART, ALLOW_LOST, ALLOW_RESET, ALLOW_WEDGE,
   ALLOW_DRAIN, ALLOW_IDLE, ALLOW_STOP
@@ -194,7 +198,16 @@ THostLost(a, h) ==
 RRelease(a) == [a EXCEPT !.bh = NoHost, !.be = 0, !.ph = "none", !.wake = TRUE]
 \* A previous-release host's brain is released only by its loss (OLD_HOST).
 RExited(a, h, e) == IF a.bh = h /\ e >= a.be /\ h # OLD_HOST THEN RRelease(a) ELSE a
-RHostLost(a, h, e) == IF a.bh = h /\ (LOSS_EPOCH => e >= a.be) THEN RRelease(a) ELSE a
+\* Host loss at delivery (main@b2b9219 agent.ts onHostLost 1079-1090): it
+\* releases only a record at or below its epoch (LOSS_EPOCH; a previous-release
+\* host's epoch-less legacy row counts as the record's own epoch), and only
+\* while FleetDO still reports the host lost (LOST_RECHECK, `hostGone`).
+StillLost(h) == fStatus[h] = "expired" \/ (fStatus[h] = "dead" /\ (A6 => ~up[h]))
+RHostLost(a, h, e) ==
+  IF /\ a.bh = h
+     /\ (LOSS_EPOCH /\ h # OLD_HOST) => e >= a.be
+     /\ LOST_RECHECK => StillLost(h)
+  THEN RRelease(a) ELSE a
 
 Exited(a, h, e, r) == IF RECORD THEN RExited(a, h, e) ELSE TExited(a, h, e, r)
 \* e: the epoch of FleetDO's index row for (agent, h) when the loss was sent.
@@ -447,6 +460,9 @@ REscalate ==
   /\ A2 => ~Lost(fStatus[ag.bh])                 \* RStatusRelease first
   /\ ag.bh # OLD_HOST                            \* never wedges or releases a previous-release host
   /\ LET h == ag.bh
+         \* "processed" = the host's own result for the kill (Exec -> EventDeliver).
+         \* FleetDO never writes a kill's answer itself in this model, matching
+         \* PR #32 (`commands.answered_by`: 'fleet' answers never count).
          processed == fKillDone[h] >= ag.be
          row == fRow[h] # 0 /\ fRow[h] <= ag.be
      IN IF processed /\ ~row
@@ -855,7 +871,9 @@ LostDeliver(h) ==
   /\ fRpc[h] > 0
   /\ ag' = HostLost(ag, h, fRpc[h])
   /\ fRpc' = [fRpc EXCEPT ![h] = 0]
-  /\ \/ fRow' = [fRow EXCEPT ![h] = IF A5 /\ @ # fRpc[h] THEN @ ELSE 0] /\ UNCHANGED faults
+  \* (with LOST_RECHECK a host no longer lost keeps its row: `hostGone` false)
+  /\ \/ fRow' = [fRow EXCEPT ![h] = IF (A5 /\ @ # fRpc[h]) \/ (LOST_RECHECK /\ ~StillLost(h)) THEN @ ELSE 0]
+        /\ UNCHANGED faults
      \/ ALLOW_LOST /\ CanFault /\ faults' = faults + 1 /\ UNCHANGED fRow
   /\ UNCHANGED <<hostV, brainV, nestdV, fStatus, fWedged, sinceRx, fQ, fKillDone, fExp, tn, hBad, startAfterKill>>
 
@@ -1022,6 +1040,15 @@ NoEpochRegression ==
 TurnsDrain == Work ~> (~Work \/ ag.epoch = MaxEpoch)
 NoWedge == (IF RECORD THEN ag.ph = "condemned" ELSE ag.awaitH # NoHost)
            ~> ((IF RECORD THEN ag.ph # "condemned" ELSE ag.awaitH = NoHost) \/ ag.epoch = MaxEpoch)
+
+\* Liveness under a stable environment: a lease lapse with no fault behind it
+\* (a host merely slow to heartbeat) is free in this model, so a behaviour can
+\* lapse and expire hosts forever.  L is stated for behaviours where lapses
+\* eventually stop (finitely many slow periods and faults).
+LapseStep == \E h \in Hosts : ~lapsed[h] /\ lapsed'[h]
+EventuallyStable == <>[][~LapseStep]_vars
+StableTurnsDrain == EventuallyStable => TurnsDrain
+StableNoWedge == EventuallyStable => NoWedge
 
 Bounds == \A h \in Hosts : Len(fQ[h]) <= 3 /\ Len(nIn[h]) <= 3 /\ Len(hOut[h]) <= 4
 \* The smaller bound used by the exhaustive runs.
