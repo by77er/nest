@@ -5,8 +5,10 @@
 name: fuzz
 
 on:
+  # Weekly (Sunday): about 40 runner minutes a run, which nightly would make most of the account's
+  # included Actions minutes (dev/ci.md#cost).
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 3 * * 0"
   workflow_dispatch:
 
 permissions:

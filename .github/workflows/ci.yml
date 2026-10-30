@@ -1,5 +1,7 @@
 # The checks every change to main must pass. See dev/ci.md. Branch protection requires only
 # `ci-ok`, so adding a job here never needs a settings change.
+# `plan` runs the repo checks and decides which jobs a change needs (scripts/ci-changes.py); a push
+# to main whose tree a pull request's run already passed runs nothing again (dev/ci.md#what-runs).
 # Actions are pinned by commit; the comment names the release.
 name: ci
 
@@ -23,7 +25,97 @@ env:
   NEST_CI_REQUIRE_USERNS: "1"
 
 jobs:
+  # The cheap checks every change gets, and which of the jobs below it needs. Everything else waits
+  # for this, so a failing guard costs no Rust build.
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # To find the artifact a pull request's passing run left for this tree.
+      actions: read
+    env:
+      GITLEAKS: v8.30.1
+    outputs:
+      tree: ${{ steps.tree.outputs.tree }}
+      rust: ${{ steps.jobs.outputs.rust }}
+      control-plane: ${{ steps.jobs.outputs.control-plane }}
+      dashboard: ${{ steps.jobs.outputs.dashboard }}
+      e2e: ${{ steps.jobs.outputs.e2e }}
+      infra: ${{ steps.jobs.outputs.infra }}
+      verify-nestd: ${{ steps.jobs.outputs.verify-nestd }}
+      fuzz-nestd: ${{ steps.jobs.outputs.fuzz-nestd }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: tree
+        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+      # Guards: doc links, source fences for the CLAUDE.md invariants, and tests proving each guard
+      # can fail.
+      - run: python3 -I scripts/check-doc-links.py
+      - run: python3 -I scripts/check-fences.py
+      - run: python3 -I scripts/check-core-manifest.py
+      # PyYAML, pinned by hash, in a venv (the runner's Python is externally managed).
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/guards"
+          "$RUNNER_TEMP/guards/bin/pip" install --require-hashes --only-binary :all: -r scripts/requirements-guards.txt
+      - run: '"$RUNNER_TEMP/guards/bin/python" -I scripts/check-workflows.py'
+      - run: '"$RUNNER_TEMP/guards/bin/python" -m unittest discover -s scripts/tests'
+      # Secrets: gitleaks over the full history, built from source (the Go checksum database
+      # verifies the module) once per version.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: gitleaks
+        with:
+          path: ~/gitleaks-bin
+          key: gitleaks-${{ runner.os }}-${{ env.GITLEAKS }}
+      - if: steps.gitleaks.outputs.cache-hit != 'true'
+        run: GOBIN="$HOME/gitleaks-bin" go install "github.com/zricethezav/gitleaks/v8@$GITLEAKS"
+      - run: '"$HOME/gitleaks-bin/gitleaks" git --redact --no-banner -c .gitleaks.toml .'
+      # A squash merge whose tree equals the one its pull request's run tested (main didn't move in
+      # between) has passed already: ci-ok of that run uploaded `ci-passed-<tree>`. Only a run of the
+      # pull request this push merged counts, so no other pull request's workflow can vouch for it.
+      - name: Passed already as a pull request?
+        id: reuse
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TREE: ${{ steps.tree.outputs.tree }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            -q '[.[] | select(.merged_at != null and .merge_commit_sha == env.GITHUB_SHA)][0].head.sha // empty')
+          [ -n "$head" ] || exit 0
+          for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ci-passed-$TREE&per_page=20" \
+              -q ".artifacts[] | select((.expired | not) and .workflow_run.head_sha == \"$head\") | .workflow_run.id"); do
+            if [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" -q '[.path, .event, .conclusion, .head_sha] | join(" ")')" \
+                = ".github/workflows/ci.yml pull_request success $head" ]; then
+              echo "run=$run" >> "$GITHUB_OUTPUT"
+              echo "::notice::Tree $TREE passed in run $run (its pull request); no job runs again."
+              break
+            fi
+          done
+      - name: Which jobs this change needs
+        id: jobs
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          REUSED: ${{ steps.reuse.outputs.run }}
+        # A pull request is checked out as its merge commit, whose first parent is the base.
+        run: |
+          if [ -n "$REUSED" ]; then
+            python3 -I scripts/ci-changes.py --none
+          elif [ "$EVENT" = pull_request ]; then
+            git diff --name-only --no-renames 'HEAD^1' HEAD | python3 -I scripts/ci-changes.py
+          elif [ "$EVENT" = push ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            git diff --name-only --no-renames "$BEFORE" HEAD | python3 -I scripts/ci-changes.py
+          else
+            python3 -I scripts/ci-changes.py --all
+          fi | tee -a "$GITHUB_OUTPUT"
+
   rust:
+    needs: plan
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -31,6 +123,7 @@ jobs:
       # cache save) small enough for the runner's disk, which ran out during that save.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_DENY: 0.20.2
     steps:
       # The runner image's preinstalled toolchains this job never uses: about 25 GB back.
       - name: Free disk
@@ -68,8 +161,22 @@ jobs:
           cargo build -p nestd-core --target x86_64-unknown-none --locked
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+      # cargo-deny (deny.toml): RustSec advisories, licenses, wildcards, unknown sources.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: deny
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY }}-${{ hashFiles('rust-toolchain.toml') }}
+      - if: steps.deny.outputs.cache-hit != 'true'
+        run: cargo install --locked "cargo-deny@$CARGO_DENY"
+      - run: cargo deny --locked check
+      # The standalone verification crates have their own lockfiles; same policy.
+      - run: cargo deny --manifest-path verification/nestd/check/Cargo.toml --config deny.toml --locked check
+      - run: cargo deny --manifest-path verification/nestd/fuzz/Cargo.toml --config deny.toml --locked check
 
   control-plane:
+    needs: plan
+    if: needs.plan.outputs.control-plane == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
@@ -89,6 +196,8 @@ jobs:
       - run: npm test
 
   dashboard:
+    needs: plan
+    if: needs.plan.outputs.dashboard == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
@@ -109,6 +218,8 @@ jobs:
       - run: npm run build
 
   e2e:
+    needs: plan
+    if: needs.plan.outputs.e2e == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -165,6 +276,8 @@ jobs:
   # credentials: a pull request can't change IAM in a way that breaks a theorem. Plans run only
   # in deploy.yml, which holds the credentials.
   infra:
+    needs: plan
+    if: needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -193,65 +306,11 @@ jobs:
           inframe test --stack use1
           inframe test --stack edge
 
-  # Repo guards: doc links, source fences for the CLAUDE.md invariants, and tests proving each
-  # guard can fail.
-  guards:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: python3 -I scripts/check-doc-links.py
-      - run: python3 -I scripts/check-fences.py
-      - run: python3 -I scripts/check-core-manifest.py
-      # PyYAML, pinned by hash, in a venv (the runner's Python is externally managed).
-      - run: |
-          python3 -m venv "$RUNNER_TEMP/guards"
-          "$RUNNER_TEMP/guards/bin/pip" install --require-hashes --only-binary :all: -r scripts/requirements-guards.txt
-      - run: '"$RUNNER_TEMP/guards/bin/python" -I scripts/check-workflows.py'
-      - run: '"$RUNNER_TEMP/guards/bin/python" -m unittest discover -s scripts/tests'
-
-  deny:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      CARGO_DENY: 0.20.2
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: cache
-        with:
-          path: ~/.cargo/bin/cargo-deny
-          key: cargo-deny-${{ env.CARGO_DENY }}-${{ hashFiles('rust-toolchain.toml') }}
-      - if: steps.cache.outputs.cache-hit != 'true'
-        run: cargo install --locked "cargo-deny@$CARGO_DENY"
-      - run: cargo deny --locked check
-      # The standalone verification crates have their own lockfiles; same policy.
-      - run: cargo deny --manifest-path verification/nestd/check/Cargo.toml --config deny.toml --locked check
-      - run: cargo deny --manifest-path verification/nestd/fuzz/Cargo.toml --config deny.toml --locked check
-
-  secrets:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    env:
-      GITLEAKS: v8.30.1
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      # Built from source; the Go checksum database verifies the module.
-      - run: GOBIN="$RUNNER_TEMP/bin" go install "github.com/zricethezav/gitleaks/v8@$GITLEAKS"
-      - run: '"$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner -c .gitleaks.toml .'
-
   # nestd's cores checked as the code that ships (docs/verification/nestd/): the Stateright checks
   # at CI bounds and mutation testing of nestd-core. Both crates are standalone (own lockfiles).
   verify-nestd:
+    needs: plan
+    if: needs.plan.outputs.verify-nestd == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -285,6 +344,8 @@ jobs:
 
   # Kani proofs of nestd-core's decision functions (bounded; see docs/verification/nestd/).
   kani-nestd:
+    needs: plan
+    if: needs.plan.outputs.verify-nestd == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -312,6 +373,8 @@ jobs:
   # deterministic: the seeds still decode, and every target replays the seeds and the corpus the
   # scheduled fuzzing grew (fuzz.yml), once each. Timed fuzzing runs only on that schedule.
   fuzz-nestd:
+    needs: plan
+    if: needs.plan.outputs.fuzz-nestd == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -355,18 +418,36 @@ jobs:
           path: verification/nestd/fuzz/artifacts
           retention-days: 7
 
+  # Each job ran and passed if `plan` said the change needs it, and was skipped otherwise. A pull
+  # request's pass leaves `ci-passed-<tree>` for the push of its squash merge (see `plan`).
   ci-ok:
     if: always()
-    needs: [rust, control-plane, dashboard, e2e, infra, guards, deny, secrets, verify-nestd, kani-nestd, fuzz-nestd]
+    needs: [plan, rust, control-plane, dashboard, e2e, infra, verify-nestd, kani-nestd, fuzz-nestd]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Every job passed
+      - name: Every needed job passed
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           python3 -I -c '
           import json, os, sys
-          bad = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items() if v["result"] != "success"}
-          print(bad or "all jobs passed")
+          needs = json.loads(os.environ["NEEDS"])
+          plan = needs.pop("plan")
+          if plan["result"] != "success":
+              sys.exit("plan: " + plan["result"])
+          want = {k: plan["outputs"].get("verify-nestd" if k == "kani-nestd" else k) == "true" for k in needs}
+          bad = {k: v["result"] for k, v in needs.items() if v["result"] != ("success" if want[k] else "skipped")}
+          print(bad or {k: v["result"] for k, v in needs.items()})
           sys.exit(1 if bad else 0)'
+      - if: github.event_name == 'pull_request'
+        run: echo "$TREE" > "$RUNNER_TEMP/ci-passed"
+        env:
+          TREE: ${{ needs.plan.outputs.tree }}
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-passed-${{ needs.plan.outputs.tree }}
+          path: ${{ runner.temp }}/ci-passed
+          if-no-files-found: error
+          retention-days: 7

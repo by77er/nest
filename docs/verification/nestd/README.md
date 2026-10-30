@@ -20,7 +20,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
     - The crate is `#![cfg_attr(not(test), no_std)]` with `extern crate alloc`. On the host, `no_std` alone doesn't forbid an explicit `extern crate std`; the no-std target does.
     - It is `#![forbid(unsafe_code)]`.
     - Its unit tests are built with `std`, on the host only.
-  - **The manifest and the sources, in `guards`.** [scripts/check-core-manifest.py](../../../scripts/check-core-manifest.py) fails on:
+  - **The manifest and the sources, in CI `plan`.** [scripts/check-core-manifest.py](../../../scripts/check-core-manifest.py) fails on:
     - any dependency table or key in `crates/nestd-core/Cargo.toml` (parsed as TOML: dotted, inline or per target);
     - any build key, `[patch]` or `[replace]`, or a `build.rs`;
     - a `lib.rs` without the `no_std` line;
@@ -325,15 +325,15 @@ The seeds are built from `protocol/fixtures/` at every run and never committed, 
 
 ## CI
 
-- **Every PR, existing jobs:**
+- **Every PR that touches their inputs** ([dev/ci.md](../../../dev/ci.md#what-runs)), **existing jobs:**
   - `rust` runs nestd-core's tests and clippy, and builds it for `x86_64-unknown-none` (no `std`).
-  - `guards` runs the purity fence, the manifest and source check, and their tests.
-  - `deny` also checks the checker's and the fuzz crate's lockfiles.
-- **New jobs on every PR** (times on a runner not yet measured). None of them fuzzes for a time. Two of their inputs do change from run to run: the fuzz replay's corpus comes from the latest nightly run, and cargo-mutants kills a mutant after a 60 s wall-clock timeout.
+  - `plan` runs the purity fence, the manifest and source check, and their tests.
+  - `rust` also runs cargo-deny over the checker's and the fuzz crate's lockfiles.
+- **New jobs on every PR** (times on a runner not yet measured). None of them fuzzes for a time. Two of their inputs do change from run to run: the fuzz replay's corpus comes from the latest weekly run, and cargo-mutants kills a mutant after a 60 s wall-clock timeout.
   - `verify-nestd`: the checker's tests (`verification/nestd/check`, `cargo test --release`), then cargo-mutants on nestd-core in place.
   - `kani-nestd`: the Kani proofs.
   - `fuzz-nestd`: the seeds still decode, and every target replays the seeds and the cached corpus once.
-- **Timed fuzzing** runs nightly in `fuzz.yml`, which grows the corpus the PR job replays.
+- **Timed fuzzing** runs weekly in `fuzz.yml`, which grows the corpus the PR job replays.
 - **Longer runs** (the every-fault check) are in [dev/ci.md](../../../dev/ci.md#verification).
 
 ## Phase 2 design
