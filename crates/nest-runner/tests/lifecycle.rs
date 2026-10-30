@@ -1,6 +1,5 @@
 //! Brain lifecycle regressions (no real Claude Code: a shell script that never reads stdin).
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,8 +32,8 @@ fn now_ms() -> i64 {
 fn env() -> Env {
     let dir = tempfile::tempdir().unwrap();
     let fake = dir.path().join("claude");
-    std::fs::write(&fake, FAKE).unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Never `std::fs::write`: a parallel test's fork could hold it open and fail its exec (ETXTBSY).
+    nest_runner::test_support::install_executable(&fake, FAKE);
     std::fs::create_dir_all(dir.path().join("empty")).unwrap();
     let cfg = Config { claude_bin: fake, cwd: dir.path().join("empty"), ..Config::default() };
     let rt = Runtime::new(cfg);
@@ -81,16 +80,17 @@ async fn events(rt: &Runtime, wait: Duration) -> Vec<RunnerEvent> {
     out
 }
 
-/// Polls `f` for up to 15 s. The bound is a margin, not a timing claim: a GitHub runner has
-/// taken more than 5 s to start the fake brain (a Python process) under load.
-async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+/// Polls `f` for up to 15 s (a margin: the fake brain starts in milliseconds). A timeout shows
+/// what the runner reported meanwhile, e.g. an exit saying why the brain never came.
+async fn wait_for(rt: &Runtime, what: &str, mut f: impl FnMut() -> bool) {
     for _ in 0..300 {
         if f() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("timed out waiting for {what}");
+    let evs = events(rt, Duration::from_millis(200)).await;
+    panic!("timed out waiting for {what}: {evs:?}");
 }
 
 fn exited(evs: &[RunnerEvent]) -> Vec<ExitReason> {
@@ -114,12 +114,12 @@ async fn a_start_never_runs_beside_or_adopts_a_registered_brain() {
     let e = env();
     let id = AgentId("agt_dup".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_dup", 1));
-    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "first brain", || pids(e.dir.path()).len() == 1).await;
     let first = e.rt.agent(&id).expect("registered");
     let pid = pids(e.dir.path())[0];
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_dup", 2));
-    wait_for("the first brain gone", || !alive(pid)).await;
-    wait_for("a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
+    wait_for(&e.rt, "the first brain gone", || !alive(pid)).await;
+    wait_for(&e.rt, "a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
     assert_eq!(first.epoch(), nest_protocol::model::Epoch(1), "never adopted");
     assert!(pids(e.dir.path()).iter().filter(|p| alive(**p)).count() <= 1, "never two at once");
     let evs = events(&e.rt, Duration::from_millis(500)).await;
@@ -147,7 +147,7 @@ async fn a_brain_with_full_stdin_is_still_killed() {
     let e = env();
     let id = AgentId("agt_full".into());
     nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_full", &[]));
-    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "brain", || pids(e.dir.path()).len() == 1).await;
     let a = e.rt.agent(&id).unwrap();
     for i in 0..4 {
         a.command(AgentCmd::RunTurn { turn: TurnId(format!("trn_{i}")), input: TurnInput { kind: TurnInputKind::User, text: "x".repeat(1 << 20) } });
@@ -155,8 +155,8 @@ async fn a_brain_with_full_stdin_is_still_killed() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     nest_runner::supervisor::handle(&e.rt, RunnerCommand::Fence { agents: vec![], reason: "test".into() });
     let pid = pids(e.dir.path())[0];
-    wait_for("brain killed despite a full stdin", || !alive(pid)).await;
-    wait_for("deregistered", || e.rt.agent(&id).is_none()).await;
+    wait_for(&e.rt, "brain killed despite a full stdin", || !alive(pid)).await;
+    wait_for(&e.rt, "deregistered", || e.rt.agent(&id).is_none()).await;
     let evs = events(&e.rt, Duration::from_millis(500)).await;
     assert!(exited(&evs).contains(&ExitReason::Fenced), "{evs:?}");
 }
@@ -209,7 +209,7 @@ async fn a_start_for_a_stopping_brain_replaces_it_instead_of_adopting_it() {
     let e = env();
     let id = AgentId("agt_stopping".into());
     nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_stopping", &[]));
-    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "first brain", || pids(e.dir.path()).len() == 1).await;
     let first = e.rt.agent(&id).expect("registered");
     let pid = pids(e.dir.path())[0];
     nest_runner::supervisor::handle(
@@ -218,8 +218,8 @@ async fn a_start_for_a_stopping_brain_replaces_it_instead_of_adopting_it() {
     );
     assert!(first.is_stopping());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_stopping", 2));
-    wait_for("the stopping brain gone", || !alive(pid)).await;
-    wait_for("a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
+    wait_for(&e.rt, "the stopping brain gone", || !alive(pid)).await;
+    wait_for(&e.rt, "a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
     let evs = events(&e.rt, Duration::from_millis(300)).await;
     assert!(!evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "already_running")), "{evs:?}");
 }
@@ -260,7 +260,7 @@ async fn a_kill_before_its_start_registers_means_it_never_runs() {
     let e = env();
     let id = AgentId("agt_tomb".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_tomb", 1));
-    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "first brain", || pids(e.dir.path()).len() == 1).await;
     let first_pid = pids(e.dir.path())[0];
     // Stopping; the start at epoch 2 waits for it, and the kill for epoch 2 lands meanwhile.
     nest_runner::supervisor::handle(
@@ -269,7 +269,7 @@ async fn a_kill_before_its_start_registers_means_it_never_runs() {
     );
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_tomb", 2));
     nest_runner::supervisor::handle(&e.rt, kill_at(&id, 2));
-    wait_for("the first brain gone", || !alive(first_pid)).await;
+    wait_for(&e.rt, "the first brain gone", || !alive(first_pid)).await;
     let evs = events(&e.rt, Duration::from_millis(1500)).await;
     let exits = exits_at(&evs);
     let refused = exits.iter().position(|x| *x == (ExitReason::Fenced, Some(2)));
@@ -291,13 +291,13 @@ async fn a_kill_spares_a_newer_brain() {
     let e = env();
     let id = AgentId("agt_newer".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_newer", 2));
-    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "brain", || pids(e.dir.path()).len() == 1).await;
     let pid = pids(e.dir.path())[0];
     nest_runner::supervisor::handle(&e.rt, kill_at(&id, 1));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(alive(pid), "a kill for epoch 1 ended the brain at epoch 2");
     nest_runner::supervisor::handle(&e.rt, kill_at(&id, 2));
-    wait_for("brain killed", || !alive(pid)).await;
+    wait_for(&e.rt, "brain killed", || !alive(pid)).await;
     let evs = events(&e.rt, Duration::from_millis(800)).await;
     assert!(exits_at(&evs).contains(&(ExitReason::Stopped, Some(2))), "{evs:?}");
 }
@@ -309,7 +309,7 @@ async fn a_fence_of_every_brain_drops_a_waiting_start() {
     let e = env();
     let id = AgentId("agt_lapse".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_lapse", 1));
-    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "first brain", || pids(e.dir.path()).len() == 1).await;
     let first_pid = pids(e.dir.path())[0];
     // Stopping, so the start at epoch 2 waits for it; then the lease lapses.
     nest_runner::supervisor::handle(
@@ -318,7 +318,7 @@ async fn a_fence_of_every_brain_drops_a_waiting_start() {
     );
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_lapse", 2));
     nest_runner::supervisor::handle(&e.rt, RunnerCommand::Fence { agents: vec![], reason: "host lease expired".into() });
-    wait_for("the first brain gone", || !alive(first_pid)).await;
+    wait_for(&e.rt, "the first brain gone", || !alive(first_pid)).await;
     let evs = events(&e.rt, Duration::from_millis(1500)).await;
     assert!(exits_at(&evs).contains(&(ExitReason::Fenced, Some(2))), "{evs:?}");
     assert_eq!(pids(e.dir.path()).len(), 1, "the waiting start ran after the fence");
@@ -332,7 +332,7 @@ async fn a_refused_start_ends_the_older_brain_before_its_exit() {
     let e = env();
     let id = AgentId("agt_forbid".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_forbid", 1));
-    wait_for("first brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "first brain", || pids(e.dir.path()).len() == 1).await;
     let pid = pids(e.dir.path())[0];
     let bad = match start_cmd(e.dir.path(), "agt_forbid", &["Bash"]) {
         RunnerCommand::AgentStart(mut s) => {
@@ -342,7 +342,7 @@ async fn a_refused_start_ends_the_older_brain_before_its_exit() {
         _ => unreachable!(),
     };
     nest_runner::supervisor::handle(&e.rt, bad);
-    wait_for("the older brain ended", || !alive(pid)).await;
+    wait_for(&e.rt, "the older brain ended", || !alive(pid)).await;
     let evs = events(&e.rt, Duration::from_millis(1500)).await;
     let exits = exits_at(&evs);
     let refused = exits.iter().position(|x| *x == (ExitReason::Crashed, Some(2)));
@@ -357,7 +357,7 @@ async fn a_graceful_stop_for_an_older_epoch_spares_a_newer_brain() {
     let e = env();
     let id = AgentId("agt_grace".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_grace", 2));
-    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "brain", || pids(e.dir.path()).len() == 1).await;
     nest_runner::supervisor::handle(
         &e.rt,
         RunnerCommand::AgentStop { agent: id.clone(), mode: nest_protocol::host::runner::StopMode::Graceful, reason: "old".into(), epoch: Some(nest_protocol::model::Epoch(1)) },
@@ -377,7 +377,7 @@ async fn an_older_start_never_ends_a_newer_brain() {
     let e = env();
     let id = AgentId("agt_old".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_old", 2));
-    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "brain", || pids(e.dir.path()).len() == 1).await;
     let pid = pids(e.dir.path())[0];
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_old", 1));
     let evs = events(&e.rt, Duration::from_millis(800)).await;
@@ -393,7 +393,7 @@ async fn a_duplicate_start_is_a_no_op() {
     let e = env();
     let id = AgentId("agt_same".into());
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_same", 2));
-    wait_for("brain", || pids(e.dir.path()).len() == 1).await;
+    wait_for(&e.rt, "brain", || pids(e.dir.path()).len() == 1).await;
     let pid = pids(e.dir.path())[0];
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_same", 2));
     let evs = events(&e.rt, Duration::from_millis(800)).await;

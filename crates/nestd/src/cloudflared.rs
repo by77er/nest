@@ -336,7 +336,6 @@ async fn skip_line<R: AsyncBufRead + Unpin>(reader: &mut R) {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -377,6 +376,19 @@ mod tests {
         }
     }
 
+    /// Install a fake binary without this process ever holding it open for writing: a child another
+    /// test thread forks meanwhile inherits a write descriptor until it execs, and running the file in
+    /// that window fails with ETXTBSY. The bytes go to a staging file; `cp`, its own process, writes
+    /// the executable. (Same as `nest_runner::test_support::install_executable`.)
+    fn install_executable(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        use std::os::unix::fs::PermissionsExt;
+        let staging = std::path::PathBuf::from(format!("{}.staging", path.display()));
+        std::fs::write(&staging, contents).unwrap();
+        assert!(std::process::Command::new("cp").arg(&staging).arg(path).status().unwrap().success());
+        std::fs::remove_file(&staging).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// A fake cloudflared: a shell script whose prologue appends `spawned pid=<pid> at=<ns>
     /// argv:<args>` to the log and sets `$n` to this run's number; the body (given the log's path)
     /// follows. The token's value is never written anywhere.
@@ -396,8 +408,7 @@ mod tests {
             let log = dir.path().join("log");
             let l = log.display().to_string();
             let script = format!("#!/bin/sh\necho \"spawned pid=$$ at=$(date +%s%N) argv:$*\" >> {l}\nn=$(grep -c '^spawned' {l})\n{}\n", body(&l));
-            std::fs::write(dir.path().join("cloudflared"), script).unwrap();
-            std::fs::set_permissions(dir.path().join("cloudflared"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            install_executable(&dir.path().join("cloudflared"), script);
             Fake { dir, log }
         }
         fn path(&self, name: &str) -> PathBuf {

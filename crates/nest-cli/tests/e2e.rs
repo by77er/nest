@@ -3,7 +3,6 @@
 //! in-process + fake guest behind it. No real Claude Code and no credentials are ever used.
 #![allow(clippy::result_large_err)] // tungstenite handshake callback signature
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -287,8 +286,8 @@ impl Harness {
     async fn new(idle_grace: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("claude");
-        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_claude.py"), &fake).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Not `std::fs::copy`: a parallel test's fork could hold it open and fail its exec (ETXTBSY).
+        nest_runner::test_support::install_executable(&fake, include_str!("fake_claude.py"));
         let cwd = dir.path().join("empty");
         std::fs::create_dir_all(&cwd).unwrap();
         let nestd = FakeNestd::start(&dir.path().join("runner.sock")).await;
