@@ -219,7 +219,7 @@ export function checkCapability(cap: Capability, registry: readonly string[]): R
   return ok(cap);
 }
 
-/** A template lists only capabilities that exist, each once. */
+/** A template lists only capabilities that exist, each once, and gives only parameters they take. */
 export function checkTemplate(tpl: Template, capabilities: Readonly<Record<string, Capability>>): Result<Template> {
   const seen = new Set<string>();
   for (const c of tpl.capabilities) {
@@ -227,6 +227,8 @@ export function checkTemplate(tpl: Template, capabilities: Readonly<Record<strin
     if (seen.has(c)) return err(`capability ${c} listed twice`);
     seen.add(c);
   }
+  const params = checkParams("the template", tpl.capabilities.map((c) => capabilities[c]!), tpl.params ?? {});
+  if (!params.ok) return err(params.error);
   return ok(tpl);
 }
 
@@ -262,7 +264,7 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     caps.push(cap);
   }
   const given = new Set(caps.flatMap((c) => c.tools));
-  const params = checkParams(name, caps, tpl.params ?? {});
+  const params = checkParams(`template ${name}`, caps, tpl.params ?? {});
   if (!params.ok) return params;
   const prompt = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter((t) => t.length > 0).join("\n\n");
   return ok({
@@ -278,15 +280,15 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   });
 }
 
-/** `params`, each of which a capability in `caps` must declare. */
-function checkParams(template: string, caps: readonly Capability[], params: SpecParams): Result<SpecParams> {
+/** `params`, each of which a capability in `caps` must take (`what`: the template, in a refusal). */
+function checkParams(what: string, caps: readonly Capability[], params: SpecParams): Result<SpecParams> {
   const declared = new Set(caps.flatMap((c) => c.params ?? []));
   const parsed = SpecParams.safeParse(params);
   if (!parsed.success) return err(`params: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
   const out: SpecParams = {};
   for (const [k, v] of Object.entries(parsed.data) as [ParamName, string | undefined][]) {
     if (v === undefined) continue;
-    if (!declared.has(k)) return err(`no capability of template ${template} takes ${k}`);
+    if (!declared.has(k)) return err(`no capability of ${what} takes ${k}`);
     out[k] = v;
   }
   return ok(out);
@@ -325,12 +327,14 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     if (!o.success) return err(`a spawner can only narrow tools and add deny or ask rules: ${o.error.issues.map((i) => i.message).join("; ")}`);
     const tools = narrowTools(spec.template, base.value.tools, o.data.tools);
     if (!tools.ok) return tools;
-    return ok({ ...base.value, tools: tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) });
+    // No parameters, not even the template's defaults: a spawner would otherwise reach whatever ledger a
+    // template names. A child's parameters wait for attenuation against the spawner's own.
+    return ok({ ...base.value, tools: tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} });
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value.tools, o.tools);
   if (!tools.ok) return tools;
-  const params = checkParams(spec.template, capsOf(catalog, spec.template), { ...base.value.params, ...o.params });
+  const params = checkParams(`template ${spec.template}`, capsOf(catalog, spec.template), { ...base.value.params, ...o.params });
   if (!params.ok) return params;
   return ok({
     ...base.value,

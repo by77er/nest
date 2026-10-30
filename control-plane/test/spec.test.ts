@@ -181,6 +181,20 @@ describe("the current seed adds the task ledger (seed version 2)", () => {
     expect(expand(withDefault, "t", true, { params: { ledger: "other" } }).params).toEqual({ ledger: "other" });
     const undeclared: Catalog = { ...SEED_CATALOG_V1, templates: { t: { ...SEED_CATALOG_V1.templates.worker!, params: { ledger: "dflt" } } } };
     expect(expandTemplate(undeclared, PLATFORM_TOOL_NAMES, "t")).toEqual({ ok: false, error: "no capability of template t takes ledger" });
+    // The admin route's check refuses such a template up front (not at its first spawn).
+    expect(checkTemplate(undeclared.templates.t!, undeclared.capabilities)).toEqual({ ok: false, error: "no capability of the template takes ledger" });
+    expect(checkTemplate(withDefault.templates.t!, withDefault.capabilities).ok).toBe(true);
+  });
+
+  it("a spawner's child never gets a template's default ledger (it would reach a ledger the spawner may not hold)", () => {
+    const withAdminDefault: Catalog = {
+      ...SEED_CATALOG, templates: { lead: { ...SEED_CATALOG.templates.captain!, params: { ledger: "someone-elses" } } },
+    };
+    // The operator's spawn gets the default; a spawner's gets none, so its task tools refuse.
+    expect(expand(withAdminDefault, "lead", false).params).toEqual({ ledger: "someone-elses" });
+    const child = expandSpec(withAdminDefault, PLATFORM_TOOL_NAMES, { template: "lead", hands: false, by: "spawner" });
+    expect(child.ok && child.value.params).toEqual({});
+    expect(child.ok && child.value.tools).toEqual(expect.arrayContaining([...TASK_ADMIN_TOOLS]));
   });
 
   it("a spawner can't obtain tasks-admin from the worker template, nor name a ledger", () => {
@@ -253,6 +267,8 @@ function genCatalog(r: () => number): { catalog: Catalog; template: string; hand
     subscribe: r() < 0.5 ? ["workstream"] : [],
     params: {},
   };
+  // A default ledger, where a listed capability takes one (so the spawner property meets defaults).
+  if (template.capabilities.some((c) => capabilities[c]!.params.includes("ledger")) && r() < 0.6) template.params = { ledger: "dflt" };
   const given = [...new Set(template.capabilities.flatMap((c) => capabilities[c]!.tools))];
   const overrides: { tools?: string[]; rules?: ToolRule[] } = {};
   if (r() < 0.4) overrides.tools = subset(given, 0.5);
@@ -323,8 +339,9 @@ describe("expansion properties (500 generated catalogs)", () => {
       expect(allows(res.value.rules), ctx).toEqual(allows(base.value.rules));
       const baseKeys = new Set(base.value.rules.map(key));
       expect(res.value.rules.filter((x) => !baseKeys.has(key(x))).every((x) => x.decision !== "allow"), ctx).toBe(true);
-      expect([res.value.launch, res.value.credential, res.value.escalate_to, res.value.params], ctx)
-        .toEqual([base.value.launch, base.value.credential, base.value.escalate_to, base.value.params]);
+      expect([res.value.launch, res.value.credential, res.value.escalate_to], ctx).toEqual([base.value.launch, base.value.credential, base.value.escalate_to]);
+      // No parameters at all, whatever the template's defaults.
+      expect(res.value.params, ctx).toEqual({});
     }
   });
 

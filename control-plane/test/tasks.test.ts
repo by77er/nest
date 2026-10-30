@@ -4,7 +4,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { CatalogDO } from "../src/do/catalog";
-import { ledgerStub, TaskLedgerDO } from "../src/do/tasks";
+import { ledgerStub, noticeRetryMs, TaskLedgerDO } from "../src/do/tasks";
 import { SEED_CATALOG, SEED_CATALOG_V1, SEED_VERSION } from "../src/lib/spec";
 import { TASK_ADMIN_TOOLS, TASK_TOOLS } from "../src/lib/tasks";
 import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
@@ -13,6 +13,8 @@ const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const isStartOf = (agent: string) => (c: any) => c.type === "agent_start" && c.agent === agent;
 const uniqueLedger = (p = "lg") => `${p}-${crypto.randomUUID().slice(0, 8)}`;
+/** A notice's post, as an outbox row stores it. */
+const POST = { kind: "task_status", text: "T-1 is done (retry check)", data: { ledger: "x", key: "T-1", status: "done", assignee: null } };
 
 async function cell() {
   const c = uniqueCell();
@@ -119,7 +121,7 @@ describe("the tasks capability through the tool path", { timeout: 20_000 }, () =
     expect((await c.call("task_set_watcher", { watcher: c.agent })).status).toBe("ok");
     const a = await c.call("task_assign", { task: created.key, assignee: w.agent, expected_version: 1 });
     expect(c.json(a)).toMatchObject({ assignee: w.agent, version: 2 });
-    expect((await inboxHas(w.agent, "assigned T-1")).join("\n")).toContain(`Message from tasks:${L}: assigned T-1 (ledger ${L}, by ${c.agent}): Ship it`);
+    expect((await inboxHas(w.agent, "assigned T-1")).join("\n")).toContain(`Message from tasks:${L}: assigned T-1 (ledger ${L}, by ${c.agent}); task_get reads it`);
 
     // The assignee moves it along; reaching in_review tells the creator (the captain, also the watcher) once.
     expect((await w.call("task_update", { task: "T-1", status: "in_progress" })).status).toBe("ok");
@@ -133,6 +135,45 @@ describe("the tasks capability through the tool path", { timeout: 20_000 }, () =
     expect((await w.call("task_update", { task: "T-1", status: "done" })).error!.code).toBe("forbidden");
     // update_any: priority and any status.
     expect(c.json(await c.call("task_update_any", { task: "T-1", status: "todo", priority: "high" }))).toMatchObject({ status: "todo", priority: "high" });
+    // Null, not a sentinel string, unassigns and clears.
+    expect(c.json(await c.call("task_assign", { task: "T-1", assignee: null }))).toMatchObject({ assignee: null });
+    expect(c.json(await c.call("task_list", { assignee: null })).tasks.map((t: { key: string }) => t.key)).toEqual(["T-1"]);
+    expect(c.json(await c.call("task_update_any", { task: "T-1", parent: null }))).toMatchObject({ parent: null });
+    expect((await c.call("task_set_watcher", { watcher: null })).status).toBe("ok");
+    expect((await c.call("task_assign", { task: "T-1", assignee: "none" })).error!.code).toBe("invalid_message");
+  });
+
+  it("task_claim: a worker takes an unassigned task (compare-and-set); a second claim is a conflict", async () => {
+    const s = await cell();
+    const L = uniqueLedger();
+    const w1 = await spawn(s, "worker", L);
+    const w2 = await spawn(s, "worker", L);
+    await w1.call("task_create", { title: "free", status: "todo" });
+    const stale = await w2.call("task_claim", { task: "T-1", expected_version: 2 });
+    expect(stale.error!.code).toBe("conflict");
+    expect(w2.json(await w2.call("task_claim", { task: "T-1", expected_version: 1 }))).toMatchObject({ assignee: w2.agent, status: "in_progress", version: 2 });
+    const lost = await w1.call("task_claim", { task: "T-1" });
+    expect(lost.error).toMatchObject({ code: "conflict", message: `T-1 is assigned to ${w2.agent}` });
+    // Now its own: the claimant moves it along; the creator hears in_review.
+    expect((await w2.call("task_update", { task: "T-1", status: "in_review" })).status).toBe("ok");
+    expect((await inboxHas(w1.agent, "T-1 is in_review")).some((t) => t.includes("T-1 is in_review"))).toBe(true);
+    expect((await w1.call("task_list", { assignee: "me" }))).toMatchObject({ status: "ok" });
+    expect(w2.json(await w2.call("task_list", { assignee: "me" })).tasks.map((t: { key: string }) => t.key)).toEqual(["T-1"]);
+  });
+
+  it("a stored status outside its enum: listed as read, refused cleanly by the rules that need it", async () => {
+    const s = await cell();
+    const L = uniqueLedger();
+    const w = await spawn(s, "worker", L);
+    await w.call("task_create", { title: "t" });
+    await runInDurableObject(ledgerStub(env, L), (_i: TaskLedgerDO, st) => {
+      const body = JSON.parse(st.storage.sql.exec<{ body: string }>("SELECT body FROM tasks").one().body);
+      st.storage.sql.exec("UPDATE tasks SET body = ?", JSON.stringify({ ...body, status: "archived", priority: "p0" }));
+    });
+    expect(w.json(await w.call("task_list", {})).tasks[0]).toMatchObject({ status: "archived", priority: "p0" });
+    const r = await w.call("task_update", { task: "T-1", status: "todo" });
+    expect(r.error).toMatchObject({ code: "invalid_message", message: expect.stringContaining("outside its enum") });
+    expect((await adminJson(`/v1/ledgers/${L}/tasks/T-1`, { method: "PATCH", body: { status: "todo", priority: "none" } })).status).toBe("todo");
   });
 
   it("assignment and watching need an agent whose spec grants the same ledger", async () => {
@@ -169,7 +210,7 @@ describe("the tasks capability through the tool path", { timeout: 20_000 }, () =
     expect(wb.json(await wb.call("task_get", { task: "T-1" })).comments).toEqual([]);
     // Its own ledger has no T-1; B's task id doesn't resolve in A either.
     const bTask = wb.json(await wb.call("task_list", {})).tasks[0];
-    expect((await wa.call("task_get", { task: bTask.id })).error!.code).toBe("invalid_message");
+    expect((await wa.call("task_get", { task: bTask.id })).error!.code).toBe("not_found");
     expect((await wa.call("task_list", { ledger: A })).status).toBe("ok");
 
     const none = await spawn(s, "captain", null);
@@ -215,12 +256,34 @@ describe("TaskLedgerDO", () => {
       const longAgo = Date.now() - 31 * 86_400_000;
       st.storage.sql.exec("UPDATE tasks SET updated_ms = ?", longAgo);
       st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'last_prune'", String(longAgo));
+      // Idempotency records: a week old goes, a fresh one stays.
+      st.storage.sql.exec("INSERT INTO applied (key, outcome, ts_ms) VALUES ('old', '{}', ?), ('fresh', '{}', ?)", Date.now() - 8 * 86_400_000, Date.now());
       await i.alarm();
+      expect(st.storage.sql.exec<{ key: string }>("SELECT key FROM applied ORDER BY key").toArray().map((r) => r.key)).toEqual(["fresh"]);
     });
     const old = await l.get(L, op, "T-1");
     expect([old.task.status, old.comments.length, old.history.length]).toEqual(["canceled", 0, 0]);
     const live = await l.get(L, op, "T-2");
     expect([live.comments.length, live.history.length]).toEqual([1, 1]);
+  });
+
+  it("counts only open tasks against the size limit", async () => {
+    const L = uniqueLedger();
+    const l = ledgerStub(env, L);
+    const t = (await l.apply(L, op, { kind: "create", title: "seed" })).task!;
+    await runInDurableObject(l, (_i: TaskLedgerDO, st) => {
+      // 9,999 more open tasks, written as the ledger writes them.
+      for (let n = 2; n <= 10_000; n++) {
+        const body = JSON.stringify({ ...t, id: `tsk_fill${n}`, number: n });
+        st.storage.sql.exec("INSERT INTO tasks (id, number, status, assignee, parent, labels, search, updated_ms, body) VALUES (?, ?, 'backlog', NULL, NULL, '[]', '', 0, ?)",
+          `tsk_fill${n}`, n, body);
+      }
+      st.storage.sql.exec("UPDATE kv SET value = '10001' WHERE key = 'next'");
+    });
+    await expect(Promise.resolve().then(() => l.apply(L, op, { kind: "create", title: "one too many" }))).rejects.toThrow(/10000 open tasks/);
+    // Closing one makes room.
+    await l.apply(L, op, { kind: "cancel", task: "T-2" });
+    expect((await l.apply(L, op, { kind: "create", title: "fits" })).task!.key).toBe("T-10001");
   });
 
   it("keeps each task's latest 500 history rows, whatever other tasks write", async () => {
@@ -248,10 +311,59 @@ describe("TaskLedgerDO", () => {
     const l = ledgerStub(env, L);
     await l.apply(L, op, { kind: "create", title: "t" });
     await runInDurableObject(l, async (i: TaskLedgerDO, st) => {
-      st.storage.sql.exec("INSERT INTO outbox (agent, text, next_ms) VALUES ('agt_ghost0000000000000000000000', 'hello', 0)");
+      st.storage.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES ('agt_ghost0000000000000000000000/inbox', ?, 0)", JSON.stringify(POST));
       await i.alarm();
       expect(st.storage.sql.exec("SELECT COUNT(*) AS n FROM outbox").one().n).toBe(0);
     });
+  });
+
+  it("retries a notice that failed (alarm re-armed, backoff growing) and deletes it only once delivered, delivering it once", { timeout: 30_000 }, async () => {
+    expect([0, 1, 2, 3, 8, 9, 20].map(noticeRetryMs)).toEqual([1_000, 2_000, 4_000, 8_000, 256_000, 300_000, 300_000]);
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "retry" } }, 201);
+    const L = uniqueLedger();
+    const a = await adminJson("/v1/agents", { body: { template: "captain", workstream, cell: uniqueCell(), start: false, overrides: { params: { ledger: L } } } }, 201);
+    const stub = agentStub(a.agent);
+    // Break the agent's record, so postInbox fails with an ordinary error (not unknown_agent).
+    const good = await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      const v = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value;
+      st.storage.sql.exec("UPDATE kv SET value = '{' WHERE key = 'info'");
+      return v;
+    });
+    const l = ledgerStub(env, L);
+    await l.apply(L, op, { kind: "create", title: "t" });
+    await runInDurableObject(l, async (_i: TaskLedgerDO, st) => {
+      st.storage.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES (?, ?, ?)", `${a.agent}/inbox`, JSON.stringify(POST), Date.now());
+      await st.storage.setAlarm(Date.now());
+    });
+    const outbox = () => runInDurableObject(l, async (_i: TaskLedgerDO, st) => ({
+      rows: st.storage.sql.exec<{ attempts: number; next_ms: number }>("SELECT attempts, next_ms FROM outbox").toArray(),
+      alarm: await st.storage.getAlarm(),
+    }));
+    // The real alarm fails it, re-arms, and fails it again: two attempts, the row kept, an alarm set for it.
+    const t0 = Date.now();
+    let o = await outbox();
+    while ((o.rows[0]?.attempts ?? 0) < 2 && Date.now() - t0 < 10_000) {
+      await sleep(50);
+      o = await outbox();
+    }
+    expect(o.rows.length).toBe(1);
+    expect(o.rows[0]!.attempts).toBeGreaterThanOrEqual(2);
+    expect(o.alarm).not.toBeNull();
+    expect(o.alarm!).toBeLessThanOrEqual(o.rows[0]!.next_ms);
+    // Repaired: the next attempt delivers it, deletes the row, and a repeat delivers nothing more.
+    await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", good);
+    });
+    await runInDurableObject(l, async (_i: TaskLedgerDO, st) => {
+      st.storage.sql.exec("UPDATE outbox SET next_ms = 0");
+      await st.storage.setAlarm(Date.now());
+    });
+    const t1 = Date.now();
+    while ((await outbox()).rows.length && Date.now() - t1 < 5_000) await sleep(50);
+    expect((await outbox()).rows).toEqual([]);
+    expect((await inboxHas(a.agent, POST.text)).filter((t) => t.includes(POST.text)).length).toBe(1);
+    await runInDurableObject(l, async (i: TaskLedgerDO) => i.alarm());
+    expect((await inboxHas(a.agent, "never", 0)).filter((t) => t.includes(POST.text)).length).toBe(1);
   });
 });
 
@@ -286,7 +398,14 @@ describe("the operator API", () => {
     expect(d.comments.map((c: { body: string }) => c.body)).toEqual(["ping"]);
     expect(d.history.map((h: { field: string }) => h.field)).toEqual(["created", "status", "assignee"]);
 
-    expect((await adminJson(`${base}/tasks/T-9`, {}, 404)).error.code).toBe("invalid_message");
+    expect((await adminJson(`${base}/tasks/T-9`, {}, 404)).error.code).toBe("not_found");
+    // A write naming a missing task, or a missing parent, is not_found too.
+    expect((await adminJson(`${base}/tasks/T-9`, { method: "PATCH", body: { title: "x" } }, 404)).error.code).toBe("not_found");
+    expect((await adminJson(`${base}/tasks`, { body: { title: "x", parent: "T-9" } }, 404)).error.code).toBe("not_found");
+    // A request id reused on another route is another request (keys are kept per operation).
+    const reused = await adminJson(`${base}/tasks/T-1/comments`, { body: { body: "same id", request_id: "r1" } }, 201);
+    expect(reused).toMatchObject({ author: "operator", body: "same id" });
+    expect((await adminJson(`${base}/tasks/T-1`)).comments.map((c: { body: string }) => c.body)).toEqual(["ping", "same id"]);
     expect((await adminJson("/v1/ledgers/bad%20name/tasks", {}, 400)).error.code).toBe("invalid_message");
     const otherAgent = await spawn(s, "worker", uniqueLedger());
     expect((await adminJson(`${base}/tasks/T-1/assign`, { body: { assignee: otherAgent.agent } }, 403)).error.code).toBe("forbidden");
@@ -355,8 +474,21 @@ describe("the catalog's seed migration", () => {
     const a = await adminJson("/v1/agents", { body: { template: name, sandbox: await s.sandbox(), start: false, overrides: { params: { ledger: "x-1" } } } }, 201);
     expect(a.params).toEqual({ ledger: "x-1" });
     expect(a.tools).toEqual(expect.arrayContaining([...TASK_TOOLS]));
-    // A ledger for a template none of whose capabilities takes one is refused.
-    expect((await adminJson("/v1/agents", { body: { template: name, sandbox: await s.sandbox(), overrides: { params: { nope: 1 } } } }, 400)).error.code)
-      .toBe("invalid_message");
+    // A ledger for a template none of whose capabilities takes one is refused; so is a parameter that doesn't exist.
+    const plain = uniqueLedger("p");
+    await adminJson(`/v1/admin/templates/${plain}`, { method: "PUT", body: { ...tpl, capabilities: tpl.capabilities.filter((c: string) => c !== "tasks") } });
+    expect((await adminJson("/v1/agents", { body: { template: plain, sandbox: await s.sandbox(), overrides: { params: { ledger: "x-1" } } } }, 400)).error.message)
+      .toBe(`no capability of template ${plain} takes ledger`);
+    expect((await adminJson("/v1/agents", { body: { template: name, workstream: s.workstream, cell: s.cell, overrides: { params: { nope: 1 } } } }, 400)).error.message)
+      .toContain("nope");
+    // The admin routes refuse a template default no capability takes, and a capability edit that would leave one.
+    expect((await adminJson(`/v1/admin/templates/${plain}`, { method: "PUT", body: { ...tpl, capabilities: tpl.capabilities.filter((c: string) => c !== "tasks"), params: { ledger: "x" } } }, 400)).error.message)
+      .toContain("no capability of the template takes ledger");
+    const capName = uniqueLedger("c");
+    await adminJson(`/v1/admin/capabilities/${capName}`, { method: "PUT", body: { tools: ["task_list"], params: ["ledger"] } });
+    const dflt = uniqueLedger("d");
+    await adminJson(`/v1/admin/templates/${dflt}`, { method: "PUT", body: { ...tpl, capabilities: [capName], hands: "optional", params: { ledger: "x" } } });
+    expect((await adminJson(`/v1/admin/capabilities/${capName}`, { method: "PUT", body: { tools: ["task_list"] } }, 409)).error.message)
+      .toContain(`template ${dflt} would break`);
   });
 });

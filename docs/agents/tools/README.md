@@ -12,7 +12,7 @@
 | **Hooks** | `hook_create`, `hook_delete` (external events into a channel; see [sources](../../channels/sources/)) | HookDO |
 | **Brokered actions** | `github.create_pr`, `github.review_check`, `github.review_comment`, `github.comment`, `github.create_issue`, `github.dispatch_workflow`, `github.create_webhook`, `email.send`, `http.request(profile)` | Control plane, with secrets that never reach a sandbox |
 | **Metrics** | `metrics_query` (see [metrics](../../control-plane/metrics/)) | Control plane → Analytics Engine |
-| **Tasks** | `task_list`, `task_get`, `task_create`, `task_update`, `task_comment`; admin: `task_assign`, `task_update_any`, `task_cancel`, `task_set_watcher` | [TaskLedgerDO](../../control-plane/durable-objects/tasks/), on the ledger the agent's spec names |
+| **Tasks** | `task_list`, `task_get`, `task_create`, `task_update`, `task_claim`, `task_comment`; admin: `task_assign`, `task_update_any`, `task_cancel`, `task_set_watcher` | [TaskLedgerDO](../../control-plane/durable-objects/tasks/), on the ledger the agent's spec names |
 
 **Messaging and memory are channel operations.** Messaging an agent is `message` (a `post` to its inbox, through the [messaging capability](../capabilities/#messaging)); notifying me is `post` to `user`. An event is a `post` with a `kind`. Asking is `post` with `await_reply_s`. Waiting for events is `subscribe`, or `read` with a wait. Memory is a private channel read by key.
 

@@ -5,55 +5,64 @@ A **task ledger**: a small issue tracker (a simple Linear) that agents read and 
 ## Decisions
 
 - **A ledger is its own named primitive (2026-10-30).** It is keyed by a name (a label value: letters, digits, `_`, `.`, `-`, at most 64), not by a workstream: workstreams are going from the platform ([orchestration](../../../orchestration/workstreams/)), and a ledger never calls or reads WorkstreamDO. Nothing creates a ledger: its first write does.
-- **An agent's ledger is a capability parameter.** `tasks` and `tasks-admin` declare the `ledger` param; the operator gives it at spawn (`overrides.params.ledger`, or a template's `params` default) and the agent's expanded spec records it ([CatalogDO](../catalog/)). The tools act on that ledger only: an optional `ledger` argument must name it, and an agent spawned without one gets a clear `forbidden` from every task tool. A spawner can't set it (`SpawnerOverrides` stays narrow-only).
+- **An agent's ledger is a capability parameter.** `tasks` and `tasks-admin` declare the `ledger` param; the operator gives it at spawn (`overrides.params.ledger`, or a template's `params` default) and the agent's expanded spec records it ([CatalogDO](../catalog/)). The tools act on that ledger only: an optional `ledger` argument must name it, and an agent spawned without one gets a clear `forbidden` from every task tool. A spawner's child gets no parameters at all, not even a template's default, until grants attenuate them against the spawner's own.
 - **Decisions are a pure core** (`control-plane/src/lib/tasks.ts`, the [sans-IO direction](../../../verification/nestd/)): `applyTaskOp(ledger, actor, op, {now, newId}) → {task, put, history, comment, watcher, notices} | refusal`. It reads the ledger only through synchronous lookups, takes the time and the new id as inputs, and throws nothing. The DO is the shell: look up, apply, persist everything in one synchronous step with the alarm, then deliver notices from that alarm.
-- **Grants are the spec.** AgentDO's per-call check (the tool is in the agent's spec) is the grant; a `tasks-admin` tool makes the caller an admin for that call. The core checks the actor's ledger again, so a direct call with the wrong ledger is refused too. The operator API acts as `operator`, the root.
+- **Privilege is the tool.** Each tool asks for exactly one operation kind (`TOOL_OPS`: `task_update` → `update`, `task_assign` → `assign`, …), and AgentDO's per-call check that the tool is in the agent's spec is the only grant check. The admin kinds (`update_any`, `assign`, `cancel`, `set_watcher`) are reachable only through `tasks-admin` tools. The core knows only two actors: an agent, bound to its one ledger (its creates and updates bounded below), and the operator (the root, through the admin API). An earlier `admin` flag on the actor was a second source of truth for the same fact and was dropped.
 
 ## Data
 
 - **Task:** `id` (`tsk_…`), `number` (the key is `T-<n>`, dense per ledger), `title` (1–200), `description` (markdown, ≤ 20,000), `status` (`backlog`, `todo`, `in_progress`, `in_review`, `done`, `canceled`), `priority` (`none`, `urgent`, `high`, `medium`, `low`), `assignee` (agent id or null), `labels` (≤ 10, `[A-Za-z0-9][A-Za-z0-9_.:/-]{0,39}`), `parent` (a task of the same ledger; never a cycle), `created_by` (agent id or `operator`), `created_ms`, `updated_ms`, `version`.
-- **`version`** starts at 1 and is bumped by every change (a comment isn't one). Writes may pass `expected_version`; a stale one is refused with `conflict` (409), which every boundary now knows (`protocol/fixtures/codes.json`). An update that changes nothing is a no-op.
-- **History:** one row per changed field (`actor`, `field`, `from`, `to`, `ms`), plus `created`. Replaying it over the task as created gives the task as it is (property-tested).
-- **Comments:** `author`, `body` (≤ 10,000), `ms`; at most 1,000 per task, after which a comment is refused, never dropped.
-- **The watcher:** one agent per ledger, told when a task reaches `in_review`, `done` or `canceled`.
-- **Storage:** `tasks` (the JSON body, plus copies of `status`, `assignee`, `parent`, `labels` and a lower-cased `title + description` for filtering), `comments`, `history`, `outbox`, `applied`, `kv` (`name`, `next`, `watcher`, `last_prune`). At most 10,000 tasks per ledger.
+- **`version`** starts at 1 and is bumped by every change (a comment isn't one). Writes may pass `expected_version`; a stale one is refused with `conflict` (409). An update that changes nothing is a no-op. A missing task is `not_found` (404).
+- **History:** one row per changed field (`actor`, `field`: a task field or `created`, `from`, `to`, `ms`). Until it is pruned (below), replaying it over the task as created gives the task as it is (property-tested).
+- **Comments:** `author`, `body` (≤ 10,000), `ms`; at most 1,000 per task, after which a comment, or a cancel with a reason, is refused, never dropped.
+- **The watcher:** one agent per ledger, told when a task reaches `in_review`, `done` or `canceled`. Interim: it becomes a subscription to the ledger's channel when ledgers post to channels.
+- **Stored values:** a status or priority outside its enum (a hand edit, a later release's value) is logged and listed as read; `update` and `claim`, which need it, refuse it cleanly, and an admin's `task_update_any` repairs it.
+- **Storage:** `tasks` (the JSON body, plus copies of `status`, `assignee`, `parent`, `labels` and a lower-cased `title + description` for filtering), `comments`, `history`, `outbox`, `applied`, `kv` (`name`, `next`, `watcher`, `last_prune`). At most 10,000 open tasks per ledger.
 
 ## Who may do what
 
 | Operation | Tool (capability) | Rule |
 |---|---|---|
-| list, get | `task_list`, `task_get` (`tasks`) | Anyone with the ledger. Filters: `status`, `assignee` (`me`, `none`, an id), `label`, `text`, `parent`; pages of ≤ 200 by key (`cursor`) |
+| list, get | `task_list`, `task_get` (`tasks`) | Anyone with the ledger. Filters: `status`, `assignee` (`me`, an id, or null for unassigned), `label`, `text`, `parent`; pages of ≤ 200 by key (`cursor`) |
 | create | `task_create` (`tasks`) | Unassigned, `priority: none`, in `backlog` (default) or `todo`; an optional parent |
 | update | `task_update` (`tasks`) | Only a task assigned to or created by the caller: title, description, labels, and status along the transitions below. Priority, parent and assignment are refused |
+| claim | `task_claim` (`tasks`) | An unassigned open task becomes the caller's; `backlog` and `todo` move to `in_progress`. A held task is a `conflict`; with `expected_version` it is compare-and-set. No notice (nobody else held it) |
 | comment | `task_comment` (`tasks`) | Any task in the ledger |
-| assign | `task_assign` (`tasks-admin`) | To an agent whose spec grants this ledger (its `ledger` param, and a task tool), or `none` |
+| assign | `task_assign` (`tasks-admin`) | To an agent whose spec grants this ledger (its `ledger` param, and a task tool), or null |
 | update any | `task_update_any` (`tasks-admin`) | Any field of any task, any status; not assignment (that is `task_assign`, which checks and notifies) |
 | cancel | `task_cancel` (`tasks-admin`) | Any task not yet canceled; a reason becomes a comment |
-| watcher | `task_set_watcher` (`tasks-admin`) | An agent whose spec grants this ledger, or `none` |
+| watcher | `task_set_watcher` (`tasks-admin`) | An agent whose spec grants this ledger, or null |
 
 **Transitions for `task_update`:** `backlog ↔ todo`, `backlog|todo → in_progress`, `in_progress → todo|in_review|done`, `in_review → in_progress|done`. `done` and `canceled` are final for it: an admin reopens. Only an admin cancels.
 
+**Arguments:** "nobody" is JSON `null` (`assignee`, `watcher`, `parent`, the `assignee` filter). `task_list`'s `assignee` also takes `me`: an agent isn't told its own id in its prompt, and listing its own tasks is the common read.
+
 ## Notices
 
-- **Assignment** posts to the assignee's inbox (`assigned T-12 (ledger <name>, by <actor>): <title>`), and to a previous assignee that it moved away.
-- **Reaching `in_review`, `done` or `canceled`** posts to the task's creator, its assignee and the ledger's watcher, each once and never the actor (the assignee too, so a task an admin cancels reaches the agent working on it). No workstream event: when channels land, these become posts to the ledger's channel.
-- **Delivery is from the ledger's alarm only,** never while a caller awaits the ledger (the AgentDO → ledger → AgentDO deadlock). Each notice is an `outbox` row written with the change; it is deleted once `postInbox` returned (keyed `ledger/<name>/<row>`, so a retry is applied once), retried after 1 s doubling to 5 min, and dropped (logged) for an agent that doesn't exist. A notice wakes an idle agent like any inbox post.
+- **Assignment** (by `task_assign`, or an operator's create) posts to the assignee's inbox, and to a previous assignee that it moved away.
+- **Reaching `in_review`, `done` or `canceled`** posts to the task's creator, its assignee and the ledger's watcher, each once and never the actor (the assignee too, so a task an admin cancels reaches the agent working on it). No workstream event.
+- **No agent-written text in a notice:** only the key, the status, the agent ids and the ledger (`T-12 is done (by agt_…, ledger <name>); task_get reads it`), so a notice can't carry a tainted title past its reader. The recipient reads the task with `task_get`.
+- **Channel-shaped:** a notice is `{channel: "<agt>/inbox", post: {kind: task_assigned | task_status, text, data: {ledger, key, status, assignee}}}`, and an `outbox` row is `(id, channel, body)`, the shape a channel outbox keeps. One function, `deliverNotice`, knows where a channel's post goes: today `<agt>/inbox` is AgentDO's `postInbox`, keyed `ledger/<name>/<row>` so a retry is applied once; when inboxes are channels it becomes that channel's post.
+- **Delivery is from the ledger's alarm only,** never inside a write: an AgentDO calling the ledger has its input gate open at that await, so a callback would interleave with the call that caused it. A row is written with the change and deleted once `deliverNotice` returned; a failure is retried after 1 s doubling to 5 min; a notice to an agent that doesn't exist is dropped and logged. A notice wakes an idle agent like any inbox post.
 
 ## Idempotency and concurrency
 
-- A tool call's write carries `<agent>/<epoch>/<call>`; the operator's carries `request_id` or `Idempotency-Key`. The ledger keeps each applied key's outcome for 7 days and answers a repeat with it, so a call re-run after an eviction creates nothing twice.
-- An assignee's or watcher's spec is read by the caller (AgentDO, or the Worker for the operator) before the ledger is called; the ledger never calls an AgentDO synchronously. Within the ledger, an operation has no await between its reads and its writes.
+- A tool call's write carries `<agent>/<epoch>/<call>`; the operator's carries `request_id` or `Idempotency-Key`. The ledger keeps each applied key's outcome, per operation kind, for 7 days and answers a repeat with it, so a call re-run after an eviction creates nothing twice, and a request id reused on another route is a new request.
+- A model that retries after `outcome_unknown` makes a new call with a new key: a `task_create` may then run twice (creates have no natural key). The runner tells the model to check before retrying; `task_list` shows the duplicate.
+- An assignee's or watcher's spec is read by the caller (AgentDO, or the Worker for the operator) before the ledger is called. Within the ledger, an operation has no await between its reads and its writes.
 
 ## Operator API
 
-Admin auth. `GET /v1/ledgers/<name>` (`{ledger, watcher, tasks}`) · `PUT /v1/ledgers/<name>/watcher {watcher}` · `GET|POST /v1/ledgers/<name>/tasks` · `GET|PATCH /v1/ledgers/<name>/tasks/<key|id>` · `POST …/tasks/<key|id>/assign {assignee, expected_version?}` · `POST …/tasks/<key|id>/comments {body}`. A create may set any status, a priority and an assignee; `PATCH` is `update_any`. There is no route under `/v1/workstreams/` (ledgers aren't workstreams).
+Admin auth. `GET /v1/ledgers/<name>` (`{ledger, watcher, tasks}`) · `PUT /v1/ledgers/<name>/watcher {watcher}` · `GET|POST /v1/ledgers/<name>/tasks` · `GET|PATCH /v1/ledgers/<name>/tasks/<key|id>` · `POST …/tasks/<key|id>/assign {assignee, expected_version?}` · `POST …/tasks/<key|id>/comments {body}`. A create may set any status, a priority and an assignee; `PATCH` is `update_any`. The list filter `assignee=none` means unassigned (a query string has no null). There is no route under `/v1/workstreams/`.
 
 ## Retention
 
-Tasks are kept (the ledger is the record; at most 10,000). Comments and history of a task `done` or `canceled` more than 30 days ago are deleted; history keeps the latest 500 rows per task; `applied` keys 7 days; `outbox` rows until delivered. The prune runs daily from the alarm ([data](../../../data/#retention)).
+At most 10,000 open tasks per ledger: a create (or a reopen) beyond it is refused, and closing tasks makes room. Closed tasks are kept (the ledger is the record). Comments and history of a task `done` or `canceled` more than 30 days ago are deleted; history keeps the latest 500 rows per task; `applied` keys 7 days; `outbox` rows until delivered. The prune runs daily from the alarm ([data](../../../data/#retention)).
 
 ## Deploying it
 
 Adding the class is a **one-way deploy** ([deploy](../../../../dev/deploy.md)). A forward revert to the previous release leaves ledgers unreachable but intact, keeps spawning working (the seed migration edits no template), and the previous code ignores a stored spec's `params` and lists no `task_*` tool.
 
-**Not built:** capability params granting more than one ledger, or a different one per capability (`tasks{ledgers: [...]}`, the extension point); a spawner passing on a ledger it holds (waits for `agent_spawn` and grants); a ledger channel for notices; deleting a task or a ledger.
+**Open:** taint. Task text written by a tainted session reaches whoever reads it with `task_get` or `task_list`, and those reads don't taint the reader yet; notices carry no agent text, so they don't. The ledger's channel name `ledger/<name>` should be reserved before agents can create channels.
+
+**Not built:** capability params granting more than one ledger, or a different one per capability (`tasks{ledgers: [...]}`, the extension point); a spawner passing on a ledger it holds (waits for `agent_spawn` and grants); posting notices to channels; archiving closed tasks; deleting a task or a ledger; a cap on retries (a notice to an agent that keeps failing retries every 5 minutes, and per-agent order isn't kept after a failure).

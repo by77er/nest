@@ -13,7 +13,7 @@ import { toolDef, toolDefs } from "../lib/registry";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
 import {
-  type Actor, ALL_TASK_TOOLS, type SpecGrant, TASK_ADMIN_TOOLS, type TaskFilter, type TaskOp, type TaskPriority, type TaskStatus,
+  type Actor, ALL_TASK_TOOLS, type SpecGrant, type TaskFilter, type TaskOp, type TaskPriority, type TaskStatus, type TaskTool, TOOL_OPS,
 } from "../lib/tasks";
 import { signBlobUrl } from "../lib/tokens";
 import { ledgerStub, type TaskView } from "./tasks";
@@ -2122,10 +2122,10 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * The task ledger tools (docs/control-plane/durable-objects/tasks/). They act on the one ledger the
-   * agent's spec names (its `ledger` param); a `ledger` argument must name that one. The tool itself
-   * was checked against the spec: a `tasks-admin` tool makes the actor an admin. Lookups of other
-   * agents' specs (an assignee, a watcher) happen here, before the ledger is called: the ledger never
-   * calls back into an AgentDO that is awaiting it.
+   * agent's spec names (its `ledger` param); a `ledger` argument must name that one. Privilege is the
+   * tool: dispatch checked it against the spec, and each tool asks for exactly the operation `TOOL_OPS`
+   * names (checked again before the write). Other agents' specs (an assignee, a watcher) are read
+   * here, before the ledger is called, so the ledger never calls into an AgentDO mid-call.
    */
   private async taskTool(info: AgentInfo, name: string, a: Record<string, unknown>, key: string, live: () => Promise<void>): Promise<ToolOutcome> {
     const ledger = info.params.ledger;
@@ -2135,22 +2135,26 @@ export class AgentDO extends DurableObject<Env> {
     if (a.ledger !== undefined && a.ledger !== ledger) {
       throw new NestError(ErrorCodes.FORBIDDEN, `this agent may use only ledger ${ledger}, not ${String(a.ledger)}`, 403);
     }
-    const actor: Actor = { kind: "agent", agent: info.agent, ledger, admin: (TASK_ADMIN_TOOLS as readonly string[]).includes(name) };
+    const tool = name as TaskTool;
+    const actor: Actor = { kind: "agent", agent: info.agent, ledger };
     const stub = ledgerStub(this.env, ledger);
     const str = (k: string) => (typeof a[k] === "string" ? (a[k] as string) : undefined);
+    /** A nullable argument: a string, null, or absent (undefined). */
+    const strOrNull = (k: string) => (a[k] === null ? null : str(k));
     const int = (k: string) => (typeof a[k] === "number" ? (a[k] as number) : undefined);
     const task = () => String(a.task);
     const out = (line: string, value: unknown): ToolOutcome => ({ status: "ok", content: [{ type: "text", text: line }, { type: "json", value }] });
     const line = (t: TaskView) => `${t.key} [${t.status}${t.priority === "none" ? "" : `, ${t.priority}`}] ${t.title}` +
       `${t.assignee ? ` (${t.assignee})` : ""} v${t.version}`;
-    /** An agent's grant as its spec states it (`none`: null). */
-    const grantOf = async (id: string): Promise<SpecGrant | null> => {
-      if (id === "none") return null;
-      if (!id.startsWith("agt_")) throw new NestError(ErrorCodes.INVALID_MESSAGE, `expected an agent id (agt_...) or 'none', not ${id}`);
+    /** An agent's grant as its spec states it (null: nobody). */
+    const grantOf = async (id: string | null): Promise<SpecGrant | null> => {
+      if (id === null) return null;
+      if (!id.startsWith("agt_")) throw new NestError(ErrorCodes.INVALID_MESSAGE, `expected an agent id (agt_...) or null, not ${id}`);
       const other = id === info.agent ? info : await this.env.AGENT.get(this.env.AGENT.idFromName(id)).info();
       return { agent: id, ledger: other.params?.ledger ?? null, tools: other.tools };
     };
     const write = async (op: TaskOp) => {
+      if (TOOL_OPS[tool] !== op.kind) throw new NestError(ErrorCodes.INTERNAL, `${name} asks for ${TOOL_OPS[tool]}, not ${op.kind}`, 500);
       await live();
       return stub.apply(ledger, actor, op, key);
     };
@@ -2158,9 +2162,9 @@ export class AgentDO extends DurableObject<Env> {
       title: str("title"), description: str("description"), status: str("status") as TaskStatus | undefined,
       labels: Array.isArray(a.labels) ? (a.labels as string[]) : undefined,
     };
-    switch (name) {
+    switch (tool) {
       case "task_list": {
-        const assignee = str("assignee");
+        const assignee = strOrNull("assignee");
         const filter: TaskFilter = {
           status: str("status") as TaskStatus | undefined, label: str("label"), text: str("text"), parent: str("parent"),
           assignee: assignee === "me" ? info.agent : assignee,
@@ -2181,20 +2185,23 @@ export class AgentDO extends DurableObject<Env> {
         const r = await write({ kind: "update", task: task(), expected_version: int("expected_version"), ...edits });
         return out(`Updated ${line(r.task!)}`, r.task);
       }
+      case "task_claim": {
+        const r = await write({ kind: "claim", task: task(), expected_version: int("expected_version") });
+        return out(`Claimed ${line(r.task!)}`, r.task);
+      }
       case "task_comment": {
         const r = await write({ kind: "comment", task: task(), body: String(a.body) });
         return out(`Commented on ${r.task!.key}`, r);
       }
       case "task_assign": {
-        const assignee = await grantOf(String(a.assignee));
+        const assignee = await grantOf(strOrNull("assignee") ?? null);
         const r = await write({ kind: "assign", task: task(), expected_version: int("expected_version"), assignee });
         return out(`${r.task!.assignee ? "Assigned" : "Unassigned"} ${line(r.task!)}`, r.task);
       }
       case "task_update_any": {
-        const parent = str("parent");
         const r = await write({
           kind: "update_any", task: task(), expected_version: int("expected_version"), ...edits,
-          priority: str("priority") as TaskPriority | undefined, parent: parent === "none" ? null : parent,
+          priority: str("priority") as TaskPriority | undefined, parent: strOrNull("parent"),
         });
         return out(`Updated ${line(r.task!)}`, r.task);
       }
@@ -2203,7 +2210,7 @@ export class AgentDO extends DurableObject<Env> {
         return out(`Canceled ${line(r.task!)}`, r.task);
       }
       case "task_set_watcher": {
-        const watcher = await grantOf(String(a.watcher));
+        const watcher = await grantOf(strOrNull("watcher") ?? null);
         const r = await write({ kind: "set_watcher", watcher });
         return out(r.watcher ? `${r.watcher} watches ledger ${ledger}` : `Ledger ${ledger} has no watcher`, { ledger, watcher: r.watcher ?? null });
       }
@@ -2448,10 +2455,11 @@ export class AgentDO extends DurableObject<Env> {
 
 /**
  * Minimal JSON-schema check for platform tool arguments: object, required keys, no additional
- * properties, primitive types, enums, numeric bounds and array item types.
+ * properties, primitive types (one, or a list such as `["string", "null"]`), enums, numeric bounds
+ * and array item types.
  */
 export function validateArgs(schema: unknown, args: unknown): Record<string, unknown> {
-  type Prop = { type?: string; enum?: unknown[]; minimum?: number; maximum?: number; items?: { type?: string } };
+  type Prop = { type?: string | string[]; enum?: unknown[]; minimum?: number; maximum?: number; items?: { type?: string } };
   const s = schema as { properties?: Record<string, Prop>; required?: string[]; additionalProperties?: boolean };
   if (typeof args !== "object" || args === null || Array.isArray(args)) {
     throw new NestError(ErrorCodes.INVALID_MESSAGE, "arguments must be an object");
@@ -2460,8 +2468,10 @@ export function validateArgs(schema: unknown, args: unknown): Record<string, unk
   for (const k of s.required ?? []) {
     if (!(k in a)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `missing argument ${k}`);
   }
-  const typeOk = (t: string | undefined, v: unknown) =>
+  const typeOk = (t: string | string[] | undefined, v: unknown): boolean =>
     t === undefined ||
+    (Array.isArray(t) && t.some((x) => typeOk(x, v))) ||
+    (t === "null" && v === null) ||
     (t === "string" && typeof v === "string") ||
     (t === "integer" && Number.isInteger(v)) ||
     (t === "number" && typeof v === "number" && Number.isFinite(v)) ||
@@ -2474,7 +2484,7 @@ export function validateArgs(schema: unknown, args: unknown): Record<string, unk
       if (s.additionalProperties === false) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown argument ${k}`);
       continue;
     }
-    if (!typeOk(p.type, v)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `argument ${k} must be ${p.type}`);
+    if (!typeOk(p.type, v)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `argument ${k} must be ${[p.type].flat().join(" or ")}`);
     if (p.enum && !p.enum.includes(v)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `argument ${k} must be one of ${p.enum.join(", ")}`);
     if (typeof v === "number") {
       if (p.minimum !== undefined && v < p.minimum) throw new NestError(ErrorCodes.INVALID_MESSAGE, `argument ${k} must be >= ${p.minimum}`);

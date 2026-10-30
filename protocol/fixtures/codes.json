@@ -16,7 +16,8 @@
     "internal",
     "not_implemented",
     "outcome_unknown",
-    "conflict"
+    "conflict",
+    "not_found"
   ],
   "gateway_error_codes": [
     "unauthorized",

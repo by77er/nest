@@ -55,6 +55,8 @@ export const ErrorCodes = {
   OUTCOME_UNKNOWN: "outcome_unknown",
   /** The target changed since the caller read it (a task update's `expected_version`): read again and retry. */
   CONFLICT: "conflict",
+  /** The named object doesn't exist (a task in a ledger). */
+  NOT_FOUND: "not_found",
 } as const;
 /** What the control-host channels sent for `unsupported_version` before the names merged: read, never sent. */
 export const LEGACY_UNSUPPORTED_VERSION = "unsupported_protocol_version";

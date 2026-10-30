@@ -635,8 +635,11 @@
           ]
         },
         "assignee": {
-          "type": "string",
-          "description": "'me', 'none' (unassigned) or an agent id (agt_...)."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "'me' (you), an agent id (agt_...), or null for unassigned tasks."
         },
         "label": {
           "type": "string",
@@ -691,7 +694,7 @@
   },
   {
     "name": "task_create",
-    "description": "Create a task (unassigned) in your task ledger, in backlog (default) or todo.",
+    "description": "Create a task (unassigned) in your task ledger, in backlog (default) or todo. To take it yourself, task_claim it.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -789,6 +792,33 @@
     "requires_approval": false
   },
   {
+    "name": "task_claim",
+    "description": "Take an unassigned open task: it becomes yours, and backlog or todo moves to in_progress. Refused (conflict) if someone holds it or it changed since expected_version.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "ledger": {
+          "type": "string",
+          "description": "The task ledger; omit it (your spec names the one ledger you may use)."
+        },
+        "task": {
+          "type": "string",
+          "description": "Task key (T-12) or id (tsk_...)."
+        },
+        "expected_version": {
+          "type": "integer",
+          "description": "The version you last read: the change is refused (conflict) if the task changed since.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "additionalProperties": false
+    },
+    "requires_approval": false
+  },
+  {
     "name": "task_comment",
     "description": "Comment on any task in your task ledger.",
     "input_schema": {
@@ -817,7 +847,7 @@
   },
   {
     "name": "task_assign",
-    "description": "Assign a task to an agent whose spec grants this ledger (it is told in its inbox), or unassign it with 'none'.",
+    "description": "Assign a task to an agent whose spec grants this ledger (it is told in its inbox), or unassign it with null.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -835,8 +865,11 @@
           "minimum": 1
         },
         "assignee": {
-          "type": "string",
-          "description": "Agent id (agt_...), or 'none'."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Agent id (agt_...), or null to unassign."
         }
       },
       "required": [
@@ -905,8 +938,11 @@
           "description": "Labels (replaces the list; at most 10)."
         },
         "parent": {
-          "type": "string",
-          "description": "New parent task (T-12 or tsk_...), or 'none'; a cycle is refused."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "New parent task (T-12 or tsk_...), or null for none; a cycle is refused."
         }
       },
       "required": [
@@ -949,7 +985,7 @@
   },
   {
     "name": "task_set_watcher",
-    "description": "Set the ledger's watcher: an agent whose spec grants this ledger, told in its inbox when a task reaches in_review, done or canceled; 'none' clears it.",
+    "description": "Set the ledger's watcher: an agent whose spec grants this ledger, told in its inbox when a task reaches in_review, done or canceled; null clears it.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -958,8 +994,11 @@
           "description": "The task ledger; omit it (your spec names the one ledger you may use)."
         },
         "watcher": {
-          "type": "string",
-          "description": "Agent id (agt_...), or 'none'."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Agent id (agt_...), or null for none."
         }
       },
       "required": [

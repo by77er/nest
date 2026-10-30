@@ -2,14 +2,15 @@
 // `ledger/<name>`. A thin shell over the pure core (lib/tasks.ts): each write loads what the core
 // asks for through synchronous lookups, applies the operation, and persists the result (task,
 // history, comment, watcher, notices, idempotency record) in one synchronous step with the alarm
-// that delivers the notices. Notices go to agents' inboxes only from that alarm, never while a
-// caller (an AgentDO) awaits this object.
+// that delivers the notices. Notices go out only from that alarm, through `deliverNotice`, never
+// while a caller (an AgentDO) is mid-call into this object: its input gate is open at that await,
+// so a callback would interleave with the call that caused it.
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { storedEnum } from "../lib/stored";
+import { sqlIn, storedEnum } from "../lib/stored";
 import {
-  type Actor, type Applied, applyTaskOp, checkLedgerAccess, type HistoryEntry, type HistoryValue, LedgerName, type LedgerView, type Refusal,
-  type Task, type TaskFilter, type TaskOp, TaskStatus, taskKey,
+  type Actor, type Applied, applyTaskOp, checkLedgerAccess, CLOSED_STATUSES, type HistoryEntry, type HistoryValue, inboxOwner, LedgerName,
+  type LedgerView, type Notice, type Refusal, type Task, type TaskFilter, type TaskOp, TaskPriority, TaskStatus, taskKey,
 } from "../lib/tasks";
 import { asNestError, NestError, newId } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
@@ -56,6 +57,8 @@ const GET_COMMENTS = 100;
 const GET_HISTORY = 50;
 /** Undelivered notices are retried after 1 s doubling to 5 min; delivered ones are deleted. */
 const NOTICE_RETRY_MAX_MS = 5 * 60_000;
+/** When a notice that failed `attempts` times before (0 for the first) is tried again, from now. */
+export const noticeRetryMs = (attempts: number) => Math.min(1_000 * 2 ** Math.max(0, attempts), NOTICE_RETRY_MAX_MS);
 const NOTICES_PER_ALARM = 50;
 export const LIST_DEFAULT_LIMIT = 50;
 export const LIST_MAX_LIMIT = 200;
@@ -63,11 +66,37 @@ export const LIST_MAX_LIMIT = 200;
 /** Ledger `name`'s object. */
 export const ledgerStub = (env: Env, name: string) => env.TASKS.get(env.TASKS.idFromName(`ledger/${name}`));
 
+/** An `outbox` row: a post owed to a channel, the shape a channel outbox keeps (`idem` keys its delivery). */
+export interface OutboxRow {
+  id: number;
+  channel: string;
+  body: Notice["post"];
+  idem: string;
+}
+
+/**
+ * Deliver one notice: the only place that knows where a channel's post goes. Today `<agt>/inbox` is
+ * AgentDO's inbox (`postInbox`, keyed by `idem`, so a retry is applied once); when inboxes are
+ * channels this becomes that channel's post. `delivered`: the receiver took it; `gone`: it never
+ * can (no such agent, or not an inbox); a throw: try again later.
+ */
+export async function deliverNotice(env: Env, ledger: string, row: OutboxRow): Promise<"delivered" | "gone"> {
+  const agent = inboxOwner(row.channel);
+  if (!agent) return "gone";
+  try {
+    await env.AGENT.get(env.AGENT.idFromName(agent)).postInbox(`tasks:${ledger}`, row.body.text, false, row.idem);
+    return "delivered";
+  } catch (e) {
+    if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return "gone";
+    throw e;
+  }
+}
+
 function nestError(r: Refusal): NestError {
   switch (r.code) {
     case "forbidden": return new NestError(ErrorCodes.FORBIDDEN, r.message, 403);
     case "conflict": return new NestError(ErrorCodes.CONFLICT, r.message, 409);
-    case "not_found": return new NestError(ErrorCodes.INVALID_MESSAGE, r.message, 404);
+    case "not_found": return new NestError(ErrorCodes.NOT_FOUND, r.message, 404);
     case "invalid_message": return new NestError(ErrorCodes.INVALID_MESSAGE, r.message, 400);
   }
 }
@@ -91,8 +120,8 @@ export class TaskLedgerDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, actor TEXT NOT NULL,
       field TEXT NOT NULL, from_v TEXT NOT NULL, to_v TEXT NOT NULL, ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS history_task ON history (task, id)");
-    // Inbox notices not yet acknowledged by their agent.
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL, text TEXT NOT NULL,
+    // Notices not yet taken by their channel (`body`: the post, JSON).
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS applied (key TEXT PRIMARY KEY, outcome TEXT NOT NULL, ts_ms INTEGER NOT NULL)");
   }
@@ -120,9 +149,11 @@ export class TaskLedgerDO extends DurableObject<Env> {
     return stored !== undefined || write;
   }
 
+  /** A stored task. A status or priority outside its enum is logged and returned as read: the core refuses the rules that need it. */
   private parseTask(body: string): Task {
     const t = JSON.parse(body) as Task;
     storedEnum(TaskStatus, t.status, "tasks.body.status");
+    storedEnum(TaskPriority, t.priority, "tasks.body.priority");
     return t;
   }
 
@@ -138,7 +169,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
     return {
       name,
       next: Number(this.kv("next") ?? "1"),
-      taskCount: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM tasks").one().n,
+      openCount: this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN (${sqlIn(CLOSED_STATUSES)})`).one().n,
       watcher: this.kv("watcher") ?? null,
       get: (ref) => this.task(ref),
       commentCount: (task) => this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM comments WHERE task = ?", task).one().n,
@@ -176,7 +207,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
         a.comment.task, a.comment.author, a.comment.body, a.comment.ms).one().id;
     }
     if (a.watcher !== undefined) this.setKv("watcher", a.watcher);
-    for (const n of a.notices) this.sql.exec("INSERT INTO outbox (agent, text, next_ms) VALUES (?, ?, ?)", n.agent, n.text, now);
+    for (const n of a.notices) this.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES (?, ?, ?)", n.channel, JSON.stringify(n.post), now);
     return comment;
   }
 
@@ -195,10 +226,13 @@ export class TaskLedgerDO extends DurableObject<Env> {
 
   /**
    * Apply `op` by `actor` to ledger `name`. With a `key` (`<agent>/<epoch>/<call>`, or an API request
-   * id) it is applied once: a repeat gets the first outcome. Refusals throw (403, 404, 409, 400).
+   * id) it is applied once: a repeat of the same kind of operation gets the first outcome (the key is
+   * kept per kind, so a request id reused on another route is a new request). Refusals throw (403,
+   * 404, 409, 400).
    */
-  async apply(name: string, actor: Actor, op: TaskOp, key?: string): Promise<ApplyOutcome> {
+  async apply(name: string, actor: Actor, op: TaskOp, requestKey?: string): Promise<ApplyOutcome> {
     this.checkName(name, false);
+    const key = requestKey && `${op.kind}/${requestKey}`;
     if (key) {
       const prior = this.sql.exec<{ outcome: string }>("SELECT outcome FROM applied WHERE key = ?", key).toArray()[0];
       if (prior) return JSON.parse(prior.outcome) as ApplyOutcome;
@@ -240,14 +274,14 @@ export class TaskLedgerDO extends DurableObject<Env> {
       where.push("status = ?");
       args.push(filter.status);
     }
-    if (filter.assignee === "none") where.push("assignee IS NULL");
+    if (filter.assignee === null) where.push("assignee IS NULL");
     else if (filter.assignee !== undefined) {
       where.push("assignee = ?");
       args.push(filter.assignee);
     }
     if (filter.parent !== undefined) {
       const p = this.task(filter.parent);
-      if (!p) throw new NestError(ErrorCodes.INVALID_MESSAGE, `no task ${filter.parent} in ledger ${name}`, 404);
+      if (!p) throw new NestError(ErrorCodes.NOT_FOUND, `no task ${filter.parent} in ledger ${name}`, 404);
       where.push("parent = ?");
       args.push(p.id);
     }
@@ -266,37 +300,32 @@ export class TaskLedgerDO extends DurableObject<Env> {
 
   async get(name: string, actor: Actor, ref: string): Promise<TaskDetail> {
     const t = this.read(name, actor) ? this.task(ref) : undefined;
-    if (!t) throw new NestError(ErrorCodes.INVALID_MESSAGE, `no task ${ref} in ledger ${name}`, 404);
+    if (!t) throw new NestError(ErrorCodes.NOT_FOUND, `no task ${ref} in ledger ${name}`, 404);
     const comments = this.sql.exec<CommentView>("SELECT id, author, body, ms FROM comments WHERE task = ? ORDER BY id DESC LIMIT ?", t.id, GET_COMMENTS)
       .toArray().reverse();
-    const history = this.sql.exec<{ actor: string; field: string; from_v: string; to_v: string; ms: number }>(
+    const history = this.sql.exec<{ actor: string; field: HistoryEntry["field"]; from_v: string; to_v: string; ms: number }>(
       "SELECT actor, field, from_v, to_v, ms FROM history WHERE task = ? ORDER BY id DESC LIMIT ?", t.id, GET_HISTORY).toArray().reverse()
       .map((h) => ({ actor: h.actor, field: h.field, from: JSON.parse(h.from_v) as HistoryValue, to: JSON.parse(h.to_v) as HistoryValue, ms: h.ms }));
     const comment_count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM comments WHERE task = ?", t.id).one().n;
     return { task: this.view(t), comments, comment_count, history };
   }
 
-  /** Deliver due notices (each deleted only once its agent took it), and prune daily. */
+  /** Deliver due notices (each deleted only once its channel took it, or never can), and prune daily. */
   override async alarm(): Promise<void> {
     const name = this.kv("name");
     if (name === undefined) return;
     const now = Date.now();
-    const due = this.sql.exec<{ id: number; agent: string; text: string; attempts: number }>(
-      "SELECT id, agent, text, attempts FROM outbox WHERE next_ms <= ? ORDER BY id LIMIT ?", now, NOTICES_PER_ALARM).toArray();
+    const due = this.sql.exec<{ id: number; channel: string; body: string; attempts: number }>(
+      "SELECT id, channel, body, attempts FROM outbox WHERE next_ms <= ? ORDER BY id LIMIT ?", now, NOTICES_PER_ALARM).toArray();
     for (const n of due) {
+      const row: OutboxRow = { id: n.id, channel: n.channel, body: JSON.parse(n.body) as Notice["post"], idem: `ledger/${name}/${n.id}` };
       try {
-        await this.env.AGENT.get(this.env.AGENT.idFromName(n.agent)).postInbox(`tasks:${name}`, n.text, false, `ledger/${name}/${n.id}`);
+        // An agent that doesn't exist was checked when assigned; an agent is never deleted today.
+        if ((await deliverNotice(this.env, name, row)) === "gone") console.error(`ledger ${name}: ${n.channel} doesn't exist; notice dropped`);
         this.sql.exec("DELETE FROM outbox WHERE id = ?", n.id);
       } catch (e) {
-        if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) {
-          // An agent that doesn't exist (it was checked when assigned; an agent is never deleted today).
-          console.error(`ledger ${name}: ${n.agent} is not an agent; notice dropped`);
-          this.sql.exec("DELETE FROM outbox WHERE id = ?", n.id);
-        } else {
-          console.error(`ledger ${name}: notice to ${n.agent} failed; retrying`, e);
-          this.sql.exec("UPDATE outbox SET attempts = attempts + 1, next_ms = ? WHERE id = ?",
-            Date.now() + Math.min(1_000 * 2 ** n.attempts, NOTICE_RETRY_MAX_MS), n.id);
-        }
+        console.error(`ledger ${name}: notice to ${n.channel} failed; retrying`, e);
+        this.sql.exec("UPDATE outbox SET attempts = attempts + 1, next_ms = ? WHERE id = ?", Date.now() + noticeRetryMs(n.attempts), n.id);
       }
     }
     if (Number(this.kv("last_prune") ?? "0") + PRUNE_EVERY_MS <= now) this.prune(now);

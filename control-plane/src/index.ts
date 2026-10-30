@@ -268,15 +268,18 @@ async function route(req: Request, env: Env): Promise<Response> {
       if (req.method === "GET") {
         const q = (k: string) => url.searchParams.get(k) ?? undefined;
         const status = q("status");
+        // A query string has no null: `assignee=none` is the unassigned filter here.
+        const assignee = q("assignee");
         if (status !== undefined && !TaskStatus.safeParse(status).success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown status ${status}`);
         return json(await l.list(name, operator, {
-          status: status as TaskStatus | undefined, assignee: q("assignee"), label: q("label"), text: q("text"), parent: q("parent"),
+          status: status as TaskStatus | undefined, assignee: assignee === "none" ? null : assignee, label: q("label"), text: q("text"), parent: q("parent"),
         }, num(q("cursor"), 0), num(q("limit"), LIST_DEFAULT_LIMIT)));
       }
       if (req.method === "POST") {
         const r = await body(req, TaskEditsBody.extend({ title: z.string(), assignee: AgentOrNull.optional(), request_id: RequestIdField }));
         const { assignee, request_id, ...edits } = r;
-        const op: TaskOp = { kind: "create", ...edits, parent: edits.parent ?? undefined, assignee: await grantOf(assignee ?? null) };
+        const grant = await grantOf(assignee ?? null);
+        const op: TaskOp = { kind: "create", ...edits, parent: edits.parent ?? undefined, ...(grant ? { assignee: grant } : {}) };
         return json((await l.apply(name, operator, op, requestId(req, request_id))).task, 201);
       }
     }

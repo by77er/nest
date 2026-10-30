@@ -43,7 +43,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `GET /v1/admin/catalog` · `PUT|DELETE /v1/admin/capabilities/<name> {tools, rules, prompt}` ·
      `PUT|DELETE /v1/admin/templates/<name> {capabilities, launch, hands, credential, escalate_to, subscribe}`
    - Task ledgers ([TaskLedgerDO](../docs/control-plane/durable-objects/tasks/)): `GET /v1/ledgers/<name>` · `PUT /v1/ledgers/<name>/watcher {watcher}` (an agent whose
-     spec grants the ledger, or null) · `GET /v1/ledgers/<name>/tasks?status=&assignee=<agt_…|none>&label=&text=&parent=&cursor=&limit=` ·
+     spec grants the ledger, or null) · `GET /v1/ledgers/<name>/tasks?status=&assignee=<agt_…|none (unassigned)>&label=&text=&parent=&cursor=&limit=` ·
      `POST /v1/ledgers/<name>/tasks {title, description?, status?, priority?, labels?, parent?, assignee?}` · `GET|PATCH /v1/ledgers/<name>/tasks/<T-n|tsk_…>`
      (`PATCH {expected_version?, title?, description?, status?, priority?, labels?, parent?}`; a stale version is 409 `conflict`) ·
      `POST …/tasks/<ref>/assign {assignee, expected_version?}` · `POST …/tasks/<ref>/comments {body}`. Writes take `request_id` (or `Idempotency-Key`).

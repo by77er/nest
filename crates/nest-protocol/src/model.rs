@@ -152,12 +152,14 @@ pub mod error_codes {
     /// The target changed since the caller read it (a task update's `expected_version`): read it
     /// again and retry. Passed through to the model as an ordinary tool error.
     pub const CONFLICT: &str = "conflict";
+    /// The named object doesn't exist (a task in a ledger). Passed through as an ordinary tool error.
+    pub const NOT_FOUND: &str = "not_found";
 
     /// Every code above that is sent (the legacy alias is not).
     pub const ALL: &[&str] = &[
         STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
         UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
-        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT,
+        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND,
     ];
 
     /// `unsupported_version` under either name.

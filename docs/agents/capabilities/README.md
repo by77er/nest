@@ -65,7 +65,7 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
 | `metrics` | `metrics_query(sql)` over nest's own [runtime metrics](../../control-plane/metrics/) | reading them; results hold only numbers, enums and ids, so they don't taint |
-| `tasks{ledger}` | `task_list`, `task_get`, `task_create`, `task_update`, `task_comment` | reading the [task ledger](../../control-plane/durable-objects/tasks/) `ledger`, creating in it, updating its own tasks, commenting |
+| `tasks{ledger}` | `task_list`, `task_get`, `task_create`, `task_update`, `task_claim`, `task_comment` | reading the [task ledger](../../control-plane/durable-objects/tasks/) `ledger`, creating in it, claiming unassigned tasks, updating its own tasks, commenting |
 | `tasks-admin{ledger}` | `task_assign`, `task_update_any`, `task_cancel`, `task_set_watcher` | administering that ledger. Only templates and the operator give it; a spawner can't add it |
 
 **Templates compose them,** with any `mcp` or `api` capability alongside. For example:
