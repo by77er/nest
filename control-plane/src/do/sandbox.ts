@@ -796,7 +796,7 @@ export class SandboxDO extends DurableObject<Env> {
       } else if (key === OUTBOX_DEADLINE) {
         await this.outbox.flush();
       }
-    });
+    }, 5_000, [OUTBOX_DEADLINE]);
   }
 
   private async policyChanged(injectionChanged: boolean): Promise<EgressPolicy> {

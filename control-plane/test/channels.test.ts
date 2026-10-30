@@ -40,12 +40,34 @@ const attempt = (f: () => unknown) => Promise.resolve().then(async () => {
 const batchTurns = async (agent: string) => (await agentStub(agent).turns()).filter((t) => t.input.kind === "event_batch");
 
 /** A workstream and a hand-less agent that never starts (its turns just queue). */
-async function idleAgent(o: { cell?: string; workstream?: string; owner?: string } = {}) {
+/** A hand-less template with the channel tools (`read` among them), made once per file. */
+let readerTemplate: Promise<string> | null = null;
+function reader(): Promise<string> {
+  readerTemplate ??= (async () => {
+    const name = uniq("reader");
+    await adminJson(`/v1/admin/templates/${name}`, {
+      method: "PUT",
+      body: {
+        capabilities: ["nest", "channels", "messaging-tree"], launch: { builtin_tools: [], system_prompt: { mode: "replace", text: "Read." } },
+        hands: "optional", credential: "claude_oauth_token", escalate_to: "user",
+      },
+    });
+    return name;
+  })();
+  return readerTemplate;
+}
+
+/** A workstream and a hand-less agent that never starts (its turns just queue); by default it can `read`. */
+async function idleAgent(o: { cell?: string; workstream?: string; owner?: string; template?: string } = {}) {
   const cell = o.cell ?? uniqueCell();
   const workstream = o.workstream ?? (await adminJson("/v1/workstreams", { body: { goal: "channels" } }, 201)).workstream;
-  const a = await adminJson("/v1/agents", { body: { template: "captain", workstream, cell, start: false, ...(o.owner ? { owner: o.owner } : {}) } }, 201);
+  const template = o.template ?? (await reader());
+  const a = await adminJson("/v1/agents", { body: { template, workstream, cell, start: false, ...(o.owner ? { owner: o.owner } : {}) } }, 201);
   return { cell, workstream: workstream as string, agent: a.agent as string };
 }
+
+/** The wake notices queued for `agent` (several may share one coalesced turn). */
+const notices = async (agent: string) => (await batchTurns(agent)).flatMap((t) => t.input.text.split(/\n\n(?=\[nest\] Channel)/));
 
 async function newChannel(retention_days?: number): Promise<string> {
   const name = `team/${uniq("c")}`;
@@ -194,7 +216,10 @@ describe("subscriptions", () => {
     expect(text).toContain("Message from user (seq 1): secret body one");
     // A later post is a new window.
     await postAs(name, { text: "four" }, 201);
-    await until(() => batchTurns(agent), (t) => t.length === 2, 10_000, "a second wake");
+    // The first turn hasn't started (no brain): the second notice joins it rather than queue another.
+    const both = await until(() => notices(agent), (n) => n.length === 2, 10_000, "a second notice");
+    expect(both[1]).toContain("1 new message (seq 4)");
+    expect((await batchTurns(agent)).length).toBe(1);
     expect((await chStub(name).subscriptions(name)).find((s) => s.id === sub.id)).toMatchObject({ cursor: 4, inflight: null });
     expect((await adminJson(`/v1/agents/${agent}/subscriptions`))).toEqual([{ channel: name, subscription: sub.id, hw: 4, ended: false }]);
   });
@@ -226,9 +251,9 @@ describe("subscriptions", () => {
     // ...and the next window delivers what came after, once.
     await fanoutNow(name);
     await fanoutNow(name);
-    const turns = await batchTurns(agent);
-    expect(turns.length).toBe(2);
-    expect(turns[1]!.input.text).toContain("1 new message (seq 3)");
+    const ns = await notices(agent);
+    expect(ns.length).toBe(2);
+    expect(ns[1]).toContain("1 new message (seq 3)");
   });
 
   it("a retry of a batch the agent already holds is acknowledged even at its wake cap (dedup before the loop guards)", async () => {
@@ -267,9 +292,11 @@ describe("subscriptions", () => {
     const { agent } = await idleAgent();
     const name = await newChannel();
     await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    // Fails twice (a single failure can hide a retry that only works once).
     await runInDurableObject(chStub(name), (inst: ChannelDO) => {
+      let left = 2;
       inst.testHooks["fanout:beforeDeliver"] = async () => {
-        delete inst.testHooks["fanout:beforeDeliver"];
+        if (--left === 0) delete inst.testHooks["fanout:beforeDeliver"];
         throw new Error("network");
       };
     });
@@ -279,8 +306,13 @@ describe("subscriptions", () => {
     const s = (await chStub(name).subscriptions(name))[0]!;
     expect(s).toMatchObject({ attempts: 1, inflight: { to_seq: 1 } });
     expect(s.due_ms! - Date.now()).toBeGreaterThan(0);
+    await postAs(name, { text: "two" }, 201);
     await fanoutNow(name);
-    expect((await batchTurns(agent)).length).toBe(1);
+    // Still the same pinned range after the second failure, backing off further.
+    expect((await chStub(name).subscriptions(name))[0]).toMatchObject({ attempts: 2, inflight: { after_seq: 0, to_seq: 1 } });
+    expect((await batchTurns(agent)).length).toBe(0);
+    await fanoutNow(name);
+    expect((await notices(agent))[0]).toContain("1 new message (seq 1)");
     expect((await chStub(name).subscriptions(name))[0]).toMatchObject({ attempts: 0, cursor: 1, inflight: null });
   });
 
@@ -297,17 +329,23 @@ describe("subscriptions", () => {
     const once = await chStub(name).subscribe(name, asAgent(agent), agent, { filter: { reply_to: 1 }, delivery: "turn", batch_ms: 60_000, once: true });
     await postAs(name, { text: "unrelated" }, 201);
     await postAs(name, { text: "the answer", reply_to: 1 }, 201);
+    // A second reply in the same window: the once subscription still takes only the first.
+    await postAs(name, { text: "a second answer", reply_to: 1 }, 201);
     await fanoutNow(name);
     await fanoutNow(name);
     const subs = await chStub(name).subscriptions(name);
     expect(subs.some((s) => s.id === once.id)).toBe(false);
-    const turns = await batchTurns(agent);
-    // One for the catch-all subscription (seq 2-3), one for the once subscription (seq 3), ended.
-    expect(turns.length).toBe(2);
-    expect(turns.some((t) => t.input.text.includes(`(seq 3)`) && t.input.text.includes(`Subscription ${once.id} ended`))).toBe(true);
+    const ns = await notices(agent);
+    // One for the catch-all subscription (seq 2-4), one for the once subscription (seq 3 only), ended:
+    // two notices, coalesced into the one waiting turn.
+    expect(ns.length).toBe(2);
+    expect((await batchTurns(agent)).length).toBe(1);
+    expect(ns.filter((t) => t.includes("1 new message (seq 3)") && t.includes(`Subscription ${once.id} ended`)).length).toBe(1);
+    // Nothing but the once subscription's first match: a later reply isn't delivered by it.
     await postAs(name, { text: "another answer", reply_to: 1 }, 201);
     await fanoutNow(name);
-    expect((await batchTurns(agent)).filter((t) => t.input.text.includes("ended")).length).toBe(1);
+    await fanoutNow(name);
+    expect((await notices(agent)).filter((t) => t.includes("ended")).length).toBe(1);
   });
 
   it("none delivery only keeps a cursor, which a read without since moves (the same page on a re-run)", async () => {
@@ -427,7 +465,7 @@ describe("built-in channels", () => {
     expect(msgs.every((m) => m.from === "platform" && m.taint === false)).toBe(true);
   });
 
-  it("an agent's events carry its turns and exit with the final text; its spawner is subscribed by default", async () => {
+  it("an agent's events carry its turns, brain releases and its stop; its spawner (which can read) is subscribed by default", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-test" } });
     const brain = await connectHost(cell, "brain");
@@ -461,11 +499,12 @@ describe("built-in channels", () => {
     expect(((await chStub(name).read(name, asAgent(spawner.agent), {}, { agent_owner: spawner.agent })) as any).messages.length).toBe(2);
     const stranger = await idleAgent({ cell });
     await expect(attempt(() => chStub(name).read(name, asAgent(stranger.agent), {}, { agent_owner: spawner.agent }))).rejects.toThrow(/may not read/);
-    // The brain's exit is reported with its last text.
+    // An idle exit is a brain release, not the agent ending: reported apart, outside the spawner's filter.
     ws.close();
     await agentStub(child.agent).onExited(brain.host, "idle", start.epoch);
-    const exited = await until(async () => (await readAs(name)).messages as any[], (m) => m.some((x) => x.kind === "exited"), 10_000, "the exit");
-    expect(exited.find((m) => m.kind === "exited")).toMatchObject({ text: "All done: PR opened.", data: { reason: "idle", epoch: start.epoch } });
+    const released = await until(async () => (await readAs(name)).messages as any[], (m) => m.some((x) => x.kind === "brain_released"), 10_000, "the release");
+    expect(released.find((m) => m.kind === "brain_released")).toMatchObject({ text: "brain released (idle)", taint: false, data: { reason: "idle" } });
+    expect(released.some((m) => m.kind === "exited")).toBe(false);
     // A later turn with no text of its own doesn't repeat the previous one's.
     const t2 = (await adminJson(`/v1/agents/${child.agent}/turns`, { body: { text: "more" } }, 201)).turn;
     const restart = (await nextCommands(brain.ws, (c) => c.type === "agent_start" && c.agent === child.agent && c.epoch > start.epoch))[0];
@@ -478,7 +517,61 @@ describe("built-in channels", () => {
     await ws2.next("ack", (m) => m.up_to === 1);
     const all = await until(async () => (await readAs(name)).messages as any[], (m) => m.filter((x) => x.kind === "turn_completed").length === 2, 10_000, "the second turn");
     expect(all.filter((m) => m.kind === "turn_completed")[1].text).toBe(`turn ${t2} completed (end_turn)`);
+    // A stop is the agent ending: `exited`, which wakes the spawner.
     ws2.close();
+    await agentStub(child.agent).onExited(brain.host, "stopped", restart.epoch);
+    const end = await until(async () => (await readAs(name)).messages as any[], (m) => m.some((x) => x.kind === "exited"), 10_000, "the stop");
+    expect(end.find((m) => m.kind === "exited")).toMatchObject({ data: { reason: "stopped", epoch: restart.epoch } });
+    const spawnerNotices = await until(() => notices(spawner.agent), (n) => n.some((x) => x.includes("kinds exited")), 10_000, "the spawner's notice of the stop");
+    expect(spawnerNotices.some((x) => x.includes("brain_released"))).toBe(false);
+  });
+
+  it("deploy changes nothing for an owner that can't read: no default subscription, and no notice it couldn't act on", async () => {
+    const owner = await idleAgent({ template: "captain" });
+    const child = await idleAgent({ cell: owner.cell, workstream: owner.workstream, owner: owner.agent });
+    const name = `${child.agent}/events`;
+    // The child's outbox posts an event (as its runner's events would), naming its owner.
+    await runInDurableObject(agentStub(child.agent), (inst: AgentDO) => {
+      (inst as any).outbox.push(name, { kind: "turn_completed", text: "done" }, { tainted: false, agent_owner: owner.agent });
+    });
+    await until(async () => (await readAs(name)).head, (h) => h === 1, 10_000, "the event posted");
+    expect(await chStub(name).subscriptions(name)).toEqual([]);
+    // Even subscribed by the operator, it is woken only by what arrives inline (the user's own text).
+    const team = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(team)}/subscriptions`, { body: { agent: owner.agent, batch_ms: 60_000 } }, 201);
+    await chStub(team).post(team, { principal: "platform" }, { text: "an event" });
+    await fanoutNow(team);
+    expect((await batchTurns(owner.agent)).length).toBe(0);
+    expect((await chStub(team).subscriptions(team))[0]).toMatchObject({ cursor: 1, inflight: null });
+    await postAs(team, { text: "from the operator" }, 201);
+    await fanoutNow(team);
+    const ns = await notices(owner.agent);
+    expect(ns.length).toBe(1);
+    expect(ns[0]).toContain("Message from user (seq 2): from the operator");
+  });
+
+  it("a channel notice sent mid-turn that the runner never confirmed comes back as a turn", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-test" } });
+    const brain = await connectHost(cell, "brain");
+    const a = await idleAgent({ cell });
+    await agentStub(a.agent).start();
+    const [start] = await nextCommands(brain.ws, (c) => c.type === "agent_start" && c.agent === a.agent);
+    const ws = await Ws.connect(`/v1/agents/${a.agent}/session`, brain.host_token);
+    ws.send({ type: "hello", protocol_version: 1, agent: a.agent, host: brain.host, instance_id: "rin_lost", epoch: start.epoch, session: SESSION });
+    await ws.next("hello_ack");
+    const t = (await adminJson(`/v1/agents/${a.agent}/turns`, { body: { text: "work" } }, 201)).turn;
+    await ws.next("run_turn");
+    await postAs(`${a.agent}/inbox`, { text: "while you work" }, 201);
+    const inbox = await ws.next("inbox", () => true, 10_000);
+    // The runner was stopping: it never wrote the notice to the model (no inbox_delivered), and the turn ends.
+    const ev = (seq: number, body: Record<string, unknown>) => ({ agent: a.agent, epoch: start.epoch, seq, ts_ms: Date.now(), turn: t, ...body });
+    ws.send({ type: "events", seq: 1, events: [ev(1, { type: "turn_started", input_kind: "user" }), ev(2, { type: "turn_completed", stop_reason: "end_turn" })] });
+    await ws.next("ack", (m) => m.up_to === 1);
+    const next = await ws.next("run_turn", () => true, 10_000);
+    expect(next.input.kind).toBe("event_batch");
+    expect(next.input.text).toBe(inbox.message.text);
+    ws.close();
   });
 });
 
@@ -491,7 +584,7 @@ describe("channel tools through the dispatch path", () => {
     await adminJson(`/v1/admin/templates/${tpl}`, {
       method: "PUT",
       body: {
-        capabilities: ["nest", "channels", "messaging-tree"], launch: { ...launch, system_prompt: { mode: "replace", text: "Talk." } },
+        capabilities: ["nest", "channels", "messaging-tree", "messaging", "transcripts"], launch: { ...launch, system_prompt: { mode: "replace", text: "Talk." } },
         hands: "optional", credential: "claude_oauth_token", escalate_to: "user",
       },
     });
@@ -514,7 +607,7 @@ describe("channel tools through the dispatch path", () => {
   it("lists the channel tools and runs them: create, post, read, keyed CAS, subscribe, unsubscribe, message", async () => {
     const s = await setup();
     s.ws.send({ type: "tools_list_request", request: "req_c" });
-    expect((await s.ws.next("tools_list")).tools.map((t: any) => t.name)).toEqual(["channel_create", "post", "read", "subscribe", "unsubscribe", "message"]);
+    expect((await s.ws.next("tools_list")).tools.map((t: any) => t.name)).toEqual(["notify", "ask", "read_transcript", "channel_create", "post", "read", "subscribe", "unsubscribe", "message"]);
     const name = `team/${uniq("t")}`;
     expect((await s.call("channel_create", { channel: name })).status).toBe("ok");
     expect(s.value(await s.call("post", { channel: name, text: "hello", kind: "progress", data: { from: "user", taint: false } }))).toEqual({ status: "posted", seq: 1 });
@@ -593,6 +686,20 @@ describe("channel tools through the dispatch path", () => {
     expect((await readAs(name)).head).toBe(0);
   });
 
+  it("another agent's text reaching a session inline taints it: notify from a tainted agent, another agent's transcript", async () => {
+    const web = await setup({ builtin_tools: ["WebSearch"] });
+    const readTainted = (agent: string) => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'read_tainted'").toArray()[0]?.value === "true");
+    expect(await readTainted(web.owner.agent)).toBe(false);
+    expect((await web.call("notify", { to: "captain", message: "relay this" })).status).toBe("ok");
+    expect(await readTainted(web.owner.agent)).toBe(true);
+    // A clean agent reading another agent's transcript is tainted from then on.
+    const clean = await setup();
+    expect(await readTainted(clean.agent)).toBe(false);
+    expect((await clean.call("read_transcript", { agent: clean.owner.agent })).status).toBe("ok");
+    expect(await readTainted(clean.agent)).toBe(true);
+  });
+
   it("a session that can see untrusted content posts tainted, and reading a tainted message taints a clean one", async () => {
     const web = await setup({ builtin_tools: ["WebSearch"] });
     const name = `team/${uniq("taint")}`;
@@ -608,6 +715,134 @@ describe("channel tools through the dispatch path", () => {
     expect(clean.value(await clean.call("read", { channel: name })).tainted).toBe(true);
     await clean.call("post", { channel: mine, text: "after" });
     expect((await readAs(mine)).messages.map((m: any) => m.taint)).toEqual([false, true]);
+  });
+});
+
+describe("review fixes", () => {
+  const kvTainted = (agent: string) => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+    st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'read_tainted'").toArray()[0]?.value === "true");
+
+  it("deliveries to an agent whose turn hasn't started coalesce into that one turn (5 channels, 1 turn)", async () => {
+    const { agent } = await idleAgent();
+    const names: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const name = await newChannel();
+      names.push(name);
+      await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+      await postAs(name, { text: `news ${i}` }, 201);
+    }
+    for (const name of names) await fanoutNow(name);
+    expect((await batchTurns(agent)).length).toBe(1);
+    const ns = await notices(agent);
+    expect(ns.length).toBe(5);
+    for (const name of names) expect(ns.some((n) => n.includes(`Channel ${name}:`))).toBe(true);
+    // Each subscription was acknowledged (its cursor moved): nothing is redelivered.
+    for (const name of names) expect((await chStub(name).subscriptions(name))[0]).toMatchObject({ cursor: 1, inflight: null });
+  });
+
+  it("expiry deletes R2 bodies before their rows, at most 1000 keys a call, past 1000 at once", async () => {
+    const name = await newChannel(1);
+    const N = 1205;
+    await runInDurableObject(chStub(name), async (_i: ChannelDO, st) => {
+      const old = Date.now() - 3 * 86_400_000;
+      for (let seq = 1; seq <= N; seq++) {
+        const ref = `channels/${name}/b/old${seq}`;
+        await env.BUCKET.put(ref, JSON.stringify({ text: `t${seq}`, data: null }));
+        st.storage.sql.exec(`INSERT INTO messages (seq, ts_ms, from_p, taint, kind, text, data, reply_to, key, mentions, body_ref, bytes)
+          VALUES (?, ?, 'user', 0, NULL, NULL, NULL, NULL, NULL, NULL, ?, 10)`, seq, old, ref);
+      }
+      st.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('head', ?)", String(N));
+    });
+    const calls: number[] = [];
+    await runInDurableObject(chStub(name), async (inst: ChannelDO) => {
+      const bucket = (inst as any).env.BUCKET as R2Bucket;
+      (inst as any).env = { ...(inst as any).env, BUCKET: new Proxy(bucket, {
+        get(target, prop) {
+          if (prop === "delete") {
+            return async (keys: string | string[]) => {
+              const ks = Array.isArray(keys) ? keys : [keys];
+              if (ks.length > 1000) throw new Error(`R2 delete of ${ks.length} keys`);
+              calls.push(ks.length);
+              return target.delete(ks);
+            };
+          }
+          const v = (target as any)[prop];
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      }) };
+    });
+    await chStub(name).maintain(name);
+    expect(Math.max(...calls)).toBeLessThanOrEqual(1000);
+    expect(calls.reduce((a, b) => a + b, 0)).toBe(N);
+    expect((await env.BUCKET.list({ prefix: `channels/${name}/b/old` })).objects.length).toBe(0);
+    expect((await readAs(name)).messages.length).toBe(0);
+  });
+
+  it("a refused call makes no channel, no directory entry and no alarm", async () => {
+    const a = await idleAgent();
+    const name = `sbx_${uniq("x").replace(/-/g, "")}/events`;
+    await expect(attempt(() => chStub(name).read(name, asAgent(a.agent), {}))).rejects.toThrow(/may not read/);
+    await expect(attempt(() => chStub(name).post(name, asAgent(a.agent), { text: "x" }))).rejects.toThrow(/platform only/);
+    const stored = await runInDurableObject(chStub(name), async (_i: ChannelDO, st) => ({
+      meta: st.storage.sql.exec("SELECT 1 FROM kv WHERE key = 'meta'").toArray().length,
+      deadlines: st.storage.sql.exec("SELECT 1 FROM deadlines").toArray().length,
+      alarm: await st.storage.getAlarm(),
+    }));
+    expect(stored).toEqual({ meta: 0, deadlines: 0, alarm: null });
+  });
+
+  it("idempotency keys are per poster: the same key from two posters is two posts", async () => {
+    const name = await newChannel();
+    const a = await idleAgent();
+    await adminJson(`/v1/admin/channels/${enc(name)}/acl`, { method: "PUT", body: [{ principal: a.agent, action: "post" }] });
+    expect(await chStub(name).post(name, { principal: "user" }, { text: "one", idem_key: "k" })).toEqual({ status: "posted", seq: 1 });
+    expect(await chStub(name).post(name, asAgent(a.agent), { text: "two", idem_key: "k" })).toEqual({ status: "posted", seq: 2 });
+    expect(await chStub(name).post(name, asAgent(a.agent), { text: "two again", idem_key: "k" })).toEqual({ status: "existing", seq: 2 });
+  });
+
+  it("the outbox dead-letters a row refused for good after bounded tries, and the rows behind it go through", async () => {
+    const { agent } = await idleAgent();
+    await runInDurableObject(agentStub(agent), (inst: AgentDO) => {
+      (inst as any).outbox.push("Not A Channel", { kind: "x", text: "refused for good" }, { tainted: false });
+      (inst as any).outbox.push(`${agent}/events`, { kind: "state_changed", text: "behind it" }, { tainted: false });
+    });
+    const events = `${agent}/events`;
+    // The refused row is tried MAX_REFUSALS times (from the alarm, 5 s apart), then dropped.
+    for (let i = 0; i < 3; i++) {
+      await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+        st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('chan_out', 0)");
+      });
+      await runDurableObjectAlarm(agentStub(agent));
+    }
+    await until(async () => (await readAs(events)).messages as any[], (m) => m.some((x) => x.text === "behind it"), 10_000, "the row behind it");
+    const left = await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM chan_out").toArray().length);
+    expect(left).toBe(0);
+  });
+
+  it("deadlines run the outbox after every other due key", async () => {
+    const order: string[] = [];
+    await runInDurableObject(chStub(uniq("~deadlines")), async (_i: ChannelDO, st) => {
+      const { Deadlines } = await import("../src/lib/reliable");
+      const d = new Deadlines(st.storage.sql, st.storage);
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('chan_out', 1), ('intent', 2), ('condemned', 3)");
+      await d.runDue(Date.now(), async (k) => {
+        order.push(k);
+      }, 5_000, ["chan_out"]);
+    });
+    expect(order).toEqual(["intent", "condemned", "chan_out"]);
+  });
+
+  it("text relayed through the inbox API under another name, or a workstream batch, taints; the operator's own doesn't", async () => {
+    const a = await idleAgent();
+    await adminJson(`/v1/agents/${a.agent}/inbox`, { body: { text: "from the operator" } }, 201);
+    expect(await kvTainted(a.agent)).toBe(false);
+    await adminJson(`/v1/agents/${a.agent}/inbox`, { body: { text: "relayed", from: "agt_someone" } }, 201);
+    expect(await kvTainted(a.agent)).toBe(true);
+    const b = await idleAgent();
+    await adminJson(`/v1/workstreams/${b.workstream}/subscriber`, { method: "PUT", body: { subscriber: b.agent } });
+    await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(b.workstream)).ingest({ workstream: b.workstream, ts_ms: Date.now(), agent: a.agent, type: "blocked", reason: "x" });
+    await runDurableObjectAlarm(env.WORKSTREAM.get(env.WORKSTREAM.idFromName(b.workstream)));
+    await until(() => kvTainted(b.agent), (t) => t, 10_000, "the subscriber tainted by the batch");
   });
 });
 

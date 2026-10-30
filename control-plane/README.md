@@ -75,7 +75,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      - `GET /v1/admin/channels/<name>/messages?since=&limit=` (the log) or `?latest_by_key=true&prefix=&keys_only=&after_key=`
        (the keyed view) · `POST /v1/admin/channels/<name>/messages {text, kind?, data?, reply_to?, key?, if_seq?, mentions?, idem_key?}`
        (201 posted; 200 `existing` or `repeat`; 409 `conflict` with the key's `current_seq`). `GET /v1/admin/channels/user/messages`
-       is the notification queue's successor (the Discord bot isn't built)
+       is the notification queue's successor (the Discord bot isn't built). To reach an agent now, use `POST /v1/agents/<id>/inbox` (its text arrives inline, for any agent); a post to `<agt>/inbox` reaches only an agent whose template has `read` (`channels`), except the operator's own text, which arrives inline
      - `GET|POST /v1/admin/channels/<name>/subscriptions {agent, filter?, delivery?, batch_ms?, once?}` (on an agent's behalf) ·
        `DELETE /v1/admin/channels/<name>/subscriptions/<sub>`
      - `PUT /v1/admin/channels/<name>/acl [{principal, action: post|read}]` (the channel's own grant list, replaced)

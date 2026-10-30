@@ -15,7 +15,7 @@ import type { Env } from "../env";
 import {
   type AclEntry, afterDelivery, type Batch, BATCH_SCAN, type Caller, type ChannelAction, type ChannelFacts, type ChannelKind, checkPost,
   type CheckedPost, DEFAULT_BATCH_MS, DEFAULT_RETENTION_DAYS, decidePost, Delivery, DELIVERY_BACKSTOP_MS, DELIVERY_TIMEOUT_MS, type DeliveryOutcome,
-  IDEM_RETENTION_MS, isAgentCaller, KEYS_MAX_LIMIT, type Message, type MessageMeta, onAppend, parseChannel, permits, planBatch,
+  chunks, IDEM_RETENTION_MS, isAgentCaller, R2_DELETE_MAX, KEYS_MAX_LIMIT, type Message, type MessageMeta, onAppend, parseChannel, permits, planBatch,
   type PostState, RATE_WINDOW_MS, READ_DEFAULT_LIMIT, READ_MAX_BYTES, READ_MAX_LIMIT, type SubscribeInput, type Subscription,
   TIER_AFTER_MS,
 } from "../lib/channels";
@@ -29,6 +29,8 @@ export const DIRECTORY = "~directory";
 const DAY_MS = 86_400_000;
 /** Retention and tiering run this often. */
 const MAINTENANCE_EVERY_MS = DAY_MS;
+/** Pages of expired rows deleted per maintenance run (the rest a minute later). */
+const EXPIRE_PAGES = 10;
 /** Rows tiered to R2 per maintenance run (the rest wait for the next). */
 const TIER_BATCH = 200;
 /** Deliveries run in parallel per alarm, at most this many at once. */
@@ -105,6 +107,8 @@ export interface DirectoryEntry {
 export interface CallFacts {
   /** For an agent's built-in channel: that agent's owner, from its AgentDO. */
   agent_owner?: string | null;
+  /** For AgentDO's events posts: whether that owner's spec has the `read` tool (its default subscription is made only then). */
+  spawner_reads?: boolean;
 }
 
 type HookPoint = "post:afterPut" | "fanout:beforeDeliver" | "fanout:afterDeliver";
@@ -129,6 +133,8 @@ const readSub = (body: string): Subscription => {
   return { ...s, delivery: storedEnum(Delivery, s.delivery, "subs.body.delivery") };
 };
 
+const utf8Len = (t: string) => new TextEncoder().encode(t).length;
+
 const forbidden = (m: string) => new NestError(ErrorCodes.FORBIDDEN, m, 403);
 const invalid = (m: string, status = 400) => new NestError(ErrorCodes.INVALID_MESSAGE, m, status);
 
@@ -149,11 +155,13 @@ export class ChannelDO extends DurableObject<Env> {
       bytes INTEGER NOT NULL)`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS messages_from ON messages (from_p, seq)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, seq INTEGER NOT NULL, taint INTEGER NOT NULL)");
-    this.sql.exec("CREATE TABLE IF NOT EXISTS idem (idem_key TEXT PRIMARY KEY, seq INTEGER NOT NULL, ts_ms INTEGER NOT NULL)");
+    // Idempotency keys are per poster: one poster's key never answers another's post.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS idem (poster TEXT NOT NULL, idem_key TEXT NOT NULL, seq INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
+      PRIMARY KEY (poster, idem_key))`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS rate (poster TEXT PRIMARY KEY, start_ms INTEGER NOT NULL, count INTEGER NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS subs (id TEXT PRIMARY KEY, agent TEXT NOT NULL, body TEXT NOT NULL, idem_key TEXT,
       created_ms INTEGER NOT NULL, read_key TEXT, read_from INTEGER)`);
-    this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS subs_idem ON subs (idem_key) WHERE idem_key IS NOT NULL");
+    this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS subs_idem ON subs (agent, idem_key) WHERE idem_key IS NOT NULL");
     this.sql.exec("CREATE TABLE IF NOT EXISTS acl (principal TEXT NOT NULL, action TEXT NOT NULL, PRIMARY KEY (principal, action))");
     this.sql.exec("CREATE TABLE IF NOT EXISTS directory (name TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT, created_ms INTEGER NOT NULL)");
     this.deadlines = new Deadlines(this.sql, ctx.storage);
@@ -184,21 +192,32 @@ export class ChannelDO extends DurableObject<Env> {
   }
 
   /**
-   * The channel's metadata, made on first use for a built-in channel (they exist with their agent,
-   * sandbox, or always: `user`). A free channel exists only once created. Synchronous: arms the
-   * directory registration in the same step. An `agt_…/inbox` gets its agent's subscription (the
-   * agent is always subscribed to its inbox), from the start of the log.
+   * The channel's metadata without writing anything: stored, or (for a built-in channel not used
+   * yet) what it would be. A free channel exists only once created. Permission is decided on this,
+   * so a refused call never creates a channel, a directory entry or an alarm.
    */
-  private ensure(name: string): Meta {
+  private peek(name: string): Meta & { stored: boolean } {
     const kind = parseChannel(name);
     if (!kind.ok) throw invalid(kind.error);
     const cur = this.meta();
     if (cur) {
       if (cur.name !== name) throw new NestError(ErrorCodes.INTERNAL, `channel object for ${cur.name} asked about ${name}`, 500);
-      return cur;
+      return { ...cur, stored: true };
     }
     if (kind.value.kind === "free") throw invalid(`no channel ${name}`, 404);
-    return this.init(name, kind.value, null, DEFAULT_RETENTION_DAYS);
+    return { name, kind: kind.value, owner: null, created_ms: 0, retention_days: DEFAULT_RETENTION_DAYS, registered: false, stored: false };
+  }
+
+  /**
+   * The channel's metadata, made on first permitted use for a built-in channel (they exist with
+   * their agent, sandbox, or always: `user`). Synchronous: arms the directory registration in the
+   * same step. An `agt_…/inbox` gets its agent's subscription (the agent is always subscribed to
+   * its inbox), from the start of the log.
+   */
+  private ensure(name: string): Meta {
+    const m = this.peek(name);
+    if (m.stored) return this.meta()!;
+    return this.init(name, m.kind, null, DEFAULT_RETENTION_DAYS);
   }
 
   private init(name: string, kind: ChannelKind, owner: string | null, retention_days: number): Meta {
@@ -277,7 +296,7 @@ export class ChannelDO extends DurableObject<Env> {
 
   /** The operator's view. */
   async info(name: string): Promise<ChannelInfo> {
-    return this.infoOf(this.ensure(name));
+    return this.infoOf(this.peek(name));
   }
 
   /** Replace the channel's own grant list (the operator; a channel's owner always holds both actions). */
@@ -300,7 +319,7 @@ export class ChannelDO extends DurableObject<Env> {
     const checked = checkPost(raw);
     if (!checked.ok) throw invalid(checked.error);
     const post = checked.value;
-    this.check("post", caller, this.ensure(name), extra);
+    this.check("post", caller, this.peek(name), extra);
     let bodyRef: string | null = null;
     if (!post.inline) {
       bodyRef = `channels/${name}/b/${newId("blb_")}`;
@@ -316,14 +335,15 @@ export class ChannelDO extends DurableObject<Env> {
   }
 
   private commitPost(name: string, caller: Caller, post: CheckedPost, bodyRef: string | null, extra: CallFacts): PostResult {
+    // Re-checked here: the grant list may have changed during the put. Only then is a built-in
+    // channel made.
+    this.check("post", caller, this.peek(name), extra);
     const meta = this.ensure(name);
-    // Re-checked here: the grant list may have changed during the put.
-    this.check("post", caller, meta, extra);
     const now = Date.now();
     const from = caller.principal;
     const p = post.input;
     const head = this.head();
-    const idem = p.idem_key ? this.sql.exec<{ seq: number }>("SELECT seq FROM idem WHERE idem_key = ?", p.idem_key).toArray()[0] : undefined;
+    const idem = p.idem_key ? this.sql.exec<{ seq: number }>("SELECT seq FROM idem WHERE poster = ? AND idem_key = ?", from, p.idem_key).toArray()[0] : undefined;
     const key = p.key ? this.sql.exec<{ seq: number }>("SELECT seq FROM keys WHERE key = ?", p.key).toArray()[0] : undefined;
     const last = this.sql.exec<MsgRow>("SELECT * FROM messages WHERE from_p = ? ORDER BY seq DESC LIMIT 1", from).toArray()[0];
     const rate = this.sql.exec<{ start_ms: number; count: number }>("SELECT start_ms, count FROM rate WHERE poster = ?", from).toArray()[0];
@@ -360,7 +380,8 @@ export class ChannelDO extends DurableObject<Env> {
     // The spawner's default subscription to its child's events, made once, from before the first
     // event it is told about.
     if (meta.kind.kind === "events" && caller.principal === "platform" && !meta.spawner_subscribed) {
-      if (extra.agent_owner) {
+      // Only for a spawner that can `read` what it is woken for (H2): otherwise none is made.
+      if (extra.agent_owner && extra.spawner_reads) {
         this.saveSub({
           id: SPAWNER_SUB, agent: extra.agent_owner, filter: { kinds: SPAWNER_EVENT_KINDS }, delivery: "turn", batch_ms: DEFAULT_BATCH_MS,
           once: false, cursor: head, due_ms: null, inflight: null, attempts: 0,
@@ -372,7 +393,7 @@ export class ChannelDO extends DurableObject<Env> {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, seq, now, from, taint ? 1 : 0, p.kind ?? null, bodyRef ? null : p.text,
       bodyRef ? null : post.data_json, p.reply_to ?? null, p.key ?? null, p.mentions ? JSON.stringify(p.mentions) : null, bodyRef, post.bytes);
     this.putKv("head", seq);
-    if (p.idem_key) this.sql.exec("INSERT OR REPLACE INTO idem (idem_key, seq, ts_ms) VALUES (?, ?, ?)", p.idem_key, seq, now);
+    if (p.idem_key) this.sql.exec("INSERT OR REPLACE INTO idem (poster, idem_key, seq, ts_ms) VALUES (?, ?, ?, ?)", from, p.idem_key, seq, now);
     if (d.rate) this.sql.exec("INSERT OR REPLACE INTO rate (poster, start_ms, count) VALUES (?, ?, ?)", from, d.rate.start_ms, d.rate.count);
     if (p.key) {
       if (post.removes_key) this.sql.exec("DELETE FROM keys WHERE key = ?", p.key);
@@ -403,9 +424,11 @@ export class ChannelDO extends DurableObject<Env> {
    * transparently. A page holds at most `limit` messages and about 256 KiB.
    */
   async read(name: string, caller: Caller, q: ReadQuery, extra: CallFacts = {}): Promise<ReadResult> {
-    const meta = this.ensure(name);
+    const meta = this.peek(name);
     this.check("read", caller, meta, extra);
     const head = this.head();
+    // A built-in channel nobody posted to yet: empty, and reading it makes nothing.
+    if (!meta.stored) return { channel: name, head: 0, ...(q.latest_by_key ? { keys: [] } : { messages: [], next_seq: q.since ?? 0 }), more: false, tainted: false };
     if (q.latest_by_key) return this.readKeys(meta, q, head);
     const limit = Math.max(1, Math.min(q.limit ?? READ_DEFAULT_LIMIT, READ_MAX_LIMIT));
     let since = q.since;
@@ -427,7 +450,7 @@ export class ChannelDO extends DurableObject<Env> {
     let bytes = 0;
     for (const r of rows.slice(0, limit)) {
       const m = await this.message(r);
-      bytes += m.text.length + (m.data !== undefined ? JSON.stringify(m.data).length : 0);
+      bytes += utf8Len(m.text) + (m.data !== undefined ? utf8Len(JSON.stringify(m.data)) : 0);
       if (out.length && bytes > READ_MAX_BYTES) break;
       out.push(m);
     }
@@ -495,12 +518,12 @@ export class ChannelDO extends DurableObject<Env> {
    * cursor starts at the current head: only later messages are delivered. Idempotent by `idem_key`.
    */
   async subscribe(name: string, caller: Caller, agent: string, input: SubscribeInput, extra: CallFacts = {}): Promise<Subscription> {
-    const meta = this.ensure(name);
     if (isAgentCaller(caller) && caller.principal !== agent) throw forbidden(`${caller.principal} can subscribe only itself`);
     if (!/^agt_[a-z0-9]+$/.test(agent)) throw invalid("only agents subscribe");
-    this.check("read", caller, meta, extra);
+    this.check("read", caller, this.peek(name), extra);
+    this.ensure(name);
     if (input.idem_key) {
-      const prior = this.sql.exec<{ body: string }>("SELECT body FROM subs WHERE idem_key = ?", input.idem_key).toArray()[0];
+      const prior = this.sql.exec<{ body: string }>("SELECT body FROM subs WHERE agent = ? AND idem_key = ?", agent, input.idem_key).toArray()[0];
       if (prior) return JSON.parse(prior.body) as Subscription;
     }
     const sub: Subscription = {
@@ -513,18 +536,19 @@ export class ChannelDO extends DurableObject<Env> {
 
   /** End a subscription: the caller's own (the operator: any). Idempotent. */
   async unsubscribe(name: string, caller: Caller, id: string): Promise<{ removed: boolean }> {
-    this.ensure(name);
+    this.peek(name);
     const s = this.sub(id);
     if (!s) return { removed: false };
     if (isAgentCaller(caller) && s.agent !== caller.principal) throw forbidden(`${id} is not ${caller.principal}'s subscription`);
     if (caller.principal === "platform") throw forbidden("the platform ends no subscriptions");
-    if (id === INBOX_SUB && isAgentCaller(caller)) throw forbidden("an agent is always subscribed to its inbox");
+    // Made once, with the channel: removing it would be for good.
+    if (id === INBOX_SUB) throw forbidden("an agent is always subscribed to its inbox");
     this.sql.exec("DELETE FROM subs WHERE id = ?", id);
     return { removed: true };
   }
 
   async subscriptions(name: string): Promise<Subscription[]> {
-    this.ensure(name);
+    this.peek(name);
     return this.subs();
   }
 
@@ -636,21 +660,33 @@ export class ChannelDO extends DurableObject<Env> {
   /**
    * Retention (docs/data/#retention): messages older than the channel's retention go, except the
    * newest per key; bodies older than 7 days move to R2; idempotency keys go after 7 days; stale rate
-   * windows go. Rows are deleted before their R2 bodies (a reset between leaves an orphan object,
-   * never a row without its body).
+   * windows go. Expiry runs in pages of `R2_DELETE_MAX` rows, at most `EXPIRE_PAGES` per run (the
+   * rest at the next run, a minute later): a page's R2 bodies are deleted (in calls of at most
+   * `R2_DELETE_MAX` keys, R2's limit) before its rows, so a row never loses its body's reference
+   * while the body exists. A reset between leaves rows whose body is gone: they read as "no longer
+   * stored" and go at the next run.
    */
   private async maintenance(): Promise<void> {
     const meta = this.meta();
     if (!meta) return;
     const now = Date.now();
     const cutoff = now - meta.retention_days * DAY_MS;
-    const doomed = this.sql.exec<{ seq: number; body_ref: string | null }>(
-      "SELECT seq, body_ref FROM messages WHERE ts_ms < ? AND seq NOT IN (SELECT seq FROM keys)", cutoff).toArray();
-    this.sql.exec("DELETE FROM messages WHERE ts_ms < ? AND seq NOT IN (SELECT seq FROM keys)", cutoff);
     this.sql.exec("DELETE FROM idem WHERE ts_ms < ?", now - IDEM_RETENTION_MS);
     this.sql.exec("DELETE FROM rate WHERE start_ms < ?", now - RATE_WINDOW_MS);
-    const refs = doomed.map((d) => d.body_ref).filter((r): r is string => r !== null);
-    if (refs.length) await this.env.BUCKET.delete(refs);
+    let backlog = false;
+    for (let page = 0; ; page++) {
+      const doomed = this.sql.exec<{ seq: number; body_ref: string | null }>(
+        "SELECT seq, body_ref FROM messages WHERE ts_ms < ? AND seq NOT IN (SELECT seq FROM keys) ORDER BY seq LIMIT ?", cutoff, R2_DELETE_MAX).toArray();
+      if (!doomed.length) break;
+      if (page >= EXPIRE_PAGES) {
+        backlog = true;
+        break;
+      }
+      const refs = doomed.map((d) => d.body_ref).filter((r): r is string => r !== null);
+      for (const c of chunks(refs, R2_DELETE_MAX)) await this.env.BUCKET.delete(c);
+      const last = doomed[doomed.length - 1]!.seq;
+      this.sql.exec("DELETE FROM messages WHERE ts_ms < ? AND seq <= ? AND seq NOT IN (SELECT seq FROM keys)", cutoff, last);
+    }
     // Tiering: bodies older than 7 days to R2, the row keeps the reference.
     const old = this.sql.exec<{ seq: number; text: string | null; data: string | null }>(
       "SELECT seq, text, data FROM messages WHERE ts_ms < ? AND body_ref IS NULL LIMIT ?", now - TIER_AFTER_MS, TIER_BATCH).toArray();
@@ -660,12 +696,12 @@ export class ChannelDO extends DurableObject<Env> {
       const n = this.sql.exec("UPDATE messages SET text = NULL, data = NULL, body_ref = ? WHERE seq = ? AND body_ref IS NULL", ref, r.seq).rowsWritten;
       if (n === 0) await this.env.BUCKET.delete(ref);
     }
-    await this.deadlines.set("maintenance", now + (old.length === TIER_BATCH ? 60_000 : MAINTENANCE_EVERY_MS));
+    await this.deadlines.set("maintenance", Date.now() + (old.length === TIER_BATCH || backlog ? 60_000 : MAINTENANCE_EVERY_MS));
   }
 
   /** Run maintenance now (operator and tests). */
   async maintain(name: string): Promise<void> {
-    this.ensure(name);
+    this.peek(name);
     await this.maintenance();
   }
 

@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   afterDelivery, type Batch, type Caller, type ChannelFacts, checkPost, clip, decidePost, deliveryBackoff, envelopeText, type Filter, INLINE_BODY_BYTES,
   matches, MAX_BODY_BYTES, type MessageMeta, onAppend, parseChannel, patternMatches, permits, planBatch, type PostState, RATE_LIMIT_POSTS,
-  REPEAT_WINDOW_MS, sessionTaint, SubscribeInput, type Subscription,
+  chunks, R2_DELETE_MAX, REPEAT_WINDOW_MS, sessionTaint, SubscribeInput, type Subscription,
 } from "../src/lib/channels";
 
 function rng(seed: number) {
@@ -111,6 +111,22 @@ describe("permissions", () => {
     expect(permits("read", { principal: "user" }, facts("user")).ok).toBe(true);
   });
 
+  it("wildcards never reach user or a built-in channel; an exact name or a relation does", () => {
+    const wide = [{ action: "read" as const, channel: "*" }, { action: "read" as const, channel: "**" }, { action: "read" as const, channel: "*/inbox" },
+      { action: "read" as const, channel: "*/events" }, { action: "post" as const, channel: "**" }, { action: "read" as const, channel: "{owner}/**" }];
+    for (const name of ["user", `${B}/inbox`, `${B}/events`, "sbx_1/events"]) {
+      for (const action of ["read", "post"] as const) {
+        expect(permits(action, agent(A, { owner: B, grants: wide }), facts(name, { agent_owner: C })).ok, `${action} ${name}`).toBe(false);
+      }
+    }
+    // Free channels still match wildcards.
+    expect(permits("read", agent(A, { grants: wide }), facts("team/x/y")).ok).toBe(true);
+    // An exact name, or a relation, does reach a built-in.
+    expect(permits("read", agent(A, { grants: [{ action: "read", channel: "user" }] }), facts("user")).ok).toBe(true);
+    expect(permits("post", agent(A, { grants: [{ action: "post", channel: `${B}/inbox` }] }), facts(`${B}/inbox`)).ok).toBe(true);
+    expect(permits("post", agent(A, { owner: B, grants: [{ action: "post", channel: "{owner}/inbox" }] }), facts(`${B}/inbox`)).ok).toBe(true);
+  });
+
   it("{owner} and {child} name only the caller's own owner and children", () => {
     const tree = [{ action: "post" as const, channel: "{owner}/inbox" }, { action: "post" as const, channel: "{child}/inbox" }];
     // A (owner B) reaches B's inbox; not C's.
@@ -160,6 +176,51 @@ describe("post guards", () => {
     // The idempotency key wins over a conflict its own first post caused.
     expect(decidePost(post({ text: "a", key: "t/1", if_seq: 0, idem_key: "k" }), A, st({ key_seq: 11, idem_seq: 11 }), 0)).toEqual({ kind: "existing", seq: 11 });
     expect(decidePost(post({ text: "a", reply_to: 11 }), A, st(), 0)).toMatchObject({ kind: "invalid" });
+  });
+
+  it("a repeat never swallows a state change: claim, release, re-claim lands; so does A-B-A on a key", () => {
+    // Replays the post log through decidePost, keeping the keyed view and each sender's last post.
+    const sim = () => {
+      let head = 0;
+      const view = new Map<string, number>();
+      const last = new Map<string, PostState["last_by_sender"]>();
+      return (from: string, raw: Record<string, unknown>, now: number) => {
+        const p = post(raw);
+        const key = raw.key as string | undefined;
+        const d = decidePost(p, from, { head, ...(key && view.has(key) ? { key_seq: view.get(key)! } : {}), ...(last.get(from) ? { last_by_sender: last.get(from)! } : {}) }, now);
+        if (d.kind === "append") {
+          head = d.seq;
+          if (key) {
+            if (p.removes_key) view.delete(key);
+            else view.set(key, d.seq);
+          }
+          last.set(from, { seq: d.seq, ts_ms: now, text: p.input.text, data_json: p.data_json, ...(p.input.kind ? { kind: p.input.kind } : {}), ...(key ? { key } : {}) });
+        }
+        return { d, view };
+      };
+    };
+    const s1 = sim();
+    expect(s1(A, { text: "mine", key: "task/1", if_seq: 0 }, 1000).d).toMatchObject({ kind: "append", seq: 1 });
+    expect(s1(B, { text: "", key: "task/1" }, 2000).d).toMatchObject({ kind: "append", seq: 2 });
+    // A re-claims within the minute: its compare-and-set passes, so the post must land.
+    expect(s1(A, { text: "mine", key: "task/1", if_seq: 0 }, 3000).d).toMatchObject({ kind: "append", seq: 3 });
+    // C's claim now loses: one owner.
+    const c = s1(C, { text: "mine", key: "task/1", if_seq: 0 }, 4000);
+    expect(c.d).toEqual({ kind: "conflict", current_seq: 3 });
+    expect(c.view.get("task/1")).toBe(3);
+    // A-B-A on plain keyed state: the key ends where A left it.
+    const s2 = sim();
+    s2(A, { text: "up", key: "status" }, 1000);
+    s2(B, { text: "down", key: "status" }, 2000);
+    expect(s2(A, { text: "up", key: "status" }, 3000).d).toMatchObject({ kind: "append", seq: 3 });
+    // An identical keyed post while the key is still the sender's previous one is a repeat.
+    expect(s2(A, { text: "up", key: "status" }, 4000).d).toEqual({ kind: "repeat", seq: 3 });
+    // A post whose compare-and-set passed always lands, even identical to the sender's last one.
+    expect(s2(A, { text: "up", key: "status", if_seq: 3 }, 5000).d).toMatchObject({ kind: "append", seq: 4 });
+    // Same text without the key, after a keyed post: not a repeat (a different message).
+    const s3 = sim();
+    s3(A, { text: "x", key: "k" }, 1000);
+    expect(s3(A, { text: "x" }, 2000).d).toMatchObject({ kind: "append", seq: 2 });
   });
 
   it("drops a sender's identical repeat within a minute, and rate-limits agents (not user or platform)", () => {
@@ -357,6 +418,17 @@ describe("filters and batching", () => {
       }
       expect(admitted.reduce((n, b) => n + b.count, 0), ctx).toBe(want.length);
       expect(admitted.every((b) => b.senders.every((x) => x.from !== A)), ctx).toBe(true);
+    }
+  });
+});
+
+describe("R2 deletes", () => {
+  it("chunks never exceed R2's 1000 keys and cover every key once, in order", () => {
+    for (const n of [0, 1, 999, 1000, 1001, 2500]) {
+      const xs = Array.from({ length: n }, (_, i) => i);
+      const cs = chunks(xs, R2_DELETE_MAX);
+      expect(cs.every((c) => c.length > 0 && c.length <= 1000), `${n}`).toBe(true);
+      expect(cs.flat(), `${n}`).toEqual(xs);
     }
   });
 });

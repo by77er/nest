@@ -310,13 +310,17 @@ The rule A6 assumes: a kill counts as processed only when the host answered it, 
 
 ## channels (feat/channels, author's map, 2026-10-30)
 
-**Head:** `feat/channels` (ChannelDO). The author's map of each AgentDO change onto the model, for the independent check that follows; nothing here is verified by a second reader yet. No modelled transition is added or changed: channel deliveries enter as model action Q1 (enqueue), exactly as an API turn or an inbox post does.
+**Head:** `feat/channels` after the review of 4dd3fb1 (ChannelDO). The author's map of each AgentDO change onto the model; the review of 4dd3fb1 checked the first version of these rows (all held for safety; it found the alarm-ordering delay fixed below). No modelled transition is added or changed: channel deliveries enter as model action Q1 (enqueue), exactly as an API turn or an inbox post does.
 
 | Change | Code | Conforms (author) | Detail |
 |---|---|---|---|
-| Delivery admitted as a turn | agent.ts:2006-2028 | yes (Q1) | `enqueueTurn` (request id `chan/<channel>/<sub>/<to_seq>`) → pump → wake, or `postInbox` mid-turn. Reads `current_turn` only; writes `channel_subs`, `turns`/`inbox`. No brain record, intent or session write |
-| `release` reports the exit | agent.ts:1019 | yes (A5/A6 unchanged) | After the record's commit, synchronous: one `chan_out` row and its deadline row. No await added before `armed`, no guard read or changed |
-| `applyEvent` reports events | agent.ts:1780 | yes (Q3 unchanged) | Synchronous after the state update; `kv.last_text` and `chan_out` rows only. The per-event `current()` re-check (rule 1) is untouched |
-| Channel tools | agent.ts:2332 | yes (rule 1) | Every write calls `live()` (the epoch fence) after its last await; mutation M15 removes it from `post` and the fence test fails |
-| `chan_out` deadline | agent.ts:2544 | n/a | Posts to ChannelDO from the alarm; never calls back into a DO awaiting AgentDO |
-| `load()` default | agent.ts:375 | n/a | `channel_grants ?? []`; brain fields untouched |
+| Delivery admitted as a turn | agent.ts:2057-2101 | yes (Q1) | `enqueueTurn` (request id `chan/<channel>/<sub>/<to_seq>`) → pump → wake, or a notice merged into a channel turn still `queued` (its input text only: no status, `ord` or `current_turn` change), or `postInbox` mid-turn (the inbox, not modelled; it touches no modelled variable). Reads `current_turn` only; writes `channel_subs`, `turns`/`inbox`. No brain record, intent or session write |
+| `release` reports the exit | agent.ts:1020 | yes (A5/A6 unchanged) | After the record's commit, synchronous: one `chan_out` row and its deadline row. No await added before `armed`, no guard read or changed |
+| `applyEvent` reports events | agent.ts:1784 | yes (Q3 unchanged) | Synchronous after the state update; `kv.last_text` and `chan_out` rows only. The per-event `current()` re-check (rule 1) is untouched |
+| Turn completion requeues unseen notices | agent.ts:1772, 2039-2050 | yes (Q3 + Q1) | Inside Q3's synchronous completion step: channel notices pushed mid-turn whose `inbox_delivered` never came are inserted as one `queued` turn (Q1's effect), then `pump` runs as before. Nothing else in Q3 changes |
+| Inline text taints the session | agent.ts:1826, 1891 | n/a | `kv.read_tainted` only |
+| Channel tools | agent.ts:2407 | yes (rule 1) | Every write calls `live()` (the epoch fence) after its last await; mutation M15 removes it from `post` and the fence test fails |
+| `chan_out` deadline | agent.ts:2619, 2636; reliable.ts:165 | **timing: bounded** | Posts to ChannelDO from the alarm; ChannelDO never calls back into AgentDO. `runDue` runs it after every other due key (so `intent`, `wake_after_exit`, `condemned`, `starting`, `no_session` due in the same alarm go first), and a run is bounded: at most 20 rows, no new post after 5 s, each call cut off at 5 s. So it can delay a brain deadline falling due *during* a flush by about 10 s at most (the next alarm), where the review found it could precede every one of them by up to 50 unbounded calls |
+| `load()` default | agent.ts:376 | n/a | `channel_grants ?? []`; brain fields untouched |
+
+**Depends on the runner's Stop-hook inbox mirror:** a mid-turn notice whose `inbox` push is lost with a runner lineage (`rel.reset`) still stays `delivered` in AgentDO's inbox and reaches the model through the Stop hook's mirror (`runtime.rs`, the cache's `inbox`) in the recovery turn. A notice the runner refused to write (stopping) and never confirmed is requeued at the turn's completion (row above). A runner that wrote it to the model but whose `inbox_delivered` was lost gets it again as a turn (at least once).

@@ -11,7 +11,7 @@ A channel is a named, durable, append-only log of messages. Agents, programs in 
 ```
 
 - **`seq`** is per channel, dense and ordered. Readers page with `since`.
-- **`from` and `taint` are set by the platform,** never by the sender and never parsed from content. `from` is `agt_…`, `user` (me), `platform`, `hook:<hk_…>` for [external sources](sources/), or `sbx_…` with the attributed agent. `taint` is the sender session's taint (see [grants and taint](../agents/tools/#taint-and-sinks)); posts from programs in a sandbox are always tainted. Labels taken from content can be forged ([FIDES label forgery, 2026-09](https://labs.apisec.ai/research/articles/trust-me-bro-forging-security-labels-fides)).
+- **`from` and `taint` are set by the platform,** never by the sender and never parsed from content. `from` is `agt_…`, `user` (me), `platform`, `hook:<hk_…>` for [external sources](sources/), or `sbx_…` with the attributed agent (hook and sandbox posts aren't built yet). `taint` is the sender session's taint (see [grants and taint](../agents/tools/#taint-and-sinks)); posts from programs in a sandbox are always tainted. Labels taken from content can be forged ([FIDES label forgery, 2026-09](https://labs.apisec.ai/research/articles/trust-me-bro-forging-security-labels-fides)).
 - **`kind`** is a free-form label (`progress`, `question`, `blocked`, `pr_opened`, …). The platform's own kinds are listed under [built-in channels](#built-in-channels); every other kind is a convention between agents.
 - **`reply_to`** threads a message under another. Questions are answered by replying.
 - **Size:** text plus data up to 32 KiB inline. Bigger bodies (up to 1 MiB) go to R2, and the message carries a reference.
@@ -28,10 +28,10 @@ Keyed messages form a key-value view: shared state (a spec, a task board, claims
 
 | Channel | Posted by | Contents |
 |---|---|---|
-| `<agt_…>/inbox` | Whoever holds `post` on it: its owner, and peers through the [messaging capability](../agents/capabilities/#messaging) (by default, agents sharing its group label) | Messages to the agent. The agent is always subscribed. The platform also posts its background task exits here. |
-| `<agt_…>/events` | Platform | State changes, escalations, and `turn_completed` / `exited` carrying the final text (up to 2 KB) and usage. **The spawner is subscribed by default** (to `turn_completed` and `exited`), so results come back without being asked for. |
+| `<agt_…>/inbox` | Whoever holds `post` on it: its owner, and peers through the [messaging capability](../agents/capabilities/#messaging) (by default, agents sharing its group label, once labels exist; built today: `messaging-tree`, its owner and the agents it owns) | Messages to the agent. The agent is always subscribed. The platform will also post its background task exits here (not built: they go to a working brain's inbox directly). |
+| `<agt_…>/events` | Platform | State changes, escalations, `turn_completed` with the turn's final text (up to 2 KB) and usage, `exited` when the agent stops (with the last text), and `brain_released` for a brain that ends without the agent stopping (idle, a move, a host's loss). **The spawner is subscribed by default** (to `turn_completed` and `exited`) when it can `read`, so results come back without being asked for. |
 | `<sbx_…>/events` | Platform | State changes, placements (`moved`), ports exposed and unexposed, destruction; egress denials and alerts, orphaned work and rollback notices once they are reported |
-| `user` | Whoever holds `post` on it | Messages to me, read only by me. The [Discord bot](../control-plane/api/discord/) bridges it; until it exists, the operator API reads it. |
+| `user` | Whoever holds `post` on it | Messages to me, read only by me (and by an agent I grant it by its exact name). The [Discord bot](../control-plane/api/discord/) bridges it; until it exists, the operator API reads it. |
 
 Agents create any other channel (`ws/auth`, `team/review`). Names are hierarchical for tidiness only; they carry no meaning.
 
@@ -46,7 +46,7 @@ Agents create any other channel (`ws/auth`, `team/review`). Names are hierarchic
 - **`once`** ends the subscription at the first match. Replies use it.
 - **Waking a brain** that isn't running starts one. See [AgentDO](../control-plane/durable-objects/agent/).
 
-An agent subscribes itself, or its spawner subscribes it as part of the spawn spec.
+An agent subscribes itself; its spawner will subscribe it as part of the spawn spec once `agent_spawn` exists (until then the operator API can).
 
 ## The wake envelope
 
@@ -57,6 +57,8 @@ A woken turn's input is a **platform notice, not the messages**: per subscriptio
 - **Cost:** one extra tool call per wake. The notice is small, so it needs no digest step.
 
 ## Asking
+
+**Not built yet:** this section is the design. Today `ask` and approvals go through AgentDO's asks and the interim [workstream channel](../orchestration/workstreams/#the-interim-workstream-channel); moving them here is the next stage.
 
 `post(channel, text, await_reply_s?)` with `await_reply_s` (at most about 120 s) waits for the first reply. If none comes, it returns `pending`, and a `once` subscription delivers the reply as a later turn. Escalations use the same path:
 - A `PreToolUse` call that matches no rule, or a sink call from a tainted session, posts a `question` to the agent's **escalation channel** (set in its spawn spec; by default its spawner's inbox, or `user` for agents I spawn). After an egress denial, the agent asks the same way.
@@ -70,9 +72,9 @@ A woken turn's input is a **platform notice, not the messages**: per subscriptio
 - **Bounded backlog:** at most 50 subscription-started turns wait per agent. A delivery past either cap is deferred, not dropped: the channel keeps the messages, and the next delivery covers them in one wake. Claude Code's own cross-session messaging uses the same guards ([docs](https://code.claude.com/docs/en/cross-session-messaging)).
 - **Idempotent posts:** `post(idem_key?)` returns the existing `seq` for a repeated key, so a retried post after an eviction lands once.
 - **Retention:** set per channel. The default is 30 days; a keyed message is kept while it's the newest for its key.
-- **Tiering:** message bodies older than 7 days move to R2. The index and the keyed view stay in SQLite, and reads fetch old bodies transparently, so a channel's DO storage stays bounded however long it lives.
+- **Tiering:** message bodies older than 7 days move to R2. The index and the keyed view stay in SQLite, and reads fetch old bodies transparently, so old bodies leave a channel's DO storage however long it lives (its index rows, keys and subscriptions still grow: see [garbage collection](../control-plane/durable-objects/channel/)).
 - **Delivery:** at least once, in order per subscription. AgentDO deduplicates with a per-subscription high-water `seq`.
-- **Posting** needs `post` on the channel and **reading** needs `read`; a channel's owner holds both and can grant them. An agent always holds both on its own inbox and `read` on its own events, its children's events and its sandbox's events; events channels are posted by the platform only.
+- **Posting** needs `post` on the channel and **reading** needs `read`; a channel's owner holds both and can grant them. An agent always holds both on its own inbox and `read` on its own events, its children's events and its sandbox's events; events channels are posted by the platform only. A grant's wildcards match free channels only, never `user` or a built-in channel.
 
 **No interop for now:** [A2A](https://a2a-protocol.org/latest/specification/) is client-to-server tasks with no pub/sub, and [MCP tasks](https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/) have no agent-to-agent features. Either could be an adapter at the edge later.
 

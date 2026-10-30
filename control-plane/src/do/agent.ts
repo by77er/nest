@@ -323,7 +323,8 @@ export class AgentDO extends DurableObject<Env> {
     // high-water seq of each one's deliveries (dedup), and its queued posts to `<agt>/events`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS channel_subs (channel TEXT NOT NULL, sub TEXT NOT NULL, hw INTEGER NOT NULL DEFAULT 0,
       created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (channel, sub))`);
-    this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent);
+    this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
+      async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
 
   private readonly outbox: ChannelOutbox;
@@ -1766,6 +1767,9 @@ export class AgentDO extends DurableObject<Env> {
         case "turn_completed":
           if (completed && i.current_turn === ev.turn) {
             this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, ev.turn);
+            // A channel notice sent mid-turn that never reached the model (no `inbox_delivered`: the
+            // runner was stopping) isn't consumed with the turn: it comes back as the next turn.
+            this.requeueUnseenNotices();
             this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
             i.current_turn = null;
             i.state = "idle";
@@ -1807,7 +1811,7 @@ export class AgentDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------------
 
   /** Queue a turn. A retried submission with the same `requestId` gets the same turn, queued once. */
-  async enqueueTurn(input: TurnInput, requestId?: string): Promise<string> {
+  async enqueueTurn(input: TurnInput, requestId?: string, tainted = false): Promise<string> {
     // Never write a turn into an AgentDO that was never created (e.g. a subscriber id that names nobody).
     if (!this.exists()) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
     if (requestId) {
@@ -1818,6 +1822,8 @@ export class AgentDO extends DurableObject<Env> {
     const ord = (this.sql.exec<{ m: number | null }>("SELECT MAX(ord) AS m FROM turns").toArray()[0]?.m ?? 0) + 1;
     this.sql.exec(`INSERT INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, '${TURN.queued}', ?, ?)`,
       turn, ord, JSON.stringify(input), Date.now(), requestId ?? null);
+    // Another agent's text (a workstream batch) reaches the model inline: the session is tainted.
+    if (tainted) this.kvPut("read_tainted", true);
     await this.pump();
     await this.wake();
     return turn;
@@ -1873,13 +1879,16 @@ export class AgentDO extends DurableObject<Env> {
    * `inbox` turn. `interrupt` interrupts the running turn first.
    */
   /** A retried post with the same `requestId` gets the same message, delivered once. */
-  async postInbox(from: string, text: string, interrupt = false, requestId?: string): Promise<string> {
+  async postInbox(from: string, text: string, interrupt = false, requestId?: string, tainted = false): Promise<string> {
     if (requestId) {
       const prior = this.sql.exec<{ id: string }>("SELECT id FROM inbox WHERE request_id = ?", requestId).toArray()[0];
       if (prior) return prior.id;
     }
     const info = this.load();
     const message: InboxMessage = { id: newId("msg_"), from, text, interrupt, ts_ms: Date.now() };
+    // Another agent's text reaches the model inline (stdin, the Stop hook, or a turn): when it may be
+    // tainted, so is this session from now on (written with the message, in this step).
+    if (tainted) this.kvPut("read_tainted", true);
     if (info.current_turn) {
       this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, '${INBOX.delivered}', ?, ?)`,
         message.id, JSON.stringify(message), info.current_turn, Date.now(), requestId ?? null);
@@ -1987,12 +1996,54 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
-  /** Queue the brain's exit on `<agt>/events` (synchronous), with the last text it produced. */
+  /**
+   * Queue a brain release on `<agt>/events` (synchronous). `exited` means the agent stopped: the
+   * release restarts nothing (a stop, an auth failure, an unknown exit) and no start is wanted; it
+   * carries the last text the brain produced. Any other release (an idle exit, a move, a host's
+   * loss, a crash it restarts from) is platform housekeeping: `brain_released`, outside the
+   * spawner's default filter, with no text.
+   */
   private reportExit(info: AgentInfo, host: string, epoch: number, reason: AgentExitReason): void {
-    const last = this.kvGet<string>("last_text") ?? "";
-    this.outbox.push(`${info.agent}/events`, {
-      kind: "exited", text: last || `brain exited (${reason})`, data: { reason, epoch, host }, idem_key: `${info.agent}/exit/${host}/${epoch}`,
-    }, { tainted: this.tainted(info), agent_owner: info.owner });
+    const terminal = !RESTART_ON_EXIT[reason] && !info.intent;
+    const idem_key = `${info.agent}/exit/${host}/${epoch}`;
+    if (terminal) {
+      const last = this.kvGet<string>("last_text") ?? "";
+      this.outbox.push(`${info.agent}/events`, { kind: "exited", text: last || `stopped (${reason})`, data: { reason, epoch, host }, idem_key },
+        { tainted: this.tainted(info), agent_owner: info.owner });
+    } else {
+      this.outbox.push(`${info.agent}/events`, { kind: "brain_released", text: `brain released (${reason})`, data: { reason, epoch, host }, idem_key },
+        { tainted: false, agent_owner: info.owner });
+    }
+  }
+
+  /** Whether `owner`'s spec has the `read` tool (its spec is fixed at spawn, so the answer is kept). */
+  private async ownerReads(owner: string): Promise<boolean> {
+    const cached = this.kvGet<{ owner: string; reads: boolean }>("owner_reads");
+    if (cached?.owner === owner) return cached.reads;
+    let reads = false;
+    try {
+      reads = (await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info()).tools.includes("read");
+    } catch (e) {
+      // An owner that isn't an agent can't read anything; anything else is retried with the row.
+      if (asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
+    }
+    this.kvPut("owner_reads", { owner, reads });
+    return reads;
+  }
+
+  /**
+   * At a turn's end: channel notices sent into it mid-turn that the runner never confirmed
+   * (`inbox_delivered`) are queued again as one turn instead of being consumed with it.
+   * Synchronous, inside the turn's completion step.
+   */
+  private requeueUnseenNotices(): void {
+    const rows = this.sql.exec<{ message: string; request_id: string }>(
+      `SELECT message, request_id FROM inbox WHERE status = '${INBOX.delivered}' AND request_id LIKE 'chan/%' ORDER BY rowid`).toArray();
+    if (!rows.length) return;
+    const text = rows.map((r) => (JSON.parse(r.message) as InboxMessage).text).join("\n\n");
+    const ord = (this.sql.exec<{ m: number | null }>("SELECT MAX(ord) AS m FROM turns").toArray()[0]?.m ?? 0) + 1;
+    this.sql.exec(`INSERT OR IGNORE INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, '${TURN.queued}', ?, ?)`,
+      newId("trn_"), ord, JSON.stringify({ kind: "event_batch", text } satisfies TurnInput), Date.now(), `${rows[0]!.request_id}/requeued`);
   }
 
   /**
@@ -2009,6 +2060,16 @@ export class AgentDO extends DurableObject<Env> {
     const hw = this.sql.exec<{ hw: number }>("SELECT hw FROM channel_subs WHERE channel = ? AND sub = ?", d.channel, d.subscription).toArray()[0]?.hw;
     if (hw !== undefined && hw >= d.batch.to_seq) return { status: "ok" };
     const info = this.load();
+    // A notice tells the model to `read`: an agent without the tool gets only what arrives inline
+    // (the user's own messages). Anything else is taken (the high-water mark moves) but not
+    // delivered: there is nothing it could do with it. Stage 2 gives every agent `read` on its own
+    // built-in channels.
+    if (!info.tools.includes("read") && d.batch.inline.length < d.batch.count) {
+      this.sql.exec(`INSERT INTO channel_subs (channel, sub, hw, created_ms, ended) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(channel, sub) DO UPDATE SET hw = excluded.hw, ended = excluded.ended`, d.channel, d.subscription, d.batch.to_seq, now, d.batch.ends ? 1 : 0);
+      console.warn(`agent ${info.agent}: a notice from ${d.channel} skipped (no read tool)`);
+      return { status: "ok" };
+    }
     if (!info.current_turn) {
       const hour = this.sql.exec<{ n: number; oldest: number | null }>(
         "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM turns WHERE request_id LIKE 'chan/%' AND created_ms > ?", now - 3_600_000).one();
@@ -2022,8 +2083,20 @@ export class AgentDO extends DurableObject<Env> {
     const text = envelopeText(d, now, last);
     const requestId = `chan/${d.channel}/${d.subscription}/${d.batch.to_seq}`;
     // Both admit synchronously before their first await (the row is written in this step).
-    if (info.current_turn) await this.postInbox("platform", text, false, requestId);
-    else await this.enqueueTurn({ kind: "event_batch", text }, requestId);
+    if (info.current_turn) {
+      await this.postInbox("platform", text, false, requestId);
+      return { status: "ok" };
+    }
+    // Coalesced per agent: a notice joins a channel turn still waiting to start (its brain is
+    // starting, or busy elsewhere) instead of queueing another.
+    const waiting = this.sql.exec<{ turn: string; input: string }>(
+      `SELECT turn, input FROM turns WHERE status = '${TURN.queued}' AND request_id LIKE 'chan/%' ORDER BY ord DESC LIMIT 1`).toArray()[0];
+    if (waiting) {
+      const prior = JSON.parse(waiting.input) as TurnInput;
+      this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ ...prior, text: `${prior.text}\n\n${text}` } satisfies TurnInput), waiting.turn);
+      return { status: "ok" };
+    }
+    await this.enqueueTurn({ kind: "event_batch", text }, requestId);
     return { status: "ok" };
   }
 
@@ -2073,7 +2146,7 @@ export class AgentDO extends DurableObject<Env> {
         // Taint is read now, after the awaits: a read that tainted the session meanwhile counts.
         const r = await stub.post(channel, this.channelCaller(this.load()), post, facts);
         if (r.status === "conflict") {
-          throw new NestError(ErrorCodes.INVALID_MESSAGE, `conflict: key ${r.key} is at seq ${r.current_seq}, not ${post.if_seq}; read it and try again`, 409);
+          throw new NestError(ErrorCodes.CONFLICT, `conflict: key ${r.key} is at seq ${r.current_seq}, not ${post.if_seq}; read it and try again`, 409);
         }
         return json(r.status === "repeat" ? `Not stored: identical to your previous message (seq ${r.seq}).` : `Posted (seq ${r.seq}).`, r);
       }
@@ -2257,7 +2330,7 @@ export class AgentDO extends DurableObject<Env> {
           const other = await stub.info();
           if (other.workstream !== info.workstream) throw new NestError(ErrorCodes.FORBIDDEN, `${target} is in another workstream`, 403);
           await live();
-          await stub.postInbox(`${info.template}:${info.agent}`, message, false, key);
+          await stub.postInbox(`${info.template}:${info.agent}`, message, false, key, this.tainted(this.load()));
         }
         return text(`Delivered to ${to}.`);
       }
@@ -2302,6 +2375,8 @@ export class AgentDO extends DurableObject<Env> {
           const other = await stub.info();
           if (other.workstream !== info.workstream) throw new NestError(ErrorCodes.FORBIDDEN, "transcript is in another workstream", 403);
           page = await stub.readTranscript(since, limit, base);
+          // Another agent's transcript (its taint unknown here): this session is tainted from now on.
+          this.kvPut("read_tainted", true);
         }
         return {
           status: "ok",
@@ -2558,7 +2633,7 @@ export class AgentDO extends DurableObject<Env> {
           });
         }
       }
-    });
+    }, 5_000, [OUTBOX_DEADLINE]);
   }
 
   /** Bounded growth: finished calls, asks, turns and inbox messages older than a week go away. */

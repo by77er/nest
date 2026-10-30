@@ -15,7 +15,8 @@
     "sandbox_not_ready",
     "internal",
     "not_implemented",
-    "outcome_unknown"
+    "outcome_unknown",
+    "conflict"
   ],
   "gateway_error_codes": [
     "unauthorized",

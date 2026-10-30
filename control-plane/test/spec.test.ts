@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, intersectTools, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
-  SpawnerOverrides, specFromRole, type Template, templatesUsing,
+  SpawnerOverrides, specFromRole, type Template, templatesUsing, SEED_CATALOG_V1, CHANNEL_CAPABILITIES, seedMigration, SEED_VERSION,
 } from "../src/lib/spec";
 import { Credential, type ToolRule } from "../src/protocol/control";
 import type { ChannelGrant } from "../src/lib/channels";
@@ -277,5 +277,21 @@ describe("expansion properties (500 generated catalogs)", () => {
         if (b.ok) expect(b, `seed ${seed}`).toEqual(a);
       }
     }
+  });
+});
+
+describe("seed migration (pure)", () => {
+  it("a version-1 catalog gains each later step's entries whose names are free; a current one gains nothing", () => {
+    const all = { capabilities: Object.keys(SEED_CATALOG_V1.capabilities), templates: Object.keys(SEED_CATALOG_V1.templates) };
+    const m = seedMigration(all, 1);
+    expect(Object.keys(m.capabilities).sort()).toEqual(Object.keys(CHANNEL_CAPABILITIES).sort());
+    expect(m.templates).toEqual({});
+    expect(m.version).toBe(SEED_VERSION);
+    // A name the operator already uses is left alone (never overwritten).
+    expect(Object.keys(seedMigration({ ...all, capabilities: [...all.capabilities, "channels"] }, 1).capabilities)).toEqual(["messaging-tree"]);
+    // Nothing for a catalog at the current version, so a deleted entry never comes back.
+    expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION)).toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION });
+    // The version never goes back.
+    expect(seedMigration(all, SEED_VERSION + 5).version).toBe(SEED_VERSION + 5);
   });
 });

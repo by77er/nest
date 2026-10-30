@@ -429,7 +429,8 @@ async function route(req: Request, env: Env): Promise<Response> {
       const r = await body(req, z.object({
         text: z.string(), from: z.string().default("user"), interrupt: z.boolean().default(false), request_id: RequestIdField,
       }));
-      return json({ message: await a.postInbox(r.from, r.text, r.interrupt, requestId(req, r.request_id)) }, 201);
+      // The operator speaking as `user` is trusted; text it relays under another name may not be (it taints).
+      return json({ message: await a.postInbox(r.from, r.text, r.interrupt, requestId(req, r.request_id), r.from !== "user") }, 201);
     }
     if (req.method === "POST" && p[2] === "/interrupt") {
       await a.interrupt();

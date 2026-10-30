@@ -230,9 +230,14 @@ export type Decision = { ok: true } | { ok: false; error: string };
 const allow: Decision = { ok: true };
 const deny = (error: string): Decision => ({ ok: false, error });
 
-/** Whether a grant pattern names `facts.name` for this caller. */
+/**
+ * Whether a grant pattern names `facts.name` for this caller. Wildcards (`*`, `**`) never name a
+ * built-in channel (`user`, an agent's inbox or events, a sandbox's events): those are reached by
+ * the built-in rules, `{self}`/`{owner}`/`{child}`, or a grant naming them exactly.
+ */
 export function patternMatches(pattern: string, caller: Caller, facts: ChannelFacts): boolean {
   const pat = pattern.split("/");
+  if (facts.kind.kind !== "free" && pat.some((p) => p === "*" || p === "**")) return false;
   const segs = facts.name.split("/");
   const self = caller.principal;
   const owner = isAgentCaller(caller) ? caller.owner : null;
@@ -312,6 +317,11 @@ export type PostDecision =
  * earlier message; compare-and-set on the key (`if_seq`: the key's newest seq, 0 when absent);
  * a sender's identical repeat within a minute isn't stored; the per-poster rate limit (not for
  * `user` or `platform`). Otherwise the next seq.
+ *
+ * The repeat drop never swallows a state change: a post with `if_seq` is never a repeat (its
+ * compare-and-set passed, so it must land), and a keyed post is one only while the key still
+ * points at the sender's previous message (otherwise someone changed it since: claim, release,
+ * re-claim lands again).
  */
 export function decidePost(post: CheckedPost, from: string, st: PostState, now: number): PostDecision {
   const p = post.input;
@@ -319,7 +329,9 @@ export function decidePost(post: CheckedPost, from: string, st: PostState, now: 
   if (p.reply_to !== undefined && p.reply_to > st.head) return { kind: "invalid", error: `reply_to ${p.reply_to} is past the channel's last message (${st.head})` };
   if (p.if_seq !== undefined && (st.key_seq ?? 0) !== p.if_seq) return { kind: "conflict", current_seq: st.key_seq ?? 0 };
   const prev = st.last_by_sender;
-  if (prev && now - prev.ts_ms < REPEAT_WINDOW_MS && prev.text === p.text && prev.data_json === post.data_json && prev.kind === p.kind && prev.key === p.key) {
+  const keyUnchanged = p.key === undefined || st.key_seq === prev?.seq;
+  if (prev && p.if_seq === undefined && keyUnchanged && now - prev.ts_ms < REPEAT_WINDOW_MS && prev.text === p.text
+    && prev.data_json === post.data_json && prev.kind === p.kind && prev.key === p.key) {
     return { kind: "repeat", seq: prev.seq };
   }
   let rate: { start_ms: number; count: number } | null = null;
@@ -445,9 +457,9 @@ export function planBatch(sub: Subscription, msgs: readonly (MessageMeta & { tex
   const inline: { seq: number; text: string }[] = [];
   let bytes = 0;
   for (const h of hits) {
-    if (h.from !== "user" || h.text === undefined || inline.length >= ENVELOPE_INLINE_MAX) continue;
-    const text = h.text.length + bytes > ENVELOPE_INLINE_BYTES ? `${h.text.slice(0, Math.max(0, ENVELOPE_INLINE_BYTES - bytes))}…` : h.text;
-    bytes += text.length;
+    if (h.from !== "user" || h.text === undefined || inline.length >= ENVELOPE_INLINE_MAX || bytes >= ENVELOPE_INLINE_BYTES - 3) continue;
+    const text = clip(h.text, Math.max(0, ENVELOPE_INLINE_BYTES - bytes));
+    bytes += utf8(text);
     inline.push({ seq: h.seq, text });
   }
   return {
@@ -547,9 +559,24 @@ const TAINTING_BUILTINS = ["WebFetch", "WebSearch"];
 /**
  * An agent session's taint, as far as the platform tracks it today: per-call taint isn't built, so
  * an agent that can see untrusted content is assumed to have (it has hands, or a web built-in), and
- * any session that read a tainted message is (`read_tainted`, sticky). It may over-taint, never
- * under-taint.
+ * `read_tainted` is AgentDO's sticky bit, set when another agent's text reaches the session and
+ * that agent is (or may be) tainted: a channel `read`, a `notify` or inbox post, a workstream batch,
+ * another agent's transcript. What it guarantees: no text from an agent that may be tainted, and
+ * nothing from a sandbox or the web, reaches a session that then posts untainted. The operator's
+ * text (`user`) never taints. It over-taints freely (any hands agent, for life).
  */
 export function sessionTaint(a: { hands: boolean; builtin_tools: readonly string[]; read_tainted: boolean }): boolean {
   return a.hands || a.read_tainted || a.builtin_tools.some((t) => TAINTING_BUILTINS.includes(t));
+}
+
+// --- R2 ------------------------------------------------------------------------------------------------
+
+/** R2's Workers `delete` takes at most this many keys per call (developers.cloudflare.com/r2/api/workers/workers-api-reference/). */
+export const R2_DELETE_MAX = 1000;
+
+/** `xs` in chunks of at most `n`. */
+export function chunks<T>(xs: readonly T[], n: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
+  return out;
 }

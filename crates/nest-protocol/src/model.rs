@@ -149,12 +149,15 @@ pub mod error_codes {
     /// The caller gave up waiting (e.g. a platform tool call that timed out in the runner): the
     /// operation may or may not have taken effect. Not retryable under the same call id.
     pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
+    /// A compare-and-set lost: the state it was conditioned on changed (e.g. a channel key's `if_seq`).
+    /// The caller reads the current state and decides again. HTTP 409.
+    pub const CONFLICT: &str = "conflict";
 
     /// Every code above that is sent (the legacy alias is not).
     pub const ALL: &[&str] = &[
         STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
         UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
-        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN,
+        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT,
     ];
 
     /// `unsupported_version` under either name.
