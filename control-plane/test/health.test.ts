@@ -6,15 +6,19 @@ import { checkHealth, HEALTH_INSTANCE } from "../src/lib/health";
 import { ChannelName } from "../src/lib/channels";
 import { LedgerName } from "../src/lib/tasks";
 import { BASE } from "./helpers";
+import wrangler from "../wrangler.jsonc?raw";
 
-// Every binding in wrangler.jsonc, by class name: a class added there without a probe fails below.
-const CLASSES = {
-  FleetDO: env.FLEET, SandboxDO: env.SANDBOX, AgentDO: env.AGENT, WorkstreamDO: env.WORKSTREAM,
-  BrokerDO: env.BROKER, CatalogDO: env.CATALOG, ChannelDO: env.CHANNEL, TaskLedgerDO: env.TASKS,
-} as const;
+// Every Durable Object binding wrangler.jsonc declares, by class name, read from the file itself: a
+// class added there without a probe in lib/health.ts fails below.
+const CLASSES: Record<string, DurableObjectNamespace> = Object.fromEntries(
+  [...wrangler.matchAll(/\{\s*"name":\s*"(\w+)",\s*"class_name":\s*"(\w+)"\s*\}/g)]
+    .map(([, binding, cls]) => [cls!, (env as unknown as Record<string, DurableObjectNamespace>)[binding!]!]),
+);
 
 describe("GET /v1/health", () => {
   it("answers 200 only after every DO class answered, naming each class and nothing else", async () => {
+    expect(Object.keys(CLASSES).length).toBeGreaterThanOrEqual(8);
+    for (const ns of Object.values(CLASSES)) expect(ns).toBeDefined();
     const res = await SELF.fetch(`${BASE}/v1/health`);
     const body = await res.json<Record<string, unknown>>();
     expect(res.status, JSON.stringify(body)).toBe(200);
@@ -26,8 +30,7 @@ describe("GET /v1/health", () => {
   it("leaves each class's health instance with no tables and no alarm", async () => {
     expect((await SELF.fetch(`${BASE}/v1/health`)).status).toBe(200);
     for (const [name, ns] of Object.entries(CLASSES)) {
-      const n = ns as unknown as DurableObjectNamespace;
-      const stub = n.get(n.idFromName(HEALTH_INSTANCE));
+      const stub = ns.get(ns.idFromName(HEALTH_INSTANCE));
       const found = await runInDurableObject(stub, async (_i, state) => ({
         tables: state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")
           .toArray().map((r) => r.name),

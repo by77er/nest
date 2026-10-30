@@ -5,4 +5,9 @@ declare global {
     interface Env extends NestEnv {}
   }
 }
+declare module "*?raw" {
+  const text: string;
+  export default text;
+}
+
 export {};

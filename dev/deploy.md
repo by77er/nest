@@ -36,7 +36,7 @@ Built so far: the trigger, the environment, serialized runs, step 3 and a smoke 
 1. **Check the pause.** If the last production deployment was rolled back, an automatic run stops; a `workflow_dispatch` run clears the pause. The state is GitHub's own deployment statuses, so nothing else stores it.
 2. **Classify.** Diff `wrangler.jsonc` against the deployed version. A Durable Object class change or a removed binding makes this a **one-way deploy**, since Cloudflare won't roll back across one (adding `CatalogDO` is one). Recovering from a bad one-way deploy is a forward revert: the previous code deployed again on top, which is why stored records keep the previous release's fields for one release.
 3. **Deploy at 100%:** `wrangler deploy --message <sha>`, so every Worker version names its commit.
-4. **Smoke:** `GET /v1/health` reaches the Worker and makes one round trip to each DO class (built: 200 only if every class answered within 5 s, else 503 naming the class; each `curl` has 10 s).
+4. **Smoke:** `GET /v1/health` reaches the Worker and makes one round trip to each DO class (built: 200 only if every class answered within 5 s, else 503 naming the class; each `curl` has 10 s). It proves each class deploys, instantiates and answers with its SQLite reachable, on a health instance that skips the schema, so not that migrations work on stored data; host reconnection after the deploy is that canary.
 5. **Health window (10 minutes):** every minute, query [runtime metrics](../docs/control-plane/metrics/) for the new version against the previous version's last 24 hours:
    - Worker 5xx and exception rates;
    - DO exceptions per class;

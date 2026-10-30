@@ -1779,11 +1779,12 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * `agent` no longer waits for a brain host (an operator stopped it at `atMs`): its row goes, so the
-   * tick launches no brain host for it. A row written after `atMs` (a start made after the stop) stays.
+   * `agent` no longer waits for a brain host (an operator stopped it): its row goes, so the tick
+   * launches no brain host for it. A start made after the stop records its wait again at its next
+   * placement (at most 30 s later: the stop reset its backoff).
    */
-  async brainWaitEnded(agent: string, atMs: number): Promise<void> {
-    this.sql.exec("DELETE FROM brain_waiters WHERE agent = ? AND since_ms <= ?", agent, atMs);
+  async brainWaitEnded(agent: string): Promise<void> {
+    this.sql.exec("DELETE FROM brain_waiters WHERE agent = ?", agent);
   }
 
   /** Every active brain host as brain placement sees it (`pickBrainHost`, `brainHostNeeded`). */

@@ -478,6 +478,10 @@ describe("brain hosts scale with brains", () => {
     expect(ec2.launched).toHaveLength(1);
     const waiters = () => runInDurableObject(fleetStub(cell), (_i, st) => st.storage.sql.exec<{ agent: string }>("SELECT agent FROM brain_waiters").toArray().map((r) => r.agent));
     expect(await waiters()).toEqual([agent]);
+    // FleetDO's clock may run ahead of AgentDO's: the row goes whatever its time.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE brain_waiters SET since_ms = ?", Date.now() + 60_000);
+    });
     await agentStub(agent).stop("requested");
     const after = await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => ({
       info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
@@ -622,6 +626,129 @@ describe("brain hosts scale with brains", () => {
     const agent = await captain(cell);
     expect(ec2.launched).toEqual([]);
     expect(await agentStub(agent).info()).toMatchObject({ brain: null, intent: { reason: "operator" } });
+  });
+});
+
+describe("a brain the operator stopped restarts nothing, however it ends (stop_epoch)", () => {
+  const state = (agent: string) => runInDurableObject(agentStub(agent), (_i: AgentDO, s) => ({
+    info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
+    alarms: s.storage.sql.exec<{ key: string }>("SELECT key FROM deadlines WHERE key IN ('intent', 'wake', 'wake_after_exit')").toArray().map((r) => r.key),
+  }));
+  /** A turn waiting: what a release's wake (or a deadline's) would start a brain for. */
+  const queueTurn = (agent: string) => runInDurableObject(agentStub(agent), (_i: AgentDO, s) => {
+    s.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES ('trn_waiting', 1, ?, 'queued', ?)",
+      JSON.stringify({ kind: "user", text: "go" }), Date.now());
+  });
+  const runDeadline = async (agent: string, key: string) => {
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => {
+      s.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES (?, 0)", key);
+    });
+    await runDurableObjectAlarm(agentStub(agent));
+  };
+  /** Two brain hosts and a captain started on the first, with a turn waiting. */
+  const started = async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell, "brain");
+    const agent = await captain(cell, false);
+    expect(await agentStub(agent).start()).toMatchObject({ kind: "started", host: a.host });
+    const [start] = await nextCommands(a.ws, isStartOf(agent));
+    await okResult(a.ws, start.cmd);
+    const b = await connectHost(cell, "brain");
+    await queueTurn(agent);
+    return { cell, a, b, agent };
+  };
+  const nothingStarts = async (agent: string, ...hosts: Ws[]) => {
+    for (const ws of hosts) expect(await ws.none("commands", 300, (m) => (m.commands as any[]).some((c) => isStartOf(agent)(c) && c.epoch > 1))).toBe(true);
+    const st = await state(agent);
+    expect(st.info).toMatchObject({ brain: null, intent: null, agent_epoch: 1 });
+    expect(st.alarms).toEqual([]);
+    expect(st.info.state).not.toBe("errored");
+  };
+
+  it("D: its start refused after the stop, then its fenced exit, with a turn waiting", async () => {
+    const { a, b, agent } = await started();
+    // A wake armed before the stop is for work the stop ends too.
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => {
+      s.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('wake', ?)", Date.now() + 60_000);
+    });
+    await agentStub(agent).stop("requested");
+    expect((await state(agent)).alarms).toEqual([]);
+    await agentStub(agent).startFailed(a.host, { code: "spawn_failed", message: "x", retryable: true }, 1);
+    await agentStub(agent).onExited(a.host, "fenced", 1);
+    await nothingStarts(agent, a.ws, b.ws);
+  });
+
+  it("A: condemned for a drain (a move wanted), then stopped, then its fenced exit", async () => {
+    const { cell, a, b, agent } = await started();
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", a.host);
+    });
+    await agentStub(agent).onHostDraining(a.host);
+    expect((await state(agent)).info).toMatchObject({ brain: { phase: "condemned" }, intent: { reason: "drain", avoid: a.host } });
+    await agentStub(agent).stop("requested");
+    await agentStub(agent).onExited(a.host, "fenced", 1);
+    await nothingStarts(agent, b.ws);
+  });
+
+  it("B: stopped, then its host drains before it exits: condemned with no move, and its exit starts nothing", async () => {
+    const { cell, a, b, agent } = await started();
+    await agentStub(agent).stop("requested");
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", a.host);
+    });
+    await agentStub(agent).onHostDraining(a.host);
+    expect((await state(agent)).info).toMatchObject({ brain: { phase: "condemned" }, intent: null });
+    await agentStub(agent).onExited(a.host, "fenced", 1);
+    await nothingStarts(agent, b.ws);
+  });
+
+  it("the start and no-session deadlines condemn a stopped brain without counting, erroring or waking it", async () => {
+    // `starting`: no hello since its start.
+    const s = await started();
+    await agentStub(s.agent).stop("requested");
+    await runDeadline(s.agent, "starting");
+    const st = await state(s.agent);
+    expect(st.info).toMatchObject({ brain: { phase: "condemned", epoch: 1 }, intent: null });
+    expect(st.info.state).not.toBe("errored");
+    expect(st.info.start_timeouts ?? 0).toBe(0);
+    expect(st.info.exit_restarts ?? 0).toBe(0);
+    await agentStub(s.agent).onExited(s.a.host, "fenced", 1);
+    await nothingStarts(s.agent, s.a.ws, s.b.ws);
+    // `no_session`: a live brain whose session went away.
+    const t = await started();
+    await runInDurableObject(agentStub(t.agent), (_i: AgentDO, s) => {
+      const info = JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.brain.phase = "live";
+      s.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
+    await agentStub(t.agent).stop("requested");
+    await runDeadline(t.agent, "no_session");
+    const tt = await state(t.agent);
+    expect(tt.info).toMatchObject({ brain: { phase: "condemned", epoch: 1 }, intent: null });
+    expect(tt.info.exit_restarts ?? 0).toBe(0);
+    await agentStub(t.agent).onExited(t.a.host, "fenced", 1);
+    await nothingStarts(t.agent, t.a.ws, t.b.ws);
+  });
+
+  it("an exit without an epoch condemns a stopped brain and wakes nothing", async () => {
+    const { a, b, agent } = await started();
+    await agentStub(agent).stop("requested");
+    await agentStub(agent).onExited(a.host, "crashed");
+    const st = await state(agent);
+    expect(st.info).toMatchObject({ brain: { phase: "condemned", epoch: 1 }, intent: null });
+    expect(st.alarms).toEqual([]);
+    expect(st.info.exit_restarts ?? 0).toBe(0);
+    expect(await b.ws.none("commands", 300, (m) => (m.commands as any[]).some(isStartOf(agent)))).toBe(true);
+  });
+
+  it("a start made after the stop still runs after the stopped brain ends", async () => {
+    const { a, agent } = await started();
+    await agentStub(agent).stop("requested");
+    // The operator starts it again while the stopped brain is still finishing: kept, run after its exit.
+    expect(await agentStub(agent).start()).toMatchObject({ kind: "none" });
+    await agentStub(agent).onExited(a.host, "stopped", 1);
+    for (let n = 0; n < 80 && (await agentStub(agent).info()).agent_epoch < 2; n++) await new Promise((r) => setTimeout(r, 25));
+    expect((await agentStub(agent).info()).agent_epoch).toBe(2);
   });
 });
 

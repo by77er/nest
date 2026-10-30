@@ -25,14 +25,18 @@ export { WorkstreamDO } from "./do/workstream";
 
 const DEFAULT_CELL = "local";
 
-/** The last health check this isolate ran (or is running), reused for `HEALTH_REUSE_MS`. */
-let lastHealth: { at: number; result: ReturnType<typeof checkHealth> } | null = null;
+/**
+ * The last settled health check in this isolate, reused for `HEALTH_REUSE_MS`. Only a settled result
+ * is shared: a request never awaits I/O another request started (and may have been cancelled with).
+ */
+let lastHealth: { at: number; result: Awaited<ReturnType<typeof checkHealth>> } | null = null;
 const HEALTH_REUSE_MS = 3_000;
 
-function sharedHealth(env: Env): ReturnType<typeof checkHealth> {
-  const now = Date.now();
-  if (!lastHealth || now - lastHealth.at > HEALTH_REUSE_MS) lastHealth = { at: now, result: checkHealth(healthProbes(env)) };
-  return lastHealth.result;
+async function sharedHealth(env: Env): ReturnType<typeof checkHealth> {
+  if (lastHealth && Date.now() - lastHealth.at <= HEALTH_REUSE_MS) return lastHealth.result;
+  const result = await checkHealth(healthProbes(env));
+  lastHealth = { at: Date.now(), result };
+  return result;
 }
 /** A host may reconnect its fleet channel this long after its token expired (and gets a fresh one). */
 const FLEET_TOKEN_GRACE_MS = 24 * 3_600_000;
