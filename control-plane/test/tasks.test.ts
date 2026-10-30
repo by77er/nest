@@ -193,11 +193,15 @@ describe("the tasks capability through the tool path", { timeout: 20_000 }, () =
     const w = await spawn(s, "worker", L);
     const readTainted = async (agent: string) => runInDurableObject(agentStub(agent), (_i: unknown, st: DurableObjectState) =>
       st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'read_tainted'").toArray()[0]?.value === "true");
+    const c2 = await spawn(s, "captain", L);
     expect(w.json(await w.call("task_create", { title: "from the worker" })).tainted).toBe(true);
-    expect(await readTainted(c.agent)).toBe(false);
-    // An admin write returns the whole task: its text is the worker's.
-    expect(c.json(await c.call("task_update_any", { task: "T-1", priority: "high" })).tainted).toBe(true);
-    expect(await readTainted(c.agent)).toBe(true);
+    expect([await readTainted(c.agent), await readTainted(c2.agent)]).toEqual([false, false]);
+    // Listing it taints one captain.
+    expect(c.json(await c.call("task_list", {})).tainted).toBe(true);
+    expect([await readTainted(c.agent), await readTainted(c2.agent)]).toEqual([true, false]);
+    // An admin write returns the whole task, its text the worker's: it taints the other.
+    expect(c2.json(await c2.call("task_update_any", { task: "T-1", priority: "high" })).tainted).toBe(true);
+    expect(await readTainted(c2.agent)).toBe(true);
     // The operator sees the flag too.
     expect((await adminJson(`/v1/ledgers/${L}/tasks/T-1`)).task.tainted).toBe(true);
   });
