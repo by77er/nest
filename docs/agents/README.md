@@ -3,7 +3,7 @@
 **An agent is a brain plus optional hands, with capabilities, grants and subscriptions.** There are no roles: what an agent is for comes from its prompt and the capabilities it's given.
 
 - **Brain:** an unmodified Claude Code process running **on a [brain host](../compute/brain-hosts/), outside every VM and never on a sandbox host**, on my subscription. It's managed by the [agent runner](runner/), and its session state is portable. The [backend](backends/) is pluggable; `api-loop` (deferred) runs inside AgentDO, with no host at all.
-- **Hands (optional):** `nest` MCP tools that make calls into **one sandbox** (exec, read, write, edit, glob, grep), over the network through the sandbox's [gateway](../sandbox/gateway/), with a binding SandboxDO issues at `attach`. See [hands/](hands/).
+- **Hands (optional):** `nest` MCP tools that make calls into **one sandbox** (exec, read, write, edit, glob, grep), over the network through the sandbox's [gateway](../sandbox/gateway/), with a binding SandboxDO's `resolve` issues to an attached agent. See [hands/](hands/).
 - **Capabilities:** pluggable bundles of tools, the grants they need and prompt instructions (messaging, channels, spawning, memory, …). See [capabilities/](capabilities/).
 - **Grants:** what it may do, and to which resources. Capabilities expand into grants; extra grants can be added. See [tools/](tools/).
 - **Subscriptions:** the [channels](../channels/) whose messages wake it. Every agent is subscribed to its own inbox.
@@ -59,7 +59,7 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 
 ## Attach, share, fork
 
-- **Attach** binds an agent's hands to a sandbox, and needs `attach` on both: SandboxDO configures the agent's slot in the guest and issues the binding. **Moving** an agent is a new binding. A forked conversation (`--resume <id> --fork-session`) can be bound to a forked sandbox.
+- **Attach** binds an agent's hands to a sandbox, and needs `attach` on both: SandboxDO configures the agent's slot in the guest, and its `resolve` issues the binding. **Moving** an agent is a new binding. A forked conversation (`--resume <id> --fork-session`) can be bound to a forked sandbox.
 - **Several agents in one sandbox** are several RPC clients. They share files, services and ports, and conflicts are accepted. No worktrees, port blocks or per-agent uids.
 - **Isolation comes from forking the sandbox.**
 - **Per-agent grants provide attribution and prevent accidents.** Within one sandbox, they aren't a security boundary.

@@ -807,17 +807,21 @@ describe("review fixes", () => {
       (inst as any).outbox.push(`${agent}/events`, { kind: "state_changed", text: "behind it" }, { tainted: false });
     });
     const events = `${agent}/events`;
-    // The refused row is tried MAX_REFUSALS times (from the alarm, 5 s apart), then dropped.
-    for (let i = 0; i < 3; i++) {
-      await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+    // The refused row is tried MAX_REFUSALS times (from the alarm, 5 s apart: forced here), then
+    // dropped; the runtime's own alarm may take some of the tries.
+    const delivered = async () => ((await readAs(events)).messages as any[]).some((x) => x.text === "behind it");
+    const end = Date.now() + 20_000;
+    while (!(await delivered())) {
+      if (Date.now() > end) throw new Error("the row behind the refused one never went through");
+      await runInDurableObject(agentStub(agent), async (_i: AgentDO, st) => {
         st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('chan_out', 0)");
+        await st.storage.setAlarm(Date.now() + 60_000); // run below, not by the runtime
       });
       await runDurableObjectAlarm(agentStub(agent));
     }
-    await until(async () => (await readAs(events)).messages as any[], (m) => m.some((x) => x.text === "behind it"), 10_000, "the row behind it");
     const left = await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM chan_out").toArray().length);
     expect(left).toBe(0);
-  });
+  }, 30_000);
 
   it("deadlines run the outbox after every other due key", async () => {
     const order: string[] = [];

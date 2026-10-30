@@ -1,12 +1,12 @@
 # nest-runner
 
-The agent runner: runs unmodified Claude Code brains on a host, outside every VM; the design places it on brain hosts only (`docs/compute/brain-hosts/`). Design:
+The agent runner: runs unmodified Claude Code brains on a brain host (`docs/compute/brain-hosts/`), outside every VM. Sandbox hosts keep it enabled for one release only, for a Worker rolled back to the previous release (`dev/deploy.md`). Design:
 `docs/agents/runner/`. Contracts: `docs/interfaces/host-internal/` (nestd-runner, runner-hooks,
 runner-mcp, runner-claude) and `docs/interfaces/control-host/session/`.
 
 | Module | What |
 |---|---|
-| `supervisor` | nestd socket client: `agent_start/bind/stop`, `fence`, host token, lease mirror; connection generations (events about brains of an earlier connection are dropped); undecodable commands skipped. nestd gone or lease lapsed ⇒ kill every brain |
+| `supervisor` | nestd socket client: `agent_start`, `agent_stop`, `fence`, host token, lease mirror; connection generations (events about brains of an earlier connection are dropped); undecodable commands skipped. nestd gone or lease lapsed ⇒ kill every brain |
 | `agent` | Per brain: register first, then (cancellable, with timeouts) write prompt + MCP config, rebuild a resumed session file from R2 segments, `claude auth status` (must be `oauth_token`), spawn with the exact argv and a clean env; refuse any built-in outside `HOST_SAFE_BUILTINS` (at start, and in `system/init.tools`); drive stream-json through a separate stdin writer (turns, inbox, interrupt → SIGINT to the pid → SIGKILL to the group), count user messages against `result`s and report `turn_completed` + `idle` once, when none is outstanding (or after the 10 s settle), with the turn's id and usage summed over its results; check `system/init.apiKeySource == "none"`, idle grace → close stdin; input arriving during an idle exit resumes Claude Code and is replayed |
 | `session` | One WebSocket per agent to AgentDO: hello/resume (per-brain `instance_id`), reliable seq/acks with resend, event batching with state coalescing, session-file segments, platform tool relay (timed-out calls abandoned); on close keeps flushing up to 30 s until everything is acked and durable |
 | `tailer` | Native session JSONL → whole-line segments by byte offset; base reset on shrink/inode change; same-length secret redaction |
