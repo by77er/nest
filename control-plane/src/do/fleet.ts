@@ -2319,8 +2319,9 @@ export class FleetDO extends DurableObject<Env> {
    */
   private failStarts(host: string): void {
     const failed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, "host expired before running this start", true) });
-    this.sql.exec("UPDATE commands SET result = ?, result_ms = ? WHERE host = ? AND type = ? AND result IS NULL",
-      failed, Date.now(), host, "agent_start" satisfies CommandType);
+    // FleetDO's answer, not the host's: it is no evidence that the host processes commands.
+    this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE host = ? AND type = ? AND result IS NULL",
+      failed, Date.now(), "fleet" satisfies AnsweredBy, host, "agent_start" satisfies CommandType);
   }
 
   /**

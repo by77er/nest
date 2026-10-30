@@ -27,6 +27,8 @@ priority: high
 credential: claude_oauth_token:captain   # revocable separately from workers
 ```
 
+**Built so far:** the seeded `captain` template ([CatalogDO](../../control-plane/durable-objects/catalog/)) gives the tools the captain role had, its launch, `hands: forbidden`, `escalate_to: user`, `subscribe: [workstream]` and `credential: claude_oauth_token:captain`; the capabilities above aren't built.
+
 ## Conventions in its prompt
 
 - **One agent first.** Multi-agent setups win on parallel, read-heavy work and lose on sequential work: one study measured +81% on parallelizable tasks and −39% to −70% on sequential ones ([2025-12](https://arxiv.org/abs/2512.08296)), and Anthropic calls its multi-agent research design a poor fit for most coding ([2025-06](https://www.anthropic.com/engineering/multi-agent-research-system)). The captain spawns more agents only for independent, mostly read-only work.

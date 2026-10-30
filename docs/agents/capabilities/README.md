@@ -15,7 +15,7 @@ prompt:  |                                  # added to the system prompt
   To reach a peer, use `message`. …
 ```
 
-- **Data, not code:** capabilities are stored in the control plane and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
+- **Data, not code:** capabilities are stored in the control plane ([CatalogDO](../../control-plane/durable-objects/catalog/)) and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
 - **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).

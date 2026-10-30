@@ -1,0 +1,270 @@
+// Templates, capabilities and spawn-spec expansion (lib/spec.ts): pure functions, checked directly.
+// The seed catalog must give exactly what the `worker` and `captain` roles gave; the properties
+// below hold for any catalog and spec (a seeded generator, not fast-check: it isn't a dependency).
+import { describe, expect, it } from "vitest";
+import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
+import {
+  type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, intersectTools, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
+  SpawnerOverrides, specFromRole, type Template, templatesUsing,
+} from "../src/lib/spec";
+import { Credential, type ToolRule } from "../src/protocol/control";
+
+// What the roles gave (the role-filtered `platform-tools.json` and AgentDO's defaults before templates).
+const WORKER_TOOLS = ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"];
+const CAPTAIN_TOOLS = ["notify", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
+  "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "delegate", "memory_read", "memory_write", "notify_user"];
+const NEST_ALLOW: ToolRule = { pattern: "mcp__nest__*", decision: "allow" };
+const WORKER_LAUNCH = {
+  builtin_tools: ["TodoWrite", "Task", "WebSearch"],
+  system_prompt: { mode: "append", text: "You work in a remote sandbox through the mcp__nest__* tools; they behave like Claude Code's built-ins." },
+};
+const CAPTAIN_LAUNCH = {
+  builtin_tools: [],
+  system_prompt: { mode: "replace", text: "You are a nest captain. You act only through mcp__nest__* platform tools." },
+};
+
+const expand = (catalog: Catalog, template: string, hands: boolean, overrides = {}) => {
+  const r = expandSpec(catalog, PLATFORM_TOOL_NAMES, { template, hands, by: "operator", overrides });
+  if (!r.ok) throw new Error(r.error);
+  return r.value;
+};
+
+describe("the seed catalog is what the roles were", () => {
+  it("worker: the worker tools, launch, rules and token; escalates to the workstream channel", () => {
+    expect(expand(SEED_CATALOG, "worker", true)).toEqual({
+      template: "worker",
+      tools: WORKER_TOOLS,
+      launch: WORKER_LAUNCH,
+      rules: [NEST_ALLOW, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }],
+      credential: "claude_oauth_token:worker",
+      escalate_to: "workstream",
+      subscribe: [],
+    });
+  });
+
+  it("captain: the captain tools, launch, rules and token; subscribes to its workstream, escalates to the user", () => {
+    expect(expand(SEED_CATALOG, "captain", false)).toEqual({
+      template: "captain",
+      tools: CAPTAIN_TOOLS,
+      launch: CAPTAIN_LAUNCH,
+      rules: [NEST_ALLOW],
+      credential: "claude_oauth_token:captain",
+      escalate_to: "user",
+      subscribe: ["workstream"],
+    });
+  });
+
+  it("every seed entry passes the checks the admin routes apply", () => {
+    for (const c of Object.values(SEED_CATALOG.capabilities)) expect(checkCapability(c, PLATFORM_TOOL_NAMES).ok).toBe(true);
+    for (const t of Object.values(SEED_CATALOG.templates)) expect(checkTemplate(t, SEED_CATALOG.capabilities).ok).toBe(true);
+  });
+
+  it("a record stored with a role gets that role's spec, its stored launch and rules, and its grants as a narrowing", () => {
+    const launch = { builtin_tools: [], system_prompt: { mode: "append" as const, text: "custom" } };
+    const s = specFromRole({ role: "worker", grants: ["notify", "merge", "emit"], launch, rules: [NEST_ALLOW] });
+    // `merge` was never a worker tool: ignored, as the role filter ignored it.
+    expect(s).toMatchObject({ template: "worker", tools: ["notify", "emit"], launch, rules: [NEST_ALLOW], credential: "claude_oauth_token:worker" });
+    expect(specFromRole({ role: "captain", grants: null, launch: CAPTAIN_LAUNCH as never, rules: [NEST_ALLOW] }).tools)
+      .toEqual(CAPTAIN_TOOLS);
+  });
+});
+
+describe("records stored with a role read through a frozen table, not the seed", () => {
+  it("the seed still expands to what ROLE_SPECS freezes (so a seed edit can't change it unnoticed)", () => {
+    for (const role of ["worker", "captain"] as const) {
+      const { launch: _l, rules: _r, subscribe: _s, ...rest } = expand(SEED_CATALOG, role, role === "worker");
+      expect(rest, role).toEqual(ROLE_SPECS[role]);
+    }
+  });
+
+  it("the legacy grants field intersects silently; overrides.tools refuses a wider list", () => {
+    const w = expand(SEED_CATALOG, "worker", true);
+    expect(intersectTools(w, ["notify", "merge"]).tools).toEqual(["notify"]);
+  });
+});
+
+describe("a spawner's overrides can only narrow", () => {
+  const spawn = (overrides: unknown) =>
+    expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "worker", hands: true, by: "spawner", overrides: overrides as SpawnerOverrides });
+  const base = expand(SEED_CATALOG, "worker", true);
+
+  it("refuses launch, built-in tools, credential, escalation and allow rules", () => {
+    for (const bad of [
+      { launch: { builtin_tools: ["Bash"], system_prompt: { mode: "replace", text: "x" } } },
+      { builtin_tools: ["Bash"] },
+      { credential: "claude_oauth_token:captain" },
+      { escalate_to: "user" },
+      { rules: [{ pattern: "mcp__nest__merge", decision: "allow" }] },
+    ]) {
+      expect(SpawnerOverrides.safeParse(bad).success, JSON.stringify(bad)).toBe(false);
+      expect(spawn(bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+    // The operator's schema takes what a spawner's refuses.
+    expect(OperatorOverrides.safeParse({ credential: "claude_oauth_token:captain", rules: [{ pattern: "x", decision: "allow" }] }).success).toBe(true);
+  });
+
+  it("narrows tools, and puts deny and ask rules first (first match wins), keeping launch and credential", () => {
+    const r = spawn({ tools: ["notify", "ask"], rules: [{ pattern: "mcp__nest__Bash(rm *)", decision: "deny" }, { pattern: "WebSearch", decision: "ask" }] });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.tools).toEqual(["notify", "ask"]);
+    expect(r.value.rules).toEqual([{ pattern: "mcp__nest__Bash(rm *)", decision: "deny" }, { pattern: "WebSearch", decision: "ask" }, ...base.rules]);
+    expect([r.value.launch, r.value.credential, r.value.escalate_to]).toEqual([base.launch, base.credential, base.escalate_to]);
+    expect(spawn({ tools: ["merge"] }).ok).toBe(false);
+  });
+});
+
+describe("expansion refuses what it can't give", () => {
+  it("hands: required needs a sandbox, forbidden refuses one, optional takes either", () => {
+    expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "worker", hands: false, by: "operator" })).toEqual({ ok: false, error: "template worker needs a sandbox" });
+    expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "captain", hands: true, by: "operator" })).toEqual({ ok: false, error: "template captain has no hands" });
+    const optional: Catalog = { ...SEED_CATALOG, templates: { o: { ...SEED_CATALOG.templates.worker!, hands: "optional" } } };
+    expect(expandSpec(optional, PLATFORM_TOOL_NAMES, { template: "o", hands: true, by: "operator" }).ok).toBe(true);
+    expect(expandSpec(optional, PLATFORM_TOOL_NAMES, { template: "o", hands: false, by: "operator" }).ok).toBe(true);
+  });
+
+  it("tools: an override narrows and never widens", () => {
+    expect(expand(SEED_CATALOG, "worker", true, { tools: ["emit", "notify"] }).tools).toEqual(["notify", "emit"]);
+    expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "worker", hands: true, by: "operator", overrides: { tools: ["notify", "merge"] } }))
+      .toEqual({ ok: false, error: "template worker doesn't give merge" });
+  });
+
+  it("unknown names, and inherited object keys, are unknown", () => {
+    expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "nope", hands: false, by: "operator" }).ok).toBe(false);
+    expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "constructor", hands: false, by: "operator" }).ok).toBe(false);
+    const broken: Catalog = { ...SEED_CATALOG, templates: { b: { ...SEED_CATALOG.templates.captain!, capabilities: ["toString"] } } };
+    expect(expandSpec(broken, PLATFORM_TOOL_NAMES, { template: "b", hands: false, by: "operator" })).toEqual({ ok: false, error: "template b: unknown capability toString" });
+    expect(checkCapability({ tools: ["nope"], rules: [], prompt: "" }, PLATFORM_TOOL_NAMES).ok).toBe(false);
+    expect(checkCapability({ tools: ["notify", "notify"], rules: [], prompt: "" }, PLATFORM_TOOL_NAMES).ok).toBe(false);
+    expect(checkTemplate({ ...SEED_CATALOG.templates.worker!, capabilities: ["hands", "hands"] }, SEED_CATALOG.capabilities).ok).toBe(false);
+    expect(templatesUsing(SEED_CATALOG, "hands")).toEqual(["worker"]);
+  });
+
+  it("a credential names a Claude setup token and nothing else", () => {
+    for (const ok of ["claude_oauth_token", "claude_oauth_token:captain", "claude_oauth_token:team-a.1"]) expect(Credential.safeParse(ok).success).toBe(true);
+    for (const bad of ["binding_key:use1", "access:gateway", "inject:github", "claude_oauth_token:", "claude_oauth_tokenX", "cap:x"]) {
+      expect(Credential.safeParse(bad).success, bad).toBe(false);
+    }
+  });
+});
+
+// --- Properties over generated catalogs ----------------------------------------------------------------
+
+/** mulberry32: a small seeded PRNG, so a failure names its seed. */
+function rng(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function genCatalog(r: () => number): { catalog: Catalog; template: string; hands: boolean; overrides: { tools?: string[]; rules?: ToolRule[] } } {
+  const pick = <T>(xs: readonly T[]) => xs[Math.floor(r() * xs.length)]!;
+  const subset = <T>(xs: readonly T[], p: number) => xs.filter(() => r() < p);
+  const rulePool: ToolRule[] = [NEST_ALLOW, { pattern: "Agent", decision: "allow" }, { pattern: "Bash", decision: "ask" }, { pattern: "Web*", decision: "deny", reason: "no" }];
+  const capabilities: Record<string, Capability> = {};
+  const n = 1 + Math.floor(r() * 6);
+  for (let i = 0; i < n; i++) {
+    capabilities[`c${i}`] = {
+      tools: [...new Set(subset(PLATFORM_TOOL_NAMES, 0.2))].sort(() => r() - 0.5),
+      rules: subset(rulePool, 0.4),
+      prompt: r() < 0.5 ? `prompt ${i}` : "",
+    };
+  }
+  const capNames = Object.keys(capabilities);
+  const hands = pick(["required", "forbidden", "optional"] as const);
+  const template: Template = {
+    capabilities: subset(capNames, 0.6),
+    launch: { builtin_tools: [], system_prompt: { mode: pick(["append", "replace"] as const), text: r() < 0.5 ? "base" : "" } },
+    hands,
+    credential: "claude_oauth_token",
+    escalate_to: pick(["user", "workstream"] as const),
+    subscribe: r() < 0.5 ? ["workstream"] : [],
+  };
+  const given = [...new Set(template.capabilities.flatMap((c) => capabilities[c]!.tools))];
+  const overrides: { tools?: string[]; rules?: ToolRule[] } = {};
+  if (r() < 0.4) overrides.tools = subset(given, 0.5);
+  if (r() < 0.1) overrides.tools = [...(overrides.tools ?? []), pick(PLATFORM_TOOL_NAMES)];
+  if (r() < 0.2) overrides.rules = subset(rulePool, 0.5);
+  return { catalog: { capabilities, templates: { t: template } }, template: "t", hands: hands === "forbidden" ? false : hands === "required" ? true : r() < 0.5, overrides };
+}
+
+describe("expansion properties (500 generated catalogs)", () => {
+  it("tools come from the capabilities, in registry order, once; overrides only narrow; rules and prompts come from the capabilities", () => {
+    for (let seed = 1; seed <= 500; seed++) {
+      const g = genCatalog(rng(seed));
+      const res = expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: g.hands, by: "operator", overrides: g.overrides });
+      const tpl = g.catalog.templates[g.template]!;
+      const caps = tpl.capabilities.map((c) => g.catalog.capabilities[c]!);
+      const given = new Set(caps.flatMap((c) => c.tools));
+      const ctx = `seed ${seed}`;
+      if (g.overrides.tools?.some((t) => !given.has(t))) {
+        expect(res.ok, ctx).toBe(false);
+        continue;
+      }
+      if (!res.ok) throw new Error(`${ctx}: ${res.error}`);
+      const spec = res.value;
+      // Deterministic.
+      expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: g.hands, by: "operator", overrides: g.overrides }), ctx).toEqual(res);
+      // Tools: a subset of what the capabilities give (and of the override), each once, in registry order.
+      expect(spec.tools.every((t) => given.has(t)), ctx).toBe(true);
+      if (g.overrides.tools) expect(spec.tools.every((t) => g.overrides.tools!.includes(t)), ctx).toBe(true);
+      else expect(new Set(spec.tools), ctx).toEqual(given);
+      expect(spec.tools, ctx).toEqual(PLATFORM_TOOL_NAMES.filter((t) => spec.tools.includes(t)));
+      // Rules: the override, or each capability rule once, in capability order.
+      const key = (x: ToolRule) => JSON.stringify(x);
+      if (g.overrides.rules) expect(spec.rules, ctx).toEqual(g.overrides.rules);
+      else {
+        expect(new Set(spec.rules.map(key)).size, ctx).toBe(spec.rules.length);
+        expect(new Set(spec.rules.map(key)), ctx).toEqual(new Set(caps.flatMap((c) => c.rules).map(key)));
+      }
+      // Prompt: the template's text, then every non-empty capability prompt.
+      const parts = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter(Boolean);
+      expect(spec.launch.system_prompt, ctx).toEqual({ mode: tpl.launch.system_prompt.mode, text: parts.join("\n\n") });
+      expect([spec.credential, spec.escalate_to, spec.subscribe], ctx).toEqual([tpl.credential, tpl.escalate_to, tpl.subscribe]);
+      // Hands: the template's rule decides.
+      if (tpl.hands === "required") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: false, by: "operator" }).ok, ctx).toBe(false);
+      if (tpl.hands === "forbidden") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: true, by: "operator" }).ok, ctx).toBe(false);
+    }
+  });
+
+  it("a spawner's spec never adds a tool, an allow rule, a built-in tool or another credential", () => {
+    const decisions = ["allow", "deny", "ask"] as const;
+    for (let seed = 1; seed <= 500; seed++) {
+      const r = rng(seed);
+      const g = genCatalog(r);
+      const base = expandTemplate(g.catalog, PLATFORM_TOOL_NAMES, g.template);
+      if (!base.ok) throw new Error(base.error);
+      const overrides: Record<string, unknown> = {};
+      if (r() < 0.5) overrides.tools = PLATFORM_TOOL_NAMES.filter(() => r() < 0.3);
+      if (r() < 0.5) overrides.rules = [0, 1, 2].filter(() => r() < 0.5).map((i) => ({ pattern: `p${i}`, decision: decisions[Math.floor(r() * 3)] }));
+      if (r() < 0.2) overrides.credential = "claude_oauth_token:other";
+      const res = expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: g.hands, by: "spawner", overrides: overrides as SpawnerOverrides });
+      const ctx = `seed ${seed}`;
+      const allowed = SpawnerOverrides.safeParse(overrides).success && ((overrides.tools as string[] | undefined) ?? []).every((t) => base.value.tools.includes(t));
+      expect(res.ok, ctx).toBe(allowed);
+      if (!res.ok) continue;
+      const key = (x: ToolRule) => JSON.stringify(x);
+      expect(res.value.tools.every((t) => base.value.tools.includes(t)), ctx).toBe(true);
+      const allows = (rs: ToolRule[]) => new Set(rs.filter((x) => x.decision === "allow").map(key));
+      expect(allows(res.value.rules), ctx).toEqual(allows(base.value.rules));
+      const baseKeys = new Set(base.value.rules.map(key));
+      expect(res.value.rules.filter((x) => !baseKeys.has(key(x))).every((x) => x.decision !== "allow"), ctx).toBe(true);
+      expect([res.value.launch, res.value.credential, res.value.escalate_to], ctx).toEqual([base.value.launch, base.value.credential, base.value.escalate_to]);
+    }
+  });
+
+  it("expanding the template alone never depends on hands", () => {
+    for (let seed = 1; seed <= 200; seed++) {
+      const g = genCatalog(rng(seed));
+      const a = expandTemplate(g.catalog, PLATFORM_TOOL_NAMES, g.template);
+      for (const hands of [true, false]) {
+        const b = expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands, by: "operator" });
+        if (b.ok) expect(b, `seed ${seed}`).toEqual(a);
+      }
+    }
+  });
+});

@@ -478,7 +478,7 @@ mod resolve_tests {
     use crate::runtime::HandsResolveOutcome;
     use nest_protocol::control::HandsBinding;
     use nest_protocol::gateway::{GuestInfo, HandsTarget};
-    use nest_protocol::model::{AgentId, AgentRole, Epoch, SandboxId, Secret};
+    use nest_protocol::model::{AgentId, Epoch, SandboxId, Secret};
     use tokio::net::TcpListener;
 
     /// A `hands_resolve` made while the session channel is still down (no host token yet) is
@@ -526,7 +526,6 @@ mod resolve_tests {
         let (otx, orx) = mpsc::unbounded_channel();
         let agent = Agent::new(
             AgentId("agt_q".into()),
-            AgentRole::Worker,
             Epoch(3),
             std::env::temp_dir(),
             Some(HandsBinding { sandbox: SandboxId("sbx_q".into()), epoch: None }),
@@ -557,7 +556,7 @@ mod resolve_tests {
 mod epoch_tests {
     use super::*;
     use crate::config::Config;
-    use nest_protocol::model::{AgentId, AgentRole, AgentState, Epoch, Secret};
+    use nest_protocol::model::{AgentId, AgentState, Epoch, Secret};
     use tokio::net::TcpListener;
 
     async fn next_batch(rx: &mut mpsc::UnboundedReceiver<(usize, Epoch, Vec<Epoch>)>) -> (usize, Epoch, Vec<Epoch>) {
@@ -599,7 +598,7 @@ mod epoch_tests {
         rt.host_token.send_replace(Some(Secret("tok".into())));
         let (ctx, _crx) = mpsc::unbounded_channel();
         let (otx, orx) = mpsc::unbounded_channel();
-        let agent = Agent::new(AgentId("agt_e".into()), AgentRole::Captain, Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
+        let agent = Agent::new(AgentId("agt_e".into()), Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
         let transcript = std::env::temp_dir().join(format!("nest-epoch-test-{}.jsonl", uuid::Uuid::new_v4().simple()));
         let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
 

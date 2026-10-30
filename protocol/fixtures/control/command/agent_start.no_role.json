@@ -1,0 +1,17 @@
+{
+  "cmd": "cmd_01jb7q0019",
+  "issued_ms": 1760270400000,
+  "type": "agent_start",
+  "agent": "agt_01jb7n5c0p",
+  "workstream": "ws_01jb7j8r2t",
+  "epoch": 2,
+  "launch": {
+    "builtin_tools": [],
+    "system_prompt": {
+      "mode": "replace",
+      "text": "You review pull requests through mcp__nest__* platform tools."
+    }
+  },
+  "oauth_token": "sk-ant-oat01-REDACTED-EXAMPLE2",
+  "session_ws_url": "wss://nest.example.dev/v1/agents/agt_01jb7n5c0p/session"
+}
