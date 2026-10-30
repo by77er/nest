@@ -5,6 +5,7 @@ import { num, type Env } from "./env";
 import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identity";
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
+import { checkHealth, healthProbes } from "./lib/health";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
 import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
@@ -23,6 +24,20 @@ export { TaskLedgerDO } from "./do/tasks";
 export { WorkstreamDO } from "./do/workstream";
 
 const DEFAULT_CELL = "local";
+
+/**
+ * The last settled health check in this isolate, reused for `HEALTH_REUSE_MS`. Only a settled result
+ * is shared: a request never awaits I/O another request started (and may have been cancelled with).
+ */
+let lastHealth: { at: number; result: Awaited<ReturnType<typeof checkHealth>> } | null = null;
+const HEALTH_REUSE_MS = 3_000;
+
+async function sharedHealth(env: Env): ReturnType<typeof checkHealth> {
+  if (lastHealth && Date.now() - lastHealth.at <= HEALTH_REUSE_MS) return lastHealth.result;
+  const result = await checkHealth(healthProbes(env));
+  lastHealth = { at: Date.now(), result };
+  return result;
+}
 /** A host may reconnect its fleet channel this long after its token expired (and gets a fresh one). */
 const FLEET_TOKEN_GRACE_MS = 24 * 3_600_000;
 
@@ -109,7 +124,12 @@ async function route(req: Request, env: Env): Promise<Response> {
   const m = (re: RegExp) => re.exec(path);
   let p: RegExpExecArray | null = null;
 
-  if (req.method === "GET" && path === "/v1/health") return json({ ok: true, protocol_version: PROTOCOL_VERSION });
+  if (req.method === "GET" && path === "/v1/health") {
+    // Unauthenticated: one read-only round trip to each DO class's own health instance, nothing else,
+    // shared by this isolate's requests for a few seconds so a flood can't multiply it.
+    const h = await sharedHealth(env);
+    return json({ ok: h.ok, protocol_version: PROTOCOL_VERSION, durable_objects: h.durable_objects }, h.ok ? 200 : 503);
+  }
   if (req.method === "POST" && path === "/v1/hosts/enroll") return enroll(req, env);
 
   // Host-authenticated HTTP: object-store GC (a sandbox host runs it; FleetDO says when and from what).

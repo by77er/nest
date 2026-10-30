@@ -13,10 +13,11 @@ import { TASK_ADMIN_TOOLS, TASK_TOOLS } from "../src/lib/tasks";
 import { Credential, type ToolRule } from "../src/protocol/control";
 import type { ChannelGrant } from "../src/lib/channels";
 
-// What the roles gave (the role-filtered `platform-tools.json` and AgentDO's defaults before templates).
+// What the roles gave (the role-filtered `platform-tools.json` and AgentDO's defaults before templates),
+// less `delegate`, which the registry no longer has: the first seed still lists it, and expansion ignores it.
 const WORKER_TOOLS = ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"];
 const CAPTAIN_TOOLS = ["notify", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
-  "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "delegate", "memory_read", "memory_write", "notify_user"];
+  "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "memory_read", "memory_write", "notify_user"];
 const NEST_ALLOW: ToolRule = { pattern: "mcp__nest__*", decision: "allow" };
 const WORKER_LAUNCH = {
   builtin_tools: ["TodoWrite", "Task", "WebSearch"],
@@ -62,11 +63,11 @@ describe("the first seed catalog is what the roles were", () => {
     });
   });
 
-  it("every seed entry passes the checks the admin routes apply", () => {
-    for (const cat of [SEED_CATALOG_V1, SEED_CATALOG]) {
-      for (const c of Object.values(cat.capabilities)) expect(checkCapability(c, PLATFORM_TOOL_NAMES).ok).toBe(true);
-      for (const t of Object.values(cat.templates)) expect(checkTemplate(t, cat.capabilities).ok).toBe(true);
-    }
+  it("every entry of the current seed passes the checks the admin routes apply", () => {
+    for (const c of Object.values(SEED_CATALOG.capabilities)) expect(checkCapability(c, PLATFORM_TOOL_NAMES).ok).toBe(true);
+    for (const t of Object.values(SEED_CATALOG.templates)) expect(checkTemplate(t, SEED_CATALOG.capabilities).ok).toBe(true);
+    // The first seed is what older catalogs hold, not what is written now: its templates still hold together.
+    for (const t of Object.values(SEED_CATALOG_V1.templates)) expect(checkTemplate(t, SEED_CATALOG_V1.capabilities).ok).toBe(true);
   });
 
   it("a record stored with a role gets that role's spec, its stored launch and rules, and its grants as a narrowing", () => {
@@ -138,6 +139,17 @@ describe("expansion refuses what it can't give", () => {
       .toEqual({ ok: false, error: "template worker doesn't give merge" });
   });
 
+  it("a stored capability naming a tool the registry dropped still expands, without it; a write still refuses it", () => {
+    // Catalogs seeded with the first seed hold `management` with `delegate`: their captains must still spawn.
+    expect(SEED_CATALOG_V1.capabilities.management!.tools).toContain("delegate");
+    expect(PLATFORM_TOOL_NAMES).not.toContain("delegate");
+    expect(expand(SEED_CATALOG_V1, "captain", false).tools).toEqual(CAPTAIN_TOOLS);
+    const stale: Catalog = { capabilities: { old: { tools: ["notify", "gone_tool"], rules: [], prompt: "", grants: [], params: [] } },
+      templates: { t: { ...SEED_CATALOG.templates.captain!, capabilities: ["old"] } } };
+    expect(expand(stale, "t", false).tools).toEqual(["notify"]);
+    expect(checkCapability(stale.capabilities.old!, PLATFORM_TOOL_NAMES)).toEqual({ ok: false, error: "unknown platform tool gone_tool" });
+  });
+
   it("unknown names, and inherited object keys, are unknown", () => {
     expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "nope", hands: false, by: "operator" }).ok).toBe(false);
     expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "constructor", hands: false, by: "operator" }).ok).toBe(false);
@@ -157,16 +169,21 @@ describe("expansion refuses what it can't give", () => {
   });
 });
 
-describe("the current seed adds the task ledger (seed version 3)", () => {
-  it("worker gains `tasks`; captain gains `tasks` and `tasks-admin`; nothing else changes", () => {
+describe("the current seed adds the task ledger (seed version 3) and drops what the design doesn't offer", () => {
+  it("worker gains `tasks`; captain gains `tasks` and `tasks-admin`; the worker's launch and rules are the design's; nothing else changes", () => {
     const v1w = expand(SEED_CATALOG_V1, "worker", true);
     const v1c = expand(SEED_CATALOG_V1, "captain", false);
     const w = expand(SEED_CATALOG, "worker", true);
     const c = expand(SEED_CATALOG, "captain", false);
     expect(w.tools).toEqual([...WORKER_TOOLS, ...TASK_TOOLS]);
     expect(c.tools).toEqual([...CAPTAIN_TOOLS, ...TASK_TOOLS, ...TASK_ADMIN_TOOLS]);
+    // docs/agents/runner/: the task and web tools, no `TodoWrite` and no `Agent` (nor its old name `Task`),
+    // so no rule letting subagents run either.
+    expect(w.launch.builtin_tools).toEqual(["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"]);
+    expect(w.rules).toEqual([NEST_ALLOW]);
+    expect(c.launch.builtin_tools).toEqual([]);
     for (const [v1, v2] of [[v1w, w], [v1c, c]] as const) {
-      expect({ ...v2, tools: [], launch: null }).toEqual({ ...v1, tools: [], launch: null });
+      expect({ ...v2, tools: [], launch: null, rules: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [] });
       expect(v2.launch.system_prompt.text.startsWith(v1.launch.system_prompt.text)).toBe(true);
     }
     // No ledger unless the spawn names one; a spawn may name one, because `tasks` declares it.

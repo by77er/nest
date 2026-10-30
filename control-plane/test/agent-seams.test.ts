@@ -557,6 +557,89 @@ describe("one brain per agent: the brain record", () => {
     expect(await stub.info()).toMatchObject({ agent_epoch: 1, intent: { host_hint: b.host } });
   });
 
+  it("a stopped agent's sandbox moving (a placement its cancelled start began) doesn't restart it; new input does", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES ('trn_before', 1, ?, 'queued', ?)",
+        JSON.stringify({ kind: "user", text: "before the stop" }), Date.now());
+    });
+    await agentStub(s.agent).stop("requested");
+    {
+      const q = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
+      await s.host.ws.next("ack", (m) => m.up_to >= q);
+    }
+    // The move notice arms the wake alarm, which finds work from before the stop: it starts nothing.
+    await agentStub(s.agent).onSandboxMoved(s.sandbox, 2, s.sbxHost.host);
+    await runDeadline(s.agent, "wake");
+    expect(await s.host.ws.none("commands", 300, (m) => (m.commands as any[]).some(isStartOf(s.agent)))).toBe(true);
+    expect(await agentStub(s.agent).info()).toMatchObject({ brain: null, intent: null, agent_epoch: 1 });
+    // Input after the stop does.
+    await agentStub(s.agent).enqueueTurn({ kind: "user", text: "after the stop" });
+    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+  });
+
+  /** A worker mid-turn (its runner connected, a turn running, another queued), then stopped. */
+  async function stoppedMidTurn() {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "first" } }, 201);
+    await ws.next("run_turn");
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "second" } }, 201);
+    expect((await agentStub(s.agent).info()).told_sandbox_epoch).toBe(1);
+    await agentStub(s.agent).stop("requested");
+    return s;
+  }
+  const stoppedExit = async (s: Awaited<ReturnType<typeof setup>>) => {
+    const q = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= q);
+  };
+  const nothingStarted = async (s: Awaited<ReturnType<typeof setup>>) => {
+    expect(await s.host.ws.none("commands", 300, (m) => (m.commands as any[]).some((c) => isStartOf(s.agent)(c) && c.epoch > 1))).toBe(true);
+    expect(await agentStub(s.agent).info()).toMatchObject({ brain: null, intent: null, agent_epoch: 1 });
+  };
+
+  it("F1: a background task's exit note during a stopped brain's wind-down isn't input: its exit restarts nothing", async () => {
+    const s = await stoppedMidTurn();
+    await agentStub(s.agent).onTaskExited(s.sandbox, 1, {
+      task_id: "tsk_1", status: "exited", exit_code: 0, output_path: "/tmp/o", output_bytes: 0, started_ms: Date.now(),
+    });
+    const inbox = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ message: string }>("SELECT message FROM inbox").toArray().map((m) => m.message).join("\n"));
+    expect(inbox).toContain("Background task tsk_1 exited");
+    await stoppedExit(s);
+    await nothingStarted(s);
+  });
+
+  it("F2: the move note after a stopped brain's exit isn't input: the move's wake restarts nothing", async () => {
+    const s = await stoppedMidTurn();
+    await stoppedExit(s);
+    await agentStub(s.agent).onSandboxMoved(s.sandbox, 2, s.sbxHost.host);
+    const inbox = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ message: string }>("SELECT message FROM inbox").toArray().map((m) => m.message).join("\n"));
+    expect(inbox).toMatch(/Your sandbox moved to another machine/);
+    await runDeadline(s.agent, "wake");
+    await nothingStarted(s);
+  });
+
+  it("a stop flag left set past a later start (a previous release's start) quiets nothing: that brain's crash restarts it", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES ('trn_work', 1, ?, 'queued', ?)",
+        JSON.stringify({ kind: "user", text: "work" }), Date.now());
+    });
+    // Stopped at epoch 0, then started (epoch 1) by a release that kept the flag without clearing it.
+    await editAgent(s.agent, (i) => {
+      i.stop_epoch = 0;
+      i.stop_quiet = true;
+    });
+    const q = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "crashed", epoch: 1 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= q);
+    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+  });
+
   it("a brain that survives its sandbox moving hears what was lost mid-turn; a notice lost or not, its next turn starts with it", async () => {
     const s = await setup();
     const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);

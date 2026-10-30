@@ -54,10 +54,8 @@ describe("session channel", () => {
     const { ws, ack } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     expect(ack).toMatchObject({ durable_bytes: 0 });
     const cache = await ws.next("cache_update");
-    // A worker's default rules let its subagents run (Claude Code's `Agent` tool) without an approval.
-    expect(cache.cache.rules).toEqual([
-      { pattern: "mcp__nest__*", decision: "allow" }, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" },
-    ]);
+    // A seeded worker's rules: its nest tools without a prompt (it launches without `Agent`, so no subagent rule).
+    expect(cache.cache.rules).toEqual([{ pattern: "mcp__nest__*", decision: "allow" }]);
 
     const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "first" } }, 201)).turn;
     const t2 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "second" } }, 201)).turn;
@@ -240,6 +238,9 @@ describe("platform tool relay", () => {
     ws.send(toolCall("cal_t4-2", "read_transcript", { agent: s.agent, since_seq: 1 }));
     const tr = await ws.next("tool_result", (m) => m.call === "cal_t4-2");
     expect(tr.outcome.content[0].text).toBe("line two");
+    // Only an agent id names an agent: never another DO instance (`~health`, lib/health.ts).
+    ws.send(toolCall("cal_t4-2b", "read_transcript", { agent: "~health" }));
+    expect((await ws.next("tool_result", (m) => m.call === "cal_t4-2b")).outcome.error.code).toBe("invalid_message");
 
     ws.send(toolCall("cal_t4-3", "expose_port", { port: 3000 }));
     const ex = await ws.next("tool_result", (m) => m.call === "cal_t4-3");

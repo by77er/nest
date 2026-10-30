@@ -3,6 +3,7 @@
 // subscriber, woken with batches of decision events, and the user-notification queue. It knows no
 // roles: its subscriber is whichever agent subscribed.
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";
 import { num, type Env } from "../env";
 import { storedEnum, typeEnum } from "../lib/stored";
@@ -39,9 +40,16 @@ const APPLIED_RETENTION_MS = 7 * 86_400_000;
 export class WorkstreamDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
 
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.WORKSTREAM)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
       type TEXT NOT NULL, decision INTEGER NOT NULL, body TEXT NOT NULL, woke INTEGER NOT NULL DEFAULT 0)`);

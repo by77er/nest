@@ -90,3 +90,14 @@ patterns = [
 ]
 files = ["crates/nestd-core/**"]
 allow = []
+
+[[fence]]
+name = "do-schema-expand-only"
+example = 'this.sql.exec("ALTER TABLE hosts DROP COLUMN lost");'
+why = "Durable Object schema changes are expand-only (docs/control-plane/#upgrades): a rollback target and a DO not constructed since the change must still read the data, so a table or column is never renamed or dropped in the release that stops using it. A later release may drop what nothing reads, with an allow entry here that says why."
+# Line by line: RENAME is caught after ALTER TABLE on its line, or opening a line (a multi-line SQL literal).
+patterns = ['(?i)\bALTER\s+TABLE\b.*\bRENAME\b', '(?i)^[\s"\x27\x60+]*RENAME\s+(TO|COLUMN|\w+\s+TO)\b', '(?i)\bDROP\s+(TABLE|COLUMN|INDEX|VIEW|TRIGGER)\b']
+files = ["control-plane/src/**"]
+allow = [
+  "control-plane/src/do/fleet-rekey.ts",  # host_agents rekeyed by (agent, host) on 2026-10-26 (#30): the recorded exception
+]

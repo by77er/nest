@@ -6,6 +6,7 @@
 // while a caller (an AgentDO) is mid-call into this object: its input gate is open at that await,
 // so a callback would interleave with the call that caused it.
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { sqlIn, storedEnum } from "../lib/stored";
 import {
@@ -111,9 +112,16 @@ function nestError(r: Refusal): NestError {
 export class TaskLedgerDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
 
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.TASKS)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     // `body` is the task (JSON); the other columns are copies of its fields, for filtering.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, number INTEGER NOT NULL UNIQUE, status TEXT NOT NULL,

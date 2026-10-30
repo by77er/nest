@@ -1,6 +1,8 @@
 // FleetDO: one per cell. Host enrollment, the fleet WebSocket (docs/interfaces/control-host/fleet/),
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
+import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
 import { num, type Env } from "../env";
 import { commandRefSlots, REF_PURPOSES, type RefPurpose, type RefSlot } from "./broker";
@@ -243,8 +245,9 @@ export type { AwsView } from "../../../protocol/admin/view";
 
 export class FleetDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
-  private readonly rel: ReliableChannels;
-  private readonly deadlines: Deadlines;
+  // `!`: set in the constructor, except on the health instance, which serves only `health()`.
+  private readonly rel!: ReliableChannels;
+  private readonly deadlines!: Deadlines;
   /** Per-host serialization of inbound reliable messages (hello and event batches). */
   private readonly inbound = new Map<string, SerialQueue>();
   /** Per-host serialization of outbound command sends (`flush`). */
@@ -264,9 +267,16 @@ export class FleetDO extends DurableObject<Env> {
   /** Host kinds with a launch in flight (RunInstances awaits); placements meanwhile don't launch another. */
   private readonly launching = new Set<HostKind>();
 
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.FLEET)) return;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS hosts (host TEXT PRIMARY KEY, cell TEXT NOT NULL, role TEXT NOT NULL,
       instance_id TEXT, status TEXT NOT NULL, last_rx INTEGER, token_exp INTEGER NOT NULL, enrolled_ms INTEGER NOT NULL,
       capacity TEXT, nestd_instance TEXT)`);
@@ -1179,12 +1189,8 @@ export class FleetDO extends DurableObject<Env> {
       this.addHostAgentsColumns();
       return;
     }
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec("ALTER TABLE host_agents RENAME TO host_agents_by_agent");
-      this.sql.exec(create);
-      this.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch) SELECT agent, host, cmd, NULL FROM host_agents_by_agent");
-      this.sql.exec("DROP TABLE host_agents_by_agent");
-    });
+    // Keyed by `agent` (written before 2026-10-26): rekeyed once (the recorded exception to expand-only).
+    rekeyHostAgents(this.sql, this.ctx.storage, create);
     this.addHostAgentsColumns();
   }
 
@@ -1770,6 +1776,15 @@ export class FleetDO extends DurableObject<Env> {
     }
     if (brainHostNeeded(facts, req.avoid)) await this.scaleUp(BRAIN_ROLE);
     return null;
+  }
+
+  /**
+   * `agent` no longer waits for a brain host (an operator stopped it): its row goes, so the tick
+   * launches no brain host for it. A start made after the stop records its wait again at its next
+   * placement (at most 30 s later: the stop reset its backoff).
+   */
+  async brainWaitEnded(agent: string): Promise<void> {
+    this.sql.exec("DELETE FROM brain_waiters WHERE agent = ?", agent);
   }
 
   /** Every active brain host as brain placement sees it (`pickBrainHost`, `brainHostNeeded`). */

@@ -7,6 +7,7 @@
 // saved from a copy loaded before an await (`update()` loads, mutates and saves synchronously), and
 // inbound session messages are processed one at a time, in order (`SerialQueue`).
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";
 import { num, type Env } from "../env";
 import {
@@ -171,6 +172,23 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
    * `capacityRetryMs`). Not the crash-loop guard's: waiting for capacity is not a crash.
    */
   capacity_waits?: number;
+  /**
+   * The agent epoch when an operator last stopped it. One rule: a brain at or below it is stopped,
+   * so however it ends (its exit, a failed send or refusal of its start, its host's loss or drain,
+   * a start or session deadline) it restarts nothing; only a start, new input or a sandbox move
+   * after the stop starts the agent again (`stoppedBrain`). Absent: never stopped (or stored by a
+   * release before it, which keeps the field without reading it).
+   */
+  stop_epoch?: number;
+  /**
+   * Set by an operator's stop, cleared by the next input from outside the agent (a turn, an inbox
+   * message, a delivery merged into a queued turn; never the platform's own `system` notes). It
+   * quiets wakes only while no start has been issued since the stop (`quietSinceStop`): then
+   * nothing that predates the stop wakes the agent (a release, a sandbox move, a wake alarm), and a
+   * stopped brain's end wakes it only for input that came after the stop (`wake`, `release`).
+   * Derived from the epochs too, so a flag a previous release left set after its own start heals.
+   */
+  stop_quiet?: boolean;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
   capabilities?: string[];
   /** When the transcript was last made durable (a recovery turn says where it ends). */
@@ -199,6 +217,13 @@ export type Brain =
 export type IntentReason = "operator" | "restart" | "wake" | "drain" | "retry";
 /** Whether an intent moves a brain off `host` (another host named, or `host` avoided). */
 const moves = (intent: StartIntent, host: string) => (intent.host_hint !== undefined && intent.host_hint !== host) || intent.avoid === host;
+/** The sender of the platform's own notes about an agent's work (not input: see `AgentInfo.stop_quiet`). */
+const SYSTEM_SENDER = "system";
+/** Stopped with no outside input and no start since (see `AgentInfo.stop_quiet`). */
+const quietSinceStop = (info: Pick<AgentInfo, "stop_quiet" | "stop_epoch" | "agent_epoch">) =>
+  !!info.stop_quiet && (info.stop_epoch ?? -1) >= info.agent_epoch;
+/** Whether the brain at agent epoch `epoch` is one an operator stopped (see `AgentInfo.stop_epoch`). */
+const stoppedBrain = (info: Pick<AgentInfo, "stop_epoch">, epoch: number) => (info.stop_epoch ?? -1) >= epoch;
 /** Which reason wins when two starts merge into one intent. */
 const INTENT_RANK: Record<IntentReason, number> = { wake: 0, retry: 1, drain: 2, operator: 3, restart: 4 };
 
@@ -289,17 +314,25 @@ function brainHostUsable(st: { status: string; connected: boolean; current: bool
 
 export class AgentDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
-  private readonly rel: ReliableChannels;
-  private readonly deadlines: Deadlines;
+  // `!`: set in the constructor, except on the health instance, which serves only `health()`.
+  private readonly rel!: ReliableChannels;
+  private readonly deadlines!: Deadlines;
   private readonly inbound = new SerialQueue();
   /** The run of the intent in flight (single-flight, in memory only: the intent itself is stored). */
   private intentRun: Promise<StartResult | null> | null = null;
   /** Someone stored an intent while a run was in flight: run again (from the alarm) once it ends. */
   private intentDirty = false;
 
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.AGENT)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS turns (turn TEXT PRIMARY KEY, ord INTEGER NOT NULL, input TEXT NOT NULL,
       status TEXT NOT NULL, created_ms INTEGER NOT NULL DEFAULT 0)`);
@@ -341,7 +374,7 @@ export class AgentDO extends DurableObject<Env> {
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
 
-  private readonly outbox: ChannelOutbox;
+  private readonly outbox!: ChannelOutbox;
 
   // ---------------------------------------------------------------------------------------------
   // State
@@ -838,9 +871,10 @@ export class AgentDO extends DurableObject<Env> {
     } catch (e) {
       console.warn(`agent ${started.agent}: sending agent_start@${epoch} to ${host} failed; condemning it`, e);
       if (this.load().brain?.epoch === epoch) {
-        // The start is still wanted: it runs again once this one is released.
+        // The start is still wanted (unless a stop ended it while it was being sent): it runs again
+        // once this one is released.
         this.update((i) => {
-          i.intent = i.intent ?? intent;
+          if (!stoppedBrain(i, epoch)) i.intent = i.intent ?? intent;
         });
         await this.condemn("its start could not be confirmed sent", epoch);
       }
@@ -855,7 +889,23 @@ export class AgentDO extends DurableObject<Env> {
    * of the intent retries), and anything else ends the intent (`errored` if no brain is left).
    */
   private async intentFailed(intent: StartIntent, e: unknown): Promise<void> {
+    const now = this.load();
     const ne = asNestError(e);
+    if (!now.intent) {
+      // A stop ended the intent while this run awaited: nothing to keep, retry or fail. A wait for
+      // capacity this run recorded at FleetDO after the stop's notice goes too (no start wants it).
+      if (ne?.code === ErrorCodes.CAPACITY_EXHAUSTED) {
+        try {
+          await this.fleet(now.cell).brainWaitEnded(now.agent);
+        } catch (err) {
+          console.warn(`agent ${now.agent}: telling FleetDO its wait for a brain host ended failed`, err);
+        }
+      }
+      return;
+    }
+    // A newer start merged into the intent while this run awaited: its own run (queued behind this
+    // one, `intentDirty`) decides; this failure says nothing about it.
+    if (JSON.stringify(now.intent) !== JSON.stringify(intent)) return;
     if (ne?.retryable ?? true) {
       // No brain host with room (FleetDO launches one): the wait backs off, 30 s doubling to 5 min,
       // so a cell at its cap isn't asked twice a minute by every waiting agent. New input sets the
@@ -1012,9 +1062,18 @@ export class AgentDO extends DurableObject<Env> {
    */
   private async release(host: string, epoch: number, reason: AgentExitReason): Promise<boolean> {
     let released = false;
-    const restarts = RESTART_ON_EXIT[reason] && reason !== "idle";
+    // A brain the operator stopped ends as `stopped`, whatever ended it (a condemned brain's
+    // `fenced` exit, its host's loss): no wake, no crash count. Decided in the step that releases.
+    let ended = reason;
+    let restarts = false;
+    // Whether waiting work starts a brain: an exit that restarts, or a stopped brain's end when
+    // input arrived after the stop (uncounted; `stop_quiet` cleared). Work from before the stop waits.
+    let wakes = false;
     const info = this.update((i) => {
       if (!i.brain || i.brain.host !== host || epoch < i.brain.epoch) return;
+      if (stoppedBrain(i, i.brain.epoch)) ended = "stopped";
+      restarts = RESTART_ON_EXIT[ended] && ended !== "idle";
+      wakes = RESTART_ON_EXIT[ended] || (stoppedBrain(i, i.brain.epoch) && !quietSinceStop(i));
       // Counted once, where it happens (the crash-loop guard): here for a brain that ended on its
       // own; a condemned brain's exit is the condemn's outcome, counted by its cause if at all.
       if (restarts && i.brain.phase !== "condemned") i.exit_restarts = (i.exit_restarts ?? 0) + 1;
@@ -1022,7 +1081,7 @@ export class AgentDO extends DurableObject<Env> {
       // graceful stop: any other end of a brain that wasn't condemned drops it (N20), so it never
       // lingers. A move (another host named, or this one avoided, even before it condemned the
       // brain) and a condemned brain's intent always run.
-      if (i.intent?.reason === "operator" && i.brain.phase !== "condemned" && reason !== "stopped" && !moves(i.intent, i.brain.host)) {
+      if (i.intent?.reason === "operator" && i.brain.phase !== "condemned" && ended !== "stopped" && !moves(i.intent, i.brain.host)) {
         i.intent = null;
         delete i.capacity_waits;
       }
@@ -1033,37 +1092,55 @@ export class AgentDO extends DurableObject<Env> {
     });
     if (!released) return false;
     // Reported on `<agt>/events` (queued in this step; posted from the alarm). Not part of the decision.
-    this.reportExit(info, host, epoch, reason);
+    this.reportExit(info, host, epoch, reason, !wakes);
     const work = !!info.current_turn || this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
     const armed = Promise.all([
       this.deadlines.clear("condemned"),
       this.deadlines.clear("starting"),
       this.deadlines.clear("no_session"),
       info.intent ? this.deadlines.set("intent", Date.now(), true)
-        : work && RESTART_ON_EXIT[reason] ? this.deadlines.set(reason === "idle" ? "wake" : "wake_after_exit", Date.now(), true) : Promise.resolve(),
+        : work && wakes ? this.deadlines.set(restarts ? "wake_after_exit" : "wake", Date.now(), true) : Promise.resolve(),
     ]);
     await this.hook("release:afterCommit");
     await armed;
     console.log(`agent ${info.agent}: brain on ${host}@${epoch} released (${reason})`);
     this.fenceSessions(`brain released (${reason})`, host);
     await this.syncActivity();
-    if (!info.intent && RESTART_ON_EXIT[reason]) await this.wake(restarts);
+    if (!info.intent && wakes) await this.wake(restarts);
     return true;
   }
 
   /**
    * Stop the brain (an operator's request): it finishes its turn, and its exit releases it. A plain
-   * start meanwhile is kept as the intent and runs after that exit; nothing about the stop is stored.
+   * start meanwhile is kept as the intent and runs after that exit. The stop is stored as
+   * `stop_epoch`: the brain it ends restarts nothing, however it ends.
    */
   async stop(reason: string): Promise<void> {
-    // An operator's start kept from before this stop is for the brain this stop ends: dropped, so
-    // only a start made after the stop runs after its exit (N20).
+    // Every start wanted before this stop ends here, so only a start made after it runs (N20): an
+    // operator's start kept beside the brain this stop ends, a move or restart waiting for a condemned
+    // brain's release, and a start still waiting for a brain host, which its capacity retry or
+    // FleetDO's poke would otherwise run, launching a host and a brain for a stopped agent. The intent
+    // and its alarm go in this synchronous step; a run already in flight finds the intent changed at
+    // its re-check before committing (`unchanged`), and `intentFailed` arms nothing for it. A start
+    // already committed (its brain at the current epoch) that then fails is not retried either
+    // (`stop_epoch`: `issueStart`'s failed send, `startFailed`).
+    const waited = this.load().intent !== null;
     const info = this.update((i) => {
-      if (i.intent?.reason === "operator" && i.brain && i.brain.phase !== "condemned" && !moves(i.intent, i.brain.host)) {
-        i.intent = null;
-        delete i.capacity_waits;
-      }
+      i.intent = null;
+      delete i.capacity_waits;
+      i.stop_epoch = i.agent_epoch;
+      i.stop_quiet = true;
     });
+    // Wakes armed before the stop (a release's, a sandbox move's) are for work the stop ends too.
+    await Promise.all([this.deadlines.clear("intent"), this.deadlines.clear("wake"), this.deadlines.clear("wake_after_exit")]);
+    if (waited) {
+      // Best effort: a row left behind lapses when this agent no longer retries (12 min).
+      try {
+        await this.fleet(info.cell).brainWaitEnded(info.agent);
+      } catch (e) {
+        console.warn(`agent ${info.agent}: telling FleetDO its wait for a brain host ended failed`, e);
+      }
+    }
     const b = info.brain;
     if (!b || b.phase === "condemned") return;
     await this.fleet(info.cell).issueCommands(b.host, [{ type: "agent_stop", agent: info.agent, reason, mode: "graceful", epoch: b.epoch }]);
@@ -1094,8 +1171,14 @@ export class AgentDO extends DurableObject<Env> {
    */
   async onHostDraining(host: string): Promise<void> {
     if (!this.exists()) return;
-    const b = this.load().brain;
+    const info = this.load();
+    const b = info.brain;
     if (!b || b.host !== host || b.phase === "condemned") return;
+    // A stopped brain leaves the host without moving: condemned (killed now), with no intent.
+    if (stoppedBrain(info, b.epoch)) {
+      await this.condemn(`its host ${host} is draining (stopped)`, b.epoch);
+      return;
+    }
     await this.setIntent({ avoid: host, reason: "drain" });
     try {
       await this.runIntent(true);
@@ -1117,12 +1200,14 @@ export class AgentDO extends DurableObject<Env> {
     const b = info.brain;
     if (!b || b.host !== host || epoch === undefined || epoch !== b.epoch) return;
     console.warn(`agent ${info.agent}: start on ${host}@${epoch} failed: ${error.code} ${error.message}`);
-    const retry = !info.intent && error.retryable && info.start_attempts < MAX_START_ATTEMPTS;
+    // A stop since this start ended it: condemned, never retried, and not an error.
+    const stopped = stoppedBrain(info, epoch);
+    const retry = !stopped && !info.intent && error.retryable && info.start_attempts < MAX_START_ATTEMPTS;
     this.update((i) => {
       if (retry) {
         i.start_attempts += 1;
         i.intent = { reason: "retry" };
-      } else if (!i.intent) {
+      } else if (!i.intent && !stopped) {
         i.state = "errored";
       }
     });
@@ -1147,16 +1232,18 @@ export class AgentDO extends DurableObject<Env> {
       await this.release(host, epoch, reason);
       return;
     }
-    const b = this.load().brain;
+    const now = this.load();
+    const b = now.brain;
     if (!b || b.host !== host || b.phase === "condemned") return;
-    const counted = RESTART_ON_EXIT[reason] && reason !== "idle";
+    const ended = stoppedBrain(now, b.epoch) ? "stopped" : reason;
+    const counted = RESTART_ON_EXIT[ended] && ended !== "idle";
     if (counted) {
       this.update((i) => {
         i.exit_restarts = (i.exit_restarts ?? 0) + 1;
       });
     }
     await this.condemn(`an exit without an agent epoch (${reason})`, b.epoch);
-    if (RESTART_ON_EXIT[reason]) await this.wake(counted);
+    if (RESTART_ON_EXIT[ended]) await this.wake(counted);
   }
 
   /**
@@ -1179,6 +1266,19 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
+   * Input from outside the agent arrived (a turn, an inbox message, a merged delivery): a stop before
+   * it no longer quiets wakes. Not called for the platform's `system` notes about the agent's own
+   * work (a sandbox move, a background task's exit): they are not new work.
+   */
+  private inputArrived(): void {
+    if (this.load().stop_quiet) {
+      this.update((i) => {
+        delete i.stop_quiet;
+      });
+    }
+  }
+
+  /**
    * Start a brain for waiting work (a queued turn, or the turn it was in the middle of) when it has
    * none, through the intent. A condemned brain's intent waits for its release. Never throws:
    * callers are queuing work, which stays queued (a failure retries from the alarm). `afterExit`
@@ -1188,6 +1288,8 @@ export class AgentDO extends DurableObject<Env> {
   private async wake(afterExit = false): Promise<void> {
     const info = this.load();
     if (info.brain && info.brain.phase !== "condemned") return;
+    // Stopped, with no input since: the work waiting predates the stop, which ended it.
+    if (quietSinceStop(info)) return;
     const queued = this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
     if (!info.current_turn && !queued) return;
     if (afterExit && (info.exit_restarts ?? 0) > MAX_EXIT_RESTARTS) {
@@ -1252,7 +1354,7 @@ export class AgentDO extends DurableObject<Env> {
       this.update((i) => {
         i.told_sandbox_epoch = epoch;
       });
-      await this.postInbox("system", note);
+      await this.postInbox(SYSTEM_SENDER, note);
     }
     // Never a start from here: this may run inside a start that placed the sandbox. The alarm wakes
     // a stopped brain with work waiting, now that its sandbox has a host.
@@ -1827,7 +1929,7 @@ export class AgentDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------------
 
   /** Queue a turn. A retried submission with the same `requestId` gets the same turn, queued once. */
-  async enqueueTurn(input: TurnInput, requestId?: string, tainted = false): Promise<string> {
+  async enqueueTurn(input: TurnInput, requestId?: string, tainted = false, external = true): Promise<string> {
     // Never write a turn into an AgentDO that was never created (e.g. a subscriber id that names nobody).
     if (!this.exists()) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
     if (requestId) {
@@ -1840,6 +1942,7 @@ export class AgentDO extends DurableObject<Env> {
       turn, ord, JSON.stringify(input), Date.now(), requestId ?? null);
     // Another agent's text (a workstream batch) reaches the model inline: the session is tainted.
     if (tainted) this.kvPut("read_tainted", true);
+    if (external) this.inputArrived();
     await this.pump();
     await this.wake();
     return turn;
@@ -1905,6 +2008,8 @@ export class AgentDO extends DurableObject<Env> {
     // Another agent's text reaches the model inline (stdin, the Stop hook, or a turn): when it may be
     // tainted, so is this session from now on (written with the message, in this step).
     if (tainted) this.kvPut("read_tainted", true);
+    const external = from !== SYSTEM_SENDER;
+    if (external) this.inputArrived();
     if (info.current_turn) {
       this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, '${INBOX.delivered}', ?, ?)`,
         message.id, JSON.stringify(message), info.current_turn, Date.now(), requestId ?? null);
@@ -1913,7 +2018,7 @@ export class AgentDO extends DurableObject<Env> {
     } else {
       this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, NULL, '${INBOX.consumed}', ?, ?)`,
         message.id, JSON.stringify(message), Date.now(), requestId ?? null);
-      await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`);
+      await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`, false, external);
     }
     return message.id;
   }
@@ -2020,8 +2125,8 @@ export class AgentDO extends DurableObject<Env> {
    * loss, a crash it restarts from) is platform housekeeping: `brain_released`, outside the
    * spawner's default filter, with no text.
    */
-  private reportExit(info: AgentInfo, host: string, epoch: number, reason: AgentExitReason): void {
-    const terminal = !RESTART_ON_EXIT[reason] && !info.intent;
+  private reportExit(info: AgentInfo, host: string, epoch: number, reason: AgentExitReason, ends = !RESTART_ON_EXIT[reason]): void {
+    const terminal = ends && !info.intent;
     const idem_key = `${info.agent}/exit/${host}/${epoch}`;
     if (terminal) {
       const last = this.kvGet<string>("last_text") ?? "";
@@ -2137,6 +2242,7 @@ export class AgentDO extends DurableObject<Env> {
       take();
       this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ ...prior, text: merged } satisfies TurnInput), waiting.turn);
       this.sql.exec("INSERT INTO chan_wakes (ts_ms) VALUES (?)", now);
+      this.inputArrived();
       await this.wake();
       return ack;
     }
@@ -2417,6 +2523,7 @@ export class AgentDO extends DurableObject<Env> {
       }
       case "read_transcript": {
         const target = String(a.agent);
+        if (!/^agt_[a-z0-9]+$/.test(target)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${target} is not an agent id`);
         const since = typeof a.since_seq === "number" ? Math.max(0, a.since_seq) : 0;
         const limit = typeof a.limit === "number" ? a.limit : TRANSCRIPT_DEFAULT_LIMIT;
         const base = typeof a.base === "number" ? a.base : undefined;
@@ -2694,7 +2801,7 @@ export class AgentDO extends DurableObject<Env> {
     const how = task.status === "exited" ? `exited with code ${task.exit_code ?? "?"}` : task.status.replace("_", " ");
     const what = task.description ? `${task.task_id} (${task.description})` : task.task_id;
     // Only interesting while the agent is working; otherwise it reads TaskOutput when it next looks.
-    if (info.current_turn) await this.postInbox("system", `Background task ${what} ${how}.`);
+    if (info.current_turn) await this.postInbox(SYSTEM_SENDER, `Background task ${what} ${how}.`);
   }
 
   /** Answer a pending `ask`: inside the sync window it completes the tool call; afterwards it becomes a turn. */
@@ -2737,13 +2844,17 @@ export class AgentDO extends DurableObject<Env> {
           // the kill's tombstone), back off the next deadline, and wake for waiting work once it is
           // released.
           console.warn(`agent ${info.agent}: no brain connected within ${this.startDeadline(info)} ms of agent_start@${info.brain.epoch}`);
-          this.update((i) => {
-            i.state = "errored";
-            i.start_timeouts = (i.start_timeouts ?? 0) + 1;
-            i.exit_restarts = (i.exit_restarts ?? 0) + 1;
-          });
+          // A start the operator stopped meanwhile is condemned all the same, but not counted or retried.
+          const stopped = stoppedBrain(info, info.brain.epoch);
+          if (!stopped) {
+            this.update((i) => {
+              i.state = "errored";
+              i.start_timeouts = (i.start_timeouts ?? 0) + 1;
+              i.exit_restarts = (i.exit_restarts ?? 0) + 1;
+            });
+          }
           await this.condemn("no hello before the start deadline", info.brain.epoch);
-          await this.wake(true);
+          if (!stopped) await this.wake(true);
         }
       } else if (key === "no_session") {
         const info = this.load();
@@ -2751,11 +2862,14 @@ export class AgentDO extends DurableObject<Env> {
           // A live brain with no session and no exit for this long: condemned, so its kill and
           // escalation prove it gone.
           console.warn(`agent ${info.agent}: brain ${info.brain.host}@${info.brain.epoch} had no session for ${NO_SESSION_MS} ms`);
-          this.update((i) => {
-            i.exit_restarts = (i.exit_restarts ?? 0) + 1;
-          });
+          const stopped = stoppedBrain(info, info.brain.epoch);
+          if (!stopped) {
+            this.update((i) => {
+              i.exit_restarts = (i.exit_restarts ?? 0) + 1;
+            });
+          }
           await this.condemn("no session", info.brain.epoch);
-          await this.wake(true);
+          if (!stopped) await this.wake(true);
         }
       } else if (key === "activity") {
         await this.syncActivity();

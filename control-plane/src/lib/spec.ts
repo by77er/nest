@@ -188,11 +188,32 @@ export const TASK_CAPABILITIES: Readonly<Record<string, Capability>> = {
   ].join(" "), [], ["ledger"]),
 };
 
-/** The seed of an empty catalog (the current version). */
+/**
+ * The built-ins a new catalog's `worker` launches with (docs/agents/runner/#launch): the task tools and
+ * the web tools. No `TodoWrite` (inert beside the task tools) and no `Agent` (`Task` before Claude Code
+ * 2.1): in `-p` mode a subagent's result arrives in a later turn, which turn tracking doesn't model.
+ */
+export const WORKER_BUILTIN_TOOLS: readonly string[] = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
+
+/**
+ * The seed of an empty catalog (the current version). Beyond version 1 it adds the later steps'
+ * capabilities and, for new catalogs only (a seed step never edits an entry a catalog already holds):
+ * `management` without `delegate` (no such tool: inspecting without hands is a pattern,
+ * docs/orchestration/captains/), and `worker` without `subagents` and with {@link WORKER_BUILTIN_TOOLS}.
+ */
 export const SEED_CATALOG: Catalog = {
-  capabilities: { ...SEED_CATALOG_V1.capabilities, ...CHANNEL_CAPABILITIES, ...TASK_CAPABILITIES },
+  capabilities: {
+    ...SEED_CATALOG_V1.capabilities,
+    management: { ...SEED_CATALOG_V1.capabilities.management!, tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => t !== "delegate") },
+    ...CHANNEL_CAPABILITIES,
+    ...TASK_CAPABILITIES,
+  },
   templates: {
-    worker: { ...SEED_CATALOG_V1.templates.worker!, capabilities: [...SEED_CATALOG_V1.templates.worker!.capabilities, "tasks"] },
+    worker: {
+      ...SEED_CATALOG_V1.templates.worker!,
+      capabilities: [...SEED_CATALOG_V1.templates.worker!.capabilities.filter((c) => c !== "subagents"), "tasks"],
+      launch: { ...SEED_CATALOG_V1.templates.worker!.launch, builtin_tools: [...WORKER_BUILTIN_TOOLS] },
+    },
     captain: { ...SEED_CATALOG_V1.templates.captain!, capabilities: [...SEED_CATALOG_V1.templates.captain!.capabilities, "tasks", "tasks-admin"] },
   },
 };
@@ -290,12 +311,11 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   const caps: Capability[] = [];
   for (const c of tpl.capabilities) {
     if (!Object.hasOwn(catalog.capabilities, c)) return err(`template ${name}: unknown capability ${c}`);
-    const cap = catalog.capabilities[c]!;
-    const checked = checkCapability(cap, registry);
-    if (!checked.ok) return err(`capability ${c}: ${checked.error}`);
-    caps.push(cap);
+    caps.push(catalog.capabilities[c]!);
   }
-  const given = new Set(caps.flatMap((c) => c.tools));
+  // A stored capability may name a tool the registry no longer has (`delegate`, in catalogs seeded
+  // before it went): ignored, not a failed spawn. Writes still refuse one (`checkCapability`).
+  const given = new Set(caps.flatMap((c) => c.tools).filter((t) => registry.includes(t)));
   const params = checkParams(`template ${name}`, caps, tpl.params ?? {});
   if (!params.ok) return params;
   const prompt = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter((t) => t.length > 0).join("\n\n");
@@ -401,8 +421,10 @@ export const ROLE_SPECS: Readonly<Record<"worker" | "captain", Omit<AgentSpec, "
   },
   captain: {
     template: "captain",
+    // Without `delegate`, which no handler ever served and the registry no longer has (a stored
+    // record naming it lists a tool its runner is never offered).
     tools: ["notify", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
-      "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "delegate", "memory_read", "memory_write",
+      "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "memory_read", "memory_write",
       "notify_user"],
     credential: setupTokenSecret("captain"),
     escalate_to: "user",

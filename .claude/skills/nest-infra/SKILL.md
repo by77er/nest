@@ -36,9 +36,9 @@ All of `deploy/`, `.github/`, `dev/` and `scripts/` are `CODEOWNERS` paths.
   
   Say what you mutated in the PR. Several checks here once passed a mutation that should have failed them.
 - **IAM is data** (`Iam.lean`): a new permission gets a theorem bounding it (a resource tag, a template, an account), not just a policy.
-- **`include_str` isn't tracked by Lake.** After editing `deploy/host/*.sh`, delete `deploy/lean/.lake/build/{lib/lean,ir}/Cell/Stack.*`, or the build keeps the old scripts (`touch` doesn't help).
-  - CI and the deploy restore a cached `.lake` whose key doesn't hash those scripts.
-  - So after a user-data change, check that the deploy's plan shows the launch templates' user data changing. Whether a stale cache can hide the change is unverified.
+- **`include_str` isn't tracked by Lake by itself.** `deploy/lean/lakefile.toml` declares `host/bootstrap.sh` and `host/install.sh` as `input_file` targets the `Cell` library `needs`, so an edit rebuilds `Cell.Stack`, even from the cached `.lake` CI and the deploy restore (their key hashes no scripts, and `restore-keys` would bring an old build back anyway).
+  - Without those entries a cached build kept the old scripts: an edit to `bootstrap.sh` left the built `cell-use1` and `cell-test` without it (checked with Lean 4.33.1, 2026-10-30), so the plan would show no user-data change.
+  - A new `include_str` gets an `input_file` entry too.
 
 ## Host user data
 

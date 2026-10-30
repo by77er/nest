@@ -1,6 +1,7 @@
 // BrokerDO: credential storage and hand-out (docs/control-plane/durable-objects/broker/). Values never
 // leave the control plane except inside agent_start (Claude setup token) and secrets_update (proxy memory).
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
 import { b64url, NestError } from "../lib/util";
@@ -30,9 +31,16 @@ export class BrokerDO extends DurableObject<Env> {
   /** Imported signing keys by kid (memory only; rebuilt from the stored JWK after an eviction). */
   private readonly bindingSigners = new Map<string, Promise<CryptoKey>>();
 
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.BROKER)) return;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL,
       expires_ms INTEGER, updated_ms INTEGER NOT NULL)`);
   }
