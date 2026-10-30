@@ -69,7 +69,8 @@ fi
 # The gateway runs as nest-gw (install.sh made it; its ids are the AMI's, read back here): nestd
 # lets only that uid on gateway.sock and gives its group the socket and each VM's vsock socket. A
 # previous-release nestd can't (install.sh left that gateway root's): the default, root only.
-if grep -aqs gateway_gid /opt/nest/bin/nestd; then
+NESTD_FEATURES=$(/opt/nest/bin/nestd --features 2>/dev/null || true)
+if grep -qx gateway-user <<<"$NESTD_FEATURES"; then
   GW_UID=$(id -u nest-gw)
   GW_GID=$(id -g nest-gw)
   SOCKETS="{\"gateway_gid\": $GW_GID, \"gateway_uids\": [$GW_UID]}"

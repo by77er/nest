@@ -43,6 +43,9 @@ pub struct FirecrackerDriver {
     /// The gateway's group (`sockets.gateway_gid`): each VM's vsock socket, and search on its
     /// jail root, are given to it once Firecracker has bound the socket ([`gateway_access`]).
     pub gateway_gid: Option<u32>,
+    /// nestd's `run_dir`: each VM's directory under it is made search-only (`0711`) whatever the
+    /// umask, so an unjailed VM's vsock socket is reachable by the gateway's user.
+    pub run_dir: PathBuf,
 }
 
 #[async_trait]
@@ -54,7 +57,7 @@ impl Driver for FirecrackerDriver {
         true
     }
     async fn create(&self, spec: VmSpec) -> io::Result<Box<dyn Vm>> {
-        std::fs::create_dir_all(&spec.vm_dir)?;
+        super::access::create_searchable(&self.run_dir, &spec.vm_dir)?;
         let jail = match (&self.cfg.jailer_bin, &self.cfg.jailer) {
             (Some(_), Some(j)) => Some(Jail::new(&self.cfg, j, &spec)),
             (Some(_), None) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "jailer_bin is set but `jailer` (uid/gid/chroot) is not")),
@@ -97,6 +100,10 @@ impl Jail {
 
     /// Hard-link the kernel and disk into the jail root, owned by the jail uid/gid.
     fn populate(&self, fc: &FirecrackerConfig, spec: &VmSpec) -> io::Result<()> {
+        // `<chroot_base>/<exe>/<id>` search-only whatever nestd's umask: the gateway's user crosses
+        // them to the vsock socket. The jailer then makes `root` itself `0700`, the VMM's.
+        let id_dir = self.root.parent().ok_or_else(|| io::Error::other("a jail root has a parent"))?;
+        super::access::create_searchable(&self.cfg.chroot_base_dir, id_dir)?;
         std::fs::create_dir_all(&self.root)?;
         for (src, name) in [(&fc.kernel_image, "vmlinux"), (&spec.disk_path, "disk.img")] {
             let dst = self.root.join(name);
@@ -508,7 +515,7 @@ mod tests {
         fc.jailer_bin = Some("/usr/bin/jailer".into());
         fc.jailer = Some(JailerConfig { uid: 900, gid: 900, chroot_base_dir: dir.path().join("jail") });
         let root = dir.path().join("cgroup");
-        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: Some("system.slice/nestd.service/vms".into()), cgroup_root: root.clone(), gateway_gid: None };
+        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: Some("system.slice/nestd.service/vms".into()), cgroup_root: root.clone(), gateway_gid: None, run_dir: dir.path().into() };
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
         let mut vm = driver.create(s).await.unwrap();
@@ -529,8 +536,8 @@ mod tests {
         let mut fc = cfg();
         fc.jailer_bin = Some("/usr/bin/jailer".into());
         fc.jailer = Some(JailerConfig { uid: 900, gid: 900, chroot_base_dir: "/srv/jailer".into() });
-        let driver = FirecrackerDriver { cfg: fc.clone(), parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: None };
         let dir = tempfile::tempdir().unwrap();
+        let driver = FirecrackerDriver { cfg: fc.clone(), parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: None, run_dir: dir.path().into() };
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
         let vm = driver.create(s.clone()).await.unwrap();
@@ -555,7 +562,7 @@ mod tests {
         assert_eq!(reqs[2].2["path_on_host"], "/disk.img");
         // A jailer without uid/gid/chroot settings is a configuration error.
         fc.jailer = None;
-        assert!(FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: None }.create(s).await.is_err());
+        assert!(FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: None, run_dir: dir.path().into() }.create(s).await.is_err());
     }
 
     fn me() -> (u32, u32) {
@@ -622,7 +629,7 @@ while True:
         let mut fc = cfg();
         fc.firecracker_bin = bin;
         let (_, gid) = me();
-        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: Some(gid) };
+        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: Some(gid), run_dir: dir.path().into() };
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
         let mut vm = driver.create(s.clone()).await.unwrap();
@@ -669,7 +676,8 @@ while True:
     }
 
     /// The disk hard-linked into a jail is the VMM's alone (`0600`): the gateway's group may
-    /// search the jail root, and a sparse file created under umask 0022 is world-readable.
+    /// search the jail root, and a sparse file created under umask 0022 is world-readable. The
+    /// jail's parent directories are search-only whatever the umask.
     #[test]
     fn populate_makes_the_disk_private() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,8 +691,16 @@ while True:
         std::fs::write(&s.disk_path, b"d").unwrap();
         std::fs::set_permissions(&s.disk_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let jail = Jail::new(&fc, &jc, &s);
+        // What a nestd under umask 077 would have made of the jail's parents (without touching
+        // this process's umask): the gateway's user couldn't cross them.
+        let (exe_dir, id_dir) = (jail.root.parent().unwrap().parent().unwrap(), jail.root.parent().unwrap());
+        std::fs::create_dir_all(id_dir).unwrap();
+        for d in [exe_dir, id_dir] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         jail.populate(&fc, &s).unwrap();
         assert_eq!(mode_gid(&jail.root.join("disk.img")).0, 0o600);
+        assert_eq!((mode_gid(exe_dir).0, mode_gid(id_dir).0), (0o711, 0o711));
     }
 
     /// Stopping a jailed VM removes its jail directory, and only that.

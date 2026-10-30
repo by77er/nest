@@ -36,6 +36,9 @@ REAL = MODE == "real"
 # through the control plane's `claude_oauth_token` secret and the runner's explicit env.
 # A token has no whitespace; `claude setup-token` wraps it, so a copied line break is dropped.
 TOKEN = "".join(os.environ.pop("NEST_CLAUDE_OAUTH_TOKEN", "").split()) if REAL else ""
+# What the control plane holds as the Claude token: the real one, or a stand-in the fake brains get
+# the same way. Either must never reach the sandbox host's processes.
+CLAUDE_TOKEN = TOKEN if REAL else "fake-e2e-oauth-token-not-real"
 REAL_MODEL = os.environ.get("NEST_CLAUDE_MODEL", "haiku")
 REAL_TURN_TIMEOUT_S = float(os.environ.get("NEST_E2E_REAL_TURN_TIMEOUT_S", "300"))
 REAL_ENV = {}  # extra env for inner.sh in real mode (set by prepare_real)
@@ -179,9 +182,13 @@ def prepare_work():
     # run/ and state/: the sandbox host's nestd; brun/ and bstate/: the brain host's.
     for d in ["logs", "run", "state", "brun", "bstate", "netns", "runner/cwd", "files", "guest-state", "wrangler-state", "bin"]:
         os.makedirs(os.path.join(WORK, d), exist_ok=True)
-    # The gateway's user reaches its socket and the guests' through WORK, so WORK and every
-    # directory above it must let other users through.
-    os.chmod(WORK, 0o755)
+    # The gateway's user reaches its socket and the guests' through WORK/run and runs WORK/bin, so
+    # WORK, those two and every directory above WORK must let other users through (search only).
+    # Everything else is the harness's alone: the logs, and the local control plane's state, which
+    # holds the Claude token in real mode.
+    os.chmod(WORK, 0o711)
+    for d in os.listdir(WORK):
+        os.chmod(os.path.join(WORK, d), 0o711 if d in ("run", "bin") else 0o700)
     blocked = [d for d in ancestors(WORK) if not os.stat(d).st_mode & 0o001]
     if blocked:
         log(f"the gateway runs as its own uid and can't enter {blocked[0]}: set NEST_E2E_WORK to a directory "
@@ -189,7 +196,7 @@ def prepare_work():
         sys.exit(1)
     shutil.copy(os.path.join(BIN, "nest-gateway"), GW_BIN)
     os.chmod(GW_BIN, 0o755)
-    with open(os.path.join(WORK, "dev.vars"), "w") as f:
+    with open(os.open(os.path.join(WORK, "dev.vars"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write(f"ADMIN_TOKEN={ADMIN}\nHOST_TOKEN_SECRET=e2e-host-token-secret-0123456789abcdef\nALLOW_DEV_CA=1\n")
 
 
@@ -232,13 +239,13 @@ def configure_host():
     for role, name in (("sandbox", "enroll.token"), ("brain", "enroll-brain.token")):
         st, tok = api("POST", "/v1/admin/enrollment-tokens", {"role": role, "cell": "local"})
         assert st == 200, (st, tok)
-        with open(os.path.join(WORK, name), "w") as f:
+        with open(os.open(os.path.join(WORK, name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             f.write(tok["token"])
     st, ca = api("GET", "/v1/admin/root-ca", raw=True)
     assert st == 200 and "BEGIN CERTIFICATE" in ca, (st, ca)
     with open(os.path.join(WORK, "root-ca.pem"), "w") as f:
         f.write(ca)
-    st, r = api("PUT", "/v1/admin/secrets/claude_oauth_token", {"value": TOKEN if REAL else "fake-e2e-oauth-token-not-real"})
+    st, r = api("PUT", "/v1/admin/secrets/claude_oauth_token", {"value": CLAUDE_TOKEN})
     assert st == 200, (st, r)
     guest = [os.path.join(BIN, "nest-guest"), "--state-dir", os.path.join(WORK, "guest-state"),
              "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none", "--port-poll-ms", "500"]
@@ -447,12 +454,7 @@ def run_real_turn(agid):
     check("real claude: transcript has mcp__nest__ tool uses", nest_tools, f"{len(names)} tool uses: {', '.join(nest_tools) or 'none'}")
     host = sorted({n for n in names if not n.startswith("mcp__")} & {"Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS", "NotebookEdit"})
     check("real claude: no host-side built-in tool uses", not host, ", ".join(host) or "none")
-    guests = children_named(os.path.join(BIN, "nest-guest"))
-    leaked = [g for g in guests if TOKEN.encode() in read_bytes(f"/proc/{g}/environ")]
-    check("real claude: the OAuth token is not in the sandbox's environment", guests and not leaked, f"guests={guests} leaked={leaked}")
-    gateways = children_named(GW_BIN)
-    leaked = [g for g in gateways if TOKEN.encode() in read_bytes(f"/proc/{g}/environ") + read_bytes(f"/proc/{g}/cmdline")]
-    check("real claude: the OAuth token is not in the gateway's environment", gateways and not leaked, f"gateways={gateways} leaked={leaked}")
+    check_token_not_in("real claude: the OAuth token is not in the sandbox's environment", children_named(os.path.join(BIN, "nest-guest")))
     return sum(1 for n in names if n.startswith("mcp__nest__") and n[len("mcp__nest__"):] in HANDS_TOOLS)
 
 
@@ -469,12 +471,19 @@ def check_gateway_unprivileged():
           f"pids={gateways} uids={uids.group(1) if uids else None} want {outer} (harness {os.getuid()}) capeff={caps.group(1) if caps else None}")
 
 
-def read_bytes(path):
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return b""
+def check_token_not_in(name, pids):
+    """Passes only when there are processes, every one's environment and command line was read,
+    and none holds the Claude token. They are read inside the harness namespace as its root: the
+    gateway runs as another uid, whose /proc files the harness can't read from outside. A read
+    that fails fails the check; it is never taken as clean."""
+    unread, leaked = [], []
+    for pid in pids:
+        r = in_userns(["cat", f"/proc/{pid}/environ", f"/proc/{pid}/cmdline"])
+        if r.returncode != 0 or not r.stdout:
+            unread.append((pid, r.stderr.strip()[:120]))
+        elif CLAUDE_TOKEN in r.stdout:
+            leaked.append(pid)
+    check(name, bool(pids) and not unread and not leaked, f"pids={pids} unread={unread} leaked={leaked}")
 
 
 # ---------------------------------------------------------------------------------- scenario
@@ -757,6 +766,8 @@ def main():
             check("gateway listening + synced with nestd", False, str(e))
         check_gateway_unprivileged()
         ids = run_scenario()
+        # After the turns: the token has been handed to the brains by now.
+        check_token_not_in("the Claude token is not in the gateway's environment or command line", children_named(GW_BIN))
         run_fencing(ids)
         skip("transparent :443 interception", "the process driver runs the guest inside the netns itself (no tap0 peer), so nft's tap0 redirect never applies; covered by nestd's netns_redirect_reaches_listener test")
     except Exception as e:  # noqa: BLE001

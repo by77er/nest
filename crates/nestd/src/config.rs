@@ -390,6 +390,8 @@ mod tests {
         let old: SocketsConfig = serde_json::from_value(serde_json::json!({"gid": 1})).unwrap();
         assert_eq!((old.gateway_gid, old.gateway_sock_gid()), (None, Some(1)));
         assert_eq!(SocketsConfig::default().gateway_sock_gid(), None);
+        // `nestd --features` advertises it, which is what makes bootstrap write it.
+        assert!(crate::FEATURES.contains(&"gateway-user"));
     }
 
     /// Guest memory is regular pages unless a config asks for hugepages (nestd review #8).

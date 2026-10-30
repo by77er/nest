@@ -451,7 +451,7 @@ impl Host {
             None => match &cfg.driver {
                 None => Arc::new(crate::driver::NoDriver),
                 Some(DriverConfig::Process { guest_command, mount_disk }) => {
-                    Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk, gateway_gid: cfg.sockets.gateway_gid })
+                    Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk, gateway_gid: cfg.sockets.gateway_gid, run_dir: cfg.run_dir.clone() })
                 }
                 Some(DriverConfig::Firecracker(fc)) => {
                     if let (Some(_), Some(j)) = (&fc.jailer_bin, &fc.jailer) {
@@ -466,6 +466,7 @@ impl Host {
                         parent_cgroup: delegated.as_ref().map(|d| d.vms.clone()),
                         cgroup_root: cfg.cgroup_root.clone(),
                         gateway_gid: cfg.sockets.gateway_gid,
+                        run_dir: cfg.run_dir.clone(),
                     })
                 }
             },

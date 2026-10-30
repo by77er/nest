@@ -51,6 +51,21 @@ pub fn grant_socket(path: &Path, owner: u32, gid: u32) -> io::Result<()> {
     restrict(path, Kind::Socket, owner, Some(gid), 0o660)
 }
 
+/// Create `dir` and make it, and every directory between `base` (excluded) and it, `0711`: search
+/// only, whatever nestd's umask, so the gateway's user can reach a socket inside by name. Every
+/// one of them must be nestd's own (`restrict`). `dir` must be under `base`.
+pub fn create_searchable(base: &Path, dir: &Path) -> io::Result<()> {
+    let rel = dir.strip_prefix(base).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not under {}", dir.display(), base.display())))?;
+    std::fs::create_dir_all(dir)?;
+    let owner = nix::unistd::geteuid().as_raw();
+    let mut at = base.to_path_buf();
+    for part in rel.components() {
+        at.push(part);
+        restrict(&at, Kind::Dir, owner, None, 0o711)?;
+    }
+    Ok(())
+}
+
 fn open_nofollow(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_NOFOLLOW).open(path)
 }
@@ -104,6 +119,28 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link2).unwrap();
         assert!(grant_socket(&link2, uid, gid).is_err());
         assert_eq!(mode(&real), 0o700);
+    }
+
+    /// Directories left `0700` by a nestd running under umask 077 (made so here, without touching
+    /// the process umask) end `0711` from below `base` down; `base` and what lies outside are left.
+    #[test]
+    fn directories_are_made_searchable_under_any_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("run");
+        let vm = base.join("vm/sbx_1/1");
+        std::fs::create_dir_all(&vm).unwrap();
+        for d in [&base, &base.join("vm"), &base.join("vm/sbx_1"), &vm] {
+            std::fs::set_permissions(d, Permissions::from_mode(0o700)).unwrap();
+        }
+        create_searchable(&base, &vm).unwrap();
+        assert_eq!(mode(&base), 0o700);
+        for d in [base.join("vm"), base.join("vm/sbx_1"), vm.clone()] {
+            assert_eq!(mode(&d), 0o711, "{}", d.display());
+        }
+        // Created when missing, and refused outside the base.
+        create_searchable(&base, &base.join("vm/sbx_2/1")).unwrap();
+        assert_eq!(mode(&base.join("vm/sbx_2/1")), 0o711);
+        assert!(create_searchable(&base, dir.path()).is_err());
     }
 
     /// The wrong kind of file, or one with another owner, is refused unchanged.

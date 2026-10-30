@@ -71,7 +71,7 @@ def stub(bin_dir: Path, name: str, body: str) -> None:
 @unittest.skipUnless(SYSTEMCTL, "needs systemctl (for `systemctl --root`)")
 class Bootstrap(unittest.TestCase):
     def run_role(self, role: str, nestd: str = "current"):
-        """`nestd`: the installed release's nestd, `current` (knows `sockets.gateway_gid`) or
+        """`nestd`: the installed release's nestd, `current` (`--features` lists `gateway-user`) or
         `previous` (doesn't: a host launched before the release is published)."""
         fake = Path(tempfile.mkdtemp(prefix="nest-boot-"))
         self.addCleanup(shutil.rmtree, fake, ignore_errors=True)
@@ -85,8 +85,12 @@ class Bootstrap(unittest.TestCase):
         (fake / "opt/nest/release.sha256sums").write_text("sums\n")
         (fake / "opt/nest/release/VERSION").write_text("v-test\n")
         (fake / "opt/nest/bin").mkdir(parents=True)
-        # install.sh and bootstrap look for the config field's name in the binary.
-        (fake / "opt/nest/bin/nestd").write_bytes(b"\x7fELF..gateway_uids.." + (b"gateway_gid.." if nestd == "current" else b""))
+        # install.sh and bootstrap run `nestd --features`: this release's lists `gateway-user`
+        # (crates/nestd/tests/features.rs checks the real binary); the previous release's has no
+        # such flag, and clap exits 2.
+        body = ('[ "$1" = --features ] && { echo gateway-user; exit 0; }\nexit 1\n' if nestd == "current"
+                else "echo \"error: unexpected argument '$1' found\" >&2\nexit 2\n")
+        stub(fake / "opt/nest/bin", "nestd", body)
         claude_version = re.search(r'CLAUDE_VERSION="([^"]+)"', (HOST / "install.sh").read_text()).group(1)
         (fake / "root/.local/bin").mkdir(parents=True)
         stub(fake / "root/.local/bin", "claude", f'echo "{claude_version} (Claude Code)"\n')

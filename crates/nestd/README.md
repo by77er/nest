@@ -5,6 +5,7 @@ The privileged per-host daemon (`docs/compute/nestd/`). It speaks the fleet chan
 ```
 cargo build -p nestd
 nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
+nestd --features                             # what install scripts check for, one per line (`nestd::FEATURES`): `gateway-user`
 ```
 
 ## Modules
