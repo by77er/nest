@@ -50,7 +50,7 @@ jobs:
       - run: command -v cargo-fuzz || cargo install --locked "cargo-fuzz@$CARGO_FUZZ"
       - name: Seeds still decode
         run: python3 -I gen_seeds.py && cargo test --locked
-      - name: Fuzz (the guest targets longest: their input comes from inside a VM)
+      - name: "Fuzz (the guest targets longest: their input comes from inside a VM)"
         run: |
           ./run.sh guest_stream 600
           ./run.sh guest_control_json 600
