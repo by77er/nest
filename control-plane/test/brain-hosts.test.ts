@@ -9,6 +9,8 @@ import { awsCell } from "../src/lib/cells";
 import { CapacityError, type Ec2, type ImageInfo, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
 import { BRAINS_PER_VCPU, brainHostNeeded, idleStep, maxBrains, pickBrainHost, scaleUpPlan, type BrainHostFacts } from "../src/lib/placement";
 import { capacityRetryMs, type AgentDO } from "../src/do/agent";
+import { NestError } from "../src/lib/util";
+import { ErrorCodes } from "../src/protocol/model";
 import { adminJson, connectHost, csrPem, enrollHost, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
@@ -466,6 +468,67 @@ describe("brain hosts scale with brains", () => {
     const [start] = await nextCommands(a.ws, isStartOf(agent));
     expect(start).toMatchObject({ epoch: 1 });
     expect(await waiters()).toEqual([]);
+  });
+
+  it("a stop ends a start waiting for a brain host: no host launches for it, and room appearing starts nothing", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2();
+    await configure(cell, ec2);
+    const agent = await captain(cell);
+    expect(ec2.launched).toHaveLength(1);
+    const waiters = () => runInDurableObject(fleetStub(cell), (_i, st) => st.storage.sql.exec<{ agent: string }>("SELECT agent FROM brain_waiters").toArray().map((r) => r.agent));
+    expect(await waiters()).toEqual([agent]);
+    await agentStub(agent).stop("requested");
+    const after = await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => ({
+      info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
+      intentAlarm: s.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'intent'").toArray().length,
+    }));
+    expect(after.info).toMatchObject({ brain: null, intent: null });
+    expect(after.info.capacity_waits).toBeUndefined();
+    expect(after.intentAlarm).toBe(0);
+    expect(await waiters()).toEqual([]);
+    // That launch never enrolled and was ended: nobody waits, so the tick launches nothing more.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE launched SET reason = 'enroll_timeout', ended_ms = ?", Date.now());
+    });
+    await tickAt(cell, ec2);
+    expect(ec2.launched).toHaveLength(1);
+    // A brain host saying hello pokes no one, and no start reaches it.
+    const a = await connectHost(cell, "brain");
+    expect(await a.ws.none("commands", 300, (m) => (m.commands as any[]).some(isStartOf(agent)))).toBe(true);
+    expect(await agentStub(agent).info()).toMatchObject({ brain: null, intent: null });
+  });
+
+  it("a stop landing while a poked start is between finding room and committing: nothing starts, nothing is re-armed", async () => {
+    const cell = uniqueCell();
+    await configure(cell, null, { ...CONFIG, brain: undefined });
+    const agent = await captain(cell);
+    // Room appears and the poke runs the kept intent; the stop lands after placement found the host.
+    await runInDurableObject(agentStub(agent), (inst: AgentDO) => {
+      inst.testHooks["intent:beforeCommit"] = async () => {
+        delete inst.testHooks["intent:beforeCommit"];
+        await inst.stop("requested");
+      };
+    });
+    const a = await connectHost(cell, "brain");
+    for (let n = 0; n < 80 && (await runInDurableObject(agentStub(agent), (inst: AgentDO) => inst.testHooks["intent:beforeCommit"] !== undefined)); n++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(await a.ws.none("commands", 300, (m) => (m.commands as any[]).some(isStartOf(agent)))).toBe(true);
+    expect(await agentStub(agent).info()).toMatchObject({ brain: null, intent: null, agent_epoch: 0 });
+    // A run that fails after the stop ended its intent (no room after all) keeps nothing and arms nothing.
+    const failed = await runInDurableObject(agentStub(agent), async (inst: AgentDO, s) => {
+      const fail = (inst as unknown as { intentFailed(i: unknown, e: unknown): Promise<void> }).intentFailed.bind(inst);
+      await fail({ reason: "operator" }, new NestError(ErrorCodes.CAPACITY_EXHAUSTED, "no brain host available", 503, true));
+      await fail({ reason: "operator" }, new NestError(ErrorCodes.FORBIDDEN, "for good", 403));
+      return {
+        info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
+        intentAlarm: s.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'intent'").toArray().length,
+      };
+    });
+    expect(failed.intentAlarm).toBe(0);
+    expect(failed.info.capacity_waits).toBeUndefined();
+    expect(failed.info.state).not.toBe("errored");
   });
 
   it("a waiting agent is poked when a full host's brain exits and frees its slot", async () => {

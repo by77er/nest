@@ -890,10 +890,10 @@ pub mod claude {
 
     use crate::control::{LaunchConfig, SystemPrompt};
 
-    /// Built-ins workers keep: nothing that reads/writes host files or runs host commands.
-    /// The control plane sends the actual list in `LaunchConfig.builtin_tools`; this is the
-    /// recommended default. UNVERIFIED: exact set honored under `--restricted` in `-p`; the runner
-    /// logs `system/init.tools` so drift is visible.
+    /// Built-ins a worker may keep: nothing that reads/writes host files or runs host commands.
+    /// The control plane sends the actual list in `LaunchConfig.builtin_tools` (the seeded `worker`
+    /// template leaves out `Agent` and `TodoWrite`); this wider set is what the golden argv and the
+    /// `e2e/claude-verify` probes exercise. The runner logs `system/init.tools` so drift is visible.
     pub const WORKER_BUILTIN_TOOLS: &[&str] =
         &["Agent", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TodoWrite", "WebSearch", "WebFetch"];
 

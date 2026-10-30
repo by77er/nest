@@ -5,6 +5,7 @@ import { num, type Env } from "./env";
 import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identity";
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
+import { checkHealth, healthProbes } from "./lib/health";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
 import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
@@ -109,7 +110,11 @@ async function route(req: Request, env: Env): Promise<Response> {
   const m = (re: RegExp) => re.exec(path);
   let p: RegExpExecArray | null = null;
 
-  if (req.method === "GET" && path === "/v1/health") return json({ ok: true, protocol_version: PROTOCOL_VERSION });
+  if (req.method === "GET" && path === "/v1/health") {
+    // Unauthenticated: one read-only round trip to each DO class's own health instance, nothing else.
+    const h = await checkHealth(healthProbes(env));
+    return json({ ok: h.ok, protocol_version: PROTOCOL_VERSION, durable_objects: h.durable_objects }, h.ok ? 200 : 503);
+  }
   if (req.method === "POST" && path === "/v1/hosts/enroll") return enroll(req, env);
 
   // Host-authenticated HTTP: object-store GC (a sandbox host runs it; FleetDO says when and from what).

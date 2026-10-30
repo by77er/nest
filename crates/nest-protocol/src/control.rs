@@ -323,7 +323,7 @@ pub enum CommandBody {
     SandboxResume { sandbox: SandboxId, epoch: Epoch },
     /// Commit, then evict all local state; afterwards the sandbox lives only in object storage.
     SandboxArchive { sandbox: SandboxId, epoch: Epoch },
-    /// Force a commit now (e.g. before delegate inspection or on request).
+    /// Force a commit now (e.g. before a read-only fork, or on request).
     SandboxCheckpoint { sandbox: SandboxId, epoch: Epoch, reason: CommitReason },
     /// Commit the parent (reason `fork`), then create `child` from that generation on this host
     /// (same-host fast path). For a cross-host fork FleetDO instead sends `sandbox_checkpoint`
@@ -1173,12 +1173,14 @@ mod tests {
         for required in [
             "notify", "emit", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "checkpoint",
             "expose_port", "brokered", "spawn_workstream", "send", "list_workstreams", "get_status", "wait_events",
-            "approve", "deny", "merge", "kill", "delegate", "memory_read", "memory_write", "notify_user",
+            "approve", "deny", "merge", "kill", "memory_read", "memory_write", "notify_user",
             "task_list", "task_get", "task_create", "task_update", "task_claim", "task_comment", "task_assign", "task_update_any",
             "task_cancel", "task_set_watcher",
         ] {
             assert!(names.contains(required), "missing platform tool {required}");
         }
+        // Inspecting without hands is a pattern, not a tool (docs/orchestration/captains/).
+        assert!(!names.contains("delegate"), "the registry has no `delegate` tool");
     }
 
     fn fixture_json<T: serde::de::DeserializeOwned>(rel: &str) -> T {

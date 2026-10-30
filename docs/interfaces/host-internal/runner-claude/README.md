@@ -1,6 +1,6 @@
 # runner ↔ Claude Code
 
-> **Implemented contract.** The design drops `Agent` and `TodoWrite` from `--tools`, adds `--system-prompt-snapshot off`, the budget flags and `DISABLE_UPDATES=1`, and checks a [pinned version](#version); see [pending contract changes](../../README.md#pending-contract-changes).
+> **Implemented contract.** `--tools` is the template's `launch.builtin_tools` as given; the seeded `worker` template leaves out `Agent` and `TodoWrite`, as the design does ([CatalogDO](../../../control-plane/durable-objects/catalog/)). The design adds `--system-prompt-snapshot off`, the budget flags and `DISABLE_UPDATES=1`, and checks a [pinned version](#version); see [pending contract changes](../../README.md#pending-contract-changes).
 
 
 Unmodified Claude Code, documented flags only. Reference artifacts in `protocol/claude-code/`; builders in `nest_protocol::host::claude` (golden-tested).
@@ -20,7 +20,7 @@ cd /var/lib/nest/empty && exec claude -p --input-format stream-json --output-for
   (--session-id <uuid> | --resume <transcript path> [--fork-session])
 ```
 
-Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). Recommended worker built-ins: `Agent, TaskCreate, TaskGet, TaskUpdate, TaskList, TodoWrite, WebSearch, WebFetch`. **Observed on 2.1.301** (`e2e/claude-verify`, with a real turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools, `WebSearch` and `WebFetch`; `TodoWrite` is missing even when named, which is why the designed invocation leaves it out. A captain's `--tools ""` gives no built-ins. The runner logs `system/init.tools`.
+Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). The seeded worker's built-ins: `TaskCreate, TaskGet, TaskUpdate, TaskList, WebSearch, WebFetch`; the probes below also name `Agent` and `TodoWrite`. **Observed on 2.1.301** (`e2e/claude-verify`, with a real turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools, `WebSearch` and `WebFetch`; `TodoWrite` is missing even when named, which is why the designed invocation leaves it out. A captain's `--tools ""` gives no built-ins. The runner logs `system/init.tools`.
 
 **Built-ins are an allowlist** (`nest_runner::agent::HOST_SAFE_BUILTINS`): `Agent`, `Task`, `TaskCreate`, `TaskGet`, `TaskUpdate`, `TaskList`, `TodoWrite`, `WebSearch`, `WebFetch`, `ListMcpResourcesTool`, `ReadMcpResourceTool`. A `launch.builtin_tools` naming anything else fails the start, and if `system/init.tools` reports anything else besides `mcp__*` tools the brain is killed (`--restricted` re-enables tools named individually in `--tools`), so a built-in Claude Code adds later is refused until reviewed.
 

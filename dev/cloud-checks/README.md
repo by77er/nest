@@ -23,7 +23,7 @@ python3 -I dev/cloud-checks/brain_hosts_check.py
 | **Passes when** | every turn is `done`; every transcript contains `nest-ok-42`; while it polled the fleet view (every 30 s), each brain was seen only on a brain host and each sandbox only on a sandbox host (either role name counts) |
 | **Exit** | 0 on PASS, 1 on FAIL. The last line is the JSON of the agent and sandbox ids |
 | **Cleans up** | stops every agent (`POST /v1/agents/<id>/stop`) and destroys every sandbox (`DELETE /v1/sandboxes/<id>`), on every exit path |
-| **Leaves** | the workstream and the stopped agents' records (there is no delete route for either yet); the hosts it caused to launch, which retire after the cell's idle grace. A start still waiting for a brain host when the check ends isn't cancelled by the stop (`AgentDO.stop` drops an operator's start only when a brain exists): it may launch a brain host later, then fail on its destroyed sandbox |
+| **Leaves** | the workstream and the stopped agents' records (there is no delete route for either yet); the hosts it caused to launch, which retire after the cell's idle grace. |
 | **Costs** | a few minutes of two spot instances from a cold cell, and one short Claude Code turn per agent on the subscription |
 
 **Leftovers after an interrupted run:** `GET /v1/admin/fleet?cell=use1` lists live sandboxes and each host's brains. Stop and destroy the ids from the last line (or the log) with the same two routes.

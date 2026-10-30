@@ -324,3 +324,16 @@ The rule A6 assumes: a kill counts as processed only when the host answered it, 
 | `load()` default | agent.ts:383 | n/a | `channel_grants ?? []`; brain fields untouched |
 
 **Depends on the runner's Stop-hook inbox mirror:** a mid-turn notice whose `inbox` push is lost with a runner lineage (`rel.reset`) still stays `delivered` in AgentDO's inbox and reaches the model through the Stop hook's mirror (`runtime.rs`, the cache's `inbox`) in the recovery turn. A notice the runner refused to write (stopping) and never confirmed is requeued at the turn's completion (row above). A runner that wrote it to the model but whose `inbox_delivered` was lost gets it again as a turn (at least once).
+
+## stop ends the intent (fix/discrepancies, author's map, 2026-10-30)
+
+**Head:** `fix/discrepancies` (on main 653be20). The model's record design has no operator stop (`TOpStop` is main's, `~RECORD`; tla:351), and its intent waits for a healthy host without a capacity notion, so **"stop while waiting for a brain host" is not modelled.** The change only removes starts, so it can't add a brain. Unverified by a model run.
+
+| Change | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| `stop` clears any intent | agent.ts:1069-1094 | yes (S-neutral) | Intent, `capacity_waits` and the `intent` alarm in one synchronous step, before any await. A run in flight re-reads at `unchanged(snap)` before `issueStart`'s commit and finds the intent changed, so it commits nothing. Was: dropped only an operator's non-move intent beside a live brain (N20), so a start waiting for capacity, or a move or restart behind a condemned brain, outlived the stop |
+| `intentFailed` with no intent | agent.ts:866-868 | yes | Returns before keeping, backing off or marking `errored`: a failure of a run whose intent a stop ended arms nothing |
+| FleetDO `brainWaitEnded` | fleet.ts:1785-1787; agent.ts stop | outside the model | Drops the agent's `brain_waiters` row (only rows from before the stop), so the tick launches no brain host for it; best effort, the 12-minute TTL backs it |
+| Guards kept | `unchanged(snap)`, `release`'s N20 rule, `condemn`'s kill-with-alarm | unchanged | The condemned brain is still killed and released; only what starts after its release changes |
+
+Tests: `brain-hosts.test.ts`, "a stop ends a start waiting for a brain host…" and "a stop landing while a poked start is between finding room and committing…" (mutations: the old `stop` condition fails both; removing the `intentFailed` guard or the `brainWaitEnded` call fails one each).

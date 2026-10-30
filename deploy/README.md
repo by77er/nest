@@ -27,7 +27,7 @@ inframe plan --stack use1 -- -out=use1.plan
 inframe apply --stack use1 -- use1.plan
 ```
 
-- **`include_str` isn't tracked by Lake:** after editing `host/bootstrap.sh` or `host/install.sh`, delete `lean/.lake/build/{lib/lean,ir}/Cell/Stack.*` (Lake hashes contents, so `touch` doesn't help) or the plan shows no change.
+- **The host scripts are build inputs:** `Cell.Stack` embeds `host/bootstrap.sh` and `host/install.sh` with `include_str`, which Lake doesn't trace by itself, so `lakefile.toml` declares both as `input_file` targets the `Cell` library `needs`: an edit rebuilds the stack, with a cached `.lake` too. A new `include_str` needs the same entry, or a stale build keeps the old file.
 - **Host AMI:** `aws imagebuilder start-image-pipeline-execution --image-pipeline-arn $(inframe output --stack use1 | jq -r .host_image_pipeline.value)` bakes `releases/current/` into a new AMI (about 15 minutes). Its ID lands in `/imagebuilder/nest-<cell>/host-ami`, which both launch templates resolve at each launch; the parameter starts at stock AL2023. The deploy's release job starts a build whenever it publishes a changed release ([deploy](../dev/deploy.md)); run it by hand otherwise. Hosts on an older AMI still work, but download the difference at boot.
 - **Spot drill:** `aws fis start-experiment --experiment-template-id $(inframe output --stack use1 | jq -r .spot_drill_template_id.value)` sends a real two-minute interruption notice to one running nest spot host. Its role can interrupt only `nest=true` instances (proved in `Cell.Test`).
 - **Once per account:** the EC2 Spot service-linked role (`aws iam create-service-linked-role --aws-service-name spot.amazonaws.com`); without it, spot launches fail with `AuthFailure.ServiceLinkedRoleCreationNotPermitted`.

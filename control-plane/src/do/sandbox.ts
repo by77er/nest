@@ -6,6 +6,7 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { Deadlines } from "../lib/reliable";
@@ -130,13 +131,21 @@ type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
 
 export class SandboxDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
-  private readonly deadlines: Deadlines;
+  // `!`: set in the constructor, except on the health instance, which serves only `health()`.
+  private readonly deadlines!: Deadlines;
   /** Posts to `<sbx>/events` (docs/channels/#built-in-channels), queued with the change they report. */
-  private readonly outbox: ChannelOutbox;
+  private readonly outbox!: ChannelOutbox;
+
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.SANDBOX)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS generations (id TEXT PRIMARY KEY, record TEXT NOT NULL,
       orphaned INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);

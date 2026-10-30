@@ -189,7 +189,8 @@ jobs:
         run: |
           inframe provider generate aws --frontend lean --schema-json aws-schema.json
           inframe provider generate cloudflare --frontend lean --schema-json cloudflare-schema.json
-          # include_str isn't tracked by Lake: rebuild the stack so it reads this checkout's scripts.
+          # The host scripts Cell.Stack embeds (include_str) are input_file targets in lakefile.toml, so
+          # a cached .lake rebuilds the stack when they change.
           inframe test --stack use1
           inframe test --stack edge
 

@@ -10,6 +10,7 @@
 //
 // One instance, `~directory` (not a channel name), lists every channel for the operator.
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";
 import type { Env } from "../env";
 import {
@@ -140,15 +141,23 @@ const invalid = (m: string, status = 400) => new NestError(ErrorCodes.INVALID_ME
 
 export class ChannelDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
-  private readonly deadlines: Deadlines;
+  // `!`: set in the constructor, except on the health instance, which serves only `health()`.
+  private readonly deadlines!: Deadlines;
   /** Subscriptions whose delivery call is in flight in this isolate (never sent twice at once). */
   private readonly delivering = new Set<string>();
   /** Test seam: awaited at named points so a test can force an interleaving or a failure there. */
   testHooks: Partial<Record<HookPoint, () => Promise<void>>> = {};
 
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.CHANNEL)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, from_p TEXT NOT NULL,
       taint INTEGER NOT NULL, kind TEXT, text TEXT, data TEXT, reply_to INTEGER, key TEXT, mentions TEXT, body_ref TEXT,

@@ -512,40 +512,6 @@
     "requires_approval": false
   },
   {
-    "name": "delegate",
-    "description": "Have a read-only worker inspect something (code, a sandbox, a repo) in an ephemeral fork and report back. Use this instead of reading code yourself.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "task": {
-          "type": "string",
-          "description": "What to find out."
-        },
-        "sandbox": {
-          "type": "string",
-          "description": "Sandbox to inspect (forked, never modified)."
-        },
-        "repo": {
-          "type": "string",
-          "description": "Repository to clone if no sandbox."
-        },
-        "mode": {
-          "type": "string",
-          "description": "Fork mode.",
-          "enum": [
-            "disk_only",
-            "live"
-          ]
-        }
-      },
-      "required": [
-        "task"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
     "name": "memory_read",
     "description": "Read a key from your durable memory (notes per workstream).",
     "input_schema": {

@@ -16,9 +16,23 @@ path = ".generated/aws"
 name = "generated-cloudflare"
 path = ".generated/cloudflare"
 
+# The host user data Cell.Stack embeds with `include_str`, which Lake doesn't trace: as inputs of
+# the library, an edit to either rebuilds it (and the stack's executables) instead of keeping the
+# scripts a cached build embedded.
+[[input_file]]
+name = "host-bootstrap"
+path = "../host/bootstrap.sh"
+text = true
+
+[[input_file]]
+name = "host-install"
+path = "../host/install.sh"
+text = true
+
 [[lean_lib]]
 name = "Cell"
 globs = ["Cell.+"]
+needs = ["host-bootstrap", "host-install"]
 
 [[lean_exe]]
 name = "cell-use1"

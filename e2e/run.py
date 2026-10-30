@@ -374,8 +374,8 @@ def finish_real():
         shutil.rmtree(REAL_ENV["NEST_E2E_RUNNER_CWD"], ignore_errors=True)
 
 
-REAL_LAUNCH = {  # control-plane DEFAULT_WORKER_LAUNCH, plus a cheap model
-    "model": REAL_MODEL, "builtin_tools": ["TodoWrite", "Task", "WebSearch"],
+REAL_LAUNCH = {  # the seeded worker template's launch (control-plane lib/spec.ts), plus a cheap model
+    "model": REAL_MODEL, "builtin_tools": ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"],
     "system_prompt": {"mode": "append", "text": "You work in a remote sandbox through the mcp__nest__* tools; they behave like Claude Code's built-ins."},
 }
 REAL_CONTENT = "hello from nest e2e\nedited line\n"

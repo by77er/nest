@@ -7,6 +7,7 @@
 // saved from a copy loaded before an await (`update()` loads, mutates and saves synchronously), and
 // inbound session messages are processed one at a time, in order (`SerialQueue`).
 import { DurableObject } from "cloudflare:workers";
+import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";
 import { num, type Env } from "../env";
 import {
@@ -289,17 +290,25 @@ function brainHostUsable(st: { status: string; connected: boolean; current: bool
 
 export class AgentDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
-  private readonly rel: ReliableChannels;
-  private readonly deadlines: Deadlines;
+  // `!`: set in the constructor, except on the health instance, which serves only `health()`.
+  private readonly rel!: ReliableChannels;
+  private readonly deadlines!: Deadlines;
   private readonly inbound = new SerialQueue();
   /** The run of the intent in flight (single-flight, in memory only: the intent itself is stored). */
   private intentRun: Promise<StartResult | null> | null = null;
   /** Someone stored an intent while a run was in flight: run again (from the alarm) once it ends. */
   private intentDirty = false;
 
+  /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
+  async health(): Promise<true> {
+    return healthRead(this.sql);
+  }
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
+    if (isHealthInstance(ctx, env.AGENT)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS turns (turn TEXT PRIMARY KEY, ord INTEGER NOT NULL, input TEXT NOT NULL,
       status TEXT NOT NULL, created_ms INTEGER NOT NULL DEFAULT 0)`);
@@ -341,7 +350,7 @@ export class AgentDO extends DurableObject<Env> {
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
 
-  private readonly outbox: ChannelOutbox;
+  private readonly outbox!: ChannelOutbox;
 
   // ---------------------------------------------------------------------------------------------
   // State
@@ -855,6 +864,8 @@ export class AgentDO extends DurableObject<Env> {
    * of the intent retries), and anything else ends the intent (`errored` if no brain is left).
    */
   private async intentFailed(intent: StartIntent, e: unknown): Promise<void> {
+    // No intent any more (a stop ended it while this run awaited): nothing to keep, retry or fail.
+    if (!this.load().intent) return;
     const ne = asNestError(e);
     if (ne?.retryable ?? true) {
       // No brain host with room (FleetDO launches one): the wait backs off, 30 s doubling to 5 min,
@@ -1056,14 +1067,27 @@ export class AgentDO extends DurableObject<Env> {
    * start meanwhile is kept as the intent and runs after that exit; nothing about the stop is stored.
    */
   async stop(reason: string): Promise<void> {
-    // An operator's start kept from before this stop is for the brain this stop ends: dropped, so
-    // only a start made after the stop runs after its exit (N20).
+    // Every start wanted before this stop ends here, so only a start made after it runs (N20): an
+    // operator's start kept beside the brain this stop ends, a move or restart waiting for a condemned
+    // brain's release, and a start still waiting for a brain host, which its capacity retry or
+    // FleetDO's poke would otherwise run, launching a host and a brain for a stopped agent. The intent
+    // and its alarm go in this synchronous step; a run already in flight finds the intent changed at
+    // its re-check before committing (`unchanged`), and `intentFailed` arms nothing for it.
+    const waited = this.load().intent !== null;
+    const stoppedMs = Date.now();
     const info = this.update((i) => {
-      if (i.intent?.reason === "operator" && i.brain && i.brain.phase !== "condemned" && !moves(i.intent, i.brain.host)) {
-        i.intent = null;
-        delete i.capacity_waits;
-      }
+      i.intent = null;
+      delete i.capacity_waits;
     });
+    await this.deadlines.clear("intent");
+    if (waited) {
+      // Best effort: a row left behind lapses when this agent no longer retries (12 min).
+      try {
+        await this.fleet(info.cell).brainWaitEnded(info.agent, stoppedMs);
+      } catch (e) {
+        console.warn(`agent ${info.agent}: telling FleetDO its wait for a brain host ended failed`, e);
+      }
+    }
     const b = info.brain;
     if (!b || b.phase === "condemned") return;
     await this.fleet(info.cell).issueCommands(b.host, [{ type: "agent_stop", agent: info.agent, reason, mode: "graceful", epoch: b.epoch }]);
