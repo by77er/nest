@@ -32,8 +32,14 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      # To find the artifact a pull request's passing run left for this tree.
+      # To find the pull request a push merged, and the artifact its passing run left for this tree.
       actions: read
+      pull-requests: read
+    # Explicit, for `-o pipefail`: the default shell is `bash -e` alone, under which a failed
+    # `git diff` would feed the mapping nothing and skip every job.
+    defaults:
+      run:
+        shell: bash
     env:
       GITLEAKS: v8.30.1
     outputs:
@@ -82,13 +88,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TREE: ${{ steps.tree.outputs.tree }}
+        # Any lookup that fails means no reuse: the push then runs what its diff needs.
         run: |
           head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-            -q '[.[] | select(.merged_at != null and .merge_commit_sha == env.GITHUB_SHA)][0].head.sha // empty')
+            -q '[.[] | select(.merged_at != null and .merge_commit_sha == env.GITHUB_SHA)][0].head.sha // empty') || head=
           [ -n "$head" ] || exit 0
-          for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ci-passed-$TREE&per_page=20" \
-              -q ".artifacts[] | select((.expired | not) and .workflow_run.head_sha == \"$head\") | .workflow_run.id"); do
-            if [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" -q '[.path, .event, .conclusion, .head_sha] | join(" ")')" \
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ci-passed-$TREE&per_page=20" \
+            -q ".artifacts[] | select((.expired | not) and .workflow_run.head_sha == \"$head\") | .workflow_run.id") || runs=
+          for run in $runs; do
+            if [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" -q '[.path, .event, .conclusion, .head_sha] | join(" ")' || true)" \
                 = ".github/workflows/ci.yml pull_request success $head" ]; then
               echo "run=$run" >> "$GITHUB_OUTPUT"
               echo "::notice::Tree $TREE passed in run $run (its pull request); no job runs again."
