@@ -1,4 +1,6 @@
-# cargo-deny (CI job `deny`): advisories, licenses, bans and sources for the Rust workspace.
+# cargo-deny (CI job `deny`): advisories, licenses, bans and sources for the Rust workspace and the
+# standalone verification crates (verification/nestd/check, verification/nestd/fuzz), each checked
+# against its own lockfile with this config.
 # An advisory ignore must say why and when it can go.
 
 [graph]
@@ -23,6 +25,11 @@ allow = [
   "Unlicense",
   "Zlib",
 ]
+
+# libFuzzer's runtime, linked only into the fuzz crate (verification/nestd/fuzz), never shipped.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]
 
 [licenses.private]
 ignore = true   # nest's own crates are unpublished

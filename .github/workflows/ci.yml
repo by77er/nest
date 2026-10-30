@@ -201,6 +201,9 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         run: cargo install --locked "cargo-deny@$CARGO_DENY"
       - run: cargo deny --locked check
+      # The standalone verification crates have their own lockfiles; same policy.
+      - run: cargo deny --manifest-path verification/nestd/check/Cargo.toml --config deny.toml --locked check
+      - run: cargo deny --manifest-path verification/nestd/fuzz/Cargo.toml --config deny.toml --locked check
 
   secrets:
     runs-on: ubuntu-24.04
