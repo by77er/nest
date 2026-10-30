@@ -70,7 +70,9 @@ def stub(bin_dir: Path, name: str, body: str) -> None:
 
 @unittest.skipUnless(SYSTEMCTL, "needs systemctl (for `systemctl --root`)")
 class Bootstrap(unittest.TestCase):
-    def run_role(self, role: str):
+    def run_role(self, role: str, nestd: str = "current"):
+        """`nestd`: the installed release's nestd, `current` (`--features` lists `gateway-user`) or
+        `previous` (doesn't: a host launched before the release is published)."""
         fake = Path(tempfile.mkdtemp(prefix="nest-boot-"))
         self.addCleanup(shutil.rmtree, fake, ignore_errors=True)
         bin_dir = fake / "stub-bin"
@@ -82,6 +84,13 @@ class Bootstrap(unittest.TestCase):
         (fake / "opt/nest/release").mkdir(parents=True)
         (fake / "opt/nest/release.sha256sums").write_text("sums\n")
         (fake / "opt/nest/release/VERSION").write_text("v-test\n")
+        (fake / "opt/nest/bin").mkdir(parents=True)
+        # install.sh and bootstrap run `nestd --features`: this release's lists `gateway-user`
+        # (crates/nestd/tests/features.rs checks the real binary); the previous release's has no
+        # such flag, and clap exits 2.
+        body = ('[ "$1" = --features ] && { echo gateway-user; exit 0; }\nexit 1\n' if nestd == "current"
+                else "echo \"error: unexpected argument '$1' found\" >&2\nexit 2\n")
+        stub(fake / "opt/nest/bin", "nestd", body)
         claude_version = re.search(r'CLAUDE_VERSION="([^"]+)"', (HOST / "install.sh").read_text()).group(1)
         (fake / "root/.local/bin").mkdir(parents=True)
         stub(fake / "root/.local/bin", "claude", f'echo "{claude_version} (Claude Code)"\n')
@@ -93,8 +102,10 @@ case "${{args[0]}}" in daemon-reload) exit 0;; esac
 exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
 ''')
         stub(bin_dir, "aws", 'for a in "$@"; do last="$a"; done; case "$*" in *--recursive*) exit 1;; esac; echo sums > "$last"\n')
-        for name in ("rpm", "dnf", "id", "useradd", "sysctl", "sha256sum"):
+        for name in ("rpm", "dnf", "useradd", "sysctl", "sha256sum"):
             stub(bin_dir, name, "exit 0\n")
+        # The users exist (the AMI's); nest-gw's ids are whatever useradd picked there.
+        stub(bin_dir, "id", 'case "$*" in "-u nest-gw") echo 990;; "-g nest-gw") echo 989;; esac\n')
         stub(bin_dir, "curl", 'echo "curl must not run here: $*" >&2; exit 1\n')
         script = fake / "user-data.sh"
         script.write_text(render(role, fake))
@@ -102,8 +113,8 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, timeout=60)
         return fake, proc, calls.read_text() if calls.exists() else ""
 
-    def check(self, role: str):
-        fake, proc, calls = self.run_role(role)
+    def check(self, role: str, nestd: str = "current"):
+        fake, proc, calls = self.run_role(role, nestd)
         self.assertEqual(proc.returncode, 0, f"{role}: {proc.stdout[-2000:]}{proc.stderr[-2000:]}\nsystemctl: {calls}")
         wants = fake / "etc/systemd/system/multi-user.target.wants"
         enabled = {p.name for p in wants.iterdir()} if wants.exists() else set()
@@ -117,9 +128,32 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         return cfg, fake
 
     def test_sandbox_host(self):
-        cfg, _ = self.check("burst")
+        cfg, fake = self.check("burst")
         self.assertIn("driver", cfg)
         self.assertEqual(cfg["storage"]["type"], "s3")
+        # The gateway runs as nest-gw, with no capabilities; nestd lets only its uid on
+        # gateway.sock and gives its group the sockets, by the ids read back on the host.
+        self.assertEqual(cfg["sockets"], {"gateway_gid": 989, "gateway_uids": [990]})
+        unit = self.gateway_unit(fake)
+        for line in ("User=nest-gw", "Group=nest-gw", "CapabilityBoundingSet=", "NoNewPrivileges=yes", "ProtectSystem=strict",
+                     "RestrictAddressFamilies=AF_UNIX AF_INET", "IPAddressDeny=any"):
+            self.assertIn(line, unit, unit)
+        self.assertNotIn("CAP_DAC_OVERRIDE", "\n".join(unit))
+        self.assertIn("ExecStartPre=/bin/sh -c 'for i in $(seq 60); do", "\n".join(unit))
+
+    def test_sandbox_host_on_the_previous_release(self):
+        """A nestd that can't give the gateway its sockets: the gateway keeps root's file access
+        (and nothing else of root's), and nestd.json names no gateway uid that would lock it out."""
+        cfg, fake = self.check("burst", nestd="previous")
+        self.assertEqual(cfg["sockets"], {})
+        unit = self.gateway_unit(fake)
+        self.assertIn("CapabilityBoundingSet=CAP_DAC_OVERRIDE", unit)
+        self.assertFalse([line for line in unit if line.startswith(("User=", "Group="))], unit)
+        self.assertIn("NoNewPrivileges=yes", unit)
+
+    @staticmethod
+    def gateway_unit(fake: Path) -> list:
+        return (fake / "etc/systemd/system/nest-gateway.service").read_text().splitlines()
 
     def test_brain_host(self):
         cfg, fake = self.check("controller")

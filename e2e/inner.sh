@@ -3,7 +3,7 @@
 # shared, so nest-proxy reaches the internet and nestd reaches the local control plane on 127.0.0.1;
 # nestd creates the per-sandbox netns (owned by this user namespace) itself.
 set -euo pipefail
-: "${WORK:?}" "${BIN:?}" "${E2E:?}" "${NEST_E2E_GATEWAY_PORT:?}"
+: "${WORK:?}" "${BIN:?}" "${E2E:?}" "${NEST_E2E_GATEWAY_PORT:?}" "${NEST_E2E_GATEWAY_UID:?}" "${NEST_E2E_GATEWAY_BIN:?}"
 mkdir -p "$WORK/logs"
 trap 'kill $(jobs -p) 2>/dev/null; wait' EXIT TERM INT
 
@@ -35,9 +35,12 @@ RUST_LOG=info,nestd=debug "$BIN/nestd" --config "$WORK/nestd-brain.json" >"$WORK
 echo $! >"$WORK/nestd-brain.pid"
 
 # The sandbox gateway: the only way the runner's hands reach the guest. It connects to nestd's
-# gateway socket and listens on loopback; the runner learns its URL from the control plane.
+# gateway socket and listens on loopback; the runner learns its URL from the control plane. As on a
+# host it runs as its own user, with no capabilities: it reaches gateway.sock and the guest's vsock
+# socket only because nestd gave them its group (`sockets.gateway_gid`).
 for _ in $(seq 100); do [ -S "$WORK/run/gateway.sock" ] && break; sleep 0.1; done
-RUST_LOG=info,nest_gateway=debug "$BIN/nest-gateway" --listen "127.0.0.1:$NEST_E2E_GATEWAY_PORT" \
+RUST_LOG=info,nest_gateway=debug setpriv --reuid "$NEST_E2E_GATEWAY_UID" --regid "$NEST_E2E_GATEWAY_UID" --clear-groups \
+    --no-new-privs -- "$NEST_E2E_GATEWAY_BIN" --listen "127.0.0.1:$NEST_E2E_GATEWAY_PORT" \
     --nestd-sock "$WORK/run/gateway.sock" >"$WORK/logs/gateway.log" 2>&1 &
 echo $! >"$WORK/gateway.pid"
 for _ in $(seq 100); do

@@ -66,6 +66,18 @@ else
     "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none"], "mount_disk": true}'
 fi
 
+# The gateway runs as nest-gw (install.sh made it; its ids are the AMI's, read back here): nestd
+# lets only that uid on gateway.sock and gives its group the socket and each VM's vsock socket. A
+# previous-release nestd can't (install.sh left that gateway root's): the default, root only.
+NESTD_FEATURES=$(/opt/nest/bin/nestd --features 2>/dev/null || true)
+if grep -qx gateway-user <<<"$NESTD_FEATURES"; then
+  GW_UID=$(id -u nest-gw)
+  GW_GID=$(id -g nest-gw)
+  SOCKETS="{\"gateway_gid\": $GW_GID, \"gateway_uids\": [$GW_UID]}"
+else
+  SOCKETS='{}'
+fi
+
 cat >/etc/nest/nestd.json <<EOF
 {
   "role": "$ROLE",
@@ -73,6 +85,7 @@ cat >/etc/nest/nestd.json <<EOF
   "control_url": "$CONTROL_URL",
   "enrollment": {"type": "aws_imds"},
   "driver": $DRIVER,
+  "sockets": $SOCKETS,
   "network": {"type": "netns", "persist_dir": "/run/nest/netns"},
   "delegated_cgroup": true,
   "gateway_url": "ws://127.0.0.1:18790",

@@ -27,6 +27,12 @@ pub struct ProcessDriver {
     pub guest_command: Vec<String>,
     /// Loop-mount the disk image at `/workspace` in the guest's own mount namespace.
     pub mount_disk: bool,
+    /// The gateway's group (`sockets.gateway_gid`): each VM's vsock socket is given to it
+    /// (`access.rs`). `None`: the socket keeps nestd's umask mode.
+    pub gateway_gid: Option<u32>,
+    /// nestd's `run_dir`: each VM's directory under it is made search-only (`0711`) whatever the
+    /// umask, so the gateway's user can reach the vsock socket inside.
+    pub run_dir: PathBuf,
 }
 
 /// Where the image is mounted inside the guest's mount namespace.
@@ -67,14 +73,15 @@ impl Driver for ProcessDriver {
         if self.guest_command.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "process driver: empty guest_command"));
         }
-        std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), mount_disk: self.mount_disk, spec, child: None, emulator: None }))
+        super::access::create_searchable(&self.run_dir, &spec.vm_dir)?;
+        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), mount_disk: self.mount_disk, gateway_gid: self.gateway_gid, spec, child: None, emulator: None }))
     }
 }
 
 pub struct ProcessVm {
     cmd: Vec<String>,
     mount_disk: bool,
+    gateway_gid: Option<u32>,
     spec: VmSpec,
     child: Option<std::process::Child>,
     emulator: Option<Emulator>,
@@ -116,6 +123,9 @@ impl Vm for ProcessVm {
         let guest_dir = self.guest_dir();
         std::fs::create_dir_all(&guest_dir)?;
         self.emulator = Some(Emulator::start(&self.vsock_uds_path(), &guest_dir)?);
+        if let Some(gid) = self.gateway_gid {
+            super::access::grant_socket(&self.vsock_uds_path(), nix::unistd::geteuid().as_raw(), gid)?;
+        }
         let mut cmd = if self.mount_disk {
             let disk = self.spec.disk_path.clone();
             tokio::task::spawn_blocking(move || ensure_ext4(&disk)).await.map_err(io::Error::other)??;
@@ -175,6 +185,42 @@ impl Drop for ProcessVm {
 mod tests {
     use super::*;
 
+    /// With a gateway group, the vsock socket a started VM exposes is `0660` in that group, so the
+    /// gateway (another user) can dial it. Without the grant it has nestd's umask mode (`0755`
+    /// under systemd), which no other user can connect to. The directories down to it are
+    /// search-only whatever nestd's umask (here left `0700`, as under umask 077).
+    #[tokio::test]
+    async fn the_vsock_socket_is_given_to_the_gateway_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let gid = nix::unistd::getegid().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let vm_dir = dir.path().join("vm/sbx_gw/1");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let chain = [dir.path().join("vm"), dir.path().join("vm/sbx_gw"), vm_dir.clone()];
+        for d in &chain {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let driver = ProcessDriver { guest_command: vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()], mount_disk: false, gateway_gid: Some(gid), run_dir: dir.path().into() };
+        let spec = VmSpec {
+            sandbox: nest_protocol::model::SandboxId("sbx_gw".into()),
+            epoch: nest_protocol::model::Epoch(1),
+            image: "test".into(),
+            resources: nest_protocol::model::Resources { vcpus: 1, memory_mib: 128, disk_gib: 1 },
+            vm_dir,
+            disk_path: dir.path().join("disk.img"),
+            netns: None,
+        };
+        let mut vm = driver.create(spec).await.unwrap();
+        vm.start().await.unwrap();
+        let meta = std::fs::metadata(vm.vsock_uds_path()).unwrap();
+        vm.stop().await.unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o660);
+        assert_eq!(meta.gid(), gid);
+        for d in &chain {
+            assert_eq!(std::fs::metadata(d).unwrap().permissions().mode() & 0o777, 0o711, "{}", d.display());
+        }
+    }
+
     /// A fresh image is formatted once; a formatted (e.g. restored) one is left alone.
     #[test]
     fn formats_a_fresh_image_once() {
@@ -208,6 +254,8 @@ mod tests {
         let driver = ProcessDriver {
             guest_command: vec!["/bin/sh".into(), "-c".into(), "echo state-that-moves > /workspace/marker && sync && exec sleep 30".into()],
             mount_disk: true,
+            gateway_gid: None,
+            run_dir: dir.path().into(),
         };
         let spec = VmSpec {
             sandbox: nest_protocol::model::SandboxId("sbx_mounttest".into()),

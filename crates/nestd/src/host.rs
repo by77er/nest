@@ -451,7 +451,7 @@ impl Host {
             None => match &cfg.driver {
                 None => Arc::new(crate::driver::NoDriver),
                 Some(DriverConfig::Process { guest_command, mount_disk }) => {
-                    Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk })
+                    Arc::new(crate::driver::process::ProcessDriver { guest_command: guest_command.clone(), mount_disk: *mount_disk, gateway_gid: cfg.sockets.gateway_gid, run_dir: cfg.run_dir.clone() })
                 }
                 Some(DriverConfig::Firecracker(fc)) => {
                     if let (Some(_), Some(j)) = (&fc.jailer_bin, &fc.jailer) {
@@ -461,7 +461,13 @@ impl Host {
                             Err(e) => tracing::warn!("removing stale jails: {e}"),
                         }
                     }
-                    Arc::new(crate::driver::firecracker::FirecrackerDriver { cfg: fc.clone(), parent_cgroup: delegated.as_ref().map(|d| d.vms.clone()), cgroup_root: cfg.cgroup_root.clone() })
+                    Arc::new(crate::driver::firecracker::FirecrackerDriver {
+                        cfg: fc.clone(),
+                        parent_cgroup: delegated.as_ref().map(|d| d.vms.clone()),
+                        cgroup_root: cfg.cgroup_root.clone(),
+                        gateway_gid: cfg.sockets.gateway_gid,
+                        run_dir: cfg.run_dir.clone(),
+                    })
                 }
             },
         };
@@ -489,7 +495,7 @@ impl Host {
         let runner_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.runner_uids.clone() };
         let runner = RunnerLink::start(&cfg.runner_sock(), enrolled.host.clone(), cfg.role, runner_access, runner_tx)?;
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded_channel();
-        let gateway_access = Access { gid: cfg.sockets.gid, allowed_uids: cfg.sockets.gateway_uids.clone() };
+        let gateway_access = Access { gid: cfg.sockets.gateway_sock_gid(), allowed_uids: cfg.sockets.gateway_uids.clone() };
         let gateway = if sandbox_host {
             GatewayLink::start(&cfg.gateway_sock(), enrolled.host.clone(), gateway_access, tombstones.clone(), gateway_tx)?
         } else {
