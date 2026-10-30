@@ -1,19 +1,20 @@
 {
   "type": "hands_resolved",
   "request": "req_01jb7r5c3k",
-  "hands": {
-    "url": "wss://01jb7k3x9q-gw-nest.example.dev",
-    "sandbox": "sbx_01jb7m2a4c",
-    "epoch": 4,
-    "binding": "nbd_eyJ2IjoxLCJraWQiOiI3ODdlZGM2OTJkYjU3OWZlIiwic2FuZGJveCI6InNieF8wMWpiN20yYTRjIiwiZXBvY2giOjQsImNsaWVudCI6ImFndF8wMWpiN24wdzFlIiwic2NvcGUiOiJoYW5kcyIsImV4cF9tcyI6MTc2MDI3NDAwMDAwMH0.ItHh9itdu2S5HRS4wBIIpwzdd7cb-AJN7G7Ixhz5ItzrGsR7nasdi_iN1SF1whJWG3DLNUpVrsrAgy2dpeSx7Q",
-    "guest": {
-      "protocol_version": 1,
-      "capabilities": [
-        "pty",
-        "cgroup_v2",
-        "pdf",
-        "fsfreeze"
-      ]
+  "outcome": {
+    "status": "ok",
+    "hands": {
+      "url": "wss://01jb7k3x9q-gw-nest.example.dev",
+      "binding": "nbd_eyJ2IjoxLCJraWQiOiI3ODdlZGM2OTJkYjU3OWZlIiwic2FuZGJveCI6InNieF8wMWpiN20yYTRjIiwiZXBvY2giOjQsImNsaWVudCI6ImFndF8wMWpiN24wdzFlIiwic2NvcGUiOiJoYW5kcyIsImV4cF9tcyI6MTc2MDI3NDAwMDAwMH0.ItHh9itdu2S5HRS4wBIIpwzdd7cb-AJN7G7Ixhz5ItzrGsR7nasdi_iN1SF1whJWG3DLNUpVrsrAgy2dpeSx7Q",
+      "guest": {
+        "protocol_version": 1,
+        "capabilities": [
+          "pty",
+          "cgroup_v2",
+          "pdf",
+          "fsfreeze"
+        ]
+      }
     }
   }
 }

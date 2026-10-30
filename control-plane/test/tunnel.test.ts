@@ -6,7 +6,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
-import { CloudflareError, type CloudflareApi } from "../src/lib/cloudflare";
+import { CloudflareError, type CloudflareApi, type Listing } from "../src/lib/cloudflare";
 import { CapacityError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { NestError } from "../src/lib/util";
@@ -88,9 +88,11 @@ class FakeCloudflare implements CloudflareApi {
     if (this.undeletable.has(tunnelId)) this.refuse("tunnel has active connections");
     this.tunnels.delete(tunnelId);
   }
-  async listTunnels(prefix: string): Promise<{ id: string; name: string }[]> {
+  /** What the listings say about themselves (false: stopped at the page limit). */
+  complete = { tunnels: true, records: true };
+  async listTunnels(prefix: string): Promise<Listing> {
     this.calls.push(`listTunnels ${prefix}`);
-    return [...this.tunnels].filter(([, t]) => t.name.startsWith(prefix)).map(([id, t]) => ({ id, name: t.name }));
+    return { items: [...this.tunnels].filter(([, t]) => t.name.startsWith(prefix)).map(([id, t]) => ({ id, name: t.name })), complete: this.complete.tunnels };
   }
   async createRecord(zoneId: string, hostname: string, tunnelId: string, comment: string): Promise<{ id: string }> {
     this.calls.push(`createRecord ${zoneId} ${hostname} ${tunnelId} ${comment}`);
@@ -100,9 +102,9 @@ class FakeCloudflare implements CloudflareApi {
     this.records.set(id, { zone: zoneId, name: hostname, content: `${tunnelId}.cfargotunnel.com` });
     return { id };
   }
-  async listRecords(zoneId: string, suffix: string): Promise<{ id: string; name: string }[]> {
+  async listRecords(zoneId: string, suffix: string): Promise<Listing> {
     this.calls.push(`listRecords ${zoneId} ${suffix}`);
-    return [...this.records].filter(([, r]) => r.zone === zoneId && r.name.endsWith(suffix)).map(([id, r]) => ({ id, name: r.name }));
+    return { items: [...this.records].filter(([, r]) => r.zone === zoneId && r.name.endsWith(suffix)).map(([id, r]) => ({ id, name: r.name })), complete: this.complete.records };
   }
   async deleteRecord(zoneId: string, recordId: string): Promise<void> {
     this.calls.push(`deleteRecord ${zoneId} ${recordId}`);
@@ -127,6 +129,12 @@ async function recordIntent(cell: string, host: string, createdMs: number): Prom
   await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
     st.storage.sql.exec("INSERT OR REPLACE INTO tunnels_created (host, created_ms) VALUES (?, ?)", host, createdMs);
   });
+}
+
+/** The hosts this cell recorded creating a tunnel for, sorted. */
+async function intents(cell: string): Promise<string[]> {
+  return runInDurableObject(fleetStub(cell), (_i: FleetDO, st) =>
+    st.storage.sql.exec<{ host: string }>("SELECT host FROM tunnels_created ORDER BY host").toArray().map((r) => r.host));
 }
 
 /** Deletions run off the request path (`waitUntil`); wait for the fake to see them. */
@@ -409,7 +417,7 @@ describe("a revoked tunnel API token", () => {
     expect(h.gateway_url).toBeUndefined();
     expect(await hostRow(cell, h.host as string)).toMatchObject({ tunnel_id: null, tunnel_hostname: null, dns_record_id: null });
     expect(cf.tunnels.size).toBe(0);
-    expect(await sweep(cell)).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0 });
+    expect(await sweep(cell)).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0, forgotten: 0 });
     // An outage is different: the enrollment fails and the host retries.
     cf.refuseTunnelWith = 503;
     expect((await enrollRaw(cell, (await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "burst", cell } })).token)).status).toBe(502);
@@ -508,7 +516,7 @@ describe("a dead host's tunnel", () => {
     // Cloudflare still lists the tunnel later (a delete whose answer was lost): the sweep knows the
     // host as this cell's and dead, and deletes it.
     cf.tunnels.set(tunnelId, { name: `nest-${label(a.host)}`, ingress: null });
-    expect(await sweep(cell)).toEqual({ tunnels: 1, records: 0, retried: 0, failed: 0, unknown: 0 });
+    expect(await sweep(cell)).toEqual({ tunnels: 1, records: 0, retried: 0, failed: 0, unknown: 0, forgotten: 0 });
     expect(cf.tunnels.has(tunnelId)).toBe(false);
   });
 
@@ -570,7 +578,7 @@ describe("the sweep", () => {
     await recordIntent(cell, `hst_${STALE}`, Date.now() - 2 * HOUR);
     await recordIntent(cell, `hst_${YOUNG}`, Date.now());
     const counts = await sweep(cell);
-    expect(counts).toEqual({ tunnels: 1, records: 1, retried: 0, failed: 0, unknown: 4 });
+    expect(counts).toEqual({ tunnels: 1, records: 1, retried: 0, failed: 0, unknown: 4, forgotten: 0 });
     expect(cf.tunnels.has(stale), "an hour without a row: the enrollment failed").toBe(false);
     expect(cf.records.has(staleRec)).toBe(false);
     for (const id of [bitty, rollout, orphan, lookalike, otherLabel, young]) expect(cf.tunnels.has(id), id).toBe(true);
@@ -579,8 +587,12 @@ describe("the sweep", () => {
     expect(cf.recordNamed(hostnameOf(live.host)), "the live host's record").toBeDefined();
     // Only nest's name prefix and hostname suffix were ever listed.
     expect(cf.calls.filter((c) => c.startsWith("list"))).toEqual([`listRecords ${ZONE_ID} -gw-nest.example.dev`, "listTunnels nest-"]);
+    // The next complete listing no longer shows the failed enrollment's assets: its record of
+    // creating them goes. The one in flight (inside the grace) and the live host's stay.
+    expect(await sweep(cell)).toMatchObject({ tunnels: 0, records: 0, failed: 0, forgotten: 1 });
+    expect(await intents(cell)).toEqual([`hst_${YOUNG}`, live.host].sort());
     // Nothing configured: the sweep is a no-op.
-    expect(await sweep(uniqueCell())).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0 });
+    expect(await sweep(uniqueCell())).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0, forgotten: 0 });
   });
 
   it("never deletes another cell's live host from the shared account", async () => {
@@ -591,7 +603,7 @@ describe("the sweep", () => {
     await withCloudflare(theirs, cf);
     const other = await connectHost(theirs);
     const own = await connectHost(mine);
-    expect(await sweep(mine)).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 2 });
+    expect(await sweep(mine)).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 2, forgotten: 0 });
     expect(cf.tunnelNamed(`nest-${label(other.host)}`), "the other cell's tunnel").toBeDefined();
     expect(cf.recordNamed(hostnameOf(other.host)), "the other cell's record").toBeDefined();
     expect(cf.tunnelNamed(`nest-${label(own.host)}`)).toBeDefined();
@@ -608,7 +620,7 @@ describe("the sweep", () => {
     await until(() => cf.calls.some((c) => c.startsWith("createRecord")), "the tunnel to exist before its record");
     cf.gate = null;
     // The tunnel is listed and has no hosts row yet: this cell created it moments ago, so it stays.
-    expect(await sweep(cell)).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0 });
+    expect(await sweep(cell)).toEqual({ tunnels: 0, records: 0, retried: 0, failed: 0, unknown: 0, forgotten: 0 });
     release();
     const h = await enrolling;
     const [tunnelId] = cf.tunnelNamed(`nest-${label(h.host)}`)!;
@@ -622,9 +634,32 @@ describe("the sweep", () => {
     await recordIntent(cell, `hst_${STALE}`, Date.now() - 2 * HOUR);
     const listRecords = cf.listRecords.bind(cf);
     cf.listRecords = async () => (cf as unknown as { refuse(what: string): never }).refuse("records unavailable");
-    expect(await sweep(cell)).toEqual({ tunnels: 1, records: 0, retried: 0, failed: 1, unknown: 0 });
+    expect(await sweep(cell)).toEqual({ tunnels: 1, records: 0, retried: 0, failed: 1, unknown: 0, forgotten: 0 });
     expect(cf.tunnels.has(stale)).toBe(false);
     cf.listRecords = listRecords;
+  });
+
+  it("forgets what it created only once a complete listing shows nothing left", async () => {
+    const cell = uniqueCell();
+    const cf = await withCloudflare(cell);
+    // A failed enrollment left only its record behind.
+    const staleRec = cf.seedRecord(`${STALE}-gw-nest.example.dev`);
+    await recordIntent(cell, `hst_${STALE}`, Date.now() - 2 * HOUR);
+    const listRecords = cf.listRecords.bind(cf);
+    cf.listRecords = async () => (cf as unknown as { refuse(what: string): never }).refuse("records unavailable");
+    // The tunnel listing shows nothing, but the records were never listed: proof of nothing.
+    expect(await sweep(cell)).toMatchObject({ records: 0, failed: 1, forgotten: 0 });
+    expect(await intents(cell)).toEqual([`hst_${STALE}`]);
+    cf.listRecords = listRecords;
+    expect(await sweep(cell)).toMatchObject({ records: 1, failed: 0, forgotten: 0 });
+    expect(cf.records.has(staleRec)).toBe(false);
+    // A listing cut off at its page limit proves nothing either.
+    cf.complete.tunnels = false;
+    expect(await sweep(cell)).toMatchObject({ records: 0, failed: 0, forgotten: 0 });
+    expect(await intents(cell)).toEqual([`hst_${STALE}`]);
+    cf.complete.tunnels = true;
+    expect(await sweep(cell)).toMatchObject({ records: 0, forgotten: 1 });
+    expect(await intents(cell)).toEqual([]);
   });
 });
 

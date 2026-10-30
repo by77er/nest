@@ -1,0 +1,46 @@
+{
+  "cmd": "cmd_01jb7q0017",
+  "issued_ms": 1760270400000,
+  "type": "agent_start",
+  "agent": "agt_01jb7n0w1e",
+  "role": "worker",
+  "workstream": "ws_01jb7j8r2t",
+  "resume": {
+    "session": "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73",
+    "segments": [
+      {
+        "offset": 0,
+        "len": 262144,
+        "base": true,
+        "url": "https://nest.example.dev/v1/blobs/sessions/agt_01jb7n0w1e/0?exp=1767225600000&sig=ab12"
+      },
+      {
+        "offset": 262144,
+        "len": 18311,
+        "base": false,
+        "url": "https://nest.example.dev/v1/blobs/sessions/agt_01jb7n0w1e/262144?exp=1767225600000&sig=cd34"
+      }
+    ],
+    "total_bytes": 280455,
+    "fork": false
+  },
+  "hands": {
+    "sandbox": "sbx_01jb7m2a4c",
+    "epoch": 4
+  },
+  "launch": {
+    "model": "opus",
+    "effort": "high",
+    "builtin_tools": [
+      "TodoWrite",
+      "Task",
+      "WebSearch"
+    ],
+    "system_prompt": {
+      "mode": "append",
+      "text": "You work in a remote sandbox through the mcp__nest__* tools..."
+    }
+  },
+  "oauth_token": "sk-ant-oat01-REDACTED-EXAMPLE",
+  "session_ws_url": "wss://nest.example.dev/v1/agents/agt_01jb7n0w1e/session"
+}

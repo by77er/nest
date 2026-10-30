@@ -261,7 +261,7 @@ describe("#8 tool calls cut off by an eviction", () => {
 
 describe("#9 no secrets at rest outside BrokerDO", () => {
   it("stored command bodies hold references; the host receives the value", async () => {
-    const s = await setup();
+    const s = await setup({ start: false });
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
     expect(start.oauth_token).toBe("sk-ant-oat01-regress");
@@ -517,7 +517,8 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
     expect((await agentStub(s.agent).info()).state).toBe("detached");
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "wake up" } }, 201);
     const [start] = await nextCommands(s.host.ws, isStart(s.agent));
-    expect(start).toMatchObject({ hands: { sandbox: s.sandbox, epoch: 1 } });
+    // A new start, a new agent epoch (`hands.epoch` repeats it for the previous release's runners).
+    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox, epoch: 2 } });
   });
 
   it("a brain that dies mid-turn restarts; after repeated crashes only new input retries", async () => {
@@ -529,8 +530,9 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
       r.ws.close();
       const seq = exited(s, s.agent, "crashed");
       await s.host.ws.next("ack", (m) => m.up_to === seq);
-      await nextCommands(s.host.ws, isStart(s.agent));
-      r = await runner(s.agent, s.host.host, s.host.host_token, `rin_c${i}`);
+      const start = (await nextCommands(s.host.ws, isStart(s.agent))).find(isStart(s.agent));
+      expect(start.epoch).toBe(i + 1);
+      r = await runner(s.agent, s.host.host, s.host.host_token, `rin_c${i}`, start.epoch);
       await r.ws.next("run_turn", (m) => m.input.kind === "recovery");
     }
     r.ws.close();
@@ -610,7 +612,7 @@ describe("docs #13 guest CLI mapping", () => {
 
 describe("docs #8 hello.agents reconciliation", () => {
   it("a started brain the host no longer reports is marked detached; a reported one is kept", async () => {
-    const s = await setup();
+    const s = await setup({ start: false });
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
     await okResult(s.host.ws, start.cmd);
@@ -618,8 +620,15 @@ describe("docs #8 hello.agents reconciliation", () => {
     again.send(hostHello(s.host.host, s.cell, { agents: [] }));
     await again.next("hello_ack");
     await sleep(50);
-    expect((await agentStub(s.agent).info()).state).toBe("detached");
+    // Gone, at its start's epoch: the agent no longer has a host there.
+    expect(await agentStub(s.agent).info()).toMatchObject({ state: "detached", host: null });
 
+    // A brain AgentDO took for detached that the host does report is kept.
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.brain = { host: s.host.host, epoch: info.agent_epoch, phase: "live", since_ms: Date.now() };
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
     const third = await Ws.connect("/v1/fleet", s.host.host_token);
     third.send(hostHello(s.host.host, s.cell, { agents: [{ agent: s.agent, state: "idle" }] }));
     await third.next("hello_ack");
@@ -707,13 +716,14 @@ describe("#26 a recovery turn says what the transcript can't", () => {
     }]);
     await nextCommands(s.host.ws, (c) => c.type === "commit_result" && c.request === "req_rec");
     const head = (await env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)).headGeneration())!;
-    // Its host dies: the sandbox gets a new lease (epoch 2) on another host, and the brain follows.
+    // Its host dies: the sandbox gets a new lease (epoch 2) on another host, and the brain, which died
+    // with the host, starts again (today's placement puts it on the sandbox's new host).
     const b = await connectHost(s.cell);
     s.host.ws.close();
     r1.ws.close();
     await adminJson(`/v1/admin/hosts/${s.host.host}/confirm-dead?cell=${s.cell}`, { body: {} });
     expect(await sandboxStub(s.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
-    await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === s.agent && c.hands.epoch === 2);
+    await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === s.agent && c.epoch === 2);
     // "Moved during the turn" is SandboxDO's epoch against the one recorded at turn start, not AgentDO's
     // record of the move push (which can be lost): forget that record.
     await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {

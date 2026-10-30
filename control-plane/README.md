@@ -46,8 +46,12 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      the only way to mint a public share link (agents can't)
    - `POST /v1/agents {role, workstream?, sandbox?, cell?, start?}`: sends `agent_start` to the host; a worker's
      workstream and cell come from its sandbox (a mismatch is refused with 409)
-   - `POST /v1/agents/<id>/start {host?}`: start (or restart) the brain; `host` puts it on a chosen active,
-     connected host of the cell (for a test); hands still go through the sandbox's gateway
+   - `POST /v1/agents/<id>/start {host?, restart?}`: start (or restart) the brain; `host` puts it on a chosen active,
+     connected host of the cell (for a test); hands still go through the sandbox's gateway. Answers `{host, cmd}`;
+     `kind: none` when the brain already runs (nothing sent; `{restart: true}` restarts it: condemned, then started
+     again once released); `kind: waiting, waiting_for: <host>` when the brain runs on another host: it is condemned
+     and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
+     once that brain's exit or its host's loss releases it
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
@@ -55,7 +59,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/admin/hosts/<id>/confirm-dead`: manual STONITH (also releases the host's tunnel and record; a host
      still running cloudflared keeps its tunnel undeletable until the instance is gone, and the sweep finishes it)
    - `POST /v1/admin/tunnels/sweep?cell=<cell>`: run the daily tunnel sweep now; returns what it deleted, retried,
-     failed and left alone (`unknown`: nest-named tunnels and records this cell did not create)
+     failed and left alone (`unknown`: nest-named tunnels and records this cell did not create), and how many of
+     its own records of creating a tunnel it forgot (`forgotten`: no host row, and two complete listings show nothing)
    - `PUT /v1/admin/secrets/access:gateway {"value": "{\"client_id\":...,\"client_secret\":...}"}`: the Cloudflare
      Access service token `resolve` hands out as `edge` on every target that points at a host's connected tunnel
    - `GET /v1/admin/fleet?cell=<cell>`: hosts (status, tunnel state, capacity, resident sandboxes and brains, idle since),
@@ -108,10 +113,11 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   first Cloudflare call, for a host that is dead or never got a row within an hour; every other nest-shaped name
   is counted as `unknown` and logged. `resolve` carries the Access service token only when the host has a tunnel,
   never because a URL happens to be `wss://`. A sandbox host enrolled before this change has no tunnel until it
-  re-enrolls (a new instance). Not built: the agent epoch, host kinds with brain placement by capacity, key
+  re-enrolls (a new instance). Not built: host kinds with brain placement by capacity, key
   rotation and the three desired versions. The code has `burst` and `controller` host roles
   (`HostRole`), `FleetDO.controllerHost()` starts captains on a `controller` host, other brains start on the
-  sandbox's host, and `agent_start.hands` carries the sandbox id and epoch only (the runner fetches its target).
+  sandbox's host when they start (AgentDO issues an agent epoch per start; a sandbox move doesn't restart them),
+  and `agent_start.hands` carries the sandbox id only (the runner fetches its target).
 - **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
   with attenuation, spawn specs, templates and capabilities, owners and labels aren't built. The code still has
   `AgentRole` (placement, tool filtering, launch defaults, per-role setup token), WorkstreamDO with

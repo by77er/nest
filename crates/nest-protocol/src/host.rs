@@ -409,7 +409,17 @@ pub mod runner {
         LeaseUpdate { valid_until_ms: TimestampMs },
         /// Start (or resume) a brain.
         AgentStart(Box<AgentStart>),
-        AgentStop { agent: AgentId, mode: StopMode, reason: String },
+        /// `epoch`: for a kill, the agent epoch it is for (nestd forwards the control plane's).
+        /// The runner keeps it as the agent's tombstone: a brain at or below it is killed, a newer
+        /// one is left alone, and a start at or below it is refused even if it registers later.
+        /// Absent (a graceful stop, or nestd of the previous release): whatever runs is stopped.
+        AgentStop {
+            agent: AgentId,
+            mode: StopMode,
+            reason: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            epoch: Option<Epoch>,
+        },
         /// Kill these brains now (empty = all). The runner then reports
         /// `AgentExited { reason: fenced }` and closes their session channels.
         Fence {
@@ -435,6 +445,10 @@ pub mod runner {
             claude_version: String,
             /// `system/init.capabilities` (feature detection, e.g. `interrupt_receipt_v1`).
             capabilities: Vec<String>,
+            /// The agent epoch of the start this brain registered under (absent from a runner of
+            /// the previous release): nestd marks that start's entry, and no other.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            epoch: Option<Epoch>,
         },
         /// Claude Code capabilities, sent whenever they become known (`system/init` may only
         /// arrive after the first user message, i.e. after `agent_started`).
@@ -451,6 +465,9 @@ pub mod runner {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             signal: Option<i32>,
             reason: ExitReason,
+            /// The agent epoch the brain ran under (its last adopted one).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            epoch: Option<Epoch>,
         },
         Pong { nonce: u64, agents: u32 },
         Error {
@@ -465,7 +482,7 @@ pub mod runner {
     pub struct AgentStart {
         /// As received from FleetDO (`CommandBody::AgentStart`), including `oauth_token`,
         /// `session_ws_url`, `resume` (Worker-signed segment URLs the runner downloads) and
-        /// `hands` (the sandbox's id and epoch only; the runner fetches the gateway target over
+        /// `hands` (the sandbox's id only; the runner fetches the gateway target over
         /// its session channel). nestd adds nothing about hands: the runner never touches a
         /// vsock socket.
         pub start: crate::control::AgentStart,

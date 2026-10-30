@@ -1,0 +1,5 @@
+.tlc-states/
+.tools/
+*.out
+states/
+*_TTrace_*

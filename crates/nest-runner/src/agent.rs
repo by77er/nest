@@ -22,7 +22,7 @@ use nest_protocol::control::{SegmentRef, SessionResume};
 use nest_protocol::host::claude::{self, SessionArgs, StreamIn, StreamOut, SystemMessage};
 use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerEvent, StopMode};
 use nest_protocol::control::LaunchConfig;
-use nest_protocol::model::{AgentEventBody, AgentState, Epoch, ErrorBody, SessionId, TurnInputKind};
+use nest_protocol::model::{AgentEventBody, AgentState, ErrorBody, SessionId, TurnInputKind};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use tokio::io::AsyncWriteExt;
@@ -33,7 +33,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::framing;
-use crate::runtime::{Agent, AgentCmd, Outbound, Runtime};
+use crate::runtime::{Agent, AgentCmd, Outbound, Refused, Runtime};
 use crate::session;
 use crate::stream;
 
@@ -60,8 +60,8 @@ pub fn tool_allowed(name: &str) -> bool {
 const MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to wait for a previous connection's brain (being killed) to go away.
-const DYING_WAIT: Duration = Duration::from_secs(10);
+/// How often a start waiting for the previous brain (being killed) to go away looks again.
+const DYING_POLL: Duration = Duration::from_millis(100);
 /// Pending stdin messages per brain before a write is refused.
 const STDIN_QUEUE: usize = 64;
 /// After a `result` while more user messages are outstanding: if Claude Code shows no further
@@ -70,13 +70,15 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 /// Start an agent in the background. Errors are reported to nestd.
 pub fn start(rt: Arc<Runtime>, start: AgentStart) {
+    // Taken on arrival, before the task runs: a fence of every brain after this drops the start.
+    let fence_gen = rt.fence_gen();
     tokio::spawn(async move {
         let id = start.start.agent.clone();
         if let Some(bad) = start.start.launch.builtin_tools.iter().find(|t| !HOST_SAFE_BUILTINS.contains(&t.as_str())) {
             let msg = format!("refusing to start: built-in tool {bad} is not on the runner's host-safe allowlist");
             tracing::error!(agent = %id, "{msg}");
             rt.report(RunnerEvent::Error { agent: Some(id.clone()), error: ErrorBody { code: "forbidden_tool".into(), message: msg, retryable: false } });
-            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Crashed });
+            refuse_superseding(&rt, &id, start.start.agent_epoch(), ExitReason::Crashed).await;
             return;
         }
         if !rt.lease_valid() {
@@ -84,13 +86,14 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 agent: Some(id.clone()),
                 error: ErrorBody { code: "no_lease".into(), message: "no valid host lease; refusing to start a brain".into(), retryable: true },
             });
-            rt.report(RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced });
+            refuse_superseding(&rt, &id, start.start.agent_epoch(), ExitReason::Fenced).await;
             return;
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let hands = start.start.hands.clone();
-        let epoch = hands.as_ref().map(|h| h.epoch).unwrap_or(Epoch(0));
+        // The agent epoch AgentDO issued for this start; never the sandbox's.
+        let epoch = start.start.agent_epoch();
         let secrets = vec![start.start.oauth_token.expose().to_owned()];
         let agent = Agent::new(
             id.clone(),
@@ -104,24 +107,46 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             cmd_tx,
             out_tx,
         );
-        let deadline = Instant::now() + DYING_WAIT;
+        // An exit this runner reports at an agent epoch means no brain of the agent at or below it
+        // runs here any more (AgentDO releases the brain on it): a start that never runs reports
+        // its exit only once any older brain has gone.
+        let older_gone = |rt: &Runtime| rt.agent(&id).is_none_or(|a| a.epoch() > epoch);
         loop {
-            match rt.register(agent.clone()) {
+            match rt.register(agent.clone(), fence_gen) {
                 Ok(()) => break,
-                Err(existing) if existing.conn_gen != agent.conn_gen && Instant::now() < deadline => {
-                    // A brain from an earlier nestd connection: it was fenced when that
-                    // connection dropped and is on its way out.
-                    existing.kill_now(ExitReason::Fenced);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(existing) => {
-                    tracing::warn!(agent = %id, "agent_start for a brain that is already running; updating its hands only");
-                    existing.set_hands(start.start.hands.clone());
-                    rt.report(RunnerEvent::Error {
-                        agent: Some(id),
-                        error: ErrorBody { code: "already_running".into(), message: "brain already running".into(), retryable: false },
-                    });
+                Err(Refused::Killed) => {
+                    // A kill for this epoch (or a later one) overtook the start: it never runs. The
+                    // kill also ended any older brain; its exit is reported once that one is gone.
+                    tracing::warn!(agent = %id, epoch = epoch.0, "agent_start below a kill's epoch: refused");
+                    while !older_gone(&rt) {
+                        tokio::time::sleep(DYING_POLL).await;
+                    }
+                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
                     return;
+                }
+                Err(Refused::Running(existing)) if existing.epoch() == epoch => {
+                    // The same start again (a duplicate): a no-op; the brain runs on (N22).
+                    tracing::warn!(agent = %id, epoch = epoch.0, "duplicate agent_start for the registered brain: ignored");
+                    return;
+                }
+                Err(Refused::Running(existing)) if existing.epoch() > epoch => {
+                    // A newer brain is registered: this start is stale (N18). It never runs, never
+                    // ends the newer brain, and its exit says so at its own epoch.
+                    tracing::warn!(agent = %id, epoch = epoch.0, running = existing.epoch().0, "agent_start older than the registered brain: refused");
+                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
+                    return;
+                }
+                Err(Refused::Running(existing)) => {
+                    // AgentDO starts a brain only once the previous one is released, so an older
+                    // brain still registered here is one on its way out (of an earlier nestd
+                    // connection, fenced when it dropped, or killed): never adopted, never run
+                    // beside. It is ended, and this start registers once it is gone.
+                    if existing.conn_gen == agent.conn_gen && !existing.is_stopping() {
+                        tracing::warn!(agent = %id, epoch = epoch.0, "agent_start while a brain of this agent is registered; ending it first");
+                    }
+                    existing.stopping.store(true, Ordering::SeqCst);
+                    existing.kill_now(if existing.conn_gen != agent.conn_gen { ExitReason::Fenced } else { ExitReason::Stopped });
+                    tokio::time::sleep(DYING_POLL).await;
                 }
             }
         }
@@ -138,10 +163,25 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 );
             }
             agent.send_out(Outbound::Close);
-            rt.deregister(&agent);
-            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason });
+            let epoch = rt.deregister(&agent);
+            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason, epoch: Some(epoch) });
         }
     });
+}
+
+/// Refuse a start before it registers (a forbidden built-in, no lease). It supersedes any older brain
+/// of the agent here, which is ended under the start's epoch (its tombstone); the refusal's exit is
+/// reported only once that brain has gone, since an exit at an epoch means nothing of the agent at
+/// or below it runs here (A4).
+async fn refuse_superseding(rt: &Arc<Runtime>, id: &nest_protocol::model::AgentId, epoch: nest_protocol::model::Epoch, reason: ExitReason) {
+    if let Some(old) = rt.tombstone(id, epoch) {
+        old.stopping.store(true, Ordering::SeqCst);
+        old.kill_now(ExitReason::Stopped);
+    }
+    while rt.agent(id).is_some_and(|a| a.epoch() <= epoch) {
+        tokio::time::sleep(DYING_POLL).await;
+    }
+    rt.report(RunnerEvent::AgentExited { agent: id.clone(), code: None, signal: None, reason, epoch: Some(epoch) });
 }
 
 /// Run one startup step with a deadline; a kill/stop cancels it.
@@ -297,8 +337,8 @@ async fn run(
     let auth = step(&cancel, "claude auth status", AUTH_TIMEOUT, async { Ok(auth_method(&rt, &launch.env).await) }).await?;
     if auth != "oauth_token" {
         rt.report_for(&agent, RunnerEvent::AuthCheck { agent: agent.id.clone(), auth_method: auth, api_key_source: "unknown".into(), ok: false });
-        rt.deregister(&agent);
-        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed });
+        let epoch = rt.deregister(&agent);
+        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed, epoch: Some(epoch) });
         return Ok(());
     }
     let version = step(&cancel, "claude --version", VERSION_TIMEOUT, async { Ok(claude_version(&rt, &launch.env).await) }).await?;
@@ -314,10 +354,12 @@ async fn run(
         let session = session_id.clone().unwrap_or_else(|| SessionId("ses_pending".into()));
         let timeout = rt.cfg.session_open_timeout;
         let pid = proc.pid;
+        // The epoch this start registered under (not one adopted since): nestd marks that start.
+        let epoch = s.start.agent_epoch();
         tokio::spawn(async move {
             let _ = tokio::time::timeout(timeout, opened).await;
             let capabilities = agent.inner.lock().unwrap().capabilities.clone();
-            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities });
+            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities, epoch: Some(epoch) });
         });
     }
 
@@ -802,8 +844,8 @@ impl Actor {
         self.agent.cancel_hands();
         self.agent.emit(AgentEventBody::StateChanged { state: AgentState::Detached, detail: Some(reason.as_str().into()) });
         self.agent.send_out(Outbound::Close);
-        self.rt.deregister(&self.agent);
-        self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason });
+        let epoch = self.rt.deregister(&self.agent);
+        self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason, epoch: Some(epoch) });
         true
     }
 
@@ -899,7 +941,7 @@ mod tests {
         let rt = Runtime::new(crate::Config::default());
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let agent = Agent::new(AgentId("agt_t".into()), AgentRole::Worker, Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
+        let agent = Agent::new(AgentId("agt_t".into()), AgentRole::Worker, nest_protocol::model::Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
         let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
         let launch = LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: String::new() } };
         let actor = Actor {

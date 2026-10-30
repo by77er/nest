@@ -164,7 +164,14 @@ async fn connect(
     loop {
         let (target, generation) = ensure_target(agent, cancel, budgets).await?;
         let e = match nest_hands_client::open(&target, &budgets.open).await {
-            Ok(c) => return Ok((c, target.epoch, generation)),
+            // The epoch every request carries is the binding's, the one the gateway checks.
+            Ok(c) => match c.epoch() {
+                Some(epoch) => return Ok((c, epoch, generation)),
+                None => {
+                    agent.drop_target_if(generation);
+                    return Err(ToolCallResult::error("hands unavailable: the target's binding does not parse"));
+                }
+            },
             Err(e) => e,
         };
         match e.next() {
@@ -180,7 +187,7 @@ async fn connect(
                 // a fresh one. Refusals a fresh target may cure get one retry in this call.
                 agent.drop_target_if(generation);
                 if next == Next::Resolve && !retries.re_resolved {
-                    tracing::info!(agent = %agent.id, sandbox = %target.sandbox, "hands target refused ({e}); resolving again");
+                    tracing::info!(agent = %agent.id, "hands target refused ({e}); resolving again");
                     retries.re_resolved = true;
                     if edge_outage(&e) && sleep_or_cancel(budgets.edge_pause.min(budgets.max_sleep), cancel).await {
                         return Err(ToolCallResult::error("interrupted"));
@@ -291,15 +298,17 @@ async fn ensure_target(
     }
     let started = Instant::now();
     loop {
+        let seen_gen = agent.target_gen();
         let outcome = tokio::select! {
             r = agent.resolve_hands_target(budgets.resolve_timeout) => r,
             _ = &mut *cancel => return Err(ToolCallResult::error("interrupted")),
         };
         match outcome {
-            Ok(HandsResolveOutcome::Target(t)) => {
-                let generation = agent.set_hands_target(t.clone());
-                return Ok((t, generation));
-            }
+            Ok(HandsResolveOutcome::Target(t)) => match agent.set_hands_target(t.clone(), seen_gen) {
+                Some(generation) => return Ok((t, generation)),
+                // The hands moved to another sandbox while this was in flight: ask again.
+                None => continue,
+            },
             Ok(HandsResolveOutcome::Error { error, retry_after_ms }) if error.code == SANDBOX_NOT_READY && error.retryable => {
                 let wait = retry_after_ms.map(Duration::from_millis).unwrap_or(NOT_READY_RETRY);
                 let Some(wait) = capped(wait, started, budgets.not_ready, budgets.max_sleep) else {
@@ -412,7 +421,7 @@ mod tests {
             AgentRole::Worker,
             Epoch(4),
             std::env::temp_dir(),
-            Some(HandsBinding { sandbox: SandboxId(SBX.into()), epoch: Epoch(4) }),
+            Some(HandsBinding { sandbox: SandboxId(SBX.into()), epoch: None }),
             None,
             vec![],
             0,
@@ -789,8 +798,8 @@ mod tests {
     async fn a_refusal_does_not_drop_a_fresher_target_another_call_stored() {
         let (gw, _guest) = gateway_with_guest().await;
         let (agent, _) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
-        let stale_gen = agent.set_hands_target(gw.target(SBX, 3, AGENT));
-        let fresh_gen = agent.set_hands_target(gw.target(SBX, 4, AGENT));
+        let stale_gen = agent.set_hands_target(gw.target(SBX, 3, AGENT), agent.target_gen()).unwrap();
+        let fresh_gen = agent.set_hands_target(gw.target(SBX, 4, AGENT), agent.target_gen()).unwrap();
         agent.drop_target_if(stale_gen);
         assert_eq!(agent.hands_target().map(|(_, g)| g), Some(fresh_gen), "an old generation never drops a newer target");
         agent.drop_target_if(fresh_gen);
@@ -902,19 +911,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hands_resolved_wire_shapes_map_to_outcomes() {
+    async fn a_resolve_answered_after_the_hands_changed_is_not_cached() {
+        let (gw, _guest) = gateway_with_guest().await;
         let (agent, _) = agent_with_resolver(vec![]);
-        match HandsResolveOutcome::from_wire(None, None, None) {
-            HandsResolveOutcome::Error { error, .. } => assert_eq!(error.code, error_codes::INVALID_MESSAGE),
-            o => panic!("{o:?}"),
-        }
+        let seen = agent.target_gen();
+        // A later agent_start rebinds the brain to another sandbox while the resolve is in flight.
+        agent.set_hands(Some(HandsBinding { sandbox: SandboxId("sbx_other".into()), epoch: None }));
+        assert_eq!(agent.set_hands_target(gw.target(SBX, 4, AGENT), seen), None, "the old sandbox's target is not stored");
+        assert!(agent.hands_target().is_none());
+    }
+
+    #[tokio::test]
+    async fn requests_carry_the_bindings_epoch_not_the_targets_unsigned_copies() {
+        let (gw, guest) = gateway_with_guest().await;
+        // The previous release's unsigned copies, here disagreeing with the signed claims (epoch 4).
+        let mut t = gw.target(SBX, 4, AGENT);
+        t.sandbox = Some(SandboxId("sbx_somewhere_else".into()));
+        t.epoch = Some(Epoch(99));
+        let (agent, _) = agent_with_resolver(vec![target(t)]);
+        let (_tx, rx) = oneshot::channel();
+        let r = call(&agent, "c1".into(), bash("echo hi"), rx).await;
+        assert!(!r.is_error, "{r:?}");
+        assert_eq!(guest.requests().await[0].epoch, Epoch(4), "the request carries the claims' epoch");
+    }
+
+    #[tokio::test]
+    async fn an_answer_nobody_awaits_is_ignored() {
+        let (agent, _) = agent_with_resolver(vec![]);
         let e = ErrorBody { code: SANDBOX_NOT_READY.into(), message: "m".into(), retryable: true };
-        match HandsResolveOutcome::from_wire(None, Some(e.clone()), Some(7)) {
-            HandsResolveOutcome::Error { error, retry_after_ms } => assert_eq!((error, retry_after_ms), (e, Some(7))),
-            o => panic!("{o:?}"),
-        }
-        // An answer nobody awaits is ignored, not a panic, and leaves nothing behind.
-        agent.resolve_hands(&nest_protocol::model::RequestId("req_unknown".into()), HandsResolveOutcome::from_wire(None, None, None));
+        let o = HandsResolveOutcome::Error { error: e, retry_after_ms: None };
+        agent.resolve_hands(&nest_protocol::model::RequestId("req_unknown".into()), o);
         assert!(agent.pending_resolves.lock().unwrap().is_empty());
     }
 }

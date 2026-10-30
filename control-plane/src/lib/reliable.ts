@@ -82,6 +82,12 @@ export class ReliableChannels {
     this.sql.exec("UPDATE rel_state SET last_in = NULL WHERE chan = ?", chan);
   }
 
+  /** Drop the channel entirely (its peer is gone for good and will never reconnect under this name). */
+  forget(chan: string): void {
+    this.sql.exec("DELETE FROM rel_out WHERE chan = ?", chan);
+    this.sql.exec("DELETE FROM rel_state WHERE chan = ?", chan);
+  }
+
   /** Record that inbound `seq` (the next one in order) has been fully processed. */
   markProcessed(chan: string, seq: number): void {
     this.state(chan);
@@ -162,6 +168,7 @@ export class Deadlines {
   async reschedule(): Promise<void> {
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(at) AS at FROM deadlines").toArray()[0]?.at;
     if (next === null || next === undefined) await this.storage.deleteAlarm();
-    else await this.storage.setAlarm(next);
+    // A past time fires at once; the runtime refuses times <= 0 (a test may write `at = 0`).
+    else await this.storage.setAlarm(Math.max(next, 1));
   }
 }

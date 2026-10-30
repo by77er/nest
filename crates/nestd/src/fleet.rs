@@ -215,6 +215,7 @@ impl Shell {
                     tunnel: *p.tunnel.borrow(),
                     last_command_seq: last_command_seq.map(Seq),
                     cgroup_delegation_error: p.cgroup_delegation_error.clone(),
+                    brain_epochs: true,
                     sandboxes,
                     agents,
                     capacity,

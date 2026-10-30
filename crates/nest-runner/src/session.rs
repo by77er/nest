@@ -18,13 +18,13 @@ use std::time::Duration;
 
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use nest_protocol::control::{AgentToRunner, RunnerHello, RunnerToAgent, ToolCall};
+use nest_protocol::control::{AgentToRunner, HandsOutcome, RunnerHello, RunnerToAgent, ToolCall};
 use nest_protocol::model::{self, AgentEvent, AgentEventBody, SessionId, Seq, error_codes};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::runtime::{Agent, AgentCmd, HandsResolveOutcome, Outbound, Runtime};
+use crate::runtime::{Agent, AgentCmd, Outbound, Runtime};
 use crate::tailer::Tailer;
 
 /// Flush an event batch early at this size.
@@ -60,6 +60,8 @@ struct State {
     resolves: Vec<model::RequestId>,
     /// Set by `Close`: give up at this instant.
     close_deadline: Option<tokio::time::Instant>,
+    /// The epoch the current connection's hello presented.
+    epoch: model::Epoch,
 }
 
 impl State {
@@ -100,6 +102,7 @@ impl Session {
             durable: 0,
             resolves: Vec::new(),
             close_deadline: None,
+            epoch: self.agent.epoch(),
         };
         let mut backoff = Duration::from_millis(100);
         loop {
@@ -180,12 +183,22 @@ impl Session {
         let (ws, _) = tokio_tungstenite::connect_async(req).await?;
         let (mut tx, mut rx) = ws.split();
 
+        // Everything this connection carries speaks for the epoch its hello presents: events are
+        // stamped with it when sent (and unacked ones again on a reconnect), so a brain that
+        // adopted a newer epoch never sends events AgentDO's epoch filter would drop.
+        let epoch = self.agent.epoch();
+        st.epoch = epoch;
+        for (_, m) in st.unacked.iter_mut() {
+            if let RunnerToAgent::Events { events, .. } = m {
+                events.iter_mut().for_each(|e| e.epoch = epoch);
+            }
+        }
         let hello = RunnerToAgent::Hello(RunnerHello {
             protocol_version: model::PROTOCOL_VERSION,
             agent: self.agent.id.clone(),
             host: self.rt.host(),
             instance_id: self.instance_id.clone(),
-            epoch: self.agent.epoch(),
+            epoch,
             session: self.session.clone(),
             local_bytes: self.tailer.local_bytes(),
             last_seq: (st.last_in > 0).then_some(Seq(st.last_in)),
@@ -278,7 +291,7 @@ impl Session {
                         Outbound::SetTranscript(p) => self.tailer.set_path(p),
                         Outbound::SetSession(s) => self.session = Some(s),
                         Outbound::Reconnect => {
-                            self.flush_events(st, &mut tx).await?;
+                            // The batch goes out after the new hello, stamped with the new epoch.
                             let _ = tx.close().await;
                             return Ok(Step::Reconnect);
                         }
@@ -319,8 +332,8 @@ impl Session {
             AgentToRunner::CacheUpdate { cache, .. } => a.set_cache(cache),
             AgentToRunner::ToolResult { call, outcome, .. } => a.resolve_call(&call, outcome),
             AgentToRunner::ToolsList { request, tools } => a.resolve_tools(&request, tools),
-            AgentToRunner::HandsResolved { request, hands, error, retry_after_ms } => {
-                a.resolve_hands(&request, HandsResolveOutcome::from_wire(hands, error, retry_after_ms));
+            AgentToRunner::HandsResolved { request, outcome, hands, error, retry_after_ms } => {
+                a.resolve_hands(&request, HandsOutcome::from_wire(outcome, hands, error, retry_after_ms).into());
             }
             AgentToRunner::Ack { up_to } => st.unacked.retain(|(s, _)| *s > up_to.0),
             AgentToRunner::SegmentAck { durable_bytes, .. } => st.durable = st.durable.max(durable_bytes),
@@ -347,7 +360,9 @@ impl Session {
         }
         let seq = st.next_seq;
         st.next_seq += 1;
-        let m = RunnerToAgent::Events { seq: Seq(seq), events: std::mem::take(&mut st.batch) };
+        let mut events = std::mem::take(&mut st.batch);
+        events.iter_mut().for_each(|e| e.epoch = st.epoch);
+        let m = RunnerToAgent::Events { seq: Seq(seq), events };
         tx.send(text(&m)?).await?;
         st.unacked.push_back((seq, m));
         Ok(())
@@ -442,6 +457,7 @@ mod tests {
             durable: 0,
             resolves: Vec::new(),
             close_deadline: None,
+            epoch: model::Epoch(1),
         };
         st.unacked[1].1 = RunnerToAgent::Events { seq: Seq(2), events: vec![] };
         let fresh = st.abandon(&call);
@@ -473,8 +489,8 @@ mod resolve_tests {
         let url = format!("ws://{}/v1/agents/agt_q/session", listener.local_addr().unwrap());
         let target = HandsTarget {
             url: "ws://127.0.0.1:1".into(),
-            sandbox: SandboxId("sbx_q".into()),
-            epoch: Epoch(3),
+            sandbox: Some(SandboxId("sbx_q".into())),
+            epoch: Some(Epoch(3)),
             binding: Secret("nbd_x.y".into()),
             guest: GuestInfo { protocol_version: 1, capabilities: vec![] },
             edge: None,
@@ -495,7 +511,8 @@ mod resolve_tests {
                     }
                     RunnerToAgent::HandsResolve { request } => {
                         saw_resolve = true;
-                        let m = AgentToRunner::HandsResolved { request, hands: Some(t2.clone()), error: None, retry_after_ms: None };
+                        // The previous release's shape (no `outcome`), still understood.
+                        let m = AgentToRunner::HandsResolved { request, outcome: None, hands: Some(t2.clone()), error: None, retry_after_ms: None };
                         wtx.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await.unwrap();
                         break;
                     }
@@ -512,7 +529,7 @@ mod resolve_tests {
             AgentRole::Worker,
             Epoch(3),
             std::env::temp_dir(),
-            Some(HandsBinding { sandbox: SandboxId("sbx_q".into()), epoch: Epoch(3) }),
+            Some(HandsBinding { sandbox: SandboxId("sbx_q".into()), epoch: None }),
             None,
             vec![],
             0,
@@ -533,5 +550,66 @@ mod resolve_tests {
             other => panic!("{other:?}"),
         }
         assert!(server.await.unwrap(), "AgentDO received the queued hands_resolve");
+    }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+    use crate::config::Config;
+    use nest_protocol::model::{AgentId, AgentRole, AgentState, Epoch, Secret};
+    use tokio::net::TcpListener;
+
+    async fn next_batch(rx: &mut mpsc::UnboundedReceiver<(usize, Epoch, Vec<Epoch>)>) -> (usize, Epoch, Vec<Epoch>) {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("an events batch").unwrap()
+    }
+
+    /// A brain that adopts a newer agent epoch (a later `agent_start` while it ran) reconnects
+    /// with it, and the events AgentDO had not acked go out again stamped with the epoch of the
+    /// connection that carries them, so AgentDO's epoch filter never drops them.
+    #[tokio::test]
+    async fn adopting_an_epoch_reconnects_and_resends_unacked_events_under_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/agents/agt_e/session", listener.local_addr().unwrap());
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<(usize, Epoch, Vec<Epoch>)>();
+        // AgentDO: acks every hello, never acks events; reports (connection, hello epoch, event epochs).
+        tokio::spawn(async move {
+            for conn in 0.. {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (mut wtx, mut wrx) = ws.split();
+                let mut hello_epoch = Epoch(0);
+                while let Some(Ok(m)) = wrx.next().await {
+                    let Message::Text(t) = m else { continue };
+                    match serde_json::from_str::<RunnerToAgent>(&t).unwrap() {
+                        RunnerToAgent::Hello(h) => {
+                            hello_epoch = h.epoch;
+                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                            wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
+                        }
+                        RunnerToAgent::Events { events, .. } => {
+                            let _ = seen_tx.send((conn, hello_epoch, events.iter().map(|e| e.epoch).collect()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let rt = Runtime::new(Config { batch_interval: Duration::from_millis(20), tail_interval: Duration::from_millis(50), ..Config::default() });
+        rt.host_token.send_replace(Some(Secret("tok".into())));
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, orx) = mpsc::unbounded_channel();
+        let agent = Agent::new(AgentId("agt_e".into()), AgentRole::Captain, Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
+        let transcript = std::env::temp_dir().join(format!("nest-epoch-test-{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
+
+        agent.emit(AgentEventBody::StateChanged { state: AgentState::Working, detail: None });
+        assert_eq!(next_batch(&mut seen_rx).await, (0, Epoch(1), vec![Epoch(1)]));
+
+        assert!(agent.adopt_epoch(Epoch(2)), "a newer epoch is adopted");
+        assert!(!agent.adopt_epoch(Epoch(1)), "an older one changes nothing");
+        assert_eq!(agent.epoch(), Epoch(2));
+        // The unacked batch comes again on the new connection, under its epoch.
+        assert_eq!(next_batch(&mut seen_rx).await, (1, Epoch(2), vec![Epoch(2)]));
     }
 }
