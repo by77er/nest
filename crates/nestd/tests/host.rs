@@ -532,8 +532,11 @@ fn fake_proxy(path: PathBuf) -> Arc<Mutex<Vec<ProxyCommand>>> {
     got
 }
 
+/// Polls `f` until it holds. The budget is wall-clock and generous: some waits span a retry backoff
+/// (a salvage retried after 1 s), and CI runs this binary's tests in parallel on a loaded runner.
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
         if f() {
             return;
         }
