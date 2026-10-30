@@ -1024,14 +1024,12 @@ async fn fake_metrics() -> (String, Arc<std::sync::atomic::AtomicBool>) {
 /// the child SIGTERM, after which it is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let (metrics, ready) = fake_metrics().await;
     let log = dir.path().join("cloudflared.log");
     let bin = dir.path().join("cloudflared");
-    std::fs::write(&bin, format!("#!/bin/sh\necho pid=$$ >> {l}\nwhile [ $# -gt 0 ]; do [ \"$1\" = --metrics ] && echo metrics=$2 >> {l}; shift; done\ntrap 'echo term >> {l}; exit 0' TERM\nwhile :; do sleep 0.1; done\n", l = log.display())).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    install_executable(&bin, format!("#!/bin/sh\necho pid=$$ >> {l}\nwhile [ $# -gt 0 ]; do [ \"$1\" = --metrics ] && echo metrics=$2 >> {l}; shift; done\ntrap 'echo term >> {l}; exit 0' TERM\nwhile :; do sleep 0.1; done\n", l = log.display()));
     // The configured user: the test's own, the only one an unprivileged test can switch to.
     let me = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
     let cfg = tunnel_config_with_metrics(dir.path(), &fleet.url, &bin, Some(me), &metrics);
@@ -1080,13 +1078,11 @@ async fn a_missing_cloudflared_binary_is_logged_and_does_not_stop_the_host() {
 /// unusable `run_dir`) leaves no child behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_start_leaves_no_tunnel_child() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let log = dir.path().join("cloudflared.log");
     let bin = dir.path().join("cloudflared");
-    std::fs::write(&bin, format!("#!/bin/sh\necho pid=$$ >> {}\nexit 0\n", log.display())).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    install_executable(&bin, format!("#!/bin/sh\necho pid=$$ >> {}\nexit 0\n", log.display()));
     let mut cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
     cfg.run_dir = "/proc/no-such-dir/run".into();
     let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.err().unwrap();
@@ -2196,4 +2192,17 @@ async fn a_brain_host_runs_brains_and_refuses_sandboxes() {
 
     fleet.partition.store(true, Ordering::SeqCst);
     wait_until("the brains fenced at the lease lapse", || runner.lock().unwrap().iter().any(|c| matches!(c, RunnerCommand::Fence { .. }))).await;
+}
+
+/// Install a fake binary without this process ever holding it open for writing: a child another
+/// test thread forks meanwhile inherits a write descriptor until it execs, and running the file in
+/// that window fails with ETXTBSY. The bytes go to a staging file; `cp`, its own process, writes
+/// the executable. (Same as `nest_runner::test_support::install_executable`.)
+fn install_executable(path: &Path, contents: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    let staging = PathBuf::from(format!("{}.staging", path.display()));
+    std::fs::write(&staging, contents).unwrap();
+    assert!(std::process::Command::new("cp").arg(&staging).arg(path).status().unwrap().success());
+    std::fs::remove_file(&staging).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
