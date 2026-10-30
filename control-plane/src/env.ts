@@ -1,6 +1,7 @@
 import type { AgentDO } from "./do/agent";
 import type { BrokerDO } from "./do/broker";
 import type { CatalogDO } from "./do/catalog";
+import type { ChannelDO } from "./do/channel";
 import type { FleetDO } from "./do/fleet";
 import type { SandboxDO } from "./do/sandbox";
 import type { TaskLedgerDO } from "./do/tasks";
@@ -13,6 +14,7 @@ export interface Env {
   WORKSTREAM: DurableObjectNamespace<WorkstreamDO>;
   BROKER: DurableObjectNamespace<BrokerDO>;
   CATALOG: DurableObjectNamespace<CatalogDO>;
+  CHANNEL: DurableObjectNamespace<ChannelDO>;
   /** Task ledgers, one per name (`ledger/<name>`). */
   TASKS: DurableObjectNamespace<TaskLedgerDO>;
   BUCKET: R2Bucket;

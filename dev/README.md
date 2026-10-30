@@ -3,11 +3,12 @@
 How this repo is built, tested and shipped, and how nest's own agents will maintain it. **This is about the project, not the platform.** Running nest on its own repo is one use of the [repo maintenance](../docs/orchestration/repo-maintenance/) pattern, so it lives here, outside `docs/`.
 
 > Built:
-> - CI (`.github/workflows/ci.yml`) and `.github/CODEOWNERS`;
+> - CI (`.github/workflows/ci.yml`), `.github/CODEOWNERS`, branch protection on `main` (`ci-ok`) and the `production` environment;
 > - the repo guards (`scripts/`);
-> - the agent skills (`.claude/skills/`).
+> - the agent skills (`.claude/skills/`);
+> - the first cut of the deploy (`deploy.yml`: infra, the Worker with a smoke check and rollback, the host release; `deploy-dashboard.yml`) and nightly fuzzing (`fuzz.yml`).
 >
-> The rest is a plan.
+> The rest (the reviewer's `nest/review` check, the health window, `rollback.yml`, nest's own agents on this repo) is a plan.
 
 ## Pipeline
 
@@ -16,8 +17,8 @@ worker ── push + github.create_pr{auto_merge} ──► PR
 PR ── ci.yml (ci-ok) ──────────────────────────────┐
 PR ── reviewer: nest/review check ────────────────┤──► GitHub auto-merge (squash) ──► main
 PR ── me, only if CODEOWNERS paths changed ───────┘
-main ── ci.yml green ──► deploy.yml (environment production): wrangler deploy ─► smoke ─► 10-min health window
-                                                                        └─ regression ─► wrangler rollback, deploys pause
+main ── ci.yml green ──► deploy.yml (environment production): infra ─► wrangler deploy ─► smoke ─► 10-min health window ─► host release
+                                                                                  └─ regression ─► wrangler rollback, deploys pause
 runtime ── Worker, DOs, hosts ──► Analytics Engine ◄── metrics_query ── monitor agent
 ```
 
@@ -48,21 +49,21 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | [setup.md](setup.md) | What I set up on GitHub and Cloudflare for all of the above |
 | [practices.md](practices.md) | Guards, test rules, evidence tiers, review and supply chain: what keeps agent-written changes safe |
 | [review-lessons.md](review-lessons.md) | Standalone lessons from real findings, checked on every review |
-| [verification.md](verification.md) | Proposal: the formal models in `verification/` as a CI job |
+| [verification.md](verification.md) | The formal models in `verification/` and their CI jobs |
+| [cloud-checks/](cloud-checks/) | Scripted checks against the live control plane after a deploy, run by hand |
 
 ## Path to self-maintenance
 
 1. **CI, `CODEOWNERS`, guards and agent skills.** Done.
-2. **Merge this branch into `main`.** `main` still holds only the initial commit.
-3. **Me:** the GitHub and Cloudflare steps in [setup.md](setup.md), and stages 1–3 of the [platform setup](../docs/setup/) (a Claude token, the control plane on Cloudflare, one sandbox host and one brain host).
-4. **Build the minimum platform slice,** in this order. Each step is a PR through the gates above, with me as reviewer until step 5:
+2. **Me:** the GitHub and Cloudflare steps in [setup.md](setup.md), and stages 1–3 of the [platform setup](../docs/setup/) (a Claude token, the control plane on Cloudflare, cell hosts). Done, except `nest/review` as a required check, which waits for the hand-over.
+3. **Build the minimum platform slice,** in this order. Each step is a PR through the gates above, with me as reviewer until step 4:
    1. ChannelDO with posts, reads, subscriptions and wakes; the `user` channel through the API.
-   2. Spawn specs, templates, capabilities and grants (taint included), replacing roles and WorkstreamDO.
+   2. Grants (taint included), and a channel in place of WorkstreamDO. Spawn specs, templates and capabilities are built.
    3. HookDO with GitHub verification, and `wake_at`.
    4. BrokerDO's GitHub App minting and the `github.*` brokered actions.
    5. A dev sandbox image: git, `gh`, Rust, Node, Python, nftables, with a warm build cache.
-   6. Metrics emitters, the `metrics` capability, and `deploy.yml`.
-5. **Hand over:** spawn the maintainer and the monitor. From then on, agents build the rest (Discord, the autoscaler, the S3 store, host rollout), and I review only `CODEOWNERS` paths.
+   6. Metrics emitters, the `metrics` capability, and the rest of `deploy.yml` (the health window).
+4. **Hand over:** spawn the maintainer and the monitor. From then on, agents build the rest (Discord, versioned host rollout), and I review only `CODEOWNERS` paths.
 
 Workspaces don't need the S3 store first: for a code repo, git is the durable copy, so a lost sandbox costs a re-clone.
 

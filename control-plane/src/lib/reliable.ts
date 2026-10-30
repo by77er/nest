@@ -162,8 +162,11 @@ export class Deadlines {
    * Run the handler for every key due at `now`. A key is removed only after its handler succeeds
    * (and only if nobody re-armed it meanwhile); a failing handler is retried after `retryMs`.
    */
-  async runDue(now: number, handler: (key: string) => Promise<void>, retryMs = 5_000): Promise<void> {
-    const due = this.sql.exec<{ key: string; at: number }>("SELECT key, at FROM deadlines WHERE at <= ? ORDER BY at", now).toArray();
+  async runDue(now: number, handler: (key: string) => Promise<void>, retryMs = 5_000, last: readonly string[] = []): Promise<void> {
+    // In time order, except `last` (background work, e.g. a channel outbox): after every other key,
+    // so it never holds up the object's own transitions.
+    const due = this.sql.exec<{ key: string; at: number }>("SELECT key, at FROM deadlines WHERE at <= ? ORDER BY at", now).toArray()
+      .sort((a, b) => Number(last.includes(a.key)) - Number(last.includes(b.key)));
     for (const { key, at } of due) {
       this.running.set(key, at);
       try {

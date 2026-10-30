@@ -2,6 +2,8 @@
 
 Which formal method or tool fits which part of nest, what it costs, how a spec stays in sync with the code, and which past bugs each would have caught. Evaluated on 2026-10-25 against `main` at `edf6829`. Every tool marked "ran" was installed without root and run on a toy nest model in a scratch directory. Nothing was added to the repo or to CI.
 
+> **Since:** the owner's [direction](../README.md#verification) (2026-10-26) settled how these picks apply: protocol logic moves into pure cores checked as the real code (nestd's with Stateright, Kani, cargo-fuzz and cargo-mutants, in CI), and TLA+ or Quint models are for design exploration.
+
 ## Decision
 
 | Need | Tool | Why |

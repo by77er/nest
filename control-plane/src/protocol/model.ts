@@ -53,9 +53,9 @@ export const ErrorCodes = {
   /** The operation exists in the contract but has no implementation yet (passed through as a tool error). */
   NOT_IMPLEMENTED: "not_implemented",
   OUTCOME_UNKNOWN: "outcome_unknown",
-  /** The target changed since the caller read it (a task update's `expected_version`): read again and retry. */
+  /** A compare-and-set lost (e.g. a channel key's `if_seq`, a task's `expected_version`): read the current state and decide again. HTTP 409. */
   CONFLICT: "conflict",
-  /** The named object doesn't exist (a task in a ledger). */
+  /** The named object doesn't exist (a task in a ledger). HTTP 404. */
   NOT_FOUND: "not_found",
 } as const;
 /** What the control-host channels sent for `unsupported_version` before the names merged: read, never sent. */

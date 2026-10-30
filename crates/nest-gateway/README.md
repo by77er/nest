@@ -27,6 +27,7 @@ RUST_LOG=debug   # tracing filter
 - **Bounded before authentication:** the upgrade and the `bind` share one 5 s deadline from the accept, at most 256 connections sit before `bound` at once (each may hold a 16 MiB message), and every write toward a client has a 2 s bound, so a client that stops reading cannot pin a task, its registration or the guest connection.
 - **One frame per message:** `len == message_len - 4` with a known kind, or the connection closes with 4400; a message over 16 MiB is refused by the WebSocket layer.
 - **Detach revokes:** a binding whose client is not in the sandbox's attached set is `unauthorized`, so a detached agent's hour-long binding stops working at once.
+- **Runs as its own user** (`nest-gw` on a host, uid 1001 on the e2e harness), with no capabilities. It needs only `gateway.sock` and each guest's vsock socket, which nestd gives its group (`sockets.gateway_gid`), and its TCP port above 1024; the unit's hardening is in `deploy/host/install.sh` (no IP beyond loopback, no bind but its port; like any user it can still reach loopback services and world-readable files).
 - **Logs** carry sandbox ids, clients and outcomes, never a token or a key. `bound` and `bind refused` say `via=edge` when the upgrade request carried Cloudflare's `cf-ray` header (it came through the host's tunnel) and `via=direct` otherwise: the evidence that a brain's calls crossed the edge, not an admission check (the binding is).
 
 ## Not built

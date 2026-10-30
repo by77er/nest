@@ -21,6 +21,14 @@ rustup target add "$TARGET" >&2
 CC_x86_64_unknown_linux_musl=musl-gcc cargo build --locked --release --target "$TARGET" \
   -p nestd -p nest-guest -p nest-proxy -p nest-gateway -p nest-runner -p nest-cli >&2
 
+# Hosts decide how to run the gateway from `nestd --features` (deploy/host/install.sh): the
+# binary that ships must say `gateway-user`, or every host falls back to a root gateway.
+NESTD_FEATURES=$("target/$TARGET/release/nestd" --features)
+if ! grep -qx gateway-user <<<"$NESTD_FEATURES"; then
+  echo "target/$TARGET/release/nestd --features doesn't list gateway-user" >&2
+  exit 1
+fi
+
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 for b in "${BINS[@]}"; do install -m 0755 "target/$TARGET/release/$b" "$STAGE/$b"; done

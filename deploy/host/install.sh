@@ -54,6 +54,22 @@ fi
 id -u nest-fc >/dev/null 2>&1 || useradd --system --uid 900 --user-group --no-create-home --shell /sbin/nologin nest-fc
 # cloudflared runs as its own user, not as nestd (root).
 id -u nest-cf >/dev/null 2>&1 || useradd --system --uid 901 --user-group --no-create-home --shell /sbin/nologin nest-cf
+# So does the sandbox gateway: nestd gives its group gateway.sock and each VM's vsock socket
+# (`sockets.gateway_gid`). Its ids are whatever useradd picks here; bootstrap reads them back.
+id -u nest-gw >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /sbin/nologin nest-gw
+# A nestd without the `gateway-user` feature (the previous release, installed by a host launched
+# between the cell stack's apply and the release's publish; it has no `--features` and exits 2)
+# can't give the gateway its sockets: there the gateway keeps root's file access
+# (CAP_DAC_OVERRIDE only), as before. Bootstrap makes the same check for nestd.json. Drop this
+# with the previous release (dev/deploy.md).
+NESTD_FEATURES=$(/opt/nest/bin/nestd --features 2>/dev/null || true)
+if grep -qx gateway-user <<<"$NESTD_FEATURES"; then
+  GATEWAY_USER="User=nest-gw
+Group=nest-gw
+CapabilityBoundingSet="
+else
+  GATEWAY_USER="CapabilityBoundingSet=CAP_DAC_OVERRIDE"
+fi
 
 # Claude Code, pinned (the installer checks the release's checksum).
 CLAUDE_BIN=/root/.local/bin/claude
@@ -116,19 +132,54 @@ EOF
 
 # The sandbox gateway: the only way hands reach a guest. It connects to nestd's gateway socket and
 # listens on loopback, where cloudflared forwards the host's tunnel hostname; the loopback URL nestd
-# advertises in its hello counts only for a host without a tunnel.
-cat >/etc/systemd/system/nest-gateway.service <<'EOF'
+# advertises in its hello counts only for a host without a tunnel. It parses untrusted input from
+# the internet, so it runs as nest-gw: no capabilities, a read-only host without /var/lib/nest or
+# /etc/nest, unix sockets and loopback TCP. What it gains over any unprivileged user is gateway.sock
+# and the guests' vsock sockets (their group is nest-gw), and through those every guest on the
+# host. Like any user it can still reach loopback services, world-connectable unix sockets and
+# world-readable files; no IP beyond loopback, so not IMDS.
+cat >/etc/systemd/system/nest-gateway.service <<EOF
 [Unit]
 Description=nest sandbox gateway (hands over WebSocket to the guests' vsock ports)
 After=nestd.service
 Wants=nestd.service
 [Service]
+$GATEWAY_USER
+NoNewPrivileges=yes
+# It writes nothing (logs go to the journal).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+InaccessiblePaths=-/var/lib/nest -/etc/nest
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+# nestd's socket and the guests' vsock sockets; cloudflared's connections on 127.0.0.1. No IP
+# beyond loopback (not IMDS), and the only port it may bind is its listener's (systemd 249+).
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressAllow=localhost
+IPAddressDeny=any
+SocketBindAllow=tcp:18790
+SocketBindDeny=any
 # Under memory pressure the kernel kills a guest VMM (score 0), never nest's own services.
 OOMScoreAdjust=-900
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=RUST_LOG=info
-ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S /run/nest/gateway.sock ] && exit 0; sleep 1; done; exit 1'
+ExecStartPre=/bin/sh -c 'for i in \$(seq 60); do [ -S /run/nest/gateway.sock ] && exit 0; sleep 1; done; exit 1'
 ExecStart=/opt/nest/bin/nest-gateway --listen 127.0.0.1:18790 --nestd-sock /run/nest/gateway.sock
 Restart=always
 RestartSec=2

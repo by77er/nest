@@ -10,6 +10,8 @@ What a model of FleetDO ↔ nestd ↔ EC2 ↔ Cloudflare needs: state, transitio
 | `index.ts` | [control-plane/src/index.ts](../../../control-plane/src/index.ts) |
 | `fleet.rs`, `host.rs` | [crates/nestd/src/fleet.rs](../../../crates/nestd/src/fleet.rs), [crates/nestd/src/host.rs](../../../crates/nestd/src/host.rs) |
 
+> **Since** (checked on `main` at b63c0a3): B4 is fixed by #30: the tick expires any silent host, and one holding no lease at once (`expireSilent`), so a host terminated outside FleetDO stops counting toward `max_hosts`. #36 split hosts into two kinds (`sandbox` and `brain`, stored as `burst` and `controller` for one release); the `burst` rows below are today's sandbox hosts.
+
 Design docs: [FleetDO](../../control-plane/durable-objects/fleet/), [autoscaling](../../compute/autoscaling/), [fleet channel](../../interfaces/control-host/fleet/), [enrollment](../../interfaces/control-host/enrollment/).
 
 ## 1. Scope, actors, state

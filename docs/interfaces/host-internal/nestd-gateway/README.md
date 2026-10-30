@@ -4,7 +4,7 @@ How nestd feeds the [gateway](../../../sandbox/gateway/) everything it needs to 
 
 ## Transport
 
-`/run/nest/gateway.sock` (`paths::GATEWAY_SOCK`; the e2e uses `<run_dir>/gateway.sock`): nestd listens (`SOCK_STREAM`, `0660` with the configured group), the gateway connects. Length-prefixed JSON (`u32` big-endian, then one object, 16 MiB at most) like `runner.sock`. The peer uid is checked with `SO_PEERCRED` against `sockets.gateway_uids`; one gateway is served at a time, and a second connect is refused while the first is live. The gateway reconnects with a backoff from 250 ms to 5 s, reset once a `hello_ack` arrives.
+`/run/nest/gateway.sock` (`paths::GATEWAY_SOCK`; the e2e uses `<run_dir>/gateway.sock`): nestd listens (`SOCK_STREAM`, `0660` in `sockets.gateway_gid`, else `sockets.gid`), the gateway connects. Length-prefixed JSON (`u32` big-endian, then one object, 16 MiB at most) like `runner.sock`. The peer uid is checked with `SO_PEERCRED` against `sockets.gateway_uids`; one gateway is served at a time, and a second connect is refused while the first is live. The gateway reconnects with a backoff from 250 ms to 5 s, reset once a `hello_ack` arrives.
 
 ## Messages
 

@@ -6,10 +6,12 @@ import { describe, expect, it } from "vitest";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, intersectTools, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
-  SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, SpawnerOverrides, specFromRole, type Template, templatesUsing,
+  SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES,
+  TASK_CAPABILITIES,
 } from "../src/lib/spec";
 import { TASK_ADMIN_TOOLS, TASK_TOOLS } from "../src/lib/tasks";
 import { Credential, type ToolRule } from "../src/protocol/control";
+import type { ChannelGrant } from "../src/lib/channels";
 
 // What the roles gave (the role-filtered `platform-tools.json` and AgentDO's defaults before templates).
 const WORKER_TOOLS = ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"];
@@ -42,6 +44,7 @@ describe("the first seed catalog is what the roles were", () => {
       escalate_to: "workstream",
       subscribe: [],
       params: {},
+      channel_grants: [],
     });
   });
 
@@ -55,6 +58,7 @@ describe("the first seed catalog is what the roles were", () => {
       escalate_to: "user",
       subscribe: ["workstream"],
       params: {},
+      channel_grants: [],
     });
   });
 
@@ -78,7 +82,7 @@ describe("the first seed catalog is what the roles were", () => {
 describe("records stored with a role read through a frozen table, not the seed", () => {
   it("the first seed still expands to what ROLE_SPECS freezes (so a seed edit can't change it unnoticed)", () => {
     for (const role of ["worker", "captain"] as const) {
-      const { launch: _l, rules: _r, subscribe: _s, params: _p, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
+      const { launch: _l, rules: _r, subscribe: _s, params: _p, channel_grants: _g, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
       expect(rest, role).toEqual(ROLE_SPECS[role]);
     }
   });
@@ -139,8 +143,8 @@ describe("expansion refuses what it can't give", () => {
     expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "constructor", hands: false, by: "operator" }).ok).toBe(false);
     const broken: Catalog = { ...SEED_CATALOG, templates: { b: { ...SEED_CATALOG.templates.captain!, capabilities: ["toString"] } } };
     expect(expandSpec(broken, PLATFORM_TOOL_NAMES, { template: "b", hands: false, by: "operator" })).toEqual({ ok: false, error: "template b: unknown capability toString" });
-    expect(checkCapability({ tools: ["nope"], rules: [], prompt: "", params: [] }, PLATFORM_TOOL_NAMES).ok).toBe(false);
-    expect(checkCapability({ tools: ["notify", "notify"], rules: [], prompt: "", params: [] }, PLATFORM_TOOL_NAMES).ok).toBe(false);
+    expect(checkCapability({ tools: ["nope"], rules: [], prompt: "", grants: [], params: [] }, PLATFORM_TOOL_NAMES).ok).toBe(false);
+    expect(checkCapability({ tools: ["notify", "notify"], rules: [], prompt: "", grants: [], params: [] }, PLATFORM_TOOL_NAMES).ok).toBe(false);
     expect(checkTemplate({ ...SEED_CATALOG.templates.worker!, capabilities: ["hands", "hands"] }, SEED_CATALOG.capabilities).ok).toBe(false);
     expect(templatesUsing(SEED_CATALOG, "hands")).toEqual(["worker"]);
   });
@@ -153,7 +157,7 @@ describe("expansion refuses what it can't give", () => {
   });
 });
 
-describe("the current seed adds the task ledger (seed version 2)", () => {
+describe("the current seed adds the task ledger (seed version 3)", () => {
   it("worker gains `tasks`; captain gains `tasks` and `tasks-admin`; nothing else changes", () => {
     const v1w = expand(SEED_CATALOG_V1, "worker", true);
     const v1c = expand(SEED_CATALOG_V1, "captain", false);
@@ -209,15 +213,27 @@ describe("the current seed adds the task ledger (seed version 2)", () => {
     expect(spawn({ rules: [{ pattern: "mcp__nest__task_assign", decision: "allow" }] }).ok).toBe(false);
   });
 
-  it("seedMigration: from version 1, adds the capabilities whose names are free; from the current version, nothing", () => {
-    const v1 = { capabilities: Object.keys(SEED_CATALOG_V1.capabilities), templates: Object.keys(SEED_CATALOG_V1.templates) };
-    const m = seedMigration(v1, 1);
+  it("seed steps: versions strictly increase, the last is the seed version, and every step's entries are the current seed's", () => {
+    const versions = SEED_STEPS.map((s) => s.version);
+    expect(versions).toEqual([2, 3]);
+    for (let i = 1; i < versions.length; i++) expect(versions[i]!, String(i)).toBeGreaterThan(versions[i - 1]!);
+    expect(SEED_VERSION).toBe(versions.at(-1));
+    // No two steps name the same entry (one would never be applied to a catalog the other already reached).
+    const names = SEED_STEPS.flatMap((s) => [...Object.keys(s.capabilities), ...Object.keys(s.templates)]);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it("seedMigration: a catalog at version 2 (channels applied) gains exactly the task capabilities", () => {
+    const v2 = { capabilities: [...Object.keys(SEED_CATALOG_V1.capabilities), ...Object.keys(CHANNEL_CAPABILITIES)], templates: Object.keys(SEED_CATALOG_V1.templates) };
+    const m = seedMigration(v2, 2);
     expect(Object.keys(m.capabilities).sort()).toEqual(["tasks", "tasks-admin"]);
-    expect(m.capabilities.tasks).toEqual(SEED_CATALOG.capabilities.tasks);
+    expect(m.capabilities).toEqual(TASK_CAPABILITIES);
     expect(m.templates).toEqual({});
-    expect(m.version).toBe(SEED_VERSION);
+    expect(m.version).toBe(3);
+    // Even with channels' entries since deleted: version 2's step doesn't run again.
+    expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 2).capabilities).sort()).toEqual(["tasks", "tasks-admin"]);
     // An operator's own `tasks` stays theirs.
-    expect(Object.keys(seedMigration({ ...v1, capabilities: [...v1.capabilities, "tasks"] }, 1).capabilities)).toEqual(["tasks-admin"]);
+    expect(Object.keys(seedMigration({ ...v2, capabilities: [...v2.capabilities, "tasks"] }, 2).capabilities)).toEqual(["tasks-admin"]);
     // Once it reached a version it adds nothing, whatever is missing: deleted entries stay deleted.
     expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION)).toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION });
     // Every step's entries are what the current seed holds.
@@ -246,6 +262,7 @@ function genCatalog(r: () => number): { catalog: Catalog; template: string; hand
   const pick = <T>(xs: readonly T[]) => xs[Math.floor(r() * xs.length)]!;
   const subset = <T>(xs: readonly T[], p: number) => xs.filter(() => r() < p);
   const rulePool: ToolRule[] = [NEST_ALLOW, { pattern: "Agent", decision: "allow" }, { pattern: "Bash", decision: "ask" }, { pattern: "Web*", decision: "deny", reason: "no" }];
+  const grantPool: ChannelGrant[] = [{ action: "post", channel: "user" }, { action: "read", channel: "team/*" }, { action: "post", channel: "{owner}/inbox" }];
   const capabilities: Record<string, Capability> = {};
   const n = 1 + Math.floor(r() * 6);
   for (let i = 0; i < n; i++) {
@@ -254,6 +271,7 @@ function genCatalog(r: () => number): { catalog: Catalog; template: string; hand
       rules: subset(rulePool, 0.4),
       prompt: r() < 0.5 ? `prompt ${i}` : "",
       params: r() < 0.3 ? ["ledger"] : [],
+      grants: subset(grantPool, 0.3),
     };
   }
   const capNames = Object.keys(capabilities);
@@ -310,6 +328,10 @@ describe("expansion properties (500 generated catalogs)", () => {
       const parts = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter(Boolean);
       expect(spec.launch.system_prompt, ctx).toEqual({ mode: tpl.launch.system_prompt.mode, text: parts.join("\n\n") });
       expect([spec.credential, spec.escalate_to, spec.subscribe], ctx).toEqual([tpl.credential, tpl.escalate_to, tpl.subscribe]);
+      // Channel grants: every capability grant once, whatever the overrides (an operator's narrow only tools).
+      const gk = (x: ChannelGrant) => `${x.action} ${x.channel}`;
+      expect(new Set(spec.channel_grants.map(gk)).size, ctx).toBe(spec.channel_grants.length);
+      expect(new Set(spec.channel_grants.map(gk)), ctx).toEqual(new Set(caps.flatMap((c) => c.grants).map(gk)));
       // Hands: the template's rule decides.
       if (tpl.hands === "required") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: false, by: "operator" }).ok, ctx).toBe(false);
       if (tpl.hands === "forbidden") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: true, by: "operator" }).ok, ctx).toBe(false);
@@ -342,6 +364,8 @@ describe("expansion properties (500 generated catalogs)", () => {
       expect([res.value.launch, res.value.credential, res.value.escalate_to], ctx).toEqual([base.value.launch, base.value.credential, base.value.escalate_to]);
       // No parameters at all, whatever the template's defaults.
       expect(res.value.params, ctx).toEqual({});
+      // A spawner never widens channel grants either.
+      expect(res.value.channel_grants, ctx).toEqual(base.value.channel_grants);
     }
   });
 
@@ -354,5 +378,21 @@ describe("expansion properties (500 generated catalogs)", () => {
         if (b.ok) expect(b, `seed ${seed}`).toEqual(a);
       }
     }
+  });
+});
+
+describe("seed migration (pure)", () => {
+  it("a version-1 catalog gains each later step's entries whose names are free; a current one gains nothing", () => {
+    const all = { capabilities: Object.keys(SEED_CATALOG_V1.capabilities), templates: Object.keys(SEED_CATALOG_V1.templates) };
+    const m = seedMigration(all, 1);
+    expect(Object.keys(m.capabilities).sort()).toEqual([...Object.keys(CHANNEL_CAPABILITIES), ...Object.keys(TASK_CAPABILITIES)].sort());
+    expect(m.templates).toEqual({});
+    expect(m.version).toBe(SEED_VERSION);
+    // A name the operator already uses is left alone (never overwritten).
+    expect(Object.keys(seedMigration({ ...all, capabilities: [...all.capabilities, "channels"] }, 1).capabilities)).toEqual(["messaging-tree", "tasks", "tasks-admin"]);
+    // Nothing for a catalog at the current version, so a deleted entry never comes back.
+    expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION)).toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION });
+    // The version never goes back.
+    expect(seedMigration(all, SEED_VERSION + 5).version).toBe(SEED_VERSION + 5);
   });
 });

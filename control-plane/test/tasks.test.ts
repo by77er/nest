@@ -5,7 +5,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { CatalogDO } from "../src/do/catalog";
 import { ledgerStub, noticeRetryMs, TaskLedgerDO } from "../src/do/tasks";
-import { SEED_CATALOG, SEED_CATALOG_V1, SEED_VERSION } from "../src/lib/spec";
+import { CHANNEL_CAPABILITIES, SEED_CATALOG, SEED_CATALOG_V1, SEED_VERSION } from "../src/lib/spec";
 import { TASK_ADMIN_TOOLS, TASK_TOOLS } from "../src/lib/tasks";
 import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
@@ -414,18 +414,21 @@ describe("the operator API", () => {
 
 describe("the catalog's seed migration", () => {
   const catalogStub = () => env.CATALOG.get(env.CATALOG.idFromName(uniqueLedger("catalog")));
-  /** Make a fresh catalog look like one seeded by the first release (seed version 1, no seed_version). */
-  const asV1 = (st: DurableObjectState) => {
+  /**
+   * Make a fresh catalog look like the live one before this release: seeded by the first release and
+   * migrated by the channels release (seed version 2), with no `params` anywhere.
+   */
+  const asV2 = (st: DurableObjectState) => {
     st.storage.sql.exec("DELETE FROM capabilities");
     st.storage.sql.exec("DELETE FROM templates");
-    st.storage.sql.exec("DELETE FROM kv WHERE key = 'seed_version'");
-    for (const [n, c] of Object.entries(SEED_CATALOG_V1.capabilities)) {
-      const { params: _p, ...v1 } = c; // the first release stored no params field
-      st.storage.sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", n, JSON.stringify(v1));
+    st.storage.sql.exec("UPDATE kv SET value = '2' WHERE key = 'seed_version'");
+    for (const [n, c] of Object.entries({ ...SEED_CATALOG_V1.capabilities, ...CHANNEL_CAPABILITIES })) {
+      const { params: _p, ...old } = c;
+      st.storage.sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", n, JSON.stringify(old));
     }
     for (const [n, t] of Object.entries(SEED_CATALOG_V1.templates)) {
-      const { params: _p, ...v1 } = t;
-      st.storage.sql.exec("INSERT INTO templates (name, body) VALUES (?, ?)", n, JSON.stringify(v1));
+      const { params: _p, ...old } = t;
+      st.storage.sql.exec("INSERT INTO templates (name, body) VALUES (?, ?)", n, JSON.stringify(old));
     }
   };
   const restart = (st: DurableObjectState) => new CatalogDO(st, env as never);
@@ -436,15 +439,16 @@ describe("the catalog's seed migration", () => {
     expect(cat.templates.captain!.capabilities).toEqual(SEED_CATALOG.templates.captain!.capabilities);
   });
 
-  it("adds the new capabilities once, leaves the templates alone, and never brings back what the operator deleted", async () => {
+  it("a catalog at version 2 gains the task capabilities once, keeps its templates, and never brings back what the operator deleted", async () => {
     const stub = catalogStub();
     await runInDurableObject(stub, async (_i: CatalogDO, st) => {
-      asV1(st);
-      // The operator had removed `memory` and the `captain` template under the first release.
-      st.storage.sql.exec("DELETE FROM capabilities WHERE name = 'memory'");
+      asV2(st);
+      // The operator had removed `memory`, channels' `messaging-tree` and the `captain` template.
+      st.storage.sql.exec("DELETE FROM capabilities WHERE name IN ('memory', 'messaging-tree')");
       st.storage.sql.exec("DELETE FROM templates WHERE name = 'captain'");
       const after = await restart(st).catalog();
-      expect(Object.keys(after.capabilities).sort()).toEqual([...Object.keys(SEED_CATALOG_V1.capabilities).filter((n) => n !== "memory"), "tasks", "tasks-admin"].sort());
+      expect(Object.keys(after.capabilities).sort()).toEqual(
+        [...Object.keys(SEED_CATALOG_V1.capabilities).filter((n) => n !== "memory"), "channels", "tasks", "tasks-admin"].sort());
       expect(after.capabilities.tasks).toEqual(SEED_CATALOG.capabilities.tasks);
       expect(Object.keys(after.templates)).toEqual(["worker"]);
       expect(after.templates.worker!.capabilities).toEqual(SEED_CATALOG_V1.templates.worker!.capabilities);
@@ -458,7 +462,7 @@ describe("the catalog's seed migration", () => {
   it("keeps an operator's own capability of the same name", async () => {
     const stub = catalogStub();
     await runInDurableObject(stub, async (_i: CatalogDO, st) => {
-      asV1(st);
+      asV2(st);
       st.storage.sql.exec("INSERT INTO capabilities (name, body) VALUES ('tasks', ?)", JSON.stringify({ tools: ["notify"], rules: [], prompt: "mine" }));
       const after = await restart(st).catalog();
       expect(after.capabilities.tasks).toMatchObject({ tools: ["notify"], prompt: "mine" });

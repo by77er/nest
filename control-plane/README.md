@@ -12,9 +12,10 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay |
 | `src/do/workstream.ts` | **WorkstreamDO**: the interim workstream channel: event log, batched wakes of its one subscriber, user-notification queue |
 | `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, GitHub App minter (interface only) |
-| `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per seed version; expansion is `src/lib/spec.ts` (pure) |
+| `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries only); expansion is `src/lib/spec.ts` (pure) |
+| `src/do/channel.ts` | **ChannelDO** (one per channel, plus `~directory`): the log, keyed view, grant list, subscriptions and their cursors, fan-out from the alarm, retention and tiering. Every decision is `src/lib/channels.ts` (pure) |
 | `src/do/tasks.ts` | **TaskLedgerDO** (one per ledger name): tasks, comments, history, watcher, inbox notices from its alarm; its decisions are `src/lib/tasks.ts` (pure) |
-| `src/lib/` | Reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry |
+| `src/lib/` | Channels core (`channels.ts`: names, validation, permissions, post guards, filters, batching, envelopes) and the channel outbox (`outbox.ts`), the task ledger core (`tasks.ts`), reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry |
 | `test/regressions.test.ts` | One regression test per finding of the control-plane review |
 
 ## Commands
@@ -50,7 +51,6 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      An agent reaches a ledger only if it was spawned with `overrides.params.ledger` and a template listing `tasks` (and `tasks-admin` to administer)
    - `POST /v1/workstreams {goal}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent of that
      workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
-     (it no longer answers `captain`)
    - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
@@ -72,7 +72,19 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      again once released); `kind: waiting, waiting_for: <host>` when the brain runs on another host: it is condemned
      and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
      once that brain's exit or its host's loss releases it
-   - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
+   - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}` ·
+     `GET /v1/agents/<id>/subscriptions` (its channel subscriptions, with each one's delivered high-water seq)
+   - Channels ([docs/channels/](../docs/channels/)); the operator is `user`, the root, and a channel's name is one
+     URL-encoded path segment (`agt_…%2Finbox`):
+     - `POST /v1/admin/channels {name, retention_days?}` (a free channel, owned by `user`) ·
+       `GET /v1/admin/channels?prefix=&after=&limit=` (the directory) · `GET /v1/admin/channels/<name>` (head, grant list, subscriptions)
+     - `GET /v1/admin/channels/<name>/messages?since=&limit=` (the log) or `?latest_by_key=true&prefix=&keys_only=&after_key=`
+       (the keyed view) · `POST /v1/admin/channels/<name>/messages {text, kind?, data?, reply_to?, key?, if_seq?, mentions?, idem_key?}`
+       (201 posted; 200 `existing` or `repeat`; 409 `conflict` with the key's `current_seq`). `GET /v1/admin/channels/user/messages`
+       is the notification queue's successor (the Discord bot isn't built). To reach an agent now, use `POST /v1/agents/<id>/inbox` (its text arrives inline, for any agent); a post to `<agt>/inbox` reaches an agent whose template has `read` (`channels`) fully, and one without it only with the operator's own text, inline (every message whole, across turns if need be; one over 32 KiB as a note that it needs `read`). Another agent's `message` to one without `read` is refused
+     - `GET|POST /v1/admin/channels/<name>/subscriptions {agent, filter?, delivery?, batch_ms?, once?}` (on an agent's behalf) ·
+       `DELETE /v1/admin/channels/<name>/subscriptions/<sub>`
+     - `PUT /v1/admin/channels/<name>/acl [{principal, action: post|read}]` (the channel's own grant list, replaced)
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
      `{lines, next_seq, more}`)
@@ -104,7 +116,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `WAKE_BATCH_MS` | Batching window of the workstream channel's subscriber wakes; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
 | `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname (a tunnel host that serves none is not ready, never its loopback `gateway_url`). `NEST_DOMAIN` also names previews (`<port>-<sandbox>-preview-<label>.<zone>`) and share links (`<token>-share-<label>.<zone>`). The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url`, and preview names use `nest.localhost` |
-| `AWS_CELLS` | Per-cell AWS settings, written by the cell stacks: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?, sandbox_reserve_mib?, max_sandboxes_per_host?, proxy_root_key_arn?}` (`src/lib/cells.ts`). A cell without an entry is never scaled |
+| `AWS_CELLS` | Per-cell AWS settings, written by the cell stacks: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?, sandbox_reserve_mib?, max_sandboxes_per_host?, proxy_root_key_arn?, brain?}` (`src/lib/cells.ts`); `brain` is the brain hosts' `{launch_template_id, instance_types, spot?, max_hosts?, idle_grace_ms?, max_brains_per_host?}`. A cell without an entry is never scaled, and one without `brain` launches no brain host |
 
 Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its resend queue) carry
 `$nest-secret:<name>` references, resolved when the command is sent to a host.
@@ -112,7 +124,6 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 ## Known gaps
 
 - **The two-system split** (`docs/architecture/`): the control plane's side of the seam is built: BrokerDO holds
-- Agent removal isn't built, so `SandboxDO.detach` has no caller yet: a stopped agent keeps its slot, proxy port and gateway client entry, and revocation by detach is exercised only by tests.
   the per-cell binding signing key (`binding_key:<cell>`, a P-256 private JWK; `signBinding`, `bindingPublicKeys`),
   FleetDO sends `binding_key` after every hello and records each host's `gateway_url`, SandboxDO configures agent
   slots with `agent_attach`/`agent_detach` and answers `resolve` with a `HandsTarget` only once the slot's result
@@ -143,29 +154,40 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   `idleStep`; `test/brain-hosts.test.ts`). A brain host enrolls without a proxy CA. AgentDO issues an agent
   epoch per start (a sandbox move doesn't restart a brain), and `agent_start.hands` carries the sandbox id only
   (the runner fetches its target). Not built: key rotation, the three desired versions, and gentle drains.
-- **Behind the design** (`docs/agents/`, `docs/channels/`): channels (ChannelDO), webhooks (HookDO), grants
-  with attenuation, capability sources (`mcp`, `api`) and parameters, `agent_spawn`, and labels aren't built.
+- **Agent removal** isn't built, so `SandboxDO.detach` has no caller yet: a stopped agent keeps its slot, proxy port
+  and gateway client entry, and revocation by detach is exercised only by tests.
+- **Channels** (`docs/channels/`) are built as the design's subset listed in
+  `docs/control-plane/durable-objects/channel/`: ChannelDO, subscriptions delivered through AgentDO's turn queue
+  and inbox, the built-in channels, channel grants on capabilities (`channels`, `messaging-tree`), and the tools.
+  Not yet: `await_reply_s`, `read` with a wait, `interrupt`, the guest `nest post`, hooks, budgets in the wake
+  envelope, and moving the workstream channel, `notify`, `ask` and the user-notification queue onto channels
+  (stage 2 of removing workstreams).
+- **Behind the design** (`docs/agents/`): webhooks (HookDO), grants with attenuation beyond channel grants,
+  capability sources (`mcp`, `api`) and parameters, `agent_spawn`, and labels aren't built.
   Templates and capabilities are data (CatalogDO), an agent stores its expanded spec and `owner`, and nothing
   decides on a role; `agent_start.role` and `ToolDef.roles` are still sent for one release. WorkstreamDO is the
   interim workstream channel (`WorkstreamEvent`, one subscriber woken with batches), and there is a `workstream`
-  egress policy layer. Taint and sinks, budgets, wake envelopes and the hands journal aren't built either.
+  egress policy layer. Taint is a conservative stand-in (an agent with hands or a web built-in, or one that read a
+  tainted message, is tainted); sinks, budgets and the hands journal aren't built.
   Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
-  commit and flushes at turn boundaries. Placement packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox
-  reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one. The contract changes are listed in `docs/interfaces/README.md`.
+  commit and flushes at turn boundaries. The contract changes are listed in `docs/interfaces/README.md`.
+- **Built: placement** packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox
+  reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
   `attach`, `checkpoint`, `brokered`, and the seeded `management` and `memory` capabilities' tools.
 - **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`; `/v1/health` doesn't reach the DOs yet.
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO has no issuance audit.
-- **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
-- **Built:** the autoscaler (`AWS_CELLS`: `RunInstances` from the cell's launch template, idle retirement, enroll timeouts).
-- **Not built:** Discord, the Cloudflare Access applications (created by hand; the control plane only stores
-  the service token), the preview/share Worker routes, the api-loop backend (deferred), budgets. Preview and
+- **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, generation retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
+- **Built:** the autoscaler, per host kind (`AWS_CELLS`: `RunInstances` from the cell's launch template, or the `brain` section's for brain hosts; idle retirement, enroll timeouts).
+- **Not built:** Discord, Cloudflare Access applications from the control plane (the `edge` inframe stack manages
+  them; the control plane only stores the service token), the preview/share Worker routes, the api-loop backend (deferred), budgets. Preview and
   share URLs are already minted by the hostname rule (`sandbox.ts`), so nothing routes them yet.
 - **Host-side behavior is driven, not modeled.** The control plane issues create (including re-place
   and reassign), destroy, fence, suspend (idle and spot drains) and resume (lazy wake); checkpoint,
   fork, archive and drain are never sent.
-- **Commands aren't batched:** FleetDO sends one `commands` frame per `issueCommands` call.
+- **Commands aren't coalesced:** each `issueCommands` call is one `commands` batch, sent in seq order through the
+  host's send chain.
 - **Delivery semantics to know:** platform tool calls are at least once across an AgentDO eviction
   (a call cut off mid-dispatch runs again when redelivered); a turn cut off by a brain restart comes
   back as a `recovery` turn; a guest `nest ask` waiting in memory falls back to an async answer on

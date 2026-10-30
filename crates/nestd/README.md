@@ -5,6 +5,7 @@ The privileged per-host daemon (`docs/compute/nestd/`). It speaks the fleet chan
 ```
 cargo build -p nestd
 nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
+nestd --features                             # what install scripts check for, one per line (`nestd::FEATURES`): `gateway-user`
 ```
 
 ## Modules
@@ -21,31 +22,35 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
 | `tombstones` | The host's one map of fenced epochs, written by the host core's fence and consulted by the proxy and gateway links; pruned when a newer epoch runs here or the sandbox is destroyed |
 | `recovery` | Per-incarnation directories (`sandboxes/<id>/<epoch>/`) and their versioned `meta.json` (sandbox, epoch, head, whether the disk equals it, an unanswered commit request; written atomically), and the start-up scan of what a previous nestd left |
 | `cgroup` | The delegated unit cgroup (`<unit>/supervisor`, `<unit>/vms` for the jailer) and the start-up kill of leftover VMM cgroups |
-| `runner_link` | nestd ↔ agent runner, lifecycle only. Keeps the desired set of brains and re-issues `agent_start` on reconnect (the sandbox's id and epoch, never a socket path or a binding). Drops stale `agent_exited{fenced}` queued before the reconnect. Socket access control, one runner at a time |
+| `runner_link` | nestd ↔ agent runner, lifecycle only. One brain table keyed by (agent, agent epoch); never replays a start: when the runner connection drops, each start sent on it is reported `agent_exited{crashed}` (or `fenced`) and AgentDO restarts it. Drops stale `agent_exited{fenced}` from an earlier connection. Socket access control, one runner at a time |
 | `gateway_link` | nestd ↔ sandbox gateway (`gateway.sock`). A mirror of the binding verification keys and, per sandbox, the epoch, the vsock socket, the attached clients and the guest's version; replayed in full on every (re)connection and closed with `resync_done`, then deltas on attach, detach, boot, resume, the guest's hello, fence and teardown. Ping every 5 s, a silent gateway is dropped after 15 s. Socket access control, one gateway at a time |
 | `guest` | Guest control connection (vsock 1024): hello (the guest's version and capabilities are kept and reported with `running`), configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
 | `vsock` | Hybrid-vsock `CONNECT` client and the unix-socket emulator (test transport) |
-| `driver` | `Driver`/`Vm`/`Pauser` traits; `supervise` forks every VM process from one long-lived thread with a death signal, records a pidfile, and kills leftovers at start; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (2M hugepages, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths |
+| `driver` | `Driver`/`Vm`/`Pauser` traits; `supervise` forks every VM process from one long-lived thread with a death signal, records a pidfile, and kills leftovers at start; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (regular pages unless `huge_pages` is set, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths; `access` gives the gateway's group each VM's vsock socket (`0660`) and, jailed, search on the jail root (`0710`) once the VM has started, through `O_PATH \| O_NOFOLLOW` descriptors checked for kind and owner (a jailed VMM owns its chroot); the API socket is `0600` and the jailed disk `0600` |
 | `storage` | Content-addressed chunks and manifests. Hole-aware disk chunking (`SEEK_DATA`), `LocalFsStore` backend. On restore, chunk names and every chunk's and manifest's hash are verified |
+| `s3` | The cell's S3 store: SigV4 with the instance role, a capped write-through cache, parallel transfers, retries, multipart, and the 12 h reuse rule (`REUSE_MS`) |
+| `gc` | One object-store GC pass for FleetDO: mark from the roots it snapshots, sweep unmarked versions past the 24 h grace, fail closed |
+| `credentials` | What enrollment gave the host (host id, token, fleet URL, proxy intermediate, tunnel token), kept root-only so a restart reconnects without re-enrolling |
+| `cloudflared` | The host's Cloudflare Tunnel as nestd's child, and its `/ready` poll (`none`, `connecting`, `connected`) |
 
 ## Example config
 
 ```json
 {
   "role": "sandbox",
-  "cell": "aws-us-east-1",
+  "cell": "use1",
   "control_url": "https://nest.example.com",
   "enrollment": {"type": "aws_imds"},
   "driver": {"type": "process", "guest_command": ["/usr/lib/nest/nest-guest"]},
   "network": {"type": "netns", "persist_dir": "/run/netns"},
-  "sockets": {"gid": 990, "proxy_uids": [991], "runner_uids": [992], "gateway_uids": [993]},
+  "sockets": {"gid": 990, "proxy_uids": [991], "runner_uids": [992], "gateway_uids": [993], "gateway_gid": 993},
   "gateway_url": "ws://127.0.0.1:18790",
   "cloudflared_bin": "/opt/nest/bin/cloudflared",
   "cloudflared_user": "nest-cf"
 }
 ```
 
-`sockets`: who may connect to `proxy.sock`/`runner.sock`/`gateway.sock`. Empty lists allow only nestd's own euid and root. `gateway_url`: where clients reach this host's sandbox gateway, reported in the fleet hello (the e2e harness uses `ws://127.0.0.1:18790`); omit it on a host that runs no sandboxes. `cloudflared_bin` and `cloudflared_user`: the cloudflared binary and the system user it runs as (`cloudflared.rs`). When the binary is set and enrollment handed the host a tunnel token, nestd runs `cloudflared --no-autoupdate tunnel --metrics <cloudflared_metrics> run` (default `127.0.0.1:18791`) as a child of its own: as `cloudflared_user` (a different user from nestd; a name that does not exist fails startup), with its environment cleared down to `PATH`, `HOME` (a directory under `state_dir`) and the token in `TUNNEL_TOKEN`. The token is never on a command line, where `/proc/<pid>/cmdline` is world-readable; `/proc/<pid>/environ` is readable only by that user and root, like the credentials file. The child's output goes to nestd's log at info; on every exit it is restarted with a backoff of 1 s doubling to 30 s (a revoked token makes cloudflared exit at once, so that loop warns every 30 s until the host is re-enrolled); at shutdown it gets SIGTERM, then SIGKILL after 5 s. Enrollment saves the token and the control plane's URL for the host in the credentials file whether or not `cloudflared_bin` is set, so a restart brings the tunnel back without re-enrolling; a token without a binary is logged every minute, because the control plane already advertises a tunnel URL for the host. Without a token, no tunnel. With the Firecracker driver in production, also set `"jailer_bin"` and `"jailer": {"uid": …, "gid": …, "chroot_base_dir": "/srv/jailer"}`. Without the jailer, Firecracker runs with nestd's privileges, which is for development only and is logged as a warning.
+`sockets`: who may connect to `proxy.sock`/`runner.sock`/`gateway.sock`. Empty lists allow only nestd's own euid and root. `gateway_gid` is the gateway's own group (`nest-gw` on a host): it owns `gateway.sock` in place of `gid`, and each VM's vsock socket and jail root (`driver/access.rs`), so a gateway running as its own user can dial the guests; unset, the vsock sockets keep the VMM's umask mode and only root can reach them. `gateway_url`: where clients reach this host's sandbox gateway, reported in the fleet hello (the e2e harness uses `ws://127.0.0.1:18790`); omit it on a host that runs no sandboxes. `cloudflared_bin` and `cloudflared_user`: the cloudflared binary and the system user it runs as (`cloudflared.rs`). When the binary is set and enrollment handed the host a tunnel token, nestd runs `cloudflared --no-autoupdate tunnel --metrics <cloudflared_metrics> run` (default `127.0.0.1:18791`) as a child of its own: as `cloudflared_user` (a different user from nestd; a name that does not exist fails startup), with its environment cleared down to `PATH`, `HOME` (a directory under `state_dir`) and the token in `TUNNEL_TOKEN`. The token is never on a command line, where `/proc/<pid>/cmdline` is world-readable; `/proc/<pid>/environ` is readable only by that user and root, like the credentials file. The child's output goes to nestd's log at info; on every exit it is restarted with a backoff of 1 s doubling to 30 s (a revoked token makes cloudflared exit at once, so that loop warns every 30 s until the host is re-enrolled); at shutdown it gets SIGTERM, then SIGKILL after 5 s. Enrollment saves the token and the control plane's URL for the host in the credentials file whether or not `cloudflared_bin` is set, so a restart brings the tunnel back without re-enrolling; a token without a binary is logged every minute, because the control plane already advertises a tunnel URL for the host. Without a token, no tunnel. With the Firecracker driver in production, also set `"jailer_bin"` and `"jailer": {"uid": …, "gid": …, "chroot_base_dir": "/srv/jailer"}`. Without the jailer, Firecracker runs with nestd's privileges, which is for development only and is logged as a warning.
 
 A brain host's config is the rest: `{"role": "controller", "cell": …, "control_url": …, "enrollment": …, "versions": …}`.
 
@@ -96,11 +101,11 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 
 - **ublk lazy disk and the copy-on-write epoch flip.** Checkpoints currently pause the VM while chunking.
 - **UFFD memory restore.** Restores from `checkpoint` generations cold-boot from the disk.
-- **Garbage collection** of the object store, and the 12 h chunk-reuse rule it depends on. (Built: the S3 `ObjectStore` with parallel transfers, retries, multipart and a capped cache; spot notices from IMDS; resuming with saved host credentials after a restart.)
+- **S3 Inventory** for the GC sweep (it lists object versions), and generation retention (every generation is a GC root).
 - **Gateway features** beyond hands (`docs/sandbox/gateway/`): `port_expose` is recorded only; nothing on the host uses ingress port 10000 yet: no terminal attach, no `nest port-forward`. (Built: the gateway and `gateway.sock`, and cloudflared as nestd's child when configured, with its `/ready` polled so the fleet hello and `tunnel_state` events say whether the tunnel is `none`, `connecting` or `connected`.)
 - **Live forks.** They're disk-only.
 - **Firecracker** runs on EC2 sandbox hosts with nested virtualization and is verified there end to end ([driver](../../docs/sandbox/drivers/firecracker/)); this dev environment has no `/dev/kvm`, so locally the driver is unit-tested only.
-- **Jailer path untested against a real jailer.** The chroot hard-links require the disk and kernel on the same filesystem as the chroot base.
+- **The jailer's chroot hard-links** require the disk and kernel on the same filesystem as the chroot base.
 - **`WatchdogSec`** on nestd, and **per-agent `DynamicUser` ownership** of config dirs. The delegated cgroup and the start-up VMM kill are built but unverified on a real host.
 - **`capacity.warm`**, `drain` ending with nestd exiting, and the control `health` probe to the guest.
 - **Remaining review items:**

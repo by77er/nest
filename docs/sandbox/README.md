@@ -13,7 +13,7 @@
 ## Lifecycle
 
 ```
-running ⇄ paused (on host H, hugepages kept)
+running ⇄ paused (on host H, memory kept)
 running, paused → suspended (on H; disk-only or with memory) → running
 suspended → archived (S3 only) → restore in the cell: disk on any host, memory only on a host that loads its restore ABI
 ```
@@ -30,7 +30,7 @@ suspended → archived (S3 only) → restore in the cell: disk on any host, memo
 
 After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock (VMClock where the guest kernel supports it), and sets a new machine-id and hostname. Firecracker calls resuming one snapshot more than once insecure, so a live fork treats userspace RNG state and other process state as duplicated. Forking an agent's conversation is a separate step (`--fork-session`).
 
-**Sizing:** hugetlbfs memory can't be ballooned in the traditional way, and hotplug isn't assumed. Size the sandbox for the agents it will hold; if it gets crowded, fork instead of growing it.
+**Sizing:** a sandbox's declared memory is a ceiling (its VMM's cgroup limit), not a reservation; hotplug isn't assumed, and the snapshot path's hugetlbfs memory can't be ballooned in the traditional way. Size the sandbox for the agents it will hold; if it gets crowded, fork instead of growing it.
 
 ## Components
 

@@ -9,7 +9,7 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
   │    ├─ nest-proxy    (unprivileged; listeners handed over by nestd)
   │    ├─ nestd         (role `burst`, a sandbox host; enrolls with a one-time token; `process` driver; one netns per sandbox; advertises gateway_url)
   │    │    └─ nest-guest   (in the sandbox netns, behind the unix-socket vsock emulator)
-  │    └─ nest-gateway  (ws://127.0.0.1:18790; fed by nestd over gateway.sock; forwards hands calls to the guest's vsock port)
+  │    └─ nest-gateway  (ws://127.0.0.1:18790; its own uid (1001 in the namespace), no capabilities; fed by nestd over gateway.sock; forwards hands calls to the guest's vsock port)
   └─ brain host (brun/, bstate/)
        ├─ nestd         (role `controller`, a brain host; its own token; no driver, proxy, gateway or netns)
        └─ nest-runner   (brains = e2e/fake_claude.py, or real `claude`; hands through the real `nest mcp` bridge and the hands client)
@@ -29,7 +29,7 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
    - **credential injection:** the sandbox policy (set through `POST /v1/sandboxes {policy}`) binds a placeholder to `httpbin.org`, and the secret is stored with `PUT /v1/admin/secrets/inject:httpbin`. `curl -H 'Authorization: Bearer <placeholder>' https://httpbin.org/headers` returns 200. The echoed header is masked to the **secret's** length (not the placeholder's), so the upstream got the real secret and the proxy scrubbed it on the way back.
    - a direct connection with no proxy fails (no route)
    - from inside the sandbox netns: no route out, and the proxy listener on `172.16.0.1:443` is reachable
-4. **The seam:** the gateway's log shows at least as many bound connections as the scripted hands calls (the SessionStart CLAUDE.md read adds one), counted before the probes below run; the gateway was listening and had synced with nestd before the scenario; `POST /v1/sandboxes/<sbx>/resolve` returns a target whose URL is the advertised `gateway_url` and whose binding the gateway admits (`bound`, probed by `gateway_probe.mjs` with Node's WebSocket client); the same binding with one character of its signature flipped is refused `unauthorized` with `executed: false`; after the self-fence the still-valid binding is refused `moved`, and the log shows nestd removed the sandbox rather than the gateway losing its nestd link.
+4. **The seam:** the gateway's log shows at least as many bound connections as the scripted hands calls (the SessionStart CLAUDE.md read adds one), counted before the probes below run; the gateway was listening and had synced with nestd before the scenario, as its own uid with no capabilities (`/proc/<pid>/status`), so every call reached the guest through the sockets nestd gave its group; `POST /v1/sandboxes/<sbx>/resolve` returns a target whose URL is the advertised `gateway_url` and whose binding the gateway admits (`bound`, probed by `gateway_probe.mjs` with Node's WebSocket client); the same binding with one character of its signature flipped is refused `unauthorized` with `executed: false`; after the self-fence the still-valid binding is refused `moved`, and the log shows nestd removed the sandbox rather than the gateway losing its nestd link.
 5. **Platform tool:** `notify` reaches the workstream's user-notification queue.
 6. **Control plane state:**
    - the session transcript is in R2 (read through `GET /v1/agents/<id>/transcript`)
@@ -46,7 +46,7 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
 e2e/run.sh            # builds with CARGO_TARGET_DIR=target/e2e (release), runs, cleans up
 ```
 
-- **Requirements:** cargo, Node 22 or newer with npm (the gateway probe uses Node's global WebSocket client; `control-plane/node_modules` is installed if missing), `unshare`/`nsenter` with unprivileged user namespaces, curl, and internet access for `registry.npmjs.org` and `httpbin.org`.
+- **Requirements:** cargo, Node 22 or newer with npm (the gateway probe uses Node's global WebSocket client; `control-plane/node_modules` is installed if missing), `unshare`/`nsenter` with unprivileged user namespaces, curl, and internet access for `registry.npmjs.org` and `httpbin.org`. The gateway runs as its own uid, as on a host, so the harness also needs `newuidmap`/`newgidmap` (package `uidmap`) and a subordinate uid and gid range of at least 1001 for your user in `/etc/subuid` and `/etc/subgid`, and a work directory that other users can reach: a repo under a `0700` home needs `NEST_E2E_WORK=/var/tmp/nest-e2e-<tag>` (the harness says so and stops). It runs a copy of `nest-gateway` from the work directory for the same reason.
 - **Outputs:** each run starts from a fresh `e2e/.work/` (git-ignored). It holds logs in `logs/`, `summary.json`, the wrangler state, and the scenario files.
 - **Env:**
   - `NEST_E2E_PORT` (default 18787)

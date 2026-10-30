@@ -1,6 +1,6 @@
 # Setup for self-maintenance
 
-What I set up so nest can maintain this repo, beyond the [platform setup](../docs/setup/) (stages 1–3). The GitHub steps can be done now; CI and `CODEOWNERS` are already in the repo. The [credential rules](../docs/setup/#rules-for-every-credential) apply: never paste a credential into a chat.
+What I set up so nest can maintain this repo, beyond the [platform setup](../docs/setup/) (stages 1–3). Done, except adding `nest/review` to branch protection, which waits for the reviewer. The [credential rules](../docs/setup/#rules-for-every-credential) apply: never paste a credential into a chat.
 
 | What | How | Where it goes |
 |---|---|---|

@@ -153,7 +153,8 @@ export class WorkstreamDO extends DurableObject<Env> {
       ...(progress.length ? ["Recent progress:", ...progress.map((e) => line(e.body))] : []),
     ].join("\n");
     try {
-      await this.env.AGENT.get(this.env.AGENT.idFromName(info.subscriber)).enqueueTurn({ kind: "event_batch", text });
+      // Agents' event text inline, of unknown taint: the subscriber's session is tainted by it.
+      await this.env.AGENT.get(this.env.AGENT.idFromName(info.subscriber)).enqueueTurn({ kind: "event_batch", text }, undefined, true);
     } catch (e) {
       // A subscriber that names no agent (stored before subscribers were checked): keep the events
       // for a real one instead of retrying.

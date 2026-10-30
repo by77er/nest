@@ -40,7 +40,7 @@ export class CatalogDO extends DurableObject<Env> {
     }
   }
 
-  private insertSeed(c: Catalog): void {
+  private insertSeed(c: Pick<Catalog, "capabilities" | "templates">): void {
     for (const [name, cap] of Object.entries(c.capabilities)) {
       this.sql.exec("INSERT OR IGNORE INTO capabilities (name, body) VALUES (?, ?)", name, JSON.stringify(cap));
     }

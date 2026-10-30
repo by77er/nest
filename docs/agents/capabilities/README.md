@@ -17,9 +17,10 @@ prompt:  |                                  # added to the system prompt
 
 - **Data, not code:** capabilities are stored in the control plane ([CatalogDO](../../control-plane/durable-objects/catalog/)) and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
-- **Parameters (built for `ledger` only):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. Until attenuation is built a spawner can't set one, so its children get the template's. A parameter naming several values (`tasks{ledgers}`) is the extension point.
+- **Parameters (built for `ledger` only):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. Until attenuation is built a spawner can't set one and its children get none (not even the template's defaults). A parameter naming several values (`tasks{ledgers}`) is the extension point.
 - **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
+- **Built so far:** `builtin` tools only, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)). The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `tasks` and `tasks-admin`; of the parameters only `ledger` is built (`peers: label:<key>`, `any` aren't), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
 
 ## Sources
 

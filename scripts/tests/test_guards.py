@@ -2,6 +2,7 @@
 one that never looks. Each test copies a guard into a scratch tree, plants a violation, and
 checks the guard rejects it; then checks it accepts the clean case."""
 
+import os
 import shutil
 import subprocess
 import sys
@@ -285,6 +286,55 @@ class DocLinks(unittest.TestCase):
 
     def test_links_in_code_are_ignored(self):
         self.assertEqual(self.check("`[a](nope/)`\n\n```\n[b](nope/)\n```\n")[0], 0)
+
+
+try:
+    import yaml  # noqa: F401  (check-workflows.py needs it; CI installs scripts/requirements-guards.txt)
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+    if os.environ.get("CI") != "true":
+        print("NEST-TEST-SKIP: Workflows: PyYAML is not installed (required on CI)")
+
+
+@unittest.skipUnless(HAVE_YAML or os.environ.get("CI") == "true", "PyYAML is not installed (required on CI)")
+class Workflows(unittest.TestCase):
+    GOOD = "name: ok\non:\n  push:\njobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo hi\n"
+
+    def setUp(self):
+        self.assertTrue(HAVE_YAML, "CI must run check-workflows: a skip is not a pass")
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def check(self, **files):
+        for name, text in files.items():
+            (self.dir / f"{name}.yml").write_text(text, encoding="utf-8")
+        return run(SCRIPTS / "check-workflows.py", self.dir, str(self.dir))
+
+    def test_the_real_workflows_pass(self):
+        code, out = run(SCRIPTS / "check-workflows.py", SCRIPTS.parent)
+        self.assertEqual(code, 0, out)
+
+    def test_a_good_workflow_passes(self):
+        self.assertEqual(self.check(good=self.GOOD)[0], 0)
+
+    def test_an_unquoted_colon_in_a_step_name_fails(self):
+        # The fuzz.yml bug: a plain scalar containing ": " is a nested mapping, which YAML rejects here.
+        bad = self.GOOD.replace("      - run: echo hi", "      - name: replay: seeds\n        run: echo hi")
+        code, out = self.check(good=self.GOOD, fuzz=bad)
+        self.assertEqual(code, 1, out)
+        self.assertIn("fuzz.yml: does not parse", out)
+        self.assertNotIn("good.yml", out)
+
+    def test_a_workflow_without_jobs_or_trigger_fails(self):
+        code, out = self.check(empty="name: nothing\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn("has no `on` trigger", out)
+        self.assertIn("has no `jobs` mapping", out)
+
+    def test_no_workflows_fails(self):
+        self.assertEqual(self.check()[0], 1)
 
 
 if __name__ == "__main__":

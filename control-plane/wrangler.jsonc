@@ -12,12 +12,14 @@
       { "name": "WORKSTREAM", "class_name": "WorkstreamDO" },
       { "name": "BROKER", "class_name": "BrokerDO" },
       { "name": "CATALOG", "class_name": "CatalogDO" },
+      { "name": "CHANNEL", "class_name": "ChannelDO" },
       { "name": "TASKS", "class_name": "TaskLedgerDO" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["FleetDO", "SandboxDO", "AgentDO", "WorkstreamDO", "BrokerDO"] },
     { "tag": "catalog", "new_sqlite_classes": ["CatalogDO"] },
+    { "tag": "channels", "new_sqlite_classes": ["ChannelDO"] },
     { "tag": "tasks", "new_sqlite_classes": ["TaskLedgerDO"] }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "nest-control" }],

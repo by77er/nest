@@ -14,6 +14,8 @@
 | **Metrics** | `metrics_query` (see [metrics](../../control-plane/metrics/)) | Control plane → Analytics Engine |
 | **Tasks** | `task_list`, `task_get`, `task_create`, `task_update`, `task_claim`, `task_comment`; admin: `task_assign`, `task_update_any`, `task_cancel`, `task_set_watcher` | [TaskLedgerDO](../../control-plane/durable-objects/tasks/), on the ledger the agent's spec names |
 
+**Built:** the table is the design. The registry (`protocol/schemas/control/platform-tools.json`) holds interim tools that predate channels and grants: `notify`, `ask`, `emit`, `read_transcript` and `expose_port` work; `fork_sandbox`, `spawn_agent`, `attach`, `checkpoint`, `brokered` and the seeded `management` and `memory` capabilities' tools answer `not_implemented`. Hands are built ([hands](../hands/)).
+
 **Messaging and memory are channel operations.** Messaging an agent is `message` (a `post` to its inbox, through the [messaging capability](../capabilities/#messaging)); notifying me is `post` to `user`. An event is a `post` with a `kind`. Asking is `post` with `await_reply_s`. Waiting for events is `subscribe`, or `read` with a wait. Memory is a private channel read by key.
 
 ## Grants
@@ -35,6 +37,7 @@ An agent that reads untrusted content, holds private data and can send data out 
 - **It propagates:** a spawned agent starts with its spawner's taint, and every post carries its sender's taint.
 - **Sinks** are the actions that can send data out or widen authority: widening an egress policy, external brokered actions, `mcp` tools not marked read-only, `api` capabilities with `mode: rw`, and granting a sink action. Each sink grant carries `when_tainted: approve | allow` (default `approve`), and attenuation can only tighten it.
 - **A sink call from a tainted session** with `approve` posts a question to the escalation channel. Only I or an untainted holder of that grant can approve it.
+- **Built so far:** a conservative stand-in kept by AgentDO: a session is tainted if the agent has hands or a web built-in, or once another agent's text reached it that may be tainted (sticky): a tainted channel message it read, a `notify` from a tainted agent, an inbox post relayed under another name than `user`, a workstream batch, or another agent's transcript. It guarantees that no such text, and nothing from a sandbox or the web, reaches a session that then posts untainted; the operator's own text never taints. It over-taints freely (a captain that reads a hands worker's result once is tainted for good). It stamps channel posts; nothing checks it at a sink yet.
 - **Ways back to clean:**
   - A fresh session starts untainted unless the wake that starts it carries taint, or it then reads tainted content.
   - **Quarantined reports:** a spawn spec can declare a `report_schema` of enums, numbers and ids. A child's final report that validates against it reaches the spawner untainted, even from a tainted child. This is the dual-LLM / map-reduce pattern from [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837) (2025-06), and how a captain stays clean while its workers read code.
