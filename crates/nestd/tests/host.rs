@@ -243,6 +243,8 @@ fn fake_guest(dir: &Path, seen: Seen, latch: Option<Arc<AttachLatch>>) -> tokio:
 #[derive(Default)]
 struct FleetLog {
     events: Vec<HostEvent>,
+    /// Event batches failed by `fail_next_events` (not logged in `events`, not acked).
+    failed: Vec<Vec<HostEvent>>,
     hellos: Vec<HostHello>,
     acks: Vec<u64>,
     claims: Vec<Vec<LeaseClaim>>,
@@ -271,6 +273,9 @@ const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, c
 
 /// Mock FleetDO. Accepts reconnects. While `partition` is set it answers nothing on the open
 /// connection and refuses new ones (a network partition); clearing it lets the host reconnect.
+/// Like FleetDO, it keeps each command batch until the host acks it and, after each hello_ack,
+/// resends those past the hello's `last_command_seq`: a batch sent on a connection the host was
+/// already dropping (after a retryable error) is not lost.
 async fn mock_fleet() -> MockFleet {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/fleet", l.local_addr().unwrap());
@@ -285,6 +290,8 @@ async fn mock_fleet() -> MockFleet {
     let (reject, commit_s) = (reject_salvage.clone(), commit_salvage.clone());
     tokio::spawn(async move {
         let mut seq = 0u64;
+        // Command batches sent and not yet acked by the host, by seq.
+        let mut unacked: BTreeMap<u64, Vec<Command>> = BTreeMap::new();
         let mut last_event_seq: Option<u64> = None;
         // SandboxDO's commit compare-and-set: one head per sandbox, outcomes stored per request.
         let mut heads: BTreeMap<SandboxId, GenerationId> = BTreeMap::new();
@@ -309,6 +316,7 @@ async fn mock_fleet() -> MockFleet {
                     cmds = rx.recv() => {
                         let Some(cmds) = cmds else { return };
                         seq += 1;
+                        unacked.insert(seq, cmds.clone());
                         if ws.send(send(FleetToHost::Commands { seq: Seq(seq), commands: cmds })).await.is_err() { break; }
                     }
                     frame = frx.recv() => {
@@ -323,9 +331,15 @@ async fn mock_fleet() -> MockFleet {
                         let m: HostToFleet = serde_json::from_str(&t).unwrap();
                         match m {
                             HostToFleet::Hello(h) => {
+                                if let Some(done) = h.last_command_seq {
+                                    unacked.retain(|s, _| *s > done.0);
+                                }
                                 log2.lock().unwrap().hellos.push(*h);
                                 let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease: LEASE, host_token_expires_ms: 0, next_command_seq: None };
                                 if ws.send(send(FleetToHost::HelloAck(ack))).await.is_err() { break; }
+                                for (s, cmds) in &unacked {
+                                    let _ = ws.send(send(FleetToHost::Commands { seq: Seq(*s), commands: cmds.clone() })).await;
+                                }
                             }
                             HostToFleet::Heartbeat { sent_ms, leases } => {
                                 log2.lock().unwrap().claims.push(leases);
@@ -333,6 +347,7 @@ async fn mock_fleet() -> MockFleet {
                             }
                             HostToFleet::Events { seq: es, events } => {
                                 if fail.swap(false, Ordering::SeqCst) {
+                                    log2.lock().unwrap().failed.push(events);
                                     let err = ErrorBody { code: "internal".into(), message: "handler failed".into(), retryable: true };
                                     let _ = ws.send(send(FleetToHost::Error { error: err })).await;
                                     continue;
@@ -378,10 +393,14 @@ async fn mock_fleet() -> MockFleet {
                                 let _ = ws.send(send(FleetToHost::Ack { up_to: es })).await;
                                 if !answers.is_empty() {
                                     seq += 1;
+                                    unacked.insert(seq, answers.clone());
                                     let _ = ws.send(send(FleetToHost::Commands { seq: Seq(seq), commands: answers })).await;
                                 }
                             }
-                            HostToFleet::Ack { up_to } => log2.lock().unwrap().acks.push(up_to.0),
+                            HostToFleet::Ack { up_to } => {
+                                unacked.retain(|s, _| *s > up_to.0);
+                                log2.lock().unwrap().acks.push(up_to.0);
+                            }
                             HostToFleet::CaRenew { csr_pem } => {
                                 log2.lock().unwrap().ca_renews.push(csr_pem);
                                 let ca = CaCertificate { cert_pem: "RENEWED".into(), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 2 };
@@ -399,7 +418,8 @@ async fn mock_fleet() -> MockFleet {
 impl MockFleet {
     /// Wait until `pred` matches some logged event; returns it.
     async fn wait_event(&self, what: &str, pred: impl Fn(&HostEventBody) -> bool) -> HostEventBody {
-        for _ in 0..1500 {
+        let deadline = std::time::Instant::now() + WAIT;
+        while std::time::Instant::now() < deadline {
             if let Some(e) = self.log.lock().unwrap().events.iter().find(|e| pred(&e.body)) {
                 return e.body.clone();
             }
@@ -532,10 +552,15 @@ fn fake_proxy(path: PathBuf) -> Arc<Mutex<Vec<ProxyCommand>>> {
     got
 }
 
-/// Polls `f` until it holds. The budget is wall-clock and generous: some waits span a retry backoff
-/// (a salvage retried after 1 s), and CI runs this binary's tests in parallel on a loaded runner.
+/// How long `wait_until` and `MockFleet::wait_event` poll before failing. Wall-clock, not a count
+/// of polls (whose sleeps overrun on a loaded machine), and generous: some waits span a retry
+/// backoff (a salvage retried after 1 s; a reconnect after nestd's first 200 ms backoff), and CI
+/// runs this binary's tests in parallel on a loaded runner.
+const WAIT: Duration = Duration::from_secs(15);
+
+/// Polls `f` until it holds, for at most [`WAIT`].
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + WAIT;
     while std::time::Instant::now() < deadline {
         if f() {
             return;
@@ -840,10 +865,8 @@ fn netns_listeners_handed_to_proxy() {
                 },
             )])
             .unwrap();
-        for _ in 0..400 {
-            if received.lock().unwrap().len() == 5 {
-                break;
-            }
+        let deadline = std::time::Instant::now() + WAIT;
+        while received.lock().unwrap().len() != 5 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let n = received.lock().unwrap().len();
@@ -1291,13 +1314,23 @@ async fn fence_applies_on_arrival_behind_slow_commands() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retryable_fleet_error_resends_the_failed_batch() {
     let h = start_host().await;
+    // The startup capacity report goes first, so the batch failed below is cmd_a's.
+    h.fleet.wait_event("startup capacity", |b| matches!(b, HostEventBody::Capacity { .. })).await;
     h.fleet.fail_next_events.store(true, Ordering::SeqCst);
     h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
     // The batch carrying cmd_a's events failed once; it still arrives, exactly once.
     assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
     wait_until("reconnect", || h.fleet.log.lock().unwrap().hellos.len() >= 2).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let n = h.fleet.log.lock().unwrap().events.iter().filter(|e| matches!(&e.body, HostEventBody::CommandResult { cmd, .. } if cmd.0 == "cmd_a")).count();
+    let log = h.fleet.log.lock().unwrap();
+    let [failed] = log.failed.as_slice() else { panic!("one failed batch: {:#?}", log.failed) };
+    let about_a = |b: &HostEventBody| matches!(b, HostEventBody::CommandResult { cmd, .. } if cmd.0 == "cmd_a") || matches!(b, HostEventBody::SandboxState { sandbox, .. } if sandbox.0 == "sbx_a");
+    assert!(failed.iter().any(|e| about_a(&e.body)), "the failed batch carried cmd_a's events: {failed:#?}");
+    for e in failed {
+        let (sent, logged) = (failed.iter().filter(|f| *f == e).count(), log.events.iter().filter(|f| *f == e).count());
+        assert_eq!(logged, sent, "resent exactly once: {e:#?}");
+    }
+    let n = log.events.iter().filter(|e| matches!(&e.body, HostEventBody::CommandResult { cmd, .. } if cmd.0 == "cmd_a")).count();
     assert_eq!(n, 1);
 }
 
