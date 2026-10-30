@@ -504,7 +504,7 @@ fn accept_event(state: &Mutex<State>, conn: u64, ev: RunnerEvent) -> Vec<RunnerE
 mod tests {
     use super::*;
     use nest_protocol::control::{AgentStart as CpAgentStart, HandsBinding, LaunchConfig, SystemPrompt};
-    use nest_protocol::model::{AgentRole, Epoch, SandboxId, SessionId, WorkstreamId};
+    use nest_protocol::model::{Epoch, SandboxId, SessionId, WorkstreamId};
     use tokio::net::UnixStream;
 
     type Conn = Framed<UnixStream, LengthDelimitedCodec>;
@@ -512,7 +512,7 @@ mod tests {
     pub fn cp_start(agent: &str) -> CpAgentStart {
         CpAgentStart {
             agent: AgentId(agent.into()),
-            role: AgentRole::Captain,
+            role: None,
             workstream: WorkstreamId("ws_1".into()),
             epoch: Some(Epoch(1)),
             resume: None,

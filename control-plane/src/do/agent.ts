@@ -9,17 +9,18 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { num, type Env } from "../env";
-import { toolDef, toolsFor } from "../lib/registry";
+import { toolDef, toolDefs } from "../lib/registry";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
+import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
 import { signBlobUrl } from "../lib/tokens";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
 import { storedEnum, storedEnumOrNull } from "../lib/stored";
 import {
   type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage,
-  type LaunchConfig, RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
+  RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
-  type AgentEvent, type AgentRole, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
+  type AgentEvent, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
   type TaskInfo, type WorkstreamEvent,
 } from "../protocol/model";
 
@@ -91,27 +92,19 @@ const EMIT_EVENTS = ["progress", "blocked", "pr_opened", "completed", "failed"] 
 const RECOVERY_MARK = "\nThe turn was:\n";
 const iso = (ms: number) => new Date(ms).toISOString();
 
-export const DEFAULT_RULES: ToolRule[] = [{ pattern: "mcp__nest__*", decision: "allow" }];
-/** Workers' launch enables subagents (Claude Code's `Agent` tool, `Task` before 2.1); they run without an approval. */
-export const DEFAULT_WORKER_RULES: ToolRule[] = [...DEFAULT_RULES, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }];
-export const DEFAULT_WORKER_LAUNCH: LaunchConfig = {
-  builtin_tools: ["TodoWrite", "Task", "WebSearch"],
-  system_prompt: {
-    mode: "append",
-    text: "You work in a remote sandbox through the mcp__nest__* tools; they behave like Claude Code's built-ins.",
-  },
-};
-export const DEFAULT_CAPTAIN_LAUNCH: LaunchConfig = {
-  builtin_tools: [],
-  system_prompt: { mode: "replace", text: "You are a nest captain. You act only through mcp__nest__* platform tools." },
-};
-
-export interface AgentInfo {
+/**
+ * An agent, as AgentDO stores it. Its expanded spec (`AgentSpec`: template name, tools, launch,
+ * rules, credential, escalation) is copied in at spawn; nothing about it is decided by a role.
+ */
+export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
   agent: string;
-  role: AgentRole;
   workstream: string;
   cell: string;
-  captain: string | null;
+  /**
+   * The agent this one reports to (its spawner, or the one the operator named), recorded once at
+   * spawn and checked then to be an agent of the same workstream: `notify` to `captain` reaches it.
+   */
+  owner: string | null;
   /**
    * The bound sandbox, by id only. Its epoch is SandboxDO's (read there when needed, and fenced by
    * FleetDO's lease check for host-relayed calls); AgentDO keeps no copy.
@@ -134,9 +127,6 @@ export interface AgentInfo {
   intent: StartIntent | null;
   /** The host the last released brain ran on: preferred for the next start while healthy (a warm session). */
   prev_host?: string;
-  launch: LaunchConfig;
-  grants: string[] | null;
-  rules: ToolRule[];
   /** Session of the committed base (what `--resume` restores). */
   session: string | null;
   state: AgentState;
@@ -203,9 +193,15 @@ export interface StartIntent {
 /** What `info()` answers: the stored record plus the brain's host (derived, never stored). */
 export type AgentView = AgentInfo & { host: string | null };
 
-/** The field of records stored by the previous release that the brain record replaces (`load()`). */
+/**
+ * Fields of records stored by the previous release (`load()` migrates them): `host` (the brain
+ * record replaced it), and `role`, `grants` and `captain` (the expanded spec and `owner` did).
+ */
 interface PreviousReleaseFields {
   host?: string | null;
+  role?: RoleRecord["role"];
+  grants?: string[] | null;
+  captain?: string | null;
 }
 
 /** Points where a test can force an interleaving (`testHooks`). */
@@ -215,14 +211,12 @@ export type HookPoint =
 
 export interface CreateAgent {
   agent: string;
-  role: AgentRole;
   workstream: string;
   cell: string;
-  captain?: string | null;
+  /** The expanded spawn spec (CatalogDO checked the template's hands rule against `sandbox`). */
+  spec: AgentSpec;
+  owner?: string | null;
   sandbox?: string | null;
-  launch?: LaunchConfig;
-  grants?: string[] | null;
-  rules?: ToolRule[];
 }
 
 interface Attachment {
@@ -326,7 +320,13 @@ export class AgentDO extends DurableObject<Env> {
     // Stored before the agent epoch: `hands.epoch` was the session epoch of the running brain.
     const legacy = info.hands as { sandbox: string; epoch?: number } | null;
     const agentEpoch = info.agent_epoch ?? legacy?.epoch ?? 0;
-    const { host, ...rest } = info;
+    const { host, role, grants, captain, ...rest } = info;
+    // Stored with a role (the previous release): its role's seed template, expanded with the launch,
+    // rules and grant list it stored; its `captain` is its owner. Persisted once, below.
+    let spec: Omit<AgentSpec, "subscribe"> | undefined;
+    if (info.tools === undefined) {
+      spec = specFromRole({ role: role ?? (legacy ? "worker" : "captain"), grants, launch: info.launch, rules: info.rules });
+    }
     let brain = info.brain;
     let migrated = false;
     if (brain === undefined) {
@@ -345,6 +345,9 @@ export class AgentDO extends DurableObject<Env> {
     }
     const out: AgentInfo = {
       ...rest,
+      ...spec,
+      escalate_to: storedEnum(EscalateTo, (spec ?? rest).escalate_to, "kv.info.escalate_to"),
+      owner: info.owner !== undefined ? info.owner : captain ?? null,
       brain,
       intent: info.intent ?? null,
       hands: legacy ? { sandbox: legacy.sandbox } : null,
@@ -363,12 +366,19 @@ export class AgentDO extends DurableObject<Env> {
       if (b?.phase === "condemned") this.ctx.waitUntil(this.deadlines.set("condemned", Date.now(), true));
       else if (b?.phase === "starting") this.ctx.waitUntil(this.deadlines.set("starting", Date.now() + START_DEADLINE_MS, true));
       else if (b?.phase === "live") this.ctx.waitUntil(this.deadlines.set("no_session", Date.now() + NO_SESSION_MS, true));
+    } else if (spec) {
+      this.save(out);
     }
     return out;
   }
 
   private save(info: AgentInfo): void {
-    this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(info));
+    // For one release, the previous release's fields beside the spec, derived from it, so a forward
+    // revert to that release reads the record as its own (`role` from hands, `grants` = the tools,
+    // `captain` = the owner). `load()` drops them: the spec is the authority.
+    const legacy: PreviousReleaseFields = { role: info.hands ? "worker" : "captain", grants: info.tools, captain: info.owner };
+    this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      JSON.stringify({ ...info, ...legacy }));
   }
 
   /** Load, mutate and save synchronously (never across an await). */
@@ -385,31 +395,39 @@ export class AgentDO extends DurableObject<Env> {
 
   async create(req: CreateAgent): Promise<AgentInfo> {
     if (this.exists()) return this.load();
+    // The owner is recorded once, here: it must be an agent (`info()` refuses one never created) of
+    // this workstream, the only agents `notify` reaches.
+    const owner = req.owner ?? null;
+    if (owner !== null) {
+      const o = await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info();
+      if (o.workstream !== req.workstream) {
+        throw new NestError(ErrorCodes.INVALID_MESSAGE, `owner ${owner} is in workstream ${o.workstream}, not ${req.workstream}`, 409);
+      }
+    }
     let hands: AgentInfo["hands"] = null;
-    if (req.role === "worker" && req.sandbox) {
-      // A worker's cell and workstream are its sandbox's: its brain starts through that cell's FleetDO,
-      // and its sandbox's secrets and events belong to that workstream. Checked before attaching.
+    if (req.sandbox) {
+      // An agent's cell and workstream are its sandbox's: its brain starts through that cell's
+      // FleetDO, and its sandbox's secrets and events belong to that workstream. Checked before
+      // attaching.
       const stub = this.sandboxStub(req.sandbox);
       const cur = await stub.info();
       if (cur.cell !== req.cell || cur.workstream !== req.workstream) {
         throw new NestError(ErrorCodes.INVALID_MESSAGE,
-          `${req.sandbox} is in cell ${cur.cell}, workstream ${cur.workstream}; the worker must be too`, 409);
+          `${req.sandbox} is in cell ${cur.cell}, workstream ${cur.workstream}; the agent must be too`, 409);
       }
       await stub.attach(req.agent);
       hands = { sandbox: req.sandbox };
     }
     if (this.exists()) return this.load();
+    const { subscribe: _, ...spec } = req.spec;
     const info: AgentInfo = {
+      ...spec,
       agent: req.agent,
-      role: req.role,
       workstream: req.workstream,
       cell: req.cell,
-      captain: req.captain ?? null,
+      owner,
       hands,
       agent_epoch: 0,
-      launch: req.launch ?? (req.role === "captain" ? DEFAULT_CAPTAIN_LAUNCH : DEFAULT_WORKER_LAUNCH),
-      grants: req.grants ?? null,
-      rules: req.rules ?? (req.role === "worker" ? DEFAULT_WORKER_RULES : DEFAULT_RULES),
       brain: null,
       intent: null,
       session: null,
@@ -485,7 +503,7 @@ export class AgentDO extends DurableObject<Env> {
   private async syncActivity(force = false): Promise<void> {
     for (let n = 0; n < 3; n++) {
       const info = this.load();
-      if (!info.hands || info.role !== "worker") return;
+      if (!info.hands) return;
       const want = this.working(info);
       if (!force && info.activity_sent === want) return;
       force = false;
@@ -659,7 +677,7 @@ export class AgentDO extends DurableObject<Env> {
           return this.startStatus();
         }
         const host = await this.pickHost(snap, intent);
-        const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).oauthTokenRef(snap.role);
+        const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).credentialRef(snap.credential);
         // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
         // resume from up to a flush interval ago.
         await this.flush();
@@ -747,7 +765,8 @@ export class AgentDO extends DurableObject<Env> {
     // `current()` refuses what it sends, and the new brain's hello supersedes it.
     const body: AgentStartBody = {
       agent: started.agent,
-      role: started.role,
+      // Deprecated, for one release: runners of the previous release require a role (and ignore it).
+      role: started.hands ? "worker" : "captain",
       workstream: started.workstream,
       epoch,
       ...(resume ? { resume } : {}),
@@ -1275,7 +1294,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (msg.type === "tools_list_request") {
       const info = this.load();
-      this.send(ws, { type: "tools_list", request: msg.request, tools: toolsFor(info.role, info.grants ?? undefined) });
+      this.send(ws, { type: "tools_list", request: msg.request, tools: toolDefs(info.tools) });
       return;
     }
     if (msg.type === "hands_resolve") {
@@ -1714,7 +1733,7 @@ export class AgentDO extends DurableObject<Env> {
       // async ask; the answer becomes the agent's next turn.
       const input = JSON.stringify(ev.input ?? null);
       const question = `Allow ${ev.tool}? (request ${ev.call}) input: ${input.length > 500 ? `${input.slice(0, 500)}…` : input}`;
-      await this.postAsk(info, ev.call, ev.epoch, question, "async", "captain");
+      await this.postAsk(info, ev.call, ev.epoch, question, "async", "escalation");
     }
     await this.syncActivity();
     if (completed) {
@@ -1731,7 +1750,7 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Queue a turn. A retried submission with the same `requestId` gets the same turn, queued once. */
   async enqueueTurn(input: TurnInput, requestId?: string): Promise<string> {
-    // Never write a turn into an AgentDO that was never created (e.g. a captain id that names nobody).
+    // Never write a turn into an AgentDO that was never created (e.g. a subscriber id that names nobody).
     if (!this.exists()) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
     if (requestId) {
       const prior = this.sql.exec<{ turn: string }>("SELECT turn FROM turns WHERE request_id = ?", requestId).toArray()[0];
@@ -1953,7 +1972,7 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     const def = toolDef(name);
     if (!def) throw new NestError(ErrorCodes.UNKNOWN_TOOL, `unknown tool ${name}`);
-    if (!toolsFor(info.role, info.grants ?? undefined).some((t) => t.name === name)) {
+    if (!info.tools.includes(name)) {
       throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not granted to this agent`, 403);
     }
     const a = validateArgs(def.input_schema, args);
@@ -1972,20 +1991,19 @@ export class AgentDO extends DurableObject<Env> {
       case "notify": {
         const to = String(a.to);
         const message = String(a.message);
-        if (to === "user") {
+        const target = to === "captain" ? await this.captainOf(info) : to;
+        if (target === "user") {
           await live();
           await this.workstream(info.workstream).notifyUser(message, a.urgency === "high" ? "high" : "normal", key);
         } else {
-          const wsCaptain = (await this.workstream(info.workstream).info()).captain;
-          const target = to === "captain" ? info.captain ?? wsCaptain : to;
           if (!target?.startsWith("agt_")) throw new NestError(ErrorCodes.INVALID_MESSAGE, `no recipient for ${to}`);
           const stub = this.env.AGENT.get(this.env.AGENT.idFromName(target));
-          // Only within the workstream, captains included: a prompt-injected agent can't reach others,
-          // and a recorded captain (set at create, or by the workstream route) is no exception.
+          // Only within the workstream, the owner and the subscriber included: a prompt-injected
+          // agent can't reach others.
           const other = await stub.info();
           if (other.workstream !== info.workstream) throw new NestError(ErrorCodes.FORBIDDEN, `${target} is in another workstream`, 403);
           await live();
-          await stub.postInbox(`${info.role}:${info.agent}`, message, false, key);
+          await stub.postInbox(`${info.template}:${info.agent}`, message, false, key);
         }
         return text(`Delivered to ${to}.`);
       }
@@ -2014,7 +2032,7 @@ export class AgentDO extends DurableObject<Env> {
         const question = String(a.question);
         const options = Array.isArray(a.options) ? (a.options as unknown[]).map(String) : [];
         const full = options.length ? `${question} (options: ${options.join(" | ")})` : question;
-        await this.postAsk(info, call, epoch, full, "sync", a.to === "user" ? "user" : "captain", sandboxEpoch, fence);
+        await this.postAsk(info, call, epoch, full, "sync", a.to === "user" ? "user" : "escalation", sandboxEpoch, fence);
         return "wait";
       }
       case "read_transcript": {
@@ -2056,12 +2074,23 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * Record an ask and route the question to the captain (workstream `needs_input`) or the user.
+   * Who `notify` to `captain` reaches: the owner when there is one, else whoever reads the agent's
+   * escalation channel (the workstream channel's subscriber, or the user).
+   */
+  private async captainOf(info: AgentInfo): Promise<string | null> {
+    if (info.owner) return info.owner;
+    if (info.escalate_to === "user") return "user";
+    return (await this.workstream(info.workstream).info()).subscriber;
+  }
+
+  /**
+   * Record an ask and route the question to the user, or to the agent's escalation channel (`ask`
+   * to `captain`, approvals): the workstream channel (`needs_input`) or the user, as its spec says.
    * `sync`: a tool call waits for it (until the sync-window deadline). `cli`: a guest `nest ask` waits
    * in memory. `async`: nothing waits; the answer becomes the next turn.
    */
   private async postAsk(
-    info: AgentInfo, call: string, epoch: number, question: string, status: "sync" | "cli" | "async", to: "captain" | "user",
+    info: AgentInfo, call: string, epoch: number, question: string, status: "sync" | "cli" | "async", to: "escalation" | "user",
     sandboxEpoch?: number, fence: number = epoch,
   ): Promise<string> {
     // Re-run for the same call (after an eviction, or an event resent because routing failed): the
@@ -2080,7 +2109,7 @@ export class AgentDO extends DurableObject<Env> {
     const q = prior?.question ?? question;
     // The brain's own asks are fenced by its epoch; a guest's (`sandboxEpoch`) by FleetDO's lease check.
     if (sandboxEpoch === undefined) this.assertEpoch(fence);
-    if (to === "user") {
+    if (to === "user" || info.escalate_to === "user") {
       await this.workstream(info.workstream).notifyUser(`[${ask}] ${info.agent} asks: ${q}`, "high", `${info.agent}/${ask}`);
     } else {
       await this.workstream(info.workstream).ingest({
@@ -2140,7 +2169,7 @@ export class AgentDO extends DurableObject<Env> {
           return await run("expose_port", { port: command.port });
         case "ask": {
           const full = command.options.length ? `${command.question} (options: ${command.options.join(" | ")})` : command.question;
-          const ask = await this.postAsk(info, call, key, full, "cli", "captain", epoch);
+          const ask = await this.postAsk(info, call, key, full, "cli", "escalation", epoch);
           const waitMs = Math.min(command.wait_s, 120) * 1000;
           const answer = await new Promise<string | null>((resolve) => {
             const timer = setTimeout(() => { this.cliWaiters.delete(ask); resolve(null); }, waitMs);

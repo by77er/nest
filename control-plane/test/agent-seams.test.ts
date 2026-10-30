@@ -7,6 +7,8 @@ import type { FleetDO } from "../src/do/fleet";
 import type { AwsCellConfig } from "../src/lib/cells";
 import type { SandboxDO } from "../src/do/sandbox";
 import { verifyBinding } from "../src/lib/binding";
+import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
+import { expandTemplate, SEED_CATALOG } from "../src/lib/spec";
 import { b64urlToBytes } from "../src/lib/util";
 import { adminJson, connectHost, hostHello, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
@@ -16,6 +18,11 @@ const isStartOf = (agent: string) => (c: any) => c.type === "agent_start" && c.a
 const isKillOf = (agent: string) => (c: any) => c.type === "agent_stop" && c.agent === agent && c.mode === "kill";
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const wsStub = (id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
+const WORKER_SPEC = (() => {
+  const r = expandTemplate(SEED_CATALOG, PLATFORM_TOOL_NAMES, "worker");
+  if (!r.ok) throw new Error(r.error);
+  return r.value;
+})();
 
 async function setup(opts: { captain?: boolean; launch?: unknown } = {}) {
   const cell = uniqueCell();
@@ -2166,7 +2173,7 @@ describe("a worker's cell and workstream are its sandbox's", () => {
     // AgentDO checks it too, for any caller.
     // Wrapped: an RPC thenable that rejects is otherwise also reported as unhandled.
     await expect(Promise.resolve().then(() => agentStub("agt_direct0000000000000000000").create({
-      agent: "agt_direct0000000000000000000", role: "worker", workstream: other, cell, sandbox: sbx.sandbox,
+      agent: "agt_direct0000000000000000000", spec: WORKER_SPEC, workstream: other, cell, sandbox: sbx.sandbox,
     }))).rejects.toThrow(/workstream/);
   });
 });
@@ -2192,7 +2199,7 @@ describe("`starting` has a deadline", () => {
 });
 
 describe("captains named in several places", () => {
-  it("a worker's recorded captain in another workstream can't be notified", async () => {
+  it("an owner in another workstream is refused at spawn, so it can never be notified", async () => {
     const other = await setup({ captain: true });
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
@@ -2201,12 +2208,12 @@ describe("captains named in several places", () => {
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "mine" } }, 201);
     const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
     await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
-    const w = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, captain: other.captain } }, 201);
-    await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === w.agent);
-    const ws = await runner(w.agent, host.host, host.host_token);
-    ws.send({ type: "tool_call", seq: 1, call: "cal_cap-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "hi" } });
-    expect((await ws.next("tool_result", (m) => m.call === "cal_cap-1")).outcome.error.code).toBe("forbidden");
+    const refused = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, captain: other.captain } }, 409);
+    expect(refused.error.message).toMatch(/owner .* is in workstream/);
     expect(await agentStub(other.captain!).turns()).toEqual([]);
+    // An owner that names no agent is refused too.
+    expect((await adminJson("/v1/agents", { body: { template: "worker", sandbox: sbx.sandbox, owner: "agt_nobody00000000000000000000" } }, 404))
+      .error.code).toBe("unknown_agent");
   });
 
   it("a turn for an agent that was never created is refused and writes nothing", async () => {

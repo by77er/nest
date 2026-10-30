@@ -374,7 +374,7 @@ mod tests {
     use crate::test_support::FakeGuest;
     use crate::test_support::gateway::TestGateway;
     use nest_protocol::control::HandsBinding;
-    use nest_protocol::model::{AgentId, AgentRole, Epoch, SandboxId, error_codes};
+    use nest_protocol::model::{AgentId, Epoch, SandboxId, error_codes};
     use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -418,7 +418,6 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
         let agent = Agent::new(
             AgentId(AGENT.into()),
-            AgentRole::Worker,
             Epoch(4),
             std::env::temp_dir(),
             Some(HandsBinding { sandbox: SandboxId(SBX.into()), epoch: None }),

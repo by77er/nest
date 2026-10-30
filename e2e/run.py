@@ -460,7 +460,7 @@ def run_scenario():
     netns = os.path.join(WORK, "netns", f"ns-{sbxid}")
     wait_for(lambda: os.path.exists(netns), 20, 0.2, "sandbox netns")
 
-    body = {"role": "worker", "workstream": wsid, "sandbox": sbxid, "cell": "local"}
+    body = {"template": "worker", "workstream": wsid, "sandbox": sbxid, "cell": "local"}
     if REAL:
         body["launch"] = REAL_LAUNCH
     st, ag = api("POST", "/v1/agents", body)

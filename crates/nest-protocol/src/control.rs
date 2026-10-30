@@ -428,7 +428,11 @@ pub const DEFAULT_CWD: &str = "/workspace";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStart {
     pub agent: AgentId,
-    pub role: AgentRole,
+    /// Deprecated, for one release: the control plane still sends it because runners of the
+    /// previous release require it. Nothing reads it: an agent's tools, hands and prompt come from
+    /// its spec (`hands` here, `tools_list`, `launch`), never from a role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<AgentRole>,
     pub workstream: WorkstreamId,
     /// The agent epoch AgentDO issued for this brain start (one per start, never reused). The
     /// brain presents it in its session `hello`; AgentDO keys platform tool calls and filters
@@ -913,8 +917,10 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    /// Roles the tool is offered to.
-    pub roles: Vec<AgentRole>,
+    /// Deprecated, for one release: sent as `[]` because runners of the previous release
+    /// require it. Which tools an agent gets is its spec's, decided by AgentDO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<AgentRole>>,
     /// Always routed through the approval gate.
     #[serde(default)]
     pub requires_approval: bool,
@@ -1158,7 +1164,7 @@ mod tests {
             assert!(names.insert(t.name.as_str()), "duplicate tool {}", t.name);
             assert_eq!(t.input_schema["type"], "object", "{}: input_schema must be an object schema", t.name);
             assert_eq!(t.input_schema["additionalProperties"], false, "{}: additionalProperties must be false", t.name);
-            assert!(!t.roles.is_empty(), "{}: no roles", t.name);
+            assert!(t.roles.is_none(), "{}: the catalog has no roles (an agent's spec picks its tools)", t.name);
         }
         for required in [
             "notify", "emit", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "checkpoint",

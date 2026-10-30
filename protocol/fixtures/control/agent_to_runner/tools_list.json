@@ -31,10 +31,7 @@
         ],
         "additionalProperties": false
       },
-      "roles": [
-        "worker",
-        "captain"
-      ],
+      "roles": [],
       "requires_approval": false
     },
     {
@@ -68,10 +65,7 @@
         ],
         "additionalProperties": false
       },
-      "roles": [
-        "worker",
-        "captain"
-      ],
+      "roles": [],
       "requires_approval": false
     }
   ]

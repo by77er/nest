@@ -78,6 +78,7 @@ export const HostRole = z.preprocess(
   z.enum(HOST_ROLES),
 );
 export type HostRole = z.output<typeof HostRole>;
+/** Deprecated wire value, for one release only (`agent_start.role`, `ToolDef.roles`); nothing decides on it. */
 export const AgentRole = z.enum(["worker", "captain"]);
 export type AgentRole = z.output<typeof AgentRole>;
 

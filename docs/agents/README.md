@@ -40,6 +40,7 @@ labels:        {workstream: auth}
 credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:captain
 ```
 
+- **Built so far:** the admin API's spawn is `{template, sandbox?, workstream?, owner?, overrides?}`, expanded by [CatalogDO](../control-plane/durable-objects/catalog/) (the fields above that aren't built: backend, grants, budget, subscriptions, report schema, priority, labels; `escalate_to` is `user` or `workstream` until channels exist). An agent's own spawn may only narrow.
 - **Templates** are named specs stored in the control plane and edited by me, mostly a list of [capabilities](capabilities/). `captain` and `worker` are just the two I start with. See [../orchestration/](../orchestration/).
 - **Brain placement is by backend and capacity, never by sandbox:** a `claude-code` brain starts on any [brain host](../compute/brain-hosts/) with capacity, preferring the host that ran the agent last (a warm session file), a preference and not a rule; an `api-loop` brain needs no host. Hands are a binding to one sandbox, reached through its [gateway](../sandbox/gateway/) from wherever the brain runs.
 - **Ownership:** the spawner owns the new agent and holds every grant on it: post to its inbox, stop it, attach it, read its transcript. It's subscribed to the new agent's `events` by default, so the agent's final text comes back when it finishes.
