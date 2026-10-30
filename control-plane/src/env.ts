@@ -1,5 +1,6 @@
 import type { AgentDO } from "./do/agent";
 import type { BrokerDO } from "./do/broker";
+import type { CatalogDO } from "./do/catalog";
 import type { FleetDO } from "./do/fleet";
 import type { SandboxDO } from "./do/sandbox";
 import type { WorkstreamDO } from "./do/workstream";
@@ -10,6 +11,7 @@ export interface Env {
   AGENT: DurableObjectNamespace<AgentDO>;
   WORKSTREAM: DurableObjectNamespace<WorkstreamDO>;
   BROKER: DurableObjectNamespace<BrokerDO>;
+  CATALOG: DurableObjectNamespace<CatalogDO>;
   BUCKET: R2Bucket;
 
   /** Bearer token for the admin API (Cloudflare Access replaces this later). */
@@ -47,7 +49,7 @@ export interface Env {
   CELLS?: string;
   /** A placed, running sandbox with no agent working is suspended after this long (default 11 min). */
   SANDBOX_SUSPEND_IDLE_MS?: string;
-  /** Captain wake batching window. */
+  /** Batching window of the workstream channel's subscriber wakes. */
   WAKE_BATCH_MS?: string;
   /** The nest domain, `<label>.<zone>` (e.g. `nest.bitcru.sh`): sandbox hosts get `<host>-gw-<label>.<zone>`, previews `<port>-<sandbox>-preview-<label>.<zone>`, share links `<token>-share-<label>.<zone>`. Unset: no tunnels, and preview names use `nest.localhost`. */
   NEST_DOMAIN?: string;

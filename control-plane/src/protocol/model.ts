@@ -71,6 +71,7 @@ export function openEnum<const T extends readonly [string, ...string[]]>(members
 
 export const HostRole = z.enum(["burst", "controller"]);
 export type HostRole = z.output<typeof HostRole>;
+/** Deprecated wire value, for one release only (`agent_start.role`, `ToolDef.roles`); nothing decides on it. */
 export const AgentRole = z.enum(["worker", "captain"]);
 export type AgentRole = z.output<typeof AgentRole>;
 

@@ -268,14 +268,14 @@ mod tests {
     use crate::config::Config;
     use crate::runtime::{AgentCmd, Outbound};
     use nest_protocol::control::{AgentCache, InboxMessage, ToolRule};
-    use nest_protocol::model::{AgentEvent, AgentId, AgentRole, Epoch, MessageId};
+    use nest_protocol::model::{AgentEvent, AgentId, Epoch, MessageId};
     use tokio::sync::mpsc;
 
     fn setup() -> (Arc<Runtime>, Arc<Agent>, mpsc::UnboundedReceiver<Outbound>, mpsc::UnboundedReceiver<AgentCmd>) {
         let rt = Runtime::new(Config::default());
         let (ctx, crx) = mpsc::unbounded_channel();
         let (otx, orx) = mpsc::unbounded_channel();
-        let a = Agent::new(AgentId("agt_h".into()), AgentRole::Worker, Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
+        let a = Agent::new(AgentId("agt_h".into()), Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
         assert!(rt.register(a.clone(), rt.fence_gen()).is_ok());
         (rt, a, orx, crx)
     }
@@ -409,7 +409,7 @@ mod session_start_tests {
     use crate::test_support::FakeGuest;
     use crate::test_support::gateway::TestGateway;
     use nest_protocol::control::HandsBinding;
-    use nest_protocol::model::{AgentId, AgentRole, Epoch, ErrorBody, SandboxId};
+    use nest_protocol::model::{AgentId, Epoch, ErrorBody, SandboxId};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
@@ -425,7 +425,6 @@ mod session_start_tests {
         let (otx, mut orx) = mpsc::unbounded_channel::<Outbound>();
         let agent = Agent::new(
             AgentId("agt_s".into()),
-            AgentRole::Worker,
             Epoch(2),
             std::env::temp_dir(),
             Some(HandsBinding { sandbox: SandboxId("sbx_s".into()), epoch: None }),

@@ -173,6 +173,8 @@ pub enum HostRole {
     Controller,
 }
 
+/// Deprecated wire value, for one release only ([`crate::control::AgentStart::role`],
+/// [`crate::control::ToolDef::roles`]): nothing decides on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {

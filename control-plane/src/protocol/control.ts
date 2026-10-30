@@ -191,12 +191,27 @@ export const LaunchConfig = z.object({
 });
 export type LaunchConfig = z.output<typeof LaunchConfig>;
 
+/** BrokerDO's name of the default Claude setup token; a named one is `<this>:<name>`. */
+export const SETUP_TOKEN_SECRET = "claude_oauth_token";
+/** The BrokerDO name of setup token `name` (the default one without a name). */
+export const setupTokenSecret = (name?: string): string => (name ? `${SETUP_TOKEN_SECRET}:${name}` : SETUP_TOKEN_SECRET);
+/**
+ * An agent spec's `credential`: a Claude setup token's BrokerDO name, and nothing else. Its value is
+ * resolved into `agent_start` and sent to a brain host, so it must never name another kind of secret.
+ */
+export const Credential = z.string().regex(/^claude_oauth_token(:[A-Za-z0-9_.-]{1,64})?$/,
+  "a credential is claude_oauth_token or claude_oauth_token:<name>");
+
 /** How a brain stops (`host::runner::StopMode`). */
 export const StopMode = z.enum(["graceful", "kill"]);
 
 const AgentStartFields = {
   agent: AgentId,
-  role: AgentRole,
+  /**
+   * Deprecated, for one release: runners of the previous release require it (and ignore it). An
+   * agent's tools, hands and prompt come from its spec, never from a role.
+   */
+  role: AgentRole.optional(),
   workstream: WorkstreamId,
   /** The agent epoch AgentDO issued for this brain start; absent only from the previous release. */
   epoch: Epoch.optional(),
@@ -461,7 +476,8 @@ export const ToolDef = z.object({
   name: z.string(),
   description: z.string(),
   input_schema: z.unknown(),
-  roles: z.array(AgentRole),
+  /** Deprecated, for one release: sent as `[]` because runners of the previous release require it. */
+  roles: z.array(AgentRole).optional(),
   requires_approval: z.boolean().default(false),
 });
 export type ToolDef = z.output<typeof ToolDef>;

@@ -10,11 +10,13 @@
       { "name": "SANDBOX", "class_name": "SandboxDO" },
       { "name": "AGENT", "class_name": "AgentDO" },
       { "name": "WORKSTREAM", "class_name": "WorkstreamDO" },
-      { "name": "BROKER", "class_name": "BrokerDO" }
+      { "name": "BROKER", "class_name": "BrokerDO" },
+      { "name": "CATALOG", "class_name": "CatalogDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["FleetDO", "SandboxDO", "AgentDO", "WorkstreamDO", "BrokerDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["FleetDO", "SandboxDO", "AgentDO", "WorkstreamDO", "BrokerDO"] },
+    { "tag": "catalog", "new_sqlite_classes": ["CatalogDO"] }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "nest-control" }],
   // Production hostname (a Workers Custom Domain on the bitcru.sh zone; Cloudflare issues its certificate).

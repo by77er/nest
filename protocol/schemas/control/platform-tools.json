@@ -1,13 +1,13 @@
 [
   {
     "name": "notify",
-    "description": "Send a short message to your captain, to the user (via Discord), or to another agent's inbox. Does not wait for a reply.",
+    "description": "Send a short message to `captain` (your owner, or else whoever reads your escalation channel), to the user (via Discord), or to another agent's inbox. Does not wait for a reply.",
     "input_schema": {
       "type": "object",
       "properties": {
         "to": {
           "type": "string",
-          "description": "Recipient: 'captain', 'user', or an agent id (agt_...)."
+          "description": "Recipient: 'captain' (your owner, or your escalation channel's reader), 'user', or an agent id (agt_...)."
         },
         "message": {
           "type": "string",
@@ -28,15 +28,11 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
     "name": "emit",
-    "description": "Emit a structured workstream event (progress, blocked, pr_opened, completed, failed). Decision events wake your captain.",
+    "description": "Emit a structured workstream event (progress, blocked, pr_opened, completed, failed). Decision events wake the workstream channel's subscriber.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -70,14 +66,11 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker"
-    ],
     "requires_approval": false
   },
   {
     "name": "ask",
-    "description": "Ask your captain or the user a question. Answers within ~2 minutes are returned directly; otherwise the call returns 'pending', you should end your turn, and the answer arrives as your next input.",
+    "description": "Ask whoever reads your escalation channel (`captain`, the default) or the user a question. Answers within ~2 minutes are returned directly; otherwise the call returns 'pending', you should end your turn, and the answer arrives as your next input.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -94,7 +87,7 @@
         },
         "to": {
           "type": "string",
-          "description": "captain (default) or user.",
+          "description": "captain (your escalation channel; the default) or user.",
           "enum": [
             "captain",
             "user"
@@ -106,10 +99,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -141,9 +130,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -174,10 +160,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -200,9 +182,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -233,10 +212,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -253,9 +228,6 @@
       "required": [],
       "additionalProperties": false
     },
-    "roles": [
-      "worker"
-    ],
     "requires_approval": false
   },
   {
@@ -288,9 +260,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker"
-    ],
     "requires_approval": false
   },
   {
@@ -314,10 +283,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "worker",
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -353,9 +318,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -387,9 +349,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -412,9 +371,6 @@
       "required": [],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -433,9 +389,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -467,9 +420,6 @@
       "required": [],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -492,9 +442,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -517,9 +464,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -542,9 +486,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": true
   },
   {
@@ -568,9 +509,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -605,9 +543,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -626,9 +561,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -652,9 +584,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   },
   {
@@ -681,9 +610,6 @@
       ],
       "additionalProperties": false
     },
-    "roles": [
-      "captain"
-    ],
     "requires_approval": false
   }
 ]

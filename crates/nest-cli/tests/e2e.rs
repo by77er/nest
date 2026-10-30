@@ -19,7 +19,7 @@ use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerCommand, RunnerEvent};
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
-    AgentEventBody, AgentId, AgentRole, Epoch, HostId, HostRole, MessageId, SandboxId, Seq, SessionId, TurnId, TurnInputKind,
+    AgentEventBody, AgentId, Epoch, HostId, HostRole, MessageId, SandboxId, Seq, SessionId, TurnId, TurnInputKind,
     WorkstreamId,
 };
 use nest_runner::test_support::FakeGuest;
@@ -256,7 +256,7 @@ fn notify_tool() -> ToolDef {
         name: "notify".into(),
         description: "Send a message.".into(),
         input_schema: json!({"type": "object", "properties": {"to": {"type": "string"}, "message": {"type": "string"}}, "required": ["to", "message"], "additionalProperties": false}),
-        roles: vec![AgentRole::Worker, AgentRole::Captain],
+        roles: None,
         requires_approval: false,
     }
 }
@@ -328,7 +328,7 @@ impl Harness {
     fn start_agent(&self, oauth: &str, resume: Option<SessionResume>) {
         let start = control::AgentStart {
             agent: AgentId(AGENT.into()),
-            role: AgentRole::Worker,
+            role: None,
             workstream: WorkstreamId("ws_e2e".into()),
             // The agent epoch (3) is unrelated to the sandbox's (7, inside the binding).
             epoch: Some(Epoch(3)),

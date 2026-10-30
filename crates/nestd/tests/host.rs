@@ -632,7 +632,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     // 2. Start a worker: the runner gets the sandbox's id and its agent epoch, never a socket path.
     let start = AgentStart {
         agent: AgentId("agt_w".into()),
-        role: AgentRole::Worker,
+        role: None,
         workstream: WorkstreamId("ws_1".into()),
         epoch: Some(Epoch(1)),
         resume: None,
@@ -1442,7 +1442,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     let mut r = connect().await;
     let start = AgentStart {
         agent: AgentId("agt_c".into()),
-        role: AgentRole::Captain,
+        role: None,
         workstream: WorkstreamId("ws_1".into()),
         epoch: Some(Epoch(1)),
         resume: None,
@@ -2061,7 +2061,7 @@ async fn a_sandbox_fence_leaves_its_brains_running() {
 fn bound_start(agent: &str, sandbox: &str) -> AgentStart {
     AgentStart {
         agent: AgentId(agent.into()),
-        role: AgentRole::Worker,
+        role: None,
         workstream: WorkstreamId("ws_1".into()),
         epoch: Some(Epoch(1)),
         resume: None,
