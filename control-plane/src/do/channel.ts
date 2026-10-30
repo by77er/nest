@@ -111,7 +111,7 @@ export interface CallFacts {
   spawner_reads?: boolean;
 }
 
-type HookPoint = "post:afterPut" | "fanout:beforeDeliver" | "fanout:afterDeliver";
+type HookPoint = "post:enter" | "post:afterPut" | "fanout:beforeDeliver" | "fanout:afterDeliver";
 
 type MsgRow = {
   seq: number; ts_ms: number; from_p: string; taint: number; kind: string | null; text: string | null; data: string | null;
@@ -316,6 +316,7 @@ export class ChannelDO extends DurableObject<Env> {
    * window and the fan-out alarm is armed in that step. Fan-out never runs here.
    */
   async post(name: string, caller: Caller, raw: unknown, extra: CallFacts = {}): Promise<PostResult> {
+    await this.hook("post:enter");
     const checked = checkPost(raw);
     if (!checked.ok) throw invalid(checked.error);
     const post = checked.value;
@@ -380,14 +381,15 @@ export class ChannelDO extends DurableObject<Env> {
     // The spawner's default subscription to its child's events, made once, from before the first
     // event it is told about.
     if (meta.kind.kind === "events" && caller.principal === "platform" && !meta.spawner_subscribed) {
-      // Only for a spawner that can `read` what it is woken for (H2): otherwise none is made.
+      // Only for a spawner that can `read` what it is woken for: otherwise none is made yet, and a
+      // later event (once the spawner can read) makes it then. Marked only when made.
       if (extra.agent_owner && extra.spawner_reads) {
         this.saveSub({
           id: SPAWNER_SUB, agent: extra.agent_owner, filter: { kinds: SPAWNER_EVENT_KINDS }, delivery: "turn", batch_ms: DEFAULT_BATCH_MS,
           once: false, cursor: head, due_ms: null, inflight: null, attempts: 0,
         });
+        this.putKv("meta", { ...meta, spawner_subscribed: true });
       }
-      if (extra.agent_owner !== undefined) this.putKv("meta", { ...meta, spawner_subscribed: true });
     }
     this.sql.exec(`INSERT INTO messages (seq, ts_ms, from_p, taint, kind, text, data, reply_to, key, mentions, body_ref, bytes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, seq, now, from, taint ? 1 : 0, p.kind ?? null, bodyRef ? null : p.text,

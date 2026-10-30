@@ -69,6 +69,10 @@ const RESTART_ON_EXIT: Record<AgentExitReason, boolean> = {
 /** Restarts after an exit without a turn completing in between, before giving up (`errored`). */
 const MAX_EXIT_RESTARTS = 3;
 const RETENTION_MS = 7 * 86_400_000;
+/** A merged channel turn's text is at most this big; a delivery past it waits (the channel keeps it). */
+const MERGED_TURN_BYTES = 64 * 1024;
+/** How long an owner without `read` is remembered as such. */
+const OWNER_READS_NO_MS = 10 * 60_000;
 
 // Closed unions for the status columns (docs/data/#enums): SQL names them through these constants,
 // and every status read back is checked (`storedEnum`: a value outside the union is logged).
@@ -323,6 +327,9 @@ export class AgentDO extends DurableObject<Env> {
     // high-water seq of each one's deliveries (dedup), and its queued posts to `<agt>/events`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS channel_subs (channel TEXT NOT NULL, sub TEXT NOT NULL, hw INTEGER NOT NULL DEFAULT 0,
       created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (channel, sub))`);
+    // Notices taken without delivery (no `read` tool): how many, and up to which seq.
+    this.addColumn("channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("channel_subs", "skipped_to", "INTEGER");
     this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
@@ -1957,12 +1964,13 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** For another agent's built-in channel, that agent's owner (read from it, so a `{child}` grant or a spawner's read can be decided). */
-  private async channelFacts(info: AgentInfo, channel: string): Promise<{ agent_owner?: string | null }> {
+  private async channelFacts(info: AgentInfo, channel: string): Promise<{ agent_owner?: string | null; target_reads?: boolean }> {
     const k = parseChannel(channel);
     if (!k.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, k.error);
     if (k.value.kind !== "inbox" && k.value.kind !== "events") return {};
-    if (k.value.agent === info.agent) return { agent_owner: info.owner };
-    return { agent_owner: (await this.env.AGENT.get(this.env.AGENT.idFromName(k.value.agent)).info()).owner };
+    if (k.value.agent === info.agent) return { agent_owner: info.owner, target_reads: info.tools.includes("read") };
+    const other = await this.env.AGENT.get(this.env.AGENT.idFromName(k.value.agent)).info();
+    return { agent_owner: other.owner, target_reads: other.tools.includes("read") };
   }
 
   private channelStub(name: string) {
@@ -2018,8 +2026,10 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Whether `owner`'s spec has the `read` tool (its spec is fixed at spawn, so the answer is kept). */
   private async ownerReads(owner: string): Promise<boolean> {
-    const cached = this.kvGet<{ owner: string; reads: boolean }>("owner_reads");
-    if (cached?.owner === owner) return cached.reads;
+    // A yes is kept (a spec's tools never shrink); a no only for `OWNER_READS_NO_MS`, so a later
+    // grant of `read` (stage 2) is seen.
+    const cached = this.kvGet<{ owner: string; reads: boolean; ms?: number }>("owner_reads");
+    if (cached?.owner === owner && (cached.reads || Date.now() - (cached.ms ?? 0) < OWNER_READS_NO_MS)) return cached.reads;
     let reads = false;
     try {
       reads = (await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info()).tools.includes("read");
@@ -2027,7 +2037,7 @@ export class AgentDO extends DurableObject<Env> {
       // An owner that isn't an agent can't read anything; anything else is retried with the row.
       if (asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
     }
-    this.kvPut("owner_reads", { owner, reads });
+    this.kvPut("owner_reads", { owner, reads, ms: Date.now() });
     return reads;
   }
 
@@ -2057,18 +2067,35 @@ export class AgentDO extends DurableObject<Env> {
   async deliverChannel(d: ChannelDelivery): Promise<DeliveryOutcome> {
     if (!this.exists()) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
     const now = Date.now();
-    const hw = this.sql.exec<{ hw: number }>("SELECT hw FROM channel_subs WHERE channel = ? AND sub = ?", d.channel, d.subscription).toArray()[0]?.hw;
-    if (hw !== undefined && hw >= d.batch.to_seq) return { status: "ok" };
     const info = this.load();
-    // A notice tells the model to `read`: an agent without the tool gets only what arrives inline
-    // (the user's own messages). Anything else is taken (the high-water mark moves) but not
-    // delivered: there is nothing it could do with it. Stage 2 gives every agent `read` on its own
-    // built-in channels.
-    if (!info.tools.includes("read") && d.batch.inline.length < d.batch.count) {
-      this.sql.exec(`INSERT INTO channel_subs (channel, sub, hw, created_ms, ended) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(channel, sub) DO UPDATE SET hw = excluded.hw, ended = excluded.ended`, d.channel, d.subscription, d.batch.to_seq, now, d.batch.ends ? 1 : 0);
-      console.warn(`agent ${info.agent}: a notice from ${d.channel} skipped (no read tool)`);
-      return { status: "ok" };
+    const reads = info.tools.includes("read");
+    // A notice tells the model to `read`. An agent without the tool takes a batch only as far as
+    // its user messages arrive inline (`inline_to`; the first always does), with an envelope of
+    // those alone; the rest of the range comes as the next batch. Other posters' messages it can't
+    // act on are taken without a notice, and counted (`skipped`, `skipped_to`) so stage 2, which
+    // gives every agent `read` on its own built-ins, can point it at them.
+    const upTo = reads ? d.batch.to_seq : Math.min(d.batch.inline_to ?? d.batch.to_seq, d.batch.to_seq);
+    const ack: DeliveryOutcome = upTo < d.batch.to_seq ? { status: "ok", up_to: upTo } : { status: "ok" };
+    // Deduplicated first (a retry of a batch already taken is acknowledged whatever the guards say).
+    const hw = this.sql.exec<{ hw: number }>("SELECT hw FROM channel_subs WHERE channel = ? AND sub = ?", d.channel, d.subscription).toArray()[0]?.hw;
+    if (hw !== undefined && hw >= upTo) return ack;
+    const shown: ChannelDelivery = reads ? d : {
+      ...d,
+      batch: {
+        ...d.batch, to_seq: upTo, count: d.batch.inline.length, first_seq: d.batch.inline[0]?.seq ?? upTo, last_seq: d.batch.inline.at(-1)?.seq ?? upTo,
+        senders: d.batch.inline.length ? [{ from: "user", n: d.batch.inline.length }] : [], kinds: [], tainted: 0,
+      },
+    };
+    const skipped = !reads && d.batch.count > d.batch.inline.length;
+    const take = () => {
+      this.sql.exec(`INSERT INTO channel_subs (channel, sub, hw, created_ms, ended, skipped, skipped_to) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(channel, sub) DO UPDATE SET hw = excluded.hw, ended = excluded.ended, skipped = skipped + excluded.skipped,
+          skipped_to = COALESCE(excluded.skipped_to, skipped_to)`,
+      d.channel, d.subscription, upTo, now, d.batch.ends && upTo >= d.batch.to_seq ? 1 : 0, skipped ? 1 : 0, skipped ? upTo : null);
+    };
+    if (!shown.batch.inline.length && !reads) {
+      take();
+      return ack;
     }
     if (!info.current_turn) {
       const hour = this.sql.exec<{ n: number; oldest: number | null }>(
@@ -2077,33 +2104,40 @@ export class AgentDO extends DurableObject<Env> {
       const waiting = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM turns WHERE request_id LIKE 'chan/%' AND status = '${TURN.queued}'`).one().n;
       if (waiting >= MAX_WAITING_DELIVERIES) return { status: "defer", retry_after_ms: WAKE_RETRY_MS };
     }
-    this.sql.exec(`INSERT INTO channel_subs (channel, sub, hw, created_ms, ended) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(channel, sub) DO UPDATE SET hw = excluded.hw, ended = excluded.ended`, d.channel, d.subscription, d.batch.to_seq, now, d.batch.ends ? 1 : 0);
     const last = this.sql.exec<{ t: number | null }>("SELECT MAX(COALESCE(started_ms, created_ms)) AS t FROM turns").one().t;
-    const text = envelopeText(d, now, last);
-    const requestId = `chan/${d.channel}/${d.subscription}/${d.batch.to_seq}`;
+    const text = envelopeText(shown, now, last);
+    const requestId = `chan/${d.channel}/${d.subscription}/${upTo}`;
     // Both admit synchronously before their first await (the row is written in this step).
     if (info.current_turn) {
+      take();
       await this.postInbox("platform", text, false, requestId);
-      return { status: "ok" };
+      return ack;
     }
     // Coalesced per agent: a notice joins a channel turn still waiting to start (its brain is
-    // starting, or busy elsewhere) instead of queueing another.
+    // starting, or can't start yet) instead of queueing another, up to a size cap; past it the
+    // delivery is deferred and the channel keeps the messages. Then the agent is woken, as any new
+    // input wakes it (a stopped or errored brain gets its fresh try, Q1/Q6).
     const waiting = this.sql.exec<{ turn: string; input: string }>(
       `SELECT turn, input FROM turns WHERE status = '${TURN.queued}' AND request_id LIKE 'chan/%' ORDER BY ord DESC LIMIT 1`).toArray()[0];
     if (waiting) {
       const prior = JSON.parse(waiting.input) as TurnInput;
-      this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ ...prior, text: `${prior.text}\n\n${text}` } satisfies TurnInput), waiting.turn);
-      return { status: "ok" };
+      const merged = `${prior.text}\n\n${text}`;
+      if (new TextEncoder().encode(merged).length > MERGED_TURN_BYTES) return { status: "defer", retry_after_ms: WAKE_RETRY_MS };
+      take();
+      this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ ...prior, text: merged } satisfies TurnInput), waiting.turn);
+      await this.wake();
+      return ack;
     }
+    take();
     await this.enqueueTurn({ kind: "event_batch", text }, requestId);
-    return { status: "ok" };
+    return ack;
   }
 
   /** This agent's channel subscriptions (display). */
-  async channelSubscriptions(): Promise<{ channel: string; subscription: string; hw: number; ended: boolean }[]> {
-    return this.sql.exec<{ channel: string; sub: string; hw: number; ended: number }>("SELECT channel, sub, hw, ended FROM channel_subs ORDER BY created_ms")
-      .toArray().map((r) => ({ channel: r.channel, subscription: r.sub, hw: r.hw, ended: r.ended === 1 }));
+  async channelSubscriptions(): Promise<{ channel: string; subscription: string; hw: number; ended: boolean; skipped: number; skipped_to: number | null }[]> {
+    return this.sql.exec<{ channel: string; sub: string; hw: number; ended: number; skipped: number; skipped_to: number | null }>(
+      "SELECT channel, sub, hw, ended, skipped, skipped_to FROM channel_subs ORDER BY created_ms")
+      .toArray().map((r) => ({ channel: r.channel, subscription: r.sub, hw: r.hw, ended: r.ended === 1, skipped: r.skipped, skipped_to: r.skipped_to }));
   }
 
   /** The channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`, `message`). */
@@ -2115,7 +2149,12 @@ export class AgentDO extends DurableObject<Env> {
       if (!/^agt_[a-z0-9]+$/.test(target)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "agent must be an agent id (agt_...)");
       if (target === info.agent) throw new NestError(ErrorCodes.INVALID_MESSAGE, "that is you");
       const channel = `${target}/inbox`;
-      const facts = await this.channelFacts(info, channel);
+      const { target_reads, ...facts } = await this.channelFacts(info, channel);
+      // A message only reaches an agent that can `read` it: refused rather than posted unseen.
+      if (target_reads === false) {
+        throw new NestError(ErrorCodes.INVALID_MESSAGE,
+          `${target} can't read channel messages (its template has no \`read\`): nothing was posted; reach it another way (e.g. notify)`);
+      }
       const post: PostInput = {
         text: String(a.text), ...(typeof a.kind === "string" ? { kind: a.kind } : {}), ...(typeof a.reply_to === "number" ? { reply_to: a.reply_to } : {}),
         idem_key: key,
@@ -2126,7 +2165,7 @@ export class AgentDO extends DurableObject<Env> {
       return json(`Delivered to ${target} (seq ${r.seq}).`, r);
     }
     const channel = String(a.channel);
-    const facts = await this.channelFacts(info, channel);
+    const { target_reads: _reads, ...facts } = await this.channelFacts(info, channel);
     const stub = this.channelStub(channel);
     switch (name) {
       case "channel_create": {

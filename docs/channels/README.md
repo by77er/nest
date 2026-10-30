@@ -53,7 +53,7 @@ An agent subscribes itself; its spawner will subscribe it as part of the spawn s
 A woken turn's input is a **platform notice, not the messages**: per subscription, the channel, `seq` range, count, senders, kinds and taint, plus the wall-clock time, the time since the agent's last turn, and its remaining budget. **Message bodies reach the model only as `read` results** (tool output).
 
 - **Why:** the user role is where a principal gives instructions. Claude treats tool results as information rather than commands ([Claude's constitution](https://www.anthropic.com/constitution)), while naming the sender inside a user message is only a prompt heuristic ([spotlighting](https://arxiv.org/abs/2403.14720)). Injections also spread from agent to agent ([Prompt Infection](https://arxiv.org/abs/2410.07283)).
-- **Messages from me** (`user`) are the exception: they arrive inline, as user messages.
+- **Messages from me** (`user`) are the exception: they arrive inline, as user messages, each whole (as many as fit a notice; the rest in the next). An agent without `read` gets only these.
 - **Cost:** one extra tool call per wake. The notice is small, so it needs no digest step.
 
 ## Asking

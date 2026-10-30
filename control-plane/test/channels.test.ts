@@ -221,7 +221,7 @@ describe("subscriptions", () => {
     expect(both[1]).toContain("1 new message (seq 4)");
     expect((await batchTurns(agent)).length).toBe(1);
     expect((await chStub(name).subscriptions(name)).find((s) => s.id === sub.id)).toMatchObject({ cursor: 4, inflight: null });
-    expect((await adminJson(`/v1/agents/${agent}/subscriptions`))).toEqual([{ channel: name, subscription: sub.id, hw: 4, ended: false }]);
+    expect((await adminJson(`/v1/agents/${agent}/subscriptions`))).toEqual([{ channel: name, subscription: sub.id, hw: 4, ended: false, skipped: 0, skipped_to: null }]);
   });
 
   it("delivers once even when the channel crashes after the agent took the batch, and retries", async () => {
@@ -624,7 +624,7 @@ describe("channel tools through the dispatch path", () => {
     // Subscribe, then a post from the operator wakes it; unsubscribe stops that.
     const sub = s.value(await s.call("subscribe", { channel: name, batch_ms: 0, kinds: ["review"] }));
     expect(sub).toMatchObject({ cursor: 2, delivery: "turn" });
-    expect(await adminJson(`/v1/agents/${s.agent}/subscriptions`)).toEqual([{ channel: name, subscription: sub.subscription, hw: 0, ended: false }]);
+    expect(await adminJson(`/v1/agents/${s.agent}/subscriptions`)).toEqual([{ channel: name, subscription: sub.subscription, hw: 0, ended: false, skipped: 0, skipped_to: null }]);
     expect(s.value(await s.call("unsubscribe", { channel: name, subscription: sub.subscription }))).toEqual({ removed: true });
     expect(await chStub(name).subscriptions(name)).toEqual([]);
     // `message`: its owner yes, a stranger no.
@@ -635,6 +635,11 @@ describe("channel tools through the dispatch path", () => {
     await until(() => batchTurns(s.owner.agent), (t) => t.length === 1, 10_000, "the owner's wake");
     const stranger = await idleAgent({ cell: s.cell });
     expect((await s.call("message", { agent: stranger.agent, text: "hi" })).error.code).toBe("forbidden");
+    // A child that can't `read` is refused, and nothing is posted to its inbox.
+    const blind = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.owner.workstream, cell: s.cell, owner: s.agent, start: false } }, 201);
+    const refused = await s.call("message", { agent: blind.agent, text: "you won't see this" });
+    expect(refused.error.message).toMatch(/can't read channel messages/);
+    expect((await readAs(`${blind.agent}/inbox`)).head).toBe(0);
     // Others' channels: can't read another's inbox; can't post to events; `user` is post-only.
     expect((await s.call("read", { channel: `${s.owner.agent}/inbox` })).error.code).toBe("forbidden");
     expect((await s.call("post", { channel: `${s.agent}/events`, text: "fake" })).error.code).toBe("forbidden");
@@ -754,7 +759,10 @@ describe("review fixes", () => {
       st.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('head', ?)", String(N));
     });
     const calls: number[] = [];
-    await runInDurableObject(chStub(name), async (inst: ChannelDO) => {
+    // Rows still present when each delete call is made: the bodies of a page go before its rows.
+    const rowsAtCall: number[] = [];
+    let failFirst = true;
+    await runInDurableObject(chStub(name), async (inst: ChannelDO, st) => {
       const bucket = (inst as any).env.BUCKET as R2Bucket;
       (inst as any).env = { ...(inst as any).env, BUCKET: new Proxy(bucket, {
         get(target, prop) {
@@ -762,7 +770,12 @@ describe("review fixes", () => {
             return async (keys: string | string[]) => {
               const ks = Array.isArray(keys) ? keys : [keys];
               if (ks.length > 1000) throw new Error(`R2 delete of ${ks.length} keys`);
+              if (failFirst) {
+                failFirst = false;
+                throw new Error("R2 unavailable");
+              }
               calls.push(ks.length);
+              rowsAtCall.push(st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one().n);
               return target.delete(ks);
             };
           }
@@ -771,7 +784,12 @@ describe("review fixes", () => {
         },
       }) };
     });
+    // A failed R2 delete leaves every row (and its reference) in place.
+    await expect(attempt(() => chStub(name).maintain(name))).rejects.toThrow(/R2 unavailable/);
+    expect((await readAs(name, "?limit=1")).head).toBe(N);
+    expect(await runInDurableObject(chStub(name), (_i: ChannelDO, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one().n)).toBe(N);
     await chStub(name).maintain(name);
+    expect(rowsAtCall).toEqual([N, N - 1000]);
     expect(Math.max(...calls)).toBeLessThanOrEqual(1000);
     expect(calls.reduce((a, b) => a + b, 0)).toBe(N);
     expect((await env.BUCKET.list({ prefix: `channels/${name}/b/old` })).objects.length).toBe(0);
@@ -848,6 +866,138 @@ describe("review fixes", () => {
     await runDurableObjectAlarm(env.WORKSTREAM.get(env.WORKSTREAM.idFromName(b.workstream)));
     await until(() => kvTainted(b.agent), (t) => t, 10_000, "the subscriber tainted by the batch");
   });
+});
+
+describe("review round 2", () => {
+  const captain = () => idleAgent({ template: "captain" });
+
+  it("an agent without read gets every operator message: six in one window (P6), across batches", async () => {
+    const { agent } = await captain();
+    const inbox = `${agent}/inbox`;
+    for (let i = 1; i <= 6; i++) await postAs(inbox, { text: `operator message ${i}` }, 201);
+    const want = [1, 2, 3, 4, 5, 6].map((i) => `operator message ${i}`);
+    const ns = await until(() => notices(agent), (n) => want.every((w) => n.join("\n").includes(w)), 15_000, "all six");
+    for (const w of want) expect(ns.join("\n").split(w).length - 1, w).toBe(1);
+    expect((await batchTurns(agent)).length).toBe(1);
+  });
+
+  it("an agent without read gets the operator's text from a mixed batch (P7); the peer post is recorded as skipped", async () => {
+    const { agent } = await captain();
+    const peer = await idleAgent();
+    const inbox = `${agent}/inbox`;
+    await adminJson(`/v1/admin/channels/${enc(inbox)}/acl`, { method: "PUT", body: [{ principal: peer.agent, action: "post" }] });
+    await chStub(inbox).post(inbox, asAgent(peer.agent), { text: "a peer's message" });
+    await postAs(inbox, { text: "please stop" }, 201);
+    const ns = await until(() => notices(agent), (n) => n.length >= 1, 10_000, "the operator's message");
+    expect(ns.join("\n")).toContain("Message from user (seq 2): please stop");
+    expect(ns.join("\n")).not.toContain("a peer's message");
+    const subs = await adminJson(`/v1/agents/${agent}/subscriptions`);
+    expect(subs).toEqual([expect.objectContaining({ channel: inbox, subscription: "sub_inbox", hw: 2, skipped: 1, skipped_to: 2 })]);
+  });
+
+  it("operator messages past the inline budget come whole in later batches; one too big to inline arrives as a note", async () => {
+    const { agent } = await captain();
+    const inbox = `${agent}/inbox`;
+    const a = `A${"a".repeat(6 * 1024)}`;
+    const b = `B${"b".repeat(6 * 1024)}`;
+    await postAs(inbox, { text: a }, 201);
+    await postAs(inbox, { text: b }, 201);
+    const ns = await until(() => notices(agent), (n) => n.join("").includes(b), 15_000, "both whole");
+    expect(ns.join("").includes(a)).toBe(true);
+    expect(ns.length).toBe(2);
+    // One too big to keep inline (its body is in R2) arrives as a note that it needs `read`, never silently.
+    await postAs(inbox, { text: "z".repeat(40 * 1024) }, 201);
+    const more = await until(() => notices(agent), (n) => n.length === 3, 15_000, "the note");
+    expect(more[2]).toContain("Message from user (seq 3, not shown in full; the rest needs `read`)");
+  });
+
+  it("a notice merged into a waiting turn wakes the agent (Q1's wake), and the merged text is capped", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    await postAs(name, { text: "one" }, 201);
+    await fanoutNow(name);
+    expect((await batchTurns(agent)).length).toBe(1);
+    // As if the agent had gone `errored` with its start dropped: only new input starts it again.
+    await runInDurableObject(agentStub(agent), (inst: AgentDO, st) => {
+      (inst as any).update((i: any) => {
+        i.intent = null;
+        i.state = "errored";
+      });
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'intent'");
+    });
+    await postAs(name, { text: "two" }, 201);
+    await fanoutNow(name);
+    expect((await notices(agent)).length).toBe(2);
+    expect((await agentStub(agent).info()).intent).toMatchObject({ reason: "wake" });
+    // Past the cap the delivery waits; the channel keeps the message.
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      const t = st.storage.sql.exec<{ turn: string }>("SELECT turn FROM turns WHERE request_id LIKE 'chan/%' AND status = 'queued'").one().turn;
+      st.storage.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ kind: "event_batch", text: "x".repeat(64 * 1024) }), t);
+    });
+    await postAs(name, { text: "three" }, 201);
+    await fanoutNow(name);
+    const s = (await chStub(name).subscriptions(name))[0]!;
+    expect(s).toMatchObject({ cursor: 2, inflight: null });
+    expect(s.due_ms! - Date.now()).toBeGreaterThan(0);
+  });
+
+  it("the spawner's subscription isn't marked made when it wasn't; once the owner can read, the next event makes it", async () => {
+    const owner = await captain();
+    const child = await idleAgent({ cell: owner.cell, workstream: owner.workstream, owner: owner.agent });
+    const name = `${child.agent}/events`;
+    await runInDurableObject(agentStub(child.agent), (inst: AgentDO) => {
+      (inst as any).outbox.push(name, { kind: "state_changed", text: "state: working" }, { tainted: false, agent_owner: owner.agent });
+    });
+    await until(async () => (await readAs(name)).head, (h) => h === 1, 10_000, "the first event");
+    expect(await chStub(name).subscriptions(name)).toEqual([]);
+    // The owner's "no" is remembered only briefly: say it has since gained `read`.
+    await runInDurableObject(agentStub(owner.agent), (inst: AgentDO) => {
+      (inst as any).update((i: any) => {
+        i.tools = [...i.tools, "read"];
+      });
+    });
+    await runInDurableObject(agentStub(child.agent), (inst: AgentDO, st) => {
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'owner_reads'", JSON.stringify({ owner: owner.agent, reads: false, ms: Date.now() - 11 * 60_000 }));
+      (inst as any).outbox.push(name, { kind: "state_changed", text: "state: idle" }, { tainted: false, agent_owner: owner.agent });
+    });
+    await until(() => chStub(name).subscriptions(name), (s) => s.length === 1, 10_000, "the spawner's subscription");
+    expect((await chStub(name).subscriptions(name))[0]).toMatchObject({ id: "sub_spawner", agent: owner.agent, cursor: 1 });
+  });
+
+  it("the outbox never dead-letters a plain (retryable) failure: the row waits and then goes through", async () => {
+    const { agent } = await idleAgent();
+    const events = `${agent}/events`;
+    let failures = 0;
+    await runInDurableObject(chStub(events), (inst: ChannelDO) => {
+      inst.testHooks["post:enter"] = async () => {
+        failures++;
+        if (failures >= 5) delete inst.testHooks["post:enter"];
+        throw new Error("network");
+      };
+    });
+    await runInDurableObject(agentStub(agent), (inst: AgentDO) => {
+      (inst as any).outbox.push(events, { kind: "state_changed", text: "kept through failures" }, { tainted: false });
+    });
+    const force = () => runInDurableObject(agentStub(agent), async (_i: AgentDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('chan_out', 0)");
+      await st.storage.setAlarm(Date.now() + 60_000);
+    });
+    const end = Date.now() + 20_000;
+    while (failures < 4) {
+      if (Date.now() > end) throw new Error("the post wasn't tried");
+      await force();
+      await runDurableObjectAlarm(agentStub(agent));
+    }
+    // Past MAX_REFUSALS tries, still queued and never counted as a refusal.
+    expect(await runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ refusals: number }>("SELECT refusals FROM chan_out").toArray())).toEqual([{ refusals: 0 }]);
+    while (!((await readAs(events)).messages as any[]).some((m) => m.text === "kept through failures")) {
+      if (Date.now() > end) throw new Error("the post never went through");
+      await force();
+      await runDurableObjectAlarm(agentStub(agent));
+    }
+  }, 30_000);
 });
 
 describe("catalog seed migration", () => {

@@ -82,12 +82,13 @@ export class ChannelOutbox {
       const body = JSON.parse(r.body) as PostInput;
       const post: PostInput = { ...body, idem_key: body.idem_key ?? `${this.keyPrefix()}/out/${r.id}` };
       try {
-        const extra = r.has_owner
-          ? { agent_owner: r.agent_owner, ...(r.agent_owner && this.ownerFacts ? await this.ownerFacts(r.agent_owner) : {}) }
-          : {};
-        const call: Promise<unknown> = Promise.resolve(this.env.CHANNEL.get(this.env.CHANNEL.idFromName(r.channel)).post(r.channel, { principal: "platform", tainted: r.tainted === 1 }, post, extra));
-        await withTimeout(call,
-          POST_TIMEOUT_MS);
+        // The owner lookup and the post share one timeout.
+        await withTimeout((async () => {
+          const extra = r.has_owner
+            ? { agent_owner: r.agent_owner, ...(r.agent_owner && this.ownerFacts ? await this.ownerFacts(r.agent_owner) : {}) }
+            : {};
+          await this.env.CHANNEL.get(this.env.CHANNEL.idFromName(r.channel)).post(r.channel, { principal: "platform", tainted: r.tainted === 1 }, post, extra);
+        })(), POST_TIMEOUT_MS);
       } catch (e) {
         const ne = asNestError(e);
         if (!ne || ne.retryable) throw e;
