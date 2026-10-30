@@ -29,7 +29,7 @@ impl OutboxEvent for NoEvent {
     }
 }
 
-/// fleet.ts DEFAULT_LEASE_TIMING (control-plane/src/protocol/control.ts:13-15).
+/// `DEFAULT_LEASE_TIMING` (control-plane/src/protocol/control.ts).
 const LEASE: Lease = Lease { heartbeat_ms: 5_000, host_fence_ms: 20_000, cp_expiry_ms: 30_000 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

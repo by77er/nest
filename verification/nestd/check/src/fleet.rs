@@ -10,10 +10,28 @@
 //! shell steps it (every effect performed in order, failures fed back), plus the executor: FIFO,
 //! one batch at a time, dedup by `cmd` through `nestd_core::results::ResultCache`.
 //!
-//! Abstractions (see docs/verification/nestd/): one command per batch, so a seq names a command
-//! (seqs survive `rel.reset`); the command's payload is its index; results travel up as `events`
-//! through the real outbox; heartbeats run once per connection (time advances only for reconnect
-//! backoff); events never fail in FleetDO's handler; reported sandboxes are not modelled.
+//! With the fixes on (`Config::fixed`), FleetDO sends every batch through one per-host chain
+//! (`flush`): a run takes `socketFor(host)` (the first helloed socket), sends everything above that
+//! socket's `sent` in seq order with secrets resolved for the whole run first, and advances `sent`;
+//! the hello acks `last_command_seq`, sets `sent` to it, sends `hello_ack` and enqueues a run in one
+//! synchronous step. `Config::main` is FleetDO as on main: each send on its own.
+//!
+//! Abstractions, each a part of fleet.ts this model leaves out because nothing in it can change
+//! what nestd's command and event channels do (see docs/verification/nestd/):
+//! - one command per batch, so a seq names a command (seqs survive `rel.reset`); its payload is its
+//!   index; every command is the same kind, so sendResolved's filter of answered `agent_start`s
+//!   (#30) never applies (a batch it empties is still sent, with its seq);
+//! - results travel up as `events` through the real outbox, and FleetDO's event handler never
+//!   fails (the study's B4, a batch failing partway, is out of scope);
+//! - heartbeats run once per connection and FleetDO's answer is left out (it only renews the lease:
+//!   `lease.rs`); time advances only for reconnect backoff;
+//! - no wedged hosts (the 4408 close a wedged host's hello gets), no CA renewals and their errors,
+//!   no malformed frames (`invalid_message`): all are closes, which a drop already covers;
+//! - no sandboxes: `dropUnreported` and its lease writes, the `sandbox_create` reconciliation in
+//!   `failPendingCommands`, and `answered_by`/`killProgress` (which read results, never send) are
+//!   outside; FleetDO's own answers are modelled as `Res::Synthetic`;
+//! - `onCommandResult` throwing midway through `failPendingCommands`: the job ends and the `kv`
+//!   capture stays for the next hello, which a FleetDO restart already models.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -38,7 +56,7 @@ impl OutboxEvent for Ev {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Config {
     /// `onHello` captures the old lineage's unanswered commands in the same step as `rel.reset`
-    /// (main: after the awaits, fleet.ts:789 at edf6829).
+    /// (main: after the awaits).
     pub capture_at_reset: bool,
     /// ... and keeps the capture in `kv` until failed, so a restart midway leaves it to the next hello.
     pub durable_capture: bool,
@@ -137,7 +155,7 @@ pub enum Res {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HelloStage {
-    /// Queued; its synchronous start (fleet.ts:730-771) runs when it reaches the head.
+    /// Queued; its synchronous start (`onHello` up to `hello_ack`) runs when it reaches the head.
     Start,
     /// Awaiting rotateToken / sendBindingKeys (772-774).
     Keys,
@@ -360,7 +378,7 @@ impl FleetModel {
         s.gc_wires();
     }
 
-    /// `onHello`'s synchronous start (fleet.ts:730-771, and the capture at the reset when fixed).
+    /// `onHello`'s synchronous start, up to `hello_ack` (and the capture at the reset when fixed).
     fn hello_start(&self, s: &mut State) {
         let c = &self.cfg;
         let Some(Job::Hello { wire, inst, last, .. }) = s.fleet.queue.front().cloned() else { return };
@@ -399,6 +417,12 @@ impl FleetModel {
             *stage = HelloStage::Keys;
         }
         s.fleet.nestd_instance = Some(inst);
+        if c.send_chain
+            && let Some(l) = last
+        {
+            // With the chain, the hello acks what the host processed in this same step.
+            s.rel_ack(l);
+        }
         if let Some(w) = s.wire(wire).filter(|w| w.fleet_open) {
             w.helloed = true;
             // The chain sends this socket everything above what the host has processed.
@@ -607,7 +631,7 @@ impl Model for FleetModel {
                         s.fleet.queue.push_back(Job::Hello { wire: id, inst, last, stage: HelloStage::Start, new_process: false, captured: None })
                     }
                     _ if !helloed => {
-                        // "first frame must be hello" (fleet.ts:644-647).
+                        // `webSocketMessage`: "first frame must be hello".
                         s.send_down(id, Down::Error);
                         s.fleet_close(id);
                     }
@@ -620,9 +644,9 @@ impl Model for FleetModel {
             }
             Action::FleetJob => match s.fleet.queue.front().cloned()? {
                 Job::Hello { stage: HelloStage::Start, .. } => self.hello_start(&mut s),
-                // fleet.ts:776-778: ack what the host processed, resend the rest.
+                // `onHello` after its awaits: ack what the host processed, resend the rest (main).
                 Job::Hello { wire, last, stage: HelloStage::Keys, .. } => {
-                    if let Some(l) = last {
+                    if let Some(l) = last.filter(|_| !c.send_chain) {
                         s.rel_ack(l);
                     }
                     let pending: Vec<u64> = s.fleet.rel_out.iter().copied().filter(|q| *q > last.unwrap_or(0)).collect();
@@ -640,7 +664,7 @@ impl Model for FleetModel {
                         self.hello_after_resend(&mut s);
                     }
                 }
-                // fleet.ts:783-792: fail what the old process never answered.
+                // `onHello`'s end: `failPendingCommands` for what the old process never answered.
                 Job::Hello { inst, new_process, captured, stage: HelloStage::Reconcile, .. } => {
                     let fail = if c.durable_capture {
                         s.fleet.orphans.take()
@@ -655,7 +679,7 @@ impl Model for FleetModel {
                     s.fleet.queue.pop_front();
                 }
                 Job::Hello { stage: HelloStage::Resolving(_), .. } => return None,
-                // fleet.ts:962-983.
+                // `onEvents`.
                 Job::Events { wire, seq, results } => {
                     s.fleet.queue.pop_front();
                     if c.events_socket_guard && !s.wires.iter().any(|w| w.id == wire && w.fleet_open && w.helloed) {
