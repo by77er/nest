@@ -12,11 +12,20 @@ struct Args {
     /// Path to the JSON config file.
     #[arg(long, default_value = "/etc/nest/nestd.json")]
     config: PathBuf,
+    /// Print what this nestd supports (`nestd::FEATURES`), one per line, and exit.
+    #[arg(long)]
+    features: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let args = Args::parse();
+    if args.features {
+        for f in nestd::FEATURES {
+            println!("{f}");
+        }
+        return Ok(());
+    }
     let text = std::fs::read_to_string(&args.config).with_context(|| format!("read {}", args.config.display()))?;
     let cfg: Config = serde_json::from_str(&text).with_context(|| format!("parse {}", args.config.display()))?;
     cfg.validate().with_context(|| format!("check {}", args.config.display()))?;
