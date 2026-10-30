@@ -853,72 +853,86 @@ export class FleetDO extends DurableObject<Env> {
   /**
    * Put the host's unsent command batches on the wire, in seq order. Runs go one at a time per host
    * (the outbound chain), so no batch overtakes a lower one while that one awaits BrokerDO. A run
-   * takes the host's current socket, and sends every unacked batch above what that socket was sent
-   * (`Attachment.sent`), all of them or none (`sendResolved`). `issueCommands` pushes, then runs one;
-   * a hello queues its socket's first run in the step that marks it helloed.
+   * takes the host's current socket and sends the unacked batches above what that socket was sent
+   * (`Attachment.sent`), in order, up to the first that can't be resolved (`sendResolved`).
+   * `issueCommands` pushes, then queues one; a hello queues its socket's first run in the step that
+   * marks it helloed; the tick queues one for a connected host with batches above its `sent`. A run
+   * that throws closes its socket (retryable), so the hello resends what it didn't send.
    */
   private flush(host: string): Promise<void> {
+    let ws: WebSocket | undefined;
     return this.queue(host, this.outbound).run(async () => {
-      const ws = this.socketFor(host);
+      ws = this.socketFor(host);
       if (!ws) return;
       const msgs = this.rel.pendingAfter(host, (ws.deserializeAttachment() as Attachment).sent) as { seq: number }[];
       if (msgs.length) await this.sendResolved(ws, host, msgs);
-    }).catch((e) => console.error(`FleetDO: sending commands to ${host} failed; resent after the next hello`, e));
+    }).catch((e) => {
+      console.error(`FleetDO: sending commands to ${host} failed; closing, so its hello resends them`, e);
+      if (ws) this.closeRetryable(ws, "sending commands failed; reconnect and resend");
+    });
+  }
+
+  /** Close a host's socket so it reconnects at once, its hello resending what is unacked. */
+  private closeRetryable(ws: WebSocket, why: string): void {
+    this.send(ws, { type: "error", error: errorBody(ErrorCodes.INTERNAL, why, true) });
+    try {
+      ws.close(4503, why);
+    } catch {
+      // already closed
+    }
   }
 
   /**
-   * Send one outbound run on `ws` after replacing BrokerDO secret references with current values,
-   * and record its last seq as sent there. Every batch's secrets are resolved before any is sent:
-   * a BrokerDO failure sends nothing and closes the socket, so the host reconnects and its hello
-   * resends. A socket that stopped being the host's meanwhile (superseded, closed) gets nothing.
-   * Only the typed slots `commandRefSlots` names are resolved, each to the names valid for its
-   * purpose (`REF_PURPOSES`). A reference anywhere else (a launch prompt, say) goes out as its
-   * literal text, so no command field can pull an arbitrary secret (a binding key) out of BrokerDO.
+   * Send one outbound run on `ws`, a batch at a time in seq order: each goes out once its BrokerDO
+   * secret references resolve to current values, and its seq is then recorded as sent there. The
+   * first failure stops the run (what went out stays sent, the rest waits) and closes the socket,
+   * so the host reconnects and its hello resends the rest; a batch needing no secret ahead of it is
+   * never held back. A socket that stops being the host's meanwhile (superseded, closing) gets
+   * nothing more. Only the typed slots `commandRefSlots` names are resolved, each to the names
+   * valid for its purpose (`REF_PURPOSES`). A reference anywhere else (a launch prompt, say) goes
+   * out as its literal text, so no command field can pull an arbitrary secret (a binding key) out
+   * of BrokerDO.
    */
   private async sendResolved(ws: WebSocket, host: string, msgs: { seq: number }[]): Promise<void> {
-    const out = msgs.map((m) => structuredClone(m) as { type?: unknown; commands?: unknown });
-    // An `agent_start` already answered (failed when its host was expired: A3) is never resent.
-    for (const m of out) {
-      if (m.type === "commands" && Array.isArray(m.commands)) {
-        m.commands = (m.commands as { cmd: string; type: string }[]).filter((c) => c.type !== "agent_start"
-          || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd).toArray().length === 0);
+    for (const msg of msgs) {
+      const m = structuredClone(msg) as { seq: number; type?: unknown; commands?: unknown };
+      const commands = m.type === "commands" && Array.isArray(m.commands) ? (m.commands as Record<string, unknown>[]) : [];
+      // An `agent_start` already answered (failed when its host was expired: A3) is never resent.
+      if (commands.length) {
+        m.commands = commands.filter((c) => c.type !== "agent_start"
+          || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd as string).toArray().length === 0);
       }
-    }
-    const slots: RefSlot[] = [];
-    for (const m of out) {
-      if (m.type === "commands" && Array.isArray(m.commands)) {
-        for (const c of m.commands as Record<string, unknown>[]) slots.push(...commandRefSlots(c));
+      const slots = (m.commands as Record<string, unknown>[] | undefined ?? []).flatMap((c) => commandRefSlots(c));
+      const values = new Map<RefPurpose, Record<string, string | null>>();
+      for (const purpose of new Set(slots.map((s) => s.purpose))) {
+        const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
+        try {
+          values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
+        } catch (e) {
+          console.error(`FleetDO: resolving secret references for batch ${m.seq} failed; holding it and the rest, closing`, e);
+          this.closeRetryable(ws, "resolving secret references failed; reconnect and resend");
+          return;
+        }
       }
-    }
-    const values = new Map<RefPurpose, Record<string, string | null>>();
-    for (const purpose of new Set(slots.map((s) => s.purpose))) {
-      const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
-      try {
-        values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
-      } catch (e) {
-        // Nothing of the run is sent; it stays queued. Closing makes the host reconnect at once, so
-        // its hello resends the run instead of it waiting for an unrelated reconnect. Unmarked first,
-        // so no later run picks the closing socket.
-        console.error("FleetDO: resolving secret references failed; not sending, closing", e);
-        ws.serializeAttachment({ host, helloed: false } satisfies Attachment);
-        this.send(ws, { type: "error", error: errorBody(ErrorCodes.INTERNAL, "resolving secret references failed; reconnect", true) });
-        ws.close(4503, "secret references unavailable; reconnect and resend");
-        return;
+      // Superseded or closing (meanwhile, or by an earlier failure): its successor's hello resends.
+      if (this.socketFor(host) !== ws) return;
+      for (const s of slots) {
+        const value = values.get(s.purpose)?.[s.ref];
+        if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
+        s.set(value ?? "");
       }
+      this.send(ws, m as FleetToHost);
+      ws.serializeAttachment({ host, helloed: true, sent: m.seq } satisfies Attachment);
     }
-    // Superseded or closed while resolving: that socket's successor's hello resends the run.
-    if (this.socketFor(host) !== ws || ws.readyState !== WebSocket.OPEN) return;
-    for (const s of slots) {
-      const value = values.get(s.purpose)?.[s.ref];
-      if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
-      s.set(value ?? "");
-    }
-    for (const m of out) this.send(ws, m as FleetToHost);
-    ws.serializeAttachment({ host, helloed: true, sent: msgs[msgs.length - 1]!.seq } satisfies Attachment);
   }
 
+  /**
+   * The host's current socket: helloed, and open. A superseded socket is un-helloed; one being
+   * closed (superseded, or after a send failure) stays listed until its peer answers the close, and
+   * carries nothing more meanwhile.
+   */
   private socketFor(host: string): WebSocket | undefined {
-    return this.ctx.getWebSockets(host).find((ws) => (ws.deserializeAttachment() as Attachment).helloed);
+    return this.ctx.getWebSockets(host).find((ws) => ws.readyState === WebSocket.OPEN && (ws.deserializeAttachment() as Attachment).helloed);
   }
 
   private async onHello(ws: WebSocket, att: Attachment, hello: Extract<HostToFleet, { type: "hello" }>): Promise<void> {
@@ -1488,7 +1502,8 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * Queue commands for a host: persisted, delivered reliably in order, each with exactly one result.
-   * Secret values must arrive as BrokerDO references; they are resolved only when sent.
+   * Secret values must arrive as BrokerDO references; they are resolved only when sent. Returns once
+   * the commands are stored; the send happens behind it.
    */
   async issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): Promise<string[]> {
     const now = Date.now();
@@ -1547,7 +1562,9 @@ export class FleetDO extends DurableObject<Env> {
       return commands.map((c) => c.cmd);
     }
     this.rel.push(host, (seq) => ({ type: "commands" as const, seq, commands }));
-    await this.flush(host);
+    // Durable now: sent by the outbound chain without holding the caller (an event batch, a hello,
+    // an RPC) behind unrelated BrokerDO resolution.
+    void this.flush(host);
     return commands.map((c) => c.cmd);
   }
 
@@ -1848,6 +1865,9 @@ export class FleetDO extends DurableObject<Env> {
     }
     for (const h of this.hostsBy({ status: LIVE_STATUSES })) {
       const ws = this.socketFor(h.host);
+      // Batches above what the socket was sent that no run is carrying (a run lost to a reset, say):
+      // a run is queued for them. Idempotent: a run sends only what its socket wasn't sent.
+      if (ws && this.rel.hasPendingAfter(h.host, (ws.deserializeAttachment() as Attachment).sent)) void this.flush(h.host);
       if (ws) await this.ensureStonithFence(h.host);
       if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
     }
