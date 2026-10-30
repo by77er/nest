@@ -471,18 +471,13 @@ mod proofs {
     }
 
     /// [`tombstones_hold`] over the fixed-array stand-in, so the map's own logic is proved for
-    /// every epoch; the `BTreeMap` is trusted to be a map (as in `results::proofs`).
+    /// every epoch; the `BTreeMap` is trusted to be a map (as in `results::proofs`). Over the real
+    /// `BTreeMap<u8, u64>` (unwind 13) Kani 0.68 was still in symbolic execution after 15 min at
+    /// 3.2 GB, with these same bounds.
     #[kani::proof]
     #[kani::unwind(5)]
     fn the_tombstone_map_refuses_a_fenced_epoch_until_a_destroy_or_newer_run_reaches_it() {
         tombstones_hold::<SlotEpochs>();
-    }
-
-    /// The same over the `BTreeMap` nestd ships.
-    #[kani::proof]
-    #[kani::unwind(13)]
-    fn the_shipped_tombstone_map_refuses_a_fenced_epoch_until_released() {
-        tombstones_hold::<BTreeMap<u8, u64>>();
     }
 
     /// Every entry name (bounded: up to 6 ASCII bytes) ending in `.del` is a deletion to finish
