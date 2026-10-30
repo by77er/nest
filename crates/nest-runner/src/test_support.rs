@@ -1,7 +1,8 @@
 //! Test doubles shared by this crate's unit tests and the end-to-end tests in `nest-cli`.
 //! Not part of the runner's behavior.
 
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nest_protocol::guest::{self, HandsDetail, HandsOp, HandsRequest, HandsResponse, HandsResult, ToolContent};
@@ -10,6 +11,24 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
 use crate::framing;
+
+/// Install `contents` as an executable (a fake `claude`) at `path` without this process ever
+/// holding the file open for writing.
+///
+/// Tests run in parallel threads of one process and spawn children all the time. A file written
+/// here (`std::fs::write`, `std::fs::copy`) has its write descriptor copied into any child another
+/// thread forks meanwhile, until that child execs; running the file in that window fails with
+/// ETXTBSY ("Text file busy"), so a fake binary written and run at once failed now and then (about
+/// one lifecycle run in 15). Here the bytes go to a staging file that is never run, and `cp` (its
+/// own process, which nothing forks) writes the executable.
+pub fn install_executable(path: &Path, contents: impl AsRef<[u8]>) {
+    let staging = PathBuf::from(format!("{}.staging", path.display()));
+    std::fs::write(&staging, contents).unwrap();
+    let st = std::process::Command::new("cp").arg(&staging).arg(path).status().unwrap();
+    assert!(st.success(), "cp {} {}: {st}", staging.display(), path.display());
+    std::fs::remove_file(&staging).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
 
 #[derive(Default)]
 struct GuestLog {
@@ -237,5 +256,45 @@ pub mod gateway {
                 edge: None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// The lifecycle flake made deterministic enough to own: while other threads spawn children
+    /// nonstop, every freshly installed executable runs at once. A plain `std::fs::write` here
+    /// fails with ETXTBSY within a few hundred tries.
+    #[test]
+    fn an_installed_executable_runs_at_once_while_other_threads_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let mut failed = None;
+        for i in 0..400 {
+            let bin = dir.path().join(format!("fake{i}"));
+            install_executable(&bin, "#!/bin/sh\nexit 0\n");
+            if let Err(e) = std::process::Command::new(&bin).status() {
+                failed = Some((i, e));
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in spawners {
+            t.join().unwrap();
+        }
+        assert!(failed.is_none(), "a just-installed executable could not be run: {failed:?}");
     }
 }
