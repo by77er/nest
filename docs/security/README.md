@@ -10,7 +10,7 @@
 | Agents within one sandbox | One shared trust domain. Grants give attribution only. |
 | Brain (Claude Code process on a brain host) | Holds the subscription token in its process environment. It has no local exec or file tools, and repo config can't load. A prompt injection can only act through `nest` tools and the web built-ins (host-allowlisted, tainting). |
 | Gateway (on each sandbox host) | The only way into a sandbox's hands, terminals and ports. Admits a connection only with a binding SandboxDO signed for that sandbox, epoch, client and scope, behind an Access service token at the edge; the guest checks the epoch again. |
-| Sandbox hosts (nestd, proxy, gateway, cloudflared) | Trusted, but fenced by lease and STONITH. S3 for their whole cell through the instance role; no R2 credentials; no subscription token; no brain. nest-proxy can't reach IMDS or other non-public addresses (kernel rule on its uid). |
+| Sandbox hosts (nestd, proxy, gateway, cloudflared) | Trusted, but fenced by lease and STONITH. S3 for their whole cell through the instance role; no R2 credentials; no subscription token; no brain. nest-proxy can't reach IMDS or other non-public addresses (kernel rule on its uid). The gateway, which parses input from the internet, runs as its own user with no capabilities and reaches only nestd's gateway socket and the guests' vsock sockets ([gateway](../sandbox/gateway/)); cloudflared runs as its own user too. |
 | Brain hosts (nestd, runner) | Trusted, but fenced by lease and the agent epoch. No KVM, no sandbox state; in S3 it may read the release (`releases/*`) only. |
 | Control plane | Authoritative. No S3 credentials; AWS permissions scoped to EC2 and to KMS `Sign` with the proxy root key. Operator access is by scoped token. |
 

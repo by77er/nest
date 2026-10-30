@@ -17,6 +17,7 @@
 //! with the `Uffd` backend); until then restores are cold boots from the disk generation.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,9 @@ pub struct FirecrackerDriver {
     pub parent_cgroup: Option<String>,
     /// The cgroup v2 mount: a jailed VMM's cgroup is removed there once it has exited.
     pub cgroup_root: PathBuf,
+    /// The gateway's group (`sockets.gateway_gid`): each VM's vsock socket, and search on its
+    /// jail root, are given to it once Firecracker has bound the socket ([`gateway_access`]).
+    pub gateway_gid: Option<u32>,
 }
 
 #[async_trait]
@@ -59,7 +63,15 @@ impl Driver for FirecrackerDriver {
                 None
             }
         };
-        Ok(Box::new(FirecrackerVm { cfg: self.cfg.clone(), parent_cgroup: self.parent_cgroup.clone(), cgroup_root: self.cgroup_root.clone(), spec, child: None, jail }))
+        Ok(Box::new(FirecrackerVm {
+            cfg: self.cfg.clone(),
+            parent_cgroup: self.parent_cgroup.clone(),
+            cgroup_root: self.cgroup_root.clone(),
+            gateway_gid: self.gateway_gid,
+            spec,
+            child: None,
+            jail,
+        }))
     }
 }
 
@@ -92,7 +104,11 @@ impl Jail {
             std::fs::hard_link(src, &dst).map_err(|e| io::Error::new(e.kind(), format!("hard-link {} into the jail (same filesystem required): {e}", src.display())))?;
         }
         let (uid, gid) = (nix::unistd::Uid::from_raw(self.cfg.uid), nix::unistd::Gid::from_raw(self.cfg.gid));
-        nix::unistd::chown(&self.root.join("disk.img"), Some(uid), Some(gid)).map_err(io::Error::from)?;
+        let disk = self.root.join("disk.img");
+        nix::unistd::chown(&disk, Some(uid), Some(gid)).map_err(io::Error::from)?;
+        // The VMM's alone: the gateway's group may search the jail root to reach the vsock socket,
+        // and a sparse file created under umask 0022 would be readable by everyone.
+        std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 }
@@ -110,6 +126,7 @@ pub struct FirecrackerVm {
     cfg: FirecrackerConfig,
     parent_cgroup: Option<String>,
     cgroup_root: PathBuf,
+    gateway_gid: Option<u32>,
     spec: VmSpec,
     child: Option<std::process::Child>,
     jail: Option<Jail>,
@@ -176,6 +193,27 @@ pub fn jailer_args(fc: &FirecrackerConfig, jail: &Jail, netns: &Path, api_sock: 
     ]);
     a.extend(["--".into(), "--api-sock".into(), api_sock.display().to_string()]);
     a
+}
+
+/// What the gateway's group may reach of a started VM, and what it may not:
+/// - the vsock socket: `0660` in `gateway_gid`, so the gateway (its own user) can dial it;
+/// - the jail root (`root`, jailed only): `0710` in `gateway_gid`, search only, so the socket's
+///   path resolves but nothing in the jail can be listed; the jailer leaves it `0700` and owned by
+///   the VMM's user. The disk in it is `0600` (`Jail::populate`), the jailer's `dev/` and `run/`
+///   are `0700`, and the kernel and Firecracker binary are public anyway;
+/// - the API socket: `0600`, the VMM user's alone whatever the umask (it drives the VM).
+///
+/// Without `gateway_gid` only the API socket changes. `owner` is the user the VMM runs as: each
+/// path must be its and of the expected kind, never a symlink (`access.rs`).
+pub fn gateway_access(root: Option<&Path>, api_sock: &Path, vsock: &Path, owner: u32, gateway_gid: Option<u32>) -> io::Result<()> {
+    use super::access::{Kind, grant_socket, restrict};
+    restrict(api_sock, Kind::Socket, owner, None, 0o600)?;
+    let Some(gid) = gateway_gid else { return Ok(()) };
+    grant_socket(vsock, owner, gid)?;
+    if let Some(root) = root {
+        restrict(root, Kind::Dir, owner, Some(gid), 0o710)?;
+    }
+    Ok(())
 }
 
 struct ApiPauser(PathBuf);
@@ -269,7 +307,13 @@ impl Vm for FirecrackerVm {
         for (method, path, body) in boot_requests(&self.cfg, &self.spec, &paths) {
             api.call(method, &path, Some(&body)).await?;
         }
-        Ok(())
+        // Firecracker bound the vsock socket at `PUT /vsock`, with its umask's mode; nestd tells
+        // the gateway about the sandbox only after this returns.
+        let (owner, root) = match &self.jail {
+            Some(j) => (j.cfg.uid, Some(j.root.as_path())),
+            None => (nix::unistd::geteuid().as_raw(), None),
+        };
+        gateway_access(root, &self.api_sock(), &self.vsock_uds_path(), owner, self.gateway_gid)
     }
     async fn pause(&mut self) -> io::Result<()> {
         self.api().call("PATCH", "/vm", Some(&json!({ "state": "Paused" }))).await.map(|_| ())
@@ -464,7 +508,7 @@ mod tests {
         fc.jailer_bin = Some("/usr/bin/jailer".into());
         fc.jailer = Some(JailerConfig { uid: 900, gid: 900, chroot_base_dir: dir.path().join("jail") });
         let root = dir.path().join("cgroup");
-        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: Some("system.slice/nestd.service/vms".into()), cgroup_root: root.clone() };
+        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: Some("system.slice/nestd.service/vms".into()), cgroup_root: root.clone(), gateway_gid: None };
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
         let mut vm = driver.create(s).await.unwrap();
@@ -485,7 +529,7 @@ mod tests {
         let mut fc = cfg();
         fc.jailer_bin = Some("/usr/bin/jailer".into());
         fc.jailer = Some(JailerConfig { uid: 900, gid: 900, chroot_base_dir: "/srv/jailer".into() });
-        let driver = FirecrackerDriver { cfg: fc.clone(), parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into() };
+        let driver = FirecrackerDriver { cfg: fc.clone(), parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: None };
         let dir = tempfile::tempdir().unwrap();
         let mut s = spec();
         s.vm_dir = dir.path().join("vm");
@@ -511,7 +555,136 @@ mod tests {
         assert_eq!(reqs[2].2["path_on_host"], "/disk.img");
         // A jailer without uid/gid/chroot settings is a configuration error.
         fc.jailer = None;
-        assert!(FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into() }.create(s).await.is_err());
+        assert!(FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: None }.create(s).await.is_err());
+    }
+
+    fn me() -> (u32, u32) {
+        (nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw())
+    }
+
+    fn mode_gid(p: &Path) -> (u32, u32) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(p).unwrap();
+        (m.mode() & 0o7777, m.gid())
+    }
+
+    /// Install a fake binary without this process holding it open for writing (ETXTBSY; see
+    /// `cloudflared.rs`).
+    fn install_executable(path: &Path, contents: &str) {
+        let staging = PathBuf::from(format!("{}.staging", path.display()));
+        std::fs::write(&staging, contents).unwrap();
+        assert!(std::process::Command::new("cp").arg(&staging).arg(path).status().unwrap().success());
+        std::fs::remove_file(&staging).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A Firecracker stand-in: answers every API call 204 and, like Firecracker, binds the vsock
+    /// socket at `PUT /vsock` with the process umask's mode.
+    const FAKE_FIRECRACKER: &str = r#"#!/usr/bin/env python3
+import json, socket, sys
+api = sys.argv[sys.argv.index("--api-sock") + 1]
+keep = []
+s = socket.socket(socket.AF_UNIX)
+s.bind(api)
+s.listen(8)
+while True:
+    c, _ = s.accept()
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = c.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    n = 0
+    for line in head.split(b"\r\n")[1:]:
+        k, _, v = line.partition(b":")
+        if k.strip().lower() == b"content-length":
+            n = int(v)
+    while len(body) < n:
+        body += c.recv(4096)
+    if head.startswith(b"PUT /vsock "):
+        v = socket.socket(socket.AF_UNIX)
+        v.bind(json.loads(body)["uds_path"])
+        v.listen(1)
+        keep.append(v)
+    c.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+    keep.append(c)
+"#;
+
+    /// A started VM's vsock socket is the gateway group's (`0660`) and its API socket the VMM
+    /// user's alone (`0600`), through the real `start` against a fake Firecracker.
+    #[tokio::test]
+    async fn start_gives_the_vsock_socket_to_the_gateway_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("firecracker");
+        install_executable(&bin, FAKE_FIRECRACKER);
+        let mut fc = cfg();
+        fc.firecracker_bin = bin;
+        let (_, gid) = me();
+        let driver = FirecrackerDriver { cfg: fc, parent_cgroup: None, cgroup_root: "/sys/fs/cgroup".into(), gateway_gid: Some(gid) };
+        let mut s = spec();
+        s.vm_dir = dir.path().join("vm");
+        let mut vm = driver.create(s.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), vm.start()).await.expect("start timed out").unwrap();
+        let vsock = vm.vsock_uds_path();
+        let api = s.vm_dir.join("fc.sock");
+        let got = (mode_gid(&vsock), mode_gid(&api).0);
+        vm.stop().await.unwrap();
+        assert_eq!(got, ((0o660, gid), 0o600));
+    }
+
+    /// Jailed: the jail root becomes search-only for the gateway's group (`0710`), the vsock
+    /// socket `0660` in it, the API socket `0600`; nothing changes for the group without one but
+    /// the API socket.
+    #[test]
+    fn gateway_access_grants_the_socket_and_search_only() {
+        use std::os::unix::net::UnixListener;
+        let (uid, gid) = me();
+        for gateway_gid in [Some(gid), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (api, vsock) = (root.join("api.sock"), root.join("vsock.sock"));
+            let _l = (UnixListener::bind(&api).unwrap(), UnixListener::bind(&vsock).unwrap());
+            for p in [&api, &vsock] {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            gateway_access(Some(&root), &api, &vsock, uid, gateway_gid).unwrap();
+            assert_eq!(mode_gid(&api).0, 0o600);
+            match gateway_gid {
+                Some(g) => {
+                    assert_eq!(mode_gid(&root), (0o710, g));
+                    assert_eq!(mode_gid(&vsock), (0o660, g));
+                }
+                None => {
+                    assert_eq!(mode_gid(&root).0, 0o700);
+                    assert_eq!(mode_gid(&vsock).0, 0o755);
+                }
+            }
+            // A path the VMM doesn't own is refused (its user is the owner every path is checked for).
+            assert!(gateway_access(Some(&root), &api, &vsock, uid.wrapping_add(1), gateway_gid).is_err());
+        }
+    }
+
+    /// The disk hard-linked into a jail is the VMM's alone (`0600`): the gateway's group may
+    /// search the jail root, and a sparse file created under umask 0022 is world-readable.
+    #[test]
+    fn populate_makes_the_disk_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let (uid, gid) = me();
+        let mut fc = cfg();
+        fc.kernel_image = dir.path().join("vmlinux");
+        std::fs::write(&fc.kernel_image, b"k").unwrap();
+        let jc = JailerConfig { uid, gid, chroot_base_dir: dir.path().join("jail") };
+        let mut s = spec();
+        s.disk_path = dir.path().join("disk.img");
+        std::fs::write(&s.disk_path, b"d").unwrap();
+        std::fs::set_permissions(&s.disk_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let jail = Jail::new(&fc, &jc, &s);
+        jail.populate(&fc, &s).unwrap();
+        assert_eq!(mode_gid(&jail.root.join("disk.img")).0, 0o600);
     }
 
     /// Stopping a jailed VM removes its jail directory, and only that.

@@ -121,26 +121,33 @@ jobs:
           restore-keys: e2e-${{ runner.os }}-
       - name: Host tools
         run: |
-          sudo apt-get update -q && sudo apt-get install -yq nftables
+          sudo apt-get update -q && sudo apt-get install -yq nftables uidmap
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          # The harness runs the gateway as its own uid: a subordinate id range to map it from.
+          for f in /etc/subuid /etc/subgid; do
+            grep -q "^$(id -un):" "$f" 2>/dev/null || echo "$(id -un):100000:65536" | sudo tee -a "$f"
+          done
       - name: Install control plane
         run: npm ci
         working-directory: control-plane
       # The probe harness's own tests; they use a stub, never the real claude.
       - name: claude-verify harness tests
         run: python3 -m unittest discover -s e2e/claude-verify
+      # Outside the home directory, which the gateway's own uid may not be able to enter.
       - name: End to end (fake brain)
         run: e2e/run.sh
+        env:
+          NEST_E2E_WORK: /tmp/nest-e2e
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs
           path: |
-            e2e/.work/logs
-            e2e/.work/summary.json
+            /tmp/nest-e2e/logs
+            /tmp/nest-e2e/summary.json
           retention-days: 7
 
   # The cell stack's proofs and graph policies (deploy/lean/Cell/Test.lean), with no AWS

@@ -112,9 +112,21 @@ pub struct SocketsConfig {
     /// Uids allowed to connect to `gateway.sock`. Empty: nestd's own euid and root only.
     #[serde(default)]
     pub gateway_uids: Vec<u32>,
+    /// The gateway's own group (`nest-gw` on a host). It owns `gateway.sock` in place of `gid`,
+    /// and each sandbox's vsock socket (`0660`) and jail root (`0710`, search only), so a gateway
+    /// that runs as its own user can dial the guests (`driver/access.rs`). Unset: `gateway.sock`
+    /// takes `gid`, and the vsock sockets keep the mode the VMM gave them, which only root and
+    /// the VMM's user can connect to.
+    #[serde(default)]
+    pub gateway_gid: Option<u32>,
 }
 
 impl SocketsConfig {
+    /// The group owning `gateway.sock`: the gateway's own, else the shared one.
+    pub fn gateway_sock_gid(&self) -> Option<u32> {
+        self.gateway_gid.or(self.gid)
+    }
+
     /// Whether a peer with `uid` may use a socket whose allow-list is `allowed`.
     pub fn allows(allowed: &[u32], uid: u32) -> bool {
         if allowed.is_empty() {
@@ -367,6 +379,17 @@ mod tests {
         for f in ["driver", "network (netns)", "storage (s3)", "cloudflared_bin", "gateway_url"] {
             assert!(e.contains(f), "{e}");
         }
+    }
+
+    /// The gateway's group owns `gateway.sock` when set, else the shared group does; it parses
+    /// from a host's `sockets` block and is absent from an older config.
+    #[test]
+    fn gateway_group_owns_the_gateway_socket() {
+        let s: SocketsConfig = serde_json::from_value(serde_json::json!({"gid": 1, "gateway_gid": 7, "gateway_uids": [8]})).unwrap();
+        assert_eq!((s.gateway_sock_gid(), s.gateway_uids.as_slice()), (Some(7), &[8][..]));
+        let old: SocketsConfig = serde_json::from_value(serde_json::json!({"gid": 1})).unwrap();
+        assert_eq!((old.gateway_gid, old.gateway_sock_gid()), (None, Some(1)));
+        assert_eq!(SocketsConfig::default().gateway_sock_gid(), None);
     }
 
     /// Guest memory is regular pages unless a config asks for hugepages (nestd review #8).

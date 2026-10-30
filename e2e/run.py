@@ -10,7 +10,7 @@ NEST_E2E_CLAUDE=fake (default): brains are e2e/fake_claude.py running a scripted
 `claude` binary is never invoked. NEST_E2E_CLAUDE=real: brains are the real `claude` with the token
 from NEST_CLAUDE_OAUTH_TOKEN, given a short natural-language turn that uses the hands tools.
 """
-import json, os, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
+import json, os, pwd, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 E2E = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(E2E)
@@ -20,6 +20,11 @@ PORT = int(os.environ.get("NEST_E2E_PORT", "18787"))
 BASE = f"http://127.0.0.1:{PORT}"
 GW_PORT = int(os.environ.get("NEST_E2E_GATEWAY_PORT", "18790"))
 GW_URL = f"ws://127.0.0.1:{GW_PORT}"
+# The gateway runs as its own user, as on a host (nest-gw): this uid inside the namespace, mapped to
+# one of the invoking user's subordinate uids. It runs a copy of the binary under WORK, since the
+# repo may sit in a home directory other users can't enter.
+GW_UID = 1001
+GW_BIN = os.path.join(WORK, "bin", "nest-gateway")
 # The hands tools the scripted scenario and the real prompt use. Every one of these is a gateway
 # connection; the guest's full list is longer, and drift here only undercounts (a weaker check).
 HANDS_TOOLS = {"Bash", "Read", "Write", "Edit", "Glob", "Grep", "TaskOutput", "TaskStop"}
@@ -142,13 +147,60 @@ def build():
         subprocess.run(["npm", "install", "--silent"], cwd=os.path.join(ROOT, "control-plane"), check=True)
 
 
+def subid_range(path):
+    """This user's first subordinate id range in /etc/subuid or /etc/subgid: (start, count)."""
+    me = {str(os.getuid()), pwd.getpwuid(os.getuid()).pw_name}
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.strip().split(":")
+                if len(parts) == 3 and parts[0] in me:
+                    return int(parts[1]), int(parts[2])
+    except OSError:
+        pass
+    return None
+
+
+def id_maps():
+    """`unshare` mappings for the gateway's own uid and gid (1..count onto the subordinate ranges),
+    beside root (the invoking user). Exits with a reason when they can't be made."""
+    ranges = [subid_range("/etc/subuid"), subid_range("/etc/subgid")]
+    if not all(r and r[1] >= GW_UID for r in ranges) or not shutil.which("newuidmap") or not shutil.which("newgidmap"):
+        log(f"the gateway runs as its own uid ({GW_UID} in the namespace): this needs newuidmap/newgidmap (package uidmap) "
+            f"and a subordinate uid and gid range of at least {GW_UID} for {pwd.getpwuid(os.getuid()).pw_name} in /etc/subuid and /etc/subgid")
+        sys.exit(1)
+    (su, sc), (sg, gc) = ranges
+    return ["--map-users", f"1:{su}:{sc}", "--map-groups", f"1:{sg}:{gc}"], su + GW_UID - 1
+
+
 def prepare_work():
+    id_maps()  # fail before anything starts
     shutil.rmtree(WORK, ignore_errors=True)
     # run/ and state/: the sandbox host's nestd; brun/ and bstate/: the brain host's.
-    for d in ["logs", "run", "state", "brun", "bstate", "netns", "runner/cwd", "files", "guest-state", "wrangler-state"]:
+    for d in ["logs", "run", "state", "brun", "bstate", "netns", "runner/cwd", "files", "guest-state", "wrangler-state", "bin"]:
         os.makedirs(os.path.join(WORK, d), exist_ok=True)
+    # The gateway's user reaches its socket and the guests' through WORK, so WORK and every
+    # directory above it must let other users through.
+    os.chmod(WORK, 0o755)
+    blocked = [d for d in ancestors(WORK) if not os.stat(d).st_mode & 0o001]
+    if blocked:
+        log(f"the gateway runs as its own uid and can't enter {blocked[0]}: set NEST_E2E_WORK to a directory "
+            "other users can reach, e.g. NEST_E2E_WORK=/var/tmp/nest-e2e-<tag>")
+        sys.exit(1)
+    shutil.copy(os.path.join(BIN, "nest-gateway"), GW_BIN)
+    os.chmod(GW_BIN, 0o755)
     with open(os.path.join(WORK, "dev.vars"), "w") as f:
         f.write(f"ADMIN_TOKEN={ADMIN}\nHOST_TOKEN_SECRET=e2e-host-token-secret-0123456789abcdef\nALLOW_DEV_CA=1\n")
+
+
+def ancestors(path):
+    """`path` and every directory above it."""
+    path = os.path.abspath(path)
+    out = [path]
+    while os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+        out.append(path)
+    return out
 
 
 def start_control_plane():
@@ -199,6 +251,9 @@ def configure_host():
         "driver": {"type": "process", "guest_command": guest},
         "network": {"type": "netns", "persist_dir": os.path.join(WORK, "netns")},
         "gateway_url": GW_URL,
+        # As on a host: only the gateway's uid on gateway.sock, and its group owns that socket and
+        # each guest's vsock socket.
+        "sockets": {"gateway_gid": GW_UID, "gateway_uids": [GW_UID]},
         "flush_interval_ms": 500,
         "versions": {"nest_proxy": "e2e", "agent_runner": "e2e", "claude_code": REAL_ENV.get("version", "real") if REAL else "fake"},
     }
@@ -218,12 +273,14 @@ def configure_host():
 
 def start_inner():
     log("starting the sandbox host (nest-proxy, nestd, nest-gateway) and the brain host (nestd, nest-runner) inside `unshare --user --map-root-user --mount`")
-    env = dict(os.environ, WORK=WORK, BIN=BIN, E2E=E2E, NEST_E2E_GATEWAY_PORT=str(GW_PORT))
+    maps, _ = id_maps()
+    env = dict(os.environ, WORK=WORK, BIN=BIN, E2E=E2E, NEST_E2E_GATEWAY_PORT=str(GW_PORT), NEST_E2E_GATEWAY_UID=str(GW_UID),
+               NEST_E2E_GATEWAY_BIN=GW_BIN)
     if REAL:
         env.update({k: v for k, v in REAL_ENV.items() if k.startswith("NEST_E2E_")})
     logf = open(os.path.join(WORK, "logs", "inner.log"), "w")
     PROCS["inner"] = subprocess.Popen(
-        ["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private", "bash", os.path.join(E2E, "inner.sh")],
+        ["unshare", "--user", "--map-root-user", *maps, "--mount", "--propagation", "private", "bash", os.path.join(E2E, "inner.sh")],
         env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
     wait_for(lambda: os.path.exists(os.path.join(WORK, "inner.ready")), 30, 0.2, "inner ready")
 
@@ -240,7 +297,7 @@ def stop_inner():
             except ProcessLookupError:
                 pass
     # Guests/brains may have been re-parented; sweep anything under WORK.
-    for pat in [os.path.join(BIN, "nest-guest"), os.path.join(BIN, "nest-gateway"), os.path.join(E2E, "fake_claude.py"),
+    for pat in [os.path.join(BIN, "nest-guest"), GW_BIN, os.path.join(E2E, "fake_claude.py"),
                 os.path.join(BIN, "nest") + " mcp"]:
         for pid in children_named(pat):
             try:
@@ -393,10 +450,23 @@ def run_real_turn(agid):
     guests = children_named(os.path.join(BIN, "nest-guest"))
     leaked = [g for g in guests if TOKEN.encode() in read_bytes(f"/proc/{g}/environ")]
     check("real claude: the OAuth token is not in the sandbox's environment", guests and not leaked, f"guests={guests} leaked={leaked}")
-    gateways = children_named(os.path.join(BIN, "nest-gateway"))
+    gateways = children_named(GW_BIN)
     leaked = [g for g in gateways if TOKEN.encode() in read_bytes(f"/proc/{g}/environ") + read_bytes(f"/proc/{g}/cmdline")]
     check("real claude: the OAuth token is not in the gateway's environment", gateways and not leaked, f"gateways={gateways} leaked={leaked}")
     return sum(1 for n in names if n.startswith("mcp__nest__") and n[len("mcp__nest__"):] in HANDS_TOOLS)
+
+
+def check_gateway_unprivileged():
+    """The gateway runs as its own uid, not the harness's (root in the namespace), with no
+    capabilities: what it reaches, it reaches through the sockets nestd gave its group."""
+    _, outer = id_maps()
+    gateways = children_named(GW_BIN)
+    status = read(f"/proc/{gateways[0]}/status") if gateways else ""
+    uids = re.search(r"^Uid:\s+(.*)$", status, re.M)
+    caps = re.search(r"^CapEff:\s+(\S+)$", status, re.M)
+    ok = bool(uids and caps) and set(uids.group(1).split()) == {str(outer)} and int(caps.group(1), 16) == 0
+    check("gateway runs as its own uid with no capabilities", ok,
+          f"pids={gateways} uids={uids.group(1) if uids else None} want {outer} (harness {os.getuid()}) capeff={caps.group(1) if caps else None}")
 
 
 def read_bytes(path):
@@ -685,6 +755,7 @@ def main():
             check("gateway listening + synced with nestd", True)
         except TimeoutError as e:
             check("gateway listening + synced with nestd", False, str(e))
+        check_gateway_unprivileged()
         ids = run_scenario()
         run_fencing(ids)
         skip("transparent :443 interception", "the process driver runs the guest inside the netns itself (no tap0 peer), so nft's tap0 redirect never applies; covered by nestd's netns_redirect_reaches_listener test")

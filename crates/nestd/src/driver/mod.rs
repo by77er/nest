@@ -12,6 +12,7 @@ use nest_protocol::model::{Epoch, Resources, SandboxId};
 
 use crate::net::Netns;
 
+pub mod access;
 pub mod firecracker;
 pub mod process;
 pub mod supervise;
