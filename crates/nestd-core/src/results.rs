@@ -119,7 +119,14 @@ impl<V, K: Clone, M: OutcomeMap<K, V>, O: KeyOrder<K>> ResultCache<V, K, M, O> {
                 self.map.remove(&old);
             }
         }
-        crate::invariant::check(self.map.len() == self.order.len() && self.map.len() <= self.cap, "result_cache_bounded");
+        crate::invariant::check(self.bounded(), "result_cache_bounded");
+    }
+
+    /// The invariant `insert` keeps: map and order hold as many keys, and no more than the cap.
+    /// In a function of its own so `.cargo/mutants.toml` can name it: it holds by construction, so
+    /// no input tells it apart from a weakened copy.
+    fn bounded(&self) -> bool {
+        self.map.len() == self.order.len() && self.map.len() <= self.cap
     }
 
     pub fn len(&self) -> usize {

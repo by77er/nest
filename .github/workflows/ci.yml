@@ -49,6 +49,12 @@ jobs:
           fi
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # nestd-core's purity, enforced by the compiler: on a target with no std at all, naming std
+      # in any spelling (`extern crate std as s`, a `#[path]` module that uses it) fails to build.
+      - name: nestd-core builds without std
+        run: |
+          rustup target add x86_64-unknown-none
+          cargo build -p nestd-core --target x86_64-unknown-none --locked
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 

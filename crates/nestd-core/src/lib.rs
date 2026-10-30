@@ -7,10 +7,12 @@
 //! fence (`scripts/fences.toml`) fails CI if one does. That is what lets the model checker
 //! (`verification/nestd/check/`), Kani and cargo-mutants run against the shipped code.
 //!
-//! The compiler enforces most of that: outside its own unit tests the crate is `no_std`, so `std`
-//! (the filesystem, sockets, processes, threads, the environment, clocks, stdio, hashed maps) is
-//! not linked and naming it fails to build; it has `core` and `alloc` only. It has no dependencies
-//! either (`scripts/check-core-manifest.py`, which also requires the `no_std` line below).
+//! The compiler enforces that in CI: the library is built for `x86_64-unknown-none`, a target with
+//! no `std` at all, so naming `std` in any spelling (the filesystem, sockets, processes, threads,
+//! the environment, clocks, stdio, hashed maps) fails to build; it has `core` and `alloc` only.
+//! (`no_std` alone wouldn't: naming the std crate explicitly still links it on the host.) It has no
+//! dependencies either; `scripts/check-core-manifest.py` checks that, the `no_std` line below, and
+//! that no source file names another crate or pulls in code from outside this one.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

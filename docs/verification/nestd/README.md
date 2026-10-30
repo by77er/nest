@@ -15,10 +15,20 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 
 ## The core/shell split
 
-- **A core** is `step(&mut state, now, input) -> Vec<Effect>`. It lives in `crates/nestd-core`, which has no dependencies at all. Purity is enforced in three layers:
-  - **The compiler:** the crate is `#![cfg_attr(not(test), no_std)]` with `extern crate alloc`, so naming `std` (a clock, the filesystem, the network, processes, threads, the environment, I/O, a hashed map seeded from the OS) outside its unit tests fails to build. It is also `#![forbid(unsafe_code)]`.
-  - **The manifest:** [scripts/check-core-manifest.py](../../../scripts/check-core-manifest.py) parses `crates/nestd-core/Cargo.toml` and fails on any dependency table or key (dotted, inline or per target), any build key, `[patch]`/`[replace]`, a `build.rs`, or a `lib.rs` without the `no_std` line. It runs in the `guards` job with tests that prove each case fails.
-  - **A text fence**, `nestd-core-purity` ([scripts/fences.toml](../../../scripts/fences.toml)), stays as a second layer over the sources.
+- **A core** is `step(&mut state, now, input) -> Vec<Effect>`. It lives in `crates/nestd-core`, which has no dependencies at all. What is enforced, and where:
+  - **The compiler, in CI.** The `rust` job builds the library for `x86_64-unknown-none`, a target with no `std` at all, so any use of `std` fails to build, whatever its spelling. That includes a clock, the filesystem, the network, processes, threads, the environment, stdio and an OS-seeded hasher, and covers `extern crate std as s` split over lines and a `#[path]` module that uses `std`.
+    - The crate is `#![cfg_attr(not(test), no_std)]` with `extern crate alloc`. On the host, `no_std` alone doesn't forbid an explicit `extern crate std`; the no-std target does.
+    - It is `#![forbid(unsafe_code)]`.
+    - Its unit tests are built with `std`, on the host only.
+  - **The manifest and the sources, in `guards`.** [scripts/check-core-manifest.py](../../../scripts/check-core-manifest.py) fails on:
+    - any dependency table or key in `crates/nestd-core/Cargo.toml` (parsed as TOML: dotted, inline or per target);
+    - any build key, `[patch]` or `[replace]`, or a `build.rs`;
+    - a `lib.rs` without the `no_std` line;
+    - in any source file, an `extern crate` other than `alloc`, a `#[path]` module or `include!`.
+
+    It checks the sources with comments stripped, so a commented-out line neither satisfies it nor trips it. Tests prove each case fails.
+  - **A text fence**, `nestd-core-purity` ([scripts/fences.toml](../../../scripts/fences.toml)): a line-based third layer over the same names.
+  - **Not enforced:** a core could still loop forever, or allocate without bound. Model checking and tests find those, not the build.
 - **The shell makes no decisions.** It only does five things:
   1. read and decode an input;
   2. read the clocks and pass them in (`Now { mono, boot, wall }` in ms);
@@ -227,7 +237,7 @@ Time is abstract: 5 s steps, 70 s explored. Frames are delayed any number of ste
 
 ## Kani
 
-The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them one at a time with `cargo kani -p nestd-core --harness <name> --exact` (kani-verifier 0.68.0, CBMC 6.11.0). Every harness runs shipped code over symbolic inputs.
+The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them one at a time with `cargo kani -p nestd-core --harness <module>::proofs::<name> --exact` (for example `incarnation::proofs::the_retire_backoff_grows_to_the_max_and_stays`, or `results::proofs::` for the cache) (kani-verifier 0.68.0, CBMC 6.11.0). Every harness runs shipped code over symbolic inputs.
 
 **What was extracted.** Phase 1 moved the decision functions that already existed into [`nestd_core::incarnation`](../../../crates/nestd-core/src/incarnation.rs), unchanged in behaviour. Table-driven tests of today's behaviour came first; then nestd's call sites changed to call them:
 - the tombstone map, `TombstoneMap` (nestd's `Tombstones` only shares one behind its lock);
@@ -308,10 +318,10 @@ The seeds are built from `protocol/fixtures/` at every run and never committed, 
 ## CI
 
 - **Every PR, existing jobs:**
-  - `rust` runs nestd-core's tests and clippy.
-  - `guards` runs the purity fence, the manifest check, and their tests.
+  - `rust` runs nestd-core's tests and clippy, and builds it for `x86_64-unknown-none` (no `std`).
+  - `guards` runs the purity fence, the manifest and source check, and their tests.
   - `deny` also checks the checker's and the fuzz crate's lockfiles.
-- **New jobs on every PR**, all deterministic (times on a runner not yet measured):
+- **New jobs on every PR** (times on a runner not yet measured). None of them fuzzes for a time. Two of their inputs do change from run to run: the fuzz replay's corpus comes from the latest nightly run, and cargo-mutants kills a mutant after a 60 s wall-clock timeout.
   - `verify-nestd`: the checker's tests (`verification/nestd/check`, `cargo test --release`), then cargo-mutants on nestd-core in place.
   - `kani-nestd`: the Kani proofs.
   - `fuzz-nestd`: the seeds still decode, and every target replays the seeds and the cached corpus once.

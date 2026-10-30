@@ -4,7 +4,7 @@
 
 | Job | Runs | Needs |
 |---|---|---|
-| `rust` | `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` | iproute2, nftables and unprivileged user namespaces for nestd's netns tests |
+| `rust` | `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p nestd-core --target x86_64-unknown-none` (the core without `std`), `cargo test --workspace` | iproute2, nftables and unprivileged user namespaces for nestd's netns tests |
 | `control-plane` | `npm ci`, `npm run typecheck`, `npm test` (vitest in workerd) | Node 22 |
 | `e2e` | The `claude-verify` harness tests (with a stub, never the real binary), then `e2e/run.sh` with the fake brain | The above, plus outbound access to `registry.npmjs.org` and `httpbin.org`; logs are uploaded on failure |
 | `infra` | `inframe test --stack use1`: the cell stack's IAM theorems and graph policies, with no AWS credentials (plans run only in [deploy.yml](deploy.md)) | elan and the inframe CLI (`scripts/infra-tools.sh`, pinned) |
@@ -13,7 +13,7 @@
 | `secrets` | gitleaks over the full history (`.gitleaks.toml`): default rules plus nest's token formats | gitleaks, built from source and verified by Go's checksum database |
 | `verify-nestd` | The Stateright checks of nestd's real cores at CI bounds (`verification/nestd/check`, `cargo test --release`), then `cargo mutants -p nestd-core --in-place` (0 missed expected) | cargo-mutants, pinned and cached ([verification](#verification)) |
 | `kani-nestd` | `cargo kani -p nestd-core`: the proofs of nestd-core's decision functions | kani-verifier, pinned and cached |
-| `fuzz-nestd` | The fuzz seeds still decode, and every target in `verification/nestd/fuzz` replays the seeds and the cached corpus once (deterministic; `fuzz.yml` does the timed fuzzing) | the pinned nightly in that directory, cargo-fuzz |
+| `fuzz-nestd` | The fuzz seeds still decode, and every target in `verification/nestd/fuzz` replays the seeds and the cached corpus once (no timed fuzzing: `fuzz.yml` does that nightly) | the pinned nightly in that directory, cargo-fuzz |
 | `ci-ok` | Fails unless every job above succeeded | — |
 
 - **Pinned:** the Rust toolchain (`rust-toolchain.toml`), every action by commit, cargo-deny and gitleaks by version. A new stable Rust or a moved action tag can't break an unrelated PR; bumps are their own PRs.
@@ -25,7 +25,7 @@
 
 ## Verification
 
-nestd's cores are checked as shipped ([docs/verification/nestd/](../docs/verification/nestd/)). The checker and the fuzz crate are standalone (each has its own `[workspace]` and lockfile), so `cargo test --workspace` doesn't see them; `deny` checks their lockfiles with the same `deny.toml`. The purity fence and the manifest check on `crates/nestd-core` run in `guards`. Every PR check is deterministic: no result depends on how long something ran.
+nestd's cores are checked as shipped ([docs/verification/nestd/](../docs/verification/nestd/)). The checker and the fuzz crate are standalone (each has its own `[workspace]` and lockfile), so `cargo test --workspace` doesn't see them; `deny` checks their lockfiles with the same `deny.toml`. The `rust` job builds `crates/nestd-core` for `x86_64-unknown-none` (no `std`, so the compiler enforces its purity); its manifest check and purity fence run in `guards`. No PR check fuzzes for a time. Two inputs still vary between runs: the fuzz replay reads the corpus the latest nightly run saved, and cargo-mutants times a mutant out after 60 s of wall clock.
 
 | Check | On every PR | Longer |
 |---|---|---|

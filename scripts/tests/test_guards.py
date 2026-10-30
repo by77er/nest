@@ -173,6 +173,43 @@ class CoreManifest(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("no_std", out)
 
+    def test_a_commented_out_no_std_fails(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        for name, hidden in {
+            "block comment": "/*\n#![cfg_attr(not(test), no_std)]\n*/\n",
+            "nested block comment": "/* /* */\n#![cfg_attr(not(test), no_std)]\n*/\n",
+        }.items():
+            with self.subTest(name):
+                lib.write_text(text.replace("#![cfg_attr(not(test), no_std)]\n", hidden), encoding="utf-8")
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn("no_std", out)
+
+    def test_code_from_outside_the_crate_or_std_fails(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        cases = {
+            "extern crate std": ("extern crate std;", "extern crate"),
+            "split over lines and renamed": ("extern\ncrate std as s;", "extern crate"),
+            "another crate": ("extern crate core as c;", "extern crate"),
+            "#[path]": ('#[path = "../../nestd/src/util.rs"]\nmod util;', "#[path]"),
+            "spaced #[path]": ('# [ path = "x.rs" ] mod x;', "#[path]"),
+            "include!": ('include!("../../nestd/src/util.rs");', "include!"),
+        }
+        for name, (line, what) in cases.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + line + "\n", encoding="utf-8")
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn(what, out)
+        with self.subTest("only in a comment"):
+            lib.write_text(text + "\n// extern crate std;\n/* #[path = \"x.rs\"] mod x; include!(\"y\"); */\n", encoding="utf-8")
+            self.assertEqual(self.check()[0], 0)
+        with self.subTest("alloc"):
+            lib.write_text(text.replace("extern crate alloc;", "extern\ncrate alloc;"), encoding="utf-8")
+            self.assertEqual(self.check()[0], 0)
+
 
 class DocLinks(unittest.TestCase):
     def setUp(self):
