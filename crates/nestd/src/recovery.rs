@@ -20,6 +20,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use nest_protocol::model::{CommitReason, Epoch, GenerationId, GenerationKind, GenerationRecord, ManifestHash, RequestId, Resources, SandboxId, WorkstreamId};
+use nestd_core::incarnation::{self, DELETING, Disposition, Entry, MetaRead, MetaVersion};
 use serde::{Deserialize, Serialize};
 
 pub const META_FILE: &str = "meta.json";
@@ -83,10 +84,10 @@ pub fn write_meta(dir: &Path, meta: &SandboxMeta) -> io::Result<()> {
 pub fn read_meta(dir: &Path) -> io::Result<SandboxMeta> {
     let bytes = std::fs::read(dir.join(META_FILE))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    match value.get("version").and_then(|v| v.as_u64()) {
-        Some(v) if v == u64::from(META_VERSION) => {}
-        Some(v) => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("meta.json version {v}, this nestd reads {META_VERSION}"))),
-        None => return Err(io::Error::new(io::ErrorKind::InvalidData, "meta.json without a version")),
+    match incarnation::meta_version(value.get("version").and_then(|v| v.as_u64()), u64::from(META_VERSION)) {
+        MetaVersion::Current => {}
+        MetaVersion::Other(v) => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("meta.json version {v}, this nestd reads {META_VERSION}"))),
+        MetaVersion::Missing => return Err(io::Error::new(io::ErrorKind::InvalidData, "meta.json without a version")),
     }
     serde_json::from_value(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -124,27 +125,41 @@ pub fn scan(sandboxes_dir: &Path) -> Vec<Found> {
         }
         for inc in std::fs::read_dir(sbx.path()).into_iter().flatten().flatten() {
             let path = inc.path();
-            let epoch = inc.file_name().to_string_lossy().parse::<u64>().ok().filter(|_| inc.file_type().is_ok_and(|t| t.is_dir()));
-            let Some(epoch) = epoch else {
-                if inc.file_name().to_string_lossy().ends_with(DELETING) {
+            let epoch = match incarnation::classify_entry(&inc.file_name().to_string_lossy(), inc.file_type().is_ok_and(|t| t.is_dir())) {
+                Entry::Incarnation(epoch) => epoch,
+                Entry::Deleting => {
                     tracing::info!(path = %path.display(), "finishing the deletion of an incarnation");
-                } else {
-                    tracing::warn!(path = %path.display(), "removing what is not an incarnation directory (an older nestd's flat layout, without meta.json)");
+                    remove(&path);
+                    continue;
                 }
-                remove(&path);
-                continue;
+                Entry::Other => {
+                    tracing::warn!(path = %path.display(), "removing what is not an incarnation directory (an older nestd's flat layout, without meta.json)");
+                    remove(&path);
+                    continue;
+                }
             };
-            match read_meta(&path) {
-                Ok(meta) if meta.sandbox.0 == name && meta.sandbox.is_valid() && meta.epoch == Epoch(epoch) => found.push(Found { meta, state_dir: path }),
-                Ok(meta) => {
+            let meta = read_meta(&path);
+            let read = match &meta {
+                Ok(meta) if meta.sandbox.0 == name && meta.sandbox.is_valid() && meta.epoch == Epoch(epoch) => MetaRead::ThisIncarnation,
+                Ok(_) => MetaRead::AnotherIncarnation,
+                Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => MetaRead::Unusable,
+                Err(_) => MetaRead::Unreadable,
+            };
+            match (incarnation::disposition(read), meta) {
+                (Disposition::Found, Ok(meta)) => found.push(Found { meta, state_dir: path }),
+                (Disposition::Remove, Ok(meta)) => {
                     tracing::warn!(path = %path.display(), names = %meta.sandbox, epoch = meta.epoch.0, "removing an incarnation directory whose meta.json names another incarnation");
                     remove(&path);
                 }
-                Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => {
+                (Disposition::Remove, Err(err)) => {
                     tracing::warn!(path = %path.display(), error = %err, "removing an incarnation directory without a usable meta.json (nothing is salvaged from it)");
                     remove(&path);
                 }
-                Err(err) => tracing::error!(path = %path.display(), error = %err, "keeping an incarnation directory whose meta.json can't be read; it is not salvaged or deleted"),
+                // `Found` only ever comes from a meta.json that read.
+                (Disposition::Keep | Disposition::Found, meta) => {
+                    let error = meta.err().map(|e| e.to_string()).unwrap_or_default();
+                    tracing::error!(path = %path.display(), %error, "keeping an incarnation directory whose meta.json can't be read; it is not salvaged or deleted");
+                }
             }
         }
         let _ = std::fs::remove_dir(sbx.path()); // only if now empty
@@ -153,8 +168,6 @@ pub fn scan(sandboxes_dir: &Path) -> Vec<Found> {
     found
 }
 
-/// Suffix an incarnation directory takes while it is being deleted.
-const DELETING: &str = ".del";
 
 /// Remove the incarnation directories `<root>/<sandbox>/<epoch>` at or below `up_to` (a destroy),
 /// and `<root>/<sandbox>` once empty.

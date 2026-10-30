@@ -1,33 +1,24 @@
-//! Fleet channel client (`docs/interfaces/control-host/fleet/`).
+//! Fleet channel client (`docs/interfaces/control-host/fleet/`): the I/O shell around
+//! [`nestd_core::fleet`], which makes every decision (hello, the reliable outbox, command dedup,
+//! heartbeats and the lease, liveness, reconnects).
 //!
-//! One WebSocket per host to FleetDO. This task owns the transport concerns only:
-//! - hello (with a full report) / hello_ack, reconnect with backoff;
-//! - **reliable outbox** of `events` batches (seq, cumulative acks, resend after the peer's
-//!   `last_event_seq`), flushed every `flush_interval` or at 100 events;
-//! - inbound `commands` dedup by seq; a batch is acked only after the host reports it processed;
-//! - heartbeats every `heartbeat_ms`; each `heartbeat_ack` renews the lease to
-//!   `sent_instant + host_fence_ms`. Heartbeats are keyed by a strictly increasing `sent_ms`
-//!   (never a raw wall-clock reading, so clock steps can't drop entries), and the deadline is kept
-//!   on both `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` (the latter keeps running across suspend);
-//! - liveness: no inbound message for ~2.5 heartbeat intervals ⇒ reconnect (a half-open TCP
-//!   connection must not silently turn into a fence);
-//! - a retryable `error` from FleetDO closes the socket: the reconnect resends everything unacked,
-//!   so a batch FleetDO failed to process is never skipped by a later cumulative ack;
-//! - the outbox is bounded: audit batches coalesce, and low-value events (audit, capacity,
-//!   egress-denied, port-opened) are shed first when it overflows while offline.
-//!
-//! Everything else is reported to the host as [`FleetNotice`]s.
+//! This file only moves bytes and time: it decodes what arrives (from the host, the WebSocket, or
+//! the clock) into one core input, steps the core, and performs the effects it returns in order,
+//! one I/O operation each, feeding every failure back as another input. The audit table of its
+//! effects is in `docs/verification/nestd/`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::control::{
-    AgentReport, CaCertificate, Capacity, Command, ComponentVersions, FleetToHost, HelloAck, HostEvent, HostEventBody, HostHello,
-    HostToFleet, LeaseClaim, LeaseTiming, SandboxReport, TunnelState,
+    AgentReport, CaCertificate, Capacity, Command, ComponentVersions, FleetToHost, HostEvent, HostEventBody, HostHello, HostToFleet,
+    LeaseClaim, LeaseTiming, SandboxReport, TunnelState,
 };
+use nest_protocol::gateway::BindingKey;
 use nest_protocol::model::{ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Seq, TimestampMs};
+use nestd_core::fleet::{self as core, Effect, EventKind, FleetLink, Inbound, Input, Log, Notice, Now, Outbound};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -53,7 +44,7 @@ pub enum FleetNotice {
     HostToken { token: String, expires_ms: TimestampMs },
     ProxyCa(CaCertificate),
     /// Every binding verification key still valid, for the sandbox gateway.
-    BindingKey(Vec<nest_protocol::gateway::BindingKey>),
+    BindingKey(Vec<BindingKey>),
     Error(ErrorBody),
 }
 
@@ -82,369 +73,364 @@ pub struct FleetParams {
     pub cgroup_delegation_error: Option<String>,
 }
 
+/// A host event as the core queues it. The core decides what to shed and what to coalesce from its
+/// [`EventKind`]; this only reads the kind off the event and performs a merge the core asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ev(pub HostEvent);
 
-pub fn spawn(params: FleetParams, reporter: Arc<dyn FleetReporter>, input: UnboundedReceiver<FleetInput>, notices: UnboundedSender<FleetNotice>) {
-    let state = State {
-        params,
-        reporter,
-        notices,
-        pending: Vec::new(),
-        unacked: VecDeque::new(),
-        // A new process has a new `instance_id`, so FleetDO resets the lineage: start at 1.
-        next_seq: 1,
-        last_command_seq: None,
-        forwarded_command_seq: None,
-        lease: LeaseTiming::default(),
-        sent: BTreeMap::new(),
-        last_sent_ms: 0,
-        pending_ca_renew: None,
-        shed: 0,
-    };
-    tokio::spawn(state.run(input));
+impl core::OutboxEvent for Ev {
+    fn kind(&self) -> EventKind {
+        use nest_protocol::model::WorkstreamEventKind as K;
+        match &self.0.body {
+            HostEventBody::EgressAudit { records } => EventKind::Audit { records: records.len() },
+            HostEventBody::Capacity { .. } => EventKind::Capacity,
+            HostEventBody::Workstream { event } => match event.kind {
+                K::EgressDenied { .. } => EventKind::EgressDenied,
+                K::PortOpened { .. } => EventKind::PortOpened,
+                _ => EventKind::Other,
+            },
+            _ => EventKind::Other,
+        }
+    }
+
+    fn merge(&mut self, next: Self) {
+        if let (HostEventBody::EgressAudit { records: last }, HostEventBody::EgressAudit { records }) = (&mut self.0.body, next.0.body) {
+            last.extend(records);
+        }
+    }
 }
 
-struct State {
+/// Frames the core passes through to the host untouched.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Other {
+    ProxyCa(CaCertificate),
+    BindingKey(Vec<BindingKey>),
+    Error(ErrorBody),
+}
+
+/// The fleet core's input, as this shell instantiates it.
+pub type CoreInput = Input<Ev, Vec<Command>, Vec<LeaseClaim>, Other>;
+type CoreEffect = Effect<Ev, Vec<Command>, Vec<LeaseClaim>, Other>;
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+pub fn spawn(params: FleetParams, reporter: Arc<dyn FleetReporter>, input: UnboundedReceiver<FleetInput>, notices: UnboundedSender<FleetNotice>) {
+    let cfg = core::Config { protocol_version: PROTOCOL_VERSION, flush_interval_ms: params.flush_interval.as_millis() as u64 };
+    let link = FleetLink::new(cfg, params.token.clone());
+    let shell = Shell { params, reporter, notices, ws: None, anchor: Instant::now() };
+    tokio::spawn(shell.run(link, input));
+}
+
+struct Shell {
     params: FleetParams,
     reporter: Arc<dyn FleetReporter>,
     notices: UnboundedSender<FleetNotice>,
-    /// Events not yet assigned a seq.
-    pending: Vec<HostEvent>,
-    /// Sent (or to be sent) batches awaiting a cumulative ack.
-    unacked: VecDeque<(Seq, Vec<HostEvent>)>,
-    next_seq: u64,
-    /// Highest command batch fully processed (and acked).
-    last_command_seq: Option<Seq>,
-    /// Highest command batch handed to the host (may still be processing).
-    forwarded_command_seq: Option<Seq>,
-    lease: LeaseTiming,
-    /// heartbeat `sent_ms` → (monotonic, boottime) send instants.
-    sent: BTreeMap<TimestampMs, (Instant, Duration)>,
-    /// Last `sent_ms` used: heartbeats get strictly increasing keys even if the clock steps back.
-    last_sent_ms: TimestampMs,
-    /// A CA renewal requested while disconnected; sent on the next connection.
-    pending_ca_renew: Option<String>,
-    /// Events dropped by outbox shedding since the last report.
-    shed: u64,
+    ws: Option<Ws>,
+    /// `Now::mono` counts from here.
+    anchor: Instant,
 }
 
-/// Outbox bound (pending + unacked events) before shedding low-value events.
-const MAX_OUTBOX_EVENTS: usize = 4096;
-/// Audit records merged into one `egress_audit` event at most.
-const MAX_AUDIT_RECORDS_PER_EVENT: usize = 512;
-
-/// Events that may be shed when the outbox overflows, in shedding order (lower first).
-fn shed_rank(e: &HostEvent) -> Option<u8> {
-    use nest_protocol::model::WorkstreamEventKind as K;
-    match &e.body {
-        HostEventBody::EgressAudit { .. } => Some(0),
-        HostEventBody::Capacity { .. } => Some(0),
-        HostEventBody::Workstream { event } => match event.kind {
-            K::EgressDenied { .. } | K::PortOpened { .. } => Some(1),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-enum Exit {
-    Closed,
-    InputGone,
-}
-
-impl State {
-    async fn run(mut self, mut input: UnboundedReceiver<FleetInput>) {
-        let mut backoff = Duration::from_millis(200);
+impl Shell {
+    /// Receive → step → perform, until the host goes away. Outcomes of effects are stepped before
+    /// anything new is read.
+    async fn run(mut self, mut link: FleetLink<Ev>, mut input: UnboundedReceiver<FleetInput>) {
+        let mut queue: VecDeque<CoreInput> = VecDeque::new();
         loop {
-            match self.connect().await {
+            while let Some(i) = queue.pop_front() {
+                for e in link.step(self.now(), i) {
+                    queue.extend(self.perform(e).await);
+                }
+            }
+            let wake = link.wake_at().map(|ms| self.anchor + Duration::from_millis(ms));
+            let next = tokio::select! {
+                m = input.recv() => match m {
+                    Some(FleetInput::Event(e)) => Input::Event(Ev(e)),
+                    Some(FleetInput::CommandsDone(seq)) => Input::CommandsDone(seq.0),
+                    Some(FleetInput::CaRenew { csr_pem }) => Input::CaRenew(csr_pem),
+                    None => return,
+                },
+                m = recv(&mut self.ws) => {
+                    let i = decode(m);
+                    if matches!(i, Input::Closed) {
+                        self.ws = None; // transport state: the socket is done
+                    }
+                    i
+                }
+                _ = sleep_until(wake) => Input::Tick,
+            };
+            queue.push_back(next);
+        }
+    }
+
+    fn now(&self) -> Now {
+        Now { mono: self.anchor.elapsed().as_millis() as u64, boot: crate::util::boottime().as_millis() as u64, wall: now_ms() }
+    }
+
+    /// One effect, one I/O operation; a failure comes back as the core's input.
+    async fn perform(&mut self, e: CoreEffect) -> Option<CoreInput> {
+        match e {
+            Effect::Connect { token } => match connect(&self.params.url, &token).await {
                 Ok(ws) => {
-                    backoff = Duration::from_millis(200);
-                    match self.session(ws, &mut input).await {
-                        Exit::InputGone => return,
-                        Exit::Closed => {}
-                    }
-                    let _ = self.notices.send(FleetNotice::Disconnected);
+                    self.ws = Some(ws);
+                    Some(Input::Connected)
                 }
-                Err(e) => tracing::warn!(error = %e, url = %self.params.url, "fleet connect failed"),
+                Err(e) => Some(Input::ConnectFailed { error: format!("{e:#}") }),
+            },
+            Effect::Send(frame) => {
+                let text = serde_json::to_string(&self.encode(&frame)).expect("frames serialize");
+                let sent = match self.ws.as_mut() {
+                    Some(ws) => ws.send(Message::Text(text.into())).await.is_ok(),
+                    None => false,
+                };
+                if sent {
+                    return None;
+                }
+                self.ws = None;
+                Some(Input::SendFailed(frame))
             }
-            // Keep accepting events while disconnected.
-            let sleep = tokio::time::sleep(backoff);
-            tokio::pin!(sleep);
-            loop {
-                tokio::select! {
-                    _ = &mut sleep => break,
-                    msg = input.recv() => match msg {
-                        Some(m) => self.on_input_offline(m),
-                        None => return,
-                    },
-                }
+            Effect::Close => {
+                self.ws = None;
+                None
             }
-            backoff = (backoff * 2).min(Duration::from_secs(30));
-        }
-    }
-
-    fn on_input_offline(&mut self, m: FleetInput) {
-        match m {
-            FleetInput::Event(e) => self.push_event(e),
-            FleetInput::CommandsDone(seq) => self.last_command_seq = Some(seq),
-            FleetInput::CaRenew { csr_pem } => self.pending_ca_renew = Some(csr_pem),
-        }
-    }
-
-    /// Queue an event: coalesce audit batches, and shed low-value events past the bound.
-    fn push_event(&mut self, e: HostEvent) {
-        if let HostEventBody::EgressAudit { records } = &e.body
-            && let Some(HostEvent { body: HostEventBody::EgressAudit { records: last }, .. }) = self.pending.last_mut()
-            && last.len() + records.len() <= MAX_AUDIT_RECORDS_PER_EVENT
-        {
-            last.extend(records.iter().cloned());
-            return;
-        }
-        self.pending.push(e);
-        let total = self.pending.len() + self.unacked.iter().map(|(_, v)| v.len()).sum::<usize>();
-        if total > MAX_OUTBOX_EVENTS {
-            let target = MAX_OUTBOX_EVENTS * 3 / 4;
-            for rank in 0..=1u8 {
-                let before = self.pending.len();
-                let mut excess = total.saturating_sub(target);
-                self.pending.retain(|e| {
-                    if excess > 0 && shed_rank(e) == Some(rank) {
-                        excess -= 1;
-                        false
-                    } else {
-                        true
-                    }
-                });
-                self.shed += (before - self.pending.len()) as u64;
-                let total = self.pending.len() + self.unacked.iter().map(|(_, v)| v.len()).sum::<usize>();
-                if total <= target {
-                    break;
-                }
+            Effect::Notify(n) => {
+                let _ = self.notices.send(self.notice(n));
+                None
             }
-            tracing::warn!(shed = self.shed, "fleet outbox full: shed low-value events");
-        }
-    }
-
-    async fn connect(&mut self) -> anyhow::Result<Ws> {
-        let mut req = self.params.url.as_str().into_client_request()?;
-        req.headers_mut().insert("Authorization", format!("Bearer {}", self.params.token).parse()?);
-        let (ws, _) = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(req)).await??;
-        Ok(ws)
-    }
-
-    async fn send(ws: &mut Ws, msg: &HostToFleet) -> bool {
-        match serde_json::to_string(msg) {
-            Ok(text) => ws.send(Message::Text(text.into())).await.is_ok(),
-            Err(_) => false,
-        }
-    }
-
-    async fn session(&mut self, mut ws: Ws, input: &mut UnboundedReceiver<FleetInput>) -> Exit {
-        // hello
-        let (sandboxes, agents, capacity) = self.reporter.report();
-        let hello = HostToFleet::Hello(Box::new(HostHello {
-            protocol_version: PROTOCOL_VERSION,
-            host: self.params.host.clone(),
-            instance_id: self.params.instance_id.clone(),
-            role: self.params.role,
-            cell: self.params.cell.clone(),
-            versions: self.params.versions.clone(),
-            gateway_url: self.params.gateway_url.clone(),
-            tunnel: *self.params.tunnel.borrow(),
-            last_command_seq: self.last_command_seq,
-            cgroup_delegation_error: self.params.cgroup_delegation_error.clone(),
-            brain_epochs: true,
-            sandboxes,
-            agents,
-            capacity,
-        }));
-        let hello_sent = Instant::now();
-        let hello_sent_boot = crate::util::boottime();
-        if !Self::send(&mut ws, &hello).await {
-            return Exit::Closed;
-        }
-        let mut last_rx = Instant::now();
-        let ack: HelloAck = loop {
-            let msg = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
-            let Ok(Some(Ok(msg))) = msg else { return Exit::Closed };
-            match parse(&msg) {
-                Some(FleetToHost::HelloAck(a)) => break a,
-                Some(FleetToHost::Error { error }) => {
-                    tracing::error!(code = %error.code, message = %error.message, "fleet refused hello");
-                    let _ = self.notices.send(FleetNotice::Error(error));
-                    return Exit::Closed;
-                }
-                _ => continue,
-            }
-        };
-        if ack.protocol_version != PROTOCOL_VERSION {
-            tracing::error!(theirs = ack.protocol_version, "fleet protocol mismatch");
-            return Exit::Closed;
-        }
-        self.lease = ack.lease;
-        // Hello acknowledged: the lease is renewed from the moment the hello was sent.
-        self.renew(hello_sent, hello_sent_boot);
-        let _ = self.notices.send(FleetNotice::Connected { lease: ack.lease });
-        if let Some(up_to) = ack.last_event_seq {
-            self.unacked.retain(|(s, _)| *s > up_to);
-        }
-        for (seq, events) in self.unacked.clone() {
-            if !Self::send(&mut ws, &HostToFleet::Events { seq, events }).await {
-                return Exit::Closed;
-            }
-        }
-        // The forwarded-but-unprocessed batch will be resent by FleetDO; dedup handles it.
-        self.forwarded_command_seq = self.last_command_seq;
-        if let Some(csr_pem) = self.pending_ca_renew.take()
-            && !Self::send(&mut ws, &HostToFleet::CaRenew { csr_pem: csr_pem.clone() }).await
-        {
-            self.pending_ca_renew = Some(csr_pem);
-            return Exit::Closed;
-        }
-        let hb_interval = Duration::from_millis(self.lease.heartbeat_ms.max(10));
-        // No inbound traffic for 2.5 intervals: the connection is presumed dead.
-        let liveness = hb_interval * 5 / 2;
-
-        let mut heartbeat = tokio::time::interval(hb_interval);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut flush = tokio::time::interval(self.params.flush_interval);
-        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = heartbeat.tick() => {
-                    if last_rx.elapsed() > liveness {
-                        tracing::warn!(silent_ms = last_rx.elapsed().as_millis() as u64, "fleet connection silent; reconnecting");
-                        return Exit::Closed;
-                    }
-                    let sent_ms = now_ms().max(self.last_sent_ms + 1);
-                    self.last_sent_ms = sent_ms;
-                    self.sent.insert(sent_ms, (Instant::now(), crate::util::boottime()));
-                    // Keep only recent send times.
-                    while self.sent.len() > 64 { let k = *self.sent.keys().next().expect("non-empty"); self.sent.remove(&k); }
-                    let hb = HostToFleet::Heartbeat { sent_ms, leases: self.reporter.lease_claims() };
-                    if !Self::send(&mut ws, &hb).await { return Exit::Closed; }
-                }
-                _ = flush.tick() => {
-                    if !self.flush(&mut ws).await { return Exit::Closed; }
-                }
-                msg = input.recv() => {
-                    let Some(m) = msg else { return Exit::InputGone };
-                    match m {
-                        FleetInput::Event(e) => {
-                            self.push_event(e);
-                            if self.pending.len() >= 100 && !self.flush(&mut ws).await { return Exit::Closed; }
-                        }
-                        FleetInput::CommandsDone(seq) => {
-                            self.last_command_seq = Some(self.last_command_seq.map_or(seq, |s| s.max(seq)));
-                            // Flush first so command results precede the ack.
-                            if !self.flush(&mut ws).await { return Exit::Closed; }
-                            if !Self::send(&mut ws, &HostToFleet::Ack { up_to: seq }).await { return Exit::Closed; }
-                        }
-                        FleetInput::CaRenew { csr_pem } => {
-                            if !Self::send(&mut ws, &HostToFleet::CaRenew { csr_pem: csr_pem.clone() }).await {
-                                self.pending_ca_renew = Some(csr_pem);
-                                return Exit::Closed;
-                            }
-                        }
-                    }
-                }
-                msg = ws.next() => {
-                    let Some(Ok(msg)) = msg else { return Exit::Closed };
-                    if let Message::Close(_) = msg { return Exit::Closed; }
-                    last_rx = Instant::now();
-                    let Some(m) = parse(&msg) else { continue };
-                    if !self.on_message(&mut ws, m).await { return Exit::Closed; }
-                }
+            Effect::Log(l) => {
+                log(&self.params.url, l);
+                None
             }
         }
     }
 
-    async fn flush(&mut self, ws: &mut Ws) -> bool {
-        if self.pending.is_empty() {
-            return true;
+    fn encode(&self, frame: &Outbound<Ev>) -> HostToFleet {
+        match frame {
+            Outbound::Hello { last_command_seq } => {
+                let (sandboxes, agents, capacity) = self.reporter.report();
+                let p = &self.params;
+                HostToFleet::Hello(Box::new(HostHello {
+                    protocol_version: PROTOCOL_VERSION,
+                    host: p.host.clone(),
+                    instance_id: p.instance_id.clone(),
+                    role: p.role,
+                    cell: p.cell.clone(),
+                    versions: p.versions.clone(),
+                    gateway_url: p.gateway_url.clone(),
+                    tunnel: *p.tunnel.borrow(),
+                    last_command_seq: last_command_seq.map(Seq),
+                    cgroup_delegation_error: p.cgroup_delegation_error.clone(),
+                    brain_epochs: true,
+                    sandboxes,
+                    agents,
+                    capacity,
+                }))
+            }
+            Outbound::Events { seq, events } => HostToFleet::Events { seq: Seq(*seq), events: events.iter().map(|e| e.0.clone()).collect() },
+            Outbound::Ack { up_to } => HostToFleet::Ack { up_to: Seq(*up_to) },
+            Outbound::Heartbeat { sent_ms } => HostToFleet::Heartbeat { sent_ms: *sent_ms, leases: self.reporter.lease_claims() },
+            Outbound::CaRenew { csr_pem } => HostToFleet::CaRenew { csr_pem: csr_pem.clone() },
         }
-        let events = std::mem::take(&mut self.pending);
-        let seq = Seq(self.next_seq);
-        self.next_seq += 1;
-        self.unacked.push_back((seq, events.clone()));
-        Self::send(ws, &HostToFleet::Events { seq, events }).await
     }
 
-    fn renew(&mut self, sent_at: Instant, sent_boot: Duration) {
-        let fence = Duration::from_millis(self.lease.host_fence_ms);
-        let deadline = sent_at + fence;
-        let deadline_boot = sent_boot + fence;
-        let remaining = deadline_boot.saturating_sub(crate::util::boottime()).min(deadline.saturating_duration_since(Instant::now()));
-        let valid_until_ms = now_ms() + remaining.as_millis() as i64;
-        let _ = self.notices.send(FleetNotice::LeaseRenewed { deadline, deadline_boot, valid_until_ms });
-    }
-
-    async fn on_message(&mut self, ws: &mut Ws, m: FleetToHost) -> bool {
-        match m {
-            FleetToHost::HelloAck(_) => {}
-            FleetToHost::HeartbeatAck { sent_ms, revoked, .. } => {
-                if let Some((at, boot)) = self.sent.get(&sent_ms).copied() {
-                    self.sent.retain(|k, _| *k > sent_ms);
-                    self.renew(at, boot);
-                }
-                if !revoked.is_empty() {
-                    let _ = self.notices.send(FleetNotice::Revoked(revoked));
-                }
+    fn notice(&self, n: Notice<Vec<Command>, Vec<LeaseClaim>, Other>) -> FleetNotice {
+        match n {
+            Notice::Connected { lease } => {
+                FleetNotice::Connected { lease: LeaseTiming { heartbeat_ms: lease.heartbeat_ms, host_fence_ms: lease.host_fence_ms, cp_expiry_ms: lease.cp_expiry_ms } }
             }
-            FleetToHost::Commands { seq, commands } => {
-                if self.last_command_seq.is_some_and(|l| seq <= l) {
-                    // Already processed: re-ack.
-                    return Self::send(ws, &HostToFleet::Ack { up_to: self.last_command_seq.expect("checked") }).await;
-                }
-                if self.forwarded_command_seq.is_some_and(|f| seq <= f) {
-                    return true; // still processing
-                }
-                self.forwarded_command_seq = Some(seq);
-                let _ = self.notices.send(FleetNotice::Commands { seq, commands });
-            }
-            FleetToHost::Ack { up_to } => {
-                self.unacked.retain(|(s, _)| *s > up_to);
-            }
-            FleetToHost::HostToken { token, expires_ms } => {
-                self.params.token = token.clone();
-                let _ = self.notices.send(FleetNotice::HostToken { token, expires_ms });
-            }
-            FleetToHost::ProxyCa(ca) => {
-                let _ = self.notices.send(FleetNotice::ProxyCa(ca));
-            }
-            FleetToHost::BindingKey { keys } => {
-                let _ = self.notices.send(FleetNotice::BindingKey(keys));
-            }
-            FleetToHost::Error { error } => {
-                let fatal = error.code == nest_protocol::model::error_codes::UNAUTHORIZED
-                    || nest_protocol::model::error_codes::is_unsupported_version(&error.code);
-                // A retryable error means FleetDO failed to process something we sent (it did not
-                // ack it). Reconnect so everything unacked is resent in order; carrying on would
-                // let a later batch's cumulative ack cover the failed one.
-                let reconnect = fatal || error.retryable;
-                tracing::warn!(code = %error.code, message = %error.message, reconnect, "fleet error");
-                let _ = self.notices.send(FleetNotice::Error(error));
-                if reconnect {
-                    return false;
-                }
-            }
+            Notice::Disconnected => FleetNotice::Disconnected,
+            Notice::Commands { seq, commands } => FleetNotice::Commands { seq: Seq(seq), commands },
+            Notice::LeaseRenewed { deadline_mono, deadline_boot, valid_until_ms } => FleetNotice::LeaseRenewed {
+                deadline: self.anchor + Duration::from_millis(deadline_mono),
+                deadline_boot: Duration::from_millis(deadline_boot),
+                valid_until_ms,
+            },
+            Notice::Revoked(r) => FleetNotice::Revoked(r),
+            Notice::HostToken { token, expires_ms } => FleetNotice::HostToken { token, expires_ms },
+            Notice::Error(o) | Notice::Other(o) => match o {
+                Other::ProxyCa(ca) => FleetNotice::ProxyCa(ca),
+                Other::BindingKey(keys) => FleetNotice::BindingKey(keys),
+                Other::Error(e) => FleetNotice::Error(e),
+            },
         }
-        true
     }
 }
 
-fn parse(msg: &Message) -> Option<FleetToHost> {
-    let text = match msg {
-        Message::Text(t) => t.as_str(),
-        Message::Binary(b) => std::str::from_utf8(b).ok()?,
-        _ => return None,
+/// What arrived on the WebSocket (the next item of its stream), as the core's input: a pure decode,
+/// no I/O. The connection ends on a close, an error, or the end of the stream ([`Input::Closed`]).
+/// Public so the `fleet_to_host` fuzz target (`verification/nestd/fuzz/`) drives this very code.
+pub fn decode(m: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>) -> CoreInput {
+    let text = match &m {
+        Some(Ok(Message::Text(t))) => Some(t.as_str()),
+        Some(Ok(Message::Binary(b))) => std::str::from_utf8(b).ok(),
+        Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => return Input::Noise { unparseable: None },
+        Some(Ok(Message::Close(_)) | Err(_)) | None => return Input::Closed,
     };
-    match serde_json::from_str(text) {
-        Ok(m) => Some(m),
-        Err(e) => {
-            tracing::warn!(error = %e, "unparseable fleet message");
-            None
+    match text.map(serde_json::from_str::<FleetToHost>) {
+        Some(Ok(f)) => Input::Frame(inbound(f)),
+        Some(Err(e)) => Input::Noise { unparseable: Some(e.to_string()) },
+        None => Input::Noise { unparseable: Some("binary frame is not UTF-8".into()) },
+    }
+}
+
+/// A FleetDO frame in the core's vocabulary.
+fn inbound(f: FleetToHost) -> Inbound<Vec<Command>, Vec<LeaseClaim>, Other> {
+    match f {
+        FleetToHost::HelloAck(a) => Inbound::HelloAck {
+            protocol_version: a.protocol_version,
+            last_event_seq: a.last_event_seq.map(|s| s.0),
+            next_command_seq: a.next_command_seq.map(|s| s.0),
+            lease: core::Lease { heartbeat_ms: a.lease.heartbeat_ms, host_fence_ms: a.lease.host_fence_ms, cp_expiry_ms: a.lease.cp_expiry_ms },
+        },
+        FleetToHost::HeartbeatAck { sent_ms, revoked, .. } => Inbound::HeartbeatAck { sent_ms, revoked: (!revoked.is_empty()).then_some(revoked) },
+        FleetToHost::Commands { seq, commands } => Inbound::Commands { seq: seq.0, commands },
+        FleetToHost::Ack { up_to } => Inbound::Ack { up_to: up_to.0 },
+        FleetToHost::HostToken { token, expires_ms } => Inbound::HostToken { token, expires_ms },
+        FleetToHost::BindingKey { keys } => Inbound::Other(Other::BindingKey(keys)),
+        FleetToHost::ProxyCa(ca) => Inbound::Other(Other::ProxyCa(ca)),
+        FleetToHost::Error { error } => Inbound::Error { code: error.code.clone(), retryable: error.retryable, error: Other::Error(error) },
+    }
+}
+
+fn log(url: &str, l: Log) {
+    match l {
+        Log::ConnectFailed { error } => tracing::warn!(%error, url, "fleet connect failed"),
+        Log::HelloRefused => tracing::error!("fleet refused hello"),
+        Log::ProtocolMismatch { theirs } => tracing::error!(theirs, "fleet protocol mismatch"),
+        Log::Silent { silent_ms } => tracing::warn!(silent_ms, "fleet connection silent; reconnecting"),
+        Log::PeerError { reconnect } => tracing::warn!(reconnect, "fleet error"),
+        Log::Unparseable { error } => tracing::warn!(%error, "unparseable fleet message"),
+        Log::CommandGap { seq, expected } => tracing::warn!(seq, expected, "fleet command batch out of order; reconnecting"),
+        Log::OutboxShed { shed } => tracing::warn!(shed, "fleet outbox full: shed low-value events"),
+        Log::InvariantViolated { name } => tracing::error!(invariant = name, "fleet core invariant violated"),
+    }
+}
+
+async fn connect(url: &str, token: &str) -> anyhow::Result<Ws> {
+    let mut req = url.into_client_request()?;
+    req.headers_mut().insert("Authorization", format!("Bearer {token}").parse()?);
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(req)).await??;
+    Ok(ws)
+}
+
+async fn recv(ws: &mut Option<Ws>) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+    match ws {
+        Some(ws) => ws.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use nest_protocol::model::error_codes;
+    use nestd_core::fleet::{OutboxEvent, absorbs, error_is_fatal, shed_rank};
+
+    use super::*;
+
+    fn fixtures(dir: &str) -> Vec<(String, serde_json::Value)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/fixtures/control").join(dir);
+        let mut out: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .map(|p| (p.file_stem().unwrap().to_string_lossy().into_owned(), serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn fixture(dir: &str, name: &str) -> serde_json::Value {
+        fixtures(dir).into_iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("{dir}/{name}")).1
+    }
+
+    fn event(v: serde_json::Value) -> Ev {
+        Ev(serde_json::from_value(v).expect("a host event"))
+    }
+
+    /// The core's fatal classification (it has no dependencies, so it mirrors the code names) agrees
+    /// with what this shell decided from nest-protocol's list before the decision moved: for every
+    /// code sent, plus the legacy name for another version.
+    #[test]
+    fn the_cores_fatal_codes_are_nest_protocols() {
+        for code in error_codes::ALL.iter().chain([&error_codes::LEGACY_UNSUPPORTED_VERSION]) {
+            let protocol = *code == error_codes::UNAUTHORIZED || error_codes::is_unsupported_version(code);
+            assert_eq!(error_is_fatal(code), protocol, "{code}");
         }
+        assert_eq!(core::error_codes::UNAUTHORIZED, error_codes::UNAUTHORIZED);
+        assert_eq!(core::error_codes::UNSUPPORTED_VERSION, error_codes::UNSUPPORTED_VERSION);
+        assert_eq!(core::error_codes::LEGACY_UNSUPPORTED_VERSION, error_codes::LEGACY_UNSUPPORTED_VERSION);
+    }
+
+    /// Every host event fixture reads as the kind, and so sheds at the rank, this shell gave it
+    /// before the decision moved into the core: audits and capacity first, denied and opened ports
+    /// next, anything else never.
+    #[test]
+    fn every_host_event_reads_as_its_kind() {
+        let all = fixtures("host_event");
+        assert!(all.len() >= 10, "the fixtures are there");
+        for (name, v) in all {
+            let (kind, rank) = match name.as_str() {
+                "egress_audit" => (EventKind::Audit { records: 4 }, Some(0)),
+                "capacity" => (EventKind::Capacity, Some(0)),
+                "workstream" => (EventKind::PortOpened, Some(1)),
+                _ => (EventKind::Other, None),
+            };
+            let e = event(v);
+            assert_eq!((e.kind(), shed_rank(e.kind())), (kind, rank), "{name}");
+        }
+        let host_event = fixture("host_event", "workstream");
+        for (name, w) in fixtures("workstream_event") {
+            let mut v = host_event.clone();
+            v["event"] = w;
+            let (kind, rank) = match name.as_str() {
+                "egress_denied" => (EventKind::EgressDenied, Some(1)),
+                "port_opened" => (EventKind::PortOpened, Some(1)),
+                _ => (EventKind::Other, None),
+            };
+            let e = event(v);
+            assert_eq!((e.kind(), shed_rank(e.kind())), (kind, rank), "workstream {name}");
+        }
+    }
+
+    /// A merge the core asks for appends the next batch's records, in order.
+    #[test]
+    fn a_merge_appends_the_audit_records() {
+        let (mut a, b) = (event(fixture("host_event", "egress_audit")), event(fixture("host_event", "egress_audit")));
+        assert!(absorbs(a.kind(), b.kind()));
+        let HostEventBody::EgressAudit { records } = &b.0.body else { unreachable!() };
+        let want: Vec<_> = records.iter().chain(records).cloned().collect();
+        a.merge(b);
+        assert!(matches!(&a.0.body, HostEventBody::EgressAudit { records } if *records == want));
+    }
+
+    /// The decode the shell runs on each WebSocket item: frames (text or binary) become the core's
+    /// frames, error codes pass through for the core to judge, control messages are noise, and a
+    /// close, an error or the end of the stream ends the connection.
+    #[test]
+    fn websocket_items_decode_to_core_inputs() {
+        for (name, v) in fixtures("fleet_to_host") {
+            let text = v.to_string();
+            let from_text = decode(Some(Ok(Message::Text(text.clone().into()))));
+            assert!(matches!(from_text, Input::Frame(_)), "{name}: {from_text:?}");
+            assert_eq!(decode(Some(Ok(Message::Binary(text.into_bytes().into())))), from_text, "{name}");
+            if name == "error" {
+                let Input::Frame(Inbound::Error { code, error: Other::Error(e), .. }) = &from_text else { panic!("{from_text:?}") };
+                assert_eq!(*code, e.code);
+            }
+        }
+        let not_utf8 = decode(Some(Ok(Message::Binary(vec![0xff].into()))));
+        assert_eq!(not_utf8, Input::Noise { unparseable: Some("binary frame is not UTF-8".into()) });
+        assert!(matches!(decode(Some(Ok(Message::Text("{".into())))), Input::Noise { unparseable: Some(_) }));
+        assert_eq!(decode(Some(Ok(Message::Ping(vec![1].into())))), Input::Noise { unparseable: None });
+        assert_eq!(decode(Some(Ok(Message::Pong(vec![].into())))), Input::Noise { unparseable: None });
+        assert_eq!(decode(Some(Ok(Message::Close(None)))), Input::Closed);
+        assert_eq!(decode(Some(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed))), Input::Closed);
+        assert_eq!(decode(None), Input::Closed);
     }
 }

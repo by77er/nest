@@ -2,6 +2,8 @@
 
 Inventory for modelling: per-(sandbox, epoch) state on a sandbox host, `Fenced` as terminal, salvage and retire, the tombstone map, restart reconciliation, and FleetDO's reap of stale incarnations. Code is cited at main `edf6829` (PR #27). Design: [nestd](../../compute/nestd/README.md), [fencing](../../sandbox/fencing/README.md).
 
+> **Since:** the pure decisions here (tombstones, the scan, `meta.json` versions, salvage retry, retire backoff) are extracted into `nestd_core::incarnation` and proved with Kani; the machine itself is phase 2 of [nestd/](../nestd/#phase-2-design).
+
 ## Scope and actors
 
 | Actor | State (exact) | Code |

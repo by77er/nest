@@ -44,6 +44,22 @@ export class ReliableChannels {
       .map((r) => JSON.parse(r.body) as unknown);
   }
 
+  /** Whether any unacked message has seq > `after`. */
+  hasPendingAfter(chan: string, after: number | undefined): boolean {
+    return this.sql.exec("SELECT 1 FROM rel_out WHERE chan = ? AND seq > ? LIMIT 1", chan, after ?? 0).toArray().length > 0;
+  }
+
+  /**
+   * The lowest seq a resend after `after` or any later push can carry: the first unacked message
+   * above `after`, else the next seq to assign. The peer's in-order baseline for a new connection.
+   */
+  firstToSend(chan: string, after: number | undefined): number {
+    const row = this.sql
+      .exec<{ seq: number | null }>("SELECT MIN(seq) AS seq FROM rel_out WHERE chan = ? AND seq > ?", chan, after ?? 0)
+      .toArray()[0];
+    return row?.seq ?? this.state(chan).next_out;
+  }
+
   /** Highest inbound seq fully processed, if any. */
   lastIn(chan: string): number | undefined {
     return this.state(chan).last_in ?? undefined;
@@ -86,14 +102,23 @@ export class ReliableChannels {
 
 /**
  * Runs async work one item at a time, in submission order, within one Durable Object instance.
- * Inbound reliable messages go through it so a batch never overtakes an earlier one that is still
- * awaiting other Durable Objects (the input gate opens across those awaits).
+ * Reliable messages go through it, inbound and outbound, so one never overtakes an earlier one that
+ * is still awaiting other Durable Objects (the input gate opens across those awaits).
  */
 export class SerialQueue {
   private tail: Promise<unknown> = Promise.resolve();
+  private count = 0;
+
+  /** Items submitted and not yet finished (the running one included). */
+  get pending(): number {
+    return this.count;
+  }
 
   run<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(fn, fn);
+    this.count++;
+    const next = this.tail.then(fn, fn).finally(() => {
+      this.count--;
+    });
     this.tail = next.catch(() => undefined);
     return next;
   }

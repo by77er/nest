@@ -2,6 +2,8 @@
 
 > **Study, not a decision.** Code on `main` (edf6829); every claim cites `file:line`. Contract: [control-host](../../interfaces/control-host/), [fleet](../../interfaces/control-host/fleet/), [session](../../interfaces/control-host/session/); settled rule in [docs/README.md](../../README.md) ("Reliable channels deliver strictly in order ... a new `instance_id` resets the lineage").
 
+> **Since:** the fleet direction is now checked over nestd's real core ([nestd/](../nestd/)). B1, B2 (with the pilot's F2 and F3), B3 and the pilot's F4 are fixed there; the checker shows each fix holds, and each, removed, fails.
+
 ## Scope and actors
 
 | Channel | Sender → receiver | Seq'd messages | Ack | Lineage key |

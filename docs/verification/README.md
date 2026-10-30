@@ -28,10 +28,10 @@ Each row is a machine or protocol worth modelling. Its doc lists states, transit
 | Sandbox lease, placement, fencing, STONITH, salvage | SandboxDO, FleetDO, nestd, EC2 | One committer (head moves only from `(host, epoch)`); no double run; no leased epoch reused; reassignment after STONITH; salvage never dropped; `destroyed` final | A lost sandbox is placed again; markers clear; queues drain | [sandbox-lease/](sandbox-lease/) | TLA+ pilot |
 | Brain lifecycle, one brain per agent | AgentDO, FleetDO, nestd, runner, gateway | At most one brain can act (on AgentDO or through a binding); no epoch regression; no start at or below a kill | A queued turn runs or fails; no agent or healthy host wedges | [agent-brain/](agent-brain/) | TLA+ pilot, conformance check |
 | Host lifecycle, autoscaling, command delivery | FleetDO, nestd, EC2, Cloudflare | Dead is final; terminate only when empty; every command gets exactly one result | Capacity eventually arrives; STONITH resolves | [hosts/](hosts/) | none yet |
-| Reliable channels | FleetDO, AgentDO, nestd, runner | In-order exactly-once processing per lineage; ack only after effects | Every event processed given connectivity | [reliable-channels/](reliable-channels/) | Stateright pilot (commands) |
+| Reliable channels | FleetDO, AgentDO, nestd, runner | In-order exactly-once processing per lineage; ack only after effects | Every event processed given connectivity | [reliable-channels/](reliable-channels/) | Stateright pilot (commands); the fleet link checked over nestd's real core ([nestd/](nestd/)) |
 | Gateway bindings and the hands path | SandboxDO, nestd, gateway, guest, hands client | A call runs only under a binding at the guest's current epoch; no epoch regression; detach voids | A refused call re-resolves and succeeds | [gateway-bindings/](gateway-bindings/) | none yet |
 | Commit chain and object-store GC | SandboxDO, FleetDO, nestd, S3 | No object reachable from a live or pending generation is deleted; the chain is a tree; commits are idempotent | Garbage is collected | [commit-gc/](commit-gc/) | Lean pilot |
-| nestd incarnations, tombstones, restart recovery | nestd, FleetDO | A dirty incarnation's work ends as a head, an orphan or a recorded loss; fenced is terminal; tombstones pruned only when safe | Every stale incarnation is reaped | [nestd-incarnations/](nestd-incarnations/) | none yet |
+| nestd incarnations, tombstones, restart recovery | nestd, FleetDO | A dirty incarnation's work ends as a head, an orphan or a recorded loss; fenced is terminal; tombstones pruned only when safe | Every stale incarnation is reaped | [nestd-incarnations/](nestd-incarnations/) | decisions proved with Kani; the machine is phase 2 of [nestd/](nestd/) |
 
 ## Pilots
 
@@ -97,4 +97,5 @@ The inventories list more suspected bugs, each with what would confirm it.
 | [gateway-bindings/](gateway-bindings/) | Inventory |
 | [commit-gc/](commit-gc/) | Inventory; [pilot/](commit-gc/pilot/) |
 | [nestd-incarnations/](nestd-incarnations/) | Inventory |
+| [nestd/](nestd/) | nestd's pure cores checked as shipped: Stateright over the real fleet-link core and the lease, Kani, cargo-fuzz, cargo-mutants; phase 2 design |
 | [roadmap/](roadmap/) | What to model next, CI, assertions and tests to add now |

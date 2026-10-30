@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly (-Zsanitizer). Pinned so runs are reproducible; bump deliberately.
+[toolchain]
+channel = "nightly-2026-08-21"
+profile = "minimal"

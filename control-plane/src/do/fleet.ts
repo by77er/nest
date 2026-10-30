@@ -129,6 +129,29 @@ interface LeaseRow {
 interface Attachment {
   host: string;
   helloed: boolean;
+  /**
+   * The highest command seq this socket has been sent: its hello's `last_command_seq` to start
+   * with, advanced by each outbound run. Absent (a socket from before it): everything unacked.
+   */
+  sent?: number;
+}
+
+/**
+ * `kv` key of a host's lineage-reset capture (`Orphans`): what its old nestd process never
+ * answered, kept until it has been dealt with.
+ */
+const orphansKey = (host: string) => `orphaned_commands:${host}`;
+/**
+ * The old process's unanswered commands, and (until `dropUnreported` has run) the leases it held
+ * that the new process doesn't report. An older shape is the bare array of commands.
+ */
+interface Orphans {
+  cmds: string[];
+  gone?: { sandbox: string; epoch: number }[];
+}
+function parseOrphans(value: string): Orphans {
+  const v = JSON.parse(value) as Orphans | string[];
+  return Array.isArray(v) ? { cmds: v } : v;
 }
 
 export interface PlaceRequest {
@@ -224,6 +247,8 @@ export class FleetDO extends DurableObject<Env> {
   private readonly deadlines: Deadlines;
   /** Per-host serialization of inbound reliable messages (hello and event batches). */
   private readonly inbound = new Map<string, SerialQueue>();
+  /** Per-host serialization of outbound command sends (`flush`). */
+  private readonly outbound = new Map<string, SerialQueue>();
   /** Override for tests; `undefined` derives a client from the AWS_* secrets. */
   ec2Override: Ec2 | null | undefined = undefined;
   /** Override for tests; `undefined` reads the cell's entry in `AWS_CELLS`. */
@@ -339,9 +364,9 @@ export class FleetDO extends DurableObject<Env> {
     if (!cols.some((c) => c.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 
-  private queue(host: string): SerialQueue {
-    let q = this.inbound.get(host);
-    if (!q) this.inbound.set(host, (q = new SerialQueue()));
+  private queue(host: string, map = this.inbound): SerialQueue {
+    let q = map.get(host);
+    if (!q) map.set(host, (q = new SerialQueue()));
     return q;
   }
 
@@ -826,49 +851,94 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Send messages after replacing BrokerDO secret references with current values. Only the typed
-   * slots `commandRefSlots` names are resolved, each to the names valid for its purpose
-   * (`REF_PURPOSES`). A reference anywhere else (a launch prompt, say) goes out as its literal text,
-   * so no command field can pull an arbitrary secret (a binding key) out of BrokerDO.
+   * Put the host's unsent command batches on the wire, in seq order. Runs go one at a time per host
+   * (the outbound chain), so no batch overtakes a lower one while that one awaits BrokerDO. A run
+   * takes the host's current socket and sends the unacked batches above what that socket was sent
+   * (`Attachment.sent`), in order, up to the first that can't be resolved (`sendResolved`).
+   * `issueCommands` pushes, then queues one; a hello queues its socket's first run in the step that
+   * marks it helloed; the tick queues one for a connected host with batches above its `sent`. A run
+   * that throws closes its socket (retryable), so the hello resends what it didn't send.
    */
-  private async sendResolved(ws: WebSocket, msgs: unknown[]): Promise<void> {
-    const out = msgs.map((m) => structuredClone(m) as { type?: unknown; commands?: unknown });
-    // An `agent_start` already answered (failed when its host was expired: A3) is never resent.
-    for (const m of out) {
-      if (m.type === "commands" && Array.isArray(m.commands)) {
-        m.commands = (m.commands as { cmd: string; type: string }[]).filter((c) => c.type !== "agent_start"
-          || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd).toArray().length === 0);
-      }
-    }
-    const slots: RefSlot[] = [];
-    for (const m of out) {
-      if (m.type === "commands" && Array.isArray(m.commands)) {
-        for (const c of m.commands as Record<string, unknown>[]) slots.push(...commandRefSlots(c));
-      }
-    }
-    const values = new Map<RefPurpose, Record<string, string | null>>();
-    for (const purpose of new Set(slots.map((s) => s.purpose))) {
-      const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
-      try {
-        values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
-      } catch (e) {
-        console.error("FleetDO: resolving secret references failed; not sending", e);
-        return; // stays queued; resent after the next hello
-      }
-    }
-    for (const s of slots) {
-      const value = values.get(s.purpose)?.[s.ref];
-      if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
-      s.set(value ?? "");
-    }
-    for (const m of out) this.send(ws, m as FleetToHost);
+  private flush(host: string): Promise<void> {
+    let ws: WebSocket | undefined;
+    return this.queue(host, this.outbound).run(async () => {
+      ws = this.socketFor(host);
+      if (!ws) return;
+      const msgs = this.rel.pendingAfter(host, (ws.deserializeAttachment() as Attachment).sent) as { seq: number }[];
+      if (msgs.length) await this.sendResolved(ws, host, msgs);
+    }).catch((e) => {
+      console.error(`FleetDO: sending commands to ${host} failed; closing, so its hello resends them`, e);
+      if (ws) this.closeRetryable(ws, "sending commands failed; reconnect and resend");
+    });
   }
 
+  /** Close a host's socket so it reconnects at once, its hello resending what is unacked. */
+  private closeRetryable(ws: WebSocket, why: string): void {
+    this.send(ws, { type: "error", error: errorBody(ErrorCodes.INTERNAL, why, true) });
+    try {
+      ws.close(4503, why);
+    } catch {
+      // already closed
+    }
+  }
+
+  /**
+   * Send one outbound run on `ws`, a batch at a time in seq order: each goes out once its BrokerDO
+   * secret references resolve to current values, and its seq is then recorded as sent there. The
+   * first failure stops the run (what went out stays sent, the rest waits) and closes the socket,
+   * so the host reconnects and its hello resends the rest; a batch needing no secret ahead of it is
+   * never held back. A socket that stops being the host's meanwhile (superseded, closing) gets
+   * nothing more. Only the typed slots `commandRefSlots` names are resolved, each to the names
+   * valid for its purpose (`REF_PURPOSES`). A reference anywhere else (a launch prompt, say) goes
+   * out as its literal text, so no command field can pull an arbitrary secret (a binding key) out
+   * of BrokerDO.
+   */
+  private async sendResolved(ws: WebSocket, host: string, msgs: { seq: number }[]): Promise<void> {
+    for (const msg of msgs) {
+      const m = structuredClone(msg) as { seq: number; type?: unknown; commands?: unknown };
+      const commands = m.type === "commands" && Array.isArray(m.commands) ? (m.commands as Record<string, unknown>[]) : [];
+      // An `agent_start` already answered (failed when its host was expired: A3) is never resent.
+      if (commands.length) {
+        m.commands = commands.filter((c) => c.type !== "agent_start"
+          || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd as string).toArray().length === 0);
+      }
+      const slots = (m.commands as Record<string, unknown>[] | undefined ?? []).flatMap((c) => commandRefSlots(c));
+      const values = new Map<RefPurpose, Record<string, string | null>>();
+      for (const purpose of new Set(slots.map((s) => s.purpose))) {
+        const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
+        try {
+          values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
+        } catch (e) {
+          console.error(`FleetDO: resolving secret references for batch ${m.seq} failed; holding it and the rest, closing`, e);
+          this.closeRetryable(ws, "resolving secret references failed; reconnect and resend");
+          return;
+        }
+      }
+      // Superseded or closing (meanwhile, or by an earlier failure): its successor's hello resends.
+      if (this.socketFor(host) !== ws) return;
+      for (const s of slots) {
+        const value = values.get(s.purpose)?.[s.ref];
+        if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
+        s.set(value ?? "");
+      }
+      this.send(ws, m as FleetToHost);
+      ws.serializeAttachment({ host, helloed: true, sent: m.seq } satisfies Attachment);
+    }
+  }
+
+  /**
+   * The host's current socket: helloed, and open. A superseded socket is un-helloed; one being
+   * closed (superseded, or after a send failure) stays listed until its peer answers the close, and
+   * carries nothing more meanwhile.
+   */
   private socketFor(host: string): WebSocket | undefined {
-    return this.ctx.getWebSockets(host).find((ws) => (ws.deserializeAttachment() as Attachment).helloed);
+    return this.ctx.getWebSockets(host).find((ws) => ws.readyState === WebSocket.OPEN && (ws.deserializeAttachment() as Attachment).helloed);
   }
 
   private async onHello(ws: WebSocket, att: Attachment, hello: Extract<HostToFleet, { type: "hello" }>): Promise<void> {
+    // A hello that waited in the host's queue while its socket closed is stale: the host has
+    // reconnected or will. Acting on it would supersede the live socket before its own hello runs.
+    if (ws.readyState !== WebSocket.OPEN) return;
     if (hello.protocol_version !== PROTOCOL_VERSION) {
       this.send(ws, {
         type: "error",
@@ -895,18 +965,34 @@ export class FleetDO extends DurableObject<Env> {
       old.close(4000, "superseded by a new connection");
     }
     const now = Date.now();
-    // A new nestd process (new instance_id): both seq lineages restart. Its unacked commands fail
-    // (retryably) or are reconciled from the report below.
+    const reported = new Map(hello.sandboxes.map((s) => [s.sandbox, s]));
+    // A new nestd process (new instance_id): both seq lineages restart. What the old process left is
+    // captured in the same step as the reset, before any await lets a command or a lease go to the
+    // new process: its unanswered commands (they fail retryably, or are reconciled from the report
+    // below) and the leases it held that the new one doesn't report (dropped). The capture is kept in
+    // `kv` until both are done, so a FleetDO restart midway leaves them to the next hello (the same
+    // instance_id, so no reset then).
     const lastInstance = prior.nestd_instance as string | null;
     const newProcess = lastInstance !== null && lastInstance !== hello.instance_id;
-    if (newProcess) this.rel.reset(att.host);
+    if (newProcess) {
+      this.rel.reset(att.host);
+      const capture: Orphans = {
+        cmds: this.sql.exec<{ cmd: string }>("SELECT cmd FROM commands WHERE host = ? AND result IS NULL", att.host).toArray().map((r) => r.cmd),
+        gone: this.leasesOf(att.host).filter((l) => !l.expired && !reported.has(l.sandbox)).map((l) => ({ sandbox: l.sandbox, epoch: l.epoch })),
+      };
+      this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", orphansKey(att.host), JSON.stringify(capture));
+    }
+    const stored = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", orphansKey(att.host)).toArray()[0]?.value;
+    const orphans = stored === undefined ? undefined : parseOrphans(stored);
+    // The host has processed every command up to `last_command_seq`; the socket starts there.
+    if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
     this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ? WHERE host = ?",
       now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior as HostRow);
     if (hello.cgroup_delegation_error) {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
     }
-    ws.serializeAttachment({ host: att.host, helloed: true } satisfies Attachment);
+    ws.serializeAttachment({ host: att.host, helloed: true, sent: hello.last_command_seq ?? 0 } satisfies Attachment);
 
     this.send(ws, {
       type: "hello_ack",
@@ -915,14 +1001,16 @@ export class FleetDO extends DurableObject<Env> {
       ...(this.rel.lastIn(att.host) !== undefined ? { last_event_seq: this.rel.lastIn(att.host) } : {}),
       lease: DEFAULT_LEASE_TIMING,
       host_token_expires_ms: prior.token_exp,
+      // Read in the same step as the reset and `helloed`: the resend below starts here, and anything
+      // issued later is pushed above it.
+      next_command_seq: this.rel.firstToSend(att.host, hello.last_command_seq),
     });
+    // The resend of what the host hasn't processed, queued on the outbound chain in this same step:
+    // a command issued from here on goes out behind it, never ahead of a lower one.
+    void this.flush(att.host);
     if (prior.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, att.host);
     this.keysSent.delete(att.host);
     await this.sendBindingKeys(ws, prior.cell, att.host);
-
-    // Resend unacked commands the host hasn't processed.
-    if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
-    await this.sendResolved(ws, this.rel.pendingAfter(att.host, hello.last_command_seq));
 
     // A `stonith_pending` host stays so (liveness is `last_rx` and the socket) until its fence
     // succeeds or EC2 confirms the instance gone. A silent host is back. Its expiry proved its brains gone (its lease lapsed, and nestd refused
@@ -934,12 +1022,12 @@ export class FleetDO extends DurableObject<Env> {
     await this.reconcileSandboxes(att.host, hello.sandboxes);
     // The hello's capacity counts the sandboxes it reports: marked after their first states.
     this.sql.exec("UPDATE hosts SET capacity_seq = ? WHERE host = ?", this.mark(), att.host);
-    const reported = new Map(hello.sandboxes.map((s) => [s.sandbox, s]));
-    if (newProcess) {
-      // What the old process never answered, captured before re-placement issues anything new.
-      const pending = new Set(this.sql.exec<{ cmd: string }>("SELECT cmd FROM commands WHERE host = ? AND result IS NULL", att.host).toArray().map((r) => r.cmd));
-      await this.dropUnreported(att.host, reported);
-      await this.failPendingCommands(att.host, "host process restarted before running this command", reported, pending);
+    if (orphans?.gone) {
+      await this.dropUnreported(att.host, orphans.gone, new Set(orphans.cmds));
+      this.sql.exec("UPDATE kv SET value = ? WHERE key = ?", JSON.stringify({ cmds: orphans.cmds } satisfies Orphans), orphansKey(att.host));
+    }
+    if (orphans) {
+      await this.failPendingCommands(att.host, "host process restarted before running this command", reported, orphans.cmds);
     }
     // A host of the previous release (no brain epochs) is drained of brains on sight, before its
     // agents are reconciled: no new placements and its brains condemned; its sandboxes are left as
@@ -957,16 +1045,21 @@ export class FleetDO extends DurableObject<Env> {
   /**
    * A new nestd process on this host (a restart) reported its sandboxes; one we leased to the host
    * that it doesn't report is gone with the old process, so it can't run twice. A suspended one is
-   * evicted (it wakes lazily); any other is placed again from its head.
+   * evicted (it wakes lazily); any other is placed again from its head. `unreported` and `cmds` were
+   * captured at the lineage reset; a lease since moved or expired is left alone. Idempotent.
    */
-  private async dropUnreported(host: string, reported: Map<string, SandboxReport>): Promise<void> {
-    const gone = this.leasesOf(host).filter((l) => !l.expired && !reported.has(l.sandbox));
+  private async dropUnreported(host: string, unreported: Orphans["gone"] & {}, cmds: Set<string>): Promise<void> {
+    const gone = this.leasesOf(host).filter((l) => !l.expired && unreported.some((u) => u.sandbox === l.sandbox && u.epoch === l.epoch));
     if (!gone.length) return;
-    // Their unanswered commands died with the old process; close them without the retries a
-    // failure would trigger (the sandbox is placed again below, under a new epoch).
+    // Their commands the old process never answered died with it; closed without the retries a
+    // failure would trigger (the sandbox is placed again below, under a new epoch). FleetDO's
+    // answer, not the host's (`killProgress`).
     const closed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, "sandbox lost with the old host process", false) });
-    for (const l of gone) {
-      this.sql.exec("UPDATE commands SET result = ?, result_ms = ? WHERE host = ? AND sandbox = ? AND result IS NULL", closed, Date.now(), host, l.sandbox);
+    const lost = new Set(gone.map((l) => l.sandbox));
+    const unanswered = this.sql.exec<{ cmd: string; sandbox: string | null }>("SELECT cmd, sandbox FROM commands WHERE host = ? AND result IS NULL", host).toArray();
+    for (const c of unanswered) {
+      if (!cmds.has(c.cmd) || c.sandbox === null || !lost.has(c.sandbox)) continue;
+      this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE cmd = ?", closed, Date.now(), "fleet" satisfies AnsweredBy, c.cmd);
     }
     console.warn(`FleetDO: ${host} restarted without ${gone.map((l) => l.sandbox).join(", ")}`);
     await this.evict(host, gone.filter((l) => l.state === "suspended").map((l) => l.sandbox));
@@ -1201,6 +1294,10 @@ export class FleetDO extends DurableObject<Env> {
    * failure closes the connection so the host reconnects and resends from `last_event_seq`.
    */
   private async onEvents(ws: WebSocket, host: string, seq: number, events: HostEvent[]): Promise<void> {
+    // Checked here, not at arrival: a hello queued ahead of this batch may have superseded its
+    // socket and reset the lineage. A superseded socket's lineage is over; its batch, processed,
+    // would become the new lineage's baseline. Dropped unacked (its sender is gone).
+    if (this.socketFor(host) !== ws) return;
     const verdict = this.rel.classify(host, seq);
     if (verdict === "duplicate") {
       this.send(ws, { type: "ack", up_to: this.rel.lastIn(host)! });
@@ -1328,23 +1425,28 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Fail every command still awaiting a result on `host` (retryable). A `sandbox_create` the new
-   * process reports running anyway is completed instead.
+   * Fail (retryably) the commands an old nestd process never answered: `cmds`, captured at its
+   * lineage reset and kept under `orphaned_commands:<host>` in `kv` until this finishes. One answered
+   * since is skipped. A `sandbox_create` the new process reports running anyway is completed instead.
+   * FleetDO's answers, not the host's (`killProgress`).
    */
-  private async failPendingCommands(host: string, message: string, reported = new Map<string, SandboxReport>(), only?: Set<string>): Promise<void> {
+  private async failPendingCommands(host: string, message: string, reported: Map<string, SandboxReport>, cmds: string[]): Promise<void> {
+    const only = new Set(cmds);
     const pending = this.sql
       .exec<{ cmd: string; type: string; sandbox: string | null; epoch: number | null }>(
         "SELECT cmd, type, sandbox, epoch FROM commands WHERE host = ? AND result IS NULL ORDER BY issued_ms", host)
       .toArray()
-      .filter((c) => !only || only.has(c.cmd));
+      .filter((c) => only.has(c.cmd));
     for (const c of pending) {
       const r = c.sandbox ? reported.get(c.sandbox) : undefined;
       const done = storedEnum(CommandTypeEnum, c.type, "commands.type") === "sandbox_create" && r && r.epoch === c.epoch;
-      await this.onCommandResult(host, c.cmd, done ? { status: "ok" } : { status: "error", error: errorBody(ErrorCodes.INTERNAL, message, true) });
+      await this.onCommandResult(host, c.cmd, done ? { status: "ok" } : { status: "error", error: errorBody(ErrorCodes.INTERNAL, message, true) }, "fleet");
     }
+    this.sql.exec("DELETE FROM kv WHERE key = ?", orphansKey(host));
   }
 
-  private async onCommandResult(host: string, cmd: string, outcome: Extract<HostEvent, { type: "command_result" }>["outcome"]) {
+  /** Record a command's one result (`answeredBy`: null for the host's own, else who wrote it) and act on it. */
+  private async onCommandResult(host: string, cmd: string, outcome: Extract<HostEvent, { type: "command_result" }>["outcome"], answeredBy: AnsweredBy | null = null) {
     const stored = this.sql
       .exec<{ type: string; sandbox: string | null; agent: string | null; epoch: number | null; purpose: string | null; body: string; result: string | null; host: string }>(
         "SELECT type, sandbox, agent, epoch, purpose, body, result, host FROM commands WHERE cmd = ?", cmd)
@@ -1355,7 +1457,7 @@ export class FleetDO extends DurableObject<Env> {
       type: storedEnum(CommandTypeEnum, stored.type, "commands.type"),
       purpose: storedEnumOrNull(PurposeEnum, stored.purpose, "commands.purpose"),
     };
-    this.sql.exec("UPDATE commands SET result = ?, result_ms = ? WHERE cmd = ?", JSON.stringify(outcome), Date.now(), cmd);
+    this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE cmd = ?", JSON.stringify(outcome), Date.now(), answeredBy, cmd);
 
     if (row.purpose === "stonith_fence") {
       const body = JSON.parse(row.body) as Extract<CommandBody, { type: "fence" }>;
@@ -1400,7 +1502,8 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * Queue commands for a host: persisted, delivered reliably in order, each with exactly one result.
-   * Secret values must arrive as BrokerDO references; they are resolved only when sent.
+   * Secret values must arrive as BrokerDO references; they are resolved only when sent. Returns once
+   * the commands are stored; the send happens behind it.
    */
   async issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): Promise<string[]> {
     const now = Date.now();
@@ -1458,9 +1561,10 @@ export class FleetDO extends DurableObject<Env> {
       console.warn(`FleetDO: ${commands.map((c) => c.type).join(", ")} for ${target ? "dead" : "unknown"} host ${host} answered with an error`);
       return commands.map((c) => c.cmd);
     }
-    const msg = this.rel.push(host, (seq) => ({ type: "commands" as const, seq, commands }));
-    const ws = this.socketFor(host);
-    if (ws) await this.sendResolved(ws, [msg]);
+    this.rel.push(host, (seq) => ({ type: "commands" as const, seq, commands }));
+    // Durable now: sent by the outbound chain without holding the caller (an event batch, a hello,
+    // an RPC) behind unrelated BrokerDO resolution.
+    void this.flush(host);
     return commands.map((c) => c.cmd);
   }
 
@@ -1761,6 +1865,9 @@ export class FleetDO extends DurableObject<Env> {
     }
     for (const h of this.hostsBy({ status: LIVE_STATUSES })) {
       const ws = this.socketFor(h.host);
+      // Batches above what the socket was sent that no run is carrying (a run lost to a reset, say):
+      // a run is queued for them. Idempotent: a run sends only what its socket wasn't sent.
+      if (ws && this.rel.hasPendingAfter(h.host, (ws.deserializeAttachment() as Attachment).sent)) void this.flush(h.host);
       if (ws) await this.ensureStonithFence(h.host);
       if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
     }
@@ -1817,10 +1924,10 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   private pruneTables(now: number): void {
-    // A command FleetDO answered for a host whose death isn't proof yet stays: `killProgress` would
-    // read a missing row as processed.
+    // A kill FleetDO answered for a host whose death isn't proof yet stays: `killProgress` would
+    // read a missing row as processed. It asks only about kills, so other FleetDO answers go.
     this.sql.exec(`DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?
-      AND (answered_by IS NULL OR host NOT IN (SELECT host FROM hosts WHERE lost = 0))`, now - COMMAND_RETENTION_MS);
+      AND (answered_by IS NULL OR type <> 'agent_stop' OR host NOT IN (SELECT host FROM hosts WHERE lost = 0))`, now - COMMAND_RETENTION_MS);
     this.sql.exec("DELETE FROM stale_incarnations WHERE cmd IS NOT NULL AND first_seen_ms < ?", now - STALE_INCARNATION_RETENTION_MS);
     this.sql.exec("DELETE FROM enroll_tokens WHERE used_ms IS NOT NULL AND used_ms < ?", now - ENROLL_TOKEN_RETENTION_MS);
     const dead = this.hostsBy({
@@ -2460,6 +2567,8 @@ export class FleetDO extends DurableObject<Env> {
     const closed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, `host is dead (${why})`, false) });
     this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE host = ? AND result IS NULL",
       closed, Date.now(), "fleet" satisfies AnsweredBy, host);
+    // Its lineage-reset capture, if any, is answered with the rest.
+    this.sql.exec("DELETE FROM kv WHERE key = ?", orphansKey(host));
     this.rel.reset(host);
   }
 

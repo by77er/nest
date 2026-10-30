@@ -774,3 +774,466 @@ describe("#27 a turn is work until it completes", () => {
     expect(cp).toMatchObject({ sandbox: s.sandbox, reason: "turn_end" });
   });
 });
+
+// FleetDO's two BrokerDO calls, routed through hooks that run first (a gate, a failure). Gates are
+// module state polled on a timer, not promises: the hooks run in FleetDO's request context. A
+// `resolveRefs` hook that returns values answers for BrokerDO (no call to it, so no I/O).
+type BrokerHooks = {
+  bindingPublicKeys?: () => Promise<void>;
+  resolveRefs?: (refs: string[]) => Promise<void | Record<string, string | null>>;
+};
+async function hookBroker(cell: string, hooks: BrokerHooks): Promise<void> {
+  await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+    const self = inst as unknown as { env: Cloudflare.Env };
+    const real = self.env;
+    const stub = () => real.BROKER.get(real.BROKER.idFromName("broker"));
+    const broker = {
+      bindingPublicKeys: async (c: string) => {
+        await hooks.bindingPublicKeys?.();
+        return stub().bindingPublicKeys(c);
+      },
+      resolveRefs: async (refs: string[], allow: readonly string[]) => {
+        return (await hooks.resolveRefs?.(refs)) ?? stub().resolveRefs(refs, allow);
+      },
+    };
+    self.env = Object.create(real, { BROKER: { value: { idFromName: () => undefined, get: () => broker } } }) as Cloudflare.Env;
+  });
+}
+
+/** A hook that holds its caller until `released`, and records that it was entered. */
+function gate() {
+  const g = { entered: false, released: false, hook: async () => {} };
+  g.hook = async () => {
+    g.entered = true;
+    while (!g.released) await new Promise((r) => setTimeout(r, 5));
+  };
+  return g;
+}
+
+async function until(what: string, pred: () => boolean, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(5);
+  }
+}
+
+async function untilAsync(what: string, pred: () => Promise<boolean>, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!(await pred())) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(5);
+  }
+}
+
+/** Inbound items (hellos, event batches) submitted for `host` and not finished, the running one included. */
+const inboundPending = (cell: string, host: string) => runInDurableObject(fleetStub(cell), (inst: FleetDO) =>
+  (inst as unknown as { inbound: Map<string, { pending: number }> }).inbound.get(host)?.pending ?? 0);
+
+const fleetRows = <T,>(cell: string, q: string, ...args: SqlStorageValue[]) =>
+  runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => st.storage.sql.exec(q, ...args).toArray() as T[]);
+
+const fence = (reason: string) => ({ type: "fence" as const, sandboxes: [], reason });
+
+/**
+ * The seqs of the `commands` frames carrying `cmds`, in the order they reached the host, and any
+ * repeat of one of them that follows within 150 ms (a batch sent twice on one connection).
+ */
+async function wireOrder(ws: Ws, cmds: string[]): Promise<number[]> {
+  const want = new Set(cmds);
+  const carries = (f: Record<string, any>) => (f.commands as { cmd: string }[]).some((c) => cmds.includes(c.cmd));
+  const seqs: number[] = [];
+  while (want.size) {
+    const m = await ws.next("commands", (f) => (f.commands as { cmd: string }[]).some((c) => want.has(c.cmd)));
+    for (const c of m.commands as { cmd: string }[]) want.delete(c.cmd);
+    seqs.push(m.seq as number);
+  }
+  for (;;) {
+    try {
+      seqs.push((await ws.next("commands", carries, 150)).seq as number);
+    } catch {
+      return seqs;
+    }
+  }
+}
+
+const increasing = (seqs: number[]) => seqs.every((s, i) => i === 0 || s > seqs[i - 1]!);
+
+describe("#28 command delivery across nestd reconnects", () => {
+  it("a command issued to a new nestd process during its hello is not failed with the old process's", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const [old] = await fleetStub(cell).issueCommands(h.host, [fence("old")]);
+    await h.ws.next("commands"); // the old process never answers it
+
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    const ws2 = await Ws.connect("/v1/fleet", h.host_token);
+    ws2.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    await ws2.next("hello_ack");
+    await until("onHello to await BrokerDO", () => keys.entered);
+    // Issued while onHello awaits: it goes to the new process.
+    const [fresh] = await fleetStub(cell).issueCommands(h.host, [fence("new")]);
+    await ws2.next("commands", (m) => m.commands[0].cmd === fresh);
+    keys.released = true;
+    // An event batch is queued behind the hello, so its ack means the hello is done.
+    const seq = sendEvents(ws2, []);
+    await ws2.next("ack", (m) => m.up_to === seq);
+
+    expect(await fleetStub(cell).commandResult(old!)).toMatchObject({ status: "error", error: { retryable: true } });
+    expect(await fleetStub(cell).commandResult(fresh!)).toBeNull();
+    await okResult(ws2, fresh!);
+    expect(await fleetStub(cell).commandResult(fresh!)).toEqual({ status: "ok" });
+  });
+
+  it("the old process's unanswered commands still fail when FleetDO restarts mid-hello", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const [old] = await fleetStub(cell).issueCommands(h.host, [fence("old")]);
+    await h.ws.next("commands");
+
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    const ws2 = await Ws.connect("/v1/fleet", h.host_token);
+    ws2.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    await ws2.next("hello_ack");
+    await until("onHello to await BrokerDO", () => keys.entered);
+    // FleetDO restarts after the lineage reset and before the failures.
+    await runInDurableObject(fleetStub(cell), (_i, st) => st.abort("restart mid-hello")).catch(() => undefined);
+    keys.released = true;
+
+    // The same process reconnects: the same instance_id, so no reset this time.
+    const ws3 = await Ws.connect("/v1/fleet", h.host_token);
+    ws3.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    await ws3.next("hello_ack");
+    const seq = sendEvents(ws3, []);
+    await ws3.next("ack", (m) => m.up_to === seq);
+    expect(await fleetStub(cell).commandResult(old!)).toMatchObject({ status: "error", error: { retryable: true } });
+  });
+
+  it("hello_ack.next_command_seq is the first seq sent on the connection", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const reconnect = async (extra: Record<string, unknown>) => {
+      const ws = await Ws.connect("/v1/fleet", h.host_token);
+      ws.send(hostHello(h.host, cell, extra));
+      return { ws, ack: await ws.next("hello_ack") };
+    };
+    for (const r of ["a", "b", "c"]) await fleetStub(cell).issueCommands(h.host, [fence(r)]);
+    const seqs: number[] = [];
+    for (let i = 0; i < 3; i++) seqs.push((await h.ws.next("commands")).seq as number);
+
+    // The same process, its batches unacked and the first one processed: the lowest unacked above it.
+    const same = await reconnect({ last_command_seq: seqs[0] });
+    expect(same.ack.next_command_seq).toBe(seqs[1]);
+    expect((await same.ws.next("commands")).seq).toBe(seqs[1]);
+    same.ws.send({ type: "ack", up_to: seqs[2] });
+
+    // Nothing pending: the next seq to assign.
+    const idle = await reconnect({ last_command_seq: seqs[2] });
+    expect(idle.ack.next_command_seq).toBe(seqs[2]! + 1);
+    await fleetStub(cell).issueCommands(h.host, [fence("d")]);
+    expect((await idle.ws.next("commands")).seq).toBe(seqs[2]! + 1);
+
+    // A new process: its lineage starts above everything the reset dropped.
+    const fresh = await reconnect({ instance_id: "nestdtest0000002" });
+    expect(fresh.ack.next_command_seq).toBe(seqs[2]! + 2);
+  });
+
+  it("a BrokerDO failure while sending an agent_start closes the socket; the reconnect resends it", async () => {
+    const s = await setup({ start: false });
+    const hooks: BrokerHooks = {
+      resolveRefs: async () => {
+        throw new Error("BrokerDO unavailable");
+      },
+    };
+    await hookBroker(s.cell, hooks);
+    const { cmd } = await agentStub(s.agent).start();
+    expect((await s.host.ws.next("error")).error).toMatchObject({ code: "internal", retryable: true });
+    await until("the socket to close", () => s.host.ws.closed !== null);
+    expect(s.host.ws.closed?.code).toBe(4503);
+
+    delete hooks.resolveRefs; // BrokerDO is back
+    const ws2 = await Ws.connect("/v1/fleet", s.host.host_token);
+    ws2.send(hostHello(s.host.host, s.cell));
+    await ws2.next("hello_ack");
+    const [start] = await nextCommands(ws2, (c) => c.cmd === cmd);
+    expect(start).toMatchObject({ type: "agent_start", oauth_token: "sk-ant-oat01-regress" });
+  });
+
+  it("a hello whose socket closed while it waited in the host's queue doesn't supersede the live socket", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    // A hello that holds the host's queue on BrokerDO.
+    const busy = await Ws.connect("/v1/fleet", h.host_token);
+    busy.send(hostHello(h.host, cell));
+    await busy.next("hello_ack");
+    await until("the queue to be held", () => keys.entered);
+    // Hello A waits in the queue, and A drops before it runs.
+    const a = await Ws.connect("/v1/fleet", h.host_token);
+    a.send(hostHello(h.host, cell));
+    a.close();
+    await until("FleetDO to see A close", () => a.closed !== null);
+    // The host reconnects on B; its hello waits behind A's.
+    const b = await Ws.connect("/v1/fleet", h.host_token);
+    b.send(hostHello(h.host, cell));
+    keys.released = true;
+
+    await b.next("hello_ack");
+    expect(a.received.some((m) => m.type === "hello_ack")).toBe(false);
+    const [cmd] = await fleetStub(cell).issueCommands(h.host, [fence("after")]);
+    expect((await b.next("commands")).commands[0].cmd).toBe(cmd);
+    expect(b.closed).toBeNull();
+  });
+
+  it("an old process's event batch queued behind the new process's hello doesn't become the new lineage's baseline", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    // The old process reconnects on `old`; its hello holds the host's queue on BrokerDO.
+    const old = await Ws.connect("/v1/fleet", h.host_token);
+    old.send(hostHello(h.host, cell));
+    await old.next("hello_ack");
+    await until("the queue to be held", () => keys.entered);
+    // The new process's hello queues next; then the old socket's batch 1 arrives while that socket
+    // is still the helloed one, and queues behind it.
+    const fresh = await Ws.connect("/v1/fleet", h.host_token);
+    fresh.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    await untilAsync("the new hello to wait in the queue", async () => (await inboundPending(cell, h.host)) === 2);
+    sendEvents(old, [], 1);
+    await untilAsync("the old batch to wait behind it", async () => (await inboundPending(cell, h.host)) === 3);
+    keys.released = true;
+    await fresh.next("hello_ack");
+
+    // The new process's own batch 1 answers a command it ran.
+    const [cmd] = await fleetStub(cell).issueCommands(h.host, [fence("new")]);
+    await fresh.next("commands", (m) => m.commands[0].cmd === cmd);
+    sendEvents(fresh, [{ ts_ms: Date.now(), type: "command_result", cmd, outcome: { status: "ok" } }], 1);
+    await fresh.next("ack", (m) => m.up_to === 1);
+    expect(await fleetStub(cell).commandResult(cmd!)).toEqual({ status: "ok" });
+  });
+});
+
+/** A batch whose one secret reference FleetDO must resolve in BrokerDO before sending it. */
+const secretBatch = () => ({
+  type: "secrets_update" as const, sandbox: "sbx_nope0000000000000000000000", epoch: 1,
+  secrets: [{ binding: "github", value: "$nest-secret:inject:github" }],
+});
+
+describe("#29 command batches go on the wire in seq order", () => {
+  it("a batch issued while a hello awaits BrokerDO goes out after the hello's resend of a lower one", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    await fleetStub(cell).issueCommands(h.host, [fence("a")]);
+    const last = (await h.ws.next("commands")).seq as number;
+    h.ws.close();
+    await until("FleetDO to see the close", () => h.ws.closed !== null);
+    const [resent] = await fleetStub(cell).issueCommands(h.host, [fence("b")]); // unacked while offline
+
+    const keys = gate();
+    await hookBroker(cell, { bindingPublicKeys: keys.hook });
+    const ws2 = await Ws.connect("/v1/fleet", h.host_token);
+    ws2.send(hostHello(h.host, cell, { last_command_seq: last }));
+    await ws2.next("hello_ack");
+    await until("onHello to await BrokerDO", () => keys.entered);
+    const [fresh] = await fleetStub(cell).issueCommands(h.host, [fence("c")]);
+    keys.released = true;
+    expect(await wireOrder(ws2, [resent!, fresh!])).toEqual([last + 1, last + 2]);
+  });
+
+  it("a plain batch doesn't overtake a lower one awaiting BrokerDO for its secrets, and neither goes out twice", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const refs = gate();
+    await hookBroker(cell, { resolveRefs: refs.hook });
+    const secret = fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+    await until("the secret batch to await BrokerDO", () => refs.entered);
+    const plain = fleetStub(cell).issueCommands(h.host, [fence("plain")]);
+    await untilAsync("the plain batch to be stored", async () =>
+      (await fleetRows(cell, "SELECT 1 FROM commands WHERE host = ? AND type = 'fence'", h.host)).length === 1);
+    refs.released = true;
+    const [[s], [p]] = await Promise.all([secret, plain]);
+    expect(increasing(await wireOrder(h.ws, [s!, p!]))).toBe(true);
+  });
+
+  it("two agent_starts go out in seq order, once each, when their secrets resolve in reverse", async () => {
+    const s = await setup({ start: false });
+    const second = await adminJson("/v1/agents", { body: { role: "worker", workstream: s.workstream, sandbox: s.sandbox, cell: s.cell, start: false } }, 201);
+    const first = gate();
+    let calls = 0;
+    await hookBroker(s.cell, { resolveRefs: async () => {
+      if (calls++ === 0) await first.hook(); // the first start's secrets resolve last
+    } });
+    const a = agentStub(s.agent).start();
+    await until("the first start to await BrokerDO", () => first.entered);
+    const b = agentStub(second.agent).start();
+    await untilAsync("the second start to be stored", async () =>
+      (await fleetRows(s.cell, "SELECT 1 FROM commands WHERE agent = ? AND type = 'agent_start'", second.agent)).length === 1);
+    first.released = true;
+    const [{ cmd: ca }, { cmd: cb }] = await Promise.all([a, b]);
+    expect(increasing(await wireOrder(s.host.ws, [ca!, cb!]))).toBe(true);
+  });
+
+  it("a BrokerDO failure holds back its batch and what follows, not a kill ahead of it, and closes", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    await fleetStub(cell).issueCommands(h.host, [fence("a")]);
+    const last = (await h.ws.next("commands")).seq as number;
+    h.ws.close();
+    await until("FleetDO to see the close", () => h.ws.closed !== null);
+    const kill = { type: "agent_stop" as const, agent: "agt_01killaheadofsecret0000000", reason: "t", mode: "kill" as const, epoch: 1 };
+    await fleetStub(cell).issueCommands(h.host, [kill]); // last + 1
+    await fleetStub(cell).issueCommands(h.host, [secretBatch()]); // last + 2
+    await fleetStub(cell).issueCommands(h.host, [fence("after")]); // last + 3
+
+    await hookBroker(cell, { resolveRefs: async () => { throw new Error("BrokerDO unavailable"); } });
+    const ws2 = await Ws.connect("/v1/fleet", h.host_token);
+    ws2.send(hostHello(h.host, cell, { last_command_seq: last }));
+    await ws2.next("hello_ack");
+    expect((await ws2.next("error")).error).toMatchObject({ code: "internal", retryable: true });
+    await until("the socket to close", () => ws2.closed !== null);
+    expect(ws2.closed?.code).toBe(4503);
+    expect(ws2.received.filter((m) => m.type === "commands").map((m) => [m.seq, m.commands[0].type])).toEqual([[last + 1, "agent_stop"]]);
+    // The next connection starts after it: the kill isn't sent twice.
+    const ws3 = await Ws.connect("/v1/fleet", h.host_token);
+    ws3.send(hostHello(h.host, cell, { last_command_seq: last + 1 }));
+    expect((await ws3.next("hello_ack")).next_command_seq).toBe(last + 2);
+  });
+
+  it("issuing doesn't wait for the send: a kill is stored at once while an earlier batch awaits BrokerDO", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const refs = gate();
+    await hookBroker(cell, { resolveRefs: refs.hook });
+    const [secret] = await fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+    await until("the secret batch to await BrokerDO", () => refs.entered);
+    // AgentDO's escalation issues kills by RPC: it gets the id back while the chain is held.
+    const kill = await Promise.race([
+      fleetStub(cell).issueKill(h.host, "agt_01killwhilechainheld00000", 1, "t"),
+      sleep(1000).then(() => "held"),
+    ]);
+    expect(kill).toMatch(/^cmd_/);
+    refs.released = true;
+    expect(increasing(await wireOrder(h.ws, [secret!, kill]))).toBe(true);
+  });
+
+  it("a run that throws closes its socket, so the hello resends what it didn't send", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    // An outbox row nothing can parse: the run that reaches it throws.
+    await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
+      const next = st.storage.sql.exec<{ next_out: number }>("SELECT next_out FROM rel_state WHERE chan = ?", h.host).toArray()[0]?.next_out ?? 1;
+      st.storage.sql.exec("INSERT OR REPLACE INTO rel_state (chan, next_out, last_in) VALUES (?, ?, (SELECT last_in FROM rel_state WHERE chan = ?))", h.host, next + 1, h.host);
+      st.storage.sql.exec("INSERT INTO rel_out (chan, seq, body) VALUES (?, ?, 'not json')", h.host, next);
+    });
+    await fleetStub(cell).issueCommands(h.host, [fence("behind it")]);
+    expect((await h.ws.next("error")).error).toMatchObject({ code: "internal", retryable: true });
+    await until("the socket to close", () => h.ws.closed !== null);
+    expect(h.ws.closed?.code).toBe(4503);
+  });
+
+  it("the tick sends batches above what the socket was sent that no run carried", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    // Pushed without a run (as if the run was lost with a reset of this object).
+    const seq = await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      const rel = (inst as unknown as { rel: { push(chan: string, make: (seq: number) => { seq: number }): { seq: number } } }).rel;
+      return rel.push(h.host, (s) => ({ type: "commands", seq: s, commands: [{ cmd: "cmd_01tickcarried000000000000", issued_ms: Date.now(), ...fence("tick") }] })).seq;
+    });
+    expect(await h.ws.none("commands", 150)).toBe(true);
+    await runInDurableObject(fleetStub(cell), async (_i: FleetDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+      await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
+    });
+    await runDurableObjectAlarm(fleetStub(cell));
+    expect((await h.ws.next("commands", (m) => m.seq === seq)).commands[0].cmd).toBe("cmd_01tickcarried000000000000");
+  });
+
+  it("a socket being closed is not the host's: nothing more is sent on it", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    // Closed by FleetDO (a send failure, say): listed, CLOSING, until the peer answers.
+    const current = await runInDurableObject(fleetStub(cell), (inst: FleetDO, st) => {
+      const [ws] = st.getWebSockets(h.host);
+      ws!.close(4503, "test");
+      return (inst as unknown as { socketFor(host: string): WebSocket | undefined }).socketFor(h.host) ?? null;
+    });
+    expect(current).toBeNull();
+  });
+
+  it("a run whose socket was superseded while it resolved sends nothing there and doesn't revive it", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell); // socket A
+    // A superseded socket stays listed (CLOSING) until its peer answers the close, an I/O event. So
+    // A's run is released from inside B's hello, right after it superseded A, and resolves without
+    // I/O: it resumes while A is still listed.
+    const held: { entered: boolean; release?: () => void } = { entered: false };
+    let calls = 0;
+    await hookBroker(cell, {
+      resolveRefs: async (refs) => {
+        if (calls++ === 0) {
+          held.entered = true;
+          await new Promise<void>((r) => { held.release = r; });
+        }
+        return Object.fromEntries(refs.map((r) => [r, null]));
+      },
+      bindingPublicKeys: async () => held.release?.(), // B's hello, after superseding A
+    });
+    const issued = fleetStub(cell).issueCommands(h.host, [secretBatch()]);
+    await until("the run on A to await BrokerDO", () => held.entered);
+    const b = await Ws.connect("/v1/fleet", h.host_token);
+    b.send(hostHello(h.host, cell));
+    await b.next("hello_ack");
+    const [cmd] = await issued;
+
+    // B's own run sends it, once; A gets nothing; and B stays the host's socket.
+    expect(await wireOrder(b, [cmd!])).toHaveLength(1);
+    const onA = (c: string) => h.ws.received.filter((m) => m.type === "commands" && (m.commands as { cmd: string }[]).some((x) => x.cmd === c));
+    expect(onA(cmd!)).toEqual([]);
+    const [after] = await fleetStub(cell).issueCommands(h.host, [fence("after")]);
+    expect(await wireOrder(b, [after!])).toHaveLength(1);
+  });
+});
+
+/** Hold a new nestd process's hello on BrokerDO, then restart FleetDO: after the reset, before anything else. */
+async function restartMidHello(cell: string, host: string, token: string, instance: string) {
+  const keys = gate();
+  await hookBroker(cell, { bindingPublicKeys: keys.hook });
+  const ws = await Ws.connect("/v1/fleet", token);
+  ws.send(hostHello(host, cell, { instance_id: instance }));
+  await ws.next("hello_ack");
+  await until("onHello to await BrokerDO", () => keys.entered);
+  await runInDurableObject(fleetStub(cell), (_i, st) => st.abort("restart mid-hello")).catch(() => undefined);
+  keys.released = true;
+}
+
+describe("#30 a nestd restart's capture outlives a FleetDO restart, not its host", () => {
+  it("leases the old process held and the new one doesn't report are dropped by the next hello", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: await workstream(), cell } }, 201);
+    const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
+    await okResult(h.ws, create.cmd);
+    await restartMidHello(cell, h.host, h.host_token, "nestdtest0000002");
+
+    const ws = await Ws.connect("/v1/fleet", h.host_token);
+    ws.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002" }));
+    // Placed again under a new epoch (here: the one host there is).
+    const [again] = await nextCommands(ws, (c) => c.type === "sandbox_create");
+    expect(again).toMatchObject({ sandbox: sbx.sandbox, epoch: 2 });
+  });
+
+  it("is deleted when the host dies", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    await fleetStub(cell).issueCommands(h.host, [fence("old")]);
+    await restartMidHello(cell, h.host, h.host_token, "nestdtest0000002");
+    const key = `orphaned_commands:${h.host}`;
+    expect(await fleetRows(cell, "SELECT 1 FROM kv WHERE key = ?", key)).toHaveLength(1);
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    expect(await fleetRows(cell, "SELECT 1 FROM kv WHERE key = ?", key)).toHaveLength(0);
+  });
+});

@@ -74,6 +74,189 @@ class Fences(unittest.TestCase):
         self.assertIn("stale allow entry", out)
 
 
+class CorePurityFence(unittest.TestCase):
+    """The nestd-core fence lets the crate name `alloc`, never bring `std` back."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        (self.root / "scripts").mkdir()
+        for f in ("check-fences.py", "fences.toml"):
+            shutil.copy(SCRIPTS / f, self.root / "scripts" / f)
+
+    def check(self, line):
+        path = self.root / "crates" / "nestd-core" / "src" / "lib.rs"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(line + "\n", encoding="utf-8")
+        return run(self.root / "scripts" / "check-fences.py", self.root, "--fence", "nestd-core-purity")
+
+    def test_extern_crate_alloc_passes(self):
+        self.assertEqual(self.check("extern crate alloc;")[0], 0)
+
+    def test_extern_crate_std_fails(self):
+        for line in ("extern crate std;", "extern crate std as s;", "extern  crate alloc as std;"):
+            with self.subTest(line=line):
+                self.assertEqual(self.check(line)[0], 1, line)
+
+
+class CoreManifest(unittest.TestCase):
+    """check-core-manifest.py over a copy of nestd-core's real manifest and lib.rs."""
+
+    CRATE = SCRIPTS.parent / "crates" / "nestd-core"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        self.crate = self.root / "nestd-core"
+        (self.crate / "src").mkdir(parents=True)
+        shutil.copy(self.CRATE / "Cargo.toml", self.crate / "Cargo.toml")
+        shutil.copy(self.CRATE / "src" / "lib.rs", self.crate / "src" / "lib.rs")
+
+    def check(self):
+        return run(SCRIPTS / "check-core-manifest.py", self.root, str(self.crate))
+
+    def prepend(self, text):
+        """At the top, so a dotted or inline key is top-level rather than inside the last table."""
+        path = self.crate / "Cargo.toml"
+        path.write_text(text + "\n\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def test_the_real_crate_passes(self):
+        self.assertEqual(self.check()[0], 0)
+
+    def test_dev_dependencies_pass(self):
+        self.prepend('[dev-dependencies]\nproptest = "1"\n\n[target.\'cfg(unix)\'.dev-dependencies]\nx = "1"')
+        self.assertEqual(self.check()[0], 0)
+
+    def test_every_way_to_name_a_dependency_fails(self):
+        cases = {
+            "table": '[dependencies]\nlibc = "0.2"',
+            "dotted key": 'dependencies.libc = "0.2"',
+            "dotted table": '[dependencies.libc]\nversion = "0.2"',
+            "inline table": 'dependencies = { libc = "0.2" }',
+            "workspace dependency": "[dependencies]\nlibc.workspace = true",
+            "build dependency": '[build-dependencies]\ncc = "1"',
+            "old spelling": '[build_dependencies]\ncc = "1"',
+            "target table": '[target.\'cfg(unix)\'.dependencies]\nlibc = "0.2"',
+            "target dotted": 'target."cfg(unix)".dependencies.libc = "0.2"',
+            "target build": '[target.x86_64-unknown-linux-gnu.build-dependencies]\ncc = "1"',
+            "patch": '[patch.crates-io]\nlibc = { path = "x" }',
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                shutil.copy(self.CRATE / "Cargo.toml", self.crate / "Cargo.toml")
+                self.prepend(text)
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn("nestd-core", out)
+
+    def test_a_build_script_fails(self):
+        manifest = (self.CRATE / "Cargo.toml").read_text(encoding="utf-8")
+        with self.subTest("package.build"):
+            (self.crate / "Cargo.toml").write_text(manifest.replace("[package]\n", '[package]\nbuild = "gen.rs"\n', 1), encoding="utf-8")
+            code, out = self.check()
+            self.assertEqual(code, 1, out)
+            self.assertIn("package.build", out)
+        with self.subTest("[build] table"):
+            (self.crate / "Cargo.toml").write_text(manifest + '\n[build]\nrustflags = ["--cfg", "x"]\n', encoding="utf-8")
+            self.assertEqual(self.check()[0], 1)
+        with self.subTest("build.rs"):
+            (self.crate / "Cargo.toml").write_text(manifest, encoding="utf-8")
+            (self.crate / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
+            code, out = self.check()
+            self.assertEqual(code, 1, out)
+            self.assertIn("build.rs", out)
+
+    def test_dropping_no_std_fails(self):
+        lib = self.crate / "src" / "lib.rs"
+        lib.write_text(lib.read_text(encoding="utf-8").replace("#![cfg_attr(not(test), no_std)]\n", ""), encoding="utf-8")
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("no_std", out)
+
+    def test_a_commented_out_no_std_fails(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        for name, hidden in {
+            "block comment": "/*\n#![cfg_attr(not(test), no_std)]\n*/\n",
+            "nested block comment": "/* /* */\n#![cfg_attr(not(test), no_std)]\n*/\n",
+        }.items():
+            with self.subTest(name):
+                lib.write_text(text.replace("#![cfg_attr(not(test), no_std)]\n", hidden), encoding="utf-8")
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn("no_std", out)
+
+    def test_code_from_outside_the_crate_or_std_fails(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        cases = {
+            "extern crate std": ("extern crate std;", "extern crate"),
+            "split over lines and renamed": ("extern\ncrate std as s;", "extern crate"),
+            "another crate": ("extern crate core as c;", "extern crate"),
+            "#[path]": ('#[path = "../../nestd/src/util.rs"]\nmod util;', "#[path]"),
+            "spaced #[path]": ('# [ path = "x.rs" ] mod x;', "#[path]"),
+            "include!": ('include!("../../nestd/src/util.rs");', "include!"),
+        }
+        for name, (line, what) in cases.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + line + "\n", encoding="utf-8")
+                code, out = self.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn(what, out)
+        with self.subTest("only in a comment"):
+            lib.write_text(text + "\n// extern crate std;\n/* #[path = \"x.rs\"] mod x; include!(\"y\"); */\n", encoding="utf-8")
+            self.assertEqual(self.check()[0], 0)
+        with self.subTest("alloc"):
+            lib.write_text(text.replace("extern crate alloc;", "extern\ncrate alloc;"), encoding="utf-8")
+            self.assertEqual(self.check()[0], 0)
+
+    def test_literals_neither_hide_nor_fake_code(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        hidden = {
+            # The reviewer's repro: a comment opener and closer inside string literals.
+            "comment markers in strings": 'const A: &str = "/*";\nextern\ncrate std as s;\nconst B: &str = "*/";',
+            "escaped quote": 'const A: &str = "\\"/*";\nextern crate std;\nconst B: &str = "*/";',
+            "raw string": 'const A: &str = r#"/*"#;\nextern crate std;\nconst B: &str = r#"*/"#;',
+            "byte string": 'const A: &[u8] = b"/*";\nextern crate std;\nconst B: &[u8] = b"*/";',
+            "char literal": "const A: char = '\"';\nextern crate std;\nconst B: char = '\"';",
+        }
+        for name, code in hidden.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + code + "\n", encoding="utf-8")
+                code_, out = self.check()
+                self.assertEqual(code_, 1, out)
+                self.assertIn("extern crate", out)
+        harmless = {
+            "code-like text in a string": 'const A: &str = "extern crate std; #[path = \\"x\\"] include!(y)";',
+            "raw string with a quote": 'const A: &str = r#"extern crate std; " still"#;',
+            "lifetimes": "fn f<'a>(x: &'a str) -> &'a str { x }",
+        }
+        for name, code in harmless.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + code + "\n", encoding="utf-8")
+                self.assertEqual(self.check()[0], 0, name)
+
+    def test_a_cfg_on_the_target_fails(self):
+        lib = self.crate / "src" / "lib.rs"
+        text = lib.read_text(encoding="utf-8")
+        for name, code in {
+            "cfg": '#[cfg(not(target_os = "none"))]\nmod m {}',
+            "cfg_attr": '#[cfg_attr(target_arch = "x86_64", allow(dead_code))]\nmod m {}',
+            "nested": '#[cfg(any(test, all(unix, target_family = "unix")))]\nmod m {}',
+            "cfg!": "pub fn f() -> bool { cfg!(target_has_atomic = \"64\") }",
+            "spaced": '# [ cfg ( target_os = "linux" ) ] mod m {}',
+        }.items():
+            with self.subTest(name):
+                lib.write_text(text + "\n" + code + "\n", encoding="utf-8")
+                code_, out = self.check()
+                self.assertEqual(code_, 1, out)
+                self.assertIn("target_", out)
+        with self.subTest("cfg(test) and cfg!(debug_assertions)"):
+            lib.write_text(text + "\n#[cfg(test)]\nmod t {}\npub fn d() -> bool { cfg!(debug_assertions) }\n", encoding="utf-8")
+            self.assertEqual(self.check()[0], 0)
+
+
 class DocLinks(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())

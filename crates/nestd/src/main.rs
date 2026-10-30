@@ -34,6 +34,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // Pick rustls's provider explicitly: a workspace build that includes nest-proxy also enables
     // `ring`, and with two providers compiled in rustls panics at the first TLS connection.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    tokio::spawn(watch_invariants());
     let enrolled = nestd::enroll::enroll(&cfg).await.context("enrollment")?;
     tracing::info!(host = %enrolled.host, fleet = %enrolled.fleet_ws_url, tunnel_url = enrolled.gateway_url.as_deref().unwrap_or("-"), tunnel = enrolled.tunnel_token.is_some(), "enrolled");
     let host = nestd::host::Host::start(cfg, enrolled, None).await?;
@@ -47,4 +48,21 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!("shutting down");
     host.shutdown().await;
     Ok(())
+}
+
+/// A core invariant that fails in a release build is never fatal (a test build panics on it). One
+/// checked inside a step comes back as an effect its shell logs (`fleet.rs`, `Log::InvariantViolated`);
+/// one checked outside a step (`ResultCache::insert`) is only counted, so this logs each rise of
+/// the count (`nestd_core::invariant`).
+async fn watch_invariants() {
+    let mut seen = 0;
+    let mut every = tokio::time::interval(std::time::Duration::from_secs(10));
+    loop {
+        every.tick().await;
+        let total = nestd_core::invariant::violations();
+        if total > seen {
+            tracing::error!(new = total - seen, total, "core invariant violated outside a step");
+            seen = total;
+        }
+    }
 }

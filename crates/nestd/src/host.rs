@@ -16,13 +16,15 @@
 //! vCPUs are frozen through a lock-free [`Pauser`] — none of these wait for the sandbox mutex or for
 //! nest-proxy.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use nestd_core::incarnation;
+use nestd_core::results::ResultCache;
 use nest_protocol::control::{
     AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressAuditRecord,
     EgressVerdict, HostEvent, HostEventBody, HostHeaderMode, LeaseClaim, SandboxReport,
@@ -57,10 +59,6 @@ use crate::util::{error, new_id, now_ms};
 
 const MAX_AGENT_SLOTS: u16 = 64;
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(60);
-/// A retired incarnation's salvage is retried after this, doubling up to the max, until it lands
-/// or the incarnation is destroyed (FleetDO destroys a dirty one after its salvage window).
-const RETIRE_RETRY_FIRST: Duration = Duration::from_secs(1);
-const RETIRE_RETRY_MAX: Duration = Duration::from_secs(300);
 /// How long a non-`ask` guest CLI relay waits for `guest_cli_result`. The guest gives up after
 /// 30 s; nestd answers 3 s earlier so the caller gets nestd's error, not a bare guest timeout.
 const CLI_RELAY_TIMEOUT_S: u64 = 27;
@@ -225,25 +223,6 @@ impl Pausers {
     }
 }
 
-/// Bounded `cmd` → outcome cache for redelivered commands.
-#[derive(Default)]
-struct Results {
-    map: HashMap<String, CommandOutcome>,
-    order: VecDeque<String>,
-}
-
-impl Results {
-    fn insert(&mut self, cmd: &str, o: CommandOutcome) {
-        if self.map.insert(cmd.to_string(), o).is_none() {
-            self.order.push_back(cmd.to_string());
-            if self.order.len() > 4096
-                && let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
-                }
-        }
-    }
-}
-
 type CmdResult = Result<Option<serde_json::Value>, ErrorBody>;
 
 pub struct Inner {
@@ -267,7 +246,8 @@ pub struct Inner {
     pending_commits: Mutex<HashMap<RequestId, oneshot::Sender<CommitOutcome>>>,
     /// Guest `nest` CLI relays awaiting `guest_cli_result`.
     pending_cli: Mutex<HashMap<RequestId, oneshot::Sender<CliResult>>>,
-    results: Mutex<Results>,
+    /// Command dedup (`nestd_core::results`): a redelivered `cmd` answers with its first outcome.
+    results: Mutex<ResultCache<CommandOutcome>>,
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
     /// Starts against lease lapses (amendment A3).
     lapse_guard: LapseGuard,
@@ -456,7 +436,7 @@ impl Host {
         let mut found = vec![];
         let scanned = if sandbox_host { recovery::scan(&cfg.sandboxes_dir()) } else { vec![] };
         for f in scanned {
-            if f.meta.clean && f.meta.unanswered.is_none() {
+            if incarnation::deletes_unreported(f.meta.clean, f.meta.unanswered.is_some()) {
                 tracing::info!(sandbox = %f.meta.sandbox, epoch = f.meta.epoch.0, "deleting a clean incarnation left by a previous nestd");
                 recovery::remove_incarnation(&f.state_dir);
             } else {
@@ -566,7 +546,7 @@ impl Host {
             sandboxes: Mutex::new(BTreeMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
             pending_cli: Mutex::new(HashMap::new()),
-            results: Mutex::new(Results::default()),
+            results: Mutex::new(ResultCache::default()),
             lease_deadline: lease_tx,
             lapse_guard: LapseGuard::default(),
             denied_seen: Mutex::new(HashMap::new()),
@@ -1148,19 +1128,19 @@ impl Inner {
                     }
                 }
                 Some((d, db)) => {
-                    let expired = Instant::now() >= d || crate::util::boottime() >= db;
-                    if expired {
-                        self.self_fence().await;
-                        // Stay fenced until the next renewal.
-                        if rx.changed().await.is_err() {
-                            return;
+                    let remaining = (d.saturating_duration_since(Instant::now()), db.saturating_sub(crate::util::boottime()));
+                    match nestd_core::lease::check(remaining.0.as_millis() as u64, remaining.1.as_millis() as u64) {
+                        nestd_core::lease::LeaseCheck::Expired => {
+                            self.self_fence().await;
+                            // Stay fenced until the next renewal.
+                            if rx.changed().await.is_err() {
+                                return;
+                            }
                         }
-                        continue;
-                    }
-                    let wait = d.saturating_duration_since(Instant::now()).min(db.saturating_sub(crate::util::boottime())).min(Duration::from_millis(250));
-                    tokio::select! {
-                        changed = rx.changed() => { if changed.is_err() { return; } }
-                        _ = tokio::time::sleep(wait) => {}
+                        nestd_core::lease::LeaseCheck::Valid { recheck_ms } => tokio::select! {
+                            changed = rx.changed() => { if changed.is_err() { return; } }
+                            _ = tokio::time::sleep(Duration::from_millis(recheck_ms)) => {}
+                        },
                     }
                 }
             }
@@ -1262,7 +1242,7 @@ impl Inner {
         }
         s.retiring = true;
         let (id, epoch) = (s.id.clone(), s.epoch);
-        let mut backoff = RETIRE_RETRY_FIRST;
+        let mut backoff = incarnation::RETIRE_RETRY_FIRST;
         while dirty && s.state_dir.exists() {
             let (s2, r) = self.commit(&entry, s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
             s = s2;
@@ -1280,7 +1260,7 @@ impl Inner {
                     tracing::warn!(sandbox = %id, epoch = epoch.0, code = %e.code, message = %e.message, retry_in = ?backoff, "salvage failed: the disk is kept and the salvage retried");
                     drop(s);
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(RETIRE_RETRY_MAX);
+                    backoff = incarnation::retire_backoff(backoff);
                     s = entry.lock().await;
                 }
             }
@@ -1410,7 +1390,7 @@ impl Inner {
     // ------------------------------------------------------------------------------------------
 
     async fn execute(self: &Arc<Self>, cmd: Command) {
-        let cached = self.results.lock().expect("results").map.get(&cmd.cmd.0).cloned();
+        let cached = self.results.lock().expect("results").get(&cmd.cmd.0).cloned();
         if let Some(outcome) = cached {
             self.emit(HostEventBody::CommandResult { cmd: cmd.cmd, outcome });
             return;
@@ -2249,7 +2229,7 @@ impl Inner {
         .map_err(internal)?;
         // The disk is exactly its head's (nothing written since; a head's memory doesn't matter to
         // a salvage, which has none): there is no work to salvage.
-        if reason == CommitReason::Salvage && s.head.as_ref().is_some_and(|h| h.disk_manifest == disk_manifest) {
+        if incarnation::nothing_to_salvage(reason == CommitReason::Salvage, s.head.as_ref().map(|h| &h.disk_manifest), &disk_manifest) {
             return Ok(None);
         }
         let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
@@ -2323,7 +2303,7 @@ fn hostname(id: &SandboxId) -> String {
 /// retryable), or a `parent_mismatch`. A non-retryable refusal (`stale_epoch`, `invalid_message`)
 /// is SandboxDO's final word on that work.
 fn salvage_retryable(e: &ErrorBody) -> bool {
-    e.retryable || e.code == error_codes::PARENT_MISMATCH
+    incarnation::salvage_retryable(e.retryable, e.code == error_codes::PARENT_MISMATCH)
 }
 
 fn internal(e: impl std::fmt::Display) -> ErrorBody {

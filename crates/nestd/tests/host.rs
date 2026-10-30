@@ -324,7 +324,7 @@ async fn mock_fleet() -> MockFleet {
                         match m {
                             HostToFleet::Hello(h) => {
                                 log2.lock().unwrap().hellos.push(*h);
-                                let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease: LEASE, host_token_expires_ms: 0 };
+                                let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease: LEASE, host_token_expires_ms: 0, next_command_seq: None };
                                 if ws.send(send(FleetToHost::HelloAck(ack))).await.is_err() { break; }
                             }
                             HostToFleet::Heartbeat { sent_ms, leases } => {

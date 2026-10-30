@@ -1,0 +1,72 @@
+# Timed fuzzing of nestd's wire parsers (verification/nestd/fuzz), off the PR path: a PR only
+# replays the seeds and the corpus this grows (ci.yml `fuzz-nestd`), so its result never depends on
+# how long a fuzzer ran. See dev/ci.md.
+# Actions are pinned by commit; the comment names the release.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ: 0.13.2
+
+jobs:
+  fuzz-nestd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: verification/nestd/fuzz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (verification/nestd/fuzz/rust-toolchain.toml, a pinned nightly)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/cargo-fuzz
+            verification/nestd/fuzz/target
+          key: fuzz-nestd-${{ runner.os }}-${{ env.CARGO_FUZZ }}-${{ hashFiles('verification/nestd/fuzz/rust-toolchain.toml', 'verification/nestd/fuzz/Cargo.lock') }}
+          restore-keys: fuzz-nestd-${{ runner.os }}-${{ env.CARGO_FUZZ }}-
+      - name: The corpus so far
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: verification/nestd/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-
+          restore-keys: fuzz-corpus-${{ runner.os }}-
+      - run: command -v cargo-fuzz || cargo install --locked "cargo-fuzz@$CARGO_FUZZ"
+      - name: Seeds still decode
+        run: python3 -I gen_seeds.py && cargo test --locked
+      - name: Fuzz (the guest targets longest: their input comes from inside a VM)
+        run: |
+          ./run.sh guest_stream 600
+          ./run.sh guest_control_json 600
+          for t in vsock_handshake proxy_events gateway_events runner_events fleet_to_host meta_json; do
+            ./run.sh "$t" 180
+          done
+      - name: Keep the grown corpus for the PR replay
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: verification/nestd/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: verification/nestd/fuzz/artifacts
+          retention-days: 30

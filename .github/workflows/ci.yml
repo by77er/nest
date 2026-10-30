@@ -49,6 +49,12 @@ jobs:
           fi
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # nestd-core's purity: on a target with no std, code that uses std fails to build.
+      # (scripts/check-core-manifest.py, in `guards`, rejects cfg on target_* so none can hide.)
+      - name: nestd-core builds without std
+        run: |
+          rustup target add x86_64-unknown-none
+          cargo build -p nestd-core --target x86_64-unknown-none --locked
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
@@ -180,6 +186,7 @@ jobs:
           persist-credentials: false
       - run: python3 -I scripts/check-doc-links.py
       - run: python3 -I scripts/check-fences.py
+      - run: python3 -I scripts/check-core-manifest.py
       - run: python3 -m unittest discover -s scripts/tests
 
   deny:
@@ -201,6 +208,9 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         run: cargo install --locked "cargo-deny@$CARGO_DENY"
       - run: cargo deny --locked check
+      # The standalone verification crates have their own lockfiles; same policy.
+      - run: cargo deny --manifest-path verification/nestd/check/Cargo.toml --config deny.toml --locked check
+      - run: cargo deny --manifest-path verification/nestd/fuzz/Cargo.toml --config deny.toml --locked check
 
   secrets:
     runs-on: ubuntu-24.04
@@ -216,9 +226,115 @@ jobs:
       - run: GOBIN="$RUNNER_TEMP/bin" go install "github.com/zricethezav/gitleaks/v8@$GITLEAKS"
       - run: '"$RUNNER_TEMP/bin/gitleaks" git --redact --no-banner -c .gitleaks.toml .'
 
+  # nestd's cores checked as the code that ships (docs/verification/nestd/): the Stateright checks
+  # at CI bounds and mutation testing of nestd-core. Both crates are standalone (own lockfiles).
+  verify-nestd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_MUTANTS: 27.1.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/cargo-mutants
+            verification/nestd/check/target
+            target
+          key: verify-nestd-${{ runner.os }}-${{ env.CARGO_MUTANTS }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'verification/nestd/check/Cargo.lock') }}
+          restore-keys: verify-nestd-${{ runner.os }}-${{ env.CARGO_MUTANTS }}-
+      - name: Model checks (bounded; the every-fault run is `--include-ignored`)
+        working-directory: verification/nestd/check
+        run: |
+          cargo clippy --release --all-targets --locked -- -D warnings
+          cargo test --release --locked
+      - name: Mutation testing of nestd-core (0 missed expected)
+        run: |
+          command -v cargo-mutants || cargo install --locked "cargo-mutants@$CARGO_MUTANTS"
+          # In place, so the cached `target/` above is the one it builds in (a copied tree would
+          # build from scratch every run).
+          cargo mutants -p nestd-core --in-place --timeout 60
+
+  # Kani proofs of nestd-core's decision functions (bounded; see docs/verification/nestd/).
+  kani-nestd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KANI: 0.68.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+            ~/.kani
+          key: kani-${{ runner.os }}-${{ env.KANI }}
+      - name: Kani
+        run: |
+          command -v cargo-kani || cargo install --locked "kani-verifier@$KANI"
+          cargo kani setup
+          cargo kani -p nestd-core
+
+  # Every wire parser nestd runs at a trust boundary, guest (vsock) first. The PR gate is
+  # deterministic: the seeds still decode, and every target replays the seeds and the corpus the
+  # scheduled fuzzing grew (fuzz.yml), once each. Timed fuzzing runs only on that schedule.
+  fuzz-nestd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_FUZZ: 0.13.2
+    defaults:
+      run:
+        working-directory: verification/nestd/fuzz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (verification/nestd/fuzz/rust-toolchain.toml, a pinned nightly)
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/cargo-fuzz
+            verification/nestd/fuzz/target
+          key: fuzz-nestd-${{ runner.os }}-${{ env.CARGO_FUZZ }}-${{ hashFiles('verification/nestd/fuzz/rust-toolchain.toml', 'verification/nestd/fuzz/Cargo.lock') }}
+          restore-keys: fuzz-nestd-${{ runner.os }}-${{ env.CARGO_FUZZ }}-
+      - run: command -v cargo-fuzz || cargo install --locked "cargo-fuzz@$CARGO_FUZZ"
+      - name: Seeds still decode
+        run: python3 -I gen_seeds.py && cargo test --locked
+      - name: The scheduled runs' corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: verification/nestd/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-
+          restore-keys: fuzz-corpus-${{ runner.os }}-
+      - name: Replay the seeds and the corpus through every target
+        run: |
+          for t in guest_stream guest_control_json vsock_handshake proxy_events gateway_events runner_events fleet_to_host meta_json; do
+            ./run.sh "$t" replay
+          done
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: verification/nestd/fuzz/artifacts
+          retention-days: 7
+
   ci-ok:
     if: always()
-    needs: [rust, control-plane, dashboard, e2e, infra, guards, deny, secrets]
+    needs: [rust, control-plane, dashboard, e2e, infra, guards, deny, secrets, verify-nestd, kani-nestd, fuzz-nestd]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

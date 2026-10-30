@@ -23,7 +23,7 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello_ack` | first frame | `last_event_seq` (host resends after it), lease timings, `host_token_expires_ms` |
+| `hello_ack` | first frame | `last_event_seq` (host resends after it), lease timings, `host_token_expires_ms`, `next_command_seq?` (the seq of the first `commands` batch on this connection; see in-order delivery) |
 | `heartbeat_ack` | no | Echoes `sent_ms`; `revoked[(sandbox, epoch)]` must be fenced now |
 | `commands` | seq | A batch of `Command{cmd, issued_ms, type, …}`, applied **in order** |
 | `ack` | — | Cumulative ack of `events` |
@@ -32,9 +32,12 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 | `proxy_ca` | no | Renewed intermediate |
 | `error` | — | `ErrorBody`. `unauthorized` and `unsupported_version` close the socket (nestd also reads the older name `unsupported_protocol_version`) |
 
-**Process lineage.** Both seq lineages (host events, commands) belong to one nestd process. When `hello.instance_id` differs from the previous connection's, FleetDO **resets both**: it forgets `last_event_seq` (the new process starts its events at 1), drops unacked commands and fails them retryably (`command_result` error, `retryable: true`), and reconciles from the hello report instead of replaying. A reconnect of the same process resumes as usual.
+**Process lineage.** Both seq lineages (host events, commands) belong to one nestd process. When `hello.instance_id` differs from the previous connection's, FleetDO **resets both**: it forgets `last_event_seq` (the new process starts its events at 1), drops unacked commands and fails the ones still unanswered at the reset retryably (`command_result` error, `retryable: true`; a command issued after the reset belongs to the new process), and reconciles from the hello report instead of replaying. A reconnect of the same process resumes as usual.
 
-**In-order delivery.** On both channels a reliable message must carry `seq == last + 1`. A gap or a processing failure **closes the socket** instead of answering with an error and continuing. The sender then reconnects and resends everything unacked, so a later batch's cumulative ack can never cover an earlier failed one.
+**In-order delivery.** On both channels a reliable message must carry `seq == last + 1`. A gap or a processing failure **closes the socket** instead of answering with an error and continuing. The host then reconnects and the sender resends everything unacked, so a later batch's cumulative ack can never cover an earlier failed one.
+
+- **Command baseline.** FleetDO sends a connection's command batches in seq order, each once, starting at `hello_ack.next_command_seq`: the lowest unacked seq above `hello.last_command_seq` (above none, if absent), else the next seq FleetDO will assign, read after any lineage reset. The host's in-order check takes it as the connection's baseline, so a batch that ever arrives out of order is a gap. A FleetDO that predates the field omits it, and could put a higher batch on the wire before a lower one.
+- **Unresolvable secrets.** When FleetDO can't resolve a batch's secret references (BrokerDO unavailable), it sends the batches before it, not that one or any after it, sends a retryable `error` and closes the socket (4503), so the reconnect's hello resends the rest.
 
 **One bad event never blocks a batch.** FleetDO parses a batch's events one at a time. An event that fails its schema (say, a malformed id that came from inside a sandbox) is **quarantined**: logged and skipped, and the batch is acked with the rest applied. Rejecting the whole frame would make the host resend it forever and stall every sandbox on the host. A processing failure, by contrast, is retryable and closes the socket as above.
 

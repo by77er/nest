@@ -16,6 +16,7 @@ futures-util = "0.3.34"
 hex = "0.4.3"
 libc = "0.2.190"
 nest-protocol = { path = "../nest-protocol" }
+nestd-core = { path = "../nestd-core" }
 nix = { version = "0.31", features = ["sched", "socket", "fs", "signal", "process", "mount", "uio", "user"] }
 rand = "0.10.3"
 rcgen = "0.14.10"
