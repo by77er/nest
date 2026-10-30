@@ -338,7 +338,7 @@ The seeds are built from `protocol/fixtures/` at every run and never committed, 
 
 ## Phase 2 design
 
-Phase 2 waits for the proxy link's rework (PR #28) to merge. The brain record it also waited for is on main (#30). Each machine moves out of `host.rs` the way the fleet link did:
+Phase 2 waits for the proxy link's rework (PR #28, still open on 2026-10-29) to merge. Each machine moves out of `host.rs` the way the fleet link did:
 1. characterization tests first;
 2. the core with its invariants;
 3. a shell that only performs effects;
@@ -416,5 +416,5 @@ Phase 2 waits for the proxy link's rework (PR #28) to merge. The brain record it
 
 ## Open questions
 
-- **Capability gating for new command variants:** the study's B5, so an old nestd never drops an unknown batch. Owned by the fleet contract.
+- **Capability gating for new command variants:** the study's B5. An old nestd can't parse a new variant. Since phase 1 it no longer loses the batch silently: it skips it as unparseable, the next batch's gap makes it reconnect, and the resend brings the same batch back, so the host takes no further commands until it is upgraded (by code reading). Gating new variants on the hello's capabilities would avoid that. It belongs to the [fleet contract](../../interfaces/control-host/fleet/).
 - **Should the checker's every-fault run gate merges?** It does at about a minute on CI hardware, unmeasured; today it runs only with `--include-ignored`.
