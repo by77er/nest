@@ -37,8 +37,9 @@ Subsystem skills: `nest-control-plane`, `nest-host`, `nest-wire`, `nest-infra`, 
   - any `CODEOWNERS` paths touched;
   - the rollout rule, if any.
 - **Wait for CI:** `gh pr checks <n> --watch --required`. `ci-ok` aggregates every job. A red job gets a root cause, not a rerun-until-green.
-- **Merge on green:** the owner's standing instruction (2026-10-23) is to merge your own PR once CI is green, unless the task says otherwise. Use `gh pr merge <n> --squash --delete-branch`.
-  - A PR that touches `CODEOWNERS` paths needs the owner's approval ([dev/github.md](../../../dev/github.md#merge-policy)), and branch protection requires code-owner review. Never bypass that with `gh pr merge --admin`: report it and leave the merge to the owner.
+- **Self-merge on green:** the owner's standing instruction (2026-10-23) is that you merge your own PR once CI is green, unless your task says otherwise. Use auto-merge: `gh pr merge <n> --squash --auto --delete-branch`. It has merged PRs touching `CODEOWNERS` paths too.
+  - Never use `--admin`, and never bypass branch protection in any other way.
+  - If auto-merge is blocked by a required review, stop and tell the owner.
   - `inframe apply`, secrets and the owner's own cloud resources stay the owner's.
 
 ## 5. After the merge
