@@ -26,6 +26,9 @@ Review from the diff, the task and the repo, never the author's transcript. Run 
    - claims name their evidence tier;
    - skipped tests are called out.
 4. **Contracts:** a wire change updates `protocol/fixtures/` and the interface doc. Old peers stay compatible as the interface doc requires (a guest version range, additive fields).
+   - Stored data and the wire stay readable by the previous release (`wrangler rollback`), and new host behaviour is gated by a capability flag (the `nest-wire` skill).
+   - A change to a modelled handler updates the conformance doc or the spec (the `nest-verification` skill).
+   - Check the rules of the subsystem skill for each area the diff touches: `nest-control-plane`, `nest-host`, `nest-infra`.
 5. **Dependencies:** a new or bumped crate or package says why, passes `cargo deny check`, and needs the owner (`CODEOWNERS`).
 6. **[Review lessons](../../../dev/review-lessons.md):** check the change against each lesson. If a finding recurs, propose a new lesson.
 7. **Scope:** one concern per PR; unrelated cleanups go elsewhere.

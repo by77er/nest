@@ -74,7 +74,9 @@ run_tla() {
       local states
       states="$(printf '%s\n' "$out" | grep -E 'distinct states found' | tail -1 | sed -E 's/.* ([0-9,]+) distinct states found.*/\1/')"
       if [ "$expect" = "holds" ]; then
-        if [ $code -eq 0 ] && printf '%s\n' "$out" | grep -q 'No error has been found'; then
+        # A here-string, not `printf | grep -q`: grep -q exits at the first match, and under pipefail
+        # the writer's SIGPIPE on output past the pipe buffer (a long trace) failed the match.
+        if [ $code -eq 0 ] && grep -q 'No error has been found' <<<"$out"; then
           echo "ok    $name holds (${states:-?} states)"
         else
           echo "FAIL  $name expected to hold (TLC exit $code)"; printf '%s\n' "$out" | tail -40; fail=1
@@ -83,7 +85,7 @@ run_tla() {
         local prop="${expect#violates:}"
         # TLC names a violated invariant or action property; v1.7.4 prints a temporal (liveness)
         # violation without its name, so that line is matched for any expected temporal property.
-        if [ $code -ne 0 ] && printf '%s\n' "$out" | grep -E -q "Invariant $prop is violated|Action property $prop is violated|$prop is violated|Temporal properties were violated|Deadlock reached"; then
+        if [ $code -ne 0 ] && grep -E -q "Invariant $prop is violated|Action property $prop is violated|$prop is violated|Temporal properties were violated|Deadlock reached" <<<"$out"; then
           echo "ok    $name violates $prop, as expected"
         else
           echo "FAIL  $name expected a violation of $prop (TLC exit $code)"; printf '%s\n' "$out" | tail -40; fail=1

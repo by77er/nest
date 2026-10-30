@@ -19,3 +19,6 @@ description: Use when writing or changing tests in nest (Rust, the TypeScript co
 - **No `std::env::set_var` or `remove_var`** (clippy denies them); set the environment on the child `Command`.
 - **A new guard** (a fence, a lint, a check script) ships with a test that plants a violation and expects failure (`scripts/tests/test_guards.py`).
 - **Tests are not evidence of effort.** Fewer tests that can fail beat many that can't.
+- **Per-area patterns:**
+  - Durable Objects (wrapping RPC rejections, real alarms, migrations on the old shape): the `nest-control-plane` skill;
+  - wall-clock waits, parallel-safe Rust tests and pure-core checks: the `nest-host` skill.
