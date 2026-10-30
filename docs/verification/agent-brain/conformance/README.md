@@ -1,6 +1,6 @@
 # Conformance: the brain-record code against the model
 
-> **As of 36b60d5** (2026-10-29): the code checked below has moved on since (brain hosts: `agent_start` goes only to brain hosts, `pickHost` asks FleetDO's `placeBrain`, and the brain cap is enforced in `issueCommands`). A conformance check of that AgentDO delta found the one-brain invariants unchanged; this study will be refreshed.
+> **Scope and freshness (2026-10-29):** the passes below follow `origin/deferred/brain-record` from a38d3c0 to 36b60d5 (merged as #30). Two later sections cover main@b2b9219 (`answered_by`, #32; the one low item it found was fixed in #33) and the brain-hosts delta at fe7b0d0 (merged as #36 from a later head; the check covered fe7b0d0 only). Code merged after those heads has not been checked.
 
 **Head checked:** `origin/deferred/brain-record` at **82396b3** (82396b304eaf8524a69999a4fdee8d11aecb9479, fetched 2026-10-26). **Design:** `BRAIN-RECORD-DESIGN.md`: invariant S, liveness L, rules 1-6, amendments A1-A6, plus the owner's as-built choices for 82396b3 (no same-host re-issue, one outstanding start per agent and host, no adopt, `brain_epochs` gating, the two-step wedge, the N1 re-check and orphan kill). **Model:** `verification/tla/agent-brain/AgentBrain.tla` as it stood on 2026-10-26 (`NO_REISSUE`, `SPLIT_EXPIRE`/`EXPIRE_RECHECK`, the `MC_nr_*` configs; another agent is still editing it). Background: [../README.md](../README.md), [../pilot/](../pilot/README.md).
 
@@ -52,7 +52,7 @@
 | wedge (`fWedged`) | 4, M1 | fleet.ts:1449-1457, 769-772, 1052, 1352, 1401, 1461, 1479 | yes | Socket closed, excluded from placement, STONITH only |
 | `ResetAgentDO` | durability | agent.ts:612-615, 695-707, 777-787, 880-900 | yes | No new split in AgentDO |
 | Version gating `brain_epochs` | choice | fleet.ts:785-786, 1467-1482; agent.ts:674-677, 849-853 | partly | Preference only: an old host is still used when no current one is free (N4, N12) |
-| Release on `lost` ignores the epoch (`LOSS_EPOCH = FALSE`) | A3+A6 | agent.ts:592-595, 831-834 | yes | Sound while lost implies nothing runs; not on old nestd (N4) |
+| Release on `lost` ignores the epoch (`LOSS_EPOCH = FALSE`) | A3+A6 | agent.ts:592-595, 831-834 | yes | Sound while lost implies nothing runs; not on old nestd (N4). That was at 6073da7. On main@b2b9219, `onHostLost` is epoch-bounded and re-checks `lost` at delivery (agent.ts:1085-1087, tested at agent-seams.test.ts:918); the model's C6 shows both guards are needed |
 | Tool calls keyed by call id | — | runtime.rs:526-531 | yes | 128-bit stems (N9 fixed) |
 
 ## Status of N1-N10 (and the D items left partly)
@@ -266,3 +266,44 @@ Spot-checked claims that hold: reverting N24 fails the N19/N24 test, and droppin
 - **S: yes**, for an all-new fleet and in the mixed window.
 - **L, all-new fleet: yes with low items:** N16, N17, N20 residual, the latent `drain_told` keying, and wedges needing an operator without EC2, as before.
 - **L, mixed window: no, by N25:** agents end (with EC2), but healthy old sandbox hosts are wedged and STONITHed by design. N25 blocks a Worker deploy that precedes host upgrades. It doesn't block S. Cleared by any N25 fix above, or by the owner accepting the forced STONITH with a runbook.
+
+## main b2b9219 (#32): `commands.answered_by`
+
+The rule A6 assumes: a kill counts as processed only when the host answered it, so the brains of a host that is dead but not yet lost wait for `lost`. Checked on `main` at b2b9219 by reading the code (no runs). Citations are `main@b2b9219:control-plane/src/do/fleet.ts:line`.
+
+| Path | Writes `answered_by = 'fleet'`? | Effect on `killProgress` (1557-1573) |
+|---|---|---|
+| A command issued to a dead or unknown host, answered at insert (1395-1407) | yes | Not processed. The brain waits for `lost` (conforms) |
+| `hostDied` closing a dead host's open commands (2333-2341) | yes | Not processed (conforms) |
+| `failPendingCommands` on a new nestd process (1309-1319, through `onCommandResult`) | no | A pending kill counts as processed. This is safe because the release also needs no indexed row, and the new process's hello reconciles its brains first (a reported brain keeps its row) |
+| `failStarts` on expiry (2296-2299) | no | No kill is involved, but these answers count as `host_processing` evidence (1565), so a wedge for a host that processes nothing waits for the cap instead of 60 s. This delays L only (low) |
+| `dropUnreported` (947) | no | Sandbox commands only. No kill |
+
+**Verdict:** conforms for S. One low L delay (`failStarts` should set `answered_by = 'fleet'`), fixed on main in #33 (fe892c1). The model already treats FleetDO-written answers as not processed. The pilot's report says whether the model encodes this explicitly.
+
+## brain-hosts fe7b0d0 (stream G merge gate)
+
+**Head:** `origin/deferred/brain-hosts` at fe7b0d0d37c6cf726de703cd7fcea47a96a1fd64 (fetched 2026-10-29; main at f10eb75). I read `git diff origin/main...fe7b0d0` for agent.ts, fleet.ts, `lib/placement.ts`, `lib/cells.ts`, `protocol/model.ts` and nestd's `host_kind_refusal`, and ran nothing: every claim is **unverified by execution**. The agent.ts diff touches only `brainHostUsable`, `start()`'s hint check and `pickHost`; condemn, release, escalation, the wedge and the epoch code are byte-identical to main. Citations are `brain-hosts@fe7b0d0:path:line`, abbreviated as above; `placement.ts`/`cells.ts` = `control-plane/src/lib/`.
+
+| Model action / invariant | Code at fe7b0d0 | Conforms | Detail |
+|---|---|---|---|
+| `RStart(h)`: `Healthy(h) /\ h # avoid` (tla:384) | agent.ts:714-722; fleet.ts:1628-1640; placement.ts:28-36 | yes | Code's set is a subset of the model's: active, connected, `brain_epochs = 1`, not wedged, role `brain`, never `avoid`, below `max_brains`. `prev` is a preference among those (not in the model; S-neutral) |
+| `RStart`, live brain never moved by a hint (tla:385) | agent.ts:652-678 | yes, unchanged | `pickHost` runs only with no brain; a hint elsewhere condemns first and starts after release |
+| Hint validity | agent.ts:260-263, 555-561, 715-717 | yes | `brainHostUsable` adds `role === "brain"` to main's check; wedged excluded via the closed socket, as on main |
+| Gate 1 (`brain_epochs`) | agent.ts:262; fleet.ts:1632 | yes | Both paths require it. Legacy `controller` rows become `brain` (fleet.ts:303-305; model.ts alias) but keep `brain_epochs = 0` until a current hello |
+| A3(c) and N23 at the send | fleet.ts:1397-1406 | yes | Expired/dead/unknown and `brain_epochs = 0` refusals intact; the role refusal is added after them, retryable |
+| `Issue`, record commit after awaits | agent.ts:679-687, 749-760 | yes | `unchanged(snap)` at 686 follows every new await (`placeBrain`, sandbox `wake`); commit is one synchronous step |
+| `IssueFail` | agent.ts:780-791 | yes, unchanged | A refused send condemns the committed epoch, intent kept |
+| Drain moves (tla:937) | agent.ts:1022-1032 | yes, unchanged | Then `placeBrain(avoid)`; a draining host is not `active`, so excluded twice |
+| No capacity | agent.ts:721, 801-806, 2275-2281 | yes (L conditional) | Retryable: intent kept, retried every 30 s (fixed interval, no cap); no record, so no `starting` deadline, no `start_attempts`, no `exit_restarts` |
+| S, CondemnedFenced, KillTombstone, NoEpochRegression | (unchanged code) | unchanged | Placement only narrows targets; one agent's starts stay single-flight via the record |
+| NoHealthyWedge | fleet.ts:1949-1971 | unchanged | Brain-host idle retirement marks `dead`, never wedged or `lost`; `busy` counts indexed brains (1959) |
+
+**Findings, ranked.**
+- **G1 (medium, rollout, L).** `brain` in `AWS_CELLS` is optional (cells.ts:58) and a cell without it launches nothing (fleet.ts:1880-1883, 1891-1895). After the Worker deploy, any agent whose brain exits in such a cell, with no current-release brain host, retries every 30 s forever; turns stay queued. By design and tested (`brain-hosts.test.ts:320`). Deploy order: brain section (or a brain host) per cell before the Worker. Brains already on sandbox hosts keep running until they exit (the live-brain health check, agent.ts:661-662, ignores role).
+- **G2 (low, L delay).** Idle retirement can race a pick. `placeBrain` reserves nothing and leaves `idle_since` set. If FleetDO's tick retires the picked host (idle past `brain.idle_grace_ms`, no row yet) during AgentDO's awaits before the send, `issueCommands` refuses (dead), the committed epoch is condemned, and the record waits for EC2 to confirm the termination (`lost`). No S effect. Fix: clear `idle_since` in `placeBrain`, or pass the pick through as a short reservation.
+- **G3 (low, accepted).** Soft cap: different agents racing may over-commit one host's last slot. One agent cannot (single-flight `runIntent`, `unchanged(snap)`). Over-commit only.
+- **G4 (low, outside the model).** The `avoid` path now wakes the agent's sandbox (agent.ts:726-733); main deliberately did not. Sandbox-system effect only; unverified.
+- Removed `controllerHost`, `otherHost`, `currentHost`: their only callers were `pickHost` (main agent.ts:722, 729, 737). No Discord singleton DO exists. A hands-less agent now uses `placeBrain` like any other. No safety check lost.
+
+**Verdict at fe7b0d0.** S and the other safety invariants: **unchanged**. No modelled transition changes beyond a narrower target set. Liveness: **holds once a brain host can exist in the cell**. G1 blocks a Worker deploy to any cell without a `brain` section or a hand-added brain host. It blocks the merge only if the merge deploys. G2-G4 are low.
