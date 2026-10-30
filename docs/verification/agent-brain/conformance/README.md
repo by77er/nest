@@ -307,3 +307,16 @@ The rule A6 assumes: a kill counts as processed only when the host answered it, 
 - Removed `controllerHost`, `otherHost`, `currentHost`: their only callers were `pickHost` (main agent.ts:722, 729, 737). No Discord singleton DO exists. A hands-less agent now uses `placeBrain` like any other. No safety check lost.
 
 **Verdict at fe7b0d0.** S and the other safety invariants: **unchanged**. No modelled transition changes beyond a narrower target set. Liveness: **holds once a brain host can exist in the cell**. G1 blocks a Worker deploy to any cell without a `brain` section or a hand-added brain host. It blocks the merge only if the merge deploys. G2-G4 are low.
+
+## channels (feat/channels, author's map, 2026-10-30)
+
+**Head:** `feat/channels` (ChannelDO). The author's map of each AgentDO change onto the model, for the independent check that follows; nothing here is verified by a second reader yet. No modelled transition is added or changed: channel deliveries enter as model action Q1 (enqueue), exactly as an API turn or an inbox post does.
+
+| Change | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| Delivery admitted as a turn | agent.ts:2006-2028 | yes (Q1) | `enqueueTurn` (request id `chan/<channel>/<sub>/<to_seq>`) → pump → wake, or `postInbox` mid-turn. Reads `current_turn` only; writes `channel_subs`, `turns`/`inbox`. No brain record, intent or session write |
+| `release` reports the exit | agent.ts:1019 | yes (A5/A6 unchanged) | After the record's commit, synchronous: one `chan_out` row and its deadline row. No await added before `armed`, no guard read or changed |
+| `applyEvent` reports events | agent.ts:1780 | yes (Q3 unchanged) | Synchronous after the state update; `kv.last_text` and `chan_out` rows only. The per-event `current()` re-check (rule 1) is untouched |
+| Channel tools | agent.ts:2332 | yes (rule 1) | Every write calls `live()` (the epoch fence) after its last await; mutation M15 removes it from `post` and the fence test fails |
+| `chan_out` deadline | agent.ts:2544 | n/a | Posts to ChannelDO from the alarm; never calls back into a DO awaiting AgentDO |
+| `load()` default | agent.ts:375 | n/a | `channel_grants ?? []`; brain fields untouched |

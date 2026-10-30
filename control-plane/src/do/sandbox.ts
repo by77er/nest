@@ -7,6 +7,7 @@
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
 import { num, type Env } from "../env";
+import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { asNestError, b64url, NestError, newId } from "../lib/util";
@@ -130,6 +131,8 @@ type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
 export class SandboxDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private readonly deadlines: Deadlines;
+  /** Posts to `<sbx>/events` (docs/channels/#built-in-channels), queued with the change they report. */
+  private readonly outbox: ChannelOutbox;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -155,6 +158,7 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
       expires_ms INTEGER NOT NULL)`);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
+    this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.info_().sandbox);
     // The blob's capped `history` is merged in on every start: it holds what a release before the
     // table (or a rollback to one) recorded. The table never loses an epoch it already has.
     for (const h of this.get<{ history?: { epoch: number; host: string }[] }>("info")?.history ?? []) {
@@ -222,6 +226,12 @@ export class SandboxDO extends DurableObject<Env> {
 
   private fleet(cell: string) {
     return this.env.FLEET.get(this.env.FLEET.idFromName(cell));
+  }
+
+  /** Queue a platform post on `<sbx>/events` (synchronous; posted from the alarm). Never a decision. */
+  private report(kind: string, text: string, data: Record<string, unknown>, idem?: string): void {
+    const sandbox = this.info_().sandbox;
+    this.outbox.push(`${sandbox}/events`, { kind, text, data, ...(idem ? { idem_key: idem } : {}) }, { tainted: false });
   }
 
   // --- lifecycle ----------------------------------------------------------------------------------
@@ -426,6 +436,7 @@ export class SandboxDO extends DurableObject<Env> {
       i.state = state;
       if (guest && state === "running") i.guest = guest;
     });
+    if (state !== info.state) this.report("state_changed", `state: ${state}`, { state, epoch, host });
     // A guest that just came up (boot, resume) takes the slots its sandbox was suspended without.
     if (becameRunning) await this.reissuePendingAttaches(true);
     await this.armIdle();
@@ -543,6 +554,9 @@ export class SandboxDO extends DurableObject<Env> {
    * lost, and wakes a stopped one with work waiting. The latest placement is what is sent.
    */
   private async notifyAgentsMoved(_host: string | null): Promise<void> {
+    const info = this.info_();
+    this.report("moved", info.host ? `placed on ${info.host} at epoch ${info.epoch}` : "no host: restored from its head when next woken",
+      { epoch: info.epoch, host: info.host }, `${info.sandbox}/moved/${info.epoch}/${info.host ?? "none"}`);
     await this.deadlines.set("notify_moved", Date.now(), true);
   }
 
@@ -584,6 +598,7 @@ export class SandboxDO extends DurableObject<Env> {
       i.state = "destroyed";
       i.host = null;
     });
+    this.report("destroyed", "destroyed", { epoch: info.epoch }, `${info.sandbox}/destroyed`);
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
     // Its generations stop being GC roots.
@@ -778,6 +793,8 @@ export class SandboxDO extends DurableObject<Env> {
         await this.pruneCommitRecords();
       } else if (key === "notify_moved") {
         await this.sendMoveNotices();
+      } else if (key === OUTBOX_DEADLINE) {
+        await this.outbox.flush();
       }
     });
   }
@@ -1021,6 +1038,7 @@ export class SandboxDO extends DurableObject<Env> {
     this.update((i) => {
       i.ports = [...i.ports.filter((p) => p.port !== port), { port, url }];
     });
+    this.report("port_exposed", `port ${port} exposed at ${url}`, { port, url });
     let shareUrl: string | undefined;
     if (share) {
       // Signed, expiring share token for one {sandbox, port}; verified by the preview Worker route.
@@ -1038,5 +1056,6 @@ export class SandboxDO extends DurableObject<Env> {
     this.update((i) => {
       i.ports = i.ports.filter((p) => p.port !== port);
     });
+    this.report("port_unexposed", `port ${port} no longer exposed`, { port });
   }
 }

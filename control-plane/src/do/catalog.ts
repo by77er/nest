@@ -1,11 +1,12 @@
 // CatalogDO (one, named "catalog"): templates and capabilities, stored as data and edited by the
-// operator (docs/control-plane/durable-objects/catalog/). Seeded once with `worker` and `captain`;
+// operator (docs/control-plane/durable-objects/catalog/). Seeded once with `worker` and `captain` (and
+// migrated once per later seed version: new entries only);
 // expansion itself is pure (lib/spec.ts).
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
-  type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, SEED_CATALOG, type SpawnSpec, Template,
+  type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template,
   templatesUsing,
 } from "../lib/spec";
 import { NestError } from "../lib/util";
@@ -20,16 +21,36 @@ export class CatalogDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS capabilities (name TEXT PRIMARY KEY, body TEXT NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS templates (name TEXT PRIMARY KEY, body TEXT NOT NULL)");
-    // Seeded once: an entry the operator deletes stays deleted.
-    if (!this.sql.exec("SELECT 1 FROM kv WHERE key = 'seeded'").toArray().length) {
-      for (const [name, c] of Object.entries(SEED_CATALOG.capabilities)) {
-        this.sql.exec("INSERT OR IGNORE INTO capabilities (name, body) VALUES (?, ?)", name, JSON.stringify(c));
-      }
-      for (const [name, t] of Object.entries(SEED_CATALOG.templates)) {
-        this.sql.exec("INSERT OR IGNORE INTO templates (name, body) VALUES (?, ?)", name, JSON.stringify(t));
-      }
+    // Seeded once: an entry the operator deletes stays deleted. A catalog seeded by an earlier
+    // version (no `seed_version`: version 1) gains each later version's new entries once, where the
+    // name is free; existing entries are never edited.
+    const kv = (key: string) => this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray()[0]?.value;
+    if (kv("seeded") === undefined) {
+      this.insertSeed(SEED_CATALOG);
       this.sql.exec("INSERT INTO kv (key, value) VALUES ('seeded', '1')");
+      this.setSeedVersion(SEED_VERSION);
+    } else {
+      const from = Number(kv("seed_version") ?? "1");
+      if (from < SEED_VERSION) {
+        const names = (table: string) => this.sql.exec<{ name: string }>(`SELECT name FROM ${table}`).toArray().map((r) => r.name);
+        const m = seedMigration({ capabilities: names("capabilities"), templates: names("templates") }, from);
+        this.insertSeed(m);
+        this.setSeedVersion(m.version);
+      }
     }
+  }
+
+  private insertSeed(c: Pick<Catalog, "capabilities" | "templates">): void {
+    for (const [name, cap] of Object.entries(c.capabilities)) {
+      this.sql.exec("INSERT OR IGNORE INTO capabilities (name, body) VALUES (?, ?)", name, JSON.stringify(cap));
+    }
+    for (const [name, t] of Object.entries(c.templates)) {
+      this.sql.exec("INSERT OR IGNORE INTO templates (name, body) VALUES (?, ?)", name, JSON.stringify(t));
+    }
+  }
+
+  private setSeedVersion(v: number): void {
+    this.sql.exec("INSERT INTO kv (key, value) VALUES ('seed_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", String(v));
   }
 
   /**

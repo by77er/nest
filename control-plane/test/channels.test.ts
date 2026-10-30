@@ -1,0 +1,665 @@
+// Channels end to end (docs/channels/): ChannelDO through the operator API and its stub (ordering,
+// paging, the keyed view, compare-and-set, size limits, retention), subscriptions delivered into
+// AgentDO's turn queue and inbox (batched, once per window under retries and a crash mid-delivery,
+// `none` and `once`), the built-in channels, permission refusals, the channel tools through the
+// real dispatch path, and the catalog's seed migration.
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
+import type { AgentDO } from "../src/do/agent";
+import { CatalogDO } from "../src/do/catalog";
+import type { ChannelDO } from "../src/do/channel";
+import type { Caller } from "../src/lib/channels";
+import { SEED_CATALOG_V1 } from "../src/lib/spec";
+import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+
+const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
+const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
+const chStub = (name: string) => env.CHANNEL.get(env.CHANNEL.idFromName(name));
+const enc = encodeURIComponent;
+const uniq = (p: string) => `${p}-${crypto.randomUUID().slice(0, 8)}`;
+const asAgent = (id: string, o: { owner?: string | null; tainted?: boolean } = {}): Caller =>
+  ({ principal: id, owner: o.owner ?? null, sandbox: null, grants: [], tainted: o.tainted ?? false });
+
+/** Poll `f` until `ok` holds, within a wall-clock budget (alarms run for real in the pool). */
+async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, ms = 10_000, what = "condition"): Promise<T> {
+  const end = Date.now() + ms;
+  let v = await f();
+  while (!ok(v)) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}: ${JSON.stringify(v).slice(0, 800)}`);
+    await sleep(50);
+    v = await f();
+  }
+  return v;
+}
+
+/** A DO call that should fail, as a promise (an RPC rejection left bare fails the run; LESSONS). */
+const attempt = (f: () => unknown) => Promise.resolve().then(async () => {
+  await f();
+});
+
+const batchTurns = async (agent: string) => (await agentStub(agent).turns()).filter((t) => t.input.kind === "event_batch");
+
+/** A workstream and a hand-less agent that never starts (its turns just queue). */
+async function idleAgent(o: { cell?: string; workstream?: string; owner?: string } = {}) {
+  const cell = o.cell ?? uniqueCell();
+  const workstream = o.workstream ?? (await adminJson("/v1/workstreams", { body: { goal: "channels" } }, 201)).workstream;
+  const a = await adminJson("/v1/agents", { body: { template: "captain", workstream, cell, start: false, ...(o.owner ? { owner: o.owner } : {}) } }, 201);
+  return { cell, workstream: workstream as string, agent: a.agent as string };
+}
+
+async function newChannel(retention_days?: number): Promise<string> {
+  const name = `team/${uniq("c")}`;
+  await adminJson("/v1/admin/channels", { body: { name, ...(retention_days ? { retention_days } : {}) } }, 201);
+  return name;
+}
+
+const postAs = (name: string, body: unknown, status?: number) => adminJson(`/v1/admin/channels/${enc(name)}/messages`, { body }, status);
+const readAs = (name: string, q = "") => adminJson(`/v1/admin/channels/${enc(name)}/messages${q}`);
+
+/** Force a channel's fan-out now (the batch window or a retry backoff elapsed). */
+async function fanoutNow(name: string): Promise<void> {
+  await runInDurableObject(chStub(name), (_i: ChannelDO, st) => {
+    for (const r of st.storage.sql.exec<{ id: string; body: string }>("SELECT id, body FROM subs").toArray()) {
+      const s = JSON.parse(r.body);
+      if (s.due_ms !== null) st.storage.sql.exec("UPDATE subs SET body = ? WHERE id = ?", JSON.stringify({ ...s, due_ms: 0 }), r.id);
+    }
+    st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('fanout', 0)");
+  });
+  await runDurableObjectAlarm(chStub(name));
+}
+
+describe("ChannelDO: the log", () => {
+  it("assigns dense seqs in order and pages with since and limit", async () => {
+    const name = await newChannel();
+    for (let i = 1; i <= 7; i++) expect((await postAs(name, { text: `m${i}` }, 201)).seq).toBe(i);
+    const p1 = await readAs(name, "?limit=3");
+    expect(p1.messages.map((m: any) => m.text)).toEqual(["m1", "m2", "m3"]);
+    expect(p1).toMatchObject({ head: 7, next_seq: 3, more: true });
+    const p2 = await readAs(name, `?since=${p1.next_seq}&limit=10`);
+    expect(p2.messages.map((m: any) => m.seq)).toEqual([4, 5, 6, 7]);
+    expect(p2.more).toBe(false);
+    // `from` and `taint` are the platform's: the operator is `user`, untainted.
+    expect(p2.messages[0]).toMatchObject({ from: "user", taint: false });
+  });
+
+  it("refuses from/taint in a body, reserved names, built-in creates, and unknown free channels", async () => {
+    const name = await newChannel();
+    expect((await postAs(name, { text: "x", from: "agt_spoof" }, 400)).error.code).toBe("invalid_message");
+    expect((await postAs(name, { text: "x", taint: false }, 400)).error.code).toBe("invalid_message");
+    expect((await adminJson("/v1/admin/channels", { body: { name: "ws_1/x" } }, 400)).error.message).toMatch(/reserved/);
+    expect((await adminJson("/v1/admin/channels", { body: { name: "user" } }, 409)).error.message).toMatch(/built-in/);
+    expect((await postAs(`team/${uniq("nope")}`, { text: "x" }, 404)).error.message).toMatch(/no channel/);
+    // An agent's built-in channel exists only with its agent.
+    expect((await admin(`/v1/admin/channels/${enc("agt_0000nobody/inbox")}/messages`)).status).toBe(404);
+  });
+
+  it("idempotency keys land once; an identical repeat within a minute isn't stored", async () => {
+    const name = await newChannel();
+    expect(await postAs(name, { text: "a", idem_key: "k1" }, 201)).toEqual({ status: "posted", seq: 1 });
+    expect(await postAs(name, { text: "a", idem_key: "k1" }, 200)).toEqual({ status: "existing", seq: 1 });
+    expect(await postAs(name, { text: "b" }, 201)).toEqual({ status: "posted", seq: 2 });
+    expect(await postAs(name, { text: "b" }, 200)).toEqual({ status: "repeat", seq: 2 });
+    expect((await readAs(name)).head).toBe(2);
+  });
+
+  it("keyed view: newest per key, prefix, keys_only, compare-and-set, and removal by an empty keyed post", async () => {
+    const name = await newChannel();
+    expect((await postAs(name, { text: "claimed by a", key: "task/1", if_seq: 0 }, 201)).seq).toBe(1);
+    // A second claim at the same version loses, with the current seq.
+    expect(await postAs(name, { text: "claimed by b", key: "task/1", if_seq: 0 }, 409)).toEqual({ status: "conflict", key: "task/1", current_seq: 1 });
+    expect((await postAs(name, { text: "done", key: "task/1", if_seq: 1 }, 201)).seq).toBe(2);
+    await postAs(name, { text: "spec v1", key: "spec" }, 201);
+    await postAs(name, { text: "t2", key: "task/2" }, 201);
+    const view = await readAs(name, "?latest_by_key=true");
+    expect(view.messages.map((m: any) => [m.key, m.text])).toEqual([["spec", "spec v1"], ["task/1", "done"], ["task/2", "t2"]]);
+    const tasks = await readAs(name, "?latest_by_key=true&prefix=task/&keys_only=true");
+    expect(tasks.keys).toEqual([{ key: "task/1", seq: 2, taint: false }, { key: "task/2", seq: 4, taint: false }]);
+    // Removal: the key leaves the view; the log keeps the post.
+    expect((await postAs(name, { text: "", key: "task/1" }, 201)).seq).toBe(5);
+    expect((await readAs(name, "?latest_by_key=true&keys_only=true")).keys.map((k: any) => k.key)).toEqual(["spec", "task/2"]);
+    expect((await readAs(name, "?since=4")).messages).toMatchObject([{ seq: 5, key: "task/1", text: "" }]);
+    // A removed key is absent again: if_seq 0 claims it.
+    expect((await postAs(name, { text: "reclaimed", key: "task/1", if_seq: 0 }, 201)).seq).toBe(6);
+    // A keys page continues after `after_key`.
+    expect((await readAs(name, "?latest_by_key=true&keys_only=true&limit=1&after_key=spec")).keys.map((k: any) => k.key)).toEqual(["task/1"]);
+  });
+
+  it("keeps bodies over 32 KiB in R2 and reads them back; refuses bodies over 1 MiB", async () => {
+    const name = await newChannel();
+    const big = "x".repeat(40 * 1024);
+    await postAs(name, { text: big, data: { n: 1 } }, 201);
+    const listed = await env.BUCKET.list({ prefix: `channels/${name}/b/` });
+    expect(listed.objects.length).toBe(1);
+    const read = await readAs(name);
+    expect(read.messages[0].text.length).toBe(big.length);
+    expect(read.messages[0].data).toEqual({ n: 1 });
+    expect((await postAs(name, { text: "y".repeat(1024 * 1024 + 1) }, 400)).error.message).toMatch(/at most/);
+    // Both stored inline rows and the R2 row stay ordered.
+    await postAs(name, { text: "small" }, 201);
+    expect((await readAs(name, "?since=1")).messages[0]).toMatchObject({ seq: 2, text: "small" });
+  });
+
+  it("retention drops old messages but keeps the newest per key, and tiers week-old bodies to R2", async () => {
+    const name = await newChannel(1);
+    await postAs(name, { text: "old", key: "k" }, 201);
+    await postAs(name, { text: "old unkeyed" }, 201);
+    await postAs(name, { text: "older version", key: "j" }, 201);
+    await postAs(name, { text: "newer version", key: "j" }, 201);
+    await postAs(name, { text: "fresh" }, 201);
+    await runInDurableObject(chStub(name), (_i: ChannelDO, st) => {
+      st.storage.sql.exec("UPDATE messages SET ts_ms = ? WHERE seq <= 4", Date.now() - 2 * 86_400_000);
+    });
+    await chStub(name).maintain(name);
+    const left = (await readAs(name)).messages.map((m: any) => [m.seq, m.text]);
+    // 1 (newest for k) and 4 (newest for j) stay; 2 (unkeyed) and 3 (superseded) go; 5 is fresh.
+    expect(left).toEqual([[1, "old"], [4, "newer version"], [5, "fresh"]]);
+
+    // Tiering: a body older than 7 days (a channel with longer retention) moves to R2, read transparently.
+    const t = await newChannel(30);
+    await postAs(t, { text: "tier me", data: { a: [1] } }, 201);
+    await runInDurableObject(chStub(t), (_i: ChannelDO, st) => {
+      st.storage.sql.exec("UPDATE messages SET ts_ms = ? WHERE seq = 1", Date.now() - 8 * 86_400_000);
+    });
+    await chStub(t).maintain(t);
+    const row = await runInDurableObject(chStub(t), (_i: ChannelDO, st) =>
+      st.storage.sql.exec<{ text: string | null; body_ref: string | null }>("SELECT text, body_ref FROM messages WHERE seq = 1").one());
+    expect(row.text).toBeNull();
+    expect(row.body_ref).toMatch(new RegExp(`^channels/${t}/b/`));
+    expect((await readAs(t)).messages[0]).toMatchObject({ text: "tier me", data: { a: [1] } });
+  });
+
+  it("lists channels in the directory once registered", async () => {
+    const name = await newChannel();
+    await until(async () => (await adminJson(`/v1/admin/channels?prefix=${enc(name)}`)).channels, (c: any[]) => c.length === 1, 10_000, "registration");
+    expect((await adminJson(`/v1/admin/channels/${enc(name)}`))).toMatchObject({ name, kind: "free", owner: "user", head: 0 });
+  });
+});
+
+describe("subscriptions", () => {
+  it("a burst of posts wakes a subscribed agent once per batch window, with a notice and not the bodies", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    const sub = await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 400 } }, 201);
+    expect(sub).toMatchObject({ agent, delivery: "turn", cursor: 0 });
+    await postAs(name, { text: "secret body one", kind: "progress" }, 201);
+    await postAs(name, { text: "secret body two", kind: "question" }, 201);
+    await postAs(name, { text: "secret body three" }, 201);
+    const turns = await until(() => batchTurns(agent), (t) => t.length >= 1, 10_000, "a wake");
+    await sleep(600);
+    expect((await batchTurns(agent)).length).toBe(1);
+    const text = turns[0]!.input.text;
+    expect(text).toContain(`Channel ${name}: 3 new messages (seq 1-3)`);
+    expect(text).toContain("kinds progress, question");
+    // Bodies reach the model only through `read`; `user`'s arrive inline (the operator is `user`).
+    expect(text).toContain("Message from user (seq 1): secret body one");
+    // A later post is a new window.
+    await postAs(name, { text: "four" }, 201);
+    await until(() => batchTurns(agent), (t) => t.length === 2, 10_000, "a second wake");
+    expect((await chStub(name).subscriptions(name)).find((s) => s.id === sub.id)).toMatchObject({ cursor: 4, inflight: null });
+    expect((await adminJson(`/v1/agents/${agent}/subscriptions`))).toEqual([{ channel: name, subscription: sub.id, hw: 4, ended: false }]);
+  });
+
+  it("delivers once even when the channel crashes after the agent took the batch, and retries", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    const sub = await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    // The settle after a delivery fails (as if the object were reset between the agent's ack and the cursor's move).
+    await runInDurableObject(chStub(name), (inst: ChannelDO) => {
+      inst.testHooks["fanout:afterDeliver"] = async () => {
+        delete inst.testHooks["fanout:afterDeliver"];
+        throw new Error("reset after the agent took the batch");
+      };
+    });
+    await postAs(name, { text: "one" }, 201);
+    await postAs(name, { text: "two" }, 201);
+    await fanoutNow(name);
+    expect((await batchTurns(agent)).length).toBe(1);
+    // The batch is still pinned: the retry carries the same range.
+    const pinned = (await chStub(name).subscriptions(name)).find((s) => s.id === sub.id)!;
+    expect(pinned).toMatchObject({ cursor: 0, inflight: { after_seq: 0, to_seq: 2 } });
+    // A post meanwhile doesn't widen the pinned batch.
+    await postAs(name, { text: "three" }, 201);
+    await fanoutNow(name);
+    const after = (await chStub(name).subscriptions(name)).find((s) => s.id === sub.id)!;
+    expect(after).toMatchObject({ cursor: 2, inflight: null });
+    expect((await batchTurns(agent)).length).toBe(1);
+    // ...and the next window delivers what came after, once.
+    await fanoutNow(name);
+    await fanoutNow(name);
+    const turns = await batchTurns(agent);
+    expect(turns.length).toBe(2);
+    expect(turns[1]!.input.text).toContain("1 new message (seq 3)");
+  });
+
+  it("a retry of a batch the agent already holds is acknowledged even at its wake cap (dedup before the loop guards)", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    const sub = await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    await runInDurableObject(chStub(name), (inst: ChannelDO) => {
+      inst.testHooks["fanout:afterDeliver"] = async () => {
+        delete inst.testHooks["fanout:afterDeliver"];
+        throw new Error("reset after the agent took the batch");
+      };
+    });
+    await postAs(name, { text: "one" }, 201);
+    await fanoutNow(name);
+    expect((await batchTurns(agent)).length).toBe(1);
+    // Now the agent is at its cap: the retry must still settle as taken, never be re-planned wider.
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      for (let i = 0; i < 60; i++) {
+        st.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, 'done', ?, ?)",
+          `trn_cap${i}`, -100 - i, JSON.stringify({ kind: "event_batch", text: "x" }), Date.now() - 1000, `chan/other/sub_x/${i}`);
+      }
+    });
+    await postAs(name, { text: "two" }, 201);
+    await fanoutNow(name);
+    expect((await chStub(name).subscriptions(name)).find((x) => x.id === sub.id)).toMatchObject({ cursor: 1, inflight: null });
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("UPDATE turns SET created_ms = ? WHERE request_id LIKE 'chan/other/%'", Date.now() - 2 * 3_600_000);
+    });
+    await fanoutNow(name);
+    const turns = await batchTurns(agent);
+    expect(turns.filter((t) => t.input.text.includes("(seq 1)")).length).toBe(1);
+    expect(turns.at(-1)!.input.text).toContain("1 new message (seq 2)");
+  });
+
+  it("a failed delivery call keeps the batch pinned and is retried with backoff", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    await runInDurableObject(chStub(name), (inst: ChannelDO) => {
+      inst.testHooks["fanout:beforeDeliver"] = async () => {
+        delete inst.testHooks["fanout:beforeDeliver"];
+        throw new Error("network");
+      };
+    });
+    await postAs(name, { text: "one" }, 201);
+    await fanoutNow(name);
+    expect((await batchTurns(agent)).length).toBe(0);
+    const s = (await chStub(name).subscriptions(name))[0]!;
+    expect(s).toMatchObject({ attempts: 1, inflight: { to_seq: 1 } });
+    expect(s.due_ms! - Date.now()).toBeGreaterThan(0);
+    await fanoutNow(name);
+    expect((await batchTurns(agent)).length).toBe(1);
+    expect((await chStub(name).subscriptions(name))[0]).toMatchObject({ attempts: 0, cursor: 1, inflight: null });
+  });
+
+  it("the agent's own posts never wake it; filters select; a once subscription ends at its first match", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/acl`, { method: "PUT", body: [{ principal: agent, action: "post" }, { principal: agent, action: "read" }] });
+    await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    const asked = await chStub(name).post(name, asAgent(agent), { text: "a question", kind: "question" });
+    expect(asked).toMatchObject({ status: "posted", seq: 1 });
+    await fanoutNow(name);
+    expect((await batchTurns(agent)).length).toBe(0);
+    // A once subscription to replies to seq 1.
+    const once = await chStub(name).subscribe(name, asAgent(agent), agent, { filter: { reply_to: 1 }, delivery: "turn", batch_ms: 60_000, once: true });
+    await postAs(name, { text: "unrelated" }, 201);
+    await postAs(name, { text: "the answer", reply_to: 1 }, 201);
+    await fanoutNow(name);
+    await fanoutNow(name);
+    const subs = await chStub(name).subscriptions(name);
+    expect(subs.some((s) => s.id === once.id)).toBe(false);
+    const turns = await batchTurns(agent);
+    // One for the catch-all subscription (seq 2-3), one for the once subscription (seq 3), ended.
+    expect(turns.length).toBe(2);
+    expect(turns.some((t) => t.input.text.includes(`(seq 3)`) && t.input.text.includes(`Subscription ${once.id} ended`))).toBe(true);
+    await postAs(name, { text: "another answer", reply_to: 1 }, 201);
+    await fanoutNow(name);
+    expect((await batchTurns(agent)).filter((t) => t.input.text.includes("ended")).length).toBe(1);
+  });
+
+  it("none delivery only keeps a cursor, which a read without since moves (the same page on a re-run)", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/acl`, { method: "PUT", body: [{ principal: agent, action: "read" }] });
+    const s = await chStub(name).subscribe(name, asAgent(agent), agent, { filter: {}, delivery: "none", batch_ms: 0, once: false });
+    await postAs(name, { text: "one" }, 201);
+    await postAs(name, { text: "two" }, 201);
+    await fanoutNow(name);
+    expect((await agentStub(agent).turns()).length).toBe(0);
+    const r1 = await chStub(name).read(name, asAgent(agent), { idem_key: "call-1" }) as any;
+    expect(r1.messages.map((m: any) => m.text)).toEqual(["one", "two"]);
+    expect(r1.cursor).toBe(s.id);
+    // A re-run of the same call reads the same page; a new call reads what's new.
+    expect(((await chStub(name).read(name, asAgent(agent), { idem_key: "call-1" })) as any).messages.length).toBe(2);
+    expect(((await chStub(name).read(name, asAgent(agent), { idem_key: "call-2" })) as any).messages.length).toBe(0);
+    await postAs(name, { text: "three" }, 201);
+    expect(((await chStub(name).read(name, asAgent(agent), { idem_key: "call-3" })) as any).messages.map((m: any) => m.text)).toEqual(["three"]);
+    expect((await chStub(name).subscriptions(name)).find((x) => x.id === s.id)).toMatchObject({ cursor: 3, due_ms: null });
+  });
+
+  it("a subscription whose agent doesn't exist is dropped, not retried for ever", async () => {
+    const name = await newChannel();
+    await chStub(name).subscribe(name, { principal: "user" }, "agt_0000ghost", { filter: {}, delivery: "turn", batch_ms: 0, once: false });
+    await postAs(name, { text: "x" }, 201);
+    await fanoutNow(name);
+    // The runtime's own alarm may be the one that runs it.
+    await until(() => chStub(name).subscriptions(name), (s) => s.length === 0, 10_000, "the ghost subscription dropped");
+  });
+
+  it("the agent's loop guards defer a delivery: the channel keeps it, coalesces, and retries", async () => {
+    const { agent } = await idleAgent();
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/subscriptions`, { body: { agent, batch_ms: 60_000 } }, 201);
+    // 60 subscription-started turns this hour already.
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      for (let i = 0; i < 60; i++) {
+        st.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, 'done', ?, ?)",
+          `trn_cap${i}`, -100 - i, JSON.stringify({ kind: "event_batch", text: "x" }), Date.now() - 1000, `chan/other/sub_x/${i}`);
+      }
+    });
+    await postAs(name, { text: "one" }, 201);
+    await fanoutNow(name);
+    await postAs(name, { text: "two" }, 201);
+    const s = (await chStub(name).subscriptions(name))[0]!;
+    expect(s).toMatchObject({ cursor: 0, inflight: null });
+    expect(s.due_ms! - Date.now()).toBeGreaterThan(30 * 60_000);
+    // Once the hour has passed: one wake covering both.
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("UPDATE turns SET created_ms = ? WHERE request_id LIKE 'chan/other/%'", Date.now() - 2 * 3_600_000);
+    });
+    await fanoutNow(name);
+    const turns = (await batchTurns(agent)).filter((t) => t.status === "queued");
+    expect(turns.length).toBe(1);
+    expect(turns[0]!.input.text).toContain("2 new messages (seq 1-2)");
+  });
+});
+
+describe("permissions (server side)", () => {
+  it("an agent can't read another's inbox, post to events, subscribe others, or unsubscribe someone else", async () => {
+    const a = await idleAgent();
+    const b = await idleAgent({ cell: a.cell, workstream: a.workstream });
+    const inbox = `${b.agent}/inbox`;
+    await expect(attempt(() => chStub(inbox).read(inbox, asAgent(a.agent), {}, { agent_owner: null }))).rejects.toThrow(/may not read/);
+    await expect(attempt(() => chStub(inbox).post(inbox, asAgent(a.agent), { text: "hi" }, { agent_owner: null }))).rejects.toThrow(/may not post/);
+    const events = `${a.agent}/events`;
+    await expect(attempt(() => chStub(events).post(events, asAgent(a.agent), { text: "turn_completed" }))).rejects.toThrow(/platform only/);
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/acl`, { method: "PUT", body: [{ principal: a.agent, action: "read" }, { principal: b.agent, action: "read" }] });
+    await expect(attempt(() => chStub(name).subscribe(name, asAgent(a.agent), b.agent, { filter: {}, delivery: "turn", batch_ms: 0, once: false })))
+      .rejects.toThrow(/only itself/);
+    const sb = await chStub(name).subscribe(name, asAgent(b.agent), b.agent, { filter: {}, delivery: "turn", batch_ms: 0, once: false });
+    await expect(attempt(() => chStub(name).unsubscribe(name, asAgent(a.agent), sb.id))).rejects.toThrow(/not agt_/);
+    // The always-on inbox subscription can't be dropped by its agent.
+    await chStub(inbox).post(inbox, { principal: "user" }, { text: "hello" });
+    await expect(attempt(() => chStub(inbox).unsubscribe(inbox, asAgent(b.agent), "sub_inbox"))).rejects.toThrow(/always subscribed/);
+    // A revoked grant is refused at once.
+    await adminJson(`/v1/admin/channels/${enc(name)}/acl`, { method: "PUT", body: [] });
+    await expect(attempt(() => chStub(name).read(name, asAgent(a.agent), {}))).rejects.toThrow(/may not read/);
+  });
+
+  it("a big post re-checks its permission after the R2 put", async () => {
+    const a = await idleAgent();
+    const name = await newChannel();
+    await adminJson(`/v1/admin/channels/${enc(name)}/acl`, { method: "PUT", body: [{ principal: a.agent, action: "post" }] });
+    await runInDurableObject(chStub(name), (inst: ChannelDO, st) => {
+      inst.testHooks["post:afterPut"] = async () => {
+        delete inst.testHooks["post:afterPut"];
+        st.storage.sql.exec("DELETE FROM acl");
+      };
+    });
+    await expect(attempt(() => chStub(name).post(name, asAgent(a.agent), { text: "z".repeat(40 * 1024) }))).rejects.toThrow(/may not post/);
+    expect((await readAs(name)).head).toBe(0);
+  });
+});
+
+describe("built-in channels", () => {
+  it("an operator post to an agent's inbox wakes it, with the user's text inline", async () => {
+    const { agent } = await idleAgent();
+    await postAs(`${agent}/inbox`, { text: "please look at PR 7" }, 201);
+    const turns = await until(() => batchTurns(agent), (t) => t.length === 1, 10_000, "an inbox wake");
+    expect(turns[0]!.input.text).toContain(`Channel ${agent}/inbox: 1 new message`);
+    expect(turns[0]!.input.text).toContain("Message from user (seq 1): please look at PR 7");
+  });
+
+  it("a sandbox's events record its placement, ports and destruction", async () => {
+    const cell = uniqueCell();
+    const host = await connectHost(cell);
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "sbx events" } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+    await adminJson(`/v1/sandboxes/${sbx.sandbox}`, { method: "DELETE" });
+    const name = `${sbx.sandbox}/events`;
+    const msgs = await until(async () => (await readAs(name)).messages as any[], (m) => m.some((x) => x.kind === "destroyed"), 10_000, "sandbox events");
+    expect(msgs.map((m) => m.kind)).toEqual(expect.arrayContaining(["moved", "destroyed"]));
+    expect(msgs.every((m) => m.from === "platform" && m.taint === false)).toBe(true);
+  });
+
+  it("an agent's events carry its turns and exit with the final text; its spawner is subscribed by default", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-test" } });
+    const brain = await connectHost(cell, "brain");
+    const spawner = await idleAgent({ cell });
+    const child = await adminJson("/v1/agents", { body: { template: "captain", workstream: spawner.workstream, cell, owner: spawner.agent } }, 201);
+    const [start] = await nextCommands(brain.ws, (c) => c.type === "agent_start" && c.agent === child.agent);
+    const ws = await Ws.connect(`/v1/agents/${child.agent}/session`, brain.host_token);
+    ws.send({ type: "hello", protocol_version: 1, agent: child.agent, host: brain.host, instance_id: "rin_ev", epoch: start.epoch, session: SESSION });
+    await ws.next("hello_ack");
+    const t = (await adminJson(`/v1/agents/${child.agent}/turns`, { body: { text: "work" } }, 201)).turn;
+    await ws.next("run_turn");
+    const ev = (seq: number, body: Record<string, unknown>) => ({ agent: child.agent, epoch: start.epoch, seq, ts_ms: Date.now(), turn: t, ...body });
+    ws.send({ type: "events", seq: 1, events: [
+      ev(1, { type: "turn_started", input_kind: "user" }),
+      ev(2, { type: "state_changed", state: "working" }),
+      ev(3, { type: "assistant_text", text: "All done: PR opened." }),
+      ev(4, { type: "turn_completed", stop_reason: "end_turn" }),
+    ] });
+    await ws.next("ack", (m) => m.up_to === 1);
+    // A resent batch (an eviction) doesn't post twice.
+    const name = `${child.agent}/events`;
+    const msgs = await until(async () => (await readAs(name)).messages as any[], (m) => m.some((x) => x.kind === "turn_completed"), 10_000, "child events");
+    expect(msgs.map((m) => m.kind)).toEqual(["state_changed", "turn_completed"]);
+    expect(msgs[1]).toMatchObject({ from: "platform", text: "All done: PR opened.", data: { turn: t, stop_reason: "end_turn" } });
+    // The spawner is woken with a notice about its child's results.
+    const wakes = await until(() => batchTurns(spawner.agent), (x) => x.length === 1, 10_000, "the spawner's wake");
+    expect(wakes[0]!.input.text).toContain(`Channel ${name}: 1 new message`);
+    expect(wakes[0]!.input.text).toContain("kinds turn_completed");
+    expect((await chStub(name).subscriptions(name)).map((s) => s.agent)).toEqual([spawner.agent]);
+    // The spawner may read its child's events; a stranger may not.
+    expect(((await chStub(name).read(name, asAgent(spawner.agent), {}, { agent_owner: spawner.agent })) as any).messages.length).toBe(2);
+    const stranger = await idleAgent({ cell });
+    await expect(attempt(() => chStub(name).read(name, asAgent(stranger.agent), {}, { agent_owner: spawner.agent }))).rejects.toThrow(/may not read/);
+    // The brain's exit is reported with its last text.
+    ws.close();
+    await agentStub(child.agent).onExited(brain.host, "idle", start.epoch);
+    const exited = await until(async () => (await readAs(name)).messages as any[], (m) => m.some((x) => x.kind === "exited"), 10_000, "the exit");
+    expect(exited.find((m) => m.kind === "exited")).toMatchObject({ text: "All done: PR opened.", data: { reason: "idle", epoch: start.epoch } });
+    // A later turn with no text of its own doesn't repeat the previous one's.
+    const t2 = (await adminJson(`/v1/agents/${child.agent}/turns`, { body: { text: "more" } }, 201)).turn;
+    const restart = (await nextCommands(brain.ws, (c) => c.type === "agent_start" && c.agent === child.agent && c.epoch > start.epoch))[0];
+    const ws2 = await Ws.connect(`/v1/agents/${child.agent}/session`, brain.host_token);
+    ws2.send({ type: "hello", protocol_version: 1, agent: child.agent, host: brain.host, instance_id: "rin_ev2", epoch: restart.epoch, session: SESSION });
+    await ws2.next("hello_ack");
+    await ws2.next("run_turn", (m) => m.turn === t2);
+    const ev2 = (seq: number, body: Record<string, unknown>) => ({ agent: child.agent, epoch: restart.epoch, seq, ts_ms: Date.now(), turn: t2, ...body });
+    ws2.send({ type: "events", seq: 1, events: [ev2(1, { type: "turn_started", input_kind: "user" }), ev2(2, { type: "turn_completed", stop_reason: "end_turn" })] });
+    await ws2.next("ack", (m) => m.up_to === 1);
+    const all = await until(async () => (await readAs(name)).messages as any[], (m) => m.filter((x) => x.kind === "turn_completed").length === 2, 10_000, "the second turn");
+    expect(all.filter((m) => m.kind === "turn_completed")[1].text).toBe(`turn ${t2} completed (end_turn)`);
+    ws2.close();
+  });
+});
+
+describe("channel tools through the dispatch path", () => {
+  async function setup(launch: { builtin_tools: string[] } = { builtin_tools: [] }) {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-test" } });
+    const brain = await connectHost(cell, "brain");
+    const tpl = uniq("chan");
+    await adminJson(`/v1/admin/templates/${tpl}`, {
+      method: "PUT",
+      body: {
+        capabilities: ["nest", "channels", "messaging-tree"], launch: { ...launch, system_prompt: { mode: "replace", text: "Talk." } },
+        hands: "optional", credential: "claude_oauth_token", escalate_to: "user",
+      },
+    });
+    const owner = await idleAgent({ cell });
+    const a = await adminJson("/v1/agents", { body: { template: tpl, workstream: owner.workstream, cell, owner: owner.agent } }, 201);
+    const [start] = await nextCommands(brain.ws, (c) => c.type === "agent_start" && c.agent === a.agent);
+    const ws = await Ws.connect(`/v1/agents/${a.agent}/session`, brain.host_token);
+    ws.send({ type: "hello", protocol_version: 1, agent: a.agent, host: brain.host, instance_id: "rin_tools", epoch: start.epoch, session: SESSION });
+    await ws.next("hello_ack");
+    let seq = 0;
+    const call = async (name: string, args: unknown) => {
+      const id = `cal_${uniq("t").replace(/-/g, "")}`;
+      ws.send({ type: "tool_call", seq: ++seq, call: id, turn: "trn_x", name, arguments: args });
+      return (await ws.next("tool_result", (m) => m.call === id)).outcome;
+    };
+    const value = (o: any) => o.content.find((c: any) => c.type === "json").value;
+    return { cell, brain, owner, agent: a.agent as string, ws, call, value, start, nextSeq: () => ++seq };
+  }
+
+  it("lists the channel tools and runs them: create, post, read, keyed CAS, subscribe, unsubscribe, message", async () => {
+    const s = await setup();
+    s.ws.send({ type: "tools_list_request", request: "req_c" });
+    expect((await s.ws.next("tools_list")).tools.map((t: any) => t.name)).toEqual(["channel_create", "post", "read", "subscribe", "unsubscribe", "message"]);
+    const name = `team/${uniq("t")}`;
+    expect((await s.call("channel_create", { channel: name })).status).toBe("ok");
+    expect(s.value(await s.call("post", { channel: name, text: "hello", kind: "progress", data: { from: "user", taint: false } }))).toEqual({ status: "posted", seq: 1 });
+    // `from` and `taint` are the platform's, whatever the data says; this agent's session is clean.
+    const read = s.value(await s.call("read", { channel: name }));
+    expect(read.messages[0]).toMatchObject({ from: s.agent, taint: false, kind: "progress", data: { from: "user", taint: false } });
+    // Spoofing as an argument is refused before anything runs.
+    expect((await s.call("post", { channel: name, text: "x", from: "user" })).error.code).toBe("invalid_message");
+    // Keyed compare-and-set.
+    expect(s.value(await s.call("post", { channel: name, text: "mine", key: "claim/1", if_seq: 0 })).seq).toBe(2);
+    const lost = await s.call("post", { channel: name, text: "mine too", key: "claim/1", if_seq: 0 });
+    expect(lost.error.message).toMatch(/conflict: key claim\/1 is at seq 2/);
+    expect(s.value(await s.call("read", { channel: name, latest_by_key: true, keys_only: true })).keys).toEqual([{ key: "claim/1", seq: 2, taint: false }]);
+    // Subscribe, then a post from the operator wakes it; unsubscribe stops that.
+    const sub = s.value(await s.call("subscribe", { channel: name, batch_ms: 0, kinds: ["review"] }));
+    expect(sub).toMatchObject({ cursor: 2, delivery: "turn" });
+    expect(await adminJson(`/v1/agents/${s.agent}/subscriptions`)).toEqual([{ channel: name, subscription: sub.subscription, hw: 0, ended: false }]);
+    expect(s.value(await s.call("unsubscribe", { channel: name, subscription: sub.subscription }))).toEqual({ removed: true });
+    expect(await chStub(name).subscriptions(name)).toEqual([]);
+    // `message`: its owner yes, a stranger no.
+    const m = await s.call("message", { agent: s.owner.agent, text: "status: green", kind: "result" });
+    expect(m.status).toBe("ok");
+    const ownerInbox = await readAs(`${s.owner.agent}/inbox`);
+    expect(ownerInbox.messages[0]).toMatchObject({ from: s.agent, text: "status: green", kind: "result" });
+    await until(() => batchTurns(s.owner.agent), (t) => t.length === 1, 10_000, "the owner's wake");
+    const stranger = await idleAgent({ cell: s.cell });
+    expect((await s.call("message", { agent: stranger.agent, text: "hi" })).error.code).toBe("forbidden");
+    // Others' channels: can't read another's inbox; can't post to events; `user` is post-only.
+    expect((await s.call("read", { channel: `${s.owner.agent}/inbox` })).error.code).toBe("forbidden");
+    expect((await s.call("post", { channel: `${s.agent}/events`, text: "fake" })).error.code).toBe("forbidden");
+    expect(s.value(await s.call("post", { channel: "user", text: "need a decision" })).status).toBe("posted");
+    expect((await s.call("read", { channel: "user" })).error.code).toBe("forbidden");
+    expect((await readAs("user", "?since=0")).messages.some((x: any) => x.from === s.agent && x.text === "need a decision")).toBe(true);
+  });
+
+  it("a redelivered call lands once; a mid-turn delivery joins the inbox stream", async () => {
+    const s = await setup();
+    const name = `team/${uniq("r")}`;
+    await s.call("channel_create", { channel: name });
+    // The same call id again (the runner resent it after a reconnect): the stored outcome, no second post.
+    const id = "cal_redeliver1";
+    s.ws.send({ type: "tool_call", seq: s.nextSeq(), call: id, turn: "trn_x", name: "post", arguments: { channel: name, text: "once" } });
+    const first = await s.ws.next("tool_result", (m) => m.call === id);
+    s.ws.send({ type: "tool_call", seq: s.nextSeq(), call: id, turn: "trn_x", name: "post", arguments: { channel: name, text: "once" } });
+    const second = await s.ws.next("tool_result", (m) => m.call === id);
+    expect(second.outcome).toEqual(first.outcome);
+    expect((await readAs(name)).head).toBe(1);
+    // Mid-turn: an inbox post reaches the brain as an inbox message (stdin and the Stop hook's mirror), not a turn.
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
+    await s.ws.next("run_turn");
+    await postAs(`${s.agent}/inbox`, { text: "ping mid-turn" }, 201);
+    const inbox = await s.ws.next("inbox", () => true, 10_000);
+    expect(inbox.message).toMatchObject({ from: "platform" });
+    expect(inbox.message.text).toContain(`Channel ${s.agent}/inbox: 1 new message`);
+    expect(inbox.message.text).toContain("ping mid-turn");
+    expect((await batchTurns(s.agent)).length).toBe(0);
+  });
+
+  it("rule 1: a channel write re-checks the agent epoch after its awaits (a superseded brain posts nothing)", async () => {
+    const s = await setup();
+    const name = `team/${uniq("fence")}`;
+    await s.call("channel_create", { channel: name });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["dispatch:beforeWrite"] = async () => {
+        delete inst.testHooks["dispatch:beforeWrite"];
+        (inst as any).update((i: any) => {
+          i.agent_epoch += 1;
+          i.brain.epoch = i.agent_epoch;
+        });
+      };
+    });
+    const id = "cal_fenced1";
+    s.ws.send({ type: "tool_call", seq: s.nextSeq(), call: id, turn: "trn_x", name: "post", arguments: { channel: name, text: "from a stale brain" } });
+    const res = await s.ws.next("tool_result", (m) => m.call === id, 2000).catch(() => null);
+    expect(res === null || res.outcome.status === "error").toBe(true);
+    expect((await readAs(name)).head).toBe(0);
+  });
+
+  it("a session that can see untrusted content posts tainted, and reading a tainted message taints a clean one", async () => {
+    const web = await setup({ builtin_tools: ["WebSearch"] });
+    const name = `team/${uniq("taint")}`;
+    await web.call("channel_create", { channel: name });
+    await web.call("post", { channel: name, text: "from the web" });
+    expect((await readAs(name)).messages[0]).toMatchObject({ from: web.agent, taint: true });
+    // A clean agent with read on it reads the tainted message: its own later posts are tainted.
+    const clean = await setup();
+    await adminJson(`/v1/admin/channels/${enc(name)}/acl`, { method: "PUT", body: [{ principal: clean.agent, action: "read" }] });
+    const mine = `team/${uniq("mine")}`;
+    await clean.call("channel_create", { channel: mine });
+    await clean.call("post", { channel: mine, text: "before" });
+    expect(clean.value(await clean.call("read", { channel: name })).tainted).toBe(true);
+    await clean.call("post", { channel: mine, text: "after" });
+    expect((await readAs(mine)).messages.map((m: any) => m.taint)).toEqual([false, true]);
+  });
+});
+
+describe("catalog seed migration", () => {
+  const catalogStub = (name: string) => env.CATALOG.get(env.CATALOG.idFromName(name));
+
+  /** A catalog as the previous release seeded it: version 1, no `seed_version`. */
+  async function v1Catalog(edit?: (sql: SqlStorage) => void) {
+    const stub = catalogStub(uniq("catalog-v1"));
+    await runInDurableObject(stub, (_i: CatalogDO, st) => {
+      const sql = st.storage.sql;
+      sql.exec("DELETE FROM capabilities");
+      sql.exec("DELETE FROM templates");
+      sql.exec("DELETE FROM kv");
+      for (const [n, c] of Object.entries(SEED_CATALOG_V1.capabilities)) {
+        const { grants: _g, ...old } = c;
+        sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", n, JSON.stringify(old));
+      }
+      for (const [n, t] of Object.entries(SEED_CATALOG_V1.templates)) sql.exec("INSERT INTO templates (name, body) VALUES (?, ?)", n, JSON.stringify(t));
+      sql.exec("INSERT INTO kv (key, value) VALUES ('seeded', '1')");
+      edit?.(sql);
+    });
+    return stub;
+  }
+  const restart = (stub: ReturnType<typeof catalogStub>) =>
+    runInDurableObject(stub, async (_i: CatalogDO, st) => new CatalogDO(st, env as never).catalog());
+
+  it("adds the new seed capabilities once, keeps the operator's entries, and never resurrects a deleted one", async () => {
+    const stub = await v1Catalog((sql) => {
+      // The operator deleted `memory` and made their own `channels` before this release.
+      sql.exec("DELETE FROM capabilities WHERE name = 'memory'");
+      sql.exec("INSERT INTO capabilities (name, body) VALUES ('channels', ?)", JSON.stringify({ tools: ["notify"], rules: [], prompt: "mine" }));
+    });
+    const after = await restart(stub);
+    expect(after.capabilities["messaging-tree"]?.tools).toEqual(["message"]);
+    expect(after.capabilities.channels).toMatchObject({ tools: ["notify"], prompt: "mine" });
+    expect(after.capabilities).not.toHaveProperty("memory");
+    // Templates are the operator's: unchanged.
+    expect(after.templates.worker?.capabilities).toEqual(SEED_CATALOG_V1.templates.worker!.capabilities);
+    const version = await runInDurableObject(stub, (_i: CatalogDO, st) => st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value);
+    expect(version).toBe("2");
+    // Deleted after the migration: stays deleted across restarts.
+    await stub.deleteCapability("messaging-tree");
+    expect(await restart(stub)).not.toHaveProperty("capabilities.messaging-tree");
+    // A capability stored before grants existed still parses and expands (no grants).
+    expect((await stub.expand({ template: "worker", hands: true, by: "operator" })).channel_grants).toEqual([]);
+  });
+
+  it("a fresh catalog has the channel capabilities and records the current version", async () => {
+    const stub = catalogStub(uniq("catalog-fresh"));
+    const cat = await stub.catalog();
+    expect(cat.capabilities.channels?.grants).toEqual([{ action: "post", channel: "user" }]);
+    expect(Object.keys(cat.templates).sort()).toEqual(["captain", "worker"]);
+  });
+});

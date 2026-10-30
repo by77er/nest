@@ -34,6 +34,7 @@ An agent that reads untrusted content, holds private data and can send data out 
 - **It propagates:** a spawned agent starts with its spawner's taint, and every post carries its sender's taint.
 - **Sinks** are the actions that can send data out or widen authority: widening an egress policy, external brokered actions, `mcp` tools not marked read-only, `api` capabilities with `mode: rw`, and granting a sink action. Each sink grant carries `when_tainted: approve | allow` (default `approve`), and attenuation can only tighten it.
 - **A sink call from a tainted session** with `approve` posts a question to the escalation channel. Only I or an untainted holder of that grant can approve it.
+- **Built so far:** a conservative stand-in kept by AgentDO: a session is tainted if the agent has hands or a web built-in, or once it read a tainted channel message (sticky). It stamps channel posts; nothing checks it at a sink yet.
 - **Ways back to clean:**
   - A fresh session starts untainted unless the wake that starts it carries taint, or it then reads tainted content.
   - **Quarantined reports:** a spawn spec can declare a `report_schema` of enums, numbers and ids. A child's final report that validates against it reaches the spawner untainted, even from a tainted child. This is the dual-LLM / map-reduce pattern from [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837) (2025-06), and how a captain stays clean while its workers read code.

@@ -1,18 +1,21 @@
 # ChannelDO
 
-The authority for one [channel](../../../channels/): its log, subscriptions and their cursors.
+The authority for one [channel](../../../channels/): its log, keyed view, grant list, subscriptions and their cursors.
 
-- **Storage:** message index, keyed view and recent bodies in SQLite. Bodies over about 32 KB, and every body older than 7 days, go to R2 (`channels/<channel>/<seq>`); reads fetch them transparently. Retention and tiering run from the alarm.
+- **Storage:** message index, keyed view and recent bodies in SQLite. Bodies over 32 KiB, and every body older than 7 days, go to R2 (`channels/<channel>/b/<id>`, a random id: the object is written before the post's `seq` is assigned); reads fetch them transparently. Retention and tiering run from the alarm (daily `maintenance`).
 - **Post:**
-  1. Check the poster's grant (AgentDO already checked it; ChannelDO checks the channel's own grant list again).
-  2. Assign `seq`, store, update the keyed index.
-  3. Set the alarm and return. **Fan-out never runs in the post path,** so one slow subscriber can't stall a post or keep the channel billed.
-- **Fan-out runs from the alarm:** `AgentDO.deliver(channel, messages)` per matching subscription, with bounded parallelism, RPC timeouts and per-subscriber backoff. It's at least once and in order per subscription: a cursor advances only after its AgentDO acks. Past about 100 subscribers, a channel would shard its fan-out (or use Queues).
-- **Guards:** idempotency keys, dropped repeats and per-poster rate limits are applied before `seq` is assigned. See [limits](../../../channels/#limits-and-loop-guards).
-- **Subscriptions live here** (filter, delivery, batch window, `once`, cursor). AgentDO keeps only the list of its own subscriptions, for display and cleanup.
-- **Batching:** a subscription with `batch_ms` is flushed by the alarm.
-- **Replies:** an `await_reply_s` wait is held in the poster's AgentDO call and backed by a `once` subscription. An eviction loses only the synchronous wait, never the reply.
-- **Built-in channels** (`<agt>/inbox`, `<agt>/events`, `<sbx>/events`, `user`) are ordinary ChannelDOs, created with the agent or sandbox and owned by it.
-- **Cost:** idle channels hold no WebSocket and no alarm, so they cost only storage.
+  1. Check the poster's permission (the caller's identity, the channel's own grant list, the caller's capability grants: one pure decision, `permits` in `control-plane/src/lib/channels.ts`).
+  2. A body over 32 KiB is put in R2 first; then, in one synchronous step, the permission is checked again (the grant list may have changed during the put), the guards run, `seq` is assigned, the message and keyed view are written, matching `turn` subscriptions open their batch window, and the alarm is armed.
+  3. Return. **Fan-out never runs in the post path,** so one slow subscriber can't stall a post or keep the channel billed.
+- **`from` and `taint` come from the caller,** never the body: the body schema is strict, so a post naming either is refused. AgentDO passes the agent's identity and its session's taint, the operator API passes `user`, and AgentDO and SandboxDO post their events as `platform`.
+- **Guards** (`decidePost`), in order, before `seq` is assigned: idempotency keys (a repeated key returns its `seq`; kept 7 days), `reply_to` must name an earlier message, compare-and-set on the key (`if_seq`; `0` means absent), a sender's identical repeat within a minute (not stored; its earlier `seq` is returned), and the per-poster rate limit (120 posts a minute per channel; not for `user` or `platform`). See [limits](../../../channels/#limits-and-loop-guards).
+- **Fan-out runs from the alarm** (`fanout`): `AgentDO.deliverChannel` per due subscription, 8 at a time, with a 30 s call timeout. At least once and in order per subscription: the batch is **pinned** (stored with a 35 s backstop retry) before the call, every retry carries the same range, the cursor moves only after AgentDO acknowledged it, and an answer counts only against the batch still pinned. A failed call backs off (1 s doubling to 5 min); AgentDO's loop guards answer `defer`, which unpins without moving the cursor, so later matches coalesce into the next batch. A subscriber that isn't an agent is dropped. Past about 100 subscribers a channel would shard its fan-out (or use Queues).
+- **Subscriptions live here** (filter, delivery, batch window, `once`, cursor, the pinned batch). AgentDO keeps only its own list with each one's delivered high-water `seq`, for display and deduplication. A subscriber needs `read`; an agent subscribes only itself (the operator may subscribe any agent). The cursor starts at the head: only later messages are delivered.
+  - `turn`: matches open a window of `batch_ms` (default 2 s, at most 10 min); everything matching in the window is one batch.
+  - `none`: no delivery; the subscriber's `read` without `since` reads from the cursor and moves it (a re-run of the same tool call reads the same page again).
+  - `once`: the first match is the batch, and the subscription ends when AgentDO takes it.
+- **Built-in channels** (`<agt>/inbox`, `<agt>/events`, `<sbx>/events`, `user`) exist implicitly: their object is made on first use. An agent's inbox has its agent's subscription (`sub_inbox`, `turn`, from the start of the log), which the agent can't remove. An agent's events gets its spawner's subscription (`sub_spawner`, kinds `turn_completed` and `exited`) on the first event AgentDO posts. Free channels are made by `channel_create` (the creator owns them; idempotent for the owner, refused for anyone else) or the operator; names starting with `agt_`, `sbx_`, `hk_`, `ws_`, `user/` or `platform` are reserved.
+- **Directory:** each channel registers itself (from its alarm, retried) with the `~directory` instance, which the operator API lists.
+- **Cost:** idle channels hold no WebSocket and no alarm beyond the daily maintenance, so they cost only storage.
 
-**Not built.**
+**Built** (control-plane `src/do/channel.ts`, every decision in `src/lib/channels.ts`, unit- and property-tested): all of the above. **Not built:** `await_reply_s` and `read` with a wait (the `once` subscription they rely on is built), hooks posting (HookDO), the guest `nest post`, the `interrupt` flag, the wake envelope's budget line, and background task exits on `<agt>/inbox` (they still reach a working brain's inbox directly). `notify`, `ask`, `emit` and `POST /v1/agents/<id>/inbox` still go to AgentDO's inbox and the interim [workstream channel](../../../orchestration/workstreams/#the-interim-workstream-channel); moving them onto channels is the next stage. Retention is set per channel at creation (`retention_days`, default 30; built-in channels use the default); there is no route to change it later.
