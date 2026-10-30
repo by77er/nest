@@ -12,7 +12,7 @@ import type { CommitRequestEvent } from "../src/protocol/control";
 import { storedEnum } from "../src/lib/stored";
 import { SandboxState } from "../src/protocol/model";
 import type { AgentDO } from "../src/do/agent";
-import { adminJson, BASE, connectHost, csrPem, manifest, nextCommands, okResult, uniqueCell } from "./helpers";
+import { adminJson, BASE, connectHost, csrPem, hostHello, manifest, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
@@ -693,5 +693,44 @@ describe("FleetDO's own answers are no evidence that a host processes commands",
       expect(p.processed).toBe(false);
       expect(p.host_processing).toBe(false);
     });
+  });
+
+  it("nor are the answers to what an old nestd process left: a kill it never ran is not processed", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "restart answers" } }, 201);
+    const sbx = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
+    await okResult(h.ws, create.cmd);
+    const agent = "agt_01restartkill000000000000";
+    // Unanswered when nestd restarts: one for the sandbox the new process won't report (closed by
+    // dropUnreported), one for the host (failed retryably), and the kill (issued last).
+    const [checkpoint] = await fleetStub(cell).issueCommands(h.host, [{ type: "sandbox_checkpoint", sandbox: sbx.sandbox, epoch: 1, reason: "checkpoint" }]);
+    const [fence] = await fleetStub(cell).issueCommands(h.host, [{ type: "fence", sandboxes: [], reason: "t" }]);
+    const kill = await fleetSql(cell, (_sql, inst) => inst.issueKill(h.host, agent, 1, "t"));
+    const ws = await Ws.connect("/v1/fleet", h.host_token);
+    ws.send(hostHello(h.host, cell, { instance_id: "nestdtest0000002", sandboxes: [] }));
+    const seq = sendEvents(ws, []); // queued behind the hello: its ack means the hello is done
+    await ws.next("ack", (m) => m.up_to === seq);
+
+    expect(await fleetSql(cell, (_sql, inst) => inst.killProgress(kill, agent, h.host, 1))).toMatchObject({ processed: false, host_processing: false });
+    const answered = await fleetSql(cell, (sql) =>
+      rows(sql, "SELECT answered_by FROM commands WHERE cmd IN (?, ?, ?) AND result IS NOT NULL", checkpoint!, fence!, kill));
+    expect(answered).toEqual([{ answered_by: "fleet" }, { answered_by: "fleet" }, { answered_by: "fleet" }]);
+  });
+
+  it("only its kills outlive their retention on a host whose death isn't proof", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell); // live: `lost` = 0
+    const old = Date.now() - 2 * DAY;
+    await fleetSql(cell, (sql) => {
+      for (const [cmd, type, by] of [["cmd_fleetfence", "fence", "fleet"], ["cmd_fleetkill", "agent_stop", "fleet"], ["cmd_hostkill", "agent_stop", null]]) {
+        sql.exec(`INSERT INTO commands (cmd, host, type, body, issued_ms, result, result_ms, answered_by)
+          VALUES (?, ?, ?, '{}', ?, '{"status":"ok"}', ?, ?)`, cmd, h.host, type, old, old, by);
+      }
+    });
+    await prune(cell);
+    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT cmd FROM commands WHERE cmd IN ('cmd_fleetfence', 'cmd_fleetkill', 'cmd_hostkill')")))
+      .toEqual([{ cmd: "cmd_fleetkill" }]);
   });
 });
