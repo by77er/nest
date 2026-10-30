@@ -4,7 +4,7 @@
 //! and "Retiring an incarnation"). Plain values only; `nestd` keeps the maps, files and timers and
 //! calls these for the decision.
 
-use std::time::Duration;
+use core::time::Duration;
 
 // Tombstones (`nestd::tombstones`): the highest fenced epoch per sandbox; nothing at or below it is
 // accepted.
@@ -402,7 +402,7 @@ mod proofs {
         let bytes: [u8; 6] = kani::any();
         let len: usize = kani::any_where(|l| *l <= 6);
         kani::assume(bytes[..len].is_ascii());
-        let name = std::str::from_utf8(&bytes[..len]).unwrap();
+        let name = core::str::from_utf8(&bytes[..len]).unwrap();
         let is_dir: bool = kani::any();
         let entry = classify_entry(name, is_dir);
         if name.ends_with(DELETING) {

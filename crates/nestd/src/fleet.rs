@@ -303,6 +303,7 @@ fn log(url: &str, l: Log) {
         Log::Unparseable { error } => tracing::warn!(%error, "unparseable fleet message"),
         Log::CommandGap { seq, expected } => tracing::warn!(seq, expected, "fleet command batch out of order; reconnecting"),
         Log::OutboxShed { shed } => tracing::warn!(shed, "fleet outbox full: shed low-value events"),
+        Log::InvariantViolated { name } => tracing::error!(invariant = name, "fleet core invariant violated"),
     }
 }
 

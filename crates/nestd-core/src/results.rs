@@ -5,8 +5,10 @@
 //! Ordered maps only, never a hashed one: its hasher seeds itself from the OS, which a core must not
 //! touch, and Kani can't reason about it.
 
-use std::borrow::Borrow;
-use std::collections::{BTreeMap, VecDeque};
+use alloc::borrow::ToOwned;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
+use core::borrow::Borrow;
 
 /// How many outcomes nestd keeps: far more than FleetDO can have unacked at once.
 pub const RESULTS_KEPT: usize = 4096;
@@ -83,7 +85,7 @@ pub struct ResultCache<V, K = String, M = BTreeMap<K, V>, O = VecDeque<K>> {
     map: M,
     /// Insertion order of the keys in `map`, oldest first.
     order: O,
-    _entries: std::marker::PhantomData<(K, V)>,
+    _entries: core::marker::PhantomData<(K, V)>,
 }
 
 impl<V, K: Clone, M: OutcomeMap<K, V>, O: KeyOrder<K>> Default for ResultCache<V, K, M, O> {
@@ -94,7 +96,7 @@ impl<V, K: Clone, M: OutcomeMap<K, V>, O: KeyOrder<K>> Default for ResultCache<V
 
 impl<V, K: Clone, M: OutcomeMap<K, V>, O: KeyOrder<K>> ResultCache<V, K, M, O> {
     pub fn new(cap: usize) -> Self {
-        Self { cap, map: M::default(), order: O::default(), _entries: std::marker::PhantomData }
+        Self { cap, map: M::default(), order: O::default(), _entries: core::marker::PhantomData }
     }
 
     /// The outcome recorded for `cmd`, if it ran (and hasn't been evicted).
@@ -151,7 +153,7 @@ mod tests {
 /// Kani harnesses (`cargo kani -p nestd-core --harness results::proofs::<name>`).
 #[cfg(kani)]
 mod proofs {
-    use std::borrow::Borrow;
+    use core::borrow::Borrow;
 
     use super::{KeyOrder, OutcomeMap, ResultCache};
 

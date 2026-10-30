@@ -17,7 +17,9 @@
 //! through to the host. nestd instantiates them with the protocol types; the model checker with
 //! small ones.
 
-use std::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::invariant;
 
@@ -141,6 +143,8 @@ pub enum Log {
     Unparseable { error: String },
     CommandGap { seq: Seq, expected: Seq },
     OutboxShed { shed: u64 },
+    /// A core invariant failed in this step (release builds; a debug build panics first).
+    InvariantViolated { name: &'static str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -333,10 +337,22 @@ impl<E: OutboxEvent> FleetLink<E> {
             Input::Frame(f) => self.on_frame(now, f, &mut fx),
             Input::Tick => self.on_tick(now, &mut fx),
         }
-        invariant::check(Self::effects_well_formed(&fx), "fleet_effects_well_formed");
-        invariant::check(self.unacked.iter().zip(self.unacked.iter().skip(1)).all(|(a, b)| a.0 < b.0), "fleet_unacked_in_order");
-        invariant::check(self.unacked.back().is_none_or(|(s, _)| *s < self.next_seq), "fleet_seq_never_reused");
+        let well_formed = Self::effects_well_formed(&fx);
+        Self::check(well_formed, "fleet_effects_well_formed", &mut fx);
+        let in_order = self.unacked.iter().zip(self.unacked.iter().skip(1)).all(|(a, b)| a.0 < b.0);
+        Self::check(in_order, "fleet_unacked_in_order", &mut fx);
+        let fresh = self.unacked.back().is_none_or(|(s, _)| *s < self.next_seq);
+        Self::check(fresh, "fleet_seq_never_reused", &mut fx);
         fx
+    }
+
+    /// Assert an invariant inside a step: a violation is reported as this step's
+    /// [`Log::InvariantViolated`] (pushed before a debug build panics on it).
+    fn check<C, R, O>(ok: bool, name: &'static str, fx: &mut Effects<E, C, R, O>) -> bool {
+        if !ok {
+            fx.push(Effect::Log(Log::InvariantViolated { name }));
+        }
+        invariant::holds(ok, name)
     }
 
     /// At most one connect per step, and nothing is sent after a close.
@@ -390,7 +406,7 @@ impl<E: OutboxEvent> FleetLink<E> {
                         return self.close(now, fx);
                     }
                     let sent_ms = now.wall.max(self.last_sent_ms + 1);
-                    invariant::check(sent_ms > self.last_sent_ms, "fleet_heartbeat_keys_increase");
+                    Self::check(sent_ms > self.last_sent_ms, "fleet_heartbeat_keys_increase", fx);
                     self.last_sent_ms = sent_ms;
                     self.sent.insert(sent_ms, (now.mono, now.boot));
                     while self.sent.len() > HEARTBEATS_KEPT {
@@ -477,7 +493,7 @@ impl<E: OutboxEvent> FleetLink<E> {
                         fx.push(Effect::Log(Log::CommandGap { seq, expected }));
                         self.close(now, fx);
                     } else {
-                        invariant::check(self.forwarded_command_seq.is_none_or(|f| seq > f), "fleet_commands_forwarded_in_order");
+                        Self::check(self.forwarded_command_seq.is_none_or(|f| seq > f), "fleet_commands_forwarded_in_order", fx);
                         self.forwarded_command_seq = Some(seq);
                         self.expected_command_seq = Some(seq + 1);
                         fx.push(Effect::Notify(Notice::Commands { seq, commands }));
@@ -517,7 +533,7 @@ impl<E: OutboxEvent> FleetLink<E> {
         if self.pending.is_empty() {
             return;
         }
-        let events = std::mem::take(&mut self.pending);
+        let events = core::mem::take(&mut self.pending);
         let seq = self.next_seq;
         self.next_seq += 1;
         self.unacked.push_back((seq, events.clone()));
@@ -564,7 +580,7 @@ impl<E: OutboxEvent> FleetLink<E> {
 mod tests {
     use super::*;
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq)]
     struct E;
 
     impl OutboxEvent for E {
@@ -588,5 +604,17 @@ mod tests {
         assert!(!ok(vec![Effect::Close, send()]));
         assert!(!ok(vec![Effect::Close, Effect::Close]));
         assert!(!ok(vec![connect(), connect()]));
+    }
+
+    /// A violated invariant inside a step comes back as that step's effect, which the shell logs:
+    /// a release build reports it this way and carries on; a debug build also panics.
+    #[test]
+    fn a_violated_invariant_is_reported_as_an_effect() {
+        let mut fx: Effects<E, (), (), ()> = vec![Effect::Close];
+        assert!(FleetLink::<E>::check(true, "holds", &mut fx));
+        assert_eq!(fx, vec![Effect::Close], "a holding invariant adds nothing");
+        let held = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| FleetLink::<E>::check(false, "broken", &mut fx)));
+        assert_eq!(held.is_err(), cfg!(debug_assertions), "a debug build panics, a release build doesn't");
+        assert_eq!(fx, vec![Effect::Close, Effect::Log(Log::InvariantViolated { name: "broken" })]);
     }
 }
