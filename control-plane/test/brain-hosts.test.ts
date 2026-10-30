@@ -741,14 +741,52 @@ describe("a brain the operator stopped restarts nothing, however it ends (stop_e
     expect(await b.ws.none("commands", 300, (m) => (m.commands as any[]).some(isStartOf(agent)))).toBe(true);
   });
 
+  const epochReaches = async (agent: string, epoch: number) => {
+    for (let n = 0; n < 80 && (await agentStub(agent).info()).agent_epoch < epoch; n++) await new Promise((r) => setTimeout(r, 25));
+    return (await agentStub(agent).info()).agent_epoch;
+  };
+
+  it("E1: input after the stop, while the stopped brain winds down, starts the agent once it exits", async () => {
+    const { a, agent } = await started();
+    await agentStub(agent).stop("requested");
+    await agentStub(agent).enqueueTurn({ kind: "user", text: "after the stop" });
+    expect((await agentStub(agent).info()).agent_epoch).toBe(1);
+    await agentStub(agent).onExited(a.host, "stopped", 1);
+    expect(await epochReaches(agent, 2)).toBe(2);
+  });
+
+  it("E2: input after the stop, then a drain condemns the stopped brain: its fenced exit starts the agent elsewhere", async () => {
+    const { cell, a, b, agent } = await started();
+    // Mid-turn: the message goes to the brain's inbox, not a new turn.
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => {
+      const info = JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.current_turn = "trn_waiting";
+      s.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+      s.storage.sql.exec("UPDATE turns SET status = 'active' WHERE turn = 'trn_waiting'");
+    });
+    await agentStub(agent).stop("requested");
+    await agentStub(agent).postInbox("user", "after the stop");
+    expect(await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => s.storage.sql.exec("SELECT 1 FROM turns WHERE status = 'queued'").toArray().length)).toBe(0);
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", a.host);
+    });
+    await agentStub(agent).onHostDraining(a.host);
+    await agentStub(agent).onExited(a.host, "fenced", 1);
+    const [start] = await nextCommands(b.ws, isStartOf(agent));
+    expect(start).toMatchObject({ epoch: 2 });
+  });
+
   it("a start made after the stop still runs after the stopped brain ends", async () => {
     const { a, agent } = await started();
     await agentStub(agent).stop("requested");
     // The operator starts it again while the stopped brain is still finishing: kept, run after its exit.
     expect(await agentStub(agent).start()).toMatchObject({ kind: "none" });
     await agentStub(agent).onExited(a.host, "stopped", 1);
-    for (let n = 0; n < 80 && (await agentStub(agent).info()).agent_epoch < 2; n++) await new Promise((r) => setTimeout(r, 25));
-    expect((await agentStub(agent).info()).agent_epoch).toBe(2);
+    expect(await epochReaches(agent, 2)).toBe(2);
+    // That new brain is not the stopped one: its crash with the old work still waiting restarts it.
+    const host = (await agentStub(agent).info()).brain!.host;
+    await agentStub(agent).onExited(host, "crashed", 2);
+    expect(await epochReaches(agent, 3)).toBe(3);
   });
 });
 

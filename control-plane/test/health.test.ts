@@ -10,13 +10,17 @@ import wrangler from "../wrangler.jsonc?raw";
 
 // Every Durable Object binding wrangler.jsonc declares, by class name, read from the file itself: a
 // class added there without a probe in lib/health.ts fails below.
+// Each binding object, whatever its key order; every `class_name` in the file must be one of them.
+const BINDINGS = [...wrangler.matchAll(/\{[^{}]*"class_name"[^{}]*\}/g)].map(([obj]) => ({
+  binding: /"name":\s*"(\w+)"/.exec(obj)?.[1], cls: /"class_name":\s*"(\w+)"/.exec(obj)?.[1],
+}));
 const CLASSES: Record<string, DurableObjectNamespace> = Object.fromEntries(
-  [...wrangler.matchAll(/\{\s*"name":\s*"(\w+)",\s*"class_name":\s*"(\w+)"\s*\}/g)]
-    .map(([, binding, cls]) => [cls!, (env as unknown as Record<string, DurableObjectNamespace>)[binding!]!]),
+  BINDINGS.map(({ binding, cls }) => [cls!, (env as unknown as Record<string, DurableObjectNamespace>)[binding!]!]),
 );
 
 describe("GET /v1/health", () => {
   it("answers 200 only after every DO class answered, naming each class and nothing else", async () => {
+    expect(Object.keys(CLASSES).length).toBe([...wrangler.matchAll(/"class_name"/g)].length);
     expect(Object.keys(CLASSES).length).toBeGreaterThanOrEqual(8);
     for (const ns of Object.values(CLASSES)) expect(ns).toBeDefined();
     const res = await SELF.fetch(`${BASE}/v1/health`);

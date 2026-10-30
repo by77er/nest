@@ -180,6 +180,13 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
    * release before it, which keeps the field without reading it).
    */
   stop_epoch?: number;
+  /**
+   * Set by an operator's stop, cleared by the next input (a turn, an inbox message, a delivery merged
+   * into a queued turn) or the next start issued: while set, nothing that predates the stop wakes the
+   * agent (a release, a sandbox move, a wake alarm). Input after the stop clears it, so a stopped
+   * brain's end then wakes the agent for it (`wake`, `release`).
+   */
+  stop_quiet?: boolean;
   /** Claude Code `system/init.capabilities`, from the latest `capabilities` event. */
   capabilities?: string[];
   /** When the transcript was last made durable (a recovery turn says where it ends). */
@@ -823,6 +830,7 @@ export class AgentDO extends DurableObject<Env> {
   private async issueStart(host: string, oauthRef: string, resume: AgentStartBody["resume"], intent: StartIntent): Promise<StartResult> {
     const started = this.update((i) => {
       i.agent_epoch += 1;
+      delete i.stop_quiet;
       i.brain = { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() };
       i.intent = null;
       delete i.capacity_waits;
@@ -1052,10 +1060,14 @@ export class AgentDO extends DurableObject<Env> {
     // `fenced` exit, its host's loss): no wake, no crash count. Decided in the step that releases.
     let ended = reason;
     let restarts = false;
+    // Whether waiting work starts a brain: an exit that restarts, or a stopped brain's end when
+    // input arrived after the stop (uncounted; `stop_quiet` cleared). Work from before the stop waits.
+    let wakes = false;
     const info = this.update((i) => {
       if (!i.brain || i.brain.host !== host || epoch < i.brain.epoch) return;
       if (stoppedBrain(i, i.brain.epoch)) ended = "stopped";
       restarts = RESTART_ON_EXIT[ended] && ended !== "idle";
+      wakes = RESTART_ON_EXIT[ended] || (stoppedBrain(i, i.brain.epoch) && !i.stop_quiet);
       // Counted once, where it happens (the crash-loop guard): here for a brain that ended on its
       // own; a condemned brain's exit is the condemn's outcome, counted by its cause if at all.
       if (restarts && i.brain.phase !== "condemned") i.exit_restarts = (i.exit_restarts ?? 0) + 1;
@@ -1074,21 +1086,21 @@ export class AgentDO extends DurableObject<Env> {
     });
     if (!released) return false;
     // Reported on `<agt>/events` (queued in this step; posted from the alarm). Not part of the decision.
-    this.reportExit(info, host, epoch, reason, !RESTART_ON_EXIT[ended]);
+    this.reportExit(info, host, epoch, reason, !wakes);
     const work = !!info.current_turn || this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
     const armed = Promise.all([
       this.deadlines.clear("condemned"),
       this.deadlines.clear("starting"),
       this.deadlines.clear("no_session"),
       info.intent ? this.deadlines.set("intent", Date.now(), true)
-        : work && RESTART_ON_EXIT[ended] ? this.deadlines.set(ended === "idle" ? "wake" : "wake_after_exit", Date.now(), true) : Promise.resolve(),
+        : work && wakes ? this.deadlines.set(restarts ? "wake_after_exit" : "wake", Date.now(), true) : Promise.resolve(),
     ]);
     await this.hook("release:afterCommit");
     await armed;
     console.log(`agent ${info.agent}: brain on ${host}@${epoch} released (${reason})`);
     this.fenceSessions(`brain released (${reason})`, host);
     await this.syncActivity();
-    if (!info.intent && RESTART_ON_EXIT[ended]) await this.wake(restarts);
+    if (!info.intent && wakes) await this.wake(restarts);
     return true;
   }
 
@@ -1111,6 +1123,7 @@ export class AgentDO extends DurableObject<Env> {
       i.intent = null;
       delete i.capacity_waits;
       i.stop_epoch = i.agent_epoch;
+      i.stop_quiet = true;
     });
     // Wakes armed before the stop (a release's, a sandbox move's) are for work the stop ends too.
     await Promise.all([this.deadlines.clear("intent"), this.deadlines.clear("wake"), this.deadlines.clear("wake_after_exit")]);
@@ -1246,6 +1259,15 @@ export class AgentDO extends DurableObject<Env> {
     return true;
   }
 
+  /** Input arrived (a turn, an inbox message, a merged delivery): a stop before it no longer quiets wakes. */
+  private inputArrived(): void {
+    if (this.load().stop_quiet) {
+      this.update((i) => {
+        delete i.stop_quiet;
+      });
+    }
+  }
+
   /**
    * Start a brain for waiting work (a queued turn, or the turn it was in the middle of) when it has
    * none, through the intent. A condemned brain's intent waits for its release. Never throws:
@@ -1256,6 +1278,8 @@ export class AgentDO extends DurableObject<Env> {
   private async wake(afterExit = false): Promise<void> {
     const info = this.load();
     if (info.brain && info.brain.phase !== "condemned") return;
+    // Stopped, with no input since: the work waiting predates the stop, which ended it.
+    if (info.stop_quiet) return;
     const queued = this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
     if (!info.current_turn && !queued) return;
     if (afterExit && (info.exit_restarts ?? 0) > MAX_EXIT_RESTARTS) {
@@ -1908,6 +1932,7 @@ export class AgentDO extends DurableObject<Env> {
       turn, ord, JSON.stringify(input), Date.now(), requestId ?? null);
     // Another agent's text (a workstream batch) reaches the model inline: the session is tainted.
     if (tainted) this.kvPut("read_tainted", true);
+    this.inputArrived();
     await this.pump();
     await this.wake();
     return turn;
@@ -1973,6 +1998,7 @@ export class AgentDO extends DurableObject<Env> {
     // Another agent's text reaches the model inline (stdin, the Stop hook, or a turn): when it may be
     // tainted, so is this session from now on (written with the message, in this step).
     if (tainted) this.kvPut("read_tainted", true);
+    this.inputArrived();
     if (info.current_turn) {
       this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, '${INBOX.delivered}', ?, ?)`,
         message.id, JSON.stringify(message), info.current_turn, Date.now(), requestId ?? null);
@@ -2205,6 +2231,7 @@ export class AgentDO extends DurableObject<Env> {
       take();
       this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ ...prior, text: merged } satisfies TurnInput), waiting.turn);
       this.sql.exec("INSERT INTO chan_wakes (ts_ms) VALUES (?)", now);
+      this.inputArrived();
       await this.wake();
       return ack;
     }
