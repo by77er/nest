@@ -62,12 +62,18 @@ export class WorkstreamDO extends DurableObject<Env> {
   private info_(): WorkstreamInfo | undefined {
     const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0];
     if (!row) return undefined;
-    const { captain, ...info } = JSON.parse(row.value) as Partial<WorkstreamInfo> & Omit<WorkstreamInfo, "subscriber"> & PreviousReleaseFields;
-    return { ...info, subscriber: info.subscriber ?? captain ?? null };
+    const raw = JSON.parse(row.value) as Partial<WorkstreamInfo> & Omit<WorkstreamInfo, "subscriber"> & PreviousReleaseFields;
+    const { captain, ...info } = raw;
+    // `captain` is written beside `subscriber` (below), and the previous release writes only it: when
+    // present it is the latest, even after a forward revert changed it.
+    return { ...info, subscriber: "captain" in raw ? captain ?? null : info.subscriber ?? null };
   }
 
   private save(info: WorkstreamInfo): void {
-    this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(info));
+    // For one release `captain` too, so a forward revert to the previous release keeps the subscriber.
+    const legacy: PreviousReleaseFields = { captain: info.subscriber };
+    this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      JSON.stringify({ ...info, ...legacy }));
   }
 
   async init(workstream: string, goal: string, subscriber: string | null): Promise<WorkstreamInfo> {

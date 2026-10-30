@@ -32,16 +32,26 @@ export class CatalogDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Every row that parses. One that doesn't (written by a later release, or edited by hand) is logged
+   * and skipped, so one bad row cannot stop spawning from every other template.
+   */
   private load(): Catalog {
-    const capabilities: Record<string, Capability> = {};
-    for (const r of this.sql.exec<{ name: string; body: string }>("SELECT name, body FROM capabilities").toArray()) {
-      capabilities[r.name] = Capability.parse(JSON.parse(r.body));
-    }
-    const templates: Record<string, Template> = {};
-    for (const r of this.sql.exec<{ name: string; body: string }>("SELECT name, body FROM templates").toArray()) {
-      templates[r.name] = Template.parse(JSON.parse(r.body));
-    }
-    return { capabilities, templates };
+    const rows = <T>(table: string, schema: { safeParse(v: unknown): { success: true; data: T } | { success: false } }) => {
+      const out: Record<string, T> = {};
+      for (const r of this.sql.exec<{ name: string; body: string }>(`SELECT name, body FROM ${table}`).toArray()) {
+        let parsed: { success: true; data: T } | { success: false };
+        try {
+          parsed = schema.safeParse(JSON.parse(r.body));
+        } catch {
+          parsed = { success: false };
+        }
+        if (parsed.success) out[r.name] = parsed.data;
+        else console.error(`catalog: ${table} row ${r.name} does not parse; skipped`);
+      }
+      return out;
+    };
+    return { capabilities: rows("capabilities", Capability), templates: rows("templates", Template) };
   }
 
   async catalog(): Promise<Catalog> {

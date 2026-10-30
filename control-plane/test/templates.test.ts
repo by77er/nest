@@ -4,6 +4,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
+import { CatalogDO } from "../src/do/catalog";
 import { adminJson, connectHost, nextCommands, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -215,10 +216,107 @@ describe("records stored with a role (the previous release)", () => {
     const stored = await runInDurableObject(agentStub(w.agent), (_i: AgentDO, st) =>
       JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
     expect(stored).toMatchObject({ tools: ["notify", "emit"], owner: c.agent });
-    for (const k of ["role", "grants", "captain"]) expect(stored).not.toHaveProperty(k);
+    // For a forward revert, the previous release's fields are written beside the spec, derived from
+    // it; the record the control plane reads has none of them.
+    expect(stored).toMatchObject({ role: "worker", grants: ["notify", "emit"], captain: c.agent });
+    for (const k of ["role", "grants", "captain"]) expect(info).not.toHaveProperty(k);
 
     await nextCommands(s.burst.ws, isStartOf(w.agent));
     const ws = await runner(w.agent, s.burst.host, s.burst.host_token);
     expect((await toolNames(ws)).map((t) => t.name)).toEqual(["notify", "emit"]);
+  });
+});
+
+describe("one release of compatibility, and the review's edge cases", () => {
+  const raw = async (stub: any) => runInDurableObject(stub, (_i: unknown, st: DurableObjectState) =>
+    JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
+
+  it("writes the previous release's fields beside the new ones, and reads a `captain` the previous release changed", async () => {
+    const s = await cellWithSandbox();
+    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell, start: false } }, 201);
+    expect(await raw(agentStub(c.agent))).toMatchObject({ role: "captain", captain: null, grants: (await agentStub(c.agent).info()).tools });
+    expect(await raw(wsStub(s.workstream))).toMatchObject({ subscriber: c.agent, captain: c.agent });
+    // A forward revert's release changes only `captain`: once back, that is the subscriber.
+    await runInDurableObject(wsStub(s.workstream), (_i, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.captain = null;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
+    expect((await wsStub(s.workstream).info()).subscriber).toBeNull();
+  });
+
+  it("a subscriber is an agent of the workstream; a new workstream takes none", async () => {
+    const s = await cellWithSandbox();
+    const other = await cellWithSandbox();
+    const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: other.sandbox, start: false } }, 201);
+    expect((await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: w.agent } }, 409)).error.message)
+      .toContain("is in workstream");
+    expect((await adminJson("/v1/workstreams", { body: { goal: "g", captain: w.agent } }, 400)).error.code).toBe("invalid_message");
+  });
+
+  it("the legacy grants field intersects silently", async () => {
+    const s = await cellWithSandbox();
+    const a = await adminJson("/v1/agents", { body: { role: "worker", sandbox: s.sandbox, grants: ["notify", "merge"], start: false } }, 201);
+    expect(a.tools).toEqual(["notify"]);
+  });
+
+  it("a stored owner in another workstream (an older record) still can't be notified", async () => {
+    const other = await cellWithSandbox();
+    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: other.workstream, cell: other.cell, start: false } }, 201);
+    const s = await cellWithSandbox();
+    const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
+    await editAgent(w.agent, (i) => {
+      i.owner = c.agent;
+    });
+    await nextCommands(s.burst.ws, isStartOf(w.agent));
+    const ws = await runner(w.agent, s.burst.host, s.burst.host_token);
+    ws.send({ type: "tool_call", seq: 1, call: "cal_own-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "hi" } });
+    expect((await ws.next("tool_result", (m) => m.call === "cal_own-1")).outcome.error.code).toBe("forbidden");
+    expect(await agentStub(c.agent).turns()).toEqual([]);
+  });
+
+  it("an ask re-run after its escalation changed is applied once, where it first went", async () => {
+    const s = await cellWithSandbox();
+    const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
+    await nextCommands(s.burst.ws, isStartOf(w.agent));
+    const ws = await runner(w.agent, s.burst.host, s.burst.host_token);
+    const ask = { type: "tool_call", call: "cal_rr-1", turn: "trn_x", name: "ask", arguments: { question: "Rerouted?" } };
+    ws.send({ ...ask, seq: 1 });
+    await ws.next("ack", (m) => m.up_to >= 1);
+    expect((await wsStub(s.workstream).events()).filter((e) => e.type === "needs_input").length).toBe(1);
+    // An eviction mid-call, across a deploy that sends this agent's questions to the user.
+    await editAgent(w.agent, (i) => {
+      i.escalate_to = "user";
+    });
+    await runInDurableObject(agentStub(w.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("UPDATE tool_calls SET status = 'dispatching', outcome = NULL");
+    });
+    ws.send({ ...ask, seq: 2 });
+    await ws.next("ack", (m) => m.up_to >= 2);
+    expect((await wsStub(s.workstream).events()).filter((e) => e.type === "needs_input").length).toBe(1);
+    expect((await wsStub(s.workstream).userNotifications()).some((n) => n.text.includes("Rerouted?"))).toBe(false);
+  });
+});
+
+describe("CatalogDO storage", () => {
+  const catalogStub = (name: string) => env.CATALOG.get(env.CATALOG.idFromName(name));
+
+  it("an entry deleted from the seed stays deleted when the object starts again", async () => {
+    const stub = catalogStub(uniqueName("catalog-restart"));
+    await stub.deleteTemplate("captain");
+    const after = await runInDurableObject(stub, async (_i: CatalogDO, st) => new CatalogDO(st, env as never).catalog());
+    expect(Object.keys(after.templates)).toEqual(["worker"]);
+  });
+
+  it("a row that doesn't parse is skipped, not fatal", async () => {
+    const stub = catalogStub(uniqueName("catalog-bad"));
+    await runInDurableObject(stub, (_i: CatalogDO, st) => {
+      st.storage.sql.exec("INSERT INTO templates (name, body) VALUES ('broken', '{\"hands\": \"sometimes\"}')");
+      st.storage.sql.exec("INSERT INTO capabilities (name, body) VALUES ('garbled', 'not json')");
+    });
+    const cat = await stub.catalog();
+    expect(Object.keys(cat.templates).sort()).toEqual(["captain", "worker"]);
+    expect(cat.capabilities).not.toHaveProperty("garbled");
+    expect((await stub.expand({ template: "worker", hands: true, by: "operator" })).template).toBe("worker");
   });
 });

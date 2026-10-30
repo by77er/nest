@@ -40,8 +40,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 5. Create work (all admin endpoints use `Authorization: Bearer $ADMIN_TOKEN`):
    - `GET /v1/admin/catalog` · `PUT|DELETE /v1/admin/capabilities/<name> {tools, rules, prompt}` ·
      `PUT|DELETE /v1/admin/templates/<name> {capabilities, launch, hands, credential, escalate_to, subscribe}`
-   - `POST /v1/workstreams {goal, subscriber?}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent
-     id or null; `captain` is accepted for one release)
+   - `POST /v1/workstreams {goal}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent of that
+     workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
+     (it no longer answers `captain`)
    - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (the `burst` role; 201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
@@ -50,10 +51,11 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
      the only way to mint a public share link (agents can't)
    - `POST /v1/agents {template, workstream?, sandbox?, owner?, overrides?, cell?, start?}`: expands the template
-     (`overrides`: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`) and sends `agent_start` to
+     (operator overrides: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`; an agent's own
+     spawn will take only `SpawnerOverrides`, which narrow) and sends `agent_start` to
      the host; an agent with a sandbox takes its workstream and cell (a mismatch is refused with 409), and an
      `owner` must be an agent of the same workstream. For one release `role` is read as the same-named template,
-     `captain` as `owner`, and top-level `launch`, `rules` and `grants` as overrides
+     `captain` as `owner`, top-level `launch` and `rules` as overrides, and `grants` intersects the tools silently
    - `POST /v1/agents/<id>/start {host?, restart?}`: start (or restart) the brain; `host` puts it on a chosen active,
      connected host of the cell (for a test); hands still go through the sandbox's gateway. Answers `{host, cmd}`;
      `kind: none` when the brain already runs (nothing sent; `{restart: true}` restarts it: condemned, then started

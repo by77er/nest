@@ -6,7 +6,7 @@ import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identit
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
-import { Capability, CatalogName, SpecOverrides, Template } from "./lib/spec";
+import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
 import { AgentRole, ErrorCodes, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
@@ -213,10 +213,12 @@ async function route(req: Request, env: Env): Promise<Response> {
     const r = await body(req, z.object({
       goal: z.string(), subscriber: z.string().startsWith("agt_").nullable().optional(), captain: z.string().startsWith("agt_").nullable().optional(),
     }));
-    const subscriber = r.subscriber ?? r.captain ?? null;
-    if (subscriber) await existingAgent(env, subscriber);
+    // A subscriber must be an agent of the workstream, and a new one has none yet.
+    if (r.subscriber || r.captain) {
+      throw new NestError(ErrorCodes.INVALID_MESSAGE, "a new workstream has no agents yet: set its subscriber once one is spawned in it");
+    }
     const id = newId("ws_");
-    return json(await workstream(env, id).init(id, r.goal, subscriber), 201);
+    return json(await workstream(env, id).init(id, r.goal, null), 201);
   }
   if ((p = m(/^\/v1\/workstreams\/(ws_[A-Za-z0-9]+)(\/events|\/subscriber|\/captain|\/notifications)?$/))) {
     const ws = workstream(env, p[1]!);
@@ -229,7 +231,11 @@ async function route(req: Request, env: Env): Promise<Response> {
       }));
       const subscriber = r.subscriber !== undefined ? r.subscriber : r.captain;
       if (subscriber === undefined) throw new NestError(ErrorCodes.INVALID_MESSAGE, "subscriber is required (an agent id, or null)");
-      if (subscriber) await existingAgent(env, subscriber);
+      if (subscriber) {
+        // Only an agent of this workstream reads its channel (its events come from that workstream's agents).
+        const other = (await existingAgent(env, subscriber)).workstream;
+        if (other !== p[1]) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${subscriber} is in workstream ${other}, not ${p[1]}`, 409);
+      }
       await ws.setSubscriber(subscriber);
       return json({ ok: true });
     }
@@ -287,9 +293,10 @@ async function route(req: Request, env: Env): Promise<Response> {
   }
 
   if (req.method === "POST" && path === "/v1/agents") {
-    // A spawn spec: a template, a sandbox (hands) or none, and overrides. For one release the
+    // A spawn spec from the operator (the root: `OperatorOverrides`; an agent's spawn may only narrow,
+    // `SpawnerOverrides`): a template, a sandbox (hands) or none, and overrides. For one release the
     // previous release's fields are accepted: `role` (the same-named template), `captain` (`owner`),
-    // and top-level `launch`, `rules` and `grants` (overrides; `grants` narrows the tools).
+    // top-level `launch` and `rules` (overrides), and `grants` (intersects the tools silently, as it did).
     const r = await body(req, z.object({
       template: CatalogName.optional(),
       role: AgentRole.optional(),
@@ -298,7 +305,7 @@ async function route(req: Request, env: Env): Promise<Response> {
       sandbox: z.string().startsWith("sbx_").optional(),
       owner: z.string().startsWith("agt_").optional(),
       captain: z.string().startsWith("agt_").optional(),
-      overrides: SpecOverrides.optional(),
+      overrides: OperatorOverrides.optional(),
       launch: LaunchConfig.optional(),
       grants: z.array(z.string()).optional(),
       rules: z.array(ToolRule).optional(),
@@ -309,10 +316,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     const template = r.template ?? r.role;
     if (!template) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template is required");
     if (r.owner && r.captain && r.owner !== r.captain) throw new NestError(ErrorCodes.INVALID_MESSAGE, "owner and captain differ");
-    const overrides: SpecOverrides = {
-      ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...(r.grants ? { tools: r.grants } : {}),
-      ...r.overrides,
-    };
+    const overrides: OperatorOverrides = { ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...r.overrides };
     let wsId = r.workstream;
     let cellName = r.cell ?? DEFAULT_CELL;
     if (r.sandbox) {
@@ -326,7 +330,8 @@ async function route(req: Request, env: Env): Promise<Response> {
     }
     if (!wsId) throw new NestError(ErrorCodes.INVALID_MESSAGE, "an agent without a sandbox needs a workstream");
     checkCell(env, cellName);
-    const spec = await catalog(env).expand({ template, hands: !!r.sandbox, overrides });
+    const expanded = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides });
+    const spec = r.grants ? intersectTools(expanded, r.grants) : expanded;
     const id = newId("agt_");
     const a = agent(env, id);
     await a.create({ agent: id, workstream: wsId, cell: cellName, spec, owner: r.owner ?? r.captain ?? null, sandbox: r.sandbox ?? null });

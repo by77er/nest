@@ -3,8 +3,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
-import { Credential } from "../lib/spec";
 import { b64url, NestError } from "../lib/util";
+import { Credential } from "../protocol/control";
 import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
 import { ErrorCodes, type InjectionSecret } from "../protocol/model";
 

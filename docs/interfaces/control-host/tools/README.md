@@ -6,12 +6,12 @@
 
 | Tool | Seed templates | Notes |
 |---|---|---|
-| `notify` | worker, captain | To `captain`, `user` (Discord) or `agt_…`. Doesn't wait for a reply |
-| `emit` | worker | Workstream event: `progress`, `blocked`, `pr_opened`, `completed`, `failed`. Decision events wake the captain |
-| `ask` | worker, captain | Synchronous up to about 2 min, then `pending`. The answer arrives as an `ask_answer` turn |
-| `spawn_agent` | captain | New worker in a workstream, optionally bound or with a forked session |
+| `notify` | worker, captain | To `captain` (the owner, else the escalation channel's reader), `user` (Discord) or `agt_…`. Doesn't wait for a reply |
+| `emit` | worker | Workstream event: `progress`, `blocked`, `pr_opened`, `completed`, `failed`. Decision events wake the workstream channel's subscriber |
+| `ask` | worker, captain | To the escalation channel (`captain`, the default) or `user`. Synchronous up to about 2 min, then `pending`. The answer arrives as an `ask_answer` turn |
+| `spawn_agent` | captain | New agent in a workstream, optionally bound or with a forked session; its overrides may only narrow (`SpawnerOverrides`, [CatalogDO](../../../control-plane/durable-objects/catalog/)) |
 | `fork_sandbox` | worker, captain | `disk_only` (default) or `live`; `read_only` for inspection |
-| `attach` | captain | Bind or unbind a **worker's** hands. Captains never get hands |
+| `attach` | captain | Bind or unbind another agent's hands |
 | `read_transcript` | worker, captain | Normalized transcript from R2; never wakes anything |
 | `checkpoint` | worker | Commit the bound sandbox now |
 | `expose_port` | worker | Preview URL, optionally with a share link |
@@ -22,7 +22,7 @@ Only `notify`, `emit`, `ask`, `read_transcript` and `expose_port` run; the rest 
 
 **Grants:**
 - AgentDO lists exactly the tools in the agent's expanded spec, and checks every `tool_call` against it again.
-- A captain can only give its workers grants it holds itself.
+- A spawning agent can only give the agents it spawns what it holds itself (grants aren't built; today its overrides can only narrow the template).
 - `requires_approval` tools always go through the approval gate.
 
 **Brokered action pipeline:** check the grant → rate limit → scan arguments for secrets → approval gate → run with idempotency key `(agent, epoch, call)` → write to the journal.

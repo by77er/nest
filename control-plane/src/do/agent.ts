@@ -9,9 +9,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { num, type Env } from "../env";
-import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
+import { toolDef, toolDefs } from "../lib/registry";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
-import { type AgentSpec, type RoleRecord, specFromRole } from "../lib/spec";
+import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
 import { signBlobUrl } from "../lib/tokens";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
 import { storedEnum, storedEnumOrNull } from "../lib/stored";
@@ -320,10 +320,7 @@ export class AgentDO extends DurableObject<Env> {
     // rules and grant list it stored; its `captain` is its owner. Persisted once, below.
     let spec: Omit<AgentSpec, "subscribe"> | undefined;
     if (info.tools === undefined) {
-      const { subscribe: _, ...fields } = specFromRole(PLATFORM_TOOL_NAMES, {
-        role: role ?? (legacy ? "worker" : "captain"), grants, launch: info.launch, rules: info.rules,
-      });
-      spec = fields;
+      spec = specFromRole({ role: role ?? (legacy ? "worker" : "captain"), grants, launch: info.launch, rules: info.rules });
     }
     let brain = info.brain;
     let migrated = false;
@@ -344,6 +341,7 @@ export class AgentDO extends DurableObject<Env> {
     const out: AgentInfo = {
       ...rest,
       ...spec,
+      escalate_to: storedEnum(EscalateTo, (spec ?? rest).escalate_to, "kv.info.escalate_to"),
       owner: info.owner !== undefined ? info.owner : captain ?? null,
       brain,
       intent: info.intent ?? null,
@@ -370,7 +368,12 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   private save(info: AgentInfo): void {
-    this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(info));
+    // For one release, the previous release's fields beside the spec, derived from it, so a forward
+    // revert to that release reads the record as its own (`role` from hands, `grants` = the tools,
+    // `captain` = the owner). `load()` drops them: the spec is the authority.
+    const legacy: PreviousReleaseFields = { role: info.hands ? "worker" : "captain", grants: info.tools, captain: info.owner };
+    this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      JSON.stringify({ ...info, ...legacy }));
   }
 
   /** Load, mutate and save synchronously (never across an await). */

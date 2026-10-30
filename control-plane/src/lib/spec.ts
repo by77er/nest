@@ -4,16 +4,10 @@
 // against them gives the agent's stored spec. Everything here is pure and synchronous: the catalog
 // is passed in, nothing is awaited, and errors are returned, not thrown.
 import { z } from "zod";
-import { LaunchConfig, ToolRule } from "../protocol/control";
+import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
-
-/**
- * A Claude setup token's BrokerDO secret name. Only these names: a credential is resolved into
- * `agent_start` and sent to a brain host, so it must never name another kind of secret.
- */
-export const Credential = z.string().regex(/^claude_oauth_token(:[A-Za-z0-9_.-]{1,64})?$/, "a credential is claude_oauth_token or claude_oauth_token:<name>");
 
 /**
  * Where an agent's questions go (`ask`, approvals) until channels exist: the user's notification
@@ -21,11 +15,13 @@ export const Credential = z.string().regex(/^claude_oauth_token(:[A-Za-z0-9_.-]{
  */
 export const EscalateTo = z.enum(["user", "workstream"]);
 export type EscalateTo = z.output<typeof EscalateTo>;
+export const HandsRule = z.enum(["required", "forbidden", "optional"]);
+export const Subscription = z.enum(["workstream"]);
 
 export const Capability = z.object({
   /** Platform tools (from `platform-tools.json`). */
   tools: z.array(z.string()).default([]),
-  /** Permission rules the tools need, as the runner's hook rules. */
+  /** Permission rules the tools need, as the runner's hook rules (first match wins). */
   rules: z.array(ToolRule).default([]),
   /** Added to the system prompt (after the template's own text). */
   prompt: z.string().default(""),
@@ -36,28 +32,43 @@ export const Template = z.object({
   capabilities: z.array(CatalogName),
   /** Model, effort, built-in tools and the base system prompt; capability prompts are appended to its text. */
   launch: LaunchConfig,
-  /** Whether a spawn from it takes a sandbox: `required`, `forbidden` or `optional`. */
-  hands: z.enum(["required", "forbidden", "optional"]),
+  /** Whether a spawn from it takes a sandbox. */
+  hands: HandsRule,
   credential: Credential,
   escalate_to: EscalateTo,
   /** Channels the new agent subscribes to at spawn: `workstream` is its workstream's. */
-  subscribe: z.array(z.literal("workstream")).default([]),
+  subscribe: z.array(Subscription).default([]),
 });
 export type Template = z.output<typeof Template>;
 
-/** What a spawn may change. `tools` only narrows (no tool the template doesn't give). */
-export const SpecOverrides = z.object({
+/**
+ * What the operator may change at spawn (the admin API only; it holds the root): replace the launch
+ * or the rules, narrow the tools, and pick the escalation and the setup token.
+ */
+export const OperatorOverrides = z.object({
   launch: LaunchConfig.optional(),
   rules: z.array(ToolRule).optional(),
   tools: z.array(z.string()).optional(),
   escalate_to: EscalateTo.optional(),
   credential: Credential.optional(),
 });
-export type SpecOverrides = z.output<typeof SpecOverrides>;
+export type OperatorOverrides = z.output<typeof OperatorOverrides>;
+
+/**
+ * What an agent spawning another may change: it can only narrow. `tools` is a subset of the
+ * template's, and `rules` only `deny` or `ask`, placed before the template's (first match wins), so
+ * they can only take permissions away. No launch, built-in tools, credential or escalation: those
+ * stay the template's. Anything else is refused (`strict`).
+ */
+export const SpawnerOverrides = z.strictObject({
+  tools: z.array(z.string()).optional(),
+  rules: z.array(ToolRule.extend({ decision: z.enum(["deny", "ask"]) })).optional(),
+});
+export type SpawnerOverrides = z.output<typeof SpawnerOverrides>;
 
 /** An agent's expanded spec, as AgentDO stores it: nothing refers back to the template. */
 export interface AgentSpec {
-  /** The template it came from (for display; never consulted again). */
+  /** The template it came from: shown, and the sender label of its inbox posts; never consulted again. */
   template: string;
   /** Platform tools, in registry order. */
   tools: string[];
@@ -77,9 +88,9 @@ export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 const ok = <T>(value: T): Result<T> => ({ ok: true, value });
 const err = <T>(error: string): Result<T> => ({ ok: false, error });
 
-// --- The seed catalog: what the `worker` and `captain` roles did --------------------------------------
+// --- The seed catalog ---------------------------------------------------------------------------------
 
-/** Seeded into an empty catalog; also what records stored with a role are migrated from. */
+/** Seeded into an empty catalog: what the `worker` and `captain` roles gave. */
 export const SEED_CATALOG: Catalog = {
   capabilities: {
     // Every agent's nest MCP tools run without a prompt: the platform checks each call itself.
@@ -109,7 +120,7 @@ export const SEED_CATALOG: Catalog = {
       capabilities: ["nest", "hands", "subagents", "messaging", "transcripts", "events", "sandboxes", "brokered"],
       launch: { builtin_tools: ["TodoWrite", "Task", "WebSearch"], system_prompt: { mode: "append", text: "" } },
       hands: "required",
-      credential: "claude_oauth_token:worker",
+      credential: setupTokenSecret("worker"),
       escalate_to: "workstream",
       subscribe: [],
     },
@@ -120,7 +131,7 @@ export const SEED_CATALOG: Catalog = {
         system_prompt: { mode: "replace", text: "You are a nest captain. You act only through mcp__nest__* platform tools." },
       },
       hands: "forbidden",
-      credential: "claude_oauth_token:captain",
+      credential: setupTokenSecret("captain"),
       escalate_to: "user",
       subscribe: ["workstream"],
     },
@@ -159,12 +170,19 @@ export function templatesUsing(catalog: Catalog, name: string): string[] {
 // --- Expansion ---------------------------------------------------------------------------------------
 
 const ruleKey = (r: ToolRule) => JSON.stringify([r.pattern, r.decision, r.reason ?? null]);
+const dedupeRules = (rules: readonly ToolRule[]): ToolRule[] => {
+  const seen = new Set<string>();
+  const out: ToolRule[] = [];
+  for (const r of rules) {
+    if (seen.has(ruleKey(r))) continue;
+    seen.add(ruleKey(r));
+    out.push(r);
+  }
+  return out;
+};
 
-/**
- * Expand template `name` with `overrides`, without the hands check (records stored before templates
- * are migrated through this; a spawn goes through {@link expandSpec}).
- */
-export function expandTemplate(catalog: Catalog, registry: readonly string[], name: string, overrides: SpecOverrides = {}): Result<AgentSpec> {
+/** Template `name` expanded as it stands: no overrides, no hands check. */
+export function expandTemplate(catalog: Catalog, registry: readonly string[], name: string): Result<AgentSpec> {
   if (!Object.hasOwn(catalog.templates, name)) return err(`unknown template ${name}`);
   const tpl = catalog.templates[name]!;
   const caps: Capability[] = [];
@@ -176,54 +194,91 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     caps.push(cap);
   }
   const given = new Set(caps.flatMap((c) => c.tools));
-  let tools = registry.filter((t) => given.has(t));
-  if (overrides.tools) {
-    const wider = overrides.tools.filter((t) => !given.has(t));
-    if (wider.length) return err(`template ${name} doesn't give ${wider.join(", ")}`);
-    const narrowed = new Set(overrides.tools);
-    tools = tools.filter((t) => narrowed.has(t));
-  }
-  // Rules in capability order, each once (first occurrence kept).
-  let rules = overrides.rules;
-  if (!rules) {
-    const seen = new Set<string>();
-    rules = [];
-    for (const r of caps.flatMap((c) => c.rules)) {
-      if (seen.has(ruleKey(r))) continue;
-      seen.add(ruleKey(r));
-      rules.push(r);
-    }
-  }
   const prompt = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter((t) => t.length > 0).join("\n\n");
-  const launch = overrides.launch ?? { ...tpl.launch, system_prompt: { ...tpl.launch.system_prompt, text: prompt } };
   return ok({
     template: name,
-    tools,
-    launch,
-    rules,
-    credential: overrides.credential ?? tpl.credential,
-    escalate_to: overrides.escalate_to ?? tpl.escalate_to,
+    tools: registry.filter((t) => given.has(t)),
+    launch: { ...tpl.launch, system_prompt: { ...tpl.launch.system_prompt, text: prompt } },
+    // In capability order, each once (first occurrence kept).
+    rules: dedupeRules(caps.flatMap((c) => c.rules)),
+    credential: tpl.credential,
+    escalate_to: tpl.escalate_to,
     subscribe: [...tpl.subscribe],
   });
 }
 
-/** A spawn spec: a template, whether a sandbox is given (hands), and overrides. */
-export interface SpawnSpec {
-  template: string;
-  hands: boolean;
-  overrides?: SpecOverrides;
+/** `tools` narrowed to `subset`, which must not name a tool `tools` lacks. */
+function narrowTools(name: string, tools: string[], subset: readonly string[] | undefined): Result<string[]> {
+  if (!subset) return ok(tools);
+  const wider = subset.filter((t) => !tools.includes(t));
+  if (wider.length) return err(`template ${name} doesn't give ${wider.join(", ")}`);
+  return ok(tools.filter((t) => subset.includes(t)));
 }
 
-/** Expand a spawn spec: the template's hands rule, then {@link expandTemplate}. */
+/**
+ * A spawn spec: a template, whether a sandbox is given (hands), and overrides, from the operator (the
+ * admin API) or from a spawning agent (which can only narrow; see {@link SpawnerOverrides}).
+ */
+export type SpawnSpec =
+  | { template: string; hands: boolean; by: "operator"; overrides?: OperatorOverrides }
+  | { template: string; hands: boolean; by: "spawner"; overrides?: SpawnerOverrides };
+
+/** Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make. */
 export function expandSpec(catalog: Catalog, registry: readonly string[], spec: SpawnSpec): Result<AgentSpec> {
   const tpl = Object.hasOwn(catalog.templates, spec.template) ? catalog.templates[spec.template]! : undefined;
   if (!tpl) return err(`unknown template ${spec.template}`);
   if (tpl.hands === "required" && !spec.hands) return err(`template ${spec.template} needs a sandbox`);
   if (tpl.hands === "forbidden" && spec.hands) return err(`template ${spec.template} has no hands`);
-  return expandTemplate(catalog, registry, spec.template, spec.overrides);
+  const base = expandTemplate(catalog, registry, spec.template);
+  if (!base.ok) return base;
+  if (spec.by === "spawner") {
+    // Parsed again: a caller's object that carries anything else is refused, whatever its type said.
+    const o = SpawnerOverrides.safeParse(spec.overrides ?? {});
+    if (!o.success) return err(`a spawner can only narrow tools and add deny or ask rules: ${o.error.issues.map((i) => i.message).join("; ")}`);
+    const tools = narrowTools(spec.template, base.value.tools, o.data.tools);
+    if (!tools.ok) return tools;
+    return ok({ ...base.value, tools: tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) });
+  }
+  const o = spec.overrides ?? {};
+  const tools = narrowTools(spec.template, base.value.tools, o.tools);
+  if (!tools.ok) return tools;
+  return ok({
+    ...base.value,
+    tools: tools.value,
+    launch: o.launch ?? base.value.launch,
+    rules: o.rules ?? base.value.rules,
+    credential: o.credential ?? base.value.credential,
+    escalate_to: o.escalate_to ?? base.value.escalate_to,
+  });
+}
+
+/** The previous release's `grants` field on the admin route: intersects the tools silently, as it did. */
+export function intersectTools(spec: AgentSpec, grants: readonly string[]): AgentSpec {
+  return { ...spec, tools: spec.tools.filter((t) => grants.includes(t)) };
 }
 
 // --- Records stored with a role (the previous release) ----------------------------------------------
+
+/**
+ * What each role meant when records were stored with one, frozen here so editing the seed (or the
+ * catalog) never changes how an old record is read. (A test checks the seed still expands to it.)
+ */
+export const ROLE_SPECS: Readonly<Record<"worker" | "captain", Omit<AgentSpec, "launch" | "rules" | "subscribe">>> = {
+  worker: {
+    template: "worker",
+    tools: ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"],
+    credential: setupTokenSecret("worker"),
+    escalate_to: "workstream",
+  },
+  captain: {
+    template: "captain",
+    tools: ["notify", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
+      "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "delegate", "memory_read", "memory_write",
+      "notify_user"],
+    credential: setupTokenSecret("captain"),
+    escalate_to: "user",
+  },
+};
 
 /** The fields an AgentInfo stored by the previous release carried instead of a spec. */
 export interface RoleRecord {
@@ -234,13 +289,12 @@ export interface RoleRecord {
 }
 
 /**
- * The spec a role-era record means: its role's seed template, with the launch and rules it stored
+ * The spec a role-era record means: its role's frozen spec, with the launch and rules it stored
  * (they were already that role's defaults or the operator's overrides) and its grant list narrowing
  * the tools (names the role didn't offer are ignored, as they were).
  */
-export function specFromRole(registry: readonly string[], rec: RoleRecord): AgentSpec {
-  const r = expandTemplate(SEED_CATALOG, registry, rec.role, { launch: rec.launch, rules: rec.rules });
-  if (!r.ok) throw new Error(`seed template ${rec.role}: ${r.error}`);
+export function specFromRole(rec: RoleRecord): Omit<AgentSpec, "subscribe"> {
+  const r = ROLE_SPECS[rec.role];
   const grants = rec.grants;
-  return grants ? { ...r.value, tools: r.value.tools.filter((t) => grants.includes(t)) } : r.value;
+  return { ...r, tools: grants ? r.tools.filter((t) => grants.includes(t)) : [...r.tools], launch: rec.launch, rules: rec.rules };
 }
