@@ -24,7 +24,7 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 ## Pending contract changes
 
 The design in [agents/](../agents/) and [channels/](../channels/) needs these contract changes; the specs below and the fixtures describe what's implemented until they land:
-- **Agents** carry `owner`, `labels` and a spawn spec (with `capabilities`) instead of a role (built in the control plane: AgentDO stores the expanded spec and `owner`; `agent_start.role` and `ToolDef.roles` are deprecated, still sent for one release for runners that require them, and go in the next). A brain is placed on a brain host by backend and capacity, and its hands are a binding to a sandbox anywhere ([gateway](gateway/)). Capability definitions are control-plane data, not contract.
+- **Agents** carry `labels` (pending), and `owner` and a spawn spec (with `capabilities`) instead of a role (built in the control plane: AgentDO stores the expanded spec and `owner`). `agent_start.role` and `ToolDef.roles` are deprecated, still sent for one release for runners that require them, and go in the next. Capability definitions are control-plane data, not contract.
 - **Sandboxes** carry `owner`, `labels` and the channels their programs may post to; sandbox commands carry no grouping field. Every `workstream` field goes; grouping is labels.
 - **Platform events** are posts to `<sbx>/events` and `<agt>/events`: `ChannelMessage{seq, ts_ms, from, taint, kind?, text, data?, reply_to?, key?, mentions?}`, with kinds such as `port_opened`, `egress_denied`, `egress_alert` and `orphaned_work`.
 - **`EgressPolicy` layers** are `base`, `sandbox` and `grant`.
@@ -35,7 +35,7 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **Metrics:** hosts send a `metrics` frame on the fleet channel every 60 s; `GET /v1/health` makes one round trip to each DO class (see [metrics](../control-plane/metrics/) and [upgrades](../control-plane/#upgrades)).
 - **Session channel:** one stream per file of the session directory, keyed by relative path; `segment_ack` follows the SQLite commit. (`hands_resolve` / `hands_resolved` with a tagged `outcome`, and the agent epoch in the hello, are built.) The next release drops the previous release's shapes kept for one release: `hands_resolved`'s `hands` / `error` / `retry_after_ms`, `HandsTarget.sandbox` / `.epoch`, `agent_start.hands.epoch`, and the hello epoch `0` accepted for an agent without hands (what a previous-release runner presents for a captain).
 - **Hands journal:** records stay in the guest, keyed by `(agent, epoch, tool_use_id)`; the runner's `call_status` lookups go through the gateway, and outcomes reach AgentDO as the runner's canonical events. nestd relays none of it.
-- **Gateway** ([gateway/](gateway/)): the `/hands` route, bindings and `resolve` are built; the `/pty` and `/ingress/<port>` routes and the `edge` credential's use are pending.
+- **Gateway** ([gateway/](gateway/)): the `/hands` route, bindings, `resolve` and the `edge` credential are built; the `/pty` and `/ingress/<port>` routes are pending.
 - **`GenerationRecord`** gains `restore_abi` (a `sha256:` reference), `reason`, `state` and `session{offset, last_tool_use}`.
 - **Guest protocol version 2** ([host-guest](host-guest/)):
   - the version range and capabilities;
@@ -51,13 +51,13 @@ The design in [agents/](../agents/) and [channels/](../channels/) needs these co
 - **`InjectionBinding`** gains `methods?`, `path_prefix?` and `wildcard?`; header names are checked against the reserved names.
 - **Fleet:**
   - **Policy:** `policy_update` carries the policy's sha256 and its secrets, and `secrets_update` names the policy version and sha256.
-  - **Host kinds:** a brain host reports brain capacity; FleetDO holds three desired versions per cell (brain host, sandbox host, guest image). (Reading `sandbox | brain` as well as `burst | controller` in `hello`, enrollment and host tokens, a brain host enrolling without a proxy CSR, and its refusal of sandbox commands, are built; this release still writes `burst | controller`, and the next writes the new names ([deploy](../../dev/deploy.md#host-role-names-expandcontract)). `binding_key{keys}` after `hello_ack`, `gateway_url` in `hello`, `guest` in `SandboxReport` and `sandbox_state`, and `agent_attach`/`agent_detach` are built.)
+  - **Host kinds:** the next release writes `sandbox | brain` everywhere, and a sandbox host refuses `agent_start` ([deploy](../../dev/deploy.md#host-role-names-expandcontract)); FleetDO holds three desired versions per cell (brain host, sandbox host, guest image). (Reading `sandbox | brain` as well as `burst | controller` in `hello`, enrollment and host tokens, a brain host enrolling without a proxy CSR, its refusal of sandbox commands, and FleetDO counting its capacity in brains, are built; this release still writes `burst | controller`. `binding_key{keys}` after `hello_ack`, `gateway_url` in `hello`, `guest` in `SandboxReport` and `sandbox_state`, and `agent_attach`/`agent_detach` are built.)
   - **Placement:** `hello` and `capacity` carry `restore_abis{create, load}`; `sandbox_create` carries the claim's `attempt`; `sandbox_state` reports the guest's hello and ready as evidence.
   - **Pause and suspend:** a `sandbox_pause` command. Pause and suspend carry `wake_seq` and add the outcomes `superseded` and `busy`; a commit can fail with `guest_flush_failed`.
   - **Drain:** `drain{mode: gentle|forced}`, and an all-or-nothing `pending_uploads` report with each sandbox's last committed generation.
   - **Sandboxes:** ingress-guard `activity` events; `base_prepare` and `from: base`; drive rate limits in `resources`.
   - **CLI and metrics:** `guest_cli` carries `hold`; the metrics frame carries guest log-site counts.
-  - **Agents:** `agent_start` goes to a brain host chosen by capacity; brokered actions carry the agent epoch. (`agent_start.epoch`, the agent epoch AgentDO issues per start, and a `hands` field naming the sandbox's id only: built.)
+  - **Agents:** brokered actions carry the agent epoch. (`agent_start` sent to a brain host chosen by capacity, `agent_start.epoch`, the agent epoch AgentDO issues per start, and a `hands` field naming the sandbox's id only: built.)
 - **Enrollment:** a fixed-shape CSR, and `proxy_ca` is pathLen 0. (A sandbox host's response carrying `tunnel_token` and `gateway_url`, a brain host's neither: built.)
 - **Operator API:** scoped tokens, never accepted in URLs; the revocation counter goes into share links, terminal sessions and host tokens.
 - **Channels:** a loss-record kind on `<sbx>/events`. **Tool schema:** a per-tool list of rejected fields in `hands-tools.json`.

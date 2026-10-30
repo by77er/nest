@@ -51,7 +51,7 @@ A host's kind (nestd's config `role`: `burst` or `controller` this release, `san
 
 ## Upgrades
 
-Hosts are replaced, never updated in place. The two host kinds roll separately, brain hosts before sandbox hosts, and the [gateway protocol](../../interfaces/gateway/) lets a brain host and a sandbox host be one release apart in either direction. Not built; it needs the autoscaler.
+Hosts are replaced, never updated in place. The two host kinds roll separately, brain hosts before sandbox hosts, and the [gateway protocol](../../interfaces/gateway/) lets a brain host and a sandbox host be one release apart in either direction. **Not built:** desired versions, canaries, probes and gentle drains. Today every host installs `releases/current` at boot, so a release reaches each kind as its hosts are next launched, and the ordering constraints of a release are its rollout rule in [deploy](../../../dev/deploy.md).
 
 - **Versions:** host binaries (nestd, nest-proxy, the gateway, the runner, the hands client, `nest`, the guest agent) and images are built per release into the cell's bucket, versioned by commit. FleetDO holds **three desired versions per cell:** the brain-host version, the sandbox-host version and the guest image.
 - **One release, in order,** each stage gated before the next ([deploys](../../../dev/deploy.md)):

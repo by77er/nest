@@ -1,5 +1,7 @@
 # Disk
 
+**Designed, not built:** ublk, lazy reads, the copy-on-write epoch flip and `nest diff`. Today a sandbox's disk is a local file (a copy of `nest-base`), chunked whole while the VM is paused, and a restore fetches every chunk before boot ([nestd](../../../compute/nestd/), [object store](../object-store/)).
+
 - **ublk** (a userspace block device, Linux 6.0+). Firecracker sees an ordinary block device.
 - **Reads** fetch 4 MB chunks lazily into a local NVMe cache, prefetching the working set recorded during the previous run.
 - **Writes** go to local copy-on-write chunks and are tracked in a dirty set.
@@ -9,6 +11,8 @@
 ## Flush before commit
 
 Writes still in the guest's page cache aren't in a cut, and writes the guest has flushed may not be either: Firecracker's default `Unsafe` cache mode doesn't offer the guest a flush, so a guest `syncfs` ends once the data reaches the host, without an `fsync` ([block caching](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md)). So every commit, pause and suspend:
+
+**Designed, not built** (guest protocol v2): today nestd asks the guest to `sync` through `prepare_snapshot`, ignores a failure, and pauses the VM while it chunks ([nestd](../../../compute/nestd/)).
 
 1. asks the guest agent to `syncfs` every filesystem (its `flush` request; [host-guest](../../../interfaces/host-guest/)), within a **30 s** budget (SPACE uses the same budget; [guest-io.md](https://github.com/perplexityai/space/blob/main/docs/space/design/guest-io.md));
 2. `fsync`s the ublk device on the host, so the ublk daemon has every write (that Firecracker's writes pass through the host page cache on their way to ublk is unverified; the `fsync` is cheap either way);
@@ -20,7 +24,7 @@ Writes still in the guest's page cache aren't in a cut, and writes the guest has
 
 ## I/O limits
 
-**Decided: every sandbox's drive gets Firecracker's rate limiter:** 10,000 operations/s and 100 MiB/s, each bucket holding 30 s of its rate as burst, the same defaults SPACE uses ([guest-io.md](https://github.com/perplexityai/space/blob/main/docs/space/design/guest-io.md)). Placement packs only hugepages and vCPUs, so without a cap one sandbox's builds could starve every other sandbox on the host.
+**Decided: every sandbox's drive gets Firecracker's rate limiter:** 10,000 operations/s and 100 MiB/s, each bucket holding 30 s of its rate as burst, the same defaults SPACE uses ([guest-io.md](https://github.com/perplexityai/space/blob/main/docs/space/design/guest-io.md)). Placement packs only memory and vCPUs, so without a cap one sandbox's builds could starve every other sandbox on the host. Not built.
 - **Per sandbox:** the operator can set other limits; they're part of the sandbox's resources and survive restores and moves.
 - **The ops bucket counts guest requests,** cached or not. At 4 KiB per request, 10,000 ops/s is about 39 MiB/s.
 - **Not fair on a dense host:** idle sandboxes all bank their burst, and nothing bounds many spending it at once (SPACE notes the same gap).

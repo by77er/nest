@@ -27,7 +27,7 @@ priority: high
 credential: claude_oauth_token:captain   # revocable separately from workers
 ```
 
-**Built so far:** the seeded `captain` template ([CatalogDO](../../control-plane/durable-objects/catalog/)) gives the tools the captain role had, its launch, `hands: forbidden`, `escalate_to: user`, `subscribe: [workstream]` and `credential: claude_oauth_token:captain`; the capabilities above aren't built.
+**Built so far:** the seeded `captain` template ([CatalogDO](../../control-plane/durable-objects/catalog/)): the interim `messaging`, `transcripts`, `sandboxes`, `brokered`, `management` and `memory` capabilities (most of their tools answer `not_implemented`; see [tools](../../agents/tools/)), a replaced prompt with no built-ins, `hands: forbidden`, `escalate_to: user`, `subscribe: [workstream]` and `credential: claude_oauth_token:captain`. The capabilities above aren't built.
 
 ## Conventions in its prompt
 
