@@ -41,6 +41,20 @@ pub trait Driver: Send + Sync {
     async fn create(&self, spec: VmSpec) -> io::Result<Box<dyn Vm>>;
 }
 
+/// A brain host's driver: it runs no sandboxes, so every create is refused (nestd refuses sandbox
+/// commands there before reaching it; this is the backstop).
+pub struct NoDriver;
+
+#[async_trait]
+impl Driver for NoDriver {
+    fn name(&self) -> &'static str {
+        "none"
+    }
+    async fn create(&self, _spec: VmSpec) -> io::Result<Box<dyn Vm>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "a brain host runs no sandboxes"))
+    }
+}
+
 /// A lock-free handle that freezes a VM's vCPUs. Fencing uses it so a sandbox is paused at once,
 /// even while a long command holds the sandbox's own lock.
 #[async_trait]

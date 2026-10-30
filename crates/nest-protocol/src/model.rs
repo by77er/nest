@@ -163,14 +163,21 @@ pub mod error_codes {
     }
 }
 
-/// What a host is for. See docs/compute/.
+/// What a host is for: it runs sandboxes or brains, never both. See docs/compute/.
+///
+/// Renamed by expand/contract over two releases (dev/deploy.md): this release reads `sandbox` and
+/// `brain` but still writes the previous release's names, `burst` and `controller`, so a control
+/// plane rolled back to the previous release accepts every host of this one; the next release
+/// writes the new names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRole {
-    /// Spot host: Firecracker sandboxes plus their workers' brains.
-    Burst,
-    /// Always-on stateless host: captain brains and the Discord gateway. No sandboxes.
-    Controller,
+    /// Runs sandboxes (Firecracker, the gateway, nest-proxy, the tunnel); never a brain.
+    #[serde(rename = "burst", alias = "sandbox")]
+    Sandbox,
+    /// Runs brains (the agent runner and Claude Code); never a sandbox.
+    #[serde(rename = "controller", alias = "brain")]
+    Brain,
 }
 
 /// Deprecated wire value, for one release only ([`crate::control::AgentStart::role`],

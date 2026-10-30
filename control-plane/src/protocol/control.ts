@@ -29,7 +29,8 @@ export const EnrollRequest = z.object({
   role: HostRole,
   cell: z.string(),
   proof: EnrollmentProof,
-  proxy_ca_csr_pem: z.string(),
+  /** Required from a sandbox host; a brain host runs no proxy and sends none (see FleetDO `enroll`). */
+  proxy_ca_csr_pem: z.string().optional(),
 });
 export type EnrollRequest = z.output<typeof EnrollRequest>;
 
@@ -45,7 +46,8 @@ export const EnrollResponse = z.object({
   host_token: z.string(),
   host_token_expires_ms: TimestampMs,
   fleet_ws_url: z.string(),
-  proxy_ca: CaCertificate,
+  /** Signed from the request's CSR; absent when it had none (a brain host). */
+  proxy_ca: CaCertificate.optional(),
   /** The host's Cloudflare Tunnel token when the control plane created one for it; never on a command line. */
   tunnel_token: z.string().optional(),
   /** What clients will be told for this host's gateway; the control plane is the authority. */

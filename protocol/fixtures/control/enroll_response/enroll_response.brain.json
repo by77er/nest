@@ -1,0 +1,6 @@
+{
+  "host": "hst_01jb7k4m2r",
+  "host_token": "nht_eyJhbGciOiJFZERTQSJ9.eyJob3N0IjoiaHN0XzAyIn0.c2ln",
+  "host_token_expires_ms": 1760274000000,
+  "fleet_ws_url": "wss://nest.example.dev/v1/fleet"
+}

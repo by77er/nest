@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """nest local end-to-end harness. See e2e/README.md.
 
-Runs the real control plane (wrangler dev --local) and the real host components (nest-proxy, nestd
-with the `process` driver running nest-guest, nest-runner) inside an unprivileged user namespace,
+Runs the real control plane (wrangler dev --local) and the real host components inside an
+unprivileged user namespace, as two hosts: a sandbox host (nest-proxy, nest-gateway, nestd with the
+`process` driver running nest-guest) and a brain host (a second nestd in brain mode, nest-runner),
 then drives a scenario through the admin API and checks the results.
 
 NEST_E2E_CLAUDE=fake (default): brains are e2e/fake_claude.py running a scripted scenario; the real
@@ -143,7 +144,8 @@ def build():
 
 def prepare_work():
     shutil.rmtree(WORK, ignore_errors=True)
-    for d in ["logs", "run", "state", "netns", "runner/cwd", "files", "guest-state", "wrangler-state"]:
+    # run/ and state/: the sandbox host's nestd; brun/ and bstate/: the brain host's.
+    for d in ["logs", "run", "state", "brun", "bstate", "netns", "runner/cwd", "files", "guest-state", "wrangler-state"]:
         os.makedirs(os.path.join(WORK, d), exist_ok=True)
     with open(os.path.join(WORK, "dev.vars"), "w") as f:
         f.write(f"ADMIN_TOKEN={ADMIN}\nHOST_TOKEN_SECRET=e2e-host-token-secret-0123456789abcdef\nALLOW_DEV_CA=1\n")
@@ -174,10 +176,12 @@ def stop_control_plane():
 
 
 def configure_host():
-    st, tok = api("POST", "/v1/admin/enrollment-tokens", {"role": "burst", "cell": "local"})
-    assert st == 200, (st, tok)
-    with open(os.path.join(WORK, "enroll.token"), "w") as f:
-        f.write(tok["token"])
+    # Two hosts, two one-time tokens: the sandbox host's and the brain host's.
+    for role, name in (("sandbox", "enroll.token"), ("brain", "enroll-brain.token")):
+        st, tok = api("POST", "/v1/admin/enrollment-tokens", {"role": role, "cell": "local"})
+        assert st == 200, (st, tok)
+        with open(os.path.join(WORK, name), "w") as f:
+            f.write(tok["token"])
     st, ca = api("GET", "/v1/admin/root-ca", raw=True)
     assert st == 200 and "BEGIN CERTIFICATE" in ca, (st, ca)
     with open(os.path.join(WORK, "root-ca.pem"), "w") as f:
@@ -187,6 +191,8 @@ def configure_host():
     guest = [os.path.join(BIN, "nest-guest"), "--state-dir", os.path.join(WORK, "guest-state"),
              "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none", "--port-poll-ms", "500"]
     cfg = {
+        # The previous release's role names, as the cell's bootstrap writes them this release
+        # (expand/contract; dev/deploy.md): nestd reads both.
         "role": "burst", "cell": "local", "control_url": BASE,
         "enrollment": {"type": "token_file", "path": os.path.join(WORK, "enroll.token")},
         "run_dir": os.path.join(WORK, "run"), "state_dir": os.path.join(WORK, "state"),
@@ -198,10 +204,20 @@ def configure_host():
     }
     with open(os.path.join(WORK, "nestd.json"), "w") as f:
         json.dump(cfg, f, indent=2)
+    # The brain host: supervisor duties only (no driver, netns, proxy, gateway or tunnel).
+    brain = {
+        "role": "controller", "cell": "local", "control_url": BASE,
+        "enrollment": {"type": "token_file", "path": os.path.join(WORK, "enroll-brain.token")},
+        "run_dir": os.path.join(WORK, "brun"), "state_dir": os.path.join(WORK, "bstate"),
+        "flush_interval_ms": 500,
+        "versions": cfg["versions"],
+    }
+    with open(os.path.join(WORK, "nestd-brain.json"), "w") as f:
+        json.dump(brain, f, indent=2)
 
 
 def start_inner():
-    log("starting nest-proxy, nestd, nest-gateway, nest-runner inside `unshare --user --map-root-user --mount`")
+    log("starting the sandbox host (nest-proxy, nestd, nest-gateway) and the brain host (nestd, nest-runner) inside `unshare --user --map-root-user --mount`")
     env = dict(os.environ, WORK=WORK, BIN=BIN, E2E=E2E, NEST_E2E_GATEWAY_PORT=str(GW_PORT))
     if REAL:
         env.update({k: v for k, v in REAL_ENV.items() if k.startswith("NEST_E2E_")})
@@ -242,7 +258,7 @@ def stop_inner():
 # ---------------------------------------------------------------------------------- real-Claude mode
 def real_brains():
     """Real Claude Code brains of this run: their argv names a config dir under WORK."""
-    marker = f"--mcp-config\0{os.path.join(WORK, 'state', 'agents')}/"
+    marker = f"--mcp-config\0{os.path.join(WORK, 'bstate', 'agents')}/"
     out = []
     for d in os.listdir("/proc"):
         if d.isdigit():
@@ -460,12 +476,22 @@ def run_scenario():
     netns = os.path.join(WORK, "netns", f"ns-{sbxid}")
     wait_for(lambda: os.path.exists(netns), 20, 0.2, "sandbox netns")
 
+    # The brain host must be connected before the agent starts (otherwise its start waits for one).
+    wait_for(lambda: any(h["role"] == "brain" and h["connected"] for h in (api("GET", "/v1/admin/fleet?cell=local")[1] or {}).get("hosts", [])),
+             30, 0.5, "the brain host connected")
     body = {"template": "worker", "workstream": wsid, "sandbox": sbxid, "cell": "local"}
     if REAL:
         body["launch"] = REAL_LAUNCH
     st, ag = api("POST", "/v1/agents", body)
     check("agent created + started", st == 201, json.dumps(ag)[:300])
     agid = ag.get("agent") or ag.get("id")
+    # The brain runs on the brain host, never the sandbox's: two hosts, joined only by the gateway.
+    st, fleet = api("GET", "/v1/admin/fleet?cell=local")
+    roles = {h["host"]: h["role"] for h in (fleet or {}).get("hosts", [])} if st == 200 else {}
+    brain_host = ag.get("host") or (ag.get("started") or {}).get("host")
+    check("brain on a brain host, sandbox on a sandbox host",
+          roles.get(brain_host) == "brain" and roles.get(sbx.get("host")) == "sandbox" and brain_host != sbx.get("host"),
+          f"brain {brain_host} ({roles.get(brain_host)}), sandbox {sbx.get('host')} ({roles.get(sbx.get('host'))})")
 
     if REAL:
         nhands = run_real_turn(agid)
@@ -597,13 +623,16 @@ def run_fencing(ids):
     log("stopping the control plane to cut heartbeats")
     t0 = time.time()
     stop_control_plane()
-    nestd_log = os.path.join(WORK, "logs", "nestd.log")
-    try:
-        wait_for(lambda: re.search(r"self[- _]?fenc", read(nestd_log), re.I), FENCE_BUDGET_S, 0.5, "nestd self-fence log")
-        dt = time.time() - t0
-        check("nestd self-fences after control-plane loss", dt <= 25, f"{dt:.1f}s after cut (spec: ~20s after last sent renewal)")
-    except TimeoutError:
-        check("nestd self-fences after control-plane loss", False, "no self-fence in nestd.log within budget")
+    # Both hosts hold a lease: each nestd self-fences on its own (the sandbox host its VMs, the
+    # brain host its runner's brains).
+    for name, what in (("nestd.log", "sandbox host"), ("nestd-brain.log", "brain host")):
+        nestd_log = os.path.join(WORK, "logs", name)
+        try:
+            wait_for(lambda: re.search(r"self[- _]?fenc", read(nestd_log), re.I), FENCE_BUDGET_S, 0.5, f"{what} nestd self-fence log")
+            dt = time.time() - t0
+            check(f"{what} nestd self-fences after control-plane loss", dt <= 25, f"{dt:.1f}s after cut (spec: ~20s after last sent renewal)")
+        except TimeoutError:
+            check(f"{what} nestd self-fences after control-plane loss", False, f"no self-fence in {name} within budget")
     time.sleep(2)
     left = [p for p in brains if alive(p)]
     check("runner brains killed", not left, f"still alive: {left}")
@@ -645,11 +674,12 @@ def main():
         start_control_plane()
         configure_host()
         start_inner()
-        try:
-            wait_for(lambda: re.search(r"enrolled", read(os.path.join(WORK, "logs", "nestd.log"))), 30, 0.5, "nestd enrolled")
-            check("nestd enrolled + fleet connected", True)
-        except TimeoutError as e:
-            check("nestd enrolled + fleet connected", False, str(e))
+        for name, what in (("nestd.log", "sandbox host"), ("nestd-brain.log", "brain host")):
+            try:
+                wait_for(lambda: re.search(r"enrolled", read(os.path.join(WORK, "logs", name))), 30, 0.5, f"{what} nestd enrolled")
+                check(f"{what} nestd enrolled + fleet connected", True)
+            except TimeoutError as e:
+                check(f"{what} nestd enrolled + fleet connected", False, str(e))
         try:
             wait_for(lambda: ("nest-gateway listening" in gateway_log() and "resync done" in gateway_log()) or None, 30, 0.5, "gateway up and synced")
             check("gateway listening + synced with nestd", True)

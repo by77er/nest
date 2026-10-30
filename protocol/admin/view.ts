@@ -12,7 +12,7 @@ export const SANDBOX_STATES = [
 export type SandboxState = (typeof SANDBOX_STATES)[number];
 
 /** protocol/model.ts `HostRole`. */
-export const HOST_ROLES = ["burst", "controller"] as const;
+export const HOST_ROLES = ["sandbox", "brain"] as const;
 export type HostRole = (typeof HOST_ROLES)[number];
 
 /** protocol/control.ts `TunnelState`. */
@@ -20,8 +20,8 @@ export const TUNNEL_STATES = ["none", "connecting", "connected"] as const;
 export type TunnelState = (typeof TUNNEL_STATES)[number];
 
 /**
- * FleetDO's `hosts.status`: connected or not (`active`), taking no placements (`draining`), a silent
- * controller (`expired`), leases expired awaiting STONITH (`stonith_pending`), gone (`dead`).
+ * FleetDO's `hosts.status`: connected or not (`active`), taking no placements (`draining`), silent
+ * holding no lease (`expired`), leases expired awaiting STONITH (`stonith_pending`), gone (`dead`).
  */
 export const HOST_STATUSES = ["active", "draining", "expired", "stonith_pending", "dead"] as const;
 export type HostStatus = (typeof HOST_STATUSES)[number];
@@ -86,6 +86,8 @@ export interface HostView {
   lost: boolean;
   /** Its nestd keys brains by agent epoch (false: the previous release). */
   brain_epochs: boolean;
+  /** How many brains a brain host may hold (the cell's setting, else from its vCPUs); null for a sandbox host. */
+  max_brains: number | null;
 }
 
 export interface LaunchView {

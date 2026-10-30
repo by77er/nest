@@ -89,6 +89,12 @@ impl GatewayLink {
         Self::start_with(path, host_id, access, tombstones, notices, Timings::default())
     }
 
+    /// No gateway on this host (a brain host): no socket is bound, so no gateway ever connects and
+    /// nothing is sent.
+    pub fn disabled(tombstones: crate::tombstones::Tombstones) -> GatewayLink {
+        GatewayLink { state: Arc::new(Mutex::new(State { tombstones, ..State::default() })) }
+    }
+
     pub fn start_with(
         path: &Path,
         host_id: HostId,

@@ -2,13 +2,14 @@
 //!
 //! Proves the host's identity (AWS IMDSv2 instance identity document, or a one-time token for
 //! hosts outside AWS), sends a CSR for nest-proxy's per-host intermediate CA (the key stays
-//! here), and receives the host token, fleet URL and signed intermediate.
+//! here; a sandbox host only: a brain host runs no proxy), and receives the host token, fleet URL
+//! and signed intermediate.
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
 use nest_protocol::control::{CaCertificate, EnrollRequest, EnrollResponse, EnrollmentProof};
 use nest_protocol::host::Secret;
-use nest_protocol::model::{HostId, PROTOCOL_VERSION, TimestampMs};
+use nest_protocol::model::{HostId, HostRole, PROTOCOL_VERSION, TimestampMs};
 
 use crate::config::{Config, EnrollmentConfig};
 
@@ -113,7 +114,14 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
         }
         EnrollmentConfig::AwsImds { imds_url } => aws_identity_proof(&http_client()?, imds_url).await?,
     };
-    let (key, csr) = proxy_ca_csr(&cfg.cell)?;
+    // Only a sandbox host runs nest-proxy, so only it asks for (and holds) a proxy CA.
+    let (key, csr) = match cfg.role {
+        HostRole::Sandbox => {
+            let (key, csr) = proxy_ca_csr(&cfg.cell)?;
+            (Some(key), Some(csr))
+        }
+        HostRole::Brain => (None, None),
+    };
     let req = EnrollRequest { protocol_version: PROTOCOL_VERSION, role: cfg.role, cell: cfg.cell.clone(), proof, proxy_ca_csr_pem: csr };
     let url = format!("{}/v1/hosts/enroll", cfg.control_url.trim_end_matches('/'));
     // The control plane may create the host's tunnel before answering: up to four Cloudflare calls
@@ -134,7 +142,13 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
         host_token: Secret(r.host_token),
         host_token_expires_ms: r.host_token_expires_ms,
         fleet_ws_url: r.fleet_ws_url,
-        proxy_ca: Some((r.proxy_ca, key)),
+        proxy_ca: match (r.proxy_ca, key) {
+            (Some(ca), Some(key)) => Some((ca, key)),
+            // A sandbox host runs nest-proxy: without its intermediate CA, inspected egress fails
+            // closed, so the enrollment is a failure, not a host that comes up broken.
+            (None, Some(_)) => bail!("enrollment answered no proxy_ca for a sandbox host"),
+            (_, None) => None,
+        },
         tunnel_token: r.tunnel_token,
         gateway_url: r.gateway_url,
     };
@@ -175,6 +189,11 @@ mod tests {
 
     /// `fleet_ws_url` defaults to this server's own address (as a real control plane answers).
     async fn mock_server_with(fleet_ws_url: Option<&str>) -> (String, Arc<Mutex<Option<serde_json::Value>>>) {
+        mock_server_with_ca(fleet_ws_url, true).await
+    }
+
+    /// `with_ca`: whether the enrollment answer carries a proxy CA.
+    async fn mock_server_with_ca(fleet_ws_url: Option<&str>, with_ca: bool) -> (String, Arc<Mutex<Option<serde_json::Value>>>) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         let fleet = fleet_ws_url.map_or_else(|| format!("{}/v1/fleet", url.replace("http://", "ws://")), str::to_string);
@@ -211,12 +230,16 @@ mod tests {
                         r#"{"action": "terminate", "time": "2026-10-17T04:20:00Z"}"#.to_string()
                     } else if line.starts_with("POST /v1/hosts/enroll") {
                         *seen.lock().unwrap() = Some(serde_json::from_str(body).unwrap());
-                        serde_json::json!({
+                        let mut answer = serde_json::json!({
                             "host": "hst_new", "host_token": "tok", "host_token_expires_ms": 4_102_444_800_000i64,
                             "fleet_ws_url": fleet,
                             "proxy_ca": {"cert_pem": "CERT", "chain_pem": "CHAIN", "expires_ms": 456},
                             "tunnel_token": "tunnel-token-value", "gateway_url": "wss://new-gw-nest.example.dev"
-                        }).to_string()
+                        });
+                        if !with_ca {
+                            answer.as_object_mut().unwrap().remove("proxy_ca");
+                        }
+                        answer.to_string()
                     } else {
                         String::new()
                     };
@@ -233,7 +256,7 @@ mod tests {
 
     fn aws_config(url: &str, state_dir: &std::path::Path) -> Config {
         serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "aws-us-east-1", "control_url": url,
+            "role": "sandbox", "cell": "aws-us-east-1", "control_url": url,
             "enrollment": {"type": "aws_imds", "imds_url": url},
             "driver": {"type": "process", "guest_command": ["x"]},
             "state_dir": state_dir,
@@ -281,7 +304,7 @@ mod tests {
         let (url, seen) = mock_server().await;
         let state = tempfile::tempdir().unwrap();
         let cfg = aws_config(&url, state.path());
-        assert!(matches!(cfg.driver, DriverConfig::Process { .. }));
+        assert!(matches!(cfg.driver, Some(DriverConfig::Process { .. })));
         let e = enroll(&cfg).await.unwrap();
         assert_eq!(e.host.0, "hst_new");
         assert_eq!(e.fleet_ws_url, format!("{}/v1/fleet", url.replace("http://", "ws://")));
@@ -300,5 +323,30 @@ mod tests {
         assert_eq!(&sig[..4], &[0x30, 0x80, 0x06, 0x09]);
         assert_eq!(body["proof"]["pkcs7_b64"], RSA2048_IMDS.replace('\n', ""));
         assert!(body["proxy_ca_csr_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE REQUEST"));
+    }
+
+    /// A sandbox host whose enrollment answer has no proxy CA fails to enroll (it would come up
+    /// with no CA for its proxy), and saves nothing.
+    #[tokio::test]
+    async fn a_sandbox_host_without_a_proxy_ca_does_not_enroll() {
+        let (url, _) = mock_server_with_ca(None, false).await;
+        let state = tempfile::tempdir().unwrap();
+        let err = enroll(&aws_config(&url, state.path())).await.unwrap_err();
+        assert!(err.to_string().contains("no proxy_ca"), "{err:#}");
+        assert!(!state.path().join("host-credentials.json").exists());
+    }
+
+    /// A brain host runs no proxy: it sends no CSR and keeps no proxy CA, even if one is offered.
+    #[tokio::test]
+    async fn a_brain_host_enrolls_without_a_proxy_ca() {
+        let (url, seen) = mock_server().await;
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = aws_config(&url, state.path());
+        cfg.role = HostRole::Brain;
+        let e = enroll(&cfg).await.unwrap();
+        let body = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(body["role"], "controller", "the name the previous control plane reads");
+        assert!(body.get("proxy_ca_csr_pem").is_none(), "{body}");
+        assert!(e.proxy_ca.is_none());
     }
 }

@@ -202,6 +202,14 @@ impl ProxyLink {
         Ok(ProxyLink { shared, writer: tx })
     }
 
+    /// No proxy on this host (a brain host): no socket is bound and nothing is ever sent; the mirror
+    /// still answers what was applied, so callers need no special case.
+    pub fn disabled(tombstones: crate::tombstones::Tombstones) -> ProxyLink {
+        let shared = Arc::new(Mutex::new(Shared { mirror: Mirror::default(), next_seq: 1, tombstones }));
+        let (tx, _) = mpsc::channel();
+        ProxyLink { shared, writer: tx }
+    }
+
     /// Apply a state change: update the mirror and queue the command (atomically, briefly locked;
     /// never blocks on the proxy). Returns `false` if the change was refused because the sandbox
     /// epoch is tombstoned (fenced).

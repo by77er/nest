@@ -1,9 +1,11 @@
 #!/bin/bash
-# Installs a burst host's software: packages, the release from the cell's bucket (host binaries,
-# Firecracker, the guest kernel and image), the jail user, Claude Code and the systemd units. Run
-# twice: by the host-image pipeline (EC2 Image Builder, see docs/compute/provisioning/), which bakes
-# it into the host AMI, and by every host's bootstrap, where it only fills in what the AMI lacks
-# (everything, on stock Amazon Linux 2023). It enables nothing and holds no secrets.
+# Installs a host's software, for both kinds (one AMI): packages, the release from the cell's bucket
+# (host binaries, Firecracker, the guest kernel and image), the jail user, Claude Code and the
+# systemd units. Run by the host-image pipeline (EC2 Image Builder, see docs/compute/provisioning/),
+# which bakes it into the host AMI, and by every host's bootstrap, both kinds, where it only fills
+# in what the AMI lacks (everything, on stock Amazon Linux 2023); a brain host's role may read the
+# release (`releases/*`) and nothing else in the bucket. It enables nothing (bootstrap enables each
+# kind's units) and holds no secrets.
 set -euo pipefail
 
 BUCKET="@BUCKET@"
@@ -89,8 +91,9 @@ EOF
 cat >/etc/systemd/system/nestd.service <<'EOF'
 [Unit]
 Description=nest host daemon
+# Ordered after nest-proxy where it runs, but never pulls it in: a brain host has none.
 After=network-online.target nest-proxy.service
-Wants=network-online.target nest-proxy.service
+Wants=network-online.target
 [Service]
 # Under memory pressure the kernel kills a guest VMM (score 0), never nest's own services.
 OOMScoreAdjust=-900
