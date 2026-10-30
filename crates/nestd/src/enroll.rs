@@ -289,7 +289,7 @@ mod tests {
         let (url, seen) = mock_server().await;
         let state = tempfile::tempdir().unwrap();
         let cfg = aws_config(&url, state.path());
-        assert!(matches!(cfg.driver, DriverConfig::Process { .. }));
+        assert!(matches!(cfg.driver, Some(DriverConfig::Process { .. })));
         let e = enroll(&cfg).await.unwrap();
         assert_eq!(e.host.0, "hst_new");
         assert_eq!(e.fleet_ws_url, format!("{}/v1/fleet", url.replace("http://", "ws://")));

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    /// What this host is for, set at bootstrap (the launch template's user data writes it):
+    /// `sandbox` runs sandboxes and everything beside them; `brain` runs nestd's supervisor duties
+    /// only (enrollment, the fleet channel and lease, command delivery to the runner, self-fencing).
+    /// See [`Config::validate`] for what each kind may configure.
     pub role: HostRole,
     /// e.g. `aws-us-east-1`; selects the object store and placement.
     pub cell: String,
@@ -20,7 +24,9 @@ pub struct Config {
     pub run_dir: PathBuf,
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
-    pub driver: DriverConfig,
+    /// How sandboxes run: required on a sandbox host, refused on a brain host.
+    #[serde(default)]
+    pub driver: Option<DriverConfig>,
     #[serde(default)]
     pub network: NetworkConfig,
     /// Event batch flush interval (spec: 1–2 s).
@@ -192,7 +198,7 @@ pub enum NetworkConfig {
         #[serde(default)]
         persist_dir: Option<PathBuf>,
     },
-    /// No sandbox networking (tests, controller hosts).
+    /// No sandbox networking (tests, brain hosts).
     #[default]
     None,
 }
@@ -211,6 +217,38 @@ impl Default for VersionsConfig {
 }
 
 impl Config {
+    /// What each host kind may configure. A sandbox host needs a driver. A brain host runs no
+    /// sandbox, so nothing that serves one: no driver (no KVM or hugepages), no sandbox networking,
+    /// no object store but the local one (it has no S3 access), no cloudflared and no gateway URL.
+    /// Refused rather than ignored, so a bootstrap that mixes them up fails loudly at start.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self.role {
+            HostRole::Sandbox => {
+                anyhow::ensure!(self.driver.is_some(), "a sandbox host needs a `driver`");
+            }
+            HostRole::Brain => {
+                let mut extra = vec![];
+                if self.driver.is_some() {
+                    extra.push("driver");
+                }
+                if matches!(self.network, NetworkConfig::Netns { .. }) {
+                    extra.push("network (netns)");
+                }
+                if matches!(self.storage, StorageConfig::S3 { .. }) {
+                    extra.push("storage (s3)");
+                }
+                if self.cloudflared_bin.is_some() {
+                    extra.push("cloudflared_bin");
+                }
+                if self.gateway_url.is_some() {
+                    extra.push("gateway_url");
+                }
+                anyhow::ensure!(extra.is_empty(), "a brain host runs no sandboxes; remove {} from its config", extra.join(", "));
+            }
+        }
+        Ok(())
+    }
+
     pub fn flush_interval(&self) -> Duration {
         Duration::from_millis(self.flush_interval_ms)
     }
@@ -305,6 +343,32 @@ fn default_vm_overhead_mib() -> u32 {
 mod tests {
     use super::*;
 
+    /// Each host kind configures only what it runs: a sandbox host needs a driver; a brain host may
+    /// name nothing a sandbox needs. The previous release's role names still parse.
+    #[test]
+    fn validates_what_each_host_kind_configures() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<Config>(v).unwrap();
+        let brain = parse(serde_json::json!({"role": "brain", "cell": "c", "enrollment": {"type": "aws_imds"}}));
+        assert_eq!(brain.role, HostRole::Brain);
+        brain.validate().unwrap();
+        let old = parse(serde_json::json!({"role": "controller", "cell": "c", "enrollment": {"type": "aws_imds"}}));
+        assert_eq!(old.role, HostRole::Brain);
+        let sandbox = parse(serde_json::json!({"role": "burst", "cell": "c", "enrollment": {"type": "aws_imds"}}));
+        assert_eq!(sandbox.role, HostRole::Sandbox);
+        assert!(sandbox.validate().unwrap_err().to_string().contains("needs a `driver`"));
+        let mixed = parse(serde_json::json!({
+            "role": "brain", "cell": "c", "enrollment": {"type": "aws_imds"},
+            "driver": {"type": "process", "guest_command": ["g"]},
+            "network": {"type": "netns"},
+            "storage": {"type": "s3", "bucket": "b", "region": "r"},
+            "cloudflared_bin": "/cf", "gateway_url": "ws://127.0.0.1:1"
+        }));
+        let e = mixed.validate().unwrap_err().to_string();
+        for f in ["driver", "network (netns)", "storage (s3)", "cloudflared_bin", "gateway_url"] {
+            assert!(e.contains(f), "{e}");
+        }
+    }
+
     /// Guest memory is regular pages unless a config asks for hugepages (nestd review #8).
     #[test]
     fn huge_pages_default_off() {
@@ -330,6 +394,7 @@ mod tests {
         assert_eq!(cfg.gateway_sock(), PathBuf::from(paths::GATEWAY_SOCK));
         assert_eq!(cfg.agents_dir(), PathBuf::from(paths::AGENTS_DIR));
         assert!(matches!(cfg.storage, StorageConfig::Local));
+        cfg.validate().unwrap();
         let s3: StorageConfig = serde_json::from_value(serde_json::json!({"type": "s3", "bucket": "b", "region": "us-east-1"})).unwrap();
         assert!(matches!(s3, StorageConfig::S3 { ref prefix, .. } if prefix == "store/"));
     }
