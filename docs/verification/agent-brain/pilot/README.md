@@ -3,7 +3,7 @@
 A TLC-checked model of how an agent's brain is started, killed, moved and released, across AgentDO, FleetDO, nestd and the agent runner. It covers:
 
 - `origin/deferred/agent-epoch` at 65bf6ef;
-- the single-record design chosen on 2026-10-25 (`BRAIN-RECORD-DESIGN.md`), with the amendments A1-A6 that this model's counterexamples led to;
+- the single-record design chosen on 2026-10-25 ([design/](../design/)), with the amendments A1-A6 that this model's counterexamples led to;
 - the **current design** as built on `brain-record` 82396b3 / 36b60d5 and main@b2b9219. It has no same-host re-issue and never adopts, and the tick re-checks a host before expiring it. A host-loss notice releases only a record at or below its epoch, and only while FleetDO still reports the host lost (`AgentDO.onHostLost`). A previous-release host is closed off as described below.
 
 Spec, configs and expected outcomes: [verification/tla/agent-brain/](../../../../verification/tla/agent-brain/); `verification/run.sh` runs them. Tools: the TLC 2026.10.24 nightly for exploration, and TLC v1.7.4 for every `ci` config and every current-design run. Prose inventory: [../](../README.md). Conformance against the code: [../conformance/](../conformance/README.md). This version supersedes the copies merged in PRs #29 and #31.

@@ -12,7 +12,7 @@
 (* Designs (constant RECORD):                                              *)
 (*   FALSE  65bf6ef (origin/deferred/agent-epoch): awaiting_exit,          *)
 (*          pending_start, stop_requested.                                 *)
-(*   TRUE   the single-record design (BRAIN-RECORD-DESIGN.md):             *)
+(*   TRUE   single-record design (docs/verification/agent-brain/design):   *)
 (*          brain {host, epoch, phase starting|live|condemned} + intent.   *)
 (* Per-fix toggles (RECORD and all FIX_* FALSE = 65bf6ef as coded):        *)
 (*   FIX_H1  nestd's brain table keyed by (agent, epoch): an older exit    *)
