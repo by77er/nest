@@ -1416,7 +1416,8 @@ impl Inner {
             return;
         }
         let kind = command_kind(&cmd.body);
-        let result = match (cmd.body, host_kind_refusal(self.cfg.role, kind)) {
+        let refusal = host_kind_refusal(self.cfg.role, &cmd.body);
+        let result = match (cmd.body, refusal) {
             (_, Some(why)) => Err(error(error_codes::FORBIDDEN, why, false)),
             (CommandBody::AgentStart(start), None) if self.lapse_guard.outlived(&cmd.cmd.0) => {
                 self.refuse_start(&start, "the host lease lapsed since this start arrived")
@@ -2346,14 +2347,32 @@ fn cli_name(c: &nest_protocol::guest::CliCommand) -> &'static str {
 /// brain is FleetDO's rule (`issueCommands` refuses an `agent_start` there), and a sandbox host runs
 /// no agent runner, so a start that reached one would never run. Pure, so the rule is tested apart
 /// from the executor that applies it.
-pub(crate) fn host_kind_refusal(role: HostRole, kind: &str) -> Option<&'static str> {
-    const SANDBOX_COMMANDS: &[&str] = &[
-        "sandbox_create", "sandbox_suspend", "sandbox_resume", "sandbox_archive", "sandbox_checkpoint", "sandbox_fork",
-        "sandbox_destroy", "policy_update", "secrets_update", "port_expose", "port_unexpose", "agent_attach", "agent_detach",
-    ];
+pub(crate) fn host_kind_refusal(role: HostRole, body: &CommandBody) -> Option<&'static str> {
+    // Exhaustive on purpose: a new command must be placed on one side or the other.
+    let about_a_sandbox = match body {
+        CommandBody::SandboxCreate { .. }
+        | CommandBody::SandboxSuspend { .. }
+        | CommandBody::SandboxResume { .. }
+        | CommandBody::SandboxArchive { .. }
+        | CommandBody::SandboxCheckpoint { .. }
+        | CommandBody::SandboxFork { .. }
+        | CommandBody::SandboxDestroy { .. }
+        | CommandBody::PolicyUpdate { .. }
+        | CommandBody::SecretsUpdate { .. }
+        | CommandBody::PortExpose { .. }
+        | CommandBody::PortUnexpose { .. }
+        | CommandBody::AgentAttach { .. }
+        | CommandBody::AgentDetach { .. } => true,
+        CommandBody::CommitResult { .. }
+        | CommandBody::GuestCliResult { .. }
+        | CommandBody::AgentStart(_)
+        | CommandBody::AgentStop { .. }
+        | CommandBody::Fence { .. }
+        | CommandBody::Drain { .. } => false,
+    };
     match role {
-        HostRole::Brain if SANDBOX_COMMANDS.contains(&kind) => Some("this is a brain host: it runs no sandboxes"),
-        _ => None,
+        HostRole::Brain if about_a_sandbox => Some("this is a brain host: it runs no sandboxes"),
+        HostRole::Brain | HostRole::Sandbox => None,
     }
 }
 
@@ -2427,29 +2446,33 @@ mod tests {
     }
 
     /// Which salvage failures are retried and which end the retire.
-    /// Amendment A3 (a): a start that arrived before a lapse, or while lapsed, never runs, even
-    /// once the lease is renewed; one that arrived after the renewal runs.
     /// A brain host refuses every sandbox command and nothing else; a sandbox host refuses nothing
-    /// (FleetDO keeps brains off it). Every command kind is checked.
+    /// (FleetDO keeps brains off it). Checked on every command fixture (the fixtures cover every
+    /// variant: `nest-protocol`'s round-trip test), by kind.
     #[test]
     fn a_brain_host_refuses_every_sandbox_command_and_nothing_else() {
-        use super::host_kind_refusal;
+        use super::{command_kind, host_kind_refusal};
+        use nest_protocol::control::Command;
         use nest_protocol::model::HostRole;
         let sandbox_only = [
             "sandbox_create", "sandbox_suspend", "sandbox_resume", "sandbox_archive", "sandbox_checkpoint", "sandbox_fork",
             "sandbox_destroy", "policy_update", "secrets_update", "port_expose", "port_unexpose", "agent_attach", "agent_detach",
         ];
-        let both = ["commit_result", "guest_cli_result", "agent_start", "agent_stop", "fence", "drain"];
-        for k in sandbox_only {
-            assert!(host_kind_refusal(HostRole::Brain, k).is_some(), "{k}");
-            assert!(host_kind_refusal(HostRole::Sandbox, k).is_none(), "{k}");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/fixtures/control/command");
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let cmd: Command = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let kind = command_kind(&cmd.body);
+            seen.insert(kind);
+            assert_eq!(host_kind_refusal(HostRole::Brain, &cmd.body).is_some(), sandbox_only.contains(&kind), "{}", path.display());
+            assert!(host_kind_refusal(HostRole::Sandbox, &cmd.body).is_none(), "{}", path.display());
         }
-        for k in both {
-            assert!(host_kind_refusal(HostRole::Brain, k).is_none(), "{k}");
-            assert!(host_kind_refusal(HostRole::Sandbox, k).is_none(), "{k}");
-        }
+        assert_eq!(seen.len(), 19, "a fixture per command kind: {seen:?}");
     }
 
+    /// Amendment A3 (a): a start that arrived before a lapse, or while lapsed, never runs, even
+    /// once the lease is renewed; one that arrived after the renewal runs.
     #[test]
     fn a_start_never_outlives_a_lease_lapse() {
         let g = LapseGuard::default();

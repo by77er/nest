@@ -2173,6 +2173,9 @@ async fn a_brain_host_runs_brains_and_refuses_sandboxes() {
     assert_eq!(hello.role, HostRole::Brain);
     assert_eq!(hello.gateway_url, None);
     assert_eq!(hello.tunnel, TunnelState::None);
+    // All its vCPUs are free (no sandbox holds any): FleetDO's default brain capacity counts them.
+    let vcpus = std::thread::available_parallelism().unwrap().get() as u32;
+    assert_eq!((hello.capacity.vcpus_free, hello.capacity.sandboxes), (vcpus, 0));
     assert!(!dir.path().join("run/proxy.sock").exists(), "a brain host binds no proxy socket");
     assert!(!dir.path().join("run/gateway.sock").exists(), "a brain host binds no gateway socket");
 

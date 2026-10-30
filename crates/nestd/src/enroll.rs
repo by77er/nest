@@ -142,7 +142,13 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
         host_token: Secret(r.host_token),
         host_token_expires_ms: r.host_token_expires_ms,
         fleet_ws_url: r.fleet_ws_url,
-        proxy_ca: r.proxy_ca.zip(key),
+        proxy_ca: match (r.proxy_ca, key) {
+            (Some(ca), Some(key)) => Some((ca, key)),
+            // A sandbox host runs nest-proxy: without its intermediate CA, inspected egress fails
+            // closed, so the enrollment is a failure, not a host that comes up broken.
+            (None, Some(_)) => bail!("enrollment answered no proxy_ca for a sandbox host"),
+            (_, None) => None,
+        },
         tunnel_token: r.tunnel_token,
         gateway_url: r.gateway_url,
     };
@@ -183,6 +189,11 @@ mod tests {
 
     /// `fleet_ws_url` defaults to this server's own address (as a real control plane answers).
     async fn mock_server_with(fleet_ws_url: Option<&str>) -> (String, Arc<Mutex<Option<serde_json::Value>>>) {
+        mock_server_with_ca(fleet_ws_url, true).await
+    }
+
+    /// `with_ca`: whether the enrollment answer carries a proxy CA.
+    async fn mock_server_with_ca(fleet_ws_url: Option<&str>, with_ca: bool) -> (String, Arc<Mutex<Option<serde_json::Value>>>) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         let fleet = fleet_ws_url.map_or_else(|| format!("{}/v1/fleet", url.replace("http://", "ws://")), str::to_string);
@@ -219,12 +230,16 @@ mod tests {
                         r#"{"action": "terminate", "time": "2026-10-17T04:20:00Z"}"#.to_string()
                     } else if line.starts_with("POST /v1/hosts/enroll") {
                         *seen.lock().unwrap() = Some(serde_json::from_str(body).unwrap());
-                        serde_json::json!({
+                        let mut answer = serde_json::json!({
                             "host": "hst_new", "host_token": "tok", "host_token_expires_ms": 4_102_444_800_000i64,
                             "fleet_ws_url": fleet,
                             "proxy_ca": {"cert_pem": "CERT", "chain_pem": "CHAIN", "expires_ms": 456},
                             "tunnel_token": "tunnel-token-value", "gateway_url": "wss://new-gw-nest.example.dev"
-                        }).to_string()
+                        });
+                        if !with_ca {
+                            answer.as_object_mut().unwrap().remove("proxy_ca");
+                        }
+                        answer.to_string()
                     } else {
                         String::new()
                     };
@@ -310,6 +325,17 @@ mod tests {
         assert!(body["proxy_ca_csr_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE REQUEST"));
     }
 
+    /// A sandbox host whose enrollment answer has no proxy CA fails to enroll (it would come up
+    /// with no CA for its proxy), and saves nothing.
+    #[tokio::test]
+    async fn a_sandbox_host_without_a_proxy_ca_does_not_enroll() {
+        let (url, _) = mock_server_with_ca(None, false).await;
+        let state = tempfile::tempdir().unwrap();
+        let err = enroll(&aws_config(&url, state.path())).await.unwrap_err();
+        assert!(err.to_string().contains("no proxy_ca"), "{err:#}");
+        assert!(!state.path().join("host-credentials.json").exists());
+    }
+
     /// A brain host runs no proxy: it sends no CSR and keeps no proxy CA, even if one is offered.
     #[tokio::test]
     async fn a_brain_host_enrolls_without_a_proxy_ca() {
@@ -319,7 +345,7 @@ mod tests {
         cfg.role = HostRole::Brain;
         let e = enroll(&cfg).await.unwrap();
         let body = seen.lock().unwrap().clone().unwrap();
-        assert_eq!(body["role"], "brain");
+        assert_eq!(body["role"], "controller", "the name the previous control plane reads");
         assert!(body.get("proxy_ca_csr_pem").is_none(), "{body}");
         assert!(e.proxy_ca.is_none());
     }
