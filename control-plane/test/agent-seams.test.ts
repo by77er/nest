@@ -1318,7 +1318,14 @@ describe("FleetDO and SandboxDO at the seam", () => {
       failed = e;
     }
     expect(String(failed)).toMatch(/dead/);
-    expect(await agentStub(s.agent).info()).toMatchObject({ brain: { host: b.host, epoch: 2, phase: "condemned" }, intent: { host_hint: b.host } });
+    // Real alarms run in this pool: under load the `condemned` (or `intent`) alarm may already
+    // have released the record on b's confirmed death. Either way it is never live on b.
+    const mid = await agentStub(s.agent).info();
+    if (mid.brain?.host === b.host && mid.brain.epoch === 2) {
+      expect(mid).toMatchObject({ brain: { phase: "condemned" }, intent: { host_hint: b.host } });
+    } else {
+      expect(mid.brain === null || mid.brain.epoch >= 3).toBe(true);
+    }
     await runDeadline(s.agent, "condemned");
     expect((await agentStub(s.agent).info()).brain).not.toMatchObject({ host: b.host, epoch: 2 });
     // The kept intent's hint no longer works: dropped, and the start goes to another host.

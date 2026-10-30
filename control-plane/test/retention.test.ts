@@ -678,3 +678,20 @@ describe("the pruning pass", () => {
     expect(await fleetSql(cell, (sql) => rows(sql, "SELECT at FROM deadlines WHERE key = 'tick'").length), "the tick ran and re-armed").toBe(1);
   });
 });
+
+describe("FleetDO's own answers are no evidence that a host processes commands", () => {
+  it("a start failed on expiry (failStarts) doesn't count as host_processing for a kill issued before it", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    await runInDurableObject(fleetStub(cell), async (inst: FleetDO, st) => {
+      const sql = st.storage.sql;
+      const t0 = Date.now() - 1000;
+      sql.exec(`INSERT INTO commands (cmd, host, type, agent, epoch, body, issued_ms) VALUES ('cmd_kill', ?, 'agent_stop', 'agt_x', 1, '{}', ?)`, h.host, t0);
+      sql.exec(`INSERT INTO commands (cmd, host, type, agent, epoch, body, issued_ms) VALUES ('cmd_start', ?, 'agent_start', 'agt_y', 1, '{}', ?)`, h.host, t0 + 10);
+      (inst as unknown as { failStarts(host: string): void }).failStarts(h.host);
+      const p = await inst.killProgress("cmd_kill", "agt_x", h.host, 1);
+      expect(p.processed).toBe(false);
+      expect(p.host_processing).toBe(false);
+    });
+  });
+});
