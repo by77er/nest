@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run one fuzz target for a bounded time: run.sh <target> <seconds> [extra libFuzzer args...]
+# Run one fuzz target for a bounded time, or replay its seeds and corpus once:
+# run.sh <target> <seconds|replay> [extra libFuzzer args...]
 # Corpus grows in corpus/<target>/ (gitignored), starting from seeds/<target>/; crashes land in
 # artifacts/<target>/.
 set -euo pipefail
@@ -19,5 +20,11 @@ unset RUSTUP_TOOLCHAIN
 # The seeds are built from protocol/fixtures/ (the source of truth) at every run, never committed.
 python3 -I gen_seeds.py >/dev/null
 mkdir -p "corpus/$target"
+if [ "$secs" = replay ]; then
+  # Run every seed and corpus input once and stop: deterministic, for the PR gate.
+  limit=(-runs=0)
+else
+  limit=(-max_total_time="$secs")
+fi
 exec cargo fuzz run --fuzz-dir . "$target" "corpus/$target" "seeds/$target" -- \
-  -max_total_time="$secs" -rss_limit_mb=2048 -malloc_limit_mb=2048 -max_len="$max_len" -timeout=60 -print_final_stats=1 "$@"
+  "${limit[@]}" -rss_limit_mb=2048 -malloc_limit_mb=2048 -max_len="$max_len" -timeout=60 -print_final_stats=1 "$@"

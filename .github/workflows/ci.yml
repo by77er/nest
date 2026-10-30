@@ -246,7 +246,9 @@ jobs:
       - name: Mutation testing of nestd-core (0 missed expected)
         run: |
           command -v cargo-mutants || cargo install --locked "cargo-mutants@$CARGO_MUTANTS"
-          cargo mutants -p nestd-core --timeout 60 -j 2
+          # In place, so the cached `target/` above is the one it builds in (a copied tree would
+          # build from scratch every run).
+          cargo mutants -p nestd-core --in-place --timeout 60
 
   # Kani proofs of nestd-core's decision functions (bounded; see docs/verification/nestd/).
   kani-nestd:
@@ -273,7 +275,9 @@ jobs:
           cargo kani setup
           cargo kani -p nestd-core
 
-  # Every wire parser nestd runs at a trust boundary, guest (vsock) first, 60 s per target.
+  # Every wire parser nestd runs at a trust boundary, guest (vsock) first. The PR gate is
+  # deterministic: the seeds still decode, and every target replays the seeds and the corpus the
+  # scheduled fuzzing grew (fuzz.yml), once each. Timed fuzzing runs only on that schedule.
   fuzz-nestd:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -299,10 +303,16 @@ jobs:
       - run: command -v cargo-fuzz || cargo install --locked "cargo-fuzz@$CARGO_FUZZ"
       - name: Seeds still decode
         run: python3 -I gen_seeds.py && cargo test --locked
-      - name: Fuzz each target for 60 s
+      - name: The scheduled runs' corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: verification/nestd/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-
+          restore-keys: fuzz-corpus-${{ runner.os }}-
+      - name: Replay the seeds and the corpus through every target
         run: |
           for t in guest_stream guest_control_json vsock_handshake proxy_events gateway_events runner_events fleet_to_host meta_json; do
-            ./run.sh "$t" 60 -timeout=30
+            ./run.sh "$t" replay
           done
       - name: Upload crashes
         if: failure()
