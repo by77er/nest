@@ -745,14 +745,18 @@ describe("review fixes", () => {
     for (const name of names) expect((await chStub(name).subscriptions(name))[0]).toMatchObject({ cursor: 1, inflight: null });
   });
 
-  it("expiry deletes R2 bodies before their rows, at most 1000 keys a call, past 1000 at once", async () => {
+  // Over 2,400 R2 operations: well under a second alone, but its time grows with the machine's load.
+  it("expiry deletes R2 bodies before their rows, at most 1000 keys a call, past 1000 at once", { timeout: 30_000 }, async () => {
     const name = await newChannel(1);
     const N = 1205;
     await runInDurableObject(chStub(name), async (_i: ChannelDO, st) => {
       const old = Date.now() - 3 * 86_400_000;
+      const refs = Array.from({ length: N }, (_, i) => `channels/${name}/b/old${i + 1}`);
+      for (let i = 0; i < N; i += 100) {
+        await Promise.all(refs.slice(i, i + 100).map((ref, j) => env.BUCKET.put(ref, JSON.stringify({ text: `t${i + j + 1}`, data: null }))));
+      }
       for (let seq = 1; seq <= N; seq++) {
-        const ref = `channels/${name}/b/old${seq}`;
-        await env.BUCKET.put(ref, JSON.stringify({ text: `t${seq}`, data: null }));
+        const ref = refs[seq - 1]!;
         st.storage.sql.exec(`INSERT INTO messages (seq, ts_ms, from_p, taint, kind, text, data, reply_to, key, mentions, body_ref, bytes)
           VALUES (?, ?, 'user', 0, NULL, NULL, NULL, NULL, NULL, NULL, ?, 10)`, seq, old, ref);
       }

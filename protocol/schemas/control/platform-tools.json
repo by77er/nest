@@ -1034,7 +1034,7 @@
   },
   {
     "name": "task_claim",
-    "description": "Take an unassigned open task: it becomes yours, and backlog or todo moves to in_progress. Refused (conflict) if someone holds it or it changed since expected_version.",
+    "description": "Take an unassigned task in backlog or todo: it becomes yours, in_progress. Refused (conflict) if someone holds it or it changed since expected_version; a task in progress or in review isn't claimable.",
     "input_schema": {
       "type": "object",
       "properties": {

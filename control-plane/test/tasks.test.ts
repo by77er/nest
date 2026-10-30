@@ -386,13 +386,20 @@ describe("TaskLedgerDO", () => {
     }));
     // The real alarm fails it, re-arms, and fails it again: two attempts, the row kept, an alarm set for it.
     const t0 = Date.now();
+    /** The retry time set after each failed attempt (by attempt count). */
+    const nextAfter = new Map<number, number>();
     let o = await outbox();
     while ((o.rows[0]?.attempts ?? 0) < 2 && Date.now() - t0 < 10_000) {
       await sleep(50);
       o = await outbox();
+      if (o.rows[0]) nextAfter.set(o.rows[0].attempts, o.rows[0].next_ms);
     }
     expect(o.rows.length).toBe(1);
     expect(o.rows[0]!.attempts).toBeGreaterThanOrEqual(2);
+    // The backoff grows: attempt 2 ran at or after attempt 1's retry time and waits 2 s, not 1 s, so the
+    // retry times are at least 2 s apart (a constant 1 s backoff puts them about 1 s apart).
+    expect([...nextAfter.keys()]).toEqual(expect.arrayContaining([1, 2]));
+    expect(nextAfter.get(2)! - nextAfter.get(1)!).toBeGreaterThanOrEqual(2_000);
     expect(o.alarm).not.toBeNull();
     expect(o.alarm!).toBeLessThanOrEqual(o.rows[0]!.next_ms);
     // Repaired: the next attempt delivers it, deletes the row, and a repeat delivers nothing more.

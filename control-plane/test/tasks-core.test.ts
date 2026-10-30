@@ -237,16 +237,20 @@ describe("claim (the tasks capability)", () => {
     expect(code(m.run(agent(W1), { kind: "claim", task: "T-1" }))).toBe("conflict");
   });
 
-  it("is compare-and-set with expected_version; keeps in_review; refuses closed tasks and the operator", () => {
+  it("is compare-and-set with expected_version; takes only backlog and todo (never a task in progress or in review); refuses the operator", () => {
     const m = new Mem();
     create(m);
     ok(m.run(agent(W1), { kind: "update", task: "T-1", title: "edited" }));
     expect(code(m.run(agent(W2), { kind: "claim", task: "T-1", expected_version: 1 }))).toBe("conflict");
-    create(m, operator, { status: "in_review" });
-    expect(ok(m.run(agent(W2), { kind: "claim", task: "T-2" })).task).toMatchObject({ assignee: W2, status: "in_review" });
-    for (const s of ["done", "canceled"] as const) {
+    // Written out, not read from CLAIM_STARTS.
+    const claimable: TaskStatus[] = ["backlog", "todo"];
+    for (const s of TASK_STATUSES) {
       create(m, operator, { status: s });
-      expect(code(m.run(agent(W2), { kind: "claim", task: `T-${m.next - 1}` })), s).toBe("invalid_message");
+      const key = `T-${m.next - 1}`;
+      const r = m.run(agent(W2), { kind: "claim", task: key });
+      expect(code(r), s).toBe(claimable.includes(s) ? "ok" : "invalid_message");
+      if (r.ok) expect(r.value.task, s).toMatchObject({ assignee: W2, status: "in_progress" });
+      else expect(m.get(key), s).toMatchObject({ assignee: null, status: s });
     }
     create(m);
     expect(code(m.run(operator, { kind: "claim", task: `T-${m.next - 1}` }))).toBe("invalid_message");
@@ -561,7 +565,7 @@ describe("random operation sequences (400 seeds x 80 ops)", () => {
                 expect(prev.assignee === who || prev.created_by === who, ctx).toBe(true);
                 if (a.put.status !== prev.status) expect(EXPECTED_WORKER_MOVES[prev.status], ctx).toContain(a.put.status);
               }
-              if (op.kind === "claim" && a.put.status !== prev.status) expect([prev.status === "backlog" || prev.status === "todo", a.put.status], ctx).toEqual([true, "in_progress"]);
+              if (op.kind === "claim") expect([prev.status === "backlog" || prev.status === "todo", a.put.status], ctx).toEqual([true, "in_progress"]);
             }
             if (a.put.status !== prev.status) expect(["update", "update_any", "cancel", "claim"], ctx).toContain(op.kind);
             if (a.put.assignee !== prev.assignee) expect(["assign", "claim"], ctx).toContain(op.kind);

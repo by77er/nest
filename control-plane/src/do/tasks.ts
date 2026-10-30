@@ -347,7 +347,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
   }
 
   private prune(now: number): void {
-    const closed = "SELECT id FROM tasks WHERE status IN ('done', 'canceled') AND updated_ms < ?";
+    const closed = `SELECT id FROM tasks WHERE status IN (${sqlIn(CLOSED_STATUSES)}) AND updated_ms < ?`;
     this.sql.exec(`DELETE FROM comments WHERE task IN (${closed})`, now - CLOSED_TASK_DETAIL_MS);
     this.sql.exec(`DELETE FROM history WHERE task IN (${closed})`, now - CLOSED_TASK_DETAIL_MS);
     this.sql.exec("DELETE FROM applied WHERE ts_ms < ?", now - APPLIED_RETENTION_MS);

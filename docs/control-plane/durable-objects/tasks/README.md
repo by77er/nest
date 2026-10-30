@@ -26,7 +26,7 @@ A **task ledger**: a small issue tracker (a simple Linear) that agents read and 
 | list, get | `task_list`, `task_get` (`tasks`) | Anyone with the ledger. Filters: `status`, `assignee` (`me`, an id, or null for unassigned), `label`, `text`, `parent`; pages of ≤ 200 by key (`cursor`) |
 | create | `task_create` (`tasks`) | Unassigned, `priority: none`, in `backlog` (default) or `todo`; an optional parent |
 | update | `task_update` (`tasks`) | Only a task assigned to or created by the caller: title, description, labels, and status along the transitions below. Priority, parent and assignment are refused |
-| claim | `task_claim` (`tasks`) | An unassigned open task becomes the caller's; `backlog` and `todo` move to `in_progress`. A held task is a `conflict`; with `expected_version` it is compare-and-set. No notice (nobody else held it) |
+| claim | `task_claim` (`tasks`) | An unassigned `backlog` or `todo` task becomes the caller's, `in_progress`. Not a task in progress or in review: one an admin unassigned in review waits for a reviewer the admin picks, and a claimant could otherwise move it to `done` itself. A held task is a `conflict`; with `expected_version` it is compare-and-set. No notice (nobody else held it) |
 | comment | `task_comment` (`tasks`) | Any task in the ledger |
 | assign | `task_assign` (`tasks-admin`) | To an agent whose spec grants this ledger (its `ledger` param, and a task tool), or null |
 | update any | `task_update_any` (`tasks-admin`) | Any field of any task, any status; not assignment (that is `task_assign`, which checks and notifies) |
@@ -57,7 +57,7 @@ Admin auth. `GET /v1/ledgers/<name>` (`{ledger, watcher, tasks}`) · `PUT /v1/le
 
 ## Retention
 
-At most 10,000 open tasks per ledger: a create (or a reopen) beyond it is refused, and closing tasks makes room. Closed tasks are kept (the ledger is the record). Comments and history of a task `done` or `canceled` more than 30 days ago are deleted; history keeps the latest 500 rows per task; `applied` keys 7 days; `outbox` rows until delivered. The prune runs daily from the alarm ([data](../../../data/#retention)).
+At most 10,000 open tasks per ledger: a create (or a reopen) beyond it is refused, and closing tasks makes room. Closed tasks are kept, and are the one table here without a bound: about twice their text each (the body and its search copy), against SQLite-backed Durable Object storage of 10 GB per object ([limits](https://developers.cloudflare.com/durable-objects/platform/limits/), unverified for this account). Archiving them (to R2 after N days, keeping a stub with key and status) is an open question below. Comments and history of a task `done` or `canceled` more than 30 days ago are deleted; history keeps the latest 500 rows per task; `applied` keys 7 days; `outbox` rows until delivered. The prune runs daily from the alarm ([data](../../../data/#retention)).
 
 ## Taint
 
@@ -72,4 +72,6 @@ The ledger keeps the [taint](../../../agents/tools/#taint-and-sinks) of what it 
 
 Adding the class is a **one-way deploy** ([deploy](../../../../dev/deploy.md)). A forward revert to the previous release leaves ledgers unreachable but intact, keeps spawning working (the seed migration edits no template), and the previous code ignores a stored spec's `params` and lists no `task_*` tool.
 
-**Not built:** capability params granting more than one ledger, or a different one per capability (`tasks{ledgers: [...]}`, the extension point); a spawner passing on a ledger it holds (waits for `agent_spawn` and grants); posting notices to channels (stage 2, above); archiving closed tasks; deleting a task or a ledger; a cap on retries (a notice to an agent that keeps failing retries every 5 minutes, and per-agent order isn't kept after a failure).
+**Not built:** capability params granting more than one ledger, or a different one per capability (`tasks{ledgers: [...]}`, the extension point); a spawner passing on a ledger it holds (waits for `agent_spawn` and grants); posting notices to channels (stage 2, above); deleting a task or a ledger; a cap on retries (a notice to an agent that keeps failing retries every 5 minutes, and per-agent order isn't kept after a failure).
+
+**Open:** a retention rule for closed tasks (archive their bodies to R2 after N days and keep a stub with key, status and version, or let the operator delete them); until then a ledger's closed tasks grow without bound. Also open: whether `task_list`'s `text` and `label` filters, which tell a clean reader one bit about tainted text (whether anything matches), need a tainting result; and a structured-only list (keys, statuses, assignees, no agent text) that wouldn't taint a captain triaging a worker-written board.

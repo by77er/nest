@@ -73,7 +73,11 @@ export const NOTIFY_STATUSES: readonly TaskStatus[] = ["in_review", "done", "can
 export const CLOSED_STATUSES: readonly TaskStatus[] = ["done", "canceled"];
 /** What an agent's create may start a task in. */
 export const CREATE_STATUSES: readonly TaskStatus[] = ["backlog", "todo"];
-/** What a claim moves a task from to `in_progress` (other open statuses stay). */
+/**
+ * What a claim takes a task from (to `in_progress`): work not yet started. Not `in_progress` or
+ * `in_review`: an unassigned task in review waits for a reviewer an admin assigns, and a claimant
+ * could otherwise move it to done itself.
+ */
 export const CLAIM_STARTS: readonly TaskStatus[] = ["backlog", "todo"];
 
 export interface Task {
@@ -185,7 +189,7 @@ export type TaskOp =
   | ({ kind: "create"; assignee?: SpecGrant } & TaskEdits & { title: string })
   /** An agent's own task (assigned to or created by it): title, description, labels, status within WORKER_TRANSITIONS. */
   | ({ kind: "update"; task: string; expected_version?: number } & Pick<TaskEdits, "title" | "description" | "status" | "labels">)
-  /** An unassigned open task, to the claiming agent; backlog and todo move to in_progress. */
+  /** An unassigned backlog or todo task, to the claiming agent, in_progress. */
   | { kind: "claim"; task: string; expected_version?: number }
   /** Admin: any field of any task (assignment goes through `assign`). */
   | ({ kind: "update_any"; task: string; expected_version?: number } & TaskEdits)
@@ -458,8 +462,10 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
       if (before.assignee !== null) {
         return refuse("conflict", `${taskKey(before)} is ${before.assignee === actor.agent ? "already yours" : `assigned to ${before.assignee}`}`);
       }
-      if (CLOSED_STATUSES.includes(before.status)) return refuse("invalid_message", `${taskKey(before)} is ${before.status}`);
-      const c = change(before, { assignee: actor.agent, status: CLAIM_STARTS.includes(before.status) ? "in_progress" : undefined }, who, ctx.now)!;
+      if (!CLAIM_STARTS.includes(before.status)) {
+        return refuse("invalid_message", `${taskKey(before)} is ${before.status}: a claim takes only ${CLAIM_STARTS.join(" or ")} tasks`);
+      }
+      const c = change(before, { assignee: actor.agent, status: "in_progress" }, who, ctx.now)!;
       return done(before, c, assignNotices(ledger, before, c.after, who));
     }
 
