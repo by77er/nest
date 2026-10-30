@@ -12,6 +12,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [broker/](broker/) | Claude setup tokens, injected secrets, hook secrets, capability credentials, GitHub App token minting |
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
 | WorkstreamDO (interim) | The [workstream channel](../../orchestration/workstreams/#the-interim-workstream-channel) until ChannelDO exists |
+| [tasks/](tasks/) | One named task ledger: tasks, comments, history, its watcher, and the inbox notices its changes owe |
 
 ## Conventions
 

@@ -9,7 +9,7 @@ import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
 import type { ChannelDO } from "../src/do/channel";
 import type { Caller } from "../src/lib/channels";
-import { SEED_CATALOG_V1 } from "../src/lib/spec";
+import { SEED_CATALOG_V1, SEED_VERSION } from "../src/lib/spec";
 import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -745,14 +745,18 @@ describe("review fixes", () => {
     for (const name of names) expect((await chStub(name).subscriptions(name))[0]).toMatchObject({ cursor: 1, inflight: null });
   });
 
-  it("expiry deletes R2 bodies before their rows, at most 1000 keys a call, past 1000 at once", async () => {
+  // Over 2,400 R2 operations: well under a second alone, but its time grows with the machine's load.
+  it("expiry deletes R2 bodies before their rows, at most 1000 keys a call, past 1000 at once", { timeout: 30_000 }, async () => {
     const name = await newChannel(1);
     const N = 1205;
     await runInDurableObject(chStub(name), async (_i: ChannelDO, st) => {
       const old = Date.now() - 3 * 86_400_000;
+      const refs = Array.from({ length: N }, (_, i) => `channels/${name}/b/old${i + 1}`);
+      for (let i = 0; i < N; i += 100) {
+        await Promise.all(refs.slice(i, i + 100).map((ref, j) => env.BUCKET.put(ref, JSON.stringify({ text: `t${i + j + 1}`, data: null }))));
+      }
       for (let seq = 1; seq <= N; seq++) {
-        const ref = `channels/${name}/b/old${seq}`;
-        await env.BUCKET.put(ref, JSON.stringify({ text: `t${seq}`, data: null }));
+        const ref = refs[seq - 1]!;
         st.storage.sql.exec(`INSERT INTO messages (seq, ts_ms, from_p, taint, kind, text, data, reply_to, key, mentions, body_ref, bytes)
           VALUES (?, ?, 'user', 0, NULL, NULL, NULL, NULL, NULL, NULL, ?, 10)`, seq, old, ref);
       }
@@ -1085,7 +1089,7 @@ describe("catalog seed migration", () => {
     // Templates are the operator's: unchanged.
     expect(after.templates.worker?.capabilities).toEqual(SEED_CATALOG_V1.templates.worker!.capabilities);
     const version = await runInDurableObject(stub, (_i: CatalogDO, st) => st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value);
-    expect(version).toBe("2");
+    expect(version).toBe(String(SEED_VERSION));
     // Deleted after the migration: stays deleted across restarts.
     await stub.deleteCapability("messaging-tree");
     expect(await restart(stub)).not.toHaveProperty("capabilities.messaging-tree");

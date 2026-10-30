@@ -111,6 +111,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Brain host | A cheap host with no KVM running nestd (supervisor duties only), the agent runner and Claude Code processes. Every brain lives here; no sandbox does. Capacity is counted in brains; scales to zero. |
 | Captain | A pattern, not a platform concept: an agent without hands, spawned from the `captain` template, that manages other agents and escalates to me |
 | Workstream | A pattern, not a platform concept: a goal plus the channel, sandboxes and agents set up for it, grouped by a label |
+| Task ledger | A named issue tracker in the control plane (TaskLedgerDO): tasks with status, priority, assignee, labels, sub-tasks, comments and history. Agents reach the one their spec names through the `tasks` and `tasks-admin` capabilities |
 | nestd | Per-host daemon |
 | nest-proxy | Per-host egress proxy |
 | Guest agent | Hands server inside each sandbox VM. Holds no credentials. |
@@ -194,6 +195,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Every brain runs on a brain host: the cheapest instance class that runs Claude Code, no KVM, idle 30 min then terminated. An agent without hands is a brain like any other, and the Discord gateway client is a singleton placed on one brain host; no host kind is reserved for brains without sandboxes | [compute/brain-hosts/](compute/brain-hosts/) |
 | A release rolls out control plane, then brain hosts, then sandbox hosts, one canary and a probe gate each; FleetDO holds three desired versions per cell (brain host, sandbox host, guest image), and rollback sets a version back | [compute/provisioning/](compute/provisioning/#upgrades) |
 | `api-loop` can hold hands through the gateway (a Durable Object opens one WebSocket per call) and is deferred until the API credits are picked up | [agents/backends/api-loop/](agents/backends/api-loop/) |
+| Task ledgers are named objects, not per workstream: an agent reaches one ledger, named by its `tasks{ledger}` capability parameter; decisions are a pure core, notices go to inboxes from the ledger's alarm | [control-plane/durable-objects/tasks/](control-plane/durable-objects/tasks/) |
 
 ## Open questions and watch items
 
@@ -220,6 +222,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Open:** how the Durable Objects' protocol logic is checked once it moves into pure cores as nestd's did (the direction names a TypeScript explorer, with Rust cores via WASM for protocols spanning both sides; neither is designed), and whether their design models stay in TLA+ (the pilots) or move to Quint (the survey's pick, for model-based tests). See [verification/](verification/#open-questions).
 - **Decide:** the no-capacity placement rollback reuses an epoch number, contrary to "an epoch is never retried", and makes the old holder's salvage fail for good. Keep it and authorize that salvage, or spend an epoch per attempt? See [verification/sandbox-lease/](verification/sandbox-lease/), [SandboxDO](control-plane/durable-objects/sandbox/).
 - **Open:** channels have no garbage collection: built-in channels outlive their agent or sandbox, the directory and the daily maintenance alarm never stop, and `channel_create` has no quota. See [ChannelDO](control-plane/durable-objects/channel/).
+- **Open:** capability parameters granting more than one ledger (`tasks{ledgers}`), and a spawner passing on a ledger it holds (waits for `agent_spawn` and grants); a retention rule for a ledger's closed tasks, which grow without bound today (archive to R2, or operator deletes). See [control-plane/durable-objects/tasks/](control-plane/durable-objects/tasks/).
 - **Interim:** WorkstreamDO stands in for the workstream channel (a log, one subscriber woken with batches, the user-notification queue). ChannelDO is built; moving WorkstreamDO's duties onto channels and removing it is the next stage. See [orchestration/workstreams/](orchestration/workstreams/#the-interim-workstream-channel).
 - **Docs ahead of code:** settled above but not built: hands-call journaling (`call_status`, and `executed: false` beyond the gateway's own refusal; it waits for guest protocol v2), the single `isRestoreSource` predicate (every generation is a GC root today), the guest flush before commit, per-sandbox disk I/O limits, and the drain gate's upload report. The runner's session receiver has no gap check (FleetDO's and nestd's do). See [verification/](verification/#real-bugs-found), [sandbox/state/](sandbox/state/).
 

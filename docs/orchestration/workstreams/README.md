@@ -3,7 +3,8 @@
 A workstream is a **convention**, not a platform object: a goal plus the resources an agent sets up for it. The platform never sees a workstream, only labels.
 
 A captain running workstream `auth` typically creates:
-- a channel `ws/auth` holding the goal, the spec and the task board (keyed messages), plus progress;
+- a channel `ws/auth` holding the goal and the spec, plus progress;
+- a [task ledger](../../control-plane/durable-objects/tasks/) `auth` as the task board: workers get `tasks{ledger: auth}`, the captain also `tasks-admin` and the ledger's watcher;
 - sandboxes and workers labeled `workstream=auth`, owned by the captain;
 - subscriptions from itself to those workers' and sandboxes' `events`, filtered to the kinds it acts on and batched;
 - an egress policy on those sandboxes;

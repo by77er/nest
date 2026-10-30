@@ -14,7 +14,8 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, GitHub App minter (interface only) |
 | `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries only); expansion is `src/lib/spec.ts` (pure) |
 | `src/do/channel.ts` | **ChannelDO** (one per channel, plus `~directory`): the log, keyed view, grant list, subscriptions and their cursors, fan-out from the alarm, retention and tiering. Every decision is `src/lib/channels.ts` (pure) |
-| `src/lib/` | Channels core (`channels.ts`: names, validation, permissions, post guards, filters, batching, envelopes) and the channel outbox (`outbox.ts`), reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry |
+| `src/do/tasks.ts` | **TaskLedgerDO** (one per ledger name): tasks, comments, history, watcher, inbox notices from its alarm; its decisions are `src/lib/tasks.ts` (pure) |
+| `src/lib/` | Channels core (`channels.ts`: names, validation, permissions, post guards, filters, batching, envelopes) and the channel outbox (`outbox.ts`), the task ledger core (`tasks.ts`), reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry |
 | `test/regressions.test.ts` | One regression test per finding of the control-plane review |
 
 ## Commands
@@ -42,6 +43,12 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 5. Create work (all admin endpoints use `Authorization: Bearer $ADMIN_TOKEN`):
    - `GET /v1/admin/catalog` · `PUT|DELETE /v1/admin/capabilities/<name> {tools, rules, prompt}` ·
      `PUT|DELETE /v1/admin/templates/<name> {capabilities, launch, hands, credential, escalate_to, subscribe}`
+   - Task ledgers ([TaskLedgerDO](../docs/control-plane/durable-objects/tasks/)): `GET /v1/ledgers/<name>` · `PUT /v1/ledgers/<name>/watcher {watcher}` (an agent whose
+     spec grants the ledger, or null) · `GET /v1/ledgers/<name>/tasks?status=&assignee=<agt_…|none (unassigned)>&label=&text=&parent=&cursor=&limit=` ·
+     `POST /v1/ledgers/<name>/tasks {title, description?, status?, priority?, labels?, parent?, assignee?}` · `GET|PATCH /v1/ledgers/<name>/tasks/<T-n|tsk_…>`
+     (`PATCH {expected_version?, title?, description?, status?, priority?, labels?, parent?}`; a stale version is 409 `conflict`) ·
+     `POST …/tasks/<ref>/assign {assignee, expected_version?}` · `POST …/tasks/<ref>/comments {body}`. Writes take `request_id` (or `Idempotency-Key`).
+     An agent reaches a ledger only if it was spawned with `overrides.params.ledger` and a template listing `tasks` (and `tasks-admin` to administer)
    - `POST /v1/workstreams {goal}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent of that
      workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
    - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
@@ -52,7 +59,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
      the only way to mint a public share link (agents can't)
    - `POST /v1/agents {template, workstream?, sandbox?, owner?, overrides?, cell?, start?}`: expands the template
-     (operator overrides: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`; an agent's own
+     (operator overrides: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`, `params` (e.g. `{ledger}`); an agent's own
      spawn will take only `SpawnerOverrides`, which narrow) and sends `agent_start` to
      the host; an agent with a sandbox takes its workstream and cell (a mismatch is refused with 409), and an
      `owner` must be an agent of the same workstream. For one release `role` is read as the same-named template,

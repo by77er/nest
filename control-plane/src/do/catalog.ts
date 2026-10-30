@@ -83,6 +83,13 @@ export class CatalogDO extends DurableObject<Env> {
   async putCapability(name: string, cap: Capability): Promise<Capability> {
     const r = checkCapability(cap, PLATFORM_TOOL_NAMES);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `capability ${name}: ${r.error}`);
+    // Every template listing it must still hold together (e.g. a parameter default it no longer takes).
+    const cat = this.load();
+    const next = { ...cat.capabilities, [name]: cap };
+    for (const t of templatesUsing(cat, name)) {
+      const c = checkTemplate(cat.templates[t]!, next);
+      if (!c.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `capability ${name}: template ${t} would break: ${c.error}`, 409);
+    }
     this.sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET body = excluded.body",
       name, JSON.stringify(cap));
     return cap;
