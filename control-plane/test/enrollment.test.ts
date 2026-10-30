@@ -127,26 +127,53 @@ describe("enrollment", () => {
     const r = await enrollHost(cell);
     expect(r.host).toMatch(/^hst_/);
     const claims = await verifyHostToken(env.HOST_TOKEN_SECRET, r.host_token);
-    expect(claims).toMatchObject({ host: r.host, cell, role: "burst" });
+    expect(claims).toMatchObject({ host: r.host, cell, role: "sandbox" });
     expect(r.fleet_ws_url).toMatch(/^ws.*\/v1\/fleet$/);
 
     // The intermediate is a CA limited to signing leaves, signed by the root baked into images.
     x509.cryptoProvider.set(crypto);
-    const inter = new x509.X509Certificate(r.proxy_ca.cert_pem);
+    const inter = new x509.X509Certificate(r.proxy_ca!.cert_pem);
     const rootPem = await (await SELF.fetch(`${BASE}/v1/admin/root-ca?cell=${cell}`, { headers: { authorization: "Bearer test-admin-token" } })).text();
     const root = new x509.X509Certificate(rootPem);
     expect(await inter.verify({ publicKey: root, signatureOnly: true })).toBe(true);
     const bc = inter.getExtension(x509.BasicConstraintsExtension)!;
     expect(bc.ca).toBe(true);
     expect(bc.pathLength).toBe(0);
-    expect(r.proxy_ca.chain_pem).toContain(root.toString("pem").trim().split("\n")[1]);
-    expect(r.proxy_ca.expires_ms).toBeGreaterThan(Date.now() + 6 * 86_400_000);
+    expect(r.proxy_ca!.chain_pem).toContain(root.toString("pem").trim().split("\n")[1]);
+    expect(r.proxy_ca!.expires_ms).toBeGreaterThan(Date.now() + 6 * 86_400_000);
+  });
+
+  it("a brain host gets no proxy CA and no tunnel; a sandbox host must ask for one; an old brain host's CSR is still signed", async () => {
+    const cell = uniqueCell();
+    const post = async (role: string, csr: boolean) => {
+      const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role, cell } });
+      return SELF.fetch(`${BASE}/v1/hosts/enroll`, {
+        method: "POST",
+        body: JSON.stringify({ protocol_version: 1, role, cell, proof: { type: "enrollment_token", token }, ...(csr ? { proxy_ca_csr_pem: await csrPem() } : {}) }),
+      });
+    };
+    const brain = await post("brain", false);
+    expect(brain.status).toBe(200);
+    const b = (await brain.json()) as Record<string, unknown>;
+    expect(b.proxy_ca).toBeUndefined();
+    expect(b.tunnel_token).toBeUndefined();
+    expect(await verifyHostToken(env.HOST_TOKEN_SECRET, b.host_token as string)).toMatchObject({ role: "brain" });
+    // A sandbox host runs nest-proxy: without a CSR it is refused (and its token is not spent).
+    expect((await post("sandbox", false)).status).toBe(400);
+    // A brain host of the previous release (`controller`, with a CSR) still enrolls, as a brain host.
+    const old = await post("controller", true);
+    expect(old.status).toBe(200);
+    const o = (await old.json()) as { host: string; host_token: string; proxy_ca?: unknown };
+    expect(o.proxy_ca).toBeDefined();
+    expect(await verifyHostToken(env.HOST_TOKEN_SECRET, o.host_token)).toMatchObject({ role: "brain" });
+    const view = await adminJson<{ hosts: { host: string; role: string }[] }>(`/v1/admin/fleet?cell=${cell}`);
+    expect(view.hosts.find((h) => h.host === o.host)?.role).toBe("brain");
   });
 
   it("rejects reused, unknown and wrong-role tokens", async () => {
     const cell = uniqueCell();
-    const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "burst", cell } });
-    const post = async (t: string, role = "burst") =>
+    const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "sandbox", cell } });
+    const post = async (t: string, role = "sandbox") =>
       SELF.fetch(`${BASE}/v1/hosts/enroll`, {
         method: "POST",
         body: JSON.stringify({ protocol_version: 1, role, cell, proof: { type: "enrollment_token", token: t }, proxy_ca_csr_pem: await csrPem() }),
@@ -168,7 +195,7 @@ describe("enrollment", () => {
     const cell = uniqueCell();
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const req = {
-      protocol_version: 1, role: "burst" as const, cell,
+      protocol_version: 1, role: "sandbox" as const, cell,
       proof: { type: "aws_identity_document" as const, document_b64: "", pkcs7_b64: "" },
       proxy_ca_csr_pem: await csrPem(),
     };
@@ -189,7 +216,7 @@ describe("enrollment", () => {
   it("an AWS enrollment over HTTP without a configured certificate is unauthorized", async () => {
     const res = await SELF.fetch(`${BASE}/v1/hosts/enroll`, {
       method: "POST",
-      body: JSON.stringify({ protocol_version: 1, role: "burst", cell: "x", proof: { type: "aws_identity_document", document_b64: "e30=", pkcs7_b64: "AA==" }, proxy_ca_csr_pem: "x" }),
+      body: JSON.stringify({ protocol_version: 1, role: "sandbox", cell: "x", proof: { type: "aws_identity_document", document_b64: "e30=", pkcs7_b64: "AA==" }, proxy_ca_csr_pem: "x" }),
     });
     expect(res.status).toBe(401);
   });

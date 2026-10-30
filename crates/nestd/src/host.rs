@@ -663,7 +663,7 @@ impl Host {
             tokio::spawn(async move { inner.spot_watch(url).await });
         }
         // Object-store GC: burst hosts offer to run it; the control plane says when.
-        if inner.cfg.role == nest_protocol::model::HostRole::Burst && inner.s3.is_some() {
+        if inner.cfg.role == nest_protocol::model::HostRole::Sandbox && inner.s3.is_some() {
             let inner = inner.clone();
             tokio::spawn(async move { inner.gc_loop().await });
         }

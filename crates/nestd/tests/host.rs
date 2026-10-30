@@ -549,7 +549,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst",
+        "role": "sandbox",
         "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"),
@@ -807,7 +807,7 @@ fn netns_listeners_handed_to_proxy() {
         let dir = tempfile::tempdir().unwrap();
         let fleet = mock_fleet().await;
         let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "c",
+            "role": "sandbox", "cell": "c",
             "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
             "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
             "driver": {"type": "process", "guest_command": ["unused"]},
@@ -911,7 +911,7 @@ async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -973,7 +973,7 @@ fn tunnel_config(dir: &Path, fleet_url: &str, bin: &Path, user: Option<String>) 
 
 fn tunnel_config_with_metrics(dir: &Path, fleet_url: &str, bin: &Path, user: Option<String>, metrics: &str) -> Config {
     serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet_url},
         "run_dir": dir.join("run"), "state_dir": dir.join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1125,7 +1125,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1173,7 +1173,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1412,7 +1412,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1565,7 +1565,7 @@ fn an_attach_without_a_guest_binds_no_listener() {
         let dir = tempfile::tempdir().unwrap();
         let fleet = mock_fleet().await;
         let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "c",
+            "role": "sandbox", "cell": "c",
             "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
             "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
             "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1598,7 +1598,7 @@ fn an_attach_without_a_guest_binds_no_listener() {
 
 fn harness_config(dir: &Path, fleet_url: &str, commit_timeout_ms: u64) -> Config {
     serde_json::from_value(serde_json::json!({
-        "role": "burst", "cell": "test-cell",
+        "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet_url},
         "run_dir": dir.join("run"), "state_dir": dir.join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
@@ -1977,7 +1977,7 @@ fn a_restarted_nestd_tears_down_leftover_netns_mounts() {
         assert!(mounted());
         let fleet = mock_fleet().await;
         let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "c",
+            "role": "sandbox", "cell": "c",
             "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
             "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
             "driver": {"type": "process", "guest_command": ["unused"]},

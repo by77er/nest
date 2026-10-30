@@ -167,10 +167,14 @@ pub mod error_codes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRole {
-    /// Spot host: Firecracker sandboxes plus their workers' brains.
-    Burst,
-    /// Always-on stateless host: captain brains and the Discord gateway. No sandboxes.
-    Controller,
+    /// Runs sandboxes (Firecracker, the gateway, nest-proxy, the tunnel); never a brain. `burst`,
+    /// the previous release's name, is accepted as input for one release.
+    #[serde(alias = "burst")]
+    Sandbox,
+    /// Runs brains (the agent runner and Claude Code); never a sandbox. `controller`, the previous
+    /// release's name, is accepted as input for one release.
+    #[serde(alias = "controller")]
+    Brain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]

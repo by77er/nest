@@ -10,7 +10,7 @@ export const fleet = {
   "hosts": [
     {
       "host": "hst_01m5pv156anzgr2gqs5stpewgt",
-      "role": "burst",
+      "role": "sandbox",
       "instance_id": "i-0f1e2d3c4b5a69788",
       "status": "active",
       "idle_since": null,

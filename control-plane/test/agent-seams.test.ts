@@ -20,20 +20,21 @@ const wsStub = (id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id))
 async function setup(opts: { captain?: boolean; launch?: unknown } = {}) {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-  const host = await connectHost(cell);
+  // The sandbox's host and the brain host: never the same machine (docs/compute/brain-hosts/).
+  const sbxHost = await connectHost(cell);
+  const host = await connectHost(cell, "brain");
   const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "seams" } }, 201);
   let captain: string | undefined;
   if (opts.captain) {
-    await connectHost(cell, "controller");
     captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
   }
   const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
-  await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+  await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   const worker = await adminJson("/v1/agents", {
     body: { role: "worker", sandbox: sbx.sandbox, ...(opts.launch ? { launch: opts.launch } : {}), ...(captain ? { captain } : {}) },
   }, 201);
   const [start] = await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { cell, host, workstream: workstream as string, sandbox: sbx.sandbox as string, agent: worker.agent as string, start, captain };
+  return { cell, host, sbxHost, workstream: workstream as string, sandbox: sbx.sandbox as string, agent: worker.agent as string, start, captain };
 }
 
 async function runner(agent: string, host: string, token: string, instance = "rin_one", epoch = 1) {
@@ -134,23 +135,23 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
   it("a sandbox move neither restarts nor reconnects the brain; its next resolve gets fresh hands", async () => {
     const s = await setup();
     expect(s.start).toMatchObject({ epoch: 1, hands: { sandbox: s.sandbox } });
-    // The brain runs on another host than its sandbox (an operator's choice): started there under a
-    // new agent epoch once the brain on the old host exited.
-    const b = await connectHost(s.cell);
-    const start = await moveBrain(s, b);
-    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox, epoch: 2 } });
-    const ws = await runner(s.agent, b.host, b.host_token, "rin_b", 2);
+    // The brain runs on a brain host, never its sandbox's.
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
 
-    // The sandbox's host dies: the sandbox gets a new lease (epoch 2) on b. The brain stays.
-    s.host.ws.close();
-    await adminJson(`/v1/admin/hosts/${s.host.host}/confirm-dead?cell=${s.cell}`, { body: {} });
+    // The sandbox's host dies: the sandbox gets a new lease (epoch 2) on another sandbox host, b.
+    // The brain stays where it is, under the same agent epoch.
+    const b = await connectHost(s.cell);
+    s.sbxHost.ws.close();
+    await adminJson(`/v1/admin/hosts/${s.sbxHost.host}/confirm-dead?cell=${s.cell}`, { body: {} });
     expect(await sandboxStub(s.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
     const isAttach = (c: any) => c.type === "agent_attach" && c.agent === s.agent && c.epoch === 2;
     const attach = (await nextCommands(b.ws, isAttach)).find(isAttach);
-    expect(await b.ws.none("commands", 200, (m) => (m.commands as any[]).some((c) => c.type === "agent_start" && c.agent === s.agent))).toBe(true);
+    const isStart = (m: any) => (m.commands as any[]).some((c) => c.type === "agent_start" && c.agent === s.agent);
+    expect(await b.ws.none("commands", 200, isStart)).toBe(true);
+    expect(await s.host.ws.none("commands", 50, isStart)).toBe(true);
     expect(ws.closed).toBeNull();
     const info = await agentStub(s.agent).info();
-    expect(info).toMatchObject({ agent_epoch: 2, host: b.host, hands: { sandbox: s.sandbox } });
+    expect(info).toMatchObject({ agent_epoch: 1, host: s.host.host, hands: { sandbox: s.sandbox } });
     expect(info.hands).toEqual({ sandbox: s.sandbox });
 
     // Its next resolve, on the same session, gets the new placement and a binding for epoch 2.
@@ -184,10 +185,10 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     const r1 = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
     await r1.next("run_turn");
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     s.host.ws.close();
     await adminJson(`/v1/admin/hosts/${s.host.host}/confirm-dead?cell=${s.cell}`, { body: {} });
-    // The brain followed its own host's fate: started again (on the sandbox's new host, today's placement).
+    // The brain followed its own host's fate: started again on the other brain host.
     const start = (await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === s.agent)).find((c) => c.agent === s.agent);
     expect(start.epoch).toBe(2);
     expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: b.host }]);
@@ -207,14 +208,14 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
       st.storage.sql.exec("DELETE FROM leases WHERE sandbox = ?", s.sandbox);
     });
-    await sandboxStub(s.sandbox).evicted(s.host.host, 1);
+    await sandboxStub(s.sandbox).evicted(s.sbxHost.host, 1);
     expect(await sandboxStub(s.sandbox).info()).toMatchObject({ host: null, state: "suspended" });
     expect(ws.closed).toBeNull();
     ws.send({ type: "hands_resolve", request: "req_evicted" });
     const r = await ws.next("hands_resolved", (m) => m.request === "req_evicted");
     expect(r.outcome).toMatchObject({ status: "error", error: { code: "sandbox_not_ready", retryable: true } });
     // The resolve placed it again (a new epoch), so the next one can succeed.
-    await nextCommands(s.host.ws, (c) => c.type === "sandbox_create" && c.sandbox === s.sandbox && c.epoch === 2);
+    await nextCommands(s.sbxHost.ws, (c) => c.type === "sandbox_create" && c.sandbox === s.sandbox && c.epoch === 2);
     expect((await agentStub(s.agent).info()).agent_epoch).toBe(1);
   });
 
@@ -323,7 +324,7 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
   it("a previous-release runner's 0 is accepted for an agent without hands (one release), never for a worker", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const ctl = await connectHost(cell, "controller");
+    const ctl = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "legacy" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     const [start] = await nextCommands(ctl.ws, (c) => c.type === "agent_start" && c.agent === captain);
@@ -348,7 +349,7 @@ describe("one brain per agent: the brain record", () => {
   it("rule 2/3: no start elsewhere before the brain's exit; it is condemned and killed once; the start follows its exit at its epoch", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const stub = agentStub(s.agent);
     expect(await stub.start(b.host)).toEqual({ kind: "waiting", host: b.host, cmd: null, waiting_for: s.host.host });
     const [stop] = await nextCommands(s.host.ws, isKillOf(s.agent));
@@ -383,7 +384,7 @@ describe("one brain per agent: the brain record", () => {
   it("rule 3: an exit from a host of the previous release (no epoch) counts for the start FleetDO sent there", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await agentStub(s.agent).start(b.host);
     await nextCommands(s.host.ws, isKillOf(s.agent));
     await exited(s.host.ws, s.agent, undefined);
@@ -394,11 +395,11 @@ describe("one brain per agent: the brain record", () => {
   it("rule 3: the brain's host expiring releases it", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "expiry" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     await nextCommands(a.ws, isStartOf(captain));
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
     expect(await b.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(captain)))).toBe(true);
     // a goes silent past its lease: expired, its brains handed back, and the start goes ahead.
@@ -410,12 +411,12 @@ describe("one brain per agent: the brain record", () => {
   it("rule 4 / D5: a host processing no commands is wedged; it goes to STONITH (with no lease), and only its confirmed death releases the brain", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "wedge" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     const [start1] = await nextCommands(a.ws, isStartOf(captain));
     await okResult(a.ws, start1.cmd);
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
     await nextCommands(a.ws, (c) => c.type === "agent_stop");
     // Not yet 60 s: nothing happens.
@@ -431,9 +432,9 @@ describe("one brain per agent: the brain record", () => {
     // Cut off at once (M1): its socket closed, a new hello refused, nothing placed on it ...
     await sleep(50);
     expect(a.ws.closed?.code).toBe(4408);
-    expect(await fleet.controllerHost()).not.toBe(a.host);
+    expect(await fleet.placeBrain({})).not.toBe(a.host);
     const back = await Ws.connect("/v1/fleet", a.host_token);
-    back.send(hostHello(a.host, cell, { role: "controller" }));
+    back.send(hostHello(a.host, cell, { role: "brain" }));
     expect(await back.none("hello_ack", 200)).toBe(true);
     // ... and 30 s after its last renewal it goes to STONITH, holding no lease: never released on
     // the strength of its own watchdog.
@@ -451,7 +452,7 @@ describe("one brain per agent: the brain record", () => {
   it("rule 4 (M1): a processed kill never wedges the host: no index row left releases the brain, a row left is waited for, then capped", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const stub = agentStub(s.agent);
     await stub.start(b.host);
     const [kill] = await nextCommands(s.host.ws, isKillOf(s.agent));
@@ -470,7 +471,7 @@ describe("one brain per agent: the brain record", () => {
     // Another agent's brain on a healthy host whose index row is gone (its exit was lost): released.
     const t = await setup();
     await okResult(t.host.ws, t.start.cmd);
-    const c = await connectHost(t.cell);
+    const c = await connectHost(t.cell, "brain");
     await agentStub(t.agent).start(c.host);
     const [kill2] = await nextCommands(t.host.ws, isKillOf(t.agent));
     await okResult(t.host.ws, kill2.cmd);
@@ -487,7 +488,7 @@ describe("one brain per agent: the brain record", () => {
   it("rule 4/3: escalation releases a brain whose host is expired even when the loss notice was lost", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await agentStub(s.agent).start(b.host);
     await nextCommands(s.host.ws, isKillOf(s.agent));
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
@@ -516,14 +517,14 @@ describe("one brain per agent: the brain record", () => {
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
       st.storage.sql.exec("DELETE FROM leases WHERE sandbox = ?", s.sandbox);
     });
-    await sandboxStub(s.sandbox).evicted(s.host.host, 1);
+    await sandboxStub(s.sandbox).evicted(s.sbxHost.host, 1);
     const started = await Promise.race([
       agentStub(s.agent).start(),
       sleep(5_000).then(() => "deadlocked" as const),
     ]);
     expect(started).not.toBe("deadlocked");
     expect(started).toMatchObject({ host: s.host.host });
-    await nextCommands(s.host.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
+    await nextCommands(s.sbxHost.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
   });
 
   it("a start racing a graceful stop never starts a second brain beside it", async () => {
@@ -537,7 +538,7 @@ describe("one brain per agent: the brain record", () => {
   it("concurrent starts merge into the one intent: neither is dropped, one kill, one epoch", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const stub = agentStub(s.agent);
     const [r1, r2, r3] = await Promise.all([stub.start(b.host), stub.start(b.host), stub.start()]);
     expect(r1).toEqual({ kind: "waiting", host: b.host, cmd: null, waiting_for: s.host.host });
@@ -593,7 +594,7 @@ describe("one brain per agent: the brain record", () => {
   it("rule 2 (L4): a start without a hint never moves a live brain to follow its sandbox", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await moveBrain(s, b); // the brain runs on b; its sandbox stays on a
     expect(await agentStub(s.agent).start()).toMatchObject({ kind: "none", host: b.host });
     expect(await b.ws.none("commands", 150, (m) => (m.commands as any[]).some((c) => isKillOf(s.agent)(c) || isStartOf(s.agent)(c)))).toBe(true);
@@ -624,7 +625,7 @@ describe("one brain per agent: the brain record", () => {
   it("rule 1 (H3): a condemned brain's sessions are fenced at once, and a reconnect at its own epoch is stale and gets no hands", async () => {
     const s = await setup();
     const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await agentStub(s.agent).start(b.host);
     await sleep(50);
     expect(ws.closed?.code).toBe(4409);
@@ -689,7 +690,7 @@ describe("one brain per agent: the brain record", () => {
   it("probe 1 (H2): a start back on the old host while it is condemned starts there once released, and nothing wedges", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const stub = agentStub(s.agent);
     await stub.start(b.host);
     await nextCommands(s.host.ws, isKillOf(s.agent));
@@ -707,7 +708,7 @@ describe("one brain per agent: the brain record", () => {
   it("probe 2 (H2): an exit landing while a start is deciding never strands it", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const stub = agentStub(s.agent);
     await runInDurableObject(stub, (inst: AgentDO, st) => {
       st.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES ('trn_w', 1, ?, 'queued', ?)", JSON.stringify({ kind: "user", text: "go" }), Date.now());
@@ -741,7 +742,7 @@ describe("one brain per agent: the brain record", () => {
   it("A1: a kill lost before FleetDO stored it never wedges the host: it is owed by the record and issued again, once", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const stub = agentStub(s.agent);
     // The kill's issue fails (as if AgentDO were reset, or the RPC lost, between condemn and the store).
     let armedBeforeIssue = -1;
@@ -774,11 +775,11 @@ describe("one brain per agent: the brain record", () => {
   it("A2: an onHostLost call that fails is retried until the agent took it; the brain is released and its intent runs", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "lost" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     await nextCommands(a.ws, isStartOf(captain));
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
     await runInDurableObject(agentStub(captain), (inst: AgentDO) => {
       let fails = 2; // the expiry's call and the same tick's retry
@@ -804,7 +805,7 @@ describe("one brain per agent: the brain record", () => {
   it("A2: a start asks for the brain host's status first, and a host it finds expired releases the brain at once", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     // The host expired and the agent never heard (its notice lost for good).
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", s.host.host);
@@ -819,7 +820,7 @@ describe("one brain per agent: the brain record", () => {
   it("A3: an expired host that comes back never runs a start issued before its loss (the TLC trace)", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "a3" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     // start{1} went to a, which never acked or answered it; its lease lapses before the brain runs.
@@ -842,7 +843,7 @@ describe("one brain per agent: the brain record", () => {
     // a comes back: its hello reactivates it, and the failed start is not resent. Its report
     // (no brain) releases the record for that epoch, though the loss notice is still delayed.
     const back = await Ws.connect("/v1/fleet", a.host_token);
-    back.send(hostHello(a.host, cell, { role: "controller" }));
+    back.send(hostHello(a.host, cell, { role: "brain" }));
     await back.next("hello_ack");
     expect(await back.none("commands", 300, (m) => (m.commands as any[]).some((c) => c.cmd === start1.cmd))).toBe(true);
     expect((await agentStub(captain).info()).brain).not.toMatchObject({ host: a.host, epoch: 1 });
@@ -866,7 +867,7 @@ describe("one brain per agent: the brain record", () => {
 
   it("A3 (c): FleetDO refuses an agent_start for an expired or dead host; the start is retried elsewhere", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const body = {
       type: "agent_start", agent: "agt_x0000000000000000000000000", role: "captain", workstream: "ws_x", epoch: 1,
@@ -965,7 +966,7 @@ describe("one brain per agent: the brain record", () => {
   it("D12: a release and the alarm that carries it on are committed together", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await agentStub(s.agent).start(b.host); // intent kept while the brain is condemned
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {
       // Only the release may arm the intent's alarm or clear the escalation's.
@@ -1033,7 +1034,7 @@ describe("one brain per agent: the brain record", () => {
   it("D7: an event batch stops applying once the brain is no longer current mid-batch", async () => {
     const s = await setup();
     const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
       inst.testHooks["event:afterApply"] = async () => {
         delete inst.testHooks["event:afterApply"];
@@ -1080,7 +1081,7 @@ describe("one brain per agent: the brain record", () => {
   it("M2: a kill not yet processed doesn't wedge a host that is still working through older commands", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
     // An older command still pending there (an old nestd runs the kill behind it).
     await fleet.issueCommands(s.host.host, [{ type: "sandbox_suspend", sandbox: s.sandbox, epoch: 1, mode: "disk_only" } as any]);
@@ -1158,7 +1159,7 @@ describe("a draining host's brains", () => {
   it("are killed there at once and start elsewhere once their exit is reported", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await spotNotice(s.host.ws);
     const [stop] = await nextCommands(s.host.ws, (c) => c.type === "agent_stop" && c.agent === s.agent);
     expect(stop).toMatchObject({ mode: "kill", epoch: 1 });
@@ -1201,7 +1202,7 @@ describe("a draining host's brains", () => {
     // Now the drained host goes, and once another host exists the brain starts there.
     await tick(s.cell);
     expect((await fleet.hostStatus(s.host.host))!.status).toBe("dead");
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await runDeadline(s.agent, "intent");
     const start = (await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === s.agent)).find((c) => c.type === "agent_start");
     expect(start.epoch).toBe(2);
@@ -1212,17 +1213,17 @@ describe("a draining host's brains", () => {
 describe("FleetDO and SandboxDO at the seam", () => {
   it("a wedged host's hello is refused until it is expired", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     await env.FLEET.get(env.FLEET.idFromName(cell)).hostWedged(a.host, "test");
     const again = await Ws.connect("/v1/fleet", a.host_token);
-    again.send(hostHello(a.host, cell, { role: "controller" }));
+    again.send(hostHello(a.host, cell, { role: "brain" }));
     expect(await again.none("hello_ack", 200)).toBe(true);
     expect(again.closed?.code).toBe(4408);
   });
 
   it("A5: a host-loss (or gone) notice's acknowledgement deletes only the row it was for; a newer start's row stays", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const rows = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
       st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone) VALUES ('agt_a5', ?, 'cmd_old', 1, 1)", a.host);
@@ -1246,7 +1247,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("A6: a host merely retired as dead (no confirmation) proves nothing; a confirmed death or lease expiry does", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'dead', lost = 0 WHERE host = ?", s.host.host);
@@ -1280,8 +1281,8 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("a start re-reads its intent before committing: one changed meanwhile is the one started", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
-    const c = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
+    const c = await connectHost(s.cell, "brain");
     await editAgent(s.agent, (i) => {
       i.brain = null;
       i.state = "detached";
@@ -1299,8 +1300,8 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("a start whose send fails is condemned and its intent kept; the host's confirmed death releases it and the start runs elsewhere", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
-    const c = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
+    const c = await connectHost(s.cell, "brain");
     await editAgent(s.agent, (i) => {
       i.brain = null;
       i.state = "detached";
@@ -1339,7 +1340,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("a kill stored after its brain was released records nothing and arms no escalation", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
       inst.testHooks["kill:beforeIssue"] = async () => {
         delete inst.testHooks["kill:beforeIssue"];
@@ -1355,12 +1356,12 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("escalation decides only against the record it asked about: one replaced meanwhile isn't wedged for", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "esc" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     const [st1] = await nextCommands(a.ws, isStartOf(captain));
     await okResult(a.ws, st1.cmd);
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
     await nextCommands(a.ws, isKillOf(captain));
     await editAgent(captain, (i) => {
@@ -1378,8 +1379,8 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("N1: the tick expires a host only from its own row, re-read after the previous host's awaits", async () => {
     const cell = uniqueCell();
-    const h1 = await connectHost(cell, "controller");
-    const h2 = await connectHost(cell, "controller");
+    const h1 = await connectHost(cell, "brain");
+    const h2 = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const told = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
       st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone) VALUES ('agt_n1a', ?, 'cmd_a', 1, 0)", h1.host);
@@ -1405,7 +1406,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("N1 backstop: a host's hello reporting a brain the record places elsewhere gets it killed", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await moveBrain(s, b); // the record is on b now, at epoch 2
     const again = await Ws.connect("/v1/fleet", s.host.host_token);
     again.send(hostHello(s.host.host, s.cell, { agents: [{ agent: s.agent, state: "idle" }] }));
@@ -1417,7 +1418,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("N3/N21: a previous-release host is never wedged early (no 60 s rule, no row shortcut), and is wedged at the 15-min cap", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "old" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
@@ -1426,7 +1427,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0 WHERE host = ?", a.host);
     });
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
     await nextCommands(a.ws, isKillOf(captain));
     await editAgent(captain, (i) => {
@@ -1445,8 +1446,8 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("N3: a new brain goes to an upgraded host rather than a previous-release one", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
-    const b = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
+    const b = await connectHost(cell, "brain");
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0 WHERE host = ?", a.host);
     });
@@ -1468,7 +1469,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("N6: a loss notice AgentDO declines keeps its row; a host's hello after its expiry clears `lost`", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const rows = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
       st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone) VALUES ('agt_n6', ?, 'cmd_n6', 1, 0)", a.host);
@@ -1479,7 +1480,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     });
     expect(rows).toEqual([{ cmd: "cmd_n6" }]);
     const back = await Ws.connect("/v1/fleet", a.host_token);
-    back.send(hostHello(a.host, cell, { role: "controller" }));
+    back.send(hostHello(a.host, cell, { role: "brain" }));
     await back.next("hello_ack");
     // Written after the hello_ack goes out: wait for it.
     for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "active"; n++) await sleep(25);
@@ -1488,7 +1489,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("brainsLost tells nothing once the host isn't lost any more", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const calls = await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), async (inst: FleetDO, st) => {
       st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone) VALUES ('agt_rl', ?, 'cmd_rl', 1, 0)", a.host);
       const seen: string[] = [];
@@ -1517,7 +1518,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
       st.storage.sql.exec("ALTER TABLE hosts DROP COLUMN lost");
       st.storage.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", a.host);
       st.storage.sql.exec("UPDATE hosts SET status = 'dead', instance_id = 'i-0retired' WHERE host = ?", b.host);
-      st.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, reason) VALUES ('i-0retired', 1, 'burst', 'idle')");
+      st.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, reason) VALUES ('i-0retired', 1, 'sandbox', 'idle')");
       st.storage.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", c.host);
       (inst as any).addLostColumn();
       return st.storage.sql.exec<{ host: string; lost: number }>("SELECT host, lost FROM hosts ORDER BY host").toArray();
@@ -1532,7 +1533,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     await runInDurableObject(fleet, (inst: FleetDO, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'dead', lost = 0, instance_id = 'i-0gone' WHERE host = ?", a.host);
-      st.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, reason) VALUES ('i-0gone', 1, 'burst', 'idle')");
+      st.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, reason) VALUES ('i-0gone', 1, 'sandbox', 'idle')");
       inst.cellConfigOverride = {
         region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
         max_hosts: 0, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
@@ -1547,6 +1548,10 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("A3: a host with leases that expires fails its unanswered starts too", async () => {
     const s = await setup(); // the agent's start is never answered
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
+    // A brain host holds no lease; a host of the previous release held both, and so goes to STONITH.
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired) VALUES ('sbx_a3', ?, 1, 0)", s.host.host);
+    });
     await silent(s.cell, s.host.host);
     expect((await fleet.hostStatus(s.host.host))!.status).toBe("stonith_pending");
     const r = await runInDurableObject(fleet, (_i, st) =>
@@ -1557,7 +1562,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("M2: a row without an epoch (the previous release's) never counts as indexed: a processed kill releases", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     await agentStub(s.agent).start(b.host);
     const [kill] = await nextCommands(s.host.ws, isKillOf(s.agent));
     await okResult(s.host.ws, kill.cmd);
@@ -1599,19 +1604,19 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("merge gate 1: a host of the previous release never gets a brain; with no other host the start waits", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0 WHERE host = ?", a.host);
     });
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "gate1" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell, start: false } }, 201)).agent as string;
-    expect(await startError(captain)).toMatch(/no host available/);
+    expect(await startError(captain)).toMatch(/no brain host available/);
     expect(await a.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(captain)))).toBe(true);
     expect(await agentStub(captain).info()).toMatchObject({ brain: null, intent: { reason: "operator" } });
     // An operator can't name it either.
     expect(await startError(captain, a.host)).toMatch(/of this release/);
     // A host of this release comes: the intent runs there.
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await runDeadline(captain, "intent");
     expect((await nextCommands(b.ws, isStartOf(captain))).find(isStartOf(captain))).toMatchObject({ epoch: 1 });
   });
@@ -1631,7 +1636,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("merge gate 2: a drained controller host is retired when empty", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     await runInDurableObject(fleet, (inst: FleetDO, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'draining', instance_id = 'i-0oldctl' WHERE host = ?", a.host);
@@ -1649,7 +1654,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("merge gate 3: a brain on a previous-release host is released only by its loss, never by a processed kill without a row or an exit", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
-    const b = await connectHost(s.cell);
+    const b = await connectHost(s.cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0 WHERE host = ?", s.host.host);
@@ -1677,12 +1682,12 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const cell = uniqueCell();
     const n13 = true;
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "n13" } }, 201);
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     const [st1] = await nextCommands(a.ws, isStartOf(captain));
     await okResult(a.ws, st1.cmd);
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
     await nextCommands(a.ws, isKillOf(captain));
     await editAgent(captain, (i) => {
@@ -1700,7 +1705,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     void n13;
     const t = await setup();
     await okResult(t.host.ws, t.start.cmd);
-    const c = await connectHost(t.cell);
+    const c = await connectHost(t.cell, "brain");
     await agentStub(t.agent).start(c.host);
     await nextCommands(t.host.ws, isKillOf(t.agent));
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(t.cell)), (_i, st) => {
@@ -1730,7 +1735,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("N16: a hello's expired-to-active write never overwrites a status changed during the hello", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     await runInDurableObject(fleet, (inst: FleetDO, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", a.host);
@@ -1742,7 +1747,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
       };
     });
     const back = await Ws.connect("/v1/fleet", a.host_token);
-    back.send(hostHello(a.host, cell, { role: "controller" }));
+    back.send(hostHello(a.host, cell, { role: "brain" }));
     await back.next("hello_ack");
     await sleep(100);
     expect((await fleet.hostStatus(a.host))!.status).toBe("dead");
@@ -1776,14 +1781,14 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("wedged hosts are never chosen for brains, even with a socket still open", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
-    const w = await connectHost(cell, "burst");
+    const a = await connectHost(cell, "brain");
+    const w = await connectHost(cell, "sandbox");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET wedged_ms = ? WHERE host IN (?, ?)", Date.now(), a.host, w.host);
     });
-    expect(await fleet.controllerHost()).toBeNull();
-    expect(await fleet.otherHost("hst_none")).toBeNull();
+    expect(await fleet.placeBrain({})).toBeNull();
+    expect(await fleet.placeBrain({ prev: a.host })).toBeNull();
   });
 
   it("scale-down's idle loop re-reads each host after the previous one's awaits", async () => {
@@ -1819,7 +1824,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("N23: FleetDO refuses an agent_start for a host of the previous release", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0 WHERE host = ?", a.host);
@@ -1894,7 +1899,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("a newer start on a host resets its drain notice; a stale notice's ack marks only its own start", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const r = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
       st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone, drain_told) VALUES ('agt_dt', ?, 'cmd_old', 1, 0, 1)", a.host);
@@ -1948,7 +1953,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("a drain's notice to an agent is retried by the tick until it took it", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const calls = await runInDurableObject(fleet, async (inst: FleetDO, st) => {
       st.storage.sql.exec("INSERT INTO host_agents (agent, host, cmd, epoch, gone) VALUES ('agt_dr', ?, 'cmd_dr', 1, 0)", a.host);
@@ -1987,7 +1992,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
 
   it("N21: a previous-release host active again after STONITH by fence is drained of brains again", async () => {
     const cell = uniqueCell();
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     await runInDurableObject(fleet, async (inst: FleetDO, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'stonith_pending', brain_epochs = 0 WHERE host = ?", a.host);
@@ -1997,7 +2002,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect((await fleet.hostStatus(a.host))!.status).toBe("draining");
   });
 
-  it("rule 5: a silent burst host expired without leases is retired once the idle grace passes", async () => {
+  it("rule 5: a silent brain host expired without leases is retired once its kind's idle grace passes", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
@@ -2009,7 +2014,8 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect((await fleet.hostStatus(s.host.host))!.status).toBe("expired");
     const cfg: AwsCellConfig = {
       region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
-      max_hosts: 1, idle_grace_ms: 0, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
+      max_hosts: 1, idle_grace_ms: 3_600_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
+      brain: { launch_template_id: "lt-0b", instance_types: ["t3a.medium"], spot: true, max_hosts: 1, idle_grace_ms: 0, max_brains_per_host: 0 },
     };
     for (let n = 0; n < 2; n++) {
       await runInDurableObject(fleet, (inst: FleetDO, st) => {
@@ -2034,7 +2040,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
       st.storage.sql.exec("DELETE FROM leases WHERE sandbox = ?", s.sandbox);
     });
     const t0 = Date.now();
-    await sandboxStub(s.sandbox).evicted(s.host.host, 1);
+    await sandboxStub(s.sandbox).evicted(s.sbxHost.host, 1);
     expect(Date.now() - t0).toBeLessThan(400);
     await runDurableObjectAlarm(sandboxStub(s.sandbox));
     for (let n = 0; n < 40 && (await agentStub(s.agent).info()).hands_moved_ms === undefined; n++) await sleep(50);
@@ -2116,10 +2122,11 @@ describe("secret references resolve only in their slot", () => {
     const cell = uniqueCell();
     const ref = `$nest-secret:binding_key:${cell}`;
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const host = await connectHost(cell); // the cell's binding key exists from here on
+    const sbxHost = await connectHost(cell); // the cell's binding key exists from here on
+    const host = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "x" } }, 201);
     const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+    await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
     const launch = { builtin_tools: [], system_prompt: { mode: "append", text: ref } };
     const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, launch } }, 201);
     const [start] = await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
@@ -2189,10 +2196,11 @@ describe("captains named in several places", () => {
     const other = await setup({ captain: true });
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
-    const host = await connectHost(cell);
+    const sbxHost = await connectHost(cell);
+    const host = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "mine" } }, 201);
     const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+    await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
     const w = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, captain: other.captain } }, 201);
     await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === w.agent);
     const ws = await runner(w.agent, host.host, host.host_token);

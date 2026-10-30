@@ -162,7 +162,7 @@ describe("shared lists (the Rust crate asserts the same files)", () => {
     EgressVia: [C.EgressVia, C.EgressVia.options],
     ForkMode: [M.ForkMode, M.ForkMode.options],
     GenerationKind: [M.GenerationKind, M.GenerationKind.options],
-    HostRole: [M.HostRole, M.HostRole.options],
+    HostRole: [M.HostRole, M.HOST_ROLES],
     ManifestKind: [M.ManifestKind, M.ManifestKind.options],
     PolicyLayer: [M.PolicyLayer, M.PolicyLayer.options],
     RuleDecision: [C.RuleDecision, C.RuleDecision.options],
@@ -185,6 +185,13 @@ describe("shared lists (the Rust crate asserts the same files)", () => {
       for (const m of listed) expect(schema.parse(m), `${name}::${m}`).toBe(m);
     });
   }
+
+  it("the previous release's host roles parse as the new ones, for one release", () => {
+    expect(M.HostRole.parse("burst")).toBe("sandbox");
+    expect(M.HostRole.parse("controller")).toBe("brain");
+    expect(M.HostRole.safeParse("worker").success).toBe(false);
+    expect(M.HostRole.safeParse("toString").success).toBe(false);
+  });
 
   it("open enums parse a member they don't know (an older sender's free text) as `unknown`", () => {
     expect(C.AgentExitReason.parse("not running after host reconnect")).toBe("unknown");

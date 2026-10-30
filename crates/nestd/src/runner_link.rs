@@ -551,7 +551,7 @@ mod tests {
     fn link(dir: &Path) -> (RunnerLink, std::path::PathBuf, mpsc::UnboundedReceiver<RunnerNotice>) {
         let path = dir.join("runner.sock");
         let (ntx, nrx) = mpsc::unbounded_channel();
-        let link = RunnerLink::start(&path, HostId("hst_1".into()), HostRole::Burst, crate::proxy_link::Access::default(), ntx).unwrap();
+        let link = RunnerLink::start(&path, HostId("hst_1".into()), HostRole::Sandbox, crate::proxy_link::Access::default(), ntx).unwrap();
         (link, path, nrx)
     }
 

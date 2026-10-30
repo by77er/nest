@@ -40,13 +40,14 @@ async function prune(cell: string): Promise<void> {
 
 async function workerOnHost(cell: string) {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-retention" } });
-  const host = await connectHost(cell);
+  const sbxHost = await connectHost(cell);
+  const host = await connectHost(cell, "brain");
   const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "retention" } }, 201);
   const sbx = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-  await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+  await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   const worker = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { host, sandbox: sbx.sandbox, agent: worker.agent, workstream };
+  return { host, sbxHost, sandbox: sbx.sandbox, agent: worker.agent, workstream };
 }
 
 describe("a host's death", () => {
@@ -108,7 +109,7 @@ describe("pruning", () => {
     const old = Date.now() - 40 * DAY;
     await fleetSql(cell, (sql) => {
       const launch = (id: string, host: string | null, reason: string | null, ended: number | null) =>
-        sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role, reason, ended_ms) VALUES (?, ?, ?, 'burst', ?, ?)", id, old, host, reason, ended);
+        sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role, reason, ended_ms) VALUES (?, ?, ?, 'sandbox', ?, ?)", id, old, host, reason, ended);
       launch("i-ended-old", null, "idle", old);
       launch("i-ended-new", null, "idle", Date.now());
       launch("i-terminating", null, "idle", null); // not confirmed gone: still to terminate
@@ -459,11 +460,11 @@ describe("a host that never connected and whose proof enrolls again", () => {
     const cell = uniqueCell();
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "retire" } }, 201);
     const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 202);
-    const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "burst", cell } });
+    const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "sandbox", cell } });
     const enroll = async () => {
       const res = await SELF.fetch(`${BASE}/v1/hosts/enroll`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ protocol_version: 1, role: "burst", cell, proof: { type: "enrollment_token", token }, proxy_ca_csr_pem: await csrPem() }),
+        body: JSON.stringify({ protocol_version: 1, role: "sandbox", cell, proof: { type: "enrollment_token", token }, proxy_ca_csr_pem: await csrPem() }),
       });
       expect(res.status).toBe(200);
       return ((await res.json()) as { host: string }).host;
@@ -543,12 +544,12 @@ describe("a kill FleetDO answered itself", () => {
   it("never releases a brain on a retired host whose death isn't proof; its loss does", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-killed" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "kill answered by fleet" } }, 201);
     const captain = (await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
     const [start] = await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
     await okResult(a.ws, start.cmd);
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
     await nextCommands(a.ws, (c) => c.type === "agent_stop" && c.agent === captain && c.mode === "kill");
     // `a` is retired by FleetDO alone (a drain or idle retirement: dead, but not proof), its
@@ -625,7 +626,7 @@ describe("confirming a host dead", () => {
         state: async () => state,
       };
       sql.exec("UPDATE hosts SET instance_id = 'i-0confirm' WHERE host = ?", h.host);
-      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0confirm', ?, ?, 'burst')", Date.now(), h.host);
+      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0confirm', ?, ?, 'sandbox')", Date.now(), h.host);
     });
     h.ws.close();
     await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });

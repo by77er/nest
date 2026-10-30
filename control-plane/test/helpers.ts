@@ -34,13 +34,13 @@ export async function csrPem(): Promise<string> {
   return csr.toString("pem");
 }
 
-export async function enrollHost(cell: string, role: "burst" | "controller" = "burst"): Promise<EnrollResponse> {
+export async function enrollHost(cell: string, role: "sandbox" | "brain" = "sandbox"): Promise<EnrollResponse> {
   const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role, cell } });
   const res = await SELF.fetch(`${BASE}/v1/hosts/enroll`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      protocol_version: 1, role, cell, proof: { type: "enrollment_token", token }, proxy_ca_csr_pem: await csrPem(),
+      protocol_version: 1, role, cell, proof: { type: "enrollment_token", token }, ...(role === "sandbox" ? { proxy_ca_csr_pem: await csrPem() } : {}),
     }),
   });
   const text = await res.text();
@@ -127,7 +127,7 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
     protocol_version: 1,
     host,
     instance_id: "nestdtest0000001",
-    role: "burst",
+    role: "sandbox",
     cell,
     versions: { nestd: "0.1.0", nest_proxy: "0.1.0", agent_runner: "0.1.0", claude_code: "2.1.296" },
     gateway_url: GATEWAY_URL,
@@ -141,7 +141,7 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
 }
 
 /** Enroll a host and connect its fleet channel (hello acknowledged, the cell's binding keys received). */
-export async function connectHost(cell: string, role: "burst" | "controller" = "burst") {
+export async function connectHost(cell: string, role: "sandbox" | "brain" = "sandbox") {
   const enrolled = await enrollHost(cell, role);
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
   ws.send(hostHello(enrolled.host, cell, { role }));

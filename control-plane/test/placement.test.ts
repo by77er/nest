@@ -24,7 +24,7 @@ async function place(cell: string, ws: string, status = 201) {
 
 /** A connected burst host whose hello reports the given capacity. */
 async function hostWithCapacity(cell: string, capacity: Record<string, unknown>) {
-  const enrolled = await enrollHost(cell, "burst");
+  const enrolled = await enrollHost(cell, "sandbox");
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
   ws.send(hostHello(enrolled.host, cell, { capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, sandboxes: 0, agents: 0, warm: [], ...capacity } }));
   await ws.next("hello_ack");

@@ -23,19 +23,19 @@ async function workstream() {
 async function setup(opts: { start?: boolean; captain?: boolean } = {}) {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-regress" } });
-  const host = await connectHost(cell);
+  const sbxHost = await connectHost(cell);
+  const host = await connectHost(cell, "brain");
   const ws = await workstream();
   let captain: string | undefined;
   if (opts.captain) {
-    await connectHost(cell, "controller");
     captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: ws, cell } }, 201)).agent;
   }
   const sbx = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
-  await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+  await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   const start = opts.start ?? true;
   const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream: ws, sandbox: sbx.sandbox, cell, start, ...(captain ? { captain } : {}) } }, 201);
   if (start) await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { cell, host, workstream: ws, sandbox: sbx.sandbox as string, agent: worker.agent as string, captain };
+  return { cell, host, sbxHost, workstream: ws, sandbox: sbx.sandbox as string, agent: worker.agent as string, captain };
 }
 
 async function runner(agent: string, hostId: string, token: string, instance = "rin_one", epoch = 1, extra: Record<string, unknown> = {}) {
@@ -365,7 +365,7 @@ describe("#14 a host disconnected past token expiry can reconnect", () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
     h.ws.close();
-    const expired = await issueHostToken("test-host-token-secret-0123456789abcdef", { host: h.host, cell, role: "burst", exp: Date.now() - 60_000 });
+    const expired = await issueHostToken("test-host-token-secret-0123456789abcdef", { host: h.host, cell, role: "sandbox", exp: Date.now() - 60_000 });
     await runInDurableObject(fleetStub(cell), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET token_exp = ? WHERE host = ?", Date.now() - 60_000, h.host);
     });
@@ -383,19 +383,19 @@ describe("#15 AWS enrollment binds the role; a bad CSR doesn't burn a token", ()
   it("rejects an instance enrolling as another role than it was launched as", async () => {
     const cell = uniqueCell();
     const fleet = fleetStub(cell);
-    await fleet.registerLaunched({ instance_id: "i-0burst", role: "burst", account_id: "111", region: "us-east-1" });
-    const req = { protocol_version: 1, role: "controller" as const, cell, proof: { type: "aws_identity_document" as const, document_b64: "", pkcs7_b64: "" }, proxy_ca_csr_pem: await csrPem() };
-    await expect(Promise.resolve().then(() => fleet.enroll(req, cell, { instanceId: "i-0burst", accountId: "111", region: "us-east-1" }))).rejects.toThrow(/launched as burst/);
-    await expect(Promise.resolve().then(() => fleet.enroll({ ...req, role: "burst" }, cell, { instanceId: "i-0burst", accountId: "222", region: "us-east-1" }))).rejects.toThrow(/another AWS account/);
-    expect((await fleet.enroll({ ...req, role: "burst" }, cell, { instanceId: "i-0burst", accountId: "111", region: "us-east-1" })).host).toMatch(/^hst_/);
+    await fleet.registerLaunched({ instance_id: "i-0burst", role: "sandbox", account_id: "111", region: "us-east-1" });
+    const req = { protocol_version: 1, role: "brain" as const, cell, proof: { type: "aws_identity_document" as const, document_b64: "", pkcs7_b64: "" }, proxy_ca_csr_pem: await csrPem() };
+    await expect(Promise.resolve().then(() => fleet.enroll(req, cell, { instanceId: "i-0burst", accountId: "111", region: "us-east-1" }))).rejects.toThrow(/launched as sandbox/);
+    await expect(Promise.resolve().then(() => fleet.enroll({ ...req, role: "sandbox" }, cell, { instanceId: "i-0burst", accountId: "222", region: "us-east-1" }))).rejects.toThrow(/another AWS account/);
+    expect((await fleet.enroll({ ...req, role: "sandbox" }, cell, { instanceId: "i-0burst", accountId: "111", region: "us-east-1" })).host).toMatch(/^hst_/);
   });
 
   it("a malformed CSR leaves the enrollment token usable", async () => {
     const cell = uniqueCell();
-    const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "burst", cell } });
+    const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "sandbox", cell } });
     const enroll = (csr: string) => SELF.fetch(`${BASE}/v1/hosts/enroll`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ protocol_version: 1, role: "burst", cell, proof: { type: "enrollment_token", token }, proxy_ca_csr_pem: csr }),
+      body: JSON.stringify({ protocol_version: 1, role: "sandbox", cell, proof: { type: "enrollment_token", token }, proxy_ca_csr_pem: csr }),
     });
     expect((await enroll("not a csr")).status).not.toBe(200);
     expect((await enroll(await csrPem())).status).toBe(200);
@@ -448,7 +448,7 @@ describe("#18 argument validation", () => {
 
 describe("#19 cells", () => {
   it("rejects malformed cell names", async () => {
-    const res = await admin("/v1/admin/enrollment-tokens", { body: { role: "burst", cell: "../../evil" } });
+    const res = await admin("/v1/admin/enrollment-tokens", { body: { role: "sandbox", cell: "../../evil" } });
     expect(res.status).toBe(400);
   });
 });
@@ -575,13 +575,13 @@ describe("#23 captains move off a silent controller host", () => {
   it("a captain mid-turn restarts on another controller host", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-regress" } });
-    const a = await connectHost(cell, "controller");
+    const a = await connectHost(cell, "brain");
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: await workstream(), cell } }, 201)).agent as string;
     await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
     const r = await runner(captain, a.host, a.host_token, "rin_cap", 0);
     await adminJson(`/v1/agents/${captain}/turns`, { body: { text: "plan" } }, 201);
     await r.ws.next("run_turn");
-    const b = await connectHost(cell, "controller");
+    const b = await connectHost(cell, "brain");
     await runInDurableObject(fleetStub(cell), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, a.host);
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
@@ -605,7 +605,7 @@ describe("docs #13 guest CLI mapping", () => {
     const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
     expect(events.at(-1)).toMatchObject({ type: "progress", summary: "progress" });
     expect((await stub.guestCli(s.sandbox, 1, { command: "expose", port: 3000, exposed: false })).status).toBe("ok");
-    const [un] = await nextCommands(s.host.ws, (c) => c.type === "port_unexpose");
+    const [un] = await nextCommands(s.sbxHost.ws, (c) => c.type === "port_unexpose");
     expect(un).toMatchObject({ sandbox: s.sandbox, port: 3000 });
   });
 });
@@ -710,20 +710,23 @@ describe("#26 a recovery turn says what the transcript can't", () => {
     await agentStub(s.agent).flush();
     const durable = (await agentStub(s.agent).info()).durable_ms!;
     // The sandbox commits a generation, then moves (restored from that head) while the turn runs.
-    sendEvents(s.host.ws, [{
+    sendEvents(s.sbxHost.ws, [{
       ts_ms: Date.now(), type: "commit_request", request: "req_rec", sandbox: s.sandbox, epoch: 1, kind: "disk_only",
       disk_manifest: manifest("e"), reason: "timer",
     }]);
-    await nextCommands(s.host.ws, (c) => c.type === "commit_result" && c.request === "req_rec");
+    await nextCommands(s.sbxHost.ws, (c) => c.type === "commit_result" && c.request === "req_rec");
     const head = (await env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)).headGeneration())!;
-    // Its host dies: the sandbox gets a new lease (epoch 2) on another host, and the brain, which died
-    // with the host, starts again (today's placement puts it on the sandbox's new host).
+    // Its host dies: the sandbox gets a new lease (epoch 2) on another sandbox host. The brain host
+    // dies too, and the brain, which died with its own host, starts again on another brain host.
     const b = await connectHost(s.cell);
+    const c2 = await connectHost(s.cell, "brain");
+    s.sbxHost.ws.close();
+    await adminJson(`/v1/admin/hosts/${s.sbxHost.host}/confirm-dead?cell=${s.cell}`, { body: {} });
+    expect(await sandboxStub(s.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
     s.host.ws.close();
     r1.ws.close();
     await adminJson(`/v1/admin/hosts/${s.host.host}/confirm-dead?cell=${s.cell}`, { body: {} });
-    expect(await sandboxStub(s.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
-    await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === s.agent && c.epoch === 2);
+    await nextCommands(c2.ws, (c) => c.type === "agent_start" && c.agent === s.agent && c.epoch === 2);
     // "Moved during the turn" is SandboxDO's epoch against the one recorded at turn start, not AgentDO's
     // record of the move push (which can be lost): forget that record.
     await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
@@ -732,7 +735,7 @@ describe("#26 a recovery turn says what the transcript can't", () => {
       st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
     });
 
-    const r2 = await runner(s.agent, b.host, b.host_token, "rin_two", 2);
+    const r2 = await runner(s.agent, c2.host, c2.host_token, "rin_two", 2);
     const rec = await r2.ws.next("run_turn");
     expect(rec.input.kind).toBe("recovery");
     expect(rec.input.text).toContain(`saved transcript ends at ${new Date(durable).toISOString()}`);
@@ -741,7 +744,7 @@ describe("#26 a recovery turn says what the transcript can't", () => {
     r2.ws.close();
 
     // Interrupted again: the next recovery turn still carries the original text, once.
-    const r3 = await runner(s.agent, b.host, b.host_token, "rin_three", 2);
+    const r3 = await runner(s.agent, c2.host, c2.host_token, "rin_three", 2);
     const rec2 = await r3.ws.next("run_turn");
     expect(rec2.input.kind).toBe("recovery");
     expect(rec2.input.text.split("refactor the parser").length).toBe(2);
@@ -753,8 +756,8 @@ describe("#26 a recovery turn says what the transcript can't", () => {
 describe("#27 a turn is work until it completes", () => {
   it("SessionStart's mid-turn `ready` neither ends the sandbox's work nor commits early; the turn's end does", async () => {
     const s = await setup();
-    const seqh = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: s.sandbox, epoch: 1, state: "running" }]);
-    await s.host.ws.next("ack", (m) => m.up_to >= seqh);
+    const seqh = sendEvents(s.sbxHost.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: s.sandbox, epoch: 1, state: "running" }]);
+    await s.sbxHost.ws.next("ack", (m) => m.up_to >= seqh);
     const r = await runner(s.agent, s.host.host, s.host.host_token);
     const t = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "write a file" } }, 201)).turn;
     await r.ws.next("run_turn", (m) => m.turn === t);
@@ -762,12 +765,12 @@ describe("#27 a turn is work until it completes", () => {
     r.ws.send({ type: "events", seq: 1, events: [ev(1, { type: "turn_started", input_kind: "user" }), ev(2, { type: "state_changed", state: "ready" })] });
     await r.ws.next("ack", (m) => m.up_to === 1);
     expect((await sandboxStub(s.sandbox).info()).working).toEqual([s.agent]);
-    expect(await s.host.ws.none("commands", 300, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_checkpoint"))).toBe(true);
+    expect(await s.sbxHost.ws.none("commands", 300, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_checkpoint"))).toBe(true);
 
     r.ws.send({ type: "events", seq: 2, events: [ev(3, { type: "turn_completed", stop_reason: "end_turn" })] });
     await r.ws.next("ack", (m) => m.up_to === 2);
     expect((await sandboxStub(s.sandbox).info()).working).toEqual([]);
-    const [cp] = await nextCommands(s.host.ws, (c) => c.type === "sandbox_checkpoint");
+    const [cp] = await nextCommands(s.sbxHost.ws, (c) => c.type === "sandbox_checkpoint");
     expect(cp).toMatchObject({ sandbox: s.sandbox, reason: "turn_end" });
   });
 });

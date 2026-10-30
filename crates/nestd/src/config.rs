@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn parses_minimal_config() {
         let cfg: Config = serde_json::from_value(serde_json::json!({
-            "role": "burst",
+            "role": "sandbox",
             "cell": "aws-us-east-1",
             "enrollment": {"type": "aws_imds"},
             "driver": {"type": "process", "guest_command": ["nest-guest"]},

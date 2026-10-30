@@ -45,7 +45,7 @@ async function tick(cell: string, ec2: Ec2 | null) {
 
 /** A burst host whose hello reports this much hugepage room (placement prefers the fullest host). */
 async function hostWithRoom(cell: string, hugepagesFree: number) {
-  const enrolled = await enrollHost(cell, "burst");
+  const enrolled = await enrollHost(cell, "sandbox");
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
   ws.send(hostHello(enrolled.host, cell, { capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: hugepagesFree, hugepages_mib_total: 8192, sandboxes: 0, agents: 0, warm: [] } }));
   await ws.next("hello_ack");

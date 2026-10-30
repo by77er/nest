@@ -93,6 +93,18 @@ fn enum_members_match_enums_json() {
     assert_eq!(listed, seen, "enums.json lists an enum this test doesn't check");
 }
 
+/// The previous release's host role names (`burst`, `controller`) still parse, for one release
+/// (a host, a stored config or a token of that release), and are never sent.
+#[test]
+fn host_role_reads_the_previous_names() {
+    for (old, new) in [("burst", HostRole::Sandbox), ("controller", HostRole::Brain)] {
+        let r: HostRole = serde_json::from_value(json!(old)).unwrap();
+        assert_eq!(r, new);
+        assert_ne!(wire(r), old);
+    }
+    assert!(serde_json::from_value::<HostRole>(json!("worker")).is_err());
+}
+
 #[test]
 fn ids_check_their_prefix_when_parsed() {
     fn rejects<T: DeserializeOwned + Debug>(bad: &str) {

@@ -3,7 +3,7 @@
   "protocol_version": 1,
   "host": "hst_01jb7k3x9q",
   "instance_id": "5c2f9e1ab7d04e38",
-  "role": "burst",
+  "role": "sandbox",
   "cell": "aws-us-east-1",
   "versions": {
     "nestd": "0.1.0",

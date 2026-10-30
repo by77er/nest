@@ -309,7 +309,7 @@ impl Harness {
         };
         let runner = tokio::spawn(nest_runner::serve(Runtime::new(cfg)));
         nestd.expect("hello", |e| matches!(e, RunnerEvent::Hello { .. }).then_some(())).await;
-        nestd.send(RunnerCommand::HelloAck { protocol_version: 1, host_id: HostId("hst_test".into()), host_role: HostRole::Burst });
+        nestd.send(RunnerCommand::HelloAck { protocol_version: 1, host_id: HostId("hst_test".into()), host_role: HostRole::Sandbox });
         nestd.send(RunnerCommand::HostToken { token: Secret("host-token-abc".into()), expires_ms: now_ms() + 3_600_000 });
         nestd.send(RunnerCommand::LeaseUpdate { valid_until_ms: now_ms() + 600_000 });
         let agentdo = MockDo::start().await;

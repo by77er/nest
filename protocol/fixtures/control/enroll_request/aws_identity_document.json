@@ -1,6 +1,6 @@
 {
   "protocol_version": 1,
-  "role": "burst",
+  "role": "sandbox",
   "cell": "aws-us-east-1",
   "proof": {
     "type": "aws_identity_document",

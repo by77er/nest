@@ -39,8 +39,10 @@ pub struct EnrollRequest {
     pub cell: String,
     pub proof: EnrollmentProof,
     /// PEM PKCS#10 CSR for nest-proxy's per-host intermediate CA (key generated on the host and
-    /// never leaves it).
-    pub proxy_ca_csr_pem: String,
+    /// never leaves it). Required from a sandbox host; a brain host runs no proxy and sends none
+    /// (a brain host of the previous release still does, and is answered with a CA for one release).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_ca_csr_pem: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +54,7 @@ pub enum EnrollmentProof {
     /// historical name. FleetDO verifies the signature and that it launched this instance ID and
     /// hasn't enrolled it already.
     AwsIdentityDocument { document_b64: String, pkcs7_b64: String },
-    /// Single-use token for hosts outside AWS (e.g. the controller host on a VPS).
+    /// Single-use token for hosts outside AWS (e.g. a brain host on a VPS).
     EnrollmentToken { token: String },
 }
 
@@ -64,7 +66,10 @@ pub struct EnrollResponse {
     pub host_token: String,
     pub host_token_expires_ms: TimestampMs,
     pub fleet_ws_url: String,
-    pub proxy_ca: CaCertificate,
+    /// The proxy's intermediate CA, signed from the request's CSR: absent when the request had none
+    /// (a brain host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_ca: Option<CaCertificate>,
     /// The host's Cloudflare Tunnel token, when the control plane created a tunnel for it (a
     /// sandbox host in a cell with a zone): nestd runs cloudflared with it, in memory and in its
     /// credentials file, never on a command line. Absent on the harness and on hosts that run

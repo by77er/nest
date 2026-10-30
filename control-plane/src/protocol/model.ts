@@ -69,7 +69,14 @@ export function openEnum<const T extends readonly [string, ...string[]]>(members
   return z.string().transform((s): T[number] => (known.has(s) ? (s as T[number]) : fallback));
 }
 
-export const HostRole = z.enum(["burst", "controller"]);
+/** What a host is for: it runs sandboxes, or brains, never both (docs/compute/). */
+export const HOST_ROLES = ["sandbox", "brain"] as const;
+/** The previous release's names, read as input for one release (old hosts, tokens and stored rows); never sent. */
+export const LEGACY_HOST_ROLES: Readonly<Record<string, (typeof HOST_ROLES)[number]>> = { burst: "sandbox", controller: "brain" };
+export const HostRole = z.preprocess(
+  (v) => (typeof v === "string" && Object.hasOwn(LEGACY_HOST_ROLES, v) ? LEGACY_HOST_ROLES[v] : v),
+  z.enum(HOST_ROLES),
+);
 export type HostRole = z.output<typeof HostRole>;
 export const AgentRole = z.enum(["worker", "captain"]);
 export type AgentRole = z.output<typeof AgentRole>;

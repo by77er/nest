@@ -2,13 +2,14 @@
 //!
 //! Proves the host's identity (AWS IMDSv2 instance identity document, or a one-time token for
 //! hosts outside AWS), sends a CSR for nest-proxy's per-host intermediate CA (the key stays
-//! here), and receives the host token, fleet URL and signed intermediate.
+//! here; a sandbox host only: a brain host runs no proxy), and receives the host token, fleet URL
+//! and signed intermediate.
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
 use nest_protocol::control::{CaCertificate, EnrollRequest, EnrollResponse, EnrollmentProof};
 use nest_protocol::host::Secret;
-use nest_protocol::model::{HostId, PROTOCOL_VERSION, TimestampMs};
+use nest_protocol::model::{HostId, HostRole, PROTOCOL_VERSION, TimestampMs};
 
 use crate::config::{Config, EnrollmentConfig};
 
@@ -113,7 +114,14 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
         }
         EnrollmentConfig::AwsImds { imds_url } => aws_identity_proof(&http_client()?, imds_url).await?,
     };
-    let (key, csr) = proxy_ca_csr(&cfg.cell)?;
+    // Only a sandbox host runs nest-proxy, so only it asks for (and holds) a proxy CA.
+    let (key, csr) = match cfg.role {
+        HostRole::Sandbox => {
+            let (key, csr) = proxy_ca_csr(&cfg.cell)?;
+            (Some(key), Some(csr))
+        }
+        HostRole::Brain => (None, None),
+    };
     let req = EnrollRequest { protocol_version: PROTOCOL_VERSION, role: cfg.role, cell: cfg.cell.clone(), proof, proxy_ca_csr_pem: csr };
     let url = format!("{}/v1/hosts/enroll", cfg.control_url.trim_end_matches('/'));
     // The control plane may create the host's tunnel before answering: up to four Cloudflare calls
@@ -134,7 +142,7 @@ pub async fn enroll(cfg: &Config) -> anyhow::Result<Enrolled> {
         host_token: Secret(r.host_token),
         host_token_expires_ms: r.host_token_expires_ms,
         fleet_ws_url: r.fleet_ws_url,
-        proxy_ca: Some((r.proxy_ca, key)),
+        proxy_ca: r.proxy_ca.zip(key),
         tunnel_token: r.tunnel_token,
         gateway_url: r.gateway_url,
     };
@@ -233,7 +241,7 @@ mod tests {
 
     fn aws_config(url: &str, state_dir: &std::path::Path) -> Config {
         serde_json::from_value(serde_json::json!({
-            "role": "burst", "cell": "aws-us-east-1", "control_url": url,
+            "role": "sandbox", "cell": "aws-us-east-1", "control_url": url,
             "enrollment": {"type": "aws_imds", "imds_url": url},
             "driver": {"type": "process", "guest_command": ["x"]},
             "state_dir": state_dir,
@@ -300,5 +308,19 @@ mod tests {
         assert_eq!(&sig[..4], &[0x30, 0x80, 0x06, 0x09]);
         assert_eq!(body["proof"]["pkcs7_b64"], RSA2048_IMDS.replace('\n', ""));
         assert!(body["proxy_ca_csr_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE REQUEST"));
+    }
+
+    /// A brain host runs no proxy: it sends no CSR and keeps no proxy CA, even if one is offered.
+    #[tokio::test]
+    async fn a_brain_host_enrolls_without_a_proxy_ca() {
+        let (url, seen) = mock_server().await;
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = aws_config(&url, state.path());
+        cfg.role = HostRole::Brain;
+        let e = enroll(&cfg).await.unwrap();
+        let body = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(body["role"], "brain");
+        assert!(body.get("proxy_ca_csr_pem").is_none(), "{body}");
+        assert!(e.proxy_ca.is_none());
     }
 }

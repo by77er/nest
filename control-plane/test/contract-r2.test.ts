@@ -9,18 +9,18 @@ const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 async function setup() {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
-  const host = await connectHost(cell);
-  const controller = await connectHost(cell, "controller");
+  const sbxHost = await connectHost(cell);
+  const host = await connectHost(cell, "brain");
   const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "ship it" } }, 201);
   const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
   const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
-  await nextCommands(host.ws, (c) => c.type === "sandbox_create");
+  await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, captain } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
   const ws = await Ws.connect(`/v1/agents/${worker.agent}/session`, host.host_token);
   ws.send({ type: "hello", protocol_version: 1, agent: worker.agent, host: host.host, instance_id: "rin_r2", epoch: 1, session: SESSION });
   await ws.next("hello_ack");
-  return { workstream, agent: worker.agent as string, captain, controller, ws };
+  return { workstream, agent: worker.agent as string, captain, ws };
 }
 
 describe("cancel_call", () => {

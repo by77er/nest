@@ -32,7 +32,7 @@ nestd --config /etc/nest/nestd.json          # RUST_LOG=debug for detail
 
 ```json
 {
-  "role": "burst",
+  "role": "sandbox",
   "cell": "aws-us-east-1",
   "control_url": "https://nest.example.com",
   "enrollment": {"type": "aws_imds"},

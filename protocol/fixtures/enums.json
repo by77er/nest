@@ -14,7 +14,7 @@
   "EgressVia": ["dns", "http_transparent", "https_transparent", "explicit", "tcp_exception"],
   "ForkMode": ["disk_only", "live"],
   "GenerationKind": ["disk_only", "checkpoint"],
-  "HostRole": ["burst", "controller"],
+  "HostRole": ["sandbox", "brain"],
   "ManifestKind": ["disk", "memory"],
   "PolicyLayer": ["base", "workstream", "sandbox"],
   "RuleDecision": ["allow", "deny", "ask"],
