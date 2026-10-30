@@ -9,6 +9,9 @@ exclude_re = [
   # follows the `seq <= forwarded` branch), so no input reaches the difference.
   'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace < with <= in FleetLink<E>::(unacked_in_order|seq_never_reused)',
   'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace > with >= in FleetLink<E>::(key_is_fresh|forwarded_in_order)',
+  # The same predicates replaced by `true`: an invariant that holds by construction never fails, so
+  # no input tells an always-true check from the real one (`false` is caught: a debug build panics).
+  'crates/nestd-core/src/fleet\.rs:\d+:\d+: replace FleetLink<E>::(unacked_in_order|seq_never_reused|key_is_fresh|forwarded_in_order) -> bool with true',
   # result_cache_bounded: `&&` -> `||` (the cache keeps map and order in step by construction).
   'crates/nestd-core/src/results\.rs:\d+:\d+: replace && with \|\| in ResultCache<V, K, M, O>::insert',
 

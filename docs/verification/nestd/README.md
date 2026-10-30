@@ -9,15 +9,16 @@ The parsers at nestd's trust boundaries are fuzzed. TLA+ and Quint stay for desi
 
 **Status:**
 - **Phase 1 done:** the fleet link (with the executor's dedup and the lease watchdog) is extracted and checked; Kani covers the pure decision functions that exist today; fuzz targets cover every wire parser; runtime assertions are in place.
-- **Phase 2 designed, not built** (below): sandbox incarnations, the proxy link, the gateway link and the runner link's brain table. It waits on the host.rs branches in flight.
+- **Phase 2 designed, not built** (below): sandbox incarnations, the proxy link, the gateway link and the runner link's brain table.
 
 Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): every result here is **bounded**. A model check holds for the bounds it names, a Kani proof for its unwind bounds, and a fuzz run for the time it ran. None of it says anything about the real network, the real control plane or real hosts.
 
 ## The core/shell split
 
-- **A core** is `step(&mut state, now, input) -> Vec<Effect>`. It lives in `crates/nestd-core`, which has no dependencies at all.
-  - The `nestd-core-purity` fence ([scripts/fences.toml](../../../scripts/fences.toml)) fails CI if anything under `crates/nestd-core/` names a clock (`Instant`, `SystemTime`), `std::fs`, `std::net`, `std::process`, `std::thread`, `std::env` or `std::io`, a hashed map (its hasher seeds from the OS), `async`/`.await`, `tokio`, `rand`, `libc`, `nix`, `unsafe`, or a `[dependencies]` table.
-  - The crate is also `#![forbid(unsafe_code)]`.
+- **A core** is `step(&mut state, now, input) -> Vec<Effect>`. It lives in `crates/nestd-core`, which has no dependencies at all. Purity is enforced in three layers:
+  - **The compiler:** the crate is `#![cfg_attr(not(test), no_std)]` with `extern crate alloc`, so naming `std` (a clock, the filesystem, the network, processes, threads, the environment, I/O, a hashed map seeded from the OS) outside its unit tests fails to build. It is also `#![forbid(unsafe_code)]`.
+  - **The manifest:** [scripts/check-core-manifest.py](../../../scripts/check-core-manifest.py) parses `crates/nestd-core/Cargo.toml` and fails on any dependency table or key (dotted, inline or per target), any build key, `[patch]`/`[replace]`, a `build.rs`, or a `lib.rs` without the `no_std` line. It runs in the `guards` job with tests that prove each case fails.
+  - **A text fence**, `nestd-core-purity` ([scripts/fences.toml](../../../scripts/fences.toml)), stays as a second layer over the sources.
 - **The shell makes no decisions.** It only does five things:
   1. read and decode an input;
   2. read the clocks and pass them in (`Now { mono, boot, wall }` in ms);
@@ -30,9 +31,9 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 - **Timers are core state.** The core says when it next needs `Tick` (`wake_at()`); the shell sleeps until then.
 - **Write-ahead.** A core whose state is durable returns the record to persist with the step's effects, and the shell persists it before performing any of them. Effects carry ids (cmd, request, epoch), so a replay after a crash is idempotent. The checkers model the crash: memory lost, durable state kept.
   - The fleet link has no durable state (a new process is a new `instance_id`, and FleetDO resets the lineage). Incarnations do (`meta.json`, phase 2).
-- **Runtime assertions.** `nestd_core::invariant::check(cond, name)` asserts each core's invariants in the shipped code.
-  - A violation panics in debug builds (every test, and the checker, which builds with debug assertions).
-  - In release it is counted and logged through the hook `nestd` installs (`main.rs`), never fatal.
+- **Runtime assertions.** Each core asserts its invariants in the shipped code (`nestd_core::invariant`). A violation panics in debug builds (every test, and the checker, which builds with debug assertions). In release it is never fatal, and the core never logs:
+  - inside a fleet step, it is that step's `Log::InvariantViolated { name }` effect, which the shell logs;
+  - outside a step (`ResultCache::insert`), it is counted in an atomic that `main.rs` polls every 10 s, logging each rise.
 
 ## Machines
 
@@ -50,22 +51,24 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 
 ### Shell audit
 
-[`crates/nestd/src/fleet.rs`](../../../crates/nestd/src/fleet.rs) is 327 lines: about 135 are the public types the host uses (unchanged), 30 are the `OutboxEvent` instance (shed rank, audit coalescing), and about 160 are the loop, the interpreter and the codecs. The core is 560 lines in [`crates/nestd-core/src/fleet.rs`](../../../crates/nestd-core/src/fleet.rs).
+[`crates/nestd/src/fleet.rs`](../../../crates/nestd/src/fleet.rs) is 327 lines before its tests:
+- about 130 are the public types the host uses, plus the `OutboxEvent` instance. That instance only reads an event's kind (`EventKind`: audit with its record count, capacity, egress denied, port opened, other) and appends audit records when the core says to merge;
+- about 200 are the loop, the interpreter and the codecs.
 
-| Effect or input | I/O | Where |
+The core is 740 lines in [`crates/nestd-core/src/fleet.rs`](../../../crates/nestd-core/src/fleet.rs). It decides shedding and coalescing from the kind, and whether a peer error is fatal from its code (`error_is_fatal`, cross-checked by a nestd test against every code in nest-protocol).
+
+| Effect or input | I/O | Where (in `fleet.rs`) |
 |---|---|---|
-| `Connect { token }` → `Connected` or `ConnectFailed` | WebSocket upgrade with `Authorization: Bearer`, 10 s timeout | `fleet.rs:168`, `:308-312` |
-| `Send(frame)` → nothing, or `SendFailed(frame)` | one `ws.send` of the encoded frame. The hello adds the reporter's report and the heartbeat its lease claims (reads of host state) | `fleet.rs:175-185`, `encode` `:202-229` |
-| `Close` | drop the socket | `fleet.rs:187` |
-| `Notify(n)` | one `notices.send` to the host | `fleet.rs:191-193`, `notice` `:249-271` |
-| `Log(l)` | one `tracing` line | `fleet.rs:195`, `log` `:295-306` |
-| inputs | the host channel, `ws.next()` decoded (text or binary JSON → frame; ping, pong or unparseable → `Noise`; close, error or end → `Closed`), or the sleep until `wake_at` → `Tick` | `fleet.rs:146-156`, `decode` `:232-247`, `inbound` `:273-293` |
-
-`inbound` maps an `error` frame to `fatal` (unauthorized, or another protocol version), using nest-protocol's code list. That is a translation of wire vocabulary, not a decision about state.
+| `Connect { token }` → `Connected` or `ConnectFailed` | WebSocket upgrade with `Authorization: Bearer`, 10 s timeout | `perform`, `connect` |
+| `Send(frame)` → nothing, or `SendFailed(frame)` | one `ws.send` of the encoded frame. The hello adds the reporter's report and the heartbeat its lease claims (reads of host state) | `perform`, `encode` |
+| `Close` | drop the socket | `perform` |
+| `Notify(n)` | one `notices.send` to the host | `perform`, `notice` |
+| `Log(l)` | one `tracing` line, `InvariantViolated` included | `perform`, `log` |
+| inputs | the host channel; `ws.next()` through `decode`, a pure public function (text or binary JSON → a frame; ping, pong or unparseable → `Noise`; close, error or end → `Closed`, on which the shell drops its socket); or the sleep until `wake_at` → `Tick` | `Shell::run`, `decode`, `inbound` |
 
 **Outside the shell (host.rs), unchanged in phase 1:**
-- The executor loop (`host.rs:536-540`) and `execute` (`:1310`), which looks up and records `ResultCache` and dispatches.
-- The lease watchdog (`:1036`), which calls `lease::check`.
+- The executor loop (in `Host::start`) and `Inner::execute`, which looks up and records `ResultCache` and dispatches.
+- `Inner::lease_watchdog`, which calls `lease::check`.
 
 The executor still branches on the cache lookup itself; it moves into a core with the incarnations in phase 2.
 
@@ -81,26 +84,29 @@ The executor still branches on the cache lookup itself; it moves into a core wit
 - **Volatile** (lost on a restart): the per-host `SerialQueue`, in-flight `sendResolved` awaits, and sockets with their `helloed` attachment.
 - **Handlers.**
   - **`webSocketMessage`:** reads the attachment on arrival; the first frame must be a hello.
-  - **`onHello`:** split at each `await`: its synchronous start (supersede other sockets, reset on a new instance, `helloed`, `hello_ack`), the resend (with its own BrokerDO await), and the reconcile that fails the old lineage.
-  - **`onEvents`:** classify, `markProcessed`, ack, or gap → error and close.
-  - **`issueCommands`:** push, then send at once, or after a BrokerDO await when the batch carries a secret reference.
+  - **`onHello`:** split at each `await`. Its synchronous start does the following: the stale-socket guard, superseding other sockets, the reset and capture on a new instance, the ack of `last_command_seq`, the socket's `sent` mark, `helloed`, `hello_ack`, and enqueuing the resend on the send chain. The reconcile that fails the old lineage comes after the awaits.
+  - **The send chain (`flush`):** one per host. A run takes `socketFor(host)` (the first helloed socket), resolves secrets for everything above that socket's `sent` mark, and only then sends it all in seq order and advances `sent`. A BrokerDO failure sends nothing and closes.
+  - **`onEvents`:** the socket must still be the host's helloed one; then classify, `markProcessed` and ack, or on a gap an error and a close.
+  - **`issueCommands`:** push, then enqueue a run.
   - **`ack`:** cumulative.
 - **Faults:**
   - a dropped connection (frames in flight lost);
   - a nestd restart (new `instance_id`; core, executor and cache start empty);
   - a FleetDO restart;
   - a BrokerDO failure.
-- **Abstractions:**
+- **Abstractions:** each part of fleet.ts the model leaves out, with why, is listed in the model's module docs. In short:
   - one command per batch, so a seq names a command;
-  - results travel up as `events` through the real outbox;
-  - FleetDO's event handler never fails;
-  - reported sandboxes are not modelled (the `sandbox_create` reconciliation).
+  - every command is the same kind, so #30's filter of answered `agent_start`s never applies;
+  - results travel up as `events` through the real outbox, and FleetDO's event handler never fails;
+  - no wedged hosts, CA renewals or malformed frames: all are closes, which a drop already covers;
+  - no sandboxes: `dropUnreported`, the `sandbox_create` reconciliation, `answered_by` and `killProgress` read or write results but never send;
+  - an `onCommandResult` throw midway through the failures leaves the `kv` capture for the next hello, which a FleetDO restart already models.
 - **Reductions:** each one removes only interleavings this model can't observe.
   - FleetDO's heartbeat answer is left out; the lease check covers it.
   - A fresh connection's first timer tick runs in the step that opened it.
   - A hello with nothing to fail ends after its resend.
   - Time moves only for reconnect backoff, so heartbeats run once per connection.
-- **Variants:** each FleetDO fix can be turned off on its own (`Config`), and `main` is FleetDO as on `edf6829`.
+- **Variants:** each FleetDO fix can be turned off on its own (`Config`), and `main` is FleetDO as on main: none of this work's fixes.
 
 ### Properties
 
@@ -109,31 +115,41 @@ The executor still branches on the cache lookup itself; it moves into a core wit
 | `no_ack_without_execution` | always | a seq leaves `rel_out` by an ack only if some nestd process ran its command (a reset isn't an ack) |
 | `in_order_per_lineage` | always | each process runs (not replays) commands at consecutive seqs from its lineage's first |
 | `failed_never_executed` | always | a command FleetDO failed at instance `I`'s hello was never run by a process `≥ I` (exactly one true result) |
-| `reconnects_bounded` | always | closes ≤ 3 per fault used + 2: only a loop exceeds it (the boundary stops exploring one step later) |
+| `never_a_gap` | always | nestd never meets a command gap: with an in-order sender, any gap would be a reconnect per overtaking batch |
+| `finished_never_reforwarded` | always | a batch a process has finished is never handed to its executor again |
+| `reconnects_bounded` | always | closes ≤ 3 per fault used, and none without a fault: a loop exceeds it (the boundary stops exploring one step later) |
 | `every_command_answered` | eventually | every issued command gets a result. Faults are bounded, so a terminal state has the link up and nothing left to do. Stateright checks `eventually` on terminal paths; the predicate is monotone and every path is finite |
-| `answered_after_a_restart`, `answered_after_a_broker_failure` | sometimes | recovery paths exist, so a pass isn't vacuous |
+| `answered_after_a_restart`, `answered_after_a_broker_failure` | sometimes | recovery paths exist. A spec whose faults allow one fails if its example is never found, so a pass isn't vacuous |
 | core invariants | assertion | effects well formed (one connect per step, no send after a close); unacked batches in order; a seq never reused; heartbeat keys increase; commands forwarded in order; the result cache bounded and consistent |
 
 ### Results
 
-Each spec is FleetDO's variant, the number of commands (each with or without a secret reference), and the faults: drops, nestd restarts, FleetDO restarts, BrokerDO failures. Times are on a shared WSL2 box at load averages of 100 to 300, 8 threads (4 for the CI tests), and vary 2×.
+Each spec is FleetDO's variant, the number of commands (each with or without a secret reference), and the faults: drops, nestd restarts, FleetDO restarts, BrokerDO failures. The violating variants are the fixed system with one fix removed, at the smallest bounds that show it. Times are on a shared WSL2 box on 4 threads, and vary 2×.
 
 | Spec | Unique states | Time | Outcome |
 |---|---|---|---|
-| fixed, 2 cmds, 1 of each fault | 20,698,472 | 38-42 s | holds |
-| fixed, 3 cmds, 1 drop | 2,643,116 | 10 s | holds |
-| fixed, 2 cmds, 1 drop, 1 restart | 575,951 | 1.2 s | holds |
-| fixed, 2 cmds, 1 restart, 1 reset, 1 broker failure | 1,640,221 | 3.5 s | holds |
-| main FleetDO + the extracted (pre-fix) nestd core, 3 cmds, no fault (the model before its reductions) | 455,821 | 1.5 s | B1: `no_ack_without_execution` (11 steps), `in_order_per_lineage` (9), `every_command_answered` (19) |
-| main FleetDO, 2 cmds, 1 of each fault | 3,701,569 | 4 s | all of the above, plus `failed_never_executed` (16) and `reconnects_bounded` (37) |
-| no baseline (a FleetDO older than `next_command_seq`), 2 cmds | 12,229,432 | 23 s | `no_ack` (11), `in_order` (9), liveness (19): the fallback is no worse than main, no better |
-| capture after the awaits, 2 cmds | 27,444,541 | 79 s | `failed_never_executed` (16), liveness (20) |
-| capture kept in memory only, 2 cmds | 20,489,626 | 49 s | liveness (20) |
-| quiet BrokerDO failure, 2 cmds | 6,641,172 | 11 s | liveness (14) |
-| no stale-hello guard, 2 cmds, 1 drop | 62,428 | 0.1 s | `reconnects_bounded` (37), liveness (45) |
-| no stale-events guard, 2 cmds, 1 restart | 44,875 | 0.1 s | liveness (26) |
+| fixed, 2 cmds, 1 of each fault | 7,991,292 | 51 s | holds; both recovery examples found |
+| fixed, 4 cmds, no fault | 58,516 | 0.3 s | holds |
+| fixed, 3 cmds, 1 drop | 491,254 | 2.6 s | holds |
+| fixed, 2 cmds, 2 drops | 419,279 | 2.3 s | holds |
+| fixed, 2 cmds, 1 drop, 1 restart | 450,388 | 1.7 s | holds |
+| fixed, 2 cmds, 1 restart, 1 reset, 1 broker failure | 568,906 | 1.9 s | holds |
+| an in-order FleetDO without the baseline, 2 cmds, 1 drop, 1 restart | 449,644 | 1.7 s | holds |
+| main FleetDO + the extracted (pre-fix) nestd core, 3 cmds, no fault (the first model, before its reductions) | 455,821 | 1.5 s | B1: `no_ack_without_execution` (11 steps), `in_order_per_lineage` (9), `every_command_answered` (19) |
+| main FleetDO, 2 cmds, no fault | 2,466 | <0.1 s | `no_ack` (11), `in_order` (9), liveness (14) |
+| no send chain (H1), 2 cmds, no fault | 2,721 | <0.1 s | `never_a_gap` (8), `reconnects_bounded` (8) |
+| capture after the awaits (F2), 1 cmd, 1 restart | 3,800 | <0.1 s | `failed_never_executed` (17) |
+| capture kept in memory only (F3), 1 cmd, 1 restart, 1 reset | 17,039 | <0.1 s | liveness (21) |
+| quiet BrokerDO failure (F4), 1 cmd, 1 broker failure | 144 | <0.1 s | liveness (10) |
+| no stale-hello guard, 1 cmd, 1 drop | 3,814 | <0.1 s | `reconnects_bounded` (25), liveness (37) |
+| no stale-events guard (B3), 2 cmds, 1 restart | 30,704 | 0.1 s | liveness (30) |
 
-`verification/nestd/check/tests/variants.rs` pins the expected outcome of each spec at CI bounds (13 tests, about 16 s). The every-fault run is `#[ignore]`d and runs with `--include-ignored`.
+**Mutations of the nestd core the checker catches:**
+- an offline `last_command_seq` that goes backwards: `finished_never_reforwarded`, 31 steps at 2 commands and 2 drops;
+- the hello's baseline without `.max(last + 1)`: `never_a_gap`, 20 steps at 2 commands and 1 drop;
+- `CommandsDone` not moving the expected seq: `never_a_gap`, 20 steps at 2 commands and 1 drop.
+
+`verification/nestd/check/tests/variants.rs` pins the expected outcome of each spec at CI bounds: 15 tests plus the lease, about 10 s on 4 threads. The every-fault run is `#[ignore]`d and runs with `--include-ignored`.
 
 ### What it found, and the fixes
 
@@ -144,7 +160,20 @@ Each spec is FleetDO's variant, the number of commands (each with or without a s
     3. The higher one's cumulative ack deleted the lower one: never run, never answered.
   - **Evidence:** reproduced against the extracted core with no fault (11 steps); the replay is a unit test (`a_batch_that_overtakes_a_lower_one_is_a_gap_not_an_ack`).
   - **Fix (nestd):** the core forwards only the expected seq. That is `hello_ack.next_command_seq` (FleetDO's baseline: the lowest unacked seq above the host's `last_command_seq`, else `next_out`, read in the step that resets), raised to one past the last processed, then one past each forwarded batch. Anything else above what it has processed or is processing is a gap: it closes the connection, and the hello resends in order. The fleet contract already said a gap closes the socket ([fleet](../../interfaces/control-host/fleet/)).
-  - **Old Worker:** without the field (a FleetDO older than this release), the first batch after the hello is taken. The model shows that fallback is unsound, exactly as before, so the Worker deploys first.
+  - **Old Worker:** without the field (a FleetDO older than this release), the first batch after the hello is taken. Against main's FleetDO, which sends out of order, that fallback is unsound exactly as before, so the Worker deploys first. Against an in-order FleetDO without the field, it holds.
+- **H1, FleetDO sent batches out of seq order with no fault (FleetDO; found by the first independent review).**
+  - **Mechanism:** three paths put a higher batch on the wire before a lower one:
+    1. a batch issued while onHello awaited BrokerDO went out ahead of the hello's resend;
+    2. a plain batch overtook one awaiting BrokerDO in `sendResolved`;
+    3. two `agent_start`s resolved in either order.
+  - **Consequences:** against the new nestd, a reconnect per overtaking batch (a storm risk); against an old nestd, B1.
+  - **Evidence:** the checker without the chain fails `never_a_gap` and `reconnects_bounded` in 8 steps with no fault.
+  - **Fix (at the source):** one per-host send chain (`flush`) for `issueCommands` and the hello's resend. Each run sends everything above its socket's `sent` mark, in seq order, with secrets resolved for the whole run before any of it goes out. Rows and seqs are still written synchronously; only the send moved.
+  - **Tests:** vitest on all three orderings, plus a BrokerDO failure mid-run.
+- **The expected seq stayed behind a batch that finished after the hello (nestd; found by the checker once FleetDO sent in order).**
+  - **Mechanism:** with one dropped connection, a batch still running at the reconnect finished after the hello, and its ack deleted it from FleetDO's outbox. The resend then started one past it while nestd still expected it: a gap, so a reconnect.
+  - **Fix:** `CommandsDone` moves the expected seq past the finished batch.
+  - **Test:** replayed as a core test (`a_batch_finished_after_the_hello_moves_the_expected_seq_past_it`); 20 steps without the fix.
 - **Offline `last_command_seq` went backwards (nestd).** A replayed older batch finishing while offline lowered it, so the next hello asked for acked batches, and with a gap check reconnected forever (the study's pilot showed the loop). Now it only rises. Test: `last_processed_never_moves_back_while_offline`.
 - **F2, capture race (FleetDO).** onHello captured the old lineage's unanswered commands after its awaits, so a command issued to the new process meanwhile was failed while the new process ran it, and its real result was dropped as redelivered (16 steps). Fix: the capture is taken in the same step as `rel.reset`.
 - **F3, capture lost with a FleetDO restart (FleetDO).** The capture is kept in `kv` (`orphaned_commands:<host>`) until failed, and every hello finishes it (20 steps without).
@@ -154,8 +183,10 @@ Each spec is FleetDO's variant, the number of commands (each with or without a s
     1. A hello waits in the host's queue while its socket drops.
     2. The host reconnects, and when the stale hello runs it supersedes, so closes, the live socket before that socket's hello_ack.
     3. Under one dropped connection this repeats as long as each stale hello outlasts the host's reconnect delay. The host gets no hello_ack (its lease lapses), and FleetDO's `last_rx` keeps being refreshed.
-  - **Fix:** onHello returns at once if its socket isn't open.
-  - **Caveats:** the loop's persistence depends on timing the model abstracts. vitest shows a stale hello closing the live socket, not the loop.
+  - **Fix:** onHello returns at once if its socket isn't open (`readyState`).
+  - **Caveats:**
+    - The loop's persistence depends on timing the model abstracts. vitest shows a stale hello closing the live socket, not the loop.
+    - That `readyState` reports `CLOSED` once the peer has closed was observed in the workers test pool. It is unverified on Cloudflare's runtime, and a silently half-open socket reads `OPEN` until the edge notices.
 - **B3, a dead process's event batch becomes the new lineage's baseline (FleetDO; the study's suspicion, now a 26-step trace).**
   - **Mechanism:**
     1. The batch arrives on the old socket after the new hello is queued.
@@ -164,7 +195,13 @@ Each spec is FleetDO's variant, the number of commands (each with or without a s
   - **Fix:** onEvents processes a batch only if its socket is still the host's helloed one.
 - **Shedding over-shed rank 1 (nestd, minor).** Rank 1 shed up to the whole original excess even when rank 0 had covered part of it. It now sheds only what's left.
 
-The FleetDO fixes have vitest regressions in [control-plane/test/regressions.test.ts](../../../control-plane/test/regressions.test.ts) (`#28`), each mutation-checked. The nestd fixes have core tests and a WebSocket-level test in [crates/nestd/tests/fleet.rs](../../../crates/nestd/tests/fleet.rs).
+- **FleetDO's own answers counted as the host's (FleetDO; review M2).**
+  - **Mechanism:** the failures written at a new process's hello, and `dropUnreported`'s, were untagged, so `killProgress` read them as the host processing commands.
+  - **Fix:** they carry `answered_by = 'fleet'`, and pruning keeps a fleet-answered row on a live host only for a kill.
+- **A FleetDO restart before `dropUnreported` (FleetDO; review L5).**
+  - **Fix:** the `kv` capture also records, at the reset, the leases the new process doesn't report. A recovery hello drops them too, and a host's death deletes the record.
+
+The FleetDO fixes have vitest regressions in [control-plane/test/regressions.test.ts](../../../control-plane/test/regressions.test.ts) and [retention.test.ts](../../../control-plane/test/retention.test.ts), each mutation-checked. The nestd fixes have core tests and a WebSocket-level test in [crates/nestd/tests/fleet.rs](../../../crates/nestd/tests/fleet.rs).
 
 ### Lease
 
@@ -185,46 +222,37 @@ Time is abstract: 5 s steps, 70 s explored. Frames are delayed any number of ste
 
 - A silently half-open socket reads `OPEN`, so the stale-hello guard misses it until the edge notices; one extra reconnect, not a loop.
 - After a FleetDO restart between `onCommandResult`'s write and its follow-up DO calls, the follow-ups are lost. That is true of every result, not only this path.
-- A restart before `dropUnreported` leaves leases of sandboxes the old process lost until the next new-process hello.
 - B5 (a frame an old nestd can't parse is dropped, and a later batch's ack covers it) is not modelled. The gap check now turns it into a reconnect loop instead of a silent loss, which is louder but still needs capability gating.
 - The fleet link's events direction is checked only with results as events, and FleetDO's event handler never fails (the study's B4, partial-batch re-application, is out of this model).
 
 ## Kani
 
-The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them with `cargo kani -p nestd-core`: kani-verifier 0.68.0 with CBMC 6.11.0, about 1 min in all, peak about 1.1 GB.
+The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them one at a time with `cargo kani -p nestd-core --harness <name> --exact` (kani-verifier 0.68.0, CBMC 6.11.0). Every harness runs shipped code over symbolic inputs.
 
 **What was extracted.** Phase 1 moved the decision functions that already existed into [`nestd_core::incarnation`](../../../crates/nestd-core/src/incarnation.rs), unchanged in behaviour. Table-driven tests of today's behaviour came first; then nestd's call sites changed to call them:
-- `tombstones.rs`'s comparisons;
+- the tombstone map, `TombstoneMap` (nestd's `Tombstones` only shares one behind its lock);
 - `recovery.rs`'s `meta.json` version verdict and the scan's per-entry decisions;
 - `host.rs`'s clean-at-start check, retire backoff, "nothing to salvage" check and `salvage_retryable` (single expressions, plus two constants).
 
-**Harnesses.** Epochs and versions range over all of `u64` unless a bound is given.
+Functions of one expression have table tests and no harness of their own; the tombstone harness proves them in use.
 
-| Harness | Property | Bounds | Time |
-|---|---|---|---|
-| `a_fence_never_lowers_the_tombstone` | the result is at least the old tombstone and the new epoch, and one of them | — | 0.07 s |
-| `a_fence_refuses_its_epoch_and_every_older_one` | after fencing e every e' ≤ e is refused; nothing above both is | — | 0.06 s |
-| `refusal_is_monotone_in_the_fenced_epoch` | no tombstone refuses nothing; a higher one refuses what a lower one does | — | 0.04 s |
-| `a_run_prunes_exactly_the_tombstones_it_gets_past` | a newer epoch running at e prunes only tombstones below e, exactly when they wouldn't refuse e | — | 0.03 s |
-| `a_destroy_keeps_every_tombstone_above_it` | a destroy at e never removes a tombstone above e | — | 0.04 s |
-| `a_fenced_epoch_stays_refused_until_a_destroy_or_newer_run_reaches_it` | any sequence of fences, destroys and runs | 4 operations | 0.8 s |
-| `only_the_current_meta_version_reads_on` | one verdict per input; only the current version reads on | all `u64` pairs | 0.05 s |
-| `the_scan_finds_only_its_own_incarnation_and_never_removes_an_unreadable_one` | found only for a meta naming this incarnation; an unreadable meta is kept | — | 0.03 s |
-| `a_deleting_entry_is_always_removed` | a name ending `.del` is a deletion whatever its type; only a directory is an incarnation | names ≤ 6 ASCII bytes | 31 s |
-| `a_found_incarnation_with_work_is_always_reported` | a dirty disk or an unanswered commit is never deleted unreported | — | 0.02 s |
-| `a_final_refusal_ends_the_salvage_and_a_parent_mismatch_never_does` | `parent_mismatch` is always retried; non-retryable and no mismatch is final | — | 0.02 s |
-| `the_retire_backoff_grows_to_the_max_and_stays` | from any wait in [1 s, 300 s]: never shrinks or passes 300 s, doubles unless capped, reaches 300 s within 9 steps | any ns in range | 1.6 s |
-| `only_a_salvage_of_the_heads_own_disk_is_skipped` | skipped iff a salvage of a disk equal to its head's | — | 0.06 s |
-| `the_cache_is_bounded_and_keeps_recent_outcomes` | after every insert: size ≤ cap; map and order hold the same keys once; a never-inserted key has no value; a value is the latest for its key; a key stays while fewer than cap other keys entered since | cap 1-3, 6 inserts, keys 0-3 | 29-41 s |
+**Harnesses.** Epochs range over all of `u64` unless a bound is given. Each was run alone on this box; peak memory is the whole process tree.
+
+| Harness | Property | Bounds | Time | Peak |
+|---|---|---|---|---|
+| `the_tombstone_map_refuses_a_fenced_epoch_until_a_destroy_or_newer_run_reaches_it` | `TombstoneMap` as `Tombstones` drives it. After a fence of `k@e` and any 4 calls (fence, destroy or run of either sandbox, at any epoch), `k@e` stays refused until a destroy at or above `e` or a run above `e`. A fence keeps the higher epoch; a destroy keeps exactly a tombstone above it, and a run exactly one that refuses it. Other sandboxes are untouched, and `refuses` and `len` agree with the map | 2 sandboxes, 5 calls | 19 s | 0.3 GB |
+| `a_deleting_entry_is_always_removed` | a name ending `.del` is a deletion whatever its type; only a directory is an incarnation | names ≤ 6 ASCII bytes | 46 s | 1.0 GB |
+| `the_retire_backoff_grows_to_the_max_and_stays` | from any wait in [1 s, 300 s]: never shrinks or passes 300 s, doubles unless capped, reaches 300 s within 9 steps | any ns in range | 4 s | 0.2 GB |
+| `the_cache_is_bounded_and_keeps_recent_outcomes` | after every insert: size ≤ cap; map and order hold the same keys once; a never-inserted key has no value; a value is the latest for its key; a key stays while fewer than cap other keys entered since | cap 1-3, 6 inserts, keys 0-3 | 60 s | 1.5 GB |
 
 **Mutation sanity.** Each of these mutations made its harness fail:
-- a fence that lowers the tombstone (`max` → `min`);
-- pruning at an equal epoch;
-- an unreadable meta removed;
+- `prune_below` using the destroy rule;
+- a fence that overwrites the tombstone instead of keeping the higher epoch;
+- `refuses` with `<` instead of `<=`;
 - the cache evicting at `len >= cap`.
 
 **Limits.**
-- **The cache proof:** Kani doesn't finish over `BTreeMap` and `VecDeque` (a popped `VecDeque` value stalls CBMC), so `ResultCache` is generic over its map and queue. The proof runs the cache's own code over fixed-array stand-ins, which leaves the standard map and FIFO trusted, not proved.
+- **The map stand-ins:** Kani doesn't finish over `BTreeMap` and `VecDeque` (a popped `VecDeque` value stalls CBMC; the tombstone harness over the real `BTreeMap` had no verdict after 900 s at 3.2 GB). So `ResultCache` and `TombstoneMap` are generic over their map (and queue), and the proofs run their own code over fixed-array stand-ins. The standard map and FIFO are trusted, not proved.
 - **The fleet core is too large for Kani:** a harness on the real `FleetLink` (strict command order from the baseline) passed 2 GB in symbolic execution and was dropped. Stateright covers it instead. Kani on it would need the same stand-ins for its `sent` map and `unacked` queue.
 - **A possible gap, found while proving:** the scan accepts `007` or `+7` as epoch 7 (`u64` parsing). nestd writes plain decimal names, so it matters only if something else writes there.
 
@@ -242,7 +270,7 @@ The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them with `carg
 | `proxy_events` | `fdpass::recv` over a real SEQPACKET pair | `proxy_link.rs` |
 | `gateway_events` | the length-delimited codec plus `GatewayEvent` | `gateway_link.rs` |
 | `runner_events` | the length-delimited codec plus `RunnerEvent` | `runner_link.rs` |
-| `fleet_to_host` | text and binary `FleetToHost` | `fleet.rs` |
+| `fleet_to_host` | text and binary WebSocket messages through the shell's pure `decode` (FleetDO is authenticated, so this is a robustness check, not a trust boundary) | `fleet.rs` `decode` |
 | `meta_json` | the real `read_meta`, then `write_meta` | `recovery.rs` |
 
 **Properties checked:**
@@ -252,7 +280,10 @@ The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them with `carg
 
 **Local runs (bounded):**
 - 10 to 16 min for the guest targets, 3 to 10 min for the others, 0.7M to 52M executions each;
+- `fleet_to_host` over the real `decode`: 60 s, 1.5M runs;
 - **no crash, hang or mismatch.**
+
+The seeds are built from `protocol/fixtures/` at every run and never committed, so the fixtures stay the only copy.
 
 **Observations:**
 - The guest decoder copies the remaining buffer per frame. That is quadratic in what is buffered, but bounded by nestd's 64 KiB reads.
@@ -271,23 +302,25 @@ The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them with `carg
   - a mutant that only hangs.
 - **Final run:** 145 mutants, **0 missed** (140 caught, 5 unviable).
 - **After the incarnation module joined** (exclusions also cover the `#[cfg(kani)]` proof code, which `cargo test` never compiles): 192 mutants, **0 missed** (181 caught, 11 unviable), about 2 min.
-- **Exclusion pins:** some exclusions are pinned to a line, so a moved line shows up as missed again rather than being silently excluded.
+- **Round 2** (no_std core, the moved decisions, the tombstone map, the expected-seq fix): 231 mutants, **0 missed** (219 caught, 12 unviable), about 5 min at `-j 1`.
+- **Exclusions name a function and a mutation, never a line.** Where a function held both a killable mutant and an equivalent one of the same shape, the equivalent one's expression moved into a function of its own (the invariants' predicates, the heartbeat bookkeeping).
 
 ## CI
 
 - **Every PR, existing jobs:**
   - `rust` runs nestd-core's tests and clippy.
-  - `guards` runs the purity fence and its tests.
-- **New jobs on every PR** (`verify-nestd`, `kani-nestd`, `fuzz-nestd`; times on a runner not yet measured):
-  - the checker's tests (`verification/nestd/check`, `cargo test --release`);
-  - the Kani proofs;
-  - cargo-mutants on nestd-core;
-  - a 60 s run per fuzz target.
-- **Longer runs** (the every-fault check, longer fuzzing) are in [dev/ci.md](../../../dev/ci.md#verification).
+  - `guards` runs the purity fence, the manifest check, and their tests.
+  - `deny` also checks the checker's and the fuzz crate's lockfiles.
+- **New jobs on every PR**, all deterministic (times on a runner not yet measured):
+  - `verify-nestd`: the checker's tests (`verification/nestd/check`, `cargo test --release`), then cargo-mutants on nestd-core in place.
+  - `kani-nestd`: the Kani proofs.
+  - `fuzz-nestd`: the seeds still decode, and every target replays the seeds and the cached corpus once.
+- **Timed fuzzing** runs nightly in `fuzz.yml`, which grows the corpus the PR job replays.
+- **Longer runs** (the every-fault check) are in [dev/ci.md](../../../dev/ci.md#verification).
 
 ## Phase 2 design
 
-Phase 2 waits for `deferred/brain-record` and PR #28 to merge. Each machine moves out of `host.rs` the way the fleet link did:
+Phase 2 waits for the proxy link's rework (PR #28) to merge. The brain record it also waited for is on main (#30). Each machine moves out of `host.rs` the way the fleet link did:
 1. characterization tests first;
 2. the core with its invariants;
 3. a shell that only performs effects;

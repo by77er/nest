@@ -8,12 +8,12 @@
 | `control-plane` | `npm ci`, `npm run typecheck`, `npm test` (vitest in workerd) | Node 22 |
 | `e2e` | The `claude-verify` harness tests (with a stub, never the real binary), then `e2e/run.sh` with the fake brain | The above, plus outbound access to `registry.npmjs.org` and `httpbin.org`; logs are uploaded on failure |
 | `infra` | `inframe test --stack use1`: the cell stack's IAM theorems and graph policies, with no AWS credentials (plans run only in [deploy.yml](deploy.md)) | elan and the inframe CLI (`scripts/infra-tools.sh`, pinned) |
-| `guards` | Doc links (`scripts/check-doc-links.py`), source fences (`scripts/check-fences.py`), and the guards' own tests (`scripts/tests/`) | Python 3.11+ |
-| `deny` | `cargo deny check` (`deny.toml`): RustSec advisories, licenses, wildcards, unknown sources | cargo-deny, built from crates.io and cached |
+| `guards` | Doc links (`scripts/check-doc-links.py`), source fences (`scripts/check-fences.py`), nestd-core's manifest (`scripts/check-core-manifest.py`: no dependency, no build script), and the guards' own tests (`scripts/tests/`) | Python 3.11+ |
+| `deny` | `cargo deny check` (`deny.toml`): RustSec advisories, licenses, wildcards, unknown sources; for the workspace and for the standalone verification crates' lockfiles | cargo-deny, built from crates.io and cached |
 | `secrets` | gitleaks over the full history (`.gitleaks.toml`): default rules plus nest's token formats | gitleaks, built from source and verified by Go's checksum database |
-| `verify-nestd` | The Stateright checks of nestd's real cores at CI bounds (`verification/nestd/check`, `cargo test --release`), then `cargo mutants -p nestd-core` (0 missed expected) | cargo-mutants, pinned and cached ([verification](#verification)) |
+| `verify-nestd` | The Stateright checks of nestd's real cores at CI bounds (`verification/nestd/check`, `cargo test --release`), then `cargo mutants -p nestd-core --in-place` (0 missed expected) | cargo-mutants, pinned and cached ([verification](#verification)) |
 | `kani-nestd` | `cargo kani -p nestd-core`: the proofs of nestd-core's decision functions | kani-verifier, pinned and cached |
-| `fuzz-nestd` | Every fuzz target in `verification/nestd/fuzz` for 60 s | the pinned nightly in that directory, cargo-fuzz |
+| `fuzz-nestd` | The fuzz seeds still decode, and every target in `verification/nestd/fuzz` replays the seeds and the cached corpus once (deterministic; `fuzz.yml` does the timed fuzzing) | the pinned nightly in that directory, cargo-fuzz |
 | `ci-ok` | Fails unless every job above succeeded | — |
 
 - **Pinned:** the Rust toolchain (`rust-toolchain.toml`), every action by commit, cargo-deny and gitleaks by version. A new stable Rust or a moved action tag can't break an unrelated PR; bumps are their own PRs.
@@ -25,14 +25,14 @@
 
 ## Verification
 
-nestd's cores are checked as shipped ([docs/verification/nestd/](../docs/verification/nestd/)). The checker and the fuzz crate are standalone (each has its own `[workspace]` and lockfile), so `cargo test --workspace` doesn't see them, and cargo-deny doesn't cover their lockfiles. The purity fence on `crates/nestd-core` runs in `guards`.
+nestd's cores are checked as shipped ([docs/verification/nestd/](../docs/verification/nestd/)). The checker and the fuzz crate are standalone (each has its own `[workspace]` and lockfile), so `cargo test --workspace` doesn't see them; `deny` checks their lockfiles with the same `deny.toml`. The purity fence and the manifest check on `crates/nestd-core` run in `guards`. Every PR check is deterministic: no result depends on how long something ran.
 
-| Check | On every PR | Longer (by hand or a scheduled run; not wired yet) |
+| Check | On every PR | Longer |
 |---|---|---|
-| Model checks | the specs in `verification/nestd/check/tests/variants.rs`: about 16 s on 4 threads locally | `cargo test --release -- --include-ignored` adds every fault at once (about 21M states, 40 s on 8 threads locally); `cargo run --release -- <spec>` explores other bounds and prints shortest counterexamples |
-| Mutation testing | `cargo mutants -p nestd-core --timeout 60 -j 2`: 192 mutants, about 2 min at `-j 1` locally | — |
-| Kani | every harness: about 1 min locally (kani-verifier 0.68.0) | — |
-| Fuzzing | 60 s per target | 10 min for the guest targets and 3 min for the rest, with the corpus kept in a cache |
+| Model checks | the specs in `verification/nestd/check/tests/variants.rs`: about 10 s on 4 threads locally | by hand: `cargo test --release -- --include-ignored` adds every fault at once; `cargo run --release -- <spec>` explores other bounds and prints shortest counterexamples |
+| Mutation testing | `cargo mutants -p nestd-core --in-place --timeout 60` (in place, so the cached `target/` is the one it builds in): 231 mutants, about 5 min at one job locally | — |
+| Kani | every harness (kani-verifier 0.68.0): about 2 min locally, under 1.5 GB | — |
+| Fuzzing | the seeds decode, and every target replays the seeds and the cached corpus once (`run.sh <target> replay`) | nightly in `fuzz.yml`: 10 min for the guest targets, 3 min for the rest; it saves the corpus the PR job replays |
 
 - **Bumps:** stateright is pinned exactly (`=0.31.0`), cargo-mutants, kani-verifier and cargo-fuzz by version, the fuzz nightly by date.
 - **When a check fails:** a model check names the property and prints the shortest counterexample with `cargo run --release -- <spec>`; replay it as a step test in `crates/nestd-core/tests/`. A fuzz crash is uploaded as the `fuzz-artifacts` artifact; reproduce with `cargo fuzz run --fuzz-dir verification/nestd/fuzz <target> <file>`.
