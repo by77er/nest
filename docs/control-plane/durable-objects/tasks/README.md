@@ -17,7 +17,7 @@ A **task ledger**: a small issue tracker (a simple Linear) that agents read and 
 - **Comments:** `author`, `body` (≤ 10,000), `ms`, `tainted`; at most 1,000 per task, after which a comment, or a cancel with a reason, is refused, never dropped.
 - **The watcher:** one agent per ledger, told when a task reaches `in_review`, `done` or `canceled`. Interim: it becomes a subscription to the ledger's channel when ledgers post to channels.
 - **Stored values:** a status or priority outside its enum (a hand edit, a later release's value) is logged and listed as read; `update` and `claim`, which need it, refuse it cleanly, and an admin's `task_update_any` repairs it.
-- **Storage:** `tasks` (the JSON body, plus copies of `status`, `assignee`, `parent`, `labels` and a lower-cased `title + description` for filtering), `comments`, `history`, `outbox`, `applied`, `kv` (`name`, `next`, `watcher`, `last_prune`). At most 10,000 open tasks per ledger.
+- **Storage:** `tasks` (the JSON body, plus copies of `status`, `assignee`, `parent`, `labels` and a lower-cased `title + description` for filtering), `comments`, `history`, `outbox`, `applied`, `kv` (`name`, `next`, `watcher`), `deadlines` (`notices` at the earliest undelivered one, `prune` daily: the alarm is `Deadlines`, like every other object's). At most 10,000 open tasks per ledger.
 
 ## Who may do what
 

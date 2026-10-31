@@ -300,16 +300,36 @@ describe("TaskLedgerDO", () => {
     await runInDurableObject(l, async (i: TaskLedgerDO, st) => {
       const longAgo = Date.now() - 31 * 86_400_000;
       st.storage.sql.exec("UPDATE tasks SET updated_ms = ?", longAgo);
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'last_prune'", String(longAgo));
+      st.storage.sql.exec("UPDATE deadlines SET at = 1 WHERE key = 'prune'");
       // Idempotency records: a week old goes, a fresh one stays.
       st.storage.sql.exec("INSERT INTO applied (key, outcome, ts_ms) VALUES ('old', '{}', ?), ('fresh', '{}', ?)", Date.now() - 8 * 86_400_000, Date.now());
       await i.alarm();
       expect(st.storage.sql.exec<{ key: string }>("SELECT key FROM applied ORDER BY key").toArray().map((r) => r.key)).toEqual(["fresh"]);
+      // The next prune is a day out.
+      const next = st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'prune'").one().at;
+      expect(next).toBeGreaterThan(Date.now() + 86_400_000 - 60_000);
     });
     const old = await l.get(L, op, "T-1");
     expect([old.task.status, old.comments.length, old.history.length]).toEqual(["canceled", 0, 0]);
     const live = await l.get(L, op, "T-2");
     expect([live.comments.length, live.history.length]).toEqual([1, 1]);
+  });
+
+  it("a ledger from before its alarm used Deadlines (last_prune in kv, notices without a deadline) is adopted by its next alarm", async () => {
+    const L = uniqueLedger();
+    const l = ledgerStub(env, L);
+    await l.apply(L, op, { kind: "create", title: "t" });
+    const lastPrune = Date.now() - 3_600_000;
+    await runInDurableObject(l, async (i: TaskLedgerDO, st) => {
+      st.storage.sql.exec("DELETE FROM deadlines");
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('last_prune', ?)", String(lastPrune));
+      st.storage.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES ('agt_ghost0000000000000000000000/inbox', ?, 0)", JSON.stringify(POST));
+      await i.alarm();
+      expect(st.storage.sql.exec("SELECT COUNT(*) AS n FROM outbox").one().n).toBe(0);
+      expect(st.storage.sql.exec("SELECT key, at FROM deadlines").toArray()).toEqual([{ key: "prune", at: lastPrune + 86_400_000 }]);
+      expect(st.storage.sql.exec("SELECT COUNT(*) AS n FROM kv WHERE key = 'last_prune'").one().n).toBe(0);
+      expect(await st.storage.getAlarm()).toBe(lastPrune + 86_400_000);
+    });
   });
 
   it("counts only open tasks against the size limit", async () => {
