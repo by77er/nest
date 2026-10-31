@@ -30,17 +30,13 @@ export type HostStatus = (typeof HOST_STATUSES)[number];
 export const LAUNCH_END_REASONS = ["enroll_timeout", "idle", "drained", "dead"] as const;
 export type LaunchEndReason = (typeof LAUNCH_END_REASONS)[number];
 
-/** lib/cells.ts `AwsSource`: where a cell's AWS setting came from. */
-export const AWS_SOURCES = ["cell", "legacy", "none"] as const;
-export type AwsSource = (typeof AWS_SOURCES)[number];
-
 /**
- * The fleet view's `aws`: the cell's region and each setting's source (never a value), with `error`
- * when the cell's own credentials were malformed and passed over; or only `error` when its
- * `AWS_CELLS` entry is unusable.
+ * The fleet view's `aws`: the cell's region and whether it has its credentials and KMS key (never a
+ * value), with `error` when its credentials entry was malformed and passed over; or only `error`
+ * when its `AWS_CELLS` entry is unusable.
  */
 export type AwsView =
-  | { cell: string | null; region: string | null; sources: { region: AwsSource; credentials: AwsSource; kms_key: AwsSource }; error?: string }
+  | { cell: string | null; region: string | null; credentials: boolean; kms_key: boolean; error?: string }
   | { cell: string | null; error: string };
 
 /** protocol/control.ts `Capacity`, as the host last reported it. */

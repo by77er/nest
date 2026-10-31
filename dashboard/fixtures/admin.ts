@@ -72,7 +72,8 @@ export const fleet = {
   "aws": {
     "cell": "use1",
     "region": "us-east-1",
-    "sources": { "region": "cell", "credentials": "cell", "kms_key": "legacy" }
+    "credentials": true,
+    "kms_key": true
   }
 } satisfies Fleet;
 

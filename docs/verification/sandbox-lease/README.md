@@ -2,7 +2,7 @@
 
 The protocol between SandboxDO, FleetDO and nestd that decides which host runs a sandbox, at which epoch, and whose commits move its head. Written as a reference for a model (TLA+ or similar). Every claim about code cites `file:line` on main (`edf6829`), except SandboxDO's transitions, which cite the function in `control-plane/src/lib/sandbox-lease.ts` (the pure core, one function per action, checked by a seeded random walk in `control-plane/test/sandbox-lease-core.test.ts`); `sandbox.ts` is `control-plane/src/do/sandbox.ts`, `fleet.ts` is `control-plane/src/do/fleet.ts`, `host.rs` is `crates/nestd/src/host.rs`. Design intent is in [fencing](../../sandbox/fencing/), [SandboxDO](../../control-plane/durable-objects/sandbox/), [FleetDO](../../control-plane/durable-objects/fleet/) and [nestd](../../compute/nestd/).
 
-> **Since** (checked on `main` at b63c0a3): the bugs in §8 that the pilot confirmed (the no-capacity epoch rollback, destroy during placement, the double run after a lapse, L1 and L2) are still in the code. Salvage is now authorized against SandboxDO's full `epochs` table (#32), which doesn't change the rollback case: the rolled-back epoch is the current one.
+> **Since** (checked on `main` at b63c0a3): the bugs in §8 that the pilot confirmed (the no-capacity epoch rollback, destroy during placement, the double run after a lapse, L1 and L2) are still in the code. Since then STONITH waits for `terminated` (`isDead` no longer counts `shutting-down`), which closes the double run on the control-plane side. Salvage is now authorized against SandboxDO's full `epochs` table (#32), which doesn't change the rollback case: the rolled-back epoch is the current one.
 
 ## 1. Scope and actors
 
@@ -47,7 +47,7 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 | Expire | `tick` | host `active/draining`, `now - last_rx ≥ 30 s`, a live lease | all its leases `expired := 1`; host `stonith_pending`; close sockets; EC2 terminate + poll | `1304-1309`, `1749-1765` |
 | StonithFence | hello, every tick with a socket, failed fence | expired leases not queued and not covered by a pending `stonith_fence` | `fence{sandboxes}` with purpose `stonith_fence` | `795`, `1317`, `1805-1825` |
 | FenceOk | `command_result` ok of a `stonith_fence` | — | `recordStale`; host `active` if no other expired lease and a socket, and FleetDO isn't terminating it (EC2 and an instance id; the model's `StonithClear` and fence result need `ec2[h] = "running"`, an over-approximation: the code never clears such a host, even before EC2 accepts the termination); `queueReassign` | `1107-1121`, `1827-1830`; `stonithDoneIfClear` |
-| HostDead | EC2 `isDead` (`null`, `shutting-down`, `terminated`) or operator | — | host `dead`; `queueReassign` every lease | `1787-1803`, `1833-1842` |
+| HostDead | EC2 `isDead` (`null`, `terminated`; at `edf6829` also `shutting-down`) or operator | — | host `dead`; `queueReassign` every lease | `1787-1803`, `1833-1842` |
 | HolderFenced | holder's `sandbox_state{fenced}` (event or hello) | lease `(h, e, ¬expired)` | forward to SandboxDO, `recordStale`, `queueReassign` | `1003-1016`, `842`, `860-864` |
 | Unreported | hello of a new nestd process | live lease not in the report | suspended: Evict; else `queueReassign` | `790`, `804-816` |
 | Reassign | `processReassign` (after enqueue, every tick) | per row | delete lease if it is still `(h, e)`; **await** `leaseLost(h, e, dead)`; delete row; on error `attempts++`, row kept | `1845-1873` |
@@ -98,7 +98,7 @@ Constants: heartbeat 5 s, host fence 20 s, control-plane expiry 30 s (`crates/ne
 
 Let `s_a` be the send instant of the last heartbeat whose ack the host processed, `r_last ≥ s_a` the real time FleetDO processed its last heartbeat (or hello) from that host. The host fences by real time `s_a + 20/(1-ρ) + ε_w + ε_f` (ρ: host monotonic rate error; `ε_w ≤ 250 ms` watchdog granularity, `host.rs:1075`; `ε_f`: fence execution, network side immediate, vCPU pause spawned). FleetDO marks expiry no earlier than `r_last + 30 - σ`, σ the skew between the Cloudflare machines that stamped `last_rx` and read `Date.now()` (a reset DO can move machines; `last_rx` is a stored wall-clock value, so FleetDO does compare timestamps, contrary to "both sides measure durations"). Self-fence precedes expiry iff `20/(1-ρ) + ε_w + ε_f < 30 - σ + (r_last - s_a)`; with `r_last ≥ s_a` it suffices that `ρ < 1/3` and `ε_w + ε_f + σ` stays well under 10 s. Boottime covers a suspended host (`host.rs:1066`).
 
-What depends on it: not lease reassignment (that waits for fence-ok or EC2), but (a) treating EC2 `shutting-down` and `null` as dead, (b) the windows in bug B5, (c) brain hosts (out of scope). Placement RPCs add a second timing assumption: a `place(sbx, e)` call is delivered and executed within `PLACING_STALE_MS = 60 s` of its claim, or S3' below can fail.
+What depends on it: not lease reassignment (that waits for fence-ok or EC2), but (a) treating EC2 `null` as dead (and, at `edf6829`, `shutting-down`), (b) the windows in bug B5, (c) brain hosts (out of scope). Placement RPCs add a second timing assumption: a `place(sbx, e)` call is delivered and executed within `PLACING_STALE_MS = 60 s` of its claim, or S3' below can fail.
 
 ## 5. Safety properties
 

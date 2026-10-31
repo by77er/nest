@@ -820,8 +820,11 @@ describe("one brain per agent: the brain record", () => {
     });
     await newer();
     ws.send({ type: "tool_call", seq: 1, call: "cal_mid-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "mid" } });
-    const res = await ws.next("tool_result", (m) => m.call === "cal_mid-1").catch(() => null);
-    expect(res === null || res.outcome.status === "error").toBe(true);
+    // The call's ack comes once it ran (after any tool_result to this socket): no long wait for a result never sent.
+    await ws.next("ack", (m) => m.up_to >= 1);
+    expect(ws.drain().filter((m) => m.type === "tool_result" && m.call === "cal_mid-1" && m.outcome.status !== "error")).toEqual([]);
+    const outcome = await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).calls.call("cal_mid-1")?.outcome);
+    expect(outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
     expect((await wsStub(s.workstream).events()).some((e: any) => e.type === "progress" && e.summary === "mid")).toBe(false);
     // The guest's `nest emit` with a newer record landing mid-call still goes through.
     await newer();
@@ -1730,7 +1733,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect((await agentStub(s.agent).info()).brain).toMatchObject({ epoch: 1, phase: "starting" });
   });
 
-  it("A6: EC2 confirming a retired host's instance gone makes it lost", async () => {
+  it("A6: EC2 confirming a retired host's instance terminated (not shutting-down) makes it lost", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
@@ -1741,10 +1744,17 @@ describe("FleetDO and SandboxDO at the seam", () => {
         region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,
         max_hosts: 0, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
       };
-      inst.ec2Override = { state: async () => "terminated", terminate: async () => {}, launch: async () => { throw new Error("no"); } } as any;
-      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+      inst.ec2Override = { state: async () => state, terminate: async () => {}, launch: async () => { throw new Error("no"); } } as any;
     });
-    await runDurableObjectAlarm(fleet);
+    let state = "shutting-down";
+    const tick = async () => {
+      await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
+      await runDurableObjectAlarm(fleet);
+    };
+    await tick();
+    expect((await fleet.hostStatus(a.host))!.lost).toBe(false);
+    state = "terminated";
+    await tick();
     expect((await fleet.hostStatus(a.host))!.lost).toBe(true);
   });
 

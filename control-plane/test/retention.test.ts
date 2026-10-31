@@ -558,15 +558,15 @@ describe("commands for a dead or unknown host", () => {
 });
 
 describe("confirming a host dead", () => {
-  it("terminates its instance and records it ended once EC2 confirms", async () => {
+  it("terminates its instance and records it ended once EC2 says terminated, not shutting-down", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
     const terminated: string[] = [];
-    let state: "running" | "terminated" = "running";
+    let state: "running" | "shutting-down" | "terminated" = "running";
     await fleetSql(cell, (sql, inst) => {
       inst.ec2Override = {
         launch: async () => "i-x", images: async () => [],
-        terminate: async (id: string) => { terminated.push(id); state = "terminated"; },
+        terminate: async (id: string) => { terminated.push(id); state = "shutting-down"; },
         state: async () => state,
       };
       sql.exec("UPDATE hosts SET instance_id = 'i-0confirm' WHERE host = ?", h.host);
@@ -578,6 +578,12 @@ describe("confirming a host dead", () => {
     await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
     await runDurableObjectAlarm(fleetStub(cell));
     expect(terminated).toEqual(["i-0confirm"]);
+    // Shutting down is not yet ended, nor terminated again.
+    await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
+    await runDurableObjectAlarm(fleetStub(cell));
+    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT ended_ms FROM launched WHERE instance_id = 'i-0confirm'")[0]?.ended_ms)).toBeNull();
+    expect(terminated).toEqual(["i-0confirm"]);
+    state = "terminated";
     await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
     await runDurableObjectAlarm(fleetStub(cell));
     expect(await fleetSql(cell, (sql) => rows(sql, "SELECT ended_ms FROM launched WHERE instance_id = 'i-0confirm'")[0]?.ended_ms)).toEqual(expect.any(Number));

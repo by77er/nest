@@ -4,8 +4,9 @@
 (* commit protocol of nest, for ONE sandbox, one cell (FleetDO) and a     *)
 (* small set of sandbox hosts (nestd). Written against main (edf6829);     *)
 (* each switch's value on main is given first, and the code as refactored *)
-(* (refactor/all) is: FixDestroy, FixStonithFence, FixQueue TRUE; the rest *)
-(* as on main.                                                             *)
+(* (refactor/all) is: FixDestroy, FixStonithFence, FixQueue TRUE, and,    *)
+(* since STONITH waits for `terminated`, ShuttingDownIsDead FALSE; the    *)
+(* rest as on main.                                                        *)
 (*                                                                         *)
 (* Every DO method is split at each `await` on another object; the steps  *)
 (* between awaits are atomic (DO input gate). Async continuations are      *)
@@ -60,7 +61,7 @@ CONSTANTS
   RollbackEpoch,      \* TRUE: S:312 rolls the epoch back on no capacity / refusal
   CommitEpochCheck,   \* TRUE: S:585 epoch/host check
   Stonith,            \* TRUE: expiry waits for STONITH; FALSE: reassign at once (mutation)
-  ShuttingDownIsDead, \* TRUE: ec2.ts:45 counts shutting-down as dead
+  ShuttingDownIsDead, \* TRUE: ec2.ts:45 counts shutting-down as dead (FALSE now: only terminated)
   WatchdogOnce,       \* TRUE: H:1066-1072 fences once, then waits for a renewal
   DelayedRpc,         \* FALSE: a DO RPC is delivered before the 60 s marker goes stale
   NoCapAllowed,       \* TRUE: place may answer "no capacity" even with candidates
@@ -816,7 +817,7 @@ SalvageOnlyFromHolder == \A g \in gens : g.orphan => [e |-> g.e, h |-> g.h] \in 
 SalvageNeverDropped == salvageRefused = {}
 
 \* StonithBeforeReassign: a newer epoch is granted only after every older expired lease was
-\* settled by EC2 (terminated / shutting-down) or a successful STONITH fence.
+\* settled by EC2 (terminated, or shutting-down under ShuttingDownIsDead) or a successful STONITH fence.
 StonithBeforeReassign == ~stonithBad
 
 \* DestroyIsTerminal (B2): once destroy() returned, the sandbox stays destroyed with no host

@@ -46,8 +46,11 @@ export interface ImageInfo {
   tags: Record<string, string>;
 }
 
-/** States in which the instance can no longer run anything. */
-export const isDead = (s: InstanceState | null) => s === null || s === "shutting-down" || s === "terminated";
+/**
+ * Proof the instance runs nothing: `terminated`, or an instance EC2 no longer knows. A `shutting-down`
+ * one may still run its VMs (STONITH polls it again).
+ */
+export const isDead = (s: InstanceState | null) => s === null || s === "terminated";
 
 export class AwsEc2 implements Ec2 {
   private readonly api: AwsApi;
