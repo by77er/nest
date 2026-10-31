@@ -7,6 +7,8 @@ export type {
   LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
   TunnelState,
 } from "../../protocol/admin/view";
+export type { AgentRow, AgentsResponse, AgentSummary } from "./agents";
+import { errorMessage, type AgentsResponse } from "./agents";
 import type { AwsView, FleetView, HostRole, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../protocol/admin/view";
 
 /**
@@ -67,16 +69,7 @@ export class ApiError extends Error {
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { accept: "application/json" } });
   const text = await res.text();
-  if (!res.ok) {
-    let message = text.slice(0, 200);
-    try {
-      const parsed = JSON.parse(text) as { error?: string | { message?: string } };
-      message = typeof parsed.error === "string" ? parsed.error : (parsed.error?.message ?? message);
-    } catch {
-      // not JSON
-    }
-    throw new ApiError(res.status, message);
-  }
+  if (!res.ok) throw new ApiError(res.status, errorMessage(text));
   return JSON.parse(text) as T;
 }
 
@@ -84,4 +77,5 @@ export const api = {
   cells: () => get<{ cells: string[]; control_plane: string }>("/api/cells"),
   fleet: async (cell: string) => normalizeFleet(await get<FleetResponse>(`/api/fleet?cell=${encodeURIComponent(cell)}`)),
   images: (cell: string) => get<ImagesView>(`/api/images?cell=${encodeURIComponent(cell)}`),
+  agents: (cell: string) => get<AgentsResponse>(`/api/agents?cell=${encodeURIComponent(cell)}`),
 };
