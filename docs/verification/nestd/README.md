@@ -252,6 +252,8 @@ The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them one at a t
 - `recovery.rs`'s `meta.json` version verdict and the scan's per-entry decisions;
 - `host.rs`'s clean-at-start check, retire backoff, "nothing to salvage" check and `salvage_retryable` (single expressions, plus two constants).
 
+Since then, new decisions land there as they are made: `reask_failure_ends_commit` (whether a salvage goes on past a refused re-ask, the fix of the inventory's B1).
+
 Functions of one expression have table tests and no harness of their own; the tombstone harness proves them in use.
 
 **Harnesses.** Epochs range over all of `u64` unless a bound is given. Each was run alone on this box; peak memory is the whole process tree.

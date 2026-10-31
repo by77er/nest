@@ -2192,7 +2192,11 @@ impl Inner {
             s = s2;
             match r {
                 Ok(g) => answered = Some((prev, g)),
-                Err(e) => return (s, Err(e)),
+                Err(e) if incarnation::reask_failure_ends_commit(reason == CommitReason::Salvage, prev.reason == CommitReason::Salvage, !e.retryable) => {
+                    return (s, Err(e));
+                }
+                // Another commit's request was refused (B1): this incarnation's salvage still runs.
+                Err(_) => {}
             }
         }
         let c = match self.prepare_commit(&mut s, reason, mem).await {

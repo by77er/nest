@@ -285,6 +285,8 @@ struct MockFleet {
     reject_salvage: Arc<Mutex<Option<String>>>,
     /// Answer new salvage requests `committed` (the host still held that epoch), not `orphaned`.
     commit_salvage: Arc<AtomicBool>,
+    /// Answer the next new request of any reason `rejected` with this reason.
+    reject_next: Arc<Mutex<Option<String>>>,
 }
 
 const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
@@ -302,10 +304,11 @@ async fn mock_fleet() -> MockFleet {
     let fail_next_events = Arc::new(AtomicBool::new(false));
     let lose_commit_answers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (reject_salvage, commit_salvage) = (Arc::new(Mutex::new(None::<String>)), Arc::new(AtomicBool::new(false)));
+    let reject_next = Arc::new(Mutex::new(None::<String>));
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<Command>>();
     let (ftx, mut frx) = mpsc::unbounded_channel::<FleetToHost>();
     let (log2, part, fail, lose) = (log.clone(), partition.clone(), fail_next_events.clone(), lose_commit_answers.clone());
-    let (reject, commit_s) = (reject_salvage.clone(), commit_salvage.clone());
+    let (reject, commit_s, reject_n) = (reject_salvage.clone(), commit_salvage.clone(), reject_next.clone());
     tokio::spawn(async move {
         let mut seq = 0u64;
         // Command batches sent and not yet acked by the host, by seq.
@@ -386,7 +389,9 @@ async fn mock_fleet() -> MockFleet {
                                         };
                                         let outcome = outcomes.entry(request.clone()).or_insert_with(|| {
                                             let rejection = reject.lock().unwrap().clone();
-                                            if let (CommitReason::Salvage, Some(why)) = (reason, rejection) {
+                                            if let Some(why) = reject_n.lock().unwrap().take() {
+                                                CommitOutcome::Rejected { reason: why, head: heads.get(sandbox).cloned() }
+                                            } else if let (CommitReason::Salvage, Some(why)) = (reason, rejection) {
                                                 CommitOutcome::Rejected { reason: why, head: heads.get(sandbox).cloned() }
                                             } else if *reason == CommitReason::Salvage && commit_s.load(Ordering::SeqCst) {
                                                 heads.insert(sandbox.clone(), generation.id.clone());
@@ -430,7 +435,7 @@ async fn mock_fleet() -> MockFleet {
             }
         }
     });
-    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events, lose_commit_answers, reject_salvage, commit_salvage }
+    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events, lose_commit_answers, reject_salvage, commit_salvage, reject_next }
 }
 
 impl MockFleet {
@@ -2126,6 +2131,26 @@ fn a_restarted_nestd_tears_down_leftover_netns_mounts() {
 
 /// The review of the fix (M2): a final refusal of a salvage (`stale_epoch`: SandboxDO will never
 /// take that work) ends the retire at once: no retry, the disk deleted, `incarnation_retired`.
+/// Inventory B1: a retire first asks again under an unanswered request; when that request was not
+/// a salvage (here a checkpoint, answered `stale_epoch` while its answer was lost), the refusal says
+/// nothing about this incarnation's work, so the salvage still runs. It used to end the retire,
+/// deleting the disk unsalvaged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_unanswered_checkpoint_still_lets_the_salvage_run() {
+    let h = start_host_opts(None, 300).await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    *h.fleet.reject_next.lock().unwrap() = Some("stale_epoch".into());
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_ck").await), "the checkpoint's answer is lost (commit_timeout_ms 300)");
+
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+    assert_eq!(salvage_requests(&h.fleet, "sbx_1", 1).len(), 1, "the salvage ran after the refused re-ask");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_final_salvage_refusal_ends_the_retire() {
     let h = start_host_opts(None, 300).await;
