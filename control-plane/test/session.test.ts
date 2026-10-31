@@ -187,6 +187,18 @@ describe("platform tool relay", () => {
     expect(turns.at(-1)!.input).toMatchObject({ kind: "ask_answer" });
   });
 
+  it("an ask answered inside its window after its brain was restarted arrives as a turn (the call's result has no brain to reach)", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    ws.send(toolCall("cal_t3-1", "ask", { question: "Merge?" }));
+    await sleep(50);
+    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
+    const ask = (events.find((e) => e.type === "needs_input") as { ask: string }).ask;
+    await agentStub(s.agent).start(undefined, undefined, true); // an operator's restart condemns brain 1
+    expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
+    expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("yes") });
+  });
+
   it("an escalation event becomes an async ask whose answer arrives as a turn", async () => {
     const s = await setup({ captain: true });
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);

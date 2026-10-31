@@ -2733,9 +2733,15 @@ export class AgentDO extends DurableObject<Env> {
       // The waiter was lost (eviction): deliver as a turn instead.
     }
     if (row.status === "sync") {
+      const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: answer }] };
+      // Its brain is still the one waiting: the answer is the call's result. Otherwise (condemned, or
+      // restarted at a new epoch) the result would reach no model (a new lineage drops what the old
+      // one was sent), so the call ends unsent and the answer becomes a turn.
+      const waiting = this.isCurrent(this.load(), row.epoch);
+      if (waiting) this.finishCall(row.epoch, row.call, outcome);
+      else this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), row.epoch, row.call);
       await this.deadlines.clear(`ask:${ask}`);
-      this.finishCall(row.epoch, row.call, { status: "ok", content: [{ type: "text", text: answer }] });
-      return "sync";
+      if (waiting) return "sync";
     }
     await this.enqueueTurn({ kind: "ask_answer", text: `Answer to your question ${ask}: ${answer}` });
     return "async";
