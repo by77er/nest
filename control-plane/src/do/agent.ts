@@ -1873,7 +1873,7 @@ export class AgentDO extends DurableObject<Env> {
       }
     });
     // Reported on `<agt>/events` in the same step (queued; posted from the alarm). Never a brain decision.
-    this.reportEvent(info, ev, completed);
+    this.reportEvent(info, ev, completed, stale);
     if (ev.type === "rate_limited") {
       await this.workstream(info.workstream).ingest({
         workstream: info.workstream, ts_ms: ev.ts_ms, agent: info.agent, type: "quota_parked",
@@ -2051,8 +2051,11 @@ export class AgentDO extends DurableObject<Env> {
     return this.env.CHANNEL.get(this.env.CHANNEL.idFromName(name));
   }
 
-  /** Queue a runner event's report on `<agt>/events` (synchronous; idempotent per runner lineage and event). */
-  private reportEvent(info: AgentInfo, ev: AgentEvent, completed: boolean): void {
+  /**
+   * Queue a runner event's report on `<agt>/events` (synchronous; idempotent per runner lineage and
+   * event). A state change from a finished turn (`stale`) changed no state, so it isn't reported.
+   */
+  private reportEvent(info: AgentInfo, ev: AgentEvent, completed: boolean, stale: boolean): void {
     const idem = `${info.agent}/ev/${info.runner_instance ?? ""}/${ev.seq}`;
     const channel = `${info.agent}/events`;
     if (ev.type === "assistant_text") {
@@ -2060,7 +2063,7 @@ export class AgentDO extends DurableObject<Env> {
     } else if (ev.type === "turn_started") {
       // A turn without text of its own never reports the previous turn's.
       this.kvPut("last_text", "");
-    } else if (ev.type === "state_changed") {
+    } else if (ev.type === "state_changed" && !stale) {
       this.outbox.push(channel, { kind: "state_changed", text: `state: ${ev.state}`, data: { state: ev.state, epoch: ev.epoch }, idem_key: idem },
         { tainted: false, agent_owner: info.owner });
     } else if (ev.type === "turn_completed" && completed) {
