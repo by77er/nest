@@ -388,4 +388,32 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
       expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
     });
   }
+
+  it("a placement answer that arrives after the marker was reconciled changes nothing: confirmed slots stay confirmed", async () => {
+    const cell = uniqueCell();
+    const s = await createSandbox(cell, 202);
+    const a = await connectHost(cell);
+    const stub = sandboxStub(s.sandbox);
+    const after = await runInDurableObject(stub, async (inst: SandboxDO, st) => {
+      const { open } = holdPlace(inst, true);
+      const late = inst.wake();
+      await sleep(20); // FleetDO granted epoch 1; the answer is held
+      // The answer is slower than PLACING_STALE_MS: the next wake reconciles and adopts the lease.
+      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one();
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify({ ...JSON.parse(row.value), placing_ms: Date.now() - 61_000 }));
+      const adopted = (await inst.wake()).host;
+      await inst.attach("agt_x");
+      const cmd = (await inst.info()).attach_inflight["agt_x"]!;
+      await inst.attachResult(adopted!, 1, "agt_x", cmd, { status: "ok" });
+      open();
+      await late;
+      return { adopted, info: await inst.info() };
+    });
+    expect(after.adopted).toBe(a.host);
+    expect(after.info).toMatchObject({ host: a.host, epoch: 1, attach_pending: [], attach_inflight: {} });
+    // One agent_attach in all: the late answer re-sent none.
+    await sleep(200);
+    const sent = a.ws.drain().filter((m) => m.type === "commands").flatMap((m) => m.commands as { type: string }[]);
+    expect(sent.filter((c) => c.type === "agent_attach")).toHaveLength(1);
+  });
 });

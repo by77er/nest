@@ -404,10 +404,15 @@ export class SandboxDO extends DurableObject<Env> {
         this.recordEpoch(epoch, host);
       }
     });
-    if (!applied && gone(after.state)) {
-      // Destroyed while FleetDO answered: the lease it granted, and the VM it sent, go too.
-      if (host) await this.discardPlacement(after, host, epoch);
-      return null;
+    if (!applied) {
+      // Overtaken while FleetDO answered: destroyed (the lease it granted, and the VM it sent, go
+      // too), or the marker went stale and was reconciled. Either way this answer is no longer the
+      // placement's, so none of its follow-ups run: they would act on a newer claim's state.
+      if (gone(after.state)) {
+        if (host) await this.discardPlacement(after, host, epoch);
+        return null;
+      }
+      return after.host;
     }
     if (failure !== null) {
       // A refusal is not retried on its own (the leases disagree: an operator looks); anything else is.

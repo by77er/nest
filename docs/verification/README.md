@@ -53,7 +53,7 @@ Each row is a machine or protocol worth modelling. Its doc (a study record, cite
 
 ## Real bugs found
 
-Found on `main` (`edf6829`) unless marked; "Where" cites that commit. "Confirmed" means a checker trace, a test run, or the lead's own reading of the code; reproduction sketches are in the owning doc. "Now" is the state on `main` at b63c0a3 (2026-10-29), checked by reading the code.
+Found on `main` (`edf6829`) unless marked; the refactor/sandbox branch also fixes sandbox-lease B3 (a fenced sandbox never re-placed by its alarm) and B7 (a stale placement answer's follow-ups); "Where" cites that commit. "Confirmed" means a checker trace, a test run, or the lead's own reading of the code; reproduction sketches are in the owning doc. "Now" is the state on `main` at b63c0a3 (2026-10-29), checked by reading the code.
 
 | Bug | Where (`edf6829`) | Consequence | Found by | Now | Doc |
 |---|---|---|---|---|---|
