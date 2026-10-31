@@ -1,7 +1,6 @@
 //! Ingress (port 10000): raw TCP splice to an in-guest port, or a framed PTY.
 
 use std::collections::BTreeMap;
-use std::ffi::CString;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -22,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::exec::agent_env;
+use crate::exec::{PreExec, agent_env};
 use crate::framed::{FramedReader, err, parse_json, write_data, write_json};
 use crate::state::{Gate, Guest};
 use crate::transport::Conn;
@@ -213,39 +212,9 @@ async fn pty(
     let cgroup = agent_id.as_ref().and_then(|a| guest.cgroups.leaf(&a.0, "pty", &crate::state::random_hex(4)));
 
     let (master_fd, slave) = open_pty(cols, rows)?;
-    let slave_fd = slave.as_raw_fd();
-    let procs = cgroup.map(|p| CString::new(p.join("cgroup.procs").into_os_string().into_encoded_bytes()).unwrap());
-    let run_as = guest.config.run_as;
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(&dir).env_clear().envs(envs);
-    // SAFETY: async-signal-safe calls only.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            for target in 0..3 {
-                if libc::dup2(slave_fd, target) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            if let Some(p) = &procs {
-                let fd = libc::open(p.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-                if fd >= 0 {
-                    libc::write(fd, b"0".as_ptr().cast(), 1);
-                    libc::close(fd);
-                }
-            }
-            if let Some((uid, gid)) = run_as
-                && (libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0) {
-                    return Err(io::Error::last_os_error());
-                }
-            Ok(())
-        });
-    }
+    PreExec { tty: Some(slave.as_raw_fd()), cgroup: cgroup.clone(), fd3: None, run_as: guest.config.run_as }.apply_tokio(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

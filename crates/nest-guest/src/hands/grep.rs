@@ -47,7 +47,7 @@ pub async fn run(guest: &Arc<Guest>, agent: &AgentId, input: GrepInput, ctx: &Ca
         cmd.current_dir(&cwd);
     }
     let cgroup = guest.cgroups.leaf(&agent.0, "calls", &format!("grep-{}", crate::state::random_hex(4)));
-    PreExec { new_pgrp: true, cgroup: cgroup.clone(), fd3: None, run_as: guest.config.run_as }.apply_tokio(&mut cmd);
+    PreExec { tty: None, cgroup: cgroup.clone(), fd3: None, run_as: guest.config.run_as }.apply_tokio(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| err("internal", format!("could not run {}: {e}", prog.display()), false))?;
     let pgid = child.id();
     let mut so = child.stdout.take().expect("piped");

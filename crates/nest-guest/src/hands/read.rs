@@ -231,7 +231,7 @@ fn helper_ctx(guest: &Guest, agent: &AgentId) -> (Vec<(String, String)>, PreExec
         .map(|rt| agent_env(&rt.slot, guest.config.run_as))
         .unwrap_or_else(|| crate::exec::base_env(guest.config.run_as));
     let cgroup = guest.cgroups.leaf(&agent.0, "calls", &format!("helper-{}", crate::state::random_hex(4)));
-    (env, PreExec { new_pgrp: true, cgroup, fd3: None, run_as: guest.config.run_as })
+    (env, PreExec { tty: None, cgroup, fd3: None, run_as: guest.config.run_as })
 }
 
 fn cleanup(pre: &PreExec) {

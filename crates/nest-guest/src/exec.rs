@@ -71,11 +71,13 @@ fn set(env: &mut Vec<(String, String)>, k: &str, v: String) {
     env.push((k.to_string(), v));
 }
 
-/// What to do in the child between fork and exec.
+/// What to do in the child between fork and exec. The child always leads a new process group
+/// (pgid = pid), so the fallback kill reaches the whole tree.
 #[derive(Clone, Default)]
 pub struct PreExec {
-    /// New process group (pgid = pid), so the fallback kill reaches the whole tree.
-    pub new_pgrp: bool,
+    /// Lead a new session with this terminal as its controlling tty and as fds 0-2 (an ingress
+    /// PTY), instead of only a new process group.
+    pub tty: Option<RawFd>,
     /// Join this cgroup (writes `0` to `cgroup.procs`).
     pub cgroup: Option<PathBuf>,
     /// Install this fd as fd 3.
@@ -88,12 +90,26 @@ impl PreExec {
     /// The closure for `pre_exec`. Buffers are prepared here, before forking.
     fn closure(&self) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
         let procs = self.cgroup.as_ref().map(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).unwrap());
-        let (new_pgrp, fd3, run_as) = (self.new_pgrp, self.fd3, self.run_as);
+        let (tty, fd3, run_as) = (self.tty, self.fd3, self.run_as);
         move || {
             // SAFETY: only async-signal-safe libc calls between fork and exec.
             unsafe {
-                if new_pgrp && libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
+                match tty {
+                    None => {
+                        if libc::setpgid(0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Some(t) => {
+                        if libc::setsid() < 0 || libc::ioctl(t, libc::TIOCSCTTY, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        for target in 0..3 {
+                            if libc::dup2(t, target) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                    }
                 }
                 if let Some(path) = &procs {
                     let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
@@ -166,7 +182,7 @@ pub fn spawn(s: Spawn<'_>) -> std::io::Result<Child> {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
     }
-    PreExec { new_pgrp: true, cgroup: s.cgroup, fd3: s.fd3.as_ref().map(|f| f.as_raw_fd()), run_as: s.run_as }.apply_tokio(&mut cmd);
+    PreExec { tty: None, cgroup: s.cgroup, fd3: s.fd3.as_ref().map(|f| f.as_raw_fd()), run_as: s.run_as }.apply_tokio(&mut cmd);
     let child = cmd.spawn();
     drop(s.fd3);
     child
@@ -221,7 +237,7 @@ pub fn run_helper(
         Some(f) => cmd.stdin(Stdio::from(f)),
         None => cmd.stdin(Stdio::null()),
     };
-    PreExec { new_pgrp: true, ..pre }.apply_std(&mut cmd);
+    pre.apply_std(&mut cmd);
     let mut child = cmd.spawn()?;
     let pid = child.id();
     let done = Arc::new(AtomicBool::new(false));
