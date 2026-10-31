@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, ApiError, type Fleet, type Host, type Images, type SandboxState } from "./api";
+import { type AgentsResponse, api, ApiError, type Fleet, type Host, type Images, type SandboxState } from "./api";
 
 const REFRESH_MS = 10_000;
 
@@ -15,8 +15,10 @@ function age(ms: number | null | undefined, now: number): string {
   return `${Math.floor(s / 86_400)}d ${Math.floor((s % 86_400) / 3600)}h`;
 }
 
-function Chip({ kind, children }: { kind: "good" | "warn" | "bad" | "muted" | "accent"; children: React.ReactNode }) {
-  return <span className={`chip ${kind}`}>{children}</span>;
+type Kind = "good" | "warn" | "bad" | "muted" | "accent";
+
+function Chip({ kind, children, title }: { kind: Kind; children: React.ReactNode; title?: string }) {
+  return <span className={`chip ${kind}`} title={title}>{children}</span>;
 }
 
 /** Every sandbox state has a kind, so a new state fails the typecheck until it has one. */
@@ -32,6 +34,27 @@ function stateChip(state: SandboxState | null) {
   if (!state) return <Chip kind="muted">starting</Chip>;
   return <Chip kind={STATE_KIND[state]}>{state}</Chip>;
 }
+
+// An agent's fields come from `GET /v1/agents/:agent`, outside the typed view, as strings: a value
+// not listed here is shown muted.
+/** protocol/model.ts `AgentState`: an agent's `state`, and its `activity` (the runner's last report). */
+const AGENT_STATE_KIND: Record<string, Kind> = {
+  ready: "good", working: "good",
+  starting: "warn", waiting_permission: "warn", waiting_input: "warn", compacting: "warn", quota_parked: "warn",
+  idle: "muted", detached: "muted",
+  errored: "bad", stalled: "bad", needs_attention: "bad",
+};
+/** protocol/model.ts `AgentLifecycle`: AgentDO's own part of `state`. */
+const LIFECYCLE_KIND: Record<string, Kind> = { ready: "good", starting: "warn", detached: "muted", errored: "bad" };
+/** lib/brain.ts `Brain.phase`: `condemned` once none of the brain's sessions is current. */
+const PHASE_KIND: Record<string, Kind> = { live: "good", starting: "warn", condemned: "bad" };
+
+function valueChip(kinds: Record<string, Kind>, value: string | null) {
+  if (!value) return <span className="muted">—</span>;
+  return <Chip kind={kinds[value] ?? "muted"}>{value}</Chip>;
+}
+
+const describe = (e: unknown) => (e instanceof ApiError ? `${e.status}: ${e.message}` : e instanceof Error ? e.message : String(e));
 
 /** A host is live when it is active and connected; everything else is history. */
 const isLive = (h: Host) => h.status === "active" && h.connected;
@@ -80,6 +103,8 @@ export function App() {
   const [cell, setCell] = useState<string>("");
   const [fleet, setFleet] = useState<Fleet | null>(null);
   const [images, setImages] = useState<Images | null>(null);
+  const [agentInfo, setAgentInfo] = useState<AgentsResponse | null>(null);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [updated, setUpdated] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -97,15 +122,20 @@ export function App() {
     let cancelled = false;
     const load = async () => {
       try {
-        const [f, i] = await Promise.all([api.fleet(cell), api.images(cell)]);
+        // The agents' detail is extra: when it cannot be read, the rest of the page still is (its rows say unknown).
+        const [f, i, a] = await Promise.all([
+          api.fleet(cell), api.images(cell), api.agents(cell).then((r) => ({ r }), (e: unknown) => ({ e: describe(e) })),
+        ]);
         if (cancelled) return;
         setFleet(f);
         setImages(i);
+        setAgentInfo("r" in a ? a.r : null);
+        setAgentsError("e" in a ? a.e : null);
         setError(null);
         setUpdated(Date.now());
       } catch (e: unknown) {
         if (cancelled) return;
-        setError(e instanceof ApiError ? `${e.status}: ${e.message}` : e instanceof Error ? e.message : String(e));
+        setError(describe(e));
       }
     };
     void load();
@@ -119,7 +149,14 @@ export function App() {
   }, [cell]);
 
   const hosts = useMemo(() => (fleet?.hosts ?? []).filter(isLive), [fleet]);
-  const agents = useMemo(() => hosts.flatMap((h) => h.agents.map((a) => ({ agent: a, host: h.host }))), [hosts]);
+  // An agent is live when a live host indexes its brain (one being replaced may be on two); its
+  // detail is AgentDO's, read by the Worker for the same list.
+  const agents = useMemo(() => {
+    const on = new Map<string, string>();
+    for (const h of hosts) for (const a of h.agents) if (!on.has(a)) on.set(a, h.host);
+    const rows = new Map((agentInfo?.agents ?? []).map((r) => [r.agent, r]));
+    return [...on].sort(([a], [b]) => a.localeCompare(b)).map(([agent, host]) => ({ agent, host, row: rows.get(agent) }));
+  }, [hosts, agentInfo]);
   // Live sandboxes are the ones on a host; one parked in S3 is counted, not listed.
   const sandboxes = useMemo(() => (fleet?.sandboxes ?? []).filter((s) => s.host), [fleet]);
   // Without a host, the sandbox's own state says where it is: parked in S3, waiting for a host (a
@@ -153,16 +190,39 @@ export function App() {
 
       <section>
         <h2>Agents</h2>
+        {agentsError && <p className="error">Could not read the agents' detail: {agentsError}</p>}
         {agents.length === 0 ? <p className="muted">No brain is running.</p> : (
           <div className="tbl"><table>
-            <thead><tr><th>agent</th><th>brain on host</th></tr></thead>
+            <thead><tr>
+              <th>agent</th><th>template</th><th>state</th><th>lifecycle</th><th>activity</th><th>turn</th>
+              <th>brain on host</th><th>phase</th><th>phase since</th><th>sandbox</th>
+            </tr></thead>
             <tbody>
-              {agents.map((a) => (
-                <tr key={a.agent}><td className="mono" title={a.agent}>{short(a.agent)}</td><td className="mono" title={a.host}>{short(a.host)}</td></tr>
-              ))}
+              {agents.map(({ agent, host, row }) => {
+                const i = row?.info;
+                const brainHost = i?.brain?.host ?? host;
+                return (
+                  <tr key={agent}>
+                    <td className="mono" title={agent}>{short(agent)}</td>
+                    {!row ? <td colSpan={5} className="muted">{agentsError ? "unknown" : "loading"}</td>
+                      : !i ? <td colSpan={5}><Chip kind="bad" title={row.error ?? ""}>could not read: {row.error}</Chip></td> : <>
+                        <td className="mono">{i.template ?? "—"}</td>
+                        <td>{valueChip(AGENT_STATE_KIND, i.state)}</td>
+                        <td>{valueChip(LIFECYCLE_KIND, i.lifecycle)}</td>
+                        <td>{valueChip(AGENT_STATE_KIND, i.activity)}</td>
+                        <td className="mono" title={i.current_turn ?? ""}>{i.current_turn ? short(i.current_turn) : <span className="muted">—</span>}</td>
+                      </>}
+                    <td className="mono" title={brainHost}>{short(brainHost)}</td>
+                    <td>{valueChip(PHASE_KIND, i?.brain?.phase ?? null)}</td>
+                    <td title={i?.brain ? new Date(i.brain.since_ms).toISOString() : ""}>{i?.brain ? `${age(i.brain.since_ms, now)} ago` : ""}</td>
+                    <td className="mono" title={i?.sandbox ?? ""}>{i?.sandbox ? short(i.sandbox) : <span className="muted">—</span>}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table></div>
         )}
+        {!!agentInfo?.omitted && <p className="muted">{agentInfo.omitted} more agents not read (the Worker reads at most {agentInfo.agents.length}).</p>}
       </section>
 
       <section>

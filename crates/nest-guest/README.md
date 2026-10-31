@@ -10,7 +10,7 @@ nest-guest [--listen vsock|unix:<dir>] [--state-dir /run/nest] [--cgroup-root /s
 | Module | Role |
 |---|---|
 | `transport` | AF_VSOCK listeners, or `unix:<dir>` (`<dir>/<port>.sock`). `transport::emulator` plays Firecracker's hybrid-vsock socket (`CONNECT <port>` → `OK <n>`) for tests and local runs. |
-| `control` | Port 1024: hello, configure, agent attach/detach, resume, prepare_snapshot/thaw, health, buffered events (`ports`, `task_exited`), CLI relay replies |
+| `control` | Port 1024: hello, configure, agent attach/detach, resume, prepare_snapshot (`sync`, `drop_caches`; a deprecated `fsfreeze` list is ignored), thaw (a deprecated no-op), health, buffered events (`ports`, `task_exited`), CLI relay replies |
 | `hands` | Port 1025, one connection per call: `Bash` (persistent per-agent cwd via an fd-3 `$PWD` report, timeouts, background tasks, missing-cwd warning), `TaskOutput`, `TaskStop`, `Read` (regular files only, streamed ranges), `Write`/`Edit` (in place through symlinks; Write rejects stale files), `Glob` (bounded walk, top 100), `Grep` (ripgrep, capped and timed). File tools run on a blocking thread with the sandbox user's filesystem identity (`exec::AsUser`), cancellable, 120 s deadline |
 | `ingress` | Port 10000: raw TCP splice (127.0.0.1, then 172.16.0.2, then ::1) or a framed PTY |
 | `ports` | `/proc/net/tcp{,6}` watcher |
@@ -19,9 +19,9 @@ nest-guest [--listen vsock|unix:<dir>] [--state-dir /run/nest] [--cgroup-root /s
 
 **vsock peers:** only CID 2 (the host) is accepted.
 
-**Without root or cgroupfs** (tests, local runs), cgroups are skipped and kills go to the process group, `--run-as` defaults to none (no identity switch). Clock steps, `RNDADDENTROPY`, hostname/machine-id changes, `drop_caches` and `fsfreeze` are skipped with a warning.
+**Without root or cgroupfs** (tests, local runs), cgroups are skipped and kills go to the process group, `--run-as` defaults to none (no identity switch). Clock steps, `RNDADDENTROPY`, hostname/machine-id changes and `drop_caches` are skipped with a warning.
 
-**Not exercised here (needs root / a VM):** the uid drop and the per-thread `setfsuid` identity switch, cgroup v2 kill and `memory.max`, the real vsock path and its CID check, `fsfreeze`, PDF and image helpers (poppler/vips not installed).
+**Not exercised here (needs root / a VM):** the uid drop and the per-thread `setfsuid` identity switch, cgroup v2 kill and `memory.max`, the real vsock path and its CID check, PDF and image helpers (poppler/vips not installed).
 
 **Known gaps:** the `agent_root: none` package-install helper; image downscaling only via external `vips`/`convert`. Protocol version 2 ([host-guest](../../docs/interfaces/host-guest/)) isn't built: the version range and capabilities, `flush`, call records and `call_status`, pidfd exits, admission caps, terminal reattach, the change ledger and log-site counts.
 

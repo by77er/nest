@@ -293,7 +293,7 @@ describe("every lost lease is reassigned, however its losses overlap", () => {
 });
 
 describe("a host FleetDO is terminating never serves again", () => {
-  it("its fence ok re-places its sandboxes elsewhere but leaves it stonith_pending until EC2 confirms it gone (B-2)", async () => {
+  it("its fence ok re-places its sandboxes elsewhere but leaves it stonith_pending until EC2 says terminated, not shutting-down (B-2)", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
     const sbx = await createSandbox(cell);
@@ -319,7 +319,11 @@ describe("a host FleetDO is terminating never serves again", () => {
     // The fence covers the lease, so the sandbox moves; but not back onto the instance being terminated.
     expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("stonith_pending");
     expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+    // Shutting down is not proof (its VMs may still run): polled again until EC2 says terminated.
     ec2.state_ = "shutting-down";
+    await tick(cell, ec2);
+    expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("stonith_pending");
+    ec2.state_ = "terminated";
     await tick(cell, ec2);
     expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("dead");
   });

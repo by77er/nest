@@ -53,7 +53,7 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
     match req.command {
         CliCommand::Whoami {} => {
             let inner = guest.inner.lock().unwrap();
-            match inner.admit(Gate::Whoami) {
+            match inner.admit(Gate::Configured) {
                 Ok(id) => CliResult::Ok {
                     data: serde_json::json!({ "sandbox_id": id.sandbox_id, "agent_id": req.agent_id, "epoch": id.epoch }),
                 },

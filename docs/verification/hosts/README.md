@@ -54,7 +54,7 @@ In memory only: `launching` (a RunInstances in flight, `:175`), `keysSent` (`:13
 | H5 | `active`/`draining` → `stonith_pending` | tick | `now - last_rx ≥ 30 s` ∧ some unexpired lease | expire every lease, close sockets, TerminateInstances, poll | `:1307-1309`, `:1749-1765` |
 | H6 | `active`/`draining` → `expired` | tick | silent ≥ 30 s ∧ no unexpired lease ∧ role `controller` | move brains (`onHostLost`) | `:1310`, `:1773-1785` |
 | H7 | `stonith_pending` → `active` | fence result ok, or ensureStonithFence finds nothing to fence | every expired lease covered by the fence just reported ∧ a helloed socket | then reassign the fenced sandboxes | `:1107-1121`, `:1827-1830` |
-| H8 | `stonith_pending` → `dead` | tick → pollStonith | EC2 state ∈ {null, `shutting-down`, `terminated`} | `confirmHostDead`: close, release tunnel, reassign with `host_dead` | `:1787-1799`, `:1833-1842` |
+| H8 | `stonith_pending` → `dead` | tick → pollStonith | EC2 state ∈ {null, `terminated`} (`shutting-down` counted too at `edf6829`; now polled again) | `confirmHostDead`: close, release tunnel, reassign with `host_dead` | `:1787-1799`, `:1833-1842` |
 | H9 | any → `dead` | operator `confirm-dead` | none (no instance terminated on main) | as H8 | `index.ts:157-159` |
 | H10 | `active` → `draining` | `spot_notice` event | status `active` | evict suspended leases, `sandbox_suspend{disk_only}` to the rest | `fleet.ts:1042`, `:1544-1554` |
 | H11 | `active` → `dead` (idle) | tick → scaleDown | role `burst`, `instance_id` set, no lease with `state ≠ suspended`, no brain, `idle_since` ≥ `idle_grace_ms` (600 s) ago | endInstance(`idle`), release tunnel, close, evict | `:1496-1512` |

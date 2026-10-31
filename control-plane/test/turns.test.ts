@@ -70,19 +70,35 @@ describe("TurnQueue (the model's Q1-Q4)", () => {
     });
   });
 
-  it("an unseen message that interrupted its turn comes back ahead of the turns already queued; any other, behind them", async () => {
+  it("an unseen message that interrupted its turn comes back ahead of the turns already queued; any other, by when it arrived", async () => {
     await withQueue((q) => {
-      q.enqueue(user("work"));
-      const t = q.claimNext()!.turn;
-      q.enqueue(user("queued"));
-      q.mirror({ ...msg("msg_stop", "stop that"), from: "user", interrupt: true }, t);
-      q.complete(t);
-      expect(q.claimNext()!.input.text).toBe("Message from user: stop that");
-      const u = q.claimNext()!.turn;
-      q.mirror({ ...msg("msg_later", "when you can"), from: "user" }, u);
-      q.enqueue(user("next"));
-      q.complete(u);
-      expect(q.claimNext()!.input.text).toBe("next");
+      q.enqueue(user("work"), null, 1);
+      const t = q.claimNext(1)!.turn;
+      q.enqueue(user("queued"), null, 2);
+      q.mirror({ ...msg("msg_stop", "stop that"), from: "user", interrupt: true }, t, null, 3);
+      q.complete(t, 4);
+      expect(q.claimNext(5)!.input.text).toBe("Message from user: stop that");
+      expect(q.claimNext(5)!.input.text).toBe("queued");
+      // Behind the turns queued before it arrived (at the same ms too), ahead of those queued after.
+      q.enqueue(user("more"), null, 5);
+      const u = q.claimNext(5)!.turn;
+      q.enqueue(user("before"), null, 6);
+      q.enqueue(user("same ms"), null, 7);
+      q.mirror({ ...msg("msg_later", "when you can"), from: "user" }, u, null, 7);
+      q.mirror({ ...msg("msg_later2", "and this"), from: "user" }, u, null, 9);
+      q.enqueue(user("after"), null, 8);
+      q.enqueue(user("last"), null, 10);
+      q.complete(u, 11);
+      expect([1, 2, 3, 4].map(() => q.claimNext(12)!.input.text))
+        .toEqual(["before", "same ms", "Message from user: when you can\n\nMessage from user: and this", "after"]);
+      expect(q.claimNext(12)!.input.text).toBe("last");
+      // Arrived before every queued turn: ahead of them all.
+      q.enqueue(user("w"), null, 13);
+      const v = q.claimNext(13)!.turn;
+      q.mirror(msg("msg_early", "early"), v, null, 14);
+      q.enqueue(user("queued later"), null, 15);
+      q.complete(v, 16);
+      expect(q.claimNext(17)!.input.text).toBe("Message from platform: early");
     });
   });
 

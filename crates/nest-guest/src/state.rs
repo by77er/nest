@@ -73,12 +73,10 @@ pub struct Identity {
 /// What asks the guest's lifecycle to be let in.
 #[derive(Clone, Copy, Debug)]
 pub enum Gate<'a> {
-    /// A hands call: configured, not frozen, at the configured epoch, for an attached agent.
+    /// A hands call: configured, at the configured epoch, for an attached agent.
     Hands { epoch: Epoch, agent: &'a AgentId },
-    /// An ingress PTY: configured and not frozen (TCP ingress is not gated).
-    Pty,
-    /// The CLI's `whoami`: configured.
-    Whoami,
+    /// An ingress PTY or the CLI's `whoami`: configured (TCP ingress is not gated).
+    Configured,
 }
 
 impl Identity {
@@ -105,8 +103,6 @@ pub struct ExecCtx {
 pub struct Inner {
     pub identity: Option<Identity>,
     pub agents: HashMap<AgentId, AgentRt>,
-    /// Mounts currently frozen by `prepare_snapshot`; hands calls are `busy` while non-empty.
-    pub frozen: Vec<PathBuf>,
 }
 
 pub struct Guest {
@@ -123,12 +119,9 @@ pub struct Guest {
 
 impl Inner {
     /// The one admission rule ("Startup order" and "Fencing" in the host-guest contract):
-    /// `busy` (retryable) before `configure` and while frozen, then the call's own checks.
+    /// `busy` (retryable) before `configure`, then the call's own checks.
     pub fn admit(&self, gate: Gate<'_>) -> Result<&Identity, ErrorBody> {
         let Some(id) = &self.identity else { return Err(busy("guest not configured yet")) };
-        if !matches!(gate, Gate::Whoami) && !self.frozen.is_empty() {
-            return Err(busy("filesystems are frozen for a snapshot"));
-        }
         if let Gate::Hands { epoch, agent } = gate {
             if epoch != id.epoch {
                 return Err(err(error_code::STALE_EPOCH, format!("epoch {} != configured {}", epoch.0, id.epoch.0), false));
@@ -152,7 +145,6 @@ impl Guest {
             inner: Mutex::new(Inner {
                 identity: None,
                 agents: HashMap::new(),
-                frozen: Vec::new(),
             }),
             events: Events::default(),
             config,
@@ -256,29 +248,26 @@ mod tests {
     fn admission_by_gate_and_lifecycle() {
         let agent = AgentId("agt_a".into());
         let other = AgentId("agt_b".into());
-        let inner = |configured: bool, frozen: bool| Inner {
+        let inner = |configured: bool| Inner {
             identity: configured.then(|| Identity { sandbox_id: SandboxId("sbx_a".into()), epoch: Epoch(7), hostname: "h".into() }),
             agents: [(agent.clone(), AgentRt { slot: slot("agt_a"), cwd: "/".into(), reads: HashMap::new(), tasks: HashMap::new(), running_calls: 0 })].into(),
-            frozen: if frozen { vec!["/".into()] } else { vec![] },
         };
         let gates = [
             Gate::Hands { epoch: Epoch(7), agent: &agent },
             Gate::Hands { epoch: Epoch(6), agent: &agent },
             Gate::Hands { epoch: Epoch(7), agent: &other },
-            Gate::Pty,
-            Gate::Whoami,
+            Gate::Configured,
         ];
         for gate in gates {
-            for (configured, frozen) in [(false, false), (true, true), (true, false)] {
-                let got = inner(configured, frozen).admit(gate).map(|_| ()).map_err(|e| e.code);
+            for configured in [false, true] {
+                let got = inner(configured).admit(gate).map(|_| ()).map_err(|e| e.code);
                 let want: Result<(), String> = match gate {
                     _ if !configured => Err("busy".into()),
-                    Gate::Hands { .. } | Gate::Pty if frozen => Err("busy".into()),
                     Gate::Hands { epoch, .. } if epoch != Epoch(7) => Err("stale_epoch".into()),
                     Gate::Hands { agent: a, .. } if *a != agent => Err("unknown_agent".into()),
-                    Gate::Hands { .. } | Gate::Pty | Gate::Whoami => Ok(()),
+                    Gate::Hands { .. } | Gate::Configured => Ok(()),
                 };
-                assert_eq!(got, want, "{gate:?} configured={configured} frozen={frozen}");
+                assert_eq!(got, want, "{gate:?} configured={configured}");
             }
         }
     }

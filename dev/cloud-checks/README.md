@@ -45,3 +45,27 @@ STRESS_AGENTS=50 python3 -I dev/cloud-checks/stress.py      # STRESS_HANDS=0: br
 | **Costs** | at 50 agents on `use1`: about $0.20 of spot EC2 for a run, plus two short Haiku turns per agent on the subscription |
 
 **First run (2026-10-31, `use1`, caps raised by #54):** the findings are in [the stress test notes](stress-2026-10-31.md).
+
+## `ledger_check.py`
+
+The [task ledger](../../docs/control-plane/durable-objects/tasks/) end to end: tasks set up in a ledger, assigned to agents, worked to `done` through hands, then the system goes to sleep and is cleaned up.
+
+```bash
+python3 -I dev/cloud-checks/ledger_check.py      # LEDGER_DRAIN_S=2700: also watch the cell drain to zero hosts
+```
+
+| | |
+|---|---|
+| **Settings** | `NEST_BASE_URL` (default `https://nest.bitcru.sh`), `NEST_CELL` (`use1`), `LEDGER_TASKS` (6), `LEDGER_AGENTS` (3), `LEDGER_MODEL` (`haiku`), `LEDGER_TIMEOUT_S` (1800, for the work), `LEDGER_IDLE_S` (900, for the brains to exit), `LEDGER_DRAIN_S` (0: not watched), `LEDGER_SAMPLE_S` (30), `LEDGER_OUT` (`ledger-check-<run>.jsonl`) |
+| **Creates** | ledger `check-<run>` (a ledger name takes no `/`) with `LEDGER_TASKS` tasks in `todo`, each describing one command, `echo nest-task-<run>-<i>-$((<n>*7))` with a random `n`; the `ledger-check` template (`nest`, `hands`, `tasks`; kept, for reruns); one workstream (sandboxes still need one); `LEDGER_AGENTS` sandboxes and one agent per sandbox, created with `start: false` and `overrides.params.ledger` set to the run's ledger. In a cold cell, the autoscaler launches a brain host and a sandbox host |
+| **Wakes** | only the assignments: every task is assigned round-robin with `POST /v1/ledgers/<name>/tasks/<key>/assign`. Its notice reaches the assignee's inbox from the ledger's alarm, and an inbox post between turns is queued as a turn that starts the brain (`AgentDO.postInbox`); mid-turn it joins the running turn. The check sends no turn. The template's prompt tells an agent, whenever woken, to work each of its open tasks: `in_progress`, the command through `mcp__nest__Bash`, a comment holding the output, `done` |
+| **Records** | per task, from its history: assigned → `in_progress` → `done` times, who moved it, and the comment check; every `LEDGER_SAMPLE_S` the fleet (hosts by kind and load, where this run's brains and sandboxes are, the sandboxes' states), in `LEDGER_OUT` (JSONL) |
+| **Passes when** | every task is `done`, still assigned to its assignee, moved to `done` by it, with a comment by it holding the expected output, which its transcript also shows in a tool result (run through hands, not computed); every assigned agent's brain ran and then idle-exited with no turn queued or active, within `LEDGER_IDLE_S`; after cleanup, no brain of the run is on any host and none of its sandboxes is in the fleet view; with `LEDGER_DRAIN_S` set, no host of the cell is live within it (any other workload's host fails it too) |
+| **Exit** | 0 on PASS, 1 on FAIL. The last line is the JSON of the run, ledger, workstream, agent and sandbox ids |
+| **Cleans up** | stops every agent and destroys every sandbox on every exit path, SIGINT and SIGTERM included (the stop and destroy calls themselves aren't interruptible; the watch after them is) |
+| **Leaves** | the ledger and its tasks (there is no delete route for a task or a ledger), the workstream, the stopped agents' records and the template; the hosts it caused to launch, which retire after the cell's idle grace (sandbox hosts 10 min, brain hosts 30 min on `use1`) |
+| **Costs** | a few minutes of two spot instances from a cold cell (25 to 32 min after the last brain to drain, as the stress test found), and one or two short Haiku turns per agent on the subscription |
+
+**Leftovers after an interrupted run:** as for `brain_hosts_check.py`; `GET /v1/ledgers/check-<run>/tasks` shows how far the work got.
+
+**Sanity-checked locally (2026-10-31)** against `npm run dev` with no hosts (`NEST_CELL=local`): the ledger, template, sandbox, agent and assignment calls answer as the script expects, each assignment queued one `inbox` turn on its assignee (`Message from tasks:<ledger>: assigned T-1 …`), and the timeout, SIGINT and SIGTERM paths all cleaned up and printed the ids. That is no evidence for the cloud run.
