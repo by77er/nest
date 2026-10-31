@@ -116,6 +116,8 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 **B6 — session poison loop (suspected).** AgentDO rejects a frame that fails its schema with `invalid_message` and does not close (`agent.ts:626-635`); the runner reconnects on `invalid_message` (`session.rs:330-333`) and resends the same batch forever. Breaks L3.
 
+**B7 — a failed send lost a runner session message and wedged the channel (fixed).** The runner assigned a seq, sent, and only then queued the message for resending; a send that failed (a broken socket) spent the seq and dropped the message, so every later batch was a gap to AgentDO until the brain exited. Now the message is queued before it is sent (`session.rs` `send_reliable`), as the model's separate *assign* and *send* actions require: the send may fail, the message stays in `unacked` under its seq. Test: `a_batch_whose_send_fails_is_resent_under_its_seq`.
+
 ## Modelling notes
 
 - **Abstraction.** One direction at a time: `Sender{outbox: seq→msg, next}`, `Receiver{last: ⊥|n, forwarded}`, connections with ids and FIFO queues, `close` at any step, `crash` of either process (new instance; volatile state wiped, DO SQLite kept). Make **seq assignment and wire send separate actions** (B1), the **attachment read separate from processing** (B3), processing nondeterministically fail or partially apply (B4). Two receiver variants: TS (gap check) and nestd/runner (forwarded, no gap check).

@@ -276,11 +276,7 @@ impl Session {
                             }
                         }
                         Outbound::ToolCall { call, turn, name, arguments } => {
-                            let seq = st.next_seq;
-                            st.next_seq += 1;
-                            let m = RunnerToAgent::ToolCall(ToolCall { seq: Seq(seq), call, turn, name, arguments });
-                            tx.send(text(&m)?).await?;
-                            st.unacked.push_back((seq, m));
+                            send_reliable(st, &mut tx, |seq| RunnerToAgent::ToolCall(ToolCall { seq, call, turn, name, arguments })).await?;
                         }
                         Outbound::AbandonCall(call) => {
                             let m = st.abandon(&call);
@@ -358,14 +354,9 @@ impl Session {
         if st.batch.is_empty() {
             return Ok(());
         }
-        let seq = st.next_seq;
-        st.next_seq += 1;
         let mut events = std::mem::take(&mut st.batch);
         events.iter_mut().for_each(|e| e.epoch = st.epoch);
-        let m = RunnerToAgent::Events { seq: Seq(seq), events };
-        tx.send(text(&m)?).await?;
-        st.unacked.push_back((seq, m));
-        Ok(())
+        send_reliable(st, tx, |seq| RunnerToAgent::Events { seq, events }).await
     }
 
     async fn flush_tail<S>(&mut self, tx: &mut S) -> anyhow::Result<()>
@@ -391,6 +382,22 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// Assign the next seq, keep the message for resending, then send it. Kept first: a send that
+/// fails (the usual way a broken socket shows) leaves it queued, so the next connection resends
+/// it under the same seq and AgentDO never sees a gap.
+async fn send_reliable<S>(st: &mut State, tx: &mut S, make: impl FnOnce(Seq) -> RunnerToAgent) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let seq = st.next_seq;
+    st.next_seq += 1;
+    let m = make(Seq(seq));
+    let frame = text(&m)?;
+    st.unacked.push_back((seq, m));
+    tx.send(frame).await?;
+    Ok(())
 }
 
 /// Append, coalescing consecutive state changes (only the latest state matters).
@@ -443,6 +450,70 @@ mod tests {
         push_event(&mut b, ev(3, AgentEventBody::AssistantText { text: "x".into() }));
         push_event(&mut b, ev(4, AgentEventBody::StateChanged { state: AgentState::Idle, detail: None }));
         assert_eq!(b.iter().map(|e| e.seq.0).collect::<Vec<_>>(), [2, 3, 4]);
+    }
+
+    /// A sink whose every send fails, as a broken socket's does.
+    struct BrokenSink;
+
+    impl futures_util::Sink<Message> for BrokenSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// R1: a batch whose send fails stays queued under its seq, so the next connection resends it
+    /// and AgentDO sees no gap. Before, the seq was spent and the batch dropped: AgentDO answered
+    /// every later batch with a gap, and the channel stayed wedged for the brain's life.
+    #[tokio::test]
+    async fn a_batch_whose_send_fails_is_resent_under_its_seq() {
+        let rt = Runtime::new(crate::config::Config::default());
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, _orx) = mpsc::unbounded_channel();
+        let agent = Agent::new(AgentId("agt_s".into()), Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
+        let mut session = Session {
+            rt,
+            agent,
+            url: String::new(),
+            tailer: Tailer::new(std::env::temp_dir().join("nest-r1-none.jsonl"), vec![]),
+            session: None,
+            opened: None,
+            instance_id: "rin_t".into(),
+        };
+        let mut st = State {
+            next_seq: 1,
+            unacked: VecDeque::new(),
+            last_in: 0,
+            batch: vec![ev(1, AgentEventBody::AssistantText { text: "x".into() })],
+            durable: 0,
+            resolves: Vec::new(),
+            close_deadline: None,
+            epoch: Epoch(1),
+        };
+        assert!(session.flush_events(&mut st, &mut BrokenSink).await.is_err());
+        st.batch.push(ev(2, AgentEventBody::AssistantText { text: "y".into() }));
+        assert!(session.flush_events(&mut st, &mut BrokenSink).await.is_err());
+        let kept: Vec<(u64, usize)> = st
+            .unacked
+            .iter()
+            .map(|(seq, m)| match m {
+                RunnerToAgent::Events { seq: s, events } => {
+                    assert_eq!(s.0, *seq);
+                    (*seq, events.len())
+                }
+                m => panic!("{m:?}"),
+            })
+            .collect();
+        assert_eq!(kept, [(1, 1), (2, 1)], "both batches wait for the next connection, seqs 1 and 2");
     }
 
     #[test]
