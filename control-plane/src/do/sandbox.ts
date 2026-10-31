@@ -102,6 +102,8 @@ export function shareHostname(domain: string, port: number, sandbox: string): st
 }
 
 type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
+/** A command addressed to this sandbox at its current epoch, before `command()` stamps both. */
+type SandboxCommand = CommandBody extends infer C ? (C extends { sandbox: string; epoch: number } ? Omit<C, "sandbox" | "epoch"> : never) : never;
 
 export class SandboxDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -426,7 +428,7 @@ export class SandboxDO extends DurableObject<Env> {
       info = this.info_();
     }
     if (info.host) {
-      if (info.state === "suspended") await this.command([{ type: "sandbox_resume", sandbox: info.sandbox, epoch: info.epoch }]);
+      if (info.state === "suspended") await this.command({ type: "sandbox_resume" });
       return { host: info.host, state: info.state };
     }
     if (info.placing !== null) return { host: null, state: info.state };
@@ -581,10 +583,11 @@ export class SandboxDO extends DurableObject<Env> {
     if (host) await this.fleet(info.cell).issueCommands(host, [{ type: "sandbox_destroy", sandbox: info.sandbox, epoch }]);
   }
 
-  private async command(bodies: CommandBody[]): Promise<void> {
+  /** Send one command to the current holder, stamped with the sandbox and the epoch read with the host. */
+  private async command(body: SandboxCommand): Promise<void> {
     const info = this.info_();
     if (!info.host) throw new NestError(ErrorCodes.NOT_BOUND, "sandbox is not placed on a host", 409, true);
-    await this.fleet(info.cell).issueCommands(info.host, bodies);
+    await this.fleet(info.cell).issueCommands(info.host, [{ ...body, sandbox: info.sandbox, epoch: info.epoch } as CommandBody]);
   }
 
   // --- generations ----------------------------------------------------------------------------------
@@ -708,7 +711,7 @@ export class SandboxDO extends DurableObject<Env> {
   /** Effective policy merged from the base, workstream and sandbox (temporary grant) layers. */
   private effectivePolicy(now = Date.now()): EgressPolicy {
     const info = this.info_();
-    const ws = this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+    const ws = this.wsLayer();
     const allow: AllowRule[] = [
       ...BASE_ALLOW.map((host) => ({ host, ports: [80, 443], layer: "base" as const })),
       ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? [80, 443], layer: "workstream" as const })),
@@ -727,12 +730,16 @@ export class SandboxDO extends DurableObject<Env> {
     };
   }
 
+  private wsLayer(): WorkstreamPolicyLayer {
+    return this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+  }
+
   async policy(): Promise<EgressPolicy> {
     return this.effectivePolicy();
   }
 
   async workstreamPolicy(): Promise<WorkstreamPolicyLayer> {
-    return this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+    return this.wsLayer();
   }
 
   async setWorkstreamPolicy(layer: WorkstreamPolicyLayer): Promise<EgressPolicy> {
@@ -768,7 +775,7 @@ export class SandboxDO extends DurableObject<Env> {
       } else if (key === "idle") {
         const info = this.info_();
         if (info.host && info.state === "running" && info.working.length === 0) {
-          await this.command([{ type: "sandbox_suspend", sandbox: info.sandbox, epoch: info.epoch, mode: "disk_only" }]);
+          await this.command({ type: "sandbox_suspend", mode: "disk_only" });
         }
       } else if (key === "attach_retry") {
         await this.reissuePendingAttaches(false);
@@ -788,7 +795,7 @@ export class SandboxDO extends DurableObject<Env> {
     });
     const policy = this.effectivePolicy();
     if (info.host && ACTIVE_STATES.includes(info.state)) {
-      await this.command([{ type: "policy_update", sandbox: info.sandbox, epoch: info.epoch, policy }]);
+      await this.command({ type: "policy_update", policy });
       if (injectionChanged) await this.pushSecrets();
     }
     return policy;
@@ -800,11 +807,11 @@ export class SandboxDO extends DurableObject<Env> {
    */
   private async pushSecrets(): Promise<void> {
     const info = this.info_();
-    const ws = this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+    const ws = this.wsLayer();
     if (!info.host || !ws.inject.length) return;
     const secrets = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).injectionSecretRefs(
       ws.inject.map((b) => b.name), info.workstream);
-    if (secrets.length) await this.command([{ type: "secrets_update", sandbox: info.sandbox, epoch: info.epoch, secrets }]);
+    if (secrets.length) await this.command({ type: "secrets_update", secrets });
   }
 
   // --- agents, bindings and idleness (docs/control-plane/durable-objects/sandbox/#attach-and-bindings) --
@@ -827,7 +834,7 @@ export class SandboxDO extends DurableObject<Env> {
   async detach(agent: string): Promise<void> {
     const info = this.update((i) => slots.detach(i, agent));
     if (info.host) {
-      await this.command([{ type: "agent_detach", sandbox: info.sandbox, epoch: info.epoch, agent, kill_processes: true }]);
+      await this.command({ type: "agent_detach", agent, kill_processes: true });
     }
     await this.armIdle();
   }
@@ -968,14 +975,14 @@ export class SandboxDO extends DurableObject<Env> {
     const info = this.info_();
     if (!info.host || info.state !== "running") return;
     this.put("turn_checkpoint_ms", Date.now());
-    await this.command([{ type: "sandbox_checkpoint", sandbox: info.sandbox, epoch: info.epoch, reason: "turn_end" }]);
+    await this.command({ type: "sandbox_checkpoint", reason: "turn_end" });
   }
 
   // --- ports ----------------------------------------------------------------------------------------
 
   async exposePort(port: number, share: boolean, hostHeader: "localhost" | "preserve" = "localhost"): Promise<{ url: string; share_url?: string }> {
     const info = this.info_();
-    await this.command([{ type: "port_expose", sandbox: info.sandbox, epoch: info.epoch, port, host_header: { mode: hostHeader } }]);
+    await this.command({ type: "port_expose", port, host_header: { mode: hostHeader } });
     const url = this.previewUrl(info.sandbox, port);
     this.update((i) => {
       i.ports = [...i.ports.filter((p) => p.port !== port), { port, url }];
@@ -994,7 +1001,7 @@ export class SandboxDO extends DurableObject<Env> {
 
   async unexposePort(port: number): Promise<void> {
     const info = this.info_();
-    await this.command([{ type: "port_unexpose", sandbox: info.sandbox, epoch: info.epoch, port }]);
+    await this.command({ type: "port_unexpose", port });
     this.update((i) => {
       i.ports = i.ports.filter((p) => p.port !== port);
     });
