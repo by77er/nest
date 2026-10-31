@@ -49,7 +49,7 @@ use crate::fleet::{self, FleetInput, FleetNotice, FleetParams, FleetReporter};
 use crate::gateway_link::{Entry as GatewayEntry, GatewayLink, GatewayNotice};
 use crate::guest::{GuestCtl, GuestEvent};
 use crate::net::{GATEWAY_IP, Netns};
-use crate::limits::{self, Limiter};
+use crate::limits::{self, Limiter, RecentSet};
 use crate::proxy_link::{Access, HeldListener, ProxyLink, ProxyNotice, ProxyOp};
 use crate::recovery::{self, META_VERSION, SandboxMeta, SentCommit};
 use crate::runner_link::{RunnerLink, RunnerNotice};
@@ -75,7 +75,9 @@ const GC_FIRST_CHECK: Duration = Duration::from_secs(180);
 const GC_CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Coalescing window for guest port reports.
 const PORTS_COALESCE: Duration = Duration::from_millis(500);
-/// Bound on the (sandbox, host, port) dedup map for egress denials.
+/// An egress denial or alert repeated within this window is reported once.
+const RELAY_DEDUP_WINDOW: Duration = Duration::from_secs(60);
+/// Bound on each relay's dedup set.
 const MAX_DENIED_SEEN: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -279,8 +281,8 @@ pub struct Inner {
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
     /// Starts against lease lapses (amendment A3).
     lapse_guard: LapseGuard,
-    denied_seen: Mutex<HashMap<(SandboxId, String, u16), Instant>>,
-    alerts_seen: Mutex<HashMap<(SandboxId, String, String), Instant>>,
+    denied_seen: RecentSet<(SandboxId, String, u16)>,
+    alerts_seen: RecentSet<(SandboxId, String, String)>,
     proxy_ca: Mutex<CaState>,
     /// Lock-free pause handles of running VMs (fencing freezes vCPUs without the sandbox lock).
     pausers: Pausers,
@@ -584,8 +586,8 @@ impl Host {
             results: Mutex::new(ResultCache::default()),
             lease_deadline: lease_tx,
             lapse_guard: LapseGuard::default(),
-            denied_seen: Mutex::new(HashMap::new()),
-            alerts_seen: Mutex::new(HashMap::new()),
+            denied_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
+            alerts_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
             proxy_ca: Mutex::new(CaState {
                 key: enrolled.proxy_ca.as_ref().map(|(_, k)| k.clone()),
                 expires_ms: enrolled.proxy_ca.as_ref().map(|(c, _)| c.expires_ms),
@@ -964,18 +966,7 @@ impl Inner {
         match n {
             ProxyNotice::Event(ProxyEvent::Audit { records }) => {
                 for r in records.iter().filter(|r| is_request_denial(r)) {
-                    let key = (r.sandbox.clone(), r.host.clone(), r.port);
-                    let fresh = {
-                        let mut seen = self.denied_seen.lock().expect("denied");
-                        let now = Instant::now();
-                        seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                        // Bounded: random names can't grow the map without limit.
-                        if seen.len() >= MAX_DENIED_SEEN && !seen.contains_key(&key) {
-                            false
-                        } else {
-                            seen.insert(key, now).is_none()
-                        }
-                    };
+                    let fresh = self.denied_seen.fresh((r.sandbox.clone(), r.host.clone(), r.port));
                     if fresh && self.limiter.allow(&r.sandbox, "denied", limits::DENIED) {
                         self.workstream_event(&r.sandbox, r.agent.clone(), WorkstreamEventKind::EgressDenied { host: r.host.clone(), port: r.port });
                     }
@@ -989,12 +980,7 @@ impl Inner {
             ProxyNotice::Event(ProxyEvent::Alert { sandbox, agent, kind, host, binding, .. }) => {
                 let reason = nest_protocol::model::EgressAlertReason::from(kind);
                 let host: String = host.chars().take(253).collect();
-                let fresh = {
-                    let mut seen = self.alerts_seen.lock().expect("alerts");
-                    let now = Instant::now();
-                    seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                    seen.len() < MAX_DENIED_SEEN && seen.insert((sandbox.clone(), format!("{reason:?}"), host.clone()), now).is_none()
-                };
+                let fresh = self.alerts_seen.fresh((sandbox.clone(), format!("{reason:?}"), host.clone()));
                 if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS) {
                     self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason });
                 }
