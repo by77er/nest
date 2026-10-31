@@ -12,6 +12,11 @@ export interface LaunchSpec {
   spot: boolean;
   /** Idempotency token: a retried call never launches a second instance. */
   clientToken: string;
+  /**
+   * A burstable type's credit mode, given at launch: EC2 drops a launch template's
+   * `CreditSpecification` when the template names no instance type, as ours don't.
+   */
+  cpuCredits?: "standard" | "unlimited";
 }
 
 /** EC2 refused for lack of capacity or quota in this pool; another type, zone or market may work. */
@@ -79,6 +84,7 @@ export class AwsEc2 implements Ec2 {
       "LaunchTemplate.LaunchTemplateId": spec.launchTemplateId,
       InstanceType: spec.instanceType,
       SubnetId: spec.subnetId,
+      ...(spec.cpuCredits ? { "CreditSpecification.CpuCredits": spec.cpuCredits } : {}),
       ...(spec.spot ? {
         "InstanceMarketOptions.MarketType": "spot",
         "InstanceMarketOptions.SpotOptions.SpotInstanceType": "one-time",

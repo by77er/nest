@@ -390,6 +390,8 @@ describe("autoscaling", () => {
     // c8i-flex had no spot capacity; the next type launched, on spot, from the launch template.
     expect(ec2.launched).toHaveLength(1);
     expect(ec2.launched[0]).toMatchObject({ launchTemplateId: "lt-0abc", instanceType: "c8i.large", spot: true });
+    // Not burstable: EC2 refuses a credit mode for it.
+    expect(ec2.launched[0]!.cpuCredits).toBeUndefined();
     // A second unplaceable sandbox waits for the pending launch instead of launching another.
     await createSandbox(cell, 202);
     expect(ec2.launched).toHaveLength(1);

@@ -2105,6 +2105,9 @@ export class FleetDO extends DurableObject<Env> {
           const id = await ec2.launch({
             launchTemplateId: s.launch_template_id, instanceType: a.type, subnetId: a.subnet, spot: a.spot,
             clientToken: `${cell ?? "cell"}-${role}-${now}-${i}`,
+            // Brain hosts are burstable (IAM allows t3/t3a only): unlimited, so a host full of
+            // brains is never held to its baseline. Sandbox hosts aren't, and EC2 refuses the field.
+            ...(role === BRAIN_ROLE ? { cpuCredits: "unlimited" as const } : {}),
           });
           this.sql.exec(
             "INSERT INTO launched (instance_id, launched_ms, role, region, cell) VALUES (?, ?, ?, ?, ?)",
