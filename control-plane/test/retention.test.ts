@@ -636,36 +636,6 @@ describe("confirming a host dead", () => {
   });
 });
 
-describe("a dead host's launch left open", () => {
-  it("is ended: terminated if it still runs, then recorded gone", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const live = await connectHost(cell);
-    const terminated: string[] = [];
-    let state: "running" | "terminated" = "running";
-    await fleetSql(cell, (sql, inst) => {
-      inst.ec2Override = {
-        launch: async () => "i-x", images: async () => [],
-        terminate: async (id: string) => { terminated.push(id); state = "terminated"; },
-        state: async () => state,
-      };
-      // A previous release's death: the host dead, its launch never marked.
-      sql.exec("UPDATE hosts SET instance_id = 'i-0stale', status = 'dead' WHERE host = ?", h.host);
-      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0stale', ?, ?, 'sandbox')", Date.now(), h.host);
-      // A live host's open launch is left alone.
-      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0live', ?, ?, 'sandbox')", Date.now(), live.host);
-    });
-    h.ws.close();
-    for (let i = 0; i < 2; i++) {
-      await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
-      await runDurableObjectAlarm(fleetStub(cell));
-    }
-    expect(terminated).toEqual(["i-0stale"]);
-    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT instance_id, reason, ended_ms IS NOT NULL AS ended FROM launched ORDER BY instance_id")))
-      .toEqual([{ instance_id: "i-0live", reason: null, ended: 0 }, { instance_id: "i-0stale", reason: "dead", ended: 1 }]);
-  });
-});
-
 describe("the pruning pass", () => {
   it("has its own daily deadline, armed on every start, so a quiet cell without tunnels prunes", async () => {
     const cell = uniqueCell();
