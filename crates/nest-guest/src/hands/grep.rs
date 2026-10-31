@@ -14,9 +14,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::{CallCtx, resolve, text};
-use crate::exec::{PreExec, agent_env, kill_tree, which};
+use crate::exec::{Leaf, PreExec, which};
 use crate::framed::err;
-use crate::state::Guest;
+use crate::state::{ExecCtx, Guest};
 
 pub const DEFAULT_HEAD_LIMIT: u32 = 250;
 pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -33,26 +33,18 @@ pub async fn run(guest: &Arc<Guest>, agent: &AgentId, input: GrepInput, ctx: &Ca
         Some(rg) => (rg, rg_args(&input, mode, &path)),
         None => (which("grep").unwrap_or_else(|| PathBuf::from("grep")), grep_args(&input, mode, &path)),
     };
-    let (cwd, env) = {
-        let inner = guest.inner.lock().unwrap();
-        let rt = inner.agents.get(agent);
-        (
-            rt.map(|r| r.cwd.clone()).unwrap_or_else(|| "/".into()),
-            rt.map(|r| agent_env(&r.slot, guest.config.run_as)).unwrap_or_else(|| crate::exec::base_env(guest.config.run_as)),
-        )
-    };
+    let ExecCtx { cwd, env, .. } = guest.exec_ctx(agent)?;
     let mut cmd = Command::new(&prog);
     cmd.args(&args).env_clear().envs(env).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if std::path::Path::new(&cwd).is_dir() {
         cmd.current_dir(&cwd);
     }
     let cgroup = guest.cgroups.leaf(&agent.0, "calls", &format!("grep-{}", crate::state::random_hex(4)));
-    PreExec { new_pgrp: true, cgroup: cgroup.clone(), fd3: None, run_as: guest.config.run_as }.apply_tokio(&mut cmd);
+    PreExec { tty: None, cgroup: cgroup.clone(), fd3: None, run_as: guest.config.run_as }.apply_tokio(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| err("internal", format!("could not run {}: {e}", prog.display()), false))?;
-    let pgid = child.id();
+    let leaf = Leaf { cgroup, pgid: child.id() };
     let mut so = child.stdout.take().expect("piped");
     let mut se = child.stderr.take().expect("piped");
-    let kill_cg = cgroup.clone();
     let collect = async {
         let stdout = async {
             let mut out = Vec::new();
@@ -65,7 +57,7 @@ pub async fn run(guest: &Arc<Guest>, agent: &AgentId, input: GrepInput, ctx: &Ca
                         out.extend_from_slice(&buf[..MAX_OUTPUT_BYTES - out.len()]);
                         capped = true;
                         // Stop the search so stderr closes too.
-                        kill_tree(kill_cg.as_deref(), pgid);
+                        leaf.kill();
                         break;
                     }
                     Ok(n) => out.extend_from_slice(&buf[..n]),
@@ -99,27 +91,21 @@ pub async fn run(guest: &Arc<Guest>, agent: &AgentId, input: GrepInput, ctx: &Ca
         _ = ctx.cancel.cancelled() => End::Cancelled,
         _ = tokio::time::sleep(TIMEOUT) => End::TimedOut,
     };
-    let finish = |cg: Option<PathBuf>| {
-        kill_tree(cg.as_deref(), pgid);
-        if let Some(cg) = cg {
-            tokio::spawn(crate::cgroup::Cgroups::remove_later(cg));
-        }
-    };
     let (stdout_bytes, stderr_bytes, capped) = match end {
         End::Done(r) => r,
         End::Cancelled => {
-            finish(cgroup);
+            leaf.kill();
+            leaf.release();
             return Ok(text(true, "[Search interrupted]", detail(0, false)));
         }
         End::TimedOut => {
-            finish(cgroup);
+            leaf.kill();
+            leaf.release();
             return Ok(text(true, format!("Search did not finish within {}s; narrow the path or pattern.", TIMEOUT.as_secs()), detail(0, false)));
         }
     };
     let status = child.wait().await.map_err(|e| err("internal", e.to_string(), false))?;
-    if let Some(cg) = cgroup {
-        tokio::spawn(crate::cgroup::Cgroups::remove_later(cg));
-    }
+    leaf.release();
     let output = std::process::Output { status, stdout: stdout_bytes, stderr: stderr_bytes };
     let code = output.status.code().unwrap_or(2);
     let stdout = String::from_utf8_lossy(&output.stdout);

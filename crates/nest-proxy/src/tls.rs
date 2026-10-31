@@ -54,10 +54,6 @@ impl Ca {
         Ok(Ca { issuer, chain, expires_ms: ca.expires_ms, cache: Mutex::new(HashMap::new()) })
     }
 
-    pub fn expires_ms(&self) -> i64 {
-        self.expires_ms
-    }
-
     /// Leaf certificate + key for `host` (DNS name or IP literal), cached per host.
     pub fn leaf(&self, host: &str) -> Result<Arc<CertifiedKey>> {
         let now = now_ms();

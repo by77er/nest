@@ -5,13 +5,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::guest::{TaskInfo, TaskStatus};
+use nest_protocol::guest::{ControlBody, TaskInfo, TaskStatus};
 use nest_protocol::model::AgentId;
 use tokio::process::Child;
 use tokio::sync::watch;
 
-use crate::cgroup::Cgroups;
-use crate::exec::kill_tree;
+use crate::exec::Leaf;
 use crate::output::OutputSink;
 use crate::state::{Guest, now_ms};
 
@@ -21,8 +20,7 @@ pub struct Task {
     pub description: Option<String>,
     pub output_path: PathBuf,
     pub started_ms: i64,
-    pub pgid: Option<u32>,
-    pub cgroup: Option<PathBuf>,
+    pub leaf: Leaf,
     sink: OutputSink,
     state: Mutex<TaskState>,
     done: watch::Receiver<bool>,
@@ -65,7 +63,7 @@ impl Task {
 
     pub fn stop(&self) {
         self.state.lock().unwrap().stop_requested = true;
-        kill_tree(self.cgroup.as_deref(), self.pgid);
+        self.leaf.kill();
     }
 }
 
@@ -74,8 +72,7 @@ pub struct Adopt {
     pub agent_id: AgentId,
     pub description: Option<String>,
     pub child: Child,
-    pub pgid: Option<u32>,
-    pub cgroup: Option<PathBuf>,
+    pub leaf: Leaf,
     pub sink: OutputSink,
     pub started_ms: i64,
     pub time_limit: Duration,
@@ -90,8 +87,7 @@ pub fn adopt(guest: &Arc<Guest>, a: Adopt) -> Arc<Task> {
         description: a.description,
         output_path: a.sink.path.clone(),
         started_ms: a.started_ms,
-        pgid: a.pgid,
-        cgroup: a.cgroup,
+        leaf: a.leaf,
         sink: a.sink,
         state: Mutex::new(TaskState { status: TaskStatus::Running, exit_code: None, ended_ms: None, stop_requested: false }),
         done,
@@ -109,7 +105,7 @@ pub fn adopt(guest: &Arc<Guest>, a: Adopt) -> Arc<Task> {
             s = child.wait() => s.ok(),
             _ = tokio::time::sleep(limit) => {
                 timed_out = true;
-                kill_tree(t.cgroup.as_deref(), t.pgid);
+                t.leaf.kill();
                 child.wait().await.ok()
             }
         };
@@ -128,14 +124,12 @@ pub fn adopt(guest: &Arc<Guest>, a: Adopt) -> Arc<Task> {
         }
         // Reap whatever else is left in the task's group before announcing it.
         if t.state.lock().unwrap().status != TaskStatus::Exited {
-            kill_tree(t.cgroup.as_deref(), t.pgid);
+            t.leaf.kill();
         }
-        guest.emit_task_exited(&t.agent_id, t.info());
+        guest.events.emit(ControlBody::TaskExited { agent_id: t.agent_id.clone(), task: t.info() });
         let _ = done_tx.send(true);
         prune_finished(&guest, &t.agent_id);
-        if let Some(cg) = t.cgroup.clone() {
-            Cgroups::remove_later(cg).await;
-        }
+        t.leaf.release();
     });
     task
 }

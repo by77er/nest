@@ -20,7 +20,7 @@ use tracing::debug;
 
 use crate::exec::AsUser;
 use crate::framed::{FramedReader, err, parse_json, write_json};
-use crate::state::{Guest, busy};
+use crate::state::{Gate, Guest};
 use crate::transport::Conn;
 
 /// Per-call context handed to tools.
@@ -117,18 +117,7 @@ fn validate(guest: &Guest, req: &HandsRequest) -> Result<(), ErrorBody> {
             false,
         ));
     }
-    let inner = guest.inner.lock().unwrap();
-    let Some(id) = &inner.identity else { return Err(busy("guest not configured yet")) };
-    if !inner.frozen.is_empty() {
-        return Err(busy("filesystems are frozen for a snapshot"));
-    }
-    if req.epoch != id.epoch {
-        return Err(err(error_code::STALE_EPOCH, format!("epoch {} != configured {}", req.epoch.0, id.epoch.0), false));
-    }
-    if !inner.agents.contains_key(&req.agent_id) {
-        return Err(err(error_code::UNKNOWN_AGENT, format!("agent {} is not attached", req.agent_id), false));
-    }
-    Ok(())
+    guest.inner.lock().unwrap().admit(Gate::Hands { epoch: req.epoch, agent: &req.agent_id }).map(|_| ())
 }
 
 /// Upper bound for one in-process file tool call (Read/Write/Edit/Glob). The blocking thread is

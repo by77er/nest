@@ -9,7 +9,7 @@ use tokio::net::UnixListener;
 use tracing::warn;
 
 use crate::framed::{FramedReader, write_json};
-use crate::state::{Guest, busy};
+use crate::state::{Gate, Guest};
 
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
@@ -57,18 +57,11 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
     match req.command {
         CliCommand::Whoami {} => {
             let inner = guest.inner.lock().unwrap();
-            match &inner.identity {
-                Some(id) => {
-                    let sandbox = inner.forked_sandbox_id.clone().unwrap_or_else(|| id.sandbox_id.clone());
-                    CliResult::Ok {
-                        data: serde_json::json!({
-                            "sandbox_id": sandbox,
-                            "agent_id": req.agent_id,
-                            "epoch": id.epoch,
-                        }),
-                    }
-                }
-                None => CliResult::Error { error: busy("guest not configured yet") },
+            match inner.admit(Gate::Whoami) {
+                Ok(id) => CliResult::Ok {
+                    data: serde_json::json!({ "sandbox_id": id.sandbox_id, "agent_id": req.agent_id, "epoch": id.epoch }),
+                },
+                Err(error) => CliResult::Error { error },
             }
         }
         command => {
@@ -76,7 +69,7 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
                 CliCommand::Ask { wait_s, .. } => Duration::from_secs(u64::from((*wait_s).min(120)) + 15),
                 _ => Duration::from_secs(30),
             };
-            guest.relay_cli(req.agent_id, command, wait).await
+            guest.events.relay_cli(req.agent_id, command, wait).await
         }
     }
 }

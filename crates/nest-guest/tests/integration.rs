@@ -274,6 +274,23 @@ async fn bash_timeout_moves_to_background_or_kills_sleep() {
     assert!(r.is_error && text_of(&r).contains("timed out"), "{}", text_of(&r));
 }
 
+/// B2: a foreground call moved to the background is a task, and its output lives with the
+/// tasks: the newest-64 pruning of later foreground calls' outputs must not delete it.
+#[tokio::test(flavor = "multi_thread")]
+async fn moved_task_output_survives_later_calls() {
+    let (h, _c) = configured().await;
+    let r = call(&h, "slow", json!({"tool": "Bash", "command": "echo start-marker; sleep 60", "timeout": 300})).await;
+    let task_id = match &r.detail {
+        HandsDetail::Bash { task_id: Some(id), .. } => id.clone(),
+        d => panic!("{d:?}"),
+    };
+    for i in 0..=nest_guest::output::KEEP_CALL_OUTPUTS {
+        call(&h, &format!("q{i}"), json!({"tool": "Bash", "command": "true"})).await;
+    }
+    let t = text_of(&call(&h, "to", json!({"tool": "TaskOutput", "task_id": task_id})).await);
+    assert!(t.contains("start-marker"), "task output lost: {t}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn background_task_output_and_stop() {
     let (h, mut c) = configured().await;
@@ -533,6 +550,20 @@ async fn ingress_tcp_splice_and_reject() {
     assert!(matches!(resp, IngressResponse::Rejected { error } if error.code == "connect_refused" && error.retryable));
 }
 
+/// B3: like hands, an ingress PTY is `busy` (retryable) until `configure`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pty_before_configure_is_busy() {
+    let h = harness().await;
+    let s = emulator::connect(&h.socket, PORT_INGRESS).await.unwrap();
+    let (r, mut w) = tokio::io::split(s);
+    let req = IngressRequest::Pty { agent_id: None, cols: 80, rows: 24, command: Some(vec!["true".into()]), cwd: None, env: Default::default() };
+    write_json(&mut w, &req).await.unwrap();
+    let mut r = FramedReader::new(r);
+    let f = tokio::time::timeout(Duration::from_secs(5), r.next()).await.unwrap().unwrap().unwrap();
+    let resp: IngressResponse = parse_json(&f).unwrap();
+    assert!(matches!(&resp, IngressResponse::Rejected { error } if error.code == "busy" && error.retryable), "{resp:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ingress_pty() {
     let (h, _c) = configured().await;
@@ -570,6 +601,34 @@ async fn ingress_pty() {
     assert!(out.contains("got:abc"), "{out}");
     assert!(out.contains("30 100"), "resize not applied: {out}");
     assert_eq!(exit, PtyControl::Exit { code: Some(0), signal: None });
+}
+
+/// The PTY's fds are close-on-exec: the session's own process holds its terminal on 0-2 only,
+/// and no process the guest spawns (here the session's; in the failure, a concurrent Bash task)
+/// inherits the master or the slave and keeps the terminal open after the shell exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn pty_fds_are_not_inherited() {
+    let (h, _c) = configured().await;
+    let s = emulator::connect(&h.socket, PORT_INGRESS).await.unwrap();
+    let (r, mut w) = tokio::io::split(s);
+    let cmd = "for f in /proc/self/fd/*; do echo \"${f##*/} $(readlink $f)\"; done";
+    let req = IngressRequest::Pty { agent_id: None, cols: 80, rows: 24, command: Some(vec!["/bin/sh".into(), "-c".into(), cmd.into()]), cwd: None, env: Default::default() };
+    write_json(&mut w, &req).await.unwrap();
+    let mut r = FramedReader::new(r);
+    let mut out = String::new();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(10), r.next()).await.unwrap().unwrap().unwrap();
+        match f.kind {
+            Kind::Data => out.push_str(&String::from_utf8_lossy(&f.payload)),
+            Kind::Json if parse_json::<PtyControl>(&f).is_ok() => break,
+            Kind::Json => {}
+        }
+    }
+    for line in out.lines() {
+        let (fd, target) = line.trim().split_once(' ').unwrap_or((line, ""));
+        let terminal = target.contains("/dev/pts/") || target.contains("ptmx");
+        assert!(!terminal || ["0", "1", "2"].contains(&fd), "fd {fd} -> {target} leaked into the session:\n{out}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -630,6 +689,18 @@ async fn cli_relay_and_whoami() {
     assert_eq!(resp.result, CliResult::Ok { data: json!({"sandbox_id": "sbx_test", "agent_id": null, "epoch": EPOCH}) });
 }
 
+/// B4: after a memory restore the guest holds the parent's identity; nestd configures the fork
+/// child at the child's own epoch (1) before `resume{fork}`. The fence is per sandbox id.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_child_configures_at_its_own_epoch() {
+    let (h, mut c) = configured().await;
+    let child = ControlBody::Configure { sandbox_id: SandboxId("sbx_child".into()), epoch: Epoch(1), hostname: "sbx-child".into(), agents: vec![slot(&h.ws)] };
+    assert_eq!(c.request(child).await, ControlBody::Ok {});
+    let mut req = request("c1", json!({"tool": "Bash", "command": "true"}));
+    req.epoch = Epoch(1);
+    assert!(matches!(call_raw(&h, &req).await.last(), Some(HandsResponse::Result { .. })), "hands refused at the child's epoch");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn control_lifecycle_requests() {
     let (h, mut c) = configured().await;
@@ -646,6 +717,9 @@ async fn control_lifecycle_requests() {
         })
         .await;
     assert!(matches!(body, ControlBody::ResumeDone { .. }));
+    // A resume that can't reseed the RNG fails rather than reporting success.
+    let bad = ControlBody::Resume { wall_clock_ms: nest_guest::state::now_ms(), entropy_b64: "!!".into(), fork: None };
+    assert!(matches!(c.request(bad).await, ControlBody::Error { error } if error.code == "bad_request"));
     let mut s = UnixStream::connect(&h.cli).await.unwrap();
     write_json(&mut s, &CliRequest { agent_id: None, command: CliCommand::Whoami {} }).await.unwrap();
     let mut r = FramedReader::new(s);
@@ -662,9 +736,9 @@ async fn control_lifecycle_requests() {
         }
         other => panic!("{other:?}"),
     }
-    // Lowering the epoch is refused; detaching removes the agent.
+    // Lowering the epoch (of the sandbox the guest now is) is refused; detaching removes the agent.
     let low = ControlBody::Configure {
-        sandbox_id: SandboxId("sbx_test".into()),
+        sandbox_id: SandboxId("sbx_fork".into()),
         epoch: Epoch(EPOCH - 1),
         hostname: "x".into(),
         agents: vec![],

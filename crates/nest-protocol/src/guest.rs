@@ -106,6 +106,15 @@ pub mod frame {
         encode(Kind::Json, &body)
     }
 
+    /// The length of the kind byte plus payload that a frame header announces, if it is allowed.
+    fn body_len(hdr: [u8; 4]) -> Result<usize, FrameError> {
+        match u32::from_be_bytes(hdr) {
+            0 => Err(FrameError::Empty),
+            len if len > MAX_FRAME_LEN => Err(FrameError::TooLarge(len)),
+            len => Ok(len as usize),
+        }
+    }
+
     /// Incremental decoder: push bytes as they arrive, pop complete frames.
     #[derive(Default)]
     pub struct Decoder {
@@ -126,14 +135,7 @@ pub mod frame {
             if self.buf.len() < 4 {
                 return Ok(None);
             }
-            let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
-            if len == 0 {
-                return Err(FrameError::Empty);
-            }
-            if len > MAX_FRAME_LEN {
-                return Err(FrameError::TooLarge(len));
-            }
-            let total = 4 + len as usize;
+            let total = 4 + body_len([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])?;
             if self.buf.len() < total {
                 return Ok(None);
             }
@@ -154,14 +156,8 @@ pub mod frame {
     pub fn read_frame<R: std::io::Read>(r: &mut R) -> std::io::Result<Frame> {
         let mut hdr = [0u8; 4];
         r.read_exact(&mut hdr)?;
-        let len = u32::from_be_bytes(hdr);
-        if len == 0 || len > MAX_FRAME_LEN {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                if len == 0 { FrameError::Empty } else { FrameError::TooLarge(len) },
-            ));
-        }
-        let mut body = vec![0u8; len as usize];
+        let len = body_len(hdr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut body = vec![0u8; len];
         r.read_exact(&mut body)?;
         let kind = Kind::from_u8(body[0])
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, FrameError::UnknownKind(body[0])))?;
@@ -762,19 +758,12 @@ pub enum PtyControl {
 pub mod error_code {
     pub const BAD_REQUEST: &str = "bad_request";
     pub const UNSUPPORTED_VERSION: &str = crate::model::error_codes::UNSUPPORTED_VERSION;
-    pub const STALE_EPOCH: &str = "stale_epoch";
-    pub const UNKNOWN_AGENT: &str = "unknown_agent";
+    pub const STALE_EPOCH: &str = crate::model::error_codes::STALE_EPOCH;
+    pub const UNKNOWN_AGENT: &str = crate::model::error_codes::UNKNOWN_AGENT;
     pub const UNKNOWN_TASK: &str = "unknown_task";
-    pub const NOT_FOUND: &str = "not_found";
-    pub const IS_DIRECTORY: &str = "is_directory";
-    pub const NOT_READ: &str = "not_read";
-    pub const NOT_UTF8: &str = "not_utf8";
-    pub const OLD_STRING_NOT_FOUND: &str = "old_string_not_found";
-    pub const OLD_STRING_AMBIGUOUS: &str = "old_string_ambiguous";
-    pub const TOO_LARGE: &str = "too_large";
     pub const CONNECT_REFUSED: &str = "connect_refused";
     pub const BUSY: &str = "busy";
-    pub const INTERNAL: &str = "internal";
+    pub const INTERNAL: &str = crate::model::error_codes::INTERNAL;
 }
 
 // ---------------------------------------------------------------------------------------------

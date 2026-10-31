@@ -80,34 +80,23 @@ pub async fn serve_https_transparent(ctx: Arc<ConnCtx>, mut s: TcpStream) {
     tls_flow(ctx, Prefixed::new(raw, s), host, 443, info).await;
 }
 
-/// `:80` via nft redirect: plaintext HTTP/1.1, routed per request by `Host`.
-pub async fn serve_http_transparent(ctx: Arc<ConnCtx>, s: TcpStream) {
+/// HTTP/1.1 listeners: `:80` via nft redirect (plaintext, routed per request by `Host`), or with
+/// `explicit`, `:3128 + slot`, the per-agent explicit proxy (CONNECT tunnels and absolute-form HTTP).
+pub async fn serve_h1(ctx: Arc<ConnCtx>, s: TcpStream, explicit: bool) {
     let drop = ctx.sandbox.drop.clone();
     let svc = service_fn(move |req| {
         let ctx = ctx.clone();
-        async move { Ok::<_, Infallible>(plain_request(ctx, req, false).await) }
+        async move {
+            let resp = if explicit { explicit_request(ctx, req).await } else { plain_request(ctx, req, false).await };
+            Ok::<_, Infallible>(resp)
+        }
     });
     let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_TIMEOUT)
         .serve_connection(TokioIo::new(s), svc)
         .with_upgrades();
-    tokio::select! { _ = drop.cancelled() => {}, r = conn => if let Err(e) = r { tracing::debug!("http transparent: {e}") } }
-}
-
-/// `:3128 + slot`: per-agent explicit proxy (CONNECT tunnels and absolute-form HTTP).
-pub async fn serve_explicit(ctx: Arc<ConnCtx>, s: TcpStream) {
-    let drop = ctx.sandbox.drop.clone();
-    let svc = service_fn(move |req| {
-        let ctx = ctx.clone();
-        async move { Ok::<_, Infallible>(explicit_request(ctx, req).await) }
-    });
-    let conn = hyper::server::conn::http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_TIMEOUT)
-        .serve_connection(TokioIo::new(s), svc)
-        .with_upgrades();
-    tokio::select! { _ = drop.cancelled() => {}, r = conn => if let Err(e) = r { tracing::debug!("explicit proxy: {e}") } }
+    tokio::select! { _ = drop.cancelled() => {}, r = conn => if let Err(e) = r { tracing::debug!(explicit, "http/1.1 listener: {e}") } }
 }
 
 /// `:20000 + n`: raw TCP to one `host:port`, only to addresses our resolver returned.
@@ -115,7 +104,7 @@ pub async fn serve_tcp_exception(ctx: Arc<ConnCtx>, s: TcpStream, rule: String) 
     let (host, port) = split_authority(&rule, 0);
     let host = norm_host(&host);
     let view = ctx.view();
-    let permitted = view.policy.as_ref().is_some_and(|p| p.tcp.iter().any(|t| norm_host(&t.host) == host && t.port == port));
+    let permitted = view.policy.as_ref().is_some_and(|p| p.tcp_exception(&host, port));
     if !permitted || port == 0 {
         ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("tcp_exception_not_in_policy"));
         return;
@@ -356,10 +345,6 @@ async fn plain_request(ctx: Arc<ConnCtx>, req: Request<Incoming>, absolute: bool
         ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("invalid_host"));
         return simple(StatusCode::BAD_REQUEST, "request target is not a valid host");
     }
-    if decide(&ctx, &host, port) == EgressDecision::Deny {
-        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).request(req.method(), req.uri()).reason("not_allowed"));
-        return deny_response(StatusCode::FORBIDDEN, "egress_denied", &host, port, "not in this sandbox's egress policy");
-    }
     let target = Arc::new(Target { host, port, tls: false });
     let conn = UpstreamConn::lazy(ctx.clone(), target.clone(), false);
     forward(ctx, &target, &conn, req).await
@@ -377,6 +362,15 @@ pub struct Target {
 
 async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req: Request<Incoming>) -> Response<Body> {
     let mk_audit = |req: &Request<Incoming>, v: EgressVerdict| Audit::new(&target.host, target.port, v).request(req.method(), req.uri());
+
+    // Decided per request, not per connection: a push or a grant's expiry since the connection
+    // (or its previous request) was admitted may have revoked the host, or made it
+    // passthrough-only, which an inspected connection can't honour.
+    let decision = decide(&ctx, &target.host, target.port);
+    if decision == EgressDecision::Deny || (target.tls && decision == EgressDecision::Passthrough) {
+        ctx.audit(mk_audit(&req, EgressVerdict::Deny).reason("not_allowed"));
+        return deny_response(StatusCode::FORBIDDEN, "egress_denied", &target.host, target.port, "not in this sandbox's egress policy");
+    }
 
     // Every name the request carries must be the routed host (SNI / CONNECT authority / the
     // Host that routed a plaintext request) — no domain fronting via absolute-form targets or
@@ -445,9 +439,6 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
     }
     let mut audit = mk_audit(&req, EgressVerdict::Allow);
     audit.binding = verdict.binding().map(str::to_string);
-    if !ctx.live() {
-        return deny_response(StatusCode::SERVICE_UNAVAILABLE, "egress_unavailable", &target.host, target.port, "egress is paused");
-    }
 
     // Upgrades (WebSocket etc., HTTP/1.1 only).
     let upgrading = !up.h2 && req.headers().contains_key(UPGRADE);
