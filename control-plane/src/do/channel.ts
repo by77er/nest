@@ -265,14 +265,14 @@ export class ChannelDO extends DurableObject<Env> {
     return r ? readSub(r.body) : undefined;
   }
 
+  /**
+   * Store a subscription. A due one arms the fan-out in this step (keeping an earlier alarm; the
+   * deadline row is written now), so no writer can leave it due with nothing to run it.
+   */
   private saveSub(s: Subscription, idemKey?: string): void {
     this.sql.exec(`INSERT INTO subs (id, agent, body, idem_key, created_ms) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET body = excluded.body`, s.id, s.agent, JSON.stringify(s), idemKey ?? null, Date.now());
-  }
-
-  /** Arm the fan-out alarm for `due` (keeping an earlier one). Its row is written synchronously. */
-  private armFanout(due: number | null): Promise<void> {
-    return due === null ? Promise.resolve() : this.deadlines.set("fanout", Math.max(due, 1), true);
+    if (s.delivery === "turn" && s.due_ms !== null) this.ctx.waitUntil(this.deadlines.set("fanout", Math.max(s.due_ms, 1), true));
   }
 
   // --- channels -------------------------------------------------------------------------------------
@@ -414,15 +414,12 @@ export class ChannelDO extends DurableObject<Env> {
       seq, ts_ms: now, from, taint, ...(p.kind ? { kind: p.kind } : {}), ...(p.key ? { key: p.key } : {}),
       ...(p.reply_to ? { reply_to: p.reply_to } : {}), ...(p.mentions ? { mentions: p.mentions } : {}),
     };
-    let due: number | null = null;
+    // Each opened window arms the fan-out in this step (`saveSub`), and maintenance is armed here: a
+    // reset after the append can't strand a delivery or the channel's maintenance.
     for (const s of this.subs()) {
       const next = onAppend(s, msg, now);
       if (next !== s.due_ms) this.saveSub({ ...s, due_ms: next });
-      if (next !== null && (due === null || next < due)) due = next;
     }
-    // Armed in this step (rows written now; the alarm set in the background): a reset after the
-    // append can't strand a delivery or the channel's maintenance.
-    this.ctx.waitUntil(this.armFanout(due));
     if (!this.deadlines.has("maintenance")) this.ctx.waitUntil(this.deadlines.set("maintenance", now + MAINTENANCE_EVERY_MS, true));
     return { status: "posted", seq };
   }
@@ -445,13 +442,13 @@ export class ChannelDO extends DurableObject<Env> {
     let since = q.since;
     let cursorSub: Subscription | undefined;
     if (since === undefined && isAgentCaller(caller)) {
-      const row = this.sql.exec<{ id: string; read_key: string | null; read_from: number | null }>(
-        "SELECT id, read_key, read_from FROM subs WHERE agent = ? ORDER BY created_ms", caller.principal).toArray()
-        .find((r) => this.sub(r.id)?.delivery === "none");
+      const row = this.sql.exec<{ body: string; read_key: string | null; read_from: number | null }>(
+        "SELECT body, read_key, read_from FROM subs WHERE agent = ? ORDER BY created_ms", caller.principal).toArray()
+        .map((r) => ({ ...r, sub: readSub(r.body) })).find((r) => r.sub.delivery === "none");
       if (row) {
-        cursorSub = this.sub(row.id);
+        cursorSub = row.sub;
         // A re-run of the same read (its tool call cut short) reads the same page again.
-        since = q.idem_key && row.read_key === q.idem_key && row.read_from !== null ? row.read_from : cursorSub!.cursor;
+        since = q.idem_key && row.read_key === q.idem_key && row.read_from !== null ? row.read_from : cursorSub.cursor;
       }
     }
     const from = Math.max(0, since ?? 0);
@@ -535,7 +532,7 @@ export class ChannelDO extends DurableObject<Env> {
     this.ensure(name);
     if (input.idem_key) {
       const prior = this.sql.exec<{ body: string }>("SELECT body FROM subs WHERE agent = ? AND idem_key = ?", agent, input.idem_key).toArray()[0];
-      if (prior) return JSON.parse(prior.body) as Subscription;
+      if (prior) return readSub(prior.body);
     }
     const sub: Subscription = {
       id: newId("sub_"), agent, filter: input.filter, delivery: input.delivery, batch_ms: input.batch_ms, once: input.once,
@@ -600,11 +597,8 @@ export class ChannelDO extends DurableObject<Env> {
     const sub = this.sub(id);
     if (!meta || !sub || sub.due_ms === null || sub.due_ms > Date.now()) return;
     const { save, send: batch } = beginDelivery(sub, this.log(), Date.now());
-    if (save) {
-      this.saveSub(save);
-      // The backstop is armed with the pin: a reset mid-call sends the same batch again.
-      this.ctx.waitUntil(this.armFanout(save.due_ms));
-    }
+    // A pin is saved with its backstop armed: a reset mid-call sends the same batch again.
+    if (save) this.saveSub(save);
     if (!batch) return;
     this.delivering.add(id);
     let outcome: DeliveryOutcome;
@@ -636,7 +630,6 @@ export class ChannelDO extends DurableObject<Env> {
       return;
     }
     this.saveSub(next);
-    this.ctx.waitUntil(this.armFanout(next.due_ms));
   }
 
   private async callAgent(agent: string, d: { channel: string; subscription: string; batch: Batch }): Promise<DeliveryOutcome> {
