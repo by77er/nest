@@ -284,9 +284,8 @@ pub struct Agent {
     pub id: AgentId,
     /// Fixed for the brain's life: a later start for this agent ends this brain, never adopts it.
     pub epoch: Epoch,
-    /// The sandbox this agent's hands act in (its id, from `agent_start`); `None` = no hands.
-    /// Only whether and where: the sandbox's epoch comes from each target's binding claims. A
-    /// sandbox move changes neither; the next call finds the old target refused and resolves again.
+    /// The sandbox this agent's hands act in (from `agent_start`); `None` = no hands. Its epoch
+    /// comes from each target's binding claims, so a sandbox move changes nothing here.
     pub hands: Option<HandsBinding>,
     pub config_dir: PathBuf,
     /// nestd connection generation this brain was started under.
@@ -401,10 +400,9 @@ impl Agent {
         self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch, seq, ts_ms: now_ms(), turn, body }));
     }
 
-    /// The cached gateway target with its generation, if a `hands_resolve` has answered since
-    /// the last refusal and its binding is not about to expire (`nest_hands_client::refresh_due`):
-    /// a target due for refresh is forgotten, so the caller resolves a fresh one first instead
-    /// of spending a bind on an `unauthorized`.
+    /// The cached gateway target and its generation, unless its binding is due for refresh
+    /// (`nest_hands_client::refresh_due`): then it is forgotten, so the caller resolves a fresh
+    /// one instead of spending a bind on an `unauthorized`.
     pub fn hands_target(&self) -> Option<(HandsTarget, u64)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.target.as_ref().is_some_and(|t| nest_hands_client::refresh_due(t, now_ms())) {

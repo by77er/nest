@@ -72,8 +72,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
     let fence_gen = rt.fence_gen();
     tokio::spawn(async move {
         let id = start.start.agent.clone();
-        // The agent epoch AgentDO issued for this start; never the sandbox's. Every control plane
-        // since #30 sends it; a start without one would run under no epoch AgentDO accepts.
+        // The agent epoch AgentDO issued for this start (never the sandbox's): required.
         let Some(epoch) = start.start.epoch else {
             let error = ErrorBody { code: "invalid_message".into(), message: "agent_start without an agent epoch".into(), retryable: false };
             rt.report(RunnerEvent::Error { agent: Some(id.clone()), error });
@@ -140,9 +139,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 }
                 Err(Refused::Running(existing)) => {
                     // AgentDO starts a brain only once the previous one is released, so an older
-                    // brain still registered here is one on its way out (of an earlier nestd
-                    // connection, fenced when it dropped, or killed): never adopted, never run
-                    // beside. It is ended, and this start registers once it is gone.
+                    // one still here is on its way out: end it, and register once it is gone.
                     if existing.conn_gen == agent.conn_gen && !existing.is_stopping() {
                         tracing::warn!(agent = %id, epoch = epoch.0, "agent_start while a brain of this agent is registered; ending it first");
                     }
@@ -170,10 +167,9 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
     });
 }
 
-/// Refuse a start before it registers (a forbidden built-in, no lease). It supersedes any older brain
-/// of the agent here, which is ended under the start's epoch (its tombstone); the refusal's exit is
-/// reported only once that brain has gone, since an exit at an epoch means nothing of the agent at
-/// or below it runs here (A4).
+/// Refuse a start before it registers (a forbidden built-in, no lease). Any older brain of the
+/// agent here is ended under the start's epoch (its tombstone), and the refusal's exit is reported
+/// once it has gone: an exit at an epoch means nothing of the agent at or below it runs here (A4).
 async fn refuse_superseding(rt: &Arc<Runtime>, id: &nest_protocol::model::AgentId, epoch: nest_protocol::model::Epoch, reason: ExitReason) {
     if let Some(old) = rt.tombstone(id, epoch) {
         old.stopping.store(true, Ordering::SeqCst);
@@ -193,9 +189,8 @@ async fn step<T>(cancel: &CancellationToken, what: &str, limit: Duration, f: imp
     }
 }
 
-/// Where the session file for `uuid` lives (`claude::transcript_path` for the configured cwd;
-/// production: `paths::EMPTY_CWD`). The runner rebases on the `SessionStart` hook's
-/// `transcript_path` if it differs.
+/// Where the session file for `uuid` lives for the configured cwd (production: `paths::EMPTY_CWD`);
+/// the `SessionStart` hook's `transcript_path` overrides it.
 pub fn transcript_path(config_dir: &Path, cwd: &Path, uuid: &str) -> PathBuf {
     PathBuf::from(claude::transcript_path(&config_dir.to_string_lossy(), &cwd.to_string_lossy(), uuid))
 }
@@ -319,8 +314,7 @@ async fn run(
         inner.session = session_id.clone();
         inner.transcript = Some(transcript.clone());
     }
-    // Hands: ask AgentDO where the sandbox is while the slow steps run (the request waits for
-    // the session channel), so the SessionStart hook and the first tool call find the target.
+    // Ask AgentDO for the hands target while the slow steps run, for SessionStart and the first call.
     crate::hands::prefetch_target(agent.clone());
 
     let launch = Launch { launch: s.start.launch.clone(), config_dir: s.config_dir.clone(), env: process_env(&rt, &s) };
@@ -345,12 +339,10 @@ async fn run(
         let session = session_id.clone().unwrap_or_else(|| SessionId("ses_pending".into()));
         let timeout = rt.cfg.session_open_timeout;
         let pid = proc.pid;
-        // The epoch this start registered under: nestd marks that start.
-        let epoch = agent.epoch;
         tokio::spawn(async move {
             let _ = tokio::time::timeout(timeout, opened).await;
             let capabilities = agent.inner.lock().unwrap().capabilities.clone();
-            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities, epoch: Some(epoch) });
+            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities, epoch: Some(agent.epoch) });
         });
     }
 
@@ -533,7 +525,9 @@ impl Actor {
     fn handle(&mut self, c: AgentCmd) -> bool {
         let input = match c {
             AgentCmd::RunTurn { turn, input } => Input::RunTurn { turn, input },
-            AgentCmd::Inbox(m) => Input::Inbox { interrupt: m.interrupt },
+            // The mirror's hooks deliver inbox messages; only an interrupting one acts here.
+            AgentCmd::Inbox(m) if m.interrupt => Input::Interrupt { turn: None },
+            AgentCmd::Inbox(_) => return false,
             AgentCmd::Interrupt { turn } => Input::Interrupt { turn },
             AgentCmd::StopHook { blocked } => Input::StopHook { blocked },
             AgentCmd::Stop(mode) => Input::Stop(mode),
