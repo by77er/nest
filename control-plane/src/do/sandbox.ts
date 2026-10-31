@@ -799,6 +799,7 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Temporary sandbox-layer grant (e.g. approved through `ask`). Expires on its own. */
   async grant(host: string, ttlMs: number, ports: number[] = [80, 443]): Promise<EgressPolicy> {
+    this.info_(); // an unknown sandbox gets no row and no alarm
     const expires = Date.now() + ttlMs;
     this.sql.exec("INSERT INTO grants (id, host, ports, expires_ms) VALUES (?, ?, ?, ?)", newId("grt_"), host, JSON.stringify(ports), expires);
     await this.deadlines.set("grants", expires, true);

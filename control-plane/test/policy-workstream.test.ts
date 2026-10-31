@@ -85,4 +85,15 @@ describe("temporary grants are checked before anything is stored", () => {
     expect((await adminJson(`/v1/sandboxes/${sbx.sandbox}/policy`)).allow.some((r: any) => r.host === "example.com")).toBe(false);
   });
 
+  it("a grant on an unknown sandbox is 404 and leaves no row or alarm behind", async () => {
+    const id = "sbx_doesnotexist01";
+    const r = await admin(`/v1/sandboxes/${id}/grants`, { body: { host: "example.com", ttl_ms: 60_000 } });
+    expect(r.status).toBe(404);
+    const left = await runInDurableObject(env.SANDBOX.get(env.SANDBOX.idFromName(id)), async (_i, st) => ({
+      grants: st.storage.sql.exec("SELECT COUNT(*) AS n FROM grants").one().n,
+      deadlines: st.storage.sql.exec("SELECT key FROM deadlines").toArray().length,
+      alarm: await st.storage.getAlarm(),
+    }));
+    expect(left).toEqual({ grants: 0, deadlines: 0, alarm: null });
+  });
 });
