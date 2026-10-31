@@ -55,6 +55,10 @@ if [ -n "${CLOUDFLARE_TUNNEL_API_TOKEN:-}" ]; then
 fi
 # NEST_DOMAIN names the nest label and the zone (nest.bitcru.sh: label `nest`, zone `bitcru.sh`) for the
 # per-host tunnel, preview and share hostnames; the account id is where the tunnels are created.
+# A digest of every var, stamped into the code (control-plane/src/lib/build.ts): Durable Objects
+# restart only on a code change and keep the env they started with, so without it a deploy that
+# changed only vars (a cell's caps in AWS_CELLS) wouldn't reach a running FleetDO.
+vars=(--var CELLS:use1 --var NEST_DOMAIN:nest.bitcru.sh "${required[@]}" "${optional[@]}")
+config=$(printf '%s\0' "${vars[@]}" | sha256sum | cut -c1-16)
 npx wrangler deploy --message "$(git rev-parse --short HEAD) ${1:-manual}" \
-  --var CELLS:use1 --var NEST_DOMAIN:nest.bitcru.sh \
-  "${required[@]}" "${optional[@]}"
+  --define "__NEST_CONFIG__:\"$config\"" "${vars[@]}"

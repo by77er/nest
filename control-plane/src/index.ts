@@ -6,6 +6,7 @@ import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identit
 import { bearer, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { checkHealth, healthProbes } from "./lib/health";
+import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
 import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
@@ -128,7 +129,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     // Unauthenticated: one read-only round trip to each DO class's own health instance, nothing else,
     // shared by this isolate's requests for a few seconds so a flood can't multiply it.
     const h = await sharedHealth(env);
-    return json({ ok: h.ok, protocol_version: PROTOCOL_VERSION, durable_objects: h.durable_objects }, h.ok ? 200 : 503);
+    return json({ ok: h.ok, protocol_version: PROTOCOL_VERSION, config: CONFIG_DIGEST, durable_objects: h.durable_objects }, h.ok ? 200 : 503);
   }
   if (req.method === "POST" && path === "/v1/hosts/enroll") return enroll(req, env);
 

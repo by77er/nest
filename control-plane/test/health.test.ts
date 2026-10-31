@@ -26,7 +26,8 @@ describe("GET /v1/health", () => {
     const res = await SELF.fetch(`${BASE}/v1/health`);
     const body = await res.json<Record<string, unknown>>();
     expect(res.status, JSON.stringify(body)).toBe(200);
-    expect(Object.keys(body).sort()).toEqual(["durable_objects", "ok", "protocol_version"]);
+    expect(Object.keys(body).sort()).toEqual(["config", "durable_objects", "ok", "protocol_version"]);
+    expect(body.config).toBe("none");
     expect(body.ok).toBe(true);
     expect(body.durable_objects).toEqual(Object.fromEntries(Object.keys(CLASSES).map((c) => [c, "ok"])));
   });
