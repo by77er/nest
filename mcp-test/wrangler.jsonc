@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // A rudimentary remote MCP server for nest's end-to-end tests (dev tooling, not the platform).
+  "name": "nest-mcp-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // Served on nest-mcp-test.<account>.workers.dev only: no custom domain, no DNS.
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "durable_objects": { "bindings": [{ "name": "STATE", "class_name": "McpState" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["McpState"] }]
+  // Secret (wrangler secret put / .dev.vars): MCP_TEST_TOKEN, the bearer every route requires.
+  // Optional var ALLOWED_ORIGINS: comma-separated Origins admitted on /mcp (none by default).
+}
