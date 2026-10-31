@@ -12,6 +12,11 @@ serde_json = "1"
 strum = { version = "0.28", features = ["derive"] }
 # gateway: binding tokens are base64url segments (gateway.rs)
 base64 = "0.23.1"
+# async frame I/O (guest.rs `framed`), for the tokio users of the guest framing
+tokio = { version = "1", features = ["io-util"], optional = true }
+
+[features]
+tokio = ["dep:tokio"]
 
 [target.'cfg(unix)'.dependencies]
 # host-internal: SCM_RIGHTS fd passing helpers (host.rs)

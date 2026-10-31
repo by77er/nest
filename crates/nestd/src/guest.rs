@@ -11,10 +11,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::guest::frame::{self, Decoder, Kind};
+use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{AgentSlot, CliCommand, CliResult, ControlBody, ControlFrame, ForkIdentity, PORT_CONTROL, PROTOCOL_VERSION};
 use nest_protocol::model::{AgentId, Epoch, SandboxId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::util::{error, now_ms, random_hex};
@@ -41,8 +40,9 @@ struct Config {
     slots: Vec<AgentSlot>,
 }
 
-enum Req {
-    Send { body: ControlBody, reply: oneshot::Sender<io::Result<ControlBody>> },
+struct Req {
+    body: ControlBody,
+    reply: oneshot::Sender<io::Result<ControlBody>>,
 }
 
 /// Handle to one sandbox's control connection.
@@ -80,10 +80,6 @@ impl GuestCtl {
             .map_err(|_| io::Error::other("guest control task ended"))
     }
 
-    pub fn is_ready(&self) -> bool {
-        *self.ready.borrow()
-    }
-
     /// The guest's version and capabilities from its last hello, if one arrived.
     pub fn guest(&self) -> Option<nest_protocol::gateway::GuestInfo> {
         self.guest.lock().expect("guest info").clone()
@@ -92,7 +88,7 @@ impl GuestCtl {
     /// Send a request and wait for its reply. Errors if not connected.
     pub async fn request(&self, body: ControlBody) -> io::Result<ControlBody> {
         let (tx, rx) = oneshot::channel();
-        self.reqs.send(Req::Send { body, reply: tx }).map_err(|_| io::Error::other("guest control task ended"))?;
+        self.reqs.send(Req { body, reply: tx }).map_err(|_| io::Error::other("guest control task ended"))?;
         tokio::time::timeout(Duration::from_secs(30), rx)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "guest request timed out"))?
@@ -117,7 +113,7 @@ impl GuestCtl {
 
     pub async fn detach(&self, agent: &AgentId, kill_processes: bool) -> io::Result<()> {
         self.cfg.lock().expect("guest cfg").slots.retain(|s| &s.agent_id != agent);
-        if !self.is_ready() {
+        if !*self.ready.borrow() {
             return Ok(()); // the next `configure` carries the reduced slot set
         }
         expect_ok(self.request(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes }).await?)
@@ -184,7 +180,7 @@ impl Task {
                 }
             }
             // Fail queued requests while disconnected.
-            while let Ok(Req::Send { reply, .. }) = reqs.try_recv() {
+            while let Ok(Req { reply, .. }) = reqs.try_recv() {
                 let _ = reply.send(Err(io::Error::new(io::ErrorKind::NotConnected, "guest not connected")));
             }
             tokio::select! {
@@ -216,7 +212,7 @@ impl Task {
         };
         if protocol_version != PROTOCOL_VERSION {
             let e = ControlFrame { id: None, reply_to: None, body: ControlBody::Error { error: error("unsupported_version", format!("host speaks {PROTOCOL_VERSION}"), false) } };
-            let _ = c.write(&e).await;
+            let _ = write_json(&mut c.wr, &e).await;
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("guest protocol {protocol_version}")));
         }
         // Same boot and same guest-agent process = memory restore. Same boot, new process = the
@@ -263,13 +259,12 @@ impl Task {
         // 3. steady state
         loop {
             tokio::select! {
-                // Cancel-safe: a frame already decoded is returned without awaiting.
-                f = c.next() => {
+                f = c.rd.next_json() => {
                     let Some(f) = f? else { return Ok(()) };
                     self.route(c, f);
                 }
                 req = reqs.recv() => {
-                    let Some(Req::Send { body, reply }) = req else { return Ok(()) };
+                    let Some(Req { body, reply }) = req else { return Ok(()) };
                     match c.send(body).await {
                         Ok(id) => { c.pending.insert(id, reply); }
                         Err(e) => {
@@ -280,7 +275,7 @@ impl Task {
                 }
                 cli = cli_rx.recv() => {
                     let Some((id, result)) = cli else { continue };
-                    c.write(&ControlFrame { id: None, reply_to: Some(id), body: ControlBody::CliResult { result } }).await?;
+                    write_json(&mut c.wr, &ControlFrame { id: None, reply_to: Some(id), body: ControlBody::CliResult { result } }).await?;
                 }
             }
         }
@@ -334,13 +329,10 @@ impl Task {
 /// How long a handshake read waits for the guest.
 const HANDSHAKE_READ: Duration = Duration::from_secs(10);
 
-/// One control connection: its two halves, the decoder over what was read, and the requests
-/// awaiting a reply.
+/// One control connection: its reader, its writer, and the requests awaiting a reply.
 struct Session {
-    rd: tokio::net::unix::OwnedReadHalf,
+    rd: FramedReader<tokio::net::unix::OwnedReadHalf>,
     wr: tokio::net::unix::OwnedWriteHalf,
-    dec: Decoder,
-    buf: Vec<u8>,
     next_id: u64,
     pending: HashMap<u64, oneshot::Sender<io::Result<ControlBody>>>,
     /// Where a relayed CLI command's answer goes, to be written back by the session.
@@ -349,33 +341,15 @@ struct Session {
 
 impl Session {
     fn new(conn: Conn, cli_tx: mpsc::UnboundedSender<(u64, CliResult)>) -> Session {
-        let mut dec = Decoder::new();
         // Any bytes buffered after the handshake line belong to the frame stream.
-        dec.push(conn.buffer());
+        let buffered = conn.buffer().to_vec();
         let (rd, wr) = conn.into_inner().into_split();
-        Session { rd, wr, dec, buf: vec![0u8; 64 << 10], next_id: 1, pending: HashMap::new(), cli_tx }
-    }
-
-    /// The next control frame, or `None` at the end of the stream. Cancel-safe.
-    async fn next(&mut self) -> io::Result<Option<ControlFrame>> {
-        loop {
-            if let Some(f) = self.dec.next_frame().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? {
-                if f.kind != Kind::Json {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "DATA frame on control channel"));
-                }
-                return serde_json::from_slice(&f.payload).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
-            }
-            let n = self.rd.read(&mut self.buf).await?;
-            if n == 0 {
-                return Ok(None);
-            }
-            self.dec.push(&self.buf[..n]);
-        }
+        Session { rd: FramedReader::with_buffered(rd, &buffered), wr, next_id: 1, pending: HashMap::new(), cli_tx }
     }
 
     /// The next control frame within `limit`; the end of the stream is an error.
     async fn next_within(&mut self, limit: Duration) -> io::Result<ControlFrame> {
-        tokio::time::timeout(limit, self.next())
+        tokio::time::timeout(limit, self.rd.next_json())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "guest control read timed out"))??
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "guest closed control connection"))
@@ -385,13 +359,8 @@ impl Session {
     async fn send(&mut self, body: ControlBody) -> io::Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
-        self.write(&ControlFrame { id: Some(id), reply_to: None, body }).await?;
+        write_json(&mut self.wr, &ControlFrame { id: Some(id), reply_to: None, body }).await?;
         Ok(id)
-    }
-
-    async fn write(&mut self, f: &ControlFrame) -> io::Result<()> {
-        let bytes = frame::encode_json(f).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        self.wr.write_all(&bytes).await
     }
 }
 
@@ -403,6 +372,8 @@ pub fn new_machine_id() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use nest_protocol::guest::frame::{self, Decoder};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::path::Path;
     use tokio::net::UnixListener;
 
@@ -489,8 +460,7 @@ pub(crate) mod tests {
     }
 
     /// A `resume` the guest refuses (it couldn't reseed its RNG, say) is a failed readiness: the
-    /// sandbox isn't reported ready, and the next connection asks again. It used to be logged and
-    /// the guest reported ready, unreseeded.
+    /// sandbox isn't reported ready, and the next connection asks again.
     #[tokio::test]
     async fn a_refused_resume_is_not_ready_and_is_asked_again() {
         let dir = tempfile::tempdir().unwrap();

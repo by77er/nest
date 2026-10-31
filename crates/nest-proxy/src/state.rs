@@ -285,9 +285,8 @@ impl Sandbox {
         epoch >= self.view.read().unwrap().epoch
     }
 
-    /// The view a push at `epoch` applies to, or `None` if the push is stale. A newer epoch (a
-    /// re-placement) starts from an empty view: nothing of the old epoch's policy or secrets
-    /// carries over until nestd pushes that epoch's own.
+    /// The view a push at `epoch` applies to, or `None` if stale. A newer epoch (a re-placement)
+    /// starts empty: none of the old epoch's policy or secrets carries over.
     fn view_for(&self, epoch: Epoch) -> Option<std::sync::RwLockWriteGuard<'_, SandboxView>> {
         let mut v = self.view.write().unwrap();
         if epoch < v.epoch {

@@ -100,10 +100,9 @@ pub fn parse_http_date_ms(s: &str) -> Option<i64> {
     parse_rfc3339_utc_ms(&iso)
 }
 
-/// Run `f` on every item on up to `threads` threads, and return the first error. After an error
-/// no new item is taken, from `items` or for `f`; items already running finish. `items` is pulled
-/// one at a time under a lock, so a sequential reader stays sequential and at most `threads` items
-/// are in flight: no queue, so nothing can block on a consumer that has stopped.
+/// Run `f` on every item on up to `threads` threads; the first error stops new items (running
+/// ones finish) and is returned. `items` is pulled one at a time under a lock: a sequential reader
+/// stays sequential, and with no queue nothing can block on a consumer that has stopped.
 pub fn par_try_for_each<T, E: Send>(
     items: impl Iterator<Item = Result<T, E>> + Send,
     threads: usize,

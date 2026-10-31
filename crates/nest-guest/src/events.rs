@@ -1,7 +1,6 @@
-//! The control link's event side: unsolicited events to the host (`ports`, `task_exited`),
-//! buffered while no configured control connection exists, and the CLI relay's pending replies.
-//! One lock owns the link, the latest port set and the backlog, so an event can't slip between
-//! "flush the backlog" and "mark ready".
+//! The control link's event side: unsolicited events (`ports`, `task_exited`), buffered until a
+//! configured connection exists, and the CLI relay's pending replies. One lock owns the link, the
+//! latest ports and the backlog, so no event slips between "flush the backlog" and "mark ready".
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;

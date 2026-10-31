@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::gateway::{ClientMessage, GatewayMessage, ROUTE_HANDS, ROUTE_INGRESS_PREFIX, ROUTE_PTY, close_code, error_code};
-use nest_protocol::guest::frame::{self, Decoder, Kind, MAX_FRAME_LEN};
+use nest_protocol::guest::frame::{self, Kind, MAX_WS_MESSAGE};
+use nest_protocol::guest::framed::FramedReader;
 use nest_protocol::guest::{PORT_HANDS, handshake};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -127,9 +128,8 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
     tracing::info!(sandbox = %sandbox.0, client = %client, via, "bound");
 
     // The pipe.
-    let (mut guest_rd, mut guest_wr) = guest.into_split();
-    let mut decoder = Decoder::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let (guest_rd, mut guest_wr) = guest.into_split();
+    let mut guest_rd = FramedReader::new(guest_rd);
     let mut first = true;
     let outcome: &str = loop {
         tokio::select! {
@@ -151,16 +151,17 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
                     break "client error";
                 }
                 Some(Ok(Message::Binary(bytes))) => {
-                    let kind = match check_frame(&bytes) {
-                        Ok(k) => k,
-                        Err(why) => {
-                            close(&mut ws, close_code::PROTOCOL, why).await;
+                    let (kind, payload) = match frame::one_frame(&bytes) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::debug!(sandbox = %sandbox.0, client = %client, error = %e, "bad client frame");
+                            close(&mut ws, close_code::PROTOCOL, "not exactly one frame").await;
                             break "bad frame";
                         }
                     };
                     if first {
                         first = false;
-                        let json = (kind == Kind::Json).then(|| serde_json::from_slice::<serde_json::Value>(&bytes[5..]).ok()).flatten();
+                        let json = (kind == Kind::Json).then(|| serde_json::from_slice::<serde_json::Value>(payload).ok()).flatten();
                         let Some(json) = json else {
                             close(&mut ws, close_code::PROTOCOL, "first frame is not JSON").await;
                             break "bad first frame";
@@ -183,35 +184,20 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
                 // Pings are answered by the WebSocket layer; pongs and raw frames carry nothing.
                 Some(Ok(_)) => {}
             },
-            n = guest_rd.read(&mut buf) => match n {
-                Ok(0) | Err(_) => {
+            f = guest_rd.next() => match f {
+                Ok(Some(f)) => {
+                    if send(&mut ws, Message::binary(frame::encode(f.kind, &f.payload)?)).await.is_err() {
+                        break "client write failed";
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    tracing::warn!(sandbox = %sandbox.0, error = %e, "guest frame error");
+                    close(&mut ws, u16::from(CloseCode::Error), "guest frame error").await;
+                    break "guest frame error";
+                }
+                Ok(None) | Err(_) => {
                     let _ = tokio::time::timeout(WRITE_TIMEOUT, ws.close(None)).await;
                     break "guest closed";
-                }
-                Ok(n) => {
-                    decoder.push(&buf[..n]);
-                    let mut stop = None;
-                    loop {
-                        match decoder.next_frame() {
-                            Ok(Some(f)) => {
-                                let bytes = frame::encode(f.kind, &f.payload)?;
-                                if send(&mut ws, Message::binary(bytes)).await.is_err() {
-                                    stop = Some("client write failed");
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(sandbox = %sandbox.0, error = %e, "guest frame error");
-                                close(&mut ws, u16::from(CloseCode::Error), "guest frame error").await;
-                                stop = Some("guest frame error");
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(why) = stop {
-                        break why;
-                    }
                 }
             },
         }
@@ -237,8 +223,8 @@ async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> 
     let mut route = String::new();
     let mut via = "direct";
     let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME_LEN as usize + 4))
-        .max_frame_size(Some(MAX_FRAME_LEN as usize + 4));
+        .max_message_size(Some(MAX_WS_MESSAGE))
+        .max_frame_size(Some(MAX_WS_MESSAGE));
     // tungstenite's callback contract fixes the error type; nothing to box.
     #[allow(clippy::result_large_err)]
     let callback = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
@@ -274,21 +260,6 @@ async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> 
             Err(_) => return Some((ws, None, via)),
         }
     }
-}
-
-/// Exactly one well-formed frame per message: `len == message_len - 4`, a known kind.
-fn check_frame(bytes: &[u8]) -> Result<Kind, &'static str> {
-    if bytes.len() < 5 {
-        return Err("message shorter than a frame");
-    }
-    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if len > MAX_FRAME_LEN {
-        return Err("frame too large");
-    }
-    if len as usize != bytes.len() - 4 {
-        return Err("frame length does not match the message");
-    }
-    Kind::from_u8(bytes[4]).ok_or("unknown frame kind")
 }
 
 async fn send(ws: &mut Ws, msg: Message) -> Result<(), ()> {

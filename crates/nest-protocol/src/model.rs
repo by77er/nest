@@ -589,23 +589,6 @@ impl From<crate::host::proxy::AlertKind> for EgressAlertReason {
     }
 }
 
-impl WorkstreamEventKind {
-    /// Only decision events wake a captain; the rest go into its digest.
-    pub fn is_decision(&self) -> bool {
-        matches!(
-            self,
-            Self::NeedsInput { .. }
-                | Self::Blocked { .. }
-                | Self::Completed { .. }
-                | Self::Failed { .. }
-                | Self::PrOpened { .. }
-                | Self::BudgetExceeded { .. }
-                | Self::OrphanedWork { .. }
-                | Self::EgressAlert { .. }
-        )
-    }
-}
-
 // --- Generations ----------------------------------------------------------------------------------
 
 /// `blake3:<64 hex>` of a manifest object in the cell's object store.

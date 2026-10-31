@@ -62,6 +62,11 @@ impl Audit {
         self
     }
 
+    pub fn binding(mut self, b: &str) -> Self {
+        self.binding = Some(b.to_string());
+        self
+    }
+
     pub fn request(mut self, method: &http::Method, uri: &http::Uri) -> Self {
         self.method = Some(method.as_str().to_string());
         self.path = Some(path_only(uri));

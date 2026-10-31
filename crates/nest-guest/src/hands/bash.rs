@@ -239,10 +239,9 @@ struct Report {
     duration_ms: u64,
 }
 
-/// Pure: the Bash result the model sees, following Claude Code's Bash tool. Exit 0 (or 1 from a
-/// search or diff) is success, shown whole when small, else a preview and the saved path; a
-/// failure shows a head-and-tail excerpt and its exit code; an interrupt or a killed `sleep`
-/// is an error; a call moved to the background names its task.
+/// Pure: the Bash result the model sees, as Claude Code's Bash tool shows it. Exit 0 (or 1 from a
+/// search or diff) is success; a failure shows a head-and-tail excerpt and its exit code; an
+/// interrupt or a killed `sleep` is an error; a call moved to the background names its task.
 fn bash_result(ending: Ending, view: &OutputView, command: &str, r: Report) -> HandsResult {
     let path = r.output_path.display().to_string();
     let secs = r.timeout_ms as f64 / 1000.0;
@@ -408,6 +407,7 @@ async fn read_pwd(p: &mut pipe::Receiver) -> Option<String> {
     s.lines().next().map(|l| l.to_string()).filter(|l| l.starts_with('/'))
 }
 
+/// A success: the output whole when small, else a preview and the saved path.
 fn success_text(view: &OutputView, path: &Path) -> (String, bool) {
     let output = &view.text;
     let n = output.chars().count();

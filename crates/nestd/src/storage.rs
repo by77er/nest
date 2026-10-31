@@ -252,9 +252,8 @@ mod tests {
         }
     }
 
-    /// A commit whose uploads all fail returns the error. It used to deadlock: every worker stopped
-    /// on its error, and the reader blocked forever sending the next chunk into the full queue,
-    /// holding the sandbox lock and the host's command executor with it.
+    /// A commit whose uploads all fail returns the error, rather than leave the reader blocked on
+    /// workers that stopped (holding the sandbox lock and the command executor).
     #[test]
     fn commit_whose_uploads_all_fail_returns_the_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -273,8 +272,7 @@ mod tests {
         assert_eq!(r.unwrap_err(), "put refused");
     }
 
-    /// Two threads storing one chunk at once (a commit with two equal chunks) both succeed. They
-    /// used to share one temporary name, and the second rename failed with `ENOENT`.
+    /// Two threads storing one chunk at once (a commit with two equal chunks) both succeed.
     #[test]
     fn concurrent_puts_of_one_chunk_both_succeed() {
         let dir = tempfile::tempdir().unwrap();

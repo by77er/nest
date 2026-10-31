@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nest_protocol::guest::frame::Kind;
+use nest_protocol::guest::framed::{self, FramedReader, write_json};
 use nest_protocol::guest::{IngressRequest, IngressResponse, PtyControl, error_code};
 use nest_protocol::model::AgentId;
 use nix::fcntl::OFlag;
@@ -22,7 +23,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::exec::{Leaf, PreExec};
-use crate::framed::{FramedReader, err, parse_json, write_data, write_json};
+use crate::framed::{err, parse_json};
 use crate::state::{Gate, Guest};
 use crate::transport::Conn;
 
@@ -140,9 +141,8 @@ impl Master {
     }
 }
 
-/// A PTY pair whose fds are close-on-exec from the start: any process the guest spawns
-/// meanwhile (a concurrent Bash or task) would otherwise inherit the slave and keep the terminal
-/// open after the session's shell exits, so the session would never end.
+/// A PTY pair whose fds are close-on-exec from the start: a concurrent Bash or task would
+/// otherwise inherit the slave and keep the session open after its shell exits.
 fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
     grantpt(&master)?;
@@ -237,7 +237,7 @@ async fn pty(
             tokio::select! {
                 r = master.read(&mut buf) => match r {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => if write_data(&mut wr, &buf[..n]).await.is_err() { hung_up = true; break; },
+                    Ok(n) => if framed::write(&mut wr, Kind::Data, &buf[..n]).await.is_err() { hung_up = true; break; },
                 },
                 _ = hangup_rx.recv() => { hung_up = true; break; }
             }
@@ -260,22 +260,10 @@ async fn pty(
 }
 
 async fn host_to_pty(rd: ReadHalf<Conn>, rest: Vec<u8>, master: Arc<Master>, pid: u32) {
-    let mut reader = FramedReader::new(rd);
     // Bytes already buffered past the request frame are framed data too.
-    let mut pre = nest_protocol::guest::frame::Decoder::new();
-    pre.push(&rest);
-    let mut pending = std::collections::VecDeque::new();
-    while let Ok(Some(f)) = pre.next_frame() {
-        pending.push_back(f);
-    }
+    let mut reader = FramedReader::with_buffered(rd, &rest);
     loop {
-        let f = match pending.pop_front() {
-            Some(f) => f,
-            None => match reader.next().await {
-                Ok(Some(f)) => f,
-                _ => return,
-            },
-        };
+        let Ok(Some(f)) = reader.next().await else { return };
         match f.kind {
             Kind::Data => {
                 if master.write_all(&f.payload).await.is_err() {
