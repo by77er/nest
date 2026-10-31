@@ -1,8 +1,6 @@
-//! Async helpers for the two frame formats the runner speaks:
-//! - host-internal frames (`nest_protocol::host::frame`): `[u32 BE len][JSON]`;
-//! - guest frames (`nest_protocol::guest::frame`): `[u32 BE len][u8 kind][payload]`, which the
-//!   runner itself no longer reads from a socket (hands go through `nest-hands-client`); the
-//!   helpers serve the test double in `test_support` and are built only with it.
+//! Async helpers for host-internal frames (`nest_protocol::host::frame`: `[u32 BE len][JSON]`),
+//! and for guest frames (`nest_protocol::guest::frame`), which only the `test_support` double
+//! speaks (the runner's hands go through `nest-hands-client`).
 
 use std::io;
 

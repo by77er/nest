@@ -1,11 +1,10 @@
 //! Hands for the runner: one gateway WebSocket per tool call, through `nest-hands-client`.
 //!
-//! The runner never sees a vsock socket. It holds the sandbox's ids from `agent_start` and asks
-//! AgentDO for the target (gateway URL, binding, guest version) over its own session channel
-//! (`hands_resolve`), lazily before the first call, again shortly before the binding expires,
-//! and whenever a gateway refuses the target (classified by `nest_hands_client::Next`). The MCP arguments are forwarded verbatim (tagged with the tool name), and the
-//! guest's `HandsResult` content maps 1:1 to MCP content. Cancelling sends `cancel` and, if the
-//! guest doesn't answer promptly, hangs up (which also cancels).
+//! The runner never sees a vsock socket. It asks AgentDO for the target (gateway URL, binding,
+//! guest version) over its session channel (`hands_resolve`): before the first call, shortly
+//! before the binding expires, and whenever a gateway refuses the target
+//! (`nest_hands_client::Next`). MCP arguments go verbatim, `HandsResult` content maps 1:1 to MCP
+//! content. Cancelling sends `cancel`, then hangs up if the guest doesn't answer promptly.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -44,23 +44,22 @@ struct Link {
 struct Bridge {
     sock: String,
     agent: AgentId,
-    stream: Option<(u64, UnixStream)>,
+    /// Connection number `connects`, if that one is open.
+    stream: Option<UnixStream>,
     connects: u64,
 }
 
 impl Bridge {
-    /// The live connection, opening one if the last one dropped.
+    /// The live connection and its number, opening one if the last one dropped.
     fn get(&mut self, shared: &Shared) -> Option<(u64, &mut UnixStream)> {
-        let live = shared.link.lock().unwrap().conn;
-        if self.stream.as_ref().is_none_or(|(n, _)| *n != live) {
-            self.stream = None;
+        if self.stream.is_none() || shared.link.lock().unwrap().conn != self.connects {
             self.connects += 1;
-            match connect(&self.sock, &self.agent, shared, self.connects) {
-                Ok(s) => self.stream = Some((self.connects, s)),
-                Err(e) => eprintln!("nest mcp: runner unavailable: {e}"),
-            }
+            self.stream = connect(&self.sock, &self.agent, shared, self.connects)
+                .map_err(|e| eprintln!("nest mcp: runner unavailable: {e}"))
+                .ok();
         }
-        self.stream.as_mut().map(|(n, s)| (*n, s))
+        let n = self.connects;
+        self.stream.as_mut().map(|s| (n, s))
     }
 }
 
@@ -140,7 +139,7 @@ pub fn main() -> i32 {
             ("notifications/cancelled", None) => {
                 let rid = params.get("requestId").map(|v| v.to_string()).unwrap_or_default();
                 let bid = shared.by_rpc.lock().unwrap().remove(&rid);
-                if let (Some(bid), Some((_, s))) = (bid, bridge.stream.as_mut()) {
+                if let (Some(bid), Some(s)) = (bid, bridge.stream.as_mut()) {
                     let _ = frame::write(s, &McpBridgeRequest::Cancel { id: bid });
                 }
             }
@@ -182,8 +181,7 @@ fn disconnected(shared: &Shared, conn: u64) {
         if link.conn == conn {
             link.conn = 0;
         }
-        let ids: Vec<u64> = link.pending.iter().filter(|(_, p)| p.conn == conn).map(|(id, _)| *id).collect();
-        ids.into_iter().filter_map(|id| link.pending.remove(&id)).collect()
+        link.pending.extract_if(|_, p| p.conn == conn).map(|(_, p)| p).collect()
     };
     for p in lost {
         let msg = match p.kind {
@@ -198,17 +196,13 @@ fn disconnected(shared: &Shared, conn: u64) {
 }
 
 fn forward(shared: &Shared, bridge: &mut Bridge, bid: u64, rpc_id: Value, kind: Kind, req: &McpBridgeRequest) {
-    let Some((conn, s)) = bridge.get(shared) else {
-        fail(shared, &Pending { rpc_id, kind, conn: 0 }, "nest runner unavailable");
-        return;
-    };
+    let Some((conn, s)) = bridge.get(shared) else { return fail(shared, &Pending { rpc_id, kind, conn: 0 }, "nest runner unavailable") };
     {
         let mut link = shared.link.lock().unwrap();
         if link.conn != conn {
             // Its reader saw it end after `get`: nothing was sent.
             drop(link);
-            fail(shared, &Pending { rpc_id, kind, conn }, "nest runner unavailable");
-            return;
+            return fail(shared, &Pending { rpc_id, kind, conn }, "nest runner unavailable");
         }
         link.pending.insert(bid, Pending { rpc_id, kind, conn });
     }
