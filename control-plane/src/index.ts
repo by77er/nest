@@ -428,7 +428,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (req.method === "GET" && p[2] === "/generations") return json(await s.generations());
     if (req.method === "POST" && p[2] === "/place") return json({ host: await s.retryPlacement() });
     if (req.method === "POST" && p[2] === "/grants") {
-      const r = await body(req, z.object({ host: z.string(), ttl_ms: z.number().int().positive(), ports: z.array(z.number().int()).optional() }));
+      const r = await body(req, z.object({ host: z.string(), ttl_ms: z.number().int().positive(), ports: z.array(z.number().int().min(1).max(65535)).optional() }));
       return json(await s.grant(r.host, r.ttl_ms, r.ports));
     }
   }

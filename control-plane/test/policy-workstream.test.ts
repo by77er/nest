@@ -1,6 +1,6 @@
-import { env, runDurableObjectAlarm } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { adminJson, connectHost, nextCommands, sleep, uniqueCell } from "./helpers";
+import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell } from "./helpers";
 
 describe("egress policy layers", () => {
   it("a temporary grant pushes a newer policy and is withdrawn when it expires", async () => {
@@ -72,4 +72,17 @@ describe("workstreams and captain wakes", () => {
     expect(turns[0]!.input.text).toContain("2 event(s)");
     expect(turns[0]!.input.text).toContain("tests green");
   });
+});
+
+describe("temporary grants are checked before anything is stored", () => {
+  it("a port outside 1-65535 is refused: nestd's u16 couldn't parse the policy it would join", async () => {
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "x" } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell: uniqueCell() } }, 202);
+    for (const ports of [[70000], [0], [-1]]) {
+      const r = await admin(`/v1/sandboxes/${sbx.sandbox}/grants`, { body: { host: "example.com", ttl_ms: 60_000, ports } });
+      expect(r.status, JSON.stringify(ports)).toBe(400);
+    }
+    expect((await adminJson(`/v1/sandboxes/${sbx.sandbox}/policy`)).allow.some((r: any) => r.host === "example.com")).toBe(false);
+  });
+
 });
