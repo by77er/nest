@@ -172,10 +172,12 @@ mod tests {
             taken.fetch_add(1, Ordering::Relaxed);
             Ok::<_, String>(i)
         });
-        let r = super::par_try_for_each(items, 4, |i| if i == 10 { Err(format!("item {i}")) } else { Ok(()) });
-        assert_eq!(r, Err("item 10".into()));
-        // At most one more item per thread was taken while item 10 failed.
-        assert!(taken.load(Ordering::Relaxed) <= 14, "took {}", taken.load(Ordering::Relaxed));
+        let fail_at_10 = |i| if i == 10 { Err(format!("item {i}")) } else { Ok(()) };
+        // One thread, so the count is exact: with more, the others may take any number of items
+        // while the failing one is descheduled before it records its error.
+        assert_eq!(super::par_try_for_each(items, 1, fail_at_10), Err("item 10".into()));
+        assert_eq!(taken.load(Ordering::Relaxed), 11);
+        assert_eq!(super::par_try_for_each((0..100).map(Ok), 4, fail_at_10), Err("item 10".into()));
         // An error from the iterator itself is returned the same way.
         let items = (0..100).map(|i| if i == 3 { Err("read failed") } else { Ok(i) });
         assert_eq!(super::par_try_for_each(items, 2, |_| Ok(())), Err("read failed"));
