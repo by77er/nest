@@ -167,7 +167,7 @@ mod tests {
             .collect()
     }
 
-    /// B7: a scan that lands after attach but before `configure` is the one announced on ready,
+    /// A scan that lands after attach but before `configure` is the one announced on ready,
     /// exactly once; a scan before attach is superseded.
     #[test]
     fn ready_announces_the_latest_ports_once() {

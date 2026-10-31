@@ -274,7 +274,7 @@ async fn bash_timeout_moves_to_background_or_kills_sleep() {
     assert!(r.is_error && text_of(&r).contains("timed out"), "{}", text_of(&r));
 }
 
-/// B2: a foreground call moved to the background is a task, and its output lives with the
+/// A foreground call moved to the background is a task, and its output lives with the
 /// tasks: the newest-64 pruning of later foreground calls' outputs must not delete it.
 #[tokio::test(flavor = "multi_thread")]
 async fn moved_task_output_survives_later_calls() {
@@ -550,7 +550,7 @@ async fn ingress_tcp_splice_and_reject() {
     assert!(matches!(resp, IngressResponse::Rejected { error } if error.code == "connect_refused" && error.retryable));
 }
 
-/// B3: like hands, an ingress PTY is `busy` (retryable) until `configure`.
+/// Like hands, an ingress PTY is `busy` (retryable) until `configure`.
 #[tokio::test(flavor = "multi_thread")]
 async fn pty_before_configure_is_busy() {
     let h = harness().await;
@@ -689,7 +689,7 @@ async fn cli_relay_and_whoami() {
     assert_eq!(resp.result, CliResult::Ok { data: json!({"sandbox_id": "sbx_test", "agent_id": null, "epoch": EPOCH}) });
 }
 
-/// B4: after a memory restore the guest holds the parent's identity; nestd configures the fork
+/// After a memory restore the guest holds the parent's identity; nestd configures the fork
 /// child at the child's own epoch (1) before `resume{fork}`. The fence is per sandbox id.
 #[tokio::test(flavor = "multi_thread")]
 async fn fork_child_configures_at_its_own_epoch() {

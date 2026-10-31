@@ -1710,7 +1710,7 @@ async fn a_drain_past_its_deadline_keeps_the_unanswered_commit() {
     assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Running));
 }
 
-/// N7: a commit whose request can't be recorded in `meta.json` first fails (retryable) and is
+/// A commit whose request can't be recorded in `meta.json` first fails (retryable) and is
 /// never sent: sent unrecorded, a crash would lose its id, and the restart's salvage could not ask
 /// again under it. It used to be logged and sent anyway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -342,7 +342,7 @@ async fn an_expired_grant_is_denied_on_a_held_connection() {
     assert_eq!(held.get("api.stripe.test").await, 403);
 }
 
-/// B8: a re-placement at a newer epoch starts a fresh view. Until nestd sends that epoch's
+/// A re-placement at a newer epoch starts a fresh view. Until nestd sends that epoch's
 /// secrets, the previous epoch's must not substitute.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_newer_epoch_never_injects_the_previous_epochs_secret() {

@@ -1415,7 +1415,7 @@ impl Inner {
     // ------------------------------------------------------------------------------------------
 
     async fn execute(self: &Arc<Self>, cmd: Command) {
-        // Taken first, so a start answered from the cache or refused leaves no stamp behind (N9).
+        // Taken first, so a start answered from the cache or refused leaves no stamp behind.
         let outlived = self.lapse_guard.outlived(&cmd.cmd.0);
         let cached = self.results.lock().expect("results").get(&cmd.cmd.0).cloned();
         if let Some(outcome) = cached {

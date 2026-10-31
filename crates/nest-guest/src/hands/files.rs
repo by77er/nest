@@ -316,7 +316,7 @@ pub fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<Metadata> {
 mod tests {
     use super::*;
 
-    /// B6: a FIFO (here in place of a file a tool was asked for) is refused at once, for reading
+    /// A FIFO (here in place of a file a tool was asked for) is refused at once, for reading
     /// and for writing; a plain `File::open` would block until a writer or reader appears.
     #[test]
     fn open_regular_refuses_without_blocking() {
