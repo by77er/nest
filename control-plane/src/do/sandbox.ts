@@ -307,10 +307,11 @@ export class SandboxDO extends DurableObject<Env> {
     const epoch = info.placing;
     const lease = await this.fleet(info.cell).leaseOf(info.sandbox);
     let adopted: string | null = null;
-    this.update((i) => {
+    const after = this.update((i) => {
       if (i.placing !== epoch) return;
       i.placing = null;
       i.placing_ms = null;
+      if (gone(i.state)) return;
       if (lease && lease.epoch === epoch && !lease.expired) {
         i.host = lease.host;
         i.state = lease.state ?? (i.head ? "restoring" : "creating");
@@ -320,6 +321,11 @@ export class SandboxDO extends DurableObject<Env> {
         adopted = lease.host;
       }
     });
+    if (gone(after.state)) {
+      // Destroyed while FleetDO answered: a live lease at this epoch was never this object's to adopt.
+      if (lease && lease.epoch === epoch) await this.discardPlacement(after, lease.host, epoch);
+      return;
+    }
     if (adopted) {
       console.warn(`sandbox ${info.sandbox}: adopted the lease on ${adopted} (epoch ${epoch}) from an unfinished placement`);
       await this.pushSecrets();
@@ -380,8 +386,10 @@ export class SandboxDO extends DurableObject<Env> {
     }
     // FleetDO refused outright (a lease at another epoch): no lease exists under this epoch.
     const refused = failure !== null && asNestError(failure)?.code === ErrorCodes.FORBIDDEN;
-    this.update((i) => {
-      if (i.placing !== epoch) return;
+    let applied = false;
+    const after = this.update((i) => {
+      if (i.placing !== epoch || gone(i.state)) return;
+      applied = true;
       // Any other failure leaves the answer unknown (a lease may exist): the marker stays for the
       // `place` deadline to reconcile against FleetDO's lease.
       if (failure !== null && !refused) return;
@@ -396,6 +404,11 @@ export class SandboxDO extends DurableObject<Env> {
         this.recordEpoch(epoch, host);
       }
     });
+    if (!applied && gone(after.state)) {
+      // Destroyed while FleetDO answered: the lease it granted, and the VM it sent, go too.
+      if (host) await this.discardPlacement(after, host, epoch);
+      return null;
+    }
     if (failure !== null) {
       // A refusal is not retried on its own (the leases disagree: an operator looks); anything else is.
       if (refused) await this.deadlines.clear("place");
@@ -611,12 +624,21 @@ export class SandboxDO extends DurableObject<Env> {
     this.update((i) => {
       i.state = "destroyed";
       i.host = null;
+      // A placement still in flight finds no marker, so it adopts nothing (it discards what it got).
+      i.placing = null;
+      i.placing_ms = null;
     });
     this.report("destroyed", "destroyed", { epoch: info.epoch }, `${info.sandbox}/destroyed`);
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
     // Its generations stop being GC roots.
     await this.fleet(info.cell).sandboxDestroyed(info.sandbox);
+  }
+
+  /** A lease granted to a destroyed sandbox: released, and the VM FleetDO sent with it destroyed. */
+  private async discardPlacement(info: SandboxInfo, host: string, epoch: number): Promise<void> {
+    await this.fleet(info.cell).releaseLease(info.sandbox, epoch);
+    await this.fleet(info.cell).issueCommands(host, [{ type: "sandbox_destroy", sandbox: info.sandbox, epoch }]);
   }
 
   private async command(bodies: CommandBody[]): Promise<void> {

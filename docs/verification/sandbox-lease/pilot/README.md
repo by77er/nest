@@ -30,6 +30,8 @@ A TLA+ model of placement, leases, epochs, fencing, STONITH, salvage and commit 
 
 The B2 tests hold SandboxDO's `await fleet.place` open by wrapping the instance's FleetDO stub; the SandboxDO and FleetDO code is unchanged. Without that, miniflare answers too fast to interleave in 12 attempts.
 
+**Since:** B2 is fixed (`destroy` clears `placing`; a placement answer for a destroyed sandbox releases its lease and destroys the VM, `SandboxDO.discardPlacement`). Its two cases left the repro file and are regression tests, with the assertions inverted, in `control-plane/test/lifecycle.test.ts` ("the lease's guards").
+
 ## What is modelled
 
 | Actor | State | Abstraction |

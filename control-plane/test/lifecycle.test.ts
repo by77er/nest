@@ -299,6 +299,37 @@ describe("preview and share names follow the hostname rule", () => {
   });
 });
 
+/**
+ * Hold this SandboxDO's next `FleetDO.place` open until `open()`: `served` lets FleetDO grant first
+ * (a slow answer), otherwise the request itself waits (a slow request). Real SandboxDO and FleetDO
+ * code; only the await's timing is controlled (miniflare answers too fast to interleave a call).
+ */
+function holdPlace(inst: SandboxDO, served: boolean): { open: () => void } {
+  const self = inst as unknown as { fleet: (cell: string) => any };
+  const real = self.fleet.bind(inst);
+  let open!: () => void;
+  const gate = new Promise<void>((r) => (open = r));
+  let held = false;
+  self.fleet = (c: string) => {
+    const f = real(c);
+    return new Proxy(f, {
+      get(t, p: string | symbol) {
+        if (p === "then") return undefined;
+        if (p === "place" && !held) {
+          held = true;
+          return async (req: unknown) => {
+            if (served) { const h = await t.place(req); await gate; return h; }
+            await gate;
+            return t.place(req);
+          };
+        }
+        return (...args: unknown[]) => t[p](...args);
+      },
+    });
+  };
+  return { open };
+}
+
 describe("the lease's guards (docs/verification/sandbox-lease)", () => {
   it("a lost lease keeps which agents are working: the re-placed sandbox isn't idle-suspended mid-turn", async () => {
     const cell = uniqueCell();
@@ -335,4 +366,26 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
     await runDurableObjectAlarm(stub);
     expect((await stub.info()).host).toBe(b.host);
   });
+
+  for (const served of [true, false]) {
+    it(`a destroy during an in-flight placement stays destroyed, with no lease or VM left (${served ? "answer" : "request"} held)`, async () => {
+      const cell = uniqueCell();
+      const s = await createSandbox(cell, 202);
+      const a = await connectHost(cell);
+      const stub = sandboxStub(s.sandbox);
+      await runInDurableObject(stub, async (inst: SandboxDO) => {
+        const { open } = holdPlace(inst, served);
+        const woke = inst.wake().catch((e: unknown) => e);
+        await sleep(20);
+        await inst.destroy();
+        open();
+        await woke;
+      });
+      expect(await stub.info()).toMatchObject({ state: "destroyed", host: null, placing: null });
+      expect(await fleetStub(cell).leaseOf(s.sandbox)).toBeNull();
+      // FleetDO sent the VM's create with the grant: it is destroyed again at that epoch.
+      const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
+      expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
+    });
+  }
 });
