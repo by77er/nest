@@ -686,7 +686,12 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async commit(host: string, ev: CommitRequestEvent): Promise<CommitOutcome> {
     const stored = this.sql.exec<{ outcome: string }>("SELECT outcome FROM commits WHERE request = ?", ev.request).toArray()[0];
-    if (stored) return JSON.parse(stored.outcome) as CommitOutcome;
+    if (stored) {
+      const outcome = JSON.parse(stored.outcome) as CommitOutcome;
+      // The first answer's notice may not have been posted (it failed after the record was stored).
+      if (outcome.status === "orphaned") await this.noticeOrphan(ev, outcome.generation);
+      return outcome;
+    }
     const info = this.info_();
     const record = (): GenerationRecord => ({
       id: newId("gen_"),
@@ -732,18 +737,22 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES (?, ?, ?, ?)",
       ev.request, JSON.stringify(outcome), Date.now(), outcome.status === "rejected" ? null : outcome.generation.id);
     await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
-    if (orphan) {
-      await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(info.workstream)).ingest({
-        workstream: info.workstream,
-        ts_ms: Date.now(),
-        sandbox: info.sandbox,
-        epoch: info.epoch,
-        type: "orphaned_work",
-        generation: orphan.id,
-        stale_epoch: ev.epoch,
-      });
-    }
+    if (orphan) await this.noticeOrphan(ev, orphan);
     return outcome;
+  }
+
+  /** `orphaned_work` to the workstream, at least once per request (WorkstreamDO drops a repeated key). */
+  private async noticeOrphan(ev: CommitRequestEvent, orphan: GenerationRecord): Promise<void> {
+    const info = this.info_();
+    await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(info.workstream)).ingest({
+      workstream: info.workstream,
+      ts_ms: Date.now(),
+      sandbox: info.sandbox,
+      epoch: info.epoch,
+      type: "orphaned_work",
+      generation: orphan.id,
+      stale_epoch: ev.epoch,
+    }, `orphan/${ev.request}`);
   }
 
   /**

@@ -159,7 +159,7 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 
 **B7 (fixed): a stale placement continuation acts on current state.** If the marker was reconciled while `place` was still running, a later host answer still clears the current `place` deadline and notifies agents of a host the DO doesn't hold (`sandbox.ts:325-329`); together with S3', needs a `place` call slower than 60 s. **Fixed:** a continuation whose marker is gone runs none of its follow-ups (`placeCurrentEpoch`); regression test in `control-plane/test/lifecycle.test.ts`.
 
-**B8 (real; minor): a lost `orphaned_work` notice.** The orphan and its stored outcome are written before the `ingest` await (`sandbox.ts:580-598`); if `ingest` throws, the resent commit returns the stored outcome and the notice is never posted.
+**B8 (fixed): a lost `orphaned_work` notice.** The orphan and its stored outcome are written before the `ingest` await (`sandbox.ts:580-598`); if `ingest` throws, the resent commit returns the stored outcome and the notice is never posted. **Fixed:** the notice is keyed `orphan/<request>` and re-posted whenever a stored orphaned outcome is returned (`noticeOrphan`); WorkstreamDO drops a repeated key.
 
 ## 9. Modelling notes
 

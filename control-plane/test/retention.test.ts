@@ -260,6 +260,37 @@ describe("the GC registry", () => {
 });
 
 describe("salvage authorization", () => {
+  it("an orphan's orphaned_work notice survives a failed post: the resent request posts it, once", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "salvage" } }, 201);
+    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
+    const salvage = {
+      ts_ms: Date.now(), type: "commit_request", request: "req_orphan_1", sandbox, epoch: 1, kind: "disk_only", disk_manifest: manifest("6"), reason: "salvage",
+    } as CommitRequestEvent;
+    const outcomes = await runInDurableObject(sandboxStub(sandbox), async (inst: SandboxDO, st) => {
+      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one();
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify({ ...JSON.parse(row.value), epoch: 2, host: "hst_other00000000000000000" }));
+      // WorkstreamDO fails the first post (a reset, a lost reply); FleetDO resends the request.
+      let fail = true;
+      const self = inst as unknown as { env: typeof env };
+      const real = self.env.WORKSTREAM;
+      self.env = { ...self.env, WORKSTREAM: { idFromName: (n: string) => real.idFromName(n), get: (id: DurableObjectId) => {
+        const ws = real.get(id);
+        return { ingest: async (...a: Parameters<typeof ws.ingest>) => {
+          if (fail) { fail = false; throw new Error("Network connection lost."); }
+          return ws.ingest(...a);
+        } };
+      } } as unknown as typeof env.WORKSTREAM };
+      const first = await inst.commit(h.host, salvage).then((o) => o.status, (e: Error) => e.message);
+      return [first, (await inst.commit(h.host, salvage)).status, (await inst.commit(h.host, salvage)).status];
+    });
+    expect(outcomes).toEqual(["Network connection lost.", "orphaned", "orphaned"]);
+    const notices = (await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(workstream)).events()).filter((e) => e.type === "orphaned_work");
+    expect(notices).toHaveLength(1);
+  });
+
   it("holds for an epoch older than the 50 that info().history shows", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
