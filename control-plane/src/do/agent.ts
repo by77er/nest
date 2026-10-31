@@ -361,10 +361,8 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   private save(info: AgentInfo): void {
-    // For one release, the previous release's fields beside the spec, derived from it, so a forward
-    // revert to that release reads the record as its own (`role` from hands, `grants` = the tools,
-    // `captain` = the owner). `load()` drops them: the spec is the authority.
-    const legacy: PreviousReleaseFields = { role: info.hands ? "worker" : "captain", grants: info.tools, captain: info.owner, state: agentState(info) };
+    // `state` for the previous release, which reads it (`agentState`); `load()` drops it.
+    const legacy: PreviousReleaseFields = { state: agentState(info) };
     this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       JSON.stringify({ ...info, ...legacy }));
   }
