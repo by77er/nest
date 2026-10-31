@@ -241,6 +241,13 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
                 ));
             }
             let id = tasks::new_task_id();
+            // A task's output lives in tasks/, kept per task: calls/ keeps only the newest call
+            // outputs and would delete it while it runs. Same tmpfs, so the sink's open fd follows.
+            let moved = guest.agent_dir(agent).join("tasks").join(format!("{id}.out"));
+            match std::fs::rename(&out, &moved) {
+                Ok(()) => r.sink.path = moved,
+                Err(e) => tracing::warn!(error = %e, "could not move {} to tasks/", out.display()),
+            }
             let total = r.sink.total.clone();
             // Keep the $PWD pipe open: the shell's EXIT trap writes to it, and a closed reader
             // would kill the shell with SIGPIPE and lose its exit status.
@@ -276,7 +283,7 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
                     signal: None,
                     interrupted: false,
                     task_id: Some(id),
-                    output_path: out.display().to_string(),
+                    output_path: task.output_path.display().to_string(),
                     output_bytes: total.load(std::sync::atomic::Ordering::Relaxed),
                     truncated: false,
                     cwd: before_cwd,

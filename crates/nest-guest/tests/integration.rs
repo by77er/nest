@@ -274,6 +274,23 @@ async fn bash_timeout_moves_to_background_or_kills_sleep() {
     assert!(r.is_error && text_of(&r).contains("timed out"), "{}", text_of(&r));
 }
 
+/// B2: a foreground call moved to the background is a task, and its output lives with the
+/// tasks: the newest-64 pruning of later foreground calls' outputs must not delete it.
+#[tokio::test(flavor = "multi_thread")]
+async fn moved_task_output_survives_later_calls() {
+    let (h, _c) = configured().await;
+    let r = call(&h, "slow", json!({"tool": "Bash", "command": "echo start-marker; sleep 60", "timeout": 300})).await;
+    let task_id = match &r.detail {
+        HandsDetail::Bash { task_id: Some(id), .. } => id.clone(),
+        d => panic!("{d:?}"),
+    };
+    for i in 0..=nest_guest::output::KEEP_CALL_OUTPUTS {
+        call(&h, &format!("q{i}"), json!({"tool": "Bash", "command": "true"})).await;
+    }
+    let t = text_of(&call(&h, "to", json!({"tool": "TaskOutput", "task_id": task_id})).await);
+    assert!(t.contains("start-marker"), "task output lost: {t}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn background_task_output_and_stop() {
     let (h, mut c) = configured().await;
