@@ -14,6 +14,7 @@
 pub mod link;
 pub mod server;
 pub mod state;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod verify;
 

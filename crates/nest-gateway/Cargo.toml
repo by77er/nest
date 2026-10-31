@@ -24,7 +24,12 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 
+[features]
+# `testing`: a binding signer for tests. Never in a production build, which verifies bindings only.
+testing = []
+
 [dev-dependencies]
+nest-gateway = { path = ".", features = ["testing"] }
 tempfile = "3"
 
 [lints]

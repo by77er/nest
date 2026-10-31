@@ -25,6 +25,7 @@ pub mod session;
 pub mod stream;
 pub mod supervisor;
 pub mod tailer;
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
 

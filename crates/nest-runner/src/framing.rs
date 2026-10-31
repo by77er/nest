@@ -2,10 +2,11 @@
 //! - host-internal frames (`nest_protocol::host::frame`): `[u32 BE len][JSON]`;
 //! - guest frames (`nest_protocol::guest::frame`): `[u32 BE len][u8 kind][payload]`, which the
 //!   runner itself no longer reads from a socket (hands go through `nest-hands-client`); the
-//!   helpers serve the test double in `test_support`.
+//!   helpers serve the test double in `test_support` and are built only with it.
 
 use std::io;
 
+#[cfg(any(test, feature = "test-support"))]
 use nest_protocol::guest::frame::{Frame, Kind, MAX_FRAME_LEN};
 use nest_protocol::host::frame::MAX_FRAME;
 use serde::{Serialize, de::DeserializeOwned};
@@ -42,6 +43,7 @@ pub async fn read_host<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> 
 }
 
 /// Write one guest JSON frame.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn write_guest_json<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     let bytes = nest_protocol::guest::frame::encode_json(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -50,6 +52,7 @@ pub async fn write_guest_json<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, ms
 }
 
 /// Read one guest frame.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn read_guest<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
     let mut hdr = [0u8; 4];
     r.read_exact(&mut hdr).await?;

@@ -28,7 +28,7 @@ tokio-util = "0.7"
 [features]
 # `test_support::gateway`: a real gateway in-process, for tests of the hands path. Never on in
 # a production build: the runner must not carry the gateway's code or its verification key.
-test-support = ["dep:nest-gateway"]
+test-support = ["dep:nest-gateway", "nest-gateway/testing"]
 
 [dev-dependencies]
 nest-runner = { path = ".", features = ["test-support"] }
