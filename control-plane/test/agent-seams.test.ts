@@ -652,7 +652,11 @@ describe("one brain per agent: the brain record", () => {
     const inbox = await ws.next("inbox");
     expect(inbox.message).toMatchObject({ from: "system" });
     expect(inbox.message.text).toMatch(/Your sandbox moved to another machine/);
-    ws.send({ type: "events", seq: 1, events: [{ agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), turn: t1.turn, type: "turn_completed", stop_reason: "end_turn" }] });
+    // The runner shows it to the model (confirmed, so it doesn't come back as a turn), and the turn ends.
+    ws.send({ type: "events", seq: 1, events: [
+      { agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), turn: t1.turn, type: "inbox_delivered", message: inbox.message.id },
+      { agent: s.agent, epoch: 1, seq: 2, ts_ms: Date.now(), turn: t1.turn, type: "turn_completed", stop_reason: "end_turn" },
+    ] });
     await ws.next("ack");
     // Between turns, with no notice at all (as if it was lost): derived from SandboxDO's epoch.
     await editAgent(s.agent, (i) => {
@@ -662,7 +666,7 @@ describe("one brain per agent: the brain record", () => {
     const t2 = await ws.next("run_turn", (m) => m.input.text.endsWith("second"));
     expect(t2.input.text).toMatch(/^Your sandbox moved to another machine[\s\S]*\n\nsecond$/);
     // Told once: the next turn is plain.
-    ws.send({ type: "events", seq: 2, events: [{ agent: s.agent, epoch: 1, seq: 2, ts_ms: Date.now(), turn: t2.turn, type: "turn_completed", stop_reason: "end_turn" }] });
+    ws.send({ type: "events", seq: 2, events: [{ agent: s.agent, epoch: 1, seq: 3, ts_ms: Date.now(), turn: t2.turn, type: "turn_completed", stop_reason: "end_turn" }] });
     await ws.next("ack", (m) => m.up_to === 2);
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "third" } }, 201);
     expect((await ws.next("run_turn", (m) => m.input.text.endsWith("third"))).input.text).toBe("third");
