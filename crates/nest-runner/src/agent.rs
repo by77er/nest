@@ -72,11 +72,19 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
     let fence_gen = rt.fence_gen();
     tokio::spawn(async move {
         let id = start.start.agent.clone();
+        // The agent epoch AgentDO issued for this start; never the sandbox's. Every control plane
+        // since #30 sends it; a start without one would run under no epoch AgentDO accepts.
+        let Some(epoch) = start.start.epoch else {
+            let error = ErrorBody { code: "invalid_message".into(), message: "agent_start without an agent epoch".into(), retryable: false };
+            rt.report(RunnerEvent::Error { agent: Some(id.clone()), error });
+            refuse_superseding(&rt, &id, nest_protocol::model::Epoch(0), ExitReason::Crashed).await;
+            return;
+        };
         if let Some(bad) = start.start.launch.builtin_tools.iter().find(|t| !HOST_SAFE_BUILTINS.contains(&t.as_str())) {
             let msg = format!("refusing to start: built-in tool {bad} is not on the runner's host-safe allowlist");
             tracing::error!(agent = %id, "{msg}");
             rt.report(RunnerEvent::Error { agent: Some(id.clone()), error: ErrorBody { code: "forbidden_tool".into(), message: msg, retryable: false } });
-            refuse_superseding(&rt, &id, start.start.agent_epoch(), ExitReason::Crashed).await;
+            refuse_superseding(&rt, &id, epoch, ExitReason::Crashed).await;
             return;
         }
         if !rt.lease_valid() {
@@ -84,14 +92,12 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 agent: Some(id.clone()),
                 error: ErrorBody { code: "no_lease".into(), message: "no valid host lease; refusing to start a brain".into(), retryable: true },
             });
-            refuse_superseding(&rt, &id, start.start.agent_epoch(), ExitReason::Fenced).await;
+            refuse_superseding(&rt, &id, epoch, ExitReason::Fenced).await;
             return;
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let hands = start.start.hands.clone();
-        // The agent epoch AgentDO issued for this start; never the sandbox's.
-        let epoch = start.start.agent_epoch();
         let secrets = vec![start.start.oauth_token.expose().to_owned()];
         let agent = Agent::new(
             id.clone(),
@@ -350,8 +356,8 @@ async fn run(
         let session = session_id.clone().unwrap_or_else(|| SessionId("ses_pending".into()));
         let timeout = rt.cfg.session_open_timeout;
         let pid = proc.pid;
-        // The epoch this start registered under (not one adopted since): nestd marks that start.
-        let epoch = s.start.agent_epoch();
+        // The epoch this start registered under: nestd marks that start.
+        let epoch = agent.epoch;
         tokio::spawn(async move {
             let _ = tokio::time::timeout(timeout, opened).await;
             let capabilities = agent.inner.lock().unwrap().capabilities.clone();

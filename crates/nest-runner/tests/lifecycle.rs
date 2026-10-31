@@ -180,6 +180,21 @@ async fn refuses_without_lease_and_with_host_tools() {
     assert!(pids(e.dir.path()).is_empty());
 }
 
+/// A start without an agent epoch (a control plane from before #30) is refused, not run under
+/// the sandbox's epoch or 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_without_an_agent_epoch_is_refused() {
+    let e = env();
+    let mut cmd = start_cmd(e.dir.path(), "agt_noepoch", &[]);
+    let RunnerCommand::AgentStart(s) = &mut cmd else { unreachable!() };
+    s.start.epoch = None;
+    nest_runner::supervisor::handle(&e.rt, cmd);
+    let evs = events(&e.rt, Duration::from_millis(500)).await;
+    assert!(evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "invalid_message")), "{evs:?}");
+    assert_eq!(exits_at(&evs), [(ExitReason::Crashed, Some(0))]);
+    assert!(pids(e.dir.path()).is_empty(), "Claude Code was never spawned");
+}
+
 #[tokio::test]
 async fn timed_out_platform_calls_are_abandoned_and_not_retryable() {
     use nest_runner::runtime::{Agent, Outbound};
