@@ -40,8 +40,9 @@ struct Config {
     slots: Vec<AgentSlot>,
 }
 
-enum Req {
-    Send { body: ControlBody, reply: oneshot::Sender<io::Result<ControlBody>> },
+struct Req {
+    body: ControlBody,
+    reply: oneshot::Sender<io::Result<ControlBody>>,
 }
 
 /// Handle to one sandbox's control connection.
@@ -79,10 +80,6 @@ impl GuestCtl {
             .map_err(|_| io::Error::other("guest control task ended"))
     }
 
-    pub fn is_ready(&self) -> bool {
-        *self.ready.borrow()
-    }
-
     /// The guest's version and capabilities from its last hello, if one arrived.
     pub fn guest(&self) -> Option<nest_protocol::gateway::GuestInfo> {
         self.guest.lock().expect("guest info").clone()
@@ -91,7 +88,7 @@ impl GuestCtl {
     /// Send a request and wait for its reply. Errors if not connected.
     pub async fn request(&self, body: ControlBody) -> io::Result<ControlBody> {
         let (tx, rx) = oneshot::channel();
-        self.reqs.send(Req::Send { body, reply: tx }).map_err(|_| io::Error::other("guest control task ended"))?;
+        self.reqs.send(Req { body, reply: tx }).map_err(|_| io::Error::other("guest control task ended"))?;
         tokio::time::timeout(Duration::from_secs(30), rx)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "guest request timed out"))?
@@ -116,7 +113,7 @@ impl GuestCtl {
 
     pub async fn detach(&self, agent: &AgentId, kill_processes: bool) -> io::Result<()> {
         self.cfg.lock().expect("guest cfg").slots.retain(|s| &s.agent_id != agent);
-        if !self.is_ready() {
+        if !*self.ready.borrow() {
             return Ok(()); // the next `configure` carries the reduced slot set
         }
         expect_ok(self.request(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes }).await?)
@@ -183,7 +180,7 @@ impl Task {
                 }
             }
             // Fail queued requests while disconnected.
-            while let Ok(Req::Send { reply, .. }) = reqs.try_recv() {
+            while let Ok(Req { reply, .. }) = reqs.try_recv() {
                 let _ = reply.send(Err(io::Error::new(io::ErrorKind::NotConnected, "guest not connected")));
             }
             tokio::select! {
@@ -267,7 +264,7 @@ impl Task {
                     self.route(c, f);
                 }
                 req = reqs.recv() => {
-                    let Some(Req::Send { body, reply }) = req else { return Ok(()) };
+                    let Some(Req { body, reply }) = req else { return Ok(()) };
                     match c.send(body).await {
                         Ok(id) => { c.pending.insert(id, reply); }
                         Err(e) => {
