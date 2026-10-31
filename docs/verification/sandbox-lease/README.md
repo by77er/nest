@@ -46,7 +46,7 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 | Grant | `place(sbx, e)` | no lease (same e live: return its host; any other row, or same e expired: FORBIDDEN); a `burst` host `active` with a helloed socket that fits | insert `(sbx, h, e, expired 0)`, queue `sandbox_create(e)` (same synchronous block) | `fleet.ts:1191-1260` |
 | Expire | `tick` | host `active/draining`, `now - last_rx ≥ 30 s`, a live lease | all its leases `expired := 1`; host `stonith_pending`; close sockets; EC2 terminate + poll | `1304-1309`, `1749-1765` |
 | StonithFence | hello, every tick with a socket, failed fence | expired leases not queued and not covered by a pending `stonith_fence` | `fence{sandboxes}` with purpose `stonith_fence` | `795`, `1317`, `1805-1825` |
-| FenceOk | `command_result` ok of a `stonith_fence` | — | `recordStale`; host `active` if no other expired lease and a socket; `queueReassign` | `1107-1121`, `1827-1830` |
+| FenceOk | `command_result` ok of a `stonith_fence` | — | `recordStale`; host `active` if no other expired lease and a socket, and FleetDO isn't terminating it (EC2 and an instance id; the model's `StonithClear` needs `ec2[h] = "running"`, refactor/fleet); `queueReassign` | `1107-1121`, `1827-1830`; `stonithDoneIfClear` |
 | HostDead | EC2 `isDead` (`null`, `shutting-down`, `terminated`) or operator | — | host `dead`; `queueReassign` every lease | `1787-1803`, `1833-1842` |
 | HolderFenced | holder's `sandbox_state{fenced}` (event or hello) | lease `(h, e, ¬expired)` | forward to SandboxDO, `recordStale`, `queueReassign` | `1003-1016`, `842`, `860-864` |
 | Unreported | hello of a new nestd process | live lease not in the report | suspended: Evict; else `queueReassign` | `790`, `804-816` |

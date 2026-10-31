@@ -429,9 +429,10 @@ EnsureFence(h) ==
   /\ UNCHANGED <<sbxVars, lease, status, silence, queue, fleetDestroyed, llIn, hostVars,
                  hostEv, req, ans, llReq, llAns, ghostVars>>
 
-\* stonithDoneIfClear (F:1827-1830).
+\* stonithDoneIfClear (F:1827-1830). Never once FleetDO has asked EC2 to terminate the instance:
+\* only EC2's answer (PollStonith) ends that host's STONITH.
 StonithClear(h) ==
-  /\ status[h] = "stonith" /\ connected[h] /\ ~(lease.h = h /\ lease.x)
+  /\ status[h] = "stonith" /\ connected[h] /\ ~(lease.h = h /\ lease.x) /\ ec2[h] = "running"
   /\ status' = [status EXCEPT ![h] = "active"]
   /\ UNCHANGED <<sbxVars, lease, silence, queue, fencePending, fleetDestroyed, llIn, hostVars,
                  chanVars, ghostVars>>
