@@ -164,6 +164,20 @@ interface PreviousReleaseFields {
   captain?: string | null;
 }
 
+/** AgentDO's alarm keys: each has its handler in `alarm()`'s table, so a key without one doesn't compile. */
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | typeof OUTBOX_DEADLINE;
+/** Keys only a previous release arms, still handled. */
+type LegacyDeadline = "restart";
+/** A `sync` ask's window: `ask:<ask id>`. */
+const ASK_DEADLINE = "ask:";
+type AskDeadline = `${typeof ASK_DEADLINE}${string}`;
+/** `Deadlines`, taking AgentDO's keys only (the class takes any string). */
+type AgentDeadlines = Pick<Deadlines, "runDue" | "reschedule"> & {
+  set(key: AgentDeadline | AskDeadline, at: number, keepEarlier?: boolean): Promise<void>;
+  clear(key: AgentDeadline | AskDeadline): Promise<void>;
+  has(key: AgentDeadline | AskDeadline): boolean;
+};
+
 /** Points where a test can force an interleaving (`testHooks`). */
 export type HookPoint =
   | "intent:beforeCommit" | "resolveHands:afterResolve" | "dispatch:beforeWrite" | "sandboxMoved:enter" | "kill:beforeIssue"
@@ -233,7 +247,7 @@ export class AgentDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   // `!`: set in the constructor, except on the health instance, which serves only `health()`.
   private readonly rel!: ReliableChannels;
-  private readonly deadlines!: Deadlines;
+  private readonly deadlines!: AgentDeadlines;
   private readonly inbound = new SerialQueue();
   /** The run of the intent in flight (single-flight, in memory only: the intent itself is stored). */
   private intentRun: Promise<StartResult | null> | null = null;
@@ -266,7 +280,8 @@ export class AgentDO extends DurableObject<Env> {
       PRIMARY KEY (base, offset))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     this.rel = new ReliableChannels(this.sql);
-    this.deadlines = new Deadlines(this.sql, ctx.storage);
+    const deadlines = new Deadlines(this.sql, ctx.storage);
+    this.deadlines = deadlines;
     // Channels (docs/channels/): this agent's subscriptions (for display and cleanup) with the
     // high-water seq of each one's deliveries (dedup), and its queued posts to `<agt>/events`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS channel_subs (channel TEXT NOT NULL, sub TEXT NOT NULL, hw INTEGER NOT NULL DEFAULT 0,
@@ -274,7 +289,7 @@ export class AgentDO extends DurableObject<Env> {
     // Notices taken without delivery (no `read` tool): how many, and up to which seq.
     addColumn(this.sql, "channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
     addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
-    this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
+    this.outbox = new ChannelOutbox(this.sql, deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
 
@@ -2510,7 +2525,7 @@ export class AgentDO extends DurableObject<Env> {
       this.sql.exec("INSERT INTO asks (ask, call, epoch, question, status, deadline, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ask, call, epoch, question, status, deadline, Date.now());
     }
-    if ((prior?.status ?? status) === "sync") await this.deadlines.set(`ask:${ask}`, deadline);
+    if ((prior?.status ?? status) === "sync") await this.deadlines.set(`${ASK_DEADLINE}${ask}`, deadline);
     const q = prior?.question ?? question;
     // The brain's own asks are fenced by its epoch; a guest's (`sandboxEpoch`) by FleetDO's lease check.
     if (sandboxEpoch === undefined) this.assertEpoch(fence);
@@ -2634,7 +2649,7 @@ export class AgentDO extends DurableObject<Env> {
       const waiting = this.isCurrent(this.load(), row.epoch);
       if (waiting) this.finishCall(row.epoch, row.call, outcome);
       else this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), row.epoch, row.call);
-      await this.deadlines.clear(`ask:${ask}`);
+      await this.deadlines.clear(`${ASK_DEADLINE}${ask}`);
       if (waiting) return "sync";
     }
     await this.enqueueTurn({ kind: "ask_answer", text: `Answer to your question ${ask}: ${answer}` });
@@ -2644,65 +2659,69 @@ export class AgentDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------------
 
   override async alarm(): Promise<void> {
-    await this.deadlines.runDue(Date.now(), async (key) => {
-      if (key === "flush") {
-        await this.flush();
-      } else if (key === "starting") {
-        const info = this.load();
-        if (info.brain?.phase === "starting" && !this.socket()) {
-          // No hello since agent_start: condemn that start (its host kills it, or refuses it under
-          // the kill's tombstone), back off the next deadline, and wake for waiting work once it is
-          // released.
-          console.warn(`agent ${info.agent}: no brain connected within ${this.startDeadline(info)} ms of agent_start@${info.brain.epoch}`);
-          const { patch, wake } = unresponsive(info, info.brain, "starting");
-          await this.condemn("no hello before the start deadline", info.brain.epoch, patch);
-          if (wake) await this.wake(true);
-        }
-      } else if (key === "no_session") {
-        const info = this.load();
-        if (info.brain?.phase === "live" && !this.socket()) {
-          // A live brain with no session and no exit for this long: condemned, so its kill and
-          // escalation prove it gone.
-          console.warn(`agent ${info.agent}: brain ${info.brain.host}@${info.brain.epoch} had no session for ${NO_SESSION_MS} ms`);
-          const { patch, wake } = unresponsive(info, info.brain, "no_session");
-          await this.condemn("no session", info.brain.epoch, patch);
-          if (wake) await this.wake(true);
-        }
-      } else if (key === "activity") {
-        await this.syncActivity();
-      } else if (key === "wake" || key === "restart") {
-        // `restart`: the previous release's retry of a start, which a wake now covers.
-        await this.wake();
-      } else if (key === "wake_after_exit") {
-        // A release's wake, counted by the crash-loop guard (a no-op once the inline wake started one).
-        await this.wake(true);
-      } else if (key === "condemned") {
-        await this.escalate();
-      } else if (key === "intent") {
+    // One handler per key: a key with none doesn't compile (`AgentDeadline`).
+    const handlers: Record<AgentDeadline | LegacyDeadline, () => Promise<void>> = {
+      flush: () => this.flush(),
+      starting: () => this.unresponsiveBrain("starting"),
+      no_session: () => this.unresponsiveBrain("no_session"),
+      activity: () => this.syncActivity(),
+      wake: () => this.wake(),
+      // A release's wake, counted by the crash-loop guard (a no-op once the inline wake started one).
+      wake_after_exit: () => this.wake(true),
+      // The previous release's retry of a start, which a wake now covers.
+      restart: () => this.wake(),
+      condemned: () => this.escalate(),
+      intent: async () => {
         try {
           await this.runIntent(true);
         } catch (e) {
           // Kept (or dropped) by `intentFailed`, which armed any retry.
           console.warn(`agent ${this.load().agent}: running the start intent failed`, e);
         }
-      } else if (key === OUTBOX_DEADLINE) {
-        await this.outbox.flush();
-      } else if (key === "prune") {
+      },
+      [OUTBOX_DEADLINE]: () => this.outbox.flush(),
+      prune: async () => {
         this.prune();
         await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
-      } else if (key.startsWith("ask:")) {
-        const ask = key.slice(4);
-        const row = this.sql.exec<{ call: string; epoch: number; status: string }>("SELECT call, epoch, status FROM asks WHERE ask = ?", ask).toArray()[0];
-        if (storedEnumOrNull(AskStatusEnum, row?.status, "asks.status") === "sync" && row) {
-          this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE ask = ?`, ask);
-          this.finishCall(row.epoch, row.call, {
-            status: "pending",
-            ask,
-            message: "Question posted. End your turn; the answer arrives as your next input.",
-          });
-        }
-      }
+      },
+    };
+    await this.deadlines.runDue(Date.now(), async (key) => {
+      if (key.startsWith(ASK_DEADLINE)) return this.askWindowLapsed(key.slice(ASK_DEADLINE.length));
+      const run = handlers[key as AgentDeadline] as (() => Promise<void>) | undefined;
+      if (run) await run();
+      else console.error(`agent ${this.load().agent}: no handler for deadline ${key}; dropped`);
     }, 5_000, [OUTBOX_DEADLINE]);
+  }
+
+  /**
+   * A brain that went unresponsive (`unresponsive`): no hello since `agent_start` within the start
+   * deadline (the command was lost, or the host never ran it), or a live brain with no session and
+   * no exit for `NO_SESSION_MS`. Condemned (its host kills it, or refuses it under the kill's
+   * tombstone; its escalation proves it gone), and woken for waiting work once it is released.
+   */
+  private async unresponsiveBrain(kind: "starting" | "no_session"): Promise<void> {
+    const info = this.load();
+    const b = info.brain;
+    if (b?.phase !== (kind === "starting" ? "starting" : "live") || this.socket()) return;
+    console.warn(kind === "starting"
+      ? `agent ${info.agent}: no brain connected within ${this.startDeadline(info)} ms of agent_start@${b.epoch}`
+      : `agent ${info.agent}: brain ${b.host}@${b.epoch} had no session for ${NO_SESSION_MS} ms`);
+    const { patch, wake } = unresponsive(info, b, kind);
+    await this.condemn(kind === "starting" ? "no hello before the start deadline" : "no session", b.epoch, patch);
+    if (wake) await this.wake(true);
+  }
+
+  /** A `sync` ask's window lapsed unanswered: the call answers `pending`, and the answer comes as a turn. */
+  private async askWindowLapsed(ask: string): Promise<void> {
+    const row = this.sql.exec<{ call: string; epoch: number; status: string }>("SELECT call, epoch, status FROM asks WHERE ask = ?", ask).toArray()[0];
+    if (storedEnumOrNull(AskStatusEnum, row?.status, "asks.status") === "sync" && row) {
+      this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE ask = ?`, ask);
+      this.finishCall(row.epoch, row.call, {
+        status: "pending",
+        ask,
+        message: "Question posted. End your turn; the answer arrives as your next input.",
+      });
+    }
   }
 
   /** Bounded growth: finished calls, asks, turns and inbox messages older than a week go away. */
