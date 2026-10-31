@@ -727,7 +727,10 @@ async fn control_lifecycle_requests() {
     let resp: CliResponse = parse_json(&r.next().await.unwrap().unwrap()).unwrap();
     assert!(matches!(&resp.result, CliResult::Ok { data } if data["sandbox_id"] == "sbx_fork"));
 
-    assert_eq!(c.request(ControlBody::PrepareSnapshot { drop_caches: true, fsfreeze: vec![] }).await, ControlBody::Ok {});
+    // An older nestd's `fsfreeze` list is ignored (unprivileged, freezing `/` would have failed),
+    // and `thaw` is a no-op.
+    let prepare = ControlBody::PrepareSnapshot { drop_caches: true, fsfreeze: vec!["/".into()] };
+    assert_eq!(c.request(prepare).await, ControlBody::Ok {});
     assert_eq!(c.request(ControlBody::Thaw {}).await, ControlBody::Ok {});
     match c.request(ControlBody::Health {}).await {
         ControlBody::HealthReport { report } => {

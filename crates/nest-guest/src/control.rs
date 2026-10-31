@@ -104,18 +104,16 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
                 let g = guest.clone();
                 blocking(move || sys::resume(&g, wall_clock_ms, &entropy_b64, fork.as_ref()).map(|clock_step_ms| ControlBody::ResumeDone { clock_step_ms })).await
             }
-            ControlBody::PrepareSnapshot { drop_caches, fsfreeze } => {
-                let g = guest.clone();
-                blocking(move || sys::prepare_snapshot(&g, drop_caches, &fsfreeze).map(|()| ControlBody::Ok {})).await
-            }
-            ControlBody::Thaw {} => {
-                let g = guest.clone();
+            // `fsfreeze` is deprecated and ignored: nothing is frozen until memory snapshots are built.
+            ControlBody::PrepareSnapshot { drop_caches, .. } => {
                 blocking(move || {
-                    sys::thaw(&g);
+                    sys::prepare_snapshot(drop_caches);
                     Ok(ControlBody::Ok {})
                 })
                 .await
             }
+            // Nothing is ever frozen, so `thaw` has nothing to undo.
+            ControlBody::Thaw {} => ControlBody::Ok {},
             ControlBody::Health {} => {
                 let g = guest.clone();
                 blocking(move || Ok(ControlBody::HealthReport { report: sys::health(&g) })).await

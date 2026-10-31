@@ -52,7 +52,7 @@ How any client of a sandbox (the agent runner's hands client today; AgentDO's `a
 
 ```json
 {"url": "wss://01jb7k3x9q-gw-nest.example.dev",
- "binding": "nbd_…", "guest": {"protocol_version": 1, "capabilities": ["pty", "cgroup_v2", "pdf", "fsfreeze"]}}
+ "binding": "nbd_…", "guest": {"protocol_version": 1, "capabilities": ["pty", "cgroup_v2", "pdf"]}}
 ```
 
 ## Versions and capabilities

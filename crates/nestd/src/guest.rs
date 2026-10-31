@@ -119,8 +119,10 @@ impl GuestCtl {
         expect_ok(self.request(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes }).await?)
     }
 
+    /// `sync` and optionally `drop_caches`. The deprecated `fsfreeze` list stays empty, so it
+    /// isn't sent; every guest image defaults it.
     pub async fn prepare_snapshot(&self, drop_caches: bool) -> io::Result<()> {
-        expect_ok(self.request(ControlBody::PrepareSnapshot { drop_caches, fsfreeze: vec![] }).await?)
+        expect_ok(self.request(ControlBody::PrepareSnapshot { drop_caches, fsfreeze: Vec::new() }).await?)
     }
 
     pub async fn thaw(&self) -> io::Result<()> {

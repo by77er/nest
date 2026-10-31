@@ -120,7 +120,7 @@ pub async fn call_with(
         tokio::spawn(conn.close());
         match outcome {
             Exchange::Done(r) => return r,
-            // Refused before anything ran (e.g. filesystems frozen for a snapshot): the same
+            // Refused before anything ran (e.g. a guest not configured yet): the same
             // policy and budget as the gateway's `busy`.
             Exchange::GuestBusy(error, after) => {
                 if let Err(r) = busy_wait(&mut retries, after, budgets, cancel, &error.message).await {
@@ -642,7 +642,7 @@ mod tests {
         let rx = CancellationToken::new();
         let started = Instant::now();
         let r = call_with(&agent, "c2".into(), bash("echo hi"), &rx, &quick()).await;
-        assert!(text_of(&r).contains("stayed busy") && text_of(&r).contains("frozen"), "{r:?}");
+        assert!(text_of(&r).contains("stayed busy") && text_of(&r).contains("not configured"), "{r:?}");
         assert!(started.elapsed() < quick().busy + Duration::from_secs(2), "took {:?}", started.elapsed());
     }
 

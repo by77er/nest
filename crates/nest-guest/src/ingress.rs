@@ -46,7 +46,7 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
         IngressRequest::Tcp { port } => tcp(reader, port).await,
         IngressRequest::Pty { agent_id, cols, rows, command, cwd, env } => {
             let (mut conn, rest) = reader.into_parts();
-            let admitted = guest.inner.lock().unwrap().admit(Gate::Pty).map(|_| ());
+            let admitted = guest.inner.lock().unwrap().admit(Gate::Configured).map(|_| ());
             if let Err(error) = admitted {
                 let _ = write_json(&mut conn, &IngressResponse::Rejected { error }).await;
                 return;

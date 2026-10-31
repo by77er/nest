@@ -1,7 +1,6 @@
 //! Lifecycle operations: resume fixups, snapshot preparation, health.
 
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use nest_protocol::guest::{AgentUsage, DiskUsage, ForkIdentity, HealthReport, error_code};
@@ -13,9 +12,6 @@ use crate::framed::err;
 use crate::state::{Guest, now_ms};
 use crate::transport::ListenSpec;
 
-// _IOWR('X', 119, int) / _IOWR('X', 120, int)
-const FIFREEZE: libc::c_ulong = 0xC004_5877;
-const FITHAW: libc::c_ulong = 0xC004_5878;
 // _IOW('R', 0x03, int[2])
 const RNDADDENTROPY: libc::c_ulong = 0x4008_5203;
 
@@ -106,46 +102,13 @@ fn add_entropy(bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write("/dev/urandom", bytes)
 }
 
-/// `sync`, optional `drop_caches`, then freeze the listed mounts.
-pub fn prepare_snapshot(guest: &Guest, drop_caches: bool, fsfreeze: &[String]) -> Result<(), ErrorBody> {
+/// Before a snapshot: `sync`, then optionally `drop_caches`.
+pub fn prepare_snapshot(drop_caches: bool) {
     // SAFETY: plain syscall.
     unsafe { libc::sync() };
     if drop_caches && std::fs::write("/proc/sys/vm/drop_caches", "3").is_err() {
         warn!("drop_caches not permitted");
     }
-    for mount in fsfreeze {
-        let path = PathBuf::from(mount);
-        if guest.inner.lock().unwrap().frozen.contains(&path) {
-            continue;
-        }
-        // Mark busy before freezing so no new hands call starts writing.
-        guest.inner.lock().unwrap().frozen.push(path.clone());
-        if let Err(e) = ioctl_dir(&path, FIFREEZE) {
-            guest.inner.lock().unwrap().frozen.retain(|p| p != &path);
-            return Err(err(error_code::INTERNAL, format!("fsfreeze {mount}: {e}"), false));
-        }
-    }
-    Ok(())
-}
-
-/// Thaw everything we froze. Idempotent.
-pub fn thaw(guest: &Guest) {
-    let frozen: Vec<PathBuf> = std::mem::take(&mut guest.inner.lock().unwrap().frozen);
-    for p in frozen {
-        if let Err(e) = ioctl_dir(&p, FITHAW) {
-            warn!(mount = %p.display(), error = %e, "thaw failed");
-        }
-    }
-}
-
-fn ioctl_dir(path: &Path, req: libc::c_ulong) -> std::io::Result<()> {
-    let f = std::fs::File::open(path)?;
-    let mut zero: libc::c_int = 0;
-    // SAFETY: FIFREEZE/FITHAW take an int argument we own.
-    if unsafe { libc::ioctl(f.as_raw_fd(), req as _, &mut zero) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub fn health(guest: &Guest) -> HealthReport {
@@ -215,9 +178,6 @@ pub fn capabilities(guest: &Guest) -> Vec<String> {
     }
     if which("pdftotext").is_some() {
         caps.push("pdf".into());
-    }
-    if is_root() {
-        caps.push("fsfreeze".into());
     }
     caps
 }
