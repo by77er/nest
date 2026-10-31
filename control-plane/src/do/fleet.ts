@@ -2047,12 +2047,9 @@ export class FleetDO extends DurableObject<Env> {
   // Autoscaling (docs/compute/autoscaling/): launch on demand, retire idle hosts, scale to zero
   // ---------------------------------------------------------------------------------------------
 
-  /**
-   * The cell this FleetDO serves: its own name (every FleetDO is `idFromName(cell)`). Legacy, one
-   * release: the `kv.cell` row older code wrote, read only, should a runtime not expose the name.
-   */
+  /** The cell this FleetDO serves: its own name (every FleetDO is `idFromName(cell)`). */
   private cellName(): string | null {
-    return this.ctx.id.name ?? this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'cell'").toArray()[0]?.value ?? null;
+    return this.ctx.id.name ?? null;
   }
 
   private cellConfig(): AwsCellConfig | null {
