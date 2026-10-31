@@ -14,7 +14,7 @@ import {
   type Caller, type ChannelDelivery, clip, type DeliveryOutcome, envelopeText, EVENT_TEXT_BYTES, Filter,
   parseChannel, type PostInput, sessionTaint, SubscribeInput,
 } from "../lib/channels";
-import { admitDelivery, channelRequestId, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
+import { admitDelivery, channelRequestId, inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import type { ReadResult } from "./channel";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { toolDef, toolDefs } from "../lib/registry";
@@ -1964,10 +1964,11 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * Mid-turn: delivered over stdin (and mirrored for the Stop hook). Between turns: becomes the next
-   * `inbox` turn. `interrupt` interrupts the running turn first.
+   * Mid-turn: pushed to the runner and mirrored in its hook cache; one it never confirms showing the
+   * model comes back as a turn when the turn completes (`TurnQueue.complete`). Between turns: becomes
+   * the next `inbox` turn. `interrupt` interrupts the running turn first. A retried post with the same
+   * `requestId` gets the same message, delivered once.
    */
-  /** A retried post with the same `requestId` gets the same message, delivered once. */
   async postInbox(from: string, text: string, interrupt = false, requestId?: string, tainted = false): Promise<string> {
     const prior = requestId ? this.queue.messageFor(requestId) : undefined;
     if (prior) return prior;
@@ -1984,7 +1985,7 @@ export class AgentDO extends DurableObject<Env> {
       this.pushCache();
     } else {
       this.queue.recordAsTurn(message, requestId);
-      await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`, false, external);
+      await this.enqueueTurn({ kind: "inbox", text: inboxTurnText(message) }, requestId && `inbox/${requestId}`, false, external);
     }
     return message.id;
   }

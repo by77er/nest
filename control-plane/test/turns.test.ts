@@ -47,7 +47,7 @@ describe("TurnQueue (the model's Q1-Q4)", () => {
     });
   });
 
-  it("completes a turn, consuming its inbox mirror and requeueing channel notices the model never saw", async () => {
+  it("completes a turn, consuming its inbox mirror and requeueing what the model never saw", async () => {
     await withQueue((q) => {
       q.enqueue(user("work"));
       const t = q.claimNext()!.turn;
@@ -62,6 +62,11 @@ describe("TurnQueue (the model's Q1-Q4)", () => {
       const next = q.claimNext()!;
       expect(next.input).toEqual({ kind: "event_batch", text: "notice one\n\nnotice two" });
       expect(q.turnFor(`${channelRequestId("team/x", "sub_1", 3)}/requeued`)).toBe(next.turn);
+      // Any message, not only a channel's: a direct one comes back as its own turn would show it.
+      q.mirror({ ...msg("msg_direct", "ping"), from: "agt_x" }, next.turn);
+      q.mirror(msg("msg_note3", "notice three"), next.turn, channelRequestId("team/x", "sub_1", 5));
+      q.complete(next.turn);
+      expect(q.claimNext()!.input).toEqual({ kind: "inbox", text: "Message from agt_x: ping\n\nnotice three" });
     });
   });
 

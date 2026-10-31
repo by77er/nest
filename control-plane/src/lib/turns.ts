@@ -111,17 +111,17 @@ export class TurnQueue {
   }
 
   /**
-   * Q3: `turn` is done. Its inbox mirror is consumed with it, except channel notices the runner never
-   * confirmed writing to the model (no `inbox_delivered`: it was stopping), which come back as one
-   * queued turn.
+   * Q3: `turn` is done. Its inbox mirror is consumed with it, except messages the runner never
+   * confirmed writing to the model (no `inbox_delivered`), which come back as one queued turn.
    */
   complete(turn: string, now = Date.now()): void {
     this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, turn);
-    const unseen = this.sql.exec<{ message: string; request_id: string }>(
-      `SELECT message, request_id FROM inbox WHERE status = '${INBOX.delivered}' AND request_id LIKE '${CHANNEL_REQUEST}%' ORDER BY rowid`).toArray();
+    const unseen = this.sql.exec<{ message: string; request_id: string | null }>(
+      `SELECT message, request_id FROM inbox WHERE status = '${INBOX.delivered}' ORDER BY rowid`).toArray()
+      .map((r) => ({ message: JSON.parse(r.message) as InboxMessage, request_id: r.request_id }));
     if (unseen.length) {
-      const text = unseen.map((r) => (JSON.parse(r.message) as InboxMessage).text).join("\n\n");
-      this.insert({ kind: "event_batch", text }, this.ord("MAX") + 1, `${unseen[0]!.request_id}/requeued`, null, now, true);
+      const { input, requestId } = requeuedTurn(unseen);
+      this.insert(input, this.ord("MAX") + 1, requestId, null, now, true);
     }
     this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
   }
@@ -221,6 +221,21 @@ export class TurnQueue {
 }
 
 // --- decisions --------------------------------------------------------------------------------------
+
+/** An inbox message as a turn of its own shows it (a message that arrived between turns). */
+export const inboxTurnText = (m: Pick<InboxMessage, "from" | "text">) => `Message from ${m.from}: ${m.text}`;
+
+/**
+ * The turn that brings back inbox messages a finished turn never confirmed showing the model: channel
+ * notices as they are (an `event_batch`, counted as the first one's channel turn), any other message as
+ * a turn of its own would show it. Keyed by the first message, so it is queued once.
+ */
+export function requeuedTurn(unseen: { message: InboxMessage; request_id: string | null }[]): { input: TurnInput; requestId: string } {
+  const channel = (r: { request_id: string | null }) => r.request_id?.startsWith(CHANNEL_REQUEST) ?? false;
+  const text = unseen.map((r) => (channel(r) ? r.message.text : inboxTurnText(r.message))).join("\n\n");
+  const first = unseen[0]!;
+  return { input: { kind: unseen.every(channel) ? "event_batch" : "inbox", text }, requestId: `${first.request_id ?? first.message.id}/requeued` };
+}
 
 /**
  * A recovery turn's input: `notes`, then the original turn's text. A recovery turn that is itself
