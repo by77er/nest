@@ -55,19 +55,21 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
         let id = msg.id;
         let body = match msg.body {
             ControlBody::Configure { sandbox_id, epoch, hostname, agents } => {
-                let raised = {
+                let next = Identity { sandbox_id, epoch, hostname };
+                let admitted = {
                     let mut inner = guest.inner.lock().unwrap();
-                    let ok = inner.identity.as_ref().is_none_or(|i| epoch >= i.epoch);
-                    if ok {
-                        sys::configured_hostname(&guest, &hostname);
-                        inner.identity = Some(Identity { sandbox_id, epoch, hostname });
-                        inner.forked_sandbox_id = None;
+                    let admitted = Identity::admit_configure(inner.identity.as_ref(), &next);
+                    if admitted.is_ok() {
+                        sys::configured_hostname(&guest, &next.hostname);
+                        inner.identity = Some(next);
                         let keep: std::collections::HashSet<_> = agents.iter().map(|a| a.agent_id.clone()).collect();
                         inner.agents.retain(|k, _| keep.contains(k));
                     }
-                    ok
+                    admitted
                 };
-                if raised {
+                if let Err(error) = admitted {
+                    ControlBody::Error { error }
+                } else {
                     for slot in agents {
                         guest.upsert_agent(slot);
                     }
@@ -75,7 +77,6 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
                     guest.control_ready(generation);
                     continue;
                 }
-                ControlBody::Error { error: err(error_code::STALE_EPOCH, "configure would lower the epoch", false) }
             }
             ControlBody::AgentAttach { slot } => {
                 guest.upsert_agent(slot);

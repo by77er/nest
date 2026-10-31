@@ -83,10 +83,22 @@ pub enum Gate<'a> {
     Whoami,
 }
 
+impl Identity {
+    /// The guest's `configure` fence: within one sandbox the epoch never goes down. A different
+    /// sandbox id is a fork child taking over a restored parent's memory, at the child's own
+    /// epoch: only nestd for this VM (CID 2) can send `configure`, so it can't be a stale parent.
+    pub fn admit_configure(current: Option<&Identity>, next: &Identity) -> Result<(), ErrorBody> {
+        match current {
+            Some(cur) if cur.sandbox_id == next.sandbox_id && next.epoch < cur.epoch => {
+                Err(err(error_code::STALE_EPOCH, "configure would lower the epoch", false))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 pub struct Inner {
     pub identity: Option<Identity>,
-    /// Set by a fork `resume`; reported by `whoami` until the next `configure`.
-    pub forked_sandbox_id: Option<SandboxId>,
     pub agents: HashMap<AgentId, AgentRt>,
     /// Mounts currently frozen by `prepare_snapshot`; hands calls are `busy` while non-empty.
     pub frozen: Vec<PathBuf>,
@@ -151,7 +163,6 @@ impl Guest {
             cgroups,
             inner: Mutex::new(Inner {
                 identity: None,
-                forked_sandbox_id: None,
                 agents: HashMap::new(),
                 frozen: Vec::new(),
             }),
@@ -338,6 +349,21 @@ fn busy(msg: &str) -> ErrorBody {
 mod tests {
     use super::*;
 
+    #[test]
+    fn configure_fence_is_per_sandbox() {
+        let id = |sbx: &str, epoch: u64| Identity { sandbox_id: SandboxId(sbx.into()), epoch: Epoch(epoch), hostname: "h".into() };
+        let cur = id("sbx_a", 7);
+        for (current, next, ok) in [
+            (None, id("sbx_a", 1), true),
+            (Some(&cur), id("sbx_a", 6), false),
+            (Some(&cur), id("sbx_a", 7), true),
+            (Some(&cur), id("sbx_a", 8), true),
+            (Some(&cur), id("sbx_child", 1), true),
+        ] {
+            assert_eq!(Identity::admit_configure(current, &next).is_ok(), ok, "{current:?} -> {next:?}");
+        }
+    }
+
     fn slot(agent: &str) -> AgentSlot {
         AgentSlot { agent_id: AgentId(agent.into()), proxy_port: 3129, cwd: "/".into(), env: Default::default(), memory_max_bytes: None }
     }
@@ -349,7 +375,6 @@ mod tests {
         let other = AgentId("agt_b".into());
         let inner = |configured: bool, frozen: bool| Inner {
             identity: configured.then(|| Identity { sandbox_id: SandboxId("sbx_a".into()), epoch: Epoch(7), hostname: "h".into() }),
-            forked_sandbox_id: None,
             agents: [(agent.clone(), AgentRt { slot: slot("agt_a"), cwd: "/".into(), reads: HashMap::new(), tasks: HashMap::new(), running_calls: 0 })].into(),
             frozen: if frozen { vec!["/".into()] } else { vec![] },
         };

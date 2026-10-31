@@ -66,7 +66,7 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 **Rules:**
 - **Startup order:** the guest must send `hello` before anything else. The host must send `configure` before any hands call is accepted. Until then, hands and ingress-PTY return `error{code: "busy", retryable: true}`.
 - **Versions:** a v1 host requires an equal `protocol_version`; v2 accepts a [range](#versions-v2). Outside it, the host replies `error{unsupported_version}` and closes.
-- **Fencing:** the guest stores `epoch` from the last `configure` and **rejects hands calls with a different epoch** (`stale_epoch`). nestd only ever raises the epoch, and the guest enforces it: a `configure` with a **lower** epoch is rejected with `error{stale_epoch}` and changes nothing.
+- **Fencing:** the guest stores `epoch` from the last `configure` and **rejects hands calls with a different epoch** (`stale_epoch`). nestd only ever raises the epoch, and the guest enforces it: a `configure` with a **lower** epoch for the same `sandbox_id` is rejected with `error{stale_epoch}` and changes nothing. A different `sandbox_id` is a fork child configuring its restored parent's memory at its own epoch, and is accepted: only this VM's nestd (CID 2) can send `configure`.
 - **Reconnects:** if the control connection drops (vsock resets on every snapshot restore), the host reconnects. The guest sends a new `hello`. `boot_id` is the kernel boot id (`/proc/sys/kernel/random/boot_id`; it survives a memory restore and changes on reboot) and `instance_id` is random per guest-agent process:
 
   | vs. previous hello | Meaning | Host sends |
@@ -112,7 +112,7 @@ A memory snapshot keeps the guest agent it was taken with ([guest agent](../../s
 |---|---|
 | Clock | `clock_settime(CLOCK_REALTIME, wall_clock_ms)`, then `chronyc makestep` if chrony is present. Reply with the step applied. |
 | Randomness | Mix `entropy_b64` into the RNG with `RNDADDENTROPY` (Firecracker's VMGenID also triggers a kernel reseed on 6.x guests; we do both). |
-| Fork (when `fork` is set) | Write `machine_id` to `/etc/machine-id`, set `hostname`, store `new_sandbox_id` for `nest whoami`. Old-identity caches (e.g. ssh host keys, if any) are the image's business. |
+| Fork (when `fork` is set) | Write `machine_id` to `/etc/machine-id`, set `hostname`, `new_sandbox_id` becomes the guest's sandbox id (`nest whoami` reports it). Old-identity caches (e.g. ssh host keys, if any) are the image's business. |
 | Clients | Network connections are already dead: the netns listeners are new, and resetting is the clients' job. |
 
 ## Agent slots and exec context
@@ -307,7 +307,7 @@ Programs in the sandbox run the `nest` binary, which connects to `/run/nest/gues
 | `emit` | `event`, `payload` (JSON) | `ok` |
 | `ask` | `question`, `options[]`, `wait_s` (≤ 120, default 120) | `answered{answer}` within the wait, else `pending{question_id}` (the answer arrives as the agent's next turn input) |
 | `expose` | `port`, `exposed` | `ok`, or `error` (policy refusal) |
-| `whoami` | — | `ok{data: {sandbox_id, agent_id?, epoch}}`. After a fork `resume` it reports `new_sandbox_id` until the next `configure` |
+| `whoami` | — | `ok{data: {sandbox_id, agent_id?, epoch}}`. After a fork `resume` it reports `new_sandbox_id` |
 
 nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a fleet `guest_cli` event, and the control plane runs them as the platform tools of the same name (`expose` → `expose_port`; `emit` takes `payload.summary`, `payload.url`, `payload.title`). See [fleet](../control-host/fleet/).
 

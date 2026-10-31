@@ -689,6 +689,18 @@ async fn cli_relay_and_whoami() {
     assert_eq!(resp.result, CliResult::Ok { data: json!({"sandbox_id": "sbx_test", "agent_id": null, "epoch": EPOCH}) });
 }
 
+/// B4: after a memory restore the guest holds the parent's identity; nestd configures the fork
+/// child at the child's own epoch (1) before `resume{fork}`. The fence is per sandbox id.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_child_configures_at_its_own_epoch() {
+    let (h, mut c) = configured().await;
+    let child = ControlBody::Configure { sandbox_id: SandboxId("sbx_child".into()), epoch: Epoch(1), hostname: "sbx-child".into(), agents: vec![slot(&h.ws)] };
+    assert_eq!(c.request(child).await, ControlBody::Ok {});
+    let mut req = request("c1", json!({"tool": "Bash", "command": "true"}));
+    req.epoch = Epoch(1);
+    assert!(matches!(call_raw(&h, &req).await.last(), Some(HandsResponse::Result { .. })), "hands refused at the child's epoch");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn control_lifecycle_requests() {
     let (h, mut c) = configured().await;
@@ -721,9 +733,9 @@ async fn control_lifecycle_requests() {
         }
         other => panic!("{other:?}"),
     }
-    // Lowering the epoch is refused; detaching removes the agent.
+    // Lowering the epoch (of the sandbox the guest now is) is refused; detaching removes the agent.
     let low = ControlBody::Configure {
-        sandbox_id: SandboxId("sbx_test".into()),
+        sandbox_id: SandboxId("sbx_fork".into()),
         epoch: Epoch(EPOCH - 1),
         hostname: "x".into(),
         agents: vec![],

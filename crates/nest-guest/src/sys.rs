@@ -75,7 +75,9 @@ pub fn resume(guest: &Guest, wall_clock_ms: i64, entropy_b64: &str, fork: Option
         } else {
             warn!("not root: fork identity recorded but machine-id/hostname unchanged");
         }
-        guest.inner.lock().unwrap().forked_sandbox_id = Some(f.new_sandbox_id.clone());
+        if let Some(id) = guest.inner.lock().unwrap().identity.as_mut() {
+            id.sandbox_id = f.new_sandbox_id.clone();
+        }
         info!(sandbox = %f.new_sandbox_id, "took fork identity");
     }
     applied

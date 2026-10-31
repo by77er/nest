@@ -58,16 +58,9 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
         CliCommand::Whoami {} => {
             let inner = guest.inner.lock().unwrap();
             match inner.admit(Gate::Whoami) {
-                Ok(id) => {
-                    let sandbox = inner.forked_sandbox_id.clone().unwrap_or_else(|| id.sandbox_id.clone());
-                    CliResult::Ok {
-                        data: serde_json::json!({
-                            "sandbox_id": sandbox,
-                            "agent_id": req.agent_id,
-                            "epoch": id.epoch,
-                        }),
-                    }
-                }
+                Ok(id) => CliResult::Ok {
+                    data: serde_json::json!({ "sandbox_id": id.sandbox_id, "agent_id": req.agent_id, "epoch": id.epoch }),
+                },
                 Err(error) => CliResult::Error { error },
             }
         }
