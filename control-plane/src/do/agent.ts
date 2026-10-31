@@ -1834,7 +1834,7 @@ export class AgentDO extends DurableObject<Env> {
     if (prior) return prior;
     const info = this.load();
     const message: InboxMessage = { id: newId("msg_"), from, text, interrupt, ts_ms: Date.now() };
-    // Another agent's text reaches the model inline (stdin, the Stop hook, or a turn): when it may be
+    // Another agent's text reaches the model inline (a hook from the inbox mirror, or a turn): when it may be
     // tainted, so is this session from now on (written with the message, in this step).
     if (tainted) this.kvPut("read_tainted", true);
     const external = from !== SYSTEM_SENDER;
