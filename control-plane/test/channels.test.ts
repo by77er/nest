@@ -671,6 +671,25 @@ describe("channel tools through the dispatch path", () => {
     expect((await batchTurns(s.agent)).length).toBe(0);
   });
 
+  it("mid-turn, another channel's notice waits for the next turn instead of joining this one", async () => {
+    const s = await setup();
+    const name = `team/${uniq("mid")}`;
+    await s.call("channel_create", { channel: name });
+    s.value(await s.call("subscribe", { channel: name, batch_ms: 0 }));
+    const t = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201)).turn;
+    await s.ws.next("run_turn");
+    await postAs(name, { text: "review this" }, 201);
+    await fanoutNow(name);
+    // Not pushed into the running turn (where a busy model can pass over it): queued after it.
+    expect(await s.ws.next("inbox", () => true, 500).catch(() => null)).toBeNull();
+    expect((await batchTurns(s.agent)).map((x) => x.status)).toEqual(["queued"]);
+    const ev = (seq: number, body: Record<string, unknown>) => ({ agent: s.agent, epoch: s.start.epoch, seq, ts_ms: Date.now(), turn: t, ...body });
+    s.ws.send({ type: "events", seq: s.nextSeq(), events: [ev(1, { type: "turn_started", input_kind: "user" }), ev(2, { type: "turn_completed", stop_reason: "end_turn" })] });
+    const next = await s.ws.next("run_turn", () => true, 10_000);
+    expect(next.input.kind).toBe("event_batch");
+    expect(next.input.text).toContain(`Channel ${name}: 1 new message (seq 1)`);
+  });
+
   it("rule 1: a channel write re-checks the agent epoch after its awaits (a superseded brain posts nothing)", async () => {
     const s = await setup();
     const name = `team/${uniq("fence")}`;

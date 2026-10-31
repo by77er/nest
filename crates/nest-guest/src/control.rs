@@ -59,6 +59,7 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
                     let mut inner = guest.inner.lock().unwrap();
                     let ok = inner.identity.as_ref().is_none_or(|i| epoch >= i.epoch);
                     if ok {
+                        sys::configured_hostname(&guest, &hostname);
                         inner.identity = Some(Identity { sandbox_id, epoch, hostname });
                         inner.forked_sandbox_id = None;
                         let keep: std::collections::HashSet<_> = agents.iter().map(|a| a.agent_id.clone()).collect();

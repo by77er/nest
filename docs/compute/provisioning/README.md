@@ -20,7 +20,7 @@ One host image for both [host kinds](../), and one launch template per kind; a h
 
 **Launch templates,** one per host kind, both resolving the host AMI and requiring IMDSv2 with hop limit 1:
 - **Sandbox hosts:** nested virtualization enabled, restricted to the 8i family (the IAM policy allows `c8i*.*`, `m8i*.*`, `r8i*.*`; the instance types the autoscaler picks are a list in the cell stack, proved to fall inside those patterns, and written with the rest of `AWS_CELLS`). Prefer `d` variants for local NVMe. No hugepage pool: guest memory is regular pages, and bootstrap clears any pool an older AMI reserved ([memory](../../sandbox/state/memory/)).
-- **Brain hosts:** the cheapest x86 class that runs Claude Code, `t3a.medium` then `t3.medium` (x86 because the one AMI is x86_64; IAM allows `t3a*.*` and `t3*.*` from this template only, and the cell stack proves its list falls inside), standard CPU credits, no nested virtualization, no hugepages ([brain hosts](../brain-hosts/)). Its section of `AWS_CELLS` (`brain`: template, instance types, spot, `max_hosts`, `idle_grace_ms`, `max_brains_per_host`) drives FleetDO's brain-host autoscaler.
+- **Brain hosts:** the cheapest x86 class that runs Claude Code, `t3a.medium` then `t3.medium` (x86 because the one AMI is x86_64; IAM allows `t3a*.*` and `t3*.*` from this template only, and the cell stack proves its list falls inside), unlimited CPU credits ([brain hosts](../brain-hosts/)), no nested virtualization, no hugepages ([brain hosts](../brain-hosts/)). Its section of `AWS_CELLS` (`brain`: template, instance types, spot, `max_hosts`, `idle_grace_ms`, `max_brains_per_host`) drives FleetDO's brain-host autoscaler.
 
 **Network:**
 - Public subnet with public IPv4, no NAT.

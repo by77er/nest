@@ -468,14 +468,16 @@ def cell (spec : CellSpec) : Infra Unit := do
       updateDefaultVersion := true }
 
   -- The brain launch template: the same AMI, cheap instances without nested virtualization, the
-  -- brain security group and role, IMDSv2 with hop limit 1, tagged `nest=true`, standard CPU
-  -- credits (a burstable type never bills for surplus). Its user data writes `role: brain`.
+  -- brain security group and role, IMDSv2 with hop limit 1, tagged `nest=true`, unlimited CPU
+  -- credits: with standard credits a fresh t3a.medium ran out under 12-16 brains and was held to
+  -- 0.4 vCPU (stress test, 2026-10-31); surplus bills about $0.05 a vCPU-hour, and an idle host is
+  -- retired. Its user data writes `role: brain`.
   let brainTemplate ← LaunchTemplate.create "brain"
     { name := lit s!"nest-{spec.name}-brain"
       imageId := lit "resolve:ssm:" ++ hostAmi.name
       iamInstanceProfile := some { arn := brainProfile.arn }
       vpcSecurityGroupIds := some (array [brainSg.id])
-      creditSpecification := some { cpuCredits := "standard" }
+      creditSpecification := some { cpuCredits := "unlimited" }
       metadataOptions := some { httpEndpoint := "enabled", httpTokens := "required", httpPutResponseHopLimit := 1
                                 instanceMetadataTags := "disabled" }
       instanceInitiatedShutdownBehavior := "terminate"

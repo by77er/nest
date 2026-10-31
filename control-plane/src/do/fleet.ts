@@ -2198,6 +2198,11 @@ export class FleetDO extends DurableObject<Env> {
   private async confirmTerminations(): Promise<void> {
     const ec2 = this.ec2();
     if (!ec2) return;
+    // A host that died without its launch marked (by a previous release; one from 2026-10-21 was
+    // still open ten days later) ends like any other dead host's, or its row never ends and is never
+    // pruned. A re-enrolled host's row names its successor, never the dead one.
+    this.sql.exec(`UPDATE launched SET reason = 'dead' WHERE reason IS NULL AND ended_ms IS NULL
+      AND host IN (SELECT host FROM hosts WHERE status = 'dead')`);
     for (const r of this.sql.exec<{ instance_id: string }>(
       "SELECT instance_id FROM launched WHERE reason IS NOT NULL AND ended_ms IS NULL").toArray()) {
       try {
