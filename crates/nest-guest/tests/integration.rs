@@ -717,6 +717,9 @@ async fn control_lifecycle_requests() {
         })
         .await;
     assert!(matches!(body, ControlBody::ResumeDone { .. }));
+    // A resume that can't reseed the RNG fails rather than reporting success.
+    let bad = ControlBody::Resume { wall_clock_ms: nest_guest::state::now_ms(), entropy_b64: "!!".into(), fork: None };
+    assert!(matches!(c.request(bad).await, ControlBody::Error { error } if error.code == "bad_request"));
     let mut s = UnixStream::connect(&h.cli).await.unwrap();
     write_json(&mut s, &CliRequest { agent_id: None, command: CliCommand::Whoami {} }).await.unwrap();
     let mut r = FramedReader::new(s);

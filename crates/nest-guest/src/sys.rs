@@ -38,9 +38,18 @@ pub fn configured_hostname(guest: &Guest, hostname: &str) {
     }
 }
 
+/// Host entropy mixed in on every resume (the contract's `entropy_b64`).
+const RESUME_ENTROPY_BYTES: usize = 64;
+
 /// Apply `resume`: step the clock, mix in entropy, and on a fork take the new identity.
-/// Returns the clock step actually applied (0 when unprivileged).
-pub fn resume(guest: &Guest, wall_clock_ms: i64, entropy_b64: &str, fork: Option<&ForkIdentity>) -> i64 {
+/// Returns the clock step actually applied (0 when unprivileged). Fails, rather than reporting
+/// success, when the RNG could not be reseeded: two clones of one snapshot would share its state.
+pub fn resume(guest: &Guest, wall_clock_ms: i64, entropy_b64: &str, fork: Option<&ForkIdentity>) -> Result<i64, ErrorBody> {
+    let entropy = base64::engine::general_purpose::STANDARD
+        .decode(entropy_b64)
+        .ok()
+        .filter(|e| e.len() == RESUME_ENTROPY_BYTES)
+        .ok_or_else(|| err(error_code::BAD_REQUEST, format!("entropy_b64 must be {RESUME_ENTROPY_BYTES} bytes of base64"), false))?;
     let step = wall_clock_ms - now_ms();
     let applied = if step.abs() < 5 {
         0
@@ -61,9 +70,6 @@ pub fn resume(guest: &Guest, wall_clock_ms: i64, entropy_b64: &str, fork: Option
         && let Some(chronyc) = which("chronyc") {
             let _ = std::process::Command::new(chronyc).arg("makestep").output();
         }
-    if let Ok(entropy) = base64::engine::general_purpose::STANDARD.decode(entropy_b64) {
-        add_entropy(&entropy);
-    }
     if let Some(f) = fork {
         if is_root() {
             if let Err(e) = std::fs::write("/etc/machine-id", format!("{}\n", f.machine_id)) {
@@ -80,11 +86,12 @@ pub fn resume(guest: &Guest, wall_clock_ms: i64, entropy_b64: &str, fork: Option
         }
         info!(sandbox = %f.new_sandbox_id, "took fork identity");
     }
-    applied
+    add_entropy(&entropy).map_err(|e| err(error_code::INTERNAL, format!("could not mix entropy into the RNG: {e}"), false))?;
+    Ok(applied)
 }
 
 /// RNDADDENTROPY when root (credits entropy); otherwise mix into the pool via /dev/urandom.
-fn add_entropy(bytes: &[u8]) {
+fn add_entropy(bytes: &[u8]) -> std::io::Result<()> {
     if is_root()
         && let Ok(f) = std::fs::OpenOptions::new().write(true).open("/dev/random") {
             let mut buf = Vec::with_capacity(8 + bytes.len());
@@ -93,10 +100,10 @@ fn add_entropy(bytes: &[u8]) {
             buf.extend_from_slice(bytes);
             // SAFETY: struct rand_pool_info { int entropy_count; int buf_size; u32 buf[] }.
             if unsafe { libc::ioctl(f.as_raw_fd(), RNDADDENTROPY as _, buf.as_ptr()) } == 0 {
-                return;
+                return Ok(());
             }
         }
-    let _ = std::fs::write("/dev/urandom", bytes);
+    std::fs::write("/dev/urandom", bytes)
 }
 
 /// `sync`, optional `drop_caches`, then freeze the listed mounts.
