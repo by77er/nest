@@ -4,8 +4,8 @@
 //! check the size first, `offset`/`limit` reads stream with a scan cap and honor cancellation, and
 //! helpers (pdftotext, vips, convert) run as the sandbox user with a deadline and an output cap.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{File, Metadata};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{require_absolute, text};
 use crate::exec::{PreExec, agent_env, run_helper, which};
-use crate::hands::files::{record_digest, record_read};
+use crate::hands::files::{Refusal, open_regular, record_digest, record_read};
 use crate::state::Guest;
 
 pub const DEFAULT_LIMIT: u64 = 2000;
@@ -47,34 +47,37 @@ fn interrupted() -> Result<HandsResult, ErrorBody> {
 
 pub fn run(guest: &Guest, agent: &AgentId, input: ReadInput, cancel: &CancellationToken) -> Result<HandsResult, ErrorBody> {
     let path = require_absolute(&input.file_path)?;
-    let meta = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return fail(format!("Permission denied: {}", path.display())),
-        Err(_) => return fail("File does not exist."),
+    let (mut file, meta) = match open_regular(&path, false) {
+        Ok(v) => v,
+        Err(Refusal::Missing) => return fail("File does not exist."),
+        Err(Refusal::Directory) => {
+            return fail(format!("{} is a directory, not a file. Use Glob or `ls` via Bash to list it.", path.display()));
+        }
+        Err(Refusal::NotRegular) => {
+            return fail(format!(
+                "{} is not a regular file (FIFO, socket or device), so Read could block forever. Use Bash (e.g. `head -c`) instead.",
+                path.display()
+            ));
+        }
+        Err(Refusal::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return fail(format!("Permission denied: {}", path.display()));
+        }
+        Err(Refusal::Io(e)) => return fail(format!("Could not read file: {e}")),
     };
-    if meta.is_dir() {
-        return fail(format!("{} is a directory, not a file. Use Glob or `ls` via Bash to list it.", path.display()));
-    }
-    if !meta.is_file() {
-        return fail(format!(
-            "{} is not a regular file (FIFO, socket or device), so Read could block forever. Use Bash (e.g. `head -c`) instead.",
-            path.display()
-        ));
-    }
     let mut head = [0u8; 16];
-    let n = match File::open(&path).and_then(|mut f| f.read(&mut head)) {
+    let n = match file.read(&mut head).and_then(|n| file.rewind().map(|_| n)) {
         Ok(n) => n,
         Err(e) => return fail(format!("Could not read file: {e}")),
     };
     let head = &head[..n];
     if let Some(mime) = image_type(head) {
-        return read_image(guest, agent, &path, meta.len(), mime);
+        return read_image(guest, agent, &path, file, &meta, mime);
     }
     if head.starts_with(b"%PDF-") {
         return read_pdf(guest, agent, &path, input.pages.as_deref());
     }
     if path.extension().and_then(|e| e.to_str()) == Some("ipynb") {
-        return read_notebook(guest, agent, &path, meta.len());
+        return read_notebook(guest, agent, &path, file, &meta);
     }
     if input.offset.is_none() && input.limit.is_none() {
         if meta.len() > WHOLE_FILE_MAX_BYTES {
@@ -86,11 +89,11 @@ pub fn run(guest: &Guest, agent: &AgentId, input: ReadInput, cancel: &Cancellati
             ));
         }
         if meta.len() == 0 {
-            record_read(guest, agent, &path, &[]);
+            record_read(guest, agent, &path, &meta, &[]);
             return Ok(text(false, "Warning: the file exists but is empty.", detail("empty", 0, false)));
         }
     }
-    read_text(guest, agent, &path, input.offset, input.limit, cancel)
+    read_text(guest, agent, &path, file, &meta, input.offset, input.limit, cancel)
 }
 
 /// Read one line (including its `\n`) keeping at most `cap` bytes of it in `out`. Returns the
@@ -119,18 +122,17 @@ fn read_line_capped<R: BufRead>(r: &mut R, out: &mut Vec<u8>, cap: usize, hasher
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_text(
     guest: &Guest,
     agent: &AgentId,
     path: &Path,
+    file: File,
+    meta: &Metadata,
     offset: Option<u64>,
     limit: Option<u64>,
     cancel: &CancellationToken,
 ) -> Result<HandsResult, ErrorBody> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => return fail(format!("Could not read file: {e}")),
-    };
     let start = offset.unwrap_or(1).max(1);
     let count = limit.unwrap_or(DEFAULT_LIMIT).max(1);
     let end = start.saturating_add(count - 1);
@@ -179,7 +181,7 @@ fn read_text(
         }
     }
     if total == 0 {
-        record_read(guest, agent, path, &[]);
+        record_read(guest, agent, path, meta, &[]);
         return Ok(text(false, "Warning: the file exists but is empty.", detail("empty", 0, false)));
     }
     let total_note = if complete { total.to_string() } else { format!("at least {total}") };
@@ -198,7 +200,7 @@ fn read_text(
         ));
     }
     if !partial {
-        record_digest(guest, agent, path, hasher.finalize().into());
+        record_digest(guest, agent, path, meta, hasher.finalize().into());
     }
     Ok(text(false, out, detail("text", total, partial)))
 }
@@ -239,8 +241,8 @@ fn cleanup(pre: &PreExec) {
     }
 }
 
-fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    let mut f = File::open(path)?;
+fn hash_file(mut f: &File) -> std::io::Result<[u8; 32]> {
+    f.rewind()?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -252,9 +254,10 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     }
 }
 
-fn read_image(guest: &Guest, agent: &AgentId, path: &Path, size: u64, mime: &str) -> Result<HandsResult, ErrorBody> {
+fn read_image(guest: &Guest, agent: &AgentId, path: &Path, file: File, meta: &Metadata, mime: &str) -> Result<HandsResult, ErrorBody> {
+    let size = meta.len();
     let (data, mime) = if size > MAX_IMAGE_BYTES {
-        match shrink_image(guest, agent, path) {
+        match shrink_image(guest, agent, path, &file) {
             Some(j) => (j, "image/jpeg"),
             None => {
                 return fail(format!(
@@ -267,13 +270,13 @@ fn read_image(guest: &Guest, agent: &AgentId, path: &Path, size: u64, mime: &str
         }
     } else {
         let mut bytes = Vec::with_capacity(size as usize);
-        if let Err(e) = File::open(path).and_then(|f| f.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)) {
+        if let Err(e) = (&file).take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes) {
             return fail(format!("Could not read file: {e}"));
         }
         (bytes, mime)
     };
-    if let Ok(d) = hash_file(path) {
-        record_digest(guest, agent, path, d);
+    if let Ok(d) = hash_file(&file) {
+        record_digest(guest, agent, path, meta, d);
     }
     Ok(HandsResult {
         is_error: false,
@@ -285,13 +288,13 @@ fn read_image(guest: &Guest, agent: &AgentId, path: &Path, size: u64, mime: &str
     })
 }
 
-fn shrink_image(guest: &Guest, agent: &AgentId, path: &Path) -> Option<Vec<u8>> {
+fn shrink_image(guest: &Guest, agent: &AgentId, path: &Path, file: &File) -> Option<Vec<u8>> {
     let (env, pre) = helper_ctx(guest, agent);
     let p = path.to_string_lossy().into_owned();
     let out = if which("vips").is_some() {
         run_helper(
             &["vips", "thumbnail_source", "[descriptor=0]", ".jpg[Q=80]", "2000"],
-            Some(File::open(path).ok()?),
+            Some(file.try_clone().ok()?),
             env,
             pre.clone(),
             HELPER_TIMEOUT,
@@ -376,12 +379,12 @@ fn pdf_page_count(guest: &Guest, agent: &AgentId, path: &Path) -> Option<u32> {
         .find_map(|l| l.strip_prefix("Pages:").and_then(|v| v.trim().parse().ok()))
 }
 
-fn read_notebook(guest: &Guest, agent: &AgentId, path: &Path, size: u64) -> Result<HandsResult, ErrorBody> {
-    if size > WHOLE_FILE_MAX_BYTES {
+fn read_notebook(guest: &Guest, agent: &AgentId, path: &Path, file: File, meta: &Metadata) -> Result<HandsResult, ErrorBody> {
+    if meta.len() > WHOLE_FILE_MAX_BYTES {
         return fail("Notebook exceeds 256 KB. Use Bash (e.g. jq) to extract specific cells.");
     }
-    let mut bytes = Vec::with_capacity(size as usize);
-    if let Err(e) = File::open(path).and_then(|f| f.take(WHOLE_FILE_MAX_BYTES + 1).read_to_end(&mut bytes)) {
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    if let Err(e) = file.take(WHOLE_FILE_MAX_BYTES + 1).read_to_end(&mut bytes) {
         return fail(format!("Could not read file: {e}"));
     }
     let nb: serde_json::Value = match serde_json::from_slice(&bytes) {
@@ -405,7 +408,7 @@ fn read_notebook(guest: &Guest, agent: &AgentId, path: &Path, size: u64) -> Resu
             }
         }
     }
-    record_read(guest, agent, path, &bytes);
+    record_read(guest, agent, path, meta, &bytes);
     Ok(text(false, out, detail("notebook", cells.len() as u64, false)))
 }
 

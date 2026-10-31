@@ -204,7 +204,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 - `cgroup.kill` on `tasks/<task_id>`. Returns the final `TaskInfo`; the output file is kept.
 
 **`Read {file_path, offset?, limit?, pages?}`**
-- **Regular files only:** FIFOs, sockets and devices → `is_error` (`not a regular file … use Bash`), since reading them could block forever.
+- **Regular files only:** FIFOs, sockets and devices → `is_error` (`not a regular file … use Bash`), since reading them could block forever. Read, Write and Edit open the path without blocking (`O_NONBLOCK`) and judge the opened fd, so a FIFO swapped in after a check can't hang them.
 - **Text:**
   - `cat -n` format: the line number right-aligned to width 6, a tab, then the line.
   - Default: 2 000 lines from `offset` (1-based, default 1). Lines over 2 000 characters are cut, with `... [truncated]`.
