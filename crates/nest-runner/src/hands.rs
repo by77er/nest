@@ -108,8 +108,12 @@ pub async fn call_with(
             epoch,
             op: op.clone(),
         };
-        if let Err(e) = conn.send_json(&req).await {
-            return ToolCallResult::error(format!("hands request failed: {e}"));
+        match conn.send_json(&req).await {
+            Ok(()) => {}
+            // Refused before any byte left (the request does not fit a frame).
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => return ToolCallResult::error(format!("hands request failed: {e}")),
+            // Part of the frame may have left: the guest may run it.
+            Err(e) => return unknown_outcome(&format!("sending the request failed ({e})")),
         }
         let outcome = exchange(agent, &mut conn, generation, &mut cancel).await;
         tokio::spawn(conn.close());
@@ -832,6 +836,37 @@ mod tests {
         assert!(text_of(&r).contains(OUTCOME_UNKNOWN), "{r:?}");
         assert_eq!(guest.requests().await.len(), 1, "the request did reach the guest");
         assert!(agent.hands_target().is_some(), "a dropped connection is not a refused target");
+    }
+
+    /// R6 (gateway-bindings B2): a request whose send fails part-way may have reached the guest,
+    /// so the call is `outcome_unknown`, not a plain error the model would retry. A "gateway"
+    /// binds, then resets the connection while the client is still writing a large request.
+    #[tokio::test]
+    async fn a_request_send_that_fails_part_way_is_an_unknown_outcome() {
+        use futures_util::{SinkExt, StreamExt};
+        use nest_protocol::gateway::{GatewayMessage, GuestInfo};
+        use tokio_tungstenite::tungstenite::Message;
+        let gw = TestGateway::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut t = gw.target(SBX, 4, AGENT);
+        t.url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tcp.set_zero_linger().unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _bind = ws.next().await;
+            let bound = GatewayMessage::Bound { guest: GuestInfo { protocol_version: 1, capabilities: vec![] }, gateway_version: 1 };
+            ws.send(Message::text(serde_json::to_string(&bound).unwrap())).await.unwrap();
+            // Read nothing: the client's write backs up, then the reset fails it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(ws);
+        });
+        let (agent, _) = agent_with_resolver(vec![target(t)]);
+        let big = op_from_mcp("Write", &json!({"file_path": "/x", "content": "x".repeat(15 << 20)})).unwrap();
+        let (_tx, rx) = oneshot::channel();
+        let r = call_with(&agent, "c1".into(), big, rx, &quick()).await;
+        assert!(r.is_error);
+        assert!(text_of(&r).contains(OUTCOME_UNKNOWN), "{r:?}");
     }
 
     #[tokio::test]
