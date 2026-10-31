@@ -12,7 +12,8 @@ use std::time::Duration;
 use nest_protocol::guest::frame::Kind;
 use nest_protocol::guest::{IngressRequest, IngressResponse, PtyControl, error_code};
 use nest_protocol::model::AgentId;
-use nix::pty::{Winsize, openpty};
+use nix::fcntl::OFlag;
+use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use tokio::io::unix::AsyncFd;
@@ -135,6 +136,20 @@ impl Master {
     }
 }
 
+/// A PTY pair whose fds are close-on-exec from the start: any process the guest spawns
+/// meanwhile (a concurrent Bash or task) would otherwise inherit the slave and keep the terminal
+/// open after the session's shell exits, so the session would never end.
+fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+    let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let name = ptsname_r(&master)?;
+    let slave = nix::fcntl::open(name.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC, nix::sys::stat::Mode::empty())?;
+    let master = OwnedFd::from(master);
+    set_winsize(master.as_raw_fd(), cols, rows);
+    Ok((master, slave))
+}
+
 fn set_winsize(fd: RawFd, cols: u16, rows: u16) {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCSWINSZ with a valid winsize pointer.
@@ -192,9 +207,8 @@ async fn pty(
         .unwrap_or_else(|| "/".into());
     let cgroup = agent_id.as_ref().and_then(|a| guest.cgroups.leaf(&a.0, "pty", &crate::state::random_hex(4)));
 
-    let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-    let pair = openpty(&ws, None).map_err(io::Error::from)?;
-    let slave_fd = pair.slave.as_raw_fd();
+    let (master_fd, slave) = open_pty(cols, rows)?;
+    let slave_fd = slave.as_raw_fd();
     let procs = cgroup.map(|p| CString::new(p.join("cgroup.procs").into_os_string().into_encoded_bytes()).unwrap());
     let run_as = guest.config.run_as;
     let mut cmd = tokio::process::Command::new(&argv[0]);
@@ -234,9 +248,9 @@ async fn pty(
             return write_json(&mut wr, &IngressResponse::Rejected { error: e }).await;
         }
     };
-    drop(pair.slave);
+    drop(slave);
     let pid = child.id().unwrap_or(0);
-    let master = Arc::new(Master::new(pair.master)?);
+    let master = Arc::new(Master::new(master_fd)?);
     write_json(&mut wr, &IngressResponse::Accepted { connected: None, pid: Some(pid) }).await?;
 
     // Host → PTY.

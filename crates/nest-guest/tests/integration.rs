@@ -572,6 +572,34 @@ async fn ingress_pty() {
     assert_eq!(exit, PtyControl::Exit { code: Some(0), signal: None });
 }
 
+/// The PTY's fds are close-on-exec: the session's own process holds its terminal on 0-2 only,
+/// and no process the guest spawns (here the session's; in the failure, a concurrent Bash task)
+/// inherits the master or the slave and keeps the terminal open after the shell exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn pty_fds_are_not_inherited() {
+    let (h, _c) = configured().await;
+    let s = emulator::connect(&h.socket, PORT_INGRESS).await.unwrap();
+    let (r, mut w) = tokio::io::split(s);
+    let cmd = "for f in /proc/self/fd/*; do echo \"${f##*/} $(readlink $f)\"; done";
+    let req = IngressRequest::Pty { agent_id: None, cols: 80, rows: 24, command: Some(vec!["/bin/sh".into(), "-c".into(), cmd.into()]), cwd: None, env: Default::default() };
+    write_json(&mut w, &req).await.unwrap();
+    let mut r = FramedReader::new(r);
+    let mut out = String::new();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(10), r.next()).await.unwrap().unwrap().unwrap();
+        match f.kind {
+            Kind::Data => out.push_str(&String::from_utf8_lossy(&f.payload)),
+            Kind::Json if parse_json::<PtyControl>(&f).is_ok() => break,
+            Kind::Json => {}
+        }
+    }
+    for line in out.lines() {
+        let (fd, target) = line.trim().split_once(' ').unwrap_or((line, ""));
+        let terminal = target.contains("/dev/pts/") || target.contains("ptmx");
+        assert!(!terminal || ["0", "1", "2"].contains(&fd), "fd {fd} -> {target} leaked into the session:\n{out}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn port_watcher_reports_new_listener() {
     let (_h, mut c) = configured().await;
