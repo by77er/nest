@@ -1826,11 +1826,12 @@ impl Inner {
     }
 
     /// A suspend that failed before it was done goes back to `running`, so it can be asked again
-    /// (SandboxDO's idle timer): the VM runs on, unless the incarnation was fenced meanwhile. A
-    /// landed commit may have marked the disk clean, so that is undone, durably, first.
+    /// (SandboxDO's idle timer): the VM runs on, unless the incarnation was fenced meanwhile or
+    /// the failure fences it. A landed commit may have marked the disk clean, so that is undone,
+    /// durably, first.
     async fn roll_back_suspend(&self, s: &mut Sbx, why: &ErrorBody) {
         let (id, epoch) = (s.id.clone(), s.epoch);
-        if self.fenced(&id, epoch) {
+        if self.fenced(&id, epoch) || rejection_fences(&why.code) {
             return;
         }
         s.disk_clean = false;
@@ -1899,8 +1900,9 @@ impl Inner {
             s.vm.as_mut().expect("checked").pause().await.map_err(internal)?;
         }
         let (mut s, r) = self.commit(s, reason, None, self.cfg.commit_timeout()).await;
-        // Never resume a VM that was fenced while the commit was in flight.
-        if running && !self.fenced(id, epoch) {
+        // Never resume a VM that was fenced while the commit was in flight, or whose rejection
+        // fences it.
+        if running && !self.fenced(id, epoch) && !r.as_ref().is_err_and(|e| rejection_fences(&e.code)) {
             if let Some(vm) = s.vm.as_mut() {
                 let _ = vm.resume().await;
             }
@@ -2280,7 +2282,7 @@ impl Inner {
             }
             CommitOutcome::Orphaned { generation } => Ok(Some(generation)),
             CommitOutcome::Rejected { reason: why, .. } => {
-                if why == error_codes::STALE_EPOCH || why == error_codes::PARENT_MISMATCH {
+                if rejection_fences(&why) {
                     let this = self.clone();
                     let (id, epoch) = (id.clone(), s.epoch);
                     // Fence this incarnation (`fence_sandbox` checks the epoch under the summary lock:
@@ -2291,6 +2293,13 @@ impl Inner {
             }
         }
     }
+}
+
+/// Whether SandboxDO's rejection of a commit fences the incarnation: it has a newer epoch, or a
+/// head this one didn't build on. The fence runs from a spawned task (`apply_commit`), so a caller
+/// that would resume the VM checks this too, not only `fenced`.
+fn rejection_fences(code: &str) -> bool {
+    code == error_codes::STALE_EPOCH || code == error_codes::PARENT_MISMATCH
 }
 
 fn bind_listener(ns: &Netns, next: &mut u32, transport: Transport, port: u16, purpose: ListenerPurpose) -> anyhow::Result<HeldListener> {

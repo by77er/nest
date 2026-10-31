@@ -1685,6 +1685,29 @@ async fn a_failed_suspend_rolls_back_to_running() {
     assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Suspended));
 }
 
+/// A suspend or checkpoint whose commit is rejected (`parent_mismatch`: another incarnation moved
+/// the head) never resumes its VM: the rejection fences this incarnation. Both used to resume it
+/// before the fence the rejection spawns had run, so the VM of a stale epoch ran on.
+// One thread: that fence runs only once the command yields, the order that lost the race.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rejected_commit_never_resumes_its_vm() {
+    let h = start_host().await;
+    let checkpoint = |id: &str, sbx: &str| cmd(id, CommandBody::SandboxCheckpoint { sandbox: SandboxId(sbx.into()), epoch: Epoch(1), reason: CommitReason::TurnEnd });
+    for (sbx, command) in [("sbx_1", suspend_cmd("cmd_1", "sbx_1", SuspendMode::DiskOnly)), ("sbx_2", checkpoint("cmd_2", "sbx_2"))] {
+        let what = format!("{sbx} {:?}", command.body);
+        h.fleet.commands.send(vec![create(&format!("cmd_create_{sbx}"), sbx)]).unwrap();
+        assert!(is_ok(&h.fleet.result(&format!("cmd_create_{sbx}")).await));
+        *h.fleet.reject_next.lock().unwrap() = Some("parent_mismatch".into());
+        // A resume would hold the command (and its answer) until released.
+        h.resume_latch.held.store(true, Ordering::SeqCst);
+        let id = command.cmd.0.clone();
+        h.fleet.commands.send(vec![command]).unwrap();
+        assert!(!is_ok(&h.fleet.result(&id).await), "{what}");
+        assert!(!h.resume_latch.reached.load(Ordering::SeqCst), "{what} resumed its VM");
+        h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, .. } if sandbox.0 == sbx)).await;
+    }
+}
+
 /// A drain whose deadline passes while a suspend waits for its commit's answer gives the suspend
 /// that much time, never cancels it: the request is kept as unanswered, so the next commit asks
 /// again under its id. Cancelled, the record was lost, and the next commit's stale parent was
@@ -2164,8 +2187,6 @@ fn a_restarted_nestd_tears_down_leftover_netns_mounts() {
     });
 }
 
-/// The review of the fix (M2): a final refusal of a salvage (`stale_epoch`: SandboxDO will never
-/// take that work) ends the retire at once: no retry, the disk deleted, `incarnation_retired`.
 /// Inventory B1: a retire first asks again under an unanswered request; when that request was not
 /// a salvage (here a checkpoint, answered `stale_epoch` while its answer was lost), the refusal says
 /// nothing about this incarnation's work, so the salvage still runs. It used to end the retire,
@@ -2208,6 +2229,8 @@ async fn a_fence_during_a_checkpoints_resume_still_salvages() {
     assert_eq!(salvage_requests(&h.fleet, "sbx_1", 1).len(), 1, "the work after the checkpoint is salvaged");
 }
 
+/// The review of the fix (M2): a final refusal of a salvage (`stale_epoch`: SandboxDO will never
+/// take that work) ends the retire at once: no retry, the disk deleted, `incarnation_retired`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_final_salvage_refusal_ends_the_retire() {
     let h = start_host_opts(None, 300).await;
