@@ -316,4 +316,23 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
     expect((await stub.info()).working).toEqual(["agt_x"]);
     expect(await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'idle'").toArray().length)).toBe(0);
   });
+
+  it("a fenced sandbox that found no host is placed by its alarm once one has room", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell); // room for two default sandboxes
+    const s1 = await createSandbox(cell);
+    const s2 = await createSandbox(cell);
+    await events(a.ws, [
+      { type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "running" },
+      { type: "sandbox_state", sandbox: s2.sandbox, epoch: 1, state: "running" },
+      { type: "capacity", capacity: { vcpus_free: 4, memory_mib_free: 8192, hugepages_mib_free: 0, hugepages_mib_total: 8192, sandboxes: 2, agents: 0, warm: [] } },
+    ]);
+    await events(a.ws, [{ type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "fenced" }]);
+    const stub = sandboxStub(s1.sandbox);
+    expect(await stub.info()).toMatchObject({ state: "fenced", host: null });
+    const b = await hostWithRoom(cell, 8192);
+    await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'"));
+    await runDurableObjectAlarm(stub);
+    expect((await stub.info()).host).toBe(b.host);
+  });
 });

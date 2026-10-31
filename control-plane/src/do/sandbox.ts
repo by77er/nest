@@ -86,6 +86,8 @@ export interface CreateSandbox {
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
+/** Destroyed and archived are final: no transition leaves them. */
+const gone = (s: SandboxState) => s === "destroyed" || s === "archived";
 /** A `placing` marker this old belongs to a placement that never finished: reconciled against FleetDO's lease. */
 const PLACING_STALE_MS = 60_000;
 const PLACE_RETRY_MS = 30_000;
@@ -789,9 +791,10 @@ export class SandboxDO extends DurableObject<Env> {
         // An unfinished placement is reconciled first (or the deadline re-armed until it goes stale).
         await this.reconcilePlacing();
         const info = this.info_();
-        // A suspended sandbox with nobody working stays unplaced until something wakes it.
+        // A suspended sandbox with nobody working stays unplaced until something wakes it. Any other
+        // live one is placed again, whatever its last report (`fenced`, `failed`) said.
         const wanted = info.state !== "suspended" || info.working.length > 0;
-        if (info.host === null && info.placing === null && ACTIVE_STATES.includes(info.state) && wanted) await this.placeCurrentEpoch();
+        if (info.host === null && info.placing === null && !gone(info.state) && wanted) await this.placeCurrentEpoch();
       } else if (key === "turn_checkpoint") {
         await this.turnEndCheckpoint();
       } else if (key === "idle") {
