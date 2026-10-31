@@ -68,15 +68,16 @@ Before `bound`, the gateway sends a text frame `error{error{code, message, retry
 | 1 | `bad_request` | Not a well-formed text `bind` within 5 s, or an unknown route (the upgrade itself answers 404; `/pty` and `/ingress` answer 501) | No |
 | 2 | `unsupported_version` | `gateway_version` outside the served range, or a claims format this gateway does not know | No |
 | 3 | `unknown_key` | The binding's `kid` is none of the keys this gateway holds: rotated away, or never this cell's | No: resolve again |
-| 4 | `unauthorized` | Bad signature, expired, wrong scope, or a client not attached to the sandbox. The message never says which | No: resolve again once (an expired or revoked binding) |
+| 4 | `unauthorized` | Bad signature, expired, or wrong scope. The message never says which | No: resolve again once (an expired binding) |
 | 5 | `moved` | The sandbox is not on this host, or the gateway has lost nestd | No: resolve again |
 | 5 | `busy` | During a resync after the gateway reconnected to nestd, an unknown sandbox is `busy`, not `moved` | Yes, after `retry_after_ms` |
 | 6 | `stale_epoch` | The binding names an epoch older than the sandbox's current one | No: resolve again |
 | 6 | `busy` | The binding names an epoch newer than the gateway's table (a placement nestd has not pushed yet) | Yes |
-| 7 | `busy` | The guest has not been configured, or its vsock port did not answer the `CONNECT` | Yes |
-| 8 | `unsupported_version` | `bind.protocol_version` is not the guest's | No: resolve again once (the target was minted before SandboxDO heard of a guest upgrade) |
+| 7 | `unauthorized` | A client not attached to the sandbox (checked once the sandbox and epoch are known, since the attached set is that sandbox's); the same message as row 4 | No: resolve again once (a revoked binding) |
+| 8 | `busy` | The guest has not been configured, or its vsock port did not answer the `CONNECT` | Yes |
+| 9 | `unsupported_version` | `bind.protocol_version` is not the guest's | No: resolve again once (the target was minted before SandboxDO heard of a guest upgrade) |
 
-The signature is verified before any state-dependent answer, so an unsigned probe learns nothing about which sandboxes a host runs. One rule for every client (`nest_hands_client::Next`): only `busy` is retried with the same binding, per `retry_after_ms` within a 30 s budget, and a guest's own `busy` error after `bound` (refused before anything ran) shares that budget; `stale_epoch`, `moved`, `unknown_key`, `unauthorized` and `unsupported_version` mean "resolve again once", since a fresh target may carry a new epoch, key, binding or guest version; `bad_request` is final.
+The signature is verified before any state-dependent answer, so an unsigned probe learns nothing about which sandboxes a host runs. Rows 5 to 9 are checked under the lock that registers the connection, so a removal, epoch bump, detach or guest change that lands before the registration is the answer. One after it: a removal, epoch bump or lost nestd link cuts the connection (`4409`); a detach is the guest's to enforce (its slot check and cgroup kill). One rule for every client (`nest_hands_client::Next`): only `busy` is retried with the same binding, per `retry_after_ms` within a 30 s budget, and a guest's own `busy` error after `bound` (refused before anything ran) shares that budget; `stale_epoch`, `moved`, `unknown_key`, `unauthorized` and `unsupported_version` mean "resolve again once", since a fresh target may carry a new epoch, key, binding or guest version; `bad_request` is final.
 
 ## Sequence
 

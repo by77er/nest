@@ -4,9 +4,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use nest_protocol::gateway::{GuestInfo, close_code};
+use nest_protocol::gateway::{BindingClaims, GuestInfo, close_code};
 use nest_protocol::model::{Epoch, SandboxId};
 use tokio::sync::watch;
+
+use crate::verify::{self, Admission, Refusal};
 
 /// One sandbox this host runs, as nestd last described it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,14 +22,6 @@ pub struct SandboxEntry {
     /// Resync generation this entry was last (re)sent in; entries older than the current one
     /// are dropped at `resync_done`.
     generation: u64,
-}
-
-/// One read of everything a bind check needs, taken under one lock.
-#[derive(Clone, Debug)]
-pub struct Snapshot {
-    pub key: Option<Vec<u8>>,
-    pub entry: Option<SandboxEntry>,
-    pub resyncing: bool,
 }
 
 struct Conn {
@@ -120,12 +114,6 @@ impl State {
         self.read().keys.len()
     }
 
-    /// Everything one bind check needs, read under one lock.
-    pub fn snapshot(&self, kid: &str, sandbox: &SandboxId) -> Snapshot {
-        let g = self.read();
-        Snapshot { key: g.keys.get(kid).cloned(), entry: g.sandboxes.get(sandbox).cloned(), resyncing: g.resyncing }
-    }
-
     /// Add or replace a sandbox. A newer epoch cuts every connection of the old one
     /// (`close_code::MOVED`): their bindings named an epoch that is no longer current. An older
     /// epoch than the one held is refused (logged, the entry kept): accepting it would cut the
@@ -207,19 +195,21 @@ impl State {
         self.read().sandboxes.len()
     }
 
-    /// Register an open connection so a later epoch change, removal or `clear` can cut it. The
-    /// check that the sandbox is still here at this epoch happens under the same lock, so a
-    /// change between the bind check and this call cannot slip through: `None` means refuse.
-    pub fn register_conn(self: &Arc<Self>, sandbox: SandboxId, epoch: Epoch) -> Option<ConnGuard> {
-        let (tx, rx) = watch::channel(None);
+    /// Admit verified claims ([`verify::admit`]) and register the connection, under one write
+    /// lock: a removal, epoch change, detach, guest change or link loss either happened before
+    /// (and is the refusal) or happens after (and cuts the registered connection).
+    pub fn admit_and_register(
+        self: &Arc<Self>,
+        claims: &BindingClaims,
+        protocol_version: u32,
+    ) -> Result<(Admission, ConnGuard), Refusal> {
         let mut g = self.write();
-        if g.sandboxes.get(&sandbox).map(|e| e.epoch) != Some(epoch) {
-            return None;
-        }
+        let admission = verify::admit(g.sandboxes.get(&claims.sandbox), g.resyncing, claims, protocol_version)?;
+        let (tx, rx) = watch::channel(None);
         let id = g.next_conn;
         g.next_conn += 1;
-        g.conns.insert(id, Conn { sandbox, epoch, close: tx });
-        Some(ConnGuard { id, state: Arc::clone(self), rx })
+        g.conns.insert(id, Conn { sandbox: claims.sandbox.clone(), epoch: claims.epoch, close: tx });
+        Ok((admission, ConnGuard { id, state: Arc::clone(self), rx }))
     }
 
     pub fn open_connections(&self) -> usize {
@@ -238,51 +228,77 @@ fn close_matching(g: &mut Inner, pred: impl Fn(&Conn) -> bool, code: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nest_protocol::gateway::{BindingScope, error_code};
 
     fn sbx() -> SandboxId {
         SandboxId("sbx_1".into())
     }
 
+    fn v1() -> Option<GuestInfo> {
+        Some(GuestInfo { protocol_version: 1, capabilities: vec![] })
+    }
+
+    fn claims(epoch: u64) -> BindingClaims {
+        BindingClaims { v: 1, kid: "k".into(), sandbox: sbx(), epoch: Epoch(epoch), client: "agt_a".into(), scope: BindingScope::Hands, exp_ms: i64::MAX }
+    }
+
+    fn register(state: &Arc<State>, epoch: u64) -> Result<ConnGuard, &'static str> {
+        state.admit_and_register(&claims(epoch), 1).map(|(_, g)| g).map_err(|r| r.code)
+    }
+
     #[test]
     fn registration_is_refused_once_the_sandbox_left_or_changed_epoch() {
         let state = State::new();
-        assert!(state.register_conn(sbx(), Epoch(4)).is_none(), "unknown sandbox");
-        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v"), ["agt_a"], None);
-        assert!(state.register_conn(sbx(), Epoch(3)).is_none(), "old epoch");
-        assert!(state.register_conn(sbx(), Epoch(5)).is_none(), "epoch not placed yet");
-        let guard = state.register_conn(sbx(), Epoch(4)).expect("current epoch");
+        assert_eq!(register(&state, 4).err(), Some(error_code::MOVED), "unknown sandbox");
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v"), ["agt_a"], v1());
+        assert_eq!(register(&state, 3).err(), Some(error_code::STALE_EPOCH));
+        assert_eq!(register(&state, 5).err(), Some(error_code::BUSY), "epoch not placed yet");
+        let guard = register(&state, 4).expect("current epoch");
         assert_eq!(state.open_connections(), 1);
         state.remove_sandbox(&sbx());
-        assert!(state.register_conn(sbx(), Epoch(4)).is_none(), "removed");
+        assert_eq!(register(&state, 4).err(), Some(error_code::MOVED), "removed");
         drop(guard);
         assert_eq!(state.open_connections(), 0);
         // A link loss keeps the keys and forgets the sandboxes.
         state.set_key("k", &[4u8; 65]);
-        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v"), ["agt_a"], None);
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v"), ["agt_a"], v1());
         state.clear();
         assert_eq!((state.key_count(), state.sandbox_count()), (1, 0));
+    }
+
+    /// Gateway-bindings S1's caveat: the client set and the guest version were checked against a
+    /// snapshot and only the epoch again at registration, so a detach or guest upgrade in between
+    /// was admitted. Both are now checked under the registering lock.
+    #[test]
+    fn a_detach_or_guest_upgrade_before_registration_is_refused() {
+        let state = State::new();
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v"), ["agt_b"], v1());
+        assert_eq!(register(&state, 4).err(), Some(error_code::UNAUTHORIZED), "detached");
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v"), ["agt_a"], Some(GuestInfo { protocol_version: 2, capabilities: vec![] }));
+        assert_eq!(register(&state, 4).err(), Some(error_code::UNSUPPORTED_VERSION), "guest upgraded");
+        assert_eq!(state.open_connections(), 0);
     }
 
     #[test]
     fn an_epoch_going_backwards_is_refused_until_the_sandbox_is_removed() {
         let state = State::new();
-        state.upsert_sandbox(sbx(), Epoch(5), PathBuf::from("/v5"), ["agt_a"], None);
-        let mut guard = state.register_conn(sbx(), Epoch(5)).expect("current epoch");
+        state.upsert_sandbox(sbx(), Epoch(5), PathBuf::from("/v5"), ["agt_a"], v1());
+        let mut guard = register(&state, 5).expect("current epoch");
         // A late update for epoch 4: the entry, and the call on epoch 5, stay.
-        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v4"), ["agt_a"], None);
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v4"), ["agt_a"], v1());
         let e = state.sandbox(&sbx()).unwrap();
         assert_eq!((e.epoch, e.vsock_uds_path), (Epoch(5), PathBuf::from("/v5")));
-        assert!(state.register_conn(sbx(), Epoch(4)).is_none(), "the old epoch is not admitted again");
+        assert!(register(&state, 4).is_err(), "the old epoch is not admitted again");
         assert!(guard.rx.borrow().is_none(), "the current call was not cut");
         // The same epoch updates in place (clients, guest); a newer one cuts the old calls.
-        state.upsert_sandbox(sbx(), Epoch(5), PathBuf::from("/v5"), ["agt_a", "agt_b"], None);
+        state.upsert_sandbox(sbx(), Epoch(5), PathBuf::from("/v5"), ["agt_a", "agt_b"], v1());
         assert!(guard.rx.borrow().is_none());
         assert_eq!(state.sandbox(&sbx()).unwrap().clients.len(), 2);
-        state.upsert_sandbox(sbx(), Epoch(6), PathBuf::from("/v6"), ["agt_a"], None);
+        state.upsert_sandbox(sbx(), Epoch(6), PathBuf::from("/v6"), ["agt_a"], v1());
         assert_eq!(*guard.rx.borrow_and_update(), Some(close_code::MOVED));
         // After a remove, any epoch is a fresh placement.
         state.remove_sandbox(&sbx());
-        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v4"), ["agt_a"], None);
+        state.upsert_sandbox(sbx(), Epoch(4), PathBuf::from("/v4"), ["agt_a"], v1());
         assert_eq!(state.sandbox(&sbx()).unwrap().epoch, Epoch(4));
     }
 }
