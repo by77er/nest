@@ -1,6 +1,7 @@
-import { env, runDurableObjectAlarm } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { bytesToB64 } from "../src/lib/util";
+import type { AgentDO } from "../src/do/agent";
 import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -41,10 +42,13 @@ describe("agent start", () => {
   it("sends agent_start to a brain host (never the sandbox's) with the setup token, hands and session URL", async () => {
     const s = await setup();
     expect(s.start).toMatchObject({
-      agent: s.agent, role: "worker", workstream: s.workstream, epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 },
+      agent: s.agent, workstream: s.workstream, epoch: 1, hands: { sandbox: s.sandbox },
       oauth_token: "sk-ant-oat01-test", launch: { system_prompt: { mode: "append" } },
     });
     expect(s.start.session_ws_url).toMatch(new RegExp(`/v1/agents/${s.agent}/session$`));
+    // Nothing for the previous release's runners: no role, and the epoch only once.
+    expect(s.start).not.toHaveProperty("role");
+    expect(s.start.hands).toEqual({ sandbox: s.sandbox });
   });
 });
 
@@ -132,6 +136,34 @@ describe("session channel", () => {
     expect(forged.status).toBe(403);
   });
 
+  it("a flush that crosses the size threshold during a slow flush loses none of the acked bytes from R2", async () => {
+    const s = await setup();
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    const a = '{"type":"user"}\n';
+    const big = `${"x".repeat(1024 * 1024)}\n`;
+    ws.send(seg(0, a));
+    await sleep(50);
+    // The first flush is held just before its R2 put.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["flush:beforePut"] = async () => {
+        delete inst.testHooks["flush:beforePut"];
+        (inst as any).testHeld = true;
+        while (!(inst as any).testGo) await sleep(5);
+      };
+    });
+    const first = agentStub(s.agent).flush();
+    while (!(await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).testHeld))) await sleep(5);
+    ws.send(seg(a.length, big)); // past 1 MiB: flushes at once
+    while ((await agentStub(s.agent).info()).received_bytes < a.length + big.length) await sleep(10);
+    await sleep(100); // room for the threshold flush to reach R2, were it not waiting for the first
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as any).testGo = true;
+    });
+    await first;
+    await ws.next("segment_ack", (m) => m.durable_bytes === a.length + big.length);
+    expect(await agentStub(s.agent).transcript()).toBe(a + big);
+  });
+
   it("routes a stale-epoch connection's segments to the orphan branch and nothing else", async () => {
     const s = await setup();
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token, 0);
@@ -185,6 +217,35 @@ describe("platform tool relay", () => {
     expect((await adminJson(`/v1/agents/${s.agent}/asks/${pending.outcome.ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
     const turns = await agentStub(s.agent).turns();
     expect(turns.at(-1)!.input).toMatchObject({ kind: "ask_answer" });
+  });
+
+  it("an ask answered inside its window after its brain was restarted arrives as a turn (the call's result has no brain to reach)", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    ws.send(toolCall("cal_t3-1", "ask", { question: "Merge?" }));
+    await sleep(50);
+    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
+    const ask = (events.find((e) => e.type === "needs_input") as { ask: string }).ask;
+    await agentStub(s.agent).start(undefined, undefined, true); // an operator's restart condemns brain 1
+    expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
+    expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("yes") });
+  });
+
+  it("an ask answered while it is still being routed ends its call `done`, never `waiting` (which is never pruned)", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {
+      inst.testHooks["ask:beforeRoute"] = async () => {
+        delete inst.testHooks["ask:beforeRoute"];
+        await inst.answerAsk(st.storage.sql.exec<{ ask: string }>("SELECT ask FROM asks").one().ask, "yes");
+      };
+    });
+    ws.send(toolCall("cal_t4-1", "ask", { question: "Merge?" }));
+    expect((await ws.next("tool_result", (m) => m.call === "cal_t4-1")).outcome).toEqual({ status: "ok", content: [{ type: "text", text: "yes" }] });
+    await ws.next("ack");
+    const status = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ status: string }>("SELECT status FROM tool_calls WHERE call = 'cal_t4-1'").one().status);
+    expect(status).toBe("done");
   });
 
   it("an escalation event becomes an async ask whose answer arrives as a turn", async () => {

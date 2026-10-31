@@ -310,7 +310,7 @@ describe("hands_resolve on the session channel", () => {
     const s = await setup();
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.brain.ws, (c) => c.cmd === cmd);
-    expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 } });
+    expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox } });
     expect(start.hands.binding, "no binding ever passes through a host command").toBeUndefined();
     const ws = await Ws.connect(`/v1/agents/${s.agent}/session`, s.brain.host_token);
     ws.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.brain.host, instance_id: "rin_hands", epoch: 1 });

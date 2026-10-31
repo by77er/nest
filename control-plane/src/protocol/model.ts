@@ -112,6 +112,13 @@ export const AgentState = z.enum([
   "quota_parked", "stalled", "needs_attention", "detached",
 ]);
 export type AgentState = z.output<typeof AgentState>;
+/**
+ * AgentDO's own part of an agent's `state`: whether a brain is starting, running (`ready`: the
+ * runner's reports then say what it does), gone (`detached`) or given up on until new input
+ * (`errored`). The other part is the runner's last report (`AgentState`, the activity).
+ */
+export const AgentLifecycle = z.enum(["starting", "ready", "detached", "errored"]);
+export type AgentLifecycle = z.output<typeof AgentLifecycle>;
 
 // --- Egress policy -------------------------------------------------------------------------------
 

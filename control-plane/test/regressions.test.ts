@@ -119,6 +119,61 @@ describe("#2 a restarted runner is a new lineage", () => {
   });
 });
 
+describe("a finished turn's trailing events", () => {
+  it("leave the next turn's state alone: its `idle` after `turn_completed` doesn't stand for the turn now running", async () => {
+    const s = await setup();
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "one" } }, 201)).turn;
+    await ws.next("run_turn", (m) => m.turn === t1);
+    const t2 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "two" } }, 201)).turn;
+    const ev = (seq: number, turn: string, body: Record<string, unknown>) => ({ agent: s.agent, epoch: 1, seq, ts_ms: seq, turn, ...body });
+    // As the runner sends them: the turn's end, then its idle (stamped with the turn that ended).
+    ws.send({ type: "events", seq: 1, events: [ev(1, t1, { type: "turn_started", input_kind: "user" }), ev(2, t1, { type: "turn_completed", stop_reason: "end_turn" })] });
+    await ws.next("ack", (m) => m.up_to === 1);
+    await ws.next("run_turn", (m) => m.turn === t2);
+    ws.send({ type: "events", seq: 2, events: [ev(3, t1, { type: "state_changed", state: "idle" })] });
+    await ws.next("ack", (m) => m.up_to === 2);
+    expect(await agentStub(s.agent).info()).toMatchObject({ current_turn: t2, state: "working" });
+    // The running turn's own events still count.
+    ws.send({ type: "events", seq: 3, events: [ev(4, t2, { type: "state_changed", state: "waiting_permission" })] });
+    await ws.next("ack", (m) => m.up_to === 3);
+    expect((await agentStub(s.agent).info()).state).toBe("waiting_permission");
+    // Nor is it reported on `<agt>/events` (posted in order: once the running turn's change is there, any earlier one is).
+    const read = () => adminJson(`/v1/admin/channels/${encodeURIComponent(`${s.agent}/events`)}/messages`);
+    let msgs: any[] = [];
+    for (let n = 0; n < 100 && !msgs.some((m) => m.data?.state === "waiting_permission"); n++, await sleep(50)) msgs = (await read()).messages;
+    expect(msgs.filter((m) => m.kind === "state_changed").map((m) => m.data.state)).toEqual(["waiting_permission"]);
+  });
+});
+
+describe("a turn recovered while pump awaits", () => {
+  it("isn't sent after its recovery turn: the new runner gets the recovery turn alone", async () => {
+    const s = await setup();
+    await runner(s.agent, s.host.host, s.host.host_token, "rin_one");
+    // Pause the pump that claims the turn after its awaits, before it sends.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["pump:beforeSend"] = async () => {
+        delete inst.testHooks["pump:beforeSend"];
+        while (!(inst as unknown as { go?: boolean }).go) await new Promise((r) => setTimeout(r, 10));
+      };
+    });
+    const queued = adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
+    for (let n = 0; n < 100 && (await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => inst.testHooks["pump:beforeSend"] !== undefined)); n++) {
+      await sleep(20);
+    }
+    // A new runner process says hello meanwhile: the claimed turn is recovered.
+    const r2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_two");
+    const rec = await r2.ws.next("run_turn");
+    expect(rec.input.kind).toBe("recovery");
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as unknown as { go?: boolean }).go = true;
+    });
+    const t = (await queued).turn;
+    expect(await r2.ws.none("run_turn", 500, (m) => m.turn === t)).toBe(true);
+    expect((await agentStub(s.agent).info()).current_turn).toBe(rec.turn);
+  });
+});
+
 describe("#3 no lost updates across awaits", () => {
   it("a flush interleaved with enqueueTurn keeps the running turn", async () => {
     const s = await setup();
@@ -566,7 +621,7 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "wake up" } }, 201);
     const [start] = await nextCommands(s.host.ws, isStart(s.agent));
     // A new start, a new agent epoch (`hands.epoch` repeats it for the previous release's runners).
-    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox, epoch: 2 } });
+    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox } });
   });
 
   it("a brain that dies mid-turn restarts; after repeated crashes only new input retries", async () => {
@@ -626,7 +681,7 @@ describe("#23 captains move off a silent brain host", () => {
     const a = await connectHost(cell, "brain");
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: await workstream(), cell } }, 201)).agent as string;
     await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
-    const r = await runner(captain, a.host, a.host_token, "rin_cap", 0);
+    const r = await runner(captain, a.host, a.host_token, "rin_cap", 1);
     await adminJson(`/v1/agents/${captain}/turns`, { body: { text: "plan" } }, 201);
     await r.ws.next("run_turn");
     const b = await connectHost(cell, "brain");
