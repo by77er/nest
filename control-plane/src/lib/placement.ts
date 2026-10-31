@@ -44,7 +44,7 @@ export function pickSandboxHost(hosts: readonly SandboxHostFacts[], need: { vcpu
     if (!cap) return { room: n ? 0 : Infinity, fits: n === 0 };
     // A lease that reported before marks existed (state set, no state_seq) is counted.
     const pending = h.leases.filter((l) => l.state === null || (l.state_seq !== null && (h.capacity_seq ?? 0) <= l.state_seq));
-    const hugepageHost = (cap.hugepages_mib_total ?? 0) > 0 || (cap.hugepages_mib_total === undefined && cap.hugepages_mib_free > 0);
+    const hugepageHost = (cap.hugepages_mib_total ?? 0) > 0;
     if (hugepageHost) {
       const huge = cap.hugepages_mib_free - pending.reduce((sum, l) => sum + (l.memory_mib ?? need.memory_mib), 0);
       const vcpus = cap.vcpus_free - pending.reduce((sum, l) => sum + (l.vcpus ?? need.vcpus), 0);

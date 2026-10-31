@@ -27,7 +27,7 @@ async function place(cell: string, ws: string, status = 201) {
 async function hostWithCapacity(cell: string, capacity: Record<string, unknown>) {
   const enrolled = await enrollHost(cell, "sandbox");
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
-  ws.send(hostHello(enrolled.host, cell, { capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, sandboxes: 0, agents: 0, warm: [], ...capacity } }));
+  ws.send(hostHello(enrolled.host, cell, { capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, hugepages_mib_total: capacity.hugepages_mib_free ?? 8192, sandboxes: 0, agents: 0, warm: [], ...capacity } }));
   await ws.next("hello_ack");
   return { host: enrolled.host, ws };
 }
@@ -64,7 +64,7 @@ describe("placement packs", () => {
     const seq = sendEvents(a.ws, [
       { ts_ms: Date.now(), type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "running" },
       { ts_ms: Date.now(), type: "sandbox_state", sandbox: s2.sandbox, epoch: 1, state: "running" },
-      { ts_ms: Date.now(), type: "capacity", capacity: { vcpus_free: 4, memory_mib_free: 8192, hugepages_mib_free: 4096, sandboxes: 2, agents: 0, warm: [] } },
+      { ts_ms: Date.now(), type: "capacity", capacity: { vcpus_free: 4, memory_mib_free: 8192, hugepages_mib_free: 4096, hugepages_mib_total: 8192, sandboxes: 2, agents: 0, warm: [] } },
     ]);
     await a.ws.next("ack", (m) => m.up_to >= seq);
     expect((await place(cell, ws)).host, "the report's free hugepages admit a third").toBe(a.host);
