@@ -52,7 +52,8 @@ impl LocalFsStore {
         if path.exists() {
             return Ok(()); // content-addressed: same name ⇒ same bytes
         }
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        // A name of its own: two threads may be storing the same chunk at once.
+        let tmp = path.with_extension(format!("tmp-{}", crate::util::random_hex(8)));
         fs::write(&tmp, data)?;
         fs::rename(tmp, path)
     }
@@ -270,6 +271,28 @@ mod tests {
         // The work is a few hashes of 2 MiB; 10 s is a hang, not a slow machine.
         let r = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("commit_file hung");
         assert_eq!(r.unwrap_err(), "put refused");
+    }
+
+    /// Two threads storing one chunk at once (a commit with two equal chunks) both succeed. They
+    /// used to share one temporary name, and the second rename failed with `ENOENT`.
+    #[test]
+    fn concurrent_puts_of_one_chunk_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path().join("store")).unwrap();
+        let data = vec![7u8; 256 << 10];
+        for round in 0..100 {
+            let hex = format!("{round:064x}");
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let put = || {
+                    barrier.wait();
+                    store.put_chunk(&hex, &data)
+                };
+                let (a, b) = (scope.spawn(put), scope.spawn(put));
+                a.join().unwrap().unwrap();
+                b.join().unwrap().unwrap();
+            });
+        }
     }
 
     /// Review #18: manifests from the shared store are untrusted. Path-traversing chunk names,
