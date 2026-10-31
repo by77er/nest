@@ -115,10 +115,9 @@ impl State {
     }
 
     /// Add or replace a sandbox. A newer epoch cuts every connection of the old one
-    /// (`close_code::MOVED`): their bindings named an epoch that is no longer current. An older
-    /// epoch than the one held is refused (logged, the entry kept): accepting it would cut the
-    /// current calls and admit the old epoch's bindings again. Only a `remove` (or a lost nestd
-    /// link) first lets a sandbox come back at a lower epoch.
+    /// (`close_code::MOVED`). An older epoch than the one held is refused (logged, the entry kept),
+    /// or it would cut current calls and admit stale bindings; only after a `remove` (or a lost
+    /// nestd link) may a sandbox come back at a lower epoch.
     pub fn upsert_sandbox(
         &self,
         sandbox: SandboxId,

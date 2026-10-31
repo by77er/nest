@@ -1,13 +1,10 @@
-//! The inbox mirror's delivery side: which of AgentDO's mirrored inbox messages the model has
-//! been handed, by the hooks alone. No I/O; it lives in [`crate::runtime::AgentInner`], so one
-//! lock covers the decision and the marking, and two hooks never hand out one message twice.
+//! The inbox mirror's delivery side: which of AgentDO's mirrored inbox messages the hooks have
+//! handed the model. No I/O; it lives in [`crate::runtime::AgentInner`], so one lock covers the
+//! decision and the marking, and two hooks never hand out one message twice.
 //!
-//! - At the main loop's tool boundary (`PostToolUse`), every pending message goes out as
-//!   `additionalContext`, which Claude Code shows the model mid-turn (checked on 2.1.316, for MCP
-//!   and built-in tools). Not at a subagent's: there it would reach the subagent instead.
-//!   `Config::inbox_at_tool_boundary` turns this off, leaving only `Stop`.
-//! - At `Stop`, every pending message goes out as `decision: block`, up to
-//!   `max_stop_continuations` per stop chain.
+//! - At the main loop's tool boundary (`PostToolUse`), as `additionalContext`; not at a
+//!   subagent's, where it would reach the subagent instead (both checked on 2.1.316).
+//! - At `Stop`, as `decision: block`, up to `max_stop_continuations` per stop chain.
 //! - Only while a turn takes inbox ([`crate::brain::Brain::takes_inbox`]). A message the running
 //!   turn never handed out stays unconfirmed, and AgentDO queues it again when the turn completes.
 
@@ -32,12 +29,21 @@ impl InboxMirror {
         self.open = open;
     }
 
-    /// `PostToolUse`: everything pending, marked delivered.
-    pub fn take_at_tool_boundary(&mut self, cache: Option<&AgentCache>) -> Vec<InboxMessage> {
+    /// Everything pending (at `PostToolUse`), marked delivered. Never an `interrupt` message: it cuts
+    /// the turn short and is AgentDO's to queue as the next one, which a hook racing the actor's
+    /// interrupt must not pre-empt.
+    pub fn take(&mut self, cache: Option<&AgentCache>) -> Vec<InboxMessage> {
         if !self.open {
             return Vec::new();
         }
-        self.take(cache)
+        let pending: Vec<InboxMessage> = cache
+            .into_iter()
+            .flat_map(|c| &c.inbox)
+            .filter(|m| !m.interrupt && !self.delivered.contains(&m.id))
+            .cloned()
+            .collect();
+        self.delivered.extend(pending.iter().map(|m| m.id.clone()));
+        pending
     }
 
     /// `Stop`: everything pending, marked delivered, unless this stop chain used up its
@@ -47,7 +53,7 @@ impl InboxMirror {
             self.stop_continuations = 0;
         }
         let max = cache.map(|c| c.max_stop_continuations).unwrap_or(0);
-        if !self.open || self.stop_continuations >= max {
+        if self.stop_continuations >= max {
             return Vec::new();
         }
         let out = self.take(cache);
@@ -62,19 +68,6 @@ impl InboxMirror {
         for id in ids {
             self.delivered.remove(id);
         }
-    }
-
-    /// Never an `interrupt` message: it cuts the running turn short and is AgentDO's to queue as
-    /// the next one, which a hook racing the actor's interrupt must not pre-empt.
-    fn take(&mut self, cache: Option<&AgentCache>) -> Vec<InboxMessage> {
-        let pending: Vec<InboxMessage> = cache
-            .into_iter()
-            .flat_map(|c| &c.inbox)
-            .filter(|m| !m.interrupt && !self.delivered.contains(&m.id))
-            .cloned()
-            .collect();
-        self.delivered.extend(pending.iter().map(|m| m.id.clone()));
-        pending
     }
 }
 
@@ -109,8 +102,8 @@ mod tests {
         let mut m = InboxMirror::default();
         m.set_open(true);
         let c = cache(&["m1"]);
-        assert_eq!(ids(&m.take_at_tool_boundary(Some(&c))), ["m1"]);
-        assert!(m.take_at_tool_boundary(Some(&c)).is_empty());
+        assert_eq!(ids(&m.take(Some(&c))), ["m1"]);
+        assert!(m.take(Some(&c)).is_empty());
         assert!(m.take_at_stop(Some(&c), false).is_empty());
         let c = cache(&["m1", "m2"]);
         assert_eq!(ids(&m.take_at_stop(Some(&c), false)), ["m2"]);
@@ -120,10 +113,10 @@ mod tests {
     fn nothing_goes_out_while_closed_and_a_release_makes_a_message_pending_again() {
         let mut m = InboxMirror::default();
         let c = cache(&["m1"]);
-        assert!(m.take_at_tool_boundary(Some(&c)).is_empty(), "no turn takes inbox");
+        assert!(m.take(Some(&c)).is_empty(), "no turn takes inbox");
         assert!(m.take_at_stop(Some(&c), false).is_empty());
         m.set_open(true);
-        let out = m.take_at_tool_boundary(Some(&c));
+        let out = m.take(Some(&c));
         m.release(&out.iter().map(|m| m.id.clone()).collect::<Vec<_>>());
         assert_eq!(ids(&m.take_at_stop(Some(&c), false)), ["m1"]);
     }
@@ -137,7 +130,7 @@ mod tests {
         m.set_open(true);
         let mut c = cache(&["m1", "m2"]);
         c.inbox[0].interrupt = true;
-        assert_eq!(ids(&m.take_at_tool_boundary(Some(&c))), ["m2"]);
+        assert_eq!(ids(&m.take(Some(&c))), ["m2"]);
         assert!(m.take_at_stop(Some(&c), false).is_empty());
     }
 
@@ -155,6 +148,6 @@ mod tests {
         m.set_open(true);
         assert_eq!(ids(&m.take_at_stop(Some(&cache(&["m1", "m2", "m3"])), true)), ["m3"]);
         // Tool boundaries have no bound.
-        assert_eq!(ids(&m.take_at_tool_boundary(Some(&cache(&["m4"])))), ["m4"]);
+        assert_eq!(ids(&m.take(Some(&cache(&["m4"])))), ["m4"]);
     }
 }

@@ -19,7 +19,7 @@ use crate::framing;
 use crate::hands;
 use crate::rules;
 use crate::mirror;
-use crate::runtime::{Agent, AgentCmd, AgentInner, Runtime};
+use crate::runtime::{Agent, AgentCmd, Runtime};
 
 /// Serve async tracking datagrams forever.
 pub async fn serve_dgram(rt: Arc<Runtime>, sock: UnixDatagram) {
@@ -56,16 +56,14 @@ pub async fn serve_sync(rt: Arc<Runtime>, listener: UnixListener) {
                 _ => return,
             };
             let peer = stream.peer_cred().ok().and_then(|c| c.pid());
-            if peer_agent(&rt, peer, &req.agent).await.is_none() {
+            let Some(agent) = peer_agent(&rt, peer, &req.agent).await else {
                 tracing::warn!(agent = %req.agent, ?peer, "hook from a process that isn't that agent's brain; using the fallback");
-                let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
-                let output = nest_protocol::host::hook::fallback_output(event).unwrap_or_default();
-                let _ = framing::write_host(&mut stream, &HookDecisionResponse { output }).await;
+                let _ = framing::write_host(&mut stream, &HookDecisionResponse { output: fallback(&req.input) }).await;
                 return;
-            }
+            };
             let answer = decide(&rt, &req).await;
             let written = framing::write_host(&mut stream, &HookDecisionResponse { output: answer.output.clone() }).await.is_ok();
-            answer.settle(written);
+            answer.settle(&agent, written);
         });
     }
 }
@@ -125,55 +123,53 @@ pub fn track(agent: &Agent, input: &Value) {
     agent.emit(AgentEventBody::StateChanged { state, detail });
 }
 
-/// A sync hook's answer, and the inbox messages it hands the model: confirmed to AgentDO
-/// (`inbox_delivered`) once the answer is written, pending again if it isn't.
-pub struct Answer {
-    pub output: HookOutput,
-    delivery: Option<Delivery>,
+fn fallback(input: &Value) -> HookOutput {
+    let event = input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
+    nest_protocol::host::hook::fallback_output(event).unwrap_or_default()
 }
 
-struct Delivery {
-    agent: Arc<Agent>,
-    messages: Vec<MessageId>,
+/// A sync hook's answer, and the inbox messages it hands the model: confirmed to AgentDO
+/// (`inbox_delivered`) once the answer is written, pending again if it isn't.
+#[derive(Default)]
+pub struct Answer {
+    pub output: HookOutput,
+    handed: Vec<MessageId>,
     /// A `Stop` answer that blocks: the actor was told a continuation is owed.
     stop_blocked: bool,
 }
 
 impl From<HookOutput> for Answer {
     fn from(output: HookOutput) -> Self {
-        Answer { output, delivery: None }
+        Answer { output, ..Default::default() }
     }
 }
 
 impl Answer {
-    pub fn settle(self, written: bool) {
-        let Some(d) = self.delivery else { return };
+    pub fn settle(self, agent: &Agent, written: bool) {
         if written {
-            for id in d.messages {
-                d.agent.emit(AgentEventBody::InboxDelivered { message: id });
+            for id in self.handed {
+                agent.emit(AgentEventBody::InboxDelivered { message: id });
             }
             return;
         }
-        d.agent.inner.lock().unwrap().mirror.release(&d.messages);
-        if d.stop_blocked {
+        agent.inner.lock().unwrap().mirror.release(&self.handed);
+        if self.stop_blocked {
             // Claude Code got no `block`, so the turn ends after all.
-            d.agent.command(AgentCmd::StopHook { blocked: false });
-            d.agent.emit(AgentEventBody::StateChanged { state: AgentState::Idle, detail: None });
+            agent.command(AgentCmd::StopHook { blocked: false });
+            agent.emit(AgentEventBody::StateChanged { state: AgentState::Idle, detail: None });
         }
     }
 }
 
 /// Answer a sync hook. Never waits on the network (the `SessionStart` read goes through hands).
 pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
-    let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default().to_string();
-    let Some(agent) = rt.agent(&req.agent) else {
-        return nest_protocol::host::hook::fallback_output(&event).unwrap_or_default().into();
-    };
+    let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
+    let Some(agent) = rt.agent(&req.agent) else { return fallback(&req.input).into() };
     // A Stop is idle only if it lets the turn end; `stop` decides.
     if event != "Stop" {
         track(&agent, &req.input);
     }
-    let output = match event.as_str() {
+    let output = match event {
         "PreToolUse" => {
             let (decision, reason) = permission(&agent, &req.input);
             HookOutput {
@@ -196,7 +192,7 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
         }
         // A subagent's tool call (its input names `agent_id`) gets nothing: the context would reach
         // the subagent, not the main loop (checked on Claude Code 2.1.316), yet count as delivered.
-        "PostToolUse" if rt.cfg.inbox_at_tool_boundary && req.input.get("agent_id").is_none() => return tool_boundary(&agent),
+        "PostToolUse" if req.input.get("agent_id").is_none() => return tool_boundary(&agent),
         "Stop" => return stop(&agent, &req.input),
         "SessionStart" => session_start(rt, &agent, &req.input).await,
         _ => HookOutput::default(),
@@ -224,39 +220,34 @@ fn permission(agent: &Agent, input: &Value) -> (PermissionDecision, Option<Strin
 }
 
 /// PostToolUse: hand pending inbox-mirror messages to the model with the tool's result.
-fn tool_boundary(agent: &Arc<Agent>) -> Answer {
+fn tool_boundary(agent: &Agent) -> Answer {
     let pending = {
-        let mut inner = agent.inner.lock().unwrap();
-        let AgentInner { cache, mirror, .. } = &mut *inner;
-        mirror.take_at_tool_boundary(cache.as_ref())
+        let inner = &mut *agent.inner.lock().unwrap();
+        inner.mirror.take(inner.cache.as_ref())
     };
     if pending.is_empty() {
-        return HookOutput::default().into();
+        return Answer::default();
     }
-    let output = HookOutput {
-        hook_specific_output: Some(HookSpecificOutput::PostToolUse { additional_context: Some(mirror::render(&pending)) }),
-        ..Default::default()
-    };
-    Answer { output, delivery: Some(Delivery { agent: agent.clone(), messages: pending.into_iter().map(|m| m.id).collect(), stop_blocked: false }) }
+    let additional_context = Some(mirror::render(&pending));
+    let output = HookOutput { hook_specific_output: Some(HookSpecificOutput::PostToolUse { additional_context }), ..Default::default() };
+    Answer { output, handed: pending.into_iter().map(|m| m.id).collect(), stop_blocked: false }
 }
 
-/// Stop: hand pending inbox-mirror messages to the model as `decision: block`, bounded by
-/// `max_stop_continuations`. The actor learns whether this stop was blocked before Claude Code
-/// can act on the answer.
-fn stop(agent: &Arc<Agent>, input: &Value) -> Answer {
+/// Stop: hand pending inbox-mirror messages to the model as `decision: block`. The actor learns
+/// whether this stop blocked before Claude Code can act on the answer.
+fn stop(agent: &Agent, input: &Value) -> Answer {
     let active = input.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
     let pending = {
-        let mut inner = agent.inner.lock().unwrap();
-        let AgentInner { cache, mirror, .. } = &mut *inner;
-        mirror.take_at_stop(cache.as_ref(), active)
+        let inner = &mut *agent.inner.lock().unwrap();
+        inner.mirror.take_at_stop(inner.cache.as_ref(), active)
     };
     agent.command(AgentCmd::StopHook { blocked: !pending.is_empty() });
     if pending.is_empty() {
         track(agent, input);
-        return HookOutput::default().into();
+        return Answer::default();
     }
     let output = HookOutput { decision: Some(TopLevelDecision::Block), reason: Some(mirror::render(&pending)), ..Default::default() };
-    Answer { output, delivery: Some(Delivery { agent: agent.clone(), messages: pending.into_iter().map(|m| m.id).collect(), stop_blocked: true }) }
+    Answer { output, handed: pending.into_iter().map(|m| m.id).collect(), stop_blocked: true }
 }
 
 /// SessionStart: rebase the tailer on the reported transcript path and pass the repo's

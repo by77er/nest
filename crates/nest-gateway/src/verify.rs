@@ -86,12 +86,10 @@ pub fn verify_token(
     Ok(claims)
 }
 
-/// The state-dependent half, run by [`crate::state::State::admit_and_register`] under the lock
-/// that registers the connection, so nothing can change between the check and the
-/// registration: sandbox known (`moved`, or `busy` during a resync) → epoch older
-/// (`stale_epoch`) or newer (`busy`) → client attached → guest known (`busy`) → guest version.
-/// The attached set is checked only once the sandbox and epoch are known, since it belongs to
-/// that sandbox.
+/// The state-dependent half, run under the lock that registers the connection
+/// ([`crate::state::State::admit_and_register`]): sandbox known (`moved`, or `busy` during a
+/// resync) → epoch older (`stale_epoch`) or newer (`busy`) → client attached (to that sandbox at
+/// that epoch) → guest known (`busy`) → guest version.
 pub fn admit(entry: Option<&SandboxEntry>, resyncing: bool, claims: &BindingClaims, protocol_version: u32) -> Result<Admission, Refusal> {
     let Some(entry) = entry else {
         if resyncing {

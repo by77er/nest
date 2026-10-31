@@ -5,9 +5,8 @@
 //! - Redaction replaces known secrets with same-length `*` runs, preserving offsets.
 //! - The file shrinking or changing inode (rewrite, `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`, path
 //!   rebase) restarts from offset 0 with `base: true`.
-//! - After a reconnect, AgentDO's `hello_ack.durable_bytes` rewinds the send cursor, unless a base
-//!   went out that AgentDO hasn't acknowledged since: then `durable_bytes` may still describe the
-//!   old file, and the base goes again.
+//! - After a reconnect, `hello_ack.durable_bytes` rewinds the send cursor; while a base is
+//!   unacknowledged (`durable_bytes` may describe the old file), the base goes again instead.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -70,9 +69,7 @@ impl Tailer {
         self.base_unconfirmed = false;
     }
 
-    /// AgentDO has `durable` bytes: resend from there (after a reconnect). An unacknowledged base
-    /// goes again: `durable` may be the old file's, and continuing the new file from it would
-    /// splice two files into one stream.
+    /// AgentDO has `durable` bytes (after a reconnect): resend from there, or the base again.
     pub fn rewind(&mut self, durable: u64) {
         if self.base_unconfirmed {
             self.need_base = true;

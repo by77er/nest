@@ -1,16 +1,12 @@
-//! One brain's decisions, with no I/O: which turn is running, when it ends, interrupts, the idle
-//! exit, why the process ended, and replaying input that arrived while it was exiting. The actor
-//! in [`crate::agent`] feeds it inputs and applies the effects it returns (stdin, signals,
-//! events, nestd reports).
+//! One brain's decisions, with no I/O: which turn runs, when it ends, interrupts, the idle exit,
+//! why the process ended, and turns that arrive while it exits. The actor in [`crate::agent`]
+//! feeds it inputs and applies the effects it returns.
 //!
-//! Turns (`docs/agents/runner/`): AgentDO is the only source of turns. A turn is exactly one user
-//! message on stdin, the `run_turn` text; inbox messages never go to stdin, the inbox mirror
-//! hands them to the model through hooks ([`crate::mirror`]). So a `result` ends the turn that
-//! is running, with two guards for Claude Code behaviour that is **unverified**:
-//! - a `result` while the turn's last `Stop` hook answered `block` is taken for an intermediate
-//!   one (the continuation is still owed), unless it is an error or the turn is being
-//!   interrupted;
-//! - a `result` with no turn running belongs to no turn and is ignored.
+//! AgentDO is the only source of turns, and a turn is one user message on stdin (inbox messages
+//! reach the model through hooks, [`crate::mirror`]). So a `result` ends the running turn, except
+//! while the turn's last `Stop` hook blocked (a continuation is owed; Claude Code 2.1.316 emits no
+//! `result` before it) and the turn isn't being interrupted; an error `result` always ends it. A
+//! `result` with no turn running is ignored.
 
 use std::time::Duration;
 
@@ -25,9 +21,7 @@ use crate::stream;
 #[derive(Clone, Debug)]
 pub enum Input {
     RunTurn { turn: TurnId, input: TurnInput },
-    /// An inbox message for the running turn. The mirror delivers it; only an interrupt acts here.
-    Inbox { interrupt: bool },
-    /// AgentDO's `interrupt`, for `turn` (`None`: whatever runs).
+    /// AgentDO's `interrupt` for `turn`, or (`None`) an interrupting inbox message: whatever runs.
     Interrupt { turn: Option<TurnId> },
     /// The `Stop` hook answered: `blocked` means the turn goes on with inbox messages.
     StopHook { blocked: bool },
@@ -138,8 +132,6 @@ impl Brain {
     pub fn step(&mut self, input: Input, now: Instant) -> Vec<Effect> {
         match input {
             Input::RunTurn { turn, input } => self.run_turn(turn, input),
-            Input::Inbox { interrupt: true } => self.interrupt(None, now),
-            Input::Inbox { interrupt: false } => vec![],
             Input::Interrupt { turn } => self.interrupt(turn, now),
             Input::StopHook { blocked } => {
                 if let Some(t) = &mut self.turn {
@@ -180,12 +172,8 @@ impl Brain {
             }
             // AgentDO sends a turn only once the previous one completed: never written, so it
             // can't merge into the running one.
-            let error = ErrorBody {
-                code: "turn_overlap".into(),
-                message: format!("turn {} arrived while {} runs; not written", turn.0, current.id.0),
-                retryable: false,
-            };
-            return vec![Effect::Emit { body: AgentEventBody::Error { error }, turn: Some(turn) }];
+            let message = format!("turn {} arrived while {} runs; not written", turn.0, current.id.0);
+            return vec![error(turn, "turn_overlap", message, false)];
         }
         self.turn = Some(Turn { id: turn.clone(), stop_blocked: false, interrupt: None });
         self.idle_at = None;
@@ -317,8 +305,11 @@ fn dropped(stash: Vec<(TurnId, TurnInput)>, why: ExitReason) -> Vec<Effect> {
 }
 
 fn not_delivered(turn: TurnId, why: ExitReason) -> Effect {
-    let error = ErrorBody { code: "agent_stopping".into(), message: format!("turn not delivered: the brain is {}", why.as_str()), retryable: true };
-    Effect::Emit { body: AgentEventBody::Error { error }, turn: Some(turn) }
+    error(turn, "agent_stopping", format!("turn not delivered: the brain is {}", why.as_str()), true)
+}
+
+fn error(turn: TurnId, code: &str, message: String, retryable: bool) -> Effect {
+    Effect::Emit { body: AgentEventBody::Error { error: ErrorBody { code: code.into(), message, retryable } }, turn: Some(turn) }
 }
 
 #[cfg(test)]
@@ -374,8 +365,6 @@ mod tests {
         let (mut b, now) = brain();
         assert_eq!(shape(&b.step(run("t1"), now)), ["turn_started t1", "working t1", "write t1"]);
         assert!(b.takes_inbox());
-        // An inbox message mid-turn writes nothing: the mirror's hooks deliver it.
-        assert_eq!(b.step(Input::Inbox { interrupt: false }, now), []);
         assert_eq!(shape(&b.step(result(false), now)), ["turn_completed t1", "idle t1"]);
         assert_eq!((b.turn(), b.takes_inbox()), (None, false));
         match &b.step(run("t2"), now)[..] {
@@ -410,10 +399,9 @@ mod tests {
     }
 
     #[test]
-    fn an_inbox_message_with_no_turn_running_does_nothing() {
+    fn an_interrupt_with_no_turn_running_does_nothing() {
         let (mut b, now) = brain();
-        assert_eq!(b.step(Input::Inbox { interrupt: false }, now), []);
-        assert_eq!(b.step(Input::Inbox { interrupt: true }, now), []);
+        assert_eq!(b.step(Input::Interrupt { turn: None }, now), []);
         assert_eq!(b.turn(), None);
     }
 
@@ -436,7 +424,7 @@ mod tests {
     fn without_the_control_request_an_interrupt_is_a_sigint() {
         let (mut b, now) = brain();
         b.step(run("t1"), now);
-        assert_eq!(b.step(Input::Inbox { interrupt: true }, now), [Effect::Sigint, Effect::CancelHands]);
+        assert_eq!(b.step(Input::Interrupt { turn: None }, now), [Effect::Sigint, Effect::CancelHands]);
         // The interrupted turn's result ends it, a block notwithstanding.
         b.step(Input::StopHook { blocked: true }, now);
         assert_eq!(shape(&b.step(result(false), now)), ["turn_completed t1", "idle t1"]);

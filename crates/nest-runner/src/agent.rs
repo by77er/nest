@@ -41,12 +41,10 @@ use crate::stream;
 /// `system/init.capabilities` flag for the stream-json interrupt control request.
 pub const CAP_INTERRUPT: &str = "interrupt_receipt_v1";
 
-/// The only Claude Code built-ins a brain may have: none reads or writes the host's files or
-/// runs a command there (its hands are the `mcp__nest__*` tools that run inside the sandbox).
-/// Subagents (`Agent`, `Task` before Claude Code 2.1), the task and todo tools (state in the
-/// config dir), the web tools (traffic through the host's egress allowlist), and the MCP
-/// resource tools (they read only from the configured `nest` server). An allowlist, so a
-/// built-in Claude Code adds later is refused until it is reviewed and listed here.
+/// The only Claude Code built-ins a brain may have, none touching the host's files or running a
+/// command there: subagents (`Agent`, `Task` before 2.1), the task and todo tools (state in the
+/// config dir), the web tools (through the host's egress allowlist), and the MCP resource tools
+/// (the `nest` server only). A built-in Claude Code adds later is refused until listed here.
 pub const HOST_SAFE_BUILTINS: &[&str] = &[
     "Agent", "Task", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TodoWrite", "WebSearch", "WebFetch",
     "ListMcpResourcesTool", "ReadMcpResourceTool",
@@ -72,8 +70,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
     let fence_gen = rt.fence_gen();
     tokio::spawn(async move {
         let id = start.start.agent.clone();
-        // The agent epoch AgentDO issued for this start; never the sandbox's. Every control plane
-        // since #30 sends it; a start without one would run under no epoch AgentDO accepts.
+        // The agent epoch AgentDO issued for this start (never the sandbox's): required.
         let Some(epoch) = start.start.epoch else {
             let error = ErrorBody { code: "invalid_message".into(), message: "agent_start without an agent epoch".into(), retryable: false };
             rt.report(RunnerEvent::Error { agent: Some(id.clone()), error });
@@ -109,9 +106,8 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             cmd_tx,
             out_tx,
         );
-        // An exit this runner reports at an agent epoch means no brain of the agent at or below it
-        // runs here any more (AgentDO releases the brain on it): a start that never runs reports
-        // its exit only once any older brain has gone.
+        // An exit at an agent epoch means no brain of the agent at or below it runs here (AgentDO
+        // releases the brain on it): a start that never runs reports it once any older one is gone.
         let older_gone = |rt: &Runtime| rt.agent(&id).is_none_or(|a| a.epoch > epoch);
         loop {
             match rt.register(agent.clone(), fence_gen) {
@@ -123,7 +119,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     while !older_gone(&rt) {
                         tokio::time::sleep(DYING_POLL).await;
                     }
-                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
+                    rt.exited(&agent, ExitReason::Fenced, (None, None));
                     return;
                 }
                 Err(Refused::Running(existing)) if existing.epoch == epoch => {
@@ -135,14 +131,12 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     // A newer brain is registered: this start is stale (N18). It never runs, never
                     // ends the newer brain, and its exit says so at its own epoch.
                     tracing::warn!(agent = %id, epoch = epoch.0, running = existing.epoch.0, "agent_start older than the registered brain: refused");
-                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
+                    rt.exited(&agent, ExitReason::Fenced, (None, None));
                     return;
                 }
                 Err(Refused::Running(existing)) => {
                     // AgentDO starts a brain only once the previous one is released, so an older
-                    // brain still registered here is one on its way out (of an earlier nestd
-                    // connection, fenced when it dropped, or killed): never adopted, never run
-                    // beside. It is ended, and this start registers once it is gone.
+                    // one still here is on its way out: end it, and register once it is gone.
                     if existing.conn_gen == agent.conn_gen && !existing.is_stopping() {
                         tracing::warn!(agent = %id, epoch = epoch.0, "agent_start while a brain of this agent is registered; ending it first");
                     }
@@ -165,16 +159,14 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 );
             }
             agent.send_out(Outbound::Close);
-            let epoch = rt.deregister(&agent);
-            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason, epoch: Some(epoch) });
+            rt.exited(&agent, reason, (None, None));
         }
     });
 }
 
-/// Refuse a start before it registers (a forbidden built-in, no lease). It supersedes any older brain
-/// of the agent here, which is ended under the start's epoch (its tombstone); the refusal's exit is
-/// reported only once that brain has gone, since an exit at an epoch means nothing of the agent at
-/// or below it runs here (A4).
+/// Refuse a start before it registers (a forbidden built-in, no lease). Any older brain of the
+/// agent here is ended under the start's epoch (its tombstone), and the refusal's exit is reported
+/// once it has gone: an exit at an epoch means nothing of the agent at or below it runs here (A4).
 async fn refuse_superseding(rt: &Arc<Runtime>, id: &nest_protocol::model::AgentId, epoch: nest_protocol::model::Epoch, reason: ExitReason) {
     if let Some(old) = rt.tombstone(id, epoch) {
         old.stopping.store(true, Ordering::SeqCst);
@@ -194,9 +186,8 @@ async fn step<T>(cancel: &CancellationToken, what: &str, limit: Duration, f: imp
     }
 }
 
-/// Where the session file for `uuid` lives (`claude::transcript_path` for the configured cwd;
-/// production: `paths::EMPTY_CWD`). The runner rebases on the `SessionStart` hook's
-/// `transcript_path` if it differs.
+/// Where the session file for `uuid` lives for the configured cwd (production: `paths::EMPTY_CWD`);
+/// the `SessionStart` hook's `transcript_path` overrides it.
 pub fn transcript_path(config_dir: &Path, cwd: &Path, uuid: &str) -> PathBuf {
     PathBuf::from(claude::transcript_path(&config_dir.to_string_lossy(), &cwd.to_string_lossy(), uuid))
 }
@@ -253,17 +244,16 @@ pub async fn materialize(resume: &SessionResume, path: &Path) -> anyhow::Result<
     Ok(())
 }
 
+/// Claude Code with exactly `env` (nothing inherited), in the configured cwd.
+fn claude_cmd(rt: &Runtime, env: &[(String, String)]) -> Command {
+    let mut c = Command::new(&rt.cfg.claude_bin);
+    c.env_clear().envs(env.iter().cloned()).current_dir(&rt.cfg.cwd).kill_on_drop(true);
+    c
+}
+
 /// `claude auth status` with the agent's environment → `authMethod` (anything else on failure).
 pub async fn auth_method(rt: &Runtime, env: &[(String, String)]) -> String {
-    let out = Command::new(&rt.cfg.claude_bin)
-        .args(["auth", "status"])
-        .env_clear()
-        .envs(env.iter().cloned())
-        .current_dir(&rt.cfg.cwd)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let out = claude_cmd(rt, env).args(["auth", "status"]).stdin(Stdio::null()).output().await;
     match out {
         Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout)
             .ok()
@@ -275,15 +265,7 @@ pub async fn auth_method(rt: &Runtime, env: &[(String, String)]) -> String {
 }
 
 async fn claude_version(rt: &Runtime, env: &[(String, String)]) -> String {
-    let out = Command::new(&rt.cfg.claude_bin)
-        .arg("--version")
-        .env_clear()
-        .envs(env.iter().cloned())
-        .current_dir(&rt.cfg.cwd)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let out = claude_cmd(rt, env).arg("--version").stdin(Stdio::null()).output().await;
     out.ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.split_whitespace().next().map(String::from))
@@ -329,8 +311,7 @@ async fn run(
         inner.session = session_id.clone();
         inner.transcript = Some(transcript.clone());
     }
-    // Hands: ask AgentDO where the sandbox is while the slow steps run (the request waits for
-    // the session channel), so the SessionStart hook and the first tool call find the target.
+    // Ask AgentDO for the hands target while the slow steps run, for SessionStart and the first call.
     crate::hands::prefetch_target(agent.clone());
 
     let launch = Launch { launch: s.start.launch.clone(), config_dir: s.config_dir.clone(), env: process_env(&rt, &s) };
@@ -339,8 +320,7 @@ async fn run(
     let auth = step(&cancel, "claude auth status", AUTH_TIMEOUT, async { Ok(auth_method(&rt, &launch.env).await) }).await?;
     if auth != "oauth_token" {
         rt.report_for(&agent, RunnerEvent::AuthCheck { agent: agent.id.clone(), auth_method: auth, api_key_source: "unknown".into(), ok: false });
-        let epoch = rt.deregister(&agent);
-        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed, epoch: Some(epoch) });
+        rt.exited(&agent, ExitReason::AuthFailed, (None, None));
         return Ok(());
     }
     let version = step(&cancel, "claude --version", VERSION_TIMEOUT, async { Ok(claude_version(&rt, &launch.env).await) }).await?;
@@ -356,12 +336,10 @@ async fn run(
         let session = session_id.clone().unwrap_or_else(|| SessionId("ses_pending".into()));
         let timeout = rt.cfg.session_open_timeout;
         let pid = proc.pid;
-        // The epoch this start registered under: nestd marks that start.
-        let epoch = agent.epoch;
         tokio::spawn(async move {
             let _ = tokio::time::timeout(timeout, opened).await;
             let capabilities = agent.inner.lock().unwrap().capabilities.clone();
-            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities, epoch: Some(epoch) });
+            rt.report_for(&agent, RunnerEvent::AgentStarted { agent: agent.id.clone(), pid, session, claude_version: version, capabilities, epoch: Some(agent.epoch) });
         });
     }
 
@@ -377,16 +355,12 @@ struct Proc {
 
 fn spawn_claude(rt: &Runtime, agent: &Arc<Agent>, launch: &Launch, session: &SessionArgs) -> anyhow::Result<Proc> {
     let args = claude::args(&launch.launch, &launch.config_dir, session);
-    let mut child = Command::new(&rt.cfg.claude_bin)
+    let mut child = claude_cmd(rt, &launch.env)
         .args(&args)
-        .env_clear()
-        .envs(launch.env.iter().cloned())
-        .current_dir(&rt.cfg.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
-        .kill_on_drop(true)
         .spawn()?;
     let pid = child.id().unwrap_or(0);
     agent.pid.store(pid, Ordering::SeqCst);
@@ -548,7 +522,9 @@ impl Actor {
     fn handle(&mut self, c: AgentCmd) -> bool {
         let input = match c {
             AgentCmd::RunTurn { turn, input } => Input::RunTurn { turn, input },
-            AgentCmd::Inbox(m) => Input::Inbox { interrupt: m.interrupt },
+            // The mirror's hooks deliver inbox messages; only an interrupting one acts here.
+            AgentCmd::Inbox(m) if m.interrupt => Input::Interrupt { turn: None },
+            AgentCmd::Inbox(_) => return false,
             AgentCmd::Interrupt { turn } => Input::Interrupt { turn },
             AgentCmd::StopHook { blocked } => Input::StopHook { blocked },
             AgentCmd::Stop(mode) => Input::Stop(mode),
@@ -614,23 +590,18 @@ impl Actor {
             Effect::CancelHands => self.agent.cancel_hands(),
             Effect::Emit { body, turn } => self.agent.emit_with_turn(body, turn),
             Effect::Respawn => {
-                let ok = match self.respawn() {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::error!(agent = %self.agent.id, "resume after idle exit failed: {e:#}");
-                        false
-                    }
-                };
-                return self.step(Input::Respawned { ok });
+                let respawned = self.respawn();
+                if let Err(e) = &respawned {
+                    tracing::error!(agent = %self.agent.id, "resume after idle exit failed: {e:#}");
+                }
+                return self.step(Input::Respawned { ok: respawned.is_ok() });
             }
             Effect::Exit(reason) => {
-                let (code, signal) = self.exit_status;
                 tracing::info!(agent = %self.agent.id, reason = reason.as_str(), "brain exited");
                 self.agent.cancel_hands();
                 self.agent.emit(AgentEventBody::StateChanged { state: AgentState::Detached, detail: Some(reason.as_str().into()) });
                 self.agent.send_out(Outbound::Close);
-                let epoch = self.rt.deregister(&self.agent);
-                self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason, epoch: Some(epoch) });
+                self.rt.exited(&self.agent, reason, self.exit_status);
                 return true;
             }
         }
@@ -710,14 +681,7 @@ impl Actor {
 
     /// Start Claude Code again on the same session (`--resume <current session file>`).
     fn respawn(&mut self) -> anyhow::Result<()> {
-        let path = self
-            .agent
-            .inner
-            .lock()
-            .unwrap()
-            .transcript
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("no session file to resume"))?;
+        let path = self.agent.inner.lock().unwrap().transcript.clone().ok_or_else(|| anyhow::anyhow!("no session file to resume"))?;
         let session = SessionArgs::Resume { path: path.to_string_lossy().into_owned(), fork: false };
         let proc = spawn_claude(&self.rt, &self.agent, &self.launch, &session)?;
         tracing::info!(agent = %self.agent.id, pid = proc.pid, "resumed Claude Code for queued input");
@@ -819,7 +783,7 @@ mod tests {
             let req = nest_protocol::host::hook::HookDecisionRequest { v: 1, agent: self.actor.agent.id.clone(), input };
             let answer = crate::hooks::decide(&self.actor.rt, &req).await;
             let output = answer.output.clone();
-            answer.settle(true);
+            answer.settle(&self.actor.agent, true);
             while let Ok(c) = self.cmds.try_recv() {
                 self.actor.handle(c);
             }

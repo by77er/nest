@@ -12,6 +12,7 @@ use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
 use nest_protocol::host::runner::{ExitReason, RunnerEvent, StopMode};
+use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 use nest_protocol::model::{
     AgentEvent, AgentEventBody, AgentId, CallId, Epoch, ErrorBody, HostId, RequestId,
     SessionId, TimestampMs, TurnId,
@@ -29,9 +30,6 @@ pub fn now_ms() -> TimestampMs {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// Error code for a platform call whose outcome is unknown (timed out after it may have been
-/// delivered).
-pub use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 
 /// Process-wide state.
 pub struct Runtime {
@@ -42,9 +40,8 @@ pub struct Runtime {
     /// Newest host token from nestd (memory only).
     pub host_token: watch::Sender<Option<Secret>>,
     pub host_id: Mutex<Option<HostId>>,
-    /// Events to nestd, tagged with the nestd connection generation they belong to; the writer
-    /// of connection N drops entries from older generations (brains killed when the previous
-    /// connection was lost must not be reported to the new one, which already re-issued them).
+    /// Events to nestd, tagged with their nestd connection generation; connection N's writer drops
+    /// older ones (brains killed when that connection was lost, which the new one re-issued).
     pub to_nestd: mpsc::UnboundedSender<(u64, RunnerEvent)>,
     pub to_nestd_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(u64, RunnerEvent)>>,
     /// Current nestd connection generation (incremented on every connect).
@@ -76,9 +73,8 @@ impl Runtime {
         self.agents.lock().unwrap().agents.values().cloned().collect()
     }
 
-    /// Register (first thing a start does, before any slow step). Refused when a kill at or above
-    /// the start's agent epoch arrived first (its tombstone), or when another brain is registered
-    /// under this id.
+    /// Register (first thing a start does). Refused when a kill at or above the start's agent epoch
+    /// arrived first (its tombstone), or another brain is registered under this id.
     pub fn register(&self, a: Arc<Agent>, fence_gen: u64) -> Result<(), Refused> {
         let mut r = self.agents.lock().unwrap();
         // A fence of every brain (lease lapse, nestd gone) since this start arrived: it never runs.
@@ -92,19 +88,20 @@ impl Runtime {
         Ok(())
     }
 
-    /// Remove `a` — only if it is still the registered instance (a duplicate start must never
-    /// deregister another brain) — and return the agent epoch its exit reports.
-    pub fn deregister(&self, a: &Arc<Agent>) -> Epoch {
-        let mut r = self.agents.lock().unwrap();
-        if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
-            r.agents.remove(&a.id);
+    /// `a` exited or never ran: deregister it if it is still the registered instance (a refused
+    /// or duplicate start never deregisters another brain), then report the exit at its epoch.
+    pub fn exited(&self, a: &Arc<Agent>, reason: ExitReason, (code, signal): (Option<i32>, Option<i32>)) {
+        {
+            let mut r = self.agents.lock().unwrap();
+            if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
+                r.agents.remove(&a.id);
+            }
         }
-        a.epoch
+        self.report_for(a, RunnerEvent::AgentExited { agent: a.id.clone(), code, signal, reason, epoch: Some(a.epoch) });
     }
 
-    /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
-    /// so no start at or below it registers from now on, and return the registered brain if it
-    /// runs at or below it (the caller kills it). A newer brain is left alone.
+    /// `agent_stop{kill, epoch}`: raise the agent's tombstone, so no start at or below `epoch`
+    /// registers from now on, and return the registered brain if it is at or below it (to kill).
     pub fn tombstone(&self, agent: &AgentId, epoch: Epoch) -> Option<Arc<Agent>> {
         let mut r = self.agents.lock().unwrap();
         let k = r.tombstones.entry(agent.clone()).or_insert(epoch.0);
@@ -155,9 +152,8 @@ impl Runtime {
         }
     }
 
-    /// The registered brain whose Claude Code process is `pid` or an ancestor of it (hooks and
-    /// `nest mcp` are its descendants). Binds a socket peer to an agent without trusting the id
-    /// it declares.
+    /// The registered brain whose Claude Code process is `pid` or an ancestor of it: binds a hook or
+    /// `nest mcp` socket peer to an agent without trusting the id it declares.
     pub fn agent_for_pid(&self, pid: i32) -> Option<Arc<Agent>> {
         let agents = self.agents();
         let mut cur = pid;
@@ -240,8 +236,7 @@ pub enum Outbound {
     Event(AgentEvent),
     ToolCall { call: CallId, turn: Option<TurnId>, name: String, arguments: Value },
     ToolsListRequest(RequestId),
-    /// Ask AgentDO where the agent's hands are now (`hands_resolve`); answered through
-    /// [`Agent::resolve_hands`].
+    /// `hands_resolve`: where are the agent's hands now? Answered through [`Agent::resolve_hands`].
     HandsResolve(RequestId),
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
@@ -284,19 +279,17 @@ pub struct Agent {
     pub id: AgentId,
     /// Fixed for the brain's life: a later start for this agent ends this brain, never adopts it.
     pub epoch: Epoch,
-    /// The sandbox this agent's hands act in (its id, from `agent_start`); `None` = no hands.
-    /// Only whether and where: the sandbox's epoch comes from each target's binding claims. A
-    /// sandbox move changes neither; the next call finds the old target refused and resolves again.
+    /// The sandbox this agent's hands act in (from `agent_start`); `None` = no hands. Its epoch
+    /// comes from each target's binding claims, so a sandbox move changes nothing here.
     pub hands: Option<HandsBinding>,
     pub config_dir: PathBuf,
     /// nestd connection generation this brain was started under.
     pub conn_gen: u64,
-    /// Claude Code's pid once spawned (0 before), for kills that must not wait on the actor and
-    /// for binding hook/MCP peers to this agent.
+    /// Claude Code's pid once spawned (0 before), for kills and for binding hook/MCP peers.
     pub pid: AtomicU32,
     /// Cancelled by any kill/stop: aborts startup steps and tells the actor.
     pub cancel: CancellationToken,
-    /// An `agent_stop` reached this brain: it is on its way out, and a later start must not adopt it.
+    /// An `agent_stop` reached this brain: it is on its way out.
     pub stopping: std::sync::atomic::AtomicBool,
     kill_reason: Mutex<Option<ExitReason>>,
     pub inner: Mutex<AgentInner>,
@@ -370,7 +363,7 @@ impl Agent {
         self.command(AgentCmd::Kill(reason));
     }
 
-    /// Told to stop, or being killed: never adopted by a later start (which waits for it instead).
+    /// Told to stop, or being killed.
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst) || self.kill_reason().is_some()
     }
@@ -401,10 +394,9 @@ impl Agent {
         self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch, seq, ts_ms: now_ms(), turn, body }));
     }
 
-    /// The cached gateway target with its generation, if a `hands_resolve` has answered since
-    /// the last refusal and its binding is not about to expire (`nest_hands_client::refresh_due`):
-    /// a target due for refresh is forgotten, so the caller resolves a fresh one first instead
-    /// of spending a bind on an `unauthorized`.
+    /// The cached gateway target and its generation, unless its binding is due for refresh
+    /// (`nest_hands_client::refresh_due`): then it is forgotten, so the caller resolves a fresh
+    /// one instead of spending a bind on an `unauthorized`.
     pub fn hands_target(&self) -> Option<(HandsTarget, u64)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.target.as_ref().is_some_and(|t| nest_hands_client::refresh_due(t, now_ms())) {
