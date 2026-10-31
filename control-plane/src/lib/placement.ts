@@ -1,7 +1,53 @@
 // Host-kind decisions FleetDO takes (docs/compute/brain-hosts/, docs/compute/autoscaling/), as pure
-// functions: inputs in, a decision out, no I/O and no clock of their own. FleetDO gathers the inputs
-// (its rows, the host's last capacity report, the cell's `AWS_CELLS` entry) and applies what comes
-// back; the decision logic lives only here, where it is unit- and property-tested.
+// functions: no I/O and no clock of their own. FleetDO gathers the inputs and applies the answer.
+import type { Capacity } from "../protocol/control";
+
+/** A connected, active, unwedged sandbox host as packing sees it. */
+export interface SandboxHostFacts {
+  host: string;
+  capacity: Capacity | null;
+  /** The `mark` of the capacity report (null: before marks existed). */
+  capacity_seq: number | null;
+  leases: readonly { state: string | null; state_seq: number | null; vcpus: number | null; memory_mib: number | null }[];
+  /** It holds a warm snapshot of what the sandbox is created from. */
+  warm: boolean;
+}
+
+/** `AWS_CELLS` packing: what a sandbox reserves against `memory_mib_free`; a per-host cap (0: none). */
+export interface PackSettings {
+  reserve_mib: number;
+  max_per_host: number;
+}
+
+/**
+ * Where a new sandbox goes (docs/compute/autoscaling/): fill hosts before opening new ones. A host's
+ * room is its last capacity report less what leases it doesn't count yet reserve (no state, or a first
+ * state after the report: capacity is reported at most every 30 s). Regular pages: `reserve_mib` each
+ * against `memory_mib_free` (the declared size is a jailer ceiling), capped by `max_per_host`. A
+ * hugepage host: the declared size against `hugepages_mib_free`, vCPUs against `vcpus_free`. An empty
+ * host always takes one. Preferred: warm, then least room left, then most leases.
+ */
+export function pickSandboxHost(hosts: readonly SandboxHostFacts[], need: { vcpus: number; memory_mib: number }, cfg: PackSettings): string | null {
+  const fit = (h: SandboxHostFacts): { room: number; fits: boolean } => {
+    const n = h.leases.length;
+    const cap = h.capacity;
+    if (!cap) return { room: n ? 0 : Infinity, fits: n === 0 };
+    // A lease that reported before marks existed (state set, no state_seq) is counted.
+    const pending = h.leases.filter((l) => l.state === null || (l.state_seq !== null && (h.capacity_seq ?? 0) <= l.state_seq));
+    const hugepageHost = (cap.hugepages_mib_total ?? 0) > 0;
+    if (hugepageHost) {
+      const huge = cap.hugepages_mib_free - pending.reduce((sum, l) => sum + (l.memory_mib ?? need.memory_mib), 0);
+      const vcpus = cap.vcpus_free - pending.reduce((sum, l) => sum + (l.vcpus ?? need.vcpus), 0);
+      return { room: huge - need.memory_mib, fits: n === 0 || (huge >= need.memory_mib && vcpus >= need.vcpus) };
+    }
+    const mem = cap.memory_mib_free - pending.length * cfg.reserve_mib;
+    const underCap = cfg.max_per_host === 0 || n < cfg.max_per_host;
+    return { room: mem - cfg.reserve_mib, fits: n === 0 || (underCap && mem >= cfg.reserve_mib) };
+  };
+  const fitting = hosts.map((h) => ({ h, ...fit(h) })).filter((c) => c.fits);
+  fitting.sort((a, b) => Number(b.h.warm) - Number(a.h.warm) || a.room - b.room || b.h.leases.length - a.h.leases.length);
+  return fitting[0]?.h.host ?? null;
+}
 
 /** A brain host as brain placement sees it. */
 export interface BrainHostFacts {
@@ -80,17 +126,16 @@ export interface LaunchAttempt {
 
 export type ScaleUp =
   | { launch: LaunchAttempt[] }
-  | { launch: null; why: "launching" | "pending" | "at_max" };
+  | { launch: null; why: "pending" | "at_max" };
 
 /**
- * A host of one kind is needed and none can take the work: launch one, unless a launch of that
- * kind is in flight (`launching`) or launched and not yet enrolled (`pending`), or the kind is at
- * `max_hosts` (`live`: its active and STONITH-pending hosts; a draining one doesn't count). The
+ * A host of one kind is needed and none can take the work: launch one, unless one of that kind was
+ * launched and hasn't enrolled (`pending`; one still in flight is the caller's to skip), or the kind
+ * is at `max_hosts` (`live`: its active and STONITH-pending hosts; a draining one doesn't count). The
  * attempts: each instance type on spot (zones rotating with the second), then the first type on
  * demand.
  */
-export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, launching: boolean, nowMs: number): ScaleUp {
-  if (launching) return { launch: null, why: "launching" };
+export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, nowMs: number): ScaleUp {
   if (pending > 0) return { launch: null, why: "pending" };
   if (live >= s.max_hosts) return { launch: null, why: "at_max" };
   const zone = (i: number) => s.subnet_ids[(Math.floor(nowMs / 1000) + i) % s.subnet_ids.length]!;
@@ -102,20 +147,10 @@ export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, lau
   };
 }
 
-export type IdleStep =
-  /** Holding work: its idle clock (if any) is cleared. */
-  | "busy"
-  /** Newly idle: its idle clock starts now. */
-  | "start"
-  /** Idle, within the grace. */
-  | "wait"
-  /** Idle for the whole grace: retire it. */
-  | "retire";
+/** `busy` clears the clock, `start` starts it, `retire`: idle for the whole grace. */
+export type IdleStep = "busy" | "start" | "wait" | "retire";
 
-/**
- * A launched host's idle clock: one holding work is busy; one that isn't starts its clock, and is
- * retired once it has held nothing for `graceMs` (`idle_since` is when the clock started).
- */
+/** A launched host's idle clock (`idleSince`: when it started). */
 export function idleStep(busy: boolean, idleSince: number | null, nowMs: number, graceMs: number): IdleStep {
   if (busy) return "busy";
   if (idleSince === null) return "start";

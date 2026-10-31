@@ -18,8 +18,8 @@ use nest_protocol::gateway::{
     MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code,
     parse_binding,
 };
-use nest_protocol::guest::frame::{self, Kind, MAX_FRAME_LEN};
-use nest_protocol::model::{Epoch, ErrorBody, SandboxId};
+use nest_protocol::guest::frame::{self, Kind};
+use nest_protocol::model::{Epoch, ErrorBody};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -162,9 +162,8 @@ pub fn guest_error_next(error: &ErrorBody) -> Next {
     }
 }
 
-/// The claims of the target's binding, unverified (the signature is the gateway's to check):
-/// the one source of the sandbox, epoch and expiry a client acts on. `HandsTarget.sandbox` and
-/// `.epoch` are unsigned copies the gateway never reads. `None` if the token does not parse.
+/// The claims of the target's binding, unverified (the gateway checks the signature): the one
+/// source of the sandbox, epoch and expiry a client acts on. `None` if the token doesn't parse.
 pub fn binding_claims(target: &HandsTarget) -> Option<BindingClaims> {
     parse_binding(target.binding.expose()).ok().map(|p| p.claims)
 }
@@ -207,15 +206,12 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// Nothing usable answered where the target points: the runner treats this like `moved` and
-    /// resolves again rather than retrying the same target. True for a refused, reset or
-    /// unreachable connect; a hostname that does not resolve (FleetDO deletes a dead host's
-    /// record); and an HTTP answer from in front of the gateway: a 5xx is Cloudflare's edge with
-    /// no connector or origin behind the hostname (502, 503, 530: the host is gone or its tunnel
-    /// is reconnecting), and 401 or 403 is Cloudflare Access refusing the `edge` credential,
-    /// which a fresh `resolve` carries anew after a rotation. 404 and 501 are the gateway itself
-    /// answering (an unknown or not yet served route; the edge never says 501) and stay final,
-    /// as does every other status.
+    /// Nothing usable answered where the target points, so resolve again (like `moved`): a
+    /// refused, reset or unreachable connect; a hostname that doesn't resolve (a dead host's
+    /// record is deleted); a 5xx from Cloudflare's edge (502, 503, 530: no host or tunnel behind
+    /// it); a 401 or 403 from Access refusing the `edge` credential (a fresh `resolve` carries the
+    /// rotated one). 404 and 501 are the gateway itself answering and stay final, as does any
+    /// other status.
     pub fn is_unreachable(&self) -> bool {
         match self {
             TransportError::Io(e) => matches!(
@@ -227,7 +223,7 @@ impl TransportError {
                     | io::ErrorKind::NetworkUnreachable
             ),
             TransportError::Dns(_) => true,
-            TransportError::Http(s) => (*s >= 500 && *s != 501) || matches!(*s, 401 | 403),
+            TransportError::Http(s) => edge_5xx(*s) || matches!(*s, 401 | 403),
             TransportError::Tls(_) | TransportError::Url(_) | TransportError::ClosedBeforeBound { .. } => false,
         }
     }
@@ -235,8 +231,13 @@ impl TransportError {
     /// An HTTP 5xx from in front of the gateway: worth a short pause before resolving again,
     /// since a tunnel that is reconnecting answers this way for a few seconds.
     pub fn is_edge_outage(&self) -> bool {
-        matches!(self, TransportError::Http(s) if *s >= 500 && *s != 501)
+        matches!(self, TransportError::Http(s) if edge_5xx(*s))
     }
+}
+
+/// A 5xx from in front of the gateway (the gateway itself answers 501 for a route not served yet).
+fn edge_5xx(status: u16) -> bool {
+    status >= 500 && status != 501
 }
 
 impl std::fmt::Display for TransportError {
@@ -381,10 +382,9 @@ fn transport(e: WsError) -> OpenError {
 }
 
 fn ws_config() -> WebSocketConfig {
-    let max = MAX_FRAME_LEN as usize + 4;
     WebSocketConfig::default()
-        .max_message_size(Some(max))
-        .max_frame_size(Some(max))
+        .max_message_size(Some(frame::MAX_WS_MESSAGE))
+        .max_frame_size(Some(frame::MAX_WS_MESSAGE))
 }
 
 /// TLS for `wss://`: the process's installed rustls provider if there is one (the runner installs
@@ -431,11 +431,6 @@ impl std::fmt::Debug for HandsConn {
 }
 
 impl HandsConn {
-    /// The sandbox this connection is bound to, from the binding's claims.
-    pub fn sandbox(&self) -> Option<&SandboxId> {
-        self.claims.as_ref().map(|c| &c.sandbox)
-    }
-
     /// The sandbox epoch this connection is bound to, from the binding's claims: the epoch the
     /// first frame must carry (the gateway closes with 4401 on any other).
     pub fn epoch(&self) -> Option<Epoch> {
@@ -576,31 +571,6 @@ pub async fn open(target: &HandsTarget, opts: &OpenOptions) -> Result<HandsConn,
     }
 }
 
-/// Exactly one frame: `len == message_len - 4`, a known kind, within the frame limit.
-fn one_frame(bytes: &[u8]) -> Result<(Kind, &[u8]), RecvError> {
-    if bytes.len() < 5 {
-        return Err(RecvError::Protocol(format!(
-            "binary message of {} bytes is not a frame",
-            bytes.len()
-        )));
-    }
-    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if len > MAX_FRAME_LEN {
-        return Err(RecvError::Protocol(
-            frame::FrameError::TooLarge(len).to_string(),
-        ));
-    }
-    if len as usize != bytes.len() - 4 {
-        return Err(RecvError::Protocol(format!(
-            "frame length {len} does not match a message of {} bytes",
-            bytes.len()
-        )));
-    }
-    let kind = Kind::from_u8(bytes[4])
-        .ok_or_else(|| RecvError::Protocol(frame::FrameError::UnknownKind(bytes[4]).to_string()))?;
-    Ok((kind, &bytes[5..]))
-}
-
 impl HandsConn {
     /// The guest's version and capabilities as the gateway reported them in `bound` (authoritative).
     pub fn guest(&self) -> &GuestInfo {
@@ -639,7 +609,8 @@ impl HandsConn {
             match self.ws.next().await {
                 None => return Ok(None),
                 Some(Ok(Message::Binary(b))) => {
-                    let (kind, payload) = one_frame(&b)?;
+                    let (kind, payload) =
+                        frame::one_frame(&b).map_err(|e| RecvError::Protocol(e.to_string()))?;
                     if kind != Kind::Json {
                         return Err(RecvError::Protocol(
                             "data frame on the hands channel".into(),

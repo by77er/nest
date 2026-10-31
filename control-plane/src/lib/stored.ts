@@ -40,3 +40,9 @@ export function typeEnum<T extends string>(variants: readonly { shape: { type: {
     safeParse: (v: unknown) => (typeof v === "string" && known.has(v) ? { success: true, data: v as T } : { success: false }),
   };
 }
+
+/** Add `column` to `table` unless it's there (expand-only schema changes, docs/data/). */
+export function addColumn(sql: SqlStorage, table: string, column: string, type: string): void {
+  const cols = sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
+  if (!cols.some((c) => c.name === column)) sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}

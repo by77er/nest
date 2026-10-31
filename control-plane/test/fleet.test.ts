@@ -331,6 +331,40 @@ describe("lease expiry and STONITH", () => {
     expect((await sandboxStub(sbx.sandbox).info())).toMatchObject({ epoch: 2, host: b.host });
   });
 
+  it("never renews the lease of a host it holds expired, though its socket is open (B-5)", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell, "brain");
+    // A FleetDO reset between a hello's ack and its expired-to-active write left it so.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", h.host);
+    });
+    h.ws.send({ type: "heartbeat", sent_ms: 1, leases: [] });
+    expect(await h.ws.none("heartbeat_ack", 300)).toBe(true);
+  });
+
+  it("a returning host is active again by the time its hello is acknowledged (B-5)", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell, "brain");
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO, state) => {
+      state.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", h.host);
+      // Whatever the hello awaits after its ack never finishes (a FleetDO reset there).
+      (inst as any).sendBindingKeys = () => new Promise(() => {});
+    });
+    const ws = await Ws.connect("/v1/fleet", h.host_token);
+    ws.send(hostHello(h.host, cell, { role: "brain" }));
+    await ws.next("hello_ack");
+    expect(await fleetStub(cell).hostStatus(h.host)).toMatchObject({ status: "active", lost: false });
+  });
+
+  it("sends a new host token on every hello, whenever the old one expires (B-9)", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const ws = await Ws.connect("/v1/fleet", h.host_token);
+    ws.send(hostHello(h.host, cell));
+    await ws.next("hello_ack");
+    expect((await ws.next("host_token")).token).toMatch(/^nht_/);
+  });
+
   it("rotates host tokens before they expire", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
@@ -425,6 +459,56 @@ describe("autoscaling", () => {
     ws.close();
   });
 
+  it("repeats a launch whose answer was lost with the same client token, so it's recorded and never launched twice (B-6)", async () => {
+    const cell = uniqueCell();
+    // EC2 launches the instance, but its answer never arrives (a timeout, a reset).
+    const byToken = new Map<string, string>();
+    let lose = true;
+    const ec2 = new MockEc2("running");
+    ec2.launch = async (spec: LaunchSpec) => {
+      if (!byToken.has(spec.clientToken)) byToken.set(spec.clientToken, `i-0${(byToken.size + 1).toString(16).padStart(8, "0")}`);
+      ec2.launched.push(spec);
+      if (lose) { lose = false; throw new Error("EC2 RunInstances: network connection lost"); }
+      return byToken.get(spec.clientToken)!;
+    };
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    expect(ec2.launched).toHaveLength(1);
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches).toEqual([]);
+    // The next run repeats that attempt, not a new one: EC2 answers with the instance it launched.
+    await tickAt(cell, ec2);
+    expect(ec2.launched.map((l) => l.clientToken)).toEqual([ec2.launched[0]!.clientToken, ec2.launched[0]!.clientToken]);
+    expect(byToken.size).toBe(1);
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches).toEqual([expect.objectContaining({ instance_id: "i-000000001" })]);
+    // It can enroll, and nothing else is launched for the waiting sandbox meanwhile.
+    expect((await enrollLaunched(cell, "i-000000001")).host).toMatch(/^hst_/);
+    await tickAt(cell, ec2);
+    expect(byToken.size).toBe(1);
+  });
+
+  it("stops repeating a launch after the enroll timeout, and the tick launches nothing in its place", async () => {
+    const cell = uniqueCell();
+    // EC2 never answers (a timeout every time): whether an instance exists is unknown.
+    const ec2 = new MockEc2("running");
+    ec2.launch = async (spec: LaunchSpec) => {
+      ec2.launched.push(spec);
+      throw new Error("EC2 RunInstances: network connection lost");
+    };
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    await tickAt(cell, ec2);
+    expect(new Set(ec2.launched.map((l) => l.clientToken)).size).toBe(1);
+    // The attempt is older than enroll_timeout_ms: its token may no longer be honoured.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.at', 0) WHERE key LIKE 'launch:%'");
+    });
+    const before = ec2.launched.length;
+    await tickAt(cell, ec2);
+    // Dropped, and no new launch without demand: the waiting sandbox's next placement asks for one.
+    expect(ec2.launched).toHaveLength(before);
+    expect(await runInDurableObject(fleetStub(cell), (_i, state) => state.storage.sql.exec("SELECT 1 FROM kv WHERE key LIKE 'launch:%'").toArray().length)).toBe(0);
+  });
+
   it("terminates a launch that never enrolls, then launches again on demand", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("terminated");
@@ -437,6 +521,24 @@ describe("autoscaling", () => {
     await autoscaled(cell, ec2);
     await sandboxStub(sbx.sandbox).retryPlacement();
     expect(ec2.launched).toHaveLength(2);
+  });
+
+  it("retires a launched host that enrolled but never said hello once the enroll timeout passes (B-8)", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    const enrolled = await enrollLaunched(cell, "i-000000001");
+    await tickAt(cell, ec2);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE hosts SET enrolled_ms = enrolled_ms - 601000");
+    });
+    await tickAt(cell, ec2);
+    // Dead with its brains proven gone (nothing was ever delivered to it), and its instance terminated.
+    expect(await fleetStub(cell).hostStatus(enrolled.host)).toMatchObject({ status: "dead", lost: true });
+    expect(ec2.terminated).toEqual(["i-000000001"]);
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches[0]).toMatchObject({ instance_id: "i-000000001", reason: "enroll_timeout" });
   });
 
   it("does nothing in a cell without AWS settings, and never retires hosts it didn't launch", async () => {
@@ -609,6 +711,46 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(recreate).toMatchObject({ sandbox: busy.sandbox, epoch: 2, from: { id: head.id } });
     expect(await sandboxStub(busy.sandbox).info()).toMatchObject({ host: b.host, state: "restoring" });
     expect(await sandboxStub(idle.sandbox).info()).toMatchObject({ host: null, state: "suspended" });
+  });
+
+  it("a spot drain survives a blip: a host back from STONITH by fence, or from expiry, is still draining (B-3)", async () => {
+    const cell = uniqueCell();
+    const fleet = fleetStub(cell);
+    await runInDurableObject(fleet, (inst: FleetDO) => {
+      inst.ec2Override = null;
+    });
+    // Through STONITH by fence: the drained host holds a lease when it goes silent.
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "running");
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    a.ws.close();
+    await expireNow(cell, a.host);
+    expect((await fleet.hostStatus(a.host))!.status).toBe("stonith_pending");
+    const ws = await Ws.connect("/v1/fleet", a.host_token);
+    ws.send(hostHello(a.host, cell, { sandboxes: [{ sandbox: sbx.sandbox, epoch: 1, state: "fenced", dirty: false }] }));
+    // The same nestd process: its event lineage continues where FleetDO's ack left it.
+    sendEvents(ws, [], (await ws.next("hello_ack")).last_event_seq + 1);
+    const [fence] = await nextCommands(ws, (c) => c.type === "fence" && c.reason === "lease expired");
+    await okResult(ws, fence!.cmd);
+    expect((await fleet.hostStatus(a.host))!.status).toBe("draining");
+
+    // Through expiry: a drained host holding nothing goes silent, then says hello.
+    const c = await connectHost(cell);
+    sendEvents(c.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await c.ws.next("ack");
+    c.ws.close();
+    await expireNow(cell, c.host);
+    expect((await fleet.hostStatus(c.host))!.status).toBe("expired");
+    const again = await Ws.connect("/v1/fleet", c.host_token);
+    again.send(hostHello(c.host, cell));
+    await again.next("hello_ack");
+    await again.next("binding_key");
+    expect((await fleet.hostStatus(c.host))!.status).toBe("draining");
+    // Neither takes a placement: with no other host, the sandbox waits.
+    expect((await createSandbox(cell, 202)).host).toBeNull();
   });
 
   it("a draining host doesn't count toward the cell's host cap", async () => {

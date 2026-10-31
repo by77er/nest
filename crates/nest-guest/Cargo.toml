@@ -13,7 +13,7 @@ name = "nest-guest"
 path = "src/main.rs"
 
 [dependencies]
-nest-protocol = { path = "../nest-protocol" }
+nest-protocol = { path = "../nest-protocol", features = ["tokio"] }
 anyhow = "1"
 base64 = "0.22"
 globset = "0.4"

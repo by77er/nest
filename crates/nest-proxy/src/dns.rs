@@ -13,7 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use nest_protocol::control::EgressVerdict;
-use nest_protocol::model::EgressPolicy;
 
 use crate::audit::Audit;
 use crate::state::{DNS_TTL_CAP_MS, Sandbox, Session, submit_audit};
@@ -22,12 +21,6 @@ use crate::util::{norm_host, now_ms};
 const TTL_SECS: u32 = (DNS_TTL_CAP_MS / 1000) as u32;
 const MAX_UDP: usize = 4096;
 const TCP_IDLE: Duration = Duration::from_secs(10);
-
-/// May `name` be resolved for this sandbox?
-pub fn name_allowed(policy: &EgressPolicy, name: &str, now: i64) -> bool {
-    policy.allow.iter().any(|r| r.host.matches(name) && r.expires_ms.is_none_or(|e| now < e))
-        || policy.tcp.iter().any(|t| norm_host(&t.host) == name)
-}
 
 /// Answer one DNS query packet. Returns `None` for unparseable input (dropped silently).
 pub async fn answer(session: &Session, sandbox: &Sandbox, query: &[u8]) -> Option<Vec<u8>> {
@@ -51,7 +44,7 @@ pub async fn answer(session: &Session, sandbox: &Sandbox, query: &[u8]) -> Optio
         let name = norm_host(&q.name().to_ascii());
         let view = sandbox.view();
         let Some(policy) = view.policy else { break 'r ResponseCode::Refused };
-        if !name_allowed(&policy, &name, now_ms()) {
+        if !policy.resolves(&name, now_ms()) {
             let a = Audit::new(&name, 53, EgressVerdict::Deny).reason("dns_nxdomain");
             submit_audit(session, sandbox, a.into_record(&sandbox.id, view.epoch, None, Some(nest_protocol::control::EgressVia::Dns)));
             break 'r ResponseCode::NXDomain;
@@ -128,32 +121,5 @@ pub async fn serve_tcp_conn(session: Arc<Session>, sandbox: Arc<Sandbox>, mut s:
         if s.write_all(&out).await.is_err() {
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nest_protocol::model::{AllowRule, EgressLimits, HostPattern, PolicyLayer, TcpException};
-
-    #[test]
-    fn allowlist() {
-        let p = EgressPolicy {
-            version: 1,
-            allow: vec![
-                AllowRule { host: HostPattern("*.githubusercontent.com".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None },
-                AllowRule { host: HostPattern("old.example".into()), ports: vec![443], layer: PolicyLayer::Sandbox, expires_ms: Some(10) },
-            ],
-            passthrough: vec![],
-            inject: vec![],
-            tcp: vec![TcpException { host: "db.example.com".into(), port: 5432 }],
-            limits: EgressLimits { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 },
-        };
-        assert!(name_allowed(&p, "raw.githubusercontent.com", 0));
-        assert!(!name_allowed(&p, "githubusercontent.com", 0));
-        assert!(name_allowed(&p, "db.example.com", 0));
-        assert!(name_allowed(&p, "old.example", 5));
-        assert!(!name_allowed(&p, "old.example", 10));
-        assert!(!name_allowed(&p, "evil.com", 0));
     }
 }

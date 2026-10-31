@@ -248,9 +248,11 @@ Time is abstract: 5 s steps, 70 s explored. Frames are delayed any number of ste
 The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them one at a time with `cargo kani -p nestd-core --harness <module>::proofs::<name> --exact` (for example `incarnation::proofs::the_retire_backoff_grows_to_the_max_and_stays`, or `results::proofs::` for the cache) (kani-verifier 0.68.0, CBMC 6.11.0). Every harness runs shipped code over symbolic inputs.
 
 **What was extracted.** Phase 1 moved the decision functions that already existed into [`nestd_core::incarnation`](../../../crates/nestd-core/src/incarnation.rs), unchanged in behaviour. Table-driven tests of today's behaviour came first; then nestd's call sites changed to call them:
-- the tombstone map, `TombstoneMap` (nestd's `Tombstones` only shares one behind its lock);
+- the tombstone map, `TombstoneMap` (nestd's `Tombstones` only shares one behind its lock; nest-proxy's session keeps its own instance for `sandbox_drop` fences, so the proof covers both);
 - `recovery.rs`'s `meta.json` version verdict and the scan's per-entry decisions;
 - `host.rs`'s clean-at-start check, retire backoff, "nothing to salvage" check and `salvage_retryable` (single expressions, plus two constants).
+
+Since then, new decisions land there as they are made: `reask_failure_ends_commit` (whether a salvage goes on past a refused re-ask, the fix of the inventory's B1).
 
 Functions of one expression have table tests and no harness of their own; the tombstone harness proves them in use.
 

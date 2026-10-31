@@ -119,6 +119,61 @@ describe("#2 a restarted runner is a new lineage", () => {
   });
 });
 
+describe("a finished turn's trailing events", () => {
+  it("leave the next turn's state alone: its `idle` after `turn_completed` doesn't stand for the turn now running", async () => {
+    const s = await setup();
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "one" } }, 201)).turn;
+    await ws.next("run_turn", (m) => m.turn === t1);
+    const t2 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "two" } }, 201)).turn;
+    const ev = (seq: number, turn: string, body: Record<string, unknown>) => ({ agent: s.agent, epoch: 1, seq, ts_ms: seq, turn, ...body });
+    // As the runner sends them: the turn's end, then its idle (stamped with the turn that ended).
+    ws.send({ type: "events", seq: 1, events: [ev(1, t1, { type: "turn_started", input_kind: "user" }), ev(2, t1, { type: "turn_completed", stop_reason: "end_turn" })] });
+    await ws.next("ack", (m) => m.up_to === 1);
+    await ws.next("run_turn", (m) => m.turn === t2);
+    ws.send({ type: "events", seq: 2, events: [ev(3, t1, { type: "state_changed", state: "idle" })] });
+    await ws.next("ack", (m) => m.up_to === 2);
+    expect(await agentStub(s.agent).info()).toMatchObject({ current_turn: t2, state: "working" });
+    // The running turn's own events still count.
+    ws.send({ type: "events", seq: 3, events: [ev(4, t2, { type: "state_changed", state: "waiting_permission" })] });
+    await ws.next("ack", (m) => m.up_to === 3);
+    expect((await agentStub(s.agent).info()).state).toBe("waiting_permission");
+    // Nor is it reported on `<agt>/events` (posted in order: once the running turn's change is there, any earlier one is).
+    const read = () => adminJson(`/v1/admin/channels/${encodeURIComponent(`${s.agent}/events`)}/messages`);
+    let msgs: any[] = [];
+    for (let n = 0; n < 100 && !msgs.some((m) => m.data?.state === "waiting_permission"); n++, await sleep(50)) msgs = (await read()).messages;
+    expect(msgs.filter((m) => m.kind === "state_changed").map((m) => m.data.state)).toEqual(["waiting_permission"]);
+  });
+});
+
+describe("a turn recovered while pump awaits", () => {
+  it("isn't sent after its recovery turn: the new runner gets the recovery turn alone", async () => {
+    const s = await setup();
+    await runner(s.agent, s.host.host, s.host.host_token, "rin_one");
+    // Pause the pump that claims the turn after its awaits, before it sends.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["pump:beforeSend"] = async () => {
+        delete inst.testHooks["pump:beforeSend"];
+        while (!(inst as unknown as { go?: boolean }).go) await new Promise((r) => setTimeout(r, 10));
+      };
+    });
+    const queued = adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
+    for (let n = 0; n < 100 && (await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => inst.testHooks["pump:beforeSend"] !== undefined)); n++) {
+      await sleep(20);
+    }
+    // A new runner process says hello meanwhile: the claimed turn is recovered.
+    const r2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_two");
+    const rec = await r2.ws.next("run_turn");
+    expect(rec.input.kind).toBe("recovery");
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as unknown as { go?: boolean }).go = true;
+    });
+    const t = (await queued).turn;
+    expect(await r2.ws.none("run_turn", 500, (m) => m.turn === t)).toBe(true);
+    expect((await agentStub(s.agent).info()).current_turn).toBe(rec.turn);
+  });
+});
+
 describe("#3 no lost updates across awaits", () => {
   it("a flush interleaved with enqueueTurn keeps the running turn", async () => {
     const s = await setup();
@@ -482,6 +537,54 @@ describe("#21 a deadline re-armed while it runs isn't dropped", () => {
     });
   });
 
+  // A bare object with a deadlines table (a ChannelDO no channel uses).
+  const bare = () => env.CHANNEL.get(env.CHANNEL.idFromName(`~deadlines-${crypto.randomUUID()}`));
+
+  it("the arm-if-absent idiom inside the key's own handler re-arms it (a running key isn't armed)", async () => {
+    await runInDurableObject(bare(), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("x", 1);
+      await d.runDue(Date.now(), async () => {
+        if (!d.has("x")) await d.set("x", Date.now() + 60_000);
+      });
+      expect(d.has("x")).toBe(true);
+    });
+  });
+
+  it("a re-arm for the very time being run survives (the handler asked to run again)", async () => {
+    await runInDurableObject(bare(), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("x", 5);
+      let runs = 0;
+      await d.runDue(Date.now(), async () => {
+        runs++;
+        await d.set("x", 5);
+      });
+      expect(runs).toBe(1);
+      expect(st.storage.sql.exec("SELECT at FROM deadlines WHERE key = 'x'").toArray()).toEqual([{ at: 5 }]);
+    });
+  });
+
+  it("a key cleared or moved by an earlier key's handler doesn't run from the stale snapshot", async () => {
+    await runInDurableObject(bare(), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("a", 1);
+      await d.set("b", 2);
+      await d.set("c", 3);
+      const later = Date.now() + 60_000;
+      const ran: string[] = [];
+      await d.runDue(Date.now(), async (k) => {
+        ran.push(k);
+        if (k === "a") {
+          await d.clear("b");
+          await d.set("c", later);
+        }
+      });
+      expect(ran).toEqual(["a"]);
+      expect(st.storage.sql.exec("SELECT key, at FROM deadlines ORDER BY key").toArray()).toEqual([{ key: "c", at: later }]);
+    });
+  });
+
   it("an unplaced sandbox keeps retrying while there is no capacity", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
@@ -517,8 +620,8 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
     expect((await agentStub(s.agent).info()).state).toBe("detached");
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "wake up" } }, 201);
     const [start] = await nextCommands(s.host.ws, isStart(s.agent));
-    // A new start, a new agent epoch (`hands.epoch` repeats it for the previous release's runners).
-    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox, epoch: 2 } });
+    // A new start, a new agent epoch.
+    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox } });
   });
 
   it("a brain that dies mid-turn restarts; after repeated crashes only new input retries", async () => {
@@ -578,7 +681,7 @@ describe("#23 captains move off a silent brain host", () => {
     const a = await connectHost(cell, "brain");
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: await workstream(), cell } }, 201)).agent as string;
     await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
-    const r = await runner(captain, a.host, a.host_token, "rin_cap", 0);
+    const r = await runner(captain, a.host, a.host_token, "rin_cap", 1);
     await adminJson(`/v1/agents/${captain}/turns`, { body: { text: "plan" } }, 201);
     await r.ws.next("run_turn");
     const b = await connectHost(cell, "brain");

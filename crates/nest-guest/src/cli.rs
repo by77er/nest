@@ -4,12 +4,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{CliCommand, CliRequest, CliResponse, CliResult};
 use tokio::net::UnixListener;
 use tracing::warn;
 
-use crate::framed::{FramedReader, write_json};
-use crate::state::{Guest, busy};
+use crate::framed::parse_json;
+use crate::state::{Gate, Guest};
 
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
@@ -39,16 +40,11 @@ pub async fn accept_loop(guest: Arc<Guest>, listener: UnixListener) {
 
 async fn handle(guest: Arc<Guest>, stream: tokio::net::UnixStream) {
     let mut reader = FramedReader::new(stream);
-    let req: CliRequest = match reader.next_json().await {
-        Ok(Some(Ok(r))) => r,
-        Ok(Some(Err(e))) => {
-            let (mut s, _) = reader.into_parts();
-            let _ = write_json(&mut s, &CliResponse { result: CliResult::Error { error: e } }).await;
-            return;
-        }
-        _ => return,
+    let Ok(Some(f)) = reader.next().await else { return };
+    let result = match parse_json::<CliRequest>(&f) {
+        Ok(req) => execute(&guest, req).await,
+        Err(error) => CliResult::Error { error },
     };
-    let result = execute(&guest, req).await;
     let (mut s, _) = reader.into_parts();
     let _ = write_json(&mut s, &CliResponse { result }).await;
 }
@@ -57,18 +53,11 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
     match req.command {
         CliCommand::Whoami {} => {
             let inner = guest.inner.lock().unwrap();
-            match &inner.identity {
-                Some(id) => {
-                    let sandbox = inner.forked_sandbox_id.clone().unwrap_or_else(|| id.sandbox_id.clone());
-                    CliResult::Ok {
-                        data: serde_json::json!({
-                            "sandbox_id": sandbox,
-                            "agent_id": req.agent_id,
-                            "epoch": id.epoch,
-                        }),
-                    }
-                }
-                None => CliResult::Error { error: busy("guest not configured yet") },
+            match inner.admit(Gate::Whoami) {
+                Ok(id) => CliResult::Ok {
+                    data: serde_json::json!({ "sandbox_id": id.sandbox_id, "agent_id": req.agent_id, "epoch": id.epoch }),
+                },
+                Err(error) => CliResult::Error { error },
             }
         }
         command => {
@@ -76,7 +65,7 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
                 CliCommand::Ask { wait_s, .. } => Duration::from_secs(u64::from((*wait_s).min(120)) + 15),
                 _ => Duration::from_secs(30),
             };
-            guest.relay_cli(req.agent_id, command, wait).await
+            guest.events.relay_cli(req.agent_id, command, wait).await
         }
     }
 }

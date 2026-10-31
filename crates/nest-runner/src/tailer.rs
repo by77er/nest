@@ -5,7 +5,8 @@
 //! - Redaction replaces known secrets with same-length `*` runs, preserving offsets.
 //! - The file shrinking or changing inode (rewrite, `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`, path
 //!   rebase) restarts from offset 0 with `base: true`.
-//! - After a reconnect, AgentDO's `hello_ack.durable_bytes` rewinds the send cursor.
+//! - After a reconnect, `hello_ack.durable_bytes` rewinds the send cursor; while a base is
+//!   unacknowledged (`durable_bytes` may describe the old file), the base goes again instead.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -28,13 +29,15 @@ pub struct Tailer {
     sent: u64,
     inode: Option<u64>,
     need_base: bool,
+    /// A base went out and no `segment_ack` has come since: AgentDO may not have it.
+    base_unconfirmed: bool,
     secrets: Vec<String>,
 }
 
 impl Tailer {
     pub fn new(path: impl Into<PathBuf>, secrets: Vec<String>) -> Self {
         let secrets = secrets.into_iter().filter(|s| s.len() >= 8).collect();
-        Self { path: path.into(), sent: 0, inode: None, need_base: false, secrets }
+        Self { path: path.into(), sent: 0, inode: None, need_base: false, base_unconfirmed: false, secrets }
     }
 
     pub fn path(&self) -> &Path {
@@ -61,8 +64,17 @@ impl Tailer {
         }
     }
 
-    /// AgentDO has `durable` bytes: resend from there (after a reconnect).
+    /// AgentDO acknowledged session bytes after the last base went out, so it has that base.
+    pub fn confirm(&mut self) {
+        self.base_unconfirmed = false;
+    }
+
+    /// AgentDO has `durable` bytes (after a reconnect): resend from there, or the base again.
     pub fn rewind(&mut self, durable: u64) {
+        if self.base_unconfirmed {
+            self.need_base = true;
+            return;
+        }
         match std::fs::metadata(&self.path) {
             Ok(m) if durable <= m.len() => {
                 self.sent = durable;
@@ -109,6 +121,7 @@ impl Tailer {
         let chunks = split(start, base, buf);
         self.sent = start + chunks.iter().map(|c| c.data.len() as u64).sum::<u64>();
         self.inode = Some(opened_ino);
+        self.base_unconfirmed |= base;
         self.need_base = false;
         Ok(chunks)
     }
@@ -209,6 +222,33 @@ mod tests {
         t.rewind(3);
         let c = t.poll().unwrap();
         assert_eq!((c[0].offset, c[0].data.as_slice()), (3, &b"l2\nl3\n"[..]));
+    }
+
+    /// R7: a base lost with its connection is sent again after the reconnect, even when the new
+    /// file is longer than what AgentDO holds of the old one. Before, the tailer had moved to the
+    /// new file, rewound to the old file's durable offset and sent the new file's tail as if it
+    /// continued the old one.
+    #[test]
+    fn an_unacknowledged_base_goes_again_after_a_reconnect() {
+        let dir = tempdir();
+        let p = dir.join("s.jsonl");
+        let mut t = Tailer::new(&p, vec![]);
+        append(&p, "old-1\nold-2\n");
+        t.poll().unwrap();
+        t.confirm();
+        let tmp = dir.join("tmp");
+        std::fs::write(&tmp, "new-1\nnew-2\nnew-3\n").unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+        assert!(t.poll().unwrap()[0].base, "the rewrite goes as a base");
+        // The connection broke with the base unacknowledged; AgentDO still holds the old file.
+        t.rewind(12);
+        let c = t.poll().unwrap();
+        assert_eq!((c[0].offset, c[0].base, c[0].data.as_slice()), (0, true, &b"new-1\nnew-2\nnew-3\n"[..]));
+        // Once acknowledged, a reconnect resumes from AgentDO's offset.
+        t.confirm();
+        t.rewind(6);
+        let c = t.poll().unwrap();
+        assert_eq!((c[0].offset, c[0].base), (6, false));
     }
 
     #[test]

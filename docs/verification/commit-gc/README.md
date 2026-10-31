@@ -20,7 +20,7 @@ Constants: `R = REUSE_MS = 12 h` (`s3.rs:54`), `G = GC_GRACE_MS = 24 h`, `W = GC
 
 ## State machines
 
-### Commit (SandboxDO.commit, `sandbox.ts:552-613`)
+### Commit (`decideCommit` in `lib/sandbox-lease.ts`; the shell `SandboxDO.commit`)
 
 One synchronous block (no await before the `commits` insert), so a commit is atomic in DO SQLite.
 
@@ -41,7 +41,7 @@ No state guard: an orphan is accepted after `destroy` (`state = destroyed`), and
 | Step | Effect | Ref |
 |---|---|---|
 | `prepare` | chunk every non-zero 4 MB block; reuse a chunk only if `recent` (this process uploaded it < R ago, or HEAD `Last-Modified` < R ago), else PUT; then the manifest under the same rule; new request id | `storage.rs:118-163`, `s3.rs:312-326`, `:475-507`, `host.rs:2124-2148` |
-| `send` | persist `meta.unanswered := c` **before** emitting `commit_request` to the in-memory outbox; wait unlocked up to `commit_timeout` (60 s) | `host.rs:2076-2121`, `config.rs:275-277` |
+| `send` | persist `meta.unanswered := c` **before** emitting `commit_request` to the in-memory outbox (a failed persist fails the commit, retryable, unsent); wait unlocked up to `commit_timeout` (60 s) | `host.rs:2076-2121`, `config.rs:275-277` |
 | timeout | keep `unanswered := c` (persisted) | `host.rs:2112-2115` |
 | next commit | re-send `unanswered` under the same id with its **original manifest and epoch**, adopt the outcome; only then prepare | `host.rs:2052-2071` |
 | `Committed` | `head := gen`; `clean := vm none ∨ paused` | `host.rs:2152-2161` |
@@ -114,7 +114,7 @@ Let `cl(m)` = `{manifests/m} ∪ {chunks/c | c ∈ m}`; `Live` = generations of 
 |---|---|
 | Prepare | `storage.rs:118-163`, `s3.rs:312-326`, `:475-507` |
 | Send / Resend | `host.rs:2076-2121`, `:2052-2058`; `fleet.rs:291` |
-| Evaluate | `sandbox.ts:552-613` |
+| Evaluate | `decideCommit`, `SandboxDO.commit` |
 | Destroy | `sandbox.ts:507-520`, `fleet.ts:1597` |
 | Claim | `fleet.ts:1619-1652`, `sandbox.ts:496-505` |
 | List / Judge / Delete | `gc.rs:91-160` |

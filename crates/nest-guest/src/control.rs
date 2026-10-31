@@ -3,13 +3,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{CliResult, ControlBody, ControlFrame, PROTOCOL_VERSION, error_code};
 use nest_protocol::model::ErrorBody;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::framed::{FramedReader, err, parse_json, write_json};
-use crate::state::{Guest, Identity, event};
+use crate::framed::{err, parse_json};
+use crate::events::event;
+use crate::state::{Guest, Identity};
 use crate::sys;
 use crate::transport::Conn;
 
@@ -32,7 +34,7 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
         capabilities: sys::capabilities(&guest),
     };
     let _ = tx.send(event(hello));
-    let generation = guest.attach_control(tx.clone());
+    let generation = guest.events.attach(tx.clone());
     info!(generation, "control connection open");
 
     let mut reader = FramedReader::new(rd);
@@ -55,27 +57,28 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
         let id = msg.id;
         let body = match msg.body {
             ControlBody::Configure { sandbox_id, epoch, hostname, agents } => {
-                let raised = {
+                let next = Identity { sandbox_id, epoch, hostname };
+                let admitted = {
                     let mut inner = guest.inner.lock().unwrap();
-                    let ok = inner.identity.as_ref().is_none_or(|i| epoch >= i.epoch);
-                    if ok {
-                        sys::configured_hostname(&guest, &hostname);
-                        inner.identity = Some(Identity { sandbox_id, epoch, hostname });
-                        inner.forked_sandbox_id = None;
+                    let admitted = Identity::admit_configure(inner.identity.as_ref(), &next);
+                    if admitted.is_ok() {
+                        sys::configured_hostname(&guest, &next.hostname);
+                        inner.identity = Some(next);
                         let keep: std::collections::HashSet<_> = agents.iter().map(|a| a.agent_id.clone()).collect();
                         inner.agents.retain(|k, _| keep.contains(k));
                     }
-                    ok
+                    admitted
                 };
-                if raised {
+                if let Err(error) = admitted {
+                    ControlBody::Error { error }
+                } else {
                     for slot in agents {
                         guest.upsert_agent(slot);
                     }
                     let _ = tx.send(reply(id, ControlBody::Ok {}));
-                    guest.control_ready(generation);
+                    guest.events.ready(generation);
                     continue;
                 }
-                ControlBody::Error { error: err(error_code::STALE_EPOCH, "configure would lower the epoch", false) }
             }
             ControlBody::AgentAttach { slot } => {
                 guest.upsert_agent(slot);
@@ -99,42 +102,34 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
             }
             ControlBody::Resume { wall_clock_ms, entropy_b64, fork } => {
                 let g = guest.clone();
-                let step = tokio::task::spawn_blocking(move || sys::resume(&g, wall_clock_ms, &entropy_b64, fork.as_ref()))
-                    .await
-                    .unwrap_or(0);
-                ControlBody::ResumeDone { clock_step_ms: step }
+                blocking(move || sys::resume(&g, wall_clock_ms, &entropy_b64, fork.as_ref()).map(|clock_step_ms| ControlBody::ResumeDone { clock_step_ms })).await
             }
             ControlBody::PrepareSnapshot { drop_caches, fsfreeze } => {
                 let g = guest.clone();
-                match tokio::task::spawn_blocking(move || sys::prepare_snapshot(&g, drop_caches, &fsfreeze)).await {
-                    Ok(Ok(())) => ControlBody::Ok {},
-                    Ok(Err(e)) => ControlBody::Error { error: e },
-                    Err(e) => ControlBody::Error { error: err(error_code::INTERNAL, e.to_string(), false) },
-                }
+                blocking(move || sys::prepare_snapshot(&g, drop_caches, &fsfreeze).map(|()| ControlBody::Ok {})).await
             }
             ControlBody::Thaw {} => {
                 let g = guest.clone();
-                let _ = tokio::task::spawn_blocking(move || sys::thaw(&g)).await;
-                ControlBody::Ok {}
+                blocking(move || {
+                    sys::thaw(&g);
+                    Ok(ControlBody::Ok {})
+                })
+                .await
             }
             ControlBody::Health {} => {
                 let g = guest.clone();
-                let report = tokio::task::spawn_blocking(move || sys::health(&g)).await;
-                match report {
-                    Ok(report) => ControlBody::HealthReport { report },
-                    Err(e) => ControlBody::Error { error: err(error_code::INTERNAL, e.to_string(), false) },
-                }
+                blocking(move || Ok(ControlBody::HealthReport { report: sys::health(&g) })).await
             }
             // Replies to our `cli` relays.
             ControlBody::CliResult { result } => {
                 if let Some(r) = msg.reply_to {
-                    guest.resolve_cli(r, result);
+                    guest.events.resolve_cli(r, result);
                 }
                 continue;
             }
             ControlBody::Error { error } => {
                 match msg.reply_to {
-                    Some(r) => guest.resolve_cli(r, CliResult::Error { error }),
+                    Some(r) => guest.events.resolve_cli(r, CliResult::Error { error }),
                     None => warn!(code = error.code, message = error.message, "host reported an error"),
                 }
                 continue;
@@ -155,10 +150,20 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
             let _ = tx.send(reply(id, body));
         }
     }
-    guest.detach_control(generation);
+    guest.events.detach(generation);
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
     info!(generation, "control connection closed");
+}
+
+/// A lifecycle step on the blocking pool, as its reply; a panic in it is an `internal` error,
+/// never success.
+async fn blocking(f: impl FnOnce() -> Result<ControlBody, ErrorBody> + Send + 'static) -> ControlBody {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => ControlBody::Error { error },
+        Err(e) => ControlBody::Error { error: err(error_code::INTERNAL, e.to_string(), false) },
+    }
 }
 
 fn reply(to: Option<u64>, body: ControlBody) -> ControlFrame {

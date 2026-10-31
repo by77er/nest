@@ -75,8 +75,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/lib/nest/nest hook",
-            "async": true
+            "command": "/usr/lib/nest/nest hook --sync",
+            "timeout": 10
           }
         ]
       }

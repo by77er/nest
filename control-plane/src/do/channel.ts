@@ -14,13 +14,13 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";
 import type { Env } from "../env";
 import {
-  type AclEntry, afterDelivery, type Batch, BATCH_SCAN, type Caller, type ChannelAction, type ChannelFacts, type ChannelKind, checkPost,
-  type CheckedPost, DEFAULT_BATCH_MS, DEFAULT_RETENTION_DAYS, decidePost, Delivery, DELIVERY_BACKSTOP_MS, DELIVERY_TIMEOUT_MS, type DeliveryOutcome,
-  chunks, IDEM_RETENTION_MS, isAgentCaller, R2_DELETE_MAX, KEYS_MAX_LIMIT, type Message, type MessageMeta, onAppend, parseChannel, permits, planBatch,
-  type PostState, RATE_WINDOW_MS, READ_DEFAULT_LIMIT, READ_MAX_BYTES, READ_MAX_LIMIT, type SubscribeInput, type Subscription,
-  TIER_AFTER_MS,
+  type AclEntry, type Batch, BATCH_SCAN, beginDelivery, type Caller, type ChannelAction, type ChannelFacts, type ChannelKind, checkPost,
+  type CheckedPost, DEFAULT_BATCH_MS, DEFAULT_RETENTION_DAYS, decidePost, Delivery, DELIVERY_TIMEOUT_MS, type DeliveryOutcome,
+  chunks, IDEM_RETENTION_MS, isAgentCaller, R2_DELETE_MAX, KEYS_MAX_LIMIT, type LogView, MAX_RETENTION_DAYS, type Message, type MessageMeta, onAppend, parseChannel,
+  permits, type PostState, RATE_WINDOW_MS, READ_DEFAULT_LIMIT, READ_MAX_BYTES, READ_MAX_LIMIT, settleDelivery, type SubscribeInput, type Subscription,
+  TIER_AFTER_MS, utf8,
 } from "../lib/channels";
-import { Deadlines } from "../lib/reliable";
+import { Deadlines, withTimeout } from "../lib/reliable";
 import { storedEnum } from "../lib/stored";
 import { asNestError, NestError, newId } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
@@ -134,7 +134,6 @@ const readSub = (body: string): Subscription => {
   return { ...s, delivery: storedEnum(Delivery, s.delivery, "subs.body.delivery") };
 };
 
-const utf8Len = (t: string) => new TextEncoder().encode(t).length;
 
 const forbidden = (m: string) => new NestError(ErrorCodes.FORBIDDEN, m, 403);
 const invalid = (m: string, status = 400) => new NestError(ErrorCodes.INVALID_MESSAGE, m, status);
@@ -265,14 +264,11 @@ export class ChannelDO extends DurableObject<Env> {
     return r ? readSub(r.body) : undefined;
   }
 
+  /** Store a subscription; a due one arms the fan-out in this step, so none is left due with nothing to run it. */
   private saveSub(s: Subscription, idemKey?: string): void {
     this.sql.exec(`INSERT INTO subs (id, agent, body, idem_key, created_ms) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET body = excluded.body`, s.id, s.agent, JSON.stringify(s), idemKey ?? null, Date.now());
-  }
-
-  /** Arm the fan-out alarm for `due` (keeping an earlier one). Its row is written synchronously. */
-  private armFanout(due: number | null): Promise<void> {
-    return due === null ? Promise.resolve() : this.deadlines.set("fanout", Math.max(due, 1), true);
+    if (s.delivery === "turn" && s.due_ms !== null) this.ctx.waitUntil(this.deadlines.set("fanout", Math.max(s.due_ms, 1), true));
   }
 
   // --- channels -------------------------------------------------------------------------------------
@@ -286,7 +282,7 @@ export class ChannelDO extends DurableObject<Env> {
     if (!kind.ok) throw invalid(kind.error);
     if (kind.value.kind !== "free") throw invalid(`${name} is a built-in channel: it exists with its owner`, 409);
     if (caller.principal === "platform") throw forbidden("the platform creates no free channels");
-    if (!(retentionDays >= 1 && retentionDays <= 365 && Number.isInteger(retentionDays))) throw invalid("retention_days is 1-365");
+    if (!(retentionDays >= 1 && retentionDays <= MAX_RETENTION_DAYS && Number.isInteger(retentionDays))) throw invalid(`retention_days is 1-${MAX_RETENTION_DAYS}`);
     const cur = this.meta();
     if (cur) {
       if (cur.owner === caller.principal) return this.infoOf(cur);
@@ -414,15 +410,11 @@ export class ChannelDO extends DurableObject<Env> {
       seq, ts_ms: now, from, taint, ...(p.kind ? { kind: p.kind } : {}), ...(p.key ? { key: p.key } : {}),
       ...(p.reply_to ? { reply_to: p.reply_to } : {}), ...(p.mentions ? { mentions: p.mentions } : {}),
     };
-    let due: number | null = null;
+    // Armed in this step (`saveSub`, and maintenance here): a reset after the append strands nothing.
     for (const s of this.subs()) {
       const next = onAppend(s, msg, now);
       if (next !== s.due_ms) this.saveSub({ ...s, due_ms: next });
-      if (next !== null && (due === null || next < due)) due = next;
     }
-    // Armed in this step (rows written now; the alarm set in the background): a reset after the
-    // append can't strand a delivery or the channel's maintenance.
-    this.ctx.waitUntil(this.armFanout(due));
     if (!this.deadlines.has("maintenance")) this.ctx.waitUntil(this.deadlines.set("maintenance", now + MAINTENANCE_EVERY_MS, true));
     return { status: "posted", seq };
   }
@@ -445,13 +437,13 @@ export class ChannelDO extends DurableObject<Env> {
     let since = q.since;
     let cursorSub: Subscription | undefined;
     if (since === undefined && isAgentCaller(caller)) {
-      const row = this.sql.exec<{ id: string; read_key: string | null; read_from: number | null }>(
-        "SELECT id, read_key, read_from FROM subs WHERE agent = ? ORDER BY created_ms", caller.principal).toArray()
-        .find((r) => this.sub(r.id)?.delivery === "none");
+      const row = this.sql.exec<{ body: string; read_key: string | null; read_from: number | null }>(
+        "SELECT body, read_key, read_from FROM subs WHERE agent = ? ORDER BY created_ms", caller.principal).toArray()
+        .map((r) => ({ ...r, sub: readSub(r.body) })).find((r) => r.sub.delivery === "none");
       if (row) {
-        cursorSub = this.sub(row.id);
+        cursorSub = row.sub;
         // A re-run of the same read (its tool call cut short) reads the same page again.
-        since = q.idem_key && row.read_key === q.idem_key && row.read_from !== null ? row.read_from : cursorSub!.cursor;
+        since = q.idem_key && row.read_key === q.idem_key && row.read_from !== null ? row.read_from : cursorSub.cursor;
       }
     }
     const from = Math.max(0, since ?? 0);
@@ -461,7 +453,7 @@ export class ChannelDO extends DurableObject<Env> {
     let bytes = 0;
     for (const r of rows.slice(0, limit)) {
       const m = await this.message(r);
-      bytes += utf8Len(m.text) + (m.data !== undefined ? utf8Len(JSON.stringify(m.data)) : 0);
+      bytes += utf8(m.text) + (m.data !== undefined ? utf8(JSON.stringify(m.data)) : 0);
       if (out.length && bytes > READ_MAX_BYTES) break;
       out.push(m);
     }
@@ -517,9 +509,7 @@ export class ChannelDO extends DurableObject<Env> {
         text = "[body no longer stored]";
       }
     }
-    const meta = metaOf({ ...r, text: null });
-    const { text: _t, ...rest } = meta as MessageMeta & { text?: string };
-    return { ...rest, text, ...(data !== null ? { data: JSON.parse(data) as unknown } : {}) };
+    return { ...metaOf({ ...r, text: null }), text, ...(data !== null ? { data: JSON.parse(data) as unknown } : {}) };
   }
 
   // --- subscriptions --------------------------------------------------------------------------------
@@ -535,7 +525,7 @@ export class ChannelDO extends DurableObject<Env> {
     this.ensure(name);
     if (input.idem_key) {
       const prior = this.sql.exec<{ body: string }>("SELECT body FROM subs WHERE agent = ? AND idem_key = ?", agent, input.idem_key).toArray()[0];
-      if (prior) return JSON.parse(prior.body) as Subscription;
+      if (prior) return readSub(prior.body);
     }
     const sub: Subscription = {
       id: newId("sub_"), agent, filter: input.filter, delivery: input.delivery, batch_ms: input.batch_ms, once: input.once,
@@ -586,39 +576,29 @@ export class ChannelDO extends DurableObject<Env> {
     this.ctx.waitUntil(next === null ? this.deadlines.clear("fanout") : this.deadlines.set("fanout", Math.max(next, Date.now() + 1)));
   }
 
-  private scan(after: number): (MessageMeta & { text?: string })[] {
-    return this.sql.exec<MsgRow>("SELECT * FROM messages WHERE seq > ? ORDER BY seq LIMIT ?", after, BATCH_SCAN).toArray()
-      .map((r) => metaOf({ ...r, text: r.from_p === "user" && !r.body_ref ? r.text : null }));
+  /** The log as deliveries read it. */
+  private log(): LogView {
+    return {
+      head: this.head(),
+      scan: (after) => this.sql.exec<MsgRow>("SELECT * FROM messages WHERE seq > ? ORDER BY seq LIMIT ?", after, BATCH_SCAN).toArray()
+        .map((r) => metaOf({ ...r, text: r.from_p === "user" && !r.body_ref ? r.text : null })),
+    };
   }
 
   private async deliverOne(id: string): Promise<void> {
     const meta = this.meta();
-    let sub = this.sub(id);
+    const sub = this.sub(id);
     if (!meta || !sub || sub.due_ms === null || sub.due_ms > Date.now()) return;
-    let batch: Batch | null = sub.inflight;
-    if (!batch) {
-      const plan = planBatch(sub, this.scan(sub.cursor));
-      if (plan.kind === "idle") {
-        this.saveSub({ ...sub, due_ms: null });
-        return;
-      }
-      if (plan.kind === "advance") {
-        // Nothing matched in the scanned range; a longer backlog is looked at again at once.
-        const more = this.head() > plan.to_seq;
-        this.saveSub({ ...sub, cursor: plan.to_seq, due_ms: more ? Date.now() : null });
-        return;
-      }
-      batch = plan.batch;
-      sub = { ...sub, inflight: batch, due_ms: Date.now() + DELIVERY_BACKSTOP_MS };
-      this.saveSub(sub);
-      // The backstop is armed with the pin: a reset mid-call sends the same batch again.
-      this.ctx.waitUntil(this.armFanout(sub.due_ms));
-    }
+    const { save, send: batch } = beginDelivery(sub, this.log(), Date.now());
+    // A pin is saved with its backstop armed: a reset mid-call sends the same batch again.
+    if (save) this.saveSub(save);
+    if (!batch) return;
     this.delivering.add(id);
     let outcome: DeliveryOutcome;
     try {
       await this.hook("fanout:beforeDeliver");
-      outcome = await this.callAgent(sub.agent, { channel: meta.name, subscription: id, batch });
+      const d = { channel: meta.name, subscription: id, batch };
+      outcome = await withTimeout<DeliveryOutcome>(this.env.AGENT.get(this.env.AGENT.idFromName(sub.agent)).deliverChannel(d), DELIVERY_TIMEOUT_MS, "delivery");
     } catch (e) {
       if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) {
         console.warn(`channel ${meta.name}: subscriber ${sub.agent} is not an agent; ${id} dropped`);
@@ -638,32 +618,12 @@ export class ChannelDO extends DurableObject<Env> {
   private settle(id: string, batch: Batch, outcome: DeliveryOutcome): void {
     const cur = this.sub(id);
     if (!cur) return;
-    const now = Date.now();
-    const next = afterDelivery(cur, batch, outcome, now);
+    const next = settleDelivery(cur, batch, outcome, this.log(), Date.now());
     if (next === null) {
       this.sql.exec("DELETE FROM subs WHERE id = ?", id);
       return;
     }
-    let s = next;
-    if (s.inflight === null && s.due_ms === null) {
-      // Matches that arrived while the batch was in flight open the next window now.
-      const plan = planBatch(s, this.scan(s.cursor));
-      if (plan.kind !== "idle") s = { ...s, due_ms: now + (plan.kind === "deliver" ? s.batch_ms : 0) };
-    }
-    this.saveSub(s);
-    this.ctx.waitUntil(this.armFanout(s.due_ms));
-  }
-
-  private async callAgent(agent: string, d: { channel: string; subscription: string; batch: Batch }): Promise<DeliveryOutcome> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("delivery timed out")), DELIVERY_TIMEOUT_MS);
-    });
-    try {
-      return await Promise.race([this.env.AGENT.get(this.env.AGENT.idFromName(agent)).deliverChannel(d), timeout]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    this.saveSub(next);
   }
 
   // --- maintenance ----------------------------------------------------------------------------------
@@ -695,8 +655,9 @@ export class ChannelDO extends DurableObject<Env> {
       }
       const refs = doomed.map((d) => d.body_ref).filter((r): r is string => r !== null);
       for (const c of chunks(refs, R2_DELETE_MAX)) await this.env.BUCKET.delete(c);
-      const last = doomed[doomed.length - 1]!.seq;
-      this.sql.exec("DELETE FROM messages WHERE ts_ms < ? AND seq <= ? AND seq NOT IN (SELECT seq FROM keys)", cutoff, last);
+      // The page's own rows, not the predicate again: a key superseded during the delete would match
+      // it now and go without its body (a key only ever moves to a newer seq).
+      this.sql.exec("DELETE FROM messages WHERE seq IN (SELECT value FROM json_each(?))", JSON.stringify(doomed.map((d) => d.seq)));
     }
     // Tiering: bodies older than 7 days to R2, the row keeps the reference.
     const old = this.sql.exec<{ seq: number; text: string | null; data: string | null }>(

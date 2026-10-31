@@ -186,18 +186,6 @@ describe("stored enums", () => {
     expect((await stub.turns()).map((t) => t.status)).toEqual(["paused"]);
     expect(error).toHaveBeenCalledWith(expect.stringContaining("turns.status"));
   });
-
-  it("a host row from before `tunnel_state` reads `none`, written once by the migration", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const state = await runInDurableObject(fleetStub(cell), (_inst: FleetDO, st) => {
-      st.storage.sql.exec("UPDATE hosts SET tunnel_state = NULL, status = 'dead', dead_ms = NULL WHERE host = ?", h.host);
-      new FleetDO(st, env); // the migrations run in the constructor
-      return st.storage.sql.exec<{ tunnel_state: string | null; dead_ms: number | null }>(
-        "SELECT tunnel_state, dead_ms FROM hosts WHERE host = ?", h.host).toArray()[0];
-    });
-    expect(state).toEqual({ tunnel_state: "none", dead_ms: expect.any(Number) });
-  });
 });
 
 describe("the fleet view", () => {
@@ -236,7 +224,8 @@ describe("the GC registry", () => {
     };
     await runInDurableObject(sandboxStub(sandbox), async (inst: SandboxDO) => {
       (inst as unknown as { env: unknown }).env = { ...env, FLEET: { idFromName: () => "x", get: () => fakeFleet } };
-      await expect(inst.create({ sandbox, workstream: "ws_01registry0000000000000000", cell })).rejects.toThrow("FleetDO unavailable");
+      // The answer is unknown: the sandbox exists, and its place deadline will finish the placement.
+      expect(await inst.create({ sandbox, workstream: "ws_01registry0000000000000000", cell })).toMatchObject({ placing: 1, host: null });
     });
     expect(registered).toEqual([sandbox]);
   });
@@ -259,6 +248,37 @@ describe("the GC registry", () => {
 });
 
 describe("salvage authorization", () => {
+  it("an orphan's orphaned_work notice survives a failed post: the resent request posts it, once", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "salvage" } }, 201);
+    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
+    const salvage = {
+      ts_ms: Date.now(), type: "commit_request", request: "req_orphan_1", sandbox, epoch: 1, kind: "disk_only", disk_manifest: manifest("6"), reason: "salvage",
+    } as CommitRequestEvent;
+    const outcomes = await runInDurableObject(sandboxStub(sandbox), async (inst: SandboxDO, st) => {
+      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one();
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify({ ...JSON.parse(row.value), epoch: 2, host: "hst_other00000000000000000" }));
+      // WorkstreamDO fails the first post (a reset, a lost reply); FleetDO resends the request.
+      let fail = true;
+      const self = inst as unknown as { env: typeof env };
+      const real = self.env.WORKSTREAM;
+      self.env = { ...self.env, WORKSTREAM: { idFromName: (n: string) => real.idFromName(n), get: (id: DurableObjectId) => {
+        const ws = real.get(id);
+        return { ingest: async (...a: Parameters<typeof ws.ingest>) => {
+          if (fail) { fail = false; throw new Error("Network connection lost."); }
+          return ws.ingest(...a);
+        } };
+      } } as unknown as typeof env.WORKSTREAM };
+      const first = await inst.commit(h.host, salvage).then((o) => o.status, (e: Error) => e.message);
+      return [first, (await inst.commit(h.host, salvage)).status, (await inst.commit(h.host, salvage)).status];
+    });
+    expect(outcomes).toEqual(["Network connection lost.", "orphaned", "orphaned"]);
+    const notices = (await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(workstream)).events()).filter((e) => e.type === "orphaned_work");
+    expect(notices).toHaveLength(1);
+  });
+
   it("holds for an epoch older than the 50 that info().history shows", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
@@ -279,70 +299,6 @@ describe("salvage authorization", () => {
     } as CommitRequestEvent);
     expect(await sandboxStub(sandbox).commit(h.host, salvage("req_salvage_1", h.host))).toMatchObject({ status: "orphaned" });
     expect(await sandboxStub(sandbox).commit("hst_other00000000000000000", salvage("req_salvage_2", "x"))).toMatchObject({ status: "rejected", reason: "stale_epoch" });
-  });
-
-  it("copies a blob's capped history into the epochs table once", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "history" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const epochs = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0]!;
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'",
-        JSON.stringify({ ...JSON.parse(row.value), history: [{ epoch: 1, host: h.host }, { epoch: 2, host: "hst_b" }] }));
-      st.storage.sql.exec("DELETE FROM epochs");
-      new SandboxDO(st, env);
-      return st.storage.sql.exec("SELECT epoch, host FROM epochs ORDER BY epoch").toArray();
-    });
-    expect(epochs).toEqual([{ epoch: 1, host: h.host }, { epoch: 2, host: "hst_b" }]);
-  });
-
-  it("merges what a rolled-back release wrote into the blob, and keeps writing the blob for it", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "rollback" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const out = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const blob = () => JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0]!.value);
-      const written = blob().history;
-      // The old release ran meanwhile: it placed epochs 2 and 3 and recorded them only in the blob.
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'",
-        JSON.stringify({ ...blob(), epoch: 3, history: [...written, { epoch: 2, host: "hst_b" }, { epoch: 3, host: "hst_c" }] }));
-      new SandboxDO(st, env);
-      return { written, epochs: st.storage.sql.exec("SELECT epoch, host FROM epochs ORDER BY epoch").toArray() };
-    });
-    expect(out.written, "the blob carries the history for the old release").toEqual([{ epoch: 1, host: h.host }]);
-    expect(out.epochs).toEqual([{ epoch: 1, host: h.host }, { epoch: 2, host: "hst_b" }, { epoch: 3, host: "hst_c" }]);
-  });
-});
-
-describe("commit records written by a release without their columns (a rollback)", () => {
-  it("get their generation and an age from now on the next start, and none is pruned at once", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "rollback commits" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const before = Date.now();
-    const out = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const sql = st.storage.sql;
-      // What the previous release inserts: the columns exist (this release added them), it leaves them null.
-      sql.exec("INSERT INTO commits (request, outcome) VALUES ('req_rb_c', ?), ('req_rb_r', ?)",
-        JSON.stringify({ status: "committed", generation: { id: "gen_rollback" } }), JSON.stringify({ status: "rejected", reason: "parent_mismatch" }));
-      new SandboxDO(st, env);
-      return sql.exec("SELECT request, generation_id, created_ms FROM commits WHERE request LIKE 'req_rb_%' ORDER BY request").toArray();
-    });
-    expect(out).toEqual([
-      { request: "req_rb_c", generation_id: "gen_rollback", created_ms: expect.any(Number) },
-      { request: "req_rb_r", generation_id: null, created_ms: expect.any(Number) },
-    ]);
-    expect((out[0] as { created_ms: number }).created_ms).toBeGreaterThanOrEqual(before);
-    await runSandboxAlarm(sandbox, "commit_prune");
-    const left = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) =>
-      st.storage.sql.exec<{ request: string }>("SELECT request FROM commits WHERE request LIKE 'req_rb_%' ORDER BY request").toArray().map((r) => r.request));
-    expect(left).toEqual(["req_rb_c", "req_rb_r"]);
   });
 });
 
@@ -374,26 +330,6 @@ describe("commit records", () => {
     expect(await sandboxDeadline(sandbox, "commit_prune")).toBeGreaterThan(Date.now() + 50 * 60_000);
     await runSandboxAlarm(sandbox, "commit_prune");
     expect(await requests()).toEqual(["req_kept", "req_next"]);
-  });
-
-  it("get their generation column filled once from the stored outcome", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "backfill" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const rows = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const sql = st.storage.sql;
-      // The table as the previous release left it.
-      sql.exec("DROP INDEX commits_generation");
-      sql.exec("DROP INDEX commits_rejected");
-      sql.exec("ALTER TABLE commits DROP COLUMN generation_id");
-      sql.exec("INSERT INTO commits (request, outcome) VALUES ('req_c', ?), ('req_r', ?)",
-        JSON.stringify({ status: "committed", generation: { id: "gen_a" } }), JSON.stringify({ status: "rejected", reason: "parent_mismatch" }));
-      new SandboxDO(st, env);
-      return sql.exec("SELECT request, generation_id FROM commits ORDER BY request").toArray();
-    });
-    expect(rows).toEqual([{ request: "req_c", generation_id: "gen_a" }, { request: "req_r", generation_id: null }]);
   });
 });
 
@@ -487,7 +423,7 @@ describe("a host that never connected and whose proof enrolls again", () => {
         ...env,
         AGENT: { idFromName: (n: string) => n, get: () => ({
           onHostLost: async () => {
-            seen.push(st.storage.sql.exec("SELECT 1 FROM reassign_queue WHERE host = ?", first).toArray().length);
+            seen.push(st.storage.sql.exec("SELECT 1 FROM reassignments WHERE host = ?", first).toArray().length);
           },
         }) },
       };
@@ -503,7 +439,7 @@ describe("a dead host's row", () => {
   it.each([
     ["a lease", "INSERT INTO leases (sandbox, host, epoch, expired) VALUES ('sbx_guard', ?, 1, 1)"],
     ["a stale incarnation", "INSERT INTO stale_incarnations (sandbox, host, epoch, first_seen_ms) VALUES ('sbx_guard', ?, 1, 0)"],
-    ["a queued reassignment", "INSERT INTO reassign_queue (sandbox, host, epoch, host_dead) VALUES ('sbx_guard', ?, 1, 1)"],
+    ["a queued reassignment", "INSERT INTO reassignments (sandbox, host, epoch, host_dead) VALUES ('sbx_guard', ?, 1, 1)"],
     ["an eviction", "INSERT INTO evictions (sandbox, host, epoch) VALUES ('sbx_guard', ?, 1)"],
   ])("is kept while %s names it", async (_what, insert) => {
     const cell = uniqueCell();
@@ -564,7 +500,7 @@ describe("a kill FleetDO answered itself", () => {
     // index row gone, and the kill it never answered answered by FleetDO.
     const kill = await fleetSql(cell, (sql, inst) => {
       sql.exec("DELETE FROM host_agents WHERE host = ?", a.host);
-      (inst as unknown as { hostDied(h: string, why: string): void }).hostDied(a.host, "drained");
+      void (inst as unknown as { die(h: string, cause: string): Promise<void> }).die(a.host, "drained");
       return rows(sql, "SELECT result, answered_by, (SELECT lost FROM hosts WHERE host = ?) AS lost FROM commands WHERE host = ? AND type = 'agent_stop'", a.host, a.host)[0];
     });
     expect(kill).toMatchObject({ result: expect.any(String), answered_by: "fleet", lost: 0 });
@@ -648,36 +584,6 @@ describe("confirming a host dead", () => {
   });
 });
 
-describe("a dead host's launch left open", () => {
-  it("is ended: terminated if it still runs, then recorded gone", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const live = await connectHost(cell);
-    const terminated: string[] = [];
-    let state: "running" | "terminated" = "running";
-    await fleetSql(cell, (sql, inst) => {
-      inst.ec2Override = {
-        launch: async () => "i-x", images: async () => [],
-        terminate: async (id: string) => { terminated.push(id); state = "terminated"; },
-        state: async () => state,
-      };
-      // A previous release's death: the host dead, its launch never marked.
-      sql.exec("UPDATE hosts SET instance_id = 'i-0stale', status = 'dead' WHERE host = ?", h.host);
-      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0stale', ?, ?, 'sandbox')", Date.now(), h.host);
-      // A live host's open launch is left alone.
-      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0live', ?, ?, 'sandbox')", Date.now(), live.host);
-    });
-    h.ws.close();
-    for (let i = 0; i < 2; i++) {
-      await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
-      await runDurableObjectAlarm(fleetStub(cell));
-    }
-    expect(terminated).toEqual(["i-0stale"]);
-    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT instance_id, reason, ended_ms IS NOT NULL AS ended FROM launched ORDER BY instance_id")))
-      .toEqual([{ instance_id: "i-0live", reason: null, ended: 0 }, { instance_id: "i-0stale", reason: "dead", ended: 1 }]);
-  });
-});
-
 describe("the pruning pass", () => {
   it("has its own daily deadline, armed on every start, so a quiet cell without tunnels prunes", async () => {
     const cell = uniqueCell();
@@ -756,6 +662,22 @@ describe("FleetDO's own answers are no evidence that a host processes commands",
     const answered = await fleetSql(cell, (sql) =>
       rows(sql, "SELECT answered_by FROM commands WHERE cmd IN (?, ?, ?) AND result IS NOT NULL", checkpoint!, fence!, kill));
     expect(answered).toEqual([{ answered_by: "fleet" }, { answered_by: "fleet" }, { answered_by: "fleet" }]);
+  });
+
+  it("nor are its answers to starts a host's expiry failed, or to commands for a dead host", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell, "brain");
+    const [start] = await fleetStub(cell).issueCommands(h.host, [{ type: "agent_start", agent: "agt_01expirestart00000000000000", epoch: 1 } as never]);
+    await fleetSql(cell, (sql) => sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, h.host));
+    await fleetSql(cell, (sql) => sql.exec("INSERT INTO leases (sandbox, host, epoch) VALUES ('sbx_01heldbyexpired000000000000', ?, 1)", h.host));
+    await fleetSql(cell, (_sql, inst) => (inst as any).expireHost(h.host));
+    h.ws.close();
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const [late] = await fleetStub(cell).issueCommands(h.host, [{ type: "fence", sandboxes: [], reason: "t" }]);
+    const answers = await fleetSql(cell, (sql) => rows(sql, "SELECT cmd, result, answered_by FROM commands WHERE cmd IN (?, ?)", start!, late!));
+    expect(answers.map((a) => [a.answered_by, JSON.parse(a.result as string).error.retryable])).toEqual(
+      answers.map((a) => a.cmd === start ? ["fleet", true] : ["fleet", false]));
+    expect(answers).toHaveLength(2);
   });
 
   it("only its kills outlive their retention on a host whose death isn't proof", async () => {

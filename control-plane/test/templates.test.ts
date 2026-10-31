@@ -95,8 +95,8 @@ describe("an agent is its expanded spec", () => {
       oauth_token: "sk-reviewer",
       launch: { builtin_tools: ["TodoWrite"], system_prompt: { mode: "append", text: "You review.\n\nReview carefully." } },
       hands: { sandbox: s.sandbox },
-      role: "worker", // deprecated, for runners of the previous release
     });
+    expect(start).not.toHaveProperty("role");
 
     const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     const tools = await toolNames(ws);
@@ -118,7 +118,8 @@ describe("an agent is its expanded spec", () => {
     });
     const a = await adminJson("/v1/agents", { body: { template: name, workstream: s.workstream, cell: s.cell } }, 201);
     const [start] = await nextCommands(s.brain.ws, isStartOf(a.agent));
-    expect(start).toMatchObject({ oauth_token: "sk-default", role: "captain" });
+    expect(start).toMatchObject({ oauth_token: "sk-default" });
+    expect(start).not.toHaveProperty("hands");
     expect(start).not.toHaveProperty("hands");
     // Nothing subscribed it to the workstream: only a template that says so does (the captain's).
     expect((await wsStub(s.workstream).info()).subscriber).toBeNull();
@@ -189,7 +190,7 @@ describe("escalation and the workstream channel's subscriber", () => {
 
     expect((await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: "agt_nobody00000000000000000000" } }, 404))
       .error.code).toBe("unknown_agent");
-    await adminJson(`/v1/workstreams/${s.workstream}/captain`, { method: "PUT", body: { captain: null } });
+    await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: null } });
     expect((await wsStub(s.workstream).info()).subscriber).toBeNull();
 
     await runInDurableObject(wsStub(s.workstream), (_i, st) => {
@@ -217,10 +218,11 @@ describe("records stored with a role (the previous release)", () => {
     const stored = await runInDurableObject(agentStub(w.agent), (_i: AgentDO, st) =>
       JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
     expect(stored).toMatchObject({ tools: ["notify", "emit"], owner: c.agent });
-    // For a forward revert, the previous release's fields are written beside the spec, derived from
-    // it; the record the control plane reads has none of them.
-    expect(stored).toMatchObject({ role: "worker", grants: ["notify", "emit"], captain: c.agent });
-    for (const k of ["role", "grants", "captain"]) expect(info).not.toHaveProperty(k);
+    // Migrated: neither the record read nor the one stored has the previous release's fields.
+    for (const k of ["role", "grants", "captain"]) {
+      expect(info).not.toHaveProperty(k);
+      expect(stored).not.toHaveProperty(k);
+    }
 
     await nextCommands(s.brain.ws, isStartOf(w.agent));
     const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
@@ -232,10 +234,9 @@ describe("one release of compatibility, and the review's edge cases", () => {
   const raw = async (stub: any) => runInDurableObject(stub, (_i: unknown, st: DurableObjectState) =>
     JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
 
-  it("writes the previous release's fields beside the new ones, and reads a `captain` the previous release changed", async () => {
+  it("a workstream writes the previous release's `captain` beside its subscriber, and reads one the previous release changed", async () => {
     const s = await cellWithSandbox();
     const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell, start: false } }, 201);
-    expect(await raw(agentStub(c.agent))).toMatchObject({ role: "captain", captain: null, grants: (await agentStub(c.agent).info()).tools });
     expect(await raw(wsStub(s.workstream))).toMatchObject({ subscriber: c.agent, captain: c.agent });
     // A forward revert's release changes only `captain`: once back, that is the subscriber.
     await runInDurableObject(wsStub(s.workstream), (_i, st) => {
@@ -252,13 +253,13 @@ describe("one release of compatibility, and the review's edge cases", () => {
     const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: other.sandbox, start: false } }, 201);
     expect((await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: w.agent } }, 409)).error.message)
       .toContain("is in workstream");
-    expect((await adminJson("/v1/workstreams", { body: { goal: "g", captain: w.agent } }, 400)).error.code).toBe("invalid_message");
+    expect((await adminJson("/v1/workstreams", { body: { goal: "g", subscriber: w.agent } }, 400)).error.code).toBe("invalid_message");
   });
 
-  it("the legacy grants field intersects silently", async () => {
+  it("the previous release's grants field is refused, never ignored (that would widen the tools)", async () => {
     const s = await cellWithSandbox();
-    const a = await adminJson("/v1/agents", { body: { role: "worker", sandbox: s.sandbox, grants: ["notify", "merge"], start: false } }, 201);
-    expect(a.tools).toEqual(["notify"]);
+    const r = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, grants: ["notify"], start: false } }, 400);
+    expect(r.error.message).toContain("overrides.tools");
   });
 
   it("a stored owner in another workstream (an older record) still can't be notified", async () => {

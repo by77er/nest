@@ -66,9 +66,6 @@ fn ensure_ext4(path: &Path) -> io::Result<()> {
 
 #[async_trait]
 impl Driver for ProcessDriver {
-    fn name(&self) -> &'static str {
-        "process"
-    }
     async fn create(&self, spec: VmSpec) -> io::Result<Box<dyn Vm>> {
         if self.guest_command.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "process driver: empty guest_command"));
@@ -115,9 +112,6 @@ impl Vm for ProcessVm {
     }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
-    }
-    fn disk_path(&self) -> PathBuf {
-        self.spec.disk_path.clone()
     }
     async fn start(&mut self) -> io::Result<()> {
         let guest_dir = self.guest_dir();

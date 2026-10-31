@@ -1,7 +1,7 @@
 //! Shared runner state: the agent registry and the per-agent handle used by the supervisor,
 //! hook server, MCP bridge and session channel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,25 +12,24 @@ use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
 use nest_protocol::host::runner::{ExitReason, RunnerEvent, StopMode};
+use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 use nest_protocol::model::{
-    AgentEvent, AgentEventBody, AgentId, CallId, Epoch, ErrorBody, HostId, MessageId, RequestId,
+    AgentEvent, AgentEventBody, AgentId, CallId, Epoch, ErrorBody, HostId, RequestId,
     SessionId, TimestampMs, TurnId,
 };
 use serde_json::Value;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::mirror::InboxMirror;
 
 pub fn now_ms() -> TimestampMs {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// Error code for a platform call whose outcome is unknown (timed out after it may have been
-/// delivered).
-pub use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 
 /// Process-wide state.
 pub struct Runtime {
@@ -41,9 +40,8 @@ pub struct Runtime {
     /// Newest host token from nestd (memory only).
     pub host_token: watch::Sender<Option<Secret>>,
     pub host_id: Mutex<Option<HostId>>,
-    /// Events to nestd, tagged with the nestd connection generation they belong to; the writer
-    /// of connection N drops entries from older generations (brains killed when the previous
-    /// connection was lost must not be reported to the new one, which already re-issued them).
+    /// Events to nestd, tagged with their nestd connection generation; connection N's writer drops
+    /// older ones (brains killed when that connection was lost, which the new one re-issued).
     pub to_nestd: mpsc::UnboundedSender<(u64, RunnerEvent)>,
     pub to_nestd_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(u64, RunnerEvent)>>,
     /// Current nestd connection generation (incremented on every connect).
@@ -75,13 +73,12 @@ impl Runtime {
         self.agents.lock().unwrap().agents.values().cloned().collect()
     }
 
-    /// Register (first thing a start does, before any slow step). Refused when a kill at or above
-    /// the start's agent epoch arrived first (its tombstone), or when another brain is registered
-    /// under this id.
+    /// Register (first thing a start does). Refused when a kill at or above the start's agent epoch
+    /// arrived first (its tombstone), or another brain is registered under this id.
     pub fn register(&self, a: Arc<Agent>, fence_gen: u64) -> Result<(), Refused> {
         let mut r = self.agents.lock().unwrap();
         // A fence of every brain (lease lapse, nestd gone) since this start arrived: it never runs.
-        if r.fence_gen != fence_gen || r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch().0) {
+        if r.fence_gen != fence_gen || r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch.0) {
             return Err(Refused::Killed);
         }
         if let Some(existing) = r.agents.get(&a.id) {
@@ -91,24 +88,25 @@ impl Runtime {
         Ok(())
     }
 
-    /// Remove `a` — only if it is still the registered instance (a duplicate start must never
-    /// deregister another brain) — and return the agent epoch its exit reports.
-    pub fn deregister(&self, a: &Arc<Agent>) -> Epoch {
-        let mut r = self.agents.lock().unwrap();
-        if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
-            r.agents.remove(&a.id);
+    /// `a` exited or never ran: deregister it if it is still the registered instance (a refused
+    /// or duplicate start never deregisters another brain), then report the exit at its epoch.
+    pub fn exited(&self, a: &Arc<Agent>, reason: ExitReason, (code, signal): (Option<i32>, Option<i32>)) {
+        {
+            let mut r = self.agents.lock().unwrap();
+            if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
+                r.agents.remove(&a.id);
+            }
         }
-        a.epoch()
+        self.report_for(a, RunnerEvent::AgentExited { agent: a.id.clone(), code, signal, reason, epoch: Some(a.epoch) });
     }
 
-    /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
-    /// so no start at or below it registers from now on, and return the registered brain if it
-    /// runs at or below it (the caller kills it). A newer brain is left alone.
+    /// `agent_stop{kill, epoch}`: raise the agent's tombstone, so no start at or below `epoch`
+    /// registers from now on, and return the registered brain if it is at or below it (to kill).
     pub fn tombstone(&self, agent: &AgentId, epoch: Epoch) -> Option<Arc<Agent>> {
         let mut r = self.agents.lock().unwrap();
         let k = r.tombstones.entry(agent.clone()).or_insert(epoch.0);
         *k = (*k).max(epoch.0);
-        r.agents.get(agent).filter(|a| a.epoch() <= epoch).cloned()
+        r.agents.get(agent).filter(|a| a.epoch <= epoch).cloned()
     }
 
     /// Whether a kill at or above `epoch` arrived for `agent`.
@@ -154,9 +152,8 @@ impl Runtime {
         }
     }
 
-    /// The registered brain whose Claude Code process is `pid` or an ancestor of it (hooks and
-    /// `nest mcp` are its descendants). Binds a socket peer to an agent without trusting the id
-    /// it declares.
+    /// The registered brain whose Claude Code process is `pid` or an ancestor of it: binds a hook or
+    /// `nest mcp` socket peer to an agent without trusting the id it declares.
     pub fn agent_for_pid(&self, pid: i32) -> Option<Arc<Agent>> {
         let agents = self.agents();
         let mut cur = pid;
@@ -218,7 +215,11 @@ fn parent_pid(pid: i32) -> Option<i32> {
 pub enum AgentCmd {
     RunTurn { turn: TurnId, input: TurnInput },
     Inbox(InboxMessage),
-    Interrupt,
+    /// AgentDO's `interrupt`, for `turn` (`None`: whatever runs).
+    Interrupt { turn: Option<TurnId> },
+    /// The `Stop` hook answered, `blocked` = the turn continues with inbox messages. Sent before
+    /// the answer is written, so it reaches the actor before the `result` that follows it.
+    StopHook { blocked: bool },
     Stop(StopMode),
     Kill(ExitReason),
     /// One stdout line from Claude Code.
@@ -235,34 +236,17 @@ pub enum Outbound {
     Event(AgentEvent),
     ToolCall { call: CallId, turn: Option<TurnId>, name: String, arguments: Value },
     ToolsListRequest(RequestId),
-    /// Ask AgentDO where the agent's hands are now (`hands_resolve`); answered through
-    /// [`Agent::resolve_hands`].
+    /// `hands_resolve`: where are the agent's hands now? Answered through [`Agent::resolve_hands`].
     HandsResolve(RequestId),
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
     SetSession(SessionId),
-    /// Re-handshake (the brain adopted a newer agent epoch).
+    /// Re-handshake: AgentDO refused something (most likely a segment gap), so resend from what it has.
     Reconnect,
     /// A platform tool call timed out: never (re)send it.
     AbandonCall(CallId),
     /// Flush and close.
     Close,
-}
-
-/// What AgentDO answered to `hands_resolve`.
-#[derive(Debug)]
-pub enum HandsResolveOutcome {
-    Target(HandsTarget),
-    Error { error: ErrorBody, retry_after_ms: Option<u64> },
-}
-
-impl From<HandsOutcome> for HandsResolveOutcome {
-    fn from(o: HandsOutcome) -> Self {
-        match o {
-            HandsOutcome::Ok { hands } => HandsResolveOutcome::Target(hands),
-            HandsOutcome::Error { error, retry_after_ms } => HandsResolveOutcome::Error { error, retry_after_ms },
-        }
-    }
 }
 
 /// AgentDO did not answer `hands_resolve` in time (or the session channel was down).
@@ -272,11 +256,6 @@ pub struct ResolveTimeout;
 /// Mutable per-agent state shared with hooks and the MCP bridge.
 #[derive(Debug, Default)]
 pub struct AgentInner {
-    /// The sandbox this agent's hands act in (its id, from `agent_start`); `None` = no hands.
-    /// Only whether and where: the sandbox's epoch comes from each target's binding claims, and
-    /// the brain's own (agent) epoch is [`Agent::epoch`]. A sandbox move changes neither this
-    /// nor the agent epoch; the next call finds the old target refused and resolves again.
-    pub hands: Option<HandsBinding>,
     /// The gateway target for those hands, fetched from AgentDO (`hands_resolve`) and dropped
     /// whenever a gateway refuses it, so the next call asks again.
     pub target: Option<HandsTarget>,
@@ -284,9 +263,9 @@ pub struct AgentInner {
     /// that one ([`Agent::drop_target_if`]) and never a fresher target another call stored.
     pub target_gen: u64,
     pub cache: Option<AgentCache>,
-    /// Inbox messages already delivered (stdin or `Stop`).
-    pub delivered: HashSet<MessageId>,
-    pub stop_continuations: u32,
+    /// Which mirrored inbox messages the hooks handed out (with `cache.inbox`, under this lock).
+    pub mirror: InboxMirror,
+    /// The turn running now; written only by the actor, from its brain.
     pub turn: Option<TurnId>,
     pub tools: Vec<ToolDef>,
     pub session: Option<SessionId>,
@@ -298,30 +277,33 @@ pub struct AgentInner {
 /// Handle to one agent.
 pub struct Agent {
     pub id: AgentId,
+    /// Fixed for the brain's life: a later start for this agent ends this brain, never adopts it.
+    pub epoch: Epoch,
+    /// The sandbox this agent's hands act in (from `agent_start`); `None` = no hands. Its epoch
+    /// comes from each target's binding claims, so a sandbox move changes nothing here.
+    pub hands: Option<HandsBinding>,
     pub config_dir: PathBuf,
     /// nestd connection generation this brain was started under.
     pub conn_gen: u64,
-    /// Claude Code's pid once spawned (0 before), for kills that must not wait on the actor and
-    /// for binding hook/MCP peers to this agent.
+    /// Claude Code's pid once spawned (0 before), for kills and for binding hook/MCP peers.
     pub pid: AtomicU32,
     /// Cancelled by any kill/stop: aborts startup steps and tells the actor.
     pub cancel: CancellationToken,
-    /// An `agent_stop` reached this brain: it is on its way out, and a later start must not adopt it.
+    /// An `agent_stop` reached this brain: it is on its way out.
     pub stopping: std::sync::atomic::AtomicBool,
     kill_reason: Mutex<Option<ExitReason>>,
     pub inner: Mutex<AgentInner>,
-    epoch: AtomicU64,
     cmd: mpsc::UnboundedSender<AgentCmd>,
     out: mpsc::UnboundedSender<Outbound>,
     pub pending_calls: Mutex<HashMap<CallId, oneshot::Sender<ToolOutcome>>>,
     pub pending_lists: Mutex<HashMap<RequestId, oneshot::Sender<Vec<ToolDef>>>>,
-    pub pending_resolves: Mutex<HashMap<RequestId, oneshot::Sender<HandsResolveOutcome>>>,
+    pub pending_resolves: Mutex<HashMap<RequestId, oneshot::Sender<HandsOutcome>>>,
     /// Held while one caller resolves the target, so N parallel first calls send one
     /// `hands_resolve` and the rest find the cached target.
     pub resolve_gate: tokio::sync::Mutex<()>,
-    pub tools_changed: broadcast::Sender<()>,
-    /// In-flight hands calls (bridge-scoped key → cancel), cancelled on hard interrupt.
-    pub hands_inflight: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    /// Parent of every hands call's cancel token: a hard interrupt or kill cancels it and starts
+    /// a fresh one for later calls.
+    hands_cancel: Mutex<CancellationToken>,
     event_seq: AtomicU64,
     call_n: AtomicU64,
     /// Values redacted from anything leaving the host (session segments).
@@ -335,7 +317,6 @@ impl Agent {
         epoch: Epoch,
         config_dir: PathBuf,
         hands: Option<HandsBinding>,
-        session: Option<SessionId>,
         secrets: Vec<String>,
         conn_gen: u64,
         cmd: mpsc::UnboundedSender<AgentCmd>,
@@ -343,30 +324,26 @@ impl Agent {
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
+            epoch,
+            hands,
             config_dir,
             conn_gen,
             pid: AtomicU32::new(0),
             cancel: CancellationToken::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
             kill_reason: Mutex::new(None),
-            inner: Mutex::new(AgentInner { hands, session, ..Default::default() }),
-            epoch: AtomicU64::new(epoch.0),
+            inner: Mutex::new(AgentInner::default()),
             cmd,
             out,
             pending_calls: Mutex::new(HashMap::new()),
             pending_lists: Mutex::new(HashMap::new()),
             pending_resolves: Mutex::new(HashMap::new()),
             resolve_gate: tokio::sync::Mutex::new(()),
-            tools_changed: broadcast::channel(8).0,
-            hands_inflight: Mutex::new(HashMap::new()),
+            hands_cancel: Mutex::new(CancellationToken::new()),
             event_seq: AtomicU64::new(0),
             call_n: AtomicU64::new(0),
             secrets,
         })
-    }
-
-    pub fn epoch(&self) -> Epoch {
-        Epoch(self.epoch.load(Ordering::SeqCst))
     }
 
     pub fn command(&self, c: AgentCmd) {
@@ -386,7 +363,7 @@ impl Agent {
         self.command(AgentCmd::Kill(reason));
     }
 
-    /// Told to stop, or being killed: never adopted by a later start (which waits for it instead).
+    /// Told to stop, or being killed.
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst) || self.kill_reason().is_some()
     }
@@ -414,41 +391,12 @@ impl Agent {
 
     pub fn emit_with_turn(&self, body: AgentEventBody, turn: Option<TurnId>) {
         let seq = nest_protocol::model::Seq(self.event_seq.fetch_add(1, Ordering::SeqCst) + 1);
-        self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch(), seq, ts_ms: now_ms(), turn, body }));
+        self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch, seq, ts_ms: now_ms(), turn, body }));
     }
 
-    /// Set the hands (a later `agent_start` for this live brain). Another sandbox drops the
-    /// cached target and bumps its generation, so a resolve in flight for the old sandbox can't
-    /// store its answer over the new one; MCP clients are told the tool list changed.
-    pub fn set_hands(&self, hands: Option<HandsBinding>) {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.hands.as_ref().map(|h| &h.sandbox) != hands.as_ref().map(|h| &h.sandbox) {
-                inner.target = None;
-                inner.target_gen += 1;
-            }
-            inner.hands = hands;
-        }
-        let _ = self.tools_changed.send(());
-    }
-
-    /// Adopt the agent epoch of a later `agent_start` for this live brain: AgentDO issued a new
-    /// one and fences the old, so the session channel re-handshakes with it. Epochs only grow:
-    /// an older one (a command overtaken by a newer start) changes nothing. Returns whether
-    /// the epoch changed.
-    pub fn adopt_epoch(&self, epoch: Epoch) -> bool {
-        let prev = self.epoch.fetch_max(epoch.0, Ordering::SeqCst);
-        if epoch.0 > prev {
-            self.send_out(Outbound::Reconnect);
-            return true;
-        }
-        false
-    }
-
-    /// The cached gateway target with its generation, if a `hands_resolve` has answered since
-    /// the last refusal and its binding is not about to expire (`nest_hands_client::refresh_due`):
-    /// a target due for refresh is forgotten, so the caller resolves a fresh one first instead
-    /// of spending a bind on an `unauthorized`.
+    /// The cached gateway target and its generation, unless its binding is due for refresh
+    /// (`nest_hands_client::refresh_due`): then it is forgotten, so the caller resolves a fresh
+    /// one instead of spending a bind on an `unauthorized`.
     pub fn hands_target(&self) -> Option<(HandsTarget, u64)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.target.as_ref().is_some_and(|t| nest_hands_client::refresh_due(t, now_ms())) {
@@ -457,22 +405,12 @@ impl Agent {
         inner.target.clone().map(|t| (t, inner.target_gen))
     }
 
-    /// Cache a target; returns its generation. `None` (nothing cached) when the hands changed
-    /// since `seen_gen` was read: the answer was for the previous sandbox.
-    pub fn set_hands_target(&self, target: HandsTarget, seen_gen: u64) -> Option<u64> {
+    /// Cache a target; returns its generation.
+    pub fn set_hands_target(&self, target: HandsTarget) -> u64 {
         let mut inner = self.inner.lock().unwrap();
-        if inner.target_gen != seen_gen {
-            return None;
-        }
         inner.target_gen += 1;
         inner.target = Some(target);
-        Some(inner.target_gen)
-    }
-
-    /// The target generation now (read before a `hands_resolve`, passed to
-    /// [`Agent::set_hands_target`]).
-    pub fn target_gen(&self) -> u64 {
-        self.inner.lock().unwrap().target_gen
+        inner.target_gen
     }
 
     /// Forget the target a call was using (a gateway refused it, or the sandbox moved mid-call),
@@ -486,7 +424,7 @@ impl Agent {
 
     /// One `hands_resolve` round trip over the session channel. Dropping the future (a caller's
     /// timeout, a cancelled call) forgets the request, so a late answer is ignored.
-    pub async fn resolve_hands_target(&self, timeout: Duration) -> Result<HandsResolveOutcome, ResolveTimeout> {
+    pub async fn resolve_hands_target(&self, timeout: Duration) -> Result<HandsOutcome, ResolveTimeout> {
         let req = RequestId(format!("req_{}", uuid::Uuid::new_v4().simple()));
         let (tx, rx) = oneshot::channel();
         self.pending_resolves.lock().unwrap().insert(req.clone(), tx);
@@ -500,7 +438,7 @@ impl Agent {
 
     /// `hands_resolved` arrived on the session channel. An id nobody waits for (the caller gave
     /// up, or a duplicate answer) is logged and ignored.
-    pub fn resolve_hands(&self, req: &RequestId, outcome: HandsResolveOutcome) {
+    pub fn resolve_hands(&self, req: &RequestId, outcome: HandsOutcome) {
         match self.pending_resolves.lock().unwrap().remove(req) {
             Some(tx) => {
                 let _ = tx.send(outcome);
@@ -592,21 +530,14 @@ impl Agent {
         }
     }
 
-    /// Cancel every in-flight hands call (hard interrupt / kill).
-    pub fn cancel_hands(&self) {
-        for (_, tx) in self.hands_inflight.lock().unwrap().drain() {
-            let _ = tx.send(());
-        }
+    /// A cancel token for one hands call, cancelled by the next [`Agent::cancel_hands`].
+    pub fn hands_token(&self) -> CancellationToken {
+        self.hands_cancel.lock().unwrap().child_token()
     }
 
-    /// Undelivered inbox-mirror messages.
-    pub fn pending_inbox(&self) -> Vec<InboxMessage> {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .cache
-            .as_ref()
-            .map(|c| c.inbox.iter().filter(|m| !inner.delivered.contains(&m.id)).cloned().collect())
-            .unwrap_or_default()
+    /// Cancel every in-flight hands call (hard interrupt / kill).
+    pub fn cancel_hands(&self) {
+        std::mem::take(&mut *self.hands_cancel.lock().unwrap()).cancel();
     }
 }
 
@@ -617,7 +548,21 @@ mod registry_tests {
     fn agent(rt: &Runtime, epoch: u64) -> Arc<Agent> {
         let (cmd, _crx) = mpsc::unbounded_channel();
         let (out, _orx) = mpsc::unbounded_channel();
-        Agent::new(AgentId("agt_r".into()), Epoch(epoch), PathBuf::from("/tmp"), None, None, vec![], rt.current_gen(), cmd, out)
+        Agent::new(AgentId("agt_r".into()), Epoch(epoch), PathBuf::from("/tmp"), None, vec![], rt.current_gen(), cmd, out)
+    }
+
+    /// A hard interrupt cancels every hands call in flight (each a child of the agent's token),
+    /// and only those: a call started after it runs.
+    #[test]
+    fn cancel_hands_cancels_the_calls_in_flight_and_no_later_one() {
+        let rt = Runtime::new(Config::default());
+        let a = agent(&rt, 1);
+        let (one, two) = (a.hands_token(), a.hands_token());
+        two.cancel();
+        assert!(!one.is_cancelled(), "a bridge's cancel of one call leaves the others");
+        a.cancel_hands();
+        assert!(one.is_cancelled());
+        assert!(!a.hands_token().is_cancelled(), "a later call gets a fresh token");
     }
 
     /// N9: a call id outside a turn carries 128 random bits.

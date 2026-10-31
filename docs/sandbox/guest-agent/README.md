@@ -4,17 +4,19 @@ The daemon inside each sandbox VM. It is the **hands server**. It holds no crede
 
 - **vsock, host-initiated:** nestd opens the control connection (1024); the [gateway](../gateway/) opens one connection per hands call (1025) and per ingress stream (10000), on behalf of clients anywhere. The guest **accepts only the host (CID 2)**, so a process inside the sandbox can't reach these ports even if the guest kernel has vsock loopback.
 - **Post-resume fixes** (nestd's `resume`): resync the clock, mix host entropy into the kernel RNG on every resume, and on a fork set a new machine-id and hostname.
-- **Hands RPC:** Bash (per-agent cwd, background tasks, PTY), Read/Write/Edit with per-agent read records and staleness checks, Glob/Grep. Everything runs as the sandbox user: processes via `setuid`, in-process file tools via a per-thread filesystem identity. Inputs that could block forever (FIFOs, devices) are refused, file tools have a deadline, and Grep and helper output is capped. Each call leaves a record on tmpfs for the [hands journal](../../agents/hands/#journal). See [../../agents/hands/](../../agents/hands/).
+- **Hands RPC:** Bash (per-agent cwd, background tasks, PTY), Read/Write/Edit with per-agent read records and staleness checks, Glob/Grep. Everything runs as the sandbox user: processes via `setuid`, in-process file tools via a per-thread filesystem identity. Inputs that could block forever (FIFOs, devices) are refused, file tools have a deadline, and Grep and helper output is capped. v2: each call leaves a record on tmpfs for the [hands journal](../../agents/hands/#journal). See [../../agents/hands/](../../agents/hands/).
 - **Per-agent context:** each process runs in its own leaf of the agent's **cgroup** (accounting, and `cgroup.kill` on interrupt) with the user's `HOME`/`USER`/`LOGNAME`/`SHELL`, `NEST_AGENT_ID` (attribution only) and `HTTP(S)_PROXY` pointing at the agent's explicit proxy port.
 - **Output retention:** call outputs live on tmpfs (`/run/nest`, i.e. guest RAM). The newest 64 foreground outputs per agent (at most 256 MB) and the newest 32 finished background tasks are kept; `agent_detach` with `kill_processes` deletes the agent's outputs.
 - **`nest` CLI endpoint** for programs inside the sandbox (`nest post`, `nest read`, `nest expose`, `nest hold`), relayed to nestd on the control connection. Its posts are always tainted ([tools](../../agents/tools/#the-nest-cli-inside-sandboxes)). The built guest still speaks `notify`/`emit`/`ask` ([pending contract changes](../../interfaces/README.md#pending-contract-changes)).
-- **Before a commit, pause or suspend:** `syncfs` on every filesystem, which must succeed ([flush before commit](../state/disk/#flush-before-commit)). `syncfs` reports writeback errors (Linux 5.8+, [syncfs(2)](https://man7.org/linux/man-pages/man2/syncfs.2.html)); `sync` doesn't. Before a snapshot, also `drop_caches`, and optionally `fsfreeze`.
+- **Before a commit, pause or suspend** (v2; built: `sync` before a snapshot): `syncfs` on every filesystem, which must succeed ([flush before commit](../state/disk/#flush-before-commit)). `syncfs` reports writeback errors (Linux 5.8+, [syncfs(2)](https://man7.org/linux/man-pages/man2/syncfs.2.html)); `sync` doesn't. Before a snapshot, also `drop_caches`, and optionally `fsfreeze`.
 - **Ingress endpoint** (vsock `:10000`): takes a `{port}` header and connects to `127.0.0.1:<port>`, then `172.16.0.2`, then `::1`. Used by previews, `nest port-forward` and terminal attach (PTY), all arriving through the gateway. See [../networking/ingress/](../networking/ingress/).
-- **Ready:** the guest agent reports ready once `configure` (and, after a restore, `resume`) is done. nestd passes it to SandboxDO as the evidence a placement needs to complete ([placement](../../control-plane/durable-objects/sandbox/#placement)).
+- **Ready:** the guest agent is ready once `configure` (and, after a restore, `resume`) is done. v2: it reports that, and nestd passes it to SandboxDO as the evidence a placement needs to complete ([placement](../../control-plane/durable-objects/sandbox/#placement)).
 - **Port watcher:** reports listening ports (`/proc/net/tcp{,6}`) as `ports` events; whether a port is exposed is the control plane's business (`nest expose` is relayed there).
 - **Packages:** with `agent_root: none`, installs go through an allowlisted helper (**not built yet**).
 
 ## Versions
+
+**v2, designed.** Built: the host requires the guest's exact `protocol_version`.
 
 A memory snapshot keeps the guest agent it was taken with. Requiring the host's exact protocol version would strand every suspended sandbox at each protocol bump.
 
@@ -29,6 +31,8 @@ A memory snapshot keeps the guest agent it was taken with. Requiring the host's 
 
 ## Processes
 
+**v2, designed.** Built: a child joins its cgroup leaf between fork and exec, but a failed placement still runs the call; the call ends when its main process exits, after up to 200 ms of output drain; `detail` carries `exit_code` and `signal`.
+
 - **Placed before exec:** a child joins its cgroup leaf (`calls/<call_id>`, `tasks/<task_id>`, `pty/<n>`) between fork and exec. If that fails, the call is refused rather than run where `cgroup.kill` can't reach it.
 - **OOM:** the guest agent runs at `oom_score_adj` −1000 and resets each child to 0 before exec (a failure refuses the call), so the kernel kills a workload, never the hands server.
 - **Exit from a pidfd:** a call's main process has exited when its pidfd says so, not when its pipes reach EOF, which a descendant can hold open forever.
@@ -36,6 +40,8 @@ A memory snapshot keeps the guest agent it was taken with. Requiring the host's 
 - **Typed outcome** in the result's `detail`: `exited{code}`, `signaled{signal}`, `timed_out` or `unknown`.
 
 ## Admission
+
+**v2, designed.** Built: hands calls and ingress PTYs are `busy` before `configure` and while frozen; nothing else below.
 
 The 64 and 256 caps, the queue and the 5 s first-frame limit are SPACE's guest numbers ([lib.rs](https://github.com/perplexityai/space/blob/main/crates/libs/spaced/guest/server/src/lib.rs), [admission_queue.rs](https://github.com/perplexityai/space/blob/main/crates/libs/spaced/common/src/admission_queue.rs)).
 
@@ -46,6 +52,8 @@ The 64 and 256 caps, the queue and the 5 s first-frame limit are SPACE's guest n
 
 ## Terminals
 
+**v2, designed.** Built: a dropped connection SIGHUPs the terminal's session.
+
 - **A dropped connection detaches.** The terminal keeps running for 60 s with its output in scrollback, and is reattached by terminal id, a reattach token and a byte offset. After 60 s it gets SIGHUP. An exited terminal's scrollback and exit status are kept 60 s. The token never goes in a URL ([ingress](../networking/ingress/)).
 - **Bounded scrollback:** all terminals share 1/32 of guest memory, clamped to 16–64 MiB, with at most 4 MiB each, oldest bytes dropped first. These are SPACE's process-output bounds ([process.rs](https://github.com/perplexityai/space/blob/main/crates/libs/spaced/guest/server/src/process.rs)).
 - **Backpressure comes only from the attached reader.** An observer that falls behind skips ahead, and a detached terminal overwrites its oldest bytes, so neither stalls the process.
@@ -53,10 +61,10 @@ The 64 and 256 caps, the queue and the 5 s first-frame limit are SPACE's guest n
 
 ## Change ledger
 
-A fanotify watch on the guest's filesystems (file names need Linux 5.9+, [fanotify_init(2)](https://man7.org/linux/man-pages/man2/fanotify_init.2.html)) records modified paths against a position counter, not a clock, since resume steps the clock. Each call record holds the position at its intent, so [recovery](../../agents/sessions/#after-a-crash) can list what changed since.
+**Designed, not built.** A fanotify watch on the guest's filesystems (file names need Linux 5.9+, [fanotify_init(2)](https://man7.org/linux/man-pages/man2/fanotify_init.2.html)) records modified paths against a position counter, not a clock, since resume steps the clock. Each call record holds the position at its intent, so [recovery](../../agents/sessions/#after-a-crash) can list what changed since.
 - **Bounded:** the newest 10,000 paths.
 - **Honest coverage:** a query that reaches past an evicted path or a kernel queue overflow says `overflowed`. A guest-agent restart starts a new ledger, so older positions report incomplete coverage.
 
 ## Diagnostics
 
-The `health` reply carries counts of the guest agent's own WARN and ERROR log sites since the last drain, by site (module and line) only. Message text and fields never leave the guest, since they can hold commands, paths and output. nestd folds the counts into its [metrics](../../control-plane/metrics/).
+**v2, designed.** The `health` reply carries counts of the guest agent's own WARN and ERROR log sites since the last drain, by site (module and line) only. Message text and fields never leave the guest, since they can hold commands, paths and output. nestd folds the counts into its [metrics](../../control-plane/metrics/).

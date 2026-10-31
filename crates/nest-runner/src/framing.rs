@@ -1,11 +1,10 @@
-//! Async helpers for the two frame formats the runner speaks:
-//! - host-internal frames (`nest_protocol::host::frame`): `[u32 BE len][JSON]`;
-//! - guest frames (`nest_protocol::guest::frame`): `[u32 BE len][u8 kind][payload]`, which the
-//!   runner itself no longer reads from a socket (hands go through `nest-hands-client`); the
-//!   helpers serve the test double in `test_support`.
+//! Async helpers for host-internal frames (`nest_protocol::host::frame`: `[u32 BE len][JSON]`),
+//! and for guest frames (`nest_protocol::guest::frame`), which only the `test_support` double
+//! speaks (the runner's hands go through `nest-hands-client`).
 
 use std::io;
 
+#[cfg(any(test, feature = "test-support"))]
 use nest_protocol::guest::frame::{Frame, Kind, MAX_FRAME_LEN};
 use nest_protocol::host::frame::MAX_FRAME;
 use serde::{Serialize, de::DeserializeOwned};
@@ -37,22 +36,12 @@ pub async fn read_host_raw<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option
 
 /// Read one host-internal frame. `Ok(None)` on clean EOF at a frame boundary.
 pub async fn read_host<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
-    let mut len = [0u8; 4];
-    match r.read_exact(&mut len).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
-    }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body).await?;
+    let Some(body) = read_host_raw(r).await? else { return Ok(None) };
     serde_json::from_slice(&body).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Write one guest JSON frame.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn write_guest_json<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     let bytes = nest_protocol::guest::frame::encode_json(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -61,6 +50,7 @@ pub async fn write_guest_json<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, ms
 }
 
 /// Read one guest frame.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn read_guest<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
     let mut hdr = [0u8; 4];
     r.read_exact(&mut hdr).await?;

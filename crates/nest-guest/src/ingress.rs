@@ -1,7 +1,6 @@
 //! Ingress (port 10000): raw TCP splice to an in-guest port, or a framed PTY.
 
 use std::collections::BTreeMap;
-use std::ffi::CString;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -10,9 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nest_protocol::guest::frame::Kind;
+use nest_protocol::guest::framed::{self, FramedReader, write_json};
 use nest_protocol::guest::{IngressRequest, IngressResponse, PtyControl, error_code};
 use nest_protocol::model::AgentId;
-use nix::pty::{Winsize, openpty};
+use nix::fcntl::OFlag;
+use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use tokio::io::unix::AsyncFd;
@@ -21,9 +22,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::exec::agent_env;
-use crate::framed::{FramedReader, err, parse_json, write_data, write_json};
-use crate::state::Guest;
+use crate::exec::{Leaf, PreExec};
+use crate::framed::{err, parse_json};
+use crate::state::{Gate, Guest};
 use crate::transport::Conn;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -44,7 +45,12 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
     match req {
         IngressRequest::Tcp { port } => tcp(reader, port).await,
         IngressRequest::Pty { agent_id, cols, rows, command, cwd, env } => {
-            let (conn, rest) = reader.into_parts();
+            let (mut conn, rest) = reader.into_parts();
+            let admitted = guest.inner.lock().unwrap().admit(Gate::Pty).map(|_| ());
+            if let Err(error) = admitted {
+                let _ = write_json(&mut conn, &IngressResponse::Rejected { error }).await;
+                return;
+            }
             if let Err(e) = pty(&guest, conn, rest, agent_id, cols, rows, command, cwd, env).await {
                 debug!(error = %e, "pty session ended with error");
             }
@@ -135,6 +141,19 @@ impl Master {
     }
 }
 
+/// A PTY pair whose fds are close-on-exec from the start: a concurrent Bash or task would
+/// otherwise inherit the slave and keep the session open after its shell exits.
+fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+    let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let name = ptsname_r(&master)?;
+    let slave = nix::fcntl::open(name.as_str(), OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC, nix::sys::stat::Mode::empty())?;
+    let master = OwnedFd::from(master);
+    set_winsize(master.as_raw_fd(), cols, rows);
+    Ok((master, slave))
+}
+
 fn set_winsize(fd: RawFd, cols: u16, rows: u16) {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCSWINSZ with a valid winsize pointer.
@@ -162,17 +181,10 @@ async fn pty(
 ) -> io::Result<()> {
     let (rd, mut wr) = tokio::io::split(conn);
     // Agent context, if any.
-    let ctx = match &agent_id {
-        Some(a) => {
-            let inner = guest.inner.lock().unwrap();
-            inner.agents.get(a).map(|rt| (agent_env(&rt.slot, guest.config.run_as), Some(rt.cwd.clone())))
-        }
-        None => Some((crate::exec::base_env(guest.config.run_as), None)),
-    };
-    let Some((mut envs, agent_cwd)) = ctx else {
-        let a = agent_id.as_ref().map(|a| a.0.clone()).unwrap_or_default();
-        let e = err(error_code::UNKNOWN_AGENT, format!("agent {a} is not attached"), false);
-        return write_json(&mut wr, &IngressResponse::Rejected { error: e }).await;
+    let (mut envs, agent_cwd) = match agent_id.as_ref().map(|a| guest.exec_ctx(a)) {
+        Some(Ok(ctx)) => (ctx.env, Some(ctx.cwd)),
+        Some(Err(error)) => return write_json(&mut wr, &IngressResponse::Rejected { error }).await,
+        None => (crate::exec::base_env(guest.config.run_as), None),
     };
     if !envs.iter().any(|(k, _)| k == "TERM") {
         envs.push(("TERM".into(), "xterm-256color".into()));
@@ -192,41 +204,10 @@ async fn pty(
         .unwrap_or_else(|| "/".into());
     let cgroup = agent_id.as_ref().and_then(|a| guest.cgroups.leaf(&a.0, "pty", &crate::state::random_hex(4)));
 
-    let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-    let pair = openpty(&ws, None).map_err(io::Error::from)?;
-    let slave_fd = pair.slave.as_raw_fd();
-    let procs = cgroup.map(|p| CString::new(p.join("cgroup.procs").into_os_string().into_encoded_bytes()).unwrap());
-    let run_as = guest.config.run_as;
+    let (master_fd, slave) = open_pty(cols, rows)?;
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(&dir).env_clear().envs(envs);
-    // SAFETY: async-signal-safe calls only.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            for target in 0..3 {
-                if libc::dup2(slave_fd, target) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            if let Some(p) = &procs {
-                let fd = libc::open(p.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-                if fd >= 0 {
-                    libc::write(fd, b"0".as_ptr().cast(), 1);
-                    libc::close(fd);
-                }
-            }
-            if let Some((uid, gid)) = run_as
-                && (libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0) {
-                    return Err(io::Error::last_os_error());
-                }
-            Ok(())
-        });
-    }
+    PreExec { tty: Some(slave.as_raw_fd()), cgroup: cgroup.clone(), fd3: None, run_as: guest.config.run_as }.apply_tokio(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -234,60 +215,55 @@ async fn pty(
             return write_json(&mut wr, &IngressResponse::Rejected { error: e }).await;
         }
     };
-    drop(pair.slave);
+    drop(slave);
     let pid = child.id().unwrap_or(0);
-    let master = Arc::new(Master::new(pair.master)?);
-    write_json(&mut wr, &IngressResponse::Accepted { connected: None, pid: Some(pid) }).await?;
+    // The session's terminal leaf goes with it, however it ends.
+    let leaf = Leaf { cgroup, pgid: Some(pid) };
+    let session = async {
+        let master = Arc::new(Master::new(master_fd)?);
+        write_json(&mut wr, &IngressResponse::Accepted { connected: None, pid: Some(pid) }).await?;
 
-    // Host → PTY.
-    let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
-    let input = {
-        let master = master.clone();
-        tokio::spawn(async move { host_to_pty(rd, rest, master, pid).await; let _ = hangup_tx.send(()).await; })
-    };
+        // Host → PTY.
+        let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
+        let input = {
+            let master = master.clone();
+            tokio::spawn(async move { host_to_pty(rd, rest, master, pid).await; let _ = hangup_tx.send(()).await; })
+        };
 
-    // PTY → host, until the shell exits (EIO) or the host hangs up.
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut hung_up = false;
-    loop {
-        tokio::select! {
-            r = master.read(&mut buf) => match r {
-                Ok(0) | Err(_) => break,
-                Ok(n) => if write_data(&mut wr, &buf[..n]).await.is_err() { hung_up = true; break; },
-            },
-            _ = hangup_rx.recv() => { hung_up = true; break; }
+        // PTY → host, until the shell exits (EIO) or the host hangs up.
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut hung_up = false;
+        loop {
+            tokio::select! {
+                r = master.read(&mut buf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => if framed::write(&mut wr, Kind::Data, &buf[..n]).await.is_err() { hung_up = true; break; },
+                },
+                _ = hangup_rx.recv() => { hung_up = true; break; }
+            }
         }
-    }
-    if hung_up {
-        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGHUP);
+        if hung_up {
+            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGHUP);
+            input.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            return Ok(());
+        }
+        let status = child.wait().await?;
         input.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-        return Ok(());
-    }
-    let status = child.wait().await?;
-    input.abort();
-    let exit = PtyControl::Exit { code: status.code(), signal: status.signal() };
-    write_json(&mut wr, &exit).await?;
-    wr.shutdown().await
+        let exit = PtyControl::Exit { code: status.code(), signal: status.signal() };
+        write_json(&mut wr, &exit).await?;
+        wr.shutdown().await
+    };
+    let ended = session.await;
+    leaf.release();
+    ended
 }
 
 async fn host_to_pty(rd: ReadHalf<Conn>, rest: Vec<u8>, master: Arc<Master>, pid: u32) {
-    let mut reader = FramedReader::new(rd);
     // Bytes already buffered past the request frame are framed data too.
-    let mut pre = nest_protocol::guest::frame::Decoder::new();
-    pre.push(&rest);
-    let mut pending = std::collections::VecDeque::new();
-    while let Ok(Some(f)) = pre.next_frame() {
-        pending.push_back(f);
-    }
+    let mut reader = FramedReader::with_buffered(rd, &rest);
     loop {
-        let f = match pending.pop_front() {
-            Some(f) => f,
-            None => match reader.next().await {
-                Ok(Some(f)) => f,
-                _ => return,
-            },
-        };
+        let Ok(Some(f)) = reader.next().await else { return };
         match f.kind {
             Kind::Data => {
                 if master.write_all(&f.payload).await.is_err() {

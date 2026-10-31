@@ -120,7 +120,7 @@ async fn a_start_never_runs_beside_or_adopts_a_registered_brain() {
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_dup", 2));
     wait_for(&e.rt, "the first brain gone", || !alive(pid)).await;
     wait_for(&e.rt, "a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
-    assert_eq!(first.epoch(), nest_protocol::model::Epoch(1), "never adopted");
+    assert_eq!(first.epoch, nest_protocol::model::Epoch(1), "never adopted");
     assert!(pids(e.dir.path()).iter().filter(|p| alive(**p)).count() <= 1, "never two at once");
     let evs = events(&e.rt, Duration::from_millis(500)).await;
     assert!(exits_at(&evs).iter().any(|x| x.1 == Some(1)), "{evs:?}");
@@ -180,12 +180,27 @@ async fn refuses_without_lease_and_with_host_tools() {
     assert!(pids(e.dir.path()).is_empty());
 }
 
+/// A start without an agent epoch (a control plane from before #30) is refused, not run under
+/// the sandbox's epoch or 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_without_an_agent_epoch_is_refused() {
+    let e = env();
+    let mut cmd = start_cmd(e.dir.path(), "agt_noepoch", &[]);
+    let RunnerCommand::AgentStart(s) = &mut cmd else { unreachable!() };
+    s.start.epoch = None;
+    nest_runner::supervisor::handle(&e.rt, cmd);
+    let evs = events(&e.rt, Duration::from_millis(500)).await;
+    assert!(evs.iter().any(|ev| matches!(ev, RunnerEvent::Error { error, .. } if error.code == "invalid_message")), "{evs:?}");
+    assert_eq!(exits_at(&evs), [(ExitReason::Crashed, Some(0))]);
+    assert!(pids(e.dir.path()).is_empty(), "Claude Code was never spawned");
+}
+
 #[tokio::test]
 async fn timed_out_platform_calls_are_abandoned_and_not_retryable() {
     use nest_runner::runtime::{Agent, Outbound};
     let (ctx, _crx) = tokio::sync::mpsc::unbounded_channel();
     let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
-    let a = Agent::new(AgentId("agt_p".into()), nest_protocol::model::Epoch(1), PathBuf::from("/tmp"), None, None, vec![], 0, ctx, otx);
+    let a = Agent::new(AgentId("agt_p".into()), nest_protocol::model::Epoch(1), PathBuf::from("/tmp"), None, vec![], 0, ctx, otx);
     let r = a.platform_call("notify", serde_json::json!({"text": "x"}), Duration::from_millis(50)).await;
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["isError"], true, "{v}");
@@ -383,7 +398,7 @@ async fn an_older_start_never_ends_a_newer_brain() {
     let evs = events(&e.rt, Duration::from_millis(800)).await;
     assert!(exits_at(&evs).contains(&(ExitReason::Fenced, Some(1))), "{evs:?}");
     assert!(alive(pid), "the newer brain was ended");
-    assert_eq!(e.rt.agent(&id).expect("registered").epoch(), nest_protocol::model::Epoch(2));
+    assert_eq!(e.rt.agent(&id).expect("registered").epoch, nest_protocol::model::Epoch(2));
     e.rt.kill_all(ExitReason::Fenced);
 }
 

@@ -10,7 +10,7 @@
   - CNAME chains ≤ 8 hops; a cycle fails
 
   These are SPACE's values ([reserved_dns.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/reserved_dns.rs), [dns.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/dns.rs)). Built: upstream resolution is the host's getaddrinfo, which hides TTLs and CNAMEs, so answers carry a fixed 60 s TTL.
-- **Answers are recorded per sandbox** (name → IPs, with TTLs capped). TCP exceptions rely on this record. A policy change prunes it to the names the new policy still allows ([policy](../policy/#changes)).
+- **Answers are recorded per sandbox** (name → IPs, with TTLs capped). TCP exceptions rely on this record. A policy change pruning it to the names the new policy still allows is designed, not built ([policy](../policy/#changes)); a TCP exception is checked against the current policy on every connection regardless.
 - Encrypted DNS (DoH/DoT) can't get around it: DoH endpoints aren't allowlisted, and UDP and port 853 are blocked.
 - **Bounded work:**
   - Each sandbox has at most 32 queries in flight. Further UDP queries are dropped (clients retry), and TCP queries wait.

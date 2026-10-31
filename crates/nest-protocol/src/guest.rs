@@ -73,6 +73,10 @@ pub mod frame {
         TooLarge(u32),
         Empty,
         UnknownKind(u8),
+        /// A message too short to hold a header and a kind byte.
+        Short(usize),
+        /// A message whose length isn't its frame's (more than one frame, or a partial one).
+        LengthMismatch { len: u32, message: usize },
     }
 
     impl std::fmt::Display for FrameError {
@@ -81,8 +85,32 @@ pub mod frame {
                 FrameError::TooLarge(n) => write!(f, "frame length {n} exceeds {MAX_FRAME_LEN}"),
                 FrameError::Empty => f.write_str("frame length 0 (missing kind byte)"),
                 FrameError::UnknownKind(k) => write!(f, "unknown frame kind 0x{k:02x}"),
+                FrameError::Short(n) => write!(f, "binary message of {n} bytes is not a frame"),
+                FrameError::LengthMismatch { len, message } => {
+                    write!(f, "frame length {len} does not match a message of {message} bytes")
+                }
             }
         }
+    }
+
+    /// Largest WebSocket message that carries one frame (the gateway's).
+    pub const MAX_WS_MESSAGE: usize = MAX_FRAME_LEN as usize + 4;
+
+    /// `message` (one WebSocket message) as exactly one frame: its kind and payload. One frame
+    /// per message, so no message can smuggle a second frame past the checks on the first.
+    pub fn one_frame(message: &[u8]) -> Result<(Kind, &[u8]), FrameError> {
+        if message.len() < 5 {
+            return Err(FrameError::Short(message.len()));
+        }
+        let len = u32::from_be_bytes([message[0], message[1], message[2], message[3]]);
+        if len > MAX_FRAME_LEN {
+            return Err(FrameError::TooLarge(len));
+        }
+        if len as usize != message.len() - 4 {
+            return Err(FrameError::LengthMismatch { len, message: message.len() });
+        }
+        let kind = Kind::from_u8(message[4]).ok_or(FrameError::UnknownKind(message[4]))?;
+        Ok((kind, &message[5..]))
     }
 
     impl std::error::Error for FrameError {}
@@ -106,6 +134,15 @@ pub mod frame {
         encode(Kind::Json, &body)
     }
 
+    /// The length of the kind byte plus payload that a frame header announces, if it is allowed.
+    fn body_len(hdr: [u8; 4]) -> Result<usize, FrameError> {
+        match u32::from_be_bytes(hdr) {
+            0 => Err(FrameError::Empty),
+            len if len > MAX_FRAME_LEN => Err(FrameError::TooLarge(len)),
+            len => Ok(len as usize),
+        }
+    }
+
     /// Incremental decoder: push bytes as they arrive, pop complete frames.
     #[derive(Default)]
     pub struct Decoder {
@@ -126,14 +163,7 @@ pub mod frame {
             if self.buf.len() < 4 {
                 return Ok(None);
             }
-            let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
-            if len == 0 {
-                return Err(FrameError::Empty);
-            }
-            if len > MAX_FRAME_LEN {
-                return Err(FrameError::TooLarge(len));
-            }
-            let total = 4 + len as usize;
+            let total = 4 + body_len([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])?;
             if self.buf.len() < total {
                 return Ok(None);
             }
@@ -150,18 +180,12 @@ pub mod frame {
         }
     }
 
-    /// Blocking read of exactly one frame (for std-io users; async users wrap [`Decoder`]).
+    /// Blocking read of exactly one frame (async users have [`super::framed`]).
     pub fn read_frame<R: std::io::Read>(r: &mut R) -> std::io::Result<Frame> {
         let mut hdr = [0u8; 4];
         r.read_exact(&mut hdr)?;
-        let len = u32::from_be_bytes(hdr);
-        if len == 0 || len > MAX_FRAME_LEN {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                if len == 0 { FrameError::Empty } else { FrameError::TooLarge(len) },
-            ));
-        }
-        let mut body = vec![0u8; len as usize];
+        let len = body_len(hdr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut body = vec![0u8; len];
         r.read_exact(&mut body)?;
         let kind = Kind::from_u8(body[0])
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, FrameError::UnknownKind(body[0])))?;
@@ -173,6 +197,79 @@ pub mod frame {
     pub fn write_frame<W: std::io::Write>(w: &mut W, kind: Kind, payload: &[u8]) -> std::io::Result<()> {
         let bytes = encode(kind, payload).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         w.write_all(&bytes)
+    }
+}
+
+/// [`frame`]s over tokio streams.
+#[cfg(feature = "tokio")]
+pub mod framed {
+    use std::io;
+
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    use super::frame::{self, Decoder, Frame, Kind};
+
+    /// Reads frames from an async byte stream. Cancel-safe: bytes read are kept in the decoder,
+    /// so a frame that arrives while `next` is dropped is returned by the next call.
+    pub struct FramedReader<R> {
+        inner: R,
+        dec: Decoder,
+        buf: Vec<u8>,
+    }
+
+    impl<R: AsyncRead + Unpin> FramedReader<R> {
+        pub fn new(inner: R) -> Self {
+            Self::with_buffered(inner, &[])
+        }
+
+        /// A reader whose stream begins with `buffered`, bytes already read from `inner`.
+        pub fn with_buffered(inner: R, buffered: &[u8]) -> Self {
+            let mut dec = Decoder::new();
+            dec.push(buffered);
+            Self { inner, dec, buf: vec![0; 64 << 10] }
+        }
+
+        /// The next frame, or `None` on a clean EOF between frames. A malformed frame is
+        /// `InvalidData`.
+        pub async fn next(&mut self) -> io::Result<Option<Frame>> {
+            loop {
+                if let Some(f) = self.dec.next_frame().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? {
+                    return Ok(Some(f));
+                }
+                let n = self.inner.read(&mut self.buf).await?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                self.dec.push(&self.buf[..n]);
+            }
+        }
+
+        /// The next frame as a JSON message; a `DATA` frame or invalid JSON is `InvalidData`.
+        pub async fn next_json<T: DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
+            let Some(f) = self.next().await? else { return Ok(None) };
+            if f.kind != Kind::Json {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected a JSON frame"));
+            }
+            serde_json::from_slice(&f.payload).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }
+
+        /// The stream and any bytes already read past the last frame (a switch to raw mode).
+        pub fn into_parts(self) -> (R, Vec<u8>) {
+            (self.inner, self.dec.into_remainder())
+        }
+    }
+
+    /// Write and flush one frame.
+    pub async fn write<W: AsyncWrite + Unpin>(w: &mut W, kind: Kind, payload: &[u8]) -> io::Result<()> {
+        let bytes = frame::encode(kind, payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        w.write_all(&bytes).await?;
+        w.flush().await
+    }
+
+    pub async fn write_json<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
+        write(w, Kind::Json, &serde_json::to_vec(msg).expect("protocol types always serialize")).await
     }
 }
 
@@ -762,19 +859,12 @@ pub enum PtyControl {
 pub mod error_code {
     pub const BAD_REQUEST: &str = "bad_request";
     pub const UNSUPPORTED_VERSION: &str = crate::model::error_codes::UNSUPPORTED_VERSION;
-    pub const STALE_EPOCH: &str = "stale_epoch";
-    pub const UNKNOWN_AGENT: &str = "unknown_agent";
+    pub const STALE_EPOCH: &str = crate::model::error_codes::STALE_EPOCH;
+    pub const UNKNOWN_AGENT: &str = crate::model::error_codes::UNKNOWN_AGENT;
     pub const UNKNOWN_TASK: &str = "unknown_task";
-    pub const NOT_FOUND: &str = "not_found";
-    pub const IS_DIRECTORY: &str = "is_directory";
-    pub const NOT_READ: &str = "not_read";
-    pub const NOT_UTF8: &str = "not_utf8";
-    pub const OLD_STRING_NOT_FOUND: &str = "old_string_not_found";
-    pub const OLD_STRING_AMBIGUOUS: &str = "old_string_ambiguous";
-    pub const TOO_LARGE: &str = "too_large";
     pub const CONNECT_REFUSED: &str = "connect_refused";
     pub const BUSY: &str = "busy";
-    pub const INTERNAL: &str = "internal";
+    pub const INTERNAL: &str = crate::model::error_codes::INTERNAL;
 }
 
 // ---------------------------------------------------------------------------------------------

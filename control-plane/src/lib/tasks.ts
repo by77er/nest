@@ -372,7 +372,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
   if (denied) return { ok: false, error: denied };
   const who = actorLabel(actor);
   const unchanged = (task: Task): ApplyResult => ({ ok: true, value: { task, next: ledger.next, history: [], notices: [] } });
-  const done = (before: Task, c: { after: Task; history: HistoryEntry[] }, notices: Notice[], comment?: Comment): ApplyResult =>
+  const done = (c: { after: Task; history: HistoryEntry[] }, notices: Notice[], comment?: Comment): ApplyResult =>
     ({ ok: true, value: { task: c.after, put: c.after, next: ledger.next, history: c.history, notices, ...(comment ? { comment } : {}) } });
   /** A task the op names, at the version it expects. */
   const target = (ref: string, expected?: number): { ok: true; task: Task } | { ok: false; error: Refusal } => {
@@ -449,7 +449,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
         return refuse("forbidden", `${taskKey(before)} can't move from ${before.status} to ${op.status} (allowed: ${WORKER_TRANSITIONS[before.status].join(", ") || "none"})`);
       }
       const c = change(before, { title: op.title, description: op.description, status: op.status, labels: op.labels }, who, ctx.now, writesTainted(actor));
-      return c ? done(before, c, statusNotices(ledger, before, c.after, who)) : unchanged(before);
+      return c ? done(c, statusNotices(ledger, before, c.after, who)) : unchanged(before);
     }
 
     case "claim": {
@@ -466,7 +466,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
         return refuse("invalid_message", `${taskKey(before)} is ${before.status}: a claim takes only ${CLAIM_STARTS.join(" or ")} tasks`);
       }
       const c = change(before, { assignee: actor.agent, status: "in_progress" }, who, ctx.now)!;
-      return done(before, c, assignNotices(ledger, before, c.after, who));
+      return done(c, assignNotices(ledger, before, c.after, who));
     }
 
     case "update_any": {
@@ -491,7 +491,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
       const c = change(before, {
         title: op.title, description: op.description, status: op.status, labels: op.labels, parent, priority: op.priority,
       }, who, ctx.now, writesTainted(actor));
-      return c ? done(before, c, statusNotices(ledger, before, c.after, who)) : unchanged(before);
+      return c ? done(c, statusNotices(ledger, before, c.after, who)) : unchanged(before);
     }
 
     case "assign": {
@@ -502,7 +502,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
         return refuse("forbidden", `${op.assignee.agent} has no access to ledger ${ledger.name}: its spec must grant it`);
       }
       const c = change(before, { assignee: op.assignee?.agent ?? null }, who, ctx.now);
-      return c ? done(before, c, assignNotices(ledger, before, c.after, who)) : unchanged(before);
+      return c ? done(c, assignNotices(ledger, before, c.after, who)) : unchanged(before);
     }
 
     case "cancel": {
@@ -517,7 +517,7 @@ export function applyTaskOp(ledger: LedgerView, actor: Actor, op: TaskOp, ctx: A
         return refuse("invalid_message", `${taskKey(before)} has ${LIMITS.comments} comments, its limit: cancel it without a reason`);
       }
       const c = change(before, { status: "canceled" }, who, ctx.now)!;
-      return done(before, c, statusNotices(ledger, before, c.after, who),
+      return done(c, statusNotices(ledger, before, c.after, who),
         reason ? { task: before.id, author: who, body: `Canceled: ${reason}`, ms: ctx.now, tainted: writesTainted(actor) } : undefined);
     }
 

@@ -228,6 +228,13 @@ pub fn salvage_retryable(retryable: bool, parent_mismatch: bool) -> bool {
     retryable || parent_mismatch
 }
 
+/// Whether a commit stops at a failed re-ask of its unanswered request (`refused`: SandboxDO's
+/// final rejection; else a timeout or store error). Only a salvage re-asking another kind of
+/// request goes on: that refusal says nothing about whether this incarnation's work can be saved.
+pub fn reask_failure_ends_commit(salvage: bool, reasked_salvage: bool, refused: bool) -> bool {
+    !(refused && salvage && !reasked_salvage)
+}
+
 /// Whether a commit has nothing to send: a salvage of a disk whose manifest is its head's (nothing
 /// written since; a head's memory doesn't matter to a salvage, which has none). A disk with no head
 /// is always salvaged, and any other commit is always sent.
@@ -354,6 +361,20 @@ mod tests {
     fn a_salvage_is_retried_when_retryable_or_a_parent_mismatch() {
         for (retryable, parent_mismatch, want) in [(true, false, true), (false, true, true), (true, true, true), (false, false, false)] {
             assert_eq!(salvage_retryable(retryable, parent_mismatch), want);
+        }
+    }
+
+    /// Inventory B1: a salvage goes on past a refused re-ask of another kind of request, and only
+    /// then.
+    #[test]
+    fn only_a_salvage_goes_on_past_a_refused_reask_of_another_commit() {
+        for salvage in [false, true] {
+            for reasked_salvage in [false, true] {
+                for refused in [false, true] {
+                    let goes_on = salvage && !reasked_salvage && refused;
+                    assert_eq!(reask_failure_ends_commit(salvage, reasked_salvage, refused), !goes_on, "salvage {salvage}, re-asked a salvage {reasked_salvage}, refused {refused}");
+                }
+            }
         }
     }
 

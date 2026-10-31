@@ -11,7 +11,6 @@ export const INLINE_BODY_BYTES = 32 * 1024;
 /** The largest body a post may carry at all (hooks' body limit). */
 export const MAX_BODY_BYTES = 1024 * 1024;
 export const MAX_NAME_LENGTH = 128;
-export const MAX_KEY_LENGTH = 64;
 export const MAX_MENTIONS = 16;
 /** A sender's message identical to its previous one on the channel within this long isn't stored. */
 export const REPEAT_WINDOW_MS = 60_000;
@@ -51,7 +50,7 @@ export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 const ok = <T>(value: T): Result<T> => ({ ok: true, value });
 const err = <T>(error: string): Result<T> => ({ ok: false, error });
 
-const utf8 = (s: string) => new TextEncoder().encode(s).length;
+export const utf8 = (s: string) => new TextEncoder().encode(s).length;
 
 // --- Names --------------------------------------------------------------------------------------------
 
@@ -533,6 +532,38 @@ export function afterDelivery(sub: Subscription, batch: Batch, outcome: Delivery
   return { ...sub, attempts, due_ms: now + deliveryBackoff(attempts) };
 }
 
+/** The log as a delivery reads it (ChannelDO's SQLite, or an array in tests). */
+export interface LogView {
+  head: number;
+  /** Up to `BATCH_SCAN` messages after `after`, ascending, with `user` texts. */
+  scan(after: number): readonly (MessageMeta & { text?: string })[];
+}
+
+/**
+ * A due subscription's next step (`save` null: unchanged; `send` null: nothing). A pinned batch is
+ * sent again; else the next is pinned with its backstop, or the cursor moves past a range with no match.
+ */
+export function beginDelivery(sub: Subscription, log: LogView, now: number): { save: Subscription | null; send: Batch | null } {
+  if (sub.inflight) return { save: null, send: sub.inflight };
+  const plan = planBatch(sub, log.scan(sub.cursor));
+  switch (plan.kind) {
+    case "idle":
+      return { save: { ...sub, due_ms: null }, send: null };
+    case "advance":
+      return { save: { ...sub, cursor: plan.to_seq, due_ms: log.head > plan.to_seq ? now : null }, send: null };
+    case "deliver":
+      return { save: { ...sub, inflight: plan.batch, due_ms: now + DELIVERY_BACKSTOP_MS }, send: plan.batch };
+  }
+}
+
+/** `afterDelivery`, then matches that arrived while the batch was in flight open the next window. Null: ended. */
+export function settleDelivery(sub: Subscription, batch: Batch, outcome: DeliveryOutcome, log: LogView, now: number): Subscription | null {
+  const next = afterDelivery(sub, batch, outcome, now);
+  if (next === null || next.inflight !== null || next.due_ms !== null) return next;
+  const plan = planBatch(next, log.scan(next.cursor));
+  return plan.kind === "idle" ? next : { ...next, due_ms: now + (plan.kind === "deliver" ? next.batch_ms : 0) };
+}
+
 // --- Wake envelope (AgentDO) --------------------------------------------------------------------------
 
 /** A delivery as AgentDO receives it. */
@@ -540,6 +571,24 @@ export interface ChannelDelivery {
   channel: string;
   subscription: string;
   batch: Batch;
+}
+
+/**
+ * What a subscriber takes of a delivery: all of it if it can `read`; else only as far as its user
+ * messages arrived inline (`inline_to`), shown those alone. `skipped`: it took messages it wasn't shown.
+ */
+export function takeBatch(d: ChannelDelivery, reads: boolean): { up_to: number; shown: ChannelDelivery; skipped: boolean } {
+  if (reads) return { up_to: d.batch.to_seq, shown: d, skipped: false };
+  const b = d.batch;
+  const up_to = Math.min(b.inline_to ?? b.to_seq, b.to_seq);
+  const shown: ChannelDelivery = {
+    ...d,
+    batch: {
+      ...b, to_seq: up_to, count: b.inline.length, first_seq: b.inline[0]?.seq ?? up_to, last_seq: b.inline.at(-1)?.seq ?? up_to,
+      senders: b.inline.length ? [{ from: "user", n: b.inline.length }] : [], kinds: [], tainted: 0,
+    },
+  };
+  return { up_to, shown, skipped: b.count > b.inline.length };
 }
 
 const ago = (ms: number) => {

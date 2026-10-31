@@ -15,7 +15,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 futures-util = "0.3.34"
 hex = "0.4.3"
 libc = "0.2.190"
-nest-protocol = { path = "../nest-protocol" }
+nest-protocol = { path = "../nest-protocol", features = ["tokio"] }
 nestd-core = { path = "../nestd-core" }
 nix = { version = "0.31", features = ["sched", "socket", "fs", "signal", "process", "mount", "uio", "user"] }
 rand = "0.10.3"

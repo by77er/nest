@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use nest_protocol::host::PROTOCOL_VERSION;
 use nest_protocol::host::fdpass::{self, MAX_PACKET_FROM_PROXY, MAX_PACKET_TO_PROXY};
-use nest_protocol::host::proxy::{ProxyCommand, ProxyEvent};
+use nest_protocol::host::proxy::{ProxyCommand, ProxyEvent, ProxyEventKind};
 use nest_protocol::model::ErrorBody;
 
 use crate::Config;
@@ -242,7 +242,8 @@ async fn send_packet(fd: &AsyncFd<OwnedFd>, ev: &ProxyEvent) -> io::Result<()> {
     let ev = crate::audit::clip_event(ev.clone());
     let len = serde_json::to_vec(&ev).map(|v| v.len()).unwrap_or(usize::MAX);
     if len > MAX_PACKET_FROM_PROXY {
-        tracing::warn!(len, kind = event_kind(&ev), "dropping oversized event to nestd");
+        let kind: &'static str = ProxyEventKind::from(&ev).into();
+        tracing::warn!(len, kind, "dropping oversized event to nestd");
         return Ok(());
     }
     let ev = &ev;
@@ -252,17 +253,5 @@ async fn send_packet(fd: &AsyncFd<OwnedFd>, ev: &ProxyEvent) -> io::Result<()> {
             Ok(r) => return r,
             Err(_would_block) => continue,
         }
-    }
-}
-
-fn event_kind(ev: &ProxyEvent) -> &'static str {
-    match ev {
-        ProxyEvent::Hello { .. } => "hello",
-        ProxyEvent::ResyncAck { .. } => "resync_ack",
-        ProxyEvent::Audit { .. } => "audit",
-        ProxyEvent::Alert { .. } => "alert",
-        ProxyEvent::ListenerFailed { .. } => "listener_failed",
-        ProxyEvent::Pong { .. } => "pong",
-        ProxyEvent::Error { .. } => "error",
     }
 }

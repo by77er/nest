@@ -50,9 +50,6 @@ pub struct FirecrackerDriver {
 
 #[async_trait]
 impl Driver for FirecrackerDriver {
-    fn name(&self) -> &'static str {
-        "firecracker"
-    }
     fn supports_memory_snapshots(&self) -> bool {
         true
     }
@@ -267,9 +264,6 @@ impl Vm for FirecrackerVm {
     }
     fn vsock_uds_path(&self) -> PathBuf {
         self.host_path(&self.fc_paths().vsock)
-    }
-    fn disk_path(&self) -> PathBuf {
-        self.spec.disk_path.clone()
     }
     async fn start(&mut self) -> io::Result<()> {
         let paths = self.fc_paths();

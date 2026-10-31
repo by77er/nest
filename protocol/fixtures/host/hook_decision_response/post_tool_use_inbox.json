@@ -1,0 +1,8 @@
+{
+  "output": {
+    "hookSpecificOutput": {
+      "hookEventName": "PostToolUse",
+      "additionalContext": "New messages arrived while you were working:\n\n[message from user]\nplease also run the tests\n"
+    }
+  }
+}

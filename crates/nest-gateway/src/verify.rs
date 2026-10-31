@@ -1,5 +1,5 @@
-//! The bind check: every refusal the gateway can give, in the order `gateway::error_code`
-//! documents, and what an accepted bind yields.
+//! The bind check: every refusal the gateway can give, in the order the contract's error-code
+//! table documents (`docs/interfaces/gateway/#error-codes`), and what an admitted bind yields.
 
 use std::path::PathBuf;
 
@@ -10,7 +10,7 @@ use nest_protocol::gateway::{
 use nest_protocol::model::ErrorBody;
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 
-use crate::state::State;
+use crate::state::SandboxEntry;
 
 /// Why a bind was refused; becomes a `GatewayMessage::Error` then a close.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,27 +43,23 @@ impl Refusal {
     }
 }
 
-/// An accepted bind: what the pipe needs.
+/// What an admitted bind yields besides its claims: where the guest is, and what it speaks.
 #[derive(Clone, Debug)]
-pub struct Accepted {
-    pub claims: BindingClaims,
+pub struct Admission {
     pub vsock_uds_path: PathBuf,
     pub guest: GuestInfo,
-    pub gateway_version: u32,
 }
 
-/// Check a `bind` against one snapshot of the state. Precedence (the first failing check wins):
-/// gateway version → token shape → claims version → key id → signature, expiry, scope →
-/// sandbox known (`moved`, or `busy` during a resync) → epoch older (`stale_epoch`) or newer
-/// (`busy`) → client attached → guest known (`busy`) → guest version. The attached set is
-/// checked only once the sandbox and epoch are known, since it belongs to that sandbox.
-pub fn check_bind(
-    state: &State,
+/// The state-free half of the bind check, run before any lock: gateway version → token shape →
+/// claims version → key id → signature, expiry, scope. `key` looks a kid up. Every answer here
+/// precedes every state-dependent one, so an unsigned probe learns nothing about which
+/// sandboxes a host runs.
+pub fn verify_token(
+    key: impl FnOnce(&str) -> Option<Vec<u8>>,
     binding: &str,
-    protocol_version: u32,
     gateway_version: u32,
     now_ms: i64,
-) -> Result<Accepted, Refusal> {
+) -> Result<BindingClaims, Refusal> {
     if !(MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&gateway_version) {
         return Err(Refusal::new(
             error_code::UNSUPPORTED_VERSION,
@@ -78,8 +74,7 @@ pub fn check_bind(
         Err(_) => return Err(unauthorized()),
     };
     let claims = parsed.claims;
-    let snap = state.snapshot(&claims.kid, &claims.sandbox);
-    let Some(key) = snap.key else {
+    let Some(key) = key(&claims.kid) else {
         return Err(Refusal::new(error_code::UNKNOWN_KEY, format!("no key with kid {}", claims.kid)));
     };
     if UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, key).verify(&parsed.message, &parsed.signature).is_err() {
@@ -88,8 +83,16 @@ pub fn check_bind(
     if claims.exp_ms <= now_ms || claims.scope != BindingScope::Hands {
         return Err(unauthorized());
     }
-    let Some(entry) = snap.entry else {
-        if snap.resyncing {
+    Ok(claims)
+}
+
+/// The state-dependent half, run under the lock that registers the connection
+/// ([`crate::state::State::admit_and_register`]): sandbox known (`moved`, or `busy` during a
+/// resync) → epoch older (`stale_epoch`) or newer (`busy`) → client attached (to that sandbox at
+/// that epoch) → guest known (`busy`) → guest version.
+pub fn admit(entry: Option<&SandboxEntry>, resyncing: bool, claims: &BindingClaims, protocol_version: u32) -> Result<Admission, Refusal> {
+    let Some(entry) = entry else {
+        if resyncing {
             return Err(Refusal::busy("resync in progress"));
         }
         return Err(Refusal::moved(format!("sandbox {} is not on this host", claims.sandbox.0)));
@@ -104,7 +107,7 @@ pub fn check_bind(
     if !entry.clients.contains(&claims.client) {
         return Err(unauthorized());
     }
-    let Some(guest) = entry.guest else {
+    let Some(guest) = entry.guest.clone() else {
         return Err(Refusal::busy("guest not configured yet"));
     };
     if protocol_version != guest.protocol_version {
@@ -113,9 +116,7 @@ pub fn check_bind(
             format!("guest speaks protocol version {}, not {protocol_version}", guest.protocol_version),
         ));
     }
-    // The highest version this gateway serves that the client also speaks: with one version
-    // served, that is the client's.
-    Ok(Accepted { claims, vsock_uds_path: entry.vsock_uds_path, guest, gateway_version })
+    Ok(Admission { vsock_uds_path: entry.vsock_uds_path.clone(), guest })
 }
 
 fn unauthorized() -> Refusal {
@@ -147,4 +148,82 @@ pub fn verify_with_key(public_key: &[u8], token: &str) -> Option<BindingClaims> 
     let parsed = parse_binding(token).ok()?;
     UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, public_key).verify(&parsed.message, &parsed.signature).ok()?;
     Some(parsed.claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::State;
+    use nest_protocol::model::{Epoch, SandboxId};
+
+    /// One combination of everything [`admit`] reads.
+    #[derive(Clone, Copy, Debug)]
+    struct Case {
+        placed: bool,
+        resyncing: bool,
+        /// The binding's epoch minus the held one: -1, 0 or 1.
+        epoch: i64,
+        attached: bool,
+        /// The guest's protocol version, `None` before its hello; the bind asks for 1.
+        guest: Option<u32>,
+    }
+
+    /// A row of the table: its code, and when it applies.
+    type Row = (&'static str, fn(&Case) -> bool);
+
+    /// The contract's error-code table (`docs/interfaces/gateway/#error-codes`), rows 5 to 9 in
+    /// order: the first row whose condition holds is the answer.
+    const TABLE: &[Row] = &[
+        (error_code::MOVED, |c| !c.placed && !c.resyncing),
+        (error_code::BUSY, |c| !c.placed && c.resyncing),
+        (error_code::STALE_EPOCH, |c| c.epoch < 0),
+        (error_code::BUSY, |c| c.epoch > 0),
+        (error_code::UNAUTHORIZED, |c| !c.attached),
+        (error_code::BUSY, |c| c.guest.is_none()),
+        (error_code::UNSUPPORTED_VERSION, |c| c.guest != Some(1)),
+    ];
+
+    #[test]
+    fn admission_follows_the_contracts_error_code_table() {
+        let mut n = 0;
+        for placed in [false, true] {
+            for resyncing in [false, true] {
+                for epoch in [-1, 0, 1] {
+                    for attached in [false, true] {
+                        for guest in [None, Some(1), Some(2)] {
+                            let c = Case { placed, resyncing, epoch, attached, guest };
+                            let state = State::new();
+                            let sandbox = SandboxId("sbx_1".into());
+                            if placed {
+                                let clients: &[&str] = if attached { &["agt_a"] } else { &["agt_b"] };
+                                let guest = guest.map(|v| GuestInfo { protocol_version: v, capabilities: vec![] });
+                                state.upsert_sandbox(sandbox.clone(), Epoch(5), PathBuf::from("/v"), clients.iter().copied(), guest);
+                            }
+                            let claims = BindingClaims {
+                                v: 1,
+                                kid: "k".into(),
+                                sandbox: sandbox.clone(),
+                                epoch: Epoch((5 + epoch) as u64),
+                                client: "agt_a".into(),
+                                scope: BindingScope::Hands,
+                                exp_ms: i64::MAX,
+                            };
+                            let got = admit(state.sandbox(&sandbox).as_ref(), resyncing, &claims, 1);
+                            let want = TABLE.iter().find(|(_, holds)| holds(&c)).map(|(code, _)| *code);
+                            match (got, want) {
+                                (Ok(a), None) => assert_eq!(a.guest.protocol_version, 1, "{c:?}"),
+                                (Err(r), Some(code)) => {
+                                    assert_eq!(r.code, code, "{c:?}");
+                                    assert_eq!(r.retryable, code == error_code::BUSY, "only busy is retried with the same binding: {c:?}");
+                                }
+                                (got, want) => panic!("{c:?}: got {got:?}, the table says {want:?}"),
+                            }
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(n, 72);
+    }
 }

@@ -6,7 +6,7 @@ unprivileged user namespace, as two hosts: a sandbox host (nest-proxy, nest-gate
 `process` driver running nest-guest) and a brain host (a second nestd in brain mode, nest-runner),
 then drives a scenario through the admin API and checks the results.
 
-NEST_E2E_CLAUDE=fake (default): brains are e2e/fake_claude.py running a scripted scenario; the real
+NEST_E2E_CLAUDE=fake (default): brains are crates/nest-cli/tests/fake_claude.py running a scripted scenario; the real
 `claude` binary is never invoked. NEST_E2E_CLAUDE=real: brains are the real `claude` with the token
 from NEST_CLAUDE_OAUTH_TOKEN, given a short natural-language turn that uses the hands tools.
 """
@@ -16,6 +16,8 @@ E2E = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(E2E)
 WORK = os.environ.get("NEST_E2E_WORK", os.path.join(E2E, ".work"))
 BIN = os.path.join(ROOT, "target", "e2e", "release")
+# The fake Claude Code the runner's own end-to-end tests use.
+FAKE_CLAUDE = os.path.join(ROOT, "crates", "nest-cli", "tests", "fake_claude.py")
 PORT = int(os.environ.get("NEST_E2E_PORT", "18787"))
 BASE = f"http://127.0.0.1:{PORT}"
 GW_PORT = int(os.environ.get("NEST_E2E_GATEWAY_PORT", "18790"))
@@ -282,7 +284,7 @@ def start_inner():
     log("starting the sandbox host (nest-proxy, nestd, nest-gateway) and the brain host (nestd, nest-runner) inside `unshare --user --map-root-user --mount`")
     maps, _ = id_maps()
     env = dict(os.environ, WORK=WORK, BIN=BIN, E2E=E2E, NEST_E2E_GATEWAY_PORT=str(GW_PORT), NEST_E2E_GATEWAY_UID=str(GW_UID),
-               NEST_E2E_GATEWAY_BIN=GW_BIN)
+               NEST_E2E_GATEWAY_BIN=GW_BIN, NEST_E2E_FAKE_CLAUDE=FAKE_CLAUDE)
     if REAL:
         env.update({k: v for k, v in REAL_ENV.items() if k.startswith("NEST_E2E_")})
     logf = open(os.path.join(WORK, "logs", "inner.log"), "w")
@@ -304,7 +306,7 @@ def stop_inner():
             except ProcessLookupError:
                 pass
     # Guests/brains may have been re-parented; sweep anything under WORK.
-    for pat in [os.path.join(BIN, "nest-guest"), GW_BIN, os.path.join(E2E, "fake_claude.py"),
+    for pat in [os.path.join(BIN, "nest-guest"), GW_BIN, FAKE_CLAUDE,
                 os.path.join(BIN, "nest") + " mcp"]:
         for pid in children_named(pat):
             try:
@@ -696,7 +698,7 @@ def tamper_signature(binding):
 
 
 def run_fencing(ids):
-    brains = real_brains() if REAL else children_named(os.path.join(E2E, "fake_claude.py"))
+    brains = real_brains() if REAL else children_named(FAKE_CLAUDE)
     guests = children_named(os.path.join(BIN, "nest-guest"))
     check("pre-fence: brain + guest alive", brains and guests, f"brains={brains} guests={guests}")
     log("stopping the control plane to cut heartbeats")

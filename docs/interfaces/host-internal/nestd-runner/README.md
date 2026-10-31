@@ -25,7 +25,7 @@
 - **No re-issue:** AgentDO starts an agent on a host only once its previous brain was released, so a start that finds an older brain of the agent still registered (one on its way out: of an earlier connection, or killed) ends it and registers once it is gone; it never adopts it or runs beside it. A start older than the registered brain is refused at its own epoch and never ends it; the same start again is a no-op. A killed brain that hasn't exited after 60 s makes nestd drop the connection (every brain on the host is then killed). An exit without an epoch (a runner of the previous release) is taken by nestd for the agent's oldest entry. A start for an agent whose previous brain is on its way out (told to stop, or of an **earlier nestd connection**) kills it and registers once it is gone, never alongside it.
 - **Connection generations:** lifecycle events are tagged with the nestd connection a brain was started under; a new connection never receives events about brains of the previous one (they were killed when it dropped). nestd keeps the same rule on its side: it accepts events only for a brain whose start went out on the current connection, and drops an `agent_exited{fenced}` that arrives before that brain's `agent_started`.
 - **A lost connection loses its brains.** When the socket closes, nestd reports each brain started on it to the control plane as `agent_exited{crashed}` (`fenced` if it was already fenced), and forgets it. AgentDO restarts a `crashed` or `fenced` brain that has work with a fresh `agent_start` (current session, resume URLs and token); nestd keeps no copy of a start to replay.
-- **One brain table** in nestd, keyed by (agent, agent epoch), holds each start's state and connection. `agent_started` marks its epoch's entry; an exit removes the agent's entries at or below its epoch, never a newer one (events without an epoch, from a runner of the previous release, are taken for the newest entry). A fence takes its brains out of the fleet hello at once; they leave the table when the runner reports the exit (forwarded to the control plane) or the connection drops. A fenced start that was never sent is reported `fenced` by nestd itself.
+- **One brain table** in nestd, keyed by (agent, agent epoch), holds each start's state and connection. `agent_started` marks its epoch's entry; an exit removes the agent's entries at or below its epoch, never a newer one (an event without an epoch, which only a runner of an older release sends, is dropped). A fence takes its brains out of the fleet hello at once; they leave the table when the runner reports the exit (forwarded to the control plane) or the connection drops. A fenced start that was never sent is reported `fenced` by nestd itself.
 - **An exit means nothing older runs.** An `agent_exited` at epoch `e`, from the runner or from nestd, means no brain of the agent at or below `e` runs on the host: AgentDO releases its brain record on it. nestd answers a kill with an exit itself only when no start at or below its epoch went out to the runner, and holds a refused start's exit until the older starts that went out have exited.
 - **Kills don't wait:** `fence`, `agent_stop{kill}` and lease lapse SIGKILL the brain's process group directly; stdin is written by a separate task, so a brain that stopped reading stdin is still killed.
 
@@ -48,9 +48,10 @@ Reported in `RunnerEvent::Error` (to nestd) or in an `AgentEventBody::Error` (on
 | `invalid_message` | `RunnerEvent::Error` | An undecodable `RunnerCommand` from nestd. It's skipped; the connection stays up. |
 | `agent_start_failed` | `RunnerEvent::Error` | A startup step failed or timed out (materialize, auth check, spawn). Retryable. |
 | `claude_version` (designed) | `RunnerEvent::Error` | Claude Code isn't the pinned baseline (version or SHA-256). The start is refused (`agent_exited{crashed}`). Not retryable. |
-| `agent_stopping` | `AgentEventBody::Error` | A turn or inbox message arrived after a stop; it isn't delivered. |
+| `agent_stopping` | `AgentEventBody::Error` | A turn arrived after a stop or kill; it isn't written (AgentDO keeps it queued). |
+| `turn_overlap` | `AgentEventBody::Error` | A `run_turn` arrived while another turn runs; it isn't written. Not retryable. |
 | `stdin` | `AgentEventBody::Error` | Writing to Claude Code's stdin failed. Retryable. |
-| `outcome_unknown` | MCP tool result | A platform call timed out in the runner (the runner sends `cancel_call`), a hands call's gateway connection closed with 4409 (the sandbox left mid-call), or (designed) a hands call went silent. The model is told the call may or may not have taken effect. |
+| `outcome_unknown` | MCP tool result | A platform call timed out in the runner (the runner sends `cancel_call`), a hands call's gateway connection closed with 4409 (the sandbox left mid-call) or its request's send failed part-way, `nest mcp`'s connection to the runner closed while a call ran, or (designed) a hands call went silent. The model is told the call may or may not have taken effect. |
 
 ## Agent start → turn → sync hook → idle exit
 
@@ -93,8 +94,9 @@ hard kill (wedged): AgentStop{kill} or Fence → SIGKILL of the process group (n
 
 ## Late input after an idle close
 
-A `run_turn` or inbox message that arrives after the runner closed stdin for idleness (Claude Code
-still exiting) is held, and once the process exits the runner starts Claude Code again with
-`--resume <current session file>` and replays it — no `agent_exited` is reported for that exit.
-After a stop or kill, such input is reported as an `error{agent_stopping}` agent event (tagged with
-the turn) instead of being dropped. Inbox messages count as delivered only once written to stdin.
+A `run_turn` that arrives after the runner closed stdin for idleness (Claude Code still exiting) is
+held, and once the process exits the runner starts Claude Code again with
+`--resume <current session file>` and runs it there — no `agent_exited` is reported for that exit.
+After a stop or kill, such a turn is reported as an `error{agent_stopping}` agent event (tagged with
+the turn) instead of being dropped, and the exit carries the stop or kill's reason. Inbox messages
+never restart a brain: with no turn running they stay in the mirror for AgentDO to queue.

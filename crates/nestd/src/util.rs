@@ -1,5 +1,6 @@
-//! Small shared helpers: wall-clock time and identifier generation.
+//! Small shared helpers: wall-clock time, identifier generation and a bounded parallel loop.
 
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nest_protocol::model::{ErrorBody, TimestampMs};
@@ -99,6 +100,43 @@ pub fn parse_http_date_ms(s: &str) -> Option<i64> {
     parse_rfc3339_utc_ms(&iso)
 }
 
+/// Run `f` on every item on up to `threads` threads; the first error stops new items (running
+/// ones finish) and is returned. `items` is pulled one at a time under a lock: a sequential reader
+/// stays sequential, and with no queue nothing can block on a consumer that has stopped.
+pub fn par_try_for_each<T, E: Send>(
+    items: impl Iterator<Item = Result<T, E>> + Send,
+    threads: usize,
+    f: impl Fn(T) -> Result<(), E> + Sync,
+) -> Result<(), E> {
+    let threads = items.size_hint().1.map_or(threads, |n| threads.min(n)).max(1);
+    let items = Mutex::new(items);
+    let failed = Mutex::new(None);
+    let fail = |e| {
+        failed.lock().expect("failed").get_or_insert(e);
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                while failed.lock().expect("failed").is_none() {
+                    let item = {
+                        let mut items = items.lock().expect("items");
+                        match items.next() {
+                            None => return,
+                            Some(Ok(item)) => item,
+                            // Recorded under the lock, so no thread reads past a failed item.
+                            Some(Err(e)) => return fail(e),
+                        }
+                    };
+                    if let Err(e) = f(item) {
+                        fail(e);
+                    }
+                }
+            });
+        }
+    });
+    failed.into_inner().expect("failed").map_or(Ok(()), Err)
+}
+
 pub fn error(code: &str, message: impl Into<String>, retryable: bool) -> ErrorBody {
     ErrorBody { code: code.into(), message: message.into(), retryable }
 }
@@ -122,6 +160,27 @@ mod tests {
         assert_eq!(super::parse_rfc3339_utc_ms("2026-10-17T04:04:14.5Z"), Some(ms + 500));
         assert_eq!(super::parse_rfc3339_utc_ms("2026-10-17 04:04:14Z"), None);
         assert_eq!(super::parse_rfc3339_utc_ms("2026-13-17T04:04:14Z"), None);
+    }
+
+    /// The first error is returned and stops the loop: no item after it is taken.
+    #[test]
+    fn par_try_for_each_stops_at_the_first_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let taken = AtomicUsize::new(0);
+        let items = (0..100).map(|i| {
+            taken.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, String>(i)
+        });
+        let fail_at_10 = |i| if i == 10 { Err(format!("item {i}")) } else { Ok(()) };
+        // One thread, so the count is exact: with more, the others may take any number of items
+        // while the failing one is descheduled before it records its error.
+        assert_eq!(super::par_try_for_each(items, 1, fail_at_10), Err("item 10".into()));
+        assert_eq!(taken.load(Ordering::Relaxed), 11);
+        assert_eq!(super::par_try_for_each((0..100).map(Ok), 4, fail_at_10), Err("item 10".into()));
+        // An error from the iterator itself is returned the same way.
+        let items = (0..100).map(|i| if i == 3 { Err("read failed") } else { Ok(i) });
+        assert_eq!(super::par_try_for_each(items, 2, |_| Ok(())), Err("read failed"));
+        assert_eq!(super::par_try_for_each((0..100).map(Ok::<_, ()>), 4, |_| Ok(())), Ok(()));
     }
 
     #[test]

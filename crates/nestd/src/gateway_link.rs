@@ -178,10 +178,6 @@ impl GatewayLink {
     pub fn entry(&self, sandbox: &SandboxId) -> Option<Entry> {
         self.state.lock().expect("gateway state").sandboxes.get(sandbox).cloned()
     }
-
-    pub fn connected(&self) -> bool {
-        self.state.lock().expect("gateway state").conn.is_some()
-    }
 }
 
 async fn serve(mut framed: Framed<tokio::net::UnixStream, LengthDelimitedCodec>, state: Arc<Mutex<State>>, host_id: HostId, notices: UnboundedSender<GatewayNotice>, timings: Timings) {

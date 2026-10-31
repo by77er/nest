@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::gateway::{ClientMessage, GatewayMessage, ROUTE_HANDS, ROUTE_INGRESS_PREFIX, ROUTE_PTY, close_code, error_code};
-use nest_protocol::guest::frame::{self, Decoder, Kind, MAX_FRAME_LEN};
+use nest_protocol::guest::frame::{self, Kind, MAX_WS_MESSAGE};
+use nest_protocol::guest::framed::FramedReader;
 use nest_protocol::guest::{PORT_HANDS, handshake};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -20,7 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::state::State;
-use crate::verify::{Refusal, check_bind, first_frame_mismatch};
+use crate::verify::{Refusal, first_frame_mismatch, verify_token};
 
 /// How long a client has, from the TCP accept, to finish the upgrade and send `bind`.
 pub const BIND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,7 +85,12 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
         refuse(&mut ws, &Refusal::new(error_code::BAD_REQUEST, "expected a bind message")).await;
         return Ok(());
     };
-    let accepted = match check_bind(&state, &binding, protocol_version, gateway_version, now_ms()) {
+    // The token outside any lock, then admission and registration under one: registered before
+    // the guest is touched, so a removal, epoch bump or link loss during the vsock connect cuts
+    // the connect below.
+    let admitted = verify_token(|kid| state.key(kid), &binding, gateway_version, now_ms())
+        .and_then(|claims| state.admit_and_register(&claims, protocol_version).map(|(a, g)| (claims, a, g)));
+    let (claims, admission, mut guard) = match admitted {
         Ok(a) => a,
         Err(r) => {
             tracing::info!(code = r.code, via, "bind refused");
@@ -92,22 +98,14 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
             return Ok(());
         }
     };
-    let sandbox = accepted.claims.sandbox.clone();
-    let client = accepted.claims.client.clone();
-    // Registered before the guest is touched, atomically with a re-check of the sandbox and
-    // epoch: a removal, epoch bump or link loss since the bind check is refused here, and one
-    // during the vsock connect cuts the connect below.
-    let Some(mut guard) = state.register_conn(sandbox.clone(), accepted.claims.epoch) else {
-        refuse(&mut ws, &Refusal::moved("the sandbox left this host")).await;
-        return Ok(());
-    };
+    let (sandbox, client) = (claims.sandbox.clone(), claims.client.clone());
     let guest = tokio::select! {
         biased;
         _ = guard.closed() => {
             refuse(&mut ws, &Refusal::moved("the sandbox left this host")).await;
             return Ok(());
         }
-        r = tokio::time::timeout(VSOCK_TIMEOUT, vsock_connect(&accepted.vsock_uds_path, PORT_HANDS)) => match r {
+        r = tokio::time::timeout(VSOCK_TIMEOUT, vsock_connect(&admission.vsock_uds_path, PORT_HANDS)) => match r {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 tracing::warn!(sandbox = %sandbox.0, error = %e, "guest vsock connect failed");
@@ -121,16 +119,17 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
         }
     };
     drop(permit);
-    let bound = GatewayMessage::Bound { guest: accepted.guest.clone(), gateway_version: accepted.gateway_version };
+    // The highest version this gateway serves that the client also speaks: with one version
+    // served, that is the client's.
+    let bound = GatewayMessage::Bound { guest: admission.guest.clone(), gateway_version };
     if send(&mut ws, Message::text(serde_json::to_string(&bound)?)).await.is_err() {
         return Ok(());
     }
     tracing::info!(sandbox = %sandbox.0, client = %client, via, "bound");
 
     // The pipe.
-    let (mut guest_rd, mut guest_wr) = guest.into_split();
-    let mut decoder = Decoder::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let (guest_rd, mut guest_wr) = guest.into_split();
+    let mut guest_rd = FramedReader::new(guest_rd);
     let mut first = true;
     let outcome: &str = loop {
         tokio::select! {
@@ -152,21 +151,22 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
                     break "client error";
                 }
                 Some(Ok(Message::Binary(bytes))) => {
-                    let kind = match check_frame(&bytes) {
-                        Ok(k) => k,
-                        Err(why) => {
-                            close(&mut ws, close_code::PROTOCOL, why).await;
+                    let (kind, payload) = match frame::one_frame(&bytes) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::debug!(sandbox = %sandbox.0, client = %client, error = %e, "bad client frame");
+                            close(&mut ws, close_code::PROTOCOL, "not exactly one frame").await;
                             break "bad frame";
                         }
                     };
                     if first {
                         first = false;
-                        let json = (kind == Kind::Json).then(|| serde_json::from_slice::<serde_json::Value>(&bytes[5..]).ok()).flatten();
+                        let json = (kind == Kind::Json).then(|| serde_json::from_slice::<serde_json::Value>(payload).ok()).flatten();
                         let Some(json) = json else {
                             close(&mut ws, close_code::PROTOCOL, "first frame is not JSON").await;
                             break "bad first frame";
                         };
-                        if let Some(field) = first_frame_mismatch(&json, &accepted.claims, accepted.guest.protocol_version) {
+                        if let Some(field) = first_frame_mismatch(&json, &claims, admission.guest.protocol_version) {
                             tracing::info!(sandbox = %sandbox.0, client = %client, field, "first frame differs from the binding");
                             close(&mut ws, close_code::UNAUTHORIZED, "frame does not match the binding").await;
                             break "unauthorized frame";
@@ -184,35 +184,20 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
                 // Pings are answered by the WebSocket layer; pongs and raw frames carry nothing.
                 Some(Ok(_)) => {}
             },
-            n = guest_rd.read(&mut buf) => match n {
-                Ok(0) | Err(_) => {
+            f = guest_rd.next() => match f {
+                Ok(Some(f)) => {
+                    if send(&mut ws, Message::binary(frame::encode(f.kind, &f.payload)?)).await.is_err() {
+                        break "client write failed";
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    tracing::warn!(sandbox = %sandbox.0, error = %e, "guest frame error");
+                    close(&mut ws, u16::from(CloseCode::Error), "guest frame error").await;
+                    break "guest frame error";
+                }
+                Ok(None) | Err(_) => {
                     let _ = tokio::time::timeout(WRITE_TIMEOUT, ws.close(None)).await;
                     break "guest closed";
-                }
-                Ok(n) => {
-                    decoder.push(&buf[..n]);
-                    let mut stop = None;
-                    loop {
-                        match decoder.next_frame() {
-                            Ok(Some(f)) => {
-                                let bytes = frame::encode(f.kind, &f.payload)?;
-                                if send(&mut ws, Message::binary(bytes)).await.is_err() {
-                                    stop = Some("client write failed");
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(sandbox = %sandbox.0, error = %e, "guest frame error");
-                                close(&mut ws, u16::from(CloseCode::Error), "guest frame error").await;
-                                stop = Some("guest frame error");
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(why) = stop {
-                        break why;
-                    }
                 }
             },
         }
@@ -238,8 +223,8 @@ async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> 
     let mut route = String::new();
     let mut via = "direct";
     let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME_LEN as usize + 4))
-        .max_frame_size(Some(MAX_FRAME_LEN as usize + 4));
+        .max_message_size(Some(MAX_WS_MESSAGE))
+        .max_frame_size(Some(MAX_WS_MESSAGE));
     // tungstenite's callback contract fixes the error type; nothing to box.
     #[allow(clippy::result_large_err)]
     let callback = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
@@ -275,21 +260,6 @@ async fn upgrade_and_bind(stream: TcpStream, deadline: tokio::time::Instant) -> 
             Err(_) => return Some((ws, None, via)),
         }
     }
-}
-
-/// Exactly one well-formed frame per message: `len == message_len - 4`, a known kind.
-fn check_frame(bytes: &[u8]) -> Result<Kind, &'static str> {
-    if bytes.len() < 5 {
-        return Err("message shorter than a frame");
-    }
-    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if len > MAX_FRAME_LEN {
-        return Err("frame too large");
-    }
-    if len as usize != bytes.len() - 4 {
-        return Err("frame length does not match the message");
-    }
-    Kind::from_u8(bytes[4]).ok_or("unknown frame kind")
 }
 
 async fn send(ws: &mut Ws, msg: Message) -> Result<(), ()> {

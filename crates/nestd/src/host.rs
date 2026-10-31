@@ -49,7 +49,7 @@ use crate::fleet::{self, FleetInput, FleetNotice, FleetParams, FleetReporter};
 use crate::gateway_link::{Entry as GatewayEntry, GatewayLink, GatewayNotice};
 use crate::guest::{GuestCtl, GuestEvent};
 use crate::net::{GATEWAY_IP, Netns};
-use crate::limits::{self, Limiter};
+use crate::limits::{self, Limiter, RecentSet};
 use crate::proxy_link::{Access, HeldListener, ProxyLink, ProxyNotice, ProxyOp};
 use crate::recovery::{self, META_VERSION, SandboxMeta, SentCommit};
 use crate::runner_link::{RunnerLink, RunnerNotice};
@@ -58,7 +58,6 @@ use crate::tombstones::Tombstones;
 use crate::util::{error, new_id, now_ms};
 
 const MAX_AGENT_SLOTS: u16 = 64;
-const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a non-`ask` guest CLI relay waits for `guest_cli_result`. The guest gives up after
 /// 30 s; nestd answers 3 s earlier so the caller gets nestd's error, not a bare guest timeout.
 const CLI_RELAY_TIMEOUT_S: u64 = 27;
@@ -76,7 +75,9 @@ const GC_FIRST_CHECK: Duration = Duration::from_secs(180);
 const GC_CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Coalescing window for guest port reports.
 const PORTS_COALESCE: Duration = Duration::from_millis(500);
-/// Bound on the (sandbox, host, port) dedup map for egress denials.
+/// An egress denial or alert repeated within this window is reported once.
+const RELAY_DEDUP_WINDOW: Duration = Duration::from_secs(60);
+/// Bound on each relay's dedup set.
 const MAX_DENIED_SEEN: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -174,6 +175,30 @@ impl Sbx {
         self.state_dir.join("disk.img")
     }
 
+    /// Whether the disk may differ from its head or a commit's outcome is unknown: decides salvage
+    /// or archive commit. Durable, read under the lock (the reported `dirty` is cleared by a commit
+    /// while a VM may still run).
+    fn may_hold_work(&self) -> bool {
+        !self.disk_clean || self.unanswered.is_some()
+    }
+
+    fn vm_spec(&self) -> VmSpec {
+        VmSpec {
+            sandbox: self.id.clone(),
+            epoch: self.epoch,
+            image: self.image.clone(),
+            resources: self.resources,
+            vm_dir: self.vm_dir.clone(),
+            disk_path: self.disk_path(),
+            netns: self.netns.clone(),
+        }
+    }
+
+    /// The attached agents' slots, as the guest's `configure` carries them.
+    fn agent_slots(&self) -> Vec<AgentSlot> {
+        self.slots.iter().map(|(agent, (slot, _))| slot_for(agent, *slot, self.slot_cwds.get(agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into()))).collect()
+    }
+
     /// What `meta.json` records about this incarnation (see `recovery.rs`), with `inflight` as the
     /// unanswered request while one is being sent.
     fn meta(&self, inflight: Option<&SentCommit>) -> SandboxMeta {
@@ -205,6 +230,9 @@ impl Sbx {
         }
     }
 }
+
+/// An incarnation's state, locked. Owned, so a commit can unlock it while it waits.
+type SbxGuard = tokio::sync::OwnedMutexGuard<Sbx>;
 
 /// Lock-free pause handles of running VMs, one per incarnation: a late step of an older epoch (its
 /// fence task, queued behind a long salvage) never takes a newer epoch's handle.
@@ -251,8 +279,8 @@ pub struct Inner {
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
     /// Starts against lease lapses (amendment A3).
     lapse_guard: LapseGuard,
-    denied_seen: Mutex<HashMap<(SandboxId, String, u16), Instant>>,
-    alerts_seen: Mutex<HashMap<(SandboxId, String, String), Instant>>,
+    denied_seen: RecentSet<(SandboxId, String, u16)>,
+    alerts_seen: RecentSet<(SandboxId, String, String)>,
     proxy_ca: Mutex<CaState>,
     /// Lock-free pause handles of running VMs (fencing freezes vCPUs without the sandbox lock).
     pausers: Pausers,
@@ -532,6 +560,7 @@ impl Host {
                 },
             );
             let mut sbx = Sbx::new(m.sandbox.clone(), m.workstream, m.epoch, m.image, m.resources, None, m.head, cfg.vm_dir(&m.sandbox.0, m.epoch.0), f.state_dir);
+            sbx.disk_clean = m.clean;
             sbx.unanswered = m.unanswered;
             recovered.push(Arc::new(tokio::sync::Mutex::new(sbx)));
         }
@@ -555,8 +584,8 @@ impl Host {
             results: Mutex::new(ResultCache::default()),
             lease_deadline: lease_tx,
             lapse_guard: LapseGuard::default(),
-            denied_seen: Mutex::new(HashMap::new()),
-            alerts_seen: Mutex::new(HashMap::new()),
+            denied_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
+            alerts_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
             proxy_ca: Mutex::new(CaState {
                 key: enrolled.proxy_ca.as_ref().map(|(_, k)| k.clone()),
                 expires_ms: enrolled.proxy_ca.as_ref().map(|(c, _)| c.expires_ms),
@@ -596,7 +625,7 @@ impl Host {
         // Incarnations left by a previous nestd: salvage (the commit request queues until the fleet
         // connects, after the hello), then delete.
         for entry in recovered {
-            inner.retire(entry, true);
+            inner.retire(entry);
         }
 
         // Command executor: in order, one at a time.
@@ -772,6 +801,14 @@ impl Inner {
         }
     }
 
+    /// A boot step's check: fail if `s`'s incarnation was fenced before `what`.
+    fn unless_fenced(&self, s: &Sbx, what: &str) -> anyhow::Result<()> {
+        if self.fenced(&s.id, s.epoch) {
+            anyhow::bail!("{}@{} fenced before {what}", s.id, s.epoch.0);
+        }
+        Ok(())
+    }
+
     fn ensure_not_fenced(&self, sbx: &SandboxId, epoch: Epoch) -> Result<(), ErrorBody> {
         if self.fenced(sbx, epoch) {
             return Err(error(error_codes::STALE_EPOCH, format!("{sbx}@{} was fenced during the operation", epoch.0), false));
@@ -927,24 +964,13 @@ impl Inner {
         match n {
             ProxyNotice::Event(ProxyEvent::Audit { records }) => {
                 for r in records.iter().filter(|r| is_request_denial(r)) {
-                    let key = (r.sandbox.clone(), r.host.clone(), r.port);
-                    let fresh = {
-                        let mut seen = self.denied_seen.lock().expect("denied");
-                        let now = Instant::now();
-                        seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                        // Bounded: random names can't grow the map without limit.
-                        if seen.len() >= MAX_DENIED_SEEN && !seen.contains_key(&key) {
-                            false
-                        } else {
-                            seen.insert(key, now).is_none()
-                        }
-                    };
-                    if fresh && self.limiter.allow(&r.sandbox, "denied", limits::DENIED, 1.0) {
+                    let fresh = self.denied_seen.fresh((r.sandbox.clone(), r.host.clone(), r.port));
+                    if fresh && self.limiter.allow(&r.sandbox, "denied", limits::DENIED) {
                         self.workstream_event(&r.sandbox, r.agent.clone(), WorkstreamEventKind::EgressDenied { host: r.host.clone(), port: r.port });
                     }
                 }
                 // Per-sandbox budget for audit records (each batch becomes an R2 write).
-                let records: Vec<_> = records.into_iter().filter(|r| self.limiter.allow(&r.sandbox, "audit", limits::AUDIT_RECORDS, 1.0)).collect();
+                let records: Vec<_> = records.into_iter().filter(|r| self.limiter.allow(&r.sandbox, "audit", limits::AUDIT_RECORDS)).collect();
                 if !records.is_empty() {
                     self.emit(HostEventBody::EgressAudit { records });
                 }
@@ -952,13 +978,8 @@ impl Inner {
             ProxyNotice::Event(ProxyEvent::Alert { sandbox, agent, kind, host, binding, .. }) => {
                 let reason = nest_protocol::model::EgressAlertReason::from(kind);
                 let host: String = host.chars().take(253).collect();
-                let fresh = {
-                    let mut seen = self.alerts_seen.lock().expect("alerts");
-                    let now = Instant::now();
-                    seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                    seen.len() < MAX_DENIED_SEEN && seen.insert((sandbox.clone(), format!("{reason:?}"), host.clone()), now).is_none()
-                };
-                if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS, 1.0) {
+                let fresh = self.alerts_seen.fresh((sandbox.clone(), format!("{reason:?}"), host.clone()));
+                if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS) {
                     self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason });
                 }
             }
@@ -1020,7 +1041,7 @@ impl Inner {
                     s.known_ports = now;
                     drop(s);
                     for port in new {
-                        if this.limiter.allow(&sbx, "ports", limits::PORTS, 1.0) {
+                        if this.limiter.allow(&sbx, "ports", limits::PORTS) {
                             this.workstream_event(&sbx, None, WorkstreamEventKind::PortOpened { port });
                         }
                     }
@@ -1028,7 +1049,7 @@ impl Inner {
             }
             GuestEvent::Cli { agent_id, command, reply } => self.relay_cli(sbx, agent_id, command, reply),
             GuestEvent::TaskExited { agent_id, task } => {
-                if !self.limiter.allow(&sbx, "tasks", limits::TASKS, 1.0) {
+                if !self.limiter.allow(&sbx, "tasks", limits::TASKS) {
                     return;
                 }
                 let Some((_, epoch)) = self.workstream_of(&sbx) else { return };
@@ -1086,7 +1107,7 @@ impl Inner {
         };
         let name = cli_name(&command);
         // Bounded per sandbox: rate and concurrency (an `ask` can be outstanding for minutes).
-        let admitted = self.limiter.allow(&sbx, "cli", limits::CLI, 1.0) && {
+        let admitted = self.limiter.allow(&sbx, "cli", limits::CLI) && {
             let mut inflight = self.cli_inflight.lock().expect("cli");
             let n = inflight.entry(sbx.clone()).or_default();
             if *n >= limits::MAX_CLI_INFLIGHT {
@@ -1180,15 +1201,14 @@ impl Inner {
     /// through the lock-free pauser. Then, under the lock: close the guest connection, stop the
     /// VM, drop the netns, and retire it (salvage, then delete) when `salvage` is set.
     async fn fence_sandbox(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: &str, salvage: bool) {
-        let dirty = {
+        {
             let mut summary = self.summary.lock().expect("summary");
             let Some(s) = summary.get_mut(id) else { return };
             if s.epoch != epoch || s.state == SandboxState::Fenced {
                 return;
             }
             s.state = SandboxState::Fenced;
-            s.dirty
-        };
+        }
         if let Some(pauser) = self.pausers.get(id, epoch) {
             tokio::spawn(async move {
                 if let Err(e) = pauser.pause().await {
@@ -1205,52 +1225,47 @@ impl Inner {
 
         let Some(entry) = self.sandbox(id) else { return };
         let this = self.clone();
-        let id = id.clone();
         tokio::spawn(async move {
             let mut s = entry.lock().await;
-            if let Some(g) = s.guest.take() {
-                g.shutdown();
+            if s.epoch != epoch {
+                return; // a newer incarnation took the entry meanwhile (S7)
             }
             // `Fenced` is terminal: this VM never runs again. Stop it now so its memory goes back
             // to the host; salvage needs only the disk.
-            this.pausers.remove(&id, epoch);
-            if let Some(mut vm) = s.vm.take() {
-                let _ = vm.stop().await;
-            }
-            s.paused = false;
+            this.stop_vm(&mut s).await;
             s.netns = None; // drops (and unmounts) the namespace
             drop(s);
             if salvage {
-                this.retire(entry, dirty);
+                this.retire(entry);
             }
         });
     }
 
-    /// An incarnation that never runs again (fenced, superseded by a newer epoch here, or left by
-    /// a previous nestd): salvage its uncommitted work as a sibling branch, if `dirty`. A transient
-    /// failure (a timeout, a store error, `parent_mismatch`, anything retryable) keeps the disk and
-    /// is retried with backoff; a final refusal (`stale_epoch`, `invalid_message`: SandboxDO will
-    /// never take that work) is logged with the error and ends it, like a landed salvage. Then its
-    /// directories are deleted, its `fenced` row (while still this epoch's) marked clean, and
-    /// `incarnation_retired` reported, so FleetDO need not wait out the salvage window. A destroy
-    /// that removed the directory meanwhile ends it silently. Once per incarnation; the sandbox
-    /// lock is held only while chunking.
-    fn retire(self: &Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, dirty: bool) {
+    /// An incarnation that never runs again (fenced, superseded here, or left by a previous nestd):
+    /// salvage its uncommitted work as a sibling branch, if [`Sbx::may_hold_work`]. A transient
+    /// failure (timeout, store error, `parent_mismatch`, anything retryable) keeps the disk and is
+    /// retried with backoff; a final refusal (`stale_epoch`, `invalid_message`) is logged and ends
+    /// it, like a landed salvage. Then its directories go, its `fenced` row (while this epoch's) is
+    /// marked clean and `incarnation_retired` reported, so FleetDO need not wait out the salvage
+    /// window. A destroy that removed the directory meanwhile ends it silently. Once per
+    /// incarnation; the lock is held only while chunking.
+    fn retire(self: &Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>) {
         let this = self.clone();
         // Boxed: retiring commits, a commit's rejection fences, a fence retires.
-        spawn_boxed(async move { this.retire_now(entry, dirty).await });
+        spawn_boxed(async move { this.retire_now(entry).await });
     }
 
-    async fn retire_now(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, dirty: bool) {
-        let mut s = entry.lock().await;
+    async fn retire_now(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>) {
+        let mut s = entry.clone().lock_owned().await;
         if s.retiring {
             return;
         }
         s.retiring = true;
         let (id, epoch) = (s.id.clone(), s.epoch);
         let mut backoff = incarnation::RETIRE_RETRY_FIRST;
-        while dirty && s.state_dir.exists() {
-            let (s2, r) = self.commit(&entry, s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
+        let salvage = s.may_hold_work();
+        while salvage && s.state_dir.exists() {
+            let (s2, r) = self.commit(s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
             s = s2;
             match r {
                 Ok(Some(g)) => {
@@ -1267,7 +1282,7 @@ impl Inner {
                     drop(s);
                     tokio::time::sleep(backoff).await;
                     backoff = incarnation::retire_backoff(backoff);
-                    s = entry.lock().await;
+                    s = entry.clone().lock_owned().await;
                 }
             }
         }
@@ -1396,6 +1411,8 @@ impl Inner {
     // ------------------------------------------------------------------------------------------
 
     async fn execute(self: &Arc<Self>, cmd: Command) {
+        // Taken first, so a start answered from the cache or refused leaves no stamp behind.
+        let outlived = self.lapse_guard.outlived(&cmd.cmd.0);
         let cached = self.results.lock().expect("results").get(&cmd.cmd.0).cloned();
         if let Some(outcome) = cached {
             self.emit(HostEventBody::CommandResult { cmd: cmd.cmd, outcome });
@@ -1405,7 +1422,7 @@ impl Inner {
         let refusal = host_kind_refusal(self.cfg.role, &cmd.body);
         let result = match (cmd.body, refusal) {
             (_, Some(why)) => Err(error(error_codes::FORBIDDEN, why, false)),
-            (CommandBody::AgentStart(start), None) if self.lapse_guard.outlived(&cmd.cmd.0) => {
+            (CommandBody::AgentStart(start), None) if outlived => {
                 self.refuse_start(&start, "the host lease lapsed since this start arrived")
             }
             (body, None) => self.dispatch(body).await,
@@ -1426,7 +1443,7 @@ impl Inner {
             CommandBody::SandboxCreate { sandbox, workstream, epoch, image, resources, policy, from } => {
                 self.create_sandbox(sandbox, workstream, epoch, image, resources, policy, from, None).await
             }
-            CommandBody::SandboxSuspend { sandbox, epoch, mode } => self.suspend(&sandbox, epoch, mode).await,
+            CommandBody::SandboxSuspend { sandbox, epoch, mode } => self.suspend(&sandbox, epoch, mode, self.cfg.commit_timeout()).await,
             CommandBody::SandboxResume { sandbox, epoch } => self.resume(&sandbox, epoch).await,
             CommandBody::SandboxArchive { sandbox, epoch } => self.archive(&sandbox, epoch).await,
             CommandBody::SandboxCheckpoint { sandbox, epoch, reason } => self.checkpoint(&sandbox, epoch, reason).await,
@@ -1510,7 +1527,7 @@ impl Inner {
             // background (salvage, then delete). It has its own directory, so this one never waits.
             self.fence_sandbox(&sandbox, s.epoch, "superseded by a newer epoch", false).await;
             if let Some(old) = self.teardown(&sandbox, DropReason::Moved).await {
-                self.retire(old, s.dirty);
+                self.retire(old);
             }
         }
         let vm_dir = self.cfg.vm_dir(&sandbox.0, epoch.0);
@@ -1531,7 +1548,6 @@ impl Inner {
         self.sandboxes.lock().expect("sandboxes").insert(sandbox.clone(), entry);
         let r = self.boot(&mut guard, from.as_ref(), fork).await;
         if r.is_ok() {
-            guard.guest_info = guard.guest.as_ref().and_then(|g| g.guest());
             if let Some(s) = self.summary.lock().expect("summary").get_mut(&sandbox) {
                 s.guest = guard.guest_info.clone();
             }
@@ -1550,9 +1566,7 @@ impl Inner {
         match r {
             Ok(()) => {
                 self.with_row(&sandbox, epoch, |s| s.dirty = true);
-                if !self.set_state(&sandbox, epoch, SandboxState::Running, None, detail.clone()) {
-                    return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced during create", epoch.0), false));
-                }
+                self.transition(&sandbox, epoch, SandboxState::Running, None, detail.clone())?;
                 // A newer epoch runs here: the summary's epoch refuses older ones from now on, so
                 // their tombstone goes (never this epoch's, should a fence land right now).
                 self.tombstones.prune_below(&sandbox, epoch);
@@ -1572,13 +1586,6 @@ impl Inner {
     /// Disk, network, VM, guest control. Leaves `sbx` populated even on error (for teardown).
     /// Re-checks for a fence after every await and before every externally visible step.
     async fn boot(self: &Arc<Self>, sbx: &mut Sbx, from: Option<&GenerationRecord>, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
-        let (id, epoch) = (sbx.id.clone(), sbx.epoch);
-        let check = |what: &str| -> anyhow::Result<()> {
-            if self.fenced(&id, epoch) {
-                anyhow::bail!("{id}@{} fenced before {what}", epoch.0);
-            }
-            Ok(())
-        };
         // Disk.
         let disk = sbx.disk_path();
         let store = self.store.clone();
@@ -1617,39 +1624,53 @@ impl Inner {
         sbx.persist(None).context("write meta.json")?;
 
         // Network (pushes listeners to the proxy).
-        check("network setup")?;
+        self.unless_fenced(sbx, "network setup")?;
         self.setup_network(sbx).context("sandbox network")?;
 
-        // VM.
-        check("VM start")?;
-        let spec = VmSpec {
-            sandbox: sbx.id.clone(),
-            epoch: sbx.epoch,
-            image: sbx.image.clone(),
-            resources: sbx.resources,
-            vm_dir: sbx.vm_dir.clone(),
-            disk_path: sbx.disk_path(),
-            netns: sbx.netns.clone(),
-        };
-        let mut vm = self.driver.create(spec).await.context("create VM")?;
-        // A VM writes to the disk from here on: recorded first, so a restart salvages it.
-        sbx.disk_clean = false;
-        sbx.persist(None).context("write meta.json")?;
-        vm.start().await.context("start VM")?;
-        let uds = vm.vsock_uds_path();
-        self.register_pauser(&sbx.id, sbx.epoch, vm.as_ref());
-        sbx.vm = Some(vm);
-        sbx.paused = false;
-        check("guest connection")?;
+        self.launch(sbx, fork).await
+    }
 
-        // Guest control.
-        let guest = GuestCtl::spawn(uds, sbx.id.clone(), sbx.epoch, hostname(&sbx.id), self.guest_events.clone());
+    /// Start a VM on `s`'s disk and wait for its guest (`fork`: a fork's first boot). `clean =
+    /// false` is persisted first, so a restart salvages. On any error the VM is stopped again: a
+    /// stranded one would share the disk with the next boot.
+    async fn launch(&self, s: &mut Sbx, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
+        s.vm = Some(self.driver.create(s.vm_spec()).await.context("create VM")?);
+        let r = self.start_vm(s, fork).await;
+        if r.is_err() {
+            self.stop_vm(s).await;
+        }
+        r
+    }
+
+    async fn start_vm(&self, s: &mut Sbx, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
+        self.unless_fenced(s, "VM start")?;
+        s.disk_clean = false;
+        s.persist(None).context("write meta.json")?;
+        let vm = s.vm.as_mut().expect("created");
+        vm.start().await.context("start VM")?;
+        self.register_pauser(&s.id, s.epoch, vm.as_ref());
+        let uds = vm.vsock_uds_path();
+        self.unless_fenced(s, "guest connection")?;
+        let guest = GuestCtl::spawn(uds, s.id.clone(), s.epoch, hostname(&s.id), s.agent_slots(), self.guest_events.clone());
         if fork.is_some() {
             guest.expect_resume(fork);
         }
-        sbx.guest = Some(guest.clone());
-        guest.wait_ready(GUEST_READY_TIMEOUT).await.context("guest agent")?;
+        s.guest = Some(guest.clone());
+        guest.wait_ready(self.cfg.guest_ready_timeout()).await.context("guest agent")?;
+        s.guest_info = guest.guest();
         Ok(())
+    }
+
+    /// Stop `s`'s VM, if any, with its guest connection and pause handle.
+    async fn stop_vm(&self, s: &mut Sbx) {
+        if let Some(g) = s.guest.take() {
+            g.shutdown();
+        }
+        self.pausers.remove(&s.id, s.epoch);
+        if let Some(mut vm) = s.vm.take() {
+            let _ = vm.stop().await;
+        }
+        s.paused = false;
     }
 
     fn register_pauser(&self, id: &SandboxId, epoch: Epoch, vm: &dyn Vm) {
@@ -1719,12 +1740,7 @@ impl Inner {
         let entry = self.sandboxes.lock().expect("sandboxes").remove(id);
         if let Some(entry) = &entry {
             let mut s = entry.lock().await;
-            if let Some(g) = s.guest.take() {
-                g.shutdown();
-            }
-            if let Some(mut vm) = s.vm.take() {
-                let _ = vm.stop().await;
-            }
+            self.stop_vm(&mut s).await;
             s.netns = None;
             let _ = std::fs::remove_dir_all(&s.vm_dir);
         }
@@ -1732,67 +1748,104 @@ impl Inner {
         entry
     }
 
-    async fn locked(&self, id: &SandboxId, epoch: Epoch) -> Result<Arc<tokio::sync::Mutex<Sbx>>, ErrorBody> {
+    /// Lock `id@epoch`'s incarnation, refusing a stale or fenced epoch before and after the wait.
+    async fn lock_live(&self, id: &SandboxId, epoch: Epoch) -> Result<SbxGuard, ErrorBody> {
         self.check_epoch(id, epoch)?;
-        self.sandbox(id).ok_or_else(|| error(error_codes::UNKNOWN_SANDBOX, format!("{id} is not on this host"), false))
+        let entry = self.sandbox(id).ok_or_else(|| error(error_codes::UNKNOWN_SANDBOX, format!("{id} is not on this host"), false))?;
+        let s = entry.lock_owned().await;
+        self.ensure_not_fenced(id, epoch)?;
+        Ok(s)
     }
 
-    async fn suspend(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, mode: SuspendMode) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
-        self.ensure_not_fenced(id, epoch)?;
+    /// Move `id@epoch` to `state`, or `stale_epoch` if it was fenced or superseded.
+    fn transition(&self, id: &SandboxId, epoch: Epoch, state: SandboxState, suspend_mode: Option<SuspendMode>, detail: Option<String>) -> Result<(), ErrorBody> {
+        if self.set_state(id, epoch, state, suspend_mode, detail) {
+            return Ok(());
+        }
+        Err(error(error_codes::STALE_EPOCH, format!("{id}@{} was fenced", epoch.0), false))
+    }
+
+    /// Suspend `id@epoch`, waiting at most `commit_timeout` for its commit's answer.
+    async fn suspend(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, mode: SuspendMode, commit_timeout: Duration) -> CmdResult {
+        let s = self.lock_live(id, epoch).await?;
         let state = self.summary.lock().expect("summary").get(id).map(|x| x.state);
         if state == Some(SandboxState::Suspended) {
             return Ok(Some(serde_json::json!({ "note": "already suspended" })));
         }
-        if !self.set_state(id, epoch, SandboxState::Suspending, Some(mode), None) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
+        self.transition(id, epoch, SandboxState::Suspending, Some(mode), None)?;
+        let (mut s, r) = self.suspend_commit(s, mode, commit_timeout).await;
+        if let Err(e) = r {
+            self.roll_back_suspend(&mut s, &e).await;
+            return Err(e);
         }
-        if let Some(g) = &s.guest {
-            let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
-        }
-        if let Some(vm) = s.vm.as_mut() {
-            vm.pause().await.map_err(internal)?;
-        }
-        s.paused = true;
-        let mem = if matches!(mode, SuspendMode::Memory) && self.driver.supports_memory_snapshots() {
-            let dir = s.state_dir.join("snapshot");
-            match s.vm.as_mut() {
-                Some(vm) => vm.snapshot_memory(&dir).await.map_err(internal)?,
-                None => None,
-            }
-        } else {
-            None
-        };
-        let (mut s, r) = self.commit(&entry, s, CommitReason::Suspend, mem, self.cfg.commit_timeout()).await;
-        r?;
         self.ensure_not_fenced(id, epoch)?;
         let mut detail = None;
         if matches!(mode, SuspendMode::DiskOnly) {
             // Disk-only: release the VM; resume is a cold boot.
-            if let Some(g) = s.guest.take() {
-                g.shutdown();
-            }
-            if let Some(mut vm) = s.vm.take() {
-                let _ = vm.stop().await;
-            }
-            self.pausers.remove(id, epoch);
-            s.paused = false;
+            self.stop_vm(&mut s).await;
         } else if !self.driver.supports_memory_snapshots() {
             detail = Some("driver keeps memory by pausing locally; generation is disk-only".to_string());
         }
         // Not reachable until resumed: clients re-resolve once instead of retrying `busy`.
         self.gateway.forget(id);
-        if !self.set_state(id, epoch, SandboxState::Suspended, Some(mode), detail.clone()) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
-        }
+        self.transition(id, epoch, SandboxState::Suspended, Some(mode), detail.clone())?;
         Ok(detail.map(|d| serde_json::json!({ "note": d })))
     }
 
+    /// Pause the VM, snapshot its memory (memory mode, where the driver can) and commit.
+    async fn suspend_commit(self: &Arc<Self>, mut s: SbxGuard, mode: SuspendMode, commit_timeout: Duration) -> (SbxGuard, Result<(), ErrorBody>) {
+        if let Some(g) = &s.guest {
+            let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
+        }
+        if let Some(vm) = s.vm.as_mut()
+            && let Err(e) = vm.pause().await
+        {
+            return (s, Err(internal(e)));
+        }
+        s.paused = true;
+        let mut mem = None;
+        if matches!(mode, SuspendMode::Memory) && self.driver.supports_memory_snapshots() {
+            let dir = s.state_dir.join("snapshot");
+            if let Some(vm) = s.vm.as_mut() {
+                match vm.snapshot_memory(&dir).await {
+                    Ok(m) => mem = m,
+                    Err(e) => return (s, Err(internal(e))),
+                }
+            }
+        }
+        let (s, r) = self.commit(s, CommitReason::Suspend, mem, commit_timeout).await;
+        (s, r.map(|_| ()))
+    }
+
+    /// A failed suspend goes back to `running` (SandboxDO's idle timer asks again) unless it was
+    /// or will be fenced. A landed commit may have marked the disk clean: undone durably first.
+    async fn roll_back_suspend(&self, s: &mut Sbx, why: &ErrorBody) {
+        let (id, epoch) = (s.id.clone(), s.epoch);
+        if self.fenced(&id, epoch) || rejection_fences(&why.code) {
+            return;
+        }
+        s.disk_clean = false;
+        if let Err(e) = s.persist(None) {
+            tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a failed suspend stays paused: meta.json can't record the VM running again");
+            return;
+        }
+        if s.paused {
+            if let Some(vm) = s.vm.as_mut()
+                && let Err(e) = vm.resume().await
+            {
+                tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a failed suspend's VM can't be resumed");
+                return;
+            }
+            s.paused = false;
+            if let Some(g) = &s.guest {
+                let _ = g.thaw().await;
+            }
+        }
+        self.set_state(&id, epoch, SandboxState::Running, None, Some(format!("suspend failed: {}", why.message)));
+    }
+
     async fn resume(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
-        self.ensure_not_fenced(id, epoch)?;
+        let mut s = self.lock_live(id, epoch).await?;
         let state = self.summary.lock().expect("summary").get(id).map(|x| x.state);
         if state == Some(SandboxState::Running) {
             return Ok(Some(serde_json::json!({ "note": "already running" })));
@@ -1800,58 +1853,32 @@ impl Inner {
         if state != Some(SandboxState::Suspended) {
             return Err(error(error_codes::INVALID_MESSAGE, format!("{id} is {state:?}, not suspended"), false));
         }
-        // A VM runs on the disk again: from here on it may differ from its head. Recorded first,
-        // or a restart would delete work as clean.
-        s.disk_clean = false;
-        s.persist(None).map_err(internal)?;
         if s.vm.is_some() && s.paused {
+            // Recorded before the VM runs again, or a restart would delete work as clean.
+            s.disk_clean = false;
+            s.persist(None).map_err(internal)?;
             self.ensure_not_fenced(id, epoch)?;
             s.vm.as_mut().expect("checked").resume().await.map_err(internal)?;
             s.paused = false;
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
             }
-            self.gateway_upsert(&s);
-        } else {
-            // Cold boot from the local disk.
-            let spec = VmSpec {
-                sandbox: s.id.clone(),
-                epoch: s.epoch,
-                image: s.image.clone(),
-                resources: s.resources,
-                vm_dir: s.vm_dir.clone(),
-                disk_path: s.disk_path(),
-                netns: s.netns.clone(),
-            };
-            let mut vm = self.driver.create(spec).await.map_err(internal)?;
+        } else if let Err(e) = self.launch(&mut s, None).await {
             self.ensure_not_fenced(id, epoch)?;
-            vm.start().await.map_err(internal)?;
-            self.register_pauser(id, epoch, vm.as_ref());
-            let guest = GuestCtl::spawn(vm.vsock_uds_path(), s.id.clone(), s.epoch, hostname(&s.id), self.guest_events.clone());
-            s.vm = Some(vm);
-            for (agent, (slot, _)) in s.slots.clone() {
-                let cwd = s.slot_cwds.get(&agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into());
-                let _ = guest.attach(slot_for(&agent, slot, cwd)).await;
-            }
-            guest.wait_ready(GUEST_READY_TIMEOUT).await.map_err(internal)?;
-            s.guest_info = guest.guest();
-            s.guest = Some(guest);
-            self.gateway_upsert(&s);
+            return Err(internal(format!("resume {id}: {e:#}")));
         }
+        self.gateway_upsert(&s);
         let guest = s.guest_info.clone();
         self.with_row(id, epoch, |x| {
             x.dirty = true;
             x.guest = guest;
         });
-        if !self.set_state(id, epoch, SandboxState::Running, None, None) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced during resume"), false));
-        }
+        self.transition(id, epoch, SandboxState::Running, None, None)?;
         Ok(None)
     }
 
     async fn checkpoint(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: CommitReason) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
+        let mut s = self.lock_live(id, epoch).await?;
         let running = s.vm.is_some() && !s.paused;
         // TODO(ublk): epoch-flip CoW cut instead of pausing for the whole chunking pass.
         if let Some(g) = &s.guest {
@@ -1860,9 +1887,9 @@ impl Inner {
         if running {
             s.vm.as_mut().expect("checked").pause().await.map_err(internal)?;
         }
-        let (mut s, r) = self.commit(&entry, s, reason, None, self.cfg.commit_timeout()).await;
-        // Never resume a VM that was fenced while the commit was in flight.
-        if running && !self.fenced(id, epoch) {
+        let (mut s, r) = self.commit(s, reason, None, self.cfg.commit_timeout()).await;
+        // Never resume a VM fenced during the commit, or whose rejection fences it.
+        if running && !self.fenced(id, epoch) && !r.as_ref().is_err_and(|e| rejection_fences(&e.code)) {
             if let Some(vm) = s.vm.as_mut() {
                 let _ = vm.resume().await;
             }
@@ -1876,27 +1903,21 @@ impl Inner {
     }
 
     async fn archive(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
         {
-            let mut s = entry.lock().await;
-            if !self.set_state(id, epoch, SandboxState::Archiving, None, None) {
-                return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
-            }
-            let dirty = self.summary.lock().expect("summary").get(id).is_some_and(|x| x.dirty);
-            if dirty || s.head.is_none() {
+            let mut s = self.lock_live(id, epoch).await?;
+            self.transition(id, epoch, SandboxState::Archiving, None, None)?;
+            if s.may_hold_work() || s.head.is_none() {
                 if let Some(vm) = s.vm.as_mut() {
                     let _ = vm.pause().await;
                 }
-                let (s2, r) = self.commit(&entry, s, CommitReason::Archive, None, self.cfg.commit_timeout()).await;
+                let (s2, r) = self.commit(s, CommitReason::Archive, None, self.cfg.commit_timeout()).await;
                 s = s2;
                 r?;
             }
             self.ensure_not_fenced(id, epoch)?;
             recovery::remove_incarnation(&s.state_dir);
         }
-        if !self.set_state(id, epoch, SandboxState::Archived, None, None) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
-        }
+        self.transition(id, epoch, SandboxState::Archived, None, None)?;
         self.teardown(id, DropReason::Teardown).await;
         Ok(None)
     }
@@ -1935,9 +1956,8 @@ impl Inner {
         mode: ForkMode,
         policy: EgressPolicy,
     ) -> CmdResult {
-        let entry = self.locked(parent, parent_epoch).await?;
         let (image, resources) = {
-            let s = entry.lock().await;
+            let s = self.lock_live(parent, parent_epoch).await?;
             (s.image.clone(), s.resources)
         };
         let generation = self
@@ -1946,7 +1966,7 @@ impl Inner {
             .and_then(|v| v.get("generation").cloned())
             .ok_or_else(|| error(error_codes::INTERNAL, "fork: parent commit produced no generation", true))?;
         let gen_id: GenerationId = serde_json::from_value(generation).map_err(internal)?;
-        let record = entry.lock().await.head.clone().filter(|h| h.id == gen_id).ok_or_else(|| error(error_codes::INTERNAL, "fork: head moved", true))?;
+        let record = self.lock_live(parent, parent_epoch).await?.head.clone().filter(|h| h.id == gen_id).ok_or_else(|| error(error_codes::INTERNAL, "fork: head moved", true))?;
         let fork = ForkIdentity { new_sandbox_id: child.clone(), hostname: hostname(&child), machine_id: crate::guest::new_machine_id() };
         let mut r = self.create_sandbox(child, child_workstream, child_epoch, image, resources, policy, Some(record), Some(fork)).await?;
         if matches!(mode, ForkMode::Live) {
@@ -1956,8 +1976,7 @@ impl Inner {
     }
 
     async fn policy_update(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, policy: EgressPolicy) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
+        let mut s = self.lock_live(id, epoch).await?;
         if s.policy.as_ref().is_some_and(|p| policy.version <= p.version) {
             return Ok(Some(serde_json::json!({ "note": "stale policy version ignored" })));
         }
@@ -2019,9 +2038,7 @@ impl Inner {
     /// The sandbox side of `attach`: a slot (explicit proxy listener + guest `agent_attach`) for
     /// the agent, then the gateway learns the client. Idempotent: an existing slot keeps its port.
     async fn agent_attach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, cwd: Option<String>) -> CmdResult {
-        let entry = self.locked(sandbox, epoch).await?;
-        let mut s = entry.lock().await;
-        self.ensure_not_fenced(sandbox, epoch)?;
+        let mut s = self.lock_live(sandbox, epoch).await?;
         let slot = match s.slots.get(agent) {
             Some((slot, _)) => *slot,
             None => {
@@ -2047,6 +2064,7 @@ impl Inner {
         self.gateway_sync(&s);
         // The guest round trip (up to 30 s) runs without the sandbox lock, so a fence, suspend or
         // checkpoint is never queued behind it.
+        let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
         drop(s);
         let attached = guest.attach(slot_for(agent, slot, cwd)).await;
         // Fenced meanwhile: the slot is moot and the answer is `stale_epoch`, whatever the guest said.
@@ -2082,8 +2100,7 @@ impl Inner {
     /// Remove an agent's slot (an unknown agent is `ok`); with `kill_processes`, its whole cgroup
     /// goes first. The gateway then refuses the agent's bindings.
     async fn agent_detach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, kill_processes: bool) -> CmdResult {
-        let entry = self.locked(sandbox, epoch).await?;
-        let mut s = entry.lock().await;
+        let mut s = self.lock_live(sandbox, epoch).await?;
         let Some((_, listener)) = s.slots.remove(agent) else {
             // Not ours, and not the guest connection's either (no stale slot is re-configured).
             if let Some(g) = &s.guest {
@@ -2116,10 +2133,10 @@ impl Inner {
             .collect();
         let mut failed = vec![];
         for (id, epoch) in running {
+            // Bounds each commit's wait; never a cancellation, which would lose the unanswered record.
             let budget = Duration::from_millis((deadline_ms - now_ms()).max(0) as u64);
-            match tokio::time::timeout(budget, self.suspend(&id, epoch, SuspendMode::DiskOnly)).await {
-                Ok(Ok(_)) => {}
-                _ => failed.push(id.0),
+            if budget.is_zero() || self.suspend(&id, epoch, SuspendMode::DiskOnly, budget.min(self.cfg.commit_timeout())).await.is_err() {
+                failed.push(id.0);
             }
         }
         if failed.is_empty() { Ok(None) } else { Err(error(error_codes::INTERNAL, format!("not drained: {}", failed.join(", ")), true)) }
@@ -2132,24 +2149,21 @@ impl Inner {
     /// while waiting for `commit_result`**, then re-taken and returned with the result: a slow or
     /// partitioned control plane never blocks fencing, guest events or other commands on this
     /// sandbox.
-    async fn commit<'a>(
-        self: &Arc<Self>,
-        entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
-        mut s: tokio::sync::MutexGuard<'a, Sbx>,
-        reason: CommitReason,
-        mem: Option<PathBuf>,
-        timeout: Duration,
-    ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
+    async fn commit(self: &Arc<Self>, mut s: SbxGuard, reason: CommitReason, mem: Option<PathBuf>, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
         // An earlier commit's answer was lost (timed out), but SandboxDO may have moved its head:
         // ask again under the same request id (idempotent per id) and adopt the outcome, rather
         // than send a new request with a stale parent that is rejected and fences the sandbox.
         let mut answered = None;
         if let Some(prev) = s.unanswered.clone() {
-            let (s2, r) = self.send_commit(entry, s, prev.clone(), timeout).await;
+            let (s2, r) = self.send_commit(s, prev.clone(), timeout).await;
             s = s2;
             match r {
                 Ok(g) => answered = Some((prev, g)),
-                Err(e) => return (s, Err(e)),
+                Err(e) if incarnation::reask_failure_ends_commit(reason == CommitReason::Salvage, prev.reason == CommitReason::Salvage, !e.retryable) => {
+                    return (s, Err(e));
+                }
+                // Another kind of request was refused: this incarnation's salvage still runs.
+                Err(_) => {}
             }
         }
         let c = match self.prepare_commit(&mut s, reason, mem).await {
@@ -2163,20 +2177,16 @@ impl Inner {
         {
             return (s, Ok(g));
         }
-        self.send_commit(entry, s, c, timeout).await
+        self.send_commit(s, c, timeout).await
     }
 
     /// Send a `commit_request` and wait (unlocked) for its answer; a timeout keeps it as
     /// [`Sbx::unanswered`] for the next commit to ask again.
-    async fn send_commit<'a>(
-        self: &Arc<Self>,
-        entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
-        s: tokio::sync::MutexGuard<'a, Sbx>,
-        c: SentCommit,
-        timeout: Duration,
-    ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
-        // Recorded before it goes out: a restart asks again under this id rather than send another.
-        s.persist_or_log(Some(&c));
+    async fn send_commit(self: &Arc<Self>, s: SbxGuard, c: SentCommit, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
+        // Recorded before it goes out (or not sent): a restart asks again under this id.
+        if let Err(e) = s.persist(Some(&c)) {
+            return (s, Err(error(error_codes::INTERNAL, format!("recording commit {}: {e}", c.request), true)));
+        }
         let (tx, rx) = oneshot::channel();
         self.pending_commits.lock().expect("pending").insert(c.request.clone(), tx);
         self.emit(HostEventBody::CommitRequest {
@@ -2190,6 +2200,7 @@ impl Inner {
             reason: c.reason,
         });
         let id = s.id.clone();
+        let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
         drop(s);
         let outcome = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(o)) => Ok(o),
@@ -2198,7 +2209,7 @@ impl Inner {
                 Err(error(error_codes::INTERNAL, format!("commit {} timed out", c.request), true))
             }
         };
-        let mut s = entry.lock().await;
+        let mut s = entry.lock_owned().await;
         let r = match outcome {
             Ok(o) => {
                 if s.unanswered.as_ref().is_some_and(|u| u.request == c.request) {
@@ -2256,7 +2267,7 @@ impl Inner {
             }
             CommitOutcome::Orphaned { generation } => Ok(Some(generation)),
             CommitOutcome::Rejected { reason: why, .. } => {
-                if why == error_codes::STALE_EPOCH || why == error_codes::PARENT_MISMATCH {
+                if rejection_fences(&why) {
                     let this = self.clone();
                     let (id, epoch) = (id.clone(), s.epoch);
                     // Fence this incarnation (`fence_sandbox` checks the epoch under the summary lock:
@@ -2267,6 +2278,12 @@ impl Inner {
             }
         }
     }
+}
+
+/// Whether SandboxDO's rejection of a commit fences the incarnation. The fence runs from a spawned
+/// task (`apply_commit`), so a caller that would resume the VM checks this, not only `fenced`.
+fn rejection_fences(code: &str) -> bool {
+    code == error_codes::STALE_EPOCH || code == error_codes::PARENT_MISMATCH
 }
 
 fn bind_listener(ns: &Netns, next: &mut u32, transport: Transport, port: u16, purpose: ListenerPurpose) -> anyhow::Result<HeldListener> {

@@ -112,6 +112,9 @@ export const AgentState = z.enum([
   "quota_parked", "stalled", "needs_attention", "detached",
 ]);
 export type AgentState = z.output<typeof AgentState>;
+/** AgentDO's own part of an agent's `state` (`ready`: the runner's last report, the activity, says the rest). */
+export const AgentLifecycle = z.enum(["starting", "ready", "detached", "errored"]);
+export type AgentLifecycle = z.output<typeof AgentLifecycle>;
 
 // --- Egress policy -------------------------------------------------------------------------------
 
@@ -308,7 +311,7 @@ export type WorkstreamEvent = z.output<typeof WorkstreamEvent>;
 const DECISION_EVENTS = new Set([
   "needs_input", "blocked", "completed", "failed", "pr_opened", "budget_exceeded", "orphaned_work", "egress_alert",
 ]);
-/** Same semantics as `WorkstreamEventKind::is_decision` in Rust: only these wake a captain. */
+/** Only these wake a captain. */
 export function isDecisionEvent(e: Pick<WorkstreamEvent, "type">): boolean {
   return DECISION_EVENTS.has(e.type);
 }

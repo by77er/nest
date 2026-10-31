@@ -53,7 +53,7 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 | `hello` | guest → host | first frame | `protocol_version`, `agent_version`, `boot_id`, `instance_id`, `since_boot_ms`, `capabilities` |
 | `configure` | host → guest | request | `sandbox_id`, `epoch`, `hostname`, complete `agents[]` set. Sent after every hello and on change. |
 | `agent_attach` / `agent_detach` | host → guest | request | Add or remove one `AgentSlot`. `kill_processes` → `cgroup.kill` the agent subtree. |
-| `resume` | host → guest | request | After a memory restore: `wall_clock_ms`, `entropy_b64` (64 bytes), optional `fork` identity. Reply `resume_done{clock_step_ms}`. |
+| `resume` | host → guest | request | After a memory restore: `wall_clock_ms`, `entropy_b64` (64 bytes), optional `fork` identity. Reply `resume_done{clock_step_ms}`, or `error`: `bad_request` when `entropy_b64` isn't 64 bytes of base64 (nothing applied), `internal` when the entropy couldn't be mixed into the RNG. |
 | `flush` (v2) | host → guest | request | `syncfs` every filesystem. Reply `ok`, or `error{sync_failed}` on a writeback error. Precedes every commit, pause and suspend ([flush before commit](../../sandbox/state/disk/#flush-before-commit)). |
 | `prepare_snapshot` | host → guest | request | `sync` (v2: the `flush` above, stopping on `sync_failed`); `drop_caches` → `echo 3 > /proc/sys/vm/drop_caches`; `fsfreeze` listed mounts. Reply `ok`. |
 | `thaw` | host → guest | request | `fsfreeze -u` everything frozen. Idempotent. |
@@ -66,7 +66,7 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 **Rules:**
 - **Startup order:** the guest must send `hello` before anything else. The host must send `configure` before any hands call is accepted. Until then, hands and ingress-PTY return `error{code: "busy", retryable: true}`.
 - **Versions:** a v1 host requires an equal `protocol_version`; v2 accepts a [range](#versions-v2). Outside it, the host replies `error{unsupported_version}` and closes.
-- **Fencing:** the guest stores `epoch` from the last `configure` and **rejects hands calls with a different epoch** (`stale_epoch`). nestd only ever raises the epoch, and the guest enforces it: a `configure` with a **lower** epoch is rejected with `error{stale_epoch}` and changes nothing.
+- **Fencing:** the guest stores `epoch` from the last `configure` and **rejects hands calls with a different epoch** (`stale_epoch`). nestd only ever raises the epoch, and the guest enforces it: a `configure` with a **lower** epoch for the same `sandbox_id` is rejected with `error{stale_epoch}` and changes nothing. A different `sandbox_id` is a fork child configuring its restored parent's memory at its own epoch, and is accepted: only this VM's nestd (CID 2) can send `configure`.
 - **Reconnects:** if the control connection drops (vsock resets on every snapshot restore), the host reconnects. The guest sends a new `hello`. `boot_id` is the kernel boot id (`/proc/sys/kernel/random/boot_id`; it survives a memory restore and changes on reboot) and `instance_id` is random per guest-agent process:
 
   | vs. previous hello | Meaning | Host sends |
@@ -112,7 +112,7 @@ A memory snapshot keeps the guest agent it was taken with ([guest agent](../../s
 |---|---|
 | Clock | `clock_settime(CLOCK_REALTIME, wall_clock_ms)`, then `chronyc makestep` if chrony is present. Reply with the step applied. |
 | Randomness | Mix `entropy_b64` into the RNG with `RNDADDENTROPY` (Firecracker's VMGenID also triggers a kernel reseed on 6.x guests; we do both). |
-| Fork (when `fork` is set) | Write `machine_id` to `/etc/machine-id`, set `hostname`, store `new_sandbox_id` for `nest whoami`. Old-identity caches (e.g. ssh host keys, if any) are the image's business. |
+| Fork (when `fork` is set) | Write `machine_id` to `/etc/machine-id`, set `hostname`, `new_sandbox_id` becomes the guest's sandbox id (`nest whoami` reports it). Old-identity caches (e.g. ssh host keys, if any) are the image's business. |
 | Clients | Network connections are already dead: the netns listeners are new, and resetting is the clients' job. |
 
 ## Agent slots and exec context
@@ -183,7 +183,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
   - v2: the call ends when the main process exits, seen through a pidfd. Output drains for up to 1 s (`POLLHUP` on a duplicate of the pipe's read end tells a descendant holding it from a reader that's behind), then the call's cgroup is killed, so `cmd &` can't hang the call.
   - If the persisted cwd no longer exists, the command runs in the slot's `cwd` (or `/` if that's gone too) and the output starts with a `nest: working directory … does not exist; running in …` line.
 - **Timeout** in ms: default 120 000, max 600 000 (larger values are clamped).
-  - On timeout the command is **moved to the background**, not killed (unless it starts with `sleep`, in which case it's killed). From then on it runs under the background default time limit (1 800 000 ms), like a `run_in_background` task without a `timeout`. The result text is `Command did not complete within its <N>s timeout and was moved to the background` plus the task ID and output path. Any cwd change made by a moved command doesn't persist, and the result says `Session cwd remains <dir>…`.
+  - On timeout the command is **moved to the background**, not killed (unless it starts with `sleep`, in which case it's killed). From then on it runs under the background default time limit (1 800 000 ms), like a `run_in_background` task without a `timeout`, and its output moves to `tasks/<task_id>.out`, under task retention (its cgroup leaf stays `calls/<call_id>`). The result text is `Command did not complete within its <N>s timeout and was moved to the background` plus the task ID and output path. Any cwd change made by a moved command doesn't persist, and the result says `Session cwd remains <dir>…`.
 - **`run_in_background`:**
   - Starts a task in `tasks/<task_id>/` and returns at once with the task ID and output path.
   - Time limit: `timeout`, default 1 800 000, max 7 200 000. When it's reached, the task is killed and `task_exited{status: timed_out}` is sent.
@@ -204,7 +204,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 - `cgroup.kill` on `tasks/<task_id>`. Returns the final `TaskInfo`; the output file is kept.
 
 **`Read {file_path, offset?, limit?, pages?}`**
-- **Regular files only:** FIFOs, sockets and devices → `is_error` (`not a regular file … use Bash`), since reading them could block forever.
+- **Regular files only:** FIFOs, sockets and devices → `is_error` (`not a regular file … use Bash`), since reading them could block forever. Read, Write and Edit open the path without blocking (`O_NONBLOCK`) and judge the opened fd, so a FIFO swapped in after a check can't hang them.
 - **Text:**
   - `cat -n` format: the line number right-aligned to width 6, a tab, then the line.
   - Default: 2 000 lines from `offset` (1-based, default 1). Lines over 2 000 characters are cut, with `... [truncated]`.
@@ -219,7 +219,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 - **PDFs:** `pages` (max 20) are rendered with `pdftotext -layout` (capability `pdf`). Without `pages`, PDFs of 10 pages or fewer are read whole. Otherwise `is_error` asking for `pages`.
 - **Helpers** (`pdftotext`, `pdfinfo`, `vips`, `convert`) run as the sandbox user in the agent's environment and a `calls/` cgroup, with a 30 s deadline and an output cap (8 MiB for text).
 - **Notebooks** (`.ipynb`): cells and outputs rendered as text. Over 256 KiB → `is_error`.
-- **Errors:** directories → `is_directory`; missing files → `is_error` text `File does not exist.`
+- **Errors:** directories, missing files and non-regular files → `is_error` text (e.g. `File does not exist.`).
 - **Read tracking:** a read that **wasn't partial** records `{mtime_ns, size, sha256}` per (agent, path).
 
 **`Write {file_path, content}`**
@@ -307,7 +307,7 @@ Programs in the sandbox run the `nest` binary, which connects to `/run/nest/gues
 | `emit` | `event`, `payload` (JSON) | `ok` |
 | `ask` | `question`, `options[]`, `wait_s` (≤ 120, default 120) | `answered{answer}` within the wait, else `pending{question_id}` (the answer arrives as the agent's next turn input) |
 | `expose` | `port`, `exposed` | `ok`, or `error` (policy refusal) |
-| `whoami` | — | `ok{data: {sandbox_id, agent_id?, epoch}}`. After a fork `resume` it reports `new_sandbox_id` until the next `configure` |
+| `whoami` | — | `ok{data: {sandbox_id, agent_id?, epoch}}`. After a fork `resume` it reports `new_sandbox_id` |
 
 nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a fleet `guest_cli` event, and the control plane runs them as the platform tools of the same name (`expose` → `expose_port`; `emit` takes `payload.summary`, `payload.url`, `payload.title`). See [fleet](../control-host/fleet/).
 
@@ -324,7 +324,6 @@ nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a flee
 | `unknown_task` | TaskOutput / TaskStop |
 | `busy` (retryable) | Before `configure`, during `prepare_snapshot` freeze, or (v2) over an admission cap or the frame-memory budget |
 | `sync_failed` (v2) | `flush` or `prepare_snapshot` hit a writeback error |
-| `not_found`, `is_directory`, `not_read`, `not_utf8`, `old_string_not_found`, `old_string_ambiguous`, `too_large` | Code names for tool-level failures. The model sees them as `is_error` text, and `error` frames use them only when the call couldn't run at all. |
 | `connect_refused` (retryable) | Ingress TCP |
 | `unknown_terminal` (v2) | Ingress `pty_attach` |
 | `internal` | Anything else |

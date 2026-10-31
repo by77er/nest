@@ -7,8 +7,9 @@ import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest";
 import { kidOf, verifyBinding } from "../src/lib/binding";
 import { b64urlToBytes } from "../src/lib/util";
+import type { SandboxDO } from "../src/do/sandbox";
 import type { HandsTarget } from "../src/protocol/gateway";
-import { adminJson, connectHost, enrollHost, GATEWAY_URL, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, enrollHost, GATEWAY_URL, hostHello, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -257,6 +258,28 @@ describe("attach and resolve", () => {
     await rejects(stub.resolve(s.agent)).toThrow(/not_bound/);
   });
 
+  it("a suspend during signing yields not ready, never a target the gateway would refuse", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.attach.cmd);
+    const outcome = await runInDurableObject(sandboxStub(s.sandbox), async (inst: SandboxDO) => {
+      const self = inst as unknown as { env: typeof env };
+      const real = self.env.BROKER;
+      let open!: () => void;
+      const gate = new Promise<void>((r) => (open = r));
+      self.env = { ...self.env, BROKER: { idFromName: (n: string) => real.idFromName(n), get: (id: DurableObjectId) => {
+        const b = real.get(id);
+        return { signBinding: async (...a: Parameters<typeof b.signBinding>) => { const t = await b.signBinding(...a); await gate; return t; },
+          accessServiceToken: () => b.accessServiceToken() };
+      } } as unknown as typeof env.BROKER };
+      const resolving = inst.resolve(s.agent).then(() => "target", (e: Error) => e.message);
+      await sleep(20);
+      await inst.reportState(s.host.host, 1, "suspended", null, null);
+      open();
+      return resolving;
+    });
+    expect(outcome).toMatch(/sandbox_not_ready/);
+  });
+
   it("detach issues agent_detach with the kill, and resolve is not_bound afterwards", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.attach.cmd);
@@ -310,7 +333,7 @@ describe("hands_resolve on the session channel", () => {
     const s = await setup();
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.brain.ws, (c) => c.cmd === cmd);
-    expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 } });
+    expect(start).toMatchObject({ type: "agent_start", epoch: 1, hands: { sandbox: s.sandbox } });
     expect(start.hands.binding, "no binding ever passes through a host command").toBeUndefined();
     const ws = await Ws.connect(`/v1/agents/${s.agent}/session`, s.brain.host_token);
     ws.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.brain.host, instance_id: "rin_hands", epoch: 1 });

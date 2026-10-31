@@ -93,7 +93,6 @@ enum WriterMsg {
     NewConn(OwnedFd),
     Op(Box<Queued>),
     Closed(u64),
-    Ping(u64),
 }
 
 struct Shared {
@@ -217,7 +216,6 @@ impl ProxyLink {
         let mut sh = self.shared.lock().expect("proxy mirror poisoned");
         let tombstones = sh.tombstones.clone();
         let m = &mut sh.mirror;
-        let refused = |_: &Mirror, sandbox: &SandboxId, epoch: Epoch| tombstones.refuses(sandbox, epoch);
         let (cmd, fds) = match op {
             ProxyOp::CaInstall { ca, key_pem } => {
                 m.ca = Some((ca.clone(), key_pem.clone()));
@@ -228,7 +226,7 @@ impl ProxyLink {
                 (ProxyCommand::LeaseUpdate { valid_until_ms }, vec![])
             }
             ProxyOp::Upsert { sandbox, epoch, workstream, policy } => {
-                if refused(m, &sandbox, epoch) {
+                if tombstones.refuses(&sandbox, epoch) {
                     tracing::warn!(%sandbox, epoch = epoch.0, "refusing proxy upsert for a fenced epoch");
                     return false;
                 }
@@ -239,14 +237,14 @@ impl ProxyLink {
                 (ProxyCommand::SandboxUpsert { sandbox, epoch, workstream, policy }, vec![])
             }
             ProxyOp::Secrets { sandbox, epoch, secrets } => {
-                if refused(m, &sandbox, epoch) {
+                if tombstones.refuses(&sandbox, epoch) {
                     return false;
                 }
                 m.sandboxes.entry(sandbox.clone()).or_default().secrets = secrets.clone();
                 (ProxyCommand::SecretsSet { sandbox, epoch, secrets }, vec![])
             }
             ProxyOp::AddListeners { sandbox, epoch, listeners } => {
-                if refused(m, &sandbox, epoch) {
+                if tombstones.refuses(&sandbox, epoch) {
                     tracing::warn!(%sandbox, epoch = epoch.0, "refusing proxy listeners for a fenced epoch");
                     return false;
                 }
@@ -295,10 +293,6 @@ impl ProxyLink {
         sh.next_seq += 1;
         let _ = self.writer.send(WriterMsg::Op(Box::new(Queued { seq, cmd, fds })));
         true
-    }
-
-    pub fn ping(&self, nonce: u64) {
-        let _ = self.writer.send(WriterMsg::Ping(nonce));
     }
 
     /// Listener ids currently held for a sandbox.
@@ -377,13 +371,6 @@ impl Writer {
                             tracing::warn!(error = %e, "proxy send failed");
                             self.drop_conn("send failed or timed out");
                         }
-                    }
-                }
-                WriterMsg::Ping(nonce) => {
-                    if let Some(conn) = self.conn.clone()
-                        && fdpass::send(conn.as_fd(), &ProxyCommand::Ping { nonce }, &[]).is_err()
-                    {
-                        self.drop_conn("ping send failed");
                     }
                 }
             }
