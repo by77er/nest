@@ -53,6 +53,12 @@ export interface Env {
   /** The Cloudflare account that holds the tunnels (a var) and a token with Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit (a secret). */
   CLOUDFLARE_ACCOUNT_ID?: string;
   CLOUDFLARE_TUNNEL_API_TOKEN?: string;
+  /** "1" lets an mcp capability name a loopback URL (http or https): tests and local development only (docs/agents/capabilities/mcp/). */
+  ALLOW_LOOPBACK_MCP?: string;
+  /** How long one forwarded MCP `tools/call` may take (default 45 s; below the runner's 150 s platform call timeout). */
+  MCP_CALL_TIMEOUT_MS?: string;
+  /** The budget of listing one MCP server's tools, initialize included (default 4 s; the runner waits 10 s for a tool list). */
+  MCP_LIST_TIMEOUT_MS?: string;
 }
 
 export const num = (v: string | undefined, fallback: number): number => {

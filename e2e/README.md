@@ -35,7 +35,8 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
    - the session transcript is in R2 (read through `GET /v1/agents/<id>/transcript`)
    - the turn is `done`; workstream events are visible
    - the egress audit (allowed and denied records) is in R2 under `audit/…`
-7. **Fencing:** the control plane is stopped. Each host's nestd self-fences within about 20 s; the brain host's runner brains are killed; the guest is paused (SIGSTOP); proxy listeners are dropped; the gateway refuses the sandbox's still-valid binding as `moved`.
+7. **Remote MCP** (fake mode; needs the MCP test server, `mcp-test/`, run with `wrangler dev --local` on its own port): an mcp capability names the local server (a loopback URL, which only `ALLOW_LOOPBACK_MCP=1` admits) with its token in BrokerDO; an agent of a template listing it calls `echo`, `note_put`/`note_get` (and a missing note, a tool error) and `counter_add` as `mcp__nest__notes_<tool>`. The server's `GET /calls` shows each call once with nest's `_meta` (`nest/agent`, `nest/epoch`, a unique `nest/call`, and `nest/taint` true: the untrusted server's tool list tainted the session). Then the control plane is restarted while a `slow` call (made non-idempotent by the capability's `idempotent` override) is out at the server: the runner redelivers it to the new AgentDO incarnation, which answers `outcome_unknown`, and the server saw it once.
+8. **Fencing:** the control plane is stopped. Each host's nestd self-fences within about 20 s; the brain host's runner brains are killed; the guest is paused (SIGSTOP); proxy listeners are dropped; the gateway refuses the sandbox's still-valid binding as `moved`.
 
 **Skipped, with the reason printed:**
 - **Transparent `:443` interception.** The process driver runs the guest in the netns itself, with no tap0 peer, so nft's tap0 redirect can't apply. nestd's `netns_redirect_reaches_listener` test covers it.
@@ -53,6 +54,7 @@ e2e/run.sh            # builds with CARGO_TARGET_DIR=target/e2e (release), runs,
   - `NEST_E2E_GATEWAY_PORT` (default 18790)
   - `NEST_E2E_WORK` (work dir)
   - `NEST_E2E_FENCE_BUDGET_S` (default 30)
+  - `NEST_E2E_MCP_DIR` (the MCP test server's directory; default `mcp-test/`, skipped when absent), `NEST_E2E_MCP_PORT` (default 18788)
   - `NEST_E2E_CLAUDE` (`fake`, the default, or `real`; see below)
 - **Exit code:** non-zero if any check fails; 2 if real mode is skipped.
 

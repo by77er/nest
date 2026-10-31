@@ -9,9 +9,9 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/index.ts` | Worker: enrollment, WebSocket routing (host-token auth), signed blob URLs, admin API |
 | `src/do/fleet.ts` | **FleetDO** (one per cell): enrollment, fleet channel, leases, expiry, STONITH, placement, commands |
 | `src/do/sandbox.ts` | **SandboxDO**: epoch, commit compare-and-set, generations, layered policy and expiring grants, idle refcount, ports |
-| `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay |
+| `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay, and the MCP client of its mcp capabilities (`src/lib/mcp-proxy.ts` over `src/lib/mcp.ts`; docs/agents/capabilities/mcp/) |
 | `src/do/workstream.ts` | **WorkstreamDO**: the interim workstream channel: event log, batched wakes of its one subscriber, user-notification queue |
-| `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, GitHub App minter (interface only) |
+| `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), GitHub App minter (interface only) |
 | `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries only); expansion is `src/lib/spec.ts` (pure) |
 | `src/do/channel.ts` | **ChannelDO** (one per channel, plus `~directory`): the log, keyed view, grant list, subscriptions and their cursors, fan-out from the alarm, retention and tiering. Every decision is `src/lib/channels.ts` (pure) |
 | `src/do/tasks.ts` | **TaskLedgerDO** (one per ledger name): tasks, comments, history, watcher, inbox notices from its alarm; its decisions are `src/lib/tasks.ts` (pure) |
@@ -101,6 +101,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/admin/launched {instance_id, role, account_id?, region?, cell}`: record an instance we
      launched so it may enroll with its AWS identity document (as that role, from that account and region)
    - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<workstream>`)
+   - A remote MCP server: its bearer token with `PUT /v1/admin/secrets/cap:<name>`, then
+     `PUT /v1/admin/capabilities/<name> {"mcp": {"url": "https://…/mcp", "auth": "cap:<name>", "tools": [...]}}` and the capability
+     added to a template (`docs/agents/capabilities/mcp/`)
 
 ## Secrets and vars
 
@@ -114,6 +117,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `PUBLIC_BASE_URL`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
 | `WAKE_BATCH_MS` | Batching window of the workstream channel's subscriber wakes; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
+| `ALLOW_LOOPBACK_MCP` | `1` lets an mcp capability name a loopback URL (`http://127.0.0.1:…`): tests and local dev (the e2e harness) only; never set in a deploy |
+| `MCP_CALL_TIMEOUT_MS`, `MCP_LIST_TIMEOUT_MS` | The MCP proxy's budget for one forwarded `tools/call` (default 45000) and for listing one server's tools, `initialize` included (default 4000) |
 | `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname (a tunnel host that serves none is not ready, never its loopback `gateway_url`). `NEST_DOMAIN` also names previews (`<port>-<sandbox>-preview-<label>.<zone>`) and share links (`<token>-share-<label>.<zone>`). The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url`, and preview names use `nest.localhost` |
 | `AWS_CELLS` | Per-cell AWS settings, written by the cell stacks: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?, sandbox_reserve_mib?, max_sandboxes_per_host?, proxy_root_key_arn?, brain?}` (`src/lib/cells.ts`); `brain` is the brain hosts' `{launch_template_id, instance_types, spot?, max_hosts?, idle_grace_ms?, max_brains_per_host?}`. A cell without an entry is never scaled, and one without `brain` launches no brain host |
 

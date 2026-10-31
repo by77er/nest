@@ -16,7 +16,9 @@ import {
 import { admitDelivery, channelRequestId, inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import type { ReadResult } from "./channel";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
-import { toolDef, toolDefs } from "../lib/registry";
+import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
+import { mcpTarget, mcpToolDefs } from "../lib/mcp";
+import { McpProxy } from "../lib/mcp-proxy";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
 import {
@@ -33,7 +35,7 @@ import {
 } from "../lib/brain";
 import {
   type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage,
-  RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
+  RunnerToAgent, type SegmentRef, type ToolDef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
   type AgentEvent, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
@@ -246,6 +248,13 @@ export class AgentDO extends DurableObject<Env> {
     // Notices taken without delivery (no `read` tool): how many, and up to which seq.
     addColumn(this.sql, "channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
     addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
+    this.mcp = new McpProxy({
+      sql: this.sql,
+      token: (ref) => env.BROKER.get(env.BROKER.idFromName("broker")).capabilityToken(ref),
+      callTimeoutMs: num(env.MCP_CALL_TIMEOUT_MS, 45_000),
+      listTimeoutMs: num(env.MCP_LIST_TIMEOUT_MS, 4_000),
+      allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
+    });
     this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
@@ -253,6 +262,8 @@ export class AgentDO extends DurableObject<Env> {
   private readonly outbox!: ChannelOutbox;
   private readonly queue!: TurnQueue;
   private readonly calls!: CallLedger;
+  /** The client of its mcp capabilities' servers (docs/agents/capabilities/mcp/). */
+  private readonly mcp!: McpProxy;
 
   // ---------------------------------------------------------------------------------------------
   // State
@@ -1120,7 +1131,8 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (msg.type === "tools_list_request") {
       const info = this.load();
-      this.send(ws, { type: "tools_list", request: msg.request, tools: toolDefs(info.tools) });
+      const remote = await this.mcpToolDefs(info);
+      this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(info.tools), ...remote] });
       return;
     }
     if (msg.type === "hands_resolve") {
@@ -1646,6 +1658,22 @@ export class AgentDO extends DurableObject<Env> {
     return sessionTaint({ hands: !!info.hands, builtin_tools: info.launch.builtin_tools, read_tainted: this.kvGet<boolean>("read_tainted") ?? false });
   }
 
+  /**
+   * Its mcp capabilities' tools (each server's cached `tools/list`, filtered by the allowlist). A server
+   * that can't be listed contributes nothing this time. An untrusted server's descriptions and schemas
+   * are its text in the model's context, so handing them out taints the session.
+   */
+  private async mcpToolDefs(info: AgentInfo): Promise<ToolDef[]> {
+    const lists = await Promise.all((info.mcp ?? []).map(async (g) => ({ g, listed: await this.mcp.list(g).catch(() => null) })));
+    const out: ToolDef[] = [];
+    for (const { g, listed } of lists) {
+      const defs = listed ? mcpToolDefs(g, listed, PLATFORM_TOOL_NAMES) : [];
+      if (defs.length && !g.trusted) this.kvPut("read_tainted", true);
+      out.push(...defs);
+    }
+    return out;
+  }
+
   /** This agent as a channel caller, from its own record, never from a tool's arguments. */
   private channelCaller(info: AgentInfo): Caller {
     return { principal: info.agent, owner: info.owner, sandbox: info.hands?.sandbox ?? null, grants: info.channel_grants, tainted: this.tainted(info) };
@@ -1950,7 +1978,7 @@ export class AgentDO extends DurableObject<Env> {
     const guest = sandboxEpoch !== undefined;
     const info = this.load();
     const def = toolDef(name);
-    if (!def) throw new NestError(ErrorCodes.UNKNOWN_TOOL, `unknown tool ${name}`);
+    if (!def) return await this.mcpTool(info, epoch, call, name, args, guest, fence);
     if (!info.tools.includes(name)) {
       throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not granted to this agent`, 403);
     }
@@ -2059,6 +2087,29 @@ export class AgentDO extends DurableObject<Env> {
       default:
         throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${name} is not implemented yet`, 501);
     }
+  }
+
+  /**
+   * A remote tool (`<capability>_<tool>`) of one of its mcp capabilities, through the proxy
+   * (docs/agents/capabilities/mcp/): only for a capability in its spec and a tool on its allowlist,
+   * never from a sandbox. An untrusted server's answer taints the session.
+   */
+  private async mcpTool(info: AgentInfo, epoch: number, call: string, name: string, args: unknown, guest: boolean, fence: number): Promise<ToolOutcome> {
+    const target = mcpTarget(info.mcp ?? [], name);
+    if (!target) throw new NestError(ErrorCodes.UNKNOWN_TOOL, `unknown tool ${name}`);
+    if (target === "forbidden") throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not on its capability's allowlist`, 403);
+    if (guest) throw new NestError(ErrorCodes.FORBIDDEN, "remote MCP tools aren't callable from a sandbox", 403);
+    if (typeof args !== "object" || args === null || Array.isArray(args)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "arguments must be an object");
+    const r = await this.mcp.call(target.grant, target.tool, args as Record<string, unknown>, {
+      agent: info.agent, epoch, key: `${info.agent}/${epoch}/${call}`,
+      live: async () => {
+        await this.hook("dispatch:beforeWrite");
+        this.assertEpoch(fence);
+      },
+      tainted: () => this.tainted(this.load()),
+    });
+    if (r.from_server && !target.grant.trusted) this.kvPut("read_tainted", true);
+    return r.outcome;
   }
 
   /**
@@ -2361,6 +2412,7 @@ export class AgentDO extends DurableObject<Env> {
   private prune(): void {
     const cutoff = Date.now() - RETENTION_MS;
     this.calls.prune(cutoff);
+    this.mcp.prune(cutoff);
     this.queue.prune(cutoff);
     this.sql.exec("DELETE FROM channel_subs WHERE ended = 1 AND created_ms < ?", cutoff);
   }

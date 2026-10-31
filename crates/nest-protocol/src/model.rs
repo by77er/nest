@@ -154,12 +154,15 @@ pub mod error_codes {
     pub const CONFLICT: &str = "conflict";
     /// The named object doesn't exist (a task in a ledger). Passed through as an ordinary tool error.
     pub const NOT_FOUND: &str = "not_found";
+    /// A remote (MCP) tool ran and reported an error (`isError`); the message is its text. Passed
+    /// through as an ordinary tool error.
+    pub const TOOL_ERROR: &str = "tool_error";
 
     /// Every code above that is sent (the legacy alias is not).
     pub const ALL: &[&str] = &[
         STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
         UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
-        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND,
+        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND, TOOL_ERROR,
     ];
 
     /// `unsupported_version` under either name.

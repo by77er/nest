@@ -408,3 +408,46 @@ describe("seed migration (pure)", () => {
     expect(seedMigration(all, SEED_VERSION + 5).version).toBe(SEED_VERSION + 5);
   });
 });
+
+describe("mcp capabilities in a spec (docs/agents/capabilities/mcp/)", () => {
+  const mcpCap = (tools?: string[]): Capability => ({
+    tools: [], rules: [], prompt: "", grants: [], params: [],
+    mcp: { url: "https://mcp.example.com/mcp", auth: "cap:tracker", ...(tools ? { tools } : {}), idempotent: ["get"], trusted: false },
+  });
+  const tpl: Template = {
+    capabilities: ["tracker", "messaging"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
+    hands: "optional", credential: "claude_oauth_token", escalate_to: "user", subscribe: [], params: {},
+  };
+  const cat: Catalog = { capabilities: { tracker: mcpCap(["get", "comment"]), messaging: SEED_CATALOG.capabilities.messaging! }, templates: { t: tpl } };
+
+  it("the spec copies the server, allowlist, overrides and trust; a spec without one has no mcp field", () => {
+    const r = expandTemplate(cat, PLATFORM_TOOL_NAMES, "t");
+    expect(r.ok && r.value.mcp).toEqual([{
+      capability: "tracker", url: "https://mcp.example.com/mcp", auth: "cap:tracker", tools: ["get", "comment"], idempotent: { get: true }, trusted: false,
+    }]);
+    const plain = expandTemplate(SEED_CATALOG, PLATFORM_TOOL_NAMES, "worker");
+    expect(plain.ok && plain.value).not.toHaveProperty("mcp");
+  });
+
+  it("an override naming tools narrows the allowlist to the remote tools it names, drops it when it names none, and never widens", () => {
+    const narrow = (tools: string[], by: "operator" | "spawner" = "operator") =>
+      expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "t", hands: false, by, overrides: { tools } } as never);
+    const a = narrow(["tracker_get", "notify"]);
+    expect(a.ok && [a.value.tools, a.value.mcp?.[0]?.tools]).toEqual([["notify"], ["get"]]);
+    const b = narrow(["notify"], "spawner");
+    expect(b.ok && b.value).not.toHaveProperty("mcp");
+    expect(narrow(["tracker_delete"])).toEqual({ ok: false, error: "template t doesn't give tracker_delete" });
+    // With no allowlist the capability gives whatever the server lists, so any remote name narrows.
+    const open: Catalog = { ...cat, capabilities: { ...cat.capabilities, tracker: mcpCap() } };
+    const c = expandSpec(open, PLATFORM_TOOL_NAMES, { template: "t", hands: false, by: "operator", overrides: { tools: ["tracker_x"] } });
+    expect(c.ok && c.value.mcp?.[0]?.tools).toEqual(["x"]);
+  });
+
+  it("checkCapability refuses a URL nest won't call and a name a platform tool starts with", () => {
+    expect(checkCapability(mcpCap(), PLATFORM_TOOL_NAMES, { name: "tracker", allowLoopback: false }).ok).toBe(true);
+    expect(checkCapability(mcpCap(), PLATFORM_TOOL_NAMES, { name: "channel", allowLoopback: false })).toMatchObject({ ok: false });
+    const http = { ...mcpCap(), mcp: { ...mcpCap().mcp!, url: "http://127.0.0.1:9/mcp" } };
+    expect(checkCapability(http, PLATFORM_TOOL_NAMES, { name: "tracker", allowLoopback: false }).ok).toBe(false);
+    expect(checkCapability(http, PLATFORM_TOOL_NAMES, { name: "tracker", allowLoopback: true }).ok).toBe(true);
+  });
+});
