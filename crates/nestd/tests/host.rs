@@ -58,7 +58,8 @@ struct ResumeLatch {
     release: tokio::sync::Notify,
 }
 
-#[derive(Default)]
+/// Every field is shared with the VMs it creates, so a clone observes and steers them.
+#[derive(Clone, Default)]
 struct FakeDriver {
     seen: Seen,
     latch: Option<Arc<AttachLatch>>,
@@ -944,19 +945,8 @@ struct Started {
     _runner: Arc<Mutex<Vec<RunnerCommand>>>,
     proxy: Arc<Mutex<Vec<ProxyCommand>>>,
     gateway: FakeGateway,
-    /// Everything the fake guests received.
-    seen: Seen,
-    /// Sandboxes whose VM was stopped.
-    stopped: Arc<Mutex<Vec<String>>>,
-    /// Set it to make the next VM start fail.
-    fail_next_start: Arc<AtomicBool>,
-    /// Set it to make the next VM start without a guest agent.
-    mute_next_guest: Arc<AtomicBool>,
-    /// Lock-free pauses, as (sandbox, epoch).
-    paused: Arc<Mutex<Vec<(String, u64)>>>,
-    /// VMs started and not yet stopped.
-    live: Arc<AtomicUsize>,
-    resume_latch: Arc<ResumeLatch>,
+    /// The fake driver its VMs come from (what they saw, which stopped, the next start's faults).
+    vm: FakeDriver,
 }
 
 /// How long the harness's nestd waits for a guest agent to come up (the fake guest is in-process).
@@ -984,21 +974,12 @@ async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
     let driver = FakeDriver::default();
-    let (seen, stopped, fail_next_start, mute_next_guest, paused, live, resume_latch) = (
-        driver.seen.clone(),
-        driver.stopped.clone(),
-        driver.fail_next_start.clone(),
-        driver.mute_next_guest.clone(),
-        driver.paused.clone(),
-        driver.live.clone(),
-        driver.resume_latch.clone(),
-    );
-    let host = Host::start(cfg, enrolled, Some(Arc::new(driver))).await.unwrap();
+    let host = Host::start(cfg, enrolled, Some(Arc::new(driver.clone()))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
-    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped, fail_next_start, mute_next_guest, paused, live, resume_latch }
+    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, vm: driver }
 }
 
 /// Whether `pid` is still a live process (a zombie counts as dead: it has been killed).
@@ -1455,7 +1436,7 @@ async fn a_fence_stops_the_vm_and_a_destroy_at_the_old_epoch_reaps_it() {
 
     h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
     h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
-    wait_until("the fenced VM is stopped", || h.stopped.lock().unwrap().contains(&"sbx_1".to_string())).await;
+    wait_until("the fenced VM is stopped", || h.vm.stopped.lock().unwrap().contains(&"sbx_1".to_string())).await;
     h.fleet.wait_event("salvage", |b| matches!(b, HostEventBody::CommitRequest { reason: CommitReason::Salvage, .. })).await;
     h.fleet.wait_event("reported clean", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
     assert!(!disk.parent().unwrap().exists(), "the salvaged incarnation's directory is gone");
@@ -1558,7 +1539,7 @@ async fn a_refused_attach_leaves_no_slot_in_the_guest_configuration() {
     assert!(is_ok(&h.fleet.result("cmd_x").await));
     assert!(is_ok(&h.fleet.result("cmd_bye").await));
     let configures = || -> Vec<Vec<nest_protocol::guest::AgentSlot>> {
-        h.seen.lock().unwrap().iter().filter_map(|b| match b { ControlBody::Configure { agents, .. } => Some(agents.clone()), _ => None }).collect()
+        h.vm.seen.lock().unwrap().iter().filter_map(|b| match b { ControlBody::Configure { agents, .. } => Some(agents.clone()), _ => None }).collect()
     };
     wait_until("the guest reconnected and was configured again", || configures().len() >= 2).await;
     let slots = configures().pop().unwrap();
@@ -1644,17 +1625,17 @@ async fn a_failed_cold_resume_stops_its_vm() {
     let h = start_host().await;
     h.fleet.commands.send(vec![create("cmd_create", "sbx_1"), suspend_cmd("cmd_suspend", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_suspend").await));
-    assert_eq!(h.live.load(Ordering::SeqCst), 0, "a disk-only suspend stops the VM");
+    assert_eq!(h.vm.live.load(Ordering::SeqCst), 0, "a disk-only suspend stops the VM");
 
-    h.mute_next_guest.store(true, Ordering::SeqCst);
+    h.vm.mute_next_guest.store(true, Ordering::SeqCst);
     h.fleet.commands.send(vec![resume_cmd("cmd_resume_1", "sbx_1")]).unwrap();
     // Outlasts the guest-ready timeout (GUEST_READY_TIMEOUT_MS): fleet.result waits WAIT.
     assert!(!is_ok(&h.fleet.result("cmd_resume_1").await), "no guest: the resume fails");
-    assert_eq!(h.live.load(Ordering::SeqCst), 0, "the failed resume's VM was stopped");
+    assert_eq!(h.vm.live.load(Ordering::SeqCst), 0, "the failed resume's VM was stopped");
 
     h.fleet.commands.send(vec![resume_cmd("cmd_resume_2", "sbx_1")]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_resume_2").await));
-    assert_eq!(h.live.load(Ordering::SeqCst), 1, "one VM on the disk");
+    assert_eq!(h.vm.live.load(Ordering::SeqCst), 1, "one VM on the disk");
 }
 
 /// The last state `sandbox` reported.
@@ -1677,7 +1658,7 @@ async fn a_failed_suspend_rolls_back_to_running() {
     h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_1", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
     assert!(!is_ok(&h.fleet.result("cmd_suspend_1").await), "the commit times out (commit_timeout_ms 400)");
     wait_until("running again", || last_state(&h.fleet, "sbx_1") == Some(SandboxState::Running)).await;
-    assert_eq!(h.live.load(Ordering::SeqCst), 1, "the VM runs on");
+    assert_eq!(h.vm.live.load(Ordering::SeqCst), 1, "the VM runs on");
 
     // Asked again, the suspend lands (adopting the lost commit's outcome).
     h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_2", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
@@ -1699,11 +1680,11 @@ async fn a_rejected_commit_never_resumes_its_vm() {
         assert!(is_ok(&h.fleet.result(&format!("cmd_create_{sbx}")).await));
         *h.fleet.reject_next.lock().unwrap() = Some("parent_mismatch".into());
         // A resume would hold the command (and its answer) until released.
-        h.resume_latch.held.store(true, Ordering::SeqCst);
+        h.vm.resume_latch.held.store(true, Ordering::SeqCst);
         let id = command.cmd.0.clone();
         h.fleet.commands.send(vec![command]).unwrap();
         assert!(!is_ok(&h.fleet.result(&id).await), "{what}");
-        assert!(!h.resume_latch.reached.load(Ordering::SeqCst), "{what} resumed its VM");
+        assert!(!h.vm.resume_latch.reached.load(Ordering::SeqCst), "{what} resumed its VM");
         h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, .. } if sandbox.0 == sbx)).await;
     }
 }
@@ -2133,7 +2114,7 @@ async fn a_fenced_epoch_stays_stale_until_a_newer_epoch_runs() {
     assert_eq!(h._host.inner.fenced_epoch(&sbx), Some(Epoch(1)));
 
     // A newer epoch's create replaces the fenced row, then fails to boot.
-    h.fail_next_start.store(true, Ordering::SeqCst);
+    h.vm.fail_next_start.store(true, Ordering::SeqCst);
     h.fleet.commands.send(vec![create_at("cmd_c2", "sbx_t", 2)]).unwrap();
     assert_eq!(error_code(&h.fleet.result("cmd_c2").await).map(|(c, _)| c), Some("internal".into()));
     assert!(!h.dir.path().join("state/sandboxes/sbx_t/2").exists(), "a failed create left its directory");
@@ -2217,14 +2198,14 @@ async fn a_fence_during_a_checkpoints_resume_still_salvages() {
     let sbx = SandboxId("sbx_1".into());
     h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_create").await));
-    h.resume_latch.held.store(true, Ordering::SeqCst);
+    h.vm.resume_latch.held.store(true, Ordering::SeqCst);
     h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
-    wait_until("the checkpoint resumes its VM", || h.resume_latch.reached.load(Ordering::SeqCst)).await;
+    wait_until("the checkpoint resumes its VM", || h.vm.resume_latch.reached.load(Ordering::SeqCst)).await;
     h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
     h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
     append_to_disk(h.dir.path(), "sbx_1", 1, b"written after the checkpoint");
-    h.resume_latch.held.store(false, Ordering::SeqCst);
-    h.resume_latch.release.notify_waiters();
+    h.vm.resume_latch.held.store(false, Ordering::SeqCst);
+    h.vm.resume_latch.release.notify_waiters();
     h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
     assert_eq!(salvage_requests(&h.fleet, "sbx_1", 1).len(), 1, "the work after the checkpoint is salvaged");
 }
@@ -2259,7 +2240,7 @@ async fn a_newer_epoch_is_frozen_through_its_own_pause_handle() {
     wait_until("the old incarnation retired", || !h.dir.path().join("state/sandboxes/sbx_p/1").exists()).await;
     h.fleet.commands.send(vec![cmd("cmd_f2", CommandBody::Fence { sandboxes: vec![SandboxId("sbx_p".into())], reason: "test".into() })]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_f2").await));
-    wait_until("the lock-free pause of epoch 2", || h.paused.lock().unwrap().contains(&("sbx_p".to_string(), 2))).await;
+    wait_until("the lock-free pause of epoch 2", || h.vm.paused.lock().unwrap().contains(&("sbx_p".to_string(), 2))).await;
 }
 
 /// The review of the fix (L9): a configured cgroup delegation that fails doesn't stop nestd; it
