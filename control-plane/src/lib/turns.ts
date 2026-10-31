@@ -1,8 +1,6 @@
 // An agent's turn queue and inbox (docs/control-plane/durable-objects/agent/; the model's Q1-Q4,
-// docs/verification/agent-brain/). `TurnQueue` is the one place that reads or writes the `turns`,
-// `inbox` and `chan_wakes` tables: queue order, statuses and the inbox mirror live here, and AgentDO
-// decides only when to call it. The decisions that need no storage (a recovery turn's text, whether
-// a channel delivery joins, merges, queues or waits) are pure functions below it.
+// docs/verification/agent-brain/). `TurnQueue` is the only code that touches the `turns`, `inbox`
+// and `chan_wakes` tables; the decisions that need no storage are pure functions below it.
 
 import { z } from "zod";
 import type { InboxMessage, TurnInput } from "../protocol/control";
@@ -10,9 +8,7 @@ import { MAX_WAITING_DELIVERIES, WAKE_CAP_PER_HOUR } from "./channels";
 import { addColumn, storedEnum } from "./stored";
 import { newId } from "./util";
 
-// Closed unions for the status columns (docs/data/#enums): SQL names them through these constants,
-// and every status read back is checked (`storedEnum`: a value outside the union is logged).
-/** `turns.status`: waiting to run, running, finished, or cut short. */
+// Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
 const TurnStatusEnum = z.enum(["queued", "active", "done", "interrupted"]);
 export type TurnStatus = z.output<typeof TurnStatusEnum>;
 /** `inbox.status`: mirrored to the running turn, or consumed (by a turn, or as its own turn). */
@@ -20,15 +16,13 @@ const InboxStatusEnum = z.enum(["delivered", "consumed"]);
 const TURN = TurnStatusEnum.enum;
 const INBOX = InboxStatusEnum.enum;
 
-/** A deferred channel delivery is retried after this long (the channel keeps the messages). */
 const DEFER_RETRY_MS = 30_000;
-/** A merged channel turn's text is at most this big; a delivery past it waits (the channel keeps it). */
 export const MERGED_TURN_BYTES = 64 * 1024;
 const HOUR_MS = 3_600_000;
 /** Separates a recovery turn's notes from the original turn's text. */
 export const RECOVERY_MARK = "\nThe turn was:\n";
 
-/** The request id of a channel delivery (`chan/…`), which the turn or inbox row it becomes keeps. */
+/** The request id prefix of a channel delivery's turn or inbox row. */
 const CHANNEL_REQUEST = "chan/";
 export const channelRequestId = (channel: string, subscription: string, upTo: number) =>
   `${CHANNEL_REQUEST}${channel}/${subscription}/${upTo}`;
@@ -46,7 +40,7 @@ export interface TurnStart {
   hands_epoch: number | null;
 }
 
-/** How busy channel deliveries keep this agent: turns they started this hour, and those still waiting. */
+/** Channel-started turns and merges this hour (and the oldest's time), and channel turns waiting. */
 export interface ChannelLoad {
   hour: number;
   oldest: number | null;
@@ -59,30 +53,25 @@ export class TurnQueue {
       status TEXT NOT NULL, created_ms INTEGER NOT NULL DEFAULT 0)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY, message TEXT NOT NULL, turn TEXT,
       status TEXT NOT NULL, created_ms INTEGER NOT NULL DEFAULT 0)`);
-    // Idempotent admission: a retried submission with the same request id gets the same turn / message.
     addColumn(sql, "turns", "request_id", "TEXT");
     addColumn(sql, "turns", "started_ms", "INTEGER");
-    // The bound sandbox's epoch (read from SandboxDO) when the turn started: a recovery turn compares
-    // it with the current one to say whether the sandbox moved meanwhile.
+    // The sandbox's epoch at the turn's start (`moveNoteDue`), and the turn a recovery turn continues.
     addColumn(sql, "turns", "hands_epoch", "INTEGER");
-    // A recovery turn's interrupted turn (whose start and sandbox epoch it is told about).
     addColumn(sql, "turns", "recovers", "TEXT");
     addColumn(sql, "inbox", "request_id", "TEXT");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS turns_request ON turns (request_id) WHERE request_id IS NOT NULL");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS inbox_request ON inbox (request_id) WHERE request_id IS NOT NULL");
-    // Wakes from notices merged into a waiting turn (no turn of their own): they count toward the
-    // hourly cap like subscription-started turns. Rows older than an hour are dropped as they're counted.
+    // Merged notices' wakes, counted toward the hourly cap like channel-started turns.
     sql.exec("CREATE TABLE IF NOT EXISTS chan_wakes (ts_ms INTEGER NOT NULL)");
   }
 
   // --- turns (Q1-Q4) ------------------------------------------------------------------------------
 
-  /** The turn a request id already made, if any. */
   turnFor(requestId: string): string | undefined {
     return this.sql.exec<{ turn: string }>("SELECT turn FROM turns WHERE request_id = ?", requestId).toArray()[0]?.turn;
   }
 
-  /** Q1: queue `input` behind everything else. */
+  /** Q1. */
   enqueue(input: TurnInput, requestId: string | null = null, now = Date.now()): string {
     return this.insert(input, this.ord("MAX") + 1, requestId, null, now);
   }
@@ -91,7 +80,7 @@ export class TurnQueue {
     return this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
   }
 
-  /** Q2: the oldest queued turn becomes active. Synchronous, so no other caller can claim it too. */
+  /** Q2: the oldest queued turn becomes active (synchronously, so it is claimed once). */
   claimNext(now = Date.now()): QueuedTurn | undefined {
     const next = this.sql.exec<{ turn: string; input: string; recovers: string | null }>(
       `SELECT turn, input, recovers FROM turns WHERE status = '${TURN.queued}' ORDER BY ord LIMIT 1`).toArray()[0];
@@ -111,10 +100,8 @@ export class TurnQueue {
   }
 
   /**
-   * Q3: `turn` is done. Its inbox mirror is consumed with it, except messages the runner never
-   * confirmed writing to the model (no `inbox_delivered`), which come back as one queued turn:
-   * ahead of everything queued if one of them interrupted the turn (it was meant for now), else
-   * behind it.
+   * Q3. Mirrored messages the runner never confirmed (`inbox_delivered`) come back as one queued turn:
+   * first if one of them interrupted the turn (it was meant for now), else last.
    */
   complete(turn: string, now = Date.now()): void {
     this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, turn);
@@ -129,10 +116,7 @@ export class TurnQueue {
     this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
   }
 
-  /**
-   * Q4: `turn` was cut short by its brain restarting. It becomes `interrupted`, and a recovery turn
-   * that continues it goes to the front of the queue, in the same step.
-   */
+  /** Q4: `turn` was cut short by a restart; a recovery turn continuing it goes first, in the same step. */
   recover(turn: string, notes: string[], now = Date.now()): void {
     const row = this.sql.exec<{ input: string }>("SELECT input FROM turns WHERE turn = ?", turn).toArray()[0];
     this.sql.exec(`UPDATE turns SET status = '${TURN.interrupted}' WHERE turn = ?`, turn);
@@ -170,7 +154,6 @@ export class TurnQueue {
     return r && { turn: r.turn, input: JSON.parse(r.input) as TurnInput };
   }
 
-  /** A notice joined waiting channel turn `turn`: its new input, and a wake counted toward the hour. */
   merge(turn: string, input: TurnInput, now = Date.now()): void {
     this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify(input), turn);
     this.sql.exec("INSERT INTO chan_wakes (ts_ms) VALUES (?)", now);
@@ -182,30 +165,28 @@ export class TurnQueue {
     return this.sql.exec<{ id: string }>("SELECT id FROM inbox WHERE request_id = ?", requestId).toArray()[0]?.id;
   }
 
-  /** `message` goes to running turn `turn`, mirrored (`delivered`) until the runner confirms it or the turn ends. */
+  /** Mirrored to running turn `turn` until the runner confirms it or the turn ends. */
   mirror(message: InboxMessage, turn: string, requestId: string | null = null, now = Date.now()): void {
     this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, '${INBOX.delivered}', ?, ?)`,
       message.id, JSON.stringify(message), turn, now, requestId);
   }
 
-  /** `message` arrived between turns and becomes a turn of its own: kept as consumed, for its request id. */
+  /** A message that becomes a turn of its own: kept as consumed, for its request id. */
   recordAsTurn(message: InboxMessage, requestId: string | null = null, now = Date.now()): void {
     this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, NULL, '${INBOX.consumed}', ?, ?)`,
       message.id, JSON.stringify(message), now, requestId);
   }
 
-  /** The runner wrote mirrored message `id` to the model. Whether it was still mirrored. */
+  /** The runner showed mirrored message `id` to the model; whether it was still mirrored. */
   confirm(id: string): boolean {
     return this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE id = ? AND status = '${INBOX.delivered}'`, id).rowsWritten > 0;
   }
 
-  /** The running turn's inbox mirror (for the runner's Stop hook). */
   mirrored(): InboxMessage[] {
     return this.sql.exec<{ message: string }>(`SELECT message FROM inbox WHERE status = '${INBOX.delivered}' ORDER BY rowid`)
       .toArray().map((r) => JSON.parse(r.message) as InboxMessage);
   }
 
-  /** Finished turns and consumed messages created before `cutoff`. */
   prune(cutoff: number): void {
     this.sql.exec(`DELETE FROM turns WHERE status IN ('${TURN.done}', '${TURN.interrupted}') AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM inbox WHERE status = '${INBOX.consumed}' AND created_ms < ?`, cutoff);
@@ -228,11 +209,7 @@ export class TurnQueue {
 /** An inbox message as a turn of its own shows it (a message that arrived between turns). */
 export const inboxTurnText = (m: Pick<InboxMessage, "from" | "text">) => `Message from ${m.from}: ${m.text}`;
 
-/**
- * The turn that brings back inbox messages a finished turn never confirmed showing the model: channel
- * notices as they are (an `event_batch`, counted as the first one's channel turn), any other message as
- * a turn of its own would show it. Keyed by the first message, so it is queued once.
- */
+/** Unconfirmed messages as one turn (all channel notices: an `event_batch`), keyed by the first so it is queued once. */
 export function requeuedTurn(unseen: { message: InboxMessage; request_id: string | null }[]): { input: TurnInput; requestId: string } {
   const channel = (r: { request_id: string | null }) => r.request_id?.startsWith(CHANNEL_REQUEST) ?? false;
   const text = unseen.map((r) => (channel(r) ? r.message.text : inboxTurnText(r.message))).join("\n\n");
@@ -240,10 +217,7 @@ export function requeuedTurn(unseen: { message: InboxMessage; request_id: string
   return { input: { kind: unseen.every(channel) ? "event_batch" : "inbox", text }, requestId: `${first.request_id ?? first.message.id}/requeued` };
 }
 
-/**
- * A recovery turn's input: `notes`, then the original turn's text. A recovery turn that is itself
- * interrupted keeps the original turn's text, once.
- */
+/** `notes`, then the original turn's text (once, however often the recovery is itself interrupted). */
 export function recoveryInput(interrupted: TurnInput, notes: string[]): TurnInput {
   const mark = interrupted.kind === "recovery" ? interrupted.text.indexOf(RECOVERY_MARK) : -1;
   const original = mark >= 0 ? interrupted.text.slice(mark + RECOVERY_MARK.length) : interrupted.text;
@@ -251,11 +225,9 @@ export function recoveryInput(interrupted: TurnInput, notes: string[]): TurnInpu
 }
 
 /**
- * Whether a turn starting now opens with what a sandbox move lost: the sandbox moved since the brain
- * was last told (`told`, the epoch it last heard of), or, for a recovery turn, during the turn it
- * continues (`continued`), whose restart may have lost a notice given mid-turn. `epoch` is SandboxDO's
- * now; null when it couldn't be read, and then only AgentDO's record of the last move (`movedMs`) can
- * say, for a recovery turn.
+ * Whether a turn starting now opens with what a sandbox move lost: a move since the brain was last
+ * told (`told`), or, for a recovery turn, during the turn it continues (whose restart may have lost a
+ * mid-turn notice). `epoch` is SandboxDO's now (null: unread; then only `movedMs` can say).
  */
 export function moveNoteDue(f: { epoch: number | null; told: number | undefined; continued: TurnStart | undefined; movedMs: number | undefined }): boolean {
   const sinceTold = f.epoch !== null && f.told !== undefined && f.told !== f.epoch;
@@ -265,24 +237,17 @@ export function moveNoteDue(f: { epoch: number | null; told: number | undefined;
     : (f.movedMs ?? 0) >= f.continued.started_ms;
 }
 
-/** What becomes of a channel notice (`text`), given the agent's turns. */
+/** A channel notice joins the running turn's inbox, merges into a waiting channel turn, queues, or defers (the channel retries). */
 export type Admission =
-  /** Into the running turn, through the inbox. */
   | { kind: "join" }
-  /** Into the channel turn still waiting to start, as its new input. */
   | { kind: "merge"; turn: string; input: TurnInput }
-  /** Queued as a turn of its own. */
   | { kind: "queue" }
-  /** Not now: the channel keeps the messages and retries. */
   | { kind: "defer"; retry_after_ms: number };
 
 /**
- * Mid-turn, only a notice from the agent's own inbox joins the running turn (`midTurnInbox`): a message
- * to the agent, as Claude Code takes a user's message mid-work. Anything else waits for a turn of its
- * own: injected into one busy with something else, the model can pass over it, and a `once`
- * subscription is then spent (3-12% of mention wakes in the 2026-10-31 stress test, dev/cloud-checks/).
- * The loop guards defer: at most `WAKE_CAP_PER_HOUR` channel-started turns or merges an hour, at most
- * `MAX_WAITING_DELIVERIES` waiting, and a merged text of at most `MERGED_TURN_BYTES`.
+ * Mid-turn, only a notice from the agent's own inbox joins the running turn: anything else injected
+ * into a busy turn can be passed over, spending a `once` subscription (3-12% of mention wakes in the
+ * 2026-10-31 stress test, dev/cloud-checks/). The loop guards defer.
  */
 export function admitDelivery(f: {
   midTurnInbox: boolean;

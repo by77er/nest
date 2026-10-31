@@ -1,13 +1,11 @@
 // An agent's platform tool calls and asks (docs/control-plane/durable-objects/agent/, "Tool relay").
-// `CallLedger` is the one place that reads or writes the `tool_calls` and `asks` tables; AgentDO
-// decides when to call it. Where an answer goes (`askRoute`) is a pure decision below it.
+// `CallLedger` is the only code that touches the `tool_calls` and `asks` tables.
 
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
 import { storedEnum } from "./stored";
 
-// Closed unions for the status columns (docs/data/#enums): SQL names them through these constants,
-// and every status read back is checked (`storedEnum`: a value outside the union is logged).
+// Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
 /** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
 const CallStatusEnum = z.enum(["dispatching", "waiting", "done"]);
 export type CallStatus = z.output<typeof CallStatusEnum>;
@@ -17,7 +15,7 @@ export type AskStatus = z.output<typeof AskStatusEnum>;
 const CALL = CallStatusEnum.enum;
 const ASK = AskStatusEnum.enum;
 
-/** A call as stored: the epoch whose row and idempotency key it keeps, and its outcome once done. */
+/** A call as stored: the epoch whose row and idempotency key it keeps. */
 export interface StoredCall {
   epoch: number;
   status: CallStatus;
@@ -35,18 +33,13 @@ export interface StoredAsk {
 
 export class CallLedger {
   constructor(private readonly sql: SqlStorage) {
-    // status: dispatching (not finished; re-dispatched if redelivered after an eviction), waiting (an
-    // ask; answered later), done (outcome stored).
     sql.exec(`CREATE TABLE IF NOT EXISTS tool_calls (epoch INTEGER NOT NULL, call TEXT NOT NULL, name TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'dispatching', outcome TEXT, created_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (epoch, call))`);
     sql.exec(`CREATE TABLE IF NOT EXISTS asks (ask TEXT PRIMARY KEY, call TEXT NOT NULL, epoch INTEGER NOT NULL,
       question TEXT NOT NULL, status TEXT NOT NULL, deadline INTEGER NOT NULL, answer TEXT, created_ms INTEGER NOT NULL DEFAULT 0)`);
   }
 
-  /**
-   * The call, keyed by its own id: one first seen at an earlier epoch (redelivered after its brain
-   * adopted a newer epoch) keeps that epoch's row and idempotency key, so its writes never run twice.
-   */
+  /** By call id: one first seen at an earlier epoch keeps that epoch's row and key, so its writes never run twice. */
   call(call: string): StoredCall | undefined {
     const r = this.sql.exec<{ epoch: number; status: string; outcome: string | null }>(
       "SELECT epoch, status, outcome FROM tool_calls WHERE call = ? ORDER BY epoch LIMIT 1", call).toArray()[0];
@@ -54,7 +47,6 @@ export class CallLedger {
     return { epoch: r.epoch, status: storedEnum(CallStatusEnum, r.status, "tool_calls.status"), outcome: r.outcome ? JSON.parse(r.outcome) as ToolOutcome : null };
   }
 
-  /** A call about to run. */
   begin(epoch: number, call: string, name: string): void {
     this.sql.exec(`INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, ?, '${CALL.dispatching}', NULL, ?)`,
       epoch, call, name, Date.now());
@@ -69,10 +61,7 @@ export class CallLedger {
     this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), epoch, call);
   }
 
-  /**
-   * The runner gave up on the call: one that hasn't run never runs (`outcome` stored), and its ask's
-   * answer, if one comes, arrives as a turn. A call already done keeps its outcome.
-   */
+  /** The runner gave up on the call: it never runs, and its ask's answer comes as a turn. A done call keeps its outcome. */
   cancel(epoch: number, call: string, outcome: ToolOutcome, prior: StoredCall | undefined): void {
     if (!prior) {
       this.sql.exec(`INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, '', '${CALL.done}', ?, ?)`,
@@ -83,7 +72,6 @@ export class CallLedger {
     }
   }
 
-  /** The ask a call made, if any. */
   askOf(call: string, epoch: number): StoredAsk | undefined {
     return this.askWhere("call = ? AND epoch = ?", call, epoch);
   }
@@ -106,7 +94,6 @@ export class CallLedger {
     this.sql.exec(`UPDATE asks SET status = '${ASK.answered}', answer = ? WHERE ask = ?`, text, ask);
   }
 
-  /** Finished calls and answered asks created before `cutoff`. */
   prune(cutoff: number): void {
     this.sql.exec(`DELETE FROM tool_calls WHERE status = '${CALL.done}' AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
@@ -119,14 +106,12 @@ export class CallLedger {
   }
 }
 
-/** Where an answer goes: nowhere (answered already), the guest CLI waiting for it, the waiting call's result, or a turn. */
 export type AskRoute = "already_answered" | "waiter" | "result" | "turn";
 
 /**
- * An answer reaches the model whatever happened to the brain that asked: a guest CLI's waiter if it
- * is still there (lost with an eviction otherwise), the call's result if the call still waits in
- * its sync window on the brain that asked (`callCurrent`: a condemned or restarted brain's new
- * lineage drops what the old one was sent), and otherwise the next turn.
+ * An answer reaches the model whatever happened to the brain that asked: the guest CLI's waiter (lost
+ * with an eviction), the call's result while it waits on the brain that asked (`callCurrent`: a new
+ * lineage drops what the old one was sent), else the next turn.
  */
 export function askRoute(status: AskStatus, waiter: boolean, callCurrent: boolean): AskRoute {
   if (status === "answered") return "already_answered";

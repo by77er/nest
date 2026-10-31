@@ -264,10 +264,7 @@ export class ChannelDO extends DurableObject<Env> {
     return r ? readSub(r.body) : undefined;
   }
 
-  /**
-   * Store a subscription. A due one arms the fan-out in this step (keeping an earlier alarm; the
-   * deadline row is written now), so no writer can leave it due with nothing to run it.
-   */
+  /** Store a subscription; a due one arms the fan-out in this step, so none is left due with nothing to run it. */
   private saveSub(s: Subscription, idemKey?: string): void {
     this.sql.exec(`INSERT INTO subs (id, agent, body, idem_key, created_ms) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET body = excluded.body`, s.id, s.agent, JSON.stringify(s), idemKey ?? null, Date.now());
@@ -413,8 +410,7 @@ export class ChannelDO extends DurableObject<Env> {
       seq, ts_ms: now, from, taint, ...(p.kind ? { kind: p.kind } : {}), ...(p.key ? { key: p.key } : {}),
       ...(p.reply_to ? { reply_to: p.reply_to } : {}), ...(p.mentions ? { mentions: p.mentions } : {}),
     };
-    // Each opened window arms the fan-out in this step (`saveSub`), and maintenance is armed here: a
-    // reset after the append can't strand a delivery or the channel's maintenance.
+    // Armed in this step (`saveSub`, and maintenance here): a reset after the append strands nothing.
     for (const s of this.subs()) {
       const next = onAppend(s, msg, now);
       if (next !== s.due_ms) this.saveSub({ ...s, due_ms: next });
@@ -660,8 +656,7 @@ export class ChannelDO extends DurableObject<Env> {
       const refs = doomed.map((d) => d.body_ref).filter((r): r is string => r !== null);
       for (const c of chunks(refs, R2_DELETE_MAX)) await this.env.BUCKET.delete(c);
       // The page's own rows, not the predicate again: a key superseded during the delete would match
-      // it now, and go without its body. A paged row can't have come back into `keys` (a key only ever
-      // moves to a newer seq).
+      // it now and go without its body (a key only ever moves to a newer seq).
       this.sql.exec("DELETE FROM messages WHERE seq IN (SELECT value FROM json_each(?))", JSON.stringify(doomed.map((d) => d.seq)));
     }
     // Tiering: bodies older than 7 days to R2, the row keeps the reference.

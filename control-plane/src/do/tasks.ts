@@ -236,16 +236,13 @@ export class TaskLedgerDO extends DurableObject<Env> {
     return comment;
   }
 
-  /** Arm the notices deadline for the earliest undelivered one (keeping an earlier deadline). Its row is written now. */
+  /** Arm the notices deadline for the earliest undelivered one (its row is written now). */
   private armNotices(): Promise<void> {
     const at = this.sql.exec<{ at: number | null }>("SELECT MIN(next_ms) AS at FROM outbox").one().at;
     return at === null ? Promise.resolve() : this.deadlines.set(NOTICES, at, true);
   }
 
-  /**
-   * A ledger written before its alarm went through `Deadlines` has `last_prune` in kv and no prune
-   * deadline, and the alarm it armed directly is pending: its first alarm since moves it to the deadline.
-   */
+  /** A ledger from before `Deadlines` keeps `last_prune` in kv: its first alarm since moves it to the deadline. */
   private adoptLastPrune(): void {
     const lastPrune = this.kv("last_prune");
     if (lastPrune === undefined) return;
@@ -353,7 +350,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
     const name = this.kv("name");
     if (name === undefined) return;
     this.adoptLastPrune();
-    // Every row is covered, also one written before the ledger used `Deadlines` (its direct alarm brought us here).
+    // Also covers rows written before the ledger used `Deadlines`.
     this.ctx.waitUntil(this.armNotices());
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === NOTICES) await this.deliverNotices(name);
