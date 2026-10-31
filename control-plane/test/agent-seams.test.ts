@@ -2102,8 +2102,14 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const cell = uniqueCell();
     const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    // Its hello said it is of the previous release: drained of brains on sight.
+    a.ws.close();
+    const ws = await Ws.connect("/v1/fleet", a.host_token);
+    ws.send(hostHello(a.host, cell, { role: "brain", brain_epochs: false }));
+    await ws.next("hello_ack");
+    for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "draining"; n++) await sleep(25);
     await runInDurableObject(fleet, async (inst: FleetDO, st) => {
-      st.storage.sql.exec("UPDATE hosts SET status = 'stonith_pending', brain_epochs = 0 WHERE host = ?", a.host);
+      st.storage.sql.exec("UPDATE hosts SET status = 'stonith_pending' WHERE host = ?", a.host);
       (inst as any).stonithDoneIfClear(a.host);
     });
     for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "draining"; n++) await sleep(25);

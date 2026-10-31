@@ -611,6 +611,46 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(await sandboxStub(idle.sandbox).info()).toMatchObject({ host: null, state: "suspended" });
   });
 
+  it("a spot drain survives a blip: a host back from STONITH by fence, or from expiry, is still draining (B-3)", async () => {
+    const cell = uniqueCell();
+    const fleet = fleetStub(cell);
+    await runInDurableObject(fleet, (inst: FleetDO) => {
+      inst.ec2Override = null;
+    });
+    // Through STONITH by fence: the drained host holds a lease when it goes silent.
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "running");
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    a.ws.close();
+    await expireNow(cell, a.host);
+    expect((await fleet.hostStatus(a.host))!.status).toBe("stonith_pending");
+    const ws = await Ws.connect("/v1/fleet", a.host_token);
+    ws.send(hostHello(a.host, cell, { sandboxes: [{ sandbox: sbx.sandbox, epoch: 1, state: "fenced", dirty: false }] }));
+    // The same nestd process: its event lineage continues where FleetDO's ack left it.
+    sendEvents(ws, [], (await ws.next("hello_ack")).last_event_seq + 1);
+    const [fence] = await nextCommands(ws, (c) => c.type === "fence" && c.reason === "lease expired");
+    await okResult(ws, fence!.cmd);
+    expect((await fleet.hostStatus(a.host))!.status).toBe("draining");
+
+    // Through expiry: a drained host holding nothing goes silent, then says hello.
+    const c = await connectHost(cell);
+    sendEvents(c.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await c.ws.next("ack");
+    c.ws.close();
+    await expireNow(cell, c.host);
+    expect((await fleet.hostStatus(c.host))!.status).toBe("expired");
+    const again = await Ws.connect("/v1/fleet", c.host_token);
+    again.send(hostHello(c.host, cell));
+    await again.next("hello_ack");
+    await again.next("binding_key");
+    expect((await fleet.hostStatus(c.host))!.status).toBe("draining");
+    // Neither takes a placement: with no other host, the sandbox waits.
+    expect((await createSandbox(cell, 202)).host).toBeNull();
+  });
+
   it("a draining host doesn't count toward the cell's host cap", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");

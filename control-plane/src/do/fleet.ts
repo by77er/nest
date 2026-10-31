@@ -109,6 +109,8 @@ interface HostRow {
   wedged_ms: number | null;
   /** Its nestd keys brains by agent epoch (1), or is of the previous release (0). */
   brain_epochs: number;
+  /** When a drain was asked for (null: none). The status says whether it is serving; this survives an expiry and a return. */
+  drain_ms: number | null;
   [key: string]: SqlStorageValue;
 }
 
@@ -324,6 +326,9 @@ export class FleetDO extends DurableObject<Env> {
     // The host's nestd keys brains by agent epoch (its hello says so; nestd of the previous release
     // doesn't): preferred for new brains, and the only kind escalation ever wedges.
     this.addColumn("hosts", "brain_epochs", "INTEGER NOT NULL DEFAULT 0");
+    // A drain (a spot notice, a previous-release nestd) is an intent, not a liveness: a host that
+    // expires and comes back (a hello, a fence) returns to `draining`, never `active`.
+    this.addColumn("hosts", "drain_ms", "INTEGER");
     this.addColumn("leases", "state", "TEXT");
     // Packing: what each lease reserves until the host's capacity report counts the sandbox.
     this.addColumn("leases", "vcpus", "INTEGER");
@@ -2232,10 +2237,10 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * A previous-release host: no new placements (`draining`) and its brains condemned, its sandboxes
-   * left as they are. Applies again whenever the host is active again (after STONITH by fence).
+   * left as they are. Once: the drain is kept across an expiry and STONITH by fence (`drain_ms`).
    */
   private async drainBrains(host: string, why: string): Promise<void> {
-    if (this.host(host)?.status !== "active" || !this.move(host, "drain")) return;
+    if (this.host(host)?.drain_ms !== null || !this.move(host, "drain")) return;
     console.warn(`FleetDO: ${host} draining of brains (${why})`);
     this.ctx.waitUntil(this.tellDraining(host));
     if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
@@ -2632,18 +2637,15 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * STONITH by fence is done once nothing on the host is expired but what a successful fence just
-   * covered (`fenced`): a reachable `stonith_pending` host is active again and may take placements.
+   * covered (`fenced`): a reachable `stonith_pending` host serves again (or drains again: `hostStep`).
    * Never earlier (a hello doesn't do it), so a host that dies before its fence result is still
    * polled until EC2 confirms it gone.
    */
   private stonithDoneIfClear(host: string, fenced = new Set<string>()): void {
     if (this.leasesOf(host).some((l) => l.expired && !fenced.has(l.sandbox)) || !this.socketFor(host)) return;
-    // A wedged host is done only when STONITH confirms it dead (D5), never by a fence it runs itself.
-    const back = this.move(host, "fence_done") !== null;
-    // A previous-release host active again is drained of brains again (N21).
-    if (back && this.sql.exec("SELECT 1 FROM hosts WHERE host = ? AND brain_epochs = 0", host).toArray().length) {
-      this.ctx.waitUntil(this.drainBrains(host, "a previous-release nestd, active again"));
-    }
+    // A wedged host is done only when STONITH confirms it dead (D5), never by a fence it runs itself;
+    // a drained one (a spot notice, a previous-release nestd: N21) drains again.
+    this.move(host, "fence_done");
   }
 
   /**
@@ -2719,14 +2721,16 @@ export class FleetDO extends DurableObject<Env> {
   /**
    * Apply transition `t` to `host` if it applies from the host's row as it is now (`hostStep`), with
    * what the transition writes besides the status: A6's `lost` (an expiry proves it, a return clears
-   * it) and when the host died. Read and write are one synchronous step. The new status, or null.
+   * it), when a drain was asked for, and when the host died. Read and write are one synchronous
+   * step. The new status, or null.
    */
   private move(host: string, t: HostTransition): HostStatus | null {
     const h = this.host(host);
     if (!h) return null;
-    const to = hostStep({ status: h.status, draining: false, wedged: h.wedged_ms !== null, terminating: false }, t);
+    const to = hostStep({ status: h.status, draining: h.drain_ms !== null, wedged: h.wedged_ms !== null, terminating: false }, t);
     if (to === null) return null;
     this.sql.exec("UPDATE hosts SET status = ? WHERE host = ?", to, host);
+    if (t === "drain") this.sql.exec("UPDATE hosts SET drain_ms = COALESCE(drain_ms, ?) WHERE host = ?", Date.now(), host);
     if (t === "expire_silent" || t === "hello_back") this.sql.exec("UPDATE hosts SET lost = ? WHERE host = ?", t === "expire_silent" ? 1 : 0, host);
     if (t === "die") this.sql.exec("UPDATE hosts SET dead_ms = ?, wedged_ms = NULL WHERE host = ?", Date.now(), host);
     return to;
