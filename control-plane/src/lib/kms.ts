@@ -1,6 +1,6 @@
 // AWS KMS for the proxy root CA: the private key never leaves KMS. FleetDO asks KMS to sign each
 // intermediate's to-be-signed bytes (docs/sandbox/networking/egress/tls/).
-import { AwsClient } from "aws4fetch";
+import { AwsApi, type AwsOptions } from "./aws";
 
 export interface Kms {
   /** ECDSA_SHA_256 over the SHA-256 of `message`; returns the DER signature KMS produces. */
@@ -10,23 +10,16 @@ export interface Kms {
 }
 
 export class AwsKms implements Kms {
-  private readonly client: AwsClient;
-  private readonly endpoint: string;
+  private readonly api: AwsApi;
 
-  constructor(accessKeyId: string, secretAccessKey: string, region: string) {
-    this.client = new AwsClient({ accessKeyId, secretAccessKey, region, service: "kms" });
-    this.endpoint = `https://kms.${region}.amazonaws.com/`;
+  constructor(accessKeyId: string, secretAccessKey: string, region: string, opts?: AwsOptions) {
+    this.api = new AwsApi("kms", accessKeyId, secretAccessKey, region, opts);
   }
 
   private async call<T>(target: string, body: unknown): Promise<T> {
-    const res = await this.client.fetch(this.endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/x-amz-json-1.1", "x-amz-target": `TrentService.${target}` },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`KMS ${target} failed: ${res.status} ${text.slice(0, 300)}`);
-    return JSON.parse(text) as T;
+    const res = await this.api.json(`TrentService.${target}`, body);
+    if (!res.ok) throw new Error(`KMS ${target} failed: ${res.status} ${res.text.slice(0, 300)}`);
+    return JSON.parse(res.text) as T;
   }
 
   async sign(keyId: string, message: Uint8Array): Promise<Uint8Array> {

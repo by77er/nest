@@ -1707,24 +1707,6 @@ describe("FleetDO and SandboxDO at the seam", () => {
     expect((await agentStub(s.agent).info()).brain).toMatchObject({ epoch: 1, phase: "starting" });
   });
 
-  it("N10: `lost` is backfilled only where the previous release had proof", async () => {
-    const cell = uniqueCell();
-    const a = await connectHost(cell);
-    const b = await connectHost(cell);
-    const c = await connectHost(cell);
-    const lost = await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), (inst: FleetDO, st) => {
-      st.storage.sql.exec("ALTER TABLE hosts DROP COLUMN lost");
-      st.storage.sql.exec("UPDATE hosts SET status = 'expired' WHERE host = ?", a.host);
-      st.storage.sql.exec("UPDATE hosts SET status = 'dead', instance_id = 'i-0retired' WHERE host = ?", b.host);
-      st.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, reason) VALUES ('i-0retired', 1, 'sandbox', 'idle')");
-      st.storage.sql.exec("UPDATE hosts SET status = 'dead' WHERE host = ?", c.host);
-      (inst as any).addLostColumn();
-      return st.storage.sql.exec<{ host: string; lost: number }>("SELECT host, lost FROM hosts ORDER BY host").toArray();
-    });
-    const by = Object.fromEntries(lost.map((r) => [r.host, r.lost]));
-    expect([by[a.host], by[b.host], by[c.host]]).toEqual([1, 0, 1]);
-  });
-
   it("A6: EC2 confirming a retired host's instance gone makes it lost", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
@@ -2192,8 +2174,14 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const cell = uniqueCell();
     const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    // Its hello said it is of the previous release: drained of brains on sight.
+    a.ws.close();
+    const ws = await Ws.connect("/v1/fleet", a.host_token);
+    ws.send(hostHello(a.host, cell, { role: "brain", brain_epochs: false }));
+    await ws.next("hello_ack");
+    for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "draining"; n++) await sleep(25);
     await runInDurableObject(fleet, async (inst: FleetDO, st) => {
-      st.storage.sql.exec("UPDATE hosts SET status = 'stonith_pending', brain_epochs = 0 WHERE host = ?", a.host);
+      st.storage.sql.exec("UPDATE hosts SET status = 'stonith_pending' WHERE host = ?", a.host);
       (inst as any).stonithDoneIfClear(a.host);
     });
     for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "draining"; n++) await sleep(25);

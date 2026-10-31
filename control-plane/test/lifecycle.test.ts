@@ -6,7 +6,7 @@
 // `fence_sandbox` emits `sandbox_state{fenced}` before the fence command's result).
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { FleetDO } from "../src/do/fleet";
+import { FleetDO } from "../src/do/fleet";
 import { previewHostname, shareHostname, type SandboxDO } from "../src/do/sandbox";
 import type { Ec2, InstanceState } from "../src/lib/ec2";
 import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
@@ -211,6 +211,117 @@ describe("STONITH is not undone by a hello", () => {
     await tick(cell, ec2);
     expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("dead");
     expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+  });
+});
+
+/** SandboxDO runs FleetDO's next `count` leaseLost calls, but FleetDO never hears the answers. */
+async function loseLeaseLostAnswers(cell: string, count: number) {
+  await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+    const real = (inst as any).sandbox.bind(inst);
+    (inst as any).sandbox = (id: string) => new Proxy(real(id), {
+      get: (stub, prop) => prop !== "leaseLost" ? Reflect.get(stub, prop) : async (...args: unknown[]) => {
+        const r = await stub.leaseLost(...args);
+        if (count-- > 0) throw new Error("answer lost");
+        return r;
+      },
+    });
+  });
+}
+
+describe("every lost lease is reassigned, however its losses overlap", () => {
+  it("reassignments an earlier release queued are moved over and worked", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const b = await connectHost(cell);
+    a.ws.close();
+    const moved = await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'dead', dead_ms = 1 WHERE host = ?", a.host);
+      st.storage.sql.exec("INSERT INTO reassign_queue (sandbox, host, epoch, host_dead) VALUES (?, ?, 1, 1)", sbx.sandbox, a.host);
+      new FleetDO(st, env); // the migrations run in the constructor
+      return {
+        old: st.storage.sql.exec("SELECT 1 FROM reassign_queue").toArray().length,
+        now: st.storage.sql.exec("SELECT sandbox, host, epoch FROM reassignments").toArray(),
+      };
+    });
+    expect(moved).toEqual({ old: 0, now: [{ sandbox: sbx.sandbox, host: a.host, epoch: 1 }] });
+    await tick(cell, null);
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+  });
+
+  it("an older loss still retrying never stands in for the fence of a newer lease (B-4, O1)", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const b = await connectHost(cell);
+    await loseLeaseLostAnswers(cell, 100);
+    a.ws.close();
+    await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+    await nextCommands(b.ws, (c) => c.type === "sandbox_create");
+    // The new holder goes silent and comes back: it must fence its expired lease first.
+    await expireNow(cell, b.host, null);
+    const ws = await Ws.connect("/v1/fleet", b.host_token);
+    ws.send(hostHello(b.host, cell, { sandboxes: [{ sandbox: sbx.sandbox, epoch: 2, state: "fenced", dirty: false }] }));
+    await ws.next("hello_ack");
+    const fence = await nextCommands(ws, (c) => c.type === "fence" && c.reason === "lease expired");
+    expect(fence.find((c) => c.type === "fence")!.sandboxes).toEqual([sbx.sandbox]);
+  });
+
+
+  it("a loss at a newer epoch is queued while an older loss of the same sandbox is still retrying (B-4, L2)", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const others = [await connectHost(cell), await connectHost(cell)];
+    // SandboxDO takes the first reassignment, but its answer is lost: FleetDO keeps the row and retries.
+    await loseLeaseLostAnswers(cell, 1);
+    a.ws.close();
+    await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const second = await sandboxStub(sbx.sandbox).info();
+    expect(second.epoch).toBe(2);
+    // Its new holder dies before the tick retries the first row.
+    const holder = others.find((h) => h.host === second.host)!;
+    holder.ws.close();
+    await adminJson(`/v1/admin/hosts/${holder.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const last = others.find((h) => h !== holder)!;
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 3, host: last.host });
+  });
+});
+
+describe("a host FleetDO is terminating never serves again", () => {
+  it("its fence ok re-places its sandboxes elsewhere but leaves it stonith_pending until EC2 confirms it gone (B-2)", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "running", guest: GUEST }]);
+    const ec2 = new Ec2States("running");
+    await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
+      st.storage.sql.exec("UPDATE hosts SET instance_id = 'i-0hostA' WHERE host = ?", a.host);
+    });
+    a.ws.close();
+    const b = await connectHost(cell);
+    await expireNow(cell, a.host, ec2);
+    expect(ec2.terminated).toContain("i-0hostA");
+
+    // A partition heals before the instance stops: the host says hello and fences when asked.
+    const ws = await Ws.connect("/v1/fleet", a.host_token);
+    ws.send(hostHello(a.host, cell, { sandboxes: [{ sandbox: sbx.sandbox, epoch: 1, state: "fenced", dirty: false }] }));
+    const ack = await ws.next("hello_ack");
+    await events(ws, [], ack.last_event_seq + 1);
+    const fence = (await nextCommands(ws, (c) => c.type === "fence" && c.reason === "lease expired")).find((c) => c.reason === "lease expired");
+    await okResult(ws, fence.cmd);
+
+    // The fence covers the lease, so the sandbox moves; but not back onto the instance being terminated.
+    expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("stonith_pending");
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+    ec2.state_ = "shutting-down";
+    await tick(cell, ec2);
+    expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("dead");
   });
 });
 

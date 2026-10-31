@@ -11,6 +11,7 @@ import { createRootCertificate, kmsRoot } from "../src/lib/ca";
 import { awsCell, cellAws, cellCredentials, parseCellCredentials, type AwsCellConfig } from "../src/lib/cells";
 import { pemToDer } from "../src/lib/util";
 import type { Env } from "../src/env";
+import type { EnrollRequest } from "../src/protocol/control";
 import { compressedSpki, csrPem, FakeKms, uniqueCell } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
@@ -38,7 +39,7 @@ async function inFleet<T>(cell: string, over: Partial<Env>, setup: { config?: Aw
   });
 }
 
-const endpoint = (client: unknown) => (client as { endpoint: string }).endpoint;
+const endpoint = (client: unknown) => (client as { api: { endpoint: string } }).api.endpoint;
 const keptRoot = (cell: string) => runInDurableObject(fleetStub(cell), async (_inst, state) =>
   state.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'root_ca'").toArray()[0]?.value ?? null);
 /** An intermediate for a fresh CSR, signed by the cell's root. */
@@ -216,6 +217,17 @@ describe("the cell's root CA certificate", () => {
     await expect(inFleet(cell, creds, { config: config(), kms: await FakeKms.create() }, (inst) => inst.rootCertificatePem()))
       .rejects.toThrow("the root certificate the cell keeps is not a certificate for the cell's KMS key");
     expect(await keptRoot(cell)).toBe(before);
+  });
+
+  it("costs an unauthenticated enrollment no KMS call: the proof is checked before the CSR is signed", async () => {
+    const cell = uniqueCell();
+    const kms = await FakeKms.create();
+    const csr = await csrPem();
+    const enroll = (proof: EnrollRequest["proof"]) => inFleet(cell, { AWS_CELL_CREDENTIALS: credentials(cell) }, { config: config(), kms }, (inst) =>
+      inst.enroll({ protocol_version: 1, role: "sandbox", cell, proof, proxy_ca_csr_pem: csr } as EnrollRequest, cell, null));
+    await expect(enroll({ type: "enrollment_token", token: "net_unknown" })).rejects.toThrow("unknown enrollment token");
+    await expect(enroll({ type: "aws_identity_document", document_b64: "", pkcs7_b64: "" })).rejects.toThrow("unverified identity document");
+    expect([kms.calls, kms.keyIds]).toEqual([0, []]);
   });
 
   it("matches the key and the certificate whatever valid DER encodes the public key", async () => {

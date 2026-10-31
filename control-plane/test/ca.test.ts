@@ -41,4 +41,15 @@ describe("proxy root CA in KMS", () => {
     const other = await FakeKms.create();
     await expect(signIntermediate(kmsRoot(rootPem, other, "k"), await csrPem(), 3_600_000)).rejects.toThrow("does not verify against the root");
   });
+
+  it("issues concurrent intermediates, each signed by the root (B-11: no shared signer between them)", async () => {
+    const kms = await FakeKms.create();
+    const rootPem = await createRootCertificate(await kms.publicKey(), kmsRoot("", kms, "k").sign, "CN=test root", 86_400_000);
+    // A KMS round trip: each signing waits, so the issues interleave.
+    const slow = { ...kmsRoot(rootPem, kms, "k"), sign: async (tbs: Uint8Array) => { await new Promise((r) => setTimeout(r, 20)); return kmsRoot(rootPem, kms, "k").sign(tbs); } };
+    const csrs = await Promise.all([csrPem(), csrPem(), csrPem(), csrPem()]);
+    const issued = await Promise.all(csrs.map((c) => signIntermediate(slow, c, 3_600_000)));
+    const root = new x509.X509Certificate(rootPem);
+    for (const ca of issued) expect(await new x509.X509Certificate(ca.cert_pem).verify({ publicKey: root.publicKey, signatureOnly: true })).toBe(true);
+  });
 });

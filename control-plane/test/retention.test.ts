@@ -186,18 +186,6 @@ describe("stored enums", () => {
     expect((await stub.turns()).map((t) => t.status)).toEqual(["paused"]);
     expect(error).toHaveBeenCalledWith(expect.stringContaining("turns.status"));
   });
-
-  it("a host row from before `tunnel_state` reads `none`, written once by the migration", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const state = await runInDurableObject(fleetStub(cell), (_inst: FleetDO, st) => {
-      st.storage.sql.exec("UPDATE hosts SET tunnel_state = NULL, status = 'dead', dead_ms = NULL WHERE host = ?", h.host);
-      new FleetDO(st, env); // the migrations run in the constructor
-      return st.storage.sql.exec<{ tunnel_state: string | null; dead_ms: number | null }>(
-        "SELECT tunnel_state, dead_ms FROM hosts WHERE host = ?", h.host).toArray()[0];
-    });
-    expect(state).toEqual({ tunnel_state: "none", dead_ms: expect.any(Number) });
-  });
 });
 
 describe("the fleet view", () => {
@@ -487,7 +475,7 @@ describe("a host that never connected and whose proof enrolls again", () => {
         ...env,
         AGENT: { idFromName: (n: string) => n, get: () => ({
           onHostLost: async () => {
-            seen.push(st.storage.sql.exec("SELECT 1 FROM reassign_queue WHERE host = ?", first).toArray().length);
+            seen.push(st.storage.sql.exec("SELECT 1 FROM reassignments WHERE host = ?", first).toArray().length);
           },
         }) },
       };
@@ -503,7 +491,7 @@ describe("a dead host's row", () => {
   it.each([
     ["a lease", "INSERT INTO leases (sandbox, host, epoch, expired) VALUES ('sbx_guard', ?, 1, 1)"],
     ["a stale incarnation", "INSERT INTO stale_incarnations (sandbox, host, epoch, first_seen_ms) VALUES ('sbx_guard', ?, 1, 0)"],
-    ["a queued reassignment", "INSERT INTO reassign_queue (sandbox, host, epoch, host_dead) VALUES ('sbx_guard', ?, 1, 1)"],
+    ["a queued reassignment", "INSERT INTO reassignments (sandbox, host, epoch, host_dead) VALUES ('sbx_guard', ?, 1, 1)"],
     ["an eviction", "INSERT INTO evictions (sandbox, host, epoch) VALUES ('sbx_guard', ?, 1)"],
   ])("is kept while %s names it", async (_what, insert) => {
     const cell = uniqueCell();
@@ -564,7 +552,7 @@ describe("a kill FleetDO answered itself", () => {
     // index row gone, and the kill it never answered answered by FleetDO.
     const kill = await fleetSql(cell, (sql, inst) => {
       sql.exec("DELETE FROM host_agents WHERE host = ?", a.host);
-      (inst as unknown as { hostDied(h: string, why: string): void }).hostDied(a.host, "drained");
+      void (inst as unknown as { die(h: string, cause: string): Promise<void> }).die(a.host, "drained");
       return rows(sql, "SELECT result, answered_by, (SELECT lost FROM hosts WHERE host = ?) AS lost FROM commands WHERE host = ? AND type = 'agent_stop'", a.host, a.host)[0];
     });
     expect(kill).toMatchObject({ result: expect.any(String), answered_by: "fleet", lost: 0 });
@@ -648,36 +636,6 @@ describe("confirming a host dead", () => {
   });
 });
 
-describe("a dead host's launch left open", () => {
-  it("is ended: terminated if it still runs, then recorded gone", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const live = await connectHost(cell);
-    const terminated: string[] = [];
-    let state: "running" | "terminated" = "running";
-    await fleetSql(cell, (sql, inst) => {
-      inst.ec2Override = {
-        launch: async () => "i-x", images: async () => [],
-        terminate: async (id: string) => { terminated.push(id); state = "terminated"; },
-        state: async () => state,
-      };
-      // A previous release's death: the host dead, its launch never marked.
-      sql.exec("UPDATE hosts SET instance_id = 'i-0stale', status = 'dead' WHERE host = ?", h.host);
-      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0stale', ?, ?, 'sandbox')", Date.now(), h.host);
-      // A live host's open launch is left alone.
-      sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role) VALUES ('i-0live', ?, ?, 'sandbox')", Date.now(), live.host);
-    });
-    h.ws.close();
-    for (let i = 0; i < 2; i++) {
-      await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
-      await runDurableObjectAlarm(fleetStub(cell));
-    }
-    expect(terminated).toEqual(["i-0stale"]);
-    expect(await fleetSql(cell, (sql) => rows(sql, "SELECT instance_id, reason, ended_ms IS NOT NULL AS ended FROM launched ORDER BY instance_id")))
-      .toEqual([{ instance_id: "i-0live", reason: null, ended: 0 }, { instance_id: "i-0stale", reason: "dead", ended: 1 }]);
-  });
-});
-
 describe("the pruning pass", () => {
   it("has its own daily deadline, armed on every start, so a quiet cell without tunnels prunes", async () => {
     const cell = uniqueCell();
@@ -756,6 +714,22 @@ describe("FleetDO's own answers are no evidence that a host processes commands",
     const answered = await fleetSql(cell, (sql) =>
       rows(sql, "SELECT answered_by FROM commands WHERE cmd IN (?, ?, ?) AND result IS NOT NULL", checkpoint!, fence!, kill));
     expect(answered).toEqual([{ answered_by: "fleet" }, { answered_by: "fleet" }, { answered_by: "fleet" }]);
+  });
+
+  it("nor are its answers to starts a host's expiry failed, or to commands for a dead host", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell, "brain");
+    const [start] = await fleetStub(cell).issueCommands(h.host, [{ type: "agent_start", agent: "agt_01expirestart00000000000000", epoch: 1 } as never]);
+    await fleetSql(cell, (sql) => sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, h.host));
+    await fleetSql(cell, (sql) => sql.exec("INSERT INTO leases (sandbox, host, epoch) VALUES ('sbx_01heldbyexpired000000000000', ?, 1)", h.host));
+    await fleetSql(cell, (_sql, inst) => (inst as any).expireHost(h.host));
+    h.ws.close();
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const [late] = await fleetStub(cell).issueCommands(h.host, [{ type: "fence", sandboxes: [], reason: "t" }]);
+    const answers = await fleetSql(cell, (sql) => rows(sql, "SELECT cmd, result, answered_by FROM commands WHERE cmd IN (?, ?)", start!, late!));
+    expect(answers.map((a) => [a.answered_by, JSON.parse(a.result as string).error.retryable])).toEqual(
+      answers.map((a) => a.cmd === start ? ["fleet", true] : ["fleet", false]));
+    expect(answers).toHaveLength(2);
   });
 
   it("only its kills outlive their retention on a host whose death isn't proof", async () => {
