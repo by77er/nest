@@ -363,9 +363,8 @@ pub struct Target {
 async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req: Request<Incoming>) -> Response<Body> {
     let mk_audit = |req: &Request<Incoming>, v: EgressVerdict| Audit::new(&target.host, target.port, v).request(req.method(), req.uri());
 
-    // Decided per request, not per connection: a push or a grant's expiry since the connection
-    // (or its previous request) was admitted may have revoked the host, or made it
-    // passthrough-only, which an inspected connection can't honour.
+    // Decided per request: a push or a grant's expiry since admission may have revoked the host,
+    // or made it passthrough-only, which an inspected connection can't honour.
     let decision = decide(&ctx, &target.host, target.port);
     if decision == EgressDecision::Deny || (target.tls && decision == EgressDecision::Passthrough) {
         ctx.audit(mk_audit(&req, EgressVerdict::Deny).reason("not_allowed"));

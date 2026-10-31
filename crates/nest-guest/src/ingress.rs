@@ -141,9 +141,8 @@ impl Master {
     }
 }
 
-/// A PTY pair whose fds are close-on-exec from the start: any process the guest spawns
-/// meanwhile (a concurrent Bash or task) would otherwise inherit the slave and keep the terminal
-/// open after the session's shell exits, so the session would never end.
+/// A PTY pair whose fds are close-on-exec from the start: a concurrent Bash or task would
+/// otherwise inherit the slave and keep the session open after its shell exits.
 fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
     grantpt(&master)?;

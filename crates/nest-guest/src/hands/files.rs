@@ -35,10 +35,9 @@ pub enum Refusal {
     Io(std::io::Error),
 }
 
-/// Open `path` for reading, or for writing (created if missing, not truncated), without ever
-/// blocking: `O_NONBLOCK` makes the open of a FIFO or device return at once, the opened fd's own
-/// metadata decides (no separate stat a sandbox process could race), and only a regular file is
-/// handed back, blocking again.
+/// Open `path` for reading, or for writing (created, not truncated), without blocking: with
+/// `O_NONBLOCK` a FIFO or device returns at once, the fd's own metadata decides (no stat to race),
+/// and only a regular file is handed back, blocking again.
 pub fn open_regular(path: &Path, write: bool) -> Result<(File, Metadata), Refusal> {
     let mut o = std::fs::OpenOptions::new();
     if write {
