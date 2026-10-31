@@ -175,10 +175,9 @@ impl Sbx {
         self.state_dir.join("disk.img")
     }
 
-    /// Whether the disk may differ from its head, or a commit's outcome is still unknown: what
-    /// decides whether an incarnation is salvaged or committed before its disk goes. Durable state,
-    /// read under the lock when the decision is made (never the reported `dirty`, which a commit
-    /// clears while a VM may still run on the disk).
+    /// Whether the disk may differ from its head or a commit's outcome is unknown: decides salvage
+    /// or archive commit. Durable, read under the lock (the reported `dirty` is cleared by a commit
+    /// while a VM may still run).
     fn may_hold_work(&self) -> bool {
         !self.disk_clean || self.unanswered.is_some()
     }
@@ -232,8 +231,7 @@ impl Sbx {
     }
 }
 
-/// An incarnation's heavy state, locked. Owned, so a commit can unlock it while it waits for the
-/// answer and lock it again.
+/// An incarnation's state, locked. Owned, so a commit can unlock it while it waits.
 type SbxGuard = tokio::sync::OwnedMutexGuard<Sbx>;
 
 /// Lock-free pause handles of running VMs, one per incarnation: a late step of an older epoch (its
@@ -1243,16 +1241,14 @@ impl Inner {
         });
     }
 
-    /// An incarnation that never runs again (fenced, superseded by a newer epoch here, or left by
-    /// a previous nestd): salvage its uncommitted work as a sibling branch, if it may hold any
-    /// ([`Sbx::may_hold_work`], read when the retire takes the lock). A transient
-    /// failure (a timeout, a store error, `parent_mismatch`, anything retryable) keeps the disk and
-    /// is retried with backoff; a final refusal (`stale_epoch`, `invalid_message`: SandboxDO will
-    /// never take that work) is logged with the error and ends it, like a landed salvage. Then its
-    /// directories are deleted, its `fenced` row (while still this epoch's) marked clean, and
-    /// `incarnation_retired` reported, so FleetDO need not wait out the salvage window. A destroy
-    /// that removed the directory meanwhile ends it silently. Once per incarnation; the sandbox
-    /// lock is held only while chunking.
+    /// An incarnation that never runs again (fenced, superseded here, or left by a previous nestd):
+    /// salvage its uncommitted work as a sibling branch, if [`Sbx::may_hold_work`]. A transient
+    /// failure (timeout, store error, `parent_mismatch`, anything retryable) keeps the disk and is
+    /// retried with backoff; a final refusal (`stale_epoch`, `invalid_message`) is logged and ends
+    /// it, like a landed salvage. Then its directories go, its `fenced` row (while this epoch's) is
+    /// marked clean and `incarnation_retired` reported, so FleetDO need not wait out the salvage
+    /// window. A destroy that removed the directory meanwhile ends it silently. Once per
+    /// incarnation; the lock is held only while chunking.
     fn retire(self: &Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>) {
         let this = self.clone();
         // Boxed: retiring commits, a commit's rejection fences, a fence retires.
@@ -1634,11 +1630,9 @@ impl Inner {
         self.launch(sbx, fork).await
     }
 
-    /// Start a VM on `s`'s disk and connect its guest (with `s`'s agent slots, and `fork`'s
-    /// identity on a fork's first boot), then wait for the guest to come up. A VM writes to the
-    /// disk from the moment it starts, so `clean = false` is persisted just before (a restart
-    /// salvages it). On any error after the VM was created it is stopped again: no started VM is
-    /// left without an owner (a stranded one would share the disk with the next boot).
+    /// Start a VM on `s`'s disk and wait for its guest (`fork`: a fork's first boot). `clean =
+    /// false` is persisted first, so a restart salvages. On any error the VM is stopped again: a
+    /// stranded one would share the disk with the next boot.
     async fn launch(&self, s: &mut Sbx, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
         s.vm = Some(self.driver.create(s.vm_spec()).await.context("create VM")?);
         let r = self.start_vm(s, fork).await;
@@ -1667,8 +1661,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Stop `s`'s VM, if it has one, with what exists only while it runs: its guest connection and
-    /// its pause handle.
+    /// Stop `s`'s VM, if any, with its guest connection and pause handle.
     async fn stop_vm(&self, s: &mut Sbx) {
         if let Some(g) = s.guest.take() {
             g.shutdown();
@@ -1755,8 +1748,7 @@ impl Inner {
         entry
     }
 
-    /// Lock `id@epoch`'s incarnation, refusing a stale or fenced epoch both before and after
-    /// waiting for the lock (a fence may land meanwhile).
+    /// Lock `id@epoch`'s incarnation, refusing a stale or fenced epoch before and after the wait.
     async fn lock_live(&self, id: &SandboxId, epoch: Epoch) -> Result<SbxGuard, ErrorBody> {
         self.check_epoch(id, epoch)?;
         let entry = self.sandbox(id).ok_or_else(|| error(error_codes::UNKNOWN_SANDBOX, format!("{id} is not on this host"), false))?;
@@ -1825,10 +1817,8 @@ impl Inner {
         (s, r.map(|_| ()))
     }
 
-    /// A suspend that failed before it was done goes back to `running`, so it can be asked again
-    /// (SandboxDO's idle timer): the VM runs on, unless the incarnation was fenced meanwhile or
-    /// the failure fences it. A landed commit may have marked the disk clean, so that is undone,
-    /// durably, first.
+    /// A failed suspend goes back to `running` (SandboxDO's idle timer asks again) unless it was
+    /// or will be fenced. A landed commit may have marked the disk clean: undone durably first.
     async fn roll_back_suspend(&self, s: &mut Sbx, why: &ErrorBody) {
         let (id, epoch) = (s.id.clone(), s.epoch);
         if self.fenced(&id, epoch) || rejection_fences(&why.code) {
@@ -1864,8 +1854,7 @@ impl Inner {
             return Err(error(error_codes::INVALID_MESSAGE, format!("{id} is {state:?}, not suspended"), false));
         }
         if s.vm.is_some() && s.paused {
-            // A VM runs on the disk again: from here on it may differ from its head. Recorded
-            // first, or a restart would delete work as clean.
+            // Recorded before the VM runs again, or a restart would delete work as clean.
             s.disk_clean = false;
             s.persist(None).map_err(internal)?;
             self.ensure_not_fenced(id, epoch)?;
@@ -1875,7 +1864,6 @@ impl Inner {
                 let _ = g.thaw().await;
             }
         } else if let Err(e) = self.launch(&mut s, None).await {
-            // Cold boot from the local disk failed (its VM was stopped).
             self.ensure_not_fenced(id, epoch)?;
             return Err(internal(format!("resume {id}: {e:#}")));
         }
@@ -1900,8 +1888,7 @@ impl Inner {
             s.vm.as_mut().expect("checked").pause().await.map_err(internal)?;
         }
         let (mut s, r) = self.commit(s, reason, None, self.cfg.commit_timeout()).await;
-        // Never resume a VM that was fenced while the commit was in flight, or whose rejection
-        // fences it.
+        // Never resume a VM fenced during the commit, or whose rejection fences it.
         if running && !self.fenced(id, epoch) && !r.as_ref().is_err_and(|e| rejection_fences(&e.code)) {
             if let Some(vm) = s.vm.as_mut() {
                 let _ = vm.resume().await;
@@ -2146,8 +2133,7 @@ impl Inner {
             .collect();
         let mut failed = vec![];
         for (id, epoch) in running {
-            // The deadline bounds the wait for each commit's answer. Never a cancellation: a
-            // suspend cancelled while it waits loses its unanswered record (and its rollback).
+            // Bounds each commit's wait; never a cancellation, which would lose the unanswered record.
             let budget = Duration::from_millis((deadline_ms - now_ms()).max(0) as u64);
             if budget.is_zero() || self.suspend(&id, epoch, SuspendMode::DiskOnly, budget.min(self.cfg.commit_timeout())).await.is_err() {
                 failed.push(id.0);
@@ -2176,7 +2162,7 @@ impl Inner {
                 Err(e) if incarnation::reask_failure_ends_commit(reason == CommitReason::Salvage, prev.reason == CommitReason::Salvage, !e.retryable) => {
                     return (s, Err(e));
                 }
-                // Another commit's request was refused (B1): this incarnation's salvage still runs.
+                // Another kind of request was refused: this incarnation's salvage still runs.
                 Err(_) => {}
             }
         }
@@ -2197,8 +2183,7 @@ impl Inner {
     /// Send a `commit_request` and wait (unlocked) for its answer; a timeout keeps it as
     /// [`Sbx::unanswered`] for the next commit to ask again.
     async fn send_commit(self: &Arc<Self>, s: SbxGuard, c: SentCommit, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
-        // Recorded before it goes out: a restart asks again under this id rather than send another.
-        // Unrecorded, it doesn't go out (a crash would lose its id).
+        // Recorded before it goes out (or not sent): a restart asks again under this id.
         if let Err(e) = s.persist(Some(&c)) {
             return (s, Err(error(error_codes::INTERNAL, format!("recording commit {}: {e}", c.request), true)));
         }
@@ -2295,9 +2280,8 @@ impl Inner {
     }
 }
 
-/// Whether SandboxDO's rejection of a commit fences the incarnation: it has a newer epoch, or a
-/// head this one didn't build on. The fence runs from a spawned task (`apply_commit`), so a caller
-/// that would resume the VM checks this too, not only `fenced`.
+/// Whether SandboxDO's rejection of a commit fences the incarnation. The fence runs from a spawned
+/// task (`apply_commit`), so a caller that would resume the VM checks this, not only `fenced`.
 fn rejection_fences(code: &str) -> bool {
     code == error_codes::STALE_EPOCH || code == error_codes::PARENT_MISMATCH
 }

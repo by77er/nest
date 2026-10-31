@@ -229,10 +229,8 @@ pub fn salvage_retryable(retryable: bool, parent_mismatch: bool) -> bool {
 }
 
 /// Whether a commit stops at a failed re-ask of its unanswered request (`refused`: SandboxDO's
-/// final rejection of that request; otherwise a timeout or store error, retried later). It goes on
-/// only as a salvage re-asking a request that wasn't one: that refusal was about the other
-/// request's parent or epoch, and says nothing about whether this incarnation's work can be
-/// salvaged.
+/// final rejection; else a timeout or store error). Only a salvage re-asking another kind of
+/// request goes on: that refusal says nothing about whether this incarnation's work can be saved.
 pub fn reask_failure_ends_commit(salvage: bool, reasked_salvage: bool, refused: bool) -> bool {
     !(refused && salvage && !reasked_salvage)
 }

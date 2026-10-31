@@ -215,7 +215,7 @@ impl Task {
         };
         if protocol_version != PROTOCOL_VERSION {
             let e = ControlFrame { id: None, reply_to: None, body: ControlBody::Error { error: error("unsupported_version", format!("host speaks {PROTOCOL_VERSION}"), false) } };
-            let _ = c.write(&e).await;
+            let _ = write_json(&mut c.wr, &e).await;
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("guest protocol {protocol_version}")));
         }
         // Same boot and same guest-agent process = memory restore. Same boot, new process = the
@@ -278,7 +278,7 @@ impl Task {
                 }
                 cli = cli_rx.recv() => {
                     let Some((id, result)) = cli else { continue };
-                    c.write(&ControlFrame { id: None, reply_to: Some(id), body: ControlBody::CliResult { result } }).await?;
+                    write_json(&mut c.wr, &ControlFrame { id: None, reply_to: Some(id), body: ControlBody::CliResult { result } }).await?;
                 }
             }
         }
@@ -362,12 +362,8 @@ impl Session {
     async fn send(&mut self, body: ControlBody) -> io::Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
-        self.write(&ControlFrame { id: Some(id), reply_to: None, body }).await?;
+        write_json(&mut self.wr, &ControlFrame { id: Some(id), reply_to: None, body }).await?;
         Ok(id)
-    }
-
-    async fn write(&mut self, f: &ControlFrame) -> io::Result<()> {
-        write_json(&mut self.wr, f).await
     }
 }
 
@@ -467,8 +463,7 @@ pub(crate) mod tests {
     }
 
     /// A `resume` the guest refuses (it couldn't reseed its RNG, say) is a failed readiness: the
-    /// sandbox isn't reported ready, and the next connection asks again. It used to be logged and
-    /// the guest reported ready, unreseeded.
+    /// sandbox isn't reported ready, and the next connection asks again.
     #[tokio::test]
     async fn a_refused_resume_is_not_ready_and_is_asked_again() {
         let dir = tempfile::tempdir().unwrap();
