@@ -820,8 +820,11 @@ describe("one brain per agent: the brain record", () => {
     });
     await newer();
     ws.send({ type: "tool_call", seq: 1, call: "cal_mid-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "mid" } });
-    const res = await ws.next("tool_result", (m) => m.call === "cal_mid-1").catch(() => null);
-    expect(res === null || res.outcome.status === "error").toBe(true);
+    // The call's ack comes once it ran (after any tool_result to this socket): no long wait for a result never sent.
+    await ws.next("ack", (m) => m.up_to >= 1);
+    expect(ws.drain().filter((m) => m.type === "tool_result" && m.call === "cal_mid-1" && m.outcome.status !== "error")).toEqual([]);
+    const outcome = await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).calls.call("cal_mid-1")?.outcome);
+    expect(outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
     expect((await wsStub(s.workstream).events()).some((e: any) => e.type === "progress" && e.summary === "mid")).toBe(false);
     // The guest's `nest emit` with a newer record landing mid-call still goes through.
     await newer();
