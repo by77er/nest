@@ -482,6 +482,54 @@ describe("#21 a deadline re-armed while it runs isn't dropped", () => {
     });
   });
 
+  // A bare object with a deadlines table (a ChannelDO no channel uses).
+  const bare = () => env.CHANNEL.get(env.CHANNEL.idFromName(`~deadlines-${crypto.randomUUID()}`));
+
+  it("the arm-if-absent idiom inside the key's own handler re-arms it (a running key isn't armed)", async () => {
+    await runInDurableObject(bare(), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("x", 1);
+      await d.runDue(Date.now(), async () => {
+        if (!d.has("x")) await d.set("x", Date.now() + 60_000);
+      });
+      expect(d.has("x")).toBe(true);
+    });
+  });
+
+  it("a re-arm for the very time being run survives (the handler asked to run again)", async () => {
+    await runInDurableObject(bare(), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("x", 5);
+      let runs = 0;
+      await d.runDue(Date.now(), async () => {
+        runs++;
+        await d.set("x", 5);
+      });
+      expect(runs).toBe(1);
+      expect(st.storage.sql.exec("SELECT at FROM deadlines WHERE key = 'x'").toArray()).toEqual([{ at: 5 }]);
+    });
+  });
+
+  it("a key cleared or moved by an earlier key's handler doesn't run from the stale snapshot", async () => {
+    await runInDurableObject(bare(), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("a", 1);
+      await d.set("b", 2);
+      await d.set("c", 3);
+      const later = Date.now() + 60_000;
+      const ran: string[] = [];
+      await d.runDue(Date.now(), async (k) => {
+        ran.push(k);
+        if (k === "a") {
+          await d.clear("b");
+          await d.set("c", later);
+        }
+      });
+      expect(ran).toEqual(["a"]);
+      expect(st.storage.sql.exec("SELECT key, at FROM deadlines ORDER BY key").toArray()).toEqual([{ key: "c", at: later }]);
+    });
+  });
+
   it("an unplaced sandbox keeps retrying while there is no capacity", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);

@@ -12,7 +12,7 @@
 import type { Env } from "../env";
 import { asNestError } from "./util";
 import type { PostInput } from "./channels";
-import type { Deadlines } from "./reliable";
+import { type Deadlines, withTimeout } from "./reliable";
 
 /** The deadline key the owning object's alarm dispatches to `flush`. */
 export const OUTBOX_DEADLINE = "chan_out";
@@ -49,9 +49,8 @@ export class ChannelOutbox {
     private readonly ownerFacts?: OwnerFacts,
   ) {
     sql.exec(`CREATE TABLE IF NOT EXISTS chan_out (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL,
-      tainted INTEGER NOT NULL, agent_owner TEXT, has_owner INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
-    const cols = sql.exec<{ name: string }>("PRAGMA table_info(chan_out)").toArray();
-    if (!cols.some((c) => c.name === "refusals")) sql.exec("ALTER TABLE chan_out ADD COLUMN refusals INTEGER NOT NULL DEFAULT 0");
+      tainted INTEGER NOT NULL, agent_owner TEXT, has_owner INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL,
+      refusals INTEGER NOT NULL DEFAULT 0)`);
   }
 
   /**
@@ -62,10 +61,6 @@ export class ChannelOutbox {
     this.sql.exec("INSERT INTO chan_out (channel, body, tainted, agent_owner, has_owner, created_ms) VALUES (?, ?, ?, ?, ?, ?)",
       channel, JSON.stringify(post), opts.tainted ? 1 : 0, opts.agent_owner ?? null, opts.agent_owner !== undefined ? 1 : 0, Date.now());
     this.waitUntil(this.deadlines.set(OUTBOX_DEADLINE, Date.now(), true));
-  }
-
-  pending(): number {
-    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM chan_out").one().n;
   }
 
   /**
@@ -88,7 +83,7 @@ export class ChannelOutbox {
             ? { agent_owner: r.agent_owner, ...(r.agent_owner && this.ownerFacts ? await this.ownerFacts(r.agent_owner) : {}) }
             : {};
           await this.env.CHANNEL.get(this.env.CHANNEL.idFromName(r.channel)).post(r.channel, { principal: "platform", tainted: r.tainted === 1 }, post, extra);
-        })(), POST_TIMEOUT_MS);
+        })(), POST_TIMEOUT_MS, "channel post");
       } catch (e) {
         const ne = asNestError(e);
         if (!ne || ne.retryable) throw e;
@@ -105,16 +100,5 @@ export class ChannelOutbox {
       done++;
     }
     if (done < rows.length || rows.length === FLUSH_BATCH) await this.deadlines.set(OUTBOX_DEADLINE, Date.now() + 1, true);
-  }
-}
-
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([p, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`channel post timed out after ${ms} ms`)), ms);
-    })]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
   }
 }

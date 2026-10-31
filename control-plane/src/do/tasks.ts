@@ -8,6 +8,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
+import { Deadlines, withTimeout } from "../lib/reliable";
 import { sqlIn, storedEnum } from "../lib/stored";
 import {
   type Actor, type Applied, applyTaskOp, checkLedgerAccess, CLOSED_STATUSES, type HistoryEntry, type HistoryValue, inboxOwner, LedgerName,
@@ -68,6 +69,11 @@ const NOTICE_RETRY_MAX_MS = 5 * 60_000;
 /** When a notice that failed `attempts` times before (0 for the first) is tried again, from now. */
 export const noticeRetryMs = (attempts: number) => Math.min(1_000 * 2 ** Math.max(0, attempts), NOTICE_RETRY_MAX_MS);
 const NOTICES_PER_ALARM = 50;
+/** Deadline keys: undelivered notices (at the earliest row's `next_ms`), and the daily prune. */
+const NOTICES = "notices";
+const PRUNE = "prune";
+/** One notice's call is abandoned (and retried later, under the same idempotency key) after this long. */
+export const NOTICE_TIMEOUT_MS = 5_000;
 export const LIST_DEFAULT_LIMIT = 50;
 export const LIST_MAX_LIMIT = 200;
 
@@ -92,7 +98,8 @@ export async function deliverNotice(env: Env, ledger: string, row: OutboxRow): P
   const agent = inboxOwner(row.channel);
   if (!agent) return "gone";
   try {
-    await env.AGENT.get(env.AGENT.idFromName(agent)).postInbox(`tasks:${ledger}`, row.body.text, false, row.idem);
+    // Bounded: `postInbox` may wait on the agent's wake, and one slow agent mustn't hold the rest.
+    await withTimeout(env.AGENT.get(env.AGENT.idFromName(agent)).postInbox(`tasks:${ledger}`, row.body.text, false, row.idem), NOTICE_TIMEOUT_MS, "notice");
     return "delivered";
   } catch (e) {
     if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return "gone";
@@ -111,6 +118,8 @@ function nestError(r: Refusal): NestError {
 
 export class TaskLedgerDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  // `!`: set in the constructor, except on the health instance, which serves only `health()`.
+  private readonly deadlines!: Deadlines;
 
   /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
   async health(): Promise<true> {
@@ -139,6 +148,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS applied (key TEXT PRIMARY KEY, outcome TEXT NOT NULL, ts_ms INTEGER NOT NULL)");
+    this.deadlines = new Deadlines(this.sql, ctx.storage);
   }
 
   // --- Storage -----------------------------------------------------------------------------------------
@@ -159,7 +169,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
     if (stored !== undefined && stored !== name) throw new NestError(ErrorCodes.INTERNAL, `this is ledger ${stored}, not ${name}`, 500);
     if (stored === undefined && write) {
       this.setKv("name", name);
-      this.setKv("last_prune", String(Date.now()));
+      this.ctx.waitUntil(this.deadlines.set(PRUNE, Date.now() + PRUNE_EVERY_MS));
     }
     return stored !== undefined || write;
   }
@@ -226,15 +236,21 @@ export class TaskLedgerDO extends DurableObject<Env> {
     return comment;
   }
 
-  /** Arm the alarm for the next undelivered notice or prune. Called right after the writes it covers. */
-  private async arm(): Promise<void> {
-    const notice = this.sql.exec<{ at: number | null }>("SELECT MIN(next_ms) AS at FROM outbox").one().at;
+  /** Arm the notices deadline for the earliest undelivered one (keeping an earlier deadline). Its row is written now. */
+  private armNotices(): Promise<void> {
+    const at = this.sql.exec<{ at: number | null }>("SELECT MIN(next_ms) AS at FROM outbox").one().at;
+    return at === null ? Promise.resolve() : this.deadlines.set(NOTICES, at, true);
+  }
+
+  /**
+   * A ledger written before its alarm went through `Deadlines` has `last_prune` in kv and no prune
+   * deadline, and the alarm it armed directly is pending: its first alarm since moves it to the deadline.
+   */
+  private adoptLastPrune(): void {
     const lastPrune = this.kv("last_prune");
-    const prune = lastPrune === undefined ? null : Number(lastPrune) + PRUNE_EVERY_MS;
-    const at = Math.min(notice ?? Infinity, prune ?? Infinity);
-    if (at === Infinity) return;
-    // The call is made before any await, so the alarm is armed in the same step as the rows it covers.
-    await this.ctx.storage.setAlarm(Math.max(at, 1));
+    if (lastPrune === undefined) return;
+    this.setKv("last_prune", null);
+    if (!this.deadlines.has(PRUNE)) this.ctx.waitUntil(this.deadlines.set(PRUNE, Number(lastPrune) + PRUNE_EVERY_MS));
   }
 
   // --- RPC ---------------------------------------------------------------------------------------------
@@ -268,7 +284,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
       tainted: task?.tainted === true,
     };
     if (key) this.sql.exec("INSERT INTO applied (key, outcome, ts_ms) VALUES (?, ?, ?)", key, JSON.stringify(outcome), now);
-    await this.arm();
+    if (r.value.notices.length) await this.deadlines.set(NOTICES, now, true);
     return outcome;
   }
 
@@ -283,7 +299,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
     return this.checkName(name, false);
   }
 
-  /** Tasks matching `filter` (the same rule as the core's `matches`), by key, after `cursor`. */
+  /** Tasks matching `filter` (the core's `matches` in SQL; a property test holds them equal), by key, after `cursor`. */
   async list(name: string, actor: Actor, filter: TaskFilter, cursor = 0, limit = LIST_DEFAULT_LIMIT): Promise<TaskPage> {
     if (!this.read(name, actor)) return { tasks: [], next_cursor: null, tainted: false };
     const n = Math.min(Math.max(1, Math.floor(limit)), LIST_MAX_LIMIT);
@@ -332,10 +348,24 @@ export class TaskLedgerDO extends DurableObject<Env> {
     return { task, comments, comment_count, history, tainted: task.tainted || comments.some((c) => c.tainted) };
   }
 
-  /** Deliver due notices (each deleted only once its channel took it, or never can), and prune daily. */
+  /** Deliver due notices, and prune daily. */
   override async alarm(): Promise<void> {
     const name = this.kv("name");
     if (name === undefined) return;
+    this.adoptLastPrune();
+    // Every row is covered, also one written before the ledger used `Deadlines` (its direct alarm brought us here).
+    this.ctx.waitUntil(this.armNotices());
+    await this.deadlines.runDue(Date.now(), async (key) => {
+      if (key === NOTICES) await this.deliverNotices(name);
+      else if (key === PRUNE) {
+        this.prune(Date.now());
+        await this.deadlines.set(PRUNE, Date.now() + PRUNE_EVERY_MS);
+      }
+    });
+  }
+
+  /** Deliver due notices, each deleted only once its channel took it (or never can); a failed one backs off. */
+  private async deliverNotices(name: string): Promise<void> {
     const now = Date.now();
     const due = this.sql.exec<{ id: number; channel: string; body: string; attempts: number }>(
       "SELECT id, channel, body, attempts FROM outbox WHERE next_ms <= ? ORDER BY id LIMIT ?", now, NOTICES_PER_ALARM).toArray();
@@ -350,8 +380,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
         this.sql.exec("UPDATE outbox SET attempts = attempts + 1, next_ms = ? WHERE id = ?", Date.now() + noticeRetryMs(n.attempts), n.id);
       }
     }
-    if (Number(this.kv("last_prune") ?? "0") + PRUNE_EVERY_MS <= now) this.prune(now);
-    await this.arm();
+    await this.armNotices();
   }
 
   private prune(now: number): void {
@@ -359,6 +388,5 @@ export class TaskLedgerDO extends DurableObject<Env> {
     this.sql.exec(`DELETE FROM comments WHERE task IN (${closed})`, now - CLOSED_TASK_DETAIL_MS);
     this.sql.exec(`DELETE FROM history WHERE task IN (${closed})`, now - CLOSED_TASK_DETAIL_MS);
     this.sql.exec("DELETE FROM applied WHERE ts_ms < ?", now - APPLIED_RETENTION_MS);
-    this.setKv("last_prune", String(now));
   }
 }

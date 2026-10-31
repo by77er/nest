@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { CatalogDO } from "../src/do/catalog";
 import { ledgerStub, noticeRetryMs, TaskLedgerDO } from "../src/do/tasks";
 import { CHANNEL_CAPABILITIES, SEED_CATALOG, SEED_CATALOG_V1, SEED_VERSION } from "../src/lib/spec";
-import { TASK_ADMIN_TOOLS, TASK_TOOLS } from "../src/lib/tasks";
+import { matches, TASK_ADMIN_TOOLS, TASK_STATUSES, TASK_TOOLS, type Task, type TaskFilter } from "../src/lib/tasks";
 import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -300,16 +300,36 @@ describe("TaskLedgerDO", () => {
     await runInDurableObject(l, async (i: TaskLedgerDO, st) => {
       const longAgo = Date.now() - 31 * 86_400_000;
       st.storage.sql.exec("UPDATE tasks SET updated_ms = ?", longAgo);
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'last_prune'", String(longAgo));
+      st.storage.sql.exec("UPDATE deadlines SET at = 1 WHERE key = 'prune'");
       // Idempotency records: a week old goes, a fresh one stays.
       st.storage.sql.exec("INSERT INTO applied (key, outcome, ts_ms) VALUES ('old', '{}', ?), ('fresh', '{}', ?)", Date.now() - 8 * 86_400_000, Date.now());
       await i.alarm();
       expect(st.storage.sql.exec<{ key: string }>("SELECT key FROM applied ORDER BY key").toArray().map((r) => r.key)).toEqual(["fresh"]);
+      // The next prune is a day out.
+      const next = st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'prune'").one().at;
+      expect(next).toBeGreaterThan(Date.now() + 86_400_000 - 60_000);
     });
     const old = await l.get(L, op, "T-1");
     expect([old.task.status, old.comments.length, old.history.length]).toEqual(["canceled", 0, 0]);
     const live = await l.get(L, op, "T-2");
     expect([live.comments.length, live.history.length]).toEqual([1, 1]);
+  });
+
+  it("a ledger from before its alarm used Deadlines (last_prune in kv, notices without a deadline) is adopted by its next alarm", async () => {
+    const L = uniqueLedger();
+    const l = ledgerStub(env, L);
+    await l.apply(L, op, { kind: "create", title: "t" });
+    const lastPrune = Date.now() - 3_600_000;
+    await runInDurableObject(l, async (i: TaskLedgerDO, st) => {
+      st.storage.sql.exec("DELETE FROM deadlines");
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('last_prune', ?)", String(lastPrune));
+      st.storage.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES ('agt_ghost0000000000000000000000/inbox', ?, 0)", JSON.stringify(POST));
+      await i.alarm();
+      expect(st.storage.sql.exec("SELECT COUNT(*) AS n FROM outbox").one().n).toBe(0);
+      expect(st.storage.sql.exec("SELECT key, at FROM deadlines").toArray()).toEqual([{ key: "prune", at: lastPrune + 86_400_000 }]);
+      expect(st.storage.sql.exec("SELECT COUNT(*) AS n FROM kv WHERE key = 'last_prune'").one().n).toBe(0);
+      expect(await st.storage.getAlarm()).toBe(lastPrune + 86_400_000);
+    });
   });
 
   it("counts only open tasks against the size limit", async () => {
@@ -360,6 +380,26 @@ describe("TaskLedgerDO", () => {
       await i.alarm();
       expect(st.storage.sql.exec("SELECT COUNT(*) AS n FROM outbox").one().n).toBe(0);
     });
+  });
+
+  it("a notice whose agent never answers is cut off and retried; the notices behind it still go", { timeout: 20_000 }, async () => {
+    const L = uniqueLedger();
+    const l = ledgerStub(env, L);
+    await l.apply(L, op, { kind: "create", title: "t" });
+    const hung = "agt_hung0000000000000000000000";
+    const live = "agt_live0000000000000000000000";
+    const delivered: string[] = [];
+    await runInDurableObject(l, async (i: TaskLedgerDO, st) => {
+      (i as any).env = { ...(i as any).env, AGENT: {
+        idFromName: (n: string) => n,
+        get: (n: string) => ({ postInbox: () => (n === hung ? new Promise(() => undefined) : Promise.resolve(delivered.push(n))) }),
+      } };
+      st.storage.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES (?, ?, 0), (?, ?, 0)",
+        `${hung}/inbox`, JSON.stringify(POST), `${live}/inbox`, JSON.stringify(POST));
+      await i.alarm();
+      expect(st.storage.sql.exec("SELECT channel, attempts FROM outbox").toArray()).toEqual([{ channel: `${hung}/inbox`, attempts: 1 }]);
+    });
+    expect(delivered).toEqual([live]);
   });
 
   it("retries a notice that failed (alarm re-armed, backoff growing) and deletes it only once delivered, delivering it once", { timeout: 30_000 }, async () => {
@@ -416,6 +456,50 @@ describe("TaskLedgerDO", () => {
     expect((await inboxHas(a.agent, POST.text)).filter((t) => t.includes(POST.text)).length).toBe(1);
     await runInDurableObject(l, async (i: TaskLedgerDO) => i.alarm());
     expect((await inboxHas(a.agent, "never", 0)).filter((t) => t.includes(POST.text)).length).toBe(1);
+  });
+
+  it("property: list's SQL filter selects exactly what the core's matches does", async () => {
+    // mulberry32: a failure names its seed.
+    const rng = (seed: number) => () => {
+      seed = (seed + 0x6d2b79f5) >>> 0;
+      let t = Math.imul(seed ^ (seed >>> 15), seed | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const words = ["Login", "OAuth", "ÄRGER", "ärger", "ui", "fix", "a\nb", "%", "_"];
+    const labels = ["auth", "ui", "Auth", "x_y"];
+    const assignees = [null, "agt_w1", "agt_w2"];
+    for (let seed = 1; seed <= 8; seed++) {
+      const r = rng(seed);
+      const pick = <T,>(xs: readonly T[]) => xs[Math.floor(r() * xs.length)]!;
+      const L = uniqueLedger();
+      const l = ledgerStub(env, L);
+      await l.apply(L, op, { kind: "create", title: "first" }); // names the ledger
+      const tasks = await runInDurableObject(l, (i: TaskLedgerDO) => {
+        const made: Task[] = [];
+        for (let n = 2; n <= 25; n++) {
+          const t: Task = {
+            id: `tsk_${seed}_${n}`, number: n, title: `${pick(words)} ${pick(words)}`, description: r() < 0.5 ? pick(words) : "",
+            status: pick(TASK_STATUSES), priority: "none", assignee: pick(assignees), labels: labels.filter(() => r() < 0.3),
+            parent: made.length && r() < 0.5 ? pick(made).id : null, created_by: "operator", created_ms: 0, updated_ms: 0, version: 1,
+          };
+          (i as any).persist({ task: t, put: t, next: n + 1, history: [], notices: [] }, 0);
+          made.push(t);
+        }
+        return made;
+      });
+      for (let k = 0; k < 40; k++) {
+        const parent = r() < 0.3 ? pick(tasks) : undefined;
+        const f: TaskFilter = {
+          ...(r() < 0.3 ? { status: pick(TASK_STATUSES) } : {}), ...(r() < 0.3 ? { assignee: pick(assignees) } : {}),
+          ...(r() < 0.3 ? { label: pick(labels) } : {}), ...(r() < 0.4 ? { text: pick(words).slice(0, 1 + Math.floor(r() * 4)) } : {}),
+          ...(parent ? { parent: `T-${parent.number}` } : {}),
+        };
+        const got = (await l.list(L, op, f, 1, 200)).tasks.map((t) => t.number);
+        const want = tasks.filter((t) => matches(t, f, parent?.id)).map((t) => t.number);
+        expect(got, `seed ${seed}, filter ${JSON.stringify(f)}`).toEqual(want);
+      }
+    }
   });
 });
 

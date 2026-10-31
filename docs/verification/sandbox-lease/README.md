@@ -12,7 +12,7 @@ The protocol between SandboxDO, FleetDO and nestd that decides which host runs a
 | FleetDO | one per cell | `leases(sandbox PK, host, epoch, expired, state, guest, ...)`; `hosts(host, status ∈ active/draining/expired/stonith_pending/dead, last_rx, instance_id, nestd_instance)`; `reassign_queue(sandbox PK, host, epoch, host_dead, attempts)`; `stale_incarnations((sandbox, host, epoch) PK, first_seen_ms, clean, cmd)`; `evictions((sandbox, host, epoch) PK)`; `commands(cmd, host, type, sandbox, epoch, purpose, result)` plus the reliable channel per host | `fleet.ts:30`, `180-236` |
 | nestd | one process per host (a restart is a new process, new `instance_id`) | `summary`: one row per sandbox = its newest local incarnation `(epoch, state, head, dirty)`; older incarnations live only in retire tasks; `tombstones`: fenced epochs per sandbox; `lease_deadline` (monotonic, boottime) for the whole host; per-incarnation dirs `sandboxes/<id>/<epoch>/` with `meta.json` (survive restarts) | `host.rs:261-271`, `311-341`, `464-488` |
 | EC2 | oracle | instance state; `terminate`, `state` | `control-plane/src/lib/ec2.ts:45`, `114-118` |
-| Alarms | per DO | `Deadlines`: key → at, persisted in SQLite, a handler that throws keeps its key (regression `#20`) | `control-plane/src/lib/reliable.ts:97-119` |
+| Alarms | per DO | `Deadlines`: key → at, persisted in SQLite, a handler that throws keeps its key (regression `#20`) | `Deadlines` (`control-plane/src/lib/reliable.ts`) |
 
 Out of scope: agent epochs and brain hosts, attach/bindings (except where an epoch bump revokes them), drains' commit gate (not built), egress.
 
@@ -122,7 +122,7 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 | Id | Property | Fairness / conditions | Holds? |
 |---|---|---|---|
 | L1 | A sandbox whose lease is lost, with work, is eventually placed again | capacity eventually; EC2 reachable, or the host reconnects, or an operator confirms; weak fairness on alarms and `processReassign` | Fails in B3 (fenced/failed state never retried by the alarm), B4, and the Refused state (lease at another epoch: `place` deadline cleared, no automatic repair, `sandbox.ts:322`) |
-| L2 | Every `placing` marker is eventually cleared or adopted | the `place` deadline fires (written in the same synchronous block as the claim, `reliable.ts:117`); FleetDO eventually answers `leaseOf` | Holds |
+| L2 | Every `placing` marker is eventually cleared or adopted | the `place` deadline fires (written in the same synchronous block as the claim: `Deadlines.set` writes its row before its first await); FleetDO eventually answers `leaseOf` | Holds |
 | L3 | Every `reassign_queue` row is eventually deleted | `leaseLost` eventually returns | Holds; but rows can be silently not inserted (B4) |
 | L4 | Every stale incarnation is eventually destroyed or retired | host reachable | Mostly: `sandbox_destroy` is sent once; if the host restarts before running it the row keeps `cmd` set and is skipped for 24 h (`fleet.ts:893`, `1324`); nestd's own retire usually deletes it first |
 | L5 | STONITH eventually resolves | EC2 or reconnect or operator | By design waits forever otherwise ("we wait or ask me") |

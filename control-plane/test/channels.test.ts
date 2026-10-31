@@ -819,6 +819,43 @@ describe("review fixes", () => {
     expect((await readAs(name)).messages.length).toBe(0);
   });
 
+  it("expiry deletes only the rows of the bodies it deleted: a key superseded during the R2 delete isn't swept without its body", async () => {
+    const name = await newChannel(1);
+    await postAs(name, { text: "spec v1", key: "spec" }, 201); // seq 1: kept while it is the newest for its key
+    await postAs(name, { text: "unkeyed" }, 201); // seq 2: expires
+    const v1 = `channels/${name}/b/v1`;
+    const orphaned = async () => (await env.BUCKET.head(v1)) !== null
+      && !(await runInDurableObject(chStub(name), (_i: ChannelDO, st) => st.storage.sql.exec("SELECT 1 FROM messages WHERE body_ref = ?", v1).toArray().length));
+    await runInDurableObject(chStub(name), async (inst: ChannelDO, st) => {
+      // Both bodies in R2 (tiered), both past retention.
+      for (const [seq, ref] of [[1, v1], [2, `channels/${name}/b/v2`]] as const) {
+        await env.BUCKET.put(ref, JSON.stringify({ text: "x", data: null }));
+        st.storage.sql.exec("UPDATE messages SET text = NULL, body_ref = ?, ts_ms = ? WHERE seq = ?", ref, Date.now() - 40 * 86_400_000, seq);
+      }
+      // While seq 2's body is being deleted, `spec` is posted again: seq 1 expires, but its body wasn't in the page.
+      const bucket = (inst as any).env.BUCKET as R2Bucket;
+      (inst as any).env = { ...(inst as any).env, BUCKET: new Proxy(bucket, {
+        get(target, prop) {
+          if (prop === "delete") {
+            return async (keys: string | string[]) => {
+              (inst as any).env.BUCKET = bucket;
+              await inst.post(name, { principal: "user" }, { text: "spec v2", key: "spec" });
+              return target.delete(keys);
+            };
+          }
+          const v = (target as any)[prop];
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      }) };
+      await inst.maintain(name);
+    });
+    expect(await orphaned()).toBe(false);
+    // The next run expires seq 1, body first.
+    await chStub(name).maintain(name);
+    expect(await env.BUCKET.head(v1)).toBeNull();
+    expect((await readAs(name)).messages.map((m: any) => m.text)).toEqual(["spec v2"]);
+  });
+
   it("a refused call makes no channel, no directory entry and no alarm", async () => {
     const a = await idleAgent();
     const name = `sbx_${uniq("x").replace(/-/g, "")}/events`;
