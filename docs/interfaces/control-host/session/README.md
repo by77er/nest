@@ -3,7 +3,7 @@
 > **Implemented contract.** In the design, `segment_ack` follows the SQLite commit and there are no roles; see [pending contract changes](../../README.md#pending-contract-changes).
 
 
-One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello carries the agent epoch AgentDO issued for this brain start (`agent_start.epoch`), for every agent; the sandbox epoch travels only inside the agent's binding ([gateway](../../gateway/)). For one release a hello with epoch `0` is accepted for an agent without hands, from runners of the previous release.
+One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello carries the agent epoch AgentDO issued for this brain start (`agent_start.epoch`), for every agent; the sandbox epoch travels only inside the agent's binding ([gateway](../../gateway/)). A hello with epoch `0` (a runner that predates the agent epoch) is stale.
 
 ## Messages
 

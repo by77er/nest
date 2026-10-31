@@ -266,7 +266,7 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     await agentStub(s.agent).onExited(s.host.host, "idle", 7);
     const { cmd } = await agentStub(s.agent).start();
     const [start] = await nextCommands(s.host.ws, (c) => c.cmd === cmd);
-    expect(start).toMatchObject({ epoch: 8, hands: { sandbox: s.sandbox, epoch: 8 } });
+    expect(start).toMatchObject({ epoch: 8, hands: { sandbox: s.sandbox } });
   });
 
   it("main (M1/D13): a detached agent that kept its host is condemned, migrated once with its alarm; its kill and escalation release it", async () => {
@@ -328,7 +328,7 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
   });
 
-  it("a previous-release runner's 0 is accepted for an agent without hands (one release), never for a worker", async () => {
+  it("a previous-release runner's 0 is stale, for an agent with or without hands", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const ctl = await connectHost(cell, "brain");
@@ -336,8 +336,10 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
     const [start] = await nextCommands(ctl.ws, (c) => c.type === "agent_start" && c.agent === captain);
     expect(start.epoch).toBe(1);
-    const ws = await runner(captain, ctl.host, ctl.host_token, "rin_cap_legacy", 0);
-    expect(await ws.none("error", 150, (m) => m.error.code === "stale_epoch")).toBe(true);
+    const c0 = await Ws.connect(`/v1/agents/${captain}/session`, ctl.host_token);
+    c0.send({ type: "hello", protocol_version: 1, agent: captain, host: ctl.host, instance_id: "rin_cap_legacy", epoch: 0 });
+    await c0.next("hello_ack");
+    expect((await c0.next("error")).error.code).toBe("stale_epoch");
 
     const s = await setup();
     const w = await Ws.connect(`/v1/agents/${s.agent}/session`, s.host.host_token);
@@ -383,7 +385,7 @@ describe("one brain per agent: the brain record", () => {
     await exited(s.host.ws, s.agent, 1);
     await runDeadline(s.agent, "intent");
     const start = (await nextCommands(b.ws, isStartOf(s.agent))).find(isStartOf(s.agent));
-    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox, epoch: 2 } });
+    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox } });
     expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: b.host }]);
     expect(await stub.info()).toMatchObject({ brain: { host: b.host, epoch: 2, phase: "starting" }, intent: null });
   });
@@ -2380,7 +2382,7 @@ describe("`starting` has a deadline", () => {
     await s.host.ws.next("ack", (m) => m.up_to >= seq);
     await runDeadline(s.agent, "intent");
     const [again] = await nextCommands(s.host.ws, (c) => c.type === "agent_start" && c.agent === s.agent);
-    expect(again).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox, epoch: 2 } });
+    expect(again).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox } });
     expect((await agentStub(s.agent).info()).state).toBe("starting");
   });
 });

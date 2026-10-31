@@ -42,10 +42,13 @@ describe("agent start", () => {
   it("sends agent_start to a brain host (never the sandbox's) with the setup token, hands and session URL", async () => {
     const s = await setup();
     expect(s.start).toMatchObject({
-      agent: s.agent, role: "worker", workstream: s.workstream, epoch: 1, hands: { sandbox: s.sandbox, epoch: 1 },
+      agent: s.agent, workstream: s.workstream, epoch: 1, hands: { sandbox: s.sandbox },
       oauth_token: "sk-ant-oat01-test", launch: { system_prompt: { mode: "append" } },
     });
     expect(s.start.session_ws_url).toMatch(new RegExp(`/v1/agents/${s.agent}/session$`));
+    // Nothing for the previous release's runners: no role, and the epoch only once.
+    expect(s.start).not.toHaveProperty("role");
+    expect(s.start.hands).toEqual({ sandbox: s.sandbox });
   });
 });
 

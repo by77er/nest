@@ -95,8 +95,8 @@ describe("an agent is its expanded spec", () => {
       oauth_token: "sk-reviewer",
       launch: { builtin_tools: ["TodoWrite"], system_prompt: { mode: "append", text: "You review.\n\nReview carefully." } },
       hands: { sandbox: s.sandbox },
-      role: "worker", // deprecated, for runners of the previous release
     });
+    expect(start).not.toHaveProperty("role");
 
     const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     const tools = await toolNames(ws);
@@ -118,7 +118,8 @@ describe("an agent is its expanded spec", () => {
     });
     const a = await adminJson("/v1/agents", { body: { template: name, workstream: s.workstream, cell: s.cell } }, 201);
     const [start] = await nextCommands(s.brain.ws, isStartOf(a.agent));
-    expect(start).toMatchObject({ oauth_token: "sk-default", role: "captain" });
+    expect(start).toMatchObject({ oauth_token: "sk-default" });
+    expect(start).not.toHaveProperty("hands");
     expect(start).not.toHaveProperty("hands");
     // Nothing subscribed it to the workstream: only a template that says so does (the captain's).
     expect((await wsStub(s.workstream).info()).subscriber).toBeNull();

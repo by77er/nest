@@ -683,7 +683,7 @@ describe("starting a brain on a chosen host", () => {
     const started = await adminJson<{ host: string }>(`/v1/agents/${worker.agent}/start`, { body: { host: brainHost.host } });
     expect(started.host).toBe(brainHost.host);
     const [start] = await nextCommands(brainHost.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-    expect(start.hands).toMatchObject({ sandbox: sbx.sandbox, epoch: 1 });
+    expect(start).toMatchObject({ epoch: 1, hands: { sandbox: sbx.sandbox } });
     await sandboxHost.ws.none("commands", 200);
     // A sandbox host never runs a brain, named or not (docs/compute/brain-hosts/).
     const captain = await adminJson("/v1/agents", { body: { role: "captain", workstream, cell, start: false } }, 201);

@@ -452,15 +452,10 @@ export class AgentDO extends DurableObject<Env> {
     return this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(id));
   }
 
-  /**
-   * Rule 1: a session at `epoch` is current iff there is a brain, it isn't condemned, and `epoch` is
-   * its epoch. For one release a runner that predates the agent epoch presents `0` for an agent
-   * without hands (that release's captains), and is accepted as before; current runners always
-   * present the issued epoch (from 1).
-   */
+  /** Rule 1: a session at `epoch` is current iff there is a brain, it isn't condemned, and `epoch` is its epoch. */
   private isCurrent(info: AgentInfo, epoch: number): boolean {
     const b = info.brain;
-    return !!b && b.phase !== "condemned" && (epoch === b.epoch || (epoch === 0 && !info.hands));
+    return !!b && b.phase !== "condemned" && epoch === b.epoch;
   }
 
   /**
@@ -755,13 +750,10 @@ export class AgentDO extends DurableObject<Env> {
     // `current()` refuses what it sends, and the new brain's hello supersedes it.
     const body: AgentStartBody = {
       agent: started.agent,
-      // Deprecated, for one release: runners of the previous release require a role (and ignore it).
-      role: started.hands ? "worker" : "captain",
       workstream: started.workstream,
       epoch,
       ...(resume ? { resume } : {}),
-      // `hands.epoch`: the same agent epoch again, for runners of the previous release (one release).
-      ...(started.hands ? { hands: { sandbox: started.hands.sandbox, epoch } } : {}),
+      ...(started.hands ? { hands: { sandbox: started.hands.sandbox } } : {}),
       launch: started.launch,
       oauth_token: oauthRef,
       session_ws_url: `${this.env.PUBLIC_BASE_URL.replace(/^http/, "ws")}/v1/agents/${started.agent}/session`,

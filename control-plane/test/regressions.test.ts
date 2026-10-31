@@ -573,7 +573,7 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "wake up" } }, 201);
     const [start] = await nextCommands(s.host.ws, isStart(s.agent));
     // A new start, a new agent epoch (`hands.epoch` repeats it for the previous release's runners).
-    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox, epoch: 2 } });
+    expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox } });
   });
 
   it("a brain that dies mid-turn restarts; after repeated crashes only new input retries", async () => {
@@ -633,7 +633,7 @@ describe("#23 captains move off a silent brain host", () => {
     const a = await connectHost(cell, "brain");
     const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: await workstream(), cell } }, 201)).agent as string;
     await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
-    const r = await runner(captain, a.host, a.host_token, "rin_cap", 0);
+    const r = await runner(captain, a.host, a.host_token, "rin_cap", 1);
     await adminJson(`/v1/agents/${captain}/turns`, { body: { text: "plan" } }, 201);
     await r.ws.next("run_turn");
     const b = await connectHost(cell, "brain");
