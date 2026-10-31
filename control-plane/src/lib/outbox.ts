@@ -49,9 +49,8 @@ export class ChannelOutbox {
     private readonly ownerFacts?: OwnerFacts,
   ) {
     sql.exec(`CREATE TABLE IF NOT EXISTS chan_out (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL,
-      tainted INTEGER NOT NULL, agent_owner TEXT, has_owner INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
-    const cols = sql.exec<{ name: string }>("PRAGMA table_info(chan_out)").toArray();
-    if (!cols.some((c) => c.name === "refusals")) sql.exec("ALTER TABLE chan_out ADD COLUMN refusals INTEGER NOT NULL DEFAULT 0");
+      tainted INTEGER NOT NULL, agent_owner TEXT, has_owner INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL,
+      refusals INTEGER NOT NULL DEFAULT 0)`);
   }
 
   /**
