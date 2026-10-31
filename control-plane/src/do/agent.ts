@@ -26,7 +26,8 @@ import {
 import { signBlobUrl } from "../lib/tokens";
 import { ledgerStub, type TaskView } from "./tasks";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
-import { addColumn, storedEnum, storedEnumOrNull } from "../lib/stored";
+import { addColumn, storedEnum } from "../lib/stored";
+import { askRoute, CallLedger } from "../lib/calls";
 import {
   agentState, type Brain, type BrainFields, type BrainPatch, brainRelease, epochlessExit, escalation, liveBrainStart, mergeIntent, NO_INTENT,
   phaseDeadlines, type PhaseDeadline, splitState, startFailure, type StartIntent, stoppedBrain, unresponsive, wakeDecision,
@@ -72,16 +73,6 @@ const RETENTION_MS = 7 * 86_400_000;
 /** How long an owner without `read` is remembered as such. */
 const OWNER_READS_NO_MS = 10 * 60_000;
 
-// Closed unions for the status columns (docs/data/#enums): SQL names them through these constants,
-// and every status read back is checked (`storedEnum`: a value outside the union is logged).
-/** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
-const CallStatusEnum = z.enum(["dispatching", "waiting", "done"]);
-export type CallStatus = z.output<typeof CallStatusEnum>;
-/** `asks.status`: inside its sync window, a guest CLI's, answered as a turn later, or answered. */
-const AskStatusEnum = z.enum(["sync", "cli", "async", "answered"]);
-export type AskStatus = z.output<typeof AskStatusEnum>;
-const CALL = CallStatusEnum.enum;
-const ASK = AskStatusEnum.enum;
 const PRUNE_EVERY_MS = 3_600_000;
 /** read_transcript: entries per call by default / at most, and a response size cap. */
 const TRANSCRIPT_DEFAULT_LIMIT = 200;
@@ -268,12 +259,7 @@ export class AgentDO extends DurableObject<Env> {
     if (isHealthInstance(ctx, env.AGENT)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.queue = new TurnQueue(this.sql);
-    // status: dispatching (not finished; re-dispatched if redelivered after an eviction), waiting (an
-    // ask; answered later), done (outcome stored).
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS tool_calls (epoch INTEGER NOT NULL, call TEXT NOT NULL, name TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'dispatching', outcome TEXT, created_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (epoch, call))`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS asks (ask TEXT PRIMARY KEY, call TEXT NOT NULL, epoch INTEGER NOT NULL,
-      question TEXT NOT NULL, status TEXT NOT NULL, deadline INTEGER NOT NULL, answer TEXT, created_ms INTEGER NOT NULL DEFAULT 0)`);
+    this.calls = new CallLedger(this.sql);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS segments (base INTEGER NOT NULL, offset INTEGER NOT NULL, len INTEGER NOT NULL,
       key TEXT NOT NULL, PRIMARY KEY (base, offset))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS seg_buffer (base INTEGER NOT NULL, offset INTEGER NOT NULL, data BLOB NOT NULL,
@@ -296,6 +282,8 @@ export class AgentDO extends DurableObject<Env> {
   private readonly outbox!: ChannelOutbox;
   /** The turn queue and inbox: the one owner of the `turns`, `inbox` and `chan_wakes` tables. */
   private readonly queue!: TurnQueue;
+  /** Platform tool calls and asks: the one owner of the `tool_calls` and `asks` tables. */
+  private readonly calls!: CallLedger;
 
   // ---------------------------------------------------------------------------------------------
   // State
@@ -1697,13 +1685,9 @@ export class AgentDO extends DurableObject<Env> {
   private async onEvents(ws: WebSocket, att: Attachment, seq: number, events: AgentEvent[]): Promise<void> {
     if (!this.current(att)) return;
     // Every event on a session speaks for the epoch its hello presented (the runner stamps them so).
-    const verdict = this.rel.classify(CHAN, seq);
-    if (verdict === "duplicate") {
+    if (this.inOrder(seq) === "duplicate") {
       this.send(ws, { type: "ack", up_to: this.rel.lastIn(CHAN)! });
       return;
-    }
-    if (verdict === "gap") {
-      throw new NestError(ErrorCodes.INVALID_MESSAGE, `message ${seq} out of order; expected ${this.rel.lastIn(CHAN)! + 1}`, 400, true);
     }
     for (const ev of events) {
       // Rule 1 after every await: a brain condemned or superseded mid-batch applies nothing more,
@@ -2176,36 +2160,25 @@ export class AgentDO extends DurableObject<Env> {
    * the target applies once, so a re-run repeats no side effect.
    */
   private async onToolCall(ws: WebSocket, att: Attachment, call: Extract<RunnerToAgent, { type: "tool_call" }>): Promise<void> {
-    if (att.stale) {
-      this.send(ws, { type: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "stale epoch") });
-      return;
-    }
-    if (!this.current(att)) return;
-    const verdict = this.rel.classify(CHAN, call.seq);
-    if (verdict === "gap") {
-      throw new NestError(ErrorCodes.INVALID_MESSAGE, `message ${call.seq} out of order; expected ${this.rel.lastIn(CHAN)! + 1}`, 400, true);
-    }
-    // Keyed by the call's own id: a call first seen at an earlier epoch (redelivered after its brain
-    // adopted a newer epoch) keeps that epoch's row and idempotency key, so its writes never run
-    // twice; it is still fenced by this session's epoch.
-    const stored = this.sql
-      .exec<{ epoch: number; status: string; outcome: string | null }>("SELECT epoch, status, outcome FROM tool_calls WHERE call = ? ORDER BY epoch LIMIT 1", call.call)
-      .toArray()[0];
-    const prior = stored && { ...stored, status: storedEnum(CallStatusEnum, stored.status, "tool_calls.status") };
+    const verdict = this.admitCallMessage(ws, att, call.seq);
+    if (!verdict) return;
+    // Its own epoch's row and key (`CallLedger.call`), still fenced by this session's epoch.
+    const prior = this.calls.call(call.call);
     const epoch = prior?.epoch ?? att.epoch;
+    const resend = () => {
+      const outcome = prior?.outcome;
+      if (outcome) this.pushReliable((seq) => ({ type: "tool_result", seq, call: call.call, outcome }));
+    };
     if (verdict === "duplicate") {
       this.send(ws, { type: "ack", up_to: this.rel.lastIn(CHAN)! });
-      if (prior?.outcome) this.pushReliable((seq) => ({ type: "tool_result", seq, call: call.call, outcome: JSON.parse(prior.outcome!) as ToolOutcome }));
+      resend();
       return;
     }
     if (prior?.outcome) {
       // Idempotency on (agent, epoch, call): a redelivered call gets the stored outcome.
-      this.pushReliable((seq) => ({ type: "tool_result", seq, call: call.call, outcome: JSON.parse(prior.outcome!) as ToolOutcome }));
+      resend();
     } else if (prior?.status !== "waiting") {
-      if (!prior) {
-        this.sql.exec(`INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, ?, '${CALL.dispatching}', NULL, ?)`,
-          epoch, call.call, call.name, Date.now());
-      }
+      if (!prior) this.calls.begin(epoch, call.call, call.name);
       let result: DispatchResult;
       try {
         result = await this.dispatch(epoch, call.call, call.name, call.arguments, undefined, att.epoch);
@@ -2214,8 +2187,7 @@ export class AgentDO extends DurableObject<Env> {
         if (!ne) console.error(`AgentDO: tool ${call.name} failed`, e);
         result = { status: "error", error: ne ? ne.body() : errorBody(ErrorCodes.INTERNAL, `${call.name} failed`, true) };
       }
-      // Only from `dispatching`: an answer that came during the ask's routing has finished it already.
-      if (result === "wait") this.sql.exec(`UPDATE tool_calls SET status = '${CALL.waiting}' WHERE epoch = ? AND call = ? AND status = '${CALL.dispatching}'`, epoch, call.call);
+      if (result === "wait") this.calls.wait(epoch, call.call);
       else this.finishCall(epoch, call.call, result);
     }
     this.rel.markProcessed(CHAN, call.seq);
@@ -2228,37 +2200,41 @@ export class AgentDO extends DurableObject<Env> {
    * waiting, and the answer, if one comes, arrives as a turn. Idempotent; no `tool_result` is sent.
    */
   private onCancelCall(ws: WebSocket, att: Attachment, m: Extract<RunnerToAgent, { type: "cancel_call" }>): void {
-    if (att.stale) {
-      this.send(ws, { type: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "stale epoch") });
-      return;
-    }
-    if (!this.current(att)) return;
-    const verdict = this.rel.classify(CHAN, m.seq);
-    if (verdict === "gap") {
-      throw new NestError(ErrorCodes.INVALID_MESSAGE, `message ${m.seq} out of order; expected ${this.rel.lastIn(CHAN)! + 1}`, 400, true);
-    }
+    const verdict = this.admitCallMessage(ws, att, m.seq);
+    if (!verdict) return;
     if (verdict === "process") {
       const outcome: ToolOutcome = { status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, `cancelled by the runner: ${m.reason}`) };
-      const stored = this.sql
-        .exec<{ epoch: number; status: string }>("SELECT epoch, status FROM tool_calls WHERE call = ? ORDER BY epoch LIMIT 1", m.call)
-        .toArray()[0];
-      const prior = stored && { ...stored, status: storedEnum(CallStatusEnum, stored.status, "tool_calls.status") };
-      const epoch = prior?.epoch ?? att.epoch;
-      if (!prior) {
-        this.sql.exec(`INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, '', '${CALL.done}', ?, ?)`,
-          epoch, m.call, JSON.stringify(outcome), Date.now());
-      } else if (prior.status !== "done") {
-        this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), epoch, m.call);
-        // A pending ask keeps its question open, but any answer now arrives as a turn.
-        this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE call = ? AND epoch = ? AND status = '${ASK.sync}'`, m.call, epoch);
-      }
+      const prior = this.calls.call(m.call);
+      this.calls.cancel(prior?.epoch ?? att.epoch, m.call, outcome, prior);
       this.rel.markProcessed(CHAN, m.seq);
     }
     this.send(ws, { type: "ack", up_to: this.rel.lastIn(CHAN)! });
   }
 
+  /**
+   * A call message's admission (`tool_call`, `cancel_call`): a stale session is told, one that isn't
+   * current is ignored (null either way), a gap throws; otherwise whether it's new.
+   */
+  private admitCallMessage(ws: WebSocket, att: Attachment, seq: number): "process" | "duplicate" | null {
+    if (att.stale) {
+      this.send(ws, { type: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "stale epoch") });
+      return null;
+    }
+    if (!this.current(att)) return null;
+    return this.inOrder(seq);
+  }
+
+  /** A reliable runner message's place in order: new or a duplicate; a gap throws (the runner resends). */
+  private inOrder(seq: number): "process" | "duplicate" {
+    const verdict = this.rel.classify(CHAN, seq);
+    if (verdict === "gap") {
+      throw new NestError(ErrorCodes.INVALID_MESSAGE, `message ${seq} out of order; expected ${this.rel.lastIn(CHAN)! + 1}`, 400, true);
+    }
+    return verdict;
+  }
+
   private finishCall(epoch: number, call: string, outcome: ToolOutcome): void {
-    this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), epoch, call);
+    this.calls.finish(epoch, call, outcome);
     this.pushReliable((seq) => ({ type: "tool_result", seq, call, outcome }));
   }
 
@@ -2515,16 +2491,11 @@ export class AgentDO extends DurableObject<Env> {
   ): Promise<string> {
     // Re-run for the same call (after an eviction, or an event resent because routing failed): the
     // same ask, routed again under the same key, which the workstream applies once.
-    const stored = this.sql.exec<{ ask: string; question: string; status: string; deadline: number }>(
-      "SELECT ask, question, status, deadline FROM asks WHERE call = ? AND epoch = ?", call, epoch).toArray()[0];
-    const prior = stored && { ...stored, status: storedEnum(AskStatusEnum, stored.status, "asks.status") };
+    const prior = this.calls.askOf(call, epoch);
     if (prior?.status === "answered") return prior.ask;
     const ask = prior?.ask ?? newId("ask_");
     const deadline = prior?.deadline ?? Date.now() + num(this.env.ASK_SYNC_WINDOW_MS, 120_000);
-    if (!prior) {
-      this.sql.exec("INSERT INTO asks (ask, call, epoch, question, status, deadline, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ask, call, epoch, question, status, deadline, Date.now());
-    }
+    if (!prior) this.calls.recordAsk({ ask, call, epoch, question, status, deadline });
     if ((prior?.status ?? status) === "sync") await this.deadlines.set(`${ASK_DEADLINE}${ask}`, deadline);
     const q = prior?.question ?? question;
     // The brain's own asks are fenced by its epoch; a guest's (`sandboxEpoch`) by FleetDO's lease check.
@@ -2597,7 +2568,7 @@ export class AgentDO extends DurableObject<Env> {
             this.cliWaiters.set(ask, (a) => { clearTimeout(timer); resolve(a); });
           });
           if (answer !== null) return { status: "answered", answer };
-          this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE ask = ? AND status = '${ASK.cli}'`, ask);
+          this.calls.toAsync(ask, "cli");
           return { status: "pending", question_id: ask };
         }
         case "whoami":
@@ -2623,34 +2594,27 @@ export class AgentDO extends DurableObject<Env> {
     if (info.current_turn) await this.postInbox(SYSTEM_SENDER, `Background task ${what} ${how}.`);
   }
 
-  /** Answer a pending `ask`: inside the sync window it completes the tool call; afterwards it becomes a turn. */
+  /** Answer a pending `ask` (`askRoute`): inside the sync window it completes the tool call; otherwise it becomes a turn. */
   async answerAsk(ask: string, answer: string): Promise<"sync" | "async" | "already_answered"> {
-    const row = this.sql
-      .exec<{ call: string; epoch: number; status: string }>("SELECT call, epoch, status FROM asks WHERE ask = ?", ask)
-      .toArray()[0];
+    const row = this.calls.ask(ask);
     if (!row) throw new NestError(ErrorCodes.INVALID_MESSAGE, "unknown ask", 404);
-    row.status = storedEnum(AskStatusEnum, row.status, "asks.status");
-    if (row.status === "answered") return "already_answered";
-    this.sql.exec(`UPDATE asks SET status = '${ASK.answered}', answer = ? WHERE ask = ?`, answer, ask);
-    if (row.status === "cli") {
-      const waiter = this.cliWaiters.get(ask);
-      this.cliWaiters.delete(ask);
-      if (waiter) {
-        waiter(answer);
-        return "sync";
-      }
-      // The waiter was lost (eviction): deliver as a turn instead.
+    const waiter = row.status === "cli" ? this.cliWaiters.get(ask) : undefined;
+    const route = askRoute(row.status, !!waiter, this.isCurrent(this.load(), row.epoch));
+    if (route === "already_answered") return route;
+    this.calls.answer(ask, answer);
+    this.cliWaiters.delete(ask);
+    if (route === "waiter") {
+      waiter!(answer);
+      return "sync";
     }
     if (row.status === "sync") {
+      // The call stops waiting: its result if its brain still waits for it, else ended unsent (the
+      // answer becomes a turn).
       const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: answer }] };
-      // Its brain is still the one waiting: the answer is the call's result. Otherwise (condemned, or
-      // restarted at a new epoch) the result would reach no model (a new lineage drops what the old
-      // one was sent), so the call ends unsent and the answer becomes a turn.
-      const waiting = this.isCurrent(this.load(), row.epoch);
-      if (waiting) this.finishCall(row.epoch, row.call, outcome);
-      else this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), row.epoch, row.call);
+      if (route === "result") this.finishCall(row.epoch, row.call, outcome);
+      else this.calls.finish(row.epoch, row.call, outcome);
       await this.deadlines.clear(`${ASK_DEADLINE}${ask}`);
-      if (waiting) return "sync";
+      if (route === "result") return "sync";
     }
     await this.enqueueTurn({ kind: "ask_answer", text: `Answer to your question ${ask}: ${answer}` });
     return "async";
@@ -2713,9 +2677,9 @@ export class AgentDO extends DurableObject<Env> {
 
   /** A `sync` ask's window lapsed unanswered: the call answers `pending`, and the answer comes as a turn. */
   private async askWindowLapsed(ask: string): Promise<void> {
-    const row = this.sql.exec<{ call: string; epoch: number; status: string }>("SELECT call, epoch, status FROM asks WHERE ask = ?", ask).toArray()[0];
-    if (storedEnumOrNull(AskStatusEnum, row?.status, "asks.status") === "sync" && row) {
-      this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE ask = ?`, ask);
+    const row = this.calls.ask(ask);
+    if (row?.status === "sync") {
+      this.calls.toAsync(ask, "sync");
       this.finishCall(row.epoch, row.call, {
         status: "pending",
         ask,
@@ -2727,8 +2691,7 @@ export class AgentDO extends DurableObject<Env> {
   /** Bounded growth: finished calls, asks, turns and inbox messages older than a week go away. */
   private prune(): void {
     const cutoff = Date.now() - RETENTION_MS;
-    this.sql.exec(`DELETE FROM tool_calls WHERE status = '${CALL.done}' AND created_ms < ?`, cutoff);
-    this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
+    this.calls.prune(cutoff);
     this.queue.prune(cutoff);
     // An ended (`once`) subscription's dedup row, after its retries are long over.
     this.sql.exec("DELETE FROM channel_subs WHERE ended = 1 AND created_ms < ?", cutoff);
