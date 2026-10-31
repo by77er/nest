@@ -147,6 +147,8 @@ export class Deadlines {
    * itself, or from anything that runs while it awaits).
    */
   private readonly running = new Map<string, number>();
+  /** Running keys `set` since their handler started: their row is a new deadline, kept whatever its `at`. */
+  private readonly rearmed = new Set<string>();
 
   constructor(
     private readonly sql: SqlStorage,
@@ -163,6 +165,7 @@ export class Deadlines {
   async set(key: string, at: number, keepEarlier = false): Promise<void> {
     if (keepEarlier && this.has(key) && this.at(key)! <= at) return;
     this.sql.exec("INSERT INTO deadlines (key, at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at", key, at);
+    if (this.running.has(key)) this.rearmed.add(key);
     await this.reschedule();
   }
 
@@ -174,12 +177,13 @@ export class Deadlines {
   /** Whether `key` is armed. A key whose handler is running isn't (its row is about to be deleted). */
   has(key: string): boolean {
     const at = this.at(key);
-    return at !== undefined && this.running.get(key) !== at;
+    return at !== undefined && (this.running.get(key) !== at || this.rearmed.has(key));
   }
 
   /**
    * Run the handler for every key due at `now`. A key is removed only after its handler succeeds
-   * (and only if nobody re-armed it meanwhile); a failing handler is retried after `retryMs`.
+   * (and only if nobody re-armed it meanwhile, even for the same time); a failing handler is retried
+   * after `retryMs`.
    */
   async runDue(now: number, handler: (key: string) => Promise<void>, retryMs = 5_000, last: readonly string[] = []): Promise<void> {
     // In time order, except `last` (background work, e.g. a channel outbox): after every other key,
@@ -193,12 +197,13 @@ export class Deadlines {
       this.running.set(key, at);
       try {
         await handler(key);
-        this.sql.exec("DELETE FROM deadlines WHERE key = ? AND at = ?", key, at);
+        if (!this.rearmed.has(key)) this.sql.exec("DELETE FROM deadlines WHERE key = ? AND at = ?", key, at);
       } catch (e) {
         console.error(`deadline ${key} failed; retrying`, e);
         this.sql.exec("UPDATE deadlines SET at = ? WHERE key = ? AND at = ?", Date.now() + retryMs, key, at);
       } finally {
         this.running.delete(key);
+        this.rearmed.delete(key);
       }
     }
     await this.reschedule();

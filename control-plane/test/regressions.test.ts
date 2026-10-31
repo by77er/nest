@@ -496,6 +496,20 @@ describe("#21 a deadline re-armed while it runs isn't dropped", () => {
     });
   });
 
+  it("a re-arm for the very time being run survives (the handler asked to run again)", async () => {
+    await runInDurableObject(bare(), async (_i, st) => {
+      const d = new Deadlines(st.storage.sql, st.storage);
+      await d.set("x", 5);
+      let runs = 0;
+      await d.runDue(Date.now(), async () => {
+        runs++;
+        await d.set("x", 5);
+      });
+      expect(runs).toBe(1);
+      expect(st.storage.sql.exec("SELECT at FROM deadlines WHERE key = 'x'").toArray()).toEqual([{ at: 5 }]);
+    });
+  });
+
   it("a key cleared or moved by an earlier key's handler doesn't run from the stale snapshot", async () => {
     await runInDurableObject(bare(), async (_i, st) => {
       const d = new Deadlines(st.storage.sql, st.storage);
