@@ -2639,7 +2639,8 @@ export class FleetDO extends DurableObject<Env> {
    * STONITH by fence is done once nothing on the host is expired but what a successful fence just
    * covered (`fenced`): a reachable `stonith_pending` host serves again (or drains again: `hostStep`).
    * Never earlier (a hello doesn't do it), so a host that dies before its fence result is still
-   * polled until EC2 confirms it gone.
+   * polled until EC2 confirms it gone. Never for a host whose instance FleetDO is terminating (EC2
+   * and an instance id): its fence frees its sandboxes, but only EC2's answer ends its STONITH.
    */
   private stonithDoneIfClear(host: string, fenced = new Set<string>()): void {
     if (this.leasesOf(host).some((l) => l.expired && !fenced.has(l.sandbox)) || !this.socketFor(host)) return;
@@ -2727,7 +2728,9 @@ export class FleetDO extends DurableObject<Env> {
   private move(host: string, t: HostTransition): HostStatus | null {
     const h = this.host(host);
     if (!h) return null;
-    const to = hostStep({ status: h.status, draining: h.drain_ms !== null, wedged: h.wedged_ms !== null, terminating: false }, t);
+    // FleetDO terminates the instance of every host it sends to STONITH when it can (`expireHost`).
+    const terminating = t === "fence_done" && !!h.instance_id && !!this.ec2();
+    const to = hostStep({ status: h.status, draining: h.drain_ms !== null, wedged: h.wedged_ms !== null, terminating }, t);
     if (to === null) return null;
     this.sql.exec("UPDATE hosts SET status = ? WHERE host = ?", to, host);
     if (t === "drain") this.sql.exec("UPDATE hosts SET drain_ms = COALESCE(drain_ms, ?) WHERE host = ?", Date.now(), host);
