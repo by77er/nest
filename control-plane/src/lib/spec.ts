@@ -392,11 +392,6 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
   });
 }
 
-/** The previous release's `grants` field on the admin route: intersects the tools silently, as it did. */
-export function intersectTools(spec: AgentSpec, grants: readonly string[]): AgentSpec {
-  return { ...spec, tools: spec.tools.filter((t) => grants.includes(t)) };
-}
-
 // --- Records stored with a role (the previous release) ----------------------------------------------
 
 /**

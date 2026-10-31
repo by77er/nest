@@ -9,7 +9,7 @@ import { checkHealth, healthProbes } from "./lib/health";
 import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
-import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } from "./lib/spec";
+import { Capability, CatalogName, OperatorOverrides, Template } from "./lib/spec";
 import { type Actor, LedgerName, type SpecGrant, type TaskOp, TaskPriority, TaskStatus } from "./lib/tasks";
 import { LIST_DEFAULT_LIMIT, ledgerStub } from "./do/tasks";
 import { DIRECTORY } from "./do/channel";
@@ -535,8 +535,8 @@ export const ROUTES: Route[] = [
   route({
     // A spawn spec from the operator (the root: `OperatorOverrides`; an agent's spawn may only narrow,
     // `SpawnerOverrides`): a template, a sandbox (hands) or none, and overrides. For one release the
-    // previous release's fields are accepted: `role` (the same-named template), `captain` (`owner`),
-    // top-level `launch` and `rules` (overrides), and `grants` (intersects the tools silently, as it did).
+    // previous release's fields are accepted: `role` (the same-named template), `captain` (`owner`), and
+    // top-level `launch` and `rules` (overrides).
     method: "POST", path: "/v1/agents", auth: "admin",
     body: z.object({
       template: CatalogName.optional(),
@@ -548,8 +548,9 @@ export const ROUTES: Route[] = [
       captain: z.string().startsWith("agt_").optional(),
       overrides: OperatorOverrides.optional(),
       launch: LaunchConfig.optional(),
-      grants: z.array(z.string()).optional(),
       rules: z.array(ToolRule).optional(),
+      // Gone: a client still sending it must not silently get the template's wider tool set.
+      grants: z.never({ error: "grants is no longer accepted: narrow the tools with overrides.tools" }).optional(),
       cell: z.string().optional(),
       start: z.boolean().default(true),
     }),
@@ -572,8 +573,7 @@ export const ROUTES: Route[] = [
       }
       if (!wsId) throw new NestError(ErrorCodes.INVALID_MESSAGE, "an agent without a sandbox needs a workstream");
       checkCell(env, cellName);
-      const expanded = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides });
-      const spec = r.grants ? intersectTools(expanded, r.grants) : expanded;
+      const spec = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides });
       const id = newId("agt_");
       const a = agent(env, id);
       await a.create({ agent: id, workstream: wsId, cell: cellName, spec, owner: r.owner ?? r.captain ?? null, sandbox: r.sandbox ?? null });

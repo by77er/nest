@@ -255,10 +255,10 @@ describe("one release of compatibility, and the review's edge cases", () => {
     expect((await adminJson("/v1/workstreams", { body: { goal: "g", subscriber: w.agent } }, 400)).error.code).toBe("invalid_message");
   });
 
-  it("the legacy grants field intersects silently", async () => {
+  it("the previous release's grants field is refused, never ignored (that would widen the tools)", async () => {
     const s = await cellWithSandbox();
-    const a = await adminJson("/v1/agents", { body: { role: "worker", sandbox: s.sandbox, grants: ["notify", "merge"], start: false } }, 201);
-    expect(a.tools).toEqual(["notify"]);
+    const r = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, grants: ["notify"], start: false } }, 400);
+    expect(r.error.message).toContain("overrides.tools");
   });
 
   it("a stored owner in another workstream (an older record) still can't be notified", async () => {
