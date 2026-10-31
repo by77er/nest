@@ -24,7 +24,7 @@ use tracing::debug;
 
 use crate::exec::agent_env;
 use crate::framed::{FramedReader, err, parse_json, write_data, write_json};
-use crate::state::Guest;
+use crate::state::{Gate, Guest};
 use crate::transport::Conn;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,7 +45,12 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
     match req {
         IngressRequest::Tcp { port } => tcp(reader, port).await,
         IngressRequest::Pty { agent_id, cols, rows, command, cwd, env } => {
-            let (conn, rest) = reader.into_parts();
+            let (mut conn, rest) = reader.into_parts();
+            let admitted = guest.inner.lock().unwrap().admit(Gate::Pty).map(|_| ());
+            if let Err(error) = admitted {
+                let _ = write_json(&mut conn, &IngressResponse::Rejected { error }).await;
+                return;
+            }
             if let Err(e) = pty(&guest, conn, rest, agent_id, cols, rows, command, cwd, env).await {
                 debug!(error = %e, "pty session ended with error");
             }

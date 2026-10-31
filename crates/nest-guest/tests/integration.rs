@@ -550,6 +550,20 @@ async fn ingress_tcp_splice_and_reject() {
     assert!(matches!(resp, IngressResponse::Rejected { error } if error.code == "connect_refused" && error.retryable));
 }
 
+/// B3: like hands, an ingress PTY is `busy` (retryable) until `configure`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pty_before_configure_is_busy() {
+    let h = harness().await;
+    let s = emulator::connect(&h.socket, PORT_INGRESS).await.unwrap();
+    let (r, mut w) = tokio::io::split(s);
+    let req = IngressRequest::Pty { agent_id: None, cols: 80, rows: 24, command: Some(vec!["true".into()]), cwd: None, env: Default::default() };
+    write_json(&mut w, &req).await.unwrap();
+    let mut r = FramedReader::new(r);
+    let f = tokio::time::timeout(Duration::from_secs(5), r.next()).await.unwrap().unwrap().unwrap();
+    let resp: IngressResponse = parse_json(&f).unwrap();
+    assert!(matches!(&resp, IngressResponse::Rejected { error } if error.code == "busy" && error.retryable), "{resp:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ingress_pty() {
     let (h, _c) = configured().await;

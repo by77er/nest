@@ -9,7 +9,7 @@ use tokio::net::UnixListener;
 use tracing::warn;
 
 use crate::framed::{FramedReader, write_json};
-use crate::state::{Guest, busy};
+use crate::state::{Gate, Guest};
 
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
@@ -57,8 +57,8 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
     match req.command {
         CliCommand::Whoami {} => {
             let inner = guest.inner.lock().unwrap();
-            match &inner.identity {
-                Some(id) => {
+            match inner.admit(Gate::Whoami) {
+                Ok(id) => {
                     let sandbox = inner.forked_sandbox_id.clone().unwrap_or_else(|| id.sandbox_id.clone());
                     CliResult::Ok {
                         data: serde_json::json!({
@@ -68,7 +68,7 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
                         }),
                     }
                 }
-                None => CliResult::Error { error: busy("guest not configured yet") },
+                Err(error) => CliResult::Error { error },
             }
         }
         command => {
