@@ -436,10 +436,12 @@ export class SandboxDO extends DurableObject<Env> {
    * report carries the guest's version, which `resolve` hands to clients.
    */
   async reportState(
-    host: string, epoch: number, state: SandboxState, _mode: string | null, _detail: string | null, guest: GuestInfo | null = null,
+    host: string, epoch: number, state: SandboxState, _mode: string | null, detail: string | null, guest: GuestInfo | null = null,
   ): Promise<void> {
     const info = this.get<SandboxInfo>("info");
     if (!info || epoch !== info.epoch || host !== info.host) return;
+    // The host's reason, to Workers Logs only (it names host paths): the one place it was kept.
+    if (state === "failed" && detail) console.warn(`sandbox ${info.sandbox}: failed on ${host}: ${detail}`);
     const becameRunning = state === "running" && info.state !== "running";
     this.update((i) => {
       i.state = state;

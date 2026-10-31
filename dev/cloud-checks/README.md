@@ -27,3 +27,21 @@ python3 -I dev/cloud-checks/brain_hosts_check.py
 | **Costs** | a few minutes of two spot instances from a cold cell, and one short Claude Code turn per agent on the subscription |
 
 **Leftovers after an interrupted run:** `GET /v1/admin/fleet?cell=use1` lists live sandboxes and each host's brains. Stop and destroy the ids from the last line (or the log) with the same two routes.
+
+## `stress.py`
+
+A stress test of a cell: the control plane alone, then many agents and sandboxes at once, timed phase by phase, with the fleet view sampled throughout so a cell's limits can be read afterwards.
+
+```bash
+STRESS_AGENTS=50 python3 -I dev/cloud-checks/stress.py      # STRESS_HANDS=0: brains and channels only
+```
+
+| | |
+|---|---|
+| **Phases** (`STRESS_PHASES`) | `flood`: `FLOOD_POSTERS` concurrent operator posters × `FLOOD_POSTS` to one channel (latency percentiles, errors). `sandboxes`: `STRESS_AGENTS` sandboxes at once (placement and host launches). `ring`: one `stress` agent per sandbox (Haiku; `STRESS_MODEL`), each posting a ping to `stress/<run>` that mentions the next and woken by the one that mentions it (a `once` subscription) to post a pong. `idle`: until every brain has exited. `cleanup`: stop and destroy, then watch until no host is live (`STRESS_DRAIN_S`) |
+| **Creates** | one workstream; the sandboxes and agents; the `stress` template and `stress-chat` capability (kept, for reruns); channels `stress/<run>` and `stress/<run>/flood` (no delete route) |
+| **Records** | `STRESS_OUT` (JSONL): every `STRESS_SAMPLE_S` the fleet (hosts by kind, brains and sandboxes per host, each host's free memory, open launches), and the phase marks with their timings |
+| **Cleans up** | stops every agent and destroys every sandbox on every exit path (interrupt it with SIGINT, not SIGTERM); the last line is the JSON of the ids it made |
+| **Costs** | at 50 agents on `use1`: about $0.20 of spot EC2 for a run, plus two short Haiku turns per agent on the subscription |
+
+**First run (2026-10-31, `use1`, caps raised by #54):** the findings are in [the stress test notes](stress-2026-10-31.md).
