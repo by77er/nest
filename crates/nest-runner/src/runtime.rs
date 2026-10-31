@@ -12,6 +12,7 @@ use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
 use nest_protocol::host::runner::{ExitReason, RunnerEvent, StopMode};
+use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 use nest_protocol::model::{
     AgentEvent, AgentEventBody, AgentId, CallId, Epoch, ErrorBody, HostId, RequestId,
     SessionId, TimestampMs, TurnId,
@@ -29,9 +30,6 @@ pub fn now_ms() -> TimestampMs {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// Error code for a platform call whose outcome is unknown (timed out after it may have been
-/// delivered).
-pub use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 
 /// Process-wide state.
 pub struct Runtime {
@@ -92,14 +90,16 @@ impl Runtime {
         Ok(())
     }
 
-    /// Remove `a` — only if it is still the registered instance (a duplicate start must never
-    /// deregister another brain) — and return the agent epoch its exit reports.
-    pub fn deregister(&self, a: &Arc<Agent>) -> Epoch {
-        let mut r = self.agents.lock().unwrap();
-        if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
-            r.agents.remove(&a.id);
+    /// `a` exited or never ran: deregister it if it is still the registered instance (a refused
+    /// or duplicate start never deregisters another brain), then report the exit at its epoch.
+    pub fn exited(&self, a: &Arc<Agent>, reason: ExitReason, (code, signal): (Option<i32>, Option<i32>)) {
+        {
+            let mut r = self.agents.lock().unwrap();
+            if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
+                r.agents.remove(&a.id);
+            }
         }
-        a.epoch
+        self.report_for(a, RunnerEvent::AgentExited { agent: a.id.clone(), code, signal, reason, epoch: Some(a.epoch) });
     }
 
     /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
@@ -296,7 +296,7 @@ pub struct Agent {
     pub pid: AtomicU32,
     /// Cancelled by any kill/stop: aborts startup steps and tells the actor.
     pub cancel: CancellationToken,
-    /// An `agent_stop` reached this brain: it is on its way out, and a later start must not adopt it.
+    /// An `agent_stop` reached this brain: it is on its way out.
     pub stopping: std::sync::atomic::AtomicBool,
     kill_reason: Mutex<Option<ExitReason>>,
     pub inner: Mutex<AgentInner>,
@@ -370,7 +370,7 @@ impl Agent {
         self.command(AgentCmd::Kill(reason));
     }
 
-    /// Told to stop, or being killed: never adopted by a later start (which waits for it instead).
+    /// Told to stop, or being killed.
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst) || self.kill_reason().is_some()
     }

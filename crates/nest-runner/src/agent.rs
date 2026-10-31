@@ -123,7 +123,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     while !older_gone(&rt) {
                         tokio::time::sleep(DYING_POLL).await;
                     }
-                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
+                    rt.exited(&agent, ExitReason::Fenced, (None, None));
                     return;
                 }
                 Err(Refused::Running(existing)) if existing.epoch == epoch => {
@@ -135,7 +135,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     // A newer brain is registered: this start is stale (N18). It never runs, never
                     // ends the newer brain, and its exit says so at its own epoch.
                     tracing::warn!(agent = %id, epoch = epoch.0, running = existing.epoch.0, "agent_start older than the registered brain: refused");
-                    rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
+                    rt.exited(&agent, ExitReason::Fenced, (None, None));
                     return;
                 }
                 Err(Refused::Running(existing)) => {
@@ -165,8 +165,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                 );
             }
             agent.send_out(Outbound::Close);
-            let epoch = rt.deregister(&agent);
-            rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason, epoch: Some(epoch) });
+            rt.exited(&agent, reason, (None, None));
         }
     });
 }
@@ -253,17 +252,16 @@ pub async fn materialize(resume: &SessionResume, path: &Path) -> anyhow::Result<
     Ok(())
 }
 
+/// Claude Code with exactly `env` (nothing inherited), in the configured cwd.
+fn claude_cmd(rt: &Runtime, env: &[(String, String)]) -> Command {
+    let mut c = Command::new(&rt.cfg.claude_bin);
+    c.env_clear().envs(env.iter().cloned()).current_dir(&rt.cfg.cwd).kill_on_drop(true);
+    c
+}
+
 /// `claude auth status` with the agent's environment → `authMethod` (anything else on failure).
 pub async fn auth_method(rt: &Runtime, env: &[(String, String)]) -> String {
-    let out = Command::new(&rt.cfg.claude_bin)
-        .args(["auth", "status"])
-        .env_clear()
-        .envs(env.iter().cloned())
-        .current_dir(&rt.cfg.cwd)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let out = claude_cmd(rt, env).args(["auth", "status"]).stdin(Stdio::null()).output().await;
     match out {
         Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout)
             .ok()
@@ -275,15 +273,7 @@ pub async fn auth_method(rt: &Runtime, env: &[(String, String)]) -> String {
 }
 
 async fn claude_version(rt: &Runtime, env: &[(String, String)]) -> String {
-    let out = Command::new(&rt.cfg.claude_bin)
-        .arg("--version")
-        .env_clear()
-        .envs(env.iter().cloned())
-        .current_dir(&rt.cfg.cwd)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let out = claude_cmd(rt, env).arg("--version").stdin(Stdio::null()).output().await;
     out.ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.split_whitespace().next().map(String::from))
@@ -339,8 +329,7 @@ async fn run(
     let auth = step(&cancel, "claude auth status", AUTH_TIMEOUT, async { Ok(auth_method(&rt, &launch.env).await) }).await?;
     if auth != "oauth_token" {
         rt.report_for(&agent, RunnerEvent::AuthCheck { agent: agent.id.clone(), auth_method: auth, api_key_source: "unknown".into(), ok: false });
-        let epoch = rt.deregister(&agent);
-        rt.report_for(&agent, RunnerEvent::AgentExited { agent: agent.id.clone(), code: None, signal: None, reason: ExitReason::AuthFailed, epoch: Some(epoch) });
+        rt.exited(&agent, ExitReason::AuthFailed, (None, None));
         return Ok(());
     }
     let version = step(&cancel, "claude --version", VERSION_TIMEOUT, async { Ok(claude_version(&rt, &launch.env).await) }).await?;
@@ -377,16 +366,12 @@ struct Proc {
 
 fn spawn_claude(rt: &Runtime, agent: &Arc<Agent>, launch: &Launch, session: &SessionArgs) -> anyhow::Result<Proc> {
     let args = claude::args(&launch.launch, &launch.config_dir, session);
-    let mut child = Command::new(&rt.cfg.claude_bin)
+    let mut child = claude_cmd(rt, &launch.env)
         .args(&args)
-        .env_clear()
-        .envs(launch.env.iter().cloned())
-        .current_dir(&rt.cfg.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
-        .kill_on_drop(true)
         .spawn()?;
     let pid = child.id().unwrap_or(0);
     agent.pid.store(pid, Ordering::SeqCst);
@@ -624,13 +609,11 @@ impl Actor {
                 return self.step(Input::Respawned { ok });
             }
             Effect::Exit(reason) => {
-                let (code, signal) = self.exit_status;
                 tracing::info!(agent = %self.agent.id, reason = reason.as_str(), "brain exited");
                 self.agent.cancel_hands();
                 self.agent.emit(AgentEventBody::StateChanged { state: AgentState::Detached, detail: Some(reason.as_str().into()) });
                 self.agent.send_out(Outbound::Close);
-                let epoch = self.rt.deregister(&self.agent);
-                self.rt.report_for(&self.agent, RunnerEvent::AgentExited { agent: self.agent.id.clone(), code, signal, reason, epoch: Some(epoch) });
+                self.rt.exited(&self.agent, reason, self.exit_status);
                 return true;
             }
         }

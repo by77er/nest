@@ -18,7 +18,8 @@ use nest_protocol::model::{Epoch, ErrorBody};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::{Agent, OUTCOME_UNKNOWN, ResolveTimeout};
+use crate::runtime::{Agent, ResolveTimeout};
+use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 use nest_protocol::control::HandsOutcome;
 
 /// How long to wait for the guest's final frame after sending `cancel`.
