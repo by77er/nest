@@ -356,10 +356,6 @@ async fn plain_request(ctx: Arc<ConnCtx>, req: Request<Incoming>, absolute: bool
         ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("invalid_host"));
         return simple(StatusCode::BAD_REQUEST, "request target is not a valid host");
     }
-    if decide(&ctx, &host, port) == EgressDecision::Deny {
-        ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).request(req.method(), req.uri()).reason("not_allowed"));
-        return deny_response(StatusCode::FORBIDDEN, "egress_denied", &host, port, "not in this sandbox's egress policy");
-    }
     let target = Arc::new(Target { host, port, tls: false });
     let conn = UpstreamConn::lazy(ctx.clone(), target.clone(), false);
     forward(ctx, &target, &conn, req).await
@@ -377,6 +373,15 @@ pub struct Target {
 
 async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req: Request<Incoming>) -> Response<Body> {
     let mk_audit = |req: &Request<Incoming>, v: EgressVerdict| Audit::new(&target.host, target.port, v).request(req.method(), req.uri());
+
+    // Decided per request, not per connection: a push or a grant's expiry since the connection
+    // (or its previous request) was admitted may have revoked the host, or made it
+    // passthrough-only, which an inspected connection can't honour.
+    let decision = decide(&ctx, &target.host, target.port);
+    if decision == EgressDecision::Deny || (target.tls && decision == EgressDecision::Passthrough) {
+        ctx.audit(mk_audit(&req, EgressVerdict::Deny).reason("not_allowed"));
+        return deny_response(StatusCode::FORBIDDEN, "egress_denied", &target.host, target.port, "not in this sandbox's egress policy");
+    }
 
     // Every name the request carries must be the routed host (SNI / CONNECT authority / the
     // Host that routed a plaintext request) — no domain fronting via absolute-form targets or
@@ -445,9 +450,6 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
     }
     let mut audit = mk_audit(&req, EgressVerdict::Allow);
     audit.binding = verdict.binding().map(str::to_string);
-    if !ctx.live() {
-        return deny_response(StatusCode::SERVICE_UNAVAILABLE, "egress_unavailable", &target.host, target.port, "egress is paused");
-    }
 
     // Upgrades (WebSocket etc., HTTP/1.1 only).
     let upgrading = !up.h2 && req.headers().contains_key(UPGRADE);
