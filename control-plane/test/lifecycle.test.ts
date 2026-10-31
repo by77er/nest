@@ -495,13 +495,21 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
       });
       expect(await stub.info()).toMatchObject({ state: "destroyed", host: null, placing: null });
       expect(await fleetStub(cell).leaseOf(s.sandbox)).toBeNull();
-      // FleetDO sent the VM's create with the grant: it is destroyed again at that epoch.
-      const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
-      expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
+      if (served) {
+        // FleetDO sent the VM's create with the grant: it is destroyed again at that epoch.
+        const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
+        expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
+      } else {
+        // FleetDO knew of the destroy first and granted nothing: nothing was left for a continuation
+        // to undo (one a reset loses would have leaked the lease and the VM).
+        await sleep(100);
+        const sent = a.ws.drain().filter((m) => m.type === "commands").flatMap((m) => m.commands as { type: string }[]);
+        expect(sent.filter((c) => c.type === "sandbox_create")).toEqual([]);
+      }
     });
   }
 
-  it("a placement that lands while destroy releases the lease is still undone: no lease, the VM destroyed", async () => {
+  it("a placement that reaches FleetDO while destroy releases the lease grants nothing: FleetDO knew of the destroy first", async () => {
     const cell = uniqueCell();
     const s = await createSandbox(cell, 202);
     const a = await connectHost(cell);
@@ -521,8 +529,9 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
     });
     expect(await stub.info()).toMatchObject({ state: "destroyed", host: null, placing: null });
     expect(await fleetStub(cell).leaseOf(s.sandbox)).toBeNull();
-    const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
-    expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
+    await sleep(100);
+    const sent = a.ws.drain().filter((m) => m.type === "commands").flatMap((m) => m.commands as { type: string }[]);
+    expect(sent.filter((c) => c.type === "sandbox_create")).toEqual([]);
   });
 
   it("a placement answer that arrives after the marker was reconciled changes nothing: confirmed slots stay confirmed", async () => {

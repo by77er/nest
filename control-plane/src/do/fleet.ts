@@ -1592,8 +1592,8 @@ export class FleetDO extends DurableObject<Env> {
   /**
    * Choose a host, record the lease and send `sandbox_create`. `null` when no capacity. Idempotent
    * per (sandbox, epoch): a retry of a placement whose answer was lost gets the lease's host back
-   * (nothing is sent again). Refuses a sandbox that holds a lease at another epoch: a lease is only
-   * ever granted to one host at a time.
+   * (nothing is sent again). Refuses a sandbox that holds a lease at another epoch (a lease is only
+   * ever granted to one host at a time), and a destroyed one.
    */
   async place(req: PlaceRequest): Promise<string | null> {
     const existing = this.lease(req.sandbox);
@@ -1601,9 +1601,13 @@ export class FleetDO extends DurableObject<Env> {
     if (existing) {
       throw new NestError(ErrorCodes.FORBIDDEN, `sandbox ${req.sandbox} already holds a lease (epoch ${existing.epoch} on ${existing.host})`, 409);
     }
-    // SandboxDO registered it in `create`. A sandbox missing from the registry would lose its data
-    // to GC, so one that slipped through is registered here, loudly.
-    if (!this.sql.exec("SELECT 1 FROM sandboxes WHERE sandbox = ?", req.sandbox).toArray().length) {
+    // SandboxDO registered it in `create`, and its `destroy` marks it here before releasing the lease:
+    // a request that arrives after that grants nothing, so no lease outlives the destroy even when
+    // SandboxDO never sees this answer (sandbox-lease B2). A sandbox missing from the registry would
+    // lose its data to GC, so one that slipped through is registered here, loudly.
+    const registered = this.sql.exec<{ destroyed_ms: number | null }>("SELECT destroyed_ms FROM sandboxes WHERE sandbox = ?", req.sandbox).toArray()[0];
+    if (registered && registered.destroyed_ms !== null) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox ${req.sandbox} is destroyed`, 409);
+    if (!registered) {
       console.error(`FleetDO: placing ${req.sandbox}, which its SandboxDO never registered; registering it now`);
       this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     }
