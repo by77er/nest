@@ -16,9 +16,9 @@ import type { Env } from "../env";
 import {
   type AclEntry, type Batch, BATCH_SCAN, beginDelivery, type Caller, type ChannelAction, type ChannelFacts, type ChannelKind, checkPost,
   type CheckedPost, DEFAULT_BATCH_MS, DEFAULT_RETENTION_DAYS, decidePost, Delivery, DELIVERY_TIMEOUT_MS, type DeliveryOutcome,
-  chunks, IDEM_RETENTION_MS, isAgentCaller, R2_DELETE_MAX, KEYS_MAX_LIMIT, type LogView, type Message, type MessageMeta, onAppend, parseChannel,
+  chunks, IDEM_RETENTION_MS, isAgentCaller, R2_DELETE_MAX, KEYS_MAX_LIMIT, type LogView, MAX_RETENTION_DAYS, type Message, type MessageMeta, onAppend, parseChannel,
   permits, type PostState, RATE_WINDOW_MS, READ_DEFAULT_LIMIT, READ_MAX_BYTES, READ_MAX_LIMIT, settleDelivery, type SubscribeInput, type Subscription,
-  TIER_AFTER_MS,
+  TIER_AFTER_MS, utf8,
 } from "../lib/channels";
 import { Deadlines, withTimeout } from "../lib/reliable";
 import { storedEnum } from "../lib/stored";
@@ -134,7 +134,6 @@ const readSub = (body: string): Subscription => {
   return { ...s, delivery: storedEnum(Delivery, s.delivery, "subs.body.delivery") };
 };
 
-const utf8Len = (t: string) => new TextEncoder().encode(t).length;
 
 const forbidden = (m: string) => new NestError(ErrorCodes.FORBIDDEN, m, 403);
 const invalid = (m: string, status = 400) => new NestError(ErrorCodes.INVALID_MESSAGE, m, status);
@@ -286,7 +285,7 @@ export class ChannelDO extends DurableObject<Env> {
     if (!kind.ok) throw invalid(kind.error);
     if (kind.value.kind !== "free") throw invalid(`${name} is a built-in channel: it exists with its owner`, 409);
     if (caller.principal === "platform") throw forbidden("the platform creates no free channels");
-    if (!(retentionDays >= 1 && retentionDays <= 365 && Number.isInteger(retentionDays))) throw invalid("retention_days is 1-365");
+    if (!(retentionDays >= 1 && retentionDays <= MAX_RETENTION_DAYS && Number.isInteger(retentionDays))) throw invalid(`retention_days is 1-${MAX_RETENTION_DAYS}`);
     const cur = this.meta();
     if (cur) {
       if (cur.owner === caller.principal) return this.infoOf(cur);
@@ -458,7 +457,7 @@ export class ChannelDO extends DurableObject<Env> {
     let bytes = 0;
     for (const r of rows.slice(0, limit)) {
       const m = await this.message(r);
-      bytes += utf8Len(m.text) + (m.data !== undefined ? utf8Len(JSON.stringify(m.data)) : 0);
+      bytes += utf8(m.text) + (m.data !== undefined ? utf8(JSON.stringify(m.data)) : 0);
       if (out.length && bytes > READ_MAX_BYTES) break;
       out.push(m);
     }
@@ -514,9 +513,7 @@ export class ChannelDO extends DurableObject<Env> {
         text = "[body no longer stored]";
       }
     }
-    const meta = metaOf({ ...r, text: null });
-    const { text: _t, ...rest } = meta as MessageMeta & { text?: string };
-    return { ...rest, text, ...(data !== null ? { data: JSON.parse(data) as unknown } : {}) };
+    return { ...metaOf({ ...r, text: null }), text, ...(data !== null ? { data: JSON.parse(data) as unknown } : {}) };
   }
 
   // --- subscriptions --------------------------------------------------------------------------------

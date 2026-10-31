@@ -11,7 +11,6 @@ export const INLINE_BODY_BYTES = 32 * 1024;
 /** The largest body a post may carry at all (hooks' body limit). */
 export const MAX_BODY_BYTES = 1024 * 1024;
 export const MAX_NAME_LENGTH = 128;
-export const MAX_KEY_LENGTH = 64;
 export const MAX_MENTIONS = 16;
 /** A sender's message identical to its previous one on the channel within this long isn't stored. */
 export const REPEAT_WINDOW_MS = 60_000;
@@ -51,7 +50,7 @@ export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 const ok = <T>(value: T): Result<T> => ({ ok: true, value });
 const err = <T>(error: string): Result<T> => ({ ok: false, error });
 
-const utf8 = (s: string) => new TextEncoder().encode(s).length;
+export const utf8 = (s: string) => new TextEncoder().encode(s).length;
 
 // --- Names --------------------------------------------------------------------------------------------
 

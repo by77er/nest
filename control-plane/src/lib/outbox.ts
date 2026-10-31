@@ -64,10 +64,6 @@ export class ChannelOutbox {
     this.waitUntil(this.deadlines.set(OUTBOX_DEADLINE, Date.now(), true));
   }
 
-  pending(): number {
-    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM chan_out").one().n;
-  }
-
   /**
    * Post queued rows in order, within the batch and time bounds. A retryable failure stops the flush
    * (the deadline retries it, keeping the order); a row refused for good is retried `MAX_REFUSALS`
