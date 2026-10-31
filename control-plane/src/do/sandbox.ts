@@ -6,6 +6,7 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
@@ -19,7 +20,7 @@ import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
-  type InjectionBinding, type Resources, SandboxState,
+  InjectionBinding, type Resources, SandboxState,
 } from "../protocol/model";
 
 export const DEFAULT_IMAGE = "nest-base:latest";
@@ -31,14 +32,18 @@ export const BASE_ALLOW = [
   "github.com", "*.githubusercontent.com", "deb.debian.org",
 ];
 
-export interface WorkstreamPolicyLayer {
-  allow: { host: string; ports?: number[] }[];
-  passthrough: string[];
-  inject: InjectionBinding[];
-  tcp: { host: string; port: number }[];
-}
-
-const EMPTY_LAYER: WorkstreamPolicyLayer = { allow: [], passthrough: [], inject: [], tcp: [] };
+/** The ports an allow rule (or a grant) covers when it names none. */
+const WEB_PORTS = [80, 443];
+export const Port = z.number().int().min(1).max(65535);
+/** Workstream egress policy layer (docs/sandbox/networking/egress/policy/), as the API takes it. */
+export const WorkstreamPolicyLayer = z.object({
+  allow: z.array(z.object({ host: z.string().min(1), ports: z.array(Port).optional() })).default([]),
+  passthrough: z.array(z.string().min(1)).default([]),
+  inject: z.array(InjectionBinding).default([]),
+  tcp: z.array(z.object({ host: z.string().min(1), port: Port })).default([]),
+});
+export type WorkstreamPolicyLayer = z.output<typeof WorkstreamPolicyLayer>;
+const EMPTY_LAYER: WorkstreamPolicyLayer = WorkstreamPolicyLayer.parse({});
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
 export interface SandboxInfo extends lease.Lease, slots.Slots {
@@ -698,8 +703,8 @@ export class SandboxDO extends DurableObject<Env> {
     const info = this.info_();
     const ws = this.wsLayer();
     const allow: AllowRule[] = [
-      ...BASE_ALLOW.map((host) => ({ host, ports: [80, 443], layer: "base" as const })),
-      ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? [80, 443], layer: "workstream" as const })),
+      ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
+      ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: "workstream" as const })),
       ...this.sql
         .exec<{ host: string; ports: string; expires_ms: number }>("SELECT host, ports, expires_ms FROM grants WHERE expires_ms > ? ORDER BY expires_ms", now)
         .toArray()
@@ -734,7 +739,7 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** Temporary sandbox-layer grant (e.g. approved through `ask`). Expires on its own. */
-  async grant(host: string, ttlMs: number, ports: number[] = [80, 443]): Promise<EgressPolicy> {
+  async grant(host: string, ttlMs: number, ports: number[] = WEB_PORTS): Promise<EgressPolicy> {
     this.info_(); // an unknown sandbox gets no row and no alarm
     const expires = Date.now() + ttlMs;
     this.sql.exec("INSERT INTO grants (id, host, ports, expires_ms) VALUES (?, ?, ?, ?)", newId("grt_"), host, JSON.stringify(ports), expires);

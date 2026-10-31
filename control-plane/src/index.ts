@@ -13,7 +13,8 @@ import { Capability, CatalogName, intersectTools, OperatorOverrides, Template } 
 import { type Actor, LedgerName, type SpecGrant, type TaskOp, TaskPriority, TaskStatus } from "./lib/tasks";
 import { LIST_DEFAULT_LIMIT, ledgerStub } from "./do/tasks";
 import { DIRECTORY } from "./do/channel";
-import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, InjectionBinding, PROTOCOL_VERSION, Resources } from "./protocol/model";
+import { Port, WorkstreamPolicyLayer } from "./do/sandbox";
+import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
@@ -42,13 +43,6 @@ async function sharedHealth(env: Env): ReturnType<typeof checkHealth> {
 /** A host may reconnect its fleet channel this long after its token expired (and gets a fresh one). */
 const FLEET_TOKEN_GRACE_MS = 24 * 3_600_000;
 
-/** Workstream egress policy layer (docs/sandbox/networking/egress/policy/). */
-const PolicyLayer = z.object({
-  allow: z.array(z.object({ host: z.string().min(1), ports: z.array(z.number().int().min(1).max(65535)).optional() })).default([]),
-  passthrough: z.array(z.string().min(1)).default([]),
-  inject: z.array(InjectionBinding).default([]),
-  tcp: z.array(z.object({ host: z.string().min(1), port: z.number().int().min(1).max(65535) })).default([]),
-});
 
 /** Cells are names of FleetDOs: well-formed, and from the configured list when there is one. */
 function checkCell(env: Env, cell: string): string {
@@ -504,7 +498,7 @@ export const ROUTES: Route[] = [
   route({
     method: "POST", path: "/v1/sandboxes", auth: "admin",
     body: z.object({
-      workstream: z.string().startsWith("ws_"), image: z.string().optional(), resources: Resources.optional(), policy: PolicyLayer.optional(),
+      workstream: z.string().startsWith("ws_"), image: z.string().optional(), resources: Resources.optional(), policy: WorkstreamPolicyLayer.optional(),
       cell: z.string().default(DEFAULT_CELL),
     }),
     run: async ({ env, body: r }) => {
@@ -531,12 +525,12 @@ export const ROUTES: Route[] = [
   route({ method: "POST", path: "/v1/sandboxes/:sandbox/resolve", auth: "admin", body: z.object({ client: z.string().min(1) }),
     run: ({ env, p, body: r }) => sandbox(env, p.sandbox).resolve(r.client) }),
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).policy() }),
-  route({ method: "PUT", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", body: PolicyLayer, run: ({ env, p, body }) => sandbox(env, p.sandbox).setWorkstreamPolicy(body) }),
+  route({ method: "PUT", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", body: WorkstreamPolicyLayer, run: ({ env, p, body }) => sandbox(env, p.sandbox).setWorkstreamPolicy(body) }),
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/generations", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).generations() }),
   route({ method: "POST", path: "/v1/sandboxes/:sandbox/place", auth: "admin", run: async ({ env, p }) => ({ host: await sandbox(env, p.sandbox).retryPlacement() }) }),
   route({
     method: "POST", path: "/v1/sandboxes/:sandbox/grants", auth: "admin",
-    body: z.object({ host: z.string(), ttl_ms: z.number().int().positive(), ports: z.array(z.number().int().min(1).max(65535)).optional() }),
+    body: z.object({ host: z.string(), ttl_ms: z.number().int().positive(), ports: z.array(Port).optional() }),
     run: ({ env, p, body: r }) => sandbox(env, p.sandbox).grant(r.host, r.ttl_ms, r.ports),
   }),
 
