@@ -672,6 +672,31 @@ describe("one brain per agent: the brain record", () => {
     expect((await ws.next("run_turn", (m) => m.input.text.endsWith("third"))).input.text).toBe("third");
   });
 
+  it("two move notices racing mid-turn: the brain is left told of the newer epoch, never moved back to the older", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "first" } }, 201);
+    await ws.next("run_turn");
+    // The first notice (epoch 2) is held while it reads the sandbox's head; the second (3) runs through.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      const real = (inst as any).movedNote.bind(inst);
+      let n = 0;
+      (inst as any).movedNote = async (info: unknown) => {
+        if (n++ === 0) await held;
+        return real(info);
+      };
+    });
+    const first = agentStub(s.agent).onSandboxMoved(s.sandbox, 2, s.host.host);
+    await new Promise((r) => setTimeout(r, 20));
+    await agentStub(s.agent).onSandboxMoved(s.sandbox, 3, s.host.host);
+    expect((await agentStub(s.agent).info()).told_sandbox_epoch).toBe(3);
+    release();
+    await first;
+    expect((await agentStub(s.agent).info()).told_sandbox_epoch).toBe(3);
+  });
+
   it("rule 3: an exit of an older start releases nothing; the current one's releases the record", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);

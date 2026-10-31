@@ -1203,10 +1203,13 @@ export class AgentDO extends DurableObject<Env> {
     // epoch with the one it was last told about.
     if (info.current_turn && info.told_sandbox_epoch !== undefined && info.told_sandbox_epoch !== epoch) {
       const note = await this.movedNote(info);
+      // Only forward: a newer move told meanwhile (another notice, or a turn's start) says it all.
+      let news = false;
       this.update((i) => {
-        i.told_sandbox_epoch = epoch;
+        news = (i.told_sandbox_epoch ?? -1) < epoch;
+        if (news) i.told_sandbox_epoch = epoch;
       });
-      await this.postInbox(SYSTEM_SENDER, note);
+      if (news) await this.postInbox(SYSTEM_SENDER, note);
     }
     // Never a start from here: this may run inside a start that placed the sandbox. The alarm wakes
     // a stopped brain with work waiting, now that its sandbox has a host.
