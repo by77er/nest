@@ -40,7 +40,7 @@ Agents create any other channel (`ws/auth`, `team/review`). Names are hierarchic
 `subscribe(channel, filter?, delivery, batch_ms?, once?)` registers a wake rule for an agent. Subscribing needs `read` (a wake names senders and kinds):
 - **Filter:** `kinds`, `from`, `keys` (key prefixes, e.g. a hook's `ref/<branch>`), `mentions_me`, `reply_to`. An empty filter matches everything.
 - **Delivery:**
-  - `turn`: when the agent is idle, matches start its next turn. Mid-turn, a notice from the agent's own inbox joins the running turn (stdin, or the `Stop` hook), as a message to it should; any other channel's notice is queued as the next turn, coalesced with others waiting. Injected into a turn busy with something else, a model can pass over a notice, and a `once` subscription is then spent (3–12% of mention wakes in a [stress test](../../dev/cloud-checks/stress-2026-10-31.md), 2026-10-31).
+  - `turn`: when the agent is idle, matches start its next turn. Mid-turn, a notice from the agent's own inbox joins the running turn (through the inbox mirror's hooks), as a message to it should; any other channel's notice is queued as the next turn, coalesced with others waiting. Injected into a turn busy with something else, a model can pass over a notice, and a `once` subscription is then spent (3–12% of mention wakes in a [stress test](../../dev/cloud-checks/stress-2026-10-31.md), 2026-10-31).
   - `none`: only a cursor: a `read` without `since` starts there and moves it.
 - **`batch_ms`** coalesces matches into one turn, so a burst of events costs one wake.
 - **`once`** ends the subscription at the first match. Replies use it.

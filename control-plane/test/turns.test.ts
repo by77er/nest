@@ -70,6 +70,22 @@ describe("TurnQueue (the model's Q1-Q4)", () => {
     });
   });
 
+  it("an unseen message that interrupted its turn comes back ahead of the turns already queued; any other, behind them", async () => {
+    await withQueue((q) => {
+      q.enqueue(user("work"));
+      const t = q.claimNext()!.turn;
+      q.enqueue(user("queued"));
+      q.mirror({ ...msg("msg_stop", "stop that"), from: "user", interrupt: true }, t);
+      q.complete(t);
+      expect(q.claimNext()!.input.text).toBe("Message from user: stop that");
+      const u = q.claimNext()!.turn;
+      q.mirror({ ...msg("msg_later", "when you can"), from: "user" }, u);
+      q.enqueue(user("next"));
+      q.complete(u);
+      expect(q.claimNext()!.input.text).toBe("next");
+    });
+  });
+
   it("counts channel turns and merges into the one still waiting", async () => {
     await withQueue((q) => {
       const now = Date.now();

@@ -139,8 +139,11 @@ export async function withTimeout<T>(p: Promise<T>, ms: number, what: string): P
   }
 }
 
-/** Multiplexes several named deadlines onto a Durable Object's single alarm. */
-export class Deadlines {
+/**
+ * Multiplexes several named deadlines onto a Durable Object's single alarm. `K` narrows the keys an
+ * owner may arm; `runDue` hands back any stored key, so its handler must expect one it doesn't know.
+ */
+export class Deadlines<K extends string = string> {
   /**
    * Keys whose handler `runDue` is running, with the `at` being run. That row is about to be deleted,
    * so it counts as unarmed: `has` and `keepEarlier` must not swallow a re-arm (from the handler
@@ -162,20 +165,20 @@ export class Deadlines {
     return this.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = ?", key).toArray()[0]?.at;
   }
 
-  async set(key: string, at: number, keepEarlier = false): Promise<void> {
+  async set(key: K, at: number, keepEarlier = false): Promise<void> {
     if (keepEarlier && this.has(key) && this.at(key)! <= at) return;
     this.sql.exec("INSERT INTO deadlines (key, at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at", key, at);
     if (this.running.has(key)) this.rearmed.add(key);
     await this.reschedule();
   }
 
-  async clear(key: string): Promise<void> {
+  async clear(key: K): Promise<void> {
     this.sql.exec("DELETE FROM deadlines WHERE key = ?", key);
     await this.reschedule();
   }
 
   /** Whether `key` is armed. A key whose handler is running isn't (its row is about to be deleted). */
-  has(key: string): boolean {
+  has(key: K): boolean {
     const at = this.at(key);
     return at !== undefined && (this.running.get(key) !== at || this.rearmed.has(key));
   }
