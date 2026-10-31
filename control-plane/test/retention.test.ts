@@ -758,6 +758,22 @@ describe("FleetDO's own answers are no evidence that a host processes commands",
     expect(answered).toEqual([{ answered_by: "fleet" }, { answered_by: "fleet" }, { answered_by: "fleet" }]);
   });
 
+  it("nor are its answers to starts a host's expiry failed, or to commands for a dead host", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell, "brain");
+    const [start] = await fleetStub(cell).issueCommands(h.host, [{ type: "agent_start", agent: "agt_01expirestart00000000000000", epoch: 1 } as never]);
+    await fleetSql(cell, (sql) => sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, h.host));
+    await fleetSql(cell, (sql) => sql.exec("INSERT INTO leases (sandbox, host, epoch) VALUES ('sbx_01heldbyexpired000000000000', ?, 1)", h.host));
+    await fleetSql(cell, (_sql, inst) => (inst as any).expireHost(h.host));
+    h.ws.close();
+    await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const [late] = await fleetStub(cell).issueCommands(h.host, [{ type: "fence", sandboxes: [], reason: "t" }]);
+    const answers = await fleetSql(cell, (sql) => rows(sql, "SELECT cmd, result, answered_by FROM commands WHERE cmd IN (?, ?)", start!, late!));
+    expect(answers.map((a) => [a.answered_by, JSON.parse(a.result as string).error.retryable])).toEqual(
+      answers.map((a) => a.cmd === start ? ["fleet", true] : ["fleet", false]));
+    expect(answers).toHaveLength(2);
+  });
+
   it("only its kills outlive their retention on a host whose death isn't proof", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell); // live: `lost` = 0

@@ -1076,12 +1076,11 @@ export class FleetDO extends DurableObject<Env> {
     // Their commands the old process never answered died with it; closed without the retries a
     // failure would trigger (the sandbox is placed again below, under a new epoch). FleetDO's
     // answer, not the host's (`killProgress`).
-    const closed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, "sandbox lost with the old host process", false) });
     const lost = new Set(gone.map((l) => l.sandbox));
     const unanswered = this.sql.exec<{ cmd: string; sandbox: string | null }>("SELECT cmd, sandbox FROM commands WHERE host = ? AND result IS NULL", host).toArray();
     for (const c of unanswered) {
       if (!cmds.has(c.cmd) || c.sandbox === null || !lost.has(c.sandbox)) continue;
-      this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE cmd = ?", closed, Date.now(), "fleet" satisfies AnsweredBy, c.cmd);
+      this.answerByFleet("cmd = ?", [c.cmd], "sandbox lost with the old host process", false);
     }
     console.warn(`FleetDO: ${host} restarted without ${gone.map((l) => l.sandbox).join(", ")}`);
     await this.evict(host, gone.filter((l) => l.state === "suspended").map((l) => l.sandbox));
@@ -1111,9 +1110,9 @@ export class FleetDO extends DurableObject<Env> {
       }
       if (s.state === "fenced") fenced.push(s);
     }
-    if (fence.length) await this.issueCommands(host, [{ type: "fence", sandboxes: fence, reason: "reconcile" }]);
+    if (fence.length) this.issueCommands(host, [{ type: "fence", sandboxes: fence, reason: "reconcile" }]);
     for (const s of fenced) await this.holderFenced(host, s.sandbox, s.epoch, !s.dirty);
-    await this.reapStale();
+    this.reapStale();
   }
 
   /**
@@ -1160,7 +1159,7 @@ export class FleetDO extends DurableObject<Env> {
    * repeated. One still leased to its host (or under STONITH there) waits; one superseded by a newer
    * epoch on the same host is dropped (nestd salvages and replaces it when it creates the new one).
    */
-  private async reapStale(): Promise<void> {
+  private reapStale(): void {
     const now = Date.now();
     const rows = this.sql.exec<{ sandbox: string; host: string; epoch: number; first_seen_ms: number; clean: number }>(
       "SELECT sandbox, host, epoch, first_seen_ms, clean FROM stale_incarnations WHERE cmd IS NULL").toArray();
@@ -1174,11 +1173,7 @@ export class FleetDO extends DurableObject<Env> {
         continue;
       }
       if (!r.clean && now - r.first_seen_ms < SALVAGE_WINDOW_MS) continue;
-      // Claimed before the await, so a concurrent pass never sends a second one.
-      const claimed = this.sql.exec("UPDATE stale_incarnations SET cmd = 'issuing' WHERE sandbox = ? AND host = ? AND epoch = ? AND cmd IS NULL",
-        r.sandbox, r.host, r.epoch).rowsWritten;
-      if (!claimed) continue;
-      const [cmd] = await this.issueCommands(r.host, [{ type: "sandbox_destroy", sandbox: r.sandbox, epoch: r.epoch }]);
+      const [cmd] = this.issueCommands(r.host, [{ type: "sandbox_destroy", sandbox: r.sandbox, epoch: r.epoch }]);
       this.sql.exec("UPDATE stale_incarnations SET cmd = ? WHERE sandbox = ? AND host = ? AND epoch = ?", cmd!, r.sandbox, r.host, r.epoch);
       console.log(`FleetDO: destroying the stale ${r.sandbox}@${r.epoch} on ${r.host}`);
     }
@@ -1355,7 +1350,7 @@ export class FleetDO extends DurableObject<Env> {
         // its destroy needn't wait out the salvage window. reapStale keeps its usual lease checks
         // (one still leased to this host at that epoch waits; one superseded here is dropped).
         this.recordStale(ev.sandbox, host, ev.epoch, true);
-        await this.reapStale();
+        this.reapStale();
         return;
       case "sandbox_state":
         // The lease is the one authority for who holds a sandbox: only its holder's reports reach
@@ -1364,7 +1359,7 @@ export class FleetDO extends DurableObject<Env> {
         if (!this.holds(host, ev.sandbox, ev.epoch)) {
           if (ev.state === "fenced") {
             this.recordStale(ev.sandbox, host, ev.epoch, false);
-            await this.reapStale();
+            this.reapStale();
           }
           return;
         }
@@ -1411,7 +1406,7 @@ export class FleetDO extends DurableObject<Env> {
       }
       case "guest_cli":
         if (!this.holds(host, ev.sandbox, ev.epoch)) {
-          await this.issueCommands(host, [{
+          this.issueCommands(host, [{
             type: "guest_cli_result", request: ev.request,
             result: { status: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "this host does not hold the sandbox's lease") },
           }]);
@@ -1440,7 +1435,7 @@ export class FleetDO extends DurableObject<Env> {
       const ne = asNestError(e);
       result = { status: "error", error: ne ? ne.body() : errorBody(ErrorCodes.INTERNAL, "nest CLI relay failed", true) };
     }
-    await this.issueCommands(host, [{ type: "guest_cli_result", request: ev.request, result }]);
+    this.issueCommands(host, [{ type: "guest_cli_result", request: ev.request, result }]);
   }
 
   /**
@@ -1512,7 +1507,7 @@ export class FleetDO extends DurableObject<Env> {
 
   private async onCommitRequest(host: string, ev: CommitRequestEvent): Promise<void> {
     const outcome = await this.sandbox(ev.sandbox).commit(host, ev);
-    await this.issueCommands(host, [{ type: "commit_result", request: ev.request, sandbox: ev.sandbox, outcome }]);
+    this.issueCommands(host, [{ type: "commit_result", request: ev.request, sandbox: ev.sandbox, outcome }]);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1521,10 +1516,11 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * Queue commands for a host: persisted, delivered reliably in order, each with exactly one result.
-   * Secret values must arrive as BrokerDO references; they are resolved only when sent. Returns once
-   * the commands are stored; the send happens behind it.
+   * Secret values must arrive as BrokerDO references; they are resolved only when sent. Synchronous:
+   * the commands are stored (and any index row written) in the caller's step; the send happens
+   * behind it, on the host's outbound chain.
    */
-  async issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): Promise<string[]> {
+  issueCommands(host: string, bodies: CommandBody[], purpose: Purpose = null): string[] {
     const now = Date.now();
     // A start never goes to a host whose loss is (being) announced: expired, dead or unknown (A3),
     // nor to a host of the previous release (N23: closes the gap between AgentDO's pick and this send).
@@ -1585,6 +1581,17 @@ export class FleetDO extends DurableObject<Env> {
     // an RPC) behind unrelated BrokerDO resolution.
     void this.flush(host);
     return commands.map((c) => c.cmd);
+  }
+
+  /**
+   * FleetDO's own error answer to every unanswered command matching `where`, without acting on it:
+   * never evidence that the host ran it (`answered_by`, `killProgress`). `retryable` tells the
+   * issuer whether to try again.
+   */
+  private answerByFleet(where: string, args: SqlStorageValue[], message: string, retryable: boolean): void {
+    const answer = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, message, retryable) });
+    this.sql.exec(`UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE (${where}) AND result IS NULL`,
+      answer, Date.now(), "fleet" satisfies AnsweredBy, ...args);
   }
 
   /** Result of a command, once the host reported it. */
@@ -1664,7 +1671,7 @@ export class FleetDO extends DurableObject<Env> {
     const host = candidates[0]!.h.host;
     this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, vcpus, memory_mib) VALUES (?, ?, ?, 0, ?, ?)",
       req.sandbox, host, req.epoch, need.vcpus, need.memory_mib);
-    await this.issueCommands(host, [{
+    this.issueCommands(host, [{
       type: "sandbox_create",
       sandbox: req.sandbox,
       workstream: req.workstream,
@@ -1700,7 +1707,7 @@ export class FleetDO extends DurableObject<Env> {
       `SELECT cmd FROM commands WHERE type = 'agent_stop' AND host = ? AND agent = ? AND epoch = ?
          AND json_extract(body, '$.mode') = 'kill' ORDER BY issued_ms LIMIT 1`, host, agent, epoch).toArray()[0];
     if (prior) return prior.cmd;
-    const [cmd] = await this.issueCommands(host, [{ type: "agent_stop", agent, reason, mode: "kill", epoch }]);
+    const [cmd] = this.issueCommands(host, [{ type: "agent_stop", agent, reason, mode: "kill", epoch }]);
     return cmd!;
   }
 
@@ -1904,7 +1911,7 @@ export class FleetDO extends DurableObject<Env> {
       "SELECT DISTINCT a.host FROM host_agents a JOIN hosts h ON h.host = a.host WHERE h.status = ? AND a.drain_told = 0", "draining" satisfies HostStatus).toArray()) {
       await this.tellDraining(h.host);
     }
-    await this.reapStale();
+    this.reapStale();
     // Agents waiting for a brain host: launches happen here too, not only inside a start, so the
     // next launch after an enroll timeout doesn't wait for some agent's backed-off retry.
     this.sql.exec("DELETE FROM brain_waiters WHERE since_ms < ?", now - BRAIN_WAIT_TTL_MS);
@@ -2275,7 +2282,7 @@ export class FleetDO extends DurableObject<Env> {
     await this.evict(host, leases.filter((l) => l.state === "suspended").map((l) => l.sandbox));
     const running = leases.filter((l) => l.state !== "suspended");
     if (running.length) {
-      await this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
+      this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
     }
     // Its brains move now, where another host can take them; the rest restart once it is dead. In
     // the background (the host's event batch isn't held for brain starts), and retried by the tick
@@ -2583,10 +2590,7 @@ export class FleetDO extends DurableObject<Env> {
    * loss for that epoch from `brainsLost` (delivered until acknowledged).
    */
   private failStarts(host: string): void {
-    const failed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, "host expired before running this start", true) });
-    // FleetDO's answer, not the host's: it is no evidence that the host processes commands.
-    this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE host = ? AND type = ? AND result IS NULL",
-      failed, Date.now(), "fleet" satisfies AnsweredBy, host, "agent_start" satisfies CommandType);
+    this.answerByFleet("host = ? AND type = ?", [host, "agent_start" satisfies CommandType], "host expired before running this start", true);
   }
 
   /**
@@ -2633,9 +2637,7 @@ export class FleetDO extends DurableObject<Env> {
       if (plan.end && h.instance_id) this.endInstance(h.instance_id, plan.end, h.role);
       for (const ws of this.ctx.getWebSockets(host)) ws.close(4410, cause);
       this.releaseTunnel(host, cause);
-      const closed = JSON.stringify({ status: "error", error: errorBody(ErrorCodes.INTERNAL, `host is dead (${cause})`, false) });
-      this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE host = ? AND result IS NULL",
-        closed, Date.now(), "fleet" satisfies AnsweredBy, host);
+      this.answerByFleet("host = ?", [host], `host is dead (${cause})`, false);
       // Its lineage-reset capture, if any, is answered with the rest.
       this.sql.exec("DELETE FROM kv WHERE key = ?", orphansKey(host));
       this.rel.reset(host);
@@ -2684,7 +2686,7 @@ export class FleetDO extends DurableObject<Env> {
       for (const s of (JSON.parse(r.body) as { sandboxes: string[] }).sandboxes) covered.add(s);
     }
     const missing = expired.filter((s) => !covered.has(s));
-    if (missing.length) await this.issueCommands(host, [{ type: "fence", sandboxes: missing, reason: "lease expired" }], "stonith_fence");
+    if (missing.length) this.issueCommands(host, [{ type: "fence", sandboxes: missing, reason: "lease expired" }], "stonith_fence");
   }
 
   /**
