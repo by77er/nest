@@ -1,10 +1,12 @@
 // The dashboard's Worker: serves the built page and proxies two read-only admin routes of the
-// control plane with the admin token it holds. Nothing else is reachable through it, and the token
-// never reaches the browser. Every request, page and API alike, must carry a valid Cloudflare
+// control plane with the admin token it holds, plus `GET /v1/agents/:agent` for the agents the fleet
+// view lists (src/agents.ts), narrowed. Nothing else is reachable through it, and the token never
+// reaches the browser. Every request, page and API alike, must carry a valid Cloudflare
 // Access token for the dashboard's application (src/access.ts); without one the answer is 403, so
 // the token stays private even on a path that does not pass through Access.
 
 import { verifyAccessJwt } from "./access";
+import { AGENT_CONCURRENCY, type AgentRow, type AgentsResponse, errorMessage, listedAgents, mapBounded, MAX_AGENTS, summarizeAgent } from "./agents";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -17,7 +19,7 @@ export interface Env {
   NEST_ADMIN_TOKEN?: string;
 }
 
-/** The only control-plane routes the page may read, by the path it asks for. */
+/** The control-plane routes the page reads as they are, by the path it asks for (and `/api/agents`). */
 const ROUTES: Record<string, string> = {
   "/api/fleet": "/v1/admin/fleet",
   "/api/images": "/v1/admin/images",
@@ -25,6 +27,37 @@ const ROUTES: Record<string, string> = {
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+
+/** A GET of the control plane's admin API with the admin token. */
+const upstream = (env: Env & { NEST_ADMIN_TOKEN: string }, path: string) =>
+  fetch(`${env.NEST_CONTROL_PLANE}${path}`, { headers: { authorization: `Bearer ${env.NEST_ADMIN_TOKEN}`, "user-agent": "nest-dashboard/1" } });
+
+/** Its answer as the page's, the body passed through. */
+const passThrough = (res: Response) =>
+  new Response(res.body, { status: res.status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+
+/**
+ * `GET /api/agents`: each agent the cell's fleet view lists on a host, read from AgentDO (at most
+ * MAX_AGENTS, AGENT_CONCURRENCY at a time) and narrowed. One that cannot be read is a row with its
+ * error, not a failed answer; only a fleet view that cannot be read fails it.
+ */
+async function agents(env: Env & { NEST_ADMIN_TOKEN: string }, cell: string): Promise<Response> {
+  const fleet = await upstream(env, `/v1/admin/fleet?cell=${encodeURIComponent(cell)}`);
+  if (!fleet.ok) return passThrough(fleet);
+  const ids = listedAgents(await fleet.json());
+  const read = ids.slice(0, MAX_AGENTS);
+  const rows = await mapBounded(read, AGENT_CONCURRENCY, async (agent): Promise<AgentRow> => {
+    try {
+      const res = await upstream(env, `/v1/agents/${agent}`);
+      const text = await res.text();
+      if (!res.ok) return { agent, info: null, error: `${res.status}: ${errorMessage(text)}` };
+      return { agent, info: summarizeAgent(agent, JSON.parse(text)), error: null };
+    } catch (e) {
+      return { agent, info: null, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return json({ agents: rows, omitted: ids.length - read.length } satisfies AgentsResponse);
+}
 
 /** Whether the request carries a valid Access token for this application; fails closed. */
 async function admitted(request: Request, env: Env): Promise<boolean> {
@@ -49,16 +82,13 @@ export default {
     const cells = env.NEST_CELLS.split(",").map((c) => c.trim()).filter(Boolean);
     if (url.pathname === "/api/cells") return json({ cells, control_plane: env.NEST_CONTROL_PLANE });
     const target = ROUTES[url.pathname];
-    if (!target) return json({ error: "unknown route" }, 404);
+    if (!target && url.pathname !== "/api/agents") return json({ error: "unknown route" }, 404);
     const cell = url.searchParams.get("cell") ?? "";
     if (!cells.includes(cell)) return json({ error: `unknown cell ${cell}` }, 400);
-    if (!env.NEST_ADMIN_TOKEN) return json({ error: "NEST_ADMIN_TOKEN is not set on this Worker" }, 503);
-    const upstream = await fetch(`${env.NEST_CONTROL_PLANE}${target}?cell=${encodeURIComponent(cell)}`, {
-      headers: { authorization: `Bearer ${env.NEST_ADMIN_TOKEN}`, "user-agent": "nest-dashboard/1" },
-    });
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
-    });
+    const token = env.NEST_ADMIN_TOKEN;
+    if (!token) return json({ error: "NEST_ADMIN_TOKEN is not set on this Worker" }, 503);
+    const authed = { ...env, NEST_ADMIN_TOKEN: token };
+    if (!target) return agents(authed, cell);
+    return passThrough(await upstream(authed, `${target}?cell=${encodeURIComponent(cell)}`));
   },
 } satisfies ExportedHandler<Env>;

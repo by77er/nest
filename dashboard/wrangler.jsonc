@@ -24,5 +24,6 @@
     "DASHBOARD_AUD": "cfb5ed2f974fe3d920b95a25b6a1c6fa236697e605c65a0c641585ca1563b3b5"
   }
   // Secret (wrangler secret put / .dev.vars): NEST_ADMIN_TOKEN, the control plane's admin token.
-  // The page never sees it: the Worker adds it to the two GET routes it proxies and nothing else.
+  // The page never sees it: the Worker adds it to the GETs it makes (the fleet and images views, and
+  // each listed agent's record) and nothing else.
 }

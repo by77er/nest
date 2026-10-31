@@ -124,7 +124,7 @@ describe("the dashboard Worker's Access check", () => {
   ];
   it.each(refused)("refuses %s with 403, page and API alike", async (_name, token, over) => {
     const t = await token();
-    for (const path of ["/", "/index.html", "/api/cells", "/api/fleet?cell=use1"]) {
+    for (const path of ["/", "/index.html", "/api/cells", "/api/fleet?cell=use1", "/api/agents?cell=use1"]) {
       expect((await call(path, t, env(over))).status, path).toBe(403);
     }
     expect(assets).toEqual([]);
