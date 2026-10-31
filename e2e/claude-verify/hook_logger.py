@@ -10,7 +10,10 @@ never the environment, because whether the subprocess env scrub keeps variables 
 Output: `PreToolUse` answers like nest's runner does for an allowed call (`allow`) unless
 <decisions.json> says otherwise: {"PreToolUse": ["defer", "allow"]} answers the first call with
 `defer`, the second with `allow`, and repeats the last entry after that (the counter lives in
-<decisions.json>.state). Every other event prints nothing. Always exits 0.
+<decisions.json>.state). An entry that is an object is printed verbatim as the hook's answer (any
+event: `{"decision": "block", ...}` for `Stop`, `{"hookSpecificOutput": ...}` for `PostToolUse`);
+`null` means the default. A key `<event>:<tool_name>` takes precedence over `<event>` for calls of
+that tool. Every other event prints nothing. Always exits 0.
 """
 import hashlib, json, os, sys, time
 
@@ -29,12 +32,15 @@ def env_summary(env):
     }
 
 
-def next_decision(decisions_path, event):
+def next_decision(decisions_path, event, tool_name=None):
     """The configured decision for this call of `event` (None = default)."""
     if not decisions_path or not os.path.exists(decisions_path):
         return None
     with open(decisions_path) as f:
-        seq = json.load(f).get(event)
+        table = json.load(f)
+    if tool_name and f"{event}:{tool_name}" in table:
+        event = f"{event}:{tool_name}"
+    seq = table.get(event)
     if not seq:
         return None
     state_path = decisions_path + ".state"
@@ -51,6 +57,8 @@ def next_decision(decisions_path, event):
 
 
 def output_for(event, decision):
+    if isinstance(decision, dict):
+        return decision
     if event != "PreToolUse":
         return None
     decision = decision or "allow"
@@ -70,7 +78,7 @@ def main(argv):
     except ValueError:
         data = {"_unparsed": raw[:2000]}
     event = data.get("hook_event_name", "") if isinstance(data, dict) else ""
-    decision = next_decision(decisions, event)
+    decision = next_decision(decisions, event, data.get("tool_name") if isinstance(data, dict) else None)
     out = output_for(event, decision)
     entry = {"ts": time.time(), "pid": os.getpid(), "ppid": os.getppid(), "cwd": os.getcwd(), "event": event,
              "input": data, "env": env_summary(dict(os.environ)), "output": out}

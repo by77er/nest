@@ -2,7 +2,8 @@
 Code binary" list (plus the `forceLoginMethod` item above it). Each returns `harness.result(...)`.
 
 Items 1-5, 7 and the short-cwd half of 8 share one baseline session (one short turn with one
-`mcp__nest__echo` call), so the whole run stays at about a dozen small model requests."""
+`mcp__nest__echo` call), so the whole run stays at about a dozen small model requests; items 11 and 12
+add three short sessions of their own."""
 import glob, json, os, shutil, subprocess, sys, time, traceback, uuid
 
 import harness as h
@@ -29,6 +30,8 @@ ITEMS = [
     (8, "transcript_path", "Transcript path encoding (cwd over 200 characters included)"),
     (9, "resume_defer", "CLAUDE_CODE_RESUME_INTERRUPTED_TURN and PreToolUse defer under stream-json"),
     (10, "compaction", "SessionStart fires after compaction"),
+    (11, "post_tool_context", "PostToolUse additionalContext reaches the model mid-turn (MCP, built-in, subagent)"),
+    (12, "stop_block", "Stop hook `block`: result lines, Stop again after the continuation, the reason reaches the model"),
 ]
 
 
@@ -742,11 +745,238 @@ def probe_compaction(ctx, n, key, title):
         return h.result(n, key, title, PASS, f"After `/compact`{flag}, SessionStart fired with source 'compact'.", ev)
     return h.result(n, key, title, FAIL, f"Compaction happened{flag} but no SessionStart with source 'compact' followed (SessionStart sources: {srcs or 'none'}).", ev)
 
+# ---------------------------------------------------------------------------------- 11. PostToolUse additionalContext
+FOLLOW = "If, after it returns, you have been given any further instruction, follow it exactly; otherwise reply with the single word DONE."
+CONTEXT_PARTS = [  # (part, tool whose PostToolUse carries the context, prompt)
+    ("mcp", "mcp__nest__echo", f'Call the mcp__nest__echo tool exactly once with text "first". {FOLLOW}'),
+    ("builtin", "TaskList", f"Call the TaskList tool exactly once. {FOLLOW}"),
+    ("subagent", "mcp__nest__sleep",
+     'Use the Agent tool exactly once, with subagent_type "general-purpose" and run in the foreground, giving the subagent exactly this '
+     f'prompt: "Call the mcp__nest__sleep tool exactly once with seconds set to 1. {FOLLOW}" When the subagent has finished, reply with the single word DONE.'),
+]
+
+
+def probe_token():
+    return "nest-" + uuid.uuid4().hex[:12]
+
+
+def context_instruction(token):
+    return f'Instruction from the nest runner: call the mcp__nest__echo tool exactly once more with text "{token}", then reply with the single word DONE.'
+
+
+def post_tool_context_output(token):
+    """What the runner's PostToolUse answer looks like when it hands the model an inbox message."""
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context_instruction(token)}}
+
+
+def blocks(o, kind):
+    return [b for b in ((o.get("message") or {}).get("content") or []) if isinstance(b, dict) and b.get("type") == kind]
+
+
+def token_sightings(objs, token, tool_calls, config_dir):
+    """Where `token` turned up: model output (tool inputs and text, with the stream's parent_tool_use_id:
+    null is the main loop, an id is a subagent), other stdout lines, MCP calls, transcript rows."""
+    model, other = [], []
+    for o in objs:
+        if o.get("type") == "assistant":
+            for b in blocks(o, "tool_use"):
+                if token in json.dumps(b.get("input")):
+                    model.append({"as": "tool_use", "name": b.get("name"), "parent_tool_use_id": o.get("parent_tool_use_id")})
+            for b in blocks(o, "text"):
+                if token in b.get("text", ""):
+                    model.append({"as": "text", "text": b["text"][:200], "parent_tool_use_id": o.get("parent_tool_use_id")})
+        elif token in json.dumps(o):
+            other.append(pick(o, "type", "subtype", "parent_tool_use_id"))
+    calls = [c for c in tool_calls if token in json.dumps((c.get("msg") or {}).get("params") or {})]
+    rows = []
+    for path in glob.glob(os.path.join(config_dir, "projects", "**", "*.jsonl"), recursive=True):
+        for r in h.read_jsonl(path):
+            if token in json.dumps(r):
+                att = r.get("attachment") if isinstance(r.get("attachment"), dict) else {}
+                rows.append({"file": os.path.relpath(path, config_dir), "type": r.get("type"), "attachment": att.get("type"),
+                             "isSidechain": r.get("isSidechain")})
+    return {"model_output": model, "other_stdout": other, "mcp_calls": len(calls), "transcript_rows": rows}
+
+
+def stream_view(objs):
+    """A compact stdout trace: type/subtype, tool names, text and result heads."""
+    out = []
+    for o in objs:
+        v = pick(o, "type", "subtype")
+        if o.get("parent_tool_use_id"):
+            v["sub"] = True
+        if o.get("type") in ("assistant", "user"):
+            v["blocks"] = [b.get("name") or (b.get("text") or "")[:60] or b.get("type") for b in (o.get("message") or {}).get("content") or [] if isinstance(b, dict)]
+        if is_result(o):
+            v.update(pick(o, "stop_reason", "num_turns", "is_error"), result=str(o.get("result") or "")[:80])
+        out.append(v)
+    return out
+
+
+def run_turn(ctx, s, prompt, grace=3.0):
+    """Send one user message; wait for its result, then `grace` seconds for stragglers. Returns
+    (objs of this turn, send time)."""
+    mark, t = len(s.entries()), time.time()
+    s.send_user(prompt)
+    if s.wait_for(is_result, ctx.turn_timeout, start=mark):
+        time.sleep(grace)
+    return [e["obj"] for e in s.entries()[mark:] if e["obj"] is not None], t
+
+
+def subagent_texts(config_dir, agent_id):
+    """The assistant text a subagent wrote, from its own transcript (`subagents/agent-<id>.jsonl`);
+    stdout doesn't carry a subagent's final text."""
+    out = []
+    for path in glob.glob(os.path.join(config_dir, "projects", "**", f"agent-{agent_id}.jsonl"), recursive=True):
+        for r in h.read_jsonl(path):
+            if r.get("type") == "assistant":
+                out += [b["text"][:400] for b in blocks(r, "text") if b.get("text", "").strip()]
+    return out
+
+
+def context_part(ctx, ws, s, part, tool, prompt, token):
+    """One turn whose `tool` call gets the token instruction as PostToolUse additionalContext. The
+    model saw it if it produced the token, or (when the prompt never mentions echo) if its text
+    mentions echo: a model that declines the instruction still shows it saw it (2.1.316's haiku
+    subagent wrote "an instruction to call the echo tool ... so I ignored it")."""
+    objs, t = run_turn(ctx, s, prompt)
+    posts = ws.hooks("PostToolUse", after=t)
+    given = [x for x in posts if (x.get("input") or {}).get("tool_name") == tool and x.get("output")]
+    seen = token_sightings(objs, token, ws.tool_calls(after=t), ws.config)
+    res = next((o for o in reversed(objs) if is_result(o)), None)
+    receivers = {"subagent" if m["parent_tool_use_id"] else "main" for m in seen["model_output"]}
+    texts = {"main": [b["text"][:400] for o in objs if o.get("type") == "assistant" and not o.get("parent_tool_use_id") for b in blocks(o, "text")]}
+    for x in given:
+        aid = (x.get("input") or {}).get("agent_id")
+        if aid:
+            texts["subagent"] = subagent_texts(ws.config, aid)
+    mentions = {} if "echo" in prompt.lower() else {who: [x for x in ts if "echo" in x.lower()] for who, ts in texts.items()}
+    mentions = {who: ts for who, ts in mentions.items() if ts}
+    receivers |= set(mentions)
+    followed = bool(seen["model_output"])
+    return {"token": token, "context_given_to": tool, "followed": followed, "declined_but_mentioned": mentions if not followed else {},
+            "assistant_texts": texts,
+            "post_tool_use": [{"tool": (x.get("input") or {}).get("tool_name"), "agent_id": (x.get("input") or {}).get("agent_id"),
+                               "agent_type": (x.get("input") or {}).get("agent_type"), "answered": bool(x.get("output"))} for x in posts],
+            "context_delivered_by_hook": bool(given), "seen_by_model": followed or bool(mentions), "receivers": sorted(receivers),
+            "sightings": seen, "results_in_turn": sum(1 for o in objs if is_result(o)), "result": result_view(res),
+            "stream": stream_view(objs)[:40]}
+
+
+def probe_post_tool_context(ctx, n, key, title):
+    ws = ctx.workspace("post_tool_context")
+    tokens = {part: probe_token() for part, _, _ in CONTEXT_PARTS}
+    table = {f"PostToolUse:{tool}": [post_tool_context_output(tokens[part]), None] for part, tool, _ in CONTEXT_PARTS}
+    ws.set_decisions(table)
+    open(os.path.join(ws.state, "fast"), "w").close()  # the subagent's sleep returns at once
+    s = ws.start(("session-id", str(uuid.uuid4())), "treatment")
+    parts = {}
+    for part, tool, prompt in CONTEXT_PARTS:
+        parts[part] = context_part(ctx, ws, s, part, tool, prompt, tokens[part])
+    s.finish()
+    # Control: the MCP part's prompt with no context at all.
+    wc = ctx.workspace("post_tool_context_control")
+    sc = wc.start(("session-id", str(uuid.uuid4())), "control")
+    ctl_token = probe_token()  # never handed out: the model can only produce it by having seen it
+    control = context_part(ctx, wc, sc, "control", "mcp__nest__echo", CONTEXT_PARTS[0][2], ctl_token)
+    control["echo_calls"] = [pick(c["msg"].get("params") or {}, "arguments") for c in wc.tool_calls("echo")]
+    sc.finish()
+    ev = {"parts": parts, "control": control, "context_text": context_instruction("<token>")}
+    mcp = parts["mcp"]
+    if not mcp["context_delivered_by_hook"]:
+        return h.result(n, key, title, INCONCLUSIVE, no_turn("The model never called mcp__nest__echo, so no PostToolUse context was handed out", s.objs()) + ".", ev)
+    if control["seen_by_model"]:
+        return h.result(n, key, title, INCONCLUSIVE, "The control run produced its token without being given it; the probe is broken.", ev)
+
+    def say(p):
+        v = parts[p]
+        if not v["context_delivered_by_hook"]:
+            return f"{p}: not exercised (no {v['context_given_to']} call)"
+        if not v["seen_by_model"]:
+            return f"{p}: not seen"
+        if not v["followed"]:
+            return f"{p}: seen by the {'/'.join(v['receivers'])} loop, which declined it (its text mentions the echo instruction but it never produced the token)"
+        how = "+".join(sorted({m["as"] for m in v["sightings"]["model_output"]}))
+        return f"{p}: seen and followed by the {'/'.join(v['receivers'])} loop ({how}, {v['sightings']['mcp_calls']} MCP call(s) with the token)"
+    detail = "; ".join(say(p) for p, _, _ in CONTEXT_PARTS) + f"; control: no token, {len(control['echo_calls'])} echo call(s)"
+    if mcp["followed"]:
+        return h.result(n, key, title, PASS, f"PostToolUse additionalContext reached the model within the same turn: {detail}.", ev)
+    return h.result(n, key, title, FAIL, f"The hook returned additionalContext after mcp__nest__echo but the model never produced its token: {detail}.", ev)
+
+
+# ---------------------------------------------------------------------------------- 12. Stop hook block
+STOP_PROMPT = "Reply with the single word ALPHA."
+STOP_NEXT_PROMPT = "Reply with the single word BETA."
+
+
+def stop_reason_text(token):
+    return f'Instruction from the nest runner: before you finish, call the mcp__nest__echo tool exactly once with text "{token}", then reply with the single word OMEGA.'
+
+
+def turn_until_unblocked_stop(ctx, ws, s, prompt, grace=4.0):
+    """Send one user message and wait for a result after a Stop the hook didn't block (or the turn
+    timeout), then `grace` seconds more. Returns (this turn's stdout entries, send time)."""
+    mark, t = len(s.entries()), time.time()
+    s.send_user(prompt)
+
+    def done():
+        stops = ws.hooks("Stop", after=t)
+        if not stops or stops[-1].get("output"):
+            return False
+        return any(e["obj"] and is_result(e["obj"]) and e["ts"] >= stops[-1]["ts"] for e in s.entries()[mark:]) or s.p.poll() is not None
+    h.wait_until(done, ctx.turn_timeout)
+    time.sleep(grace)
+    return s.entries()[mark:], t
+
+
+def stop_turn_view(ws, entries, t):
+    stops = ws.hooks("Stop", after=t)
+    results = [e for e in entries if e["obj"] and is_result(e["obj"])]
+
+    def where(ts):
+        return sum(1 for x in stops if x["ts"] <= ts)  # how many Stop hooks had run by then
+    return {"stop_hooks": [{"stop_hook_active": (x.get("input") or {}).get("stop_hook_active"), "blocked": bool(x.get("output")),
+                            "t": round(x["ts"] - t, 2)} for x in stops],
+            "results": [{**result_view(e["obj"]), "t": round(e["ts"] - t, 2), "after_stop_hooks": where(e["ts"])} for e in results],
+            "stream": stream_view([e["obj"] for e in entries if e["obj"]])[:40]}
+
+
+def probe_stop_block(ctx, n, key, title):
+    ws = ctx.workspace("stop_block")
+    token = probe_token()
+    ws.set_decisions({"Stop": [{"decision": "block", "reason": stop_reason_text(token)}, None]})
+    s = ws.start(("session-id", str(uuid.uuid4())), "stop-block")
+    e1, t1 = turn_until_unblocked_stop(ctx, ws, s, STOP_PROMPT)
+    e2, t2 = turn_until_unblocked_stop(ctx, ws, s, STOP_NEXT_PROMPT)
+    s.finish()
+    turn1, turn2 = stop_turn_view(ws, [e for e in e1 if e["ts"] < t2], t1), stop_turn_view(ws, e2, t2)
+    turn1["stop_hooks"] = [x for x in turn1["stop_hooks"] if x["t"] < t2 - t1]
+    objs1 = [e["obj"] for e in e1 if e["obj"] and e["ts"] < t2]
+    seen = token_sightings(objs1, token, ws.tool_calls("echo", after=t1), ws.config)
+    seen["mcp_calls"] = sum(1 for c in ws.tool_calls("echo") if token in json.dumps(c["msg"].get("params") or {}))
+    ev = {"token": token, "reason": stop_reason_text("<token>"), "turn1": turn1, "turn2": turn2, "reason_sightings": seen,
+          "final_text_turn1": last_text(objs1)}
+    stops, results = turn1["stop_hooks"], turn1["results"]
+    if not stops:
+        return h.result(n, key, title, INCONCLUSIVE, no_turn("No Stop hook fired in the first turn", objs1) + ".", ev)
+    intermediate = [r for r in results if r["after_stop_hooks"] < len(stops)]
+    final = [r for r in results if r["after_stop_hooks"] == len(stops)]
+    fired_again = len(stops) >= 2 and stops[1]["stop_hook_active"] is True
+    acted = bool(seen["mcp_calls"]) or bool(seen["model_output"])
+    summary = (f"Turn 1: {len(results)} result line(s) ({len(intermediate)} before the continuation's Stop, {len(final)} after it); "
+               f"Stop fired {len(stops)} time(s) (stop_hook_active: {[x['stop_hook_active'] for x in stops]}); "
+               f"the reason reached the model: {acted} ({seen['mcp_calls']} echo call(s) with the token, final text {ev['final_text_turn1']!r}). "
+               f"Turn 2: {len(turn2['results'])} result line(s), Stop {len(turn2['stop_hooks'])} time(s).")
+    if fired_again and acted and final and len(turn2["results"]) == 1:
+        return h.result(n, key, title, PASS, summary, ev)
+    return h.result(n, key, title, FAIL, summary, ev)
+
 
 PROBES = {
     "auth": probe_auth, "init_order": probe_init_order, "user_shape": probe_user_shape, "meta_tool_use_id": probe_meta_tool_use_id,
     "restricted_tools": probe_restricted_tools, "cancel": probe_cancel, "env_scrub": probe_env_scrub,
     "transcript_path": probe_transcript_path, "resume_defer": probe_resume_defer, "compaction": probe_compaction,
+    "post_tool_context": probe_post_tool_context, "stop_block": probe_stop_block,
 }
 
 

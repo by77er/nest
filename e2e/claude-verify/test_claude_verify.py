@@ -147,6 +147,16 @@ class HookLoggerTest(unittest.TestCase):
         got = [self.run_hook({"hook_event_name": "PreToolUse"})["hookSpecificOutput"]["permissionDecision"] for _ in range(3)]
         self.assertEqual(got, ["defer", "allow", "allow"])
 
+    def test_object_entries_print_verbatim_and_tool_keys_win(self):
+        ctx = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "inbox"}}
+        block = {"decision": "block", "reason": "more"}
+        with open(self.decisions, "w") as f:
+            json.dump({"PostToolUse:mcp__nest__echo": [ctx, None], "Stop": [block, None]}, f)
+        post = lambda tool: self.run_hook({"hook_event_name": "PostToolUse", "tool_name": tool})
+        self.assertIsNone(post("TaskList"))  # no key for this tool, no plain PostToolUse key
+        self.assertEqual([post("mcp__nest__echo"), post("mcp__nest__echo")], [ctx, None])
+        self.assertEqual([self.run_hook({"hook_event_name": "Stop"}) for _ in range(3)], [block, None, None])
+
     def test_other_events_print_nothing(self):
         self.assertIsNone(self.run_hook({"hook_event_name": "SessionStart", "source": "startup"}))
         self.assertEqual(h.read_jsonl(self.log)[0]["event"], "SessionStart")
@@ -257,21 +267,51 @@ class RunTest(unittest.TestCase):
         self.assertIn(h.TOKEN_ENV, p.stderr)
         self.assertFalse(os.path.exists(work))
 
+    def run_stub(self, work, token, claude=os.path.join(HERE, "stub_claude.py"), only=()):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("ANTHROPIC_", "CLAUDE_"))}
+        env.update({h.TOKEN_ENV: token, "NEST_CLAUDE_BIN": claude, "NEST_CLAUDE_BWRAP": "/bin/true",
+                    "NEST_CLAUDE_INIT_WAIT_S": "1", "NEST_CLAUDE_TURN_TIMEOUT_S": "20"})
+        argv = [PY, os.path.join(HERE, "run.py"), "--work", work] + (["--only", ",".join(only)] if only else [])
+        p = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=300)
+        doc = json.loads(slurp(os.path.join(work, "report.json")))
+        return p, doc, {r["item"]: r for r in doc["results"]}
+
+    @unittest.skipUnless(userns_available(), "needs unprivileged user namespaces")
+    def test_post_tool_context_fails_when_the_model_never_sees_it(self):
+        work = tempfile.mkdtemp(prefix="cv-test-")
+        wrapper = os.path.join(work, "claude")
+        with open(wrapper, "w") as f:
+            f.write(f"#!/bin/sh\nSTUB_IGNORE_CONTEXT=1 exec {PY} {os.path.join(HERE, 'stub_claude.py')} \"$@\"\n")
+        os.chmod(wrapper, 0o755)
+        try:
+            p, _, by = self.run_stub(os.path.join(work, "w"), "stub-token-0123456789abcdef", claude=wrapper, only=("post_tool_context",))
+            r = by["post_tool_context"]
+            self.assertEqual(r["status"], h.FAIL, p.stdout[-3000:] + p.stderr[-2000:])
+            self.assertTrue(r["evidence"]["parts"]["mcp"]["context_delivered_by_hook"])
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
     @unittest.skipUnless(userns_available(), "needs unprivileged user namespaces")
     def test_all_probes_against_the_stub(self):
         work = tempfile.mkdtemp(prefix="cv-test-")
         token = "stub-token-0123456789abcdef"
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("ANTHROPIC_", "CLAUDE_"))}
-        env.update({h.TOKEN_ENV: token, "NEST_CLAUDE_BIN": os.path.join(HERE, "stub_claude.py"), "NEST_CLAUDE_BWRAP": "/bin/true",
-                    "NEST_CLAUDE_INIT_WAIT_S": "1", "NEST_CLAUDE_TURN_TIMEOUT_S": "20"})
         etc_before = os.path.exists("/etc/claude-code")
         try:
-            p = subprocess.run([PY, os.path.join(HERE, "run.py"), "--work", work], capture_output=True, text=True, env=env, timeout=300)
-            doc = json.loads(slurp(os.path.join(work, "report.json")))
-            got = {r["item"]: r["status"] for r in doc["results"]}
+            p, doc, by = self.run_stub(work, token)
+            got = {k: r["status"] for k, r in by.items()}
             want = {k: h.PASS for k in got}
             want["init_order"] = h.FAIL  # the stub, like Claude Code 2.1.300, prints system/init only after the first user message
             self.assertEqual(got, want, p.stdout[-3000:] + p.stderr[-2000:])
+            # PostToolUse context: followed by the main loop for an MCP and a built-in tool; the
+            # subagent (which declines it, like 2.1.316's) is still credited with seeing it.
+            parts = by["post_tool_context"]["evidence"]["parts"]
+            self.assertEqual({k: (v["followed"], v["receivers"]) for k, v in parts.items()},
+                             {"mcp": (True, ["main"]), "builtin": (True, ["main"]), "subagent": (False, ["subagent"])})
+            self.assertFalse(by["post_tool_context"]["evidence"]["control"]["seen_by_model"])
+            # Stop block: Stop twice, one result after the second.
+            t1 = by["stop_block"]["evidence"]["turn1"]
+            self.assertEqual([x["stop_hook_active"] for x in t1["stop_hooks"]], [False, True])
+            self.assertEqual([r["after_stop_hooks"] for r in t1["results"]], [2])
             self.assertEqual(p.returncode, 1)
             self.assertTrue(os.path.exists(os.path.join(work, "report.md")))
             self.assertTrue(doc["meta"]["bubblewrap"]["required"])

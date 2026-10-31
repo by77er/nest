@@ -83,8 +83,11 @@ python3 -m unittest discover -s e2e/claude-verify   # probe-harness tests, no to
 | 8 | Transcript path encoding | `SessionStart.transcript_path` for a cwd with `.` and `_`, and for one over 200 characters (the hash suffix is identified when it can be) |
 | 9 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`, `PreToolUse` `defer` | SIGKILL mid tool call, then `--resume` with no input; a `defer` answer, then `--resume` (does the same `tool_use_id` re-run?) |
 | 10 | `SessionStart` after compaction | `/compact` over stdin (again without `--disable-slash-commands` if needed); inconclusive if compaction can't be triggered |
+| 11 | `PostToolUse` `additionalContext` reaches the model mid-turn | the context after a tool call orders an `mcp__nest__echo` call with a random token; three turns (after `mcp__nest__echo`, after the built-in `TaskList`, inside an `Agent` subagent) and a control turn with no context. Seen = the token is produced, or (subagent) its reply mentions the instruction |
+| 12 | `Stop` `block` | the first `Stop` blocks with a reason ordering an echo with a token: `result` lines before and after the continuation's `Stop`, `stop_hook_active`, whether the model acted on the reason; then a plain second turn |
 
-- **Quota:** about eight one-line turns plus a compaction on `haiku`: roughly a dozen small requests, each carrying Claude Code's system prompt (mostly cached). The report records the client-side cost estimate.
+- **Quota:** about eight one-line turns plus a compaction on `haiku`, and items 11 and 12 add six short turns in three sessions: roughly twenty small requests, each carrying Claude Code's system prompt (mostly cached). The report records the client-side cost estimate.
+- **Observed evidence** worth keeping is committed under `claude-verify/observed/` (named by Claude Code version), redacted like the report.
 - **Outputs:** `report.md`, `report.json`, and per probe `probes/<name>/` (stdin, stdout, stderr, hook and MCP logs, the config dir). `e2e/run.sh` wipes `e2e/.work/`, reports included.
 - **Exit code:** 0 no `fail`; 1 a `fail`; 2 skipped.
 - **Tests:** `stub_claude.py` stands in for the binary so every probe runs end to end without a token.
