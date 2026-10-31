@@ -61,6 +61,7 @@ class CiChanges(unittest.TestCase):
 
     def test_union(self):
         self.assertEqual(jobs("dashboard/src/App.tsx", "deploy/lean/Cell/Stack.lean"), {"dashboard", "infra"})
+        self.assertEqual(jobs("mcp-test/src/index.ts"), {"e2e"})
 
     def test_flags(self):
         self.assertEqual(jobs(args=["--all"]), ALL)

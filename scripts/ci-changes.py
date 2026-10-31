@@ -60,6 +60,8 @@ RULES = [
     # nestd's test that its GC grace stays below FleetDO's (crates/nestd/src/s3.rs).
     ("control-plane/src/do/fleet.ts", {"control-plane", "e2e", "rust"}),
     ("dashboard/", {"dashboard"}),
+    # The MCP test server is a separate Worker with no CI job of its own; e2e runs it.
+    ("mcp-test/", {"e2e"}),
     ("e2e/", {"e2e"}),
     # The cell stack.
     ("deploy/", {"infra"}),
