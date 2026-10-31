@@ -7,7 +7,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FleetDO } from "../src/do/fleet";
-import { previewHostname, shareHostname, type SandboxDO } from "../src/do/sandbox";
+import { portHostname, type SandboxDO } from "../src/do/sandbox";
 import type { Ec2, InstanceState } from "../src/lib/ec2";
 import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
@@ -391,8 +391,8 @@ describe("a retired incarnation (incarnation_retired)", () => {
 
 describe("preview and share names follow the hostname rule", () => {
   it("first-level labels of the zone, kind as suffix, no underscore (docs/setup/#hostnames)", () => {
-    expect(previewHostname("nest.bitcru.sh", 3000, "sbx_01jb7m2a4c")).toBe("3000-01jb7m2a4c-preview-nest.bitcru.sh");
-    expect(shareHostname("nest.bitcru.sh", 3000, "sbx_01jb7m2a4c")).toBe("3000-01jb7m2a4c-share-nest.bitcru.sh");
+    expect(portHostname("preview", "nest.bitcru.sh", 3000, "sbx_01jb7m2a4c")).toBe("3000-01jb7m2a4c-preview-nest.bitcru.sh");
+    expect(portHostname("share", "nest.bitcru.sh", 3000, "sbx_01jb7m2a4c")).toBe("3000-01jb7m2a4c-share-nest.bitcru.sh");
   });
 
   it("a preview URL stored under the old naming is recomputed on read", async () => {
