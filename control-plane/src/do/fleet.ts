@@ -1003,6 +1003,12 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
     }
     ws.serializeAttachment({ host: att.host, helloed: true, sent: hello.last_command_seq ?? 0 } satisfies Attachment);
+    // A silent host is back, in the step that acks its hello (a hello_ack renews its lease). Its
+    // expiry proved its brains gone (its lease lapsed, and nestd refused or killed every start it
+    // held); the same identity comes back with none of them (re-enrolling a host that once
+    // connected isn't supported, so it keeps its identity), and `lost` clears. A `stonith_pending`
+    // host stays so (liveness is `last_rx` and the socket) until its STONITH ends.
+    this.move(att.host, "hello_back");
 
     this.send(ws, {
       type: "hello_ack",
@@ -1018,15 +1024,10 @@ export class FleetDO extends DurableObject<Env> {
     // The resend of what the host hasn't processed, queued on the outbound chain in this same step:
     // a command issued from here on goes out behind it, never ahead of a lower one.
     void this.flush(att.host);
-    if (prior.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, att.host);
+    // A new token on every connection: the frame isn't reliable, and losing it means a reconnect.
+    await this.rotateToken(ws, att.host);
     this.keysSent.delete(att.host);
     await this.sendBindingKeys(ws, prior.cell, att.host);
-
-    // A `stonith_pending` host stays so (liveness is `last_rx` and the socket) until its fence
-    // succeeds or EC2 confirms the instance gone. A silent host is back. Its expiry proved its brains gone (its lease lapsed, and nestd refused
-    // or killed every start it held); the same identity comes back with none of them (re-enrolling
-    // a host that once connected isn't supported, so it keeps its identity), and `lost` clears.
-    this.move(att.host, "hello_back");
     await this.reconcileSandboxes(att.host, hello.sandboxes);
     // The hello's capacity counts the sandboxes it reports: marked after their first states.
     this.sql.exec("UPDATE hosts SET capacity_seq = ? WHERE host = ?", this.mark(), att.host);
@@ -1278,7 +1279,8 @@ export class FleetDO extends DurableObject<Env> {
     // Wedged: no renewal and no liveness, so the host's lease lapses (it kills its brains at 20 s)
     // and this object expires it at 30 s like a silent host.
     if (this.sql.exec("SELECT 1 FROM hosts WHERE host = ? AND wedged_ms IS NOT NULL", host).toArray().length) return;
-    this.sql.exec(`UPDATE hosts SET last_rx = ? WHERE host = ? AND status IN (${sqlIn(LIVE_STATUSES)})`, now, host);
+    // Only a live host's lease is renewed: one this object holds expired or dead gets no ack.
+    if (this.sql.exec(`UPDATE hosts SET last_rx = ? WHERE host = ? AND status IN (${sqlIn(LIVE_STATUSES)})`, now, host).rowsWritten === 0) return;
     const revoked = claims.filter((c) => {
       const lease = this.lease(c.sandbox);
       return !lease || lease.host !== host || lease.epoch !== c.epoch || lease.expired === 1;

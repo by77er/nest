@@ -331,6 +331,40 @@ describe("lease expiry and STONITH", () => {
     expect((await sandboxStub(sbx.sandbox).info())).toMatchObject({ epoch: 2, host: b.host });
   });
 
+  it("never renews the lease of a host it holds expired, though its socket is open (B-5)", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell, "brain");
+    // A FleetDO reset between a hello's ack and its expired-to-active write left it so.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", h.host);
+    });
+    h.ws.send({ type: "heartbeat", sent_ms: 1, leases: [] });
+    expect(await h.ws.none("heartbeat_ack", 300)).toBe(true);
+  });
+
+  it("a returning host is active again by the time its hello is acknowledged (B-5)", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell, "brain");
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO, state) => {
+      state.storage.sql.exec("UPDATE hosts SET status = 'expired', lost = 1 WHERE host = ?", h.host);
+      // Whatever the hello awaits after its ack never finishes (a FleetDO reset there).
+      (inst as any).sendBindingKeys = () => new Promise(() => {});
+    });
+    const ws = await Ws.connect("/v1/fleet", h.host_token);
+    ws.send(hostHello(h.host, cell, { role: "brain" }));
+    await ws.next("hello_ack");
+    expect(await fleetStub(cell).hostStatus(h.host)).toMatchObject({ status: "active", lost: false });
+  });
+
+  it("sends a new host token on every hello, whenever the old one expires (B-9)", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const ws = await Ws.connect("/v1/fleet", h.host_token);
+    ws.send(hostHello(h.host, cell));
+    await ws.next("hello_ack");
+    expect((await ws.next("host_token")).token).toMatch(/^nht_/);
+  });
+
   it("rotates host tokens before they expire", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
