@@ -6,6 +6,7 @@
 pub mod cgroup;
 pub mod cli;
 pub mod control;
+pub mod events;
 pub mod exec;
 pub mod framed;
 pub mod hands;

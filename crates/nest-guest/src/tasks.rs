@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::guest::{TaskInfo, TaskStatus};
+use nest_protocol::guest::{ControlBody, TaskInfo, TaskStatus};
 use nest_protocol::model::AgentId;
 use tokio::process::Child;
 use tokio::sync::watch;
@@ -130,7 +130,7 @@ pub fn adopt(guest: &Arc<Guest>, a: Adopt) -> Arc<Task> {
         if t.state.lock().unwrap().status != TaskStatus::Exited {
             kill_tree(t.cgroup.as_deref(), t.pgid);
         }
-        guest.emit_task_exited(&t.agent_id, t.info());
+        guest.events.emit(ControlBody::TaskExited { agent_id: t.agent_id.clone(), task: t.info() });
         let _ = done_tx.send(true);
         prune_finished(&guest, &t.agent_id);
         if let Some(cg) = t.cgroup.clone() {

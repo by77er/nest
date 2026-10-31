@@ -69,7 +69,7 @@ pub async fn execute(guest: &Guest, req: CliRequest) -> CliResult {
                 CliCommand::Ask { wait_s, .. } => Duration::from_secs(u64::from((*wait_s).min(120)) + 15),
                 _ => Duration::from_secs(30),
             };
-            guest.relay_cli(req.agent_id, command, wait).await
+            guest.events.relay_cli(req.agent_id, command, wait).await
         }
     }
 }

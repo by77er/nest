@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::framed::{FramedReader, err, parse_json, write_json};
-use crate::state::{Guest, Identity, event};
+use crate::events::event;
+use crate::state::{Guest, Identity};
 use crate::sys;
 use crate::transport::Conn;
 
@@ -32,7 +33,7 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
         capabilities: sys::capabilities(&guest),
     };
     let _ = tx.send(event(hello));
-    let generation = guest.attach_control(tx.clone());
+    let generation = guest.events.attach(tx.clone());
     info!(generation, "control connection open");
 
     let mut reader = FramedReader::new(rd);
@@ -74,7 +75,7 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
                         guest.upsert_agent(slot);
                     }
                     let _ = tx.send(reply(id, ControlBody::Ok {}));
-                    guest.control_ready(generation);
+                    guest.events.ready(generation);
                     continue;
                 }
             }
@@ -133,13 +134,13 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
             // Replies to our `cli` relays.
             ControlBody::CliResult { result } => {
                 if let Some(r) = msg.reply_to {
-                    guest.resolve_cli(r, result);
+                    guest.events.resolve_cli(r, result);
                 }
                 continue;
             }
             ControlBody::Error { error } => {
                 match msg.reply_to {
-                    Some(r) => guest.resolve_cli(r, CliResult::Error { error }),
+                    Some(r) => guest.events.resolve_cli(r, CliResult::Error { error }),
                     None => warn!(code = error.code, message = error.message, "host reported an error"),
                 }
                 continue;
@@ -160,7 +161,7 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
             let _ = tx.send(reply(id, body));
         }
     }
-    guest.detach_control(generation);
+    guest.events.detach(generation);
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
     info!(generation, "control connection closed");

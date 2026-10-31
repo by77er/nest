@@ -100,8 +100,7 @@ pub async fn watch(guest: Arc<Guest>) {
     loop {
         let now = tokio::task::spawn_blocking(scan).await.unwrap_or_default();
         if last.as_ref() != Some(&now) {
-            *guest.ports.lock().unwrap() = now.clone();
-            guest.emit(ControlBody::Ports { listening: now.clone(), ts_ms: now_ms() });
+            guest.events.emit(ControlBody::Ports { listening: now.clone(), ts_ms: now_ms() });
             last = Some(now);
         }
         tokio::time::sleep(guest.config.port_poll).await;
