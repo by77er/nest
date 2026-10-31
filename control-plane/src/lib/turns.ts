@@ -112,7 +112,9 @@ export class TurnQueue {
 
   /**
    * Q3: `turn` is done. Its inbox mirror is consumed with it, except messages the runner never
-   * confirmed writing to the model (no `inbox_delivered`), which come back as one queued turn.
+   * confirmed writing to the model (no `inbox_delivered`), which come back as one queued turn:
+   * ahead of everything queued if one of them interrupted the turn (it was meant for now), else
+   * behind it.
    */
   complete(turn: string, now = Date.now()): void {
     this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, turn);
@@ -121,7 +123,8 @@ export class TurnQueue {
       .map((r) => ({ message: JSON.parse(r.message) as InboxMessage, request_id: r.request_id }));
     if (unseen.length) {
       const { input, requestId } = requeuedTurn(unseen);
-      this.insert(input, this.ord("MAX") + 1, requestId, null, now, true);
+      const ord = unseen.some((r) => r.message.interrupt) ? this.ord("MIN") - 1 : this.ord("MAX") + 1;
+      this.insert(input, ord, requestId, null, now, true);
     }
     this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
   }
