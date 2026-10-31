@@ -106,9 +106,8 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             cmd_tx,
             out_tx,
         );
-        // An exit this runner reports at an agent epoch means no brain of the agent at or below it
-        // runs here any more (AgentDO releases the brain on it): a start that never runs reports
-        // its exit only once any older brain has gone.
+        // An exit at an agent epoch means no brain of the agent at or below it runs here (AgentDO
+        // releases the brain on it): a start that never runs reports it once any older one is gone.
         let older_gone = |rt: &Runtime| rt.agent(&id).is_none_or(|a| a.epoch > epoch);
         loop {
             match rt.register(agent.clone(), fence_gen) {
@@ -591,14 +590,11 @@ impl Actor {
             Effect::CancelHands => self.agent.cancel_hands(),
             Effect::Emit { body, turn } => self.agent.emit_with_turn(body, turn),
             Effect::Respawn => {
-                let ok = match self.respawn() {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::error!(agent = %self.agent.id, "resume after idle exit failed: {e:#}");
-                        false
-                    }
-                };
-                return self.step(Input::Respawned { ok });
+                let respawned = self.respawn();
+                if let Err(e) = &respawned {
+                    tracing::error!(agent = %self.agent.id, "resume after idle exit failed: {e:#}");
+                }
+                return self.step(Input::Respawned { ok: respawned.is_ok() });
             }
             Effect::Exit(reason) => {
                 tracing::info!(agent = %self.agent.id, reason = reason.as_str(), "brain exited");
@@ -685,14 +681,7 @@ impl Actor {
 
     /// Start Claude Code again on the same session (`--resume <current session file>`).
     fn respawn(&mut self) -> anyhow::Result<()> {
-        let path = self
-            .agent
-            .inner
-            .lock()
-            .unwrap()
-            .transcript
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("no session file to resume"))?;
+        let path = self.agent.inner.lock().unwrap().transcript.clone().ok_or_else(|| anyhow::anyhow!("no session file to resume"))?;
         let session = SessionArgs::Resume { path: path.to_string_lossy().into_owned(), fork: false };
         let proc = spawn_claude(&self.rt, &self.agent, &self.launch, &session)?;
         tracing::info!(agent = %self.agent.id, pid = proc.pid, "resumed Claude Code for queued input");

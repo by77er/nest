@@ -100,9 +100,8 @@ impl Runtime {
         self.report_for(a, RunnerEvent::AgentExited { agent: a.id.clone(), code, signal, reason, epoch: Some(a.epoch) });
     }
 
-    /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
-    /// so no start at or below it registers from now on, and return the registered brain if it
-    /// runs at or below it (the caller kills it). A newer brain is left alone.
+    /// `agent_stop{kill, epoch}`: raise the agent's tombstone, so no start at or below `epoch`
+    /// registers from now on, and return the registered brain if it is at or below it (to kill).
     pub fn tombstone(&self, agent: &AgentId, epoch: Epoch) -> Option<Arc<Agent>> {
         let mut r = self.agents.lock().unwrap();
         let k = r.tombstones.entry(agent.clone()).or_insert(epoch.0);
@@ -237,8 +236,7 @@ pub enum Outbound {
     Event(AgentEvent),
     ToolCall { call: CallId, turn: Option<TurnId>, name: String, arguments: Value },
     ToolsListRequest(RequestId),
-    /// Ask AgentDO where the agent's hands are now (`hands_resolve`); answered through
-    /// [`Agent::resolve_hands`].
+    /// `hands_resolve`: where are the agent's hands now? Answered through [`Agent::resolve_hands`].
     HandsResolve(RequestId),
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),

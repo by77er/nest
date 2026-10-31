@@ -233,9 +233,8 @@ fn tool_boundary(agent: &Agent) -> Answer {
     Answer { output, handed: pending.into_iter().map(|m| m.id).collect(), stop_blocked: false }
 }
 
-/// Stop: hand pending inbox-mirror messages to the model as `decision: block`, bounded by
-/// `max_stop_continuations`. The actor learns whether this stop was blocked before Claude Code
-/// can act on the answer.
+/// Stop: hand pending inbox-mirror messages to the model as `decision: block`. The actor learns
+/// whether this stop blocked before Claude Code can act on the answer.
 fn stop(agent: &Agent, input: &Value) -> Answer {
     let active = input.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
     let pending = {
