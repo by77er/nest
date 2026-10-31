@@ -57,7 +57,7 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
   ports: { port: number; url: string }[];
   /**
    * The last `HISTORY_MAX` epochs and the host that held each, read from the `epochs` table (which
-   * keeps every one: salvage commits are checked against it); also saved in the blob for one release.
+   * keeps every one: salvage commits are checked against it).
    */
   history: { epoch: number; host: string }[];
 }
@@ -132,29 +132,19 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS generations (id TEXT PRIMARY KEY, record TEXT NOT NULL,
       orphaned INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS commits (request TEXT PRIMARY KEY, outcome TEXT NOT NULL)");
-    // When the request was answered (null only until the start below stamps it), and
-    // the generation it committed (null: rejected), so retention needs no JSON scan.
+    // When the request was answered, and the generation it committed (null: rejected), so
+    // retention needs no JSON scan.
     const commitCols = this.sql.exec<{ name: string }>("PRAGMA table_info(commits)").toArray().map((c) => c.name);
     if (!commitCols.includes("created_ms")) this.sql.exec("ALTER TABLE commits ADD COLUMN created_ms INTEGER");
     if (!commitCols.includes("generation_id")) this.sql.exec("ALTER TABLE commits ADD COLUMN generation_id TEXT");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_generation ON commits (generation_id)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_rejected ON commits (created_ms) WHERE generation_id IS NULL");
-    // On every start: a record written by a release without these columns (before them, or during a
-    // rollback to one) gets its generation from its outcome, and counts its age from now, so a
-    // committed record is never mistaken for a rejected one and nothing is pruned at once.
-    this.sql.exec("UPDATE commits SET generation_id = json_extract(outcome, '$.generation.id'), created_ms = ? WHERE generation_id IS NULL AND created_ms IS NULL",
-      Date.now());
     // Every epoch and the host that held it: salvage from any older epoch is authorized against it.
     this.sql.exec("CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, host TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
       expires_ms INTEGER NOT NULL)`);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
     this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.info_().sandbox);
-    // The blob's capped `history` is merged in on every start: it holds what a release before the
-    // table (or a rollback to one) recorded. The table never loses an epoch it already has.
-    for (const h of this.get<{ history?: { epoch: number; host: string }[] }>("info")?.history ?? []) {
-      this.sql.exec("INSERT OR IGNORE INTO epochs (epoch, host) VALUES (?, ?)", h.epoch, h.host);
-    }
   }
 
   // --- state helpers ------------------------------------------------------------------------------
@@ -207,16 +197,13 @@ export class SandboxDO extends DurableObject<Env> {
     return `https://${previewHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, sandbox)}`;
   }
 
-  /**
-   * Load, mutate and save synchronously (never across an await). The saved `history` is the
-   * table's last `HISTORY_MAX` epochs, re-read after `fn`: written for one release, so the release
-   * before the table (after a rollback) still authorizes salvage from recent epochs.
-   */
+  /** Load, mutate and save synchronously (never across an await). `history` is the table's, never saved. */
   private update(fn: (info: SandboxInfo) => void): SandboxInfo {
     const info = this.info_();
     fn(info);
     info.history = this.recentEpochs();
-    this.put("info", info);
+    const { history: _derived, ...stored } = info;
+    this.put("info", stored);
     return info;
   }
 

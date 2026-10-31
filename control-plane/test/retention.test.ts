@@ -312,70 +312,6 @@ describe("salvage authorization", () => {
     expect(await sandboxStub(sandbox).commit(h.host, salvage("req_salvage_1", h.host))).toMatchObject({ status: "orphaned" });
     expect(await sandboxStub(sandbox).commit("hst_other00000000000000000", salvage("req_salvage_2", "x"))).toMatchObject({ status: "rejected", reason: "stale_epoch" });
   });
-
-  it("copies a blob's capped history into the epochs table once", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "history" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const epochs = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0]!;
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'",
-        JSON.stringify({ ...JSON.parse(row.value), history: [{ epoch: 1, host: h.host }, { epoch: 2, host: "hst_b" }] }));
-      st.storage.sql.exec("DELETE FROM epochs");
-      new SandboxDO(st, env);
-      return st.storage.sql.exec("SELECT epoch, host FROM epochs ORDER BY epoch").toArray();
-    });
-    expect(epochs).toEqual([{ epoch: 1, host: h.host }, { epoch: 2, host: "hst_b" }]);
-  });
-
-  it("merges what a rolled-back release wrote into the blob, and keeps writing the blob for it", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "rollback" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const out = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const blob = () => JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").toArray()[0]!.value);
-      const written = blob().history;
-      // The old release ran meanwhile: it placed epochs 2 and 3 and recorded them only in the blob.
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'",
-        JSON.stringify({ ...blob(), epoch: 3, history: [...written, { epoch: 2, host: "hst_b" }, { epoch: 3, host: "hst_c" }] }));
-      new SandboxDO(st, env);
-      return { written, epochs: st.storage.sql.exec("SELECT epoch, host FROM epochs ORDER BY epoch").toArray() };
-    });
-    expect(out.written, "the blob carries the history for the old release").toEqual([{ epoch: 1, host: h.host }]);
-    expect(out.epochs).toEqual([{ epoch: 1, host: h.host }, { epoch: 2, host: "hst_b" }, { epoch: 3, host: "hst_c" }]);
-  });
-});
-
-describe("commit records written by a release without their columns (a rollback)", () => {
-  it("get their generation and an age from now on the next start, and none is pruned at once", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "rollback commits" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const before = Date.now();
-    const out = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const sql = st.storage.sql;
-      // What the previous release inserts: the columns exist (this release added them), it leaves them null.
-      sql.exec("INSERT INTO commits (request, outcome) VALUES ('req_rb_c', ?), ('req_rb_r', ?)",
-        JSON.stringify({ status: "committed", generation: { id: "gen_rollback" } }), JSON.stringify({ status: "rejected", reason: "parent_mismatch" }));
-      new SandboxDO(st, env);
-      return sql.exec("SELECT request, generation_id, created_ms FROM commits WHERE request LIKE 'req_rb_%' ORDER BY request").toArray();
-    });
-    expect(out).toEqual([
-      { request: "req_rb_c", generation_id: "gen_rollback", created_ms: expect.any(Number) },
-      { request: "req_rb_r", generation_id: null, created_ms: expect.any(Number) },
-    ]);
-    expect((out[0] as { created_ms: number }).created_ms).toBeGreaterThanOrEqual(before);
-    await runSandboxAlarm(sandbox, "commit_prune");
-    const left = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) =>
-      st.storage.sql.exec<{ request: string }>("SELECT request FROM commits WHERE request LIKE 'req_rb_%' ORDER BY request").toArray().map((r) => r.request));
-    expect(left).toEqual(["req_rb_c", "req_rb_r"]);
-  });
 });
 
 describe("commit records", () => {
@@ -406,26 +342,6 @@ describe("commit records", () => {
     expect(await sandboxDeadline(sandbox, "commit_prune")).toBeGreaterThan(Date.now() + 50 * 60_000);
     await runSandboxAlarm(sandbox, "commit_prune");
     expect(await requests()).toEqual(["req_kept", "req_next"]);
-  });
-
-  it("get their generation column filled once from the stored outcome", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "backfill" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const rows = await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
-      const sql = st.storage.sql;
-      // The table as the previous release left it.
-      sql.exec("DROP INDEX commits_generation");
-      sql.exec("DROP INDEX commits_rejected");
-      sql.exec("ALTER TABLE commits DROP COLUMN generation_id");
-      sql.exec("INSERT INTO commits (request, outcome) VALUES ('req_c', ?), ('req_r', ?)",
-        JSON.stringify({ status: "committed", generation: { id: "gen_a" } }), JSON.stringify({ status: "rejected", reason: "parent_mismatch" }));
-      new SandboxDO(st, env);
-      return sql.exec("SELECT request, generation_id FROM commits ORDER BY request").toArray();
-    });
-    expect(rows).toEqual([{ request: "req_c", generation_id: "gen_a" }, { request: "req_r", generation_id: null }]);
   });
 });
 
