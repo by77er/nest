@@ -282,27 +282,18 @@ export function templatesUsing(catalog: Catalog, name: string): string[] {
 
 // --- Expansion ---------------------------------------------------------------------------------------
 
-const ruleKey = (r: ToolRule) => JSON.stringify([r.pattern, r.decision, r.reason ?? null]);
-const dedupeRules = (rules: readonly ToolRule[]): ToolRule[] => {
+/** The first of each set of items with the same key, in order. */
+function dedupeBy<T>(items: readonly T[], key: (t: T) => string): T[] {
   const seen = new Set<string>();
-  const out: ToolRule[] = [];
-  for (const r of rules) {
-    if (seen.has(ruleKey(r))) continue;
-    seen.add(ruleKey(r));
-    out.push(r);
-  }
-  return out;
-};
-
-const dedupeGrants = (grants: readonly ChannelGrant[]): ChannelGrant[] => {
-  const seen = new Set<string>();
-  return grants.filter((g) => {
-    const k = `${g.action} ${g.channel}`;
+  return items.filter((t) => {
+    const k = key(t);
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
   });
-};
+}
+const dedupeRules = (rules: readonly ToolRule[]) => dedupeBy(rules, (r) => JSON.stringify([r.pattern, r.decision, r.reason ?? null]));
+const dedupeGrants = (grants: readonly ChannelGrant[]) => dedupeBy(grants, (g) => `${g.action} ${g.channel}`);
 
 /** Template `name` expanded as it stands: no overrides, no hands check. */
 export function expandTemplate(catalog: Catalog, registry: readonly string[], name: string): Result<AgentSpec> {

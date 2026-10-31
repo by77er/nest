@@ -12,22 +12,8 @@ import { ErrorCodes, type InjectionSecret } from "../protocol/model";
 /** The per-cell binding signing key, stored as a secret named `binding_key:<cell>`. */
 type StoredBindingKey = { kid: string; public_key: string; private_jwk: JsonWebKey };
 
-/** Mints short-lived GitHub App installation tokens per workstream. Not implemented yet. */
-export interface GitHubAppMinter {
-  installationToken(workstream: string, repos: string[]): Promise<{ token: string; expires_ms: number }>;
-}
-
-export class NotImplementedGitHubAppMinter implements GitHubAppMinter {
-  async installationToken(): Promise<{ token: string; expires_ms: number }> {
-    // TODO: sign an app JWT with the GitHub App private key (RS256) and call
-    // POST /app/installations/{id}/access_tokens with the workstream's repositories.
-    throw new NestError(ErrorCodes.NOT_IMPLEMENTED, "GitHub App token minting is not implemented", 501);
-  }
-}
-
 export class BrokerDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
-  github: GitHubAppMinter = new NotImplementedGitHubAppMinter();
   /** Imported signing keys by kid (memory only; rebuilt from the stored JWK after an eviction). */
   private readonly bindingSigners = new Map<string, Promise<CryptoKey>>();
 
@@ -51,14 +37,6 @@ export class BrokerDO extends DurableObject<Env> {
        ON CONFLICT(name) DO UPDATE SET value = excluded.value, expires_ms = excluded.expires_ms, updated_ms = excluded.updated_ms`,
       name, value, expiresMs ?? null, Date.now(),
     );
-  }
-
-  async deleteSecret(name: string): Promise<void> {
-    this.sql.exec("DELETE FROM secrets WHERE name = ?", name);
-  }
-
-  async listSecretNames(): Promise<string[]> {
-    return this.sql.exec<{ name: string }>("SELECT name FROM secrets ORDER BY name").toArray().map((r) => r.name);
   }
 
   private secret(name: string): { value: string; expires_ms: number | null } | undefined {

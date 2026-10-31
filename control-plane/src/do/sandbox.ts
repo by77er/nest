@@ -729,10 +729,6 @@ export class SandboxDO extends DurableObject<Env> {
     return this.effectivePolicy();
   }
 
-  async workstreamPolicy(): Promise<WorkstreamPolicyLayer> {
-    return this.wsLayer();
-  }
-
   async setWorkstreamPolicy(layer: WorkstreamPolicyLayer): Promise<EgressPolicy> {
     this.info_();
     this.put("ws_layer", layer);
