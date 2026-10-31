@@ -13,7 +13,7 @@ The runner owns the Claude Code process, so it sees the **stream-json output** d
 | `Elicitation` | `waiting_input` (async tracking hook) |
 | `SubagentStart` / `SubagentStop` | `working`, detail names the subagent |
 | `PreCompact` / `PostCompact` | `compacting` |
-| `Stop` / `result` | `idle`: updates the sandbox's idle refcount |
+| `Stop` (one that lets the turn end, not one that returns `block`) / `result` | `idle`: updates the sandbox's idle refcount |
 | `StopFailure`, or `api_retry` with `rate_limit` | `errored` / `quota_parked` |
 | `Notification` | `needs_attention` |
 | Process exit / `SessionEnd` | `detached` |

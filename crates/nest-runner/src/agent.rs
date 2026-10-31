@@ -831,8 +831,7 @@ mod tests {
             v
         }
 
-        /// `(turn, kind)` for the turn and inbox events sent so far (state changes come from hooks
-        /// too, and are left out).
+        /// `(turn, kind)` for every turn, state and inbox event sent so far.
         fn events(&mut self) -> Vec<(Option<String>, &'static str)> {
             let mut v = Vec::new();
             while let Ok(o) = self.out.try_recv() {
@@ -840,6 +839,8 @@ mod tests {
                     let kind = match e.body {
                         AgentEventBody::TurnStarted { .. } => "turn_started",
                         AgentEventBody::TurnCompleted { .. } => "turn_completed",
+                        AgentEventBody::StateChanged { state: AgentState::Idle, .. } => "idle",
+                        AgentEventBody::StateChanged { state: AgentState::Working, .. } => "working",
                         AgentEventBody::InboxDelivered { .. } => "inbox_delivered",
                         _ => continue,
                     };
@@ -882,19 +883,21 @@ mod tests {
         assert_eq!((b.written(), b.events()), (vec![], vec![]), "no turn: nothing written, no turn started");
         let o = b.hook(json!({"hook_event_name": "Stop", "stop_hook_active": false})).await;
         assert_eq!(o.decision, None, "no turn takes inbox");
+        assert_eq!(b.events(), [(None, "idle")]);
 
         b.actor.handle(run_turn("t1"));
         b.actor.handle(AgentCmd::Inbox(msg("m1")));
         assert_eq!(b.written(), ["go t1"]);
         let t1 = Some("t1".to_string());
-        assert_eq!(b.events(), [(t1.clone(), "turn_started")]);
+        assert_eq!(b.events(), [(t1.clone(), "turn_started"), (t1.clone(), "working")]);
+        // A Stop that blocks keeps the turn going: no idle.
         let o = b.hook(json!({"hook_event_name": "Stop", "stop_hook_active": false})).await;
         assert!(o.reason.unwrap().contains("also m1"));
         assert_eq!(b.events(), [(t1.clone(), "inbox_delivered")]);
         // Delivered once: the next stop of the chain lets the turn end, and its result ends it.
         assert_eq!(b.hook(json!({"hook_event_name": "Stop", "stop_hook_active": true})).await.decision, None);
         b.actor.handle(AgentCmd::Line(result_line()));
-        assert_eq!(b.events(), [(t1, "turn_completed")]);
+        assert_eq!(b.events(), [(t1.clone(), "idle"), (t1.clone(), "turn_completed"), (t1, "idle")]);
         assert!(b.written().is_empty());
     }
 
@@ -905,16 +908,19 @@ mod tests {
         let mut b = bare_actor();
         b.actor.handle(run_turn("t1"));
         b.events();
+        let t1 = Some("t1".to_string());
         let o = b.hook(json!({"hook_event_name": "PostToolUse", "tool_name": "mcp__nest__Bash"})).await;
         assert_eq!(o, Default::default(), "nothing pending");
+        assert_eq!(b.events(), [(t1.clone(), "working")]);
         b.actor.agent.set_cache(cache(vec![msg("m1")], 1));
         let o = b.hook(json!({"hook_event_name": "PostToolUse", "tool_name": "mcp__nest__Bash"})).await;
         match o.hook_specific_output {
             Some(nest_protocol::host::hook::HookSpecificOutput::PostToolUse { additional_context: Some(c) }) => assert!(c.contains("also m1"), "{c}"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(b.events(), [(Some("t1".to_string()), "inbox_delivered")]);
+        assert_eq!(b.events(), [(t1.clone(), "working"), (t1.clone(), "inbox_delivered")]);
         assert_eq!(b.hook(json!({"hook_event_name": "Stop", "stop_hook_active": false})).await.decision, None, "already delivered");
+        assert_eq!(b.events(), [(t1, "idle")]);
     }
 
     /// A `result` after the Stop hook blocked is taken for an intermediate one (UNVERIFIED that
@@ -931,7 +937,8 @@ mod tests {
         assert_eq!(b.events(), [], "the continuation is owed");
         assert!(b.hook(json!({"hook_event_name": "Stop", "stop_hook_active": true})).await.decision.is_none());
         b.actor.handle(AgentCmd::Line(result_line()));
-        assert_eq!(b.events(), [(Some("t1".to_string()), "turn_completed")]);
+        let t1 = Some("t1".to_string());
+        assert_eq!(b.events(), [(t1.clone(), "idle"), (t1.clone(), "turn_completed"), (t1, "idle")]);
     }
 
     /// R8: the idle exit is not held off by mirrored inbox messages (a message no turn took is

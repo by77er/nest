@@ -157,7 +157,9 @@ impl Answer {
         }
         d.agent.inner.lock().unwrap().mirror.release(&d.messages);
         if d.stop_blocked {
+            // Claude Code got no `block`, so the turn ends after all.
             d.agent.command(AgentCmd::StopHook { blocked: false });
+            d.agent.emit(AgentEventBody::StateChanged { state: AgentState::Idle, detail: None });
         }
     }
 }
@@ -168,7 +170,10 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
     let Some(agent) = rt.agent(&req.agent) else {
         return nest_protocol::host::hook::fallback_output(&event).unwrap_or_default().into();
     };
-    track(&agent, &req.input);
+    // A Stop is idle only if it lets the turn end; `stop` decides.
+    if event != "Stop" {
+        track(&agent, &req.input);
+    }
     let output = match event.as_str() {
         "PreToolUse" => {
             let (decision, reason) = permission(&agent, &req.input);
@@ -246,6 +251,7 @@ fn stop(agent: &Arc<Agent>, input: &Value) -> Answer {
     };
     agent.command(AgentCmd::StopHook { blocked: !pending.is_empty() });
     if pending.is_empty() {
+        track(agent, input);
         return HookOutput::default().into();
     }
     let output = HookOutput { decision: Some(TopLevelDecision::Block), reason: Some(mirror::render(&pending)), ..Default::default() };
