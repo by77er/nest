@@ -128,8 +128,8 @@ export class SerialQueue {
 export class Deadlines {
   /**
    * Keys whose handler `runDue` is running, with the `at` being run. That row is about to be deleted,
-   * so it must not make `keepEarlier` swallow a re-arm (from the handler itself, or from anything that
-   * runs while it awaits).
+   * so it counts as unarmed: `has` and `keepEarlier` must not swallow a re-arm (from the handler
+   * itself, or from anything that runs while it awaits).
    */
   private readonly running = new Map<string, number>();
 
@@ -140,11 +140,13 @@ export class Deadlines {
     sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
   }
 
+  /** The key's stored `at`, if it has a row. */
+  private at(key: string): number | undefined {
+    return this.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = ?", key).toArray()[0]?.at;
+  }
+
   async set(key: string, at: number, keepEarlier = false): Promise<void> {
-    if (keepEarlier) {
-      const cur = this.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = ?", key).toArray()[0];
-      if (cur && cur.at <= at && this.running.get(key) !== cur.at) return;
-    }
+    if (keepEarlier && this.has(key) && this.at(key)! <= at) return;
     this.sql.exec("INSERT INTO deadlines (key, at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at", key, at);
     await this.reschedule();
   }
@@ -154,8 +156,10 @@ export class Deadlines {
     await this.reschedule();
   }
 
+  /** Whether `key` is armed. A key whose handler is running isn't (its row is about to be deleted). */
   has(key: string): boolean {
-    return this.sql.exec("SELECT 1 FROM deadlines WHERE key = ?", key).toArray().length > 0;
+    const at = this.at(key);
+    return at !== undefined && this.running.get(key) !== at;
   }
 
   /**
@@ -165,9 +169,12 @@ export class Deadlines {
   async runDue(now: number, handler: (key: string) => Promise<void>, retryMs = 5_000, last: readonly string[] = []): Promise<void> {
     // In time order, except `last` (background work, e.g. a channel outbox): after every other key,
     // so it never holds up the object's own transitions.
-    const due = this.sql.exec<{ key: string; at: number }>("SELECT key, at FROM deadlines WHERE at <= ? ORDER BY at", now).toArray()
+    const due = this.sql.exec<{ key: string }>("SELECT key FROM deadlines WHERE at <= ? ORDER BY at", now).toArray()
       .sort((a, b) => Number(last.includes(a.key)) - Number(last.includes(b.key)));
-    for (const { key, at } of due) {
+    for (const { key } of due) {
+      // Read again: an earlier key's handler (or a call while it awaited) may have cleared or moved it.
+      const at = this.at(key);
+      if (at === undefined || at > now) continue;
       this.running.set(key, at);
       try {
         await handler(key);
