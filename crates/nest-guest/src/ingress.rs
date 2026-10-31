@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::exec::PreExec;
+use crate::exec::{Leaf, PreExec};
 use crate::framed::{FramedReader, err, parse_json, write_data, write_json};
 use crate::state::{Gate, Guest};
 use crate::transport::Conn;
@@ -217,39 +217,46 @@ async fn pty(
     };
     drop(slave);
     let pid = child.id().unwrap_or(0);
-    let master = Arc::new(Master::new(master_fd)?);
-    write_json(&mut wr, &IngressResponse::Accepted { connected: None, pid: Some(pid) }).await?;
+    // The session's terminal leaf goes with it, however it ends.
+    let leaf = Leaf { cgroup, pgid: Some(pid) };
+    let session = async {
+        let master = Arc::new(Master::new(master_fd)?);
+        write_json(&mut wr, &IngressResponse::Accepted { connected: None, pid: Some(pid) }).await?;
 
-    // Host → PTY.
-    let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
-    let input = {
-        let master = master.clone();
-        tokio::spawn(async move { host_to_pty(rd, rest, master, pid).await; let _ = hangup_tx.send(()).await; })
-    };
+        // Host → PTY.
+        let (hangup_tx, mut hangup_rx) = mpsc::channel::<()>(1);
+        let input = {
+            let master = master.clone();
+            tokio::spawn(async move { host_to_pty(rd, rest, master, pid).await; let _ = hangup_tx.send(()).await; })
+        };
 
-    // PTY → host, until the shell exits (EIO) or the host hangs up.
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut hung_up = false;
-    loop {
-        tokio::select! {
-            r = master.read(&mut buf) => match r {
-                Ok(0) | Err(_) => break,
-                Ok(n) => if write_data(&mut wr, &buf[..n]).await.is_err() { hung_up = true; break; },
-            },
-            _ = hangup_rx.recv() => { hung_up = true; break; }
+        // PTY → host, until the shell exits (EIO) or the host hangs up.
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut hung_up = false;
+        loop {
+            tokio::select! {
+                r = master.read(&mut buf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => if write_data(&mut wr, &buf[..n]).await.is_err() { hung_up = true; break; },
+                },
+                _ = hangup_rx.recv() => { hung_up = true; break; }
+            }
         }
-    }
-    if hung_up {
-        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGHUP);
+        if hung_up {
+            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGHUP);
+            input.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            return Ok(());
+        }
+        let status = child.wait().await?;
         input.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-        return Ok(());
-    }
-    let status = child.wait().await?;
-    input.abort();
-    let exit = PtyControl::Exit { code: status.code(), signal: status.signal() };
-    write_json(&mut wr, &exit).await?;
-    wr.shutdown().await
+        let exit = PtyControl::Exit { code: status.code(), signal: status.signal() };
+        write_json(&mut wr, &exit).await?;
+        wr.shutdown().await
+    };
+    let ended = session.await;
+    leaf.release();
+    ended
 }
 
 async fn host_to_pty(rd: ReadHalf<Conn>, rest: Vec<u8>, master: Arc<Master>, pid: u32) {

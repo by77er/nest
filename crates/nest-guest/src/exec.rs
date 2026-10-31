@@ -188,15 +188,32 @@ pub fn spawn(s: Spawn<'_>) -> std::io::Result<Child> {
     child
 }
 
-/// Kill everything started for one call/task: `cgroup.kill` if available, else the process group.
-pub fn kill_tree(cgroup: Option<&Path>, pgid: Option<u32>) {
-    if let Some(cg) = cgroup
-        && Cgroups::kill(cg)
-    {
-        return;
+/// Where one call's, task's or terminal's processes live: its cgroup leaf (when cgroups are on)
+/// and its process group.
+#[derive(Clone, Debug, Default)]
+pub struct Leaf {
+    pub cgroup: Option<PathBuf>,
+    pub pgid: Option<u32>,
+}
+
+impl Leaf {
+    /// Kill everything in it: `cgroup.kill` if available, else the process group.
+    pub fn kill(&self) {
+        if let Some(cg) = &self.cgroup
+            && Cgroups::kill(cg)
+        {
+            return;
+        }
+        if let Some(pgid) = self.pgid {
+            let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+        }
     }
-    if let Some(pgid) = pgid {
-        let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+
+    /// Remove the cgroup in the background once its processes have left.
+    pub fn release(&self) {
+        if let Some(cg) = self.cgroup.clone() {
+            tokio::spawn(Cgroups::remove_later(cg));
+        }
     }
 }
 

@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{require_absolute, text};
-use crate::exec::{PreExec, run_helper, which};
+use crate::exec::{Leaf, PreExec, run_helper, which};
 use crate::hands::files::{Refusal, open_regular, record_digest, record_read};
 use crate::state::Guest;
 
@@ -228,10 +228,9 @@ fn helper_ctx(guest: &Guest, agent: &AgentId) -> Result<(Vec<(String, String)>, 
 }
 
 fn cleanup(pre: &PreExec) {
-    if let Some(cg) = &pre.cgroup {
-        crate::cgroup::Cgroups::kill(cg);
-        let _ = std::fs::remove_dir(cg);
-    }
+    let leaf = Leaf { cgroup: pre.cgroup.clone(), pgid: None };
+    leaf.kill();
+    leaf.release();
 }
 
 fn hash_file(mut f: &File) -> std::io::Result<[u8; 32]> {

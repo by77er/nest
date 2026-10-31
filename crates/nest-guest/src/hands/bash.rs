@@ -14,7 +14,7 @@ use tokio::net::unix::pipe;
 use tokio::process::Child;
 
 use super::{CallCtx, text};
-use crate::exec::{self, Spawn, kill_tree};
+use crate::exec::{self, Leaf, Spawn};
 use crate::framed::err;
 use crate::output::{OutputSink, read_output, tail_chars};
 use crate::state::{Guest, now_ms};
@@ -43,8 +43,7 @@ eval "$2" 3>&-"#;
 
 struct Running {
     child: Child,
-    pgid: Option<u32>,
-    cgroup: Option<PathBuf>,
+    leaf: Leaf,
     sink: OutputSink,
     pwd: Option<pipe::Receiver>,
 }
@@ -101,15 +100,15 @@ fn spawn_shell(
         run_as: guest.config.run_as,
     })
     .map_err(internal)?;
-    let pgid = child.id();
-    let (kill_cg, kill_pg) = (cgroup.clone(), pgid);
-    let sink = OutputSink::capture(out_r, out, Box::new(move || kill_tree(kill_cg.as_deref(), kill_pg)))
+    let leaf = Leaf { cgroup, pgid: child.id() };
+    let overflow = leaf.clone();
+    let sink = OutputSink::capture(out_r, out, Box::new(move || overflow.kill()))
         .map_err(internal)?;
     let pwd = match pwd_r {
         Some(r) => Some(pipe::Receiver::from_owned_fd(r).map_err(internal)?),
         None => None,
     };
-    Ok(Running { child, pgid, cgroup, sink, pwd })
+    Ok(Running { child, leaf, sink, pwd })
 }
 
 pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<HandsResult, ErrorBody> {
@@ -147,9 +146,7 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
                     }
                     cwd = new;
                 }
-            if let Some(cg) = r.cgroup.clone() {
-                tokio::spawn(crate::cgroup::Cgroups::remove_later(cg));
-            }
+            r.leaf.release();
             let view = read_output(&out);
             if let Some(dir) = out.parent() {
                 crate::output::prune_dir(dir, crate::output::KEEP_CALL_OUTPUTS, crate::output::CALL_OUTPUT_BUDGET, &out);
@@ -188,12 +185,10 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
             ))
         }
         End::Cancelled => {
-            kill_tree(r.cgroup.as_deref(), r.pgid);
+            r.leaf.kill();
             let status = tokio::time::timeout(Duration::from_secs(2), r.child.wait()).await.ok().and_then(|s| s.ok());
             let _ = r.sink.wait_eof(Duration::from_millis(200)).await;
-            if let Some(cg) = r.cgroup.clone() {
-                tokio::spawn(crate::cgroup::Cgroups::remove_later(cg));
-            }
+            r.leaf.release();
             let mut t = excerpt(&read_output(&out).text, FAILURE_EXCERPT_CHARS);
             if !t.is_empty() && !t.ends_with('\n') {
                 t.push('\n');
@@ -218,8 +213,9 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
         End::TimedOut => {
             let secs = timeout as f64 / 1000.0;
             if starts_with_sleep(&input.command) {
-                kill_tree(r.cgroup.as_deref(), r.pgid);
+                r.leaf.kill();
                 let _ = tokio::time::timeout(Duration::from_secs(2), r.child.wait()).await;
+                r.leaf.release();
                 return Ok(text(
                     true,
                     format!("Command timed out after {secs}s and was killed."),
@@ -260,8 +256,7 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
                     agent_id: agent.clone(),
                     description: input.description.clone(),
                     child: r.child,
-                    pgid: r.pgid,
-                    cgroup: r.cgroup,
+                    leaf: r.leaf,
                     sink: r.sink,
                     started_ms: now_ms() - started.elapsed().as_millis() as i64,
                     time_limit: Duration::from_millis(DEFAULT_BG_LIMIT_MS),
@@ -309,8 +304,7 @@ async fn start_background(
             agent_id: agent.clone(),
             description: input.description.clone(),
             child: r.child,
-            pgid: r.pgid,
-            cgroup: r.cgroup,
+            leaf: r.leaf,
             sink: r.sink,
             started_ms: now_ms(),
             time_limit: Duration::from_millis(limit),
