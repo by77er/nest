@@ -11,6 +11,9 @@ export default defineConfig({
           HOST_TOKEN_SECRET: "test-host-token-secret-0123456789abcdef",
           ASK_SYNC_WINDOW_MS: "200",
           ALLOW_DEV_CA: "1",
+          // The MCP proxy's timeouts, short so lost answers are quick to provoke (test/mcp.test.ts).
+          MCP_CALL_TIMEOUT_MS: "1500",
+          MCP_LIST_TIMEOUT_MS: "1500",
         },
       },
     }),

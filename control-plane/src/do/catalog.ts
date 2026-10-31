@@ -87,9 +87,9 @@ export class CatalogDO extends DurableObject<Env> {
     return this.load();
   }
 
-  /** Create or replace a capability. Its tools must be platform tools. */
+  /** Create or replace a capability. Its tools must be platform tools, and its mcp source a server nest will call. */
   async putCapability(name: string, cap: Capability): Promise<Capability> {
-    const r = checkCapability(cap, PLATFORM_TOOL_NAMES);
+    const r = checkCapability(cap, PLATFORM_TOOL_NAMES, { name, allowLoopback: this.env.ALLOW_LOOPBACK_MCP === "1" });
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `capability ${name}: ${r.error}`);
     // Every template listing it must still hold together (e.g. a parameter default it no longer takes).
     const cat = this.load();

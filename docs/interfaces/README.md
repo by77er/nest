@@ -8,6 +8,7 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 | Brain ↔ sandbox gateway (WebSocket; through the host's tunnel on a real host): bindings, `resolve`, hands (PTY and ingress designed) | [gateway/](gateway/) | `gateway` |
 | Host ↔ guest agent (vsock), hands tools; nestd and the gateway are the host side | [host-guest/](host-guest/) | `guest` |
 | Host-internal: nestd ↔ nest-proxy (fd passing), nestd ↔ runner, nestd ↔ gateway, runner ↔ `nest hook` / Claude Code | [host-internal/](host-internal/) | `host` |
+| Control plane → a remote MCP server (an mcp capability's): transport and the `_meta` keys nest sends | [remote-mcp/](remote-mcp/) | none (control plane only) |
 
 ## Conventions
 

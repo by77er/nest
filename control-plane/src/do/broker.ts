@@ -112,6 +112,16 @@ export class BrokerDO extends DurableObject<Env> {
     return null;
   }
 
+  /**
+   * A capability's credential (`cap:<name>`, docs/agents/capabilities/mcp/), for the MCP client in
+   * AgentDO, the only caller: it never goes into a host command (`cap:` is in {@link NEVER_RESOLVED}).
+   * Null when none is stored.
+   */
+  async capabilityToken(ref: string): Promise<string | null> {
+    if (!/^cap:./.test(ref)) throw new NestError(ErrorCodes.FORBIDDEN, `${ref} is not a capability credential`, 403);
+    return this.secret(ref)?.value ?? null;
+  }
+
   /** Every key a gateway in `cell` must accept (one today; the list is what a rotation extends). */
   async bindingPublicKeys(cell: string): Promise<BindingKey[]> {
     const k = await this.bindingKey(cell);

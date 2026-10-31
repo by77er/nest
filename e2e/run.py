@@ -199,7 +199,8 @@ def prepare_work():
     shutil.copy(os.path.join(BIN, "nest-gateway"), GW_BIN)
     os.chmod(GW_BIN, 0o755)
     with open(os.open(os.path.join(WORK, "dev.vars"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        f.write(f"ADMIN_TOKEN={ADMIN}\nHOST_TOKEN_SECRET=e2e-host-token-secret-0123456789abcdef\nALLOW_DEV_CA=1\n")
+        # ALLOW_LOOPBACK_MCP: the mcp capability names the local MCP test server on 127.0.0.1.
+        f.write(f"ADMIN_TOKEN={ADMIN}\nHOST_TOKEN_SECRET=e2e-host-token-secret-0123456789abcdef\nALLOW_DEV_CA=1\nALLOW_LOOPBACK_MCP=1\n")
 
 
 def ancestors(path):
@@ -524,9 +525,9 @@ def scenario(sbx_dir):
     return path, len(steps), sum(1 for _, tool, _ in steps if tool in HANDS_TOOLS)
 
 
-def results_by_label():
+def results_by_label(path=None):
     out = {}
-    for line in read(os.path.join(WORK, "results.jsonl")).splitlines():
+    for line in read(path or os.path.join(WORK, "results.jsonl")).splitlines():
         if line.strip():
             r = json.loads(line)
             out[r["label"]] = r
@@ -697,6 +698,146 @@ def tamper_signature(binding):
     return f"{head}.{c}{sig[1:]}"
 
 
+# ---------------------------------------------------------------------------------- remote MCP
+# The MCP test server (mcp-test/, its own Worker), run locally like the control plane. A capability
+# names it; an agent's fake brain calls its tools through `nest mcp` -> the runner -> AgentDO's MCP
+# proxy -> the server, whose call log (`GET /calls`) shows what the proxy sent.
+MCP_DIR = os.environ.get("NEST_E2E_MCP_DIR", os.path.join(ROOT, "mcp-test"))
+MCP_PORT = int(os.environ.get("NEST_E2E_MCP_PORT", "18788"))
+MCP_URL = f"http://127.0.0.1:{MCP_PORT}"
+MCP_TOKEN = "e2e-mcp-test-token"
+MCP_CAP = "notes"
+# Long enough to restart the control plane while the call is out (well under the server's 30 s cap).
+MCP_SLOW_MS = 20000
+
+
+def mcp_api(method, path):
+    req = urllib.request.Request(MCP_URL + path, method=method, data=b"" if method == "POST" else None,
+                                 headers={"authorization": f"Bearer {MCP_TOKEN}"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        text = r.read().decode()
+        return json.loads(text) if text else None
+
+
+def mcp_calls():
+    return (mcp_api("GET", "/calls?since=0") or {}).get("calls", [])
+
+
+def start_mcp_server():
+    log(f"starting the MCP test server ({MCP_DIR}) with wrangler dev --local on :{MCP_PORT}")
+    if not os.path.exists(os.path.join(MCP_DIR, "node_modules")):
+        subprocess.run(["npm", "install", "--silent"], cwd=MCP_DIR, check=True)
+    vars_path = os.path.join(WORK, "mcp.vars")
+    with open(os.open(vars_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(f"MCP_TEST_TOKEN={MCP_TOKEN}\n")
+    logf = open(os.path.join(WORK, "logs", "mcp-test.log"), "w")
+    PROCS["mcp"] = subprocess.Popen(
+        ["npx", "wrangler", "dev", "--local", "--port", str(MCP_PORT), "--ip", "127.0.0.1",
+         "--persist-to", os.path.join(WORK, "mcp-state"), "--env-file", vars_path,
+         "--show-interactive-dev-session=false", "--log-level", "info"],
+        cwd=MCP_DIR, stdout=logf, stderr=subprocess.STDOUT, env=dict(os.environ, WRANGLER_SEND_METRICS="false", CI="1"),
+        start_new_session=True)
+    wait_for(lambda: (mcp_api("POST", "/reset"), True)[1], 90, 0.5, "the MCP test server")
+
+
+def stop_mcp_server():
+    p = PROCS.get("mcp")
+    if p and p.poll() is None:
+        os.killpg(p.pid, signal.SIGTERM)
+        try:
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+
+
+def mcp_turn(agid, name, steps, wait_s=90):
+    """One fake-brain turn of scripted calls to `<cap>_<tool>`; returns the results by label."""
+    path = os.path.join(WORK, f"mcp-{name}.json")
+    out = os.path.join(WORK, f"mcp-{name}.jsonl")
+    with open(path, "w") as fh:
+        json.dump({"results": out, "steps": [{"label": l, "tool": f"{MCP_CAP}_{t}", "args": a} for l, t, a in steps]}, fh, indent=2)
+    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
+    check(f"mcp: {name} turn enqueued", st == 201, json.dumps(t)[:200])
+    return path, out
+
+
+def run_mcp(ids):
+    if not os.path.isdir(MCP_DIR):
+        skip("remote MCP capability", f"no MCP test server at {MCP_DIR} (set NEST_E2E_MCP_DIR to an mcp-test/ checkout)")
+        return
+    if REAL:
+        skip("remote MCP capability", "fake mode only: the calls are scripted")
+        return
+    start_mcp_server()
+    mcp_api("POST", "/reset")
+    st, _ = api("PUT", f"/v1/admin/secrets/cap:{MCP_CAP}", {"value": MCP_TOKEN})
+    check("mcp: credential stored in BrokerDO", st in (200, 204), str(st))
+    # `slow` is read-only (so idempotent by its annotation); the operator overrides it here, so a lost
+    # answer to it must never be sent again.
+    cap = {"mcp": {"url": f"{MCP_URL}/mcp", "auth": f"cap:{MCP_CAP}", "tools": ["echo", "note_put", "note_get", "counter_add", "slow"],
+                   "idempotent": {"slow": False}},
+           "prompt": "The notes server: echo, notes and counters."}
+    st, r = api("PUT", f"/v1/admin/capabilities/{MCP_CAP}", cap)
+    check("mcp: capability configured (a loopback URL, local dev only)", st == 200, json.dumps(r)[:200])
+    tpl = {"capabilities": ["nest", MCP_CAP], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
+           "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
+    st, r = api("PUT", "/v1/admin/templates/mcp-worker", tpl)
+    check("mcp: template configured", st == 200, json.dumps(r)[:200])
+    st, ag = api("POST", "/v1/agents", {"template": "mcp-worker", "workstream": ids["workstream"], "cell": "local"})
+    check("mcp: agent created", st == 201, json.dumps(ag)[:200])
+    agid = ag.get("agent")
+
+    steps = [("echo", "echo", {"text": "hello over mcp"}), ("put", "note_put", {"key": "k1", "value": "v1"}),
+             ("get", "note_get", {"key": "k1"}), ("missing", "note_get", {"key": "nope"}),
+             ("add2", "counter_add", {"name": "c", "n": 2}), ("add3", "counter_add", {"name": "c", "n": 3})]
+    _, out = mcp_turn(agid, "calls", steps)
+    try:
+        wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, 120, 0.5, "mcp tool results")
+    except TimeoutError as e:
+        check("mcp: all tool results returned", False, str(e)[:200])
+    res = results_by_label(out)
+    text = lambda k: (res.get(k) or {}).get("text") or ""
+    err = lambda k: (res.get(k) or {}).get("is_error")
+    check("mcp: echo through mcp__nest__notes_echo", text("echo") == "hello over mcp" and not err("echo"), text("echo")[:200])
+    check("mcp: note_put then note_get", not err("put") and text("get") == "v1" and not err("get"), f"{text('put')!r} {text('get')!r}")
+    check("mcp: a tool's isError reaches the model as a tool error", err("missing") and "tool_error" in text("missing"), text("missing")[:200])
+    check("mcp: counter_add totals", text("add2") == "2" and text("add3") == "5", f"{text('add2')!r} {text('add3')!r}")
+    calls = mcp_calls()
+    keys = [(c.get("_meta") or {}).get("nest/call") for c in calls]
+    metas_ok = all((c.get("_meta") or {}).get("nest/agent") == agid and isinstance((c.get("_meta") or {}).get("nest/epoch"), int)
+                   and str((c.get("_meta") or {}).get("nest/call", "")).startswith(f"{agid}/") for c in calls)
+    check("mcp: the server saw each call once, with nest's _meta", len(calls) == len(steps) and metas_ok and len(set(keys)) == len(keys),
+          json.dumps([{k: c.get(k) for k in ("tool", "_meta")} for c in calls])[:400])
+    # The listing (untrusted server: descriptions in the model's context) tainted the session first.
+    check("mcp: untrusted server: every call says the session is tainted",
+          calls and all((c.get("_meta") or {}).get("nest/taint") is True for c in calls), json.dumps([(c.get("_meta") or {}).get("nest/taint") for c in calls]))
+
+    # Redelivery: the control plane restarts while a non-idempotent call is out at the server. The
+    # runner resends the unacked call to a new AgentDO incarnation, which finds it forwarded and
+    # unanswered: outcome_unknown, never a second request.
+    before = len(calls)
+    _, out = mcp_turn(agid, "redelivery", [("slow", "slow", {"ms": MCP_SLOW_MS})])
+    try:
+        wait_for(lambda: any(c.get("tool") == "slow" for c in mcp_calls()[before:]) or None, 60, 0.25, "the slow call at the server")
+    except TimeoutError as e:
+        check("mcp: slow call reached the server", False, str(e)[:200])
+        return
+    t0 = time.time()
+    stop_control_plane()
+    start_control_plane()
+    log(f"control plane restarted in {time.time() - t0:.1f}s with the slow call out")
+    try:
+        wait_for(lambda: results_by_label(out).get("slow"), 90, 0.5, "the redelivered call's result")
+    except TimeoutError as e:
+        check("mcp: redelivered call answered", False, str(e)[:200])
+    r = results_by_label(out).get("slow") or {}
+    check("mcp: the redelivered call is outcome_unknown", r.get("is_error") and "outcome_unknown" in (r.get("text") or ""), (r.get("text") or "")[:200])
+    time.sleep(2)  # a resend would have left before the answer came back
+    slow = [c for c in mcp_calls() if c.get("tool") == "slow"]
+    check("mcp: the redelivered call reached the server once", len(slow) == 1,
+          json.dumps([(c.get("_meta") or {}).get("nest/call") for c in slow]))
+
+
 def run_fencing(ids):
     brains = real_brains() if REAL else children_named(FAKE_CLAUDE)
     guests = children_named(os.path.join(BIN, "nest-guest"))
@@ -768,6 +909,7 @@ def main():
             check("gateway listening + synced with nestd", False, str(e))
         check_gateway_unprivileged()
         ids = run_scenario()
+        run_mcp(ids)
         # After the turns: the token has been handed to the brains by now.
         check_token_not_in("the Claude token is not in the gateway's environment or command line", children_named(GW_BIN))
         run_fencing(ids)
@@ -776,6 +918,7 @@ def main():
         check("harness", False, f"{type(e).__name__}: {e}")
     finally:
         stop_control_plane()
+        stop_mcp_server()
         stop_inner()
         passed = sum(1 for _, ok, _ in RESULTS if ok)
         failed = [n for n, ok, _ in RESULTS if ok is False]

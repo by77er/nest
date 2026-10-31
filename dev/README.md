@@ -51,6 +51,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | [review-lessons.md](review-lessons.md) | Standalone lessons from real findings, checked on every review |
 | [verification.md](verification.md) | The formal models in `verification/` and their CI jobs |
 | [cloud-checks/](cloud-checks/) | Scripted checks against the live control plane after a deploy, run by hand |
+| [../mcp-test/](../mcp-test/README.md) | A rudimentary remote MCP server (its own Worker, `nest-mcp-test`) for end-to-end tests of `mcp` capabilities, deployed by hand |
 
 ## Path to self-maintenance
 
