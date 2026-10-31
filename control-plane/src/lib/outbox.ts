@@ -12,7 +12,7 @@
 import type { Env } from "../env";
 import { asNestError } from "./util";
 import type { PostInput } from "./channels";
-import type { Deadlines } from "./reliable";
+import { type Deadlines, withTimeout } from "./reliable";
 
 /** The deadline key the owning object's alarm dispatches to `flush`. */
 export const OUTBOX_DEADLINE = "chan_out";
@@ -88,7 +88,7 @@ export class ChannelOutbox {
             ? { agent_owner: r.agent_owner, ...(r.agent_owner && this.ownerFacts ? await this.ownerFacts(r.agent_owner) : {}) }
             : {};
           await this.env.CHANNEL.get(this.env.CHANNEL.idFromName(r.channel)).post(r.channel, { principal: "platform", tainted: r.tainted === 1 }, post, extra);
-        })(), POST_TIMEOUT_MS);
+        })(), POST_TIMEOUT_MS, "channel post");
       } catch (e) {
         const ne = asNestError(e);
         if (!ne || ne.retryable) throw e;
@@ -105,16 +105,5 @@ export class ChannelOutbox {
       done++;
     }
     if (done < rows.length || rows.length === FLUSH_BATCH) await this.deadlines.set(OUTBOX_DEADLINE, Date.now() + 1, true);
-  }
-}
-
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([p, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`channel post timed out after ${ms} ms`)), ms);
-    })]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
   }
 }

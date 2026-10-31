@@ -124,6 +124,21 @@ export class SerialQueue {
   }
 }
 
+/**
+ * `p`, or a rejection after `ms`: a call another object may never answer can't hold up the caller
+ * (an alarm loop). The call itself runs on; its result is dropped.
+ */
+export async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([p, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
+    })]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /** Multiplexes several named deadlines onto a Durable Object's single alarm. */
 export class Deadlines {
   /**

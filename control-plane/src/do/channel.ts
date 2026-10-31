@@ -20,7 +20,7 @@ import {
   permits, type PostState, RATE_WINDOW_MS, READ_DEFAULT_LIMIT, READ_MAX_BYTES, READ_MAX_LIMIT, settleDelivery, type SubscribeInput, type Subscription,
   TIER_AFTER_MS,
 } from "../lib/channels";
-import { Deadlines } from "../lib/reliable";
+import { Deadlines, withTimeout } from "../lib/reliable";
 import { storedEnum } from "../lib/stored";
 import { asNestError, NestError, newId } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
@@ -604,7 +604,8 @@ export class ChannelDO extends DurableObject<Env> {
     let outcome: DeliveryOutcome;
     try {
       await this.hook("fanout:beforeDeliver");
-      outcome = await this.callAgent(sub.agent, { channel: meta.name, subscription: id, batch });
+      const d = { channel: meta.name, subscription: id, batch };
+      outcome = await withTimeout<DeliveryOutcome>(this.env.AGENT.get(this.env.AGENT.idFromName(sub.agent)).deliverChannel(d), DELIVERY_TIMEOUT_MS, "delivery");
     } catch (e) {
       if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) {
         console.warn(`channel ${meta.name}: subscriber ${sub.agent} is not an agent; ${id} dropped`);
@@ -630,18 +631,6 @@ export class ChannelDO extends DurableObject<Env> {
       return;
     }
     this.saveSub(next);
-  }
-
-  private async callAgent(agent: string, d: { channel: string; subscription: string; batch: Batch }): Promise<DeliveryOutcome> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("delivery timed out")), DELIVERY_TIMEOUT_MS);
-    });
-    try {
-      return await Promise.race([this.env.AGENT.get(this.env.AGENT.idFromName(agent)).deliverChannel(d), timeout]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
   }
 
   // --- maintenance ----------------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
+import { withTimeout } from "../lib/reliable";
 import { sqlIn, storedEnum } from "../lib/stored";
 import {
   type Actor, type Applied, applyTaskOp, checkLedgerAccess, CLOSED_STATUSES, type HistoryEntry, type HistoryValue, inboxOwner, LedgerName,
@@ -68,6 +69,8 @@ const NOTICE_RETRY_MAX_MS = 5 * 60_000;
 /** When a notice that failed `attempts` times before (0 for the first) is tried again, from now. */
 export const noticeRetryMs = (attempts: number) => Math.min(1_000 * 2 ** Math.max(0, attempts), NOTICE_RETRY_MAX_MS);
 const NOTICES_PER_ALARM = 50;
+/** One notice's call is abandoned (and retried later, under the same idempotency key) after this long. */
+export const NOTICE_TIMEOUT_MS = 5_000;
 export const LIST_DEFAULT_LIMIT = 50;
 export const LIST_MAX_LIMIT = 200;
 
@@ -92,7 +95,8 @@ export async function deliverNotice(env: Env, ledger: string, row: OutboxRow): P
   const agent = inboxOwner(row.channel);
   if (!agent) return "gone";
   try {
-    await env.AGENT.get(env.AGENT.idFromName(agent)).postInbox(`tasks:${ledger}`, row.body.text, false, row.idem);
+    // Bounded: `postInbox` may wait on the agent's wake, and one slow agent mustn't hold the rest.
+    await withTimeout(env.AGENT.get(env.AGENT.idFromName(agent)).postInbox(`tasks:${ledger}`, row.body.text, false, row.idem), NOTICE_TIMEOUT_MS, "notice");
     return "delivered";
   } catch (e) {
     if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return "gone";

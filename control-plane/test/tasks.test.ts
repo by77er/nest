@@ -362,6 +362,26 @@ describe("TaskLedgerDO", () => {
     });
   });
 
+  it("a notice whose agent never answers is cut off and retried; the notices behind it still go", { timeout: 20_000 }, async () => {
+    const L = uniqueLedger();
+    const l = ledgerStub(env, L);
+    await l.apply(L, op, { kind: "create", title: "t" });
+    const hung = "agt_hung0000000000000000000000";
+    const live = "agt_live0000000000000000000000";
+    const delivered: string[] = [];
+    await runInDurableObject(l, async (i: TaskLedgerDO, st) => {
+      (i as any).env = { ...(i as any).env, AGENT: {
+        idFromName: (n: string) => n,
+        get: (n: string) => ({ postInbox: () => (n === hung ? new Promise(() => undefined) : Promise.resolve(delivered.push(n))) }),
+      } };
+      st.storage.sql.exec("INSERT INTO outbox (channel, body, next_ms) VALUES (?, ?, 0), (?, ?, 0)",
+        `${hung}/inbox`, JSON.stringify(POST), `${live}/inbox`, JSON.stringify(POST));
+      await i.alarm();
+      expect(st.storage.sql.exec("SELECT channel, attempts FROM outbox").toArray()).toEqual([{ channel: `${hung}/inbox`, attempts: 1 }]);
+    });
+    expect(delivered).toEqual([live]);
+  });
+
   it("retries a notice that failed (alarm re-armed, backoff growing) and deletes it only once delivered, delivering it once", { timeout: 30_000 }, async () => {
     expect([0, 1, 2, 3, 8, 9, 20].map(noticeRetryMs)).toEqual([1_000, 2_000, 4_000, 8_000, 256_000, 300_000, 300_000]);
     const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "retry" } }, 201);
