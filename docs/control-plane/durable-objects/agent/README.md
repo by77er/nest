@@ -43,7 +43,7 @@ The authority for one agent (conversation).
 - **Session stream:**
   - One stream per file of the session directory (the main JSONL, subagents, sidecars), keyed by relative path.
   - Acked to the **agent runner** by offset once committed to SQLite, which is durable.
-  - Flushed to R2 as segments at 1 MiB, at turn end, after 30 s idle, and **before any start**, so `--resume` gets everything AgentDO holds.
+  - Flushed to R2 as segments at 1 MiB, at turn end, after 30 s idle, and **before any start**, so `--resume` gets everything AgentDO holds. One flush at a time: two reading the same rows would write one R2 key twice, and the shorter put landing last would lose acked bytes.
   - SQLite holds the segment index and the unflushed buffer.
   - **Rewritten file (`base: true`) or new session id:** a new receive stream starts. The committed base stays what `--resume` and transcripts read until the new stream is durable and caught up.
   - See [../../../agents/sessions/](../../../agents/sessions/).

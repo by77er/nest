@@ -240,7 +240,8 @@ interface PreviousReleaseFields {
 /** Points where a test can force an interleaving (`testHooks`). */
 export type HookPoint =
   | "intent:beforeCommit" | "resolveHands:afterResolve" | "dispatch:beforeWrite" | "sandboxMoved:enter" | "kill:beforeIssue"
-  | "hostLost:enter" | "exited:enter" | "start:afterCommit" | "release:afterCommit" | "event:afterApply" | "escalate:afterProgress" | "escalate:afterStatus" | "pump:beforeSend";
+  | "hostLost:enter" | "exited:enter" | "start:afterCommit" | "release:afterCommit" | "event:afterApply" | "escalate:afterProgress" | "escalate:afterStatus" | "pump:beforeSend"
+  | "flush:beforePut";
 
 export interface CreateAgent {
   agent: string;
@@ -311,6 +312,8 @@ export class AgentDO extends DurableObject<Env> {
   private intentRun: Promise<StartResult | null> | null = null;
   /** Someone stored an intent while a run was in flight: run again (from the alarm) once it ends. */
   private intentDirty = false;
+  /** The flush in flight (single-flight, see `flush`). */
+  private flushing: Promise<void> | null = null;
 
   /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
   async health(): Promise<true> {
@@ -1699,6 +1702,20 @@ export class AgentDO extends DurableObject<Env> {
    * the new durable offset. A pending base becomes the committed base once it is durable and caught up.
    */
   async flush(): Promise<void> {
+    // Single-flight: two flushes reading the same rows would write one R2 key twice, and the slower,
+    // shorter put could land last, losing bytes already acked. A flush called during one waits for it,
+    // then writes what is left.
+    while (this.flushing) await this.flushing.catch(() => undefined);
+    const p = this.flushOnce();
+    this.flushing = p;
+    try {
+      await p;
+    } finally {
+      if (this.flushing === p) this.flushing = null;
+    }
+  }
+
+  private async flushOnce(): Promise<void> {
     const info = this.load();
     const base = info.recv_base;
     const rows = this.sql
@@ -1709,6 +1726,7 @@ export class AgentDO extends DurableObject<Env> {
     const last = rows[rows.length - 1]!.offset;
     const bytes = concatBytes(rows.map((r) => new Uint8Array(r.data)));
     const key = `sessions/${info.agent}/b${base}/${start}`;
+    await this.hook("flush:beforePut");
     await this.env.BUCKET.put(key, bytes.slice().buffer);
     // State may have moved on during the put: apply only what this flush made durable.
     this.sql.exec("INSERT OR REPLACE INTO segments (base, offset, len, key) VALUES (?, ?, ?, ?)", base, start, bytes.length, key);

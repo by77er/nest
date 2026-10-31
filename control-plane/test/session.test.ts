@@ -1,6 +1,7 @@
-import { env, runDurableObjectAlarm } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { bytesToB64 } from "../src/lib/util";
+import type { AgentDO } from "../src/do/agent";
 import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -130,6 +131,34 @@ describe("session channel", () => {
     expect(await blob.text()).toBe(c);
     const forged = await (await import("cloudflare:test")).SELF.fetch(`http://cp.test${url.pathname}?exp=${url.searchParams.get("exp")}&sig=AAAA`);
     expect(forged.status).toBe(403);
+  });
+
+  it("a flush that crosses the size threshold during a slow flush loses none of the acked bytes from R2", async () => {
+    const s = await setup();
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    const a = '{"type":"user"}\n';
+    const big = `${"x".repeat(1024 * 1024)}\n`;
+    ws.send(seg(0, a));
+    await sleep(50);
+    // The first flush is held just before its R2 put.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["flush:beforePut"] = async () => {
+        delete inst.testHooks["flush:beforePut"];
+        (inst as any).testHeld = true;
+        while (!(inst as any).testGo) await sleep(5);
+      };
+    });
+    const first = agentStub(s.agent).flush();
+    while (!(await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).testHeld))) await sleep(5);
+    ws.send(seg(a.length, big)); // past 1 MiB: flushes at once
+    while ((await agentStub(s.agent).info()).received_bytes < a.length + big.length) await sleep(10);
+    await sleep(100); // room for the threshold flush to reach R2, were it not waiting for the first
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as any).testGo = true;
+    });
+    await first;
+    await ws.next("segment_ack", (m) => m.durable_bytes === a.length + big.length);
+    expect(await agentStub(s.agent).transcript()).toBe(a + big);
   });
 
   it("routes a stale-epoch connection's segments to the orphan branch and nothing else", async () => {
