@@ -1736,6 +1736,9 @@ export class AgentDO extends DurableObject<Env> {
     });
     // Reported on `<agt>/events` in the same step (queued; posted from the alarm). Never a brain decision.
     this.reportEvent(info, ev, completed, stale);
+    // The emptied mirror goes before any later `run_turn` (one may start while this awaits): a requeued
+    // message must not be shown again from the runner's old cache.
+    if (completed) this.pushCache();
     if (ev.type === "rate_limited") {
       await this.workstream(info.workstream).ingest({
         workstream: info.workstream, ts_ms: ev.ts_ms, agent: info.agent, type: "quota_parked",
@@ -1751,10 +1754,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.postAsk(info, ev.call, ev.epoch, question, "async", "escalation");
     }
     await this.syncActivity();
-    if (completed) {
-      this.pushCache();
-      await this.pump();
-    }
+    if (completed) await this.pump();
     this.sql.exec("INSERT OR IGNORE INTO events (seq, body) VALUES (?, ?)", ev.seq, JSON.stringify(ev));
     this.sql.exec("DELETE FROM events WHERE seq < ?", ev.seq - 500);
   }

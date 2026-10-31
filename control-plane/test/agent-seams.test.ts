@@ -674,6 +674,29 @@ describe("one brain per agent: the brain record", () => {
     expect((await ws.next("run_turn", (m) => m.input.text.endsWith("third"))).input.text).toBe("third");
   });
 
+  it("a message the model never saw comes back as a turn the runner's stale mirror can't show again: the cache goes first", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "first" } }, 201);
+    const t1 = await ws.next("run_turn");
+    await adminJson(`/v1/agents/${s.agent}/inbox`, { body: { from: "user", text: "unseen" } }, 201);
+    await ws.next("inbox");
+    // While the completion tells the sandbox the agent stopped working (an await), a pump starts the requeued turn.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      const real = (inst as any).syncActivity.bind(inst);
+      (inst as any).syncActivity = async (force?: boolean) => {
+        (inst as any).syncActivity = real;
+        await (inst as any).pump();
+        return real(force);
+      };
+    });
+    ws.drain();
+    ws.send({ type: "events", seq: 1, events: [{ agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), turn: t1.turn, type: "turn_completed", stop_reason: "end_turn" }] });
+    const again = await ws.next("run_turn", (m) => m.input.text.includes("unseen"));
+    const cleared = await ws.next("cache_update", (m) => m.cache.inbox.length === 0);
+    expect(cleared.seq).toBeLessThan(again.seq);
+  });
+
   it("two move notices racing mid-turn: the brain is left told of the newer epoch, never moved back to the older", async () => {
     const s = await setup();
     const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
