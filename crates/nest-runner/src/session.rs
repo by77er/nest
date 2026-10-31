@@ -49,8 +49,10 @@ pub struct Session {
     pub instance_id: String,
 }
 
+#[derive(Default)]
 struct State {
-    next_seq: u64,
+    /// The last seq given to an outbound reliable message.
+    last_out: u64,
     unacked: VecDeque<(u64, RunnerToAgent)>,
     last_in: u64,
     batch: Vec<AgentEvent>,
@@ -71,10 +73,20 @@ impl State {
         self.close_deadline.is_some_and(|d| tokio::time::Instant::now() >= d)
     }
 
-    /// Abandon a timed-out platform call without breaking the in-order seq lineage. If the call is
-    /// still unacked, it is replaced in place by a `cancel_call` with the same seq (so a resend can
-    /// never execute it); a fresh `cancel_call` is always queued too, covering a call AgentDO has
-    /// already received (a pending ask stops waiting). AgentDO handles cancels idempotently.
+    fn close(&mut self) {
+        self.close_deadline.get_or_insert(tokio::time::Instant::now() + CLOSE_FLUSH);
+    }
+
+    /// Give the next seq to a reliable message and keep it until AgentDO acks it.
+    fn queue(&mut self, make: impl FnOnce(Seq) -> RunnerToAgent) -> &RunnerToAgent {
+        self.last_out += 1;
+        self.unacked.push_back((self.last_out, make(Seq(self.last_out))));
+        &self.unacked.back().expect("just pushed").1
+    }
+
+    /// Abandon a timed-out platform call, keeping the seq lineage: an unacked copy becomes a
+    /// `cancel_call` at its seq (a resend never runs it), and a fresh `cancel_call` covers one
+    /// AgentDO already has. AgentDO handles cancels idempotently.
     fn abandon(&mut self, call: &model::CallId) -> RunnerToAgent {
         let reason = "timed out in the runner; the model was told the outcome is unknown".to_string();
         for (seq, m) in self.unacked.iter_mut() {
@@ -82,25 +94,13 @@ impl State {
                 *m = RunnerToAgent::CancelCall { seq: Seq(*seq), call: call.clone(), reason: reason.clone() };
             }
         }
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let m = RunnerToAgent::CancelCall { seq: Seq(seq), call: call.clone(), reason };
-        self.unacked.push_back((seq, m.clone()));
-        m
+        self.queue(|seq| RunnerToAgent::CancelCall { seq, call: call.clone(), reason }).clone()
     }
 }
 
 impl Session {
     pub async fn run(mut self, mut out: mpsc::UnboundedReceiver<Outbound>) {
-        let mut st = State {
-            next_seq: 1,
-            unacked: VecDeque::new(),
-            last_in: 0,
-            batch: Vec::new(),
-            durable: 0,
-            resolves: Vec::new(),
-            close_deadline: None,
-        };
+        let mut st = State::default();
         let mut backoff = Duration::from_millis(100);
         loop {
             match self.connect_once(&mut st, &mut out).await {
@@ -120,7 +120,7 @@ impl Session {
                     _ = &mut deadline => break,
                     o = out.recv(), if !st.closing() => match o {
                         Some(o) => self.absorb(&mut st, o),
-                        None => { st.close_deadline.get_or_insert(tokio::time::Instant::now() + CLOSE_FLUSH); }
+                        None => st.close(),
                     },
                 }
             }
@@ -133,9 +133,7 @@ impl Session {
         match o {
             Outbound::Event(e) => push_event(&mut st.batch, e),
             Outbound::ToolCall { call, turn, name, arguments } => {
-                let seq = st.next_seq;
-                st.next_seq += 1;
-                st.unacked.push_back((seq, RunnerToAgent::ToolCall(ToolCall { seq: Seq(seq), call, turn, name, arguments })));
+                st.queue(|seq| RunnerToAgent::ToolCall(ToolCall { seq, call, turn, name, arguments }));
             }
             Outbound::AbandonCall(call) => {
                 st.abandon(&call);
@@ -144,9 +142,7 @@ impl Session {
             Outbound::ToolsListRequest(_) | Outbound::Reconnect => {}
             Outbound::SetTranscript(p) => self.tailer.set_path(p),
             Outbound::SetSession(s) => self.session = Some(s),
-            Outbound::Close => {
-                st.close_deadline.get_or_insert(tokio::time::Instant::now() + CLOSE_FLUSH);
-            }
+            Outbound::Close => st.close(),
         }
     }
 
@@ -169,7 +165,7 @@ impl Session {
                     r = rx.changed() => r?,
                     o = out.recv(), if !st.closing() => match o {
                         Some(o) => self.absorb(st, o),
-                        None => { st.close_deadline.get_or_insert(tokio::time::Instant::now() + CLOSE_FLUSH); }
+                        None => st.close(),
                     },
                     _ = tokio::time::sleep(Duration::from_millis(500)), if st.closing() => {}
                 }
@@ -252,7 +248,7 @@ impl Session {
                 },
                 o = out.recv(), if !st.closing() => {
                     let Some(o) = o else {
-                        st.close_deadline.get_or_insert(tokio::time::Instant::now() + CLOSE_FLUSH);
+                        st.close();
                         continue;
                     };
                     match o {
@@ -278,7 +274,7 @@ impl Session {
                             return Ok(Step::Reconnect);
                         }
                         Outbound::Close => {
-                            st.close_deadline = Some(tokio::time::Instant::now() + CLOSE_FLUSH);
+                            st.close();
                             self.flush_tail(&mut tx).await?;
                             self.flush_events(st, &mut tx).await?;
                         }
@@ -377,18 +373,13 @@ impl Session {
     }
 }
 
-/// Assign the next seq, keep the message for resending, then send it. Kept first: a send that
-/// fails (the usual way a broken socket shows) leaves it queued, so the next connection resends
-/// it under the same seq and AgentDO never sees a gap.
+/// Queue, then send: a send that fails (the usual way a broken socket shows) leaves the message
+/// queued, so the next connection resends it under the same seq and AgentDO never sees a gap.
 async fn send_reliable<S>(st: &mut State, tx: &mut S, make: impl FnOnce(Seq) -> RunnerToAgent) -> anyhow::Result<()>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let seq = st.next_seq;
-    st.next_seq += 1;
-    let m = make(Seq(seq));
-    let frame = text(&m)?;
-    st.unacked.push_back((seq, m));
+    let frame = text(st.queue(make))?;
     tx.send(frame).await?;
     Ok(())
 }
@@ -482,15 +473,7 @@ mod tests {
             opened: None,
             instance_id: "rin_t".into(),
         };
-        let mut st = State {
-            next_seq: 1,
-            unacked: VecDeque::new(),
-            last_in: 0,
-            batch: vec![ev(1, AgentEventBody::AssistantText { text: "x".into() })],
-            durable: 0,
-            resolves: Vec::new(),
-            close_deadline: None,
-        };
+        let mut st = State { batch: vec![ev(1, AgentEventBody::AssistantText { text: "x".into() })], ..State::default() };
         assert!(session.flush_events(&mut st, &mut BrokenSink).await.is_err());
         st.batch.push(ev(2, AgentEventBody::AssistantText { text: "y".into() }));
         assert!(session.flush_events(&mut st, &mut BrokenSink).await.is_err());
@@ -512,15 +495,7 @@ mod tests {
     fn abandoning_a_call_keeps_the_seq_lineage_contiguous() {
         let call = model::CallId("cal_t1-1".into());
         let tc = |seq| RunnerToAgent::ToolCall(ToolCall { seq: Seq(seq), call: call.clone(), turn: None, name: "notify".into(), arguments: serde_json::json!({}) });
-        let mut st = State {
-            next_seq: 3,
-            unacked: VecDeque::from([(1, tc(1)), (2, tc(2))]),
-            last_in: 0,
-            batch: Vec::new(),
-            durable: 0,
-            resolves: Vec::new(),
-            close_deadline: None,
-        };
+        let mut st = State { last_out: 2, unacked: VecDeque::from([(1, tc(1)), (2, tc(2))]), ..State::default() };
         st.unacked[1].1 = RunnerToAgent::Events { seq: Seq(2), events: vec![] };
         let fresh = st.abandon(&call);
         // The unacked copy became a cancel at the same seq; a fresh cancel follows at the next seq.
@@ -528,7 +503,7 @@ mod tests {
         assert!(matches!(&fresh, RunnerToAgent::CancelCall { seq: Seq(3), .. }));
         let seqs: Vec<u64> = st.unacked.iter().map(|(s, _)| *s).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
-        assert_eq!(st.next_seq, 4);
+        assert_eq!(st.last_out, 3);
         assert!(!st.unacked.iter().any(|(_, m)| matches!(m, RunnerToAgent::ToolCall(_))));
     }
 }

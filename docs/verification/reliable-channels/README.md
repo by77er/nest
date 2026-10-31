@@ -23,7 +23,7 @@ Out of scope (not seq/ack channels): `segment` (offset-keyed), nestd↔runner (c
 | FleetDO | `hosts.nestd_instance`, `commands(cmd, result?)` | per-host `SerialQueue`, socket attachment `{helloed}`, `keysSent` | `control-plane/src/do/fleet.ts:161,243-247,1152-1173` |
 | AgentDO | `runner_instance`, `events` dedup rows, `tool_calls` | one `SerialQueue`, attachment `{helloed, stale, instance, epoch}` | `control-plane/src/do/agent.ts:117,169,726-797` |
 | nestd fleet task | none | `pending`, `unacked`, `next_seq`, `last_command_seq`, `forwarded_command_seq`, `shed` | `crates/nestd/src/fleet.rs:106-128` |
-| runner session | none | `next_seq`, `unacked`, `last_in` | `crates/nest-runner/src/session.rs` `State` |
+| runner session | none | `last_out` (the model's `next_seq − 1`), `unacked`, `last_in` | `crates/nest-runner/src/session.rs` `State` |
 
 ## Transitions
 
@@ -116,7 +116,7 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 **B6 — session poison loop (suspected).** AgentDO rejects a frame that fails its schema with `invalid_message` and does not close (`agent.ts:626-635`); the runner reconnects on `invalid_message` (`session.rs` `inbound`) and resends the same batch forever. Breaks L3.
 
-**B7 — a failed send lost a runner session message and wedged the channel (fixed).** The runner assigned a seq, sent, and only then queued the message for resending; a send that failed (a broken socket) spent the seq and dropped the message, so every later batch was a gap to AgentDO until the brain exited. Now the message is queued before it is sent (`session.rs` `send_reliable`), as the model's separate *assign* and *send* actions require: the send may fail, the message stays in `unacked` under its seq. Test: `a_batch_whose_send_fails_is_resent_under_its_seq`.
+**B7 — a failed send lost a runner session message and wedged the channel (fixed).** The runner assigned a seq, sent, and only then queued the message for resending; a send that failed (a broken socket) spent the seq and dropped the message, so every later batch was a gap to AgentDO until the brain exited. Now the message is queued before it is sent (`session.rs` `State::queue`, `send_reliable`), as the model's separate *assign* and *send* actions require: the send may fail, the message stays in `unacked` under its seq. Test: `a_batch_whose_send_fails_is_resent_under_its_seq`.
 
 ## Modelling notes
 
