@@ -459,6 +459,33 @@ describe("autoscaling", () => {
     ws.close();
   });
 
+  it("repeats a launch whose answer was lost with the same client token, so it's recorded and never launched twice (B-6)", async () => {
+    const cell = uniqueCell();
+    // EC2 launches the instance, but its answer never arrives (a timeout, a reset).
+    const byToken = new Map<string, string>();
+    let lose = true;
+    const ec2 = new MockEc2("running");
+    ec2.launch = async (spec: LaunchSpec) => {
+      if (!byToken.has(spec.clientToken)) byToken.set(spec.clientToken, `i-0${(byToken.size + 1).toString(16).padStart(8, "0")}`);
+      ec2.launched.push(spec);
+      if (lose) { lose = false; throw new Error("EC2 RunInstances: network connection lost"); }
+      return byToken.get(spec.clientToken)!;
+    };
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    expect(ec2.launched).toHaveLength(1);
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches).toEqual([]);
+    // The next run repeats that attempt, not a new one: EC2 answers with the instance it launched.
+    await tickAt(cell, ec2);
+    expect(ec2.launched.map((l) => l.clientToken)).toEqual([ec2.launched[0]!.clientToken, ec2.launched[0]!.clientToken]);
+    expect(byToken.size).toBe(1);
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches).toEqual([expect.objectContaining({ instance_id: "i-000000001" })]);
+    // It can enroll, and nothing else is launched for the waiting sandbox meanwhile.
+    expect((await enrollLaunched(cell, "i-000000001")).host).toMatch(/^hst_/);
+    await tickAt(cell, ec2);
+    expect(byToken.size).toBe(1);
+  });
+
   it("terminates a launch that never enrolls, then launches again on demand", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("terminated");

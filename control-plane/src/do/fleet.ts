@@ -146,6 +146,10 @@ interface Attachment {
  * answered, kept until it has been dealt with.
  */
 const orphansKey = (host: string) => `orphaned_commands:${host}`;
+
+/** A RunInstances attempt FleetDO hasn't seen the end of (`scaleUp`), kept in `kv` under `launchKey`. */
+interface LaunchIntent { token: string; type: string; subnet: string; spot: boolean; at: number }
+const launchKey = (role: HostKind) => `launch:${role}`;
 /**
  * The old process's unanswered commands, and (until `dropUnreported` has run) the leases it held
  * that the new process doesn't report. An older shape is the bare array of commands.
@@ -267,7 +271,7 @@ export class FleetDO extends DurableObject<Env> {
   private kmsRoot: { keyId: string; root: RootCa } | null = null;
   /** Override for tests: a fake Cloudflare API and the domain; `null` = no tunnels; `undefined` reads the env. */
   cloudflareOverride: { api: CloudflareApi; domain: string } | null | undefined = undefined;
-  /** Host kinds with a launch in flight (RunInstances awaits); placements meanwhile don't launch another. */
+  /** Host kinds with a RunInstances call in flight in this instance; placements meanwhile don't launch another. */
   private readonly launching = new Set<HostKind>();
 
   /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
@@ -1908,6 +1912,8 @@ export class FleetDO extends DurableObject<Env> {
     if (this.sql.exec("SELECT 1 FROM brain_waiters LIMIT 1").toArray().length && brainHostNeeded(this.brainFacts())) {
       await this.scaleUp(BRAIN_ROLE);
     }
+    // A launch whose answer was lost is repeated until EC2 answers it, so its instance is recorded.
+    for (const role of [SANDBOX_ROLE, BRAIN_ROLE]) if (this.launchIntent(role)) await this.scaleUp(role);
     await this.scaleDown(now);
     await this.confirmTerminations();
     const busy = this.hostsBy({ status: LIVE_STATUSES }).length
@@ -1919,7 +1925,8 @@ export class FleetDO extends DurableObject<Env> {
       || (this.ec2() && this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND reason IS NOT NULL").toArray().length)
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length
       || this.sql.exec("SELECT 1 FROM brain_waiters").toArray().length
-      || this.sql.exec("SELECT 1 FROM stale_incarnations WHERE cmd IS NULL").toArray().length;
+      || this.sql.exec("SELECT 1 FROM stale_incarnations WHERE cmd IS NULL").toArray().length
+      || this.sql.exec("SELECT 1 FROM kv WHERE key IN (?, ?)", launchKey(SANDBOX_ROLE), launchKey(BRAIN_ROLE)).toArray().length;
     if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
   }
 
@@ -2089,12 +2096,25 @@ export class FleetDO extends DurableObject<Env> {
    * kind's launch template, as `scaleUpPlan` decides (not while one of that kind is launching or
    * not yet enrolled, nor at the kind's `max_hosts`). The instance may enroll only as that kind, in
    * this cell, from this region. A cell with no settings for the kind launches nothing.
+   *
+   * Each RunInstances attempt is recorded (`kv launch:<kind>`) before it is sent, and the next run
+   * repeats an unfinished one with the same client token before planning another: EC2 answers a
+   * repeat with the instance the first call launched, so one whose answer was lost (a timeout, a
+   * reset) is recorded and can enroll, never launched twice
+   * ([idempotency](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-idempotency.html)).
    */
   private async scaleUp(role: HostKind = SANDBOX_ROLE): Promise<void> {
     const cfg = this.cellConfig();
     const ec2 = this.ec2();
     const s = cfg ? this.scaleSettings(cfg, role) : null;
-    if (!cfg || !s || !ec2) return;
+    if (!cfg || !s || !ec2 || this.launching.has(role)) return;
+    const unfinished = this.launchIntent(role);
+    if (unfinished && Date.now() - unfinished.at < cfg.enroll_timeout_ms) {
+      await this.launchAttempt(ec2, cfg, s.launch_template_id, role, unfinished);
+      return;
+    }
+    // Too old to repeat (its token may no longer be honoured): an instance it launched never enrolls.
+    if (unfinished) this.endLaunchIntent(role, unfinished.token);
     const pending = this.sql.exec(`SELECT 1 FROM launched WHERE host IS NULL AND reason IS NULL AND role IN (${sqlIn([roleName(role), role])})`).toArray().length;
     // A brain host of the previous release (its hello lacked `brain_epochs`) never gets a brain and
     // is drained on sight: it isn't capacity, so it doesn't count toward the cap.
@@ -2104,35 +2124,54 @@ export class FleetDO extends DurableObject<Env> {
     const plan = scaleUpPlan(s, live, pending, this.launching.has(role), now);
     if (!plan.launch) return;
     const cell = this.cellName();
+    for (const [i, a] of plan.launch.entries()) {
+      const intent = { token: `${cell ?? "cell"}-${role}-${now}-${i}`, type: a.type, subnet: a.subnet, spot: a.spot, at: now };
+      if ((await this.launchAttempt(ec2, cfg, s.launch_template_id, role, intent)) !== "capacity") return;
+    }
+  }
+
+  /** One RunInstances attempt, recorded first; the record ends once it launched or EC2 had no room. */
+  private async launchAttempt(
+    ec2: Ec2, cfg: AwsCellConfig, template: string, role: HostKind, a: LaunchIntent,
+  ): Promise<"launched" | "capacity" | "failed"> {
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", launchKey(role), JSON.stringify(a));
     this.launching.add(role);
     try {
-      for (const [i, a] of plan.launch.entries()) {
-        try {
-          const id = await ec2.launch({
-            launchTemplateId: s.launch_template_id, instanceType: a.type, subnetId: a.subnet, spot: a.spot,
-            clientToken: `${cell ?? "cell"}-${role}-${now}-${i}`,
-            // Brain hosts are burstable (IAM allows t3/t3a only): unlimited, so a host full of
-            // brains is never held to its baseline. Sandbox hosts aren't, and EC2 refuses the field.
-            ...(role === BRAIN_ROLE ? { cpuCredits: "unlimited" as const } : {}),
-          });
-          this.sql.exec(
-            "INSERT INTO launched (instance_id, launched_ms, role, region, cell) VALUES (?, ?, ?, ?, ?)",
-            id, Date.now(), roleName(role), cfg.region, cell,
-          );
-          console.log(`FleetDO: launched ${role} host ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
-          if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
-          return;
-        } catch (e) {
-          if (!(e instanceof CapacityError)) {
-            console.error("FleetDO: launch failed", e);
-            return;
-          }
-          console.warn(`FleetDO: no capacity for ${a.type} (${a.spot ? "spot" : "on-demand"}): ${e.message}`);
-        }
+      const id = await ec2.launch({
+        launchTemplateId: template, instanceType: a.type, subnetId: a.subnet, spot: a.spot, clientToken: a.token,
+        // Brain hosts are burstable (IAM allows t3/t3a only): unlimited, so a host full of
+        // brains is never held to its baseline. Sandbox hosts aren't, and EC2 refuses the field.
+        ...(role === BRAIN_ROLE ? { cpuCredits: "unlimited" as const } : {}),
+      });
+      this.sql.exec(
+        "INSERT OR IGNORE INTO launched (instance_id, launched_ms, role, region, cell) VALUES (?, ?, ?, ?, ?)",
+        id, a.at, roleName(role), cfg.region, this.cellName(),
+      );
+      this.endLaunchIntent(role, a.token);
+      console.log(`FleetDO: launched ${role} host ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
+      await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
+      return "launched";
+    } catch (e) {
+      if (!(e instanceof CapacityError)) {
+        console.error("FleetDO: launch failed; will repeat it", e);
+        return "failed";
       }
+      this.endLaunchIntent(role, a.token);
+      console.warn(`FleetDO: no capacity for ${a.type} (${a.spot ? "spot" : "on-demand"}): ${e.message}`);
+      return "capacity";
     } finally {
       this.launching.delete(role);
     }
+  }
+
+  private launchIntent(role: HostKind): LaunchIntent | null {
+    const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", launchKey(role)).toArray()[0]?.value;
+    return v === undefined ? null : (JSON.parse(v) as LaunchIntent);
+  }
+
+  /** Only the attempt's own record: a later attempt's stays. */
+  private endLaunchIntent(role: HostKind, token: string): void {
+    if (this.launchIntent(role)?.token === token) this.sql.exec("DELETE FROM kv WHERE key = ?", launchKey(role));
   }
 
   /**
