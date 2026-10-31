@@ -316,7 +316,7 @@ impl Session {
             AgentToRunner::ToolResult { call, outcome, .. } => a.resolve_call(&call, outcome),
             AgentToRunner::ToolsList { request, tools } => a.resolve_tools(&request, tools),
             AgentToRunner::HandsResolved { request, outcome, hands, error, retry_after_ms } => {
-                a.resolve_hands(&request, HandsOutcome::from_wire(outcome, hands, error, retry_after_ms).into());
+                a.resolve_hands(&request, HandsOutcome::from_wire(outcome, hands, error, retry_after_ms));
             }
             AgentToRunner::Ack { up_to } => st.unacked.retain(|(s, _)| *s > up_to.0),
             AgentToRunner::SegmentAck { durable_bytes, .. } => {
@@ -468,7 +468,7 @@ mod tests {
         let rt = Runtime::new(crate::config::Config::default());
         let (ctx, _crx) = mpsc::unbounded_channel();
         let (otx, _orx) = mpsc::unbounded_channel();
-        let agent = Agent::new(AgentId("agt_s".into()), Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
+        let agent = Agent::new(AgentId("agt_s".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
         let mut session = Session {
             rt,
             agent,
@@ -533,7 +533,7 @@ mod tests {
 mod resolve_tests {
     use super::*;
     use crate::config::Config;
-    use crate::runtime::HandsResolveOutcome;
+    use nest_protocol::control::HandsOutcome;
     use nest_protocol::control::HandsBinding;
     use nest_protocol::gateway::{GuestInfo, HandsTarget};
     use nest_protocol::model::{AgentId, Epoch, SandboxId, Secret};
@@ -587,7 +587,6 @@ mod resolve_tests {
             Epoch(3),
             std::env::temp_dir(),
             Some(HandsBinding { sandbox: SandboxId("sbx_q".into()), epoch: None }),
-            None,
             vec![],
             0,
             ctx,
@@ -603,7 +602,7 @@ mod resolve_tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         rt.host_token.send_replace(Some(Secret("tok".into())));
         match waiter.await.unwrap() {
-            Ok(HandsResolveOutcome::Target(t)) => assert_eq!(t, target),
+            Ok(HandsOutcome::Ok { hands: t }) => assert_eq!(t, target),
             other => panic!("{other:?}"),
         }
         assert!(server.await.unwrap(), "AgentDO received the queued hands_resolve");

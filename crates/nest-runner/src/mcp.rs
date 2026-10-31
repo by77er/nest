@@ -57,12 +57,7 @@ async fn connection(rt: Arc<Runtime>, stream: UnixStream) {
         _ => return,
     };
     let peer = rd.as_ref().peer_cred().ok().and_then(|c| c.pid());
-    let found = rt.agent(&agent).filter(|_| true);
-    let verified = match &found {
-        Some(_) => crate::hooks::peer_matches(&rt, peer, &agent).await,
-        None => false,
-    };
-    let Some(agent) = found.filter(|_| verified) else {
+    let Some(agent) = crate::hooks::peer_agent(&rt, peer, &agent).await else {
         tracing::warn!(%agent, ?peer, "nest mcp hello from a process that isn't that agent's brain");
         let e = ErrorBody { code: error_codes::UNKNOWN_AGENT.into(), message: format!("{agent} is not running here"), retryable: false };
         let _ = framing::write_host(&mut wr, &McpBridgeResponse::Error { id: None, error: e }).await;
@@ -162,7 +157,7 @@ mod tests {
         let agent = |hands: Option<HandsBinding>, platform: &[&str]| {
             let (ctx, _) = mpsc::unbounded_channel();
             let (otx, _) = mpsc::unbounded_channel();
-            let a = Agent::new(AgentId("agt_m".into()), Epoch(1), std::env::temp_dir(), hands, None, vec![], 0, ctx, otx);
+            let a = Agent::new(AgentId("agt_m".into()), Epoch(1), std::env::temp_dir(), hands, vec![], 0, ctx, otx);
             // What AgentDO last listed (no AgentDO here: the list request times out to it).
             a.inner.lock().unwrap().tools = platform.iter().map(|n| def(n)).collect();
             a

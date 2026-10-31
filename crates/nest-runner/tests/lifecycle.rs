@@ -185,7 +185,7 @@ async fn timed_out_platform_calls_are_abandoned_and_not_retryable() {
     use nest_runner::runtime::{Agent, Outbound};
     let (ctx, _crx) = tokio::sync::mpsc::unbounded_channel();
     let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
-    let a = Agent::new(AgentId("agt_p".into()), nest_protocol::model::Epoch(1), PathBuf::from("/tmp"), None, None, vec![], 0, ctx, otx);
+    let a = Agent::new(AgentId("agt_p".into()), nest_protocol::model::Epoch(1), PathBuf::from("/tmp"), None, vec![], 0, ctx, otx);
     let r = a.platform_call("notify", serde_json::json!({"text": "x"}), Duration::from_millis(50)).await;
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["isError"], true, "{v}");

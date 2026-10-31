@@ -254,22 +254,6 @@ pub enum Outbound {
     Close,
 }
 
-/// What AgentDO answered to `hands_resolve`.
-#[derive(Debug)]
-pub enum HandsResolveOutcome {
-    Target(HandsTarget),
-    Error { error: ErrorBody, retry_after_ms: Option<u64> },
-}
-
-impl From<HandsOutcome> for HandsResolveOutcome {
-    fn from(o: HandsOutcome) -> Self {
-        match o {
-            HandsOutcome::Ok { hands } => HandsResolveOutcome::Target(hands),
-            HandsOutcome::Error { error, retry_after_ms } => HandsResolveOutcome::Error { error, retry_after_ms },
-        }
-    }
-}
-
 /// AgentDO did not answer `hands_resolve` in time (or the session channel was down).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolveTimeout;
@@ -320,7 +304,7 @@ pub struct Agent {
     out: mpsc::UnboundedSender<Outbound>,
     pub pending_calls: Mutex<HashMap<CallId, oneshot::Sender<ToolOutcome>>>,
     pub pending_lists: Mutex<HashMap<RequestId, oneshot::Sender<Vec<ToolDef>>>>,
-    pub pending_resolves: Mutex<HashMap<RequestId, oneshot::Sender<HandsResolveOutcome>>>,
+    pub pending_resolves: Mutex<HashMap<RequestId, oneshot::Sender<HandsOutcome>>>,
     /// Held while one caller resolves the target, so N parallel first calls send one
     /// `hands_resolve` and the rest find the cached target.
     pub resolve_gate: tokio::sync::Mutex<()>,
@@ -340,7 +324,6 @@ impl Agent {
         epoch: Epoch,
         config_dir: PathBuf,
         hands: Option<HandsBinding>,
-        session: Option<SessionId>,
         secrets: Vec<String>,
         conn_gen: u64,
         cmd: mpsc::UnboundedSender<AgentCmd>,
@@ -356,7 +339,7 @@ impl Agent {
             cancel: CancellationToken::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
             kill_reason: Mutex::new(None),
-            inner: Mutex::new(AgentInner { session, ..Default::default() }),
+            inner: Mutex::new(AgentInner::default()),
             cmd,
             out,
             pending_calls: Mutex::new(HashMap::new()),
@@ -449,7 +432,7 @@ impl Agent {
 
     /// One `hands_resolve` round trip over the session channel. Dropping the future (a caller's
     /// timeout, a cancelled call) forgets the request, so a late answer is ignored.
-    pub async fn resolve_hands_target(&self, timeout: Duration) -> Result<HandsResolveOutcome, ResolveTimeout> {
+    pub async fn resolve_hands_target(&self, timeout: Duration) -> Result<HandsOutcome, ResolveTimeout> {
         let req = RequestId(format!("req_{}", uuid::Uuid::new_v4().simple()));
         let (tx, rx) = oneshot::channel();
         self.pending_resolves.lock().unwrap().insert(req.clone(), tx);
@@ -463,7 +446,7 @@ impl Agent {
 
     /// `hands_resolved` arrived on the session channel. An id nobody waits for (the caller gave
     /// up, or a duplicate answer) is logged and ignored.
-    pub fn resolve_hands(&self, req: &RequestId, outcome: HandsResolveOutcome) {
+    pub fn resolve_hands(&self, req: &RequestId, outcome: HandsOutcome) {
         match self.pending_resolves.lock().unwrap().remove(req) {
             Some(tx) => {
                 let _ = tx.send(outcome);
@@ -573,7 +556,7 @@ mod registry_tests {
     fn agent(rt: &Runtime, epoch: u64) -> Arc<Agent> {
         let (cmd, _crx) = mpsc::unbounded_channel();
         let (out, _orx) = mpsc::unbounded_channel();
-        Agent::new(AgentId("agt_r".into()), Epoch(epoch), PathBuf::from("/tmp"), None, None, vec![], rt.current_gen(), cmd, out)
+        Agent::new(AgentId("agt_r".into()), Epoch(epoch), PathBuf::from("/tmp"), None, vec![], rt.current_gen(), cmd, out)
     }
 
     /// A hard interrupt cancels every hands call in flight (each a child of the agent's token),

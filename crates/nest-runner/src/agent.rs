@@ -98,7 +98,6 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
             epoch,
             PathBuf::from(&start.config_dir),
             hands,
-            None,
             secrets,
             rt.current_gen(),
             cmd_tx,
@@ -798,7 +797,7 @@ mod tests {
         let rt = Runtime::new(crate::Config::default());
         let (cmd_tx, cmds) = mpsc::unbounded_channel();
         let (out_tx, out) = mpsc::unbounded_channel();
-        let agent = Agent::new(AgentId("agt_t".into()), nest_protocol::model::Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
+        let agent = Agent::new(AgentId("agt_t".into()), nest_protocol::model::Epoch(1), std::env::temp_dir(), None, vec![], 0, cmd_tx, out_tx);
         assert!(rt.register(agent.clone(), rt.fence_gen()).is_ok());
         let (stdin_tx, stdin) = mpsc::channel(STDIN_QUEUE);
         let launch = LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: String::new() } };

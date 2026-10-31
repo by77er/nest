@@ -2,7 +2,7 @@
 //! sends. nestd is the source of truth; losing it drops every sandbox and cuts every connection
 //! (the keys stay: they are public, and the next bind must be `moved`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -154,9 +154,4 @@ pub async fn read(stream: &mut UnixStream) -> std::io::Result<Option<std::io::Re
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;
     Ok(Some(serde_json::from_slice(&body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))))
-}
-
-/// The socket path nestd listens on by default.
-pub fn default_sock() -> &'static Path {
-    Path::new(host::paths::GATEWAY_SOCK)
 }

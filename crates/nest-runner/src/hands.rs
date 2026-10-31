@@ -18,7 +18,8 @@ use nest_protocol::model::{Epoch, ErrorBody};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::{Agent, HandsResolveOutcome, OUTCOME_UNKNOWN, ResolveTimeout};
+use crate::runtime::{Agent, OUTCOME_UNKNOWN, ResolveTimeout};
+use nest_protocol::control::HandsOutcome;
 
 /// How long to wait for the guest's final frame after sending `cancel`.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(5);
@@ -307,8 +308,8 @@ async fn ensure_target(
             _ = cancel.cancelled() => return Err(ToolCallResult::error("interrupted")),
         };
         match outcome {
-            Ok(HandsResolveOutcome::Target(t)) => return Ok((t.clone(), agent.set_hands_target(t))),
-            Ok(HandsResolveOutcome::Error { error, retry_after_ms }) if error.code == SANDBOX_NOT_READY && error.retryable => {
+            Ok(HandsOutcome::Ok { hands: t }) => return Ok((t.clone(), agent.set_hands_target(t))),
+            Ok(HandsOutcome::Error { error, retry_after_ms }) if error.code == SANDBOX_NOT_READY && error.retryable => {
                 let wait = retry_after_ms.map(Duration::from_millis).unwrap_or(NOT_READY_RETRY);
                 let Some(wait) = capped(wait, started, budgets.not_ready, budgets.max_sleep) else {
                     return Err(not_ready_error(budgets, &error.message));
@@ -320,7 +321,7 @@ async fn ensure_target(
                     return Err(not_ready_error(budgets, &error.message));
                 }
             }
-            Ok(HandsResolveOutcome::Error { error, .. }) => return Err(error_result(&error)),
+            Ok(HandsOutcome::Error { error, .. }) => return Err(error_result(&error)),
             Err(ResolveTimeout) => {
                 return Err(ToolCallResult::error(format!(
                     "hands unavailable: AgentDO did not answer hands_resolve within {}s",
@@ -412,7 +413,7 @@ mod tests {
 
     /// An agent whose `hands_resolve` requests a scripted "AgentDO" answers in order; the last
     /// answer repeats; `None` answers never arrive. Returns the agent and the resolve counter.
-    fn agent_with_resolver(answers: Vec<Option<HandsResolveOutcome>>) -> (Arc<Agent>, Arc<Mutex<usize>>) {
+    fn agent_with_resolver(answers: Vec<Option<HandsOutcome>>) -> (Arc<Agent>, Arc<Mutex<usize>>) {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
         let agent = Agent::new(
@@ -420,7 +421,6 @@ mod tests {
             Epoch(4),
             std::env::temp_dir(),
             Some(HandsBinding { sandbox: SandboxId(SBX.into()), epoch: None }),
-            None,
             vec![],
             0,
             cmd_tx,
@@ -428,7 +428,7 @@ mod tests {
         );
         let resolves = Arc::new(Mutex::new(0usize));
         let (a2, r2) = (agent.clone(), resolves.clone());
-        let mut answers: VecDeque<Option<HandsResolveOutcome>> = answers.into();
+        let mut answers: VecDeque<Option<HandsOutcome>> = answers.into();
         tokio::spawn(async move {
             while let Some(o) = out_rx.recv().await {
                 if let Outbound::HandsResolve(req) = o {
@@ -436,7 +436,7 @@ mod tests {
                     let answer = if answers.len() > 1 {
                         answers.pop_front().unwrap()
                     } else {
-                        answers.front().and_then(|a| a.as_ref().map(clone_outcome))
+                        answers.front().and_then(|a| a.clone())
                     };
                     if let Some(answer) = answer {
                         a2.resolve_hands(&req, answer);
@@ -447,17 +447,8 @@ mod tests {
         (agent, resolves)
     }
 
-    fn clone_outcome(o: &HandsResolveOutcome) -> HandsResolveOutcome {
-        match o {
-            HandsResolveOutcome::Target(t) => HandsResolveOutcome::Target(t.clone()),
-            HandsResolveOutcome::Error { error, retry_after_ms } => {
-                HandsResolveOutcome::Error { error: error.clone(), retry_after_ms: *retry_after_ms }
-            }
-        }
-    }
-
-    fn target(t: HandsTarget) -> Option<HandsResolveOutcome> {
-        Some(HandsResolveOutcome::Target(t))
+    fn target(t: HandsTarget) -> Option<HandsOutcome> {
+        Some(HandsOutcome::Ok { hands: t })
     }
 
     fn bash(cmd: &str) -> HandsOp {
@@ -708,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn not_ready_waits_and_not_bound_fails() {
         let (gw, _guest) = gateway_with_guest().await;
-        let not_ready = HandsResolveOutcome::Error {
+        let not_ready = HandsOutcome::Error {
             error: ErrorBody { code: SANDBOX_NOT_READY.into(), message: "placing".into(), retryable: true },
             retry_after_ms: Some(50),
         };
@@ -718,7 +709,7 @@ mod tests {
         assert!(!r.is_error, "{r:?}");
         assert_eq!(*resolves.lock().unwrap(), 2);
 
-        let not_bound = HandsResolveOutcome::Error {
+        let not_bound = HandsOutcome::Error {
             error: ErrorBody { code: error_codes::NOT_BOUND.into(), message: "agent has no hands".into(), retryable: false },
             retry_after_ms: None,
         };
@@ -732,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn the_not_ready_budget_ends_a_call_even_with_a_huge_hint() {
         let (gw, _guest) = gateway_with_guest().await;
-        let forever = HandsResolveOutcome::Error {
+        let forever = HandsOutcome::Error {
             error: ErrorBody { code: SANDBOX_NOT_READY.into(), message: "placing".into(), retryable: true },
             retry_after_ms: Some(600_000),
         };
@@ -958,7 +949,7 @@ mod tests {
     async fn an_answer_nobody_awaits_is_ignored() {
         let (agent, _) = agent_with_resolver(vec![]);
         let e = ErrorBody { code: SANDBOX_NOT_READY.into(), message: "m".into(), retryable: true };
-        let o = HandsResolveOutcome::Error { error: e, retry_after_ms: None };
+        let o = HandsOutcome::Error { error: e, retry_after_ms: None };
         agent.resolve_hands(&nest_protocol::model::RequestId("req_unknown".into()), o);
         assert!(agent.pending_resolves.lock().unwrap().is_empty());
     }

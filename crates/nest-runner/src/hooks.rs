@@ -56,7 +56,7 @@ pub async fn serve_sync(rt: Arc<Runtime>, listener: UnixListener) {
                 _ => return,
             };
             let peer = stream.peer_cred().ok().and_then(|c| c.pid());
-            if !peer_matches(&rt, peer, &req.agent).await {
+            if peer_agent(&rt, peer, &req.agent).await.is_none() {
                 tracing::warn!(agent = %req.agent, ?peer, "hook from a process that isn't that agent's brain; using the fallback");
                 let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
                 let output = nest_protocol::host::hook::fallback_output(event).unwrap_or_default();
@@ -70,17 +70,17 @@ pub async fn serve_sync(rt: Arc<Runtime>, listener: UnixListener) {
     }
 }
 
-/// Is `peer` (a pid from `SO_PEERCRED`) a descendant of `agent`'s Claude Code process? Retries
-/// briefly: right after a spawn the pid may not be recorded yet.
-pub async fn peer_matches(rt: &Runtime, peer: Option<i32>, agent: &nest_protocol::model::AgentId) -> bool {
-    let Some(pid) = peer else { return false };
+/// The agent whose Claude Code process `peer` (a pid from `SO_PEERCRED`) descends from, if it is
+/// the one `declared`. Retries briefly: right after a spawn the pid may not be recorded yet.
+pub async fn peer_agent(rt: &Runtime, peer: Option<i32>, declared: &nest_protocol::model::AgentId) -> Option<Arc<Agent>> {
+    let pid = peer?;
     for _ in 0..10 {
         if let Some(a) = rt.agent_for_pid(pid) {
-            return &a.id == agent;
+            return (&a.id == declared).then_some(a);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    None
 }
 
 /// Drain `nest-hook-spool.jsonl` (datagrams `nest hook` couldn't send).
@@ -329,7 +329,7 @@ mod tests {
         let rt = Runtime::new(Config::default());
         let (ctx, crx) = mpsc::unbounded_channel();
         let (otx, orx) = mpsc::unbounded_channel();
-        let a = Agent::new(AgentId("agt_h".into()), Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
+        let a = Agent::new(AgentId("agt_h".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
         assert!(rt.register(a.clone(), rt.fence_gen()).is_ok());
         (rt, a, orx, crx)
     }
@@ -427,7 +427,8 @@ mod session_start_tests {
     use super::*;
     use crate::config::Config;
     use crate::hands::SANDBOX_NOT_READY;
-    use crate::runtime::{AgentCmd, HandsResolveOutcome, Outbound};
+    use crate::runtime::{AgentCmd, Outbound};
+    use nest_protocol::control::HandsOutcome;
     use crate::test_support::FakeGuest;
     use crate::test_support::gateway::TestGateway;
     use nest_protocol::control::HandsBinding;
@@ -450,7 +451,6 @@ mod session_start_tests {
             Epoch(2),
             std::env::temp_dir(),
             Some(HandsBinding { sandbox: SandboxId("sbx_s".into()), epoch: None }),
-            None,
             vec![],
             0,
             ctx,
@@ -463,12 +463,12 @@ mod session_start_tests {
             while let Some(o) = orx.recv().await {
                 if let Outbound::HandsResolve(req) = o {
                     let outcome = if Instant::now() < ready_at {
-                        HandsResolveOutcome::Error {
+                        HandsOutcome::Error {
                             error: ErrorBody { code: SANDBOX_NOT_READY.into(), message: "placing".into(), retryable: true },
                             retry_after_ms: Some(200),
                         }
                     } else {
-                        HandsResolveOutcome::Target(target.clone())
+                        HandsOutcome::Ok { hands: target.clone() }
                     };
                     a2.resolve_hands(&req, outcome);
                 }
