@@ -16,7 +16,7 @@ use ring::{digest, hmac};
 use serde::Deserialize;
 
 use crate::storage::{LocalFsStore, ObjectStore};
-use crate::util::{amz_date, parse_http_date_ms, parse_rfc3339_utc_ms};
+use crate::util::{amz_date, now_ms, par_try_for_each, parse_http_date_ms, parse_rfc3339_utc_ms};
 
 /// Refresh role credentials this long before they expire.
 const REFRESH_BEFORE_MS: i64 = 5 * 60_000;
@@ -416,31 +416,12 @@ impl S3Store {
 
     fn upload_parts(&self, key: &str, upload: &str, parts: &[&[u8]]) -> io::Result<Vec<String>> {
         let etags: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; parts.len()]);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let failed: Mutex<Option<io::Error>> = Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..PART_PARALLELISM.min(parts.len()) {
-                scope.spawn(|| {
-                    while failed.lock().unwrap().is_none() {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(part) = parts.get(i) else { return };
-                        let n = (i + 1).to_string();
-                        let r = self.request(reqwest::Method::PUT, key, &[("partNumber", &n), ("uploadId", upload)], Some(part)).and_then(|r| {
-                            r.and_then(|r| r.etag).ok_or_else(|| io::Error::other(format!("{key} part {n}: no ETag")))
-                        });
-                        match r {
-                            Ok(etag) => etags.lock().unwrap()[i] = Some(etag),
-                            Err(e) => {
-                                failed.lock().unwrap().get_or_insert(e);
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(e) = failed.into_inner().unwrap() {
-            return Err(e);
-        }
+        par_try_for_each(parts.iter().enumerate().map(Ok::<_, io::Error>), PART_PARALLELISM, |(i, part)| {
+            let n = (i + 1).to_string();
+            let r = self.request(reqwest::Method::PUT, key, &[("partNumber", &n), ("uploadId", upload)], Some(part))?;
+            etags.lock().unwrap()[i] = Some(r.and_then(|r| r.etag).ok_or_else(|| io::Error::other(format!("{key} part {n}: no ETag")))?);
+            Ok(())
+        })?;
         Ok(etags.into_inner().unwrap().into_iter().map(|e| e.expect("every part uploaded")).collect())
     }
 
@@ -531,10 +512,6 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
     std::fs::read_dir(dir)
         .map(|rd| rd.filter_map(|e| e.ok()?.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
         .unwrap_or(0)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
@@ -659,14 +636,7 @@ struct ImdsCredentials {
 
 /// The instance role's temporary credentials (IMDSv2).
 async fn imds_credentials(http: &reqwest::Client, imds_url: &str) -> anyhow::Result<Credentials> {
-    let token = http
-        .put(format!("{imds_url}/latest/api/token"))
-        .header("X-aws-ec2-metadata-token-ttl-seconds", "300")
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let token = crate::enroll::imds_token(http, imds_url, 300).await?;
     let base = format!("{imds_url}/latest/meta-data/iam/security-credentials/");
     let get = |url: String| http.get(url).header("X-aws-ec2-metadata-token", token.clone()).send();
     let role = get(base.clone()).await?.error_for_status()?.text().await?;

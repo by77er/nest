@@ -59,8 +59,9 @@ pub struct GuestCtl {
 }
 
 impl GuestCtl {
-    pub fn spawn(uds: PathBuf, sandbox: SandboxId, epoch: Epoch, hostname: String, events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>) -> GuestCtl {
-        let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots: vec![] }));
+    /// Connect to the guest behind `uds`; every `configure` carries `slots` and those attached since.
+    pub fn spawn(uds: PathBuf, sandbox: SandboxId, epoch: Epoch, hostname: String, slots: Vec<AgentSlot>, events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>) -> GuestCtl {
+        let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots }));
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = watch::channel(false);
         let ctl = GuestCtl { cfg, reqs: tx, ready: ready_rx, pending_resume: Arc::new(Mutex::new(None)), stop: Arc::new(tokio::sync::Notify::new()), guest: Arc::new(Mutex::new(None)) };
@@ -86,10 +87,6 @@ impl GuestCtl {
     /// The guest's version and capabilities from its last hello, if one arrived.
     pub fn guest(&self) -> Option<nest_protocol::gateway::GuestInfo> {
         self.guest.lock().expect("guest info").clone()
-    }
-
-    pub fn slots(&self) -> Vec<AgentSlot> {
-        self.cfg.lock().expect("guest cfg").slots.clone()
     }
 
     /// Send a request and wait for its reply. Errors if not connected.
@@ -137,10 +134,6 @@ impl GuestCtl {
     /// Arrange for `resume` (clock + entropy, optional fork identity) after the next hello.
     pub fn expect_resume(&self, fork: Option<ForkIdentity>) {
         *self.pending_resume.lock().expect("resume") = Some(fork);
-    }
-
-    pub fn set_epoch(&self, epoch: Epoch) {
-        self.cfg.lock().expect("guest cfg").epoch = epoch;
     }
 
     /// Stop the connection task (sandbox stopped, fenced or destroyed).
@@ -204,25 +197,26 @@ impl Task {
     }
 
     async fn session(&mut self, conn: Conn, reqs: &mut mpsc::UnboundedReceiver<Req>) -> io::Result<()> {
-        let mut dec = Decoder::new();
-        // Any bytes buffered after the handshake line belong to the frame stream.
-        dec.push(conn.buffer());
-        let mut stream = conn.into_inner();
-        let mut buf = vec![0u8; 64 << 10];
-        let mut next_id: u64 = 1;
-        let mut pending: HashMap<u64, oneshot::Sender<io::Result<ControlBody>>> = HashMap::new();
         // Created before the handshake: the guest may relay `cli` (and flush buffered
         // `task_exited`) as soon as `configure` succeeds, while `resume` is still in flight.
-        let (cli_tx, mut cli_rx) = mpsc::unbounded_channel::<(u64, CliResult)>();
+        let (cli_tx, mut cli_rx) = mpsc::unbounded_channel();
+        let mut c = Session::new(conn, cli_tx);
+        let r = self.serve(&mut c, reqs, &mut cli_rx).await;
+        for (_, reply) in c.pending.drain() {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::ConnectionReset, "guest control connection closed")));
+        }
+        r
+    }
 
+    async fn serve(&mut self, c: &mut Session, reqs: &mut mpsc::UnboundedReceiver<Req>, cli_rx: &mut mpsc::UnboundedReceiver<(u64, CliResult)>) -> io::Result<()> {
         // 1. hello
-        let hello = read_frame(&mut stream, &mut dec, &mut buf).await?;
+        let hello = c.next_within(HANDSHAKE_READ).await?;
         let ControlBody::Hello { protocol_version, boot_id, instance_id, capabilities, .. } = hello.body else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "first guest frame was not hello"));
         };
         if protocol_version != PROTOCOL_VERSION {
             let e = ControlFrame { id: None, reply_to: None, body: ControlBody::Error { error: error("unsupported_version", format!("host speaks {PROTOCOL_VERSION}"), false) } };
-            let _ = write(&mut stream, &e).await;
+            let _ = c.write(&e).await;
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("guest protocol {protocol_version}")));
         }
         // Same boot and same guest-agent process = memory restore. Same boot, new process = the
@@ -240,16 +234,25 @@ impl Task {
         // 2. configure (complete slot set), then resume if a restore is pending.
         let cfg = self.ctl.cfg.lock().expect("guest cfg").clone();
         let body = ControlBody::Configure { sandbox_id: cfg.sandbox, epoch: cfg.epoch, hostname: cfg.hostname, agents: cfg.slots };
-        expect_ok(self.call(&mut stream, &mut dec, &mut buf, &mut next_id, body, &mut pending, &cli_tx).await?)?;
+        expect_ok(self.call(c, body).await?)?;
         let resume = self.ctl.pending_resume.lock().expect("resume").take();
         if let Some(fork) = resume {
             let mut entropy = [0u8; 64];
             rand::fill(&mut entropy[..]);
             use base64::Engine as _;
-            let body = ControlBody::Resume { wall_clock_ms: now_ms(), entropy_b64: base64::engine::general_purpose::STANDARD.encode(entropy), fork };
-            match self.call(&mut stream, &mut dec, &mut buf, &mut next_id, body, &mut pending, &cli_tx).await? {
-                ControlBody::ResumeDone { clock_step_ms } => tracing::info!(sandbox = %self.sandbox, clock_step_ms, "guest resumed"),
-                other => tracing::warn!(?other, "unexpected resume reply"),
+            let body = ControlBody::Resume { wall_clock_ms: now_ms(), entropy_b64: base64::engine::general_purpose::STANDARD.encode(entropy), fork: fork.clone() };
+            let reply = self.call(c, body).await;
+            if let Ok(ControlBody::ResumeDone { clock_step_ms }) = reply {
+                tracing::info!(sandbox = %self.sandbox, clock_step_ms, "guest resumed");
+            } else {
+                // Not resumed (its clock or RNG not reseeded): not ready, and the next connection
+                // asks again, unless a newer resume was asked for meanwhile.
+                self.ctl.pending_resume.lock().expect("resume").get_or_insert(fork);
+                return Err(match reply {
+                    Err(e) => e,
+                    Ok(ControlBody::Error { error }) => io::Error::other(format!("guest resume: {}: {}", error.code, error.message)),
+                    Ok(other) => io::Error::other(format!("unexpected resume reply {other:?}")),
+                });
             }
         }
         let guest = nest_protocol::gateway::GuestInfo { protocol_version, capabilities };
@@ -259,50 +262,35 @@ impl Task {
 
         // 3. steady state
         loop {
-            // Drain complete frames first.
-            while let Some(f) = dec.next_frame().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? {
-                self.on_frame(f, &mut pending, &cli_tx)?;
-            }
             tokio::select! {
-                n = stream.read(&mut buf) => {
-                    let n = n?;
-                    if n == 0 { break; }
-                    dec.push(&buf[..n]);
+                // Cancel-safe: a frame already decoded is returned without awaiting.
+                f = c.next() => {
+                    let Some(f) = f? else { return Ok(()) };
+                    self.route(c, f);
                 }
                 req = reqs.recv() => {
-                    let Some(Req::Send { body, reply }) = req else { break };
-                    let id = next_id; next_id += 1;
-                    if let Err(e) = write(&mut stream, &ControlFrame { id: Some(id), reply_to: None, body }).await {
-                        let _ = reply.send(Err(e));
-                        break;
+                    let Some(Req::Send { body, reply }) = req else { return Ok(()) };
+                    match c.send(body).await {
+                        Ok(id) => { c.pending.insert(id, reply); }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                            return Ok(());
+                        }
                     }
-                    pending.insert(id, reply);
                 }
                 cli = cli_rx.recv() => {
                     let Some((id, result)) = cli else { continue };
-                    write(&mut stream, &ControlFrame { id: None, reply_to: Some(id), body: ControlBody::CliResult { result } }).await?;
+                    c.write(&ControlFrame { id: None, reply_to: Some(id), body: ControlBody::CliResult { result } }).await?;
                 }
             }
         }
-        for (_, r) in pending.drain() {
-            let _ = r.send(Err(io::Error::new(io::ErrorKind::ConnectionReset, "guest control connection closed")));
-        }
-        Ok(())
     }
 
-    fn on_frame(&self, f: frame::Frame, pending: &mut HashMap<u64, oneshot::Sender<io::Result<ControlBody>>>, cli_tx: &mpsc::UnboundedSender<(u64, CliResult)>) -> io::Result<()> {
-        if f.kind != Kind::Json {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "DATA frame on control channel"));
-        }
-        let cf: ControlFrame = serde_json::from_slice(&f.payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.on_control_frame(cf, pending, cli_tx);
-        Ok(())
-    }
-
-    /// Route a parsed frame: replies to their waiters, events and CLI relays to nestd.
-    fn on_control_frame(&self, cf: ControlFrame, pending: &mut HashMap<u64, oneshot::Sender<io::Result<ControlBody>>>, cli_tx: &mpsc::UnboundedSender<(u64, CliResult)>) {
+    /// Route a frame that isn't the handshake's reply: replies to their waiters, events and CLI
+    /// relays to nestd.
+    fn route(&self, c: &mut Session, cf: ControlFrame) {
         if let Some(r) = cf.reply_to {
-            if let Some(tx) = pending.remove(&r) {
+            if let Some(tx) = c.pending.remove(&r) {
                 let _ = tx.send(Ok(cf.body));
             }
             return;
@@ -319,7 +307,7 @@ impl Task {
                 let Some(id) = cf.id else { return };
                 let (tx, rx) = oneshot::channel();
                 let _ = self.events.send((sbx, GuestEvent::Cli { agent_id, command, reply: tx }));
-                let cli_tx = cli_tx.clone();
+                let cli_tx = c.cli_tx.clone();
                 tokio::spawn(async move {
                     let result = rx.await.unwrap_or_else(|_| CliResult::Error { error: error("internal", "nestd dropped the request", true) });
                     let _ = cli_tx.send((id, result));
@@ -331,51 +319,80 @@ impl Task {
 
     /// Request/reply during the handshake (before the steady-state loop runs). Every other frame
     /// that arrives meanwhile (ports, `task_exited`, `cli`) is routed normally, not dropped.
-    #[allow(clippy::too_many_arguments)]
-    async fn call(
-        &self,
-        stream: &mut tokio::net::UnixStream,
-        dec: &mut Decoder,
-        buf: &mut [u8],
-        next_id: &mut u64,
-        body: ControlBody,
-        pending: &mut HashMap<u64, oneshot::Sender<io::Result<ControlBody>>>,
-        cli_tx: &mpsc::UnboundedSender<(u64, CliResult)>,
-    ) -> io::Result<ControlBody> {
-        let id = *next_id;
-        *next_id += 1;
-        write(stream, &ControlFrame { id: Some(id), reply_to: None, body }).await?;
+    async fn call(&self, c: &mut Session, body: ControlBody) -> io::Result<ControlBody> {
+        let id = c.send(body).await?;
         loop {
-            let f = read_frame(stream, dec, buf).await?;
+            let f = c.next_within(HANDSHAKE_READ).await?;
             if f.reply_to == Some(id) {
                 return Ok(f.body);
             }
-            self.on_control_frame(f, pending, cli_tx);
+            self.route(c, f);
         }
     }
 }
 
-async fn read_frame(stream: &mut tokio::net::UnixStream, dec: &mut Decoder, buf: &mut [u8]) -> io::Result<ControlFrame> {
-    loop {
-        if let Some(f) = dec.next_frame().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? {
-            if f.kind != Kind::Json {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "DATA frame on control channel"));
+/// How long a handshake read waits for the guest.
+const HANDSHAKE_READ: Duration = Duration::from_secs(10);
+
+/// One control connection: its two halves, the decoder over what was read, and the requests
+/// awaiting a reply.
+struct Session {
+    rd: tokio::net::unix::OwnedReadHalf,
+    wr: tokio::net::unix::OwnedWriteHalf,
+    dec: Decoder,
+    buf: Vec<u8>,
+    next_id: u64,
+    pending: HashMap<u64, oneshot::Sender<io::Result<ControlBody>>>,
+    /// Where a relayed CLI command's answer goes, to be written back by the session.
+    cli_tx: mpsc::UnboundedSender<(u64, CliResult)>,
+}
+
+impl Session {
+    fn new(conn: Conn, cli_tx: mpsc::UnboundedSender<(u64, CliResult)>) -> Session {
+        let mut dec = Decoder::new();
+        // Any bytes buffered after the handshake line belong to the frame stream.
+        dec.push(conn.buffer());
+        let (rd, wr) = conn.into_inner().into_split();
+        Session { rd, wr, dec, buf: vec![0u8; 64 << 10], next_id: 1, pending: HashMap::new(), cli_tx }
+    }
+
+    /// The next control frame, or `None` at the end of the stream. Cancel-safe.
+    async fn next(&mut self) -> io::Result<Option<ControlFrame>> {
+        loop {
+            if let Some(f) = self.dec.next_frame().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? {
+                if f.kind != Kind::Json {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "DATA frame on control channel"));
+                }
+                return serde_json::from_slice(&f.payload).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
             }
-            return serde_json::from_slice(&f.payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+            let n = self.rd.read(&mut self.buf).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            self.dec.push(&self.buf[..n]);
         }
-        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "guest control read timed out"))??;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "guest closed control connection"));
-        }
-        dec.push(&buf[..n]);
     }
-}
 
-async fn write(stream: &mut tokio::net::UnixStream, f: &ControlFrame) -> io::Result<()> {
-    let bytes = frame::encode_json(f).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    stream.write_all(&bytes).await
+    /// The next control frame within `limit`; the end of the stream is an error.
+    async fn next_within(&mut self, limit: Duration) -> io::Result<ControlFrame> {
+        tokio::time::timeout(limit, self.next())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "guest control read timed out"))??
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "guest closed control connection"))
+    }
+
+    /// Send a request; its id.
+    async fn send(&mut self, body: ControlBody) -> io::Result<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write(&ControlFrame { id: Some(id), reply_to: None, body }).await?;
+        Ok(id)
+    }
+
+    async fn write(&mut self, f: &ControlFrame) -> io::Result<()> {
+        let bytes = frame::encode_json(f).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.wr.write_all(&bytes).await
+    }
 }
 
 /// 32 lowercase hex chars for a forked guest's `/etc/machine-id`.
@@ -445,7 +462,7 @@ pub(crate) mod tests {
         let fake = FakeGuest::start(&guest_dir, "boot-1");
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, mut erx) = mpsc::unbounded_channel();
-        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), etx);
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![], etx);
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
         assert!(matches!(erx.recv().await, Some((_, GuestEvent::Ready { resumed: false, guest })) if guest.protocol_version == PROTOCOL_VERSION));
         assert!(matches!(erx.recv().await, Some((_, GuestEvent::Ports(p))) if p[0].port == 5173));
@@ -468,6 +485,57 @@ pub(crate) mod tests {
         let seen = fake2.seen.lock().unwrap().clone();
         assert!(matches!(&seen[0], ControlBody::Configure { epoch: Epoch(3), agents, .. } if agents.len() == 1));
         assert!(matches!(&seen[1], ControlBody::Resume { fork: None, .. }));
+        ctl.shutdown();
+    }
+
+    /// A `resume` the guest refuses (it couldn't reseed its RNG, say) is a failed readiness: the
+    /// sandbox isn't reported ready, and the next connection asks again. It used to be logged and
+    /// the guest reported ready, unreseeded.
+    #[tokio::test]
+    async fn a_refused_resume_is_not_ready_and_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest_dir = dir.path().join("guest");
+        std::fs::create_dir_all(&guest_dir).unwrap();
+        let listener = UnixListener::bind(guest_dir.join("1024.sock")).unwrap();
+        let resumes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resumes2 = resumes.clone();
+        tokio::spawn(async move {
+            let send = |b: ControlBody, reply_to: Option<u64>| frame::encode_json(&ControlFrame { id: None, reply_to, body: b }).unwrap();
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { break };
+                s.write_all(&send(ControlBody::Hello { protocol_version: PROTOCOL_VERSION, agent_version: "f".into(), boot_id: "b".into(), instance_id: "i".into(), since_boot_ms: 1, capabilities: vec![] }, None)).await.unwrap();
+                let mut dec = Decoder::new();
+                let mut buf = vec![0u8; 65536];
+                'conn: loop {
+                    let n = match s.read(&mut buf).await { Ok(0) | Err(_) => break 'conn, Ok(n) => n };
+                    dec.push(&buf[..n]);
+                    while let Ok(Some(f)) = dec.next_frame() {
+                        let cf: ControlFrame = serde_json::from_slice(&f.payload).unwrap();
+                        let reply = match cf.body {
+                            ControlBody::Resume { .. } if resumes2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => {
+                                ControlBody::Error { error: error("internal", "can't reseed the RNG", true) }
+                            }
+                            ControlBody::Resume { .. } => ControlBody::ResumeDone { clock_step_ms: 0 },
+                            _ => ControlBody::Ok {},
+                        };
+                        if s.write_all(&send(reply, cf.id)).await.is_err() {
+                            break 'conn;
+                        }
+                    }
+                }
+            }
+        });
+        let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
+        let (etx, mut erx) = mpsc::unbounded_channel();
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(1), "h".into(), vec![], etx);
+        ctl.expect_resume(None);
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), erx.recv()).await.unwrap().unwrap().1 {
+                GuestEvent::Ready { .. } => break,
+                _ => continue,
+            }
+        }
+        assert_eq!(resumes.load(std::sync::atomic::Ordering::SeqCst), 2, "ready only once a resume was done");
         ctl.shutdown();
     }
 
@@ -511,7 +579,7 @@ pub(crate) mod tests {
         });
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, mut erx) = mpsc::unbounded_channel();
-        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(1), "h".into(), etx);
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(1), "h".into(), vec![], etx);
         ctl.expect_resume(None);
         let (mut saw_cli, mut saw_task, mut ready) = (false, false, false);
         while !(saw_cli && saw_task && ready) {

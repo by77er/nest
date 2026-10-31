@@ -41,20 +41,18 @@ pub fn proxy_ca_csr(cell: &str) -> anyhow::Result<(Secret, String)> {
     Ok((Secret(key.serialize_pem()), csr.pem().context("CSR PEM")?))
 }
 
+/// An IMDSv2 session token valid for `ttl_secs`.
+pub async fn imds_token(http: &reqwest::Client, imds_url: &str, ttl_secs: u32) -> anyhow::Result<String> {
+    let res = http.put(format!("{imds_url}/latest/api/token")).header("X-aws-ec2-metadata-token-ttl-seconds", ttl_secs.to_string()).send().await;
+    Ok(res.context("IMDSv2 token")?.error_for_status()?.text().await?)
+}
+
 /// IMDSv2: session token, then the identity document and its RSA-2048 signature (`rsa2048`: the
 /// CMS/PKCS#7 form the Worker verifies; the legacy `pkcs7` endpoint is DSA and not accepted).
 /// `rsa2048` is already base64 (line-wrapped, possibly PEM-armored): it is sent as-is, joined,
 /// never encoded again.
 pub async fn aws_identity_proof(http: &reqwest::Client, imds_url: &str) -> anyhow::Result<EnrollmentProof> {
-    let token = http
-        .put(format!("{imds_url}/latest/api/token"))
-        .header("X-aws-ec2-metadata-token-ttl-seconds", "300")
-        .send()
-        .await
-        .context("IMDSv2 token")?
-        .error_for_status()?
-        .text()
-        .await?;
+    let token = imds_token(http, imds_url, 300).await?;
     let get = |path: &str| {
         http.get(format!("{imds_url}/latest/dynamic/instance-identity/{path}")).header("X-aws-ec2-metadata-token", token.clone()).send()
     };
@@ -69,15 +67,7 @@ pub async fn aws_identity_proof(http: &reqwest::Client, imds_url: &str) -> anyho
 /// The spot interruption deadline (Unix ms) once EC2 has scheduled one, from IMDSv2
 /// `spot/instance-action` (404 until then). Rebalance recommendations are not notices.
 pub async fn spot_deadline(http: &reqwest::Client, imds_url: &str) -> anyhow::Result<Option<i64>> {
-    let token = http
-        .put(format!("{imds_url}/latest/api/token"))
-        .header("X-aws-ec2-metadata-token-ttl-seconds", "60")
-        .send()
-        .await
-        .context("IMDSv2 token")?
-        .error_for_status()?
-        .text()
-        .await?;
+    let token = imds_token(http, imds_url, 60).await?;
     let res = http.get(format!("{imds_url}/latest/meta-data/spot/instance-action")).header("X-aws-ec2-metadata-token", token).send().await?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
