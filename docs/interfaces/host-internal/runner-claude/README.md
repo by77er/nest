@@ -85,6 +85,15 @@ Shapes checked against `@anthropic-ai/claude-agent-sdk` 0.3.296 type definitions
 - **`defer`:** a `defer` answer ends the run with `stop_reason: "tool_deferred"`, and `--resume` fires `PreToolUse` again for the same `tool_use_id`.
 - **Compaction:** `SessionStart` fires with `source: "compact"` after `/compact`, which needs slash commands enabled.
 
+### Hooks (checked on 2.1.316)
+
+`e2e/claude-verify` items 11 and 12, haiku, 2026-10-31, one user message per turn on stdin; evidence in [`e2e/claude-verify/observed/2.1.316-hooks.json`](../../../../e2e/claude-verify/observed/2.1.316-hooks.json).
+
+- **`PostToolUse` `additionalContext` reaches the model mid-turn** (sync hook, as managed settings wire it). The context after a call carried a random token and an order to pass it to `mcp__nest__echo`. After `mcp__nest__echo` and after the built-in `TaskList`, the main loop made that call with the token in the same turn (one `result` per turn). A control turn without context made one echo call and never produced its token. The context isn't on stdout: the transcript holds it as a `hook_additional_context` attachment.
+- **In a subagent,** `PostToolUse` fires for the subagent's own call (input has `agent_id` and `agent_type`) and its context goes to the subagent, not the main loop: the subagent's transcript holds the attachment, and the haiku subagent replied that the tool result "included an instruction to call the echo tool … so I ignored it" (twice in two runs). The main loop never saw it.
+- **`Stop` `block`:** a `{"decision":"block","reason":…}` answer gives **no intermediate `result`**. The reason arrives as a `user` line (`Stop hook feedback:` plus the reason); the model acted on it (called echo with the token, then replied with the word it asked for); `Stop` fired again at the continuation's end with `stop_hook_active: true`, and the turn's one `result` came after that. The next turn had one `Stop` and one `result`.
+- **`system/init` comes once per turn,** before the turn's first assistant line (three turns, three `init` lines), not once per process. The runner treats a repeat as a no-op (the auth check reports once).
+
 ## Sources
 
 Every flag and variable used here is documented by Anthropic. Anything not confirmed against the real binary is marked **unverified** above.

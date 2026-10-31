@@ -34,7 +34,7 @@ These are the runner's reports: AgentDO stores them as the agent's `activity`, a
 |---|---|
 | `PreToolUse` policy gate | Grant and policy cache in the runner, pushed down from AgentDO. A call no rule allows is held with `defer` and escalated as a question; it runs once approved (see [runner](../runner/#lifecycle)) |
 | `PermissionRequest` | Same cache |
-| `PostToolUse` | **Local inbox mirror,** mid-turn: messages pending at a tool boundary go to the model as `additionalContext` (unverified that Claude Code shows it mid-turn under `-p`; if it doesn't, the message is confirmed but lost, since `Stop` won't offer it again; `NEST_RUNNER_INBOX_AT_TOOL_BOUNDARY=0` leaves only `Stop`) |
+| `PostToolUse` | **Local inbox mirror,** mid-turn: messages pending at a tool boundary go to the model as `additionalContext` (verified on 2.1.316 for MCP and built-in tools, [runner-claude](../../interfaces/host-internal/runner-claude/#hooks-checked-on-21316); a subagent's tool call gives it to the subagent, which ignored it on 2.1.316: open, see [runner-hooks](../../interfaces/host-internal/runner-hooks/); `NEST_RUNNER_INBOX_AT_TOOL_BOUNDARY=0` leaves only `Stop`) |
 | `Stop` | **Local inbox mirror:** messages still pending come back as `decision: "block"`, at most `max_stop_continuations` per stop chain (`stop_hook_active: false` starts a new chain) |
 
 The mirror hands a message out only while a turn runs and isn't being interrupted, never an `interrupt` message (AgentDO queues it as the next turn), at most once (under the agent's lock), and confirms it (`inbox_delivered`) only once the hook's answer was written; otherwise it is pending again.
