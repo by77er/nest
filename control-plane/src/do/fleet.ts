@@ -16,7 +16,7 @@ import {
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
 import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, valueOf, type AwsCellConfig, type AwsSource, type CellAws } from "../lib/cells";
-import { brainHostNeeded, idleStep, maxBrains, pickBrainHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
+import { brainHostNeeded, idleStep, maxBrains, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
@@ -1622,53 +1622,23 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: placing ${req.sandbox}, which its SandboxDO never registered; registering it now`);
       this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     }
-    // Packing (docs/compute/autoscaling/): fill hosts before opening new ones, so idle hosts empty
-    // out. A host's room is its last capacity report less what leases placed since reserve (a
-    // lease with no state yet, or whose first state the last capacity report predates: nestd
-    // reports state at once but capacity at most every 30 s, so a burst would otherwise see none
-    // of its own placements). On regular pages (no hugepage pool, the
-    // default) a sandbox costs what it touches: it reserves the cell's `sandbox_reserve_mib`
-    // against `memory_mib_free`, its declared size being a ceiling the jailer enforces, and an
-    // optional `max_sandboxes_per_host` caps the count. On a hugepage host the pool is a hard
-    // reservation: the declared size counts against `hugepages_mib_free`, declared vCPUs against
-    // `vcpus_free`. An empty host always takes one.
+    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts.
     const need = req.resources;
     const cfg = this.cellConfig();
-    const reserveMib = cfg?.sandbox_reserve_mib ?? DEFAULT_SANDBOX_RESERVE_MIB;
-    const maxPerHost = cfg?.max_sandboxes_per_host ?? 0;
-    const room = (h: HostRow): { room: number; leases: number; fits: boolean } => {
-      const leases = this.leasesOf(h.host);
-      if (!h.capacity) return { room: leases.length ? 0 : Infinity, leases: leases.length, fits: leases.length === 0 };
-      const cap = JSON.parse(h.capacity) as Capacity;
-      // A lease that reported before marks existed (state set, no state_seq) is counted.
-      const pending = leases.filter((l) => l.state === null || (l.state_seq !== null && (h.capacity_seq ?? 0) <= l.state_seq));
-      const hugepageHost = (cap.hugepages_mib_total ?? 0) > 0 || (cap.hugepages_mib_total === undefined && cap.hugepages_mib_free > 0);
-      if (hugepageHost) {
-        const huge = cap.hugepages_mib_free - pending.reduce((sum, l) => sum + (l.memory_mib ?? need.memory_mib), 0);
-        const vcpus = cap.vcpus_free - pending.reduce((sum, l) => sum + (l.vcpus ?? need.vcpus), 0);
-        return { room: huge - need.memory_mib, leases: leases.length, fits: leases.length === 0 || (huge >= need.memory_mib && vcpus >= need.vcpus) };
-      }
-      const mem = cap.memory_mib_free - pending.length * reserveMib;
-      const underCap = maxPerHost === 0 || leases.length < maxPerHost;
-      return { room: mem - reserveMib, leases: leases.length, fits: leases.length === 0 || (underCap && mem >= reserveMib) };
-    };
-    const candidates = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: "wedged_ms IS NULL" })
+    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: "wedged_ms IS NULL" })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
-      .map((h) => ({ h, r: room(h) }))
-      .filter((c) => c.r.fits);
-    if (!candidates.length) {
+      .map((h) => {
+        const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
+        return { host: h.host, capacity, capacity_seq: h.capacity_seq, leases: this.leasesOf(h.host), warm: !!req.from && !!capacity?.warm.includes(req.from.id) };
+      });
+    const host = pickSandboxHost(hosts, need, {
+      reserve_mib: cfg?.sandbox_reserve_mib ?? DEFAULT_SANDBOX_RESERVE_MIB, max_per_host: cfg?.max_sandboxes_per_host ?? 0,
+    });
+    if (!host) {
       // SandboxDO retries placement on its own alarm; by then the new host may have enrolled.
       await this.scaleUp();
       return null;
     }
-    const warm = (h: HostRow) => {
-      if (!req.from || !h.capacity) return false;
-      return (JSON.parse(h.capacity) as Capacity).warm.includes(req.from.id);
-    };
-    // Warm snapshot first; then the fullest host that still fits (least room left after this
-    // sandbox, then most leases).
-    candidates.sort((a, b) => Number(warm(b.h)) - Number(warm(a.h)) || a.r.room - b.r.room || b.r.leases - a.r.leases);
-    const host = candidates[0]!.h.host;
     this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, vcpus, memory_mib) VALUES (?, ?, ?, 0, ?, ?)",
       req.sandbox, host, req.epoch, need.vcpus, need.memory_mib);
     this.issueCommands(host, [{

@@ -6,6 +6,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import type { Ec2, ImageInfo } from "../src/lib/ec2";
+import { pickSandboxHost, type SandboxHostFacts } from "../src/lib/placement";
 import { adminJson, connectHost, enrollHost, hostHello, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
@@ -189,5 +190,58 @@ describe("operator views", () => {
     expect((v as unknown as { templates: { name: string; default: boolean }[] }).templates).toEqual([expect.objectContaining({ name: "nest-base:latest", default: true })]);
     expect(v.current_since_ms).toBe(1760000000000);
     expect(v.images.map((i) => i.image_id)).toEqual(["ami-old", "ami-new"]);
+  });
+});
+
+/** A small deterministic generator (mulberry32), so a failing property names its seed. */
+function rng(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+describe("pickSandboxHost", () => {
+  const need = { vcpus: 2, memory_mib: 2048 };
+  const cfg = { reserve_mib: 768, max_per_host: 0 };
+  const cap = (memory: number, huge = 0, vcpus = 8) =>
+    ({ vcpus_free: vcpus, memory_mib_free: memory, hugepages_mib_free: huge, hugepages_mib_total: huge, sandboxes: 0, agents: 0, warm: [] });
+  const lease = (state: string | null = "running", state_seq: number | null = 1) => ({ state, state_seq, vcpus: 2, memory_mib: 2048 });
+  const host = (id: string, f: Partial<SandboxHostFacts> = {}): SandboxHostFacts => ({ host: id, capacity: cap(16384), capacity_seq: 5, leases: [], warm: false, ...f });
+
+  it("prefers a warm snapshot, then the fullest host that fits", () => {
+    expect(pickSandboxHost([host("hst_a", { capacity: cap(4000) }), host("hst_b", { capacity: cap(9000) })], need, cfg)).toBe("hst_a");
+    expect(pickSandboxHost([host("hst_a", { capacity: cap(4000) }), host("hst_b", { capacity: cap(9000), warm: true })], need, cfg)).toBe("hst_b");
+    // Leases since the last capacity report reserve their share; one it already counts doesn't.
+    expect(pickSandboxHost([host("hst_a", { capacity: cap(1500), leases: [lease(null)] })], need, cfg)).toBeNull();
+    expect(pickSandboxHost([host("hst_a", { capacity: cap(1500), leases: [lease("running", 1)] })], need, cfg)).toBe("hst_a");
+    expect(pickSandboxHost([host("hst_a", { leases: [lease()] })], need, { ...cfg, max_per_host: 1 })).toBeNull();
+    // A hugepage host counts declared sizes against its pool.
+    expect(pickSandboxHost([host("hst_a", { capacity: cap(16384, 2047), leases: [lease()] })], need, cfg)).toBeNull();
+    expect(pickSandboxHost([host("hst_a", { capacity: cap(16384, 2048), leases: [lease()] })], need, cfg)).toBe("hst_a");
+  });
+
+  it("property: an empty host always fits, a pick always fits, and no pick means none fits", () => {
+    for (let seed = 1; seed <= 500; seed++) {
+      const r = rng(seed);
+      const hosts = Array.from({ length: Math.floor(r() * 4) }, (_, i) => host(`hst_${i}`, {
+        capacity: r() < 0.15 ? null : cap(Math.floor(r() * 8000), r() < 0.4 ? Math.floor(r() * 6000) : 0, Math.floor(r() * 6)),
+        capacity_seq: Math.floor(r() * 4),
+        leases: Array.from({ length: Math.floor(r() * 3) }, () => lease(r() < 0.3 ? null : "running", Math.floor(r() * 4))),
+        warm: r() < 0.2,
+      }));
+      const c = { reserve_mib: 768, max_per_host: Math.floor(r() * 3) };
+      const picked = pickSandboxHost(hosts, need, c);
+      const fits = (h: SandboxHostFacts) => pickSandboxHost([h], need, c) === h.host;
+      if (hosts.some((h) => h.leases.length === 0)) expect(picked, `seed ${seed}`).not.toBeNull();
+      if (picked) expect(fits(hosts.find((h) => h.host === picked)!), `seed ${seed}`).toBe(true);
+      else expect(hosts.some(fits), `seed ${seed}`).toBe(false);
+      // Warm first: a warm host that fits beats every cold one.
+      if (hosts.some((h) => h.warm && fits(h))) expect(hosts.find((h) => h.host === picked)!.warm, `seed ${seed}`).toBe(true);
+    }
   });
 });
