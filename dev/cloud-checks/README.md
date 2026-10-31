@@ -69,3 +69,28 @@ python3 -I dev/cloud-checks/ledger_check.py      # LEDGER_DRAIN_S=2700: also wat
 **Leftovers after an interrupted run:** as for `brain_hosts_check.py`; `GET /v1/ledgers/check-<run>/tasks` shows how far the work got.
 
 **Sanity-checked locally (2026-10-31)** against `npm run dev` with no hosts (`NEST_CELL=local`): the ledger, template, sandbox, agent and assignment calls answer as the script expects, each assignment queued one `inbox` turn on its assignee (`Message from tasks:<ledger>: assigned T-1 …`), and the timeout, SIGINT and SIGTERM paths all cleaned up and printed the ids. That is no evidence for the cloud run.
+
+## `mcp_check.py`
+
+[Remote MCP capabilities](../../docs/agents/capabilities/mcp/) end to end: real Claude Code agents use tools from the MCP test server ([`mcp-test/`](../../mcp-test/), its own Worker, deployed by hand) through AgentDO's MCP proxy, and the platform's guarantees are checked against the server's own call log.
+
+```bash
+# NEST_ADMIN_TOKEN as above; the server's URL and bearer (never echo the token):
+export MCP_TEST_URL=https://nest-mcp-test.<account>.workers.dev/mcp
+read -rs MCP_TEST_TOKEN && export MCP_TEST_TOKEN
+python3 -I dev/cloud-checks/mcp_check.py      # MCP_DRAIN_S=2700: also watch the cell drain to zero hosts
+```
+
+| | |
+|---|---|
+| **Settings** | `NEST_ADMIN_TOKEN`, `MCP_TEST_URL` (the server's `/mcp` URL), `MCP_TEST_TOKEN` (all required; no token is printed), `NEST_BASE_URL` (default `https://nest.bitcru.sh`), `NEST_CELL` (`use1`), `MCP_AGENTS` (2), `MCP_MODEL` (`haiku`), `MCP_TIMEOUT_S` (1200, for the turns), `MCP_IDLE_S` (900, for the brains to exit), `MCP_DRAIN_S` (0: not watched), `MCP_OUT` (`mcp-check-<run>.jsonl`: the marks, every logged call and each agent's checks and reply) |
+| **Creates** | `POST /reset` on the server first; the server's token in BrokerDO as `cap:mcp-check`; the capability `mcp-check` (`mcp{url: MCP_TEST_URL, auth: cap:mcp-check}`, untrusted, all five tools allowed, `idempotent` stating every tool so only `note_put` is idempotent) and the template `mcp-check` (`nest`, `mcp-check`; hands forbidden, so no sandbox; `MCP_MODEL`); one workstream (an agent without a sandbox still needs one); `MCP_AGENTS` agents created with `start: false`, each sent one turn (which wakes it): `echo` a phrase holding its id, `note_put` key `<agent>/k` = a random value, `note_get` it, `counter_add` name `<agent>` by 1 twice, then reply with what it got. In a cold cell, the autoscaler launches a brain host (spot EC2) |
+| **Passes when** | every turn is `done`; every call in the server's log names one of the run's agents in `_meta`; per agent: every call's `_meta` has `nest/agent` = the agent, `nest/epoch` = an epoch its brain was seen with (polled while the turn ran, plus its last `agent_epoch`), `nest/call` starting `<agent>/<that epoch>/` and `nest/taint` true; epochs never go back in log order; no call key reaches the server twice (bar one retry of `note_put`, the idempotent tool); `echo` answered with its id; `note_get` returned the value `note_put` stored; the counter is exactly 2 (two `counter_add` of 1, totals 1 then 2); the session is tainted, as its `turn_completed` event on `<agent>/events` records (the agent's record exposes no taint field); every brain then idle-exits with no turn queued or active, within `MCP_IDLE_S`; after cleanup no brain of the run is on any host; with `MCP_DRAIN_S` set, no host of the cell is live within it. Whether the reply names the value is logged, not checked (the model's words) |
+| **Exit** | 0 on PASS, 1 on FAIL. The last line is the JSON of the run, capability, template, workstream and agent ids |
+| **Cleans up** | stops every agent on every exit path, SIGINT and SIGTERM included |
+| **Leaves** | the server's state (notes, counters, call log: `POST /reset` clears it); the capability, its secret and the template (kept for reruns: a rerun overwrites them); the workstream and the stopped agents' records; the brain host it caused to launch, which retires after the cell's idle grace |
+| **Costs** | a few minutes of one spot brain host from a cold cell, one short Haiku turn per agent on the subscription, and a handful of requests to the test server's Worker |
+
+**Leftovers after an interrupted run:** stop the agent ids from the last line with `POST /v1/agents/<id>/stop`; `GET /calls?since=0` on the server shows what reached it.
+
+**Sanity-checked locally (2026-10-31)** against `wrangler dev` control plane (`ALLOW_LOOPBACK_MCP=1`, no hosts, `NEST_CELL=local`) and a local `mcp-test`: the reset, secret, capability, template, workstream, agent, turn and events calls answer as the script expects, and the timeout, SIGINT and SIGTERM paths stopped the agents and printed the ids. The log checks were run over the local server's real log after calls sent with crafted `_meta`: a well-behaved agent passed every check, and a repeated non-idempotent key, an older epoch after a newer one, an untainted call and a counter of 3 each failed. No brain ran (no hosts, no Claude), so that is no evidence for the cloud run.
