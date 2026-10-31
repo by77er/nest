@@ -173,6 +173,14 @@ impl Sbx {
         self.state_dir.join("disk.img")
     }
 
+    /// Whether the disk may differ from its head, or a commit's outcome is still unknown: what
+    /// decides whether an incarnation is salvaged or committed before its disk goes. Durable state,
+    /// read under the lock when the decision is made (never the reported `dirty`, which a commit
+    /// clears while a VM may still run on the disk).
+    fn may_hold_work(&self) -> bool {
+        !self.disk_clean || self.unanswered.is_some()
+    }
+
     fn vm_spec(&self) -> VmSpec {
         VmSpec {
             sandbox: self.id.clone(),
@@ -548,6 +556,7 @@ impl Host {
                 },
             );
             let mut sbx = Sbx::new(m.sandbox.clone(), m.workstream, m.epoch, m.image, m.resources, None, m.head, cfg.vm_dir(&m.sandbox.0, m.epoch.0), f.state_dir);
+            sbx.disk_clean = m.clean;
             sbx.unanswered = m.unanswered;
             recovered.push(Arc::new(tokio::sync::Mutex::new(sbx)));
         }
@@ -612,7 +621,7 @@ impl Host {
         // Incarnations left by a previous nestd: salvage (the commit request queues until the fleet
         // connects, after the hello), then delete.
         for entry in recovered {
-            inner.retire(entry, true);
+            inner.retire(entry);
         }
 
         // Command executor: in order, one at a time.
@@ -1204,15 +1213,14 @@ impl Inner {
     /// through the lock-free pauser. Then, under the lock: close the guest connection, stop the
     /// VM, drop the netns, and retire it (salvage, then delete) when `salvage` is set.
     async fn fence_sandbox(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: &str, salvage: bool) {
-        let dirty = {
+        {
             let mut summary = self.summary.lock().expect("summary");
             let Some(s) = summary.get_mut(id) else { return };
             if s.epoch != epoch || s.state == SandboxState::Fenced {
                 return;
             }
             s.state = SandboxState::Fenced;
-            s.dirty
-        };
+        }
         if let Some(pauser) = self.pausers.get(id, epoch) {
             tokio::spawn(async move {
                 if let Err(e) = pauser.pause().await {
@@ -1240,13 +1248,14 @@ impl Inner {
             s.netns = None; // drops (and unmounts) the namespace
             drop(s);
             if salvage {
-                this.retire(entry, dirty);
+                this.retire(entry);
             }
         });
     }
 
     /// An incarnation that never runs again (fenced, superseded by a newer epoch here, or left by
-    /// a previous nestd): salvage its uncommitted work as a sibling branch, if `dirty`. A transient
+    /// a previous nestd): salvage its uncommitted work as a sibling branch, if it may hold any
+    /// ([`Sbx::may_hold_work`], read when the retire takes the lock). A transient
     /// failure (a timeout, a store error, `parent_mismatch`, anything retryable) keeps the disk and
     /// is retried with backoff; a final refusal (`stale_epoch`, `invalid_message`: SandboxDO will
     /// never take that work) is logged with the error and ends it, like a landed salvage. Then its
@@ -1254,13 +1263,13 @@ impl Inner {
     /// `incarnation_retired` reported, so FleetDO need not wait out the salvage window. A destroy
     /// that removed the directory meanwhile ends it silently. Once per incarnation; the sandbox
     /// lock is held only while chunking.
-    fn retire(self: &Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, dirty: bool) {
+    fn retire(self: &Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>) {
         let this = self.clone();
         // Boxed: retiring commits, a commit's rejection fences, a fence retires.
-        spawn_boxed(async move { this.retire_now(entry, dirty).await });
+        spawn_boxed(async move { this.retire_now(entry).await });
     }
 
-    async fn retire_now(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, dirty: bool) {
+    async fn retire_now(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>) {
         let mut s = entry.lock().await;
         if s.retiring {
             return;
@@ -1268,7 +1277,8 @@ impl Inner {
         s.retiring = true;
         let (id, epoch) = (s.id.clone(), s.epoch);
         let mut backoff = incarnation::RETIRE_RETRY_FIRST;
-        while dirty && s.state_dir.exists() {
+        let salvage = s.may_hold_work();
+        while salvage && s.state_dir.exists() {
             let (s2, r) = self.commit(&entry, s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
             s = s2;
             match r {
@@ -1529,7 +1539,7 @@ impl Inner {
             // background (salvage, then delete). It has its own directory, so this one never waits.
             self.fence_sandbox(&sandbox, s.epoch, "superseded by a newer epoch", false).await;
             if let Some(old) = self.teardown(&sandbox, DropReason::Moved).await {
-                self.retire(old, s.dirty);
+                self.retire(old);
             }
         }
         let vm_dir = self.cfg.vm_dir(&sandbox.0, epoch.0);
@@ -1924,8 +1934,7 @@ impl Inner {
             if !self.set_state(id, epoch, SandboxState::Archiving, None, None) {
                 return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
             }
-            let dirty = self.summary.lock().expect("summary").get(id).is_some_and(|x| x.dirty);
-            if dirty || s.head.is_none() {
+            if s.may_hold_work() || s.head.is_none() {
                 if let Some(vm) = s.vm.as_mut() {
                     let _ = vm.pause().await;
                 }

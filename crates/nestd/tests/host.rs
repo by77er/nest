@@ -50,6 +50,14 @@ struct AttachLatch {
     release: tokio::sync::Notify,
 }
 
+/// While `held` is set, the next VM `resume` waits for `release` (after setting `reached`).
+#[derive(Default)]
+struct ResumeLatch {
+    held: AtomicBool,
+    reached: AtomicBool,
+    release: tokio::sync::Notify,
+}
+
 #[derive(Default)]
 struct FakeDriver {
     seen: Seen,
@@ -64,6 +72,7 @@ struct FakeDriver {
     paused: Arc<Mutex<Vec<(String, u64)>>>,
     /// VMs started and not yet stopped.
     live: Arc<AtomicUsize>,
+    resume_latch: Arc<ResumeLatch>,
 }
 
 #[async_trait]
@@ -86,6 +95,7 @@ impl Driver for FakeDriver {
             mute_next_guest: self.mute_next_guest.clone(),
             stopped: self.stopped.clone(),
             live: self.live.clone(),
+            resume_latch: self.resume_latch.clone(),
             running: false,
             emu: None,
             guest: None,
@@ -102,6 +112,7 @@ struct FakeVm {
     mute_next_guest: Arc<AtomicBool>,
     stopped: Arc<Mutex<Vec<String>>>,
     live: Arc<AtomicUsize>,
+    resume_latch: Arc<ResumeLatch>,
     running: bool,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
@@ -154,6 +165,11 @@ impl Vm for FakeVm {
         Ok(())
     }
     async fn resume(&mut self) -> std::io::Result<()> {
+        if self.resume_latch.held.load(Ordering::SeqCst) {
+            let released = self.resume_latch.release.notified();
+            self.resume_latch.reached.store(true, Ordering::SeqCst);
+            released.await;
+        }
         Ok(())
     }
     async fn stop(&mut self) -> std::io::Result<()> {
@@ -949,6 +965,7 @@ struct Started {
     paused: Arc<Mutex<Vec<(String, u64)>>>,
     /// VMs started and not yet stopped.
     live: Arc<AtomicUsize>,
+    resume_latch: Arc<ResumeLatch>,
 }
 
 /// How long the harness's nestd waits for a guest agent to come up (the fake guest is in-process).
@@ -976,14 +993,21 @@ async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
     let driver = FakeDriver::default();
-    let (seen, stopped, fail_next_start, mute_next_guest, paused, live) =
-        (driver.seen.clone(), driver.stopped.clone(), driver.fail_next_start.clone(), driver.mute_next_guest.clone(), driver.paused.clone(), driver.live.clone());
+    let (seen, stopped, fail_next_start, mute_next_guest, paused, live, resume_latch) = (
+        driver.seen.clone(),
+        driver.stopped.clone(),
+        driver.fail_next_start.clone(),
+        driver.mute_next_guest.clone(),
+        driver.paused.clone(),
+        driver.live.clone(),
+        driver.resume_latch.clone(),
+    );
     let host = Host::start(cfg, enrolled, Some(Arc::new(driver))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
-    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped, fail_next_start, mute_next_guest, paused, live }
+    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped, fail_next_start, mute_next_guest, paused, live, resume_latch }
 }
 
 /// Whether `pid` is still a live process (a zombie counts as dead: it has been killed).
@@ -2149,6 +2173,28 @@ async fn a_refused_unanswered_checkpoint_still_lets_the_salvage_run() {
     h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
     h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
     assert_eq!(salvage_requests(&h.fleet, "sbx_1", 1).len(), 1, "the salvage ran after the refused re-ask");
+}
+
+/// Inventory B2: a fence lands after a checkpoint's commit, while its VM is being resumed. The VM
+/// runs (and writes) again before the fence task stops it, so the retire salvages. The retire used
+/// to decide from the reported `dirty` flag, which the commit had just cleared, and deleted the
+/// disk unsalvaged; it decides from the durable `clean` now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_during_a_checkpoints_resume_still_salvages() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.resume_latch.held.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    wait_until("the checkpoint resumes its VM", || h.resume_latch.reached.load(Ordering::SeqCst)).await;
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    append_to_disk(h.dir.path(), "sbx_1", 1, b"written after the checkpoint");
+    h.resume_latch.held.store(false, Ordering::SeqCst);
+    h.resume_latch.release.notify_waiters();
+    h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+    assert_eq!(salvage_requests(&h.fleet, "sbx_1", 1).len(), 1, "the work after the checkpoint is salvaged");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
