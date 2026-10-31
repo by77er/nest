@@ -93,10 +93,10 @@ struct Turn {
 #[derive(Debug)]
 enum Ending {
     Running,
-    /// stdin closed for idleness; input arriving meanwhile waits for a `--resume`d process.
-    IdleClose { stash: Vec<Input> },
-    /// The process exited idle with input stashed; waiting for [`Input::Respawned`].
-    Respawning { stash: Vec<Input> },
+    /// stdin closed for idleness; a turn arriving meanwhile waits for a `--resume`d process.
+    IdleClose { stash: Vec<(TurnId, TurnInput)> },
+    /// The process exited idle with a turn stashed; waiting for [`Input::Respawned`].
+    Respawning { stash: Vec<(TurnId, TurnInput)> },
     /// Stopped or killed: the first such reason is the exit's, whatever idleness said.
     Requested(ExitReason),
 }
@@ -168,10 +168,10 @@ impl Brain {
     fn run_turn(&mut self, turn: TurnId, input: TurnInput) -> Vec<Effect> {
         match &mut self.ending {
             Ending::IdleClose { stash } | Ending::Respawning { stash } => {
-                stash.push(Input::RunTurn { turn, input });
+                stash.push((turn, input));
                 return vec![];
             }
-            Ending::Requested(reason) => return vec![not_delivered(turn, Some(*reason))],
+            Ending::Requested(reason) => return vec![not_delivered(turn, *reason)],
             Ending::Running => {}
         }
         if let Some(current) = &self.turn {
@@ -253,13 +253,13 @@ impl Brain {
         vec![]
     }
 
-    /// Stop or kill: the first explicit reason sticks; input waiting for a respawn never gets one.
+    /// Stop or kill: the first explicit reason sticks; a turn waiting for a respawn never gets one.
     fn request_end(&mut self, reason: ExitReason) -> Vec<Effect> {
         if matches!(self.ending, Ending::Requested(_)) {
             return vec![];
         }
         match std::mem::replace(&mut self.ending, Ending::Requested(reason)) {
-            Ending::IdleClose { stash } | Ending::Respawning { stash } => dropped(stash, Some(reason)),
+            Ending::IdleClose { stash } | Ending::Respawning { stash } => dropped(stash, reason),
             _ => vec![],
         }
     }
@@ -290,12 +290,12 @@ impl Brain {
         let stash = std::mem::take(stash);
         if !ok {
             self.ending = Ending::Requested(ExitReason::Crashed);
-            let mut fx = dropped(stash, Some(ExitReason::Crashed));
+            let mut fx = dropped(stash, ExitReason::Crashed);
             fx.extend(self.finish());
             return fx;
         }
         *self = Brain { interrupt_supported: self.interrupt_supported, ..Brain::new(self.timers, now) };
-        stash.into_iter().flat_map(|i| self.step(i, now)).collect()
+        stash.into_iter().flat_map(|(turn, input)| self.run_turn(turn, input)).collect()
     }
 
     /// The exit's reason: a requested one, else idleness, else a crash.
@@ -311,20 +311,13 @@ impl Brain {
     }
 }
 
-/// Stashed input that will never run: each turn gets an error event (AgentDO keeps it queued).
-fn dropped(stash: Vec<Input>, why: Option<ExitReason>) -> Vec<Effect> {
-    stash
-        .into_iter()
-        .filter_map(|i| match i {
-            Input::RunTurn { turn, .. } => Some(not_delivered(turn, why)),
-            _ => None,
-        })
-        .collect()
+/// Stashed turns that will never run: each gets an error event (AgentDO keeps it queued).
+fn dropped(stash: Vec<(TurnId, TurnInput)>, why: ExitReason) -> Vec<Effect> {
+    stash.into_iter().map(|(turn, _)| not_delivered(turn, why)).collect()
 }
 
-fn not_delivered(turn: TurnId, why: Option<ExitReason>) -> Effect {
-    let why = why.map(|r| r.as_str()).unwrap_or("stopping");
-    let error = ErrorBody { code: "agent_stopping".into(), message: format!("turn not delivered: the brain is {why}"), retryable: true };
+fn not_delivered(turn: TurnId, why: ExitReason) -> Effect {
+    let error = ErrorBody { code: "agent_stopping".into(), message: format!("turn not delivered: the brain is {}", why.as_str()), retryable: true };
     Effect::Emit { body: AgentEventBody::Error { error }, turn: Some(turn) }
 }
 
