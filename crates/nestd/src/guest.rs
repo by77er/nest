@@ -247,10 +247,19 @@ impl Task {
             let mut entropy = [0u8; 64];
             rand::fill(&mut entropy[..]);
             use base64::Engine as _;
-            let body = ControlBody::Resume { wall_clock_ms: now_ms(), entropy_b64: base64::engine::general_purpose::STANDARD.encode(entropy), fork };
-            match self.call(&mut stream, &mut dec, &mut buf, &mut next_id, body, &mut pending, &cli_tx).await? {
-                ControlBody::ResumeDone { clock_step_ms } => tracing::info!(sandbox = %self.sandbox, clock_step_ms, "guest resumed"),
-                other => tracing::warn!(?other, "unexpected resume reply"),
+            let body = ControlBody::Resume { wall_clock_ms: now_ms(), entropy_b64: base64::engine::general_purpose::STANDARD.encode(entropy), fork: fork.clone() };
+            let reply = self.call(&mut stream, &mut dec, &mut buf, &mut next_id, body, &mut pending, &cli_tx).await;
+            if let Ok(ControlBody::ResumeDone { clock_step_ms }) = reply {
+                tracing::info!(sandbox = %self.sandbox, clock_step_ms, "guest resumed");
+            } else {
+                // Not resumed (its clock or RNG not reseeded): not ready, and the next connection
+                // asks again, unless a newer resume was asked for meanwhile.
+                self.ctl.pending_resume.lock().expect("resume").get_or_insert(fork);
+                return Err(match reply {
+                    Err(e) => e,
+                    Ok(ControlBody::Error { error }) => io::Error::other(format!("guest resume: {}: {}", error.code, error.message)),
+                    Ok(other) => io::Error::other(format!("unexpected resume reply {other:?}")),
+                });
             }
         }
         let guest = nest_protocol::gateway::GuestInfo { protocol_version, capabilities };
@@ -469,6 +478,57 @@ pub(crate) mod tests {
         let seen = fake2.seen.lock().unwrap().clone();
         assert!(matches!(&seen[0], ControlBody::Configure { epoch: Epoch(3), agents, .. } if agents.len() == 1));
         assert!(matches!(&seen[1], ControlBody::Resume { fork: None, .. }));
+        ctl.shutdown();
+    }
+
+    /// A `resume` the guest refuses (it couldn't reseed its RNG, say) is a failed readiness: the
+    /// sandbox isn't reported ready, and the next connection asks again. It used to be logged and
+    /// the guest reported ready, unreseeded.
+    #[tokio::test]
+    async fn a_refused_resume_is_not_ready_and_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest_dir = dir.path().join("guest");
+        std::fs::create_dir_all(&guest_dir).unwrap();
+        let listener = UnixListener::bind(guest_dir.join("1024.sock")).unwrap();
+        let resumes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resumes2 = resumes.clone();
+        tokio::spawn(async move {
+            let send = |b: ControlBody, reply_to: Option<u64>| frame::encode_json(&ControlFrame { id: None, reply_to, body: b }).unwrap();
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { break };
+                s.write_all(&send(ControlBody::Hello { protocol_version: PROTOCOL_VERSION, agent_version: "f".into(), boot_id: "b".into(), instance_id: "i".into(), since_boot_ms: 1, capabilities: vec![] }, None)).await.unwrap();
+                let mut dec = Decoder::new();
+                let mut buf = vec![0u8; 65536];
+                'conn: loop {
+                    let n = match s.read(&mut buf).await { Ok(0) | Err(_) => break 'conn, Ok(n) => n };
+                    dec.push(&buf[..n]);
+                    while let Ok(Some(f)) = dec.next_frame() {
+                        let cf: ControlFrame = serde_json::from_slice(&f.payload).unwrap();
+                        let reply = match cf.body {
+                            ControlBody::Resume { .. } if resumes2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 => {
+                                ControlBody::Error { error: error("internal", "can't reseed the RNG", true) }
+                            }
+                            ControlBody::Resume { .. } => ControlBody::ResumeDone { clock_step_ms: 0 },
+                            _ => ControlBody::Ok {},
+                        };
+                        if s.write_all(&send(reply, cf.id)).await.is_err() {
+                            break 'conn;
+                        }
+                    }
+                }
+            }
+        });
+        let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
+        let (etx, mut erx) = mpsc::unbounded_channel();
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(1), "h".into(), vec![], etx);
+        ctl.expect_resume(None);
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), erx.recv()).await.unwrap().unwrap().1 {
+                GuestEvent::Ready { .. } => break,
+                _ => continue,
+            }
+        }
+        assert_eq!(resumes.load(std::sync::atomic::Ordering::SeqCst), 2, "ready only once a resume was done");
         ctl.shutdown();
     }
 
