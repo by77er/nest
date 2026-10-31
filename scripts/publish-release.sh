@@ -21,6 +21,10 @@ rustup target add "$TARGET" >&2
 CC_x86_64_unknown_linux_musl=musl-gcc cargo build --locked --release --target "$TARGET" \
   -p nestd -p nest-guest -p nest-proxy -p nest-gateway -p nest-runner -p nest-cli >&2
 
+# nestd's file-access tests on the target that ships: musl's libc differs from the glibc that CI tests
+# against (std dropped O_PATH from custom flags under musl, and no glibc run could show it).
+CC_x86_64_unknown_linux_musl=musl-gcc cargo test --locked --release --target "$TARGET" -p nestd --lib driver::access >&2
+
 # Hosts decide how to run the gateway from `nestd --features` (deploy/host/install.sh): the
 # binary that ships must say `gateway-user`, or every host falls back to a root gateway.
 NESTD_FEATURES=$("target/$TARGET/release/nestd" --features)

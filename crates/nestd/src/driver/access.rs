@@ -9,10 +9,10 @@
 //! change is then made through `/proc/self/fd/<n>`, which names the opened inode itself
 //! (`fchmod`/`fchown` refuse an `O_PATH` descriptor).
 
-use std::fs::{File, OpenOptions, Permissions};
+use std::fs::{File, Permissions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
 /// The file kind a grant expects to find at its path.
@@ -72,8 +72,13 @@ pub fn create_searchable(base: &Path, dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Through `open(2)` itself, not `OpenOptions::custom_flags`: std drops the access-mode bits from
+/// custom flags, and musl's `O_ACCMODE` includes `O_PATH` (`O_SEARCH`), so the release build (musl)
+/// opened the socket for reading instead, and every jailed VM failed to start with ENXIO.
 fn open_nofollow(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_NOFOLLOW).open(path)
+    use nix::fcntl::{OFlag, open};
+    let fd = open(path, OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC, nix::sys::stat::Mode::empty())?;
+    Ok(File::from(fd))
 }
 
 #[cfg(test)]
@@ -91,6 +96,18 @@ mod tests {
 
     /// The vsock socket ends `0660` in the gateway's group: before, it had the VMM's umask mode
     /// (`0755` under systemd), which no other user can `connect` to.
+    /// The descriptor is `O_PATH`: a socket can't be opened any other way (ENXIO). Under musl,
+    /// `OpenOptions::custom_flags` dropped the flag (the release build), which only a musl run shows.
+    #[test]
+    fn a_socket_opens_as_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("api.sock");
+        let _l = UnixListener::bind(&sock).unwrap();
+        let f = open_nofollow(&sock).unwrap();
+        let flags = nix::fcntl::fcntl(&f, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+        assert_ne!(flags & libc::O_PATH, 0, "not an O_PATH descriptor: {flags:o}");
+    }
+
     #[test]
     fn a_socket_is_granted_to_the_group() {
         let dir = tempfile::tempdir().unwrap();
