@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import { previewHostname, shareHostname, type SandboxDO } from "../src/do/sandbox";
 import type { Ec2, InstanceState } from "../src/lib/ec2";
-import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
@@ -296,5 +296,24 @@ describe("preview and share names follow the hostname rule", () => {
     expect((await sandboxStub(sbx.sandbox).info()).ports).toEqual([
       { port: 5173, url: `https://5173-${sbx.sandbox.slice("sbx_".length)}-preview-nest.localhost` },
     ]);
+  });
+});
+
+describe("the lease's guards (docs/verification/sandbox-lease)", () => {
+  it("a lost lease keeps which agents are working: the re-placed sandbox isn't idle-suspended mid-turn", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "running", guest: GUEST }]);
+    const stub = sandboxStub(sbx.sandbox);
+    await stub.attach("agt_x");
+    await stub.agentActivity("agt_x", true);
+    // The brain runs on a brain host, untouched by the sandbox host's loss: AgentDO re-sends activity only on a change.
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "fenced", detail: "host lease lapsed" }]);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 2, state: "running", guest: GUEST }]);
+    expect((await stub.info()).working).toEqual(["agt_x"]);
+    expect(await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'idle'").toArray().length)).toBe(0);
   });
 });

@@ -545,8 +545,9 @@ export class SandboxDO extends DurableObject<Env> {
     if (!cur || cur.state === "destroyed" || cur.state === "archived") return;
     if (cur.epoch === epoch && (cur.host === host || (cur.host === null && cur.placing === null))) {
       this.update((i) => {
+        // `working` stays: the brains run elsewhere, untouched by this host's loss, and AgentDO
+        // re-sends activity only when it changes.
         i.host = null;
-        i.working = [];
         i.lost_from = host;
       });
     } else if (!(cur.host === null && cur.lost_from === host)) {
