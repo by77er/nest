@@ -3,9 +3,10 @@
 // seeded generators (mulberry32: a failure names its seed) for the properties.
 import { describe, expect, it } from "vitest";
 import {
-  afterDelivery, type Batch, type Caller, type ChannelFacts, checkPost, clip, decidePost, deliveryBackoff, envelopeText, type Filter, INLINE_BODY_BYTES,
-  matches, MAX_BODY_BYTES, type MessageMeta, onAppend, parseChannel, patternMatches, permits, planBatch, type PostState, RATE_LIMIT_POSTS,
-  chunks, R2_DELETE_MAX, REPEAT_WINDOW_MS, sessionTaint, SubscribeInput, type Subscription,
+  afterDelivery, type Batch, beginDelivery, type Caller, type ChannelFacts, checkPost, clip, decidePost, type DeliveryOutcome, deliveryBackoff,
+  envelopeText, type Filter, INLINE_BODY_BYTES, type LogView, matches, MAX_BODY_BYTES, type MessageMeta, onAppend, parseChannel, patternMatches,
+  permits, planBatch, type PostState, RATE_LIMIT_POSTS, chunks, R2_DELETE_MAX, REPEAT_WINDOW_MS, sessionTaint, settleDelivery, SubscribeInput,
+  type Subscription, takeBatch,
 } from "../src/lib/channels";
 
 function rng(seed: number) {
@@ -336,77 +337,88 @@ describe("filters and batching", () => {
     expect(SubscribeInput.parse({})).toMatchObject({ delivery: "turn", once: false, filter: {} });
   });
 
+  /** The log as ChannelDO's delivery reads it, scanning at most `scan` messages (small: a backlog spans several scans). */
+  const logView = (log: readonly (MessageMeta & { text?: string })[], scan: number): LogView =>
+    ({ head: log.length, scan: (after) => log.filter((x) => x.seq > after).slice(0, scan) });
+  type Attempt = "ok" | "defer" | "error_before" | "error_after";
+  const outcomeOf = (o: Attempt, upTo: number, batch: Batch): DeliveryOutcome =>
+    o === "ok" ? { status: "ok", ...(upTo < batch.to_seq ? { up_to: upTo } : {}) }
+      : o === "defer" ? { status: "defer", retry_after_ms: 5 } : { status: "error" };
+
   /**
    * A channel, one subscription and its AgentDO (a high-water mark), driven by random posts, alarm
    * ticks and delivery outcomes (taken, deferred, failed before or after the agent took it: an ack
-   * lost), then drained. Every match is admitted exactly once, in order; nothing else is.
+   * lost), then drained, through the delivery steps ChannelDO and AgentDO run. With `reads`, every
+   * match is admitted exactly once, in order, and nothing else is. Without, the agent takes each
+   * batch only up to `inline_to` (a partial ack) and is shown only the user's messages: every user
+   * message that matches reaches it exactly once, in order.
    */
-  /**
-   * The same channel and AgentDO model for an agent without `read`: it takes each batch only up to
-   * `inline_to` (a partial ack) and is shown only the user's messages. Every user message that
-   * matches reaches it exactly once, in order, under retries, defers and lost (partial) acks.
-   */
+  function simulate(seed: number, reads: boolean) {
+    const r = rng(seed);
+    const senders = reads ? [A, B, C, "user", "platform"] : ["user", "user", "user", B, "platform"];
+    const kinds = [undefined, "progress", "question"];
+    const filter: Filter = r() < 0.3 ? { kinds: ["question"] } : r() < 0.3 ? { from: [B, "user"] } : {};
+    const scan = 1 + Math.floor(r() * 8);
+    let s: Subscription | null = {
+      id: "sub_p", agent: A, filter, delivery: "turn", batch_ms: Math.floor(r() * 50), once: reads && r() < 0.15, cursor: 0, due_ms: null,
+      inflight: null, attempts: 0,
+    };
+    const log: (MessageMeta & { text?: string })[] = [];
+    let hw = 0;
+    const admitted: Batch[] = [];
+    const shown: number[] = [];
+    let now = 0;
+    let lastCursor = 0;
+    const tick = (attempt: () => Attempt) => {
+      if (!s || s.due_ms === null || s.due_ms > now) return;
+      const view = logView(log, scan);
+      const { save, send: batch } = beginDelivery(s, view, now);
+      if (save) s = save;
+      if (!batch) return;
+      const take = takeBatch({ channel: "team/c", subscription: s.id, batch }, reads);
+      expect(take.up_to > batch.after_seq, `seed ${seed}: no progress`).toBe(true);
+      // AgentDO deduplicates before its loop guards: a batch it already holds is always `ok`.
+      const o = take.up_to <= hw ? (r() < 0.5 ? "ok" : "error_before") : attempt();
+      if ((o === "ok" || o === "error_after") && take.up_to > hw) {
+        hw = take.up_to;
+        admitted.push(take.shown.batch);
+        for (const m of take.shown.batch.inline) {
+          expect(m.seq <= take.up_to, `seed ${seed}: shown past up_to`).toBe(true);
+          shown.push(m.seq);
+        }
+      }
+      s = settleDelivery(s, batch, outcomeOf(o, take.up_to, batch), view, now);
+      if (s) {
+        expect(s.cursor >= lastCursor, `seed ${seed}: cursor went back`).toBe(true);
+        lastCursor = s.cursor;
+      }
+    };
+    for (let step = 0; step < 80; step++) {
+      now += Math.floor(r() * 30);
+      if (r() < 0.55) {
+        const kind = kinds[Math.floor(r() * 3)];
+        const from = senders[Math.floor(r() * senders.length)]!;
+        const msg = {
+          seq: log.length + 1, ts_ms: now, from, taint: r() < 0.3, ...(kind ? { kind } : {}),
+          ...(from === "user" ? { text: reads ? `t${log.length + 1}` : "x".repeat(1 + Math.floor(r() * 3000)) } : {}),
+        } as MessageMeta & { text?: string };
+        log.push(msg);
+        if (s) s = { ...s, due_ms: onAppend(s, msg, now) };
+      } else {
+        tick(() => (["ok", "defer", "error_before", "error_after"] as const)[Math.floor(r() * 4)]!);
+      }
+    }
+    // Drain: every attempt succeeds.
+    for (let i = 0; i < 1000 && s && (s.due_ms !== null || s.inflight); i++) {
+      now = Math.max(now + 1, s.due_ms ?? now);
+      tick(() => "ok");
+    }
+    return { log, filter, admitted, shown, ended: s === null };
+  }
+
   it("property: an agent without read gets every matching user message exactly once, in order, through partial acks", () => {
     for (let seed = 1; seed <= 400; seed++) {
-      const r = rng(seed);
-      const senders = ["user", "user", "user", B, "platform"];
-      const filter: Filter = r() < 0.3 ? { from: [B, "user"] } : {};
-      let s: Subscription | null = {
-        id: "sub_q", agent: A, filter, delivery: "turn", batch_ms: Math.floor(r() * 50), once: false, cursor: 0, due_ms: null, inflight: null, attempts: 0,
-      };
-      const log: (MessageMeta & { text?: string })[] = [];
-      let hw = 0;
-      const shown: number[] = [];
-      let now = 0;
-      let lastCursor = 0;
-      const tick = (outcomeOf: () => "ok" | "defer" | "error_before" | "error_after") => {
-        if (!s || s.due_ms === null || s.due_ms > now) return;
-        let batch = s.inflight;
-        if (!batch) {
-          const p = planBatch(s, log.filter((x) => x.seq > s!.cursor));
-          if (p.kind === "idle") { s = { ...s, due_ms: null }; return; }
-          if (p.kind === "advance") { s = { ...s, cursor: p.to_seq, due_ms: null }; return; }
-          batch = p.batch;
-          s = { ...s, inflight: batch, due_ms: now + 1000 };
-        }
-        // AgentDO without `read`: up to `inline_to`, deduplicated against that.
-        const upTo = Math.min(batch.inline_to ?? batch.to_seq, batch.to_seq);
-        expect(upTo > batch.after_seq, `seed ${seed}: no progress`).toBe(true);
-        const o = upTo <= hw ? (r() < 0.5 ? "ok" : "error_before") : outcomeOf();
-        if ((o === "ok" || o === "error_after") && upTo > hw) {
-          hw = upTo;
-          for (const m of batch.inline) {
-            expect(m.seq <= upTo, `seed ${seed}: shown past up_to`).toBe(true);
-            shown.push(m.seq);
-          }
-        }
-        const outcome = o === "ok" ? { status: "ok" as const, ...(upTo < batch.to_seq ? { up_to: upTo } : {}) }
-          : o === "defer" ? { status: "defer" as const, retry_after_ms: 5 } : { status: "error" as const };
-        s = afterDelivery(s, batch, outcome, now);
-        if (s && s.inflight === null && s.due_ms === null) {
-          const p = planBatch(s, log.filter((x) => x.seq > s!.cursor));
-          if (p.kind !== "idle") s = { ...s, due_ms: now + (p.kind === "deliver" ? s.batch_ms : 0) };
-        }
-        if (s) {
-          expect(s.cursor >= lastCursor, `seed ${seed}: cursor went back`).toBe(true);
-          lastCursor = s.cursor;
-        }
-      };
-      for (let step = 0; step < 80; step++) {
-        now += Math.floor(r() * 30);
-        if (r() < 0.6) {
-          const from = senders[Math.floor(r() * senders.length)]!;
-          const msg = { seq: log.length + 1, ts_ms: now, from, taint: false, ...(from === "user" ? { text: "x".repeat(1 + Math.floor(r() * 3000)) } : {}) } as MessageMeta & { text?: string };
-          log.push(msg);
-          if (s) s = { ...s, due_ms: onAppend(s, msg, now) };
-        } else {
-          tick(() => (["ok", "defer", "error_before", "error_after"] as const)[Math.floor(r() * 4)]!);
-        }
-      }
-      for (let i = 0; i < 400 && s && (s.due_ms !== null || s.inflight); i++) {
-        now = Math.max(now + 1, s.due_ms ?? now);
-        tick(() => "ok");
-      }
+      const { log, filter, shown } = simulate(seed, false);
       const want = log.filter((x) => x.from === "user" && matches(filter, x, A)).map((x) => x.seq);
       expect(shown, `seed ${seed}`).toEqual(want);
     }
@@ -414,67 +426,10 @@ describe("filters and batching", () => {
 
   it("property: delivery is exactly-once per match at the agent, in order, under retries, defers and lost acks", () => {
     for (let seed = 1; seed <= 400; seed++) {
-      const r = rng(seed);
-      const senders = [A, B, C, "user", "platform"];
-      const kinds = [undefined, "progress", "question"];
-      const filter: Filter = r() < 0.3 ? { kinds: ["question"] } : r() < 0.3 ? { from: [B, "user"] } : {};
-      let s: Subscription | null = {
-        id: "sub_p", agent: A, filter, delivery: "turn", batch_ms: Math.floor(r() * 50), once: r() < 0.15, cursor: 0, due_ms: null, inflight: null, attempts: 0,
-      };
-      const log: (MessageMeta & { text?: string })[] = [];
-      let hw = 0;
-      const admitted: Batch[] = [];
-      let now = 0;
-      let lastCursor = 0;
-      const tick = (outcomeOf: () => "ok" | "defer" | "error_before" | "error_after") => {
-        if (!s || s.due_ms === null || s.due_ms > now) return;
-        let batch = s.inflight;
-        if (!batch) {
-          const p = planBatch(s, log.slice(-500).filter((x) => x.seq > s!.cursor));
-          if (p.kind === "idle") { s = { ...s, due_ms: null }; return; }
-          if (p.kind === "advance") { s = { ...s, cursor: p.to_seq, due_ms: null }; return; }
-          batch = p.batch;
-          s = { ...s, inflight: batch, due_ms: now + 1000 };
-        }
-        // AgentDO deduplicates before its loop guards: a batch it already holds is always `ok`.
-        const o = batch.to_seq <= hw ? (r() < 0.5 ? "ok" : "error_before") : outcomeOf();
-        if (o === "ok" || o === "error_after") {
-          if (batch.to_seq > hw) { hw = batch.to_seq; admitted.push(batch); }
-        }
-        const outcome = o === "ok" ? { status: "ok" as const } : o === "defer" ? { status: "defer" as const, retry_after_ms: 5 } : { status: "error" as const };
-        s = afterDelivery(s, batch, outcome, now);
-        if (s && s.inflight === null && s.due_ms === null) {
-          const p = planBatch(s, log.filter((x) => x.seq > s!.cursor));
-          if (p.kind !== "idle") s = { ...s, due_ms: now + (p.kind === "deliver" ? s.batch_ms : 0) };
-        }
-        if (s) {
-          expect(s.cursor >= lastCursor, `seed ${seed}: cursor went back`).toBe(true);
-          lastCursor = s.cursor;
-        }
-      };
-      for (let step = 0; step < 80; step++) {
-        now += Math.floor(r() * 30);
-        if (r() < 0.5) {
-          const msg = {
-            seq: log.length + 1, ts_ms: now, from: senders[Math.floor(r() * senders.length)]!, taint: r() < 0.3,
-            ...(kinds[Math.floor(r() * 3)] ? { kind: kinds[Math.floor(r() * 3)]! } : {}),
-          } as MessageMeta & { text?: string };
-          if (msg.from === "user") msg.text = `t${msg.seq}`;
-          log.push(msg);
-          if (s) s = { ...s, due_ms: onAppend(s, msg, now) };
-        } else {
-          tick(() => (["ok", "defer", "error_before", "error_after"] as const)[Math.floor(r() * 4)]!);
-        }
-      }
-      // Drain: every attempt succeeds.
-      for (let i = 0; i < 200 && s && (s.due_ms !== null || s.inflight); i++) {
-        now = Math.max(now + 1, s.due_ms ?? now);
-        tick(() => "ok");
-      }
+      const { log, filter, admitted, ended } = simulate(seed, true);
       const ctx = `seed ${seed}`;
       const want = log.filter((x) => matches(filter, x, A));
-      const once = admitted.length && admitted[0]!.ends;
-      if (once || (s === null)) {
+      if ((admitted.length && admitted[0]!.ends) || ended) {
         // A once subscription delivers exactly its first match, then ends.
         expect(admitted.length, ctx).toBe(want.length ? 1 : 0);
         if (want.length) expect(admitted[0]!.first_seq, ctx).toBe(want[0]!.seq);

@@ -533,6 +533,44 @@ export function afterDelivery(sub: Subscription, batch: Batch, outcome: Delivery
   return { ...sub, attempts, due_ms: now + deliveryBackoff(attempts) };
 }
 
+/** The log as a delivery reads it: synchronous lookups (ChannelDO's SQLite, or an array in tests). */
+export interface LogView {
+  head: number;
+  /** Messages after `after`, ascending, at most `BATCH_SCAN`, with `user` texts. */
+  scan(after: number): readonly (MessageMeta & { text?: string })[];
+}
+
+/**
+ * A due subscription's next step: the subscription to `save` (null: unchanged) and the batch to
+ * `send` (null: none). Its pinned batch is sent again as it is; otherwise the next batch is pinned
+ * with its backstop, or there is nothing to send: idle, or the cursor moves past a scanned range
+ * with no match (due again at once while the log goes on past it).
+ */
+export function beginDelivery(sub: Subscription, log: LogView, now: number): { save: Subscription | null; send: Batch | null } {
+  if (sub.inflight) return { save: null, send: sub.inflight };
+  const plan = planBatch(sub, log.scan(sub.cursor));
+  switch (plan.kind) {
+    case "idle":
+      return { save: { ...sub, due_ms: null }, send: null };
+    case "advance":
+      return { save: { ...sub, cursor: plan.to_seq, due_ms: log.head > plan.to_seq ? now : null }, send: null };
+    case "deliver":
+      return { save: { ...sub, inflight: plan.batch, due_ms: now + DELIVERY_BACKSTOP_MS }, send: plan.batch };
+  }
+}
+
+/**
+ * `afterDelivery`, then a subscription left with nothing pinned or waiting looks at the log again:
+ * matches that arrived while the batch was in flight open the next window (a range with none is due
+ * at once, to move past it). Null: the subscription ended.
+ */
+export function settleDelivery(sub: Subscription, batch: Batch, outcome: DeliveryOutcome, log: LogView, now: number): Subscription | null {
+  const next = afterDelivery(sub, batch, outcome, now);
+  if (next === null || next.inflight !== null || next.due_ms !== null) return next;
+  const plan = planBatch(next, log.scan(next.cursor));
+  return plan.kind === "idle" ? next : { ...next, due_ms: now + (plan.kind === "deliver" ? next.batch_ms : 0) };
+}
+
 // --- Wake envelope (AgentDO) --------------------------------------------------------------------------
 
 /** A delivery as AgentDO receives it. */
@@ -540,6 +578,26 @@ export interface ChannelDelivery {
   channel: string;
   subscription: string;
   batch: Batch;
+}
+
+/**
+ * What a subscriber takes of a delivery. An agent that can `read` takes all of it. One that can't
+ * takes it only as far as its user messages arrived inline (`inline_to`; the first always does),
+ * and is shown those alone; the rest of the range comes as the next batch. `skipped`: it took other
+ * posters' messages it was not shown.
+ */
+export function takeBatch(d: ChannelDelivery, reads: boolean): { up_to: number; shown: ChannelDelivery; skipped: boolean } {
+  if (reads) return { up_to: d.batch.to_seq, shown: d, skipped: false };
+  const b = d.batch;
+  const up_to = Math.min(b.inline_to ?? b.to_seq, b.to_seq);
+  const shown: ChannelDelivery = {
+    ...d,
+    batch: {
+      ...b, to_seq: up_to, count: b.inline.length, first_seq: b.inline[0]?.seq ?? up_to, last_seq: b.inline.at(-1)?.seq ?? up_to,
+      senders: b.inline.length ? [{ from: "user", n: b.inline.length }] : [], kinds: [], tainted: 0,
+    },
+  };
+  return { up_to, shown, skipped: b.count > b.inline.length };
 }
 
 const ago = (ms: number) => {

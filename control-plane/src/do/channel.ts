@@ -14,10 +14,10 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";
 import type { Env } from "../env";
 import {
-  type AclEntry, afterDelivery, type Batch, BATCH_SCAN, type Caller, type ChannelAction, type ChannelFacts, type ChannelKind, checkPost,
-  type CheckedPost, DEFAULT_BATCH_MS, DEFAULT_RETENTION_DAYS, decidePost, Delivery, DELIVERY_BACKSTOP_MS, DELIVERY_TIMEOUT_MS, type DeliveryOutcome,
-  chunks, IDEM_RETENTION_MS, isAgentCaller, R2_DELETE_MAX, KEYS_MAX_LIMIT, type Message, type MessageMeta, onAppend, parseChannel, permits, planBatch,
-  type PostState, RATE_WINDOW_MS, READ_DEFAULT_LIMIT, READ_MAX_BYTES, READ_MAX_LIMIT, type SubscribeInput, type Subscription,
+  type AclEntry, type Batch, BATCH_SCAN, beginDelivery, type Caller, type ChannelAction, type ChannelFacts, type ChannelKind, checkPost,
+  type CheckedPost, DEFAULT_BATCH_MS, DEFAULT_RETENTION_DAYS, decidePost, Delivery, DELIVERY_TIMEOUT_MS, type DeliveryOutcome,
+  chunks, IDEM_RETENTION_MS, isAgentCaller, R2_DELETE_MAX, KEYS_MAX_LIMIT, type LogView, type Message, type MessageMeta, onAppend, parseChannel,
+  permits, type PostState, RATE_WINDOW_MS, READ_DEFAULT_LIMIT, READ_MAX_BYTES, READ_MAX_LIMIT, settleDelivery, type SubscribeInput, type Subscription,
   TIER_AFTER_MS,
 } from "../lib/channels";
 import { Deadlines } from "../lib/reliable";
@@ -586,34 +586,26 @@ export class ChannelDO extends DurableObject<Env> {
     this.ctx.waitUntil(next === null ? this.deadlines.clear("fanout") : this.deadlines.set("fanout", Math.max(next, Date.now() + 1)));
   }
 
-  private scan(after: number): (MessageMeta & { text?: string })[] {
-    return this.sql.exec<MsgRow>("SELECT * FROM messages WHERE seq > ? ORDER BY seq LIMIT ?", after, BATCH_SCAN).toArray()
-      .map((r) => metaOf({ ...r, text: r.from_p === "user" && !r.body_ref ? r.text : null }));
+  /** The log as deliveries read it. */
+  private log(): LogView {
+    return {
+      head: this.head(),
+      scan: (after) => this.sql.exec<MsgRow>("SELECT * FROM messages WHERE seq > ? ORDER BY seq LIMIT ?", after, BATCH_SCAN).toArray()
+        .map((r) => metaOf({ ...r, text: r.from_p === "user" && !r.body_ref ? r.text : null })),
+    };
   }
 
   private async deliverOne(id: string): Promise<void> {
     const meta = this.meta();
-    let sub = this.sub(id);
+    const sub = this.sub(id);
     if (!meta || !sub || sub.due_ms === null || sub.due_ms > Date.now()) return;
-    let batch: Batch | null = sub.inflight;
-    if (!batch) {
-      const plan = planBatch(sub, this.scan(sub.cursor));
-      if (plan.kind === "idle") {
-        this.saveSub({ ...sub, due_ms: null });
-        return;
-      }
-      if (plan.kind === "advance") {
-        // Nothing matched in the scanned range; a longer backlog is looked at again at once.
-        const more = this.head() > plan.to_seq;
-        this.saveSub({ ...sub, cursor: plan.to_seq, due_ms: more ? Date.now() : null });
-        return;
-      }
-      batch = plan.batch;
-      sub = { ...sub, inflight: batch, due_ms: Date.now() + DELIVERY_BACKSTOP_MS };
-      this.saveSub(sub);
+    const { save, send: batch } = beginDelivery(sub, this.log(), Date.now());
+    if (save) {
+      this.saveSub(save);
       // The backstop is armed with the pin: a reset mid-call sends the same batch again.
-      this.ctx.waitUntil(this.armFanout(sub.due_ms));
+      this.ctx.waitUntil(this.armFanout(save.due_ms));
     }
+    if (!batch) return;
     this.delivering.add(id);
     let outcome: DeliveryOutcome;
     try {
@@ -638,20 +630,13 @@ export class ChannelDO extends DurableObject<Env> {
   private settle(id: string, batch: Batch, outcome: DeliveryOutcome): void {
     const cur = this.sub(id);
     if (!cur) return;
-    const now = Date.now();
-    const next = afterDelivery(cur, batch, outcome, now);
+    const next = settleDelivery(cur, batch, outcome, this.log(), Date.now());
     if (next === null) {
       this.sql.exec("DELETE FROM subs WHERE id = ?", id);
       return;
     }
-    let s = next;
-    if (s.inflight === null && s.due_ms === null) {
-      // Matches that arrived while the batch was in flight open the next window now.
-      const plan = planBatch(s, this.scan(s.cursor));
-      if (plan.kind !== "idle") s = { ...s, due_ms: now + (plan.kind === "deliver" ? s.batch_ms : 0) };
-    }
-    this.saveSub(s);
-    this.ctx.waitUntil(this.armFanout(s.due_ms));
+    this.saveSub(next);
+    this.ctx.waitUntil(this.armFanout(next.due_ms));
   }
 
   private async callAgent(agent: string, d: { channel: string; subscription: string; batch: Batch }): Promise<DeliveryOutcome> {
