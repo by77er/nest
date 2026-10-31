@@ -101,16 +101,17 @@ export class TurnQueue {
 
   /**
    * Q3. Mirrored messages the runner never confirmed (`inbox_delivered`) come back as one queued turn:
-   * first if one of them interrupted the turn (it was meant for now), else last.
+   * first if one of them interrupted the turn (it was meant for now), else where the first of them
+   * arrived: behind the queued turns created by then, ahead of those created later.
    */
   complete(turn: string, now = Date.now()): void {
     this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, turn);
-    const unseen = this.sql.exec<{ message: string; request_id: string | null }>(
-      `SELECT message, request_id FROM inbox WHERE status = '${INBOX.delivered}' ORDER BY rowid`).toArray()
-      .map((r) => ({ message: JSON.parse(r.message) as InboxMessage, request_id: r.request_id }));
+    const unseen = this.sql.exec<{ message: string; request_id: string | null; created_ms: number }>(
+      `SELECT message, request_id, created_ms FROM inbox WHERE status = '${INBOX.delivered}' ORDER BY rowid`).toArray()
+      .map((r) => ({ message: JSON.parse(r.message) as InboxMessage, request_id: r.request_id, created_ms: r.created_ms }));
     if (unseen.length) {
       const { input, requestId } = requeuedTurn(unseen);
-      const ord = unseen.some((r) => r.message.interrupt) ? this.ord("MIN") - 1 : this.ord("MAX") + 1;
+      const ord = unseen.some((r) => r.message.interrupt) ? this.ord("MIN") - 1 : this.ordArrivedAt(Math.min(...unseen.map((r) => r.created_ms)));
       this.insert(input, ord, requestId, null, now, true);
     }
     this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
@@ -194,6 +195,19 @@ export class TurnQueue {
 
   private ord(edge: "MIN" | "MAX"): number {
     return this.sql.exec<{ m: number | null }>(`SELECT ${edge}(ord) AS m FROM turns`).toArray()[0]?.m ?? 0;
+  }
+
+  /**
+   * The ord for a turn that arrived at `ms`: just behind the last queued turn created by then (or
+   * ahead of every queued turn, none being that old). The turns from there on move back one.
+   */
+  private ordArrivedAt(ms: number): number {
+    const q = this.sql.exec<{ before: number | null; first: number | null }>(
+      `SELECT MAX(CASE WHEN created_ms <= ? THEN ord END) AS before, MIN(ord) AS first FROM turns WHERE status = '${TURN.queued}'`, ms).one();
+    if (q.first === null) return this.ord("MAX") + 1;
+    const ord = q.before === null ? q.first : q.before + 1;
+    this.sql.exec("UPDATE turns SET ord = ord + 1 WHERE ord >= ?", ord);
+    return ord;
   }
 
   private insert(input: TurnInput, ord: number, requestId: string | null, recovers: string | null, now: number, orIgnore = false): string {
