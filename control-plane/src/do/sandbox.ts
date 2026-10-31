@@ -16,7 +16,7 @@ import { signShare } from "../lib/tokens";
 import { asNestError, NestError, newId } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
-import { storedEnum } from "../lib/stored";
+import { addColumn, storedEnum } from "../lib/stored";
 import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "../protocol/control";
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
@@ -134,9 +134,8 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS commits (request TEXT PRIMARY KEY, outcome TEXT NOT NULL)");
     // When the request was answered, and the generation it committed (null: rejected), so
     // retention needs no JSON scan.
-    const commitCols = this.sql.exec<{ name: string }>("PRAGMA table_info(commits)").toArray().map((c) => c.name);
-    if (!commitCols.includes("created_ms")) this.sql.exec("ALTER TABLE commits ADD COLUMN created_ms INTEGER");
-    if (!commitCols.includes("generation_id")) this.sql.exec("ALTER TABLE commits ADD COLUMN generation_id TEXT");
+    addColumn(this.sql, "commits", "created_ms", "INTEGER");
+    addColumn(this.sql, "commits", "generation_id", "TEXT");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_generation ON commits (generation_id)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_rejected ON commits (created_ms) WHERE generation_id IS NULL");
     // Every epoch and the host that held it: salvage from any older epoch is authorized against it.
@@ -966,7 +965,6 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   async unexposePort(port: number): Promise<void> {
-    const info = this.info_();
     await this.command({ type: "port_unexpose", port });
     this.update((i) => {
       i.ports = i.ports.filter((p) => p.port !== port);

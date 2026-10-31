@@ -5,7 +5,7 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
 import { num, type Env } from "../env";
-import { commandRefSlots, REF_PURPOSES, type RefPurpose, type RefSlot } from "./broker";
+import { commandRefSlots, REF_PURPOSES, type RefPurpose } from "./broker";
 import { canonicalSpki, certificateSpki, createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
 import { AwsKms, type Kms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
@@ -22,7 +22,7 @@ import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
-import { sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
+import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
 import {
   Capacity, type CommandBody, CommandBodyVariants, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
   type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
@@ -316,47 +316,47 @@ export class FleetDO extends DurableObject<Env> {
     // complete listing no longer shows the host's tunnel or record.
     this.sql.exec("CREATE TABLE IF NOT EXISTS tunnels_created (host TEXT PRIMARY KEY, created_ms INTEGER NOT NULL)");
     // Autoscaling: when a launched instance stopped counting (`reason`) and when EC2 confirmed it gone.
-    this.addColumn("launched", "cell", "TEXT");
-    this.addColumn("launched", "reason", "TEXT");
-    this.addColumn("launched", "ended_ms", "INTEGER");
-    this.addColumn("hosts", "idle_since", "INTEGER");
+    addColumn(this.sql, "launched", "cell", "TEXT");
+    addColumn(this.sql, "launched", "reason", "TEXT");
+    addColumn(this.sql, "launched", "ended_ms", "INTEGER");
+    addColumn(this.sql, "hosts", "idle_since", "INTEGER");
     // The seam: where clients reach a host's sandbox gateway (docs/sandbox/gateway/).
-    this.addColumn("hosts", "gateway_url", "TEXT");
-    this.addColumn("hosts", "tunnel_id", "TEXT");
-    this.addColumn("hosts", "tunnel_hostname", "TEXT");
-    this.addColumn("hosts", "dns_record_id", "TEXT");
-    this.addColumn("hosts", "tunnel_state", "TEXT");
+    addColumn(this.sql, "hosts", "gateway_url", "TEXT");
+    addColumn(this.sql, "hosts", "tunnel_id", "TEXT");
+    addColumn(this.sql, "hosts", "tunnel_hostname", "TEXT");
+    addColumn(this.sql, "hosts", "dns_record_id", "TEXT");
+    addColumn(this.sql, "hosts", "tunnel_state", "TEXT");
     // When AgentDO reported a brain on this host that didn't exit after a kill (`hostWedged`): its
     // heartbeats and hellos go unanswered until it is expired, so its own lease fences it.
-    this.addColumn("hosts", "wedged_ms", "INTEGER");
+    addColumn(this.sql, "hosts", "wedged_ms", "INTEGER");
     // Amendment A6: whether the host's brains are proven gone: its lease expired (it was silent past
     // the lease; nestd refused or killed every start it held), or its death was confirmed (EC2 or
     // STONITH, an operator, or it never connected). A retirement that only marks it `dead` (idle,
     // drained) isn't proof. Rows from before were the previous release's word: dead or expired.
     // A6: the host's brains are proven gone (see the `lost` column).
-    this.addColumn("hosts", "lost", "INTEGER NOT NULL DEFAULT 0");
+    addColumn(this.sql, "hosts", "lost", "INTEGER NOT NULL DEFAULT 0");
     // The host's nestd keys brains by agent epoch (its hello says so; nestd of the previous release
     // doesn't): preferred for new brains, and the only kind escalation ever wedges.
-    this.addColumn("hosts", "brain_epochs", "INTEGER NOT NULL DEFAULT 0");
+    addColumn(this.sql, "hosts", "brain_epochs", "INTEGER NOT NULL DEFAULT 0");
     // A drain (a spot notice, a previous-release nestd) is an intent, not a liveness: a host that
     // expires and comes back (a hello, a fence) returns to `draining`, never `active`.
-    this.addColumn("hosts", "drain_ms", "INTEGER");
-    this.addColumn("leases", "state", "TEXT");
+    addColumn(this.sql, "hosts", "drain_ms", "INTEGER");
+    addColumn(this.sql, "leases", "state", "TEXT");
     // Packing: what each lease reserves until the host's capacity report counts the sandbox.
-    this.addColumn("leases", "vcpus", "INTEGER");
-    this.addColumn("leases", "memory_mib", "INTEGER");
+    addColumn(this.sql, "leases", "vcpus", "INTEGER");
+    addColumn(this.sql, "leases", "memory_mib", "INTEGER");
     // ... and until a capacity report the host made after the lease's first state (`mark` order).
-    this.addColumn("leases", "state_seq", "INTEGER");
-    this.addColumn("hosts", "capacity_seq", "INTEGER");
-    this.addColumn("leases", "guest", "TEXT");
+    addColumn(this.sql, "leases", "state_seq", "INTEGER");
+    addColumn(this.sql, "hosts", "capacity_seq", "INTEGER");
+    addColumn(this.sql, "leases", "guest", "TEXT");
     // Who answered a command: `fleet` when FleetDO answered it itself (its host died, or was dead or
     // unknown when it was issued); null for the host's own result (and the answers older releases
     // already wrote). Only a host's answer means the host ran it (`killProgress`).
-    this.addColumn("commands", "answered_by", "TEXT");
+    addColumn(this.sql, "commands", "answered_by", "TEXT");
     // Host kinds: `role` columns keep the previous release's names (`burst`, `controller`) this
     // release, and are read as either name (`hostKind`), so a rolled-back Worker reads every row.
     // Retention: when a host died.
-    this.addColumn("hosts", "dead_ms", "INTEGER");
+    addColumn(this.sql, "hosts", "dead_ms", "INTEGER");
     // Incarnations a host still has at an epoch FleetDO no longer leases to it: destroyed there once
     // their salvage is done (the host reports them clean) or its window has passed.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS stale_incarnations (sandbox TEXT NOT NULL, host TEXT NOT NULL, epoch INTEGER NOT NULL,
@@ -382,11 +382,6 @@ export class FleetDO extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       if (!this.deadlines.has(ALARM_PRUNE)) await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
     });
-  }
-
-  private addColumn(table: string, column: string, type: string): void {
-    const cols = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
-    if (!cols.some((c) => c.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 
   private queue(host: string, map = this.inbound): SerialQueue {
@@ -1188,7 +1183,7 @@ export class FleetDO extends DurableObject<Env> {
     const cols = this.sql.exec<{ name: string; pk: number }>("PRAGMA table_info(host_agents)").toArray();
     if (cols.length === 0 || cols.find((c) => c.name === "host")?.pk !== 0) {
       this.sql.exec(create);
-      this.addColumn("host_agents", "epoch", "INTEGER");
+      addColumn(this.sql, "host_agents", "epoch", "INTEGER");
       this.addHostAgentsColumns();
       return;
     }
@@ -1202,9 +1197,9 @@ export class FleetDO extends DurableObject<Env> {
    * tick until acknowledged, then the row goes).
    */
   private addHostAgentsColumns(): void {
-    this.addColumn("host_agents", "gone", "INTEGER NOT NULL DEFAULT 0");
+    addColumn(this.sql, "host_agents", "gone", "INTEGER NOT NULL DEFAULT 0");
     // Whether its agent took the host's drain (`onHostDraining`); retried by the tick until it did.
-    this.addColumn("host_agents", "drain_told", "INTEGER NOT NULL DEFAULT 0");
+    addColumn(this.sql, "host_agents", "drain_told", "INTEGER NOT NULL DEFAULT 0");
   }
 
   /**
@@ -2085,7 +2080,7 @@ export class FleetDO extends DurableObject<Env> {
     const live = this.hostsBy({ role, status: ["active", "stonith_pending"] })
       .filter((h) => role !== BRAIN_ROLE || h.brain_epochs === 1 || h.last_rx === null).length;
     const now = Date.now();
-    const plan = scaleUpPlan(s, live, pending, this.launching.has(role), now);
+    const plan = scaleUpPlan(s, live, pending, now);
     if (!plan.launch) return;
     const cell = this.cellName();
     for (const [i, a] of plan.launch.entries()) {

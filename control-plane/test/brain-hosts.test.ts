@@ -86,17 +86,16 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
     expect(maxBrains(undefined, -3)).toBe(1);
   });
 
-  it("scaleUpPlan: nothing while launching, pending or at the cap; else each type on spot, then the first on demand", () => {
+  it("scaleUpPlan: nothing while pending or at the cap; else each type on spot, then the first on demand", () => {
     const s = { instance_types: ["t3a.medium", "t3.medium"], subnet_ids: ["subnet-0a", "subnet-0b"], spot: true, max_hosts: 2 };
-    expect(scaleUpPlan(s, 0, 0, true, 0)).toEqual({ launch: null, why: "launching" });
-    expect(scaleUpPlan(s, 0, 1, false, 0)).toEqual({ launch: null, why: "pending" });
-    expect(scaleUpPlan(s, 2, 0, false, 0)).toEqual({ launch: null, why: "at_max" });
-    expect(scaleUpPlan(s, 1, 0, false, 1000)).toEqual({ launch: [
+    expect(scaleUpPlan(s, 0, 1, 0)).toEqual({ launch: null, why: "pending" });
+    expect(scaleUpPlan(s, 2, 0, 0)).toEqual({ launch: null, why: "at_max" });
+    expect(scaleUpPlan(s, 1, 0, 1000)).toEqual({ launch: [
       { type: "t3a.medium", subnet: "subnet-0b", spot: true },
       { type: "t3.medium", subnet: "subnet-0a", spot: true },
       { type: "t3a.medium", subnet: "subnet-0b", spot: false },
     ] });
-    expect(scaleUpPlan({ ...s, spot: false }, 0, 0, false, 0)).toEqual({ launch: [{ type: "t3a.medium", subnet: "subnet-0a", spot: false }] });
+    expect(scaleUpPlan({ ...s, spot: false }, 0, 0, 0)).toEqual({ launch: [{ type: "t3a.medium", subnet: "subnet-0a", spot: false }] });
   });
 
   it("property: scaleUpPlan launches only below the cap with nothing in flight, always ending on demand, in the cell's subnets", () => {
@@ -107,9 +106,8 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
       const s = { instance_types: types, subnet_ids: subnets, spot: r() < 0.5, max_hosts: 1 + Math.floor(r() * 3) };
       const live = Math.floor(r() * 4);
       const pending = r() < 0.3 ? 1 : 0;
-      const launching = r() < 0.2;
-      const p = scaleUpPlan(s, live, pending, launching, Math.floor(r() * 1e9));
-      const ok = !launching && !pending && live < s.max_hosts;
+      const p = scaleUpPlan(s, live, pending, Math.floor(r() * 1e9));
+      const ok = !pending && live < s.max_hosts;
       expect(p.launch !== null, `seed ${seed}`).toBe(ok);
       if (!p.launch) continue;
       expect(p.launch.at(-1), `seed ${seed}`).toMatchObject({ type: types[0], spot: false });

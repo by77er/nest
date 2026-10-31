@@ -167,7 +167,7 @@ export function createFailed(l: Lease, host: string, epoch: number, retryable: b
 
 /** Retry (operator): a failed sandbox's holder, to fence and release before it is placed again. */
 export const failedHolder = (l: Lease): { host: string; epoch: number } | null =>
-  l.state === "failed" && l.host && !gone(l.state) ? { host: l.host, epoch: l.epoch } : null;
+  l.state === "failed" && l.host ? { host: l.host, epoch: l.epoch } : null;
 
 /** Retry, after the fence and the release: unplaced, if nothing moved meanwhile. */
 export function retried(l: Lease, host: string, epoch: number): void {
