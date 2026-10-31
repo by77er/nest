@@ -39,7 +39,7 @@ async function inFleet<T>(cell: string, over: Partial<Env>, setup: { config?: Aw
   });
 }
 
-const endpoint = (client: unknown) => (client as { endpoint: string }).endpoint;
+const endpoint = (client: unknown) => (client as { api: { endpoint: string } }).api.endpoint;
 const keptRoot = (cell: string) => runInDurableObject(fleetStub(cell), async (_inst, state) =>
   state.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'root_ca'").toArray()[0]?.value ?? null);
 /** An intermediate for a fresh CSR, signed by the cell's root. */

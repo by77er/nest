@@ -1,6 +1,6 @@
 // Host launches and STONITH through the EC2 Query API. Scoped IAM: RunInstances only from the
 // cell's two launch templates (sandbox hosts, brain hosts); terminate/stop only instances tagged nest=true.
-import { AwsClient } from "aws4fetch";
+import { AwsApi, type AwsOptions } from "./aws";
 
 export type InstanceState = "pending" | "running" | "shutting-down" | "terminated" | "stopping" | "stopped" | "unknown";
 
@@ -31,7 +31,7 @@ export interface Ec2 {
   /** Launches one instance and returns its id; throws `CapacityError` when this pool can't. */
   launch(spec: LaunchSpec): Promise<string>;
   terminate(instanceId: string): Promise<void>;
-  /** `null` when the instance does not exist (already gone). */
+  /** `null` when the instance does not exist (already gone); throws on an answer it can't read. */
   state(instanceId: string): Promise<InstanceState | null>;
   /** The account's own AMIs tagged `nest=true` (the host images), newest first. */
   images(): Promise<ImageInfo[]>;
@@ -50,27 +50,20 @@ export interface ImageInfo {
 export const isDead = (s: InstanceState | null) => s === null || s === "shutting-down" || s === "terminated";
 
 export class AwsEc2 implements Ec2 {
-  private readonly client: AwsClient;
-  private readonly endpoint: string;
+  private readonly api: AwsApi;
 
-  constructor(accessKeyId: string, secretAccessKey: string, region: string) {
-    this.client = new AwsClient({ accessKeyId, secretAccessKey, region, service: "ec2" });
-    this.endpoint = `https://ec2.${region}.amazonaws.com/`;
+  constructor(accessKeyId: string, secretAccessKey: string, region: string, opts?: AwsOptions) {
+    this.api = new AwsApi("ec2", accessKeyId, secretAccessKey, region, opts);
   }
 
   private async call(params: Record<string, string>): Promise<string> {
     const body = new URLSearchParams({ ...params, Version: "2016-11-15" });
-    const res = await this.client.fetch(this.endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded; charset=utf-8" },
-      body: body.toString(),
-    });
-    const text = await res.text();
-    if (!res.ok) {
+    const { ok, status, text } = await this.api.post({ "content-type": "application/x-www-form-urlencoded; charset=utf-8" }, body.toString());
+    if (!ok) {
       if (text.includes("InvalidInstanceID.NotFound")) return "";
       const code = /<Code>([A-Za-z.]+)<\/Code>/.exec(text)?.[1] ?? "";
       if (CAPACITY_CODES.includes(code)) throw new CapacityError(`EC2 ${params.Action}: ${code}`);
-      throw new Error(`EC2 ${params.Action} failed: ${res.status} ${text.slice(0, 300)}`);
+      throw new Error(`EC2 ${params.Action} failed: ${status} ${text.slice(0, 300)}`);
     }
     return text;
   }
@@ -119,7 +112,10 @@ export class AwsEc2 implements Ec2 {
 
   async state(instanceId: string): Promise<InstanceState | null> {
     const xml = await this.call({ Action: "DescribeInstances", "InstanceId.1": instanceId });
+    if (xml === "" || /<reservationSet\s*\/>|<reservationSet>\s*<\/reservationSet>/.test(xml)) return null;
     const m = /<instanceState>\s*<code>\d+<\/code>\s*<name>([a-z-]+)<\/name>/.exec(xml);
-    return m ? (m[1] as InstanceState) : null;
+    // Never read as gone: `null` confirms a silent host dead without terminating it.
+    if (!m) throw new Error(`EC2 DescribeInstances: no state for ${instanceId}: ${xml.slice(0, 300)}`);
+    return m[1] as InstanceState;
   }
 }

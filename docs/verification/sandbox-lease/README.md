@@ -90,7 +90,7 @@ FleetDO forwards commits without checking the lease (`fleet.ts:1139-1142`): Sand
 | Fleet channel, FleetDO → host commands | Persisted, delivered in order, resent after reconnect, exactly one result per command; `fence` also acts on arrival, ahead of queued commands | `fleet.ts:1152-1173`, `778`; `host.rs:779-805` |
 | Fleet channel, host → FleetDO events | In order per host (serial queue), resent until acked; a processing failure closes the socket and the batch is resent | `fleet.ts:962-983` |
 | Heartbeat / ack | Unreliable, every 5 s; ack renews the host's deadline from the heartbeat's **send** instant; hello ack renews from the hello's send instant | `crates/nestd/src/fleet.rs:286`, `373-392` |
-| EC2 | `terminate` and `state` may fail (retried each tick); `state` returning `null` counts as dead | `ec2.ts:45` |
+| EC2 | `terminate` and `state` may fail (retried each tick); `state` returning `null` (the instance doesn't exist) counts as dead; an answer `state` can't read throws | `ec2.ts` `isDead`, `AwsEc2.state` |
 
 ## 4. Timing
 
@@ -155,7 +155,7 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 
 **B5 (deviation from S4/S2; suspected windows of seconds):** lease deletion without a fence acknowledgement: `retryPlacement` sends `fence` and releases the lease without waiting (`sandbox.ts:345-352`); evictions trust the lease's last reported `suspended` (`fleet.ts:1548`, `1499-1511`, `814`) although a `sandbox_resume` may be in flight (`sandbox.ts:392-393`); Unreported relies on "no VM outlives nestd", unverified on a real host. The old incarnation runs until its next revoked heartbeat (~5 s) or self-fence (≤ 20 s); commits are refused (S1), but an agent holding a still-valid binding for the old epoch reaches the old gateway meanwhile.
 
-**B6 (suspected; low): STONITH falls open on a parse failure.** `isDead(null)` is true and `state()` returns `null` for any 200 response the regex does not match (`ec2.ts:45`, `114-118`). Safety then rests on the self-fence margin (§4), not on STONITH.
+**B6 (suspected; low; fixed on refactor/fleet: an unreadable answer throws, only NotFound or an empty reservation set is `null`): STONITH falls open on a parse failure.** `isDead(null)` is true and `state()` returns `null` for any 200 response the regex does not match (`ec2.ts:45`, `114-118`). Safety then rests on the self-fence margin (§4), not on STONITH.
 
 **B7 (suspected; low): a stale placement continuation acts on current state.** If the marker was reconciled while `place` was still running, a later host answer still clears the current `place` deadline and notifies agents of a host the DO doesn't hold (`sandbox.ts:325-329`); together with S3', needs a `place` call slower than 60 s.
 
