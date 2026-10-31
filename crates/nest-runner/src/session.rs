@@ -60,8 +60,6 @@ struct State {
     resolves: Vec<model::RequestId>,
     /// Set by `Close`: give up at this instant.
     close_deadline: Option<tokio::time::Instant>,
-    /// The epoch the current connection's hello presented.
-    epoch: model::Epoch,
 }
 
 impl State {
@@ -102,7 +100,6 @@ impl Session {
             durable: 0,
             resolves: Vec::new(),
             close_deadline: None,
-            epoch: self.agent.epoch(),
         };
         let mut backoff = Duration::from_millis(100);
         loop {
@@ -183,22 +180,12 @@ impl Session {
         let (ws, _) = tokio_tungstenite::connect_async(req).await?;
         let (mut tx, mut rx) = ws.split();
 
-        // Everything this connection carries speaks for the epoch its hello presents: events are
-        // stamped with it when sent (and unacked ones again on a reconnect), so a brain that
-        // adopted a newer epoch never sends events AgentDO's epoch filter would drop.
-        let epoch = self.agent.epoch();
-        st.epoch = epoch;
-        for (_, m) in st.unacked.iter_mut() {
-            if let RunnerToAgent::Events { events, .. } = m {
-                events.iter_mut().for_each(|e| e.epoch = epoch);
-            }
-        }
         let hello = RunnerToAgent::Hello(RunnerHello {
             protocol_version: model::PROTOCOL_VERSION,
             agent: self.agent.id.clone(),
             host: self.rt.host(),
             instance_id: self.instance_id.clone(),
-            epoch,
+            epoch: self.agent.epoch,
             session: self.session.clone(),
             local_bytes: self.tailer.local_bytes(),
             last_seq: (st.last_in > 0).then_some(Seq(st.last_in)),
@@ -357,8 +344,7 @@ impl Session {
         if st.batch.is_empty() {
             return Ok(());
         }
-        let mut events = std::mem::take(&mut st.batch);
-        events.iter_mut().for_each(|e| e.epoch = st.epoch);
+        let events = std::mem::take(&mut st.batch);
         send_reliable(st, tx, |seq| RunnerToAgent::Events { seq, events }).await
     }
 
@@ -500,7 +486,6 @@ mod tests {
             durable: 0,
             resolves: Vec::new(),
             close_deadline: None,
-            epoch: Epoch(1),
         };
         assert!(session.flush_events(&mut st, &mut BrokenSink).await.is_err());
         st.batch.push(ev(2, AgentEventBody::AssistantText { text: "y".into() }));
@@ -531,7 +516,6 @@ mod tests {
             durable: 0,
             resolves: Vec::new(),
             close_deadline: None,
-            epoch: model::Epoch(1),
         };
         st.unacked[1].1 = RunnerToAgent::Events { seq: Seq(2), events: vec![] };
         let fresh = st.abandon(&call);
@@ -623,66 +607,5 @@ mod resolve_tests {
             other => panic!("{other:?}"),
         }
         assert!(server.await.unwrap(), "AgentDO received the queued hands_resolve");
-    }
-}
-
-#[cfg(test)]
-mod epoch_tests {
-    use super::*;
-    use crate::config::Config;
-    use nest_protocol::model::{AgentId, AgentState, Epoch, Secret};
-    use tokio::net::TcpListener;
-
-    async fn next_batch(rx: &mut mpsc::UnboundedReceiver<(usize, Epoch, Vec<Epoch>)>) -> (usize, Epoch, Vec<Epoch>) {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("an events batch").unwrap()
-    }
-
-    /// A brain that adopts a newer agent epoch (a later `agent_start` while it ran) reconnects
-    /// with it, and the events AgentDO had not acked go out again stamped with the epoch of the
-    /// connection that carries them, so AgentDO's epoch filter never drops them.
-    #[tokio::test]
-    async fn adopting_an_epoch_reconnects_and_resends_unacked_events_under_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/v1/agents/agt_e/session", listener.local_addr().unwrap());
-        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<(usize, Epoch, Vec<Epoch>)>();
-        // AgentDO: acks every hello, never acks events; reports (connection, hello epoch, event epochs).
-        tokio::spawn(async move {
-            for conn in 0.. {
-                let Ok((tcp, _)) = listener.accept().await else { return };
-                let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-                let (mut wtx, mut wrx) = ws.split();
-                let mut hello_epoch = Epoch(0);
-                while let Some(Ok(m)) = wrx.next().await {
-                    let Message::Text(t) = m else { continue };
-                    match serde_json::from_str::<RunnerToAgent>(&t).unwrap() {
-                        RunnerToAgent::Hello(h) => {
-                            hello_epoch = h.epoch;
-                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
-                            wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
-                        }
-                        RunnerToAgent::Events { events, .. } => {
-                            let _ = seen_tx.send((conn, hello_epoch, events.iter().map(|e| e.epoch).collect()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-        let rt = Runtime::new(Config { batch_interval: Duration::from_millis(20), tail_interval: Duration::from_millis(50), ..Config::default() });
-        rt.host_token.send_replace(Some(Secret("tok".into())));
-        let (ctx, _crx) = mpsc::unbounded_channel();
-        let (otx, orx) = mpsc::unbounded_channel();
-        let agent = Agent::new(AgentId("agt_e".into()), Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
-        let transcript = std::env::temp_dir().join(format!("nest-epoch-test-{}.jsonl", uuid::Uuid::new_v4().simple()));
-        let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
-
-        agent.emit(AgentEventBody::StateChanged { state: AgentState::Working, detail: None });
-        assert_eq!(next_batch(&mut seen_rx).await, (0, Epoch(1), vec![Epoch(1)]));
-
-        assert!(agent.adopt_epoch(Epoch(2)), "a newer epoch is adopted");
-        assert!(!agent.adopt_epoch(Epoch(1)), "an older one changes nothing");
-        assert_eq!(agent.epoch(), Epoch(2));
-        // The unacked batch comes again on the new connection, under its epoch.
-        assert_eq!(next_batch(&mut seen_rx).await, (1, Epoch(2), vec![Epoch(2)]));
     }
 }

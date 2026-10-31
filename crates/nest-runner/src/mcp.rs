@@ -28,7 +28,7 @@ pub fn hands_tools() -> &'static [McpToolDef] {
 /// Whether the agent may list and call hands: any agent with a bound sandbox, whatever its
 /// template (there are no roles in the platform; `docs/agents/`). The one check for both.
 fn has_hands(agent: &Agent) -> bool {
-    agent.inner.lock().unwrap().hands.is_some()
+    agent.hands.is_some()
 }
 
 /// Tools for an agent right now.
@@ -69,7 +69,6 @@ async fn connection(rt: Arc<Runtime>, stream: UnixStream) {
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<McpBridgeResponse>();
     let _ = tx.send(McpBridgeResponse::HelloAck { v: 1 });
-    let mut changed = agent.tools_changed.subscribe();
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             if framing::write_host(&mut wr, &m).await.is_err() {
@@ -78,39 +77,29 @@ async fn connection(rt: Arc<Runtime>, stream: UnixStream) {
         }
     });
     let inflight: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>> = Default::default();
-    loop {
-        tokio::select! {
-            r = framing::read_host::<_, McpBridgeRequest>(&mut rd) => {
-                let req = match r { Ok(Some(r)) => r, _ => break };
-                match req {
-                    McpBridgeRequest::Hello { .. } => {}
-                    McpBridgeRequest::ToolsList { id } => {
-                        let (rt, agent, tx) = (rt.clone(), agent.clone(), tx.clone());
-                        tokio::spawn(async move {
-                            let tools = list(&rt, &agent).await;
-                            let _ = tx.send(McpBridgeResponse::ToolsList { id, tools });
-                        });
-                    }
-                    McpBridgeRequest::ToolsCall { id, name, arguments, tool_use_id } => {
-                        let (cancel_tx, cancel_rx) = oneshot::channel();
-                        inflight.lock().unwrap().insert(id, cancel_tx);
-                        let (rt, agent, tx, inflight) = (rt.clone(), agent.clone(), tx.clone(), inflight.clone());
-                        tokio::spawn(async move {
-                            let resp = call(&rt, &agent, id, &name, arguments, tool_use_id, cancel_rx).await;
-                            inflight.lock().unwrap().remove(&id);
-                            let _ = tx.send(resp);
-                        });
-                    }
-                    McpBridgeRequest::Cancel { id } => {
-                        if let Some(c) = inflight.lock().unwrap().remove(&id) {
-                            let _ = c.send(());
-                        }
-                    }
-                }
+    while let Ok(Some(req)) = framing::read_host::<_, McpBridgeRequest>(&mut rd).await {
+        match req {
+            McpBridgeRequest::Hello { .. } => {}
+            McpBridgeRequest::ToolsList { id } => {
+                let (rt, agent, tx) = (rt.clone(), agent.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let tools = list(&rt, &agent).await;
+                    let _ = tx.send(McpBridgeResponse::ToolsList { id, tools });
+                });
             }
-            c = changed.recv() => {
-                if c.is_ok() {
-                    let _ = tx.send(McpBridgeResponse::ToolsChanged {});
+            McpBridgeRequest::ToolsCall { id, name, arguments, tool_use_id } => {
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                inflight.lock().unwrap().insert(id, cancel_tx);
+                let (rt, agent, tx, inflight) = (rt.clone(), agent.clone(), tx.clone(), inflight.clone());
+                tokio::spawn(async move {
+                    let resp = call(&rt, &agent, id, &name, arguments, tool_use_id, cancel_rx).await;
+                    inflight.lock().unwrap().remove(&id);
+                    let _ = tx.send(resp);
+                });
+            }
+            McpBridgeRequest::Cancel { id } => {
+                if let Some(c) = inflight.lock().unwrap().remove(&id) {
+                    let _ = c.send(());
                 }
             }
         }

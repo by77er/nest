@@ -76,7 +76,7 @@ pub async fn call(agent: &Arc<Agent>, call_id: String, op: HandsOp, cancel: ones
 /// Fetch the target in the background right after `agent_start`, so the SessionStart hook and
 /// the first tool call find it cached. Waits through `sandbox_not_ready` like a call would.
 pub fn prefetch_target(agent: Arc<Agent>) {
-    if agent.inner.lock().unwrap().hands.is_none() {
+    if agent.hands.is_none() {
         return;
     }
     tokio::spawn(async move {
@@ -302,17 +302,12 @@ async fn ensure_target(
     }
     let started = Instant::now();
     loop {
-        let seen_gen = agent.target_gen();
         let outcome = tokio::select! {
             r = agent.resolve_hands_target(budgets.resolve_timeout) => r,
             _ = &mut *cancel => return Err(ToolCallResult::error("interrupted")),
         };
         match outcome {
-            Ok(HandsResolveOutcome::Target(t)) => match agent.set_hands_target(t.clone(), seen_gen) {
-                Some(generation) => return Ok((t, generation)),
-                // The hands moved to another sandbox while this was in flight: ask again.
-                None => continue,
-            },
+            Ok(HandsResolveOutcome::Target(t)) => return Ok((t.clone(), agent.set_hands_target(t))),
             Ok(HandsResolveOutcome::Error { error, retry_after_ms }) if error.code == SANDBOX_NOT_READY && error.retryable => {
                 let wait = retry_after_ms.map(Duration::from_millis).unwrap_or(NOT_READY_RETRY);
                 let Some(wait) = capped(wait, started, budgets.not_ready, budgets.max_sleep) else {
@@ -801,8 +796,8 @@ mod tests {
     async fn a_refusal_does_not_drop_a_fresher_target_another_call_stored() {
         let (gw, _guest) = gateway_with_guest().await;
         let (agent, _) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
-        let stale_gen = agent.set_hands_target(gw.target(SBX, 3, AGENT), agent.target_gen()).unwrap();
-        let fresh_gen = agent.set_hands_target(gw.target(SBX, 4, AGENT), agent.target_gen()).unwrap();
+        let stale_gen = agent.set_hands_target(gw.target(SBX, 3, AGENT));
+        let fresh_gen = agent.set_hands_target(gw.target(SBX, 4, AGENT));
         agent.drop_target_if(stale_gen);
         assert_eq!(agent.hands_target().map(|(_, g)| g), Some(fresh_gen), "an old generation never drops a newer target");
         agent.drop_target_if(fresh_gen);
@@ -942,17 +937,6 @@ mod tests {
         assert!(r.is_error);
         assert!(text_of(&r).contains("hands unavailable"), "{r:?}");
         assert_eq!(*resolves.lock().unwrap(), 2, "a refused connect resolves again once");
-    }
-
-    #[tokio::test]
-    async fn a_resolve_answered_after_the_hands_changed_is_not_cached() {
-        let (gw, _guest) = gateway_with_guest().await;
-        let (agent, _) = agent_with_resolver(vec![]);
-        let seen = agent.target_gen();
-        // A later agent_start rebinds the brain to another sandbox while the resolve is in flight.
-        agent.set_hands(Some(HandsBinding { sandbox: SandboxId("sbx_other".into()), epoch: None }));
-        assert_eq!(agent.set_hands_target(gw.target(SBX, 4, AGENT), seen), None, "the old sandbox's target is not stored");
-        assert!(agent.hands_target().is_none());
     }
 
     #[tokio::test]

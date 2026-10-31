@@ -19,7 +19,7 @@ use nest_protocol::model::{
 use serde_json::Value;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -82,7 +82,7 @@ impl Runtime {
     pub fn register(&self, a: Arc<Agent>, fence_gen: u64) -> Result<(), Refused> {
         let mut r = self.agents.lock().unwrap();
         // A fence of every brain (lease lapse, nestd gone) since this start arrived: it never runs.
-        if r.fence_gen != fence_gen || r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch().0) {
+        if r.fence_gen != fence_gen || r.tombstones.get(&a.id).is_some_and(|k| *k >= a.epoch.0) {
             return Err(Refused::Killed);
         }
         if let Some(existing) = r.agents.get(&a.id) {
@@ -99,7 +99,7 @@ impl Runtime {
         if r.agents.get(&a.id).is_some_and(|cur| Arc::ptr_eq(cur, a)) {
             r.agents.remove(&a.id);
         }
-        a.epoch()
+        a.epoch
     }
 
     /// A kill for `agent` at agent epoch `epoch` (`agent_stop{kill, epoch}`): raise its tombstone,
@@ -109,7 +109,7 @@ impl Runtime {
         let mut r = self.agents.lock().unwrap();
         let k = r.tombstones.entry(agent.clone()).or_insert(epoch.0);
         *k = (*k).max(epoch.0);
-        r.agents.get(agent).filter(|a| a.epoch() <= epoch).cloned()
+        r.agents.get(agent).filter(|a| a.epoch <= epoch).cloned()
     }
 
     /// Whether a kill at or above `epoch` arrived for `agent`.
@@ -277,11 +277,6 @@ pub struct ResolveTimeout;
 /// Mutable per-agent state shared with hooks and the MCP bridge.
 #[derive(Debug, Default)]
 pub struct AgentInner {
-    /// The sandbox this agent's hands act in (its id, from `agent_start`); `None` = no hands.
-    /// Only whether and where: the sandbox's epoch comes from each target's binding claims, and
-    /// the brain's own (agent) epoch is [`Agent::epoch`]. A sandbox move changes neither this
-    /// nor the agent epoch; the next call finds the old target refused and resolves again.
-    pub hands: Option<HandsBinding>,
     /// The gateway target for those hands, fetched from AgentDO (`hands_resolve`) and dropped
     /// whenever a gateway refuses it, so the next call asks again.
     pub target: Option<HandsTarget>,
@@ -303,6 +298,12 @@ pub struct AgentInner {
 /// Handle to one agent.
 pub struct Agent {
     pub id: AgentId,
+    /// Fixed for the brain's life: a later start for this agent ends this brain, never adopts it.
+    pub epoch: Epoch,
+    /// The sandbox this agent's hands act in (its id, from `agent_start`); `None` = no hands.
+    /// Only whether and where: the sandbox's epoch comes from each target's binding claims. A
+    /// sandbox move changes neither; the next call finds the old target refused and resolves again.
+    pub hands: Option<HandsBinding>,
     pub config_dir: PathBuf,
     /// nestd connection generation this brain was started under.
     pub conn_gen: u64,
@@ -315,7 +316,6 @@ pub struct Agent {
     pub stopping: std::sync::atomic::AtomicBool,
     kill_reason: Mutex<Option<ExitReason>>,
     pub inner: Mutex<AgentInner>,
-    epoch: AtomicU64,
     cmd: mpsc::UnboundedSender<AgentCmd>,
     out: mpsc::UnboundedSender<Outbound>,
     pub pending_calls: Mutex<HashMap<CallId, oneshot::Sender<ToolOutcome>>>,
@@ -324,7 +324,6 @@ pub struct Agent {
     /// Held while one caller resolves the target, so N parallel first calls send one
     /// `hands_resolve` and the rest find the cached target.
     pub resolve_gate: tokio::sync::Mutex<()>,
-    pub tools_changed: broadcast::Sender<()>,
     /// In-flight hands calls (bridge-scoped key → cancel), cancelled on hard interrupt.
     pub hands_inflight: Mutex<HashMap<String, oneshot::Sender<()>>>,
     event_seq: AtomicU64,
@@ -348,30 +347,26 @@ impl Agent {
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
+            epoch,
+            hands,
             config_dir,
             conn_gen,
             pid: AtomicU32::new(0),
             cancel: CancellationToken::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
             kill_reason: Mutex::new(None),
-            inner: Mutex::new(AgentInner { hands, session, ..Default::default() }),
-            epoch: AtomicU64::new(epoch.0),
+            inner: Mutex::new(AgentInner { session, ..Default::default() }),
             cmd,
             out,
             pending_calls: Mutex::new(HashMap::new()),
             pending_lists: Mutex::new(HashMap::new()),
             pending_resolves: Mutex::new(HashMap::new()),
             resolve_gate: tokio::sync::Mutex::new(()),
-            tools_changed: broadcast::channel(8).0,
             hands_inflight: Mutex::new(HashMap::new()),
             event_seq: AtomicU64::new(0),
             call_n: AtomicU64::new(0),
             secrets,
         })
-    }
-
-    pub fn epoch(&self) -> Epoch {
-        Epoch(self.epoch.load(Ordering::SeqCst))
     }
 
     pub fn command(&self, c: AgentCmd) {
@@ -419,35 +414,7 @@ impl Agent {
 
     pub fn emit_with_turn(&self, body: AgentEventBody, turn: Option<TurnId>) {
         let seq = nest_protocol::model::Seq(self.event_seq.fetch_add(1, Ordering::SeqCst) + 1);
-        self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch(), seq, ts_ms: now_ms(), turn, body }));
-    }
-
-    /// Set the hands (a later `agent_start` for this live brain). Another sandbox drops the
-    /// cached target and bumps its generation, so a resolve in flight for the old sandbox can't
-    /// store its answer over the new one; MCP clients are told the tool list changed.
-    pub fn set_hands(&self, hands: Option<HandsBinding>) {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.hands.as_ref().map(|h| &h.sandbox) != hands.as_ref().map(|h| &h.sandbox) {
-                inner.target = None;
-                inner.target_gen += 1;
-            }
-            inner.hands = hands;
-        }
-        let _ = self.tools_changed.send(());
-    }
-
-    /// Adopt the agent epoch of a later `agent_start` for this live brain: AgentDO issued a new
-    /// one and fences the old, so the session channel re-handshakes with it. Epochs only grow:
-    /// an older one (a command overtaken by a newer start) changes nothing. Returns whether
-    /// the epoch changed.
-    pub fn adopt_epoch(&self, epoch: Epoch) -> bool {
-        let prev = self.epoch.fetch_max(epoch.0, Ordering::SeqCst);
-        if epoch.0 > prev {
-            self.send_out(Outbound::Reconnect);
-            return true;
-        }
-        false
+        self.send_out(Outbound::Event(AgentEvent { agent: self.id.clone(), epoch: self.epoch, seq, ts_ms: now_ms(), turn, body }));
     }
 
     /// The cached gateway target with its generation, if a `hands_resolve` has answered since
@@ -462,22 +429,12 @@ impl Agent {
         inner.target.clone().map(|t| (t, inner.target_gen))
     }
 
-    /// Cache a target; returns its generation. `None` (nothing cached) when the hands changed
-    /// since `seen_gen` was read: the answer was for the previous sandbox.
-    pub fn set_hands_target(&self, target: HandsTarget, seen_gen: u64) -> Option<u64> {
+    /// Cache a target; returns its generation.
+    pub fn set_hands_target(&self, target: HandsTarget) -> u64 {
         let mut inner = self.inner.lock().unwrap();
-        if inner.target_gen != seen_gen {
-            return None;
-        }
         inner.target_gen += 1;
         inner.target = Some(target);
-        Some(inner.target_gen)
-    }
-
-    /// The target generation now (read before a `hands_resolve`, passed to
-    /// [`Agent::set_hands_target`]).
-    pub fn target_gen(&self) -> u64 {
-        self.inner.lock().unwrap().target_gen
+        inner.target_gen
     }
 
     /// Forget the target a call was using (a gateway refused it, or the sandbox moved mid-call),

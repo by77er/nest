@@ -107,7 +107,7 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
         // An exit this runner reports at an agent epoch means no brain of the agent at or below it
         // runs here any more (AgentDO releases the brain on it): a start that never runs reports
         // its exit only once any older brain has gone.
-        let older_gone = |rt: &Runtime| rt.agent(&id).is_none_or(|a| a.epoch() > epoch);
+        let older_gone = |rt: &Runtime| rt.agent(&id).is_none_or(|a| a.epoch > epoch);
         loop {
             match rt.register(agent.clone(), fence_gen) {
                 Ok(()) => break,
@@ -121,15 +121,15 @@ pub fn start(rt: Arc<Runtime>, start: AgentStart) {
                     rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
                     return;
                 }
-                Err(Refused::Running(existing)) if existing.epoch() == epoch => {
+                Err(Refused::Running(existing)) if existing.epoch == epoch => {
                     // The same start again (a duplicate): a no-op; the brain runs on (N22).
                     tracing::warn!(agent = %id, epoch = epoch.0, "duplicate agent_start for the registered brain: ignored");
                     return;
                 }
-                Err(Refused::Running(existing)) if existing.epoch() > epoch => {
+                Err(Refused::Running(existing)) if existing.epoch > epoch => {
                     // A newer brain is registered: this start is stale (N18). It never runs, never
                     // ends the newer brain, and its exit says so at its own epoch.
-                    tracing::warn!(agent = %id, epoch = epoch.0, running = existing.epoch().0, "agent_start older than the registered brain: refused");
+                    tracing::warn!(agent = %id, epoch = epoch.0, running = existing.epoch.0, "agent_start older than the registered brain: refused");
                     rt.report_for(&agent, RunnerEvent::AgentExited { agent: id, code: None, signal: None, reason: ExitReason::Fenced, epoch: Some(epoch) });
                     return;
                 }
@@ -175,7 +175,7 @@ async fn refuse_superseding(rt: &Arc<Runtime>, id: &nest_protocol::model::AgentI
         old.stopping.store(true, Ordering::SeqCst);
         old.kill_now(ExitReason::Stopped);
     }
-    while rt.agent(id).is_some_and(|a| a.epoch() <= epoch) {
+    while rt.agent(id).is_some_and(|a| a.epoch <= epoch) {
         tokio::time::sleep(DYING_POLL).await;
     }
     rt.report(RunnerEvent::AgentExited { agent: id.clone(), code: None, signal: None, reason, epoch: Some(epoch) });

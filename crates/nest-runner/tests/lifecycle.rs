@@ -120,7 +120,7 @@ async fn a_start_never_runs_beside_or_adopts_a_registered_brain() {
     nest_runner::supervisor::handle(&e.rt, start_at(e.dir.path(), "agt_dup", 2));
     wait_for(&e.rt, "the first brain gone", || !alive(pid)).await;
     wait_for(&e.rt, "a new brain registered", || e.rt.agent(&id).is_some_and(|a| !Arc::ptr_eq(&a, &first))).await;
-    assert_eq!(first.epoch(), nest_protocol::model::Epoch(1), "never adopted");
+    assert_eq!(first.epoch, nest_protocol::model::Epoch(1), "never adopted");
     assert!(pids(e.dir.path()).iter().filter(|p| alive(**p)).count() <= 1, "never two at once");
     let evs = events(&e.rt, Duration::from_millis(500)).await;
     assert!(exits_at(&evs).iter().any(|x| x.1 == Some(1)), "{evs:?}");
@@ -383,7 +383,7 @@ async fn an_older_start_never_ends_a_newer_brain() {
     let evs = events(&e.rt, Duration::from_millis(800)).await;
     assert!(exits_at(&evs).contains(&(ExitReason::Fenced, Some(1))), "{evs:?}");
     assert!(alive(pid), "the newer brain was ended");
-    assert_eq!(e.rt.agent(&id).expect("registered").epoch(), nest_protocol::model::Epoch(2));
+    assert_eq!(e.rt.agent(&id).expect("registered").epoch, nest_protocol::model::Epoch(2));
     e.rt.kill_all(ExitReason::Fenced);
 }
 

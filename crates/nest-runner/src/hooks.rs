@@ -267,7 +267,7 @@ async fn session_start(rt: &Runtime, agent: &Arc<Agent>, input: &Value) -> HookO
             None => tracing::warn!(agent = %agent.id, path = p, "ignoring a transcript_path outside the agent's config dir"),
         }
     }
-    if agent.inner.lock().unwrap().hands.is_none() {
+    if agent.hands.is_none() {
         return HookOutput::default();
     }
     let op = match hands::op_from_mcp(
