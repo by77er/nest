@@ -28,13 +28,13 @@ Inventory for modelling: per-(sandbox, epoch) state on a sandbox host, `Fenced` 
 | VmStart | boot | not fenced (checked before the await) | `clean := false`; write meta **before** `vm.start` | `:1541-1560` |
 | Running | create | `set_state` refuses leaving `Fenced` | `dirty := true`; `prune_below(s, e)` | `:1472-1480`, `:674-692` |
 | CreateFail | create | not fenced | `Failed`; teardown; delete dirs (via `.del`) | `:1482-1488` |
-| Suspend | executor | `check_epoch` | pause (`paused := true`), commit; `Committed ⇒ clean := vm none ∨ paused` | `:1661-1711`, `:2155` |
-| Resume | executor | `Suspended`, not fenced | `clean := false`, write meta **before** resuming | `:1713-1771` |
-| Checkpoint | executor | — | pause the VM (`paused` untouched, so `clean` stays false); commit; resume if not fenced; `dirty := true` | `:1773-1797` |
+| Suspend | executor | `lock_live` (epoch and fence checked before and after the lock) | pause (`paused := true`), commit; `Committed ⇒ clean := vm none ∨ paused`; any failure: unless fenced, `clean := false` (meta written), resume, `Running` | `:1661-1711`, `:2155` |
+| Resume | executor | `Suspended`, `lock_live` | `clean := false`, write meta **before** resuming | `:1713-1771` |
+| Checkpoint | executor | `lock_live` | pause the VM (`paused` untouched, so `clean` stays false); commit; resume if not fenced; `dirty := true` | `:1773-1797` |
 | Fence | any (command, self-fence, rejection, reconcile) | row is `(e, ¬Fenced)` | under the summary lock `state := Fenced`; fence brains; lock-free pause; `tomb ⊔= e`; proxy `Drop(Fence)`; gateway forget; report; then under the Sbx lock stop the VM and drop the netns; retire when `salvage` is set | `:1110-1159` |
 | Retire | spawned once per Sbx (`retiring`) | — | loop while `(¬clean ∨ unanswered) ∧ state_dir exists` (`may_hold_work`, read under the Sbx lock): commit(salvage). Landed, or nothing to commit, or a non-retryable error: break. Retryable or `parent_mismatch`: sleep 1 s doubling to 5 min. Then delete dirs; if not destroyed meanwhile, `row(e).dirty := false` and emit `incarnation_retired(s, e)` | `:1176-1220`, `:62-63`, `:2216-2218` |
 | Destroy | executor | row epoch ≤ e | `Destroyed`; teardown (removes row and map entry); delete every dir ≤ e; `prune_up_to(s, e)` | `:1825-1846` |
-| Archive | executor | `check_epoch` | commit if `may_hold_work` or no head; delete dir; teardown | `:1799-1823` |
+| Archive | executor | `lock_live` | commit if `may_hold_work` or no head; delete dir; teardown | `:1799-1823` |
 
 ### Restart (Host::start, `host.rs:345-547`), strictly in this order
 
@@ -42,7 +42,7 @@ Inventory for modelling: per-(sandbox, epoch) state on a sandbox host, `Fenced` 
 2. Tear down `ns-sbx_*` netns, sweep VM dirs (`:389-398`).
 3. `scan`: remove stray files, `*.del`, non-epoch dirs, dirs with missing or invalid-JSON `meta.json`, and a meta naming another incarnation. Keep, and never retire, a dir whose meta has another version or an I/O error (`recovery.rs:111-160`).
 4. `clean ∧ unanswered = none` ⇒ delete unreported (`host.rs:402-408`). Otherwise build a row `(e, Fenced, dirty=true)` keyed by sandbox (the newest epoch wins, since the scan sorts), `tomb.fence(s, e)` for every found epoch (`:466-487`).
-5. Start the links, the fleet (the hello reports the `Fenced` rows) and `retire(entry, dirty=true)` for each found incarnation; its commit queues behind the hello (`:520-547`).
+5. Start the links, the fleet (the hello reports the `Fenced` rows) and `retire(entry)` for each found incarnation (its meta's `clean` decides the salvage); its commit queues behind the hello (`:520-547`).
 
 ### FleetDO stale incarnations (`fleet.ts:822-913`, `:996-1015`, `:1113-1119`)
 

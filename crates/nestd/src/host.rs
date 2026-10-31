@@ -230,6 +230,10 @@ impl Sbx {
     }
 }
 
+/// An incarnation's heavy state, locked. Owned, so a commit can unlock it while it waits for the
+/// answer and lock it again.
+type SbxGuard = tokio::sync::OwnedMutexGuard<Sbx>;
+
 /// Lock-free pause handles of running VMs, one per incarnation: a late step of an older epoch (its
 /// fence task, queued behind a long salvage) never takes a newer epoch's handle.
 #[derive(Default)]
@@ -1270,7 +1274,7 @@ impl Inner {
     }
 
     async fn retire_now(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>) {
-        let mut s = entry.lock().await;
+        let mut s = entry.clone().lock_owned().await;
         if s.retiring {
             return;
         }
@@ -1279,7 +1283,7 @@ impl Inner {
         let mut backoff = incarnation::RETIRE_RETRY_FIRST;
         let salvage = s.may_hold_work();
         while salvage && s.state_dir.exists() {
-            let (s2, r) = self.commit(&entry, s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
+            let (s2, r) = self.commit(s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
             s = s2;
             match r {
                 Ok(Some(g)) => {
@@ -1296,7 +1300,7 @@ impl Inner {
                     drop(s);
                     tokio::time::sleep(backoff).await;
                     backoff = incarnation::retire_backoff(backoff);
-                    s = entry.lock().await;
+                    s = entry.clone().lock_owned().await;
                 }
             }
         }
@@ -1578,9 +1582,7 @@ impl Inner {
         match r {
             Ok(()) => {
                 self.with_row(&sandbox, epoch, |s| s.dirty = true);
-                if !self.set_state(&sandbox, epoch, SandboxState::Running, None, detail.clone()) {
-                    return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced during create", epoch.0), false));
-                }
+                self.transition(&sandbox, epoch, SandboxState::Running, None, detail.clone())?;
                 // A newer epoch runs here: the summary's epoch refuses older ones from now on, so
                 // their tombstone goes (never this epoch's, should a fence land right now).
                 self.tombstones.prune_below(&sandbox, epoch);
@@ -1765,24 +1767,33 @@ impl Inner {
         entry
     }
 
-    async fn locked(&self, id: &SandboxId, epoch: Epoch) -> Result<Arc<tokio::sync::Mutex<Sbx>>, ErrorBody> {
+    /// Lock `id@epoch`'s incarnation, refusing a stale or fenced epoch both before and after
+    /// waiting for the lock (a fence may land meanwhile).
+    async fn lock_live(&self, id: &SandboxId, epoch: Epoch) -> Result<SbxGuard, ErrorBody> {
         self.check_epoch(id, epoch)?;
-        self.sandbox(id).ok_or_else(|| error(error_codes::UNKNOWN_SANDBOX, format!("{id} is not on this host"), false))
+        let entry = self.sandbox(id).ok_or_else(|| error(error_codes::UNKNOWN_SANDBOX, format!("{id} is not on this host"), false))?;
+        let s = entry.lock_owned().await;
+        self.ensure_not_fenced(id, epoch)?;
+        Ok(s)
+    }
+
+    /// Move `id@epoch` to `state`, or `stale_epoch` if it was fenced or superseded.
+    fn transition(&self, id: &SandboxId, epoch: Epoch, state: SandboxState, suspend_mode: Option<SuspendMode>, detail: Option<String>) -> Result<(), ErrorBody> {
+        if self.set_state(id, epoch, state, suspend_mode, detail) {
+            return Ok(());
+        }
+        Err(error(error_codes::STALE_EPOCH, format!("{id}@{} was fenced", epoch.0), false))
     }
 
     /// Suspend `id@epoch`, waiting at most `commit_timeout` for its commit's answer.
     async fn suspend(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, mode: SuspendMode, commit_timeout: Duration) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let s = entry.lock().await;
-        self.ensure_not_fenced(id, epoch)?;
+        let s = self.lock_live(id, epoch).await?;
         let state = self.summary.lock().expect("summary").get(id).map(|x| x.state);
         if state == Some(SandboxState::Suspended) {
             return Ok(Some(serde_json::json!({ "note": "already suspended" })));
         }
-        if !self.set_state(id, epoch, SandboxState::Suspending, Some(mode), None) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
-        }
-        let (mut s, r) = self.suspend_commit(&entry, s, mode, commit_timeout).await;
+        self.transition(id, epoch, SandboxState::Suspending, Some(mode), None)?;
+        let (mut s, r) = self.suspend_commit(s, mode, commit_timeout).await;
         if let Err(e) = r {
             self.roll_back_suspend(&mut s, &e).await;
             return Err(e);
@@ -1797,20 +1808,12 @@ impl Inner {
         }
         // Not reachable until resumed: clients re-resolve once instead of retrying `busy`.
         self.gateway.forget(id);
-        if !self.set_state(id, epoch, SandboxState::Suspended, Some(mode), detail.clone()) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
-        }
+        self.transition(id, epoch, SandboxState::Suspended, Some(mode), detail.clone())?;
         Ok(detail.map(|d| serde_json::json!({ "note": d })))
     }
 
     /// Pause the VM, snapshot its memory (memory mode, where the driver can) and commit.
-    async fn suspend_commit<'a>(
-        self: &Arc<Self>,
-        entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
-        mut s: tokio::sync::MutexGuard<'a, Sbx>,
-        mode: SuspendMode,
-        commit_timeout: Duration,
-    ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<(), ErrorBody>) {
+    async fn suspend_commit(self: &Arc<Self>, mut s: SbxGuard, mode: SuspendMode, commit_timeout: Duration) -> (SbxGuard, Result<(), ErrorBody>) {
         if let Some(g) = &s.guest {
             let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
         }
@@ -1830,7 +1833,7 @@ impl Inner {
                 }
             }
         }
-        let (s, r) = self.commit(entry, s, CommitReason::Suspend, mem, commit_timeout).await;
+        let (s, r) = self.commit(s, CommitReason::Suspend, mem, commit_timeout).await;
         (s, r.map(|_| ()))
     }
 
@@ -1863,9 +1866,7 @@ impl Inner {
     }
 
     async fn resume(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
-        self.ensure_not_fenced(id, epoch)?;
+        let mut s = self.lock_live(id, epoch).await?;
         let state = self.summary.lock().expect("summary").get(id).map(|x| x.state);
         if state == Some(SandboxState::Running) {
             return Ok(Some(serde_json::json!({ "note": "already running" })));
@@ -1895,15 +1896,12 @@ impl Inner {
             x.dirty = true;
             x.guest = guest;
         });
-        if !self.set_state(id, epoch, SandboxState::Running, None, None) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced during resume"), false));
-        }
+        self.transition(id, epoch, SandboxState::Running, None, None)?;
         Ok(None)
     }
 
     async fn checkpoint(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: CommitReason) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
+        let mut s = self.lock_live(id, epoch).await?;
         let running = s.vm.is_some() && !s.paused;
         // TODO(ublk): epoch-flip CoW cut instead of pausing for the whole chunking pass.
         if let Some(g) = &s.guest {
@@ -1912,7 +1910,7 @@ impl Inner {
         if running {
             s.vm.as_mut().expect("checked").pause().await.map_err(internal)?;
         }
-        let (mut s, r) = self.commit(&entry, s, reason, None, self.cfg.commit_timeout()).await;
+        let (mut s, r) = self.commit(s, reason, None, self.cfg.commit_timeout()).await;
         // Never resume a VM that was fenced while the commit was in flight.
         if running && !self.fenced(id, epoch) {
             if let Some(vm) = s.vm.as_mut() {
@@ -1928,26 +1926,21 @@ impl Inner {
     }
 
     async fn archive(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
         {
-            let mut s = entry.lock().await;
-            if !self.set_state(id, epoch, SandboxState::Archiving, None, None) {
-                return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
-            }
+            let mut s = self.lock_live(id, epoch).await?;
+            self.transition(id, epoch, SandboxState::Archiving, None, None)?;
             if s.may_hold_work() || s.head.is_none() {
                 if let Some(vm) = s.vm.as_mut() {
                     let _ = vm.pause().await;
                 }
-                let (s2, r) = self.commit(&entry, s, CommitReason::Archive, None, self.cfg.commit_timeout()).await;
+                let (s2, r) = self.commit(s, CommitReason::Archive, None, self.cfg.commit_timeout()).await;
                 s = s2;
                 r?;
             }
             self.ensure_not_fenced(id, epoch)?;
             recovery::remove_incarnation(&s.state_dir);
         }
-        if !self.set_state(id, epoch, SandboxState::Archived, None, None) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
-        }
+        self.transition(id, epoch, SandboxState::Archived, None, None)?;
         self.teardown(id, DropReason::Teardown).await;
         Ok(None)
     }
@@ -1986,9 +1979,8 @@ impl Inner {
         mode: ForkMode,
         policy: EgressPolicy,
     ) -> CmdResult {
-        let entry = self.locked(parent, parent_epoch).await?;
         let (image, resources) = {
-            let s = entry.lock().await;
+            let s = self.lock_live(parent, parent_epoch).await?;
             (s.image.clone(), s.resources)
         };
         let generation = self
@@ -1997,7 +1989,7 @@ impl Inner {
             .and_then(|v| v.get("generation").cloned())
             .ok_or_else(|| error(error_codes::INTERNAL, "fork: parent commit produced no generation", true))?;
         let gen_id: GenerationId = serde_json::from_value(generation).map_err(internal)?;
-        let record = entry.lock().await.head.clone().filter(|h| h.id == gen_id).ok_or_else(|| error(error_codes::INTERNAL, "fork: head moved", true))?;
+        let record = self.lock_live(parent, parent_epoch).await?.head.clone().filter(|h| h.id == gen_id).ok_or_else(|| error(error_codes::INTERNAL, "fork: head moved", true))?;
         let fork = ForkIdentity { new_sandbox_id: child.clone(), hostname: hostname(&child), machine_id: crate::guest::new_machine_id() };
         let mut r = self.create_sandbox(child, child_workstream, child_epoch, image, resources, policy, Some(record), Some(fork)).await?;
         if matches!(mode, ForkMode::Live) {
@@ -2007,8 +1999,7 @@ impl Inner {
     }
 
     async fn policy_update(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, policy: EgressPolicy) -> CmdResult {
-        let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
+        let mut s = self.lock_live(id, epoch).await?;
         if s.policy.as_ref().is_some_and(|p| policy.version <= p.version) {
             return Ok(Some(serde_json::json!({ "note": "stale policy version ignored" })));
         }
@@ -2070,9 +2061,7 @@ impl Inner {
     /// The sandbox side of `attach`: a slot (explicit proxy listener + guest `agent_attach`) for
     /// the agent, then the gateway learns the client. Idempotent: an existing slot keeps its port.
     async fn agent_attach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, cwd: Option<String>) -> CmdResult {
-        let entry = self.locked(sandbox, epoch).await?;
-        let mut s = entry.lock().await;
-        self.ensure_not_fenced(sandbox, epoch)?;
+        let mut s = self.lock_live(sandbox, epoch).await?;
         let slot = match s.slots.get(agent) {
             Some((slot, _)) => *slot,
             None => {
@@ -2098,6 +2087,7 @@ impl Inner {
         self.gateway_sync(&s);
         // The guest round trip (up to 30 s) runs without the sandbox lock, so a fence, suspend or
         // checkpoint is never queued behind it.
+        let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
         drop(s);
         let attached = guest.attach(slot_for(agent, slot, cwd)).await;
         // Fenced meanwhile: the slot is moot and the answer is `stale_epoch`, whatever the guest said.
@@ -2133,8 +2123,7 @@ impl Inner {
     /// Remove an agent's slot (an unknown agent is `ok`); with `kill_processes`, its whole cgroup
     /// goes first. The gateway then refuses the agent's bindings.
     async fn agent_detach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, kill_processes: bool) -> CmdResult {
-        let entry = self.locked(sandbox, epoch).await?;
-        let mut s = entry.lock().await;
+        let mut s = self.lock_live(sandbox, epoch).await?;
         let Some((_, listener)) = s.slots.remove(agent) else {
             // Not ours, and not the guest connection's either (no stale slot is re-configured).
             if let Some(g) = &s.guest {
@@ -2184,20 +2173,13 @@ impl Inner {
     /// while waiting for `commit_result`**, then re-taken and returned with the result: a slow or
     /// partitioned control plane never blocks fencing, guest events or other commands on this
     /// sandbox.
-    async fn commit<'a>(
-        self: &Arc<Self>,
-        entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
-        mut s: tokio::sync::MutexGuard<'a, Sbx>,
-        reason: CommitReason,
-        mem: Option<PathBuf>,
-        timeout: Duration,
-    ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
+    async fn commit(self: &Arc<Self>, mut s: SbxGuard, reason: CommitReason, mem: Option<PathBuf>, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
         // An earlier commit's answer was lost (timed out), but SandboxDO may have moved its head:
         // ask again under the same request id (idempotent per id) and adopt the outcome, rather
         // than send a new request with a stale parent that is rejected and fences the sandbox.
         let mut answered = None;
         if let Some(prev) = s.unanswered.clone() {
-            let (s2, r) = self.send_commit(entry, s, prev.clone(), timeout).await;
+            let (s2, r) = self.send_commit(s, prev.clone(), timeout).await;
             s = s2;
             match r {
                 Ok(g) => answered = Some((prev, g)),
@@ -2219,18 +2201,12 @@ impl Inner {
         {
             return (s, Ok(g));
         }
-        self.send_commit(entry, s, c, timeout).await
+        self.send_commit(s, c, timeout).await
     }
 
     /// Send a `commit_request` and wait (unlocked) for its answer; a timeout keeps it as
     /// [`Sbx::unanswered`] for the next commit to ask again.
-    async fn send_commit<'a>(
-        self: &Arc<Self>,
-        entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
-        s: tokio::sync::MutexGuard<'a, Sbx>,
-        c: SentCommit,
-        timeout: Duration,
-    ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
+    async fn send_commit(self: &Arc<Self>, s: SbxGuard, c: SentCommit, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
         // Recorded before it goes out: a restart asks again under this id rather than send another.
         // Unrecorded, it doesn't go out (a crash would lose its id).
         if let Err(e) = s.persist(Some(&c)) {
@@ -2249,6 +2225,7 @@ impl Inner {
             reason: c.reason,
         });
         let id = s.id.clone();
+        let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
         drop(s);
         let outcome = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(o)) => Ok(o),
@@ -2257,7 +2234,7 @@ impl Inner {
                 Err(error(error_codes::INTERNAL, format!("commit {} timed out", c.request), true))
             }
         };
-        let mut s = entry.lock().await;
+        let mut s = entry.lock_owned().await;
         let r = match outcome {
             Ok(o) => {
                 if s.unanswered.as_ref().is_some_and(|u| u.request == c.request) {
