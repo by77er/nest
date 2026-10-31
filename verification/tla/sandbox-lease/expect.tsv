@@ -19,6 +19,7 @@ SandboxLease.tla MCMutNoEpochCheck.cfg violates:SingleWriter ci
 SandboxLease.tla MCMutHistory.cfg violates:SalvageNeverDropped ci
 # With the fixes modelled
 SandboxLease.tla MCFixedS2.cfg holds ci
+SandboxLease.tla MCFixedB2.cfg holds ci
 SandboxLease.tla MCFixedS1.cfg holds full
 SandboxLease.tla MCFixedS3.cfg holds full
 SandboxLease.tla MCFixedS4.cfg holds full

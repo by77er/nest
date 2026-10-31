@@ -136,17 +136,16 @@ export interface LaunchAttempt {
 
 export type ScaleUp =
   | { launch: LaunchAttempt[] }
-  | { launch: null; why: "launching" | "pending" | "at_max" };
+  | { launch: null; why: "pending" | "at_max" };
 
 /**
- * A host of one kind is needed and none can take the work: launch one, unless a launch of that
- * kind is in flight (`launching`) or launched and not yet enrolled (`pending`), or the kind is at
- * `max_hosts` (`live`: its active and STONITH-pending hosts; a draining one doesn't count). The
+ * A host of one kind is needed and none can take the work: launch one, unless one of that kind was
+ * launched and hasn't enrolled (`pending`; one still in flight is the caller's to skip), or the kind
+ * is at `max_hosts` (`live`: its active and STONITH-pending hosts; a draining one doesn't count). The
  * attempts: each instance type on spot (zones rotating with the second), then the first type on
  * demand.
  */
-export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, launching: boolean, nowMs: number): ScaleUp {
-  if (launching) return { launch: null, why: "launching" };
+export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, nowMs: number): ScaleUp {
   if (pending > 0) return { launch: null, why: "pending" };
   if (live >= s.max_hosts) return { launch: null, why: "at_max" };
   const zone = (i: number) => s.subnet_ids[(Math.floor(nowMs / 1000) + i) % s.subnet_ids.length]!;

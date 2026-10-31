@@ -12,6 +12,8 @@ What a model of FleetDO ↔ nestd ↔ EC2 ↔ Cloudflare needs: state, transitio
 
 > **Since** (checked on `main` at b63c0a3): B4 is fixed by #30: the tick expires any silent host, and one holding no lease at once (`expireSilent`), so a host terminated outside FleetDO stops counting toward `max_hosts`. #36 split hosts into two kinds (`sandbox` and `brain`, stored as `burst` and `controller` for one release); the `burst` rows below are today's sandbox hosts.
 
+> **Since** (refactor/all): every status write is one guarded transition, `hostStep` in `control-plane/src/lib/host-lifecycle.ts` (applied by `FleetDO.move`; deaths by `FleetDO.die` and `deathPlan`), with transitions named after H4-H12; nothing leaves `dead` (B3 fixed). A drain is kept in `hosts.drain_ms`, so H4 and H7 return a drained host to `draining` and H10 records a drain from any live status (B5 fixed). H7 never applies to a host whose instance FleetDO is terminating (EC2 and an instance id): only H8 ends its STONITH (owner decision 4). H6 applies to any kind. A launch is recorded before RunInstances and repeated with its client token until EC2 answers or `enroll_timeout_ms` passes; only demand plans a new one (B6 fixed). A token is rotated on every hello (B11 fixed). A heartbeat from a host that isn't `active`, `draining` or `stonith_pending` gets no ack, and H4 is written in the step that acks the hello.
+
 Design docs: [FleetDO](../../control-plane/durable-objects/fleet/), [autoscaling](../../compute/autoscaling/), [fleet channel](../../interfaces/control-host/fleet/), [enrollment](../../interfaces/control-host/enrollment/).
 
 ## 1. Scope, actors, state

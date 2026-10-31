@@ -486,6 +486,29 @@ describe("autoscaling", () => {
     expect(byToken.size).toBe(1);
   });
 
+  it("stops repeating a launch after the enroll timeout, and the tick launches nothing in its place", async () => {
+    const cell = uniqueCell();
+    // EC2 never answers (a timeout every time): whether an instance exists is unknown.
+    const ec2 = new MockEc2("running");
+    ec2.launch = async (spec: LaunchSpec) => {
+      ec2.launched.push(spec);
+      throw new Error("EC2 RunInstances: network connection lost");
+    };
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    await tickAt(cell, ec2);
+    expect(new Set(ec2.launched.map((l) => l.clientToken)).size).toBe(1);
+    // The attempt is older than enroll_timeout_ms: its token may no longer be honoured.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.at', 0) WHERE key LIKE 'launch:%'");
+    });
+    const before = ec2.launched.length;
+    await tickAt(cell, ec2);
+    // Dropped, and no new launch without demand: the waiting sandbox's next placement asks for one.
+    expect(ec2.launched).toHaveLength(before);
+    expect(await runInDurableObject(fleetStub(cell), (_i, state) => state.storage.sql.exec("SELECT 1 FROM kv WHERE key LIKE 'launch:%'").toArray().length)).toBe(0);
+  });
+
   it("terminates a launch that never enrolls, then launches again on demand", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("terminated");

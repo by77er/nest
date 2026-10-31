@@ -1,33 +1,44 @@
 ---------------------------- MODULE SandboxLease ----------------------------
 (***************************************************************************)
 (* The sandbox placement / lease / epoch / fencing / STONITH / salvage /   *)
-(* commit protocol of nest, as implemented on main (edf6829), for ONE      *)
-(* sandbox, one cell (FleetDO) and a small set of sandbox hosts (nestd).   *)
+(* commit protocol of nest, for ONE sandbox, one cell (FleetDO) and a     *)
+(* small set of sandbox hosts (nestd). Written against main (edf6829);     *)
+(* each switch's value on main is given first, and the code as refactored *)
+(* (refactor/all) is: FixDestroy, FixStonithFence, FixQueue TRUE; the rest *)
+(* as on main.                                                             *)
 (*                                                                         *)
 (* Every DO method is split at each `await` on another object; the steps  *)
 (* between awaits are atomic (DO input gate). Async continuations are      *)
 (* explicit records (sk, llIn); RPC requests/answers are message sets.     *)
 (*                                                                         *)
-(* Action -> code (control-plane/src/do/sandbox.ts = S, fleet.ts = F,      *)
-(* crates/nestd/src/host.rs = H, crates/nestd/src/fleet.rs = NF)           *)
-(*   PlaceStart          S:259-281 placeCurrentEpoch claim (epoch+1, marker)*)
-(*   ServePlaceGrant/Other F:1191-1259 place (idempotent per epoch, refuse *)
-(*                       other-epoch lease, candidates active+connected)   *)
-(*   ResumePlace         S:300-333 continuation; rollback S:312            *)
-(*   ReconcileStart/Resume S:220-252 reconcilePlacing via F:1268 leaseOf   *)
-(*   ServeLL             S:460-478 leaseLost (+ placeCurrentEpoch claim)   *)
-(*   DestroyStart/ServeRelease/ResumeDestroy S:507-519, F:1263             *)
-(*   DoCommit            S:552-605 commit CAS + salvage branch (S:575-585) *)
-(*   FleetEvent          F:992-1037 handleEvent (state, commit_request,    *)
-(*                       stonith fence result F:1099-1121, holderFenced    *)
-(*                       F:860)                                            *)
-(*   Expire              F:1304-1310 tick + F:1749 expireHost              *)
-(*   Ec2Terminate/PollStonith F:1749-1798; isDead lib/ec2.ts:45            *)
-(*   EnsureFence/StonithClear F:1805-1830                                  *)
-(*   ProcessReassign/ResumeLL F:1845-1876                                  *)
-(*   HbSend/HbRecv/AckRecv NF:310-320, F:941-956, NF:372-395 renew        *)
-(*   Connect             F:729-797 onHello + reconcileSandboxes F:822 +    *)
-(*                       dropUnreported F:804; NF:285 hello_ack renews     *)
+(* Action -> code. SandboxDO's decisions are the pure functions of        *)
+(* control-plane/src/lib/sandbox-lease.ts (L); the shells are methods of   *)
+(* SandboxDO (S, do/sandbox.ts) and FleetDO (F, do/fleet.ts); nestd is     *)
+(* crates/nestd/src/host.rs (H) and fleet.rs (NF). Line numbers (S:n,    *)
+(* F:n, H:n) in the comments below are main's (edf6829).                  *)
+(*   PlaceStart          L claim; S placeCurrentEpoch, alarm `place`       *)
+(*                       (L placeWanted), wake, evicted, leaseLost         *)
+(*   ServePlaceGrant/Other F place (idempotent per epoch, refuse other-    *)
+(*                       epoch lease and a destroyed sandbox, candidates   *)
+(*                       active+connected; L pickSandboxHost)              *)
+(*   ResumePlace         L placeAnswered (rollback: B1); S discardPlacement*)
+(*   ReconcileStart/Resume L reconcileAt, reconciled; S reconcilePlacing,  *)
+(*                       discardPlacement; F leaseOf                       *)
+(*   ServeLL             L leaseLost; S leaseLost (+ placeCurrentEpoch)    *)
+(*   DestroyStart/ServeRelease/ResumeDestroy L destroyed; S destroy;       *)
+(*                       F sandboxDestroyed, releaseLease                  *)
+(*   DoCommit            L decideCommit; S commit                          *)
+(*   FleetEvent          F handleEvent (state, commit_request, holderFenced*)
+(*                       onCommandResult -> stonithDoneIfClear)            *)
+(*   Expire              F tick (expiryVerdict) + expireHost               *)
+(*   Ec2Terminate/PollStonith F expireHost, pollStonith, confirmHostDead;  *)
+(*                       isDead lib/ec2.ts                                 *)
+(*   EnsureFence/StonithClear F ensureStonithFence, stonithDoneIfClear,    *)
+(*                       hostStep in lib/host-lifecycle.ts                 *)
+(*   ProcessReassign/ResumeLL F queueReassign, processReassign            *)
+(*   HbSend/HbRecv/AckRecv NF:310-320, F onHeartbeat, NF:372-395 renew     *)
+(*   Connect             F onHello + reconcileSandboxes + dropUnreported;  *)
+(*                       NF:285 hello_ack renews                           *)
 (*   SelfFence           H:1056-1094 lease_watchdog / self_fence           *)
 (*   HostCmd             H:779-820 fence at once; H:1404-1490 create;      *)
 (*                       H:2150-2175 apply_commit; H:1176-1215 retire      *)
@@ -111,6 +122,12 @@ FenceEvs(r)     == IF r.st = "run" THEN <<Ev("fenced", r.e, 0, FALSE)>> ELSE <<>
 
 Cands == {c \in Hosts : status[c] = "active" /\ connected[c]}
 Answer(k, v, h, l) == IF k \in sk THEN ans \cup {Ans(k, v, h, l)} ELSE ans
+\* releaseLease for epoch e (0: every epoch, as destroy asks).
+Release(k, e) == [t |-> "release", k |-> k, e |-> e]
+\* discardPlacement (FixDestroy): a lease a continuation finds granted at e to a destroyed sandbox
+\* is released, and the VM sent with it destroyed when its host is known (h # None).
+DiscardReq(e)     == req \cup {Release(K("discard", e, 0, 0, NoQ), e)}
+DiscardCmds(h, e) == IF h # None THEN [cmds EXCEPT ![h] = Append(@, Cmd("destroy", e, 0, "", ""))] ELSE cmds
 LLAnswer(q, ok)    == IF q \in llIn THEN llAns \cup {[q |-> q, ok |-> ok]} ELSE llAns
 \* reassign_queue: PRIMARY KEY sandbox, INSERT OR IGNORE (F:1849-1850): a second loss of the
 \* sandbox while a row is queued is dropped. The fix keys rows by (sandbox, host, epoch).
@@ -181,7 +198,11 @@ ResumePlace(a) ==
         /\ sk' = sk \ {k}
         /\ ans' = ans \ {a}
         /\ llAns' = IF k.ll # NoQ THEN LLAnswer(k.ll, ~(fail \/ refused)) ELSE llAns
-  /\ UNCHANGED <<sHead, sStored, fleetVars, hostVars, hostEv, cmds, req, llReq, ghostVars>>
+        \* Fixed: destroyed meanwhile (`placeAnswered` is "stale"): what it may have got is discarded.
+        /\ LET discard == FixDestroy /\ sDestroyed /\ (got \/ fail) IN
+           /\ req' = IF discard THEN DiscardReq(k.e) ELSE req
+           /\ cmds' = IF discard /\ got THEN DiscardCmds(a.h, k.e) ELSE cmds
+  /\ UNCHANGED <<sHead, sStored, fleetVars, hostVars, hostEv, llReq, ghostVars>>
 
 \* reconcilePlacing (S:220-229): only once the marker is stale (60 s); unless DelayedRpc,
 \* by then the place request has been delivered and its call has ended (answered, lost, reset).
@@ -209,7 +230,11 @@ ResumeReconcile(a) ==
         /\ sDestroyed' = IF adopt THEN FALSE ELSE sDestroyed
         /\ sk' = sk \ {k}
         /\ ans' = ans \ {a}
-  /\ UNCHANGED <<sEpoch, sHead, sStored, fleetVars, hostVars, hostEv, cmds, req, llReq, llAns, ghostVars>>
+        \* Fixed: destroyed meanwhile (`reconciled` is "gone"): a lease at the epoch is discarded.
+        /\ LET discard == FixDestroy /\ sDestroyed /\ a.v # "fail" /\ L.h # None /\ L.e = k.e IN
+           /\ req' = IF discard THEN DiscardReq(k.e) ELSE req
+           /\ cmds' = IF discard THEN DiscardCmds(L.h, k.e) ELSE cmds
+  /\ UNCHANGED <<sEpoch, sHead, sStored, fleetVars, hostVars, hostEv, llReq, llAns, ghostVars>>
 
 \* leaseLost (S:460-478), called by FleetDO's reassign queue.
 ServeLL(q) ==
@@ -233,16 +258,20 @@ ServeLL(q) ==
              /\ UNCHANGED <<sHead, sHist, sDestroyed, sStored>>
   /\ UNCHANGED <<fleetVars, hostVars, hostEv, cmds, ans, ghostVars>>
 
-\* destroy (S:507-519): command to the host, await releaseLease, then mark destroyed.
+\* destroy: command to the host, await releaseLease (all epochs), then mark destroyed. Fixed
+\* (FixDestroy, `SandboxDO.destroy` + `lease.destroyed`): destroyed, unplaced and no marker before
+\* the first await; FleetDO is told first (`sandboxDestroyed`), so it grants nothing afterwards.
 DestroyStart ==
   /\ ~sDestroyed /\ budget.destroy < MaxDestroy /\ ~\E k \in sk : k.kind = "destroy"
   /\ LET k == K("destroy", 0, 0, 0, NoQ) IN
      /\ sk' = sk \cup {k}
-     /\ req' = req \cup {[t |-> "release", k |-> k]}
+     /\ req' = req \cup {Release(k, 0)}
   /\ cmds' = IF sHost # None THEN [cmds EXCEPT ![sHost] = Append(@, Cmd("destroy", sEpoch, 0, "", ""))] ELSE cmds
   /\ sDestroyed' = IF FixDestroy THEN TRUE ELSE sDestroyed
+  /\ sHost' = IF FixDestroy THEN None ELSE sHost
+  /\ sPlacing' = IF FixDestroy THEN 0 ELSE sPlacing
   /\ budget' = [budget EXCEPT !.destroy = @ + 1]
-  /\ UNCHANGED <<sEpoch, sHost, sPlacing, sLost, sHead, sHist, sStored, fleetVars, hostVars,
+  /\ UNCHANGED <<sEpoch, sLost, sHead, sHist, sStored, fleetVars, hostVars,
                  hostEv, ans, llReq, llAns, granted, expiredG, settled, gens, nGen, nSend,
                  writerBad, stonithBad, salvageRefused, destroyedEver>>
 
@@ -345,8 +374,8 @@ ServeLeaseOf(r) ==
 ServeRelease(r) ==
   /\ r \in req /\ r.t = "release"
   /\ req' = req \ {r}
-  /\ lease' = NoLease
-  /\ fleetDestroyed' = TRUE
+  /\ lease' = IF r.e = 0 \/ lease.e = r.e THEN NoLease ELSE lease
+  /\ fleetDestroyed' = (fleetDestroyed \/ r.e = 0)
   /\ ans' = Answer(r.k, "ok", None, NoLease)
   /\ UNCHANGED <<sbxVars, status, silence, queue, fencePending, llIn, hostVars, hostEv, cmds,
                  llReq, llAns, ghostVars>>
@@ -368,8 +397,11 @@ FleetEvent(h) ==
                               hostVars, cmds, req, ans, llReq, llAns, granted, expiredG, gens, nGen,
                               nSend, writerBad, stonithBad, salvageRefused, destroyedEver, budget>>
           [] ev.t = "fres" ->
-               \* stonith_fence ok (F:1105-1117): active again first, then reassign.
-               /\ status' = IF status[h] = "stonith" /\ connected[h] THEN [status EXCEPT ![h] = "active"] ELSE status
+               \* stonith_fence ok (`onCommandResult` -> `stonithDoneIfClear`): active again first
+               \* (never once FleetDO asked EC2 to terminate the instance, as in StonithClear), then
+               \* reassign.
+               /\ status' = IF status[h] = "stonith" /\ connected[h] /\ ec2[h] = "running"
+                            THEN [status EXCEPT ![h] = "active"] ELSE status
                /\ settled' = IF lease.h = h THEN settled \cup {[e |-> lease.e, h |-> h]} ELSE settled
                /\ queue' = QueueAdd(h, FALSE)
                /\ fencePending' = [fencePending EXCEPT ![h] = FALSE]
