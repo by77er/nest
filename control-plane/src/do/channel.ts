@@ -695,8 +695,10 @@ export class ChannelDO extends DurableObject<Env> {
       }
       const refs = doomed.map((d) => d.body_ref).filter((r): r is string => r !== null);
       for (const c of chunks(refs, R2_DELETE_MAX)) await this.env.BUCKET.delete(c);
-      const last = doomed[doomed.length - 1]!.seq;
-      this.sql.exec("DELETE FROM messages WHERE ts_ms < ? AND seq <= ? AND seq NOT IN (SELECT seq FROM keys)", cutoff, last);
+      // The page's own rows, not the predicate again: a key superseded during the delete would match
+      // it now, and go without its body. A paged row can't have come back into `keys` (a key only ever
+      // moves to a newer seq).
+      this.sql.exec("DELETE FROM messages WHERE seq IN (SELECT value FROM json_each(?))", JSON.stringify(doomed.map((d) => d.seq)));
     }
     // Tiering: bodies older than 7 days to R2, the row keeps the reference.
     const old = this.sql.exec<{ seq: number; text: string | null; data: string | null }>(
