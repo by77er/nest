@@ -1445,7 +1445,7 @@ impl Inner {
             CommandBody::SandboxCreate { sandbox, workstream, epoch, image, resources, policy, from } => {
                 self.create_sandbox(sandbox, workstream, epoch, image, resources, policy, from, None).await
             }
-            CommandBody::SandboxSuspend { sandbox, epoch, mode } => self.suspend(&sandbox, epoch, mode).await,
+            CommandBody::SandboxSuspend { sandbox, epoch, mode } => self.suspend(&sandbox, epoch, mode, self.cfg.commit_timeout()).await,
             CommandBody::SandboxResume { sandbox, epoch } => self.resume(&sandbox, epoch).await,
             CommandBody::SandboxArchive { sandbox, epoch } => self.archive(&sandbox, epoch).await,
             CommandBody::SandboxCheckpoint { sandbox, epoch, reason } => self.checkpoint(&sandbox, epoch, reason).await,
@@ -1760,7 +1760,8 @@ impl Inner {
         self.sandbox(id).ok_or_else(|| error(error_codes::UNKNOWN_SANDBOX, format!("{id} is not on this host"), false))
     }
 
-    async fn suspend(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, mode: SuspendMode) -> CmdResult {
+    /// Suspend `id@epoch`, waiting at most `commit_timeout` for its commit's answer.
+    async fn suspend(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, mode: SuspendMode, commit_timeout: Duration) -> CmdResult {
         let entry = self.locked(id, epoch).await?;
         let s = entry.lock().await;
         self.ensure_not_fenced(id, epoch)?;
@@ -1771,7 +1772,7 @@ impl Inner {
         if !self.set_state(id, epoch, SandboxState::Suspending, Some(mode), None) {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
         }
-        let (mut s, r) = self.suspend_commit(&entry, s, mode).await;
+        let (mut s, r) = self.suspend_commit(&entry, s, mode, commit_timeout).await;
         if let Err(e) = r {
             self.roll_back_suspend(&mut s, &e).await;
             return Err(e);
@@ -1798,6 +1799,7 @@ impl Inner {
         entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
         mut s: tokio::sync::MutexGuard<'a, Sbx>,
         mode: SuspendMode,
+        commit_timeout: Duration,
     ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<(), ErrorBody>) {
         if let Some(g) = &s.guest {
             let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
@@ -1818,7 +1820,7 @@ impl Inner {
                 }
             }
         }
-        let (s, r) = self.commit(entry, s, CommitReason::Suspend, mem, self.cfg.commit_timeout()).await;
+        let (s, r) = self.commit(entry, s, CommitReason::Suspend, mem, commit_timeout).await;
         (s, r.map(|_| ()))
     }
 
@@ -2156,10 +2158,11 @@ impl Inner {
             .collect();
         let mut failed = vec![];
         for (id, epoch) in running {
+            // The deadline bounds the wait for each commit's answer. Never a cancellation: a
+            // suspend cancelled while it waits loses its unanswered record (and its rollback).
             let budget = Duration::from_millis((deadline_ms - now_ms()).max(0) as u64);
-            match tokio::time::timeout(budget, self.suspend(&id, epoch, SuspendMode::DiskOnly)).await {
-                Ok(Ok(_)) => {}
-                _ => failed.push(id.0),
+            if budget.is_zero() || self.suspend(&id, epoch, SuspendMode::DiskOnly, budget.min(self.cfg.commit_timeout())).await.is_err() {
+                failed.push(id.0);
             }
         }
         if failed.is_empty() { Ok(None) } else { Err(error(error_codes::INTERNAL, format!("not drained: {}", failed.join(", ")), true)) }

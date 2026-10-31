@@ -1665,6 +1665,27 @@ async fn a_failed_suspend_rolls_back_to_running() {
     assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Suspended));
 }
 
+/// A drain whose deadline passes while a suspend waits for its commit's answer gives the suspend
+/// that much time, never cancels it: the request is kept as unanswered, so the next commit asks
+/// again under its id. Cancelled, the record was lost, and the next commit's stale parent was
+/// rejected `parent_mismatch`, which fences the sandbox.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_past_its_deadline_keeps_the_unanswered_commit() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    // The deadline (500 ms) comes well before the commit timeout (5 s).
+    let drain = CommandBody::Drain { reason: "test".into(), deadline_ms: nestd_now_ms() + 500 };
+    h.fleet.commands.send(vec![cmd("cmd_drain", drain)]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_drain").await), "not drained");
+    let generation = checkpoint(&h.fleet, "cmd_ck", "sbx_1", 1).await;
+    let requests: Vec<RequestId> =
+        h.fleet.log.lock().unwrap().events.iter().filter_map(|e| match &e.body { HostEventBody::CommitRequest { request, .. } => Some(request.clone()), _ => None }).collect();
+    assert_eq!(generation.0, format!("gen_{}", requests[0].0), "the lost suspend commit's outcome is adopted: {requests:?}");
+    assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Running));
+}
+
 /// nestd review #5(b): an attach to a sandbox suspended to disk (no guest connection) must not
 /// bind the agent's explicit-proxy listener; otherwise every later attach, after resume
 /// included, hits EADDRINUSE on that port.
