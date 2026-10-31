@@ -57,6 +57,8 @@ export const ErrorCodes = {
   CONFLICT: "conflict",
   /** The named object doesn't exist (a task in a ledger). HTTP 404. */
   NOT_FOUND: "not_found",
+  /** A remote (MCP) tool ran and reported an error (`isError`): its text is the message. Passed through as an ordinary tool error. */
+  TOOL_ERROR: "tool_error",
 } as const;
 /** What the control-host channels sent for `unsupported_version` before the names merged: read, never sent. */
 export const LEGACY_UNSUPPORTED_VERSION = "unsupported_protocol_version";

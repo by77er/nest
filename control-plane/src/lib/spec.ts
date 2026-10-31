@@ -7,6 +7,7 @@ import { z } from "zod";
 import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
 import { LedgerName, TASK_ADMIN_TOOLS, TASK_TOOLS } from "./tasks";
 import { ChannelGrant } from "./channels";
+import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -41,6 +42,8 @@ export const Capability = z.object({
   params: z.array(ParamName).default([]),
   /** Channel grants its tools need (docs/agents/tools/#grants): a subset of grants, for channels only. */
   grants: z.array(ChannelGrant).default([]),
+  /** A remote MCP server whose tools it gives, as `<capability>_<tool>` (docs/agents/capabilities/mcp/). */
+  mcp: McpSource.optional(),
 });
 export type Capability = z.output<typeof Capability>;
 
@@ -102,6 +105,8 @@ export interface AgentSpec {
   params: SpecParams;
   /** Channel grants: the union of its capabilities' (a stored spec without them has none). */
   channel_grants: ChannelGrant[];
+  /** Its mcp capabilities' servers, in capability order; absent when it has none (as is every stored spec before them). */
+  mcp?: McpGrant[];
 }
 
 export interface Catalog {
@@ -251,13 +256,28 @@ export function seedMigration(have: { capabilities: readonly string[]; templates
 
 // --- Validation of catalog entries -------------------------------------------------------------------
 
-/** A capability names only platform tools, each once. */
-export function checkCapability(cap: Capability, registry: readonly string[]): Result<Capability> {
+/**
+ * A capability names only platform tools, each once. Its `mcp` source, if any, has a URL nest will call
+ * (`allowLoopback`: local development only), a name no platform tool starts with, and its allowlist and
+ * overrides name each tool once.
+ */
+export function checkCapability(cap: Capability, registry: readonly string[], mcp?: { name: string; allowLoopback: boolean }): Result<Capability> {
   const seen = new Set<string>();
   for (const t of cap.tools) {
     if (!registry.includes(t)) return err(`unknown platform tool ${t}`);
     if (seen.has(t)) return err(`tool ${t} listed twice`);
     seen.add(t);
+  }
+  if (cap.mcp) {
+    if (!mcp) return err("an mcp capability is checked with its name");
+    const url = checkMcpUrl(cap.mcp.url, mcp.allowLoopback);
+    if (!url.ok) return err(`mcp.url: ${url.error}`);
+    const clash = capabilityNameClash(mcp.name, registry);
+    if (clash) return err(clash);
+    const tools = cap.mcp.tools ?? [];
+    if (new Set(tools).size !== tools.length) return err("mcp.tools lists a tool twice");
+    const idem = cap.mcp.idempotent;
+    if (Array.isArray(idem) && new Set(idem).size !== idem.length) return err("mcp.idempotent lists a tool twice");
   }
   return ok(cap);
 }
@@ -300,9 +320,12 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   if (!Object.hasOwn(catalog.templates, name)) return err(`unknown template ${name}`);
   const tpl = catalog.templates[name]!;
   const caps: Capability[] = [];
+  const mcp: McpGrant[] = [];
   for (const c of tpl.capabilities) {
     if (!Object.hasOwn(catalog.capabilities, c)) return err(`template ${name}: unknown capability ${c}`);
-    caps.push(catalog.capabilities[c]!);
+    const cap = catalog.capabilities[c]!;
+    caps.push(cap);
+    if (cap.mcp) mcp.push(grantOf(c, cap.mcp));
   }
   // A stored capability may name a tool the registry no longer has (`delegate`, in catalogs seeded
   // before it went): ignored, not a failed spawn. Writes still refuse one (`checkCapability`).
@@ -322,6 +345,7 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     // In capability order, each once.
     channel_grants: dedupeGrants(caps.flatMap((c) => c.grants)),
     params: params.value,
+    ...(mcp.length ? { mcp } : {}),
   });
 }
 
@@ -342,12 +366,29 @@ function checkParams(what: string, caps: readonly Capability[], params: SpecPara
 /** The capabilities template `name` lists (it expanded, so they exist). */
 const capsOf = (catalog: Catalog, name: string): Capability[] => catalog.templates[name]!.capabilities.map((c) => catalog.capabilities[c]!);
 
-/** `tools` narrowed to `subset`, which must not name a tool `tools` lacks. */
-function narrowTools(name: string, tools: string[], subset: readonly string[] | undefined): Result<string[]> {
-  if (!subset) return ok(tools);
-  const wider = subset.filter((t) => !tools.includes(t));
+/**
+ * A spec's tools narrowed to `subset`, which must not name a tool the spec lacks: platform tools by
+ * name, a remote tool as `<capability>_<tool>`. A given subset narrows each mcp grant's allowlist to
+ * the remote tools it names, and drops a grant it names none of.
+ */
+function narrowTools(name: string, spec: AgentSpec, subset: readonly string[] | undefined): Result<Pick<AgentSpec, "tools" | "mcp">> {
+  if (!subset) return ok({ tools: spec.tools, ...(spec.mcp ? { mcp: spec.mcp } : {}) });
+  const grants = spec.mcp ?? [];
+  const remote = new Map<string, string[]>();
+  const wider: string[] = [];
+  for (const t of subset) {
+    if (spec.tools.includes(t)) continue;
+    const g = grants.find((x) => t.startsWith(`${x.capability}_`));
+    const tool = g ? t.slice(g.capability.length + 1) : "";
+    if (!g || !tool || (g.tools && !g.tools.includes(tool))) {
+      wider.push(t);
+      continue;
+    }
+    remote.set(g.capability, [...(remote.get(g.capability) ?? []), tool]);
+  }
   if (wider.length) return err(`template ${name} doesn't give ${wider.join(", ")}`);
-  return ok(tools.filter((t) => subset.includes(t)));
+  const mcp = grants.filter((g) => remote.has(g.capability)).map((g) => ({ ...g, tools: [...new Set(remote.get(g.capability))] }));
+  return ok({ tools: spec.tools.filter((t) => subset.includes(t)), ...(mcp.length ? { mcp } : {}) });
 }
 
 /**
@@ -370,20 +411,22 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     // Parsed again: a caller's object that carries anything else is refused, whatever its type said.
     const o = SpawnerOverrides.safeParse(spec.overrides ?? {});
     if (!o.success) return err(`a spawner can only narrow tools and add deny or ask rules: ${o.error.issues.map((i) => i.message).join("; ")}`);
-    const tools = narrowTools(spec.template, base.value.tools, o.data.tools);
+    const tools = narrowTools(spec.template, base.value, o.data.tools);
     if (!tools.ok) return tools;
     // No parameters, not even the template's defaults: a spawner would otherwise reach whatever ledger a
     // template names. A child's parameters wait for attenuation against the spawner's own.
-    return ok({ ...base.value, tools: tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} });
+    const { mcp: _mcp, ...rest } = base.value;
+    return ok({ ...rest, ...tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} });
   }
   const o = spec.overrides ?? {};
-  const tools = narrowTools(spec.template, base.value.tools, o.tools);
+  const tools = narrowTools(spec.template, base.value, o.tools);
   if (!tools.ok) return tools;
   const params = checkParams(`template ${spec.template}`, capsOf(catalog, spec.template), { ...base.value.params, ...o.params });
   if (!params.ok) return params;
+  const { mcp: _mcp, ...rest } = base.value;
   return ok({
-    ...base.value,
-    tools: tools.value,
+    ...rest,
+    ...tools.value,
     params: params.value,
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,

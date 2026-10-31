@@ -17,7 +17,8 @@
     "not_implemented",
     "outcome_unknown",
     "conflict",
-    "not_found"
+    "not_found",
+    "tool_error"
   ],
   "gateway_error_codes": [
     "unauthorized",
