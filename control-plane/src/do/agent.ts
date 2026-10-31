@@ -11,9 +11,10 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";
 import { num, type Env } from "../env";
 import {
-  type Caller, type ChannelDelivery, clip, type DeliveryOutcome, envelopeText, EVENT_TEXT_BYTES, Filter, MAX_WAITING_DELIVERIES,
-  parseChannel, type PostInput, sessionTaint, SubscribeInput, WAKE_CAP_PER_HOUR,
+  type Caller, type ChannelDelivery, clip, type DeliveryOutcome, envelopeText, EVENT_TEXT_BYTES, Filter,
+  parseChannel, type PostInput, sessionTaint, SubscribeInput,
 } from "../lib/channels";
+import { admitDelivery, channelRequestId, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import type { ReadResult } from "./channel";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { toolDef, toolDefs } from "../lib/registry";
@@ -25,7 +26,7 @@ import {
 import { signBlobUrl } from "../lib/tokens";
 import { ledgerStub, type TaskView } from "./tasks";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
-import { storedEnum, storedEnumOrNull } from "../lib/stored";
+import { addColumn, storedEnum, storedEnumOrNull } from "../lib/stored";
 import {
   type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage,
   RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
@@ -74,27 +75,17 @@ const RESTART_ON_EXIT: Record<AgentExitReason, boolean> = {
 /** Restarts after an exit without a turn completing in between, before giving up (`errored`). */
 const MAX_EXIT_RESTARTS = 3;
 const RETENTION_MS = 7 * 86_400_000;
-/** A merged channel turn's text is at most this big; a delivery past it waits (the channel keeps it). */
-const MERGED_TURN_BYTES = 64 * 1024;
 /** How long an owner without `read` is remembered as such. */
 const OWNER_READS_NO_MS = 10 * 60_000;
 
 // Closed unions for the status columns (docs/data/#enums): SQL names them through these constants,
 // and every status read back is checked (`storedEnum`: a value outside the union is logged).
-/** `turns.status`: waiting to run, running, finished, or cut short. */
-const TurnStatusEnum = z.enum(["queued", "active", "done", "interrupted"]);
-export type TurnStatus = z.output<typeof TurnStatusEnum>;
-/** `inbox.status`: mirrored to the running turn, or consumed (by a turn, or as its own turn). */
-const InboxStatusEnum = z.enum(["delivered", "consumed"]);
-export type InboxStatus = z.output<typeof InboxStatusEnum>;
 /** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
 const CallStatusEnum = z.enum(["dispatching", "waiting", "done"]);
 export type CallStatus = z.output<typeof CallStatusEnum>;
 /** `asks.status`: inside its sync window, a guest CLI's, answered as a turn later, or answered. */
 const AskStatusEnum = z.enum(["sync", "cli", "async", "answered"]);
 export type AskStatus = z.output<typeof AskStatusEnum>;
-const TURN = TurnStatusEnum.enum;
-const INBOX = InboxStatusEnum.enum;
 const CALL = CallStatusEnum.enum;
 const ASK = AskStatusEnum.enum;
 const PRUNE_EVERY_MS = 3_600_000;
@@ -103,8 +94,6 @@ const TRANSCRIPT_DEFAULT_LIMIT = 200;
 const TRANSCRIPT_MAX_LIMIT = 500;
 const TRANSCRIPT_MAX_BYTES = 256 * 1024;
 const EMIT_EVENTS = ["progress", "blocked", "pr_opened", "completed", "failed"] as const;
-/** Separates a recovery turn's notes from the original turn's text. */
-const RECOVERY_MARK = "\nThe turn was:\n";
 const iso = (ms: number) => new Date(ms).toISOString();
 
 /**
@@ -251,7 +240,7 @@ interface PreviousReleaseFields {
 /** Points where a test can force an interleaving (`testHooks`). */
 export type HookPoint =
   | "intent:beforeCommit" | "resolveHands:afterResolve" | "dispatch:beforeWrite" | "sandboxMoved:enter" | "kill:beforeIssue"
-  | "hostLost:enter" | "exited:enter" | "start:afterCommit" | "release:afterCommit" | "event:afterApply" | "escalate:afterProgress" | "escalate:afterStatus";
+  | "hostLost:enter" | "exited:enter" | "start:afterCommit" | "release:afterCommit" | "event:afterApply" | "escalate:afterProgress" | "escalate:afterStatus" | "pump:beforeSend";
 
 export interface CreateAgent {
   agent: string;
@@ -334,10 +323,7 @@ export class AgentDO extends DurableObject<Env> {
     // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
     if (isHealthInstance(ctx, env.AGENT)) return;
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS turns (turn TEXT PRIMARY KEY, ord INTEGER NOT NULL, input TEXT NOT NULL,
-      status TEXT NOT NULL, created_ms INTEGER NOT NULL DEFAULT 0)`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY, message TEXT NOT NULL, turn TEXT,
-      status TEXT NOT NULL, created_ms INTEGER NOT NULL DEFAULT 0)`);
+    this.queue = new TurnQueue(this.sql);
     // status: dispatching (not finished; re-dispatched if redelivered after an eviction), waiting (an
     // ask; answered later), done (outcome stored).
     this.sql.exec(`CREATE TABLE IF NOT EXISTS tool_calls (epoch INTEGER NOT NULL, call TEXT NOT NULL, name TEXT NOT NULL,
@@ -349,15 +335,6 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS seg_buffer (base INTEGER NOT NULL, offset INTEGER NOT NULL, data BLOB NOT NULL,
       PRIMARY KEY (base, offset))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
-    // Idempotent admission: a retried submission with the same request id gets the same turn / message.
-    this.addColumn("turns", "request_id", "TEXT");
-    this.addColumn("turns", "started_ms", "INTEGER");
-    // The bound sandbox's epoch (read from SandboxDO) when the turn started: a recovery turn compares
-    // it with the current one to say whether the sandbox moved meanwhile.
-    this.addColumn("turns", "hands_epoch", "INTEGER");
-    this.addColumn("inbox", "request_id", "TEXT");
-    this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS turns_request ON turns (request_id) WHERE request_id IS NOT NULL");
-    this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS inbox_request ON inbox (request_id) WHERE request_id IS NOT NULL");
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
     // Channels (docs/channels/): this agent's subscriptions (for display and cleanup) with the
@@ -365,24 +342,23 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS channel_subs (channel TEXT NOT NULL, sub TEXT NOT NULL, hw INTEGER NOT NULL DEFAULT 0,
       created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (channel, sub))`);
     // Notices taken without delivery (no `read` tool): how many, and up to which seq.
-    this.addColumn("channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumn("channel_subs", "skipped_to", "INTEGER");
-    // Wakes from notices merged into a waiting turn (no turn of their own): they count toward the
-    // hourly cap like subscription-started turns. Rows older than an hour are dropped as they're counted.
-    this.sql.exec("CREATE TABLE IF NOT EXISTS chan_wakes (ts_ms INTEGER NOT NULL)");
+    addColumn(this.sql, "channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
+    addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
     this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
 
   private readonly outbox!: ChannelOutbox;
+  /** The turn queue and inbox: the one owner of the `turns`, `inbox` and `chan_wakes` tables. */
+  private readonly queue!: TurnQueue;
 
   // ---------------------------------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------------------------------
 
-  private addColumn(table: string, column: string, type: string): void {
-    const cols = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
-    if (!cols.some((c) => c.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  /** Work for a brain: a turn running or queued. */
+  private hasWork(info: AgentInfo): boolean {
+    return info.current_turn !== null || this.queue.hasQueued();
   }
 
   private load(): AgentInfo {
@@ -1093,7 +1069,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!released) return false;
     // Reported on `<agt>/events` (queued in this step; posted from the alarm). Not part of the decision.
     this.reportExit(info, host, epoch, reason, !wakes);
-    const work = !!info.current_turn || this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
+    const work = this.hasWork(info);
     const armed = Promise.all([
       this.deadlines.clear("condemned"),
       this.deadlines.clear("starting"),
@@ -1290,8 +1266,7 @@ export class AgentDO extends DurableObject<Env> {
     if (info.brain && info.brain.phase !== "condemned") return;
     // Stopped, with no input since: the work waiting predates the stop, which ended it.
     if (quietSinceStop(info)) return;
-    const queued = this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
-    if (!info.current_turn && !queued) return;
+    if (!this.hasWork(info)) return;
     if (afterExit && (info.exit_restarts ?? 0) > MAX_EXIT_RESTARTS) {
       this.update((i) => {
         i.state = "errored";
@@ -1624,9 +1599,10 @@ export class AgentDO extends DurableObject<Env> {
       if (i.brain && i.brain.phase === "starting") i.brain = { ...i.brain, phase: "live" };
       i.start_timeouts = 0;
     });
+    // Q4, in the step that cleared `current_turn`: nothing can start another turn ahead of it.
+    if (recovered) this.queue.recover(recovered, this.recoveryNotes(info));
     const armed = Promise.all([this.deadlines.clear("starting"), this.deadlines.clear("no_session")]);
     this.sql.exec("DELETE FROM seg_buffer WHERE base < ?", info.recv_base);
-    if (recovered) await this.requeueAsRecovery(recovered);
 
     this.send(ws, {
       type: "hello_ack",
@@ -1646,41 +1622,17 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * A turn whose brain restarted mid-turn comes back first, as a recovery turn: the one way an
    * interrupted turn continues (the runner never sets `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`, so the two
-   * can't both continue it). It says what the model can't know from its transcript: where the durable
-   * transcript ends (actions after that may have taken effect without appearing in it), and whether the
-   * sandbox was restored from a saved generation meanwhile (changes after that are gone).
+   * can't both continue it). Its notes say what the model can't know from its transcript: where the
+   * durable transcript ends (actions after that may have taken effect without appearing in it). Whether
+   * the sandbox was restored meanwhile is `pump`'s to say, when the turn starts.
    */
-  private async requeueAsRecovery(turn: string): Promise<void> {
-    const row = this.sql.exec<{ input: string; started_ms: number | null; created_ms: number; hands_epoch: number | null }>(
-      "SELECT input, started_ms, created_ms, hands_epoch FROM turns WHERE turn = ?", turn).toArray()[0];
-    this.sql.exec(`UPDATE turns SET status = '${TURN.interrupted}' WHERE turn = ?`, turn);
-    if (!row) return;
-    const orig = JSON.parse(row.input) as TurnInput;
-    // A recovery turn that is itself interrupted keeps the original turn's text.
-    const mark = orig.kind === "recovery" ? orig.text.indexOf(RECOVERY_MARK) : -1;
-    const original = mark >= 0 ? orig.text.slice(mark + RECOVERY_MARK.length) : orig.text;
-    const info = this.load();
+  private recoveryNotes(info: AgentInfo): string[] {
     const notes = ["Your session restarted while you were working on a turn."];
     if (info.durable_ms) {
       notes.push(`Your saved transcript ends at ${iso(info.durable_ms)}. Anything you did after that may be missing from it but may still have taken effect: check the workspace (e.g. git status) before redoing work.`);
     }
-    const started = row.started_ms ?? row.created_ms;
-    // Moved during the turn: SandboxDO's epoch now differs from the one recorded when the turn started.
-    // Without both (an older turn row, or SandboxDO unreachable) fall back to the last move AgentDO heard of.
-    let current: number | null = null;
-    if (info.hands && row.hands_epoch !== null) {
-      try {
-        current = (await this.sandboxStub(info.hands.sandbox).info()).epoch;
-      } catch (e) {
-        console.warn(`agent ${info.agent}: reading the sandbox epoch failed`, e);
-      }
-    }
-    const moved = current !== null ? current !== row.hands_epoch : (info.hands_moved_ms ?? 0) >= started;
-    if (info.hands && moved) notes.push(await this.movedNote(info));
     notes.push("If the turn isn't finished, continue it.");
-    const ord = (this.sql.exec<{ m: number | null }>("SELECT MIN(ord) AS m FROM turns").toArray()[0]?.m ?? 0) - 1;
-    this.sql.exec(`INSERT INTO turns (turn, ord, input, status, created_ms) VALUES (?, ?, ?, '${TURN.queued}', ?)`,
-      newId("trn_"), ord, JSON.stringify({ kind: "recovery", text: `${notes.join(" ")}${RECOVERY_MARK}${original}` } satisfies TurnInput), Date.now());
+    return notes;
   }
 
   // --- session segments ---------------------------------------------------------------------------
@@ -1868,13 +1820,17 @@ export class AgentDO extends DurableObject<Env> {
     // ingest, `postAsk` (keyed by call) and `syncActivity` (a "set to", compared with what was sent).
     if (this.sql.exec("SELECT 1 FROM events WHERE seq = ?", ev.seq).toArray().length) return;
     const completed = ev.type === "turn_completed" && !!ev.turn && ev.turn === before.current_turn;
+    // An event stamped with a turn other than the current one belongs to a turn already over: the
+    // runner reports a turn's `idle` after its `turn_completed`, by which time the next turn may be
+    // running, and that `idle` must not stand for it. Unstamped events (between turns) count.
+    const stale = !!ev.turn && ev.turn !== before.current_turn;
     const info = this.update((i) => {
       switch (ev.type) {
         case "turn_started":
-          i.state = "working";
+          if (!stale) i.state = "working";
           break;
         case "state_changed":
-          i.state = ev.state;
+          if (!stale) i.state = ev.state;
           break;
         case "rate_limited":
           i.state = "quota_parked";
@@ -1883,12 +1839,8 @@ export class AgentDO extends DurableObject<Env> {
           i.capabilities = ev.capabilities;
           break;
         case "turn_completed":
-          if (completed && i.current_turn === ev.turn) {
-            this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, ev.turn);
-            // A channel notice sent mid-turn that never reached the model (no `inbox_delivered`: the
-            // runner was stopping) isn't consumed with the turn: it comes back as the next turn.
-            this.requeueUnseenNotices();
-            this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
+          if (completed) {
+            this.queue.complete(ev.turn!);
             i.current_turn = null;
             i.state = "idle";
             i.exit_restarts = 0;
@@ -1906,8 +1858,7 @@ export class AgentDO extends DurableObject<Env> {
         ...(ev.retry_after_ms !== undefined ? { retry_after_ms: ev.retry_after_ms } : {}),
       }, `${info.agent}/${info.runner_instance ?? ""}/ev${ev.seq}`);
     } else if (ev.type === "inbox_delivered") {
-      const n = this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE id = ? AND status = '${INBOX.delivered}'`, ev.message).rowsWritten;
-      if (n > 0) this.pushCache();
+      if (this.queue.confirm(ev.message)) this.pushCache();
     } else if (ev.type === "escalation") {
       // The runner already denied the call with "pending approval (request <call>)": record an
       // async ask; the answer becomes the agent's next turn.
@@ -1932,14 +1883,9 @@ export class AgentDO extends DurableObject<Env> {
   async enqueueTurn(input: TurnInput, requestId?: string, tainted = false, external = true): Promise<string> {
     // Never write a turn into an AgentDO that was never created (e.g. a subscriber id that names nobody).
     if (!this.exists()) throw new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
-    if (requestId) {
-      const prior = this.sql.exec<{ turn: string }>("SELECT turn FROM turns WHERE request_id = ?", requestId).toArray()[0];
-      if (prior) return prior.turn;
-    }
-    const turn = newId("trn_");
-    const ord = (this.sql.exec<{ m: number | null }>("SELECT MAX(ord) AS m FROM turns").toArray()[0]?.m ?? 0) + 1;
-    this.sql.exec(`INSERT INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, '${TURN.queued}', ?, ?)`,
-      turn, ord, JSON.stringify(input), Date.now(), requestId ?? null);
+    const prior = requestId ? this.queue.turnFor(requestId) : undefined;
+    if (prior) return prior;
+    const turn = this.queue.enqueue(input, requestId);
     // Another agent's text (a workstream batch) reaches the model inline: the session is tainted.
     if (tainted) this.kvPut("read_tainted", true);
     if (external) this.inputArrived();
@@ -1951,46 +1897,46 @@ export class AgentDO extends DurableObject<Env> {
   /** Send the next queued turn when the runner is connected and no turn is running. */
   private async pump(): Promise<void> {
     if (!this.socket() || this.load().current_turn) return;
-    const next = this.sql
-      .exec<{ turn: string; input: string }>(`SELECT turn, input FROM turns WHERE status = '${TURN.queued}' ORDER BY ord LIMIT 1`)
-      .toArray()[0];
-    if (!next) return;
     // Synchronous from the check above: no other pump can claim a turn in between.
-    this.sql.exec(`UPDATE turns SET status = '${TURN.active}', started_ms = ? WHERE turn = ?`, Date.now(), next.turn);
+    const next = this.queue.claimNext();
+    if (!next) return;
     const info = this.update((i) => {
       i.current_turn = next.turn;
       i.state = "working";
     });
-    const { turn } = next;
-    const parsed = JSON.parse(next.input) as TurnInput;
-    // What a sandbox move lost since the brain was last told comes first: derived from SandboxDO's
-    // epoch now against the one the brain last heard of (durable, so no notice can be lost).
-    let note: string | null = null;
-    let sandboxEpoch: number | null = null;
+    const { turn, recovers } = next;
+    const continued = recovers ? this.queue.startOf(recovers) : undefined;
+    let epoch: number | null = null;
     if (info.hands) {
       try {
-        sandboxEpoch = (await this.sandboxStub(info.hands.sandbox).info()).epoch;
-        if (info.told_sandbox_epoch !== undefined && info.told_sandbox_epoch !== sandboxEpoch) note = await this.movedNote(info);
-        const e = sandboxEpoch;
-        this.update((i) => {
-          i.told_sandbox_epoch = e;
-        });
+        epoch = (await this.sandboxStub(info.hands.sandbox).info()).epoch;
       } catch (e) {
         console.warn(`agent ${info.agent}: reading the sandbox epoch at turn start failed`, e);
       }
     }
-    const input: TurnInput = note ? { ...parsed, text: `${note}\n\n${parsed.text}` } : parsed;
+    // What a sandbox move lost comes first (`moveNoteDue`).
+    const due = !!info.hands && moveNoteDue({ epoch, told: info.told_sandbox_epoch, continued, movedMs: info.hands_moved_ms });
+    const note = due ? await this.movedNote(info) : null;
+    await this.hook("pump:beforeSend");
+    // Re-checked after the awaits: a new runner process may have recovered this turn meanwhile, and
+    // its recovery turn is current now. Sending this one too would run its work twice.
+    if (this.load().current_turn !== turn) return;
+    if (epoch !== null) {
+      const e = epoch;
+      // Only forward: a move notice sent during the awaits above told the brain of a newer epoch.
+      this.update((i) => {
+        i.told_sandbox_epoch = Math.max(i.told_sandbox_epoch ?? e, e);
+      });
+      // Best effort: without it, a recovery turn of this one falls back to the last move AgentDO heard of.
+      this.queue.recordHandsEpoch(turn, e);
+    }
+    const input: TurnInput = note ? { ...next.input, text: `${note}\n\n${next.input.text}` } : next.input;
     this.pushReliable((seq) => ({ type: "run_turn", seq, turn, input }));
-    // Best effort: without it, a recovery turn falls back to the last move AgentDO heard of.
-    if (sandboxEpoch !== null) this.sql.exec("UPDATE turns SET hands_epoch = ? WHERE turn = ?", sandboxEpoch, turn);
     await this.syncActivity();
   }
 
   async turns(): Promise<{ turn: string; status: TurnStatus; input: TurnInput }[]> {
-    return this.sql
-      .exec<{ turn: string; status: string; input: string }>("SELECT turn, status, input FROM turns ORDER BY ord")
-      .toArray()
-      .map((r) => ({ turn: r.turn, status: storedEnum(TurnStatusEnum, r.status, "turns.status"), input: JSON.parse(r.input) as TurnInput }));
+    return this.queue.list();
   }
 
   /**
@@ -1999,10 +1945,8 @@ export class AgentDO extends DurableObject<Env> {
    */
   /** A retried post with the same `requestId` gets the same message, delivered once. */
   async postInbox(from: string, text: string, interrupt = false, requestId?: string, tainted = false): Promise<string> {
-    if (requestId) {
-      const prior = this.sql.exec<{ id: string }>("SELECT id FROM inbox WHERE request_id = ?", requestId).toArray()[0];
-      if (prior) return prior.id;
-    }
+    const prior = requestId ? this.queue.messageFor(requestId) : undefined;
+    if (prior) return prior;
     const info = this.load();
     const message: InboxMessage = { id: newId("msg_"), from, text, interrupt, ts_ms: Date.now() };
     // Another agent's text reaches the model inline (stdin, the Stop hook, or a turn): when it may be
@@ -2011,13 +1955,11 @@ export class AgentDO extends DurableObject<Env> {
     const external = from !== SYSTEM_SENDER;
     if (external) this.inputArrived();
     if (info.current_turn) {
-      this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, ?, '${INBOX.delivered}', ?, ?)`,
-        message.id, JSON.stringify(message), info.current_turn, Date.now(), requestId ?? null);
+      this.queue.mirror(message, info.current_turn, requestId);
       this.pushReliable((seq) => ({ type: "inbox", seq, message }));
       this.pushCache();
     } else {
-      this.sql.exec(`INSERT INTO inbox (id, message, turn, status, created_ms, request_id) VALUES (?, ?, NULL, '${INBOX.consumed}', ?, ?)`,
-        message.id, JSON.stringify(message), Date.now(), requestId ?? null);
+      this.queue.recordAsTurn(message, requestId);
       await this.enqueueTurn({ kind: "inbox", text: `Message from ${from}: ${text}` }, requestId && `inbox/${requestId}`, false, external);
     }
     return message.id;
@@ -2036,11 +1978,7 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   private currentCache(info: AgentInfo): AgentCache {
-    const inbox = this.sql
-      .exec<{ message: string }>(`SELECT message FROM inbox WHERE status = '${INBOX.delivered}' ORDER BY rowid`)
-      .toArray()
-      .map((r) => JSON.parse(r.message) as InboxMessage);
-    return { version: info.cache_version, rules: info.rules, inbox, max_stop_continuations: 5 };
+    return { version: info.cache_version, rules: info.rules, inbox: this.queue.mirrored(), max_stop_continuations: 5 };
   }
 
   /** Replace the runner's hook caches (rules + inbox mirror); the version only ever grows. */
@@ -2156,21 +2094,6 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * At a turn's end: channel notices sent into it mid-turn that the runner never confirmed
-   * (`inbox_delivered`) are queued again as one turn instead of being consumed with it.
-   * Synchronous, inside the turn's completion step.
-   */
-  private requeueUnseenNotices(): void {
-    const rows = this.sql.exec<{ message: string; request_id: string }>(
-      `SELECT message, request_id FROM inbox WHERE status = '${INBOX.delivered}' AND request_id LIKE 'chan/%' ORDER BY rowid`).toArray();
-    if (!rows.length) return;
-    const text = rows.map((r) => (JSON.parse(r.message) as InboxMessage).text).join("\n\n");
-    const ord = (this.sql.exec<{ m: number | null }>("SELECT MAX(ord) AS m FROM turns").toArray()[0]?.m ?? 0) + 1;
-    this.sql.exec(`INSERT OR IGNORE INTO turns (turn, ord, input, status, created_ms, request_id) VALUES (?, ?, ?, '${TURN.queued}', ?, ?)`,
-      newId("trn_"), ord, JSON.stringify({ kind: "event_batch", text } satisfies TurnInput), Date.now(), `${rows[0]!.request_id}/requeued`);
-  }
-
-  /**
    * A ChannelDO delivers one subscription's batch (at least once; the same range on every retry).
    * Deduplicated by the subscription's high-water seq; then a platform notice (the wake envelope):
    * mid-turn, a notice from the agent's own inbox joins the inbox stream; anything else is queued as
@@ -2211,48 +2134,26 @@ export class AgentDO extends DurableObject<Env> {
       take();
       return ack;
     }
-    // Mid-turn, only a message to the agent itself joins the running turn (as Claude Code takes a
-    // user's message mid-work). Another channel's notice waits for the next turn: injected into one
-    // busy with something else, the model can pass over it, and a `once` subscription is then spent
-    // (3-12% of mention wakes in the 2026-10-31 stress test, dev/cloud-checks/).
-    const midTurn = !!info.current_turn && d.channel === `${info.agent}/inbox`;
-    if (!midTurn) {
-      this.sql.exec("DELETE FROM chan_wakes WHERE ts_ms <= ?", now - 3_600_000);
-      const hour = this.sql.exec<{ n: number; oldest: number | null }>(
-        `SELECT COUNT(*) AS n, MIN(t) AS oldest FROM (SELECT created_ms AS t FROM turns WHERE request_id LIKE 'chan/%' AND created_ms > ?
-          UNION ALL SELECT ts_ms AS t FROM chan_wakes)`, now - 3_600_000).one();
-      if (hour.n >= WAKE_CAP_PER_HOUR) return { status: "defer", retry_after_ms: Math.max(1_000, (hour.oldest ?? now) + 3_600_000 - now) };
-      const waiting = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM turns WHERE request_id LIKE 'chan/%' AND status = '${TURN.queued}'`).one().n;
-      if (waiting >= MAX_WAITING_DELIVERIES) return { status: "defer", retry_after_ms: WAKE_RETRY_MS };
-    }
-    const last = this.sql.exec<{ t: number | null }>("SELECT MAX(COALESCE(started_ms, created_ms)) AS t FROM turns").one().t;
-    const text = envelopeText(shown, now, last, reads);
-    const requestId = `chan/${d.channel}/${d.subscription}/${upTo}`;
-    // Both admit synchronously before their first await (the row is written in this step).
-    if (midTurn) {
-      take();
+    const text = envelopeText(shown, now, this.queue.lastTurnMs(), reads);
+    const requestId = channelRequestId(d.channel, d.subscription, upTo);
+    const admit = admitDelivery({
+      midTurnInbox: !!info.current_turn && d.channel === `${info.agent}/inbox`,
+      load: this.queue.load(now), waiting: this.queue.waitingChannelTurn(), text, now,
+    });
+    if (admit.kind === "defer") return { status: "defer", retry_after_ms: admit.retry_after_ms };
+    // Each admits synchronously before its first await (the row is written in this step, with the
+    // high-water mark). A merge or a queued turn wakes the agent, as any new input does (a stopped
+    // or errored brain gets its fresh try, Q1/Q6).
+    take();
+    if (admit.kind === "join") {
       await this.postInbox("platform", text, false, requestId);
-      return ack;
-    }
-    // Coalesced per agent: a notice joins a channel turn still waiting to start (its brain is
-    // starting, or can't start yet) instead of queueing another, up to a size cap; past it the
-    // delivery is deferred and the channel keeps the messages. Then the agent is woken, as any new
-    // input wakes it (a stopped or errored brain gets its fresh try, Q1/Q6).
-    const waiting = this.sql.exec<{ turn: string; input: string }>(
-      `SELECT turn, input FROM turns WHERE status = '${TURN.queued}' AND request_id LIKE 'chan/%' ORDER BY ord DESC LIMIT 1`).toArray()[0];
-    if (waiting) {
-      const prior = JSON.parse(waiting.input) as TurnInput;
-      const merged = `${prior.text}\n\n${text}`;
-      if (new TextEncoder().encode(merged).length > MERGED_TURN_BYTES) return { status: "defer", retry_after_ms: WAKE_RETRY_MS };
-      take();
-      this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify({ ...prior, text: merged } satisfies TurnInput), waiting.turn);
-      this.sql.exec("INSERT INTO chan_wakes (ts_ms) VALUES (?)", now);
+    } else if (admit.kind === "merge") {
+      this.queue.merge(admit.turn, admit.input, now);
       this.inputArrived();
       await this.wake();
-      return ack;
+    } else {
+      await this.enqueueTurn({ kind: "event_batch", text }, requestId);
     }
-    take();
-    await this.enqueueTurn({ kind: "event_batch", text }, requestId);
     return ack;
   }
 
@@ -2918,8 +2819,7 @@ export class AgentDO extends DurableObject<Env> {
     const cutoff = Date.now() - RETENTION_MS;
     this.sql.exec(`DELETE FROM tool_calls WHERE status = '${CALL.done}' AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
-    this.sql.exec(`DELETE FROM turns WHERE status IN ('${TURN.done}', '${TURN.interrupted}') AND created_ms < ?`, cutoff);
-    this.sql.exec(`DELETE FROM inbox WHERE status = '${INBOX.consumed}' AND created_ms < ?`, cutoff);
+    this.queue.prune(cutoff);
     // An ended (`once`) subscription's dedup row, after its retries are long over.
     this.sql.exec("DELETE FROM channel_subs WHERE ended = 1 AND created_ms < ?", cutoff);
   }
