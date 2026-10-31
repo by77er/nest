@@ -102,35 +102,23 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
             }
             ControlBody::Resume { wall_clock_ms, entropy_b64, fork } => {
                 let g = guest.clone();
-                match blocking(move || sys::resume(&g, wall_clock_ms, &entropy_b64, fork.as_ref())).await {
-                    Ok(clock_step_ms) => ControlBody::ResumeDone { clock_step_ms },
-                    Err(error) => ControlBody::Error { error },
-                }
+                blocking(move || sys::resume(&g, wall_clock_ms, &entropy_b64, fork.as_ref()).map(|clock_step_ms| ControlBody::ResumeDone { clock_step_ms })).await
             }
             ControlBody::PrepareSnapshot { drop_caches, fsfreeze } => {
                 let g = guest.clone();
-                match blocking(move || sys::prepare_snapshot(&g, drop_caches, &fsfreeze)).await {
-                    Ok(()) => ControlBody::Ok {},
-                    Err(error) => ControlBody::Error { error },
-                }
+                blocking(move || sys::prepare_snapshot(&g, drop_caches, &fsfreeze).map(|()| ControlBody::Ok {})).await
             }
             ControlBody::Thaw {} => {
                 let g = guest.clone();
-                let thaw = move || {
+                blocking(move || {
                     sys::thaw(&g);
-                    Ok(())
-                };
-                match blocking(thaw).await {
-                    Ok(()) => ControlBody::Ok {},
-                    Err(error) => ControlBody::Error { error },
-                }
+                    Ok(ControlBody::Ok {})
+                })
+                .await
             }
             ControlBody::Health {} => {
                 let g = guest.clone();
-                match blocking(move || Ok(sys::health(&g))).await {
-                    Ok(report) => ControlBody::HealthReport { report },
-                    Err(error) => ControlBody::Error { error },
-                }
+                blocking(move || Ok(ControlBody::HealthReport { report: sys::health(&g) })).await
             }
             // Replies to our `cli` relays.
             ControlBody::CliResult { result } => {
@@ -168,9 +156,14 @@ pub async fn serve(guest: Arc<Guest>, conn: Conn) {
     info!(generation, "control connection closed");
 }
 
-/// A lifecycle step on the blocking pool; a panic in it is an `internal` error, never success.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ErrorBody> + Send + 'static) -> Result<T, ErrorBody> {
-    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| Err(err(error_code::INTERNAL, e.to_string(), false)))
+/// A lifecycle step on the blocking pool, as its reply; a panic in it is an `internal` error,
+/// never success.
+async fn blocking(f: impl FnOnce() -> Result<ControlBody, ErrorBody> + Send + 'static) -> ControlBody {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => ControlBody::Error { error },
+        Err(e) => ControlBody::Error { error: err(error_code::INTERNAL, e.to_string(), false) },
+    }
 }
 
 fn reply(to: Option<u64>, body: ControlBody) -> ControlFrame {
