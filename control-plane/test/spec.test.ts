@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
-  type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, intersectTools, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
+  type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
   SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES,
   TASK_CAPABILITIES,
 } from "../src/lib/spec";
@@ -86,11 +86,6 @@ describe("records stored with a role read through a frozen table, not the seed",
       const { launch: _l, rules: _r, subscribe: _s, params: _p, channel_grants: _g, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
       expect(rest, role).toEqual(ROLE_SPECS[role]);
     }
-  });
-
-  it("the legacy grants field intersects silently; overrides.tools refuses a wider list", () => {
-    const w = expand(SEED_CATALOG, "worker", true);
-    expect(intersectTools(w, ["notify", "merge"]).tools).toEqual(["notify"]);
   });
 });
 

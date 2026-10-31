@@ -190,7 +190,7 @@ describe("escalation and the workstream channel's subscriber", () => {
 
     expect((await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: "agt_nobody00000000000000000000" } }, 404))
       .error.code).toBe("unknown_agent");
-    await adminJson(`/v1/workstreams/${s.workstream}/captain`, { method: "PUT", body: { captain: null } });
+    await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: null } });
     expect((await wsStub(s.workstream).info()).subscriber).toBeNull();
 
     await runInDurableObject(wsStub(s.workstream), (_i, st) => {
@@ -253,13 +253,13 @@ describe("one release of compatibility, and the review's edge cases", () => {
     const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: other.sandbox, start: false } }, 201);
     expect((await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: w.agent } }, 409)).error.message)
       .toContain("is in workstream");
-    expect((await adminJson("/v1/workstreams", { body: { goal: "g", captain: w.agent } }, 400)).error.code).toBe("invalid_message");
+    expect((await adminJson("/v1/workstreams", { body: { goal: "g", subscriber: w.agent } }, 400)).error.code).toBe("invalid_message");
   });
 
-  it("the legacy grants field intersects silently", async () => {
+  it("the previous release's grants field is refused, never ignored (that would widen the tools)", async () => {
     const s = await cellWithSandbox();
-    const a = await adminJson("/v1/agents", { body: { role: "worker", sandbox: s.sandbox, grants: ["notify", "merge"], start: false } }, 201);
-    expect(a.tools).toEqual(["notify"]);
+    const r = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, grants: ["notify"], start: false } }, 400);
+    expect(r.error.message).toContain("overrides.tools");
   });
 
   it("a stored owner in another workstream (an older record) still can't be notified", async () => {

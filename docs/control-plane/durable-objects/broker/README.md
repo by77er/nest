@@ -16,7 +16,7 @@ The only DO that stores secret values. Platform keys live elsewhere: the proxy r
 
 The Cloudflare API token that creates and deletes per-host tunnels and DNS records is a Worker secret, like the other platform keys, not a BrokerDO secret.
 
-**Built:** secret storage and references, purpose-scoped resolution, setup tokens, injected secrets, the binding signing key and the Access service token. **Not built:** the double check when serving a secret, hook secrets and `verify`, capability credentials, GitHub App minting (an interface only) and the issuance audit.
+**Built:** secret storage and references, purpose-scoped resolution, setup tokens, injected secrets, the binding signing key and the Access service token. **Not built:** the double check when serving a secret, hook secrets and `verify`, capability credentials, GitHub App minting and the issuance audit.
 
 ## Issuance audit
 

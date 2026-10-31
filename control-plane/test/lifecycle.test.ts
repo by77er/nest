@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { FleetDO } from "../src/do/fleet";
 import { previewHostname, shareHostname, type SandboxDO } from "../src/do/sandbox";
 import type { Ec2, InstanceState } from "../src/lib/ec2";
-import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
@@ -407,5 +407,163 @@ describe("preview and share names follow the hostname rule", () => {
     expect((await sandboxStub(sbx.sandbox).info()).ports).toEqual([
       { port: 5173, url: `https://5173-${sbx.sandbox.slice("sbx_".length)}-preview-nest.localhost` },
     ]);
+  });
+});
+
+/**
+ * Hold this SandboxDO's next call of FleetDO's `method` open until `open()`: `served` lets FleetDO run
+ * it first (a slow answer), otherwise the request itself waits (a slow request). Real SandboxDO and
+ * FleetDO code; only the await's timing is controlled (miniflare answers too fast to interleave).
+ * Holds stack: each wraps the stub the previous one returns.
+ */
+function holdFleet(inst: SandboxDO, method: "place" | "releaseLease", served: boolean): { open: () => void } {
+  const self = inst as unknown as { fleet: (cell: string) => any };
+  const real = self.fleet.bind(inst);
+  let open!: () => void;
+  const gate = new Promise<void>((r) => (open = r));
+  let held = false;
+  self.fleet = (c: string) => {
+    const f = real(c);
+    return new Proxy(f, {
+      get(t, p: string | symbol) {
+        if (p === "then") return undefined;
+        if (p === method && !held) {
+          held = true;
+          return async (...args: unknown[]) => {
+            if (served) { const r = await t[p](...args); await gate; return r; }
+            await gate;
+            return t[p](...args);
+          };
+        }
+        return (...args: unknown[]) => t[p](...args);
+      },
+    });
+  };
+  return { open };
+}
+
+describe("the lease's guards (docs/verification/sandbox-lease)", () => {
+  it("a lost lease keeps which agents are working: the re-placed sandbox isn't idle-suspended mid-turn", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "running", guest: GUEST }]);
+    const stub = sandboxStub(sbx.sandbox);
+    await stub.attach("agt_x");
+    await stub.agentActivity("agt_x", true);
+    // The brain runs on a brain host, untouched by the sandbox host's loss: AgentDO re-sends activity only on a change.
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "fenced", detail: "host lease lapsed" }]);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
+    await events(a.ws, [{ type: "sandbox_state", sandbox: sbx.sandbox, epoch: 2, state: "running", guest: GUEST }]);
+    expect((await stub.info()).working).toEqual(["agt_x"]);
+    expect(await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'idle'").toArray().length)).toBe(0);
+  });
+
+  it("a fenced sandbox that found no host is placed by its alarm once one has room", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell); // room for two default sandboxes
+    const s1 = await createSandbox(cell);
+    const s2 = await createSandbox(cell);
+    await events(a.ws, [
+      { type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "running" },
+      { type: "sandbox_state", sandbox: s2.sandbox, epoch: 1, state: "running" },
+      { type: "capacity", capacity: { vcpus_free: 4, memory_mib_free: 8192, hugepages_mib_free: 0, hugepages_mib_total: 8192, sandboxes: 2, agents: 0, warm: [] } },
+    ]);
+    await events(a.ws, [{ type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "fenced" }]);
+    const stub = sandboxStub(s1.sandbox);
+    expect(await stub.info()).toMatchObject({ state: "fenced", host: null });
+    const b = await hostWithRoom(cell, 8192);
+    await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'"));
+    await runDurableObjectAlarm(stub);
+    expect((await stub.info()).host).toBe(b.host);
+  });
+
+  for (const served of [true, false]) {
+    it(`a destroy during an in-flight placement stays destroyed, with no lease or VM left (${served ? "answer" : "request"} held)`, async () => {
+      const cell = uniqueCell();
+      const s = await createSandbox(cell, 202);
+      const a = await connectHost(cell);
+      const stub = sandboxStub(s.sandbox);
+      await runInDurableObject(stub, async (inst: SandboxDO) => {
+        const { open } = holdFleet(inst, "place", served);
+        const woke = inst.wake().catch((e: unknown) => e);
+        await sleep(20);
+        await inst.destroy();
+        open();
+        await woke;
+      });
+      expect(await stub.info()).toMatchObject({ state: "destroyed", host: null, placing: null });
+      expect(await fleetStub(cell).leaseOf(s.sandbox)).toBeNull();
+      // FleetDO sent the VM's create with the grant: it is destroyed again at that epoch.
+      const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
+      expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
+    });
+  }
+
+  it("a placement that lands while destroy releases the lease is still undone: no lease, the VM destroyed", async () => {
+    const cell = uniqueCell();
+    const s = await createSandbox(cell, 202);
+    const a = await connectHost(cell);
+    const stub = sandboxStub(s.sandbox);
+    await runInDurableObject(stub, async (inst: SandboxDO) => {
+      const place = holdFleet(inst, "place", false);
+      const release = holdFleet(inst, "releaseLease", true);
+      const woke = inst.wake().catch((e: unknown) => e);
+      await sleep(20);
+      // destroy's releaseLease runs at FleetDO; its answer waits while the placement lands.
+      const destroying = inst.destroy();
+      await sleep(20);
+      place.open();
+      await woke;
+      release.open();
+      await destroying;
+    });
+    expect(await stub.info()).toMatchObject({ state: "destroyed", host: null, placing: null });
+    expect(await fleetStub(cell).leaseOf(s.sandbox)).toBeNull();
+    const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
+    expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
+  });
+
+  it("a placement answer that arrives after the marker was reconciled changes nothing: confirmed slots stay confirmed", async () => {
+    const cell = uniqueCell();
+    const s = await createSandbox(cell, 202);
+    const a = await connectHost(cell);
+    const stub = sandboxStub(s.sandbox);
+    const after = await runInDurableObject(stub, async (inst: SandboxDO, st) => {
+      const { open } = holdFleet(inst, "place", true);
+      const late = inst.wake();
+      await sleep(20); // FleetDO granted epoch 1; the answer is held
+      // The answer is slower than PLACING_STALE_MS: the next wake reconciles and adopts the lease.
+      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one();
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify({ ...JSON.parse(row.value), placing_ms: Date.now() - 61_000 }));
+      const adopted = (await inst.wake()).host;
+      await inst.attach("agt_x");
+      const cmd = (await inst.info()).attach_inflight["agt_x"]!;
+      await inst.attachResult(adopted!, 1, "agt_x", cmd, { status: "ok" });
+      open();
+      await late;
+      return { adopted, info: await inst.info() };
+    });
+    expect(after.adopted).toBe(a.host);
+    expect(after.info).toMatchObject({ host: a.host, epoch: 1, attach_pending: [], attach_inflight: {} });
+    // One agent_attach in all: the late answer re-sent none.
+    await sleep(200);
+    const sent = a.ws.drain().filter((m) => m.type === "commands").flatMap((m) => m.commands as { type: string }[]);
+    expect(sent.filter((c) => c.type === "agent_attach")).toHaveLength(1);
+  });
+
+  it("a create whose placement answer is unknown returns the sandbox; its place deadline finishes the job", async () => {
+    const id = `sbx_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+    const cell = uniqueCell();
+    const created = await runInDurableObject(sandboxStub(id), async (inst: SandboxDO, st) => {
+      const self = inst as unknown as { fleet: (cell: string) => any };
+      const real = self.fleet.bind(inst);
+      self.fleet = (c: string) => ({ ...real(c), registerSandbox: (x: string) => real(c).registerSandbox(x), place: async () => { throw new Error("Network connection lost."); } });
+      const info = await inst.create({ sandbox: id, workstream: "ws_lifecycle", cell }).catch((e: Error) => e.message);
+      return { info, deadline: st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'place'").toArray().length };
+    });
+    // A 500 here would make a client retry the POST, and the retry mints a second sandbox.
+    expect(created).toMatchObject({ info: { sandbox: id, placing: 1, host: null }, deadline: 1 });
   });
 });

@@ -6,18 +6,22 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
-import { asNestError, b64url, NestError, newId } from "../lib/util";
+import { signShare } from "../lib/tokens";
+import { asNestError, NestError, newId } from "../lib/util";
+import * as lease from "../lib/sandbox-lease";
+import * as slots from "../lib/slots";
 import { storedEnum } from "../lib/stored";
 import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "../protocol/control";
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
-  type InjectionBinding, type Resources, SandboxState,
+  InjectionBinding, type Resources, SandboxState,
 } from "../protocol/model";
 
 export const DEFAULT_IMAGE = "nest-base:latest";
@@ -29,51 +33,33 @@ export const BASE_ALLOW = [
   "github.com", "*.githubusercontent.com", "deb.debian.org",
 ];
 
-export interface WorkstreamPolicyLayer {
-  allow: { host: string; ports?: number[] }[];
-  passthrough: string[];
-  inject: InjectionBinding[];
-  tcp: { host: string; port: number }[];
-}
+/** The ports an allow rule (or a grant) covers when it names none. */
+const WEB_PORTS = [80, 443];
+export const Port = z.number().int().min(1).max(65535);
+/** Workstream egress policy layer (docs/sandbox/networking/egress/policy/), as the API takes it. */
+export const WorkstreamPolicyLayer = z.object({
+  allow: z.array(z.object({ host: z.string().min(1), ports: z.array(Port).optional() })).default([]),
+  passthrough: z.array(z.string().min(1)).default([]),
+  inject: z.array(InjectionBinding).default([]),
+  tcp: z.array(z.object({ host: z.string().min(1), port: Port })).default([]),
+});
+export type WorkstreamPolicyLayer = z.output<typeof WorkstreamPolicyLayer>;
+const EMPTY_LAYER: WorkstreamPolicyLayer = WorkstreamPolicyLayer.parse({});
 
-const EMPTY_LAYER: WorkstreamPolicyLayer = { allow: [], passthrough: [], inject: [], tcp: [] };
-
-export interface SandboxInfo {
+/** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
+export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
   workstream: string;
   cell: string;
   image: string;
   resources: Resources;
-  epoch: number;
-  host: string | null;
-  state: SandboxState;
-  head: string | null;
   policy_version: number;
-  attached: string[];
-  working: string[];
   ports: { port: number; url: string }[];
-  /** Epoch currently being placed (FleetDO.place in flight), and since when. */
-  placing: number | null;
-  placing_ms: number | null;
   /**
    * The last `HISTORY_MAX` epochs and the host that held each, read from the `epochs` table (which
-   * keeps every one: salvage commits are checked against it); also saved in the blob for one release.
+   * keeps every one: salvage commits are checked against it).
    */
   history: { epoch: number; host: string }[];
-  /** Host whose lease was lost, while the sandbox waits for a new placement. */
-  lost_from: string | null;
-  /** `sandbox_create` re-issues after retryable failures at the current epoch. */
-  create_attempts: number;
-  /** The guest's version and capabilities, from the host's last `running` report (null until then). */
-  guest: GuestInfo | null;
-  /** Each attached agent's slot cwd (null: the default), re-sent to every new placement. */
-  attach_cwd: Record<string, string | null>;
-  /** Agents whose `agent_attach` at the current placement has no `ok` yet: no binding for them. */
-  attach_pending: string[];
-  /** The `agent_attach` command in flight per agent; a result for any other command is stale. */
-  attach_inflight: Record<string, string>;
-  /** Failed attempts at the current placement, per agent (drives the retry backoff). */
-  attach_attempts: Record<string, number>;
 }
 
 export interface CreateSandbox {
@@ -86,8 +72,6 @@ export interface CreateSandbox {
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
-/** A `placing` marker this old belongs to a placement that never finished: reconciled against FleetDO's lease. */
-const PLACING_STALE_MS = 60_000;
 const PLACE_RETRY_MS = 30_000;
 /**
  * Idle (no agent working) this long → suspend to the object store. The design pauses at 1 min and
@@ -96,7 +80,6 @@ const PLACE_RETRY_MS = 30_000;
 const DEFAULT_SUSPEND_IDLE_MS = 11 * 60_000;
 /** At most one turn-end commit this often (docs/sandbox/state/#writeback-cadence). */
 const TURN_CHECKPOINT_MIN_MS = 10_000;
-const MAX_CREATE_ATTEMPTS = 3;
 /** How many epochs `info().history` shows; the `epochs` table keeps them all. */
 const HISTORY_MAX = 50;
 /**
@@ -107,9 +90,6 @@ const HISTORY_MAX = 50;
 const COMMIT_RECORD_RETENTION_MS = 7 * 86_400_000;
 /** Commit records are pruned from a deadline at most this often, never on the commit path. */
 const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
-/** A failed `agent_attach` is retried with this backoff (doubling), capped, for as long as the sandbox is placed. */
-const ATTACH_RETRY_MS = 2_000;
-const ATTACH_RETRY_MAX_MS = 30_000;
 /** Previews and share links without NEST_DOMAIN (the harness, tests): never routed, only named. */
 const LOCAL_DOMAIN = "nest.localhost";
 
@@ -121,13 +101,15 @@ export function previewHostname(domain: string, port: number, sandbox: string): 
   const { label, zone } = splitDomain(domain);
   return `${port}-${sandbox.replace(/^sbx_/, "")}-preview-${label}.${zone}`;
 }
-/** A share link's hostname, `<token>-share-<label>.<zone>`: the token names one `{sandbox, port}`. */
+/** A share link's hostname, `<port>-<sandbox>-share-<label>.<zone>`; its query carries the signed expiry. */
 export function shareHostname(domain: string, port: number, sandbox: string): string {
   const { label, zone } = splitDomain(domain);
   return `${port}-${sandbox.replace(/^sbx_/, "")}-share-${label}.${zone}`;
 }
 
 type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
+/** A command addressed to this sandbox at its current epoch, before `command()` stamps both. */
+type SandboxCommand = CommandBody extends infer C ? (C extends { sandbox: string; epoch: number } ? Omit<C, "sandbox" | "epoch"> : never) : never;
 
 export class SandboxDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -150,29 +132,19 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS generations (id TEXT PRIMARY KEY, record TEXT NOT NULL,
       orphaned INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS commits (request TEXT PRIMARY KEY, outcome TEXT NOT NULL)");
-    // When the request was answered (null only until the start below stamps it), and
-    // the generation it committed (null: rejected), so retention needs no JSON scan.
+    // When the request was answered, and the generation it committed (null: rejected), so
+    // retention needs no JSON scan.
     const commitCols = this.sql.exec<{ name: string }>("PRAGMA table_info(commits)").toArray().map((c) => c.name);
     if (!commitCols.includes("created_ms")) this.sql.exec("ALTER TABLE commits ADD COLUMN created_ms INTEGER");
     if (!commitCols.includes("generation_id")) this.sql.exec("ALTER TABLE commits ADD COLUMN generation_id TEXT");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_generation ON commits (generation_id)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS commits_rejected ON commits (created_ms) WHERE generation_id IS NULL");
-    // On every start: a record written by a release without these columns (before them, or during a
-    // rollback to one) gets its generation from its outcome, and counts its age from now, so a
-    // committed record is never mistaken for a rejected one and nothing is pruned at once.
-    this.sql.exec("UPDATE commits SET generation_id = json_extract(outcome, '$.generation.id'), created_ms = ? WHERE generation_id IS NULL AND created_ms IS NULL",
-      Date.now());
     // Every epoch and the host that held it: salvage from any older epoch is authorized against it.
     this.sql.exec("CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, host TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
       expires_ms INTEGER NOT NULL)`);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
     this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.info_().sandbox);
-    // The blob's capped `history` is merged in on every start: it holds what a release before the
-    // table (or a rollback to one) recorded. The table never loses an epoch it already has.
-    for (const h of this.get<{ history?: { epoch: number; host: string }[] }>("info")?.history ?? []) {
-      this.sql.exec("INSERT OR IGNORE INTO epochs (epoch, host) VALUES (?, ?)", h.epoch, h.host);
-    }
   }
 
   // --- state helpers ------------------------------------------------------------------------------
@@ -201,6 +173,11 @@ export class SandboxDO extends DurableObject<Env> {
     return info;
   }
 
+  /** The info, or undefined for a sandbox never created (a host's report may name one). */
+  private tryInfo(): SandboxInfo | undefined {
+    return this.get<SandboxInfo>("info") ? this.info_() : undefined;
+  }
+
   private recentEpochs(): { epoch: number; host: string }[] {
     return this.sql.exec<{ epoch: number; host: string }>(
       "SELECT epoch, host FROM epochs ORDER BY epoch DESC LIMIT ?", HISTORY_MAX).toArray().reverse();
@@ -220,16 +197,13 @@ export class SandboxDO extends DurableObject<Env> {
     return `https://${previewHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, sandbox)}`;
   }
 
-  /**
-   * Load, mutate and save synchronously (never across an await). The saved `history` is the
-   * table's last `HISTORY_MAX` epochs, re-read after `fn`: written for one release, so the release
-   * before the table (after a rollback) still authorizes salvage from recent epochs.
-   */
+  /** Load, mutate and save synchronously (never across an await). `history` is the table's, never saved. */
   private update(fn: (info: SandboxInfo) => void): SandboxInfo {
     const info = this.info_();
     fn(info);
     info.history = this.recentEpochs();
-    this.put("info", info);
+    const { history: _derived, ...stored } = info;
+    this.put("info", stored);
     return info;
   }
 
@@ -280,7 +254,14 @@ export class SandboxDO extends DurableObject<Env> {
     };
     this.put("info", info);
     this.put("ws_layer", req.workstreamPolicy ?? EMPTY_LAYER);
-    await this.placeCurrentEpoch();
+    try {
+      await this.placeCurrentEpoch();
+    } catch (e) {
+      // The sandbox exists either way. An unknown answer (the marker stays) is finished by the
+      // `place` deadline: an error here would only make the client retry and mint a second sandbox.
+      if (this.info_().placing === null) throw e;
+      console.warn(`sandbox ${req.sandbox}: placement answer unknown; the place deadline reconciles it`, e);
+    }
     return this.info_();
   }
 
@@ -290,78 +271,52 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * A placement that never finished (this object was reset mid-call, or FleetDO's answer was lost)
-   * leaves `placing` set. Once stale, FleetDO's lease decides: a live lease at that epoch is adopted
-   * with the state (and guest) its holder last reported; no such lease clears the marker. Before
-   * then the `place` deadline is (re)armed for when it goes stale.
+   * leaves `placing` set. Once stale, FleetDO's lease decides (`lease.reconciled`). Before then the
+   * `place` deadline is (re)armed for when it goes stale.
    */
   private async reconcilePlacing(): Promise<void> {
     const info = this.info_();
-    if (info.placing === null) return;
-    const staleAt = (info.placing_ms ?? 0) + PLACING_STALE_MS;
+    const staleAt = lease.reconcileAt(info);
+    if (staleAt === null) return;
     if (Date.now() < staleAt) {
       await this.deadlines.set("place", staleAt, true);
       return;
     }
-    const epoch = info.placing;
-    const lease = await this.fleet(info.cell).leaseOf(info.sandbox);
-    let adopted: string | null = null;
-    this.update((i) => {
-      if (i.placing !== epoch) return;
-      i.placing = null;
-      i.placing_ms = null;
-      if (lease && lease.epoch === epoch && !lease.expired) {
-        i.host = lease.host;
-        i.state = lease.state ?? (i.head ? "restoring" : "creating");
-        i.guest = lease.guest;
-        i.lost_from = null;
-        this.recordEpoch(epoch, lease.host);
-        adopted = lease.host;
-      }
+    const epoch = info.placing!;
+    const held = await this.fleet(info.cell).leaseOf(info.sandbox);
+    let r!: ReturnType<typeof lease.reconciled>;
+    const after = this.update((i) => {
+      r = lease.reconciled(i, epoch, held);
+      if (r === "adopted") this.recordEpoch(epoch, i.host!);
     });
-    if (adopted) {
-      console.warn(`sandbox ${info.sandbox}: adopted the lease on ${adopted} (epoch ${epoch}) from an unfinished placement`);
-      await this.pushSecrets();
-      await this.issueAttachesOrRetry();
-      await this.notifyAgentsMoved(adopted);
-      await this.armIdle();
-    } else {
+    if (r === "gone") {
+      // Destroyed while FleetDO answered: a lease at this epoch was never this object's to adopt.
+      if (held?.epoch === epoch) await this.discardPlacement(after, held.host, epoch);
+    } else if (r === "adopted") {
+      console.warn(`sandbox ${info.sandbox}: adopted the lease on ${after.host} (epoch ${epoch}) from an unfinished placement`);
+      await this.afterPlaced();
+    } else if (r === "cleared") {
       console.warn(`sandbox ${info.sandbox}: cleared an unfinished placement at epoch ${epoch} (no lease)`);
     }
   }
 
-  /**
-   * Place an unplaced sandbox on a host under a new epoch. Refuses a sandbox that is placed, being
-   * placed, or gone: one lease, one host, ever.
-   */
+  /** Place an unplaced sandbox on a host under a new epoch (`lease.claim` says which it may). */
   async placeCurrentEpoch(excludeHost?: string): Promise<string | null> {
     await this.reconcilePlacing();
-    const before = this.info_();
-    if (before.state === "destroyed" || before.state === "archived") {
-      throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${before.state}`, 409);
-    }
-    if (before.host) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is already placed on ${before.host} (epoch ${before.epoch})`, 409);
-    if (before.placing !== null) throw new NestError(ErrorCodes.FORBIDDEN, "placement already in progress", 409, true);
-    const epoch = before.epoch + 1;
     const now = Date.now();
-    this.update((i) => {
-      i.epoch = epoch;
-      i.placing = epoch;
-      i.placing_ms = now;
-      i.create_attempts = 0;
-      // A new placement is a new VM: the old guest version and slots mean nothing to it.
-      i.guest = null;
-      i.attach_pending = [...i.attached];
-      i.attach_inflight = {};
-      i.attach_attempts = {};
+    let claimed!: ReturnType<typeof lease.claim>;
+    const before = this.update((i) => {
+      claimed = lease.claim(i, now);
     });
+    if (!claimed.ok) throw claimed.error;
+    const epoch = claimed.epoch;
     // If this call never finishes (a reset, a lost answer), the marker is reconciled when it goes stale.
-    await this.deadlines.set("place", now + PLACING_STALE_MS, true);
+    await this.deadlines.set("place", now + lease.PLACING_STALE_MS, true);
     const from = before.head ? this.generation(before.head) : undefined;
-    let host: string | null = null;
-    let noCapacity = false;
+    let answer: lease.PlaceAnswer;
     let failure: unknown = null;
     try {
-      host = await this.fleet(before.cell).place({
+      const host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
         workstream: before.workstream,
         cell: before.cell,
@@ -372,43 +327,47 @@ export class SandboxDO extends DurableObject<Env> {
         ...(from ? { from } : {}),
         ...(excludeHost ? { excludeHost } : {}),
       });
-      noCapacity = host === null;
+      answer = host ? { kind: "host", host } : { kind: "none" };
     } catch (e) {
       failure = e;
+      answer = { kind: asNestError(e)?.code === ErrorCodes.FORBIDDEN ? "refused" : "unknown" };
     }
-    // FleetDO refused outright (a lease at another epoch): no lease exists under this epoch.
-    const refused = failure !== null && asNestError(failure)?.code === ErrorCodes.FORBIDDEN;
-    this.update((i) => {
-      if (i.placing !== epoch) return;
-      // Any other failure leaves the answer unknown (a lease may exist): the marker stays for the
-      // `place` deadline to reconcile against FleetDO's lease.
-      if (failure !== null && !refused) return;
-      i.placing = null;
-      i.placing_ms = null;
-      // No host could take it, so no lease exists under this epoch: the next attempt reuses it.
-      if ((noCapacity || refused) && i.epoch === epoch) i.epoch = before.epoch;
-      if (host) {
-        i.host = host;
-        i.state = from ? "restoring" : "creating";
-        i.lost_from = null;
-        this.recordEpoch(epoch, host);
-      }
+    let r!: ReturnType<typeof lease.placeAnswered>;
+    const after = this.update((i) => {
+      r = lease.placeAnswered(i, epoch, answer, from !== undefined);
+      if (r === "placed") this.recordEpoch(epoch, i.host!);
     });
-    if (failure !== null) {
-      // A refusal is not retried on its own (the leases disagree: an operator looks); anything else is.
-      if (refused) await this.deadlines.clear("place");
-      throw failure;
+    switch (r) {
+      case "stale":
+        // Overtaken while FleetDO answered: destroyed (whatever it granted goes too), or the marker
+        // went stale and was reconciled. No follow-ups: they would act on a newer claim's state.
+        if (!lease.gone(after.state)) return after.host;
+        if (answer.kind === "host" || answer.kind === "unknown") await this.discardPlacement(after, answer.kind === "host" ? answer.host : null, epoch);
+        return null;
+      case "unknown":
+        // A lease may exist: the marker stays for the `place` deadline to reconcile.
+        throw failure;
+      case "unplaced":
+        // A refusal is not retried on its own (the leases disagree: an operator looks); no room is.
+        if (answer.kind === "refused") {
+          await this.deadlines.clear("place");
+          throw failure;
+        }
+        await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
+        return null;
+      case "placed":
+        await this.deadlines.clear("place");
+        await this.afterPlaced();
+        return after.host;
     }
-    if (host) {
-      await this.deadlines.clear("place");
-      await this.pushSecrets();
-      await this.issueAttachesOrRetry();
-      await this.notifyAgentsMoved(host);
-      await this.armIdle();
-    } else {
-      await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
-    }
-    return host;
+  }
+
+  /** What every new placement (answered or adopted) is followed by. */
+  private async afterPlaced(): Promise<void> {
+    await this.pushSecrets();
+    await this.issueAttachesOrRetry();
+    await this.notifyAgentsMoved();
+    await this.armIdle();
   }
 
   /**
@@ -417,16 +376,11 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async retryPlacement(): Promise<string | null> {
     const info = this.info_();
-    if (info.state === "failed" && info.host) {
-      const old = info.host;
-      await this.fleet(info.cell).issueCommands(old, [{ type: "fence", sandboxes: [info.sandbox], reason: "create failed; re-placing" }]);
-      await this.fleet(info.cell).releaseLease(info.sandbox, info.epoch);
-      this.update((i) => {
-        if (i.host === old && i.epoch === info.epoch) {
-          i.host = null;
-          i.state = "creating";
-        }
-      });
+    const old = lease.failedHolder(info);
+    if (old) {
+      await this.fleet(info.cell).issueCommands(old.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "create failed; re-placing" }]);
+      await this.fleet(info.cell).releaseLease(info.sandbox, old.epoch);
+      this.update((i) => lease.retried(i, old.host, old.epoch));
     }
     return this.placeCurrentEpoch();
   }
@@ -438,18 +392,18 @@ export class SandboxDO extends DurableObject<Env> {
   async reportState(
     host: string, epoch: number, state: SandboxState, _mode: string | null, detail: string | null, guest: GuestInfo | null = null,
   ): Promise<void> {
-    const info = this.get<SandboxInfo>("info");
-    if (!info || epoch !== info.epoch || host !== info.host) return;
+    const info = this.tryInfo();
+    if (!info || !lease.holds(info, host, epoch)) return;
     // The host's reason, to Workers Logs only (it names host paths): the one place it was kept.
     if (state === "failed" && detail) console.warn(`sandbox ${info.sandbox}: failed on ${host}: ${detail}`);
-    const becameRunning = state === "running" && info.state !== "running";
+    let r!: ReturnType<typeof lease.reported>;
     this.update((i) => {
-      i.state = state;
-      if (guest && state === "running") i.guest = guest;
+      r = lease.reported(i, host, epoch, state, guest);
     });
-    if (state !== info.state) this.report("state_changed", `state: ${state}`, { state, epoch, host });
+    if (!r.applied) return;
+    if (r.changed) this.report("state_changed", `state: ${state}`, { state, epoch, host });
     // A guest that just came up (boot, resume) takes the slots its sandbox was suspended without.
-    if (becameRunning) await this.reissuePendingAttaches(true);
+    if (r.becameRunning) await this.reissuePendingAttaches(true);
     await this.armIdle();
   }
 
@@ -461,17 +415,13 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async wake(): Promise<{ host: string | null; state: SandboxState }> {
     let info = this.info_();
-    if (info.state === "destroyed" || info.state === "archived") {
-      throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
-    }
+    if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
     if (!info.host && info.placing !== null) {
       await this.reconcilePlacing();
       info = this.info_();
     }
     if (info.host) {
-      if (info.state === "suspended") {
-        await this.command([{ type: "sandbox_resume", sandbox: info.sandbox, epoch: info.epoch }]);
-      }
+      if (info.state === "suspended") await this.command({ type: "sandbox_resume" });
       return { host: info.host, state: info.state };
     }
     if (info.placing !== null) return { host: null, state: info.state };
@@ -485,15 +435,15 @@ export class SandboxDO extends DurableObject<Env> {
    * it (a spot drain), in which case it's placed elsewhere now.
    */
   async evicted(host: string, epoch: number): Promise<void> {
-    const cur = this.get<SandboxInfo>("info") ? this.info_() : undefined;
-    if (!cur || cur.host !== host || cur.epoch !== epoch) return;
-    const info = this.update((i) => {
-      i.host = null;
-      i.state = "suspended";
+    if (!this.tryInfo()) return;
+    let r!: ReturnType<typeof lease.evicted>;
+    this.update((i) => {
+      r = lease.evicted(i, host, epoch);
     });
+    if (r === "ignore") return;
     await this.deadlines.clear("idle");
-    if (info.working.length) await this.placeCurrentEpoch(host);
-    else await this.notifyAgentsMoved(null);
+    if (r === "replace") await this.placeCurrentEpoch(host);
+    else await this.notifyAgentsMoved();
   }
 
   /** Start (or clear) the idle countdown: running, placed, and no agent working. */
@@ -513,24 +463,17 @@ export class SandboxDO extends DurableObject<Env> {
    * before running it) is re-issued a few times; otherwise the sandbox is marked failed.
    */
   async commandFailed(host: string, type: string, epoch: number, error: ErrorBody): Promise<void> {
-    const info = this.get<SandboxInfo>("info") ? this.info_() : undefined;
-    if (!info || epoch !== info.epoch || host !== info.host || type !== "sandbox_create") return;
-    if (error.retryable && info.create_attempts < MAX_CREATE_ATTEMPTS) {
-      this.update((i) => {
-        i.create_attempts += 1;
-      });
-      const from = info.head ? this.generation(info.head) : undefined;
-      await this.fleet(info.cell).issueCommands(host, [{
-        type: "sandbox_create", sandbox: info.sandbox, workstream: info.workstream, epoch, image: info.image,
-        resources: info.resources, policy: this.effectivePolicy(), ...(from ? { from } : {}),
-      }]);
-      await this.pushSecrets();
-      return;
-    }
-    this.update((i) => {
-      if (i.epoch === epoch && i.host === host) i.state = "failed";
+    if (type !== "sandbox_create" || !this.tryInfo()) return;
+    let r!: ReturnType<typeof lease.createFailed>;
+    const info = this.update((i) => {
+      r = lease.createFailed(i, host, epoch, error.retryable);
     });
-    console.warn(`sandbox ${info.sandbox}: create failed: ${error.code} ${error.message}`);
+    if (r === "reissue") {
+      await this.fleet(info.cell).issueCommands(host, [this.createBody(info)]);
+      await this.pushSecrets();
+    } else if (r === "failed") {
+      console.warn(`sandbox ${info.sandbox}: create failed: ${error.code} ${error.message}`);
+    }
   }
 
   /**
@@ -538,23 +481,15 @@ export class SandboxDO extends DurableObject<Env> {
    * restore from head. Idempotent: FleetDO retries it until it succeeds.
    */
   async leaseLost(host: string, epoch: number, hostIsDead: boolean): Promise<void> {
-    const cur = this.get<SandboxInfo>("info") ? this.info_() : undefined;
-    // Keyed on the lease (host, epoch), never on the state a host reported (`fenced`, `failed`):
-    // host evidence doesn't block the control plane's own transitions. A lease this object never
-    // adopted (its placement was cut off, and the marker since cleared) counts as its own.
-    if (!cur || cur.state === "destroyed" || cur.state === "archived") return;
-    if (cur.epoch === epoch && (cur.host === host || (cur.host === null && cur.placing === null))) {
-      this.update((i) => {
-        i.host = null;
-        i.working = [];
-        i.lost_from = host;
-      });
-    } else if (!(cur.host === null && cur.lost_from === host)) {
-      return; // already handled (re-placed, or a newer epoch exists)
-    }
+    if (!this.tryInfo()) return;
+    let r!: ReturnType<typeof lease.leaseLost>;
+    this.update((i) => {
+      r = lease.leaseLost(i, host, epoch);
+    });
+    if (r === "ignore") return; // gone, or already handled (re-placed, or a newer epoch exists)
     // A dead host is excluded; a host that came back and fenced is healthy and may get the new lease.
     const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined);
-    if (!placed) await this.notifyAgentsMoved(null);
+    if (!placed) await this.notifyAgentsMoved();
   }
 
   /**
@@ -564,7 +499,7 @@ export class SandboxDO extends DurableObject<Env> {
    * call resolves the new placement); the agent records the move, tells a working brain what was
    * lost, and wakes a stopped one with work waiting. The latest placement is what is sent.
    */
-  private async notifyAgentsMoved(_host: string | null): Promise<void> {
+  private async notifyAgentsMoved(): Promise<void> {
     const info = this.info_();
     this.report("moved", info.host ? `placed on ${info.host} at epoch ${info.epoch}` : "no host: restored from its head when next woken",
       { epoch: info.epoch, host: info.host }, `${info.sandbox}/moved/${info.epoch}/${info.host ?? "none"}`);
@@ -583,7 +518,7 @@ export class SandboxDO extends DurableObject<Env> {
         console.error(`sandbox ${info.sandbox}: notifying ${agent} of the move failed; retrying`, e);
       }
     }
-    if (failed) await this.deadlines.set("notify_moved", Date.now() + ATTACH_RETRY_MS, true);
+    if (failed) await this.deadlines.set("notify_moved", Date.now() + slots.ATTACH_RETRY_MS, true);
   }
 
   /**
@@ -601,25 +536,51 @@ export class SandboxDO extends DurableObject<Env> {
     return [...roots];
   }
 
+  /**
+   * Destroyed is decided at once, before any await: a placement answer that lands while the lease
+   * is released finds the sandbox gone, and discards what it got. A retry repeats the cleanup.
+   */
   async destroy(): Promise<void> {
-    const info = this.info_();
-    if (info.host) await this.command([{ type: "sandbox_destroy", sandbox: info.sandbox, epoch: info.epoch }]);
-    await this.fleet(info.cell).releaseLease(info.sandbox);
+    const before = this.info_();
     this.update((i) => {
       i.state = "destroyed";
       i.host = null;
+      i.placing = null;
+      i.placing_ms = null;
     });
-    this.report("destroyed", "destroyed", { epoch: info.epoch }, `${info.sandbox}/destroyed`);
+    this.report("destroyed", "destroyed", { epoch: before.epoch }, `${before.sandbox}/destroyed`);
+    const fleet = this.fleet(before.cell);
+    if (before.host) await fleet.issueCommands(before.host, [{ type: "sandbox_destroy", sandbox: before.sandbox, epoch: before.epoch }]);
+    await fleet.releaseLease(before.sandbox);
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
     // Its generations stop being GC roots.
-    await this.fleet(info.cell).sandboxDestroyed(info.sandbox);
+    await fleet.sandboxDestroyed(before.sandbox);
   }
 
-  private async command(bodies: CommandBody[]): Promise<void> {
+  /** `sandbox_create` for the current epoch, from the head if there is one. */
+  private createBody(info: SandboxInfo): CommandBody {
+    const from = info.head ? this.generation(info.head) : undefined;
+    return {
+      type: "sandbox_create", sandbox: info.sandbox, workstream: info.workstream, epoch: info.epoch, image: info.image,
+      resources: info.resources, policy: this.effectivePolicy(), ...(from ? { from } : {}),
+    };
+  }
+
+  /**
+   * A lease granted to a destroyed sandbox: released, and the VM FleetDO sent with it destroyed (when
+   * the answer named its host; otherwise the host's heartbeat finds the lease revoked and fences it).
+   */
+  private async discardPlacement(info: SandboxInfo, host: string | null, epoch: number): Promise<void> {
+    await this.fleet(info.cell).releaseLease(info.sandbox, epoch);
+    if (host) await this.fleet(info.cell).issueCommands(host, [{ type: "sandbox_destroy", sandbox: info.sandbox, epoch }]);
+  }
+
+  /** Send one command to the current holder, stamped with the sandbox and the epoch read with the host. */
+  private async command(body: SandboxCommand): Promise<void> {
     const info = this.info_();
     if (!info.host) throw new NestError(ErrorCodes.NOT_BOUND, "sandbox is not placed on a host", 409, true);
-    await this.fleet(info.cell).issueCommands(info.host, bodies);
+    await this.fleet(info.cell).issueCommands(info.host, [{ ...body, sandbox: info.sandbox, epoch: info.epoch } as CommandBody]);
   }
 
   // --- generations ----------------------------------------------------------------------------------
@@ -649,7 +610,12 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async commit(host: string, ev: CommitRequestEvent): Promise<CommitOutcome> {
     const stored = this.sql.exec<{ outcome: string }>("SELECT outcome FROM commits WHERE request = ?", ev.request).toArray()[0];
-    if (stored) return JSON.parse(stored.outcome) as CommitOutcome;
+    if (stored) {
+      const outcome = JSON.parse(stored.outcome) as CommitOutcome;
+      // The first answer's notice may not have been posted (it failed after the record was stored).
+      if (outcome.status === "orphaned") await this.noticeOrphan(ev, outcome.generation);
+      return outcome;
+    }
     const info = this.info_();
     const record = (): GenerationRecord => ({
       id: newId("gen_"),
@@ -662,51 +628,40 @@ export class SandboxDO extends DurableObject<Env> {
       reason: ev.reason,
       created_ms: Date.now(),
     });
-    const rejected = (reason: string): CommitOutcome => ({ status: "rejected", reason, ...(info.head ? { head: info.head } : {}) });
-
+    const d = lease.decideCommit(info, (e) => this.epochHost(e), host, ev);
     let outcome: CommitOutcome;
-    let orphan: GenerationRecord | null = null;
-    if ((ev.kind === "checkpoint") !== (ev.mem_manifest !== undefined)) {
-      // `kind` must agree with the memory manifest: the chain is immutable, and a checkpoint
-      // without one would restore without memory.
-      outcome = rejected(ErrorCodes.INVALID_MESSAGE);
-    } else if (ev.reason === "salvage" && ev.epoch < info.epoch) {
-      if (this.epochHost(ev.epoch) !== host) {
-        outcome = rejected(ErrorCodes.STALE_EPOCH);
-      } else {
-        orphan = record();
-        this.sql.exec("INSERT INTO generations (id, record, orphaned, created_ms) VALUES (?, ?, 1, ?)",
-          orphan.id, JSON.stringify(orphan), orphan.created_ms);
-        outcome = { status: "orphaned", generation: orphan };
-      }
-    } else if (ev.epoch !== info.epoch || host !== info.host) {
-      outcome = rejected(ErrorCodes.STALE_EPOCH);
-    } else if ((ev.parent ?? null) !== info.head) {
-      outcome = rejected(ErrorCodes.PARENT_MISMATCH);
+    if (d.kind === "rejected") {
+      outcome = { status: "rejected", reason: d.reason, ...(info.head ? { head: info.head } : {}) };
     } else {
       const generation = record();
-      this.sql.exec("INSERT INTO generations (id, record, orphaned, created_ms) VALUES (?, ?, 0, ?)",
-        generation.id, JSON.stringify(generation), generation.created_ms);
-      this.update((i) => {
-        i.head = generation.id;
-      });
-      outcome = { status: "committed", generation };
+      this.sql.exec("INSERT INTO generations (id, record, orphaned, created_ms) VALUES (?, ?, ?, ?)",
+        generation.id, JSON.stringify(generation), d.kind === "orphan" ? 1 : 0, generation.created_ms);
+      if (d.kind === "head") {
+        this.update((i) => {
+          i.head = generation.id;
+        });
+      }
+      outcome = { status: d.kind === "orphan" ? "orphaned" : "committed", generation };
     }
     this.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES (?, ?, ?, ?)",
       ev.request, JSON.stringify(outcome), Date.now(), outcome.status === "rejected" ? null : outcome.generation.id);
     await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
-    if (orphan) {
-      await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(info.workstream)).ingest({
-        workstream: info.workstream,
-        ts_ms: Date.now(),
-        sandbox: info.sandbox,
-        epoch: info.epoch,
-        type: "orphaned_work",
-        generation: orphan.id,
-        stale_epoch: ev.epoch,
-      });
-    }
+    if (outcome.status === "orphaned") await this.noticeOrphan(ev, outcome.generation);
     return outcome;
+  }
+
+  /** `orphaned_work` to the workstream, at least once per request (WorkstreamDO drops a repeated key). */
+  private async noticeOrphan(ev: CommitRequestEvent, orphan: GenerationRecord): Promise<void> {
+    const info = this.info_();
+    await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(info.workstream)).ingest({
+      workstream: info.workstream,
+      ts_ms: Date.now(),
+      sandbox: info.sandbox,
+      epoch: info.epoch,
+      type: "orphaned_work",
+      generation: orphan.id,
+      stale_epoch: ev.epoch,
+    }, `orphan/${ev.request}`);
   }
 
   /**
@@ -734,10 +689,10 @@ export class SandboxDO extends DurableObject<Env> {
   /** Effective policy merged from the base, workstream and sandbox (temporary grant) layers. */
   private effectivePolicy(now = Date.now()): EgressPolicy {
     const info = this.info_();
-    const ws = this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+    const ws = this.wsLayer();
     const allow: AllowRule[] = [
-      ...BASE_ALLOW.map((host) => ({ host, ports: [80, 443], layer: "base" as const })),
-      ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? [80, 443], layer: "workstream" as const })),
+      ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
+      ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: "workstream" as const })),
       ...this.sql
         .exec<{ host: string; ports: string; expires_ms: number }>("SELECT host, ports, expires_ms FROM grants WHERE expires_ms > ? ORDER BY expires_ms", now)
         .toArray()
@@ -753,12 +708,12 @@ export class SandboxDO extends DurableObject<Env> {
     };
   }
 
-  async policy(): Promise<EgressPolicy> {
-    return this.effectivePolicy();
+  private wsLayer(): WorkstreamPolicyLayer {
+    return this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
   }
 
-  async workstreamPolicy(): Promise<WorkstreamPolicyLayer> {
-    return this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+  async policy(): Promise<EgressPolicy> {
+    return this.effectivePolicy();
   }
 
   async setWorkstreamPolicy(layer: WorkstreamPolicyLayer): Promise<EgressPolicy> {
@@ -768,7 +723,8 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** Temporary sandbox-layer grant (e.g. approved through `ask`). Expires on its own. */
-  async grant(host: string, ttlMs: number, ports: number[] = [80, 443]): Promise<EgressPolicy> {
+  async grant(host: string, ttlMs: number, ports: number[] = WEB_PORTS): Promise<EgressPolicy> {
+    this.info_(); // an unknown sandbox gets no row and no alarm
     const expires = Date.now() + ttlMs;
     this.sql.exec("INSERT INTO grants (id, host, ports, expires_ms) VALUES (?, ?, ?, ?)", newId("grt_"), host, JSON.stringify(ports), expires);
     await this.deadlines.set("grants", expires, true);
@@ -787,16 +743,13 @@ export class SandboxDO extends DurableObject<Env> {
       } else if (key === "place") {
         // An unfinished placement is reconciled first (or the deadline re-armed until it goes stale).
         await this.reconcilePlacing();
-        const info = this.info_();
-        // A suspended sandbox with nobody working stays unplaced until something wakes it.
-        const wanted = info.state !== "suspended" || info.working.length > 0;
-        if (info.host === null && info.placing === null && ACTIVE_STATES.includes(info.state) && wanted) await this.placeCurrentEpoch();
+        if (lease.placeWanted(this.info_())) await this.placeCurrentEpoch();
       } else if (key === "turn_checkpoint") {
         await this.turnEndCheckpoint();
       } else if (key === "idle") {
         const info = this.info_();
         if (info.host && info.state === "running" && info.working.length === 0) {
-          await this.command([{ type: "sandbox_suspend", sandbox: info.sandbox, epoch: info.epoch, mode: "disk_only" }]);
+          await this.command({ type: "sandbox_suspend", mode: "disk_only" });
         }
       } else if (key === "attach_retry") {
         await this.reissuePendingAttaches(false);
@@ -816,7 +769,7 @@ export class SandboxDO extends DurableObject<Env> {
     });
     const policy = this.effectivePolicy();
     if (info.host && ACTIVE_STATES.includes(info.state)) {
-      await this.command([{ type: "policy_update", sandbox: info.sandbox, epoch: info.epoch, policy }]);
+      await this.command({ type: "policy_update", policy });
       if (injectionChanged) await this.pushSecrets();
     }
     return policy;
@@ -828,11 +781,11 @@ export class SandboxDO extends DurableObject<Env> {
    */
   private async pushSecrets(): Promise<void> {
     const info = this.info_();
-    const ws = this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+    const ws = this.wsLayer();
     if (!info.host || !ws.inject.length) return;
     const secrets = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).injectionSecretRefs(
       ws.inject.map((b) => b.name), info.workstream);
-    if (secrets.length) await this.command([{ type: "secrets_update", sandbox: info.sandbox, epoch: info.epoch, secrets }]);
+    if (secrets.length) await this.command({ type: "secrets_update", secrets });
   }
 
   // --- agents, bindings and idleness (docs/control-plane/durable-objects/sandbox/#attach-and-bindings) --
@@ -843,51 +796,34 @@ export class SandboxDO extends DurableObject<Env> {
    * until that command's `ok`, so a first hands call never beats the slot. Idempotent.
    */
   async attach(agent: string, cwd?: string): Promise<SandboxInfo> {
-    const before = this.info_();
-    const wanted = cwd ?? null;
-    // Already attached and confirmed with this cwd: nothing to re-send, and no pending mark to re-set.
-    if (before.attached.includes(agent) && !before.attach_pending.includes(agent) && before.attach_cwd[agent] === wanted) return before;
+    let send = false;
     const info = this.update((i) => {
-      if (!i.attached.includes(agent)) i.attached.push(agent);
-      i.attach_cwd[agent] = wanted;
-      i.attach_attempts[agent] = 0;
-      if (i.host && !i.attach_pending.includes(agent)) i.attach_pending.push(agent);
+      send = slots.attach(i, agent, cwd ?? null, i.host !== null);
     });
-    if (info.host) await this.issueAttachCommands([agent]);
+    if (send) await this.issueAttachCommands([agent]);
     return info;
   }
 
   /** Remove the agent's slot (killing its processes); its bindings are refused from then on. */
   async detach(agent: string): Promise<void> {
-    const info = this.update((i) => {
-      i.attached = i.attached.filter((a) => a !== agent);
-      i.working = i.working.filter((a) => a !== agent);
-      i.attach_pending = i.attach_pending.filter((a) => a !== agent);
-      delete i.attach_cwd[agent];
-      delete i.attach_inflight[agent];
-      delete i.attach_attempts[agent];
-    });
+    const info = this.update((i) => slots.detach(i, agent));
     if (info.host) {
-      await this.command([{ type: "agent_detach", sandbox: info.sandbox, epoch: info.epoch, agent, kill_processes: true }]);
+      await this.command({ type: "agent_detach", agent, kill_processes: true });
     }
     await this.armIdle();
-  }
-
-  private attachBody(info: SandboxInfo, agent: string): CommandBody {
-    const cwd = info.attach_cwd[agent];
-    return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}) };
   }
 
   /** Send `agent_attach` for these agents and remember each command as the agent's one in flight. */
   private async issueAttachCommands(agents: string[]): Promise<void> {
     const info = this.info_();
     if (!info.host || !agents.length) return;
-    const cmds = await this.fleet(info.cell).issueCommands(info.host, agents.map((a) => this.attachBody(info, a)));
+    const bodies = agents.map((agent): CommandBody => {
+      const cwd = info.attach_cwd[agent];
+      return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}) };
+    });
+    const cmds = await this.fleet(info.cell).issueCommands(info.host, bodies);
     this.update((i) => {
-      if (i.host !== info.host || i.epoch !== info.epoch) return;
-      agents.forEach((a, n) => {
-        if (i.attached.includes(a)) i.attach_inflight[a] = cmds[n]!;
-      });
+      if (i.host === info.host && i.epoch === info.epoch) slots.sent(i, agents, cmds);
     });
   }
 
@@ -896,96 +832,75 @@ export class SandboxDO extends DurableObject<Env> {
    * A failure to send is logged and retried from the alarm, so the placement's other follow-ups run.
    */
   private async issueAttachesOrRetry(): Promise<void> {
+    let agents: string[] = [];
     const info = this.update((i) => {
-      i.attach_pending = [...i.attached];
-      i.attach_inflight = {};
-      for (const a of i.attached) i.attach_attempts[a] = 0;
+      agents = slots.newPlacement(i);
     });
-    if (!info.host || !info.attached.length) return;
+    if (!info.host || !agents.length) return;
     try {
-      await this.issueAttachCommands(info.attached);
+      await this.issueAttachCommands(agents);
     } catch (e) {
       console.error(`sandbox ${info.sandbox}: issuing agent_attach failed; retrying`, e);
-      await this.deadlines.set("attach_retry", Date.now() + ATTACH_RETRY_MS, true);
+      await this.deadlines.set("attach_retry", Date.now() + slots.ATTACH_RETRY_MS, true);
     }
   }
 
   /** Re-send `agent_attach` for pending agents with no command in flight (after a failure, or a guest coming up). */
-  private async reissuePendingAttaches(resetAttempts: boolean): Promise<void> {
+  private async reissuePendingAttaches(fresh: boolean): Promise<void> {
+    let agents: string[] = [];
     const info = this.update((i) => {
-      if (resetAttempts) for (const a of i.attach_pending) i.attach_attempts[a] = 0;
+      agents = slots.due(i, fresh);
     });
-    if (!info.host) return;
-    const due = info.attach_pending.filter((a) => !(a in info.attach_inflight));
-    if (due.length) await this.issueAttachCommands(due);
+    if (info.host) await this.issueAttachCommands(agents);
   }
 
   /**
-   * FleetDO routes each `agent_attach` result here. Only the command in flight for the agent counts:
-   * `ok` confirms the slot; an error schedules a retry with a doubling backoff (2 s … 30 s) for as
-   * long as the sandbox is placed, or, for a non-retryable error, waits for the next `running`.
+   * FleetDO routes each `agent_attach` result here, from the holder at the current epoch only; the
+   * slot core decides what it means (`slots.attachResult`).
    */
   async attachResult(host: string, epoch: number, agent: string, cmd: string, outcome: CommandOutcome): Promise<void> {
-    const info = this.get<SandboxInfo>("info") ? this.info_() : undefined;
-    if (!info || epoch !== info.epoch || host !== info.host || !info.attached.includes(agent)) return;
-    if (info.attach_inflight[agent] !== cmd) return; // a superseded attempt's result
-    if (outcome.status === "ok") {
-      this.update((i) => {
-        i.attach_pending = i.attach_pending.filter((a) => a !== agent);
-        delete i.attach_inflight[agent];
-        i.attach_attempts[agent] = 0;
-      });
-      return;
-    }
-    const attempts = (info.attach_attempts[agent] ?? 0) + 1;
+    const info = this.tryInfo();
+    if (!info || !lease.holds(info, host, epoch)) return;
+    let r!: ReturnType<typeof slots.attachResult>;
     this.update((i) => {
-      delete i.attach_inflight[agent];
-      i.attach_attempts[agent] = attempts;
+      r = slots.attachResult(i, agent, cmd, outcome.status === "ok", outcome.status !== "ok" && outcome.error.retryable);
     });
-    if (outcome.error.retryable) {
-      const delay = Math.min(ATTACH_RETRY_MS * 2 ** (attempts - 1), ATTACH_RETRY_MAX_MS);
-      await this.deadlines.set("attach_retry", Date.now() + delay, true);
-      return;
+    if (r.kind === "retry") {
+      await this.deadlines.set("attach_retry", Date.now() + r.delayMs, true);
+    } else if (r.kind === "failed" && outcome.status !== "ok") {
+      // The agent stays pending (no binding the gateway would refuse); the next `running` report
+      // re-issues it, and `resolve` keeps answering not-ready meanwhile.
+      console.warn(`sandbox ${info.sandbox}: attaching ${agent} failed: ${outcome.error.code} ${outcome.error.message}`);
     }
-    // The agent stays pending (no binding the gateway would refuse); the next `running` report
-    // re-issues it, and `resolve` keeps answering not-ready meanwhile.
-    console.warn(`sandbox ${info.sandbox}: attaching ${agent} failed: ${outcome.error.code} ${outcome.error.message}`);
   }
 
   /**
    * A fresh binding and the sandbox's current gateway for an attached agent. Not-ready (retryable)
-   * while the sandbox has no host, is being placed, or the agent's slot isn't confirmed; a suspended
-   * sandbox on a host is resumed first. The token is minted by BrokerDO and never stored here.
+   * until `slots.unbindable` allows it and the host's gateway is reachable; a suspended sandbox on a
+   * host is resumed first. The token is minted by BrokerDO and never stored here.
    */
   async resolve(agent: string): Promise<HandsTarget> {
     let info = this.info_();
     const notReady = (why: string) => new NestError(ErrorCodes.SANDBOX_NOT_READY, why, 503, true);
-    if (!info.attached.includes(agent)) throw new NestError(ErrorCodes.NOT_BOUND, `${agent} is not attached to this sandbox`, 409);
-    if (info.state === "destroyed" || info.state === "archived") throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
-    if (info.host && info.state === "suspended") {
+    if (info.attached.includes(agent) && info.host && info.state === "suspended") {
       await this.wake();
       info = this.info_();
     }
-    if (!info.host || info.placing !== null) throw notReady("sandbox is not placed yet");
-    // nestd forgets a suspended sandbox's gateway entry and re-adds it before it reports `running`,
-    // so a target minted during a resume would only ever be refused as `moved`.
-    if (info.state !== "running") throw notReady(`sandbox is ${info.state}`);
-    if (info.attach_pending.includes(agent)) throw notReady(`${agent}'s slot is not configured yet`);
-    const gateway = await this.fleet(info.cell).hostGatewayUrl(info.host);
+    const refused = slots.unbindable(info, agent);
+    if (refused) throw refused;
+    const host = info.host!;
+    const gateway = await this.fleet(info.cell).hostGatewayUrl(host);
     // The host may advertise one on its next hello (a restart, an upgrade): not an error, not yet.
-    if (!gateway) throw notReady(`host ${info.host} advertises no gateway yet`);
+    if (!gateway) throw notReady(`host ${host} advertises no gateway yet`);
     // Its cloudflared has no ready connection yet (the host just started, or the tunnel is
     // reconnecting): a target now would only fail at the edge. The runner retries.
-    if (gateway.kind === "connecting") throw notReady(`host ${info.host}'s tunnel is connecting`);
+    if (gateway.kind === "connecting") throw notReady(`host ${host}'s tunnel is connecting`);
     // A tunnel host serving no tunnel (an old nestd, no cloudflared) is unreachable: its hello URL is
     // its own loopback, and a runner never shares its sandbox's host.
     if (gateway.kind === "down") {
-      console.error(`SandboxDO: host ${info.host} has the tunnel ${gateway.tunnel} but serves none; ${info.sandbox} is unreachable until it does`);
-      throw notReady(`host ${info.host} serves no tunnel`);
+      console.error(`SandboxDO: host ${host} has the tunnel ${gateway.tunnel} but serves none; ${info.sandbox} is unreachable until it does`);
+      throw notReady(`host ${host} serves no tunnel`);
     }
-    // The guest's version comes from the host's report; it is never guessed.
-    if (!info.guest) throw notReady("the guest has not reported its version yet");
-    const url = gateway.url;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const binding = await broker.signBinding(info.cell, {
       sandbox: info.sandbox, epoch: info.epoch, client: agent, scope: "hands", exp_ms: Date.now() + BINDING_LIFETIME_MS,
@@ -998,24 +913,21 @@ export class SandboxDO extends DurableObject<Env> {
     if (gateway.kind === "tunnel" && !edge) {
       throw new NestError(ErrorCodes.INTERNAL, "access:gateway is not stored; a tunnel target cannot be used without it", 500, false);
     }
-    // Across the awaits the sandbox may have moved, or the agent been detached: never hand out a
-    // token the gateway would refuse, or one for an agent that is no longer attached.
+    // Across the awaits the sandbox may have moved, suspended, or the agent been detached: the same
+    // rule again, at the epoch and host the binding names. Never a token the gateway would refuse.
     const fresh = this.info_();
-    if (!fresh.attached.includes(agent)) throw new NestError(ErrorCodes.NOT_BOUND, `${agent} was detached while resolving`, 409);
-    if (fresh.epoch !== info.epoch || fresh.host !== info.host || fresh.attach_pending.includes(agent)) {
-      throw notReady("sandbox moved while resolving");
-    }
-    if (!fresh.guest) throw notReady("sandbox moved while resolving");
+    const now = slots.unbindable(fresh, agent);
+    if (now) throw now;
+    if (fresh.epoch !== info.epoch || fresh.host !== host) throw notReady("sandbox moved while resolving");
     // `sandbox` and `epoch`: unsigned copies of the claims, for clients of the previous release only.
-    return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest, ...(edge ? { edge } : {}) };
+    return { url: gateway.url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest!, ...(edge ? { edge } : {}) };
   }
 
   /** Agent activity feeds the idle refcount: the sandbox may suspend only when nobody is working. */
   async agentActivity(agent: string, working: boolean): Promise<{ idle: boolean }> {
-    const turnEnded = !working && this.info_().working.includes(agent);
+    let turnEnded = false;
     const info = this.update((i) => {
-      i.working = i.working.filter((a) => a !== agent);
-      if (working && i.attached.includes(agent)) i.working.push(agent);
+      ({ turnEnded } = slots.setWorking(i, agent, working));
     });
     await this.armIdle();
     if (turnEnded) await this.turnEndCheckpoint();
@@ -1037,14 +949,14 @@ export class SandboxDO extends DurableObject<Env> {
     const info = this.info_();
     if (!info.host || info.state !== "running") return;
     this.put("turn_checkpoint_ms", Date.now());
-    await this.command([{ type: "sandbox_checkpoint", sandbox: info.sandbox, epoch: info.epoch, reason: "turn_end" }]);
+    await this.command({ type: "sandbox_checkpoint", reason: "turn_end" });
   }
 
   // --- ports ----------------------------------------------------------------------------------------
 
   async exposePort(port: number, share: boolean, hostHeader: "localhost" | "preserve" = "localhost"): Promise<{ url: string; share_url?: string }> {
     const info = this.info_();
-    await this.command([{ type: "port_expose", sandbox: info.sandbox, epoch: info.epoch, port, host_header: { mode: hostHeader } }]);
+    await this.command({ type: "port_expose", port, host_header: { mode: hostHeader } });
     const url = this.previewUrl(info.sandbox, port);
     this.update((i) => {
       i.ports = [...i.ports.filter((p) => p.port !== port), { port, url }];
@@ -1052,18 +964,16 @@ export class SandboxDO extends DurableObject<Env> {
     this.report("port_exposed", `port ${port} exposed at ${url}`, { port, url });
     let shareUrl: string | undefined;
     if (share) {
-      // Signed, expiring share token for one {sandbox, port}; verified by the preview Worker route.
-      const exp = Date.now() + 24 * 3_600_000;
-      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(this.env.HOST_TOKEN_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-      const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`share\n${info.sandbox}\n${port}\n${exp}`)));
-      shareUrl = `https://${shareHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, info.sandbox)}/?exp=${exp}&sig=${b64url(sig)}`;
+      // Signed and expiring, for one {sandbox, port}. Minted only: no Worker route serves it yet.
+      const query = await signShare(this.env.HOST_TOKEN_SECRET, info.sandbox, port, Date.now() + 24 * 3_600_000);
+      shareUrl = `https://${shareHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, info.sandbox)}/?${query}`;
     }
     return shareUrl ? { url, share_url: shareUrl } : { url };
   }
 
   async unexposePort(port: number): Promise<void> {
     const info = this.info_();
-    await this.command([{ type: "port_unexpose", sandbox: info.sandbox, epoch: info.epoch, port }]);
+    await this.command({ type: "port_unexpose", port });
     this.update((i) => {
       i.ports = i.ports.filter((p) => p.port !== port);
     });

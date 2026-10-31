@@ -10,12 +10,13 @@ browser ─► Cloudflare Access ─► Worker (<port>-<sandbox>-preview-nest.<z
 ```
 
 - **Loopback-bound dev servers work,** because the guest agent connects from inside the guest. The gateway needs only file permission on the vsock socket: no privileges, no `setns`.
+- **Not built:** the Worker has no preview or share route yet (`control-plane/wrangler.jsonc` routes only `nest.bitcru.sh`). SandboxDO mints the names, and signs share links, for when it does.
 - **Routing in the Worker:** it looks up the sandbox's current host in SandboxDO and proxies to that host's single tunnel hostname, protected by an Access service token. WebSockets (hot module reload) pass through. Previews follow a sandbox when it moves, and **a request to a paused or suspended sandbox wakes it**. Hands, terminals and port-forwards skip the Worker: the client calls `resolve`, gets the hostname and a binding, and connects to the gateway itself ([gateway](../../gateway/)).
 - **Ingress guards:** an in-flight HTTP response, or an open WebSocket or terminal, keeps the sandbox from pausing or suspending while its client keeps reading. A stalled reader counts as absent, and a stream counts for at most 2 h ([idle rule](../../../control-plane/durable-objects/sandbox/#activity-and-idle)).
 - **Exposure is opt-in per port:** `nest expose 3000` in the sandbox, or the `expose_port` tool. The guest agent watches `/proc/net/tcp` and reports newly opened ports as events, so the UI and subscribed agents can offer a preview link.
 - **Auth:**
   - `*-preview-nest.<zone>` sits behind Access, so only me.
-  - `*-share-nest.<zone>` has no Access; the Worker checks a signed, expiring token for one specific `{sandbox, port}`.
+  - `*-share-nest.<zone>` has no Access; the Worker is to check a signed, expiring token for one specific `{sandbox, port}` (not built).
   - Every nest hostname is a first-level label of the Cloudflare zone, so Universal SSL covers it, and the kind of a name is its suffix. The sandbox hosts' own hostnames sit beside these as `<host>-gw-nest.<zone>` with no Worker route; the full table is in [setup](../../../setup/#hostnames).
 - **Host header:** dev servers often reject unfamiliar `Host` values (DNS-rebinding protection). The router sends `Host: localhost:<port>` and passes the original as `X-Forwarded-Host`, configurable per exposed port.
 - **Over the same vsock channel:**
