@@ -229,6 +229,9 @@ export function capacityRetryMs(n: number): number {
 }
 const CAPACITY_RETRY_MAX_MS = 5 * 60_000;
 
+/** The same record (a brain, an intent): equal as stored. */
+const same = <T>(a: T, b: T) => JSON.stringify(a) === JSON.stringify(b);
+
 /** A host a brain may start on: an active, connected brain host of this release (docs/compute/brain-hosts/). */
 function brainHostUsable(st: { status: string; connected: boolean; current: boolean; role: string } | null): boolean {
   return !!st && st.status === "active" && st.connected && st.current && st.role === "brain";
@@ -539,14 +542,8 @@ export class AgentDO extends DurableObject<Env> {
    */
   async start(hostHint?: string, avoid?: string, restart = false): Promise<StartResult> {
     const info = this.load();
-    if (hostHint) {
-      // An active, connected brain host of this cell and release. Hands still go through the
-      // sandbox's gateway.
-      const st = await this.fleet(info.cell).hostStatus(hostHint);
-      if (!brainHostUsable(st)) {
-        throw new NestError(ErrorCodes.FORBIDDEN, `${hostHint} is not an active, connected brain host of this release in ${info.cell}`, 409);
-      }
-    }
+    // Hands still go through the sandbox's gateway, wherever the brain runs.
+    if (hostHint) await this.requireBrainHost(info.cell, hostHint);
     await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), ...(avoid ? { avoid } : {}), reason: restart ? "restart" : "operator" });
     const r = await this.runIntent(true);
     return r ?? this.startStatus();
@@ -680,7 +677,7 @@ export class AgentDO extends DurableObject<Env> {
   /** The brain record and intent are still what `snap` saw. */
   private unchanged(snap: AgentInfo): boolean {
     const now = this.load();
-    return JSON.stringify(now.brain) === JSON.stringify(snap.brain) && JSON.stringify(now.intent) === JSON.stringify(snap.intent);
+    return same(now.brain, snap.brain) && same(now.intent, snap.intent);
   }
 
   /**
@@ -694,9 +691,7 @@ export class AgentDO extends DurableObject<Env> {
     const fleet = this.fleet(info.cell);
     let host: string | null;
     if (intent.host_hint) {
-      if (!brainHostUsable(await fleet.hostStatus(intent.host_hint))) {
-        throw new NestError(ErrorCodes.FORBIDDEN, `${intent.host_hint} is not an active, connected brain host of this release in ${info.cell}`, 409);
-      }
+      await this.requireBrainHost(info.cell, intent.host_hint);
       host = intent.host_hint;
     } else {
       host = await fleet.placeBrain({ prev: info.prev_host ?? null, avoid: intent.avoid ?? null, agent: info.agent });
@@ -714,6 +709,13 @@ export class AgentDO extends DurableObject<Env> {
       }
     }
     return host;
+  }
+
+  /** `host` is one a brain may start on (`brainHostUsable`), or the start is refused. */
+  private async requireBrainHost(cell: string, host: string): Promise<void> {
+    if (!brainHostUsable(await this.fleet(cell).hostStatus(host))) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `${host} is not an active, connected brain host of this release in ${cell}`, 409);
+    }
   }
 
   /** The `starting` deadline: above the runner's budget before its hello, doubling per consecutive timeout. */
@@ -805,7 +807,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     // A newer start merged into the intent while this run awaited: its own run (queued behind this
     // one, `intentDirty`) decides; this failure says nothing about it.
-    if (JSON.stringify(now.intent) !== JSON.stringify(intent)) return;
+    if (!same(now.intent, intent)) return;
     if (ne?.retryable ?? true) {
       // No brain host with room (FleetDO launches one): the wait backs off, 30 s doubling to 5 min,
       // so a cell at its cap isn't asked twice a minute by every waiting agent. New input sets the
@@ -913,7 +915,7 @@ export class AgentDO extends DurableObject<Env> {
     const st = await this.fleet(info.cell).hostStatus(b.host);
     await this.hook("escalate:afterStatus");
     // Re-checked after the await (N13): one released or replaced meanwhile isn't decided for.
-    if (JSON.stringify(this.load().brain) !== JSON.stringify(b)) return;
+    if (!same(this.load().brain, b)) return;
     if (!st?.current) {
       // A host of the previous release (no brain epochs): its brain is released only by that
       // host's loss (confirmed death or lease expiry), never by a processed kill without a row or
@@ -931,7 +933,7 @@ export class AgentDO extends DurableObject<Env> {
     const p = await this.fleet(info.cell).killProgress(b.kill.cmd, info.agent, b.host, b.epoch);
     await this.hook("escalate:afterProgress");
     // Decided only against the record it was asked for: one released or replaced meanwhile isn't wedged for.
-    if (JSON.stringify(this.load().brain) !== JSON.stringify(b)) return;
+    if (!same(this.load().brain, b)) return;
     const age = Date.now() - b.kill.ms;
     const verdict = escalation(p, age, EXIT_WAIT_MS, ESCALATION_CAP_MS);
     if (verdict === "release") {
