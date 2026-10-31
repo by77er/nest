@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::state::State;
-use crate::verify::{Refusal, check_bind, first_frame_mismatch};
+use crate::verify::{Refusal, first_frame_mismatch, verify_token};
 
 /// How long a client has, from the TCP accept, to finish the upgrade and send `bind`.
 pub const BIND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,7 +84,12 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
         refuse(&mut ws, &Refusal::new(error_code::BAD_REQUEST, "expected a bind message")).await;
         return Ok(());
     };
-    let accepted = match check_bind(&state, &binding, protocol_version, gateway_version, now_ms()) {
+    // The token outside any lock, then admission and registration under one: registered before
+    // the guest is touched, so a removal, epoch bump or link loss during the vsock connect cuts
+    // the connect below.
+    let admitted = verify_token(|kid| state.key(kid), &binding, gateway_version, now_ms())
+        .and_then(|claims| state.admit_and_register(&claims, protocol_version).map(|(a, g)| (claims, a, g)));
+    let (claims, admission, mut guard) = match admitted {
         Ok(a) => a,
         Err(r) => {
             tracing::info!(code = r.code, via, "bind refused");
@@ -92,22 +97,14 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
             return Ok(());
         }
     };
-    let sandbox = accepted.claims.sandbox.clone();
-    let client = accepted.claims.client.clone();
-    // Registered before the guest is touched, atomically with a re-check of the sandbox and
-    // epoch: a removal, epoch bump or link loss since the bind check is refused here, and one
-    // during the vsock connect cuts the connect below.
-    let Some(mut guard) = state.register_conn(sandbox.clone(), accepted.claims.epoch) else {
-        refuse(&mut ws, &Refusal::moved("the sandbox left this host")).await;
-        return Ok(());
-    };
+    let (sandbox, client) = (claims.sandbox.clone(), claims.client.clone());
     let guest = tokio::select! {
         biased;
         _ = guard.closed() => {
             refuse(&mut ws, &Refusal::moved("the sandbox left this host")).await;
             return Ok(());
         }
-        r = tokio::time::timeout(VSOCK_TIMEOUT, vsock_connect(&accepted.vsock_uds_path, PORT_HANDS)) => match r {
+        r = tokio::time::timeout(VSOCK_TIMEOUT, vsock_connect(&admission.vsock_uds_path, PORT_HANDS)) => match r {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 tracing::warn!(sandbox = %sandbox.0, error = %e, "guest vsock connect failed");
@@ -121,7 +118,9 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
         }
     };
     drop(permit);
-    let bound = GatewayMessage::Bound { guest: accepted.guest.clone(), gateway_version: accepted.gateway_version };
+    // The highest version this gateway serves that the client also speaks: with one version
+    // served, that is the client's.
+    let bound = GatewayMessage::Bound { guest: admission.guest.clone(), gateway_version };
     if send(&mut ws, Message::text(serde_json::to_string(&bound)?)).await.is_err() {
         return Ok(());
     }
@@ -166,7 +165,7 @@ async fn connection(stream: TcpStream, state: Arc<State>, permit: tokio::sync::O
                             close(&mut ws, close_code::PROTOCOL, "first frame is not JSON").await;
                             break "bad first frame";
                         };
-                        if let Some(field) = first_frame_mismatch(&json, &accepted.claims, accepted.guest.protocol_version) {
+                        if let Some(field) = first_frame_mismatch(&json, &claims, admission.guest.protocol_version) {
                             tracing::info!(sandbox = %sandbox.0, client = %client, field, "first frame differs from the binding");
                             close(&mut ws, close_code::UNAUTHORIZED, "frame does not match the binding").await;
                             break "unauthorized frame";

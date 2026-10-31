@@ -93,8 +93,9 @@ hard kill (wedged): AgentStop{kill} or Fence → SIGKILL of the process group (n
 
 ## Late input after an idle close
 
-A `run_turn` or inbox message that arrives after the runner closed stdin for idleness (Claude Code
-still exiting) is held, and once the process exits the runner starts Claude Code again with
-`--resume <current session file>` and replays it — no `agent_exited` is reported for that exit.
-After a stop or kill, such input is reported as an `error{agent_stopping}` agent event (tagged with
-the turn) instead of being dropped. Inbox messages count as delivered only once written to stdin.
+A `run_turn` that arrives after the runner closed stdin for idleness (Claude Code still exiting) is
+held, and once the process exits the runner starts Claude Code again with
+`--resume <current session file>` and runs it there — no `agent_exited` is reported for that exit.
+After a stop or kill, such a turn is reported as an `error{agent_stopping}` agent event (tagged with
+the turn) instead of being dropped, and the exit carries the stop or kill's reason. Inbox messages
+never restart a brain: with no turn running they stay in the mirror for AgentDO to queue.

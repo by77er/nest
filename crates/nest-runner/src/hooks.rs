@@ -11,15 +11,15 @@ use nest_protocol::host::hook::{
     PermissionRequestDecision, TopLevelDecision,
 };
 use nest_protocol::host::mcp::McpContent;
-use nest_protocol::model::{AgentEventBody, AgentState};
+use nest_protocol::model::{AgentEventBody, AgentState, MessageId};
 use serde_json::{Value, json};
 use tokio::net::{UnixDatagram, UnixListener};
-use tokio::sync::oneshot;
 
 use crate::framing;
 use crate::hands;
 use crate::rules;
-use crate::runtime::{Agent, Runtime};
+use crate::mirror;
+use crate::runtime::{Agent, AgentCmd, AgentInner, Runtime};
 
 /// Serve async tracking datagrams forever.
 pub async fn serve_dgram(rt: Arc<Runtime>, sock: UnixDatagram) {
@@ -56,29 +56,31 @@ pub async fn serve_sync(rt: Arc<Runtime>, listener: UnixListener) {
                 _ => return,
             };
             let peer = stream.peer_cred().ok().and_then(|c| c.pid());
-            let output = if peer_matches(&rt, peer, &req.agent).await {
-                decide(&rt, &req).await
-            } else {
+            if peer_agent(&rt, peer, &req.agent).await.is_none() {
                 tracing::warn!(agent = %req.agent, ?peer, "hook from a process that isn't that agent's brain; using the fallback");
                 let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
-                nest_protocol::host::hook::fallback_output(event).unwrap_or_default()
-            };
-            let _ = framing::write_host(&mut stream, &HookDecisionResponse { output }).await;
+                let output = nest_protocol::host::hook::fallback_output(event).unwrap_or_default();
+                let _ = framing::write_host(&mut stream, &HookDecisionResponse { output }).await;
+                return;
+            }
+            let answer = decide(&rt, &req).await;
+            let written = framing::write_host(&mut stream, &HookDecisionResponse { output: answer.output.clone() }).await.is_ok();
+            answer.settle(written);
         });
     }
 }
 
-/// Is `peer` (a pid from `SO_PEERCRED`) a descendant of `agent`'s Claude Code process? Retries
-/// briefly: right after a spawn the pid may not be recorded yet.
-pub async fn peer_matches(rt: &Runtime, peer: Option<i32>, agent: &nest_protocol::model::AgentId) -> bool {
-    let Some(pid) = peer else { return false };
+/// The agent whose Claude Code process `peer` (a pid from `SO_PEERCRED`) descends from, if it is
+/// the one `declared`. Retries briefly: right after a spawn the pid may not be recorded yet.
+pub async fn peer_agent(rt: &Runtime, peer: Option<i32>, declared: &nest_protocol::model::AgentId) -> Option<Arc<Agent>> {
+    let pid = peer?;
     for _ in 0..10 {
         if let Some(a) = rt.agent_for_pid(pid) {
-            return &a.id == agent;
+            return (&a.id == declared).then_some(a);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    None
 }
 
 /// Drain `nest-hook-spool.jsonl` (datagrams `nest hook` couldn't send).
@@ -123,14 +125,55 @@ pub fn track(agent: &Agent, input: &Value) {
     agent.emit(AgentEventBody::StateChanged { state, detail });
 }
 
-/// Answer a sync hook. Never waits on the network.
-pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> HookOutput {
+/// A sync hook's answer, and the inbox messages it hands the model: confirmed to AgentDO
+/// (`inbox_delivered`) once the answer is written, pending again if it isn't.
+pub struct Answer {
+    pub output: HookOutput,
+    delivery: Option<Delivery>,
+}
+
+struct Delivery {
+    agent: Arc<Agent>,
+    messages: Vec<MessageId>,
+    /// A `Stop` answer that blocks: the actor was told a continuation is owed.
+    stop_blocked: bool,
+}
+
+impl From<HookOutput> for Answer {
+    fn from(output: HookOutput) -> Self {
+        Answer { output, delivery: None }
+    }
+}
+
+impl Answer {
+    pub fn settle(self, written: bool) {
+        let Some(d) = self.delivery else { return };
+        if written {
+            for id in d.messages {
+                d.agent.emit(AgentEventBody::InboxDelivered { message: id });
+            }
+            return;
+        }
+        d.agent.inner.lock().unwrap().mirror.release(&d.messages);
+        if d.stop_blocked {
+            // Claude Code got no `block`, so the turn ends after all.
+            d.agent.command(AgentCmd::StopHook { blocked: false });
+            d.agent.emit(AgentEventBody::StateChanged { state: AgentState::Idle, detail: None });
+        }
+    }
+}
+
+/// Answer a sync hook. Never waits on the network (the `SessionStart` read goes through hands).
+pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
     let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default().to_string();
     let Some(agent) = rt.agent(&req.agent) else {
-        return nest_protocol::host::hook::fallback_output(&event).unwrap_or_default();
+        return nest_protocol::host::hook::fallback_output(&event).unwrap_or_default().into();
     };
-    track(&agent, &req.input);
-    match event.as_str() {
+    // A Stop is idle only if it lets the turn end; `stop` decides.
+    if event != "Stop" {
+        track(&agent, &req.input);
+    }
+    let output = match event.as_str() {
         "PreToolUse" => {
             let (decision, reason) = permission(&agent, &req.input);
             HookOutput {
@@ -151,10 +194,12 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> HookOutput {
             };
             HookOutput { hook_specific_output: Some(HookSpecificOutput::PermissionRequest { decision }), ..Default::default() }
         }
-        "Stop" => stop(&agent, &req.input),
+        "PostToolUse" if rt.cfg.inbox_at_tool_boundary => return tool_boundary(&agent),
+        "Stop" => return stop(&agent, &req.input),
         "SessionStart" => session_start(rt, &agent, &req.input).await,
         _ => HookOutput::default(),
-    }
+    };
+    output.into()
 }
 
 /// PreToolUse / PermissionRequest: first matching rule; `ask` escalates and denies for now.
@@ -176,31 +221,40 @@ fn permission(agent: &Agent, input: &Value) -> (PermissionDecision, Option<Strin
     }
 }
 
-/// Stop: deliver undelivered inbox-mirror messages as `decision: block`, bounded by
-/// `max_stop_continuations`.
-fn stop(agent: &Agent, input: &Value) -> HookOutput {
-    let pending = agent.pending_inbox();
-    let mut inner = agent.inner.lock().unwrap();
-    // `stop_hook_active: false` starts a new stop chain (not a continuation we caused).
-    if !input.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false) {
-        inner.stop_continuations = 0;
+/// PostToolUse: hand pending inbox-mirror messages to the model with the tool's result.
+fn tool_boundary(agent: &Arc<Agent>) -> Answer {
+    let pending = {
+        let mut inner = agent.inner.lock().unwrap();
+        let AgentInner { cache, mirror, .. } = &mut *inner;
+        mirror.take_at_tool_boundary(cache.as_ref())
+    };
+    if pending.is_empty() {
+        return HookOutput::default().into();
     }
-    let max = inner.cache.as_ref().map(|c| c.max_stop_continuations).unwrap_or(0);
-    if pending.is_empty() || inner.stop_continuations >= max {
-        return HookOutput::default();
+    let output = HookOutput {
+        hook_specific_output: Some(HookSpecificOutput::PostToolUse { additional_context: Some(mirror::render(&pending)) }),
+        ..Default::default()
+    };
+    Answer { output, delivery: Some(Delivery { agent: agent.clone(), messages: pending.into_iter().map(|m| m.id).collect(), stop_blocked: false }) }
+}
+
+/// Stop: hand pending inbox-mirror messages to the model as `decision: block`, bounded by
+/// `max_stop_continuations`. The actor learns whether this stop was blocked before Claude Code
+/// can act on the answer.
+fn stop(agent: &Arc<Agent>, input: &Value) -> Answer {
+    let active = input.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
+    let pending = {
+        let mut inner = agent.inner.lock().unwrap();
+        let AgentInner { cache, mirror, .. } = &mut *inner;
+        mirror.take_at_stop(cache.as_ref(), active)
+    };
+    agent.command(AgentCmd::StopHook { blocked: !pending.is_empty() });
+    if pending.is_empty() {
+        track(agent, input);
+        return HookOutput::default().into();
     }
-    inner.stop_continuations += 1;
-    let mut reason = String::from("New messages arrived while you were working:\n");
-    for m in &pending {
-        inner.delivered.insert(m.id.clone());
-        reason.push_str(&format!("\n[message from {}]\n{}\n", m.from, m.text));
-    }
-    drop(inner);
-    // Tell AgentDO so it prunes the mirror (a restarted brain must not see them again).
-    for m in &pending {
-        agent.emit(AgentEventBody::InboxDelivered { message: m.id.clone() });
-    }
-    HookOutput { decision: Some(TopLevelDecision::Block), reason: Some(reason), ..Default::default() }
+    let output = HookOutput { decision: Some(TopLevelDecision::Block), reason: Some(mirror::render(&pending)), ..Default::default() };
+    Answer { output, delivery: Some(Delivery { agent: agent.clone(), messages: pending.into_iter().map(|m| m.id).collect(), stop_blocked: true }) }
 }
 
 /// SessionStart: rebase the tailer on the reported transcript path and pass the repo's
@@ -212,7 +266,7 @@ async fn session_start(rt: &Runtime, agent: &Arc<Agent>, input: &Value) -> HookO
             None => tracing::warn!(agent = %agent.id, path = p, "ignoring a transcript_path outside the agent's config dir"),
         }
     }
-    if agent.inner.lock().unwrap().hands.is_none() {
+    if agent.hands.is_none() {
         return HookOutput::default();
     }
     let op = match hands::op_from_mcp(
@@ -222,8 +276,8 @@ async fn session_start(rt: &Runtime, agent: &Arc<Agent>, input: &Value) -> HookO
         Ok(op) => op,
         Err(_) => return HookOutput::default(),
     };
-    let (_tx, rx) = oneshot::channel();
-    let call = hands::call(agent, format!("ss-{}", uuid::Uuid::new_v4().simple()), op, rx);
+    // A kill or hard interrupt cancels the read like any hands call.
+    let call = hands::call(agent, format!("ss-{}", uuid::Uuid::new_v4().simple()), op, agent.hands_token());
     // With a target cached the read itself is bounded; without one the call first waits for
     // AgentDO (the sandbox may still be placing), which takes as long as the resolve budget.
     let limit = match agent.hands_target() {
@@ -268,14 +322,14 @@ mod tests {
     use crate::config::Config;
     use crate::runtime::{AgentCmd, Outbound};
     use nest_protocol::control::{AgentCache, InboxMessage, ToolRule};
-    use nest_protocol::model::{AgentEvent, AgentId, Epoch, MessageId};
+    use nest_protocol::model::{AgentEvent, AgentId, Epoch};
     use tokio::sync::mpsc;
 
     fn setup() -> (Arc<Runtime>, Arc<Agent>, mpsc::UnboundedReceiver<Outbound>, mpsc::UnboundedReceiver<AgentCmd>) {
         let rt = Runtime::new(Config::default());
         let (ctx, crx) = mpsc::unbounded_channel();
         let (otx, orx) = mpsc::unbounded_channel();
-        let a = Agent::new(AgentId("agt_h".into()), Epoch(1), std::env::temp_dir(), None, None, vec![], 0, ctx, otx);
+        let a = Agent::new(AgentId("agt_h".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
         assert!(rt.register(a.clone(), rt.fence_gen()).is_ok());
         (rt, a, orx, crx)
     }
@@ -306,15 +360,15 @@ mod tests {
     #[tokio::test]
     async fn pre_tool_use_rules_and_escalation() {
         let (rt, a, mut out, _c) = setup();
-        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "ls"}}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "ls"}}))).await.output;
         assert_eq!(pre(&o), PermissionDecision::Deny, "no cache yet → deny");
         a.set_cache(cache(vec![]));
-        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "ls"}}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "ls"}}))).await.output;
         assert_eq!(pre(&o), PermissionDecision::Allow);
-        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "git push --force"}}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "git push --force"}}))).await.output;
         assert_eq!(pre(&o), PermissionDecision::Deny);
         // No rule for WebFetch → ask → escalation event + deny with "pending approval".
-        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "WebFetch", "tool_input": {"url": "https://x"}}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "WebFetch", "tool_input": {"url": "https://x"}}))).await.output;
         assert_eq!(pre(&o), PermissionDecision::Deny);
         let mut saw_escalation = false;
         while let Ok(m) = out.try_recv() {
@@ -331,7 +385,7 @@ mod tests {
         old.version = 0;
         old.rules.clear();
         a.set_cache(old);
-        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Read", "tool_input": {"file_path": "/x"}}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Read", "tool_input": {"file_path": "/x"}}))).await.output;
         assert_eq!(pre(&o), PermissionDecision::Allow);
     }
 
@@ -339,7 +393,7 @@ mod tests {
     async fn permission_request_maps_behavior() {
         let (rt, a, _o, _c) = setup();
         a.set_cache(cache(vec![]));
-        let o = decide(&rt, &req(json!({"hook_event_name": "PermissionRequest", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "ls"}}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "PermissionRequest", "tool_name": "mcp__nest__Bash", "tool_input": {"command": "ls"}}))).await.output;
         assert!(matches!(
             o.hook_specific_output,
             Some(HookSpecificOutput::PermissionRequest { decision: PermissionRequestDecision::Allow { .. } })
@@ -347,30 +401,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_delivers_inbox_once_with_loop_guard() {
-        let (rt, a, _o, _c) = setup();
-        let msg = |id: &str| InboxMessage { id: MessageId(id.into()), from: "user".into(), text: format!("hello {id}"), interrupt: false, ts_ms: 0 };
-        a.set_cache(cache(vec![msg("msg_1")]));
-        let o = decide(&rt, &req(json!({"hook_event_name": "Stop", "stop_hook_active": false}))).await;
-        assert_eq!(o.decision, Some(TopLevelDecision::Block));
-        assert!(o.reason.unwrap().contains("hello msg_1"));
-        // Delivered: no repeat.
-        let o = decide(&rt, &req(json!({"hook_event_name": "Stop", "stop_hook_active": true}))).await;
-        assert_eq!(o, HookOutput::default());
-        // New message, but the guard (max 1) is reached.
-        let mut c2 = cache(vec![msg("msg_1"), msg("msg_2")]);
-        c2.version = 2;
-        a.set_cache(c2);
-        let o = decide(&rt, &req(json!({"hook_event_name": "Stop", "stop_hook_active": true}))).await;
-        assert_eq!(o, HookOutput::default());
-    }
-
-    #[tokio::test]
     async fn unknown_agent_gets_fallback() {
         let rt = Runtime::new(Config::default());
-        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "x"}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "x"}))).await.output;
         assert_eq!(pre(&o), PermissionDecision::Deny);
-        let o = decide(&rt, &req(json!({"hook_event_name": "Stop"}))).await;
+        let o = decide(&rt, &req(json!({"hook_event_name": "Stop"}))).await.output;
         assert_eq!(o, HookOutput::default());
     }
 
@@ -385,19 +420,6 @@ mod tests {
         assert_eq!(valid_transcript(&a, base.join("-x/u.txt").to_str().unwrap()), None);
         assert_eq!(valid_transcript(&a, "projects/-x/u.jsonl"), None);
     }
-
-    #[tokio::test]
-    async fn stop_chain_resets_the_loop_guard() {
-        let (rt, a, _o, _c) = setup();
-        let msg = |id: &str| InboxMessage { id: MessageId(id.into()), from: "user".into(), text: id.into(), interrupt: false, ts_ms: 0 };
-        a.set_cache(cache(vec![msg("m1")]));
-        assert_eq!(decide(&rt, &req(json!({"hook_event_name": "Stop", "stop_hook_active": false}))).await.decision, Some(TopLevelDecision::Block));
-        let mut c = cache(vec![msg("m1"), msg("m2")]);
-        c.version = 2;
-        a.set_cache(c);
-        // A new stop chain (not caused by our block) may continue again.
-        assert_eq!(decide(&rt, &req(json!({"hook_event_name": "Stop", "stop_hook_active": false}))).await.decision, Some(TopLevelDecision::Block));
-    }
 }
 
 #[cfg(test)]
@@ -405,7 +427,8 @@ mod session_start_tests {
     use super::*;
     use crate::config::Config;
     use crate::hands::SANDBOX_NOT_READY;
-    use crate::runtime::{AgentCmd, HandsResolveOutcome, Outbound};
+    use crate::runtime::{AgentCmd, Outbound};
+    use nest_protocol::control::HandsOutcome;
     use crate::test_support::FakeGuest;
     use crate::test_support::gateway::TestGateway;
     use nest_protocol::control::HandsBinding;
@@ -428,7 +451,6 @@ mod session_start_tests {
             Epoch(2),
             std::env::temp_dir(),
             Some(HandsBinding { sandbox: SandboxId("sbx_s".into()), epoch: None }),
-            None,
             vec![],
             0,
             ctx,
@@ -441,12 +463,12 @@ mod session_start_tests {
             while let Some(o) = orx.recv().await {
                 if let Outbound::HandsResolve(req) = o {
                     let outcome = if Instant::now() < ready_at {
-                        HandsResolveOutcome::Error {
+                        HandsOutcome::Error {
                             error: ErrorBody { code: SANDBOX_NOT_READY.into(), message: "placing".into(), retryable: true },
                             retry_after_ms: Some(200),
                         }
                     } else {
-                        HandsResolveOutcome::Target(target.clone())
+                        HandsOutcome::Ok { hands: target.clone() }
                     };
                     a2.resolve_hands(&req, outcome);
                 }

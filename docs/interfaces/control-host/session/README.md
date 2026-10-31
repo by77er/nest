@@ -27,12 +27,12 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `hello_ack` | first frame | `durable_bytes` for the stream currently being received (the committed base, or a new base or session in progress); the runner resends session bytes from here. `last_seq`. |
 | `segment_ack` | no | `durable_bytes`, sent after the bytes are durable in R2 |
 | `run_turn` | seq | `turn`, `input{kind, text}`, written to Claude Code's stdin as a user message |
-| `inbox` | seq | `InboxMessage`, delivered mid-turn through stdin or at `Stop` through the inbox mirror. `interrupt: true` interrupts first |
+| `inbox` | seq | `InboxMessage`, delivered through the inbox mirror at a tool boundary (`PostToolUse`) or at `Stop`, never through stdin. `interrupt: true` interrupts first |
 | `interrupt` | seq | The stream-json interrupt control message |
 | `cache_update` | seq | `AgentCache{version, rules, inbox, max_stop_continuations}` for answering hooks locally |
 | `tool_result` | seq | `outcome: ok{content} \| error{error} \| pending{ask, message}` |
 | `tools_list` | no | `ToolDef[]` (MCP `tools/list` plus nest metadata) |
-| `hands_resolved` | no (`request`) | `outcome`: `{status: ok, hands{url, binding, guest, edge?}}` or `{status: error, error, retry_after_ms?}`: `not_bound` (no hands, or not attached), `sandbox_not_ready` with `retry_after_ms` (no host, placing, the slot not confirmed, no gateway advertised), `stale_epoch` (not the current runner process or epoch). The binding travels only here, never in a command. For one release AgentDO also sends the previous shape (exactly one of `hands` and `error`, and `retry_after_ms`), and runners accept it when `outcome` is absent; `hands` still carries unsigned `sandbox` and `epoch` copies for those runners |
+| `hands_resolved` | no (`request`) | `outcome`: `{status: ok, hands{url, binding, guest, edge?}}` or `{status: error, error, retry_after_ms?}`: `not_bound` (no hands, or not attached), `sandbox_not_ready` with `retry_after_ms` (no host, placing, the slot not confirmed, no gateway advertised), `stale_epoch` (not the current runner process or epoch). The binding travels only here, never in a command. For one release AgentDO also sends the previous shape (exactly one of `hands` and `error`, and `retry_after_ms`); runners read only `outcome`, and one without it is an `invalid_message` error; `hands` still carries unsigned `sandbox` and `epoch` copies for those runners |
 | `ack` / `error` | — | |
 
 ## Session stream and acks
@@ -50,6 +50,7 @@ runner                                      AgentDO                          R2
 ```
 
 - **Offsets are the ordering and deduplication key.** AgentDO ignores bytes it already has and rejects a gap (`invalid_message`). The runner then resends from `durable_bytes`.
+- **A base goes again until acknowledged.** After a reconnect the runner resends from `durable_bytes`, unless it sent a base (a rewritten file) and no `segment_ack` has come since: `durable_bytes` may then still describe the old file, so the base goes again (AgentDO takes a repeated base as a fresh one). Residual: an ack for the old file crossing the base on the wire counts as confirming it.
 - **Brain lineage:** `hello.instance_id` is random per brain process. When it differs from the previous connection's, AgentDO resets the channel's seq lineage and event dedup, and re-queues an interrupted turn as a **recovery** turn. A reconnect of the same process resumes as usual.
 - **In-order delivery:** a reliable message must carry `seq == last + 1`. A gap or a processing failure **closes the socket**, and the runner resends everything unacked after reconnecting. A later batch's ack never covers an earlier failed one.
 - **Stale connections:** a runner whose `hello.epoch` is stale gets `hello_ack` (with `durable_bytes` = its own `local_bytes`) followed by `error{stale_epoch}`. Its segments are stored under `sessions/<agent>/orphan/e<epoch>/<offset>` and acknowledged, never written to the live session. Nothing else (turns, tool calls, events) flows on that connection.
@@ -59,7 +60,7 @@ runner                                      AgentDO                          R2
 ## Turns, inbox and caches
 
 - **One turn at a time.** AgentDO queues `run_turn`s and sends the next one after `turn_completed`.
-- **Inbox during a turn:** the runner writes it to stdin, where Claude Code queues it. When the turn ends, the `Stop` hook returns the pending mirror messages as `decision: "block"`, up to `max_stop_continuations` times.
+- **Inbox during a turn:** the runner hands it to the model at the next tool boundary, as `PostToolUse` `additionalContext` (unverified that Claude Code shows it mid-turn under `-p`). When the turn ends, the `Stop` hook returns messages still pending as `decision: "block"`, up to `max_stop_continuations` times per stop chain. A message no hook handed out stays in the mirror and AgentDO queues it as the next turn. stdin carries only `run_turn` text, one message per turn.
 - **Interrupts:** `interrupt` or `inbox{interrupt: true}` sends the stream-json interrupt control message. If the process has been unresponsive for 10 s, the runner falls back to SIGINT, then `cgroup.kill`.
 - **`cache_update`** replaces the rules and inbox mirror used by `PreToolUse`, `PermissionRequest` and `Stop`. The first matching rule wins; no match means `ask`: the runner emits an `escalation{call, tool, input}` event and denies the call with "pending approval (request `call`)". AgentDO records an async ask (captain's `needs_input`); the answer arrives as an `ask_answer` turn. Updates with a lower `version` are ignored.
 

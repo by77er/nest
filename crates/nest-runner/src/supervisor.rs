@@ -101,7 +101,7 @@ pub fn handle(rt: &Arc<Runtime>, cmd: RunnerCommand) {
         RunnerCommand::AgentStop { agent, mode, reason, epoch } => {
             tracing::info!(%agent, ?mode, %reason, "agent_stop");
             // A stop that names an epoch is for the brain at or below it, never a newer one.
-            if let Some(a) = rt.agent(&agent).filter(|a| epoch.is_none_or(|e| a.epoch() <= e)) {
+            if let Some(a) = rt.agent(&agent).filter(|a| epoch.is_none_or(|e| a.epoch <= e)) {
                 a.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
                 match mode {
                     StopMode::Kill => a.kill_now(ExitReason::Stopped),

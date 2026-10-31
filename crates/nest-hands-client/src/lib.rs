@@ -19,7 +19,7 @@ use nest_protocol::gateway::{
     parse_binding,
 };
 use nest_protocol::guest::frame::{self, Kind, MAX_FRAME_LEN};
-use nest_protocol::model::{Epoch, ErrorBody, SandboxId};
+use nest_protocol::model::{Epoch, ErrorBody};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -227,7 +227,7 @@ impl TransportError {
                     | io::ErrorKind::NetworkUnreachable
             ),
             TransportError::Dns(_) => true,
-            TransportError::Http(s) => (*s >= 500 && *s != 501) || matches!(*s, 401 | 403),
+            TransportError::Http(s) => edge_5xx(*s) || matches!(*s, 401 | 403),
             TransportError::Tls(_) | TransportError::Url(_) | TransportError::ClosedBeforeBound { .. } => false,
         }
     }
@@ -235,8 +235,13 @@ impl TransportError {
     /// An HTTP 5xx from in front of the gateway: worth a short pause before resolving again,
     /// since a tunnel that is reconnecting answers this way for a few seconds.
     pub fn is_edge_outage(&self) -> bool {
-        matches!(self, TransportError::Http(s) if *s >= 500 && *s != 501)
+        matches!(self, TransportError::Http(s) if edge_5xx(*s))
     }
+}
+
+/// A 5xx from in front of the gateway (the gateway itself answers 501 for a route not served yet).
+fn edge_5xx(status: u16) -> bool {
+    status >= 500 && status != 501
 }
 
 impl std::fmt::Display for TransportError {
@@ -431,11 +436,6 @@ impl std::fmt::Debug for HandsConn {
 }
 
 impl HandsConn {
-    /// The sandbox this connection is bound to, from the binding's claims.
-    pub fn sandbox(&self) -> Option<&SandboxId> {
-        self.claims.as_ref().map(|c| &c.sandbox)
-    }
-
     /// The sandbox epoch this connection is bound to, from the binding's claims: the epoch the
     /// first frame must carry (the gateway closes with 4401 on any other).
     pub fn epoch(&self) -> Option<Epoch> {

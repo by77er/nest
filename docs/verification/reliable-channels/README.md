@@ -23,7 +23,7 @@ Out of scope (not seq/ack channels): `segment` (offset-keyed), nestd↔runner (c
 | FleetDO | `hosts.nestd_instance`, `commands(cmd, result?)` | per-host `SerialQueue`, socket attachment `{helloed}`, `keysSent` | `control-plane/src/do/fleet.ts:161,243-247,1152-1173` |
 | AgentDO | `runner_instance`, `events` dedup rows, `tool_calls` | one `SerialQueue`, attachment `{helloed, stale, instance, epoch}` | `control-plane/src/do/agent.ts:117,169,726-797` |
 | nestd fleet task | none | `pending`, `unacked`, `next_seq`, `last_command_seq`, `forwarded_command_seq`, `shed` | `crates/nestd/src/fleet.rs:106-128` |
-| runner session | none | `next_seq`, `unacked`, `last_in` | `crates/nest-runner/src/session.rs:51-63` |
+| runner session | none | `next_seq`, `unacked`, `last_in` | `crates/nest-runner/src/session.rs` `State` |
 
 ## Transitions
 
@@ -59,7 +59,7 @@ Out of scope (not seq/ack channels): `segment` (offset-keyed), nestd↔runner (c
 | H1 | hello (in host queue) | version, host match | old sockets: `helloed := false`, close 4000; `nestd_instance := hello.instance_id`; this socket `helloed := true`, then `hello_ack{last_event_seq?}`, then **awaits** token rotation and binding keys, then C7, reconcile | `fleet.ts:729-797` (helloed at 762; awaits 772-774) |
 | H2 | new process | `nestd_instance ≠ ⊥ ∧ ≠ hello.instance_id` | `rel.reset`: delete `rel_out`, `last_in := ⊥`, `next_out` kept; after reconcile, commands with `result IS NULL` (captured at 789) fail retryably, a reported `sandbox_create` completes | `fleet.ts:751-755,786-792,1086-1097`, `reliable.ts:68-72` |
 
-**Session.** AgentDO hello (in its queue): stale epoch → hello_ack + `stale_epoch`, segments only; else supersede old sockets; new lineage → `rel.reset`, `DELETE FROM events`, requeue the cut-off turn as recovery; `hello_ack{last_seq?}`; resend `pendingAfter` (`agent.ts:726-797`). Inbound `events`/`tool_call`/`cancel_call` run in the queue with the attachment **read inside the queue** and `current(att)` checked (`agent.ts:664,1003-1015,1195-1235,1241-1270`); a throw → error, attachment stale, close 4500 (`agent.ts:677-689`). Outbound `pushReliable` pushes and sends synchronously (`agent.ts:718-723`). Runner: inbound `seq ≤ last_in` → ack, else `last_in := seq`, enqueue, ack — no gap check (`session.rs:296-338`); outbound seqs, `abandon` replaces an unacked `tool_call` by a `cancel_call` at the same seq (`session.rs:73-90`); reconnect resends `unacked > hello_ack.last_seq` (`session.rs:182-218`).
+**Session.** AgentDO hello (in its queue): stale epoch → hello_ack + `stale_epoch`, segments only; else supersede old sockets; new lineage → `rel.reset`, `DELETE FROM events`, requeue the cut-off turn as recovery; `hello_ack{last_seq?}`; resend `pendingAfter` (`agent.ts:726-797`). Inbound `events`/`tool_call`/`cancel_call` run in the queue with the attachment **read inside the queue** and `current(att)` checked (`agent.ts:664,1003-1015,1195-1235,1241-1270`); a throw → error, attachment stale, close 4500 (`agent.ts:677-689`). Outbound `pushReliable` pushes and sends synchronously (`agent.ts:718-723`). Runner: inbound `seq ≤ last_in` → ack, else `last_in := seq`, enqueue, ack — no gap check (`session.rs` `inbound`); outbound seqs, `abandon` replaces an unacked `tool_call` by a `cancel_call` at the same seq (`session.rs` `State::abandon`); reconnect resends `unacked > hello_ack.last_seq` (`session.rs` `connect_once`).
 
 ## Delivery and timing assumptions
 
@@ -67,7 +67,7 @@ Out of scope (not seq/ack channels): `segment` (offset-keyed), nestd↔runner (c
 - A Durable Object runs one event at a time, but its input gate opens across awaits on other DOs (stated at `reliable.ts:83-84`), so RPCs and alarms interleave with queued work. It can be evicted at any point, losing `SerialQueue` and `keysSent`, keeping SQLite.
 - A DO's outgoing `send` after a SQLite write is held until the write is durable (output gate; [Cloudflare](https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/)). Unverified for hibernatable WebSocket sends.
 - nestd and the runner hold channel state in memory only; a crash is a new process with a new `instance_id`.
-- Timers: nestd backoff 200 ms–30 s (`fleet.rs:158,183`), liveness 2.5 heartbeats (`fleet.rs:306`); runner backoff 100 ms–5 s (`session.rs:100,129`).
+- Timers: nestd backoff 200 ms–30 s (`fleet.rs:158,183`), liveness 2.5 heartbeats (`fleet.rs:306`); runner backoff 100 ms–5 s (`session.rs` `Session::run`).
 
 ## Safety properties
 
@@ -75,7 +75,7 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 | Id | Predicate | Holds on main? |
 |---|---|---|
-| S1 no gap | `proc(L)` is a contiguous interval `[b, k]` and is applied in increasing order | FleetDO, AgentDO: yes (`reliable.ts:57-62`). **nestd, runner: no** (no gap check, `fleet.rs:394-404`, `session.rs:308-313`); see B1 |
+| S1 no gap | `proc(L)` is a contiguous interval `[b, k]` and is applied in increasing order | FleetDO, AgentDO: yes (`reliable.ts:57-62`). **nestd, runner: no** (no gap check, `fleet.rs:394-404`, `session.rs` `inbound`); see B1 |
 | S2 at most once | each seq enters `proc(L)` at most once | batch level: yes (`markProcessed` after processing). Per event: **at least once** when a later event in the batch throws (B4) |
 | S3 ack ⇒ processed | `ack(n)` sent ⇒ `∀ s ≤ n, s ∈ sent(L): s ∈ proc(L)` and durable | FleetDO, AgentDO, nestd: yes. Runner: ack on enqueue; acceptable only because its lineage dies with the process |
 | S4 no loss | the sender deletes `m` from its outbox only if `m ∈ proc(L)`, or `L` was reset and `m` got a terminal outcome | **no**: B1 (commands), B3 (events) |
@@ -112,9 +112,11 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 **B4 — partial batch failure re-applies earlier events (suspected; medium).** A throw at event `j` closes the socket; the resend re-runs events `< j`. Not idempotent per event: `guest_cli` relay (`fleet.ts:1048-1058,1067-1082`, no request-id dedup seen; unverified in `AgentDO.guestCli`), `egress_audit` (new R2 key each time, `fleet.ts:1031-1035`), `task_exited`, `workstream` ingest (unverified). A permanent failure repeats them forever.
 
-**B5 — mixed-version frames vanish (latent).** An old nestd or runner that cannot parse a frame drops it silently (`fleet.rs:436-448`, `session.rs:240-243`); with no gap check the next seq is accepted and the cumulative ack deletes the unknown batch, including known commands in it. `CommandBody` has no catch-all (`crates/nest-protocol/src/control.rs:291-292`). "Compatible one version back" (`docs/control-plane/README.md:34`) covers fields, not variants; `protocol_version` must match exactly (`fleet.ts:730`, `agent.ts:730`), so no bump is possible without stranding hosts. Branch 0c3a85c gated new commands on host capabilities (later removed in 65bf6ef).
+**B5 — mixed-version frames vanish (latent).** An old nestd or runner that cannot parse a frame drops it silently (`fleet.rs:436-448`, `session.rs` `connect_once`); with no gap check the next seq is accepted and the cumulative ack deletes the unknown batch, including known commands in it. `CommandBody` has no catch-all (`crates/nest-protocol/src/control.rs:291-292`). "Compatible one version back" (`docs/control-plane/README.md:34`) covers fields, not variants; `protocol_version` must match exactly (`fleet.ts:730`, `agent.ts:730`), so no bump is possible without stranding hosts. Branch 0c3a85c gated new commands on host capabilities (later removed in 65bf6ef).
 
-**B6 — session poison loop (suspected).** AgentDO rejects a frame that fails its schema with `invalid_message` and does not close (`agent.ts:626-635`); the runner reconnects on `invalid_message` (`session.rs:330-333`) and resends the same batch forever. Breaks L3.
+**B6 — session poison loop (suspected).** AgentDO rejects a frame that fails its schema with `invalid_message` and does not close (`agent.ts:626-635`); the runner reconnects on `invalid_message` (`session.rs` `inbound`) and resends the same batch forever. Breaks L3.
+
+**B7 — a failed send lost a runner session message and wedged the channel (fixed).** The runner assigned a seq, sent, and only then queued the message for resending; a send that failed (a broken socket) spent the seq and dropped the message, so every later batch was a gap to AgentDO until the brain exited. Now the message is queued before it is sent (`session.rs` `send_reliable`), as the model's separate *assign* and *send* actions require: the send may fail, the message stays in `unacked` under its seq. Test: `a_batch_whose_send_fails_is_resent_under_its_seq`.
 
 ## Modelling notes
 
@@ -124,10 +126,10 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 | Model action | Code |
 |---|---|
-| push / send | `reliable.ts:26-31` / `fleet.ts:699-723`, `agent.ts:718-723`, `fleet.rs:362-371`, `session.rs:340-353` |
-| receive + classify | `fleet.ts:962-982`, `agent.ts:1003-1015`, `fleet.rs:394-404`, `session.rs:308-313` |
-| ack | `reliable.ts:35-37`, `fleet.rs:405-407`, `session.rs:325` |
-| hello / reset / resend | `fleet.ts:729-797`, `agent.ts:726-797`, `fleet.rs:243-297`, `session.rs:182-218` |
+| push / send | `reliable.ts:26-31` / `fleet.ts:699-723`, `agent.ts:718-723`, `fleet.rs:362-371`, `session.rs` `send_reliable`, `flush_events` |
+| receive + classify | `fleet.ts:962-982`, `agent.ts:1003-1015`, `fleet.rs:394-404`, `session.rs` `inbound` |
+| ack | `reliable.ts:35-37`, `fleet.rs:405-407`, `session.rs` `inbound` |
+| hello / reset / resend | `fleet.ts:729-797`, `agent.ts:726-797`, `fleet.rs:243-297`, `session.rs` `connect_once` |
 | shed | `fleet.rs:196-227` |
 
 ## Runtime assertions and tests to add now
