@@ -1429,6 +1429,8 @@ impl Inner {
     // ------------------------------------------------------------------------------------------
 
     async fn execute(self: &Arc<Self>, cmd: Command) {
+        // Taken first, so a start answered from the cache or refused leaves no stamp behind (N9).
+        let outlived = self.lapse_guard.outlived(&cmd.cmd.0);
         let cached = self.results.lock().expect("results").get(&cmd.cmd.0).cloned();
         if let Some(outcome) = cached {
             self.emit(HostEventBody::CommandResult { cmd: cmd.cmd, outcome });
@@ -1438,7 +1440,7 @@ impl Inner {
         let refusal = host_kind_refusal(self.cfg.role, &cmd.body);
         let result = match (cmd.body, refusal) {
             (_, Some(why)) => Err(error(error_codes::FORBIDDEN, why, false)),
-            (CommandBody::AgentStart(start), None) if self.lapse_guard.outlived(&cmd.cmd.0) => {
+            (CommandBody::AgentStart(start), None) if outlived => {
                 self.refuse_start(&start, "the host lease lapsed since this start arrived")
             }
             (body, None) => self.dispatch(body).await,
