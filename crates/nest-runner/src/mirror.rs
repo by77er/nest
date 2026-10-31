@@ -4,7 +4,8 @@
 //!
 //! - At a tool boundary (`PostToolUse`), every pending message goes out as `additionalContext`.
 //!   UNVERIFIED that Claude Code shows it to the model mid-turn under `-p` stream-json for
-//!   `mcp__nest__*` tools; `Config::inbox_at_tool_boundary` turns this off, leaving only `Stop`.
+//!   `mcp__nest__*` tools; if it doesn't, such a message is confirmed but never seen (`Stop`
+//!   doesn't offer it again). `Config::inbox_at_tool_boundary` turns this off, leaving only `Stop`.
 //! - At `Stop`, every pending message goes out as `decision: block`, up to
 //!   `max_stop_continuations` per stop chain.
 //! - Only while a turn takes inbox ([`crate::brain::Brain::takes_inbox`]). A message the running
