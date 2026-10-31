@@ -397,14 +397,13 @@ export const ROUTES: Route[] = [
     return channel(env, name).setAcl(name, body);
   } }),
 
-  // Workstreams: the interim workstream channel (docs/orchestration/workstreams/). `captain` is the
-  // previous release's name for `subscriber`, accepted for one release.
+  // Workstreams: the interim workstream channel (docs/orchestration/workstreams/).
   route({
     method: "POST", path: "/v1/workstreams", auth: "admin", status: 201,
-    body: z.object({ goal: z.string(), subscriber: z.string().startsWith("agt_").nullable().optional(), captain: z.string().startsWith("agt_").nullable().optional() }),
+    body: z.object({ goal: z.string(), subscriber: z.string().startsWith("agt_").nullable().optional() }),
     run: ({ env, body: r }) => {
       // A subscriber must be an agent of the workstream, and a new one has none yet.
-      if (r.subscriber || r.captain) {
+      if (r.subscriber) {
         throw new NestError(ErrorCodes.INVALID_MESSAGE, "a new workstream has no agents yet: set its subscriber once one is spawned in it");
       }
       const id = newId("ws_");
@@ -415,11 +414,9 @@ export const ROUTES: Route[] = [
   route({ method: "GET", path: "/v1/workstreams/:ws/events", auth: "admin", run: ({ env, url, p }) =>
     workstream(env, p.ws).events(num(url.searchParams.get("limit") ?? undefined, 100)) }),
   route({ method: "GET", path: "/v1/workstreams/:ws/notifications", auth: "admin", run: ({ env, p }) => workstream(env, p.ws).userNotifications() }),
-  ...["subscriber", "captain"].map((leaf) => route({
-    method: "PUT", path: `/v1/workstreams/:ws/${leaf}`, auth: "admin",
-    body: z.object({ subscriber: z.string().startsWith("agt_").nullable().optional(), captain: z.string().startsWith("agt_").nullable().optional() }),
-    run: async ({ env, p, body: r }) => {
-      const subscriber = r.subscriber !== undefined ? r.subscriber : r.captain;
+  route({
+    method: "PUT", path: "/v1/workstreams/:ws/subscriber", auth: "admin", body: z.object({ subscriber: z.string().startsWith("agt_").nullable().optional() }),
+    run: async ({ env, p, body: { subscriber } }) => {
       if (subscriber === undefined) throw new NestError(ErrorCodes.INVALID_MESSAGE, "subscriber is required (an agent id, or null)");
       if (subscriber) {
         // Only an agent of this workstream reads its channel (its events come from that workstream's agents).
@@ -428,7 +425,7 @@ export const ROUTES: Route[] = [
       }
       await workstream(env, p.ws).setSubscriber(subscriber);
     },
-  })),
+  }),
 
   // Task ledgers (docs/control-plane/durable-objects/tasks/): named, with the operator as the root.
   route({ method: "GET", path: "/v1/ledgers/:ledger", auth: "admin", run: ({ env, p }) => {
