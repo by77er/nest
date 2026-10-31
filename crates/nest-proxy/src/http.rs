@@ -115,7 +115,7 @@ pub async fn serve_tcp_exception(ctx: Arc<ConnCtx>, s: TcpStream, rule: String) 
     let (host, port) = split_authority(&rule, 0);
     let host = norm_host(&host);
     let view = ctx.view();
-    let permitted = view.policy.as_ref().is_some_and(|p| p.tcp.iter().any(|t| norm_host(&t.host) == host && t.port == port));
+    let permitted = view.policy.as_ref().is_some_and(|p| p.tcp_exception(&host, port));
     if !permitted || port == 0 {
         ctx.audit(Audit::new(&host, port, EgressVerdict::Deny).reason("tcp_exception_not_in_policy"));
         return;

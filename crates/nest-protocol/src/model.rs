@@ -306,6 +306,13 @@ pub struct AllowRule {
     pub expires_ms: Option<TimestampMs>,
 }
 
+impl AllowRule {
+    /// Whether the rule is in force at `now_ms`: a temporary grant is ignored once it expires.
+    pub fn active(&self, now_ms: TimestampMs) -> bool {
+        self.expires_ms.is_none_or(|e| now_ms < e)
+    }
+}
+
 /// Where in a request nest-proxy looks for (and replaces) a binding's placeholder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -357,6 +364,13 @@ pub struct TcpException {
     pub port: u16,
 }
 
+impl TcpException {
+    /// Whether this exception names `host` (case-insensitive; a trailing dot is ignored).
+    pub fn is_for(&self, host: &str) -> bool {
+        self.host.trim_end_matches('.').eq_ignore_ascii_case(host.trim_end_matches('.'))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressLimits {
     pub max_connections: u32,
@@ -393,9 +407,7 @@ pub enum EgressDecision {
 impl EgressPolicy {
     /// Decide an HTTP(S) destination. TCP exceptions are matched by listener, not here.
     pub fn decide(&self, host: &str, port: u16, now_ms: TimestampMs) -> EgressDecision {
-        let allowed = self.allow.iter().any(|r| {
-            r.host.matches(host) && r.ports.contains(&port) && r.expires_ms.is_none_or(|e| now_ms < e)
-        });
+        let allowed = self.allow.iter().any(|r| r.host.matches(host) && r.ports.contains(&port) && r.active(now_ms));
         if !allowed {
             EgressDecision::Deny
         } else if self.passthrough.iter().any(|p| p.matches(host)) {
@@ -403,6 +415,17 @@ impl EgressPolicy {
         } else {
             EgressDecision::Inspect
         }
+    }
+
+    /// Whether the proxy's DNS answers `name` for this sandbox: an active allow rule or a TCP
+    /// exception names it.
+    pub fn resolves(&self, name: &str, now_ms: TimestampMs) -> bool {
+        self.allow.iter().any(|r| r.host.matches(name) && r.active(now_ms)) || self.tcp.iter().any(|t| t.is_for(name))
+    }
+
+    /// Whether a TCP exception allows raw TCP to `host:port`.
+    pub fn tcp_exception(&self, host: &str, port: u16) -> bool {
+        self.tcp.iter().any(|t| t.is_for(host) && t.port == port)
     }
 }
 
@@ -692,5 +715,33 @@ mod tests {
         assert_eq!(p.decide("example.com", 443, 1_000), EgressDecision::Deny);
         assert_eq!(p.decide("pinned.example.net", 443, 0), EgressDecision::Passthrough);
         assert_eq!(p.decide("evil.com", 443, 0), EgressDecision::Deny);
+    }
+
+    #[test]
+    fn policy_resolves_names_and_tcp_exceptions() {
+        let p = EgressPolicy {
+            version: 1,
+            allow: vec![
+                AllowRule { host: HostPattern("*.githubusercontent.com".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None },
+                AllowRule { host: HostPattern("old.example".into()), ports: vec![443], layer: PolicyLayer::Sandbox, expires_ms: Some(10) },
+            ],
+            passthrough: vec![],
+            inject: vec![],
+            tcp: vec![TcpException { host: "DB.example.com.".into(), port: 5432 }],
+            limits: EgressLimits { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 },
+        };
+        for (name, now, resolves) in [
+            ("raw.githubusercontent.com", 0, true),
+            ("githubusercontent.com", 0, false),
+            ("db.example.com", 0, true),
+            ("old.example", 9, true),
+            ("old.example", 10, false),
+            ("evil.com", 0, false),
+        ] {
+            assert_eq!(p.resolves(name, now), resolves, "{name} at {now}");
+        }
+        assert!(p.tcp_exception("db.example.com", 5432));
+        assert!(!p.tcp_exception("db.example.com", 5433));
+        assert!(!p.tcp_exception("raw.githubusercontent.com", 443));
     }
 }
