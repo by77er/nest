@@ -1,6 +1,6 @@
 # nestd incarnations, fenced-epoch tombstones and restart recovery
 
-Inventory for modelling: per-(sandbox, epoch) state on a sandbox host, `Fenced` as terminal, salvage and retire, the tombstone map, restart reconciliation, and FleetDO's reap of stale incarnations. Code is cited at main `edf6829` (PR #27). Design: [nestd](../../compute/nestd/README.md), [fencing](../../sandbox/fencing/README.md).
+Inventory for modelling: per-(sandbox, epoch) state on a sandbox host, `Fenced` as terminal, salvage and retire, the tombstone map, restart reconciliation, and FleetDO's reap of stale incarnations. Code is cited at main `edf6829` (PR #27); rows changed since cite functions. Design: [nestd](../../compute/nestd/README.md), [fencing](../../sandbox/fencing/README.md).
 
 > **Since:** the pure decisions here (tombstones, the scan, `meta.json` versions, salvage retry, retire backoff) are extracted into `nestd_core::incarnation` and proved with Kani; the machine itself is phase 2 of [nestd/](../nestd/#phase-2-design).
 
@@ -28,13 +28,13 @@ Inventory for modelling: per-(sandbox, epoch) state on a sandbox host, `Fenced` 
 | VmStart | boot | not fenced (checked before the await) | `clean := false`; write meta **before** `vm.start` | `:1541-1560` |
 | Running | create | `set_state` refuses leaving `Fenced` | `dirty := true`; `prune_below(s, e)` | `:1472-1480`, `:674-692` |
 | CreateFail | create | not fenced | `Failed`; teardown; delete dirs (via `.del`) | `:1482-1488` |
-| Suspend | executor | `lock_live` (epoch and fence checked before and after the lock) | pause (`paused := true`), commit; `Committed ⇒ clean := vm none ∨ paused`; any failure: unless fenced, `clean := false` (meta written), resume, `Running` | `:1661-1711`, `:2155` |
-| Resume | executor | `Suspended`, `lock_live` | `clean := false`, write meta **before** resuming | `:1713-1771` |
-| Checkpoint | executor | `lock_live` | pause the VM (`paused` untouched, so `clean` stays false); commit; resume if not fenced; `dirty := true` | `:1773-1797` |
+| Suspend | executor | `lock_live` (epoch and fence checked before and after the lock) | pause (`paused := true`), commit; `Committed ⇒ clean := vm none ∨ paused`; any failure: unless fenced or a fencing rejection (`rejection_fences`), `clean := false` (meta written), resume, `Running` | `suspend`, `roll_back_suspend`, `apply_commit` |
+| Resume | executor | `Suspended`, `lock_live` | `clean := false`, write meta **before** resuming (a cold resume: `launch`, which stops the VM on any error) | `resume`, `launch` |
+| Checkpoint | executor | `lock_live` | pause the VM (`paused` untouched, so `clean` stays false); commit; resume unless fenced or a fencing rejection; `dirty := true` | `checkpoint` |
 | Fence | any (command, self-fence, rejection, reconcile) | row is `(e, ¬Fenced)` | under the summary lock `state := Fenced`; fence brains; lock-free pause; `tomb ⊔= e`; proxy `Drop(Fence)`; gateway forget; report; then under the Sbx lock stop the VM and drop the netns; retire when `salvage` is set | `:1110-1159` |
-| Retire | spawned once per Sbx (`retiring`) | — | loop while `(¬clean ∨ unanswered) ∧ state_dir exists` (`may_hold_work`, read under the Sbx lock): commit(salvage). Landed, or nothing to commit, or a non-retryable error: break. Retryable or `parent_mismatch`: sleep 1 s doubling to 5 min. Then delete dirs; if not destroyed meanwhile, `row(e).dirty := false` and emit `incarnation_retired(s, e)` | `:1176-1220`, `:62-63`, `:2216-2218` |
+| Retire | spawned once per Sbx (`retiring`) | — | loop while `(¬clean ∨ unanswered) ∧ state_dir exists` (`may_hold_work`, read under the Sbx lock): commit(salvage). Landed, or nothing to commit, or a non-retryable error: break. Retryable or `parent_mismatch`: sleep 1 s doubling to 5 min. Then delete dirs; if not destroyed meanwhile, `row(e).dirty := false` and emit `incarnation_retired(s, e)` | `retire_now`, `commit` |
 | Destroy | executor | row epoch ≤ e | `Destroyed`; teardown (removes row and map entry); delete every dir ≤ e; `prune_up_to(s, e)` | `:1825-1846` |
-| Archive | executor | `lock_live` | commit if `may_hold_work` or no head; delete dir; teardown | `:1799-1823` |
+| Archive | executor | `lock_live` | commit if `may_hold_work` or no head; delete dir; teardown | `archive` |
 
 ### Restart (Host::start, `host.rs:345-547`), strictly in this order
 
