@@ -37,18 +37,7 @@ pub async fn read_host_raw<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option
 
 /// Read one host-internal frame. `Ok(None)` on clean EOF at a frame boundary.
 pub async fn read_host<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
-    let mut len = [0u8; 4];
-    match r.read_exact(&mut len).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
-    }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body).await?;
+    let Some(body) = read_host_raw(r).await? else { return Ok(None) };
     serde_json::from_slice(&body).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
