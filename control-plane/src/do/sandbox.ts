@@ -629,22 +629,26 @@ export class SandboxDO extends DurableObject<Env> {
     return [...roots];
   }
 
+  /**
+   * Destroyed is decided at once, before any await: a placement answer that lands while the lease
+   * is released finds the sandbox gone, and discards what it got. A retry repeats the cleanup.
+   */
   async destroy(): Promise<void> {
-    const info = this.info_();
-    if (info.host) await this.command([{ type: "sandbox_destroy", sandbox: info.sandbox, epoch: info.epoch }]);
-    await this.fleet(info.cell).releaseLease(info.sandbox);
+    const before = this.info_();
     this.update((i) => {
       i.state = "destroyed";
       i.host = null;
-      // A placement still in flight finds no marker, so it adopts nothing (it discards what it got).
       i.placing = null;
       i.placing_ms = null;
     });
-    this.report("destroyed", "destroyed", { epoch: info.epoch }, `${info.sandbox}/destroyed`);
+    this.report("destroyed", "destroyed", { epoch: before.epoch }, `${before.sandbox}/destroyed`);
+    const fleet = this.fleet(before.cell);
+    if (before.host) await fleet.issueCommands(before.host, [{ type: "sandbox_destroy", sandbox: before.sandbox, epoch: before.epoch }]);
+    await fleet.releaseLease(before.sandbox);
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
     // Its generations stop being GC roots.
-    await this.fleet(info.cell).sandboxDestroyed(info.sandbox);
+    await fleet.sandboxDestroyed(before.sandbox);
   }
 
   /** A lease granted to a destroyed sandbox: released, and the VM FleetDO sent with it destroyed. */

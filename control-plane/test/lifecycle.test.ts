@@ -300,11 +300,12 @@ describe("preview and share names follow the hostname rule", () => {
 });
 
 /**
- * Hold this SandboxDO's next `FleetDO.place` open until `open()`: `served` lets FleetDO grant first
- * (a slow answer), otherwise the request itself waits (a slow request). Real SandboxDO and FleetDO
- * code; only the await's timing is controlled (miniflare answers too fast to interleave a call).
+ * Hold this SandboxDO's next call of FleetDO's `method` open until `open()`: `served` lets FleetDO run
+ * it first (a slow answer), otherwise the request itself waits (a slow request). Real SandboxDO and
+ * FleetDO code; only the await's timing is controlled (miniflare answers too fast to interleave).
+ * Holds stack: each wraps the stub the previous one returns.
  */
-function holdPlace(inst: SandboxDO, served: boolean): { open: () => void } {
+function holdFleet(inst: SandboxDO, method: "place" | "releaseLease", served: boolean): { open: () => void } {
   const self = inst as unknown as { fleet: (cell: string) => any };
   const real = self.fleet.bind(inst);
   let open!: () => void;
@@ -315,12 +316,12 @@ function holdPlace(inst: SandboxDO, served: boolean): { open: () => void } {
     return new Proxy(f, {
       get(t, p: string | symbol) {
         if (p === "then") return undefined;
-        if (p === "place" && !held) {
+        if (p === method && !held) {
           held = true;
-          return async (req: unknown) => {
-            if (served) { const h = await t.place(req); await gate; return h; }
+          return async (...args: unknown[]) => {
+            if (served) { const r = await t[p](...args); await gate; return r; }
             await gate;
-            return t.place(req);
+            return t[p](...args);
           };
         }
         return (...args: unknown[]) => t[p](...args);
@@ -374,7 +375,7 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
       const a = await connectHost(cell);
       const stub = sandboxStub(s.sandbox);
       await runInDurableObject(stub, async (inst: SandboxDO) => {
-        const { open } = holdPlace(inst, served);
+        const { open } = holdFleet(inst, "place", served);
         const woke = inst.wake().catch((e: unknown) => e);
         await sleep(20);
         await inst.destroy();
@@ -389,13 +390,37 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
     });
   }
 
+  it("a placement that lands while destroy releases the lease is still undone: no lease, the VM destroyed", async () => {
+    const cell = uniqueCell();
+    const s = await createSandbox(cell, 202);
+    const a = await connectHost(cell);
+    const stub = sandboxStub(s.sandbox);
+    await runInDurableObject(stub, async (inst: SandboxDO) => {
+      const place = holdFleet(inst, "place", false);
+      const release = holdFleet(inst, "releaseLease", true);
+      const woke = inst.wake().catch((e: unknown) => e);
+      await sleep(20);
+      // destroy's releaseLease runs at FleetDO; its answer waits while the placement lands.
+      const destroying = inst.destroy();
+      await sleep(20);
+      place.open();
+      await woke;
+      release.open();
+      await destroying;
+    });
+    expect(await stub.info()).toMatchObject({ state: "destroyed", host: null, placing: null });
+    expect(await fleetStub(cell).leaseOf(s.sandbox)).toBeNull();
+    const [destroy] = await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
+    expect(destroy).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
+  });
+
   it("a placement answer that arrives after the marker was reconciled changes nothing: confirmed slots stay confirmed", async () => {
     const cell = uniqueCell();
     const s = await createSandbox(cell, 202);
     const a = await connectHost(cell);
     const stub = sandboxStub(s.sandbox);
     const after = await runInDurableObject(stub, async (inst: SandboxDO, st) => {
-      const { open } = holdPlace(inst, true);
+      const { open } = holdFleet(inst, "place", true);
       const late = inst.wake();
       await sleep(20); // FleetDO granted epoch 1; the answer is held
       // The answer is slower than PLACING_STALE_MS: the next wake reconciles and adopts the lease.

@@ -36,7 +36,7 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 | Evicted | FleetDO `processEvictions` | `host = h ∧ epoch = e` | `host := null; state := suspended`; Claim (excluding h) if anyone works | `407-417` |
 | CreateFailed | `commandFailed(h, sandbox_create, e)` | `e = epoch ∧ h = host` | re-issue create at the **same** epoch up to 3 times, then `state := failed` | `435-454` |
 | Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseLease(e)` (not waiting for the fence), `host := null`, Claim | `341-355` |
-| Destroy | operator | — | `sandbox_destroy` if host; **await** `releaseLease` (all epochs); `state := destroyed; host := null; placing := null`; clear `place`. A Placed or Reconcile continuation that then finds the sandbox gone releases the lease it got at e and sends `sandbox_destroy(e)` to its host (`discardPlacement`) | `destroy`, `discardPlacement` |
+| Destroy | operator | — | `state := destroyed; host := null; placing := null` first (no await before it); then `sandbox_destroy` to the old host if any; **await** `releaseLease` (all epochs); clear `place`. A Placed or Reconcile continuation that then finds the sandbox gone releases the lease it got at e and sends `sandbox_destroy(e)` to its host (`discardPlacement`) | `destroy`, `discardPlacement` |
 | Commit | `commit(h, ev)` via FleetDO | see 2.4 | may move `head` | `552-611` |
 
 ### 2.2 FleetDO lease row and host status
