@@ -17,7 +17,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | nestd | per sandbox `Sbx{epoch, slots, guest_info, vm}` behind an async mutex; `summary{epoch, state}`; gateway mirror `{keys, sandboxes: id→{epoch, vsock, clients, guest}, conn}`; `Tombstones: id→max fenced epoch` | `crates/nestd/src/gateway_link.rs:55-73`, `crates/nestd/src/tombstones.rs:17-55` |
 | gateway | `keys: kid→point`; `sandboxes: id→{epoch, vsock, clients, guest, generation}`; `resyncing`; `conns: id→{sandbox, epoch, close}` | `crates/nest-gateway/src/state.rs` `SandboxEntry`, `Inner` |
 | guest | `identity{sandbox, epoch}?`, `agents` (slots), `frozen` | `crates/nest-guest/src/hands/mod.rs:116-131`, `crates/nest-guest/src/control.rs:57-77` |
-| runner | cached target `{url, sandbox, epoch, binding, guest, edge?}` + generation; per-call `Retries{re_resolved, busy_since}` | `crates/nest-runner/src/hands.rs:91-200` |
+| runner | cached target `{url, sandbox, epoch, binding, guest, edge?}` + generation; per-call `Retries{re_resolved, busy_since}` | `crates/nest-runner/src/hands.rs` `call_with`, `connect`, `ensure_target` |
 
 ## Transitions
 
@@ -56,7 +56,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | Q1 | configure | guest | `epoch ≥ identity.epoch` | set identity; else `stale_epoch` | `control.rs:57-77` |
 | Q2 | validate | guest | version; identity set (else `busy`); not frozen (else `busy`); `req.epoch = identity.epoch`; agent attached | run the tool; hangup or `cancel` cancels | `hands/mod.rs:41-111,116-131` |
 
-**Client (runner).** `ensure_target` (cached until 60 s before `exp_ms`: `crates/nest-hands-client/src/lib.rs:166-176`) → `open` → on refusal `Next::{RetrySame (busy, ≤30 s), Resolve (stale_epoch, moved, unknown_key, unauthorized, unsupported_version; once per call), Final}` (`lib.rs:129-161,286-301`; `hands.rs:158-200`) → send `HandsRequest` (**point of no return**) → `exchange`: result, guest error (`busy` → retry in the same budget; others final), close 4409 or EOF → `outcome_unknown` (`hands.rs:104-128,202-258`).
+**Client (runner).** `ensure_target` (cached until 60 s before `exp_ms`: `crates/nest-hands-client/src/lib.rs` `refresh_due`) → `open` → on refusal `Next::{RetrySame (busy, ≤30 s), Resolve (stale_epoch, moved, unknown_key, unauthorized, unsupported_version; once per call), Final}` (`lib.rs` `Refusal::next`, `guest_error_next`, `OpenError::next`; `hands.rs` `connect`) → send `HandsRequest` (**point of no return**) → `exchange`: result, guest error (`busy` → retry in the same budget; others final), close 4409 or EOF → `outcome_unknown` (`hands.rs` `call_with`, `exchange`).
 
 ## Delivery and timing assumptions
 
@@ -84,7 +84,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 
 | Id | Property | Holds on main? |
 |---|---|---|
-| L1 | sandbox `running` at `e` on `h`, client confirmed, gateway linked with keys, tunnel connected ⇒ a call is admitted after at most one re-resolve plus `busy` waits (≤ 30 s), per call | yes (`hands.rs:158-200`); a call that runs out returns an error and the next call starts afresh |
+| L1 | sandbox `running` at `e` on `h`, client confirmed, gateway linked with keys, tunnel connected ⇒ a call is admitted after at most one re-resolve plus `busy` waits (≤ 30 s), per call | yes (`hands.rs` `connect`); a call that runs out returns an error and the next call starts afresh |
 | L2 | an attach is eventually confirmed while the sandbox stays placed | retryable errors retry (P3); **a lost `agent_attach` never resolves**: `inflight` stays set and `reissuePendingAttaches` skips it (`sandbox.ts:794`) until a new placement or attach |
 | L3 | a host eventually holds the cell's keys | yes: resent on heartbeat while `keysSent` lacks it (`fleet.ts:951-954`) |
 | L4 | a detach eventually takes effect at the gateway | only if `agent_detach` is delivered (see S6) |
@@ -129,7 +129,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | fence / suspend | `host.rs:1110-1134,1706` |
 | gateway upsert / remove / clear / bind / register | `state.rs` `upsert_sandbox` … `admit_and_register`; `verify.rs` `verify_token`, `admit` |
 | guest configure / validate | `control.rs:57-77`, `hands/mod.rs:116-131` |
-| client retry policy | `nest-hands-client/src/lib.rs:129-161,286-301`, `hands.rs:91-258` |
+| client retry policy | `nest-hands-client/src/lib.rs` `Refusal::next`, `OpenError::next`; `hands.rs` `call_with`, `connect`, `exchange` |
 
 ## Runtime assertions and tests to add now
 
