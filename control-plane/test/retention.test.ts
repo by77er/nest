@@ -236,7 +236,8 @@ describe("the GC registry", () => {
     };
     await runInDurableObject(sandboxStub(sandbox), async (inst: SandboxDO) => {
       (inst as unknown as { env: unknown }).env = { ...env, FLEET: { idFromName: () => "x", get: () => fakeFleet } };
-      await expect(inst.create({ sandbox, workstream: "ws_01registry0000000000000000", cell })).rejects.toThrow("FleetDO unavailable");
+      // The answer is unknown: the sandbox exists, and its place deadline will finish the placement.
+      expect(await inst.create({ sandbox, workstream: "ws_01registry0000000000000000", cell })).toMatchObject({ placing: 1, host: null });
     });
     expect(registered).toEqual([sandbox]);
   });

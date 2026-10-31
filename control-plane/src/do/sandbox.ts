@@ -282,7 +282,14 @@ export class SandboxDO extends DurableObject<Env> {
     };
     this.put("info", info);
     this.put("ws_layer", req.workstreamPolicy ?? EMPTY_LAYER);
-    await this.placeCurrentEpoch();
+    try {
+      await this.placeCurrentEpoch();
+    } catch (e) {
+      // The sandbox exists either way. An unknown answer (the marker stays) is finished by the
+      // `place` deadline: an error here would only make the client retry and mint a second sandbox.
+      if (this.info_().placing === null) throw e;
+      console.warn(`sandbox ${req.sandbox}: placement answer unknown; the place deadline reconciles it`, e);
+    }
     return this.info_();
   }
 

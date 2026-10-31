@@ -416,4 +416,18 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
     const sent = a.ws.drain().filter((m) => m.type === "commands").flatMap((m) => m.commands as { type: string }[]);
     expect(sent.filter((c) => c.type === "agent_attach")).toHaveLength(1);
   });
+
+  it("a create whose placement answer is unknown returns the sandbox; its place deadline finishes the job", async () => {
+    const id = `sbx_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+    const cell = uniqueCell();
+    const created = await runInDurableObject(sandboxStub(id), async (inst: SandboxDO, st) => {
+      const self = inst as unknown as { fleet: (cell: string) => any };
+      const real = self.fleet.bind(inst);
+      self.fleet = (c: string) => ({ ...real(c), registerSandbox: (x: string) => real(c).registerSandbox(x), place: async () => { throw new Error("Network connection lost."); } });
+      const info = await inst.create({ sandbox: id, workstream: "ws_lifecycle", cell }).catch((e: Error) => e.message);
+      return { info, deadline: st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'place'").toArray().length };
+    });
+    // A 500 here would make a client retry the POST, and the retry mints a second sandbox.
+    expect(created).toMatchObject({ info: { sandbox: id, placing: 1, host: null }, deadline: 1 });
+  });
 });
