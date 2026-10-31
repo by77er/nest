@@ -16,7 +16,7 @@ use ring::{digest, hmac};
 use serde::Deserialize;
 
 use crate::storage::{LocalFsStore, ObjectStore};
-use crate::util::{amz_date, par_try_for_each, parse_http_date_ms, parse_rfc3339_utc_ms};
+use crate::util::{amz_date, now_ms, par_try_for_each, parse_http_date_ms, parse_rfc3339_utc_ms};
 
 /// Refresh role credentials this long before they expire.
 const REFRESH_BEFORE_MS: i64 = 5 * 60_000;
@@ -514,10 +514,6 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
-}
-
 fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
     hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data.as_bytes()).as_ref().to_vec()
 }
@@ -640,14 +636,7 @@ struct ImdsCredentials {
 
 /// The instance role's temporary credentials (IMDSv2).
 async fn imds_credentials(http: &reqwest::Client, imds_url: &str) -> anyhow::Result<Credentials> {
-    let token = http
-        .put(format!("{imds_url}/latest/api/token"))
-        .header("X-aws-ec2-metadata-token-ttl-seconds", "300")
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let token = crate::enroll::imds_token(http, imds_url, 300).await?;
     let base = format!("{imds_url}/latest/meta-data/iam/security-credentials/");
     let get = |url: String| http.get(url).header("X-aws-ec2-metadata-token", token.clone()).send();
     let role = get(base.clone()).await?.error_for_status()?.text().await?;

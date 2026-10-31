@@ -77,9 +77,6 @@ struct FakeDriver {
 
 #[async_trait]
 impl Driver for FakeDriver {
-    fn name(&self) -> &'static str {
-        "fake"
-    }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         std::fs::create_dir_all(&spec.vm_dir)?;
         // Never gets to a VM (the test kills the process meanwhile).
@@ -135,9 +132,6 @@ impl Vm for FakeVm {
     }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
-    }
-    fn disk_path(&self) -> PathBuf {
-        self.spec.disk_path.clone()
     }
     async fn start(&mut self) -> std::io::Result<()> {
         if self.fail_next_start.swap(false, Ordering::SeqCst) {
@@ -824,9 +818,6 @@ struct NetnsCapture(Arc<Mutex<Option<Arc<nestd::net::Netns>>>>);
 
 #[async_trait]
 impl Driver for NetnsCapture {
-    fn name(&self) -> &'static str {
-        "fake-netns"
-    }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         *self.0.lock().unwrap() = spec.netns.clone();
         FakeDriver::default().create(spec).await

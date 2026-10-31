@@ -976,12 +976,12 @@ impl Inner {
                             seen.insert(key, now).is_none()
                         }
                     };
-                    if fresh && self.limiter.allow(&r.sandbox, "denied", limits::DENIED, 1.0) {
+                    if fresh && self.limiter.allow(&r.sandbox, "denied", limits::DENIED) {
                         self.workstream_event(&r.sandbox, r.agent.clone(), WorkstreamEventKind::EgressDenied { host: r.host.clone(), port: r.port });
                     }
                 }
                 // Per-sandbox budget for audit records (each batch becomes an R2 write).
-                let records: Vec<_> = records.into_iter().filter(|r| self.limiter.allow(&r.sandbox, "audit", limits::AUDIT_RECORDS, 1.0)).collect();
+                let records: Vec<_> = records.into_iter().filter(|r| self.limiter.allow(&r.sandbox, "audit", limits::AUDIT_RECORDS)).collect();
                 if !records.is_empty() {
                     self.emit(HostEventBody::EgressAudit { records });
                 }
@@ -995,7 +995,7 @@ impl Inner {
                     seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
                     seen.len() < MAX_DENIED_SEEN && seen.insert((sandbox.clone(), format!("{reason:?}"), host.clone()), now).is_none()
                 };
-                if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS, 1.0) {
+                if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS) {
                     self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason });
                 }
             }
@@ -1057,7 +1057,7 @@ impl Inner {
                     s.known_ports = now;
                     drop(s);
                     for port in new {
-                        if this.limiter.allow(&sbx, "ports", limits::PORTS, 1.0) {
+                        if this.limiter.allow(&sbx, "ports", limits::PORTS) {
                             this.workstream_event(&sbx, None, WorkstreamEventKind::PortOpened { port });
                         }
                     }
@@ -1065,7 +1065,7 @@ impl Inner {
             }
             GuestEvent::Cli { agent_id, command, reply } => self.relay_cli(sbx, agent_id, command, reply),
             GuestEvent::TaskExited { agent_id, task } => {
-                if !self.limiter.allow(&sbx, "tasks", limits::TASKS, 1.0) {
+                if !self.limiter.allow(&sbx, "tasks", limits::TASKS) {
                     return;
                 }
                 let Some((_, epoch)) = self.workstream_of(&sbx) else { return };
@@ -1123,7 +1123,7 @@ impl Inner {
         };
         let name = cli_name(&command);
         // Bounded per sandbox: rate and concurrency (an `ask` can be outstanding for minutes).
-        let admitted = self.limiter.allow(&sbx, "cli", limits::CLI, 1.0) && {
+        let admitted = self.limiter.allow(&sbx, "cli", limits::CLI) && {
             let mut inflight = self.cli_inflight.lock().expect("cli");
             let n = inflight.entry(sbx.clone()).or_default();
             if *n >= limits::MAX_CLI_INFLIGHT {

@@ -89,10 +89,6 @@ impl GuestCtl {
         self.guest.lock().expect("guest info").clone()
     }
 
-    pub fn slots(&self) -> Vec<AgentSlot> {
-        self.cfg.lock().expect("guest cfg").slots.clone()
-    }
-
     /// Send a request and wait for its reply. Errors if not connected.
     pub async fn request(&self, body: ControlBody) -> io::Result<ControlBody> {
         let (tx, rx) = oneshot::channel();
@@ -138,10 +134,6 @@ impl GuestCtl {
     /// Arrange for `resume` (clock + entropy, optional fork identity) after the next hello.
     pub fn expect_resume(&self, fork: Option<ForkIdentity>) {
         *self.pending_resume.lock().expect("resume") = Some(fork);
-    }
-
-    pub fn set_epoch(&self, epoch: Epoch) {
-        self.cfg.lock().expect("guest cfg").epoch = epoch;
     }
 
     /// Stop the connection task (sandbox stopped, fenced or destroyed).

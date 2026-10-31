@@ -34,7 +34,6 @@ pub struct VmSpec {
 
 #[async_trait]
 pub trait Driver: Send + Sync {
-    fn name(&self) -> &'static str;
     /// Whether [`Vm::snapshot_memory`] produces a restorable memory snapshot.
     fn supports_memory_snapshots(&self) -> bool {
         false
@@ -48,9 +47,6 @@ pub struct NoDriver;
 
 #[async_trait]
 impl Driver for NoDriver {
-    fn name(&self) -> &'static str {
-        "none"
-    }
     async fn create(&self, _spec: VmSpec) -> io::Result<Box<dyn Vm>> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "a brain host runs no sandboxes"))
     }
@@ -71,7 +67,6 @@ pub trait Vm: Send + Sync {
     }
     /// Host-side hybrid-vsock unix socket (`CONNECT <port>` handshake).
     fn vsock_uds_path(&self) -> PathBuf;
-    fn disk_path(&self) -> PathBuf;
     /// Boot the VM (cold boot from `disk_path`).
     async fn start(&mut self) -> io::Result<()>;
     /// Freeze vCPUs; memory and processes are kept.

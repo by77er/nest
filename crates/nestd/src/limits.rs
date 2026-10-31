@@ -50,15 +50,15 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    /// Take `cost` tokens of `kind` for `sandbox`; `false` (and the drop is counted) if empty.
-    pub fn allow(&self, sandbox: &SandboxId, kind: &'static str, rate: Rate, cost: f64) -> bool {
+    /// Take a token of `kind` for `sandbox`; `false` (and the drop is counted) if empty.
+    pub fn allow(&self, sandbox: &SandboxId, kind: &'static str, rate: Rate) -> bool {
         let mut map = self.buckets.lock().expect("limiter");
         let now = Instant::now();
         let b = map.entry((sandbox.clone(), kind)).or_insert(Bucket { tokens: rate.burst, last: now, dropped: 0 });
         b.tokens = (b.tokens + now.duration_since(b.last).as_secs_f64() * rate.per_sec).min(rate.burst);
         b.last = now;
-        if b.tokens >= cost {
-            b.tokens -= cost;
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
             true
         } else {
             b.dropped += 1;
@@ -84,12 +84,12 @@ mod tests {
         let l = Limiter::default();
         let s = SandboxId("sbx_1".into());
         let r = Rate { per_sec: 0.0, burst: 3.0 };
-        assert!((0..3).all(|_| l.allow(&s, "x", r, 1.0)));
-        assert!(!l.allow(&s, "x", r, 1.0));
+        assert!((0..3).all(|_| l.allow(&s, "x", r)));
+        assert!(!l.allow(&s, "x", r));
         // Separate per sandbox and per kind.
-        assert!(l.allow(&SandboxId("sbx_2".into()), "x", r, 1.0));
-        assert!(l.allow(&s, "y", r, 1.0));
+        assert!(l.allow(&SandboxId("sbx_2".into()), "x", r));
+        assert!(l.allow(&s, "y", r));
         l.forget(&s);
-        assert!(l.allow(&s, "x", r, 1.0));
+        assert!(l.allow(&s, "x", r));
     }
 }
