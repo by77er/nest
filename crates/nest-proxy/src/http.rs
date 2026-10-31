@@ -406,22 +406,16 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
     match &verdict {
         Verdict::WrongHost(b) => {
             ctx.alert(AlertKind::PlaceholderWrongHost, &target.host, Some(b.as_str()), format!("placeholder for binding {b} sent to {}", target.host));
-            let mut a = mk_audit(&req, EgressVerdict::Alert).reason("placeholder_wrong_host");
-            a.binding = Some(b.clone());
-            ctx.audit(a);
+            ctx.audit(mk_audit(&req, EgressVerdict::Alert).reason("placeholder_wrong_host").binding(b));
             return deny_response(StatusCode::FORBIDDEN, "credential_blocked", &target.host, target.port, "a credential placeholder was sent to a host outside its binding");
         }
         Verdict::Expired(b) => {
             ctx.alert(AlertKind::InjectionAfterExpiry, &target.host, Some(b.as_str()), format!("binding {b}: no valid secret (expired, fenced or missing)"));
-            let mut a = mk_audit(&req, EgressVerdict::Alert).reason("injection_unavailable");
-            a.binding = Some(b.clone());
-            ctx.audit(a);
+            ctx.audit(mk_audit(&req, EgressVerdict::Alert).reason("injection_unavailable").binding(b));
             return deny_response(StatusCode::FORBIDDEN, "credential_unavailable", &target.host, target.port, "the credential for this host is not available right now");
         }
         Verdict::Plaintext(b) => {
-            let mut a = mk_audit(&req, EgressVerdict::Deny).reason("injection_requires_tls");
-            a.binding = Some(b.clone());
-            ctx.audit(a);
+            ctx.audit(mk_audit(&req, EgressVerdict::Deny).reason("injection_requires_tls").binding(b));
             return deny_response(StatusCode::FORBIDDEN, "credential_requires_tls", &target.host, target.port, "credentials are only injected over HTTPS");
         }
         Verdict::Clean | Verdict::Substituted(_) => {}
@@ -430,9 +424,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
     let mut needles: Vec<Vec<u8>> = Vec::new();
     if let Verdict::Substituted(b) = &verdict {
         if req.method() == Method::TRACE || req.method().as_str() == "TRACK" {
-            let mut a = mk_audit(&req, EgressVerdict::Deny).reason("trace_with_credential");
-            a.binding = Some(b.clone());
-            ctx.audit(a);
+            ctx.audit(mk_audit(&req, EgressVerdict::Deny).reason("trace_with_credential").binding(b));
             return deny_response(StatusCode::METHOD_NOT_ALLOWED, "method_blocked", &target.host, target.port, "TRACE is not allowed on requests carrying an injected credential");
         }
         needles = scrub_needles(req.headers(), view.secrets.get(b).map(|s| s.value.as_str()));
