@@ -315,8 +315,14 @@ impl Session {
             AgentToRunner::CacheUpdate { cache, .. } => a.set_cache(cache),
             AgentToRunner::ToolResult { call, outcome, .. } => a.resolve_call(&call, outcome),
             AgentToRunner::ToolsList { request, tools } => a.resolve_tools(&request, tools),
-            AgentToRunner::HandsResolved { request, outcome, hands, error, retry_after_ms } => {
-                a.resolve_hands(&request, HandsOutcome::from_wire(outcome, hands, error, retry_after_ms));
+            // Only `outcome`: every AgentDO since #30 sends it (the other fields are the previous
+            // release's shape).
+            AgentToRunner::HandsResolved { request, outcome, .. } => {
+                let outcome = outcome.map(|o| *o).unwrap_or_else(|| HandsOutcome::Error {
+                    error: model::ErrorBody { code: error_codes::INVALID_MESSAGE.into(), message: "hands_resolved carried no outcome".into(), retryable: false },
+                    retry_after_ms: None,
+                });
+                a.resolve_hands(&request, outcome);
             }
             AgentToRunner::Ack { up_to } => st.unacked.retain(|(s, _)| *s > up_to.0),
             AgentToRunner::SegmentAck { durable_bytes, .. } => {
@@ -569,8 +575,8 @@ mod resolve_tests {
                     }
                     RunnerToAgent::HandsResolve { request } => {
                         saw_resolve = true;
-                        // The previous release's shape (no `outcome`), still understood.
-                        let m = AgentToRunner::HandsResolved { request, outcome: None, hands: Some(t2.clone()), error: None, retry_after_ms: None };
+                        let outcome = Some(Box::new(HandsOutcome::Ok { hands: t2.clone() }));
+                        let m = AgentToRunner::HandsResolved { request, outcome, hands: None, error: None, retry_after_ms: None };
                         wtx.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await.unwrap();
                         break;
                     }

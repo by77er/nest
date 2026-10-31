@@ -32,7 +32,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `cache_update` | seq | `AgentCache{version, rules, inbox, max_stop_continuations}` for answering hooks locally |
 | `tool_result` | seq | `outcome: ok{content} \| error{error} \| pending{ask, message}` |
 | `tools_list` | no | `ToolDef[]` (MCP `tools/list` plus nest metadata) |
-| `hands_resolved` | no (`request`) | `outcome`: `{status: ok, hands{url, binding, guest, edge?}}` or `{status: error, error, retry_after_ms?}`: `not_bound` (no hands, or not attached), `sandbox_not_ready` with `retry_after_ms` (no host, placing, the slot not confirmed, no gateway advertised), `stale_epoch` (not the current runner process or epoch). The binding travels only here, never in a command. For one release AgentDO also sends the previous shape (exactly one of `hands` and `error`, and `retry_after_ms`), and runners accept it when `outcome` is absent; `hands` still carries unsigned `sandbox` and `epoch` copies for those runners |
+| `hands_resolved` | no (`request`) | `outcome`: `{status: ok, hands{url, binding, guest, edge?}}` or `{status: error, error, retry_after_ms?}`: `not_bound` (no hands, or not attached), `sandbox_not_ready` with `retry_after_ms` (no host, placing, the slot not confirmed, no gateway advertised), `stale_epoch` (not the current runner process or epoch). The binding travels only here, never in a command. For one release AgentDO also sends the previous shape (exactly one of `hands` and `error`, and `retry_after_ms`); runners read only `outcome`, and one without it is an `invalid_message` error; `hands` still carries unsigned `sandbox` and `epoch` copies for those runners |
 | `ack` / `error` | — | |
 
 ## Session stream and acks
