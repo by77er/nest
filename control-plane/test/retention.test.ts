@@ -564,7 +564,7 @@ describe("a kill FleetDO answered itself", () => {
     // index row gone, and the kill it never answered answered by FleetDO.
     const kill = await fleetSql(cell, (sql, inst) => {
       sql.exec("DELETE FROM host_agents WHERE host = ?", a.host);
-      (inst as unknown as { hostDied(h: string, why: string): void }).hostDied(a.host, "drained");
+      void (inst as unknown as { die(h: string, cause: string): Promise<void> }).die(a.host, "drained");
       return rows(sql, "SELECT result, answered_by, (SELECT lost FROM hosts WHERE host = ?) AS lost FROM commands WHERE host = ? AND type = 'agent_stop'", a.host, a.host)[0];
     });
     expect(kill).toMatchObject({ result: expect.any(String), answered_by: "fleet", lost: 0 });
