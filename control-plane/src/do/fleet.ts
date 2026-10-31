@@ -1011,7 +1011,7 @@ export class FleetDO extends DurableObject<Env> {
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
     this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ? WHERE host = ?",
       now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, att.host);
-    this.setTunnelState(att.host, hello.tunnel ?? "none", prior as HostRow);
+    this.setTunnelState(att.host, hello.tunnel ?? "none", prior);
     if (hello.cgroup_delegation_error) {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
     }
@@ -1061,7 +1061,7 @@ export class FleetDO extends DurableObject<Env> {
     if (prior.role === BRAIN_ROLE && hello.brain_epochs) this.pokeBrainWaitersLater();
     // A host whose leases we expired came back: it must fence them before we reassign (STONITH by fence).
     await this.ensureStonithFence(att.host);
-    await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
+    await this.armTick();
   }
 
   /**
@@ -1305,7 +1305,7 @@ export class FleetDO extends DurableObject<Env> {
       const row = this.sql.exec<{ cell: string }>("SELECT cell FROM hosts WHERE host = ?", host).toArray()[0];
       if (row) await this.sendBindingKeys(ws, row.cell, host);
     }
-    if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
+    await this.armTick();
   }
 
   /**
@@ -1530,7 +1530,7 @@ export class FleetDO extends DurableObject<Env> {
     // nor to a host of the previous release (N23: closes the gap between AgentDO's pick and this send).
     const target = this.host(host);
     if (bodies.some((b) => b.type === "agent_start")) {
-      const prev = !!target && this.sql.exec<{ b: number }>("SELECT brain_epochs AS b FROM hosts WHERE host = ?", host).one().b === 0;
+      const prev = target?.brain_epochs === 0;
       if (!target || target.status === "expired" || target.status === "dead" || prev) {
         throw new NestError(ErrorCodes.FORBIDDEN, `host ${host} is ${prev ? "of the previous release" : target?.status ?? "unknown"}: no agent_start goes there`, 409, true);
       }
@@ -1747,7 +1747,7 @@ export class FleetDO extends DurableObject<Env> {
     // Cut off at once: no socket (its hellos are refused), and no placement of anything on it.
     for (const ws of this.ctx.getWebSockets(host)) ws.close(4408, "wedged");
     console.error(`FleetDO: ${host} is wedged (${reason}); no lease renewal until it is expired`);
-    if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+    await this.armTick();
   }
 
   /** `lost`: its brains are proven gone (A6): lease expired, or death confirmed. */
@@ -1758,9 +1758,8 @@ export class FleetDO extends DurableObject<Env> {
   } | null> {
     const h = this.host(host);
     if (!h) return null;
-    const current = this.sql.exec<{ b: number }>("SELECT brain_epochs AS b FROM hosts WHERE host = ?", host).one().b === 1;
     return {
-      status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx, lost: this.hostLost(host), current,
+      status: h.status, connected: !!this.socketFor(host), last_rx: h.last_rx, lost: h.lost === 1, current: h.brain_epochs === 1,
       wedged: h.wedged_ms !== null, role: h.role,
     };
   }
@@ -1785,7 +1784,7 @@ export class FleetDO extends DurableObject<Env> {
     if (req.agent) {
       // Waiting for room: poked when it appears, and the tick keeps launching while anyone waits.
       this.sql.exec("INSERT OR REPLACE INTO brain_waiters (agent, since_ms) VALUES (?, ?)", req.agent, Date.now());
-      if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+      await this.armTick();
     }
     if (brainHostNeeded(facts, req.avoid)) await this.scaleUp(BRAIN_ROLE);
     return null;
@@ -1850,8 +1849,8 @@ export class FleetDO extends DurableObject<Env> {
 
   /** A6: proven gone (see the `lost` column); a row never seen at all counts as gone. */
   private hostLost(host: string): boolean {
-    const r = this.sql.exec<{ lost: number }>("SELECT lost FROM hosts WHERE host = ?", host).toArray()[0];
-    return !r || r.lost === 1;
+    const h = this.host(host);
+    return !h || h.lost === 1;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1927,7 +1926,7 @@ export class FleetDO extends DurableObject<Env> {
       || this.sql.exec("SELECT 1 FROM brain_waiters").toArray().length
       || this.sql.exec("SELECT 1 FROM stale_incarnations WHERE cmd IS NULL").toArray().length
       || this.sql.exec("SELECT 1 FROM kv WHERE key IN (?, ?)", launchKey(SANDBOX_ROLE), launchKey(BRAIN_ROLE)).toArray().length;
-    if (busy) await this.deadlines.set(ALARM_TICK, now + DEFAULT_LEASE_TIMING.heartbeat_ms);
+    if (busy) await this.armTick();
   }
 
   /**
@@ -2149,7 +2148,7 @@ export class FleetDO extends DurableObject<Env> {
       );
       this.endLaunchIntent(role, a.token);
       console.log(`FleetDO: launched ${role} host ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
-      await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
+      await this.armTick();
       return "launched";
     } catch (e) {
       if (!(e instanceof CapacityError)) {
@@ -2282,7 +2281,7 @@ export class FleetDO extends DurableObject<Env> {
     // the background (the host's event batch isn't held for brain starts), and retried by the tick
     // until each agent took it.
     this.ctx.waitUntil(this.tellDraining(host));
-    if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+    await this.armTick();
   }
 
   /**
@@ -2293,7 +2292,7 @@ export class FleetDO extends DurableObject<Env> {
     if (this.host(host)?.drain_ms !== null || !this.move(host, "drain")) return;
     console.warn(`FleetDO: ${host} draining of brains (${why})`);
     this.ctx.waitUntil(this.tellDraining(host));
-    if (!this.deadlines.has(ALARM_TICK)) await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
+    await this.armTick();
   }
 
   /**
@@ -2738,12 +2737,18 @@ export class FleetDO extends DurableObject<Env> {
         console.error(`FleetDO: reassigning ${r.sandbox} failed; will retry`, e);
       }
     }
-    if (this.sql.exec("SELECT 1 FROM reassignments").toArray().length && !this.deadlines.has(ALARM_TICK)) {
-      await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
-    }
+    if (this.sql.exec("SELECT 1 FROM reassignments").toArray().length) await this.armTick();
   }
 
   // ---------------------------------------------------------------------------------------------
+
+  /**
+   * The tick runs within a heartbeat. An earlier one already set is kept, and a re-arm from inside a
+   * running tick isn't swallowed by that tick's own row (`Deadlines.set`'s `keepEarlier`).
+   */
+  private armTick(): Promise<void> {
+    return this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms, true);
+  }
 
   private host(host: string): HostRow | undefined {
     const h = this.sql.exec<HostRow>("SELECT * FROM hosts WHERE host = ?", host).toArray()[0];
