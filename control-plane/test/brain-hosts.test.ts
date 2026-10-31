@@ -357,7 +357,7 @@ describe("brain hosts scale with brains", () => {
     // A sandbox host is no help.
     const sandboxHost = await connectHost(cell);
     const agent = await captain(cell);
-    expect(ec2.launched).toEqual([expect.objectContaining({ launchTemplateId: "lt-0b", instanceType: "t3a.medium", spot: true, subnetId: "subnet-0a" })]);
+    expect(ec2.launched).toEqual([expect.objectContaining({ launchTemplateId: "lt-0b", instanceType: "t3a.medium", spot: true, subnetId: "subnet-0a", cpuCredits: "unlimited" })]);
     expect(await agentStub(agent).info()).toMatchObject({ brain: null, intent: { reason: "operator" } });
     expect(await sandboxHost.ws.none("commands", 100, (m) => (m.commands as any[]).some(isStartOf(agent)))).toBe(true);
     // Waiting for the launch: no second one.

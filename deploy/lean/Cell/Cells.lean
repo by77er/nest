@@ -10,9 +10,9 @@ def use1 : CellSpec :=
     controlUrl := "https://nest.bitcru.sh"
     launchTypes := ["c8i-flex.large", "c8i.large", "c8id.large", "m8i.large"]
     -- From the stress test (dev/cloud-checks/stress-2026-10-31.md): a c8i-flex.large held 14 idle
-    -- sandboxes, so 4 hosts take about 50; 16 Haiku brains fit a t3a.medium's memory (about 105 MB
-    -- each) but spend its CPU credits, so 12, and 3 hosts hold 36. 14 vCPU in all, under the
-    -- account's 32 spot vCPUs.
+    -- sandboxes, so 4 hosts take about 50; 16 Haiku brains ran on a t3a.medium (about 105 MB each,
+    -- CPU peaking near 60%), so 12 leaves room for heavier sessions, and 3 hosts hold 36. 14 vCPU in
+    -- all, under the account's 32 spot vCPUs.
     maxHosts := 4
     maxBrainsPerHost := 12 }
 
