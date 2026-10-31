@@ -523,6 +523,24 @@ describe("autoscaling", () => {
     expect(ec2.launched).toHaveLength(2);
   });
 
+  it("retires a launched host that enrolled but never said hello once the enroll timeout passes (B-8)", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    const enrolled = await enrollLaunched(cell, "i-000000001");
+    await tickAt(cell, ec2);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE hosts SET enrolled_ms = enrolled_ms - 601000");
+    });
+    await tickAt(cell, ec2);
+    // Dead with its brains proven gone (nothing was ever delivered to it), and its instance terminated.
+    expect(await fleetStub(cell).hostStatus(enrolled.host)).toMatchObject({ status: "dead", lost: true });
+    expect(ec2.terminated).toEqual(["i-000000001"]);
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches[0]).toMatchObject({ instance_id: "i-000000001", reason: "enroll_timeout" });
+  });
+
   it("does nothing in a cell without AWS settings, and never retires hosts it didn't launch", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");

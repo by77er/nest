@@ -12,7 +12,7 @@ What a model of FleetDO ↔ nestd ↔ EC2 ↔ Cloudflare needs: state, transitio
 
 > **Since** (checked on `main` at b63c0a3): B4 is fixed by #30: the tick expires any silent host, and one holding no lease at once (`expireSilent`), so a host terminated outside FleetDO stops counting toward `max_hosts`. #36 split hosts into two kinds (`sandbox` and `brain`, stored as `burst` and `controller` for one release); the `burst` rows below are today's sandbox hosts.
 
-> **Since** (refactor/all): every status write is one guarded transition, `hostStep` in `control-plane/src/lib/host-lifecycle.ts` (applied by `FleetDO.move`; deaths by `FleetDO.die` and `deathPlan`), with transitions named after H4-H12; nothing leaves `dead` (B3 fixed). A drain is kept in `hosts.drain_ms`, so H4 and H7 return a drained host to `draining` and H10 records a drain from any live status (B5 fixed). H7 never applies to a host whose instance FleetDO is terminating (EC2 and an instance id): only H8 ends its STONITH (owner decision 4). H6 applies to any kind. A launch is recorded before RunInstances and repeated with its client token until EC2 answers or `enroll_timeout_ms` passes; only demand plans a new one (B6 fixed). A token is rotated on every hello (B11 fixed). A heartbeat from a host that isn't `active`, `draining` or `stonith_pending` gets no ack, and H4 is written in the step that acks the hello.
+> **Since** (refactor/all): every status write is one guarded transition, `hostStep` in `control-plane/src/lib/host-lifecycle.ts` (applied by `FleetDO.move`; deaths by `FleetDO.die` and `deathPlan`), with transitions named after H4-H12; nothing leaves `dead` (B3 fixed). A drain is kept in `hosts.drain_ms`, so H4 and H7 return a drained host to `draining` and H10 records a drain from any live status (B5 fixed). H7 never applies to a host whose instance FleetDO is terminating (EC2 and an instance id): only H8 ends its STONITH (owner decision 4). H6 applies to any kind. A launch is recorded before RunInstances and repeated with its client token until EC2 answers or `enroll_timeout_ms` passes; only demand plans a new one (B6 fixed). A token is rotated on every hello (B11 fixed). A launched host that enrolled but never said hello dies once `enroll_timeout_ms` has passed since its enrollment (H13). A heartbeat from a host that isn't `active`, `draining` or `stonith_pending` gets no ack, and H4 is written in the step that acks the hello.
 
 Design docs: [FleetDO](../../control-plane/durable-objects/fleet/), [autoscaling](../../compute/autoscaling/), [fleet channel](../../interfaces/control-host/fleet/), [enrollment](../../interfaces/control-host/enrollment/).
 
@@ -59,6 +59,7 @@ In memory only: `launching` (a RunInstances in flight, `:175`), `keysSent` (`:13
 | H10 | `active` → `draining` | `spot_notice` event | status `active` | evict suspended leases, `sandbox_suspend{disk_only}` to the rest | `fleet.ts:1042`, `:1544-1554` |
 | H11 | `active` → `dead` (idle) | tick → scaleDown | role `burst`, `instance_id` set, no lease with `state ≠ suspended`, no brain, `idle_since` ≥ `idle_grace_ms` (600 s) ago | endInstance(`idle`), release tunnel, close, evict | `:1496-1512` |
 | H12 | `draining` → `dead` (drained) | tick → scaleDown | role `burst`, `instance_id` set, no lease at all | endInstance(`drained`), release tunnel, close | `:1515-1523` |
+| H13 | `active`(never connected) → `dead` | tick → scaleDown | `instance_id` set ∧ `enrolled_ms` older than `enroll_timeout_ms` (added in refactor/all) | `die(enroll_timeout)`: endInstance, release tunnel, reassign leases | `scaleDown` |
 
 Absent on purpose: no transition out of `dead` (fetch and hello refuse a dead host, `:624`, `:739`; H4/H7/H10 are guarded by prior status). Two unguarded writes break this (B3). A silent host with no unexpired lease and role `burst` has **no** transition until H11 fires (the 10-minute watch item, B4). H7 returns a `draining` host to `active`, losing the drain (B5).
 
@@ -69,6 +70,7 @@ Absent on purpose: no transition out of `dead` (fetch and hello refuse a dead ho
 | ∅ → pending | `place` finds no connected candidate → scaleUp | AWS cell config and EC2 access, `¬launching`, no pending launch, `#burst hosts in {active, stonith_pending}` < `max_hosts` (default 1, `cells.ts:22`); tries each type on spot, then the first on demand; a non-capacity error stops | `fleet.ts:1234-1237`, `:1437-1480` |
 | pending → enrolled | identity enrollment | `launched` row exists; role/region/account match where recorded; `host` NULL or never connected | `:308-322` |
 | pending → ending (`enroll_timeout`) | scaleDown | `launched_ms` older than `enroll_timeout_ms` (600 s) | `:1490-1495` |
+| enrolled → ending (`enroll_timeout`) | scaleDown | the host never said hello, and `enrolled_ms` is older than `enroll_timeout_ms`: `die(host, "enroll_timeout")` | `scaleDown` |
 | enrolled → ending (`idle`/`drained`) | H11/H12 `endInstance` | | `:1572-1578` |
 | ending → ended | scaleDown | DescribeInstances says dead; otherwise TerminateInstances and retry next tick | `:1525-1536` |
 
@@ -154,7 +156,7 @@ Fairness assumed: the alarm fires; DO RPCs eventually succeed; EC2/Cloudflare ca
 |---|---|---|
 | L1 | A cell with an unplaceable sandbox and `max_hosts` headroom eventually launches. | Yes, but placement retry is SandboxDO's alarm; a disconnected `active` host counts as headroom used for up to 600 s (B4). |
 | L2 | An idle launched burst host is eventually terminated. | Yes (H11 + the `launched` retry loop). Token-enrolled hosts (no `instance_id`) never are. |
-| L3 | Every launched instance is eventually enrolled or ended. | Yes for recorded launches (`enroll_timeout`); no for B6. An enrolled-but-never-connected host ends by H11. |
+| L3 | Every launched instance is eventually enrolled or ended. | Yes for recorded launches (`enroll_timeout`); no for B6. A launched host that enrolled but never connected dies (`enroll_timeout`) once `enroll_timeout_ms` has passed since its enrollment. |
 | L4 | A `stonith_pending` host eventually becomes `dead` or `active`. | With EC2 and an `instance_id`: yes (polled every tick). Without: only by reconnect + fence, or the operator. |
 | L5 | Every sandbox with an expired lease is eventually reassigned. | Suspected no in one case: `reassign_queue` is keyed by `sandbox` alone and `INSERT OR IGNORE` (`:1849`); a second host's request for the same sandbox is dropped while an older row is retrying; if that second host then reaches `dead` (confirmHostDead runs once) nothing re-queues its expired lease and `place` refuses the sandbox for ever (`:1194-1196`). Needs a persistently failing `leaseLost`. |
 | L6 | Every command is eventually answered. | No on main (S7). |

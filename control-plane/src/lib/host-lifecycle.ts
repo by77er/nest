@@ -25,7 +25,7 @@ export type HostTransition =
   | "expire_silent"
   /** H7: a fence covered every expired lease: it serves (or drains) again. */
   | "fence_done"
-  /** H2, H8, H9, H11, H12 and an enroll timeout: gone for good. */
+  /** H2, H8, H9, H11, H12, H13: gone for good. */
   | "die";
 
 /**
@@ -69,7 +69,7 @@ export type DeathCause =
   | "confirmed"
   /** Its proof enrolled again before it ever said hello (H2). */
   | "never_connected"
-  /** It enrolled but never said hello within the cell's enroll timeout. */
+  /** It enrolled but never said hello within the cell's enroll timeout (H13). */
   | "enroll_timeout"
   /** It held nothing for its kind's idle grace (H11). */
   | "idle"

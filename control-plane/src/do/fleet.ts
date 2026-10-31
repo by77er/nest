@@ -2149,6 +2149,11 @@ export class FleetDO extends DurableObject<Env> {
       this.sql.exec("UPDATE launched SET reason = ? WHERE instance_id = ?", "enroll_timeout" satisfies LaunchEndReason, r.instance_id);
       console.warn(`FleetDO: ${r.instance_id} never enrolled; terminating`);
     }
+    // Enrolled but never said hello within the timeout: retired like a launch that never enrolls.
+    for (const h of this.hostsBy({ status: "active", where: "last_rx IS NULL AND instance_id IS NOT NULL AND enrolled_ms < ?" }, now - cfg.enroll_timeout_ms)) {
+      console.warn(`FleetDO: ${h.host} (${h.instance_id}) never connected; terminating`);
+      await this.die(h.host, "enroll_timeout");
+    }
     // An expired host (silent, holding no live lease; its brains were released) is retired like an
     // idle one if it doesn't come back within the grace. A kind the cell has no settings for (no
     // `brain` section) is never retired: its hosts were added by hand.
