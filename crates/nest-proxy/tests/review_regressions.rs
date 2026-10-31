@@ -12,7 +12,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use common::*;
 use nest_protocol::control::EgressVerdict;
 use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyCommand, ProxyEvent};
-use nest_protocol::model::Epoch;
+use nest_protocol::model::{EgressPolicy, Epoch, HostPattern};
 
 fn audit_with(ev: &ProxyEvent, f: impl Fn(&nest_protocol::control::EgressAuditRecord) -> bool) -> bool {
     matches!(ev, ProxyEvent::Audit { records } if records.iter().any(&f))
@@ -300,24 +300,29 @@ async fn push_policy(env: &mut Env, policy: nest_protocol::model::EgressPolicy) 
     link_alive(env).await;
 }
 
-/// A push that revokes a host stops the next request on an inspected connection opened while
-/// it was allowed, over h1 keep-alive and h2 alike: the policy is decided per request.
+/// A push that revokes a host, or makes it passthrough-only, stops the next request on an
+/// inspected connection opened while it was allowed, over h1 keep-alive and h2 alike: the policy
+/// is decided per request, and a passthrough host is never decrypted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_host_is_denied_on_a_held_connection() {
-    let mut env = env().await;
-    let mut held = vec![Held::open(&env, "api.stripe.test", false).await, Held::open(&env, "api.stripe.test", true).await];
-    for c in &mut held {
-        assert_eq!(c.get("api.stripe.test").await, 200);
+    let revoke = |p: &mut EgressPolicy| p.allow.retain(|r| r.host.0 != "api.stripe.test");
+    let pass_through = |p: &mut EgressPolicy| p.passthrough.push(HostPattern("api.stripe.test".into()));
+    for (what, change) in [("revoked", &revoke as &dyn Fn(&mut _)), ("passthrough", &pass_through)] {
+        let mut env = env().await;
+        let mut held = vec![Held::open(&env, "api.stripe.test", false).await, Held::open(&env, "api.stripe.test", true).await];
+        for c in &mut held {
+            assert_eq!(c.get("api.stripe.test").await, 200, "{what}");
+        }
+        let mut p = policy(2, env.echo_addr.port());
+        change(&mut p);
+        push_policy(&mut env, p).await;
+        for c in &mut held {
+            assert_eq!(c.get("api.stripe.test").await, 403, "{what}");
+        }
+        env.conn
+            .wait(|e| audit_with(e, |r| r.host == "api.stripe.test" && r.verdict == EgressVerdict::Deny && r.reason.as_deref() == Some("not_allowed")))
+            .await;
     }
-    let mut p = policy(2, env.echo_addr.port());
-    p.allow.retain(|r| r.host.0 != "api.stripe.test");
-    push_policy(&mut env, p).await;
-    for c in &mut held {
-        assert_eq!(c.get("api.stripe.test").await, 403);
-    }
-    env.conn
-        .wait(|e| audit_with(e, |r| r.host == "api.stripe.test" && r.verdict == EgressVerdict::Deny && r.reason.as_deref() == Some("not_allowed")))
-        .await;
 }
 
 /// A temporary grant stops working on a held connection once `now >= expires_ms`.
