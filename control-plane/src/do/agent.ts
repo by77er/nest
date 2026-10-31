@@ -2173,8 +2173,8 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * A ChannelDO delivers one subscription's batch (at least once; the same range on every retry).
    * Deduplicated by the subscription's high-water seq; then a platform notice (the wake envelope):
-   * mid-turn it joins the inbox stream, otherwise it is queued as the next turn, which starts a brain
-   * if none runs, exactly as any queued turn does. The loop guards answer `defer` (the channel keeps
+   * mid-turn, a notice from the agent's own inbox joins the inbox stream; anything else is queued as
+   * the next turn, which starts a brain if none runs, exactly as any queued turn does. The loop guards answer `defer` (the channel keeps
    * the messages and retries, coalescing): at most 60 subscription-started turns an hour, and at most
    * 50 waiting. The high-water mark and the turn or inbox row are written in one synchronous step.
    */
@@ -2211,7 +2211,12 @@ export class AgentDO extends DurableObject<Env> {
       take();
       return ack;
     }
-    if (!info.current_turn) {
+    // Mid-turn, only a message to the agent itself joins the running turn (as Claude Code takes a
+    // user's message mid-work). Another channel's notice waits for the next turn: injected into one
+    // busy with something else, the model can pass over it, and a `once` subscription is then spent
+    // (3-12% of mention wakes in the 2026-10-31 stress test, dev/cloud-checks/).
+    const midTurn = !!info.current_turn && d.channel === `${info.agent}/inbox`;
+    if (!midTurn) {
       this.sql.exec("DELETE FROM chan_wakes WHERE ts_ms <= ?", now - 3_600_000);
       const hour = this.sql.exec<{ n: number; oldest: number | null }>(
         `SELECT COUNT(*) AS n, MIN(t) AS oldest FROM (SELECT created_ms AS t FROM turns WHERE request_id LIKE 'chan/%' AND created_ms > ?
@@ -2224,7 +2229,7 @@ export class AgentDO extends DurableObject<Env> {
     const text = envelopeText(shown, now, last, reads);
     const requestId = `chan/${d.channel}/${d.subscription}/${upTo}`;
     // Both admit synchronously before their first await (the row is written in this step).
-    if (info.current_turn) {
+    if (midTurn) {
       take();
       await this.postInbox("platform", text, false, requestId);
       return ack;

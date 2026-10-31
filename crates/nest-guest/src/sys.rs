@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::exec::which;
 use crate::framed::err;
 use crate::state::{Guest, now_ms};
+use crate::transport::ListenSpec;
 
 // _IOWR('X', 119, int) / _IOWR('X', 120, int)
 const FIFREEZE: libc::c_ulong = 0xC004_5877;
@@ -20,6 +21,21 @@ const RNDADDENTROPY: libc::c_ulong = 0x4008_5203;
 
 fn is_root() -> bool {
     nix::unistd::geteuid().is_root()
+}
+
+/// The hostname nestd names in `configure` (`sbx-…`), set inside a VM only: there the guest is root
+/// and listens on vsock. Under the process driver (`--listen unix:`) it shares the host's UTS
+/// namespace and must leave its hostname alone. Without it a sandbox's hostname was `(none)`.
+pub fn configured_hostname(guest: &Guest, hostname: &str) {
+    if !matches!(guest.config.listen, ListenSpec::Vsock) || !is_root() {
+        return;
+    }
+    if nix::unistd::gethostname().is_ok_and(|h| h == hostname) {
+        return;
+    }
+    if let Err(e) = nix::unistd::sethostname(hostname) {
+        warn!(error = %e, "could not set hostname");
+    }
 }
 
 /// Apply `resume`: step the clock, mix in entropy, and on a fork take the new identity.
