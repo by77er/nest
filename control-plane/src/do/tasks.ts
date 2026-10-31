@@ -287,7 +287,7 @@ export class TaskLedgerDO extends DurableObject<Env> {
     return this.checkName(name, false);
   }
 
-  /** Tasks matching `filter` (the same rule as the core's `matches`), by key, after `cursor`. */
+  /** Tasks matching `filter` (the core's `matches` in SQL; a property test holds them equal), by key, after `cursor`. */
   async list(name: string, actor: Actor, filter: TaskFilter, cursor = 0, limit = LIST_DEFAULT_LIMIT): Promise<TaskPage> {
     if (!this.read(name, actor)) return { tasks: [], next_cursor: null, tainted: false };
     const n = Math.min(Math.max(1, Math.floor(limit)), LIST_MAX_LIMIT);
