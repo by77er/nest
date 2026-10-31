@@ -48,7 +48,7 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `type` | Fields | Host behavior |
 |---|---|---|
 | `sandbox_create` | sandbox, workstream, **epoch**, image, resources, policy, `from?` | **Grants the lease.** Builds the netns, proxy listeners and policy, then boots: fresh from `image`, or restored lazily from `from`. Memory restore happens only if `from.kind = checkpoint`. |
-| `sandbox_suspend` | sandbox, epoch, mode (`memory`/`disk_only`) | Commit (`suspend`), then stop the VM. Keeps the netns and local state. |
+| `sandbox_suspend` | sandbox, epoch, mode (`memory`/`disk_only`) | Commit (`suspend`), then stop the VM. Keeps the netns and local state. A suspend that fails (a pause, snapshot or commit error, a commit timeout included) resumes the VM and reports `running` again, with the error as `detail`. |
 | `sandbox_resume` | sandbox, epoch | Resume a sandbox suspended on this host |
 | `sandbox_archive` | sandbox, epoch | Commit, then evict all local state |
 | `sandbox_checkpoint` | sandbox, epoch, reason | Commit now |

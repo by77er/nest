@@ -1637,6 +1637,34 @@ async fn a_failed_cold_resume_stops_its_vm() {
     assert_eq!(h.live.load(Ordering::SeqCst), 1, "one VM on the disk");
 }
 
+/// The last state `sandbox` reported.
+fn last_state(fleet: &MockFleet, sandbox: &str) -> Option<SandboxState> {
+    fleet.log.lock().unwrap().events.iter().rev().find_map(|e| match &e.body {
+        HostEventBody::SandboxState { sandbox: s, state, .. } if s.0 == sandbox => Some(*state),
+        _ => None,
+    })
+}
+
+/// A suspend whose commit fails (here its answer is lost: a timeout) rolls back: the VM runs on and
+/// the sandbox reports `running` again, so SandboxDO's idle timer can ask again. It used to stay
+/// `suspending` with a paused VM, which nothing resumes (a wake resumes only `suspended`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_suspend_rolls_back_to_running() {
+    let h = start_host_opts(None, 400).await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_1", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_suspend_1").await), "the commit times out (commit_timeout_ms 400)");
+    wait_until("running again", || last_state(&h.fleet, "sbx_1") == Some(SandboxState::Running)).await;
+    assert_eq!(h.live.load(Ordering::SeqCst), 1, "the VM runs on");
+
+    // Asked again, the suspend lands (adopting the lost commit's outcome).
+    h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_2", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_suspend_2").await));
+    assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Suspended));
+}
+
 /// nestd review #5(b): an attach to a sandbox suspended to disk (no guest connection) must not
 /// bind the agent's explicit-proxy listener; otherwise every later attach, after resume
 /// included, hits EADDRINUSE on that port.

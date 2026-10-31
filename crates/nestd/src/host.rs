@@ -1762,7 +1762,7 @@ impl Inner {
 
     async fn suspend(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, mode: SuspendMode) -> CmdResult {
         let entry = self.locked(id, epoch).await?;
-        let mut s = entry.lock().await;
+        let s = entry.lock().await;
         self.ensure_not_fenced(id, epoch)?;
         let state = self.summary.lock().expect("summary").get(id).map(|x| x.state);
         if state == Some(SandboxState::Suspended) {
@@ -1771,24 +1771,11 @@ impl Inner {
         if !self.set_state(id, epoch, SandboxState::Suspending, Some(mode), None) {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
         }
-        if let Some(g) = &s.guest {
-            let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
+        let (mut s, r) = self.suspend_commit(&entry, s, mode).await;
+        if let Err(e) = r {
+            self.roll_back_suspend(&mut s, &e).await;
+            return Err(e);
         }
-        if let Some(vm) = s.vm.as_mut() {
-            vm.pause().await.map_err(internal)?;
-        }
-        s.paused = true;
-        let mem = if matches!(mode, SuspendMode::Memory) && self.driver.supports_memory_snapshots() {
-            let dir = s.state_dir.join("snapshot");
-            match s.vm.as_mut() {
-                Some(vm) => vm.snapshot_memory(&dir).await.map_err(internal)?,
-                None => None,
-            }
-        } else {
-            None
-        };
-        let (mut s, r) = self.commit(&entry, s, CommitReason::Suspend, mem, self.cfg.commit_timeout()).await;
-        r?;
         self.ensure_not_fenced(id, epoch)?;
         let mut detail = None;
         if matches!(mode, SuspendMode::DiskOnly) {
@@ -1803,6 +1790,64 @@ impl Inner {
             return Err(error(error_codes::STALE_EPOCH, format!("{id} was fenced"), false));
         }
         Ok(detail.map(|d| serde_json::json!({ "note": d })))
+    }
+
+    /// Pause the VM, snapshot its memory (memory mode, where the driver can) and commit.
+    async fn suspend_commit<'a>(
+        self: &Arc<Self>,
+        entry: &'a Arc<tokio::sync::Mutex<Sbx>>,
+        mut s: tokio::sync::MutexGuard<'a, Sbx>,
+        mode: SuspendMode,
+    ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<(), ErrorBody>) {
+        if let Some(g) = &s.guest {
+            let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
+        }
+        if let Some(vm) = s.vm.as_mut()
+            && let Err(e) = vm.pause().await
+        {
+            return (s, Err(internal(e)));
+        }
+        s.paused = true;
+        let mut mem = None;
+        if matches!(mode, SuspendMode::Memory) && self.driver.supports_memory_snapshots() {
+            let dir = s.state_dir.join("snapshot");
+            if let Some(vm) = s.vm.as_mut() {
+                match vm.snapshot_memory(&dir).await {
+                    Ok(m) => mem = m,
+                    Err(e) => return (s, Err(internal(e))),
+                }
+            }
+        }
+        let (s, r) = self.commit(entry, s, CommitReason::Suspend, mem, self.cfg.commit_timeout()).await;
+        (s, r.map(|_| ()))
+    }
+
+    /// A suspend that failed before it was done goes back to `running`, so it can be asked again
+    /// (SandboxDO's idle timer): the VM runs on, unless the incarnation was fenced meanwhile. A
+    /// landed commit may have marked the disk clean, so that is undone, durably, first.
+    async fn roll_back_suspend(&self, s: &mut Sbx, why: &ErrorBody) {
+        let (id, epoch) = (s.id.clone(), s.epoch);
+        if self.fenced(&id, epoch) {
+            return;
+        }
+        s.disk_clean = false;
+        if let Err(e) = s.persist(None) {
+            tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a failed suspend stays paused: meta.json can't record the VM running again");
+            return;
+        }
+        if s.paused {
+            if let Some(vm) = s.vm.as_mut()
+                && let Err(e) = vm.resume().await
+            {
+                tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a failed suspend's VM can't be resumed");
+                return;
+            }
+            s.paused = false;
+            if let Some(g) = &s.guest {
+                let _ = g.thaw().await;
+            }
+        }
+        self.set_state(&id, epoch, SandboxState::Running, None, Some(format!("suspend failed: {}", why.message)));
     }
 
     async fn resume(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
