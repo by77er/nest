@@ -620,7 +620,7 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
     expect((await agentStub(s.agent).info()).state).toBe("detached");
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "wake up" } }, 201);
     const [start] = await nextCommands(s.host.ws, isStart(s.agent));
-    // A new start, a new agent epoch (`hands.epoch` repeats it for the previous release's runners).
+    // A new start, a new agent epoch.
     expect(start).toMatchObject({ epoch: 2, hands: { sandbox: s.sandbox } });
   });
 

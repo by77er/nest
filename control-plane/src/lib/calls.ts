@@ -85,13 +85,11 @@ export class CallLedger {
 
   /** The ask a call made, if any. */
   askOf(call: string, epoch: number): StoredAsk | undefined {
-    return this.askRow(this.sql.exec<Record<string, SqlStorageValue>>(
-      "SELECT ask, call, epoch, question, status, deadline FROM asks WHERE call = ? AND epoch = ?", call, epoch).toArray()[0]);
+    return this.askWhere("call = ? AND epoch = ?", call, epoch);
   }
 
   ask(ask: string): StoredAsk | undefined {
-    return this.askRow(this.sql.exec<Record<string, SqlStorageValue>>(
-      "SELECT ask, call, epoch, question, status, deadline FROM asks WHERE ask = ?", ask).toArray()[0]);
+    return this.askWhere("ask = ?", ask);
   }
 
   recordAsk(a: StoredAsk): void {
@@ -114,12 +112,10 @@ export class CallLedger {
     this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
   }
 
-  private askRow(r: Record<string, SqlStorageValue> | undefined): StoredAsk | undefined {
-    if (!r) return undefined;
-    return {
-      ask: r.ask as string, call: r.call as string, epoch: r.epoch as number, question: r.question as string,
-      status: storedEnum(AskStatusEnum, r.status as string, "asks.status"), deadline: r.deadline as number,
-    };
+  private askWhere(where: string, ...args: SqlStorageValue[]): StoredAsk | undefined {
+    const r = this.sql.exec<Omit<StoredAsk, "status"> & { status: string }>(
+      `SELECT ask, call, epoch, question, status, deadline FROM asks WHERE ${where}`, ...args).toArray()[0];
+    return r && { ...r, status: storedEnum(AskStatusEnum, r.status, "asks.status") };
   }
 }
 

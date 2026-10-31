@@ -8,7 +8,6 @@
 // inbound session messages are processed one at a time, in order (`SerialQueue`).
 import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
-import { z } from "zod";
 import { num, type Env } from "../env";
 import {
   type Caller, type ChannelDelivery, clip, type DeliveryOutcome, envelopeText, EVENT_TEXT_BYTES, Filter,
@@ -160,12 +159,6 @@ type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after
 /** A `sync` ask's window: `ask:<ask id>`. */
 const ASK_DEADLINE = "ask:";
 type AskDeadline = `${typeof ASK_DEADLINE}${string}`;
-/** `Deadlines`, taking AgentDO's keys only (the class takes any string). */
-type AgentDeadlines = Pick<Deadlines, "runDue" | "reschedule"> & {
-  set(key: AgentDeadline | AskDeadline, at: number, keepEarlier?: boolean): Promise<void>;
-  clear(key: AgentDeadline | AskDeadline): Promise<void>;
-  has(key: AgentDeadline | AskDeadline): boolean;
-};
 
 /** Points where a test can force an interleaving (`testHooks`). */
 export type HookPoint =
@@ -239,7 +232,7 @@ export class AgentDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   // `!`: set in the constructor, except on the health instance, which serves only `health()`.
   private readonly rel!: ReliableChannels;
-  private readonly deadlines!: AgentDeadlines;
+  private readonly deadlines!: Deadlines<AgentDeadline | AskDeadline>;
   private readonly inbound = new SerialQueue();
   /** The run of the intent in flight (single-flight, in memory only: the intent itself is stored). */
   private intentRun: Promise<StartResult | null> | null = null;
@@ -267,8 +260,7 @@ export class AgentDO extends DurableObject<Env> {
       PRIMARY KEY (base, offset))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     this.rel = new ReliableChannels(this.sql);
-    const deadlines = new Deadlines(this.sql, ctx.storage);
-    this.deadlines = deadlines;
+    this.deadlines = new Deadlines(this.sql, ctx.storage);
     // Channels (docs/channels/): this agent's subscriptions (for display and cleanup) with the
     // high-water seq of each one's deliveries (dedup), and its queued posts to `<agt>/events`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS channel_subs (channel TEXT NOT NULL, sub TEXT NOT NULL, hw INTEGER NOT NULL DEFAULT 0,
@@ -276,7 +268,7 @@ export class AgentDO extends DurableObject<Env> {
     // Notices taken without delivery (no `read` tool): how many, and up to which seq.
     addColumn(this.sql, "channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
     addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
-    this.outbox = new ChannelOutbox(this.sql, deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
+    this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
 
