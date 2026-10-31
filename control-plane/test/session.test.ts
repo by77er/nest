@@ -228,6 +228,23 @@ describe("platform tool relay", () => {
     expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("yes") });
   });
 
+  it("an ask answered while it is still being routed ends its call `done`, never `waiting` (which is never pruned)", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {
+      inst.testHooks["ask:beforeRoute"] = async () => {
+        delete inst.testHooks["ask:beforeRoute"];
+        await inst.answerAsk(st.storage.sql.exec<{ ask: string }>("SELECT ask FROM asks").one().ask, "yes");
+      };
+    });
+    ws.send(toolCall("cal_t4-1", "ask", { question: "Merge?" }));
+    expect((await ws.next("tool_result", (m) => m.call === "cal_t4-1")).outcome).toEqual({ status: "ok", content: [{ type: "text", text: "yes" }] });
+    await ws.next("ack");
+    const status = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ status: string }>("SELECT status FROM tool_calls WHERE call = 'cal_t4-1'").one().status);
+    expect(status).toBe("done");
+  });
+
   it("an escalation event becomes an async ask whose answer arrives as a turn", async () => {
     const s = await setup({ captain: true });
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);

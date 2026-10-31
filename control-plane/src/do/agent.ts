@@ -241,7 +241,7 @@ interface PreviousReleaseFields {
 export type HookPoint =
   | "intent:beforeCommit" | "resolveHands:afterResolve" | "dispatch:beforeWrite" | "sandboxMoved:enter" | "kill:beforeIssue"
   | "hostLost:enter" | "exited:enter" | "start:afterCommit" | "release:afterCommit" | "event:afterApply" | "escalate:afterProgress" | "escalate:afterStatus" | "pump:beforeSend"
-  | "flush:beforePut";
+  | "flush:beforePut" | "ask:beforeRoute";
 
 export interface CreateAgent {
   agent: string;
@@ -924,9 +924,10 @@ export class AgentDO extends DurableObject<Env> {
    * and epoch) until FleetDO has stored it, whatever happens to this call; escalation takes over
    * once it is stored.
    */
-  private async condemn(why: string, epoch: number): Promise<void> {
+  private async condemn(why: string, epoch: number, also?: (i: AgentInfo) => void): Promise<void> {
     let condemned: Brain | null = null;
     this.update((i) => {
+      also?.(i);
       // Only the brain at `epoch` (N7): a record replaced meanwhile is not condemned by this call.
       if (i.brain && i.brain.phase !== "condemned" && i.brain.epoch === epoch) {
         i.brain = { host: i.brain.host, epoch: i.brain.epoch, phase: "condemned", since_ms: Date.now() };
@@ -1186,7 +1187,8 @@ export class AgentDO extends DurableObject<Env> {
     // A stop since this start ended it: condemned, never retried, and not an error.
     const stopped = stoppedBrain(info, epoch);
     const retry = !stopped && !info.intent && error.retryable && info.start_attempts < MAX_START_ATTEMPTS;
-    this.update((i) => {
+    // The retry (or `errored`) and the condemn are one step, with both alarms armed in it.
+    const condemned = this.condemn(`its start failed (${error.code})`, epoch, (i) => {
       if (retry) {
         i.start_attempts += 1;
         i.intent = { reason: "retry" };
@@ -1194,8 +1196,8 @@ export class AgentDO extends DurableObject<Env> {
         i.state = "errored";
       }
     });
-    if (retry) await this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true);
-    await this.condemn(`its start failed (${error.code})`, epoch);
+    const armed = retry ? this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true) : undefined;
+    await Promise.all([condemned, armed]);
   }
 
   /**
@@ -2328,7 +2330,8 @@ export class AgentDO extends DurableObject<Env> {
         if (!ne) console.error(`AgentDO: tool ${call.name} failed`, e);
         result = { status: "error", error: ne ? ne.body() : errorBody(ErrorCodes.INTERNAL, `${call.name} failed`, true) };
       }
-      if (result === "wait") this.sql.exec(`UPDATE tool_calls SET status = '${CALL.waiting}' WHERE epoch = ? AND call = ?`, epoch, call.call);
+      // Only from `dispatching`: an answer that came during the ask's routing has finished it already.
+      if (result === "wait") this.sql.exec(`UPDATE tool_calls SET status = '${CALL.waiting}' WHERE epoch = ? AND call = ? AND status = '${CALL.dispatching}'`, epoch, call.call);
       else this.finishCall(epoch, call.call, result);
     }
     this.rel.markProcessed(CHAN, call.seq);
@@ -2642,6 +2645,7 @@ export class AgentDO extends DurableObject<Env> {
     const q = prior?.question ?? question;
     // The brain's own asks are fenced by its epoch; a guest's (`sandboxEpoch`) by FleetDO's lease check.
     if (sandboxEpoch === undefined) this.assertEpoch(fence);
+    await this.hook("ask:beforeRoute");
     if (to === "user" || info.escalate_to === "user") {
       await this.workstream(info.workstream).notifyUser(`[${ask}] ${info.agent} asks: ${q}`, "high", `${info.agent}/${ask}`);
     } else {
