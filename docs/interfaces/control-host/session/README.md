@@ -27,7 +27,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `hello_ack` | first frame | `durable_bytes` for the stream currently being received (the committed base, or a new base or session in progress); the runner resends session bytes from here. `last_seq`. |
 | `segment_ack` | no | `durable_bytes`, sent after the bytes are durable in R2 |
 | `run_turn` | seq | `turn`, `input{kind, text}`, written to Claude Code's stdin as a user message |
-| `inbox` | seq | `InboxMessage`, delivered through the inbox mirror at a tool boundary (`PostToolUse`) or at `Stop`, never through stdin. `interrupt: true` interrupts first |
+| `inbox` | seq | `InboxMessage`, delivered through the inbox mirror at a tool boundary (`PostToolUse`) or at `Stop`, never through stdin. `interrupt: true` interrupts the turn instead, and no hook hands the message out: AgentDO queues it as the next turn |
 | `interrupt` | seq | The stream-json interrupt control message |
 | `cache_update` | seq | `AgentCache{version, rules, inbox, max_stop_continuations}` for answering hooks locally |
 | `tool_result` | seq | `outcome: ok{content} \| error{error} \| pending{ask, message}` |
