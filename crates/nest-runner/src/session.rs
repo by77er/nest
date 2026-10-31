@@ -8,8 +8,7 @@
 //! - `Close` (the brain exited) flushes the session tail and events, then keeps the channel (and
 //!   reconnects) until AgentDO has acked everything and the session bytes are durable, or
 //!   [`CLOSE_FLUSH`] passes — so a brain exiting during an AgentDO blip still lands its last turns.
-//! - A timed-out platform call is abandoned: an unacked copy is replaced by `cancel_call` (same
-//!   seq), and a fresh `cancel_call` tells AgentDO to drop it if it already arrived.
+//! - A timed-out platform call is abandoned (`State::abandon`).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;

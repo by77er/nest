@@ -172,12 +172,8 @@ impl Brain {
             }
             // AgentDO sends a turn only once the previous one completed: never written, so it
             // can't merge into the running one.
-            let error = ErrorBody {
-                code: "turn_overlap".into(),
-                message: format!("turn {} arrived while {} runs; not written", turn.0, current.id.0),
-                retryable: false,
-            };
-            return vec![Effect::Emit { body: AgentEventBody::Error { error }, turn: Some(turn) }];
+            let message = format!("turn {} arrived while {} runs; not written", turn.0, current.id.0);
+            return vec![error(turn, "turn_overlap", message, false)];
         }
         self.turn = Some(Turn { id: turn.clone(), stop_blocked: false, interrupt: None });
         self.idle_at = None;
@@ -309,8 +305,11 @@ fn dropped(stash: Vec<(TurnId, TurnInput)>, why: ExitReason) -> Vec<Effect> {
 }
 
 fn not_delivered(turn: TurnId, why: ExitReason) -> Effect {
-    let error = ErrorBody { code: "agent_stopping".into(), message: format!("turn not delivered: the brain is {}", why.as_str()), retryable: true };
-    Effect::Emit { body: AgentEventBody::Error { error }, turn: Some(turn) }
+    error(turn, "agent_stopping", format!("turn not delivered: the brain is {}", why.as_str()), true)
+}
+
+fn error(turn: TurnId, code: &str, message: String, retryable: bool) -> Effect {
+    Effect::Emit { body: AgentEventBody::Error { error: ErrorBody { code: code.into(), message, retryable } }, turn: Some(turn) }
 }
 
 #[cfg(test)]

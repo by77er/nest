@@ -19,7 +19,7 @@ use crate::framing;
 use crate::hands;
 use crate::rules;
 use crate::mirror;
-use crate::runtime::{Agent, AgentCmd, AgentInner, Runtime};
+use crate::runtime::{Agent, AgentCmd, Runtime};
 
 /// Serve async tracking datagrams forever.
 pub async fn serve_dgram(rt: Arc<Runtime>, sock: UnixDatagram) {
@@ -222,9 +222,8 @@ fn permission(agent: &Agent, input: &Value) -> (PermissionDecision, Option<Strin
 /// PostToolUse: hand pending inbox-mirror messages to the model with the tool's result.
 fn tool_boundary(agent: &Agent) -> Answer {
     let pending = {
-        let mut inner = agent.inner.lock().unwrap();
-        let AgentInner { cache, mirror, .. } = &mut *inner;
-        mirror.take(cache.as_ref())
+        let inner = &mut *agent.inner.lock().unwrap();
+        inner.mirror.take(inner.cache.as_ref())
     };
     if pending.is_empty() {
         return Answer::default();
@@ -240,9 +239,8 @@ fn tool_boundary(agent: &Agent) -> Answer {
 fn stop(agent: &Agent, input: &Value) -> Answer {
     let active = input.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
     let pending = {
-        let mut inner = agent.inner.lock().unwrap();
-        let AgentInner { cache, mirror, .. } = &mut *inner;
-        mirror.take_at_stop(cache.as_ref(), active)
+        let inner = &mut *agent.inner.lock().unwrap();
+        inner.mirror.take_at_stop(inner.cache.as_ref(), active)
     };
     agent.command(AgentCmd::StopHook { blocked: !pending.is_empty() });
     if pending.is_empty() {

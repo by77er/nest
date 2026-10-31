@@ -41,12 +41,10 @@ use crate::stream;
 /// `system/init.capabilities` flag for the stream-json interrupt control request.
 pub const CAP_INTERRUPT: &str = "interrupt_receipt_v1";
 
-/// The only Claude Code built-ins a brain may have: none reads or writes the host's files or
-/// runs a command there (its hands are the `mcp__nest__*` tools that run inside the sandbox).
-/// Subagents (`Agent`, `Task` before Claude Code 2.1), the task and todo tools (state in the
-/// config dir), the web tools (traffic through the host's egress allowlist), and the MCP
-/// resource tools (they read only from the configured `nest` server). An allowlist, so a
-/// built-in Claude Code adds later is refused until it is reviewed and listed here.
+/// The only Claude Code built-ins a brain may have, none touching the host's files or running a
+/// command there: subagents (`Agent`, `Task` before 2.1), the task and todo tools (state in the
+/// config dir), the web tools (through the host's egress allowlist), and the MCP resource tools
+/// (the `nest` server only). A built-in Claude Code adds later is refused until listed here.
 pub const HOST_SAFE_BUILTINS: &[&str] = &[
     "Agent", "Task", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TodoWrite", "WebSearch", "WebFetch",
     "ListMcpResourcesTool", "ReadMcpResourceTool",

@@ -40,9 +40,8 @@ pub struct Runtime {
     /// Newest host token from nestd (memory only).
     pub host_token: watch::Sender<Option<Secret>>,
     pub host_id: Mutex<Option<HostId>>,
-    /// Events to nestd, tagged with the nestd connection generation they belong to; the writer
-    /// of connection N drops entries from older generations (brains killed when the previous
-    /// connection was lost must not be reported to the new one, which already re-issued them).
+    /// Events to nestd, tagged with their nestd connection generation; connection N's writer drops
+    /// older ones (brains killed when that connection was lost, which the new one re-issued).
     pub to_nestd: mpsc::UnboundedSender<(u64, RunnerEvent)>,
     pub to_nestd_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(u64, RunnerEvent)>>,
     /// Current nestd connection generation (incremented on every connect).
@@ -74,9 +73,8 @@ impl Runtime {
         self.agents.lock().unwrap().agents.values().cloned().collect()
     }
 
-    /// Register (first thing a start does, before any slow step). Refused when a kill at or above
-    /// the start's agent epoch arrived first (its tombstone), or when another brain is registered
-    /// under this id.
+    /// Register (first thing a start does). Refused when a kill at or above the start's agent epoch
+    /// arrived first (its tombstone), or another brain is registered under this id.
     pub fn register(&self, a: Arc<Agent>, fence_gen: u64) -> Result<(), Refused> {
         let mut r = self.agents.lock().unwrap();
         // A fence of every brain (lease lapse, nestd gone) since this start arrived: it never runs.
@@ -155,9 +153,8 @@ impl Runtime {
         }
     }
 
-    /// The registered brain whose Claude Code process is `pid` or an ancestor of it (hooks and
-    /// `nest mcp` are its descendants). Binds a socket peer to an agent without trusting the id
-    /// it declares.
+    /// The registered brain whose Claude Code process is `pid` or an ancestor of it: binds a hook or
+    /// `nest mcp` socket peer to an agent without trusting the id it declares.
     pub fn agent_for_pid(&self, pid: i32) -> Option<Arc<Agent>> {
         let agents = self.agents();
         let mut cur = pid;
@@ -290,8 +287,7 @@ pub struct Agent {
     pub config_dir: PathBuf,
     /// nestd connection generation this brain was started under.
     pub conn_gen: u64,
-    /// Claude Code's pid once spawned (0 before), for kills that must not wait on the actor and
-    /// for binding hook/MCP peers to this agent.
+    /// Claude Code's pid once spawned (0 before), for kills and for binding hook/MCP peers.
     pub pid: AtomicU32,
     /// Cancelled by any kill/stop: aborts startup steps and tells the actor.
     pub cancel: CancellationToken,
