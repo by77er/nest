@@ -673,6 +673,12 @@ pub mod hook {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             additional_context: Option<String>,
         },
+        /// Context the model reads after the tool's result (the runner's mid-turn inbox).
+        #[serde(rename_all = "camelCase")]
+        PostToolUse {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            additional_context: Option<String>,
+        },
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -701,11 +707,10 @@ pub mod hook {
     }
 
     /// Hook events wired to `nest hook --sync` (decision via `HOOK_SOCK`). All others are async.
-    pub const SYNC_EVENTS: &[&str] = &["SessionStart", "PreToolUse", "PermissionRequest", "Stop"];
+    pub const SYNC_EVENTS: &[&str] = &["SessionStart", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop"];
     /// Hook events wired as async tracking hooks.
     pub const ASYNC_EVENTS: &[&str] = &[
         "UserPromptSubmit",
-        "PostToolUse",
         "PostToolUseFailure",
         "Notification",
         "Elicitation",
