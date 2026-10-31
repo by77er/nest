@@ -41,7 +41,7 @@ pub struct Config {
     /// SessionStart: max time for reading the repo's CLAUDE.md through hands.
     pub session_start_read_timeout: Duration,
     /// Hand mid-turn inbox messages to the model at tool boundaries (`PostToolUse` context);
-    /// off, they wait for `Stop`. UNVERIFIED that Claude Code shows that context mid-turn.
+    /// off, they wait for `Stop`.
     pub inbox_at_tool_boundary: bool,
 }
 

@@ -928,8 +928,23 @@ mod tests {
         assert_eq!(b.events(), [(t1, "idle")]);
     }
 
-    /// A `result` after the Stop hook blocked is taken for an intermediate one (UNVERIFIED that
-    /// Claude Code ever emits it): the turn ends only at the `result` after the stop it allowed,
+    /// A subagent's PostToolUse hands out nothing: its context would reach the subagent, not the
+    /// main loop. The message waits for the main loop's next tool boundary or its Stop.
+    #[tokio::test]
+    async fn a_subagents_tool_boundary_hands_out_nothing() {
+        let mut b = bare_actor();
+        b.actor.handle(run_turn("t1"));
+        b.actor.agent.set_cache(cache(vec![msg("m1")], 1));
+        b.events();
+        let sub = json!({"hook_event_name": "PostToolUse", "tool_name": "mcp__nest__Bash", "agent_id": "a1b2", "agent_type": "general-purpose"});
+        assert_eq!(b.hook(sub).await, Default::default());
+        let t1 = Some("t1".to_string());
+        assert_eq!(b.events(), [(t1.clone(), "working")]);
+        assert!(b.hook(json!({"hook_event_name": "Stop", "stop_hook_active": false})).await.decision.is_some(), "still pending at Stop");
+    }
+
+    /// A `result` after the Stop hook blocked is taken for an intermediate one (Claude Code 2.1.316
+    /// emits none): the turn ends only at the `result` after the stop it allowed,
     /// so a second `result` of one turn can never complete the next.
     #[tokio::test]
     async fn a_result_after_a_blocked_stop_does_not_end_the_turn() {

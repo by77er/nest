@@ -389,8 +389,8 @@ mod tests {
         let (mut b, now) = brain();
         b.step(run("t1"), now);
         b.step(Input::StopHook { blocked: true }, now);
-        // UNVERIFIED that Claude Code emits a `result` before a blocked stop's continuation; if
-        // it does, that one is intermediate.
+        // Claude Code 2.1.316 emits no `result` before a blocked stop's continuation; one that
+        // came anyway would be intermediate.
         assert_eq!(b.step(result(false), now), []);
         assert_eq!(b.turn().map(|t| t.0.as_str()), Some("t1"));
         b.step(Input::StopHook { blocked: false }, now);
