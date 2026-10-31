@@ -8,8 +8,8 @@
 //!
 //! **Keyed by start.** Each `agent_start` is its own entry. `agent_started` marks the entry of its
 //! epoch; an exit removes the entries of its agent at or below its epoch, never a newer start's
-//! (a replaced brain's late exit can't remove its replacement). A runner of the previous release
-//! sends neither epoch: its events are taken for the agent's newest entry.
+//! (a replaced brain's late exit can't remove its replacement). An event without an epoch is
+//! dropped (only a runner of an older release, which never meets this nestd, sends one).
 //!
 //! **No replay.** The runner kills every brain when the nestd socket closes. Each brain whose
 //! start went out on the lost connection is reported as exited ([`RunnerNotice::Disconnected`]:
@@ -103,17 +103,6 @@ impl State {
     /// The agent's entries, oldest start first.
     fn keys_of(&self, agent: &AgentId) -> Vec<(AgentId, Epoch)> {
         self.brains.keys().filter(|(a, _)| a == agent).cloned().collect()
-    }
-
-    /// The agent's newest entry (an `agent_started` without an epoch, from a runner of the previous release).
-    fn newest(&self, agent: &AgentId) -> Option<Epoch> {
-        self.keys_of(agent).last().map(|(_, e)| *e)
-    }
-
-    /// The agent's oldest entry (an exit without an epoch: taken for the oldest start, so it can
-    /// never stand for a newer one).
-    fn oldest(&self, agent: &AgentId) -> Option<Epoch> {
-        self.keys_of(agent).first().map(|(_, e)| *e)
     }
 
     /// Remove the agent's never-sent starts at or below `bound` (all for `None`); returns their epochs.
@@ -452,9 +441,7 @@ async fn serve(
 /// Apply a runner event to the brain table; `None` drops it. Events about a brain count only if a
 /// matching start went out on this connection (`conn`). An `agent_started` marks its epoch's
 /// entry; an exit removes the agent's entries at or below its epoch and is forwarded with that
-/// epoch. Without an epoch (a runner of the previous release) `agent_started` is for the newest
-/// entry and an exit for the oldest, and an `agent_exited{fenced}` for one that hasn't reported
-/// `agent_started` is one the runner queued before this connection, and is dropped.
+/// epoch. One without an epoch is dropped.
 fn accept_event(state: &Mutex<State>, conn: u64, ev: RunnerEvent) -> Vec<RunnerEvent> {
     let mut st = state.lock().expect("runner state");
     let (agent, epoch, exit) = match &ev {
@@ -462,9 +449,7 @@ fn accept_event(state: &Mutex<State>, conn: u64, ev: RunnerEvent) -> Vec<RunnerE
         RunnerEvent::AgentExited { agent, reason, epoch, .. } => (agent.clone(), *epoch, Some(*reason)),
         _ => return vec![ev],
     };
-    let legacy = epoch.is_none();
-    let fill = if exit.is_some() { st.oldest(&agent) } else { st.newest(&agent) };
-    let Some(e) = epoch.or(fill) else { return vec![] };
+    let Some(e) = epoch else { return vec![] };
     let on_conn = |b: &Brain| matches!(b.sent, Sent::On { conn: c, .. } if c == conn);
     match exit {
         None => {
@@ -475,13 +460,7 @@ fn accept_event(state: &Mutex<State>, conn: u64, ev: RunnerEvent) -> Vec<RunnerE
             b.state = AgentState::Ready;
             vec![ev]
         }
-        Some(reason) => {
-            if legacy
-                && reason == ExitReason::Fenced
-                && st.brains.get(&(agent.clone(), e)).is_some_and(|b| !b.fenced && matches!(b.sent, Sent::On { started: false, .. }))
-            {
-                return vec![];
-            }
+        Some(_) => {
             let gone: Vec<(AgentId, Epoch)> =
                 st.keys_of(&agent).into_iter().filter(|k| k.1 <= e && st.brains.get(k).is_some_and(on_conn)).collect();
             if gone.is_empty() {
@@ -555,10 +534,6 @@ mod tests {
         (link, path, nrx)
     }
 
-    fn started(agent: &AgentId) -> RunnerEvent {
-        RunnerEvent::AgentStarted { agent: agent.clone(), pid: 1, session: SessionId("ses_x".into()), claude_version: "t".into(), capabilities: vec![], epoch: None }
-    }
-
     fn started_at(agent: &AgentId, epoch: u64) -> RunnerEvent {
         RunnerEvent::AgentStarted { agent: agent.clone(), pid: 1, session: SessionId("ses_x".into()), claude_version: "t".into(), capabilities: vec![], epoch: Some(Epoch(epoch)) }
     }
@@ -591,10 +566,6 @@ mod tests {
         f
     }
 
-    fn exited(agent: &AgentId, reason: ExitReason) -> RunnerEvent {
-        RunnerEvent::AgentExited { agent: agent.clone(), code: None, signal: Some(9), reason, epoch: None }
-    }
-
     fn agents(link: &RunnerLink) -> Vec<String> {
         link.report().into_iter().map(|r| r.agent.0).collect()
     }
@@ -617,7 +588,7 @@ mod tests {
         assert!(matches!(read(&mut f).await, RunnerCommand::HostToken { .. }));
         assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(s) if s.start.agent == a), "the pending start goes out once");
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Connected { pid: 7, .. })));
-        send(&mut f, started(&a)).await;
+        send(&mut f, started_at(&a, 1)).await;
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentStarted { .. }))));
         assert_eq!(link.report()[0].state, AgentState::Ready);
 
@@ -635,7 +606,7 @@ mod tests {
         link.lease(5);
         assert!(matches!(read(&mut f).await, RunnerCommand::LeaseUpdate { valid_until_ms: 5 }), "no stale agent_start replayed");
         // The runner's queued exit for the old brain is not news.
-        send(&mut f, exited(&a, ExitReason::Fenced)).await;
+        send(&mut f, exited_at(&a, ExitReason::Fenced, 1)).await;
         send(&mut f, RunnerEvent::Pong { nonce: 1, agents: 0 }).await;
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::Pong { .. }))));
     }
@@ -664,7 +635,7 @@ mod tests {
         assert!(matches!(read(&mut f).await, RunnerCommand::Fence { ref agents, .. } if agents == std::slice::from_ref(&b)));
         assert_eq!(agents(&link), vec!["agt_a"], "the fenced brain left the report");
         assert_eq!(link.count(), 1);
-        send(&mut f, exited(&b, ExitReason::Fenced)).await;
+        send(&mut f, exited_at(&b, ExitReason::Fenced, 1)).await;
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentExited { ref agent, .. })) if agent == &b));
 
         link.fence(vec![], "lease");
@@ -677,11 +648,10 @@ mod tests {
         }
     }
 
-    /// Docs review #4: a runner's queued `agent_exited{fenced}` for an earlier brain must not cancel
-    /// a start that just went out; a real exit after `agent_started` still arrives. A second
-    /// concurrent runner is refused.
+    /// An event without an epoch (from a runner of an older release) is dropped; the start's own
+    /// events go through. A second concurrent runner is refused.
     #[tokio::test]
-    async fn stale_fenced_exit_before_started_is_dropped() {
+    async fn an_event_without_an_epoch_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let (link, path, mut nrx) = link(dir.path());
         link.agent_start(start("agt_a"));
@@ -696,9 +666,10 @@ mod tests {
         assert!(!matches!(r, Some(Ok(_))), "second runner must get nothing");
 
         let a = AgentId("agt_a".into());
-        send(&mut f, exited(&a, ExitReason::Fenced)).await;
-        send(&mut f, started(&a)).await;
-        send(&mut f, RunnerEvent::AgentExited { agent: a.clone(), code: Some(0), signal: None, reason: ExitReason::Fenced, epoch: None }).await;
+        let no_epoch = RunnerEvent::AgentExited { agent: a.clone(), code: None, signal: Some(9), reason: ExitReason::Fenced, epoch: None };
+        send(&mut f, no_epoch).await;
+        send(&mut f, started_at(&a, 1)).await;
+        send(&mut f, RunnerEvent::AgentExited { agent: a.clone(), code: Some(0), signal: None, reason: ExitReason::Fenced, epoch: Some(Epoch(1)) }).await;
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentStarted { .. }))));
         assert!(matches!(nrx.recv().await, Some(RunnerNotice::Event(RunnerEvent::AgentExited { code: Some(0), .. }))));
         assert!(agents(&link).is_empty());
@@ -757,8 +728,7 @@ mod tests {
     }
 
     /// An exit that names its epoch for a start that never reported `agent_started` (the runner
-    /// refused it under a kill's tombstone) is forwarded: only an epoch-less one from a runner of
-    /// the previous release is taken for a queued leftover.
+    /// refused it under a kill's tombstone) is forwarded.
     #[tokio::test]
     async fn an_exit_with_its_epoch_before_started_is_forwarded() {
         let dir = tempfile::tempdir().unwrap();
@@ -786,25 +756,6 @@ mod tests {
         let mut f = connected(&path, &mut nrx).await;
         link.agent_stop(&a, StopMode::Graceful, "x", Some(Epoch(7)));
         assert!(matches!(read(&mut f).await, RunnerCommand::AgentStop { mode: StopMode::Graceful, epoch: Some(Epoch(7)), .. }));
-    }
-
-    /// D8: an exit without an epoch (a runner of the previous release) stands for the agent's
-    /// oldest start here, never a newer one.
-    #[tokio::test]
-    async fn an_exit_without_an_epoch_is_taken_for_the_oldest_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let (link, path, mut nrx) = link(dir.path());
-        let mut f = connected(&path, &mut nrx).await;
-        let a = AgentId("agt_a".into());
-        assert!(link.agent_start(start_at("agt_a", 1)));
-        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(_)));
-        send(&mut f, started(&a)).await;
-        assert!(matches!(notice(&mut nrx).await, RunnerNotice::Event(RunnerEvent::AgentStarted { .. })));
-        assert!(link.agent_start(start_at("agt_a", 2)));
-        assert!(matches!(read(&mut f).await, RunnerCommand::AgentStart(_)));
-        send(&mut f, exited(&a, ExitReason::Stopped)).await;
-        assert!(matches!(notice(&mut nrx).await, RunnerNotice::Event(RunnerEvent::AgentExited { epoch: Some(Epoch(1)), .. })));
-        assert_eq!(agents(&link), vec!["agt_a"], "the start at 2 is still here");
     }
 
     /// An exit at an epoch means nothing of the agent at or below it runs here: a start refused
