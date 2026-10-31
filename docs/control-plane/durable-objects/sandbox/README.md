@@ -86,8 +86,8 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 ## Ports
 
 - `port_expose` / `port_unexpose`.
-- **Names** follow the [hostname rule](../../../setup/#hostnames), derived from `NEST_DOMAIN` (`nest.localhost` when unset, the harness): a preview is `https://<port>-<sandbox>-preview-<label>.<zone>`, the share link `https://<port>-<sandbox>-share-<label>.<zone>/?exp=…&sig=…` (the `<token>` label names the `{sandbox, port}`, the query carries the signed expiry), with the sandbox id's `sbx_` prefix dropped since a hostname has no `_`. The preview URL is recomputed on every read, never trusted from storage.
-- **Public share links** bypass Cloudflare Access, so only the operator API mints them, never an agent.
+- **Names** follow the [hostname rule](../../../setup/#hostnames), derived from `NEST_DOMAIN` (`nest.localhost` when unset, the harness): a preview is `https://<port>-<sandbox>-preview-<label>.<zone>`, the share link `https://<port>-<sandbox>-share-<label>.<zone>/?exp=…&sig=…` (the query carries an HMAC over `{sandbox, port}` and the expiry), with the sandbox id's `sbx_` prefix dropped since a hostname has no `_`. The preview URL is recomputed on every read, never trusted from storage.
+- **Public share links** bypass Cloudflare Access, so only the operator API mints them, never an agent. No Worker route serves previews or share links yet ([ingress](../../../sandbox/networking/ingress/)): the URLs are names only.
 
 ## Built
 

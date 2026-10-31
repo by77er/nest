@@ -1,4 +1,4 @@
-// Host bearer tokens (`nht_<payload>.<sig>`, HMAC-SHA256) and signed blob URLs.
+// Host bearer tokens (`nht_<payload>.<sig>`, HMAC-SHA256), signed blob URLs and share-link signatures.
 import { HostRole } from "../protocol/model";
 import { b64url, b64urlToBytes, NestError, timingSafeEqual } from "./util";
 import { ErrorCodes } from "../protocol/model";
@@ -60,6 +60,14 @@ export function bearer(req: Request): string | null {
 export async function signBlobUrl(secret: string, baseUrl: string, key: string, expMs: number): Promise<string> {
   const sig = b64url(await mac(secret, `blob\n${key}\n${expMs}`));
   return `${baseUrl.replace(/\/$/, "")}/v1/blobs/${key.split("/").map(encodeURIComponent).join("/")}?exp=${expMs}&sig=${sig}`;
+}
+
+/**
+ * A share link's signature: HMAC over `{sandbox, port}` and the expiry, carried as `?exp=..&sig=..`.
+ * Minted only; nothing serves or verifies share links yet (docs/sandbox/networking/ingress/).
+ */
+export async function signShare(secret: string, sandbox: string, port: number, expMs: number): Promise<string> {
+  return `exp=${expMs}&sig=${b64url(await mac(secret, `share\n${sandbox}\n${port}\n${expMs}`))}`;
 }
 
 export async function verifyBlobUrl(secret: string, key: string, exp: string | null, sig: string | null, nowMs = Date.now()) {

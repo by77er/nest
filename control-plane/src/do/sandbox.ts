@@ -12,7 +12,8 @@ import { num, type Env } from "../env";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
-import { asNestError, b64url, NestError, newId } from "../lib/util";
+import { signShare } from "../lib/tokens";
+import { asNestError, NestError, newId } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
 import { storedEnum } from "../lib/stored";
@@ -100,7 +101,7 @@ export function previewHostname(domain: string, port: number, sandbox: string): 
   const { label, zone } = splitDomain(domain);
   return `${port}-${sandbox.replace(/^sbx_/, "")}-preview-${label}.${zone}`;
 }
-/** A share link's hostname, `<token>-share-<label>.<zone>`: the token names one `{sandbox, port}`. */
+/** A share link's hostname, `<port>-<sandbox>-share-<label>.<zone>`; its query carries the signed expiry. */
 export function shareHostname(domain: string, port: number, sandbox: string): string {
   const { label, zone } = splitDomain(domain);
   return `${port}-${sandbox.replace(/^sbx_/, "")}-share-${label}.${zone}`;
@@ -980,11 +981,9 @@ export class SandboxDO extends DurableObject<Env> {
     this.report("port_exposed", `port ${port} exposed at ${url}`, { port, url });
     let shareUrl: string | undefined;
     if (share) {
-      // Signed, expiring share token for one {sandbox, port}; verified by the preview Worker route.
-      const exp = Date.now() + 24 * 3_600_000;
-      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(this.env.HOST_TOKEN_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-      const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`share\n${info.sandbox}\n${port}\n${exp}`)));
-      shareUrl = `https://${shareHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, info.sandbox)}/?exp=${exp}&sig=${b64url(sig)}`;
+      // Signed and expiring, for one {sandbox, port}. Minted only: no Worker route serves it yet.
+      const query = await signShare(this.env.HOST_TOKEN_SECRET, info.sandbox, port, Date.now() + 24 * 3_600_000);
+      shareUrl = `https://${shareHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, info.sandbox)}/?${query}`;
     }
     return shareUrl ? { url, share_url: shareUrl } : { url };
   }
