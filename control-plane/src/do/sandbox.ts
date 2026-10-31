@@ -635,40 +635,25 @@ export class SandboxDO extends DurableObject<Env> {
       reason: ev.reason,
       created_ms: Date.now(),
     });
-    const rejected = (reason: string): CommitOutcome => ({ status: "rejected", reason, ...(info.head ? { head: info.head } : {}) });
-
+    const d = lease.decideCommit(info, (e) => this.epochHost(e), host, ev);
     let outcome: CommitOutcome;
-    let orphan: GenerationRecord | null = null;
-    if ((ev.kind === "checkpoint") !== (ev.mem_manifest !== undefined)) {
-      // `kind` must agree with the memory manifest: the chain is immutable, and a checkpoint
-      // without one would restore without memory.
-      outcome = rejected(ErrorCodes.INVALID_MESSAGE);
-    } else if (ev.reason === "salvage" && ev.epoch < info.epoch) {
-      if (this.epochHost(ev.epoch) !== host) {
-        outcome = rejected(ErrorCodes.STALE_EPOCH);
-      } else {
-        orphan = record();
-        this.sql.exec("INSERT INTO generations (id, record, orphaned, created_ms) VALUES (?, ?, 1, ?)",
-          orphan.id, JSON.stringify(orphan), orphan.created_ms);
-        outcome = { status: "orphaned", generation: orphan };
-      }
-    } else if (ev.epoch !== info.epoch || host !== info.host) {
-      outcome = rejected(ErrorCodes.STALE_EPOCH);
-    } else if ((ev.parent ?? null) !== info.head) {
-      outcome = rejected(ErrorCodes.PARENT_MISMATCH);
+    if (d.kind === "rejected") {
+      outcome = { status: "rejected", reason: d.reason, ...(info.head ? { head: info.head } : {}) };
     } else {
       const generation = record();
-      this.sql.exec("INSERT INTO generations (id, record, orphaned, created_ms) VALUES (?, ?, 0, ?)",
-        generation.id, JSON.stringify(generation), generation.created_ms);
-      this.update((i) => {
-        i.head = generation.id;
-      });
-      outcome = { status: "committed", generation };
+      this.sql.exec("INSERT INTO generations (id, record, orphaned, created_ms) VALUES (?, ?, ?, ?)",
+        generation.id, JSON.stringify(generation), d.kind === "orphan" ? 1 : 0, generation.created_ms);
+      if (d.kind === "head") {
+        this.update((i) => {
+          i.head = generation.id;
+        });
+      }
+      outcome = { status: d.kind === "orphan" ? "orphaned" : "committed", generation };
     }
     this.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES (?, ?, ?, ?)",
       ev.request, JSON.stringify(outcome), Date.now(), outcome.status === "rejected" ? null : outcome.generation.id);
     await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
-    if (orphan) await this.noticeOrphan(ev, orphan);
+    if (outcome.status === "orphaned") await this.noticeOrphan(ev, outcome.generation);
     return outcome;
   }
 

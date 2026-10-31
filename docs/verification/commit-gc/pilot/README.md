@@ -13,7 +13,7 @@ All the inventory claims this pilot relies on match main `edf6829`: the commit g
 | Model (Lean) | Code |
 |---|---|
 | `CommitChain.State {epoch, host, head, gens, commits, history, next}` | `info.{epoch, host, head, history}`, `generations`, `commits` (`sandbox.ts:44-56`, `:125-127`) |
-| `CommitChain.commit`, guard for guard | `SandboxDO.commit` (`sandbox.ts:552-613`) |
+| `CommitChain.commit`, guard for guard | `decideCommit` (`control-plane/src/lib/sandbox-lease.ts`, pure, table-tested in `control-plane/test/sandbox-lease-core.test.ts`); the shell `SandboxDO.commit` stores the generation and the record |
 | `CommitChain.Step.place e h hist`: sets epoch, host, history to anything | placement, eviction, lease loss, destroy (`sandbox.ts:236-317`, `:348`, `:411`, `:468`, `:513`) |
 | `Gen.keys`: closure of the disk and memory manifests | `cl(m)` in the inventory; `gc.rs:76-89` |
 | `World.store : key → Option LM` (newest version's Last-Modified) | versioned cell bucket |

@@ -6,7 +6,7 @@
 // and every answer are in, no lease is left.
 import { describe, expect, it } from "vitest";
 import {
-  claim, createFailed, destroyed, evicted, failedHolder, gone, type Lease, leaseLost, type PlaceAnswer, placeAnswered,
+  claim, createFailed, decideCommit, destroyed, evicted, failedHolder, gone, type Lease, leaseLost, type PlaceAnswer, placeAnswered,
   placeWanted, reconciled, reported, retried,
 } from "../src/lib/sandbox-lease";
 import type { SandboxState } from "../src/protocol/model";
@@ -264,5 +264,34 @@ describe("decisions the walk doesn't pin", () => {
     expect(fresh.state).toBe("running");
     expect(reconciled(placed({ host: null, placing: 4, epoch: 4 }), 4, { ...lease, expired: true })).toBe("cleared");
     expect(reconciled(placed({ host: null, placing: 4, epoch: 4 }), 4, { ...lease, epoch: 3 })).toBe("cleared");
+  });
+});
+
+describe("the commit decision (sandbox-lease §2.4), guard by guard in order", () => {
+  // Epoch 3 held by hst_a; epoch 2 was hst_b's; the head is gen_h.
+  const at = { epoch: 3, host: "hst_a", head: "gen_h" };
+  const epochHost = (e: number) => ({ 1: "hst_c", 2: "hst_b", 3: "hst_a" } as Record<number, string>)[e];
+  const ev = (over: Partial<Parameters<typeof decideCommit>[3]> = {}) => ({ kind: "disk_only" as const, reason: "turn_end", epoch: 3, parent: "gen_h", ...over });
+  const rows: [string, string, ReturnType<typeof ev>, ReturnType<typeof decideCommit>][] = [
+    ["head", "hst_a", ev(), { kind: "head" }],
+    ["checkpoint with its memory", "hst_a", ev({ kind: "checkpoint", mem_manifest: "m" }), { kind: "head" }],
+    ["checkpoint without memory, even as a salvage", "hst_b", ev({ kind: "checkpoint", reason: "salvage", epoch: 2 }), { kind: "rejected", reason: "invalid_message" }],
+    ["disk_only with memory", "hst_a", ev({ mem_manifest: "m" }), { kind: "rejected", reason: "invalid_message" }],
+    ["salvage from the old epoch's holder, any parent", "hst_b", ev({ reason: "salvage", epoch: 2, parent: "gen_x" }), { kind: "orphan" }],
+    ["salvage from another host", "hst_a", ev({ reason: "salvage", epoch: 2 }), { kind: "rejected", reason: "stale_epoch" }],
+    ["salvage at the current epoch is an ordinary commit", "hst_a", ev({ reason: "salvage" }), { kind: "head" }],
+    ["not salvage, old epoch", "hst_b", ev({ epoch: 2 }), { kind: "rejected", reason: "stale_epoch" }],
+    ["current epoch, not the holder", "hst_b", ev(), { kind: "rejected", reason: "stale_epoch" }],
+    ["future epoch", "hst_a", ev({ epoch: 4 }), { kind: "rejected", reason: "stale_epoch" }],
+    ["parent not the head", "hst_a", ev({ parent: "gen_x" }), { kind: "rejected", reason: "parent_mismatch" }],
+    ["no parent on a chain with a head", "hst_a", ev({ parent: undefined }), { kind: "rejected", reason: "parent_mismatch" }],
+  ];
+  it.each(rows)("%s", (_why, host, e, want) => {
+    expect(decideCommit(at, epochHost, host, e)).toEqual(want);
+  });
+
+  it("an unplaced sandbox moves no head, and the first commit has no parent", () => {
+    expect(decideCommit({ epoch: 3, host: null, head: "gen_h" }, epochHost, "hst_a", ev())).toEqual({ kind: "rejected", reason: "stale_epoch" });
+    expect(decideCommit({ epoch: 1, host: "hst_c", head: null }, epochHost, "hst_c", ev({ epoch: 1, parent: undefined }))).toEqual({ kind: "head" });
   });
 });

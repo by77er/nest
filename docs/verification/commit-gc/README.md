@@ -20,7 +20,7 @@ Constants: `R = REUSE_MS = 12 h` (`s3.rs:54`), `G = GC_GRACE_MS = 24 h`, `W = GC
 
 ## State machines
 
-### Commit (SandboxDO.commit, `sandbox.ts:552-613`)
+### Commit (`decideCommit` in `lib/sandbox-lease.ts`; the shell `SandboxDO.commit`)
 
 One synchronous block (no await before the `commits` insert), so a commit is atomic in DO SQLite.
 
@@ -114,7 +114,7 @@ Let `cl(m)` = `{manifests/m} ∪ {chunks/c | c ∈ m}`; `Live` = generations of 
 |---|---|
 | Prepare | `storage.rs:118-163`, `s3.rs:312-326`, `:475-507` |
 | Send / Resend | `host.rs:2076-2121`, `:2052-2058`; `fleet.rs:291` |
-| Evaluate | `sandbox.ts:552-613` |
+| Evaluate | `decideCommit`, `SandboxDO.commit` |
 | Destroy | `sandbox.ts:507-520`, `fleet.ts:1597` |
 | Claim | `fleet.ts:1619-1652`, `sandbox.ts:496-505` |
 | List / Judge / Delete | `gc.rs:91-160` |

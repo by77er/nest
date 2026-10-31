@@ -37,7 +37,7 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 | CreateFailed | `commandFailed(h, sandbox_create, e)` | `e = epoch ∧ h = host` | re-issue create at the **same** epoch up to 3 times, then `state := failed` | `createFailed` |
 | Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseLease(e)` (not waiting for the fence), `host := null`, Claim | `failedHolder`, `retried` |
 | Destroy | operator | — | `state := destroyed; host := null; placing := null` first (no await before it); then `sandbox_destroy` to the old host if any; **await** `releaseLease` (all epochs); clear `place`. A Placed or Reconcile continuation that then finds the sandbox gone releases the lease it got at e and sends `sandbox_destroy(e)` to its host (`discardPlacement`) | `destroy`, `discardPlacement` |
-| Commit | `commit(h, ev)` via FleetDO | see 2.4 | may move `head` | `552-611` |
+| Commit | `commit(h, ev)` via FleetDO | see 2.4 | may move `head` | `decideCommit` |
 
 ### 2.2 FleetDO lease row and host status
 
@@ -71,7 +71,7 @@ Revocation: `heartbeat_ack.revoked` lists every claim whose lease is absent, on 
 
 Lease claims sent in each heartbeat: rows in creating, restoring, running, suspending, suspended, archiving (`328-341`). A fence command's result is `ok` whether or not it fenced anything (`1393-1398`), and it is emitted before the pause and the VM stop finish.
 
-### 2.4 Commit decision (`sandbox.ts:571-597`, synchronous, no await before the decision)
+### 2.4 Commit decision (`decideCommit` in `lib/sandbox-lease.ts`, synchronous, no await before the decision)
 
 1. Stored outcome for `request`: return it.
 2. `kind` disagrees with `mem_manifest`: rejected `invalid_message`.
@@ -178,7 +178,7 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 | `Hello` | `onHello`, `reconcileSandboxes`, `dropUnreported` (`fleet.ts:729-844`) |
 | `Heartbeat`, `Revoke` | `onHeartbeat` (`fleet.ts:941-956`), nestd `Revoked` (`host.rs:812-819`) |
 | `HostCreate`, `HostFence`, `SelfFence`, `Salvage`, `Retire`, `HostDestroy`, `HostCrash` | `host.rs:1404-1491`, `1097-1160`, `1056-1094`, `1170-1221`, `1825-1846`, `395-488` |
-| `Commit` | `SandboxDO.commit` (`sandbox.ts:552-611`) |
+| `Commit` | `decideCommit` (`lib/sandbox-lease.ts`); shell `SandboxDO.commit` |
 | `Evict` | `evict`, `processEvictions` (`fleet.ts:1561-1589`); `evicted` (`lib/sandbox-lease.ts`) |
 | `Destroy`, `Retry` | `destroyed`, `failedHolder` + `retried` (`lib/sandbox-lease.ts`); shells `SandboxDO.destroy`, `retryPlacement` |
 | `Report`, `CreateFailed`, alarm `place` | `reported`, `createFailed`, `placeWanted` (`lib/sandbox-lease.ts`); every host-event guard is `holds`, every finality check `gone` |

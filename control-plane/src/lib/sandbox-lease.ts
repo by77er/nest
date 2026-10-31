@@ -187,3 +187,23 @@ export function destroyed(l: Lease): void {
 /** The `place` alarm places a live, unplaced sandbox; a suspended one only while someone works. */
 export const placeWanted = (l: Lease): boolean =>
   l.host === null && l.placing === null && !gone(l.state) && (l.state !== "suspended" || l.working.length > 0);
+
+/**
+ * Commit (sandbox-lease §2.4, the commit-gc Lean pilot's `CommitChain.commit`, guard for guard): a
+ * request not answered before. `kind` must agree with the memory manifest (the chain is immutable,
+ * and a checkpoint without one would restore without memory). A salvage from an older epoch is an
+ * orphaned sibling (head unchanged), only from the host that held that epoch. Anything else moves
+ * the head only from the current holder at the current epoch, with the head as its parent (S1, S6).
+ */
+export function decideCommit(
+  l: Pick<Lease, "epoch" | "host" | "head">, epochHost: (epoch: number) => string | undefined, host: string,
+  ev: { kind: "disk_only" | "checkpoint"; mem_manifest?: string; reason: string; epoch: number; parent?: string },
+): { kind: "rejected"; reason: string } | { kind: "orphan" } | { kind: "head" } {
+  if ((ev.kind === "checkpoint") !== (ev.mem_manifest !== undefined)) return { kind: "rejected", reason: ErrorCodes.INVALID_MESSAGE };
+  if (ev.reason === "salvage" && ev.epoch < l.epoch) {
+    return epochHost(ev.epoch) === host ? { kind: "orphan" } : { kind: "rejected", reason: ErrorCodes.STALE_EPOCH };
+  }
+  if (ev.epoch !== l.epoch || host !== l.host) return { kind: "rejected", reason: ErrorCodes.STALE_EPOCH };
+  if ((ev.parent ?? null) !== l.head) return { kind: "rejected", reason: ErrorCodes.PARENT_MISMATCH };
+  return { kind: "head" };
+}
