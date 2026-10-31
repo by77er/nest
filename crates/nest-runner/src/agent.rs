@@ -362,25 +362,7 @@ async fn run(
         });
     }
 
-    Actor {
-        rt: rt.clone(),
-        agent: agent.clone(),
-        launch,
-        pid: proc.pid,
-        stdin: proc.stdin,
-        auth_method: auth,
-        auth_reported: false,
-        outstanding: 0,
-        tally: stream::TurnTally::default(),
-        settle_deadline: None,
-        idle_deadline: None,
-        interrupt: None,
-        exit_reason: None,
-        stash: Vec::new(),
-        req_n: 0,
-    }
-    .run(cmd_rx)
-    .await;
+    Actor::new(rt.clone(), agent.clone(), launch, proc, auth).run(cmd_rx).await;
     Ok(())
 }
 
@@ -534,6 +516,29 @@ struct Actor {
 }
 
 impl Actor {
+    fn new(rt: Arc<Runtime>, agent: Arc<Agent>, launch: Launch, proc: Proc, auth_method: String) -> Self {
+        // Armed from the start, not only after a turn: a brain that never gets one still exits, so
+        // its host can retire.
+        let idle_deadline = Some(Instant::now() + rt.cfg.idle_grace);
+        Actor {
+            rt,
+            agent,
+            launch,
+            pid: proc.pid,
+            stdin: proc.stdin,
+            auth_method,
+            auth_reported: false,
+            outstanding: 0,
+            tally: stream::TurnTally::default(),
+            settle_deadline: None,
+            idle_deadline,
+            interrupt: None,
+            exit_reason: None,
+            stash: Vec::new(),
+            req_n: 0,
+        }
+    }
+
     fn turn_active(&self) -> bool {
         self.outstanding > 0
     }
@@ -867,7 +872,7 @@ impl Actor {
         self.outstanding = 0;
         self.tally = stream::TurnTally::default();
         self.interrupt = None;
-        self.idle_deadline = None;
+        self.idle_deadline = Some(Instant::now() + self.rt.cfg.idle_grace);
         self.settle_deadline = None;
         self.auth_reported = false;
         Ok(())
@@ -943,23 +948,9 @@ mod tests {
         let agent = Agent::new(AgentId("agt_t".into()), nest_protocol::model::Epoch(1), std::env::temp_dir(), None, None, vec![], 0, cmd_tx, out_tx);
         let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
         let launch = LaunchConfig { model: None, effort: None, builtin_tools: vec![], system_prompt: SystemPrompt::Append { text: String::new() } };
-        let actor = Actor {
-            rt,
-            agent,
-            launch: Launch { launch, config_dir: String::new(), env: vec![] },
-            pid: 0,
-            stdin: StdinWriter { tx: Some(stdin_tx), task: None },
-            auth_method: "oauth_token".into(),
-            auth_reported: true,
-            outstanding: 0,
-            tally: stream::TurnTally::default(),
-            settle_deadline: None,
-            idle_deadline: None,
-            interrupt: None,
-            exit_reason: None,
-            stash: Vec::new(),
-            req_n: 0,
-        };
+        let proc = Proc { pid: 0, stdin: StdinWriter { tx: Some(stdin_tx), task: None } };
+        let mut actor = Actor::new(rt, agent, Launch { launch, config_dir: String::new(), env: vec![] }, proc, "oauth_token".into());
+        actor.auth_reported = true;
         (actor, stdin_rx, out_rx)
     }
 
@@ -1031,6 +1022,27 @@ mod tests {
         actor.on_deadline();
         let t1 = Some("trn_1".to_string());
         assert_eq!(drained(&mut out), [(t1.clone(), "turn_completed"), (t1, "idle")]);
+    }
+
+    #[tokio::test]
+    async fn a_brain_that_never_gets_a_turn_still_exits_idle() {
+        use nest_protocol::control::TurnInput;
+        use nest_protocol::model::TurnId;
+        // Before this, the idle clock started only when a turn finished: a brain started with no
+        // turn ran until stopped, and kept its brain host from retiring.
+        let (mut actor, _stdin, _out) = bare_actor();
+        assert!(actor.idle_deadline.is_some(), "armed at start");
+        actor.idle_deadline = Some(Instant::now());
+        actor.on_deadline();
+        assert_eq!(actor.exit_reason, Some(ExitReason::Idle));
+        assert!(!actor.stdin.is_open());
+
+        // A turn arriving within the grace stops the clock until the turn is over.
+        let (mut actor, _stdin, _out) = bare_actor();
+        actor.handle(AgentCmd::RunTurn { turn: TurnId("trn_1".into()), input: TurnInput { kind: TurnInputKind::User, text: "go".into() } });
+        assert!(actor.idle_deadline.is_none());
+        actor.handle(AgentCmd::Line(result_line("end_turn")));
+        assert!(actor.idle_deadline.is_some());
     }
 
     #[test]
