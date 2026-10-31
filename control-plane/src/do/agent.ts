@@ -1047,12 +1047,15 @@ export class AgentDO extends DurableObject<Env> {
     let wakes = false;
     const info = this.update((i) => {
       if (!i.brain || i.brain.host !== host || epoch < i.brain.epoch) return;
+      const condemned = i.brain.phase === "condemned";
       if (stoppedBrain(i, i.brain.epoch)) ended = "stopped";
-      restarts = RESTART_ON_EXIT[ended] && ended !== "idle";
-      wakes = RESTART_ON_EXIT[ended] || (stoppedBrain(i, i.brain.epoch) && !quietSinceStop(i));
-      // Counted once, where it happens (the crash-loop guard): here for a brain that ended on its
-      // own; a condemned brain's exit is the condemn's outcome, counted by its cause if at all.
-      if (restarts && i.brain.phase !== "condemned") i.exit_restarts = (i.exit_restarts ?? 0) + 1;
+      // A condemned brain's exit reason describes its kill (`fenced`, `stopped`), not the brain: its
+      // end was decided by its condemn, whose cause kept an intent or woke if a start is wanted (a
+      // refused start that ended `errored` wants none). So its release restarts nothing of its own,
+      // and isn't counted again by the crash-loop guard.
+      restarts = !condemned && RESTART_ON_EXIT[ended] && ended !== "idle";
+      wakes = (!condemned && RESTART_ON_EXIT[ended]) || (stoppedBrain(i, i.brain.epoch) && !quietSinceStop(i));
+      if (restarts) i.exit_restarts = (i.exit_restarts ?? 0) + 1;
       // An operator's start kept while this brain ran (N14: it answered `none`) is for after a
       // graceful stop: any other end of a brain that wasn't condemned drops it (N20), so it never
       // lingers. A move (another host named, or this one avoided, even before it condemned the
@@ -1063,7 +1066,8 @@ export class AgentDO extends DurableObject<Env> {
       }
       i.prev_host = i.brain.host;
       i.brain = null;
-      i.state = "detached";
+      // `errored` (a refused start, the crash-loop guard) stays while nothing will start a brain.
+      if (i.state !== "errored" || i.intent || wakes) i.state = "detached";
       released = true;
     });
     if (!released) return false;

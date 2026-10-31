@@ -1006,6 +1006,27 @@ describe("one brain per agent: the brain record", () => {
     expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
   });
 
+  // B1: the refusal's own `fenced` exit describes the kill, not the brain, so it must not restart it.
+  for (const [what, retryable, attempts] of [["refused for good", false, 0], ["refused a 4th time", true, 3]] as const) {
+    it(`D1: a start ${what}, with work waiting, ends \`errored\`: its exit starts nothing, and only new input starts it again`, async () => {
+      const s = await setup();
+      await okResult(s.host.ws, s.start.cmd);
+      await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
+      await editAgent(s.agent, (i) => {
+        i.start_attempts = attempts;
+      });
+      const stub = agentStub(s.agent);
+      await stub.startFailed(s.host.host, { code: "stale_epoch", message: "refused", retryable }, 1);
+      await nextCommands(s.host.ws, isKillOf(s.agent));
+      await exited(s.host.ws, s.agent, 1, "fenced");
+      expect(await stub.info()).toMatchObject({ brain: null, intent: null, state: "errored", agent_epoch: 1 });
+      await runDurableObjectAlarm(stub);
+      expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(s.agent)))).toBe(true);
+      await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "try again" } }, 201);
+      expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+    });
+  }
+
   it("D2/M4: a host-loss notice releases only the record at or below its epoch, and only while the host is still lost", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
