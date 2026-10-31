@@ -48,9 +48,10 @@ Reported in `RunnerEvent::Error` (to nestd) or in an `AgentEventBody::Error` (on
 | `invalid_message` | `RunnerEvent::Error` | An undecodable `RunnerCommand` from nestd. It's skipped; the connection stays up. |
 | `agent_start_failed` | `RunnerEvent::Error` | A startup step failed or timed out (materialize, auth check, spawn). Retryable. |
 | `claude_version` (designed) | `RunnerEvent::Error` | Claude Code isn't the pinned baseline (version or SHA-256). The start is refused (`agent_exited{crashed}`). Not retryable. |
-| `agent_stopping` | `AgentEventBody::Error` | A turn or inbox message arrived after a stop; it isn't delivered. |
+| `agent_stopping` | `AgentEventBody::Error` | A turn arrived after a stop or kill; it isn't written (AgentDO keeps it queued). |
+| `turn_overlap` | `AgentEventBody::Error` | A `run_turn` arrived while another turn runs; it isn't written. Not retryable. |
 | `stdin` | `AgentEventBody::Error` | Writing to Claude Code's stdin failed. Retryable. |
-| `outcome_unknown` | MCP tool result | A platform call timed out in the runner (the runner sends `cancel_call`), a hands call's gateway connection closed with 4409 (the sandbox left mid-call), or (designed) a hands call went silent. The model is told the call may or may not have taken effect. |
+| `outcome_unknown` | MCP tool result | A platform call timed out in the runner (the runner sends `cancel_call`), a hands call's gateway connection closed with 4409 (the sandbox left mid-call) or its request's send failed part-way, `nest mcp`'s connection to the runner closed while a call ran, or (designed) a hands call went silent. The model is told the call may or may not have taken effect. |
 
 ## Agent start → turn → sync hook → idle exit
 
