@@ -124,10 +124,7 @@ export class SerialQueue {
   }
 }
 
-/**
- * `p`, or a rejection after `ms`: a call another object may never answer can't hold up the caller
- * (an alarm loop). The call itself runs on; its result is dropped.
- */
+/** `p`, or a rejection after `ms`, so a call that never answers can't hold up an alarm loop (it runs on, unheard). */
 export async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -144,11 +141,7 @@ export async function withTimeout<T>(p: Promise<T>, ms: number, what: string): P
  * owner may arm; `runDue` hands back any stored key, so its handler must expect one it doesn't know.
  */
 export class Deadlines<K extends string = string> {
-  /**
-   * Keys whose handler `runDue` is running, with the `at` being run. That row is about to be deleted,
-   * so it counts as unarmed: `has` and `keepEarlier` must not swallow a re-arm (from the handler
-   * itself, or from anything that runs while it awaits).
-   */
+  /** Keys `runDue` is running, with the `at` run: that row is about to go, so `has` and `keepEarlier` ignore it. */
   private readonly running = new Map<string, number>();
   /** Running keys `set` since their handler started: their row is a new deadline, kept whatever its `at`. */
   private readonly rearmed = new Set<string>();
