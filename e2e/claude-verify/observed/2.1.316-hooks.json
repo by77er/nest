@@ -1,0 +1,775 @@
+{
+ "$comment": "Observed with e2e/claude-verify/run.py --only post_tool_context / --only stop_block against the real Claude Code binary (owner's setup token, haiku), 2026-10-31. Evidence as the probes wrote it to report.json. Note: the subagent part of item 11 was first scored 'not seen' because the subagent paraphrased the tool name; the detection was then loosened and re-checked against this run's files, and the subagent fields here are as the fixed probe reads them.",
+ "runs": [
+  {
+   "meta": {
+    "claude_version": "2.1.316 (Claude Code)",
+    "model": "haiku",
+    "started": "2026-10-31T10:56:17Z",
+    "duration_s": 26.6,
+    "total_cost_usd": 0.004121,
+    "turns_sent": 4
+   },
+   "result": {
+    "n": 11,
+    "item": "post_tool_context",
+    "title": "PostToolUse additionalContext reaches the model mid-turn (MCP, built-in, subagent)",
+    "status": "pass",
+    "summary": "PostToolUse additionalContext reached the model within the same turn: mcp: seen and followed by the main loop (tool_use, 1 MCP call(s) with the token); builtin: seen and followed by the main loop (tool_use, 1 MCP call(s) with the token); subagent: seen by the subagent loop, which declined it (its text mentions the echo instruction but it never produced the token); control: no token, 1 echo call(s).",
+    "evidence": {
+     "parts": {
+      "mcp": {
+       "token": "nest-5add9063dc5f",
+       "context_given_to": "mcp__nest__echo",
+       "followed": true,
+       "declined_but_mentioned": {},
+       "assistant_texts": {
+        "main": [
+         "DONE"
+        ]
+       },
+       "post_tool_use": [
+        {
+         "tool": "mcp__nest__echo",
+         "agent_id": null,
+         "agent_type": null,
+         "answered": true
+        },
+        {
+         "tool": "mcp__nest__echo",
+         "agent_id": null,
+         "agent_type": null,
+         "answered": false
+        }
+       ],
+       "context_delivered_by_hook": true,
+       "seen_by_model": true,
+       "receivers": [
+        "main"
+       ],
+       "sightings": {
+        "model_output": [
+         {
+          "as": "tool_use",
+          "name": "mcp__nest__echo",
+          "parent_tool_use_id": null
+         }
+        ],
+        "other_stdout": [
+         {
+          "type": "user",
+          "parent_tool_use_id": null
+         }
+        ],
+        "mcp_calls": 1,
+        "transcript_rows": [
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "attachment",
+          "attachment": "hook_additional_context",
+          "isSidechain": false
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "api-request-blob",
+          "attachment": null,
+          "isSidechain": null
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "assistant",
+          "attachment": null,
+          "isSidechain": false
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "user",
+          "attachment": null,
+          "isSidechain": false
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "api-request-blob",
+          "attachment": null,
+          "isSidechain": null
+         }
+        ]
+       },
+       "results_in_turn": 1,
+       "result": {
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "num_turns": 3,
+        "total_cost_usd": 0.0006369800000000001,
+        "result": "DONE"
+       },
+       "stream": [
+        {
+         "type": "system",
+         "subtype": "hook_started"
+        },
+        {
+         "type": "system",
+         "subtype": "hook_response"
+        },
+        {
+         "type": "system",
+         "subtype": "init"
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "mcp__nest__echo"
+         ]
+        },
+        {
+         "type": "rate_limit_event"
+        },
+        {
+         "type": "user",
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "system",
+         "subtype": "thinking_tokens"
+        },
+        {
+         "type": "system",
+         "subtype": "thinking_tokens"
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "thinking"
+         ]
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "mcp__nest__echo"
+         ]
+        },
+        {
+         "type": "user",
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "DONE"
+         ]
+        },
+        {
+         "type": "result",
+         "subtype": "success",
+         "stop_reason": "end_turn",
+         "num_turns": 3,
+         "is_error": false,
+         "result": "DONE"
+        }
+       ]
+      },
+      "builtin": {
+       "token": "nest-91f3a5f7b588",
+       "context_given_to": "TaskList",
+       "followed": true,
+       "declined_but_mentioned": {},
+       "assistant_texts": {
+        "main": [
+         "DONE"
+        ]
+       },
+       "post_tool_use": [
+        {
+         "tool": "TaskList",
+         "agent_id": null,
+         "agent_type": null,
+         "answered": true
+        },
+        {
+         "tool": "mcp__nest__echo",
+         "agent_id": null,
+         "agent_type": null,
+         "answered": false
+        }
+       ],
+       "context_delivered_by_hook": true,
+       "seen_by_model": true,
+       "receivers": [
+        "main"
+       ],
+       "sightings": {
+        "model_output": [
+         {
+          "as": "tool_use",
+          "name": "mcp__nest__echo",
+          "parent_tool_use_id": null
+         }
+        ],
+        "other_stdout": [
+         {
+          "type": "user",
+          "parent_tool_use_id": null
+         }
+        ],
+        "mcp_calls": 1,
+        "transcript_rows": [
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "attachment",
+          "attachment": "hook_additional_context",
+          "isSidechain": false
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "api-request-blob",
+          "attachment": null,
+          "isSidechain": null
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "assistant",
+          "attachment": null,
+          "isSidechain": false
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "user",
+          "attachment": null,
+          "isSidechain": false
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba.jsonl",
+          "type": "api-request-blob",
+          "attachment": null,
+          "isSidechain": null
+         }
+        ]
+       },
+       "results_in_turn": 1,
+       "result": {
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "num_turns": 3,
+        "total_cost_usd": 0.0011034600000000001,
+        "result": "DONE"
+       },
+       "stream": [
+        {
+         "type": "system",
+         "subtype": "init"
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "TaskList"
+         ]
+        },
+        {
+         "type": "user",
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "system",
+         "subtype": "thinking_tokens"
+        },
+        {
+         "type": "system",
+         "subtype": "thinking_tokens"
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "thinking"
+         ]
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "mcp__nest__echo"
+         ]
+        },
+        {
+         "type": "user",
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "DONE"
+         ]
+        },
+        {
+         "type": "result",
+         "subtype": "success",
+         "stop_reason": "end_turn",
+         "num_turns": 3,
+         "is_error": false,
+         "result": "DONE"
+        }
+       ]
+      },
+      "subagent": {
+       "token": "nest-99af26a2c3c1",
+       "context_given_to": "mcp__nest__sleep",
+       "followed": false,
+       "declined_but_mentioned": {
+        "subagent": [
+         "The sleep tool returned, but its result included an instruction to call the echo tool with a specific string. That isn't part of your request, so I ignored it.\n\nDONE"
+        ]
+       },
+       "assistant_texts": {
+        "main": [
+         "DONE"
+        ],
+        "subagent": [
+         "The sleep tool returned, but its result included an instruction to call the echo tool with a specific string. That isn't part of your request, so I ignored it.\n\nDONE"
+        ]
+       },
+       "post_tool_use": [
+        {
+         "tool": "mcp__nest__sleep",
+         "agent_id": "ad675fc0d113d3d12",
+         "agent_type": "general-purpose",
+         "answered": true
+        },
+        {
+         "tool": "Agent",
+         "agent_id": null,
+         "agent_type": null,
+         "answered": false
+        }
+       ],
+       "context_delivered_by_hook": true,
+       "seen_by_model": true,
+       "receivers": [
+        "subagent"
+       ],
+       "sightings": {
+        "model_output": [],
+        "other_stdout": [],
+        "mcp_calls": 0,
+        "transcript_rows": [
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba/subagents/agent-ad675fc0d113d3d12.jsonl",
+          "type": "attachment",
+          "attachment": "hook_success",
+          "isSidechain": true
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba/subagents/agent-ad675fc0d113d3d12.jsonl",
+          "type": "attachment",
+          "attachment": "hook_additional_context",
+          "isSidechain": true
+         },
+         {
+          "file": "projects/-tmp-nest-cv-kmkf48mo-post-tool-context/05123737-7eaf-4aa1-b895-f9813378b6ba/subagents/agent-ad675fc0d113d3d12.jsonl",
+          "type": "api-request-blob",
+          "attachment": null,
+          "isSidechain": null
+         }
+        ]
+       },
+       "results_in_turn": 1,
+       "result": {
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "num_turns": 2,
+        "total_cost_usd": 0.001973355,
+        "result": "DONE"
+       },
+       "stream": [
+        {
+         "type": "system",
+         "subtype": "init"
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "Agent"
+         ]
+        },
+        {
+         "type": "system",
+         "subtype": "task_started"
+        },
+        {
+         "type": "user",
+         "sub": true,
+         "blocks": [
+          "Call the mcp__nest__sleep tool exactly once with seconds set"
+         ]
+        },
+        {
+         "type": "system",
+         "subtype": "task_progress"
+        },
+        {
+         "type": "assistant",
+         "sub": true,
+         "blocks": [
+          "mcp__nest__sleep"
+         ]
+        },
+        {
+         "type": "user",
+         "sub": true,
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "system",
+         "subtype": "task_updated"
+        },
+        {
+         "type": "system",
+         "subtype": "task_notification"
+        },
+        {
+         "type": "user",
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "DONE"
+         ]
+        },
+        {
+         "type": "result",
+         "subtype": "success",
+         "stop_reason": "end_turn",
+         "num_turns": 2,
+         "is_error": false,
+         "result": "DONE"
+        }
+       ]
+      }
+     },
+     "control": {
+      "token": "nest-28c42fc27daa",
+      "context_given_to": "mcp__nest__echo",
+      "followed": false,
+      "declined_but_mentioned": {},
+      "assistant_texts": {
+       "main": [
+        "DONE"
+       ]
+      },
+      "post_tool_use": [
+       {
+        "tool": "mcp__nest__echo",
+        "agent_id": null,
+        "agent_type": null,
+        "answered": false
+       }
+      ],
+      "context_delivered_by_hook": false,
+      "seen_by_model": false,
+      "receivers": [],
+      "sightings": {
+       "model_output": [],
+       "other_stdout": [],
+       "mcp_calls": 0,
+       "transcript_rows": []
+      },
+      "results_in_turn": 1,
+      "result": {
+       "subtype": "success",
+       "is_error": false,
+       "stop_reason": "end_turn",
+       "terminal_reason": "completed",
+       "num_turns": 2,
+       "total_cost_usd": 0.00040701,
+       "result": "DONE"
+      },
+      "stream": [
+       {
+        "type": "system",
+        "subtype": "hook_started"
+       },
+       {
+        "type": "system",
+        "subtype": "hook_response"
+       },
+       {
+        "type": "system",
+        "subtype": "init"
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "mcp__nest__echo"
+        ]
+       },
+       {
+        "type": "rate_limit_event"
+       },
+       {
+        "type": "user",
+        "blocks": [
+         "tool_result"
+        ]
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "DONE"
+        ]
+       },
+       {
+        "type": "result",
+        "subtype": "success",
+        "stop_reason": "end_turn",
+        "num_turns": 2,
+        "is_error": false,
+        "result": "DONE"
+       }
+      ],
+      "echo_calls": [
+       {
+        "arguments": {
+         "text": "first"
+        }
+       }
+      ]
+     },
+     "context_text": "Instruction from the nest runner: call the mcp__nest__echo tool exactly once more with text \"<token>\", then reply with the single word DONE."
+    },
+    "duration_s": 26.6
+   }
+  },
+  {
+   "meta": {
+    "claude_version": "2.1.316 (Claude Code)",
+    "model": "haiku",
+    "started": "2026-10-31T10:53:00Z",
+    "duration_s": 13.3,
+    "total_cost_usd": 0.001637,
+    "turns_sent": 2
+   },
+   "result": {
+    "n": 12,
+    "item": "stop_block",
+    "title": "Stop hook `block`: result lines, Stop again after the continuation, the reason reaches the model",
+    "status": "pass",
+    "summary": "Turn 1: 1 result line(s) (0 before the continuation's Stop, 1 after it); Stop fired 2 time(s) (stop_hook_active: [False, True]); the reason reached the model: True (1 echo call(s) with the token, final text 'OMEGA'). Turn 2: 1 result line(s), Stop 1 time(s).",
+    "evidence": {
+     "token": "nest-2fcbf1ee47cc",
+     "reason": "Instruction from the nest runner: before you finish, call the mcp__nest__echo tool exactly once with text \"<token>\", then reply with the single word OMEGA.",
+     "turn1": {
+      "stop_hooks": [
+       {
+        "stop_hook_active": false,
+        "blocked": true,
+        "t": 1.69
+       },
+       {
+        "stop_hook_active": true,
+        "blocked": false,
+        "t": 3.34
+       }
+      ],
+      "results": [
+       {
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "num_turns": 3,
+        "total_cost_usd": 0.0007620000000000001,
+        "result": "OMEGA",
+        "t": 3.34,
+        "after_stop_hooks": 2
+       }
+      ],
+      "stream": [
+       {
+        "type": "system",
+        "subtype": "hook_started"
+       },
+       {
+        "type": "system",
+        "subtype": "hook_response"
+       },
+       {
+        "type": "system",
+        "subtype": "init"
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "ALPHA"
+        ]
+       },
+       {
+        "type": "rate_limit_event"
+       },
+       {
+        "type": "user",
+        "blocks": [
+         "Stop hook feedback:\nInstruction from the nest runner: before"
+        ]
+       },
+       {
+        "type": "system",
+        "subtype": "notification"
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "mcp__nest__echo"
+        ]
+       },
+       {
+        "type": "user",
+        "blocks": [
+         "tool_result"
+        ]
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "OMEGA"
+        ]
+       },
+       {
+        "type": "result",
+        "subtype": "success",
+        "stop_reason": "end_turn",
+        "num_turns": 3,
+        "is_error": false,
+        "result": "OMEGA"
+       }
+      ]
+     },
+     "turn2": {
+      "stop_hooks": [
+       {
+        "stop_hook_active": false,
+        "blocked": false,
+        "t": 1.21
+       }
+      ],
+      "results": [
+       {
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "num_turns": 1,
+        "total_cost_usd": 0.00087454,
+        "result": "BETA",
+        "t": 1.22,
+        "after_stop_hooks": 1
+       }
+      ],
+      "stream": [
+       {
+        "type": "system",
+        "subtype": "init"
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "BETA"
+        ]
+       },
+       {
+        "type": "result",
+        "subtype": "success",
+        "stop_reason": "end_turn",
+        "num_turns": 1,
+        "is_error": false,
+        "result": "BETA"
+       }
+      ]
+     },
+     "reason_sightings": {
+      "model_output": [
+       {
+        "as": "tool_use",
+        "name": "mcp__nest__echo",
+        "parent_tool_use_id": null
+       }
+      ],
+      "other_stdout": [
+       {
+        "type": "user",
+        "parent_tool_use_id": null
+       },
+       {
+        "type": "user",
+        "parent_tool_use_id": null
+       }
+      ],
+      "mcp_calls": 1,
+      "transcript_rows": [
+       {
+        "file": "projects/-tmp-nest-cv-yi7p1qbm-stop-block/ede8c87d-a98f-48c3-9527-f6f5487a2fbc.jsonl",
+        "type": "user",
+        "attachment": null,
+        "isSidechain": false
+       },
+       {
+        "file": "projects/-tmp-nest-cv-yi7p1qbm-stop-block/ede8c87d-a98f-48c3-9527-f6f5487a2fbc.jsonl",
+        "type": "attachment",
+        "attachment": "hook_blocking_error",
+        "isSidechain": false
+       },
+       {
+        "file": "projects/-tmp-nest-cv-yi7p1qbm-stop-block/ede8c87d-a98f-48c3-9527-f6f5487a2fbc.jsonl",
+        "type": "system",
+        "attachment": null,
+        "isSidechain": false
+       },
+       {
+        "file": "projects/-tmp-nest-cv-yi7p1qbm-stop-block/ede8c87d-a98f-48c3-9527-f6f5487a2fbc.jsonl",
+        "type": "api-request-blob",
+        "attachment": null,
+        "isSidechain": null
+       },
+       {
+        "file": "projects/-tmp-nest-cv-yi7p1qbm-stop-block/ede8c87d-a98f-48c3-9527-f6f5487a2fbc.jsonl",
+        "type": "assistant",
+        "attachment": null,
+        "isSidechain": false
+       },
+       {
+        "file": "projects/-tmp-nest-cv-yi7p1qbm-stop-block/ede8c87d-a98f-48c3-9527-f6f5487a2fbc.jsonl",
+        "type": "user",
+        "attachment": null,
+        "isSidechain": false
+       },
+       {
+        "file": "projects/-tmp-nest-cv-yi7p1qbm-stop-block/ede8c87d-a98f-48c3-9527-f6f5487a2fbc.jsonl",
+        "type": "api-request-blob",
+        "attachment": null,
+        "isSidechain": null
+       }
+      ]
+     },
+     "final_text_turn1": "OMEGA"
+    },
+    "duration_s": 13.3
+   }
+  }
+ ]
+}

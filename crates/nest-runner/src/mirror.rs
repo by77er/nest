@@ -2,9 +2,10 @@
 //! been handed, by the hooks alone. No I/O; it lives in [`crate::runtime::AgentInner`], so one
 //! lock covers the decision and the marking, and two hooks never hand out one message twice.
 //!
-//! - At a tool boundary (`PostToolUse`), every pending message goes out as `additionalContext`.
-//!   UNVERIFIED that Claude Code shows it to the model mid-turn under `-p` stream-json for
-//!   `mcp__nest__*` tools; `Config::inbox_at_tool_boundary` turns this off, leaving only `Stop`.
+//! - At the main loop's tool boundary (`PostToolUse`), every pending message goes out as
+//!   `additionalContext`, which Claude Code shows the model mid-turn (checked on 2.1.316, for MCP
+//!   and built-in tools). Not at a subagent's: there it would reach the subagent instead.
+//!   `Config::inbox_at_tool_boundary` turns this off, leaving only `Stop`.
 //! - At `Stop`, every pending message goes out as `decision: block`, up to
 //!   `max_stop_continuations` per stop chain.
 //! - Only while a turn takes inbox ([`crate::brain::Brain::takes_inbox`]). A message the running
@@ -63,9 +64,15 @@ impl InboxMirror {
         }
     }
 
+    /// Never an `interrupt` message: it cuts the running turn short and is AgentDO's to queue as
+    /// the next one, which a hook racing the actor's interrupt must not pre-empt.
     fn take(&mut self, cache: Option<&AgentCache>) -> Vec<InboxMessage> {
-        let pending: Vec<InboxMessage> =
-            cache.into_iter().flat_map(|c| &c.inbox).filter(|m| !self.delivered.contains(&m.id)).cloned().collect();
+        let pending: Vec<InboxMessage> = cache
+            .into_iter()
+            .flat_map(|c| &c.inbox)
+            .filter(|m| !m.interrupt && !self.delivered.contains(&m.id))
+            .cloned()
+            .collect();
         self.delivered.extend(pending.iter().map(|m| m.id.clone()));
         pending
     }
@@ -119,6 +126,19 @@ mod tests {
         let out = m.take_at_tool_boundary(Some(&c));
         m.release(&out.iter().map(|m| m.id.clone()).collect::<Vec<_>>());
         assert_eq!(ids(&m.take_at_stop(Some(&c), false)), ["m1"]);
+    }
+
+    /// An `interrupt` message ends the turn it arrives in, and comes back from AgentDO as the next
+    /// one. Handed out by a hook that ran before the actor saw the interrupt (the cache update
+    /// lands first), it would be consumed by the turn being cut short.
+    #[test]
+    fn an_interrupting_message_is_never_handed_out() {
+        let mut m = InboxMirror::default();
+        m.set_open(true);
+        let mut c = cache(&["m1", "m2"]);
+        c.inbox[0].interrupt = true;
+        assert_eq!(ids(&m.take_at_tool_boundary(Some(&c))), ["m2"]);
+        assert!(m.take_at_stop(Some(&c), false).is_empty());
     }
 
     #[test]

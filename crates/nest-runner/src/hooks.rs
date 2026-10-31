@@ -194,7 +194,9 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
             };
             HookOutput { hook_specific_output: Some(HookSpecificOutput::PermissionRequest { decision }), ..Default::default() }
         }
-        "PostToolUse" if rt.cfg.inbox_at_tool_boundary => return tool_boundary(&agent),
+        // A subagent's tool call (its input names `agent_id`) gets nothing: the context would reach
+        // the subagent, not the main loop (checked on Claude Code 2.1.316), yet count as delivered.
+        "PostToolUse" if rt.cfg.inbox_at_tool_boundary && req.input.get("agent_id").is_none() => return tool_boundary(&agent),
         "Stop" => return stop(&agent, &req.input),
         "SessionStart" => session_start(rt, &agent, &req.input).await,
         _ => HookOutput::default(),

@@ -274,7 +274,6 @@ impl Session {
                         Outbound::SetTranscript(p) => self.tailer.set_path(p),
                         Outbound::SetSession(s) => self.session = Some(s),
                         Outbound::Reconnect => {
-                            // The batch goes out after the new hello, stamped with the new epoch.
                             let _ = tx.close().await;
                             return Ok(Step::Reconnect);
                         }
@@ -335,7 +334,6 @@ impl Session {
                 if error.code == error_codes::STALE_EPOCH {
                     a.command(AgentCmd::StaleEpoch);
                 } else if error.code == error_codes::INVALID_MESSAGE {
-                    // Most likely a segment gap: resend from what AgentDO has on reconnect.
                     a.send_out(Outbound::Reconnect);
                 }
             }
