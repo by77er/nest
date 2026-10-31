@@ -1239,7 +1239,7 @@ describe("one brain per agent: the brain record", () => {
     expect(await wedgedMs(s.cell, s.host.host)).toBeNull();
   });
 
-  it("main's `restart` alarm wakes the agent", async () => {
+  it("a deadline key no handler knows (main's `restart`) is dropped, and starts nothing", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
     await editAgent(s.agent, (i) => {
@@ -1251,7 +1251,9 @@ describe("one brain per agent: the brain record", () => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('restart', 0)");
     });
     await runDurableObjectAlarm(agentStub(s.agent));
-    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+    expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(s.agent)))).toBe(true);
+    expect(await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'restart'").toArray().length)).toBe(0);
   });
 
   it("a platform call cut short and redelivered under a newer epoch keeps its first key (no double side effect)", async () => {

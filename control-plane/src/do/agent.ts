@@ -157,8 +157,6 @@ interface PreviousReleaseFields {
 
 /** AgentDO's alarm keys: each has its handler in `alarm()`'s table, so a key without one doesn't compile. */
 type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | typeof OUTBOX_DEADLINE;
-/** Keys only a previous release arms, still handled. */
-type LegacyDeadline = "restart";
 /** A `sync` ask's window: `ask:<ask id>`. */
 const ASK_DEADLINE = "ask:";
 type AskDeadline = `${typeof ASK_DEADLINE}${string}`;
@@ -2619,7 +2617,7 @@ export class AgentDO extends DurableObject<Env> {
 
   override async alarm(): Promise<void> {
     // One handler per key: a key with none doesn't compile (`AgentDeadline`).
-    const handlers: Record<AgentDeadline | LegacyDeadline, () => Promise<void>> = {
+    const handlers: Record<AgentDeadline, () => Promise<void>> = {
       flush: () => this.flush(),
       starting: () => this.unresponsiveBrain("starting"),
       no_session: () => this.unresponsiveBrain("no_session"),
@@ -2627,8 +2625,6 @@ export class AgentDO extends DurableObject<Env> {
       wake: () => this.wake(),
       // A release's wake, counted by the crash-loop guard (a no-op once the inline wake started one).
       wake_after_exit: () => this.wake(true),
-      // The previous release's retry of a start, which a wake now covers.
-      restart: () => this.wake(),
       condemned: () => this.escalate(),
       intent: async () => {
         try {
