@@ -1,41 +1,31 @@
 // Host-kind decisions FleetDO takes (docs/compute/brain-hosts/, docs/compute/autoscaling/), as pure
-// functions: inputs in, a decision out, no I/O and no clock of their own. FleetDO gathers the inputs
-// (its rows, the host's last capacity report, the cell's `AWS_CELLS` entry) and applies what comes
-// back; the decision logic lives only here, where it is unit- and property-tested.
+// functions: no I/O and no clock of their own. FleetDO gathers the inputs and applies the answer.
 import type { Capacity } from "../protocol/control";
 
 /** A connected, active, unwedged sandbox host as packing sees it. */
 export interface SandboxHostFacts {
   host: string;
-  /** Its last capacity report (null: none yet). */
   capacity: Capacity | null;
-  /** The `mark` at which `capacity` was reported (null: before marks existed). */
+  /** The `mark` of the capacity report (null: before marks existed). */
   capacity_seq: number | null;
-  /** Its leases: what each reserves, and whether the capacity report already counts it. */
   leases: readonly { state: string | null; state_seq: number | null; vcpus: number | null; memory_mib: number | null }[];
   /** It holds a warm snapshot of what the sandbox is created from. */
   warm: boolean;
 }
 
-/** How a cell packs sandboxes on regular pages (`AWS_CELLS`). */
+/** `AWS_CELLS` packing: what a sandbox reserves against `memory_mib_free`; a per-host cap (0: none). */
 export interface PackSettings {
-  /** What a sandbox reserves against `memory_mib_free` (MiB). */
   reserve_mib: number;
-  /** At most this many sandboxes per host; 0: no cap. */
   max_per_host: number;
 }
 
 /**
- * Where a new sandbox goes (docs/compute/autoscaling/): fill hosts before opening new ones, so idle
- * hosts empty out. A host's room is its last capacity report less what leases placed since reserve
- * (a lease with no state yet, or whose first state the last capacity report predates: nestd reports
- * state at once but capacity at most every 30 s, so a burst would otherwise see none of its own
- * placements). On regular pages (no hugepage pool, the default) a sandbox costs what it touches: it
- * reserves `reserve_mib` against `memory_mib_free`, its declared size being a ceiling the jailer
- * enforces, and `max_per_host` caps the count. On a hugepage host the pool is a hard reservation:
- * the declared size counts against `hugepages_mib_free`, declared vCPUs against `vcpus_free`. An
- * empty host always takes one. Among the hosts that fit: a warm snapshot first, then the fullest
- * (least room left after this sandbox, then most leases). `null`: none fits.
+ * Where a new sandbox goes (docs/compute/autoscaling/): fill hosts before opening new ones. A host's
+ * room is its last capacity report less what leases it doesn't count yet reserve (no state, or a first
+ * state after the report: capacity is reported at most every 30 s). Regular pages: `reserve_mib` each
+ * against `memory_mib_free` (the declared size is a jailer ceiling), capped by `max_per_host`. A
+ * hugepage host: the declared size against `hugepages_mib_free`, vCPUs against `vcpus_free`. An empty
+ * host always takes one. Preferred: warm, then least room left, then most leases.
  */
 export function pickSandboxHost(hosts: readonly SandboxHostFacts[], need: { vcpus: number; memory_mib: number }, cfg: PackSettings): string | null {
   const fit = (h: SandboxHostFacts): { room: number; fits: boolean } => {
@@ -157,20 +147,10 @@ export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, now
   };
 }
 
-export type IdleStep =
-  /** Holding work: its idle clock (if any) is cleared. */
-  | "busy"
-  /** Newly idle: its idle clock starts now. */
-  | "start"
-  /** Idle, within the grace. */
-  | "wait"
-  /** Idle for the whole grace: retire it. */
-  | "retire";
+/** `busy` clears the clock, `start` starts it, `retire`: idle for the whole grace. */
+export type IdleStep = "busy" | "start" | "wait" | "retire";
 
-/**
- * A launched host's idle clock: one holding work is busy; one that isn't starts its clock, and is
- * retired once it has held nothing for `graceMs` (`idle_since` is when the clock started).
- */
+/** A launched host's idle clock (`idleSince`: when it started). */
 export function idleStep(busy: boolean, idleSince: number | null, nowMs: number, graceMs: number): IdleStep {
   if (busy) return "busy";
   if (idleSince === null) return "start";

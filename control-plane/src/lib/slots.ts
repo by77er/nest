@@ -1,37 +1,32 @@
-// An attached agent's slot in its sandbox, and when a binding may be minted for it
-// (docs/control-plane/durable-objects/sandbox/#attach-and-bindings; docs/verification/gateway-bindings
-// P1-P6). A pure, synchronous core over SandboxDO's `info`, like lib/sandbox-lease.ts: each function
-// mutates the fields it is given inside `update()` and returns what the shell sends next.
-//
-// A slot is attached (with its cwd), pending until the guest confirms the current placement's
-// `agent_attach`, with at most one such command in flight; only the in-flight command's result counts.
+// An attached agent's slot in its sandbox, and when a binding may be minted for it (gateway-bindings
+// P1-P6), as a pure core over SandboxDO's `info` like lib/sandbox-lease.ts. A slot is pending until the
+// guest confirms this placement's `agent_attach`; only the one command in flight per agent counts.
 import { gone, type Lease } from "./sandbox-lease";
 import { NestError } from "./util";
 import { ErrorCodes } from "../protocol/model";
 
 export interface Slots {
   attached: string[];
-  /** Each attached agent's slot cwd (null: the default), re-sent to every new placement. */
+  /** Slot cwds (null: the default), re-sent to every new placement. */
   attach_cwd: Record<string, string | null>;
-  /** Agents whose `agent_attach` at the current placement has no `ok` yet: no binding for them. */
+  /** No `ok` for this placement's `agent_attach` yet: no binding. */
   attach_pending: string[];
-  /** The `agent_attach` command in flight per agent; a result for any other command is stale. */
+  /** The `agent_attach` in flight per agent. */
   attach_inflight: Record<string, string>;
-  /** Failed attempts at the current placement, per agent (drives the retry backoff). */
+  /** Failed attempts at this placement (the retry backoff). */
   attach_attempts: Record<string, number>;
   /** Agents mid-turn: the sandbox may suspend only when none is. */
   working: string[];
 }
 
-/** A failed `agent_attach` is retried with this backoff (doubling), capped, for as long as the sandbox is placed. */
+/** A failed `agent_attach`'s retry backoff (doubling, capped), for as long as the sandbox is placed. */
 export const ATTACH_RETRY_MS = 2_000;
 export const ATTACH_RETRY_MAX_MS = 30_000;
 
 const without = (xs: string[], x: string) => xs.filter((y) => y !== x);
 
-/** P1: record the agent (idempotent). True when an `agent_attach` goes out now: the sandbox is placed. */
+/** P1 (idempotent). True when an `agent_attach` goes out now. */
 export function attach(c: Slots, agent: string, cwd: string | null, placed: boolean): boolean {
-  // Already attached and confirmed with this cwd: nothing to re-send, and no pending mark to re-set.
   if (c.attached.includes(agent) && !c.attach_pending.includes(agent) && c.attach_cwd[agent] === cwd) return false;
   if (!c.attached.includes(agent)) c.attached.push(agent);
   c.attach_cwd[agent] = cwd;
@@ -40,7 +35,7 @@ export function attach(c: Slots, agent: string, cwd: string | null, placed: bool
   return placed;
 }
 
-/** P5: the agent is gone from every collection (its bindings are refused from then on). */
+/** P5: its bindings are refused from then on. */
 export function detach(c: Slots, agent: string): void {
   c.attached = without(c.attached, agent);
   c.working = without(c.working, agent);
@@ -50,7 +45,7 @@ export function detach(c: Slots, agent: string): void {
   delete c.attach_attempts[agent];
 }
 
-/** P4: a new placement is a new guest: every slot is configured again, and pending until confirmed. */
+/** P4: a new guest: every slot is pending again. */
 export function newPlacement(c: Slots): string[] {
   c.attach_pending = [...c.attached];
   c.attach_inflight = {};
@@ -58,24 +53,20 @@ export function newPlacement(c: Slots): string[] {
   return [...c.attached];
 }
 
-/** The `agent_attach` commands just issued (in `agents`' order), as each still-attached agent's one in flight. */
+/** The `agent_attach` commands just issued, in `agents`' order. */
 export function sent(c: Slots, agents: string[], cmds: string[]): void {
   agents.forEach((a, n) => {
     if (c.attached.includes(a)) c.attach_inflight[a] = cmds[n]!;
   });
 }
 
-/** Pending agents with no command in flight (after a failure, or a guest coming up: `fresh` resets their backoff). */
+/** Pending agents with no command in flight (`fresh`: a guest came up, so their backoff resets). */
 export function due(c: Slots, fresh: boolean): string[] {
   if (fresh) for (const a of c.attach_pending) c.attach_attempts[a] = 0;
   return c.attach_pending.filter((a) => !(a in c.attach_inflight));
 }
 
-/**
- * P2/P3: the result of `cmd` for `agent` (from the holder at the current epoch). `ok` confirms the
- * slot; a retryable error is retried with the doubling backoff; any other waits for the next
- * `running`. A result for a command no longer in flight is stale.
- */
+/** P2/P3: the result of `cmd` from the holder. A non-retryable error waits for the next `running`. */
 export function attachResult(
   c: Slots, agent: string, cmd: string, ok: boolean, retryable: boolean,
 ): { kind: "stale" | "confirmed" | "failed" } | { kind: "retry"; delayMs: number } {
@@ -91,7 +82,7 @@ export function attachResult(
   return retryable ? { kind: "retry", delayMs: Math.min(ATTACH_RETRY_MS * 2 ** (attempts - 1), ATTACH_RETRY_MAX_MS) } : { kind: "failed" };
 }
 
-/** An attached agent starts or stops working. `turnEnded`: it was working and stopped. */
+/** `turnEnded`: it was working and stopped. */
 export function setWorking(c: Slots, agent: string, working: boolean): { turnEnded: boolean } {
   const was = c.working.includes(agent);
   c.working = without(c.working, agent);
@@ -100,21 +91,17 @@ export function setWorking(c: Slots, agent: string, working: boolean): { turnEnd
 }
 
 /**
- * P6 / gateway-bindings S7, the one readiness rule for a binding, checked before and after
- * `resolve`'s awaits: an attached agent with a confirmed slot on a running, placed sandbox whose
- * guest reported its version. Null when a binding may be minted; otherwise why not (not-ready errors
- * are retryable).
+ * P6 / gateway-bindings S7, the one readiness rule for a binding, checked before and after `resolve`'s
+ * awaits. Null when a binding may be minted; otherwise why not.
  */
 export function unbindable(i: Slots & Pick<Lease, "state" | "host" | "placing" | "guest">, agent: string): NestError | null {
   const notReady = (why: string) => new NestError(ErrorCodes.SANDBOX_NOT_READY, why, 503, true);
   if (!i.attached.includes(agent)) return new NestError(ErrorCodes.NOT_BOUND, `${agent} is not attached to this sandbox`, 409);
   if (gone(i.state)) return new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${i.state}`, 409);
   if (!i.host || i.placing !== null) return notReady("sandbox is not placed yet");
-  // nestd forgets a suspended sandbox's gateway entry and re-adds it before it reports `running`,
-  // so a target minted during a resume would only ever be refused as `moved`.
+  // nestd re-adds a resumed sandbox's gateway entry before it reports `running`: earlier, `moved`.
   if (i.state !== "running") return notReady(`sandbox is ${i.state}`);
   if (i.attach_pending.includes(agent)) return notReady(`${agent}'s slot is not configured yet`);
-  // The guest's version comes from the host's report; it is never guessed.
   if (!i.guest) return notReady("the guest has not reported its version yet");
   return null;
 }

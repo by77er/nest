@@ -1,17 +1,10 @@
-// The sandbox lease's decisions (docs/verification/sandbox-lease/): which host holds a sandbox, at
-// which epoch, and what each event does to that. A pure, synchronous core: one function per model
-// action (§9: Claim, PlaceReply, Reconcile, Report, LeaseLost, Evict, CreateFailed, Retry, Destroy).
-// Each takes the lease fields of SandboxDO's `info`, mutates them in place (SandboxDO calls it inside
-// `update()`, so nothing is saved from a pre-await copy), awaits nothing and returns what the shell
-// does next. SandboxDO is the I/O shell: FleetDO calls, deadlines, follow-ups.
-//
-// Two rules hold in every transition here: a destroyed or archived sandbox is never changed again
-// (`gone`), and only the current lease holder's reports count (`holds`).
+// The sandbox lease's decisions (docs/verification/sandbox-lease/), one pure function per model action
+// (§9). Each mutates the lease fields of SandboxDO's `info` inside `update()` and returns what the
+// shell does next. In every one, a `gone` sandbox never changes, and only the holder's reports count.
 import { NestError } from "./util";
 import type { GuestInfo } from "../protocol/gateway";
 import { ErrorCodes, type SandboxState } from "../protocol/model";
 
-/** The fields of SandboxDO's `info` that the lease decides. */
 export interface Lease {
   epoch: number;
   /** The epoch being placed (FleetDO.place in flight), and since when. */
@@ -22,14 +15,14 @@ export interface Lease {
   head: string | null;
   /** The host whose lease was lost, while the sandbox waits for a new placement. */
   lost_from: string | null;
-  /** `sandbox_create` re-issues after retryable failures at the current epoch. */
+  /** `sandbox_create` re-issues at the current epoch. */
   create_attempts: number;
   guest: GuestInfo | null;
-  /** Agents mid-turn on the sandbox: a suspended sandbox with any is placed at once. */
+  /** Agents mid-turn: a suspended sandbox with any is placed at once. */
   working: string[];
 }
 
-/** FleetDO's lease row for the sandbox, as `leaseOf` reports it. */
+/** FleetDO's lease row (`leaseOf`). */
 export interface LeaseView {
   host: string;
   epoch: number;
@@ -38,17 +31,17 @@ export interface LeaseView {
   guest: GuestInfo | null;
 }
 
-/** A `placing` marker this old belongs to a placement that never finished: reconciled against FleetDO's lease. */
+/** A `placing` marker this old is reconciled against FleetDO's lease. */
 export const PLACING_STALE_MS = 60_000;
 export const MAX_CREATE_ATTEMPTS = 3;
 
-/** Destroyed and archived are final: no transition leaves them (S9). */
+/** Final: no transition leaves them (S9). */
 export const gone = (s: SandboxState): boolean => s === "destroyed" || s === "archived";
 
-/** `host` holds the sandbox's current lease at `epoch`: the guard on every host-reported event. */
+/** The guard on every host-reported event. */
 export const holds = (l: Lease, host: string, epoch: number): boolean => !gone(l.state) && l.host === host && l.epoch === epoch;
 
-/** Claim: a new epoch for an unplaced sandbox, marked as being placed. One lease, one host, ever. */
+/** Claim: a new epoch for an unplaced sandbox, marked as being placed. */
 export function claim(l: Lease, now: number): { ok: true; epoch: number } | { ok: false; error: NestError } {
   if (gone(l.state)) return { ok: false, error: new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${l.state}`, 409) };
   if (l.host) return { ok: false, error: new NestError(ErrorCodes.FORBIDDEN, `sandbox is already placed on ${l.host} (epoch ${l.epoch})`, 409) };
@@ -57,22 +50,16 @@ export function claim(l: Lease, now: number): { ok: true; epoch: number } | { ok
   l.placing = l.epoch;
   l.placing_ms = now;
   l.create_attempts = 0;
-  // A new placement is a new VM: the old guest's version means nothing to it.
-  l.guest = null;
+  l.guest = null; // a new VM
   return { ok: true, epoch: l.epoch };
 }
 
-/**
- * FleetDO's answer to `place`: a host (a lease at the claimed epoch), none fits, refused outright (a
- * lease at another epoch), or unknown (any other failure: a lease may exist).
- */
+/** FleetDO's answer to `place`: `refused` (a lease at another epoch), `unknown` (a lease may exist). */
 export type PlaceAnswer = { kind: "host"; host: string } | { kind: "none" } | { kind: "refused" } | { kind: "unknown" };
 
 /**
- * PlaceReply. `stale`: the marker is no longer this claim's (destroyed, or reconciled meanwhile), so
- * nothing changes and nothing follows. `unknown`: the marker stays for the `place` deadline to
- * reconcile. Otherwise the marker is cleared; with no lease under the claimed epoch it is rolled back
- * (the next claim reuses it: sandbox-lease B1, the owner's open decision).
+ * PlaceReply. `stale`: the marker is no longer this claim's, so nothing follows. `unknown`: the marker
+ * stays for the `place` deadline. With no lease, the epoch is rolled back (B1, the owner's open decision).
  */
 export function placeAnswered(l: Lease, epoch: number, a: PlaceAnswer, restoring: boolean): "stale" | "unknown" | "placed" | "unplaced" {
   if (l.placing !== epoch || gone(l.state)) return "stale";
@@ -93,10 +80,9 @@ export function placeAnswered(l: Lease, epoch: number, a: PlaceAnswer, restoring
 export const reconcileAt = (l: Lease): number | null => (l.placing === null ? null : (l.placing_ms ?? 0) + PLACING_STALE_MS);
 
 /**
- * Reconcile a stale marker for `epoch` against FleetDO's lease. `gone`: destroyed meanwhile (a lease
- * at `epoch` is the shell's to discard); `stale`: someone else already settled it; `adopted`: a live
- * lease at that epoch is taken, with the state and guest its holder last reported; `cleared`: no such
- * lease, so the marker goes.
+ * Reconcile a stale marker for `epoch` against FleetDO's lease. `gone`: destroyed meanwhile (the shell
+ * discards a lease at `epoch`); `stale`: already settled; `adopted`: a live lease at `epoch`, with its
+ * holder's last state and guest; `cleared`: no such lease.
  */
 export function reconciled(l: Lease, epoch: number, lease: LeaseView | null): "gone" | "stale" | "adopted" | "cleared" {
   if (l.placing === epoch) {
@@ -114,7 +100,7 @@ export function reconciled(l: Lease, epoch: number, lease: LeaseView | null): "g
   return "adopted";
 }
 
-/** Report: a host-reported state, from the holder only. A `running` report carries the guest's version. */
+/** Report. A `running` report carries the guest's version. */
 export function reported(
   l: Lease, host: string, epoch: number, state: SandboxState, guest: GuestInfo | null,
 ): { applied: false } | { applied: true; changed: boolean; becameRunning: boolean } {
@@ -126,27 +112,21 @@ export function reported(
 }
 
 /**
- * LeaseLost (STONITH confirmed, or the holder fenced; FleetDO already dropped the lease). Keyed on
- * the lease (host, epoch), never on a host-reported state: host evidence doesn't block the control
- * plane's own transitions. A lease this object never adopted (its placement was cut off and the
- * marker since cleared) counts as its own. `replace` again for a loss already handled and not yet
- * re-placed (FleetDO retries until the call succeeds).
+ * LeaseLost (FleetDO already dropped the lease). Keyed on (host, epoch), never on a reported state. A
+ * lease never adopted (its marker since cleared) counts as its own. A loss handled but not yet
+ * re-placed is `replace` again (FleetDO retries until the call succeeds).
  */
 export function leaseLost(l: Lease, host: string, epoch: number): "replace" | "ignore" {
   if (gone(l.state)) return "ignore";
   if (l.epoch === epoch && (l.host === host || (l.host === null && l.placing === null))) {
-    // `working` stays: the brains run elsewhere, untouched by this host's loss.
-    l.host = null;
+    l.host = null; // `working` stays: the brains run elsewhere
     l.lost_from = host;
     return "replace";
   }
   return l.host === null && l.lost_from === host ? "replace" : "ignore";
 }
 
-/**
- * Evict: FleetDO took this suspended sandbox off a host going away (its head is in the object
- * store). Placed elsewhere now if an agent is mid-turn on it, else parked until something wakes it.
- */
+/** Evict: off a host going away, suspended (head in the object store); placed now only if someone works. */
 export function evicted(l: Lease, host: string, epoch: number): "replace" | "park" | "ignore" {
   if (!holds(l, host, epoch)) return "ignore";
   l.host = null;
@@ -154,7 +134,7 @@ export function evicted(l: Lease, host: string, epoch: number): "replace" | "par
   return l.working.length ? "replace" : "park";
 }
 
-/** CreateFailed: a retryable `sandbox_create` failure is re-issued at the same epoch a few times; then failed. */
+/** CreateFailed: a retryable failure is re-issued at the same epoch a few times; then failed. */
 export function createFailed(l: Lease, host: string, epoch: number, retryable: boolean): "reissue" | "failed" | "ignore" {
   if (!holds(l, host, epoch)) return "ignore";
   if (retryable && l.create_attempts < MAX_CREATE_ATTEMPTS) {
@@ -165,18 +145,18 @@ export function createFailed(l: Lease, host: string, epoch: number, retryable: b
   return "failed";
 }
 
-/** Retry (operator): a failed sandbox's holder, to fence and release before it is placed again. */
+/** Retry (operator): a failed sandbox's holder, fenced and released before it is placed again. */
 export const failedHolder = (l: Lease): { host: string; epoch: number } | null =>
   l.state === "failed" && l.host ? { host: l.host, epoch: l.epoch } : null;
 
-/** Retry, after the fence and the release: unplaced, if nothing moved meanwhile. */
+/** Retry, after the fence and release, if nothing moved meanwhile. */
 export function retried(l: Lease, host: string, epoch: number): void {
   if (!holds(l, host, epoch)) return;
   l.host = null;
   l.state = "creating";
 }
 
-/** Destroy: final. A placement still in flight finds no marker, so it adopts nothing. */
+/** Destroy. A placement in flight finds no marker, so it adopts nothing. */
 export function destroyed(l: Lease): void {
   l.state = "destroyed";
   l.host = null;
@@ -189,11 +169,10 @@ export const placeWanted = (l: Lease): boolean =>
   l.host === null && l.placing === null && !gone(l.state) && (l.state !== "suspended" || l.working.length > 0);
 
 /**
- * Commit (sandbox-lease §2.4, the commit-gc Lean pilot's `CommitChain.commit`, guard for guard): a
- * request not answered before. `kind` must agree with the memory manifest (the chain is immutable,
- * and a checkpoint without one would restore without memory). A salvage from an older epoch is an
- * orphaned sibling (head unchanged), only from the host that held that epoch. Anything else moves
- * the head only from the current holder at the current epoch, with the head as its parent (S1, S6).
+ * Commit (sandbox-lease §2.4; the commit-gc pilot's `CommitChain.commit`, guard for guard). `kind`
+ * must agree with the memory manifest (a checkpoint without one restores without memory). A salvage
+ * from an older epoch is an orphaned sibling, only from that epoch's host. Anything else moves the
+ * head only from the holder at the current epoch, with the head as its parent (S1, S6).
  */
 export function decideCommit(
   l: Pick<Lease, "epoch" | "host" | "head">, epochHost: (epoch: number) => string | undefined, host: string,

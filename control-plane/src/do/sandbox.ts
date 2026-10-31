@@ -55,10 +55,7 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
   resources: Resources;
   policy_version: number;
   ports: { port: number; url: string }[];
-  /**
-   * The last `HISTORY_MAX` epochs and the host that held each, read from the `epochs` table (which
-   * keeps every one: salvage commits are checked against it).
-   */
+  /** The last `HISTORY_MAX` epochs and their hosts (the `epochs` table keeps every one). */
   history: { epoch: number; host: string }[];
 }
 
@@ -73,20 +70,13 @@ export interface CreateSandbox {
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
 const PLACE_RETRY_MS = 30_000;
-/**
- * Idle (no agent working) this long → suspend to the object store. The design pauses at 1 min and
- * suspends after 10 min paused; pausing isn't in the host contract yet, so this is both tiers.
- */
+/** Idle this long → suspend. The design pauses at 1 min and suspends 10 min later; pausing isn't built. */
 const DEFAULT_SUSPEND_IDLE_MS = 11 * 60_000;
 /** At most one turn-end commit this often (docs/sandbox/state/#writeback-cadence). */
 const TURN_CHECKPOINT_MIN_MS = 10_000;
 /** How many epochs `info().history` shows; the `epochs` table keeps them all. */
 const HISTORY_MAX = 50;
-/**
- * `commits` (the idempotency record of commit requests): a rejected request's record, or one whose
- * generation is no longer in the chain, is dropped this long after it was made. A record whose
- * generation is still kept stays as long as the generation (docs/data/#retention).
- */
+/** `commits` records: one rejected, or whose generation left the chain, goes this long after it was made. */
 const COMMIT_RECORD_RETENTION_MS = 7 * 86_400_000;
 /** Commit records are pruned from a deadline at most this often, never on the commit path. */
 const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
@@ -94,18 +84,19 @@ const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
 const LOCAL_DOMAIN = "nest.localhost";
 
 /**
- * Preview and share hostnames follow the naming rule (docs/setup/#hostnames): a first-level label of
- * the zone whose suffix is its kind. The sandbox id loses its `sbx_` prefix (no `_` in a hostname).
+ * A preview's or share link's hostname, by the naming rule (docs/setup/#hostnames): a first-level
+ * label of the zone whose suffix is its kind, the sandbox id without `sbx_` (no `_` in a hostname).
  */
-export function previewHostname(domain: string, port: number, sandbox: string): string {
+export function portHostname(kind: "preview" | "share", domain: string, port: number, sandbox: string): string {
   const { label, zone } = splitDomain(domain);
-  return `${port}-${sandbox.replace(/^sbx_/, "")}-preview-${label}.${zone}`;
+  return `${port}-${sandbox.replace(/^sbx_/, "")}-${kind}-${label}.${zone}`;
 }
-/** A share link's hostname, `<port>-<sandbox>-share-<label>.<zone>`; its query carries the signed expiry. */
-export function shareHostname(domain: string, port: number, sandbox: string): string {
-  const { label, zone } = splitDomain(domain);
-  return `${port}-${sandbox.replace(/^sbx_/, "")}-share-${label}.${zone}`;
-}
+
+/** What a stored record written before these fields lacks, and a new one starts with. */
+const newFields = () => ({
+  placing: null, placing_ms: null, history: [], lost_from: null, create_attempts: 0, guest: null, attach_cwd: {},
+  attach_pending: [], attach_inflight: {}, attach_attempts: {},
+});
 
 type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
 /** A command addressed to this sandbox at its current epoch, before `command()` stamps both. */
@@ -160,14 +151,10 @@ export class SandboxDO extends DurableObject<Env> {
   private info_(): SandboxInfo {
     const s = this.get<Partial<SandboxInfo>>("info");
     if (!s) throw new NestError(ErrorCodes.UNKNOWN_SANDBOX, "unknown sandbox", 404);
-    const defaults = {
-      placing: null, placing_ms: null, history: [], lost_from: null, create_attempts: 0, guest: null, attach_cwd: {},
-      attach_pending: [], attach_inflight: {}, attach_attempts: {},
-    };
-    const info = { ...defaults, ...s } as SandboxInfo;
+    const info = { ...newFields(), ...s } as SandboxInfo;
     info.state = storedEnum(SandboxState, info.state, "info.state");
     // Derived on every read: rows written before the naming rule hold other hostnames.
-    info.ports = info.ports.map((p) => ({ port: p.port, url: this.previewUrl(info.sandbox, p.port) }));
+    info.ports = info.ports.map((p) => ({ port: p.port, url: this.portUrl("preview", info.sandbox, p.port) }));
     info.history = this.recentEpochs();
     return info;
   }
@@ -192,18 +179,23 @@ export class SandboxDO extends DurableObject<Env> {
     return this.sql.exec<{ host: string }>("SELECT host FROM epochs WHERE epoch = ?", epoch).toArray()[0]?.host;
   }
 
-  private previewUrl(sandbox: string, port: number): string {
-    return `https://${previewHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, sandbox)}`;
+  private portUrl(kind: "preview" | "share", sandbox: string, port: number): string {
+    return `https://${portHostname(kind, this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, sandbox)}`;
   }
 
   /** Load, mutate and save synchronously (never across an await). `history` is the table's, never saved. */
   private update(fn: (info: SandboxInfo) => void): SandboxInfo {
+    return this.decide(fn)[1];
+  }
+
+  /** `update`, returning what `fn` decided (a core's answer) with the saved info. */
+  private decide<T>(fn: (info: SandboxInfo) => T): [T, SandboxInfo] {
     const info = this.info_();
-    fn(info);
+    const r = fn(info);
     info.history = this.recentEpochs();
     const { history: _derived, ...stored } = info;
     this.put("info", stored);
-    return info;
+    return [r, info];
   }
 
   private fleet(cell: string) {
@@ -227,6 +219,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (existing?.state !== "destroyed") await this.fleet(req.cell).registerSandbox(req.sandbox);
     if (existing) return this.info_();
     const info: SandboxInfo = {
+      ...newFields(),
       sandbox: req.sandbox,
       workstream: req.workstream,
       cell: req.cell,
@@ -240,16 +233,6 @@ export class SandboxDO extends DurableObject<Env> {
       attached: [],
       working: [],
       ports: [],
-      placing: null,
-      placing_ms: null,
-      history: [],
-      lost_from: null,
-      create_attempts: 0,
-      guest: null,
-      attach_cwd: {},
-      attach_pending: [],
-      attach_inflight: {},
-      attach_attempts: {},
     };
     this.put("info", info);
     this.put("ws_layer", req.workstreamPolicy ?? EMPTY_LAYER);
@@ -268,11 +251,7 @@ export class SandboxDO extends DurableObject<Env> {
     return this.info_();
   }
 
-  /**
-   * A placement that never finished (this object was reset mid-call, or FleetDO's answer was lost)
-   * leaves `placing` set. Once stale, FleetDO's lease decides (`lease.reconciled`). Before then the
-   * `place` deadline is (re)armed for when it goes stale.
-   */
+  /** A placement that never finished leaves `placing` set: once stale, FleetDO's lease decides. */
   private async reconcilePlacing(): Promise<void> {
     const info = this.info_();
     const staleAt = lease.reconcileAt(info);
@@ -283,11 +262,8 @@ export class SandboxDO extends DurableObject<Env> {
     }
     const epoch = info.placing!;
     const held = await this.fleet(info.cell).leaseOf(info.sandbox);
-    let r!: ReturnType<typeof lease.reconciled>;
-    const after = this.update((i) => {
-      r = lease.reconciled(i, epoch, held);
-      if (r === "adopted") this.recordEpoch(epoch, i.host!);
-    });
+    const [r, after] = this.decide((i) => lease.reconciled(i, epoch, held));
+    if (r === "adopted") this.recordEpoch(epoch, after.host!);
     if (r === "gone") {
       // Destroyed while FleetDO answered: a lease at this epoch was never this object's to adopt.
       if (held?.epoch === epoch) await this.discardPlacement(after, held.host, epoch);
@@ -303,10 +279,7 @@ export class SandboxDO extends DurableObject<Env> {
   async placeCurrentEpoch(excludeHost?: string): Promise<string | null> {
     await this.reconcilePlacing();
     const now = Date.now();
-    let claimed!: ReturnType<typeof lease.claim>;
-    const before = this.update((i) => {
-      claimed = lease.claim(i, now);
-    });
+    const [claimed, before] = this.decide((i) => lease.claim(i, now));
     if (!claimed.ok) throw claimed.error;
     const epoch = claimed.epoch;
     // If this call never finishes (a reset, a lost answer), the marker is reconciled when it goes stale.
@@ -330,11 +303,8 @@ export class SandboxDO extends DurableObject<Env> {
       failure = e;
       answer = { kind: asNestError(e)?.code === ErrorCodes.FORBIDDEN ? "refused" : "unknown" };
     }
-    let r!: ReturnType<typeof lease.placeAnswered>;
-    const after = this.update((i) => {
-      r = lease.placeAnswered(i, epoch, answer, from !== undefined);
-      if (r === "placed") this.recordEpoch(epoch, i.host!);
-    });
+    const [r, after] = this.decide((i) => lease.placeAnswered(i, epoch, answer, from !== undefined));
+    if (r === "placed") this.recordEpoch(epoch, after.host!);
     switch (r) {
       case "stale":
         // Overtaken while FleetDO answered: destroyed (whatever it granted goes too), or the marker
@@ -394,10 +364,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (!info || !lease.holds(info, host, epoch)) return;
     // The host's reason, to Workers Logs only (it names host paths): the one place it was kept.
     if (state === "failed" && detail) console.warn(`sandbox ${info.sandbox}: failed on ${host}: ${detail}`);
-    let r!: ReturnType<typeof lease.reported>;
-    this.update((i) => {
-      r = lease.reported(i, host, epoch, state, guest);
-    });
+    const [r] = this.decide((i) => lease.reported(i, host, epoch, state, guest));
     if (!r.applied) return;
     if (r.changed) this.report("state_changed", `state: ${state}`, { state, epoch, host });
     // A guest that just came up (boot, resume) takes the slots its sandbox was suspended without.
@@ -406,10 +373,8 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * Lazy start: what an agent (or anything else) calls when it needs the sandbox now. A sandbox
-   * suspended on its host resumes there; one with no host (evicted, or never placed) is placed from
-   * its head, launching a host if the cell autoscales. Returns the host, or `null` while none can
-   * take it yet (the caller retries).
+   * Lazy start: a sandbox suspended on its host resumes there; one with no host is placed from its
+   * head. The host, or `null` while none can take it yet (the caller retries).
    */
   async wake(): Promise<{ host: string | null; state: SandboxState }> {
     let info = this.info_();
@@ -427,17 +392,10 @@ export class SandboxDO extends DurableObject<Env> {
     return { host, state: this.info_().state };
   }
 
-  /**
-   * FleetDO took this suspended sandbox off a host that is going away; its head is in the object
-   * store. It stays suspended with no host until something wakes it, unless an agent is mid-turn on
-   * it (a spot drain), in which case it's placed elsewhere now.
-   */
+  /** FleetDO took this suspended sandbox off a host going away (`lease.evicted`). */
   async evicted(host: string, epoch: number): Promise<void> {
     if (!this.tryInfo()) return;
-    let r!: ReturnType<typeof lease.evicted>;
-    this.update((i) => {
-      r = lease.evicted(i, host, epoch);
-    });
+    const [r] = this.decide((i) => lease.evicted(i, host, epoch));
     if (r === "ignore") return;
     await this.deadlines.clear("idle");
     if (r === "replace") await this.placeCurrentEpoch(host);
@@ -456,16 +414,10 @@ export class SandboxDO extends DurableObject<Env> {
     }
   }
 
-  /**
-   * A command failed on the lease holder. A retryable `sandbox_create` failure (e.g. nestd restarted
-   * before running it) is re-issued a few times; otherwise the sandbox is marked failed.
-   */
+  /** A command failed on the lease holder: only `sandbox_create` failures matter here. */
   async commandFailed(host: string, type: string, epoch: number, error: ErrorBody): Promise<void> {
     if (type !== "sandbox_create" || !this.tryInfo()) return;
-    let r!: ReturnType<typeof lease.createFailed>;
-    const info = this.update((i) => {
-      r = lease.createFailed(i, host, epoch, error.retryable);
-    });
+    const [r, info] = this.decide((i) => lease.createFailed(i, host, epoch, error.retryable));
     if (r === "reissue") {
       await this.fleet(info.cell).issueCommands(host, [this.createBody(info)]);
       await this.pushSecrets();
@@ -474,16 +426,10 @@ export class SandboxDO extends DurableObject<Env> {
     }
   }
 
-  /**
-   * STONITH is confirmed for `host` (FleetDO already dropped the lease): grant a new lease elsewhere and
-   * restore from head. Idempotent: FleetDO retries it until it succeeds.
-   */
+  /** FleetDO dropped the lease (STONITH, or a fence): placed again from head. FleetDO retries until it succeeds. */
   async leaseLost(host: string, epoch: number, hostIsDead: boolean): Promise<void> {
     if (!this.tryInfo()) return;
-    let r!: ReturnType<typeof lease.leaseLost>;
-    this.update((i) => {
-      r = lease.leaseLost(i, host, epoch);
-    });
+    const [r] = this.decide((i) => lease.leaseLost(i, host, epoch));
     if (r === "ignore") return; // gone, or already handled (re-placed, or a newer epoch exists)
     // A dead host is excluded; a host that came back and fenced is healthy and may get the new lease.
     const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined);
@@ -491,11 +437,8 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * Tell bound agents their sandbox moved: from this object's own alarm, never inline. A placement
-   * can be made on an agent's behalf (its start wakes the sandbox), and calling back into that
-   * agent from inside its own call would deadlock. A brain needs nothing from it (its next hands
-   * call resolves the new placement); the agent records the move, tells a working brain what was
-   * lost, and wakes a stopped one with work waiting. The latest placement is what is sent.
+   * Tell bound agents their sandbox moved, from this object's own alarm: a placement made inside an
+   * agent's own call (its start wakes the sandbox) would deadlock calling back into it.
    */
   private async notifyAgentsMoved(): Promise<void> {
     const info = this.info_();
@@ -519,10 +462,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (failed) await this.deadlines.set("notify_moved", Date.now() + slots.ATTACH_RETRY_MS, true);
   }
 
-  /**
-   * The manifests this sandbox needs kept: every generation it records (retention isn't built, so
-   * all of them). GC marks from these.
-   */
+  /** The manifests GC must keep: every generation's (retention isn't built). */
   async gcRoots(): Promise<string[]> {
     if (!this.get<SandboxInfo>("info") || this.info_().state === "destroyed") return [];
     const roots = new Set<string>();
@@ -560,10 +500,7 @@ export class SandboxDO extends DurableObject<Env> {
     };
   }
 
-  /**
-   * A lease granted to a destroyed sandbox: released, and the VM FleetDO sent with it destroyed (when
-   * the answer named its host; otherwise the host's heartbeat finds the lease revoked and fences it).
-   */
+  /** A lease granted to a destroyed sandbox: released, and its VM destroyed (unknown host: its heartbeat fences it). */
   private async discardPlacement(info: SandboxInfo, host: string | null, epoch: number): Promise<void> {
     await this.fleet(info.cell).releaseLease(info.sandbox, epoch);
     if (host) await this.fleet(info.cell).issueCommands(host, [{ type: "sandbox_destroy", sandbox: info.sandbox, epoch }]);
@@ -596,11 +533,7 @@ export class SandboxDO extends DurableObject<Env> {
       .map((r) => ({ record: JSON.parse(r.record) as GenerationRecord, orphaned: r.orphaned === 1 }));
   }
 
-  /**
-   * Compare-and-set the head. Idempotent per `request`. A `salvage` commit from a stale epoch becomes an
-   * orphaned sibling generation (head unchanged) and raises `orphaned_work`, but only from the host
-   * that held that epoch.
-   */
+  /** Compare-and-set the head (`lease.decideCommit`), idempotent per `request`. */
   async commit(host: string, ev: CommitRequestEvent): Promise<CommitOutcome> {
     const stored = this.sql.exec<{ outcome: string }>("SELECT outcome FROM commits WHERE request = ?", ev.request).toArray()[0];
     if (stored) {
@@ -658,11 +591,8 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * Retention of the idempotency records (docs/data/#retention): a record past
-   * `COMMIT_RECORD_RETENTION_MS` goes unless its generation is still in the chain. nestd asks again
-   * with an unanswered request's id before its next commit, which may be days later: a committed
-   * request finds its record while the generation is kept, and any other meets the compare-and-set
-   * again, against the current epoch and head, as a new request would.
+   * Retention of the idempotency records (docs/data/#retention). nestd may ask again days later: a
+   * committed request finds its record while the generation is kept; any other meets the CAS anew.
    */
   private async pruneCommitRecords(): Promise<void> {
     const cutoff = Date.now() - COMMIT_RECORD_RETENTION_MS;
@@ -768,10 +698,7 @@ export class SandboxDO extends DurableObject<Env> {
     return policy;
   }
 
-  /**
-   * Deliver injection secrets for the policy's bindings (proxy memory only). They travel as BrokerDO
-   * references; FleetDO resolves them when it sends, so no copy is stored outside BrokerDO.
-   */
+  /** Injection secrets for the policy's bindings, as BrokerDO references (FleetDO resolves them when it sends). */
   private async pushSecrets(): Promise<void> {
     const info = this.info_();
     const ws = this.wsLayer();
@@ -783,16 +710,9 @@ export class SandboxDO extends DurableObject<Env> {
 
   // --- agents, bindings and idleness (docs/control-plane/durable-objects/sandbox/#attach-and-bindings) --
 
-  /**
-   * Attach an agent's hands: the agent is recorded, and when the sandbox is placed its slot (cwd,
-   * proxy port, cgroup) is configured in the guest with `agent_attach`. No binding is handed out
-   * until that command's `ok`, so a first hands call never beats the slot. Idempotent.
-   */
+  /** Attach an agent's hands: its slot is configured with `agent_attach`, and no binding is minted before its `ok`. */
   async attach(agent: string, cwd?: string): Promise<SandboxInfo> {
-    let send = false;
-    const info = this.update((i) => {
-      send = slots.attach(i, agent, cwd ?? null, i.host !== null);
-    });
+    const [send, info] = this.decide((i) => slots.attach(i, agent, cwd ?? null, i.host !== null));
     if (send) await this.issueAttachCommands([agent]);
     return info;
   }
@@ -806,7 +726,7 @@ export class SandboxDO extends DurableObject<Env> {
     await this.armIdle();
   }
 
-  /** Send `agent_attach` for these agents and remember each command as the agent's one in flight. */
+  /** Send `agent_attach` for these agents, each as the agent's one in flight. */
   private async issueAttachCommands(agents: string[]): Promise<void> {
     const info = this.info_();
     if (!info.host || !agents.length) return;
@@ -820,15 +740,9 @@ export class SandboxDO extends DurableObject<Env> {
     });
   }
 
-  /**
-   * A new placement: every attached agent's slot is configured again, and pending until confirmed.
-   * A failure to send is logged and retried from the alarm, so the placement's other follow-ups run.
-   */
+  /** A new placement configures every slot again; a failed send is retried from the alarm, so the other follow-ups run. */
   private async issueAttachesOrRetry(): Promise<void> {
-    let agents: string[] = [];
-    const info = this.update((i) => {
-      agents = slots.newPlacement(i);
-    });
+    const [agents, info] = this.decide(slots.newPlacement);
     if (!info.host || !agents.length) return;
     try {
       await this.issueAttachCommands(agents);
@@ -838,26 +752,17 @@ export class SandboxDO extends DurableObject<Env> {
     }
   }
 
-  /** Re-send `agent_attach` for pending agents with no command in flight (after a failure, or a guest coming up). */
+  /** Re-send `agent_attach` for pending agents with none in flight. */
   private async reissuePendingAttaches(fresh: boolean): Promise<void> {
-    let agents: string[] = [];
-    const info = this.update((i) => {
-      agents = slots.due(i, fresh);
-    });
+    const [agents, info] = this.decide((i) => slots.due(i, fresh));
     if (info.host) await this.issueAttachCommands(agents);
   }
 
-  /**
-   * FleetDO routes each `agent_attach` result here, from the holder at the current epoch only; the
-   * slot core decides what it means (`slots.attachResult`).
-   */
+  /** An `agent_attach` result, from the holder at the current epoch only. */
   async attachResult(host: string, epoch: number, agent: string, cmd: string, outcome: CommandOutcome): Promise<void> {
     const info = this.tryInfo();
     if (!info || !lease.holds(info, host, epoch)) return;
-    let r!: ReturnType<typeof slots.attachResult>;
-    this.update((i) => {
-      r = slots.attachResult(i, agent, cmd, outcome.status === "ok", outcome.status !== "ok" && outcome.error.retryable);
-    });
+    const [r] = this.decide((i) => slots.attachResult(i, agent, cmd, outcome.status === "ok", outcome.status !== "ok" && outcome.error.retryable));
     if (r.kind === "retry") {
       await this.deadlines.set("attach_retry", Date.now() + r.delayMs, true);
     } else if (r.kind === "failed" && outcome.status !== "ok") {
@@ -868,9 +773,8 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * A fresh binding and the sandbox's current gateway for an attached agent. Not-ready (retryable)
-   * until `slots.unbindable` allows it and the host's gateway is reachable; a suspended sandbox on a
-   * host is resumed first. The token is minted by BrokerDO and never stored here.
+   * A fresh binding and the current gateway for an attached agent: not ready (retryable) until
+   * `slots.unbindable` allows it and the gateway is reachable. The token is BrokerDO's, never stored.
    */
   async resolve(agent: string): Promise<HandsTarget> {
     let info = this.info_();
@@ -883,13 +787,9 @@ export class SandboxDO extends DurableObject<Env> {
     if (refused) throw refused;
     const host = info.host!;
     const gateway = await this.fleet(info.cell).hostGatewayUrl(host);
-    // The host may advertise one on its next hello (a restart, an upgrade): not an error, not yet.
     if (!gateway) throw notReady(`host ${host} advertises no gateway yet`);
-    // Its cloudflared has no ready connection yet (the host just started, or the tunnel is
-    // reconnecting): a target now would only fail at the edge. The runner retries.
+    // A target now would only fail at the edge.
     if (gateway.kind === "connecting") throw notReady(`host ${host}'s tunnel is connecting`);
-    // A tunnel host serving no tunnel (an old nestd, no cloudflared) is unreachable: its hello URL is
-    // its own loopback, and a runner never shares its sandbox's host.
     if (gateway.kind === "down") {
       console.error(`SandboxDO: host ${host} has the tunnel ${gateway.tunnel} but serves none; ${info.sandbox} is unreachable until it does`);
       throw notReady(`host ${host} serves no tunnel`);
@@ -898,16 +798,13 @@ export class SandboxDO extends DurableObject<Env> {
     const binding = await broker.signBinding(info.cell, {
       sandbox: info.sandbox, epoch: info.epoch, client: agent, scope: "hands", exp_ms: Date.now() + BINDING_LIFETIME_MS,
     });
-    // Only a tunnel has the Access edge in front of it; a gateway reached directly (the harness, a
-    // host's own address) would receive the service token and front nothing, so it never travels.
-    // And a tunnel target without it would be refused at the edge on every call: not retryable,
-    // an operator stores the token (docs/setup/).
+    // Only a tunnel has the Access edge in front: the service token never travels to a direct gateway.
+    // Without it a tunnel target is refused on every call: not retryable (docs/setup/).
     const edge = gateway.kind === "tunnel" ? await broker.accessServiceToken() : null;
     if (gateway.kind === "tunnel" && !edge) {
       throw new NestError(ErrorCodes.INTERNAL, "access:gateway is not stored; a tunnel target cannot be used without it", 500, false);
     }
-    // Across the awaits the sandbox may have moved, suspended, or the agent been detached: the same
-    // rule again, at the epoch and host the binding names. Never a token the gateway would refuse.
+    // Across the awaits it may have moved or suspended, or the agent detached: never a token the gateway refuses.
     const fresh = this.info_();
     const now = slots.unbindable(fresh, agent);
     if (now) throw now;
@@ -918,19 +815,15 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Agent activity feeds the idle refcount: the sandbox may suspend only when nobody is working. */
   async agentActivity(agent: string, working: boolean): Promise<{ idle: boolean }> {
-    let turnEnded = false;
-    const info = this.update((i) => {
-      ({ turnEnded } = slots.setWorking(i, agent, working));
-    });
+    const [{ turnEnded }, info] = this.decide((i) => slots.setWorking(i, agent, working));
     await this.armIdle();
     if (turnEnded) await this.turnEndCheckpoint();
     return { idle: info.working.length === 0 };
   }
 
   /**
-   * An agent finished a turn: commit the disk (`turn_end`), the rewind point and the bound on what a
-   * lost host loses. At most one per TURN_CHECKPOINT_MIN_MS; a turn ending sooner gets its commit
-   * when that interval is up, so the last turn's changes are never left uncommitted.
+   * An agent finished a turn: commit the disk (`turn_end`), at most once per TURN_CHECKPOINT_MIN_MS; a
+   * turn ending sooner gets its commit when the interval is up, so the last turn's is never skipped.
    */
   private async turnEndCheckpoint(): Promise<void> {
     const last = this.get<number>("turn_checkpoint_ms") ?? 0;
@@ -950,7 +843,7 @@ export class SandboxDO extends DurableObject<Env> {
   async exposePort(port: number, share: boolean, hostHeader: "localhost" | "preserve" = "localhost"): Promise<{ url: string; share_url?: string }> {
     const info = this.info_();
     await this.command({ type: "port_expose", port, host_header: { mode: hostHeader } });
-    const url = this.previewUrl(info.sandbox, port);
+    const url = this.portUrl("preview", info.sandbox, port);
     this.update((i) => {
       i.ports = [...i.ports.filter((p) => p.port !== port), { port, url }];
     });
@@ -959,7 +852,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (share) {
       // Signed and expiring, for one {sandbox, port}. Minted only: no Worker route serves it yet.
       const query = await signShare(this.env.HOST_TOKEN_SECRET, info.sandbox, port, Date.now() + 24 * 3_600_000);
-      shareUrl = `https://${shareHostname(this.env.NEST_DOMAIN ?? LOCAL_DOMAIN, port, info.sandbox)}/?${query}`;
+      shareUrl = `${this.portUrl("share", info.sandbox, port)}/?${query}`;
     }
     return shareUrl ? { url, share_url: shareUrl } : { url };
   }
