@@ -40,9 +40,6 @@ pub struct Config {
     pub spool_interval: Duration,
     /// SessionStart: max time for reading the repo's CLAUDE.md through hands.
     pub session_start_read_timeout: Duration,
-    /// Hand mid-turn inbox messages to the model at tool boundaries (`PostToolUse` context);
-    /// off, they wait for `Stop`.
-    pub inbox_at_tool_boundary: bool,
 }
 
 impl Default for Config {
@@ -64,13 +61,12 @@ impl Default for Config {
             session_open_timeout: Duration::from_secs(10),
             spool_interval: Duration::from_secs(5),
             session_start_read_timeout: Duration::from_secs(8),
-            inbox_at_tool_boundary: true,
         }
     }
 }
 
 impl Config {
-    /// Defaults overridden by `NEST_RUNNER_<FIELD>` (paths as-is, durations in ms, `0` for false).
+    /// Defaults overridden by `NEST_RUNNER_<FIELD>` (paths as-is, durations in ms).
     pub fn from_env() -> Self {
         let mut c = Self::default();
         let path = |k: &str, v: &mut PathBuf| {
@@ -94,9 +90,6 @@ impl Config {
         ms("NEST_RUNNER_BATCH_MS", &mut c.batch_interval);
         ms("NEST_RUNNER_TAIL_MS", &mut c.tail_interval);
         ms("NEST_RUNNER_INTERRUPT_GRACE_MS", &mut c.interrupt_grace);
-        if let Ok(v) = std::env::var("NEST_RUNNER_INBOX_AT_TOOL_BOUNDARY") {
-            c.inbox_at_tool_boundary = v != "0";
-        }
         c
     }
 }

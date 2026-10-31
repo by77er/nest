@@ -819,7 +819,7 @@ mod tests {
             let req = nest_protocol::host::hook::HookDecisionRequest { v: 1, agent: self.actor.agent.id.clone(), input };
             let answer = crate::hooks::decide(&self.actor.rt, &req).await;
             let output = answer.output.clone();
-            answer.settle(true);
+            answer.settle(&self.actor.agent, true);
             while let Ok(c) = self.cmds.try_recv() {
                 self.actor.handle(c);
             }
