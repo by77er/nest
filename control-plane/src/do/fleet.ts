@@ -335,7 +335,8 @@ export class FleetDO extends DurableObject<Env> {
     // the lease; nestd refused or killed every start it held), or its death was confirmed (EC2 or
     // STONITH, an operator, or it never connected). A retirement that only marks it `dead` (idle,
     // drained) isn't proof. Rows from before were the previous release's word: dead or expired.
-    this.addLostColumn();
+    // A6: the host's brains are proven gone (see the `lost` column).
+    this.addColumn("hosts", "lost", "INTEGER NOT NULL DEFAULT 0");
     // The host's nestd keys brains by agent epoch (its hello says so; nestd of the previous release
     // doesn't): preferred for new brains, and the only kind escalation ever wedges.
     this.addColumn("hosts", "brain_epochs", "INTEGER NOT NULL DEFAULT 0");
@@ -356,11 +357,8 @@ export class FleetDO extends DurableObject<Env> {
     this.addColumn("commands", "answered_by", "TEXT");
     // Host kinds: `role` columns keep the previous release's names (`burst`, `controller`) this
     // release, and are read as either name (`hostKind`), so a rolled-back Worker reads every row.
-    // `tunnel_state` null meant `none` (a row from before the field): made explicit, once.
-    this.sql.exec("UPDATE hosts SET tunnel_state = 'none' WHERE tunnel_state IS NULL");
-    // Retention: when a host died. A row that was dead before the column counts from now.
+    // Retention: when a host died.
     this.addColumn("hosts", "dead_ms", "INTEGER");
-    this.sql.exec("UPDATE hosts SET dead_ms = ? WHERE status = 'dead' AND dead_ms IS NULL", Date.now());
     // Incarnations a host still has at an epoch FleetDO no longer leases to it: destroyed there once
     // their salvage is done (the host reports them clean) or its window has passed.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS stale_incarnations (sandbox TEXT NOT NULL, host TEXT NOT NULL, epoch INTEGER NOT NULL,
@@ -1202,17 +1200,6 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * `hosts.lost` (A6), backfilled once where the previous release had proof (N10): an expired host,
-   * or a dead one that wasn't retired by scale-down with its termination still unconfirmed.
-   */
-  private addLostColumn(): void {
-    if (this.sql.exec<{ name: string }>("PRAGMA table_info(hosts)").toArray().some((c) => c.name === "lost")) return;
-    this.addColumn("hosts", "lost", "INTEGER NOT NULL DEFAULT 0");
-    this.sql.exec(`UPDATE hosts SET lost = 1 WHERE status = 'expired' OR (status = 'dead' AND NOT EXISTS (
-      SELECT 1 FROM launched l WHERE l.instance_id = hosts.instance_id AND l.reason IN ('idle', 'drained') AND l.ended_ms IS NULL))`);
-  }
-
-  /**
    * `gone`: the host's hello no longer reports the agent; its exit is owed to AgentDO (retried by the
    * tick until acknowledged, then the row goes).
    */
@@ -1982,7 +1969,7 @@ export class FleetDO extends DurableObject<Env> {
 
   /** What the host last reported about its tunnel; `none` until it says otherwise. */
   private setTunnelState(host: string, state: TunnelState, prior: Pick<HostRow, "tunnel_state" | "tunnel_hostname"> | undefined): void {
-    const was = (prior?.tunnel_state ?? "none") as TunnelState;
+    const was = prior?.tunnel_state ?? "none";
     this.sql.exec("UPDATE hosts SET tunnel_state = ? WHERE host = ?", state, host);
     if (was === state) return;
     if (state === "none" && prior?.tunnel_hostname) {

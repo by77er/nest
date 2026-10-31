@@ -186,18 +186,6 @@ describe("stored enums", () => {
     expect((await stub.turns()).map((t) => t.status)).toEqual(["paused"]);
     expect(error).toHaveBeenCalledWith(expect.stringContaining("turns.status"));
   });
-
-  it("a host row from before `tunnel_state` reads `none`, written once by the migration", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const state = await runInDurableObject(fleetStub(cell), (_inst: FleetDO, st) => {
-      st.storage.sql.exec("UPDATE hosts SET tunnel_state = NULL, status = 'dead', dead_ms = NULL WHERE host = ?", h.host);
-      new FleetDO(st, env); // the migrations run in the constructor
-      return st.storage.sql.exec<{ tunnel_state: string | null; dead_ms: number | null }>(
-        "SELECT tunnel_state, dead_ms FROM hosts WHERE host = ?", h.host).toArray()[0];
-    });
-    expect(state).toEqual({ tunnel_state: "none", dead_ms: expect.any(Number) });
-  });
 });
 
 describe("the fleet view", () => {
