@@ -151,9 +151,9 @@ impl Refusal {
     }
 }
 
-/// A guest's `error` frame in answer to a request. A `busy` (not configured yet, filesystems
-/// frozen for a snapshot) is refused before anything runs, so it is retried like a gateway
-/// `busy`, within the same budget; every other guest error goes to the caller as it is.
+/// A guest's `error` frame in answer to a request. A `busy` (e.g. not configured yet) is refused
+/// before anything runs, so it is retried like a gateway `busy`, within the same budget; every
+/// other guest error goes to the caller as it is.
 pub fn guest_error_next(error: &ErrorBody) -> Next {
     if error.code == nest_protocol::guest::error_code::BUSY {
         Next::RetrySame { after: BUSY_RETRY }

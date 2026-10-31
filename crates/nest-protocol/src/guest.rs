@@ -370,13 +370,15 @@ pub enum ControlBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork: Option<ForkIdentity>,
     },
-    /// Before a snapshot: `sync`, optionally `drop_caches` and `fsfreeze` the listed mounts.
+    /// Before a snapshot or commit: `sync`, then optionally `drop_caches`.
     PrepareSnapshot {
         drop_caches: bool,
-        #[serde(default)]
+        /// Deprecated: accepted and ignored. Guests no longer freeze filesystems (removed until
+        /// memory snapshots are built); every guest has defaulted it, so it is sent only if set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fsfreeze: Vec<String>,
     },
-    /// Undo `prepare_snapshot` freezes (after the snapshot, or if it was aborted).
+    /// Deprecated no-op (nothing is frozen any more): answered `ok`.
     Thaw {},
     Health {},
     /// Reply to a guest `cli` request.
@@ -931,6 +933,17 @@ mod tests {
 
     fn tag_of(v: &impl Serialize, key: &str) -> String {
         serde_json::to_value(v).unwrap()[key].as_str().unwrap().to_string()
+    }
+
+    /// `fsfreeze` is deprecated: an older host's list still parses, and an empty one isn't sent.
+    #[test]
+    fn prepare_snapshot_fsfreeze_is_optional_and_omitted_when_empty() {
+        let old: ControlBody = serde_json::from_str(r#"{"type":"prepare_snapshot","drop_caches":true,"fsfreeze":["/workspace"]}"#).unwrap();
+        assert!(matches!(old, ControlBody::PrepareSnapshot { drop_caches: true, ref fsfreeze } if fsfreeze == &["/workspace"]));
+        let new = ControlBody::PrepareSnapshot { drop_caches: false, fsfreeze: Vec::new() };
+        let wire = serde_json::to_value(&new).unwrap();
+        assert_eq!(wire, serde_json::json!({"type": "prepare_snapshot", "drop_caches": false}));
+        assert_eq!(serde_json::from_value::<ControlBody>(wire).unwrap(), new);
     }
 
     #[test]

@@ -55,8 +55,8 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 | `agent_attach` / `agent_detach` | host → guest | request | Add or remove one `AgentSlot`. `kill_processes` → `cgroup.kill` the agent subtree. |
 | `resume` | host → guest | request | After a memory restore: `wall_clock_ms`, `entropy_b64` (64 bytes), optional `fork` identity. Reply `resume_done{clock_step_ms}`, or `error`: `bad_request` when `entropy_b64` isn't 64 bytes of base64 (nothing applied), `internal` when the entropy couldn't be mixed into the RNG. |
 | `flush` (v2) | host → guest | request | `syncfs` every filesystem. Reply `ok`, or `error{sync_failed}` on a writeback error. Precedes every commit, pause and suspend ([flush before commit](../../sandbox/state/disk/#flush-before-commit)). |
-| `prepare_snapshot` | host → guest | request | `sync` (v2: the `flush` above, stopping on `sync_failed`); `drop_caches` → `echo 3 > /proc/sys/vm/drop_caches`; `fsfreeze` listed mounts. Reply `ok`. |
-| `thaw` | host → guest | request | `fsfreeze -u` everything frozen. Idempotent. |
+| `prepare_snapshot` | host → guest | request | `sync` (v2: the `flush` above, stopping on `sync_failed`); `drop_caches` → `echo 3 > /proc/sys/vm/drop_caches`. Reply `ok`. `fsfreeze` (a list of mounts) is deprecated: accepted and ignored, and nestd no longer sends it (every guest defaults it). Freezing is removed until memory snapshots are built. |
+| `thaw` | host → guest | request | Deprecated no-op (nothing is frozen): reply `ok`. nestd still sends it after resuming a paused VM. |
 | `health` | host → guest | request | Reply `health_report` (load, memory, disks, per-agent cgroup usage). v2 (`diagnostics`): `drain_log_sites: true` adds `log_sites[{level, site, count}]` and `log_sites_dropped`, the guest agent's WARN/ERROR counts since the last drain, by site (module and line), never text. Only nestd's periodic probe drains. |
 | `ports` | guest → host | event | **Full** set of listening TCP sockets. Sent after `configure` and on change (polled every 1 s, debounced). |
 | `task_exited` | guest → host | event | A background task ended (exit, kill, time limit). |
@@ -87,7 +87,8 @@ A memory snapshot keeps the guest agent it was taken with ([guest agent](../../s
 
 | Capability | Since | Feature |
 |---|---|---|
-| `pty`, `cgroup_v2`, `pdf`, `fsfreeze` | 1 | PTYs, cgroup kills, PDF pages, `fsfreeze` |
+| `pty`, `cgroup_v2`, `pdf` | 1 | PTYs, cgroup kills, PDF pages |
+| `fsfreeze` | 1 | Deprecated: no longer advertised (older guests may still report it); nothing gates on it |
 | `flush` | 2 | the `flush` request |
 | `call_status` | 2 | [call lookup](#refusals-and-call-records-v2) |
 | `modified_files` | 2 | the change ledger in `call_status` |
@@ -322,7 +323,7 @@ nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a flee
 | `stale_epoch` | Hands epoch ≠ configured epoch |
 | `unknown_agent` | Agent not in the slot set |
 | `unknown_task` | TaskOutput / TaskStop |
-| `busy` (retryable) | Before `configure`, during `prepare_snapshot` freeze, or (v2) over an admission cap or the frame-memory budget |
+| `busy` (retryable) | Before `configure`, or (v2) over an admission cap or the frame-memory budget |
 | `sync_failed` (v2) | `flush` or `prepare_snapshot` hit a writeback error |
 | `connect_refused` (retryable) | Ingress TCP |
 | `unknown_terminal` (v2) | Ingress `pty_attach` |

@@ -34,7 +34,7 @@ pub fn install_executable(path: &Path, contents: impl AsRef<[u8]>) {
 struct GuestLog {
     requests: Vec<HandsRequest>,
     cancelled: Vec<String>,
-    /// The next this many requests are refused `busy` before anything runs (a snapshot freeze).
+    /// The next this many requests are refused `busy` before anything runs (a guest not configured yet).
     busy_left: usize,
 }
 
@@ -74,7 +74,7 @@ impl FakeGuest {
     }
 
     /// Refuse the next `n` requests with the guest's own `busy` error (logged, never run), as
-    /// the guest does while a snapshot freezes its filesystems.
+    /// the guest does before nestd's `configure`.
     pub async fn refuse_busy(&self, n: usize) {
         self.log.lock().await.busy_left = n;
     }
@@ -108,7 +108,7 @@ async fn serve(mut s: tokio::net::UnixStream, log: Arc<Mutex<GuestLog>>) {
             drop(l);
             let error = nest_protocol::model::ErrorBody {
                 code: guest::error_code::BUSY.into(),
-                message: "filesystems are frozen for a snapshot".into(),
+                message: "guest not configured yet".into(),
                 retryable: true,
             };
             let _ = framing::write_guest_json(&mut s, &HandsResponse::Error { call_id, error }).await;
