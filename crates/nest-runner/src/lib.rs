@@ -12,11 +12,13 @@
 //! | the sandbox's gateway (WebSocket, via `nest-hands-client`) | hands RPC per tool call, with the target from AgentDO's `hands_resolve`: [`hands`] |
 
 pub mod agent;
+pub mod brain;
 pub mod config;
 pub mod framing;
 pub mod hands;
 pub mod hooks;
 pub mod mcp;
+pub mod mirror;
 pub mod rules;
 pub mod runtime;
 pub mod session;

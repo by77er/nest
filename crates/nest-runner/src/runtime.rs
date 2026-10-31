@@ -1,7 +1,7 @@
 //! Shared runner state: the agent registry and the per-agent handle used by the supervisor,
 //! hook server, MCP bridge and session channel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,7 @@ use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
 use nest_protocol::host::runner::{ExitReason, RunnerEvent, StopMode};
 use nest_protocol::model::{
-    AgentEvent, AgentEventBody, AgentId, CallId, Epoch, ErrorBody, HostId, MessageId, RequestId,
+    AgentEvent, AgentEventBody, AgentId, CallId, Epoch, ErrorBody, HostId, RequestId,
     SessionId, TimestampMs, TurnId,
 };
 use serde_json::Value;
@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::mirror::InboxMirror;
 
 pub fn now_ms() -> TimestampMs {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -218,7 +219,11 @@ fn parent_pid(pid: i32) -> Option<i32> {
 pub enum AgentCmd {
     RunTurn { turn: TurnId, input: TurnInput },
     Inbox(InboxMessage),
-    Interrupt,
+    /// AgentDO's `interrupt`, for `turn` (`None` from an older AgentDO: whatever runs).
+    Interrupt { turn: Option<TurnId> },
+    /// The `Stop` hook answered, `blocked` = the turn continues with inbox messages. Sent before
+    /// the answer is written, so it reaches the actor before the `result` that follows it.
+    StopHook { blocked: bool },
     Stop(StopMode),
     Kill(ExitReason),
     /// One stdout line from Claude Code.
@@ -284,9 +289,9 @@ pub struct AgentInner {
     /// that one ([`Agent::drop_target_if`]) and never a fresher target another call stored.
     pub target_gen: u64,
     pub cache: Option<AgentCache>,
-    /// Inbox messages already delivered (stdin or `Stop`).
-    pub delivered: HashSet<MessageId>,
-    pub stop_continuations: u32,
+    /// Which mirrored inbox messages the hooks handed out (with `cache.inbox`, under this lock).
+    pub mirror: InboxMirror,
+    /// The turn running now; written only by the actor, from its brain.
     pub turn: Option<TurnId>,
     pub tools: Vec<ToolDef>,
     pub session: Option<SessionId>,
@@ -597,16 +602,6 @@ impl Agent {
         for (_, tx) in self.hands_inflight.lock().unwrap().drain() {
             let _ = tx.send(());
         }
-    }
-
-    /// Undelivered inbox-mirror messages.
-    pub fn pending_inbox(&self) -> Vec<InboxMessage> {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .cache
-            .as_ref()
-            .map(|c| c.inbox.iter().filter(|m| !inner.delivered.contains(&m.id)).cloned().collect())
-            .unwrap_or_default()
     }
 }
 

@@ -324,7 +324,7 @@ impl Session {
         match msg {
             AgentToRunner::RunTurn { turn, input, .. } => a.command(AgentCmd::RunTurn { turn, input }),
             AgentToRunner::Inbox { message, .. } => a.command(AgentCmd::Inbox(message)),
-            AgentToRunner::Interrupt { .. } => a.command(AgentCmd::Interrupt),
+            AgentToRunner::Interrupt { turn, .. } => a.command(AgentCmd::Interrupt { turn }),
             AgentToRunner::CacheUpdate { cache, .. } => a.set_cache(cache),
             AgentToRunner::ToolResult { call, outcome, .. } => a.resolve_call(&call, outcome),
             AgentToRunner::ToolsList { request, tools } => a.resolve_tools(&request, tools),
