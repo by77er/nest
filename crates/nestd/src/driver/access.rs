@@ -25,8 +25,8 @@ pub enum Kind {
 /// Set `path`'s mode to `mode` and, with `gid`, its group, provided it is a `kind` owned by
 /// `owner` and not a symlink (which is never followed). Refused otherwise, nothing changed.
 pub fn restrict(path: &Path, kind: Kind, owner: u32, gid: Option<u32>, mode: u32) -> io::Result<()> {
-    let f = open_nofollow(path)?;
-    let meta = f.metadata()?;
+    let f = open_nofollow(path).map_err(|e| step("open", path, e))?;
+    let meta = f.metadata().map_err(|e| step("stat", path, e))?;
     let ft = meta.file_type();
     let is_kind = match kind {
         Kind::Socket => ft.is_socket(),
@@ -41,9 +41,15 @@ pub fn restrict(path: &Path, kind: Kind, owner: u32, gid: Option<u32>, mode: u32
     let via = Path::new("/proc/self/fd").join(f.as_raw_fd().to_string());
     // Group first: a chown can clear mode bits, never add them.
     if let Some(gid) = gid {
-        std::os::unix::fs::chown(&via, None, Some(gid))?;
+        std::os::unix::fs::chown(&via, None, Some(gid)).map_err(|e| step("chown", path, e))?;
     }
-    std::fs::set_permissions(&via, Permissions::from_mode(mode))
+    std::fs::set_permissions(&via, Permissions::from_mode(mode)).map_err(|e| step("chmod", path, e))
+}
+
+/// The step and path an error came from, its kind kept: on a host the bare OS error (`No such device
+/// or address`) named neither (stress test, 2026-10-31).
+fn step(what: &str, path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{what} {}: {e}", path.display()))
 }
 
 /// Let the gateway's group connect to a VM's vsock socket (`0660`, group `gid`).

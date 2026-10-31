@@ -4,6 +4,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Workers Logs: without it every console.warn/error (a sandbox's failure, a health probe's) is gone
+  // once the request ends.
+  "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
       { "name": "FLEET", "class_name": "FleetDO" },

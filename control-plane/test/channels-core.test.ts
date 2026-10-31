@@ -515,6 +515,9 @@ describe("envelope and taint", () => {
     const t = envelopeText({ channel: "team/x", subscription: "sub_1", batch: b }, Date.UTC(2026, 9, 29), Date.UTC(2026, 9, 29) - 5 * 60_000);
     expect(t).toContain("Channel team/x: 3 new messages (seq 4-9) from agt_bbbb (2), user; kinds q; 2 tainted.");
     expect(t).toContain('channel "team/x", since 3');
+    // Under a filter the cursor lags behind messages that didn't match: the hint starts at the first match.
+    const filtered = envelopeText({ channel: "team/x", subscription: "sub_1", batch: { ...b, after_seq: 0, first_seq: 52, last_seq: 52, count: 1 } }, Date.UTC(2026, 9, 29), null);
+    expect(filtered).toContain('channel "team/x", since 51');
     expect(t).toContain("Message from user (seq 6): from the user");
     expect(t).toContain("last turn started 5 min ago");
     // For an agent without `read`: never pointed at the tool.
