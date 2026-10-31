@@ -162,9 +162,8 @@ pub fn guest_error_next(error: &ErrorBody) -> Next {
     }
 }
 
-/// The claims of the target's binding, unverified (the signature is the gateway's to check):
-/// the one source of the sandbox, epoch and expiry a client acts on. `HandsTarget.sandbox` and
-/// `.epoch` are unsigned copies the gateway never reads. `None` if the token does not parse.
+/// The claims of the target's binding, unverified (the gateway checks the signature): the one
+/// source of the sandbox, epoch and expiry a client acts on. `None` if the token doesn't parse.
 pub fn binding_claims(target: &HandsTarget) -> Option<BindingClaims> {
     parse_binding(target.binding.expose()).ok().map(|p| p.claims)
 }
@@ -207,15 +206,12 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// Nothing usable answered where the target points: the runner treats this like `moved` and
-    /// resolves again rather than retrying the same target. True for a refused, reset or
-    /// unreachable connect; a hostname that does not resolve (FleetDO deletes a dead host's
-    /// record); and an HTTP answer from in front of the gateway: a 5xx is Cloudflare's edge with
-    /// no connector or origin behind the hostname (502, 503, 530: the host is gone or its tunnel
-    /// is reconnecting), and 401 or 403 is Cloudflare Access refusing the `edge` credential,
-    /// which a fresh `resolve` carries anew after a rotation. 404 and 501 are the gateway itself
-    /// answering (an unknown or not yet served route; the edge never says 501) and stay final,
-    /// as does every other status.
+    /// Nothing usable answered where the target points, so resolve again (like `moved`): a
+    /// refused, reset or unreachable connect; a hostname that doesn't resolve (a dead host's
+    /// record is deleted); a 5xx from Cloudflare's edge (502, 503, 530: no host or tunnel behind
+    /// it); a 401 or 403 from Access refusing the `edge` credential (a fresh `resolve` carries the
+    /// rotated one). 404 and 501 are the gateway itself answering and stay final, as does any
+    /// other status.
     pub fn is_unreachable(&self) -> bool {
         match self {
             TransportError::Io(e) => matches!(

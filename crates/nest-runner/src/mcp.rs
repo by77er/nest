@@ -26,16 +26,10 @@ pub fn hands_tools() -> &'static [McpToolDef] {
     })
 }
 
-/// Whether the agent may list and call hands: any agent with a bound sandbox, whatever its
-/// template (there are no roles in the platform; `docs/agents/`). The one check for both.
-fn has_hands(agent: &Agent) -> bool {
-    agent.hands.is_some()
-}
-
-/// Tools for an agent right now.
+/// Tools for an agent right now: hands for any agent with a bound sandbox, whatever its template.
 pub async fn list(rt: &Runtime, agent: &Agent) -> Vec<McpToolDef> {
     let mut tools = Vec::new();
-    if has_hands(agent) {
+    if agent.hands.is_some() {
         tools.extend(hands_tools().iter().cloned());
     }
     let platform = agent.platform_tools(rt.cfg.tools_list_timeout).await;
@@ -119,7 +113,7 @@ async fn call(
     cancel: CancellationToken,
 ) -> McpBridgeResponse {
     if HANDS_TOOLS.contains(&name) {
-        if !has_hands(agent) {
+        if agent.hands.is_none() {
             let e = ErrorBody { code: error_codes::NOT_BOUND.into(), message: "this agent has no sandbox bound (no hands)".into(), retryable: false };
             return McpBridgeResponse::Error { id: Some(id), error: e };
         }
