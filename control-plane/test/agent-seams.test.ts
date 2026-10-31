@@ -1251,6 +1251,42 @@ describe("one brain per agent: the brain record", () => {
   });
 });
 
+describe("state: AgentDO's lifecycle and the runner's activity", () => {
+  const rawInfo = (agent: string) => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+    JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
+
+  it("are stored apart, `state` derived from them and stored too; a `state` the previous release wrote is the authority", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await ws.next("cache_update");
+    ws.send({ type: "events", seq: 1, events: [{ agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), type: "state_changed", state: "waiting_permission" }] });
+    await ws.next("ack");
+    expect(await agentStub(s.agent).info()).toMatchObject({ lifecycle: "ready", activity: "waiting_permission", state: "waiting_permission" });
+    expect(await rawInfo(s.agent)).toMatchObject({ lifecycle: "ready", activity: "waiting_permission", state: "waiting_permission" });
+    // The previous release (after a rollback) writes `state` alone; rolled forward again, it wins.
+    await editAgent(s.agent, (i) => {
+      i.state = "errored";
+    });
+    expect(await agentStub(s.agent).info()).toMatchObject({ lifecycle: "errored", activity: null, state: "errored" });
+    await editAgent(s.agent, (i) => {
+      i.state = "idle";
+    });
+    expect(await agentStub(s.agent).info()).toMatchObject({ lifecycle: "ready", activity: "idle", state: "idle" });
+  });
+
+  it("a brain's release leaves no runner report behind: an `errored` the runner reported isn't the agent's", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await ws.next("cache_update");
+    ws.send({ type: "events", seq: 1, events: [{ agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), type: "state_changed", state: "errored" }] });
+    await ws.next("ack");
+    expect((await agentStub(s.agent).info()).state).toBe("errored");
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    expect(await agentStub(s.agent).info()).toMatchObject({ brain: null, lifecycle: "detached", activity: null, state: "detached" });
+  });
+});
+
 describe("a draining host's brains", () => {
   const config: AwsCellConfig = {
     region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"], spot: true,

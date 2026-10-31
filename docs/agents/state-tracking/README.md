@@ -19,6 +19,8 @@ The runner owns the Claude Code process, so it sees the **stream-json output** d
 | Process exit / `SessionEnd` | `detached` |
 | `rate_limit_event` (stream) | parsed but **not used yet** |
 
+These are the runner's reports: AgentDO stores them as the agent's `activity`, apart from its own `lifecycle`, and derives the API's `state` from the two ([AgentDO](../../control-plane/durable-objects/agent/)).
+
 **`stalled`:** `working` with no events for N minutes. A hands call that's still running keeps sending [heartbeats](../hands/), so check whether it's using CPU in its cgroup (`calls/<call_id>`): if it is, it's a long tool call.
 
 ## Async pipeline

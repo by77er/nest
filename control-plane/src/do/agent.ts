@@ -32,7 +32,7 @@ import {
   RunnerToAgent, type SegmentRef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
-  type AgentEvent, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
+  type AgentEvent, AgentLifecycle, type AgentState, type CliCommand, type CliResult, ErrorCodes, type GenerationRecord, PROTOCOL_VERSION,
   type TaskInfo, type WorkstreamEvent,
 } from "../protocol/model";
 
@@ -133,7 +133,13 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe"> {
   prev_host?: string;
   /** Session of the committed base (what `--resume` restores). */
   session: string | null;
-  state: AgentState;
+  /** AgentDO's part of `state` (the brain's lifecycle), written only by AgentDO's own transitions. */
+  lifecycle: AgentLifecycle;
+  /**
+   * The runner's part of `state`: what it last reported its brain doing (null: nothing since the
+   * brain started, or no brain). Counts only while `lifecycle` is `ready` (`agentState`).
+   */
+  activity: AgentState | null;
   current_turn: string | null;
   cache_version: number;
   /** Committed base: its generation and the bytes durable in R2 (what resume and transcripts read). */
@@ -223,14 +229,31 @@ export interface StartIntent {
   reason: IntentReason;
 }
 
-/** What `info()` answers: the stored record plus the brain's host (derived, never stored). */
-export type AgentView = AgentInfo & { host: string | null };
+/**
+ * What `info()` answers: the stored record plus the brain's host (derived, never stored) and
+ * `state` (derived; stored too, for the previous release, which reads it).
+ */
+export type AgentView = AgentInfo & { host: string | null; state: AgentState };
+
+/** An agent's one-word state: AgentDO's lifecycle, or while a brain runs, what its runner reports. */
+export function agentState(i: Pick<AgentInfo, "lifecycle" | "activity">): AgentState {
+  return i.lifecycle === "ready" ? i.activity ?? "ready" : i.lifecycle;
+}
+
+/** The two parts of a `state` stored alone (by the previous release): the inverse of `agentState`. */
+function splitState(state: AgentState): Pick<AgentInfo, "lifecycle" | "activity"> {
+  const own = AgentLifecycle.safeParse(state);
+  return own.success && own.data !== "ready" ? { lifecycle: own.data, activity: null } : { lifecycle: "ready", activity: state === "ready" ? null : state };
+}
 
 /**
- * Fields of records stored by the previous release (`load()` migrates them): `host` (the brain
- * record replaced it), and `role`, `grants` and `captain` (the expanded spec and `owner` did).
+ * Fields of records stored by the previous release (`load()` migrates them): `state` (`lifecycle`
+ * and `activity` replaced it), `host` (the brain record did), and `role`, `grants` and `captain`
+ * (the expanded spec and `owner` did).
  */
 interface PreviousReleaseFields {
+  /** The previous release's one field for both parts (`agentState`, still written by `save()`). */
+  state?: AgentState;
   host?: string | null;
   role?: RoleRecord["role"];
   grants?: string[] | null;
@@ -371,7 +394,7 @@ export class AgentDO extends DurableObject<Env> {
     // Stored before the agent epoch: `hands.epoch` was the session epoch of the running brain.
     const legacy = info.hands as { sandbox: string; epoch?: number } | null;
     const agentEpoch = info.agent_epoch ?? legacy?.epoch ?? 0;
-    const { host, role, grants, captain, ...rest } = info;
+    const { host, role, grants, captain, state, ...rest } = info;
     // Stored with a role (the previous release): its role's seed template, expanded with the launch,
     // rules and grant list it stored; its `captain` is its owner. Persisted once, below.
     let spec: Omit<AgentSpec, "subscribe"> | undefined;
@@ -387,10 +410,10 @@ export class AgentDO extends DurableObject<Env> {
       // persisted with its alarm, below.
       brain = null;
       if (host) {
-        const doubtful = info.state === "detached" || info.state === "errored";
+        const doubtful = state === "detached" || state === "errored";
         brain = doubtful
           ? { host, epoch: agentEpoch, phase: "condemned", since_ms: Date.now() }
-          : { host, epoch: agentEpoch, phase: info.state === "starting" ? "starting" : "live", since_ms: Date.now() };
+          : { host, epoch: agentEpoch, phase: state === "starting" ? "starting" : "live", since_ms: Date.now() };
       }
       migrated = true;
     }
@@ -412,6 +435,9 @@ export class AgentDO extends DurableObject<Env> {
       recv_durable: info.recv_durable ?? info.durable_bytes,
       runner_instance: info.runner_instance ?? null,
       start_attempts: info.start_attempts ?? 0,
+      // Stored with `state` alone, or `state` written since by the previous release (a rollback):
+      // `state` is the authority.
+      ...(state !== undefined && (info.lifecycle === undefined || agentState(info) !== state) ? splitState(state) : {}),
     };
     if (migrated) {
       this.save(out);
@@ -431,7 +457,7 @@ export class AgentDO extends DurableObject<Env> {
     // For one release, the previous release's fields beside the spec, derived from it, so a forward
     // revert to that release reads the record as its own (`role` from hands, `grants` = the tools,
     // `captain` = the owner). `load()` drops them: the spec is the authority.
-    const legacy: PreviousReleaseFields = { role: info.hands ? "worker" : "captain", grants: info.tools, captain: info.owner };
+    const legacy: PreviousReleaseFields = { role: info.hands ? "worker" : "captain", grants: info.tools, captain: info.owner, state: agentState(info) };
     this.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       JSON.stringify({ ...info, ...legacy }));
   }
@@ -486,7 +512,8 @@ export class AgentDO extends DurableObject<Env> {
       brain: null,
       intent: null,
       session: null,
-      state: "detached",
+      lifecycle: "detached",
+      activity: null,
       current_turn: null,
       cache_version: 1,
       base_gen: 0,
@@ -505,7 +532,7 @@ export class AgentDO extends DurableObject<Env> {
 
   async info(): Promise<AgentView> {
     const info = this.load();
-    return { ...info, host: info.brain?.host ?? null };
+    return { ...info, host: info.brain?.host ?? null, state: agentState(info) };
   }
 
   private sandboxStub(id: string) {
@@ -546,7 +573,8 @@ export class AgentDO extends DurableObject<Env> {
    * (SessionStart says `ready` mid-turn, so a turn in progress is work whatever state it reports).
    */
   private working(info: AgentInfo): boolean {
-    return !WAKE_STATES.includes(info.state) && (WORKING_STATES.includes(info.state) || info.current_turn !== null);
+    const state = agentState(info);
+    return !WAKE_STATES.includes(state) && (WORKING_STATES.includes(state) || info.current_turn !== null);
   }
 
   /**
@@ -819,7 +847,8 @@ export class AgentDO extends DurableObject<Env> {
       i.brain = { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() };
       i.intent = null;
       delete i.capacity_waits;
-      i.state = "starting";
+      i.lifecycle = "starting";
+      i.activity = null;
     });
     const armed = Promise.all([
       this.deadlines.clear("intent"),
@@ -909,7 +938,7 @@ export class AgentDO extends DurableObject<Env> {
     this.update((i) => {
       i.intent = null;
       delete i.capacity_waits;
-      if (!i.brain && (i.state === "starting" || i.state === "detached")) i.state = "errored";
+      if (!i.brain && (i.lifecycle === "starting" || i.lifecycle === "detached")) i.lifecycle = "errored";
     });
     await this.deadlines.clear("intent");
   }
@@ -1071,7 +1100,8 @@ export class AgentDO extends DurableObject<Env> {
       i.prev_host = i.brain.host;
       i.brain = null;
       // `errored` (a refused start, the crash-loop guard) stays while nothing will start a brain.
-      if (i.state !== "errored" || i.intent || wakes) i.state = "detached";
+      if (i.lifecycle !== "errored" || i.intent || wakes) i.lifecycle = "detached";
+      i.activity = null;
       released = true;
     });
     if (!released) return false;
@@ -1193,7 +1223,7 @@ export class AgentDO extends DurableObject<Env> {
         i.start_attempts += 1;
         i.intent = { reason: "retry" };
       } else if (!i.intent && !stopped) {
-        i.state = "errored";
+        i.lifecycle = "errored";
       }
     });
     const armed = retry ? this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true) : undefined;
@@ -1278,7 +1308,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!this.hasWork(info)) return;
     if (afterExit && (info.exit_restarts ?? 0) > MAX_EXIT_RESTARTS) {
       this.update((i) => {
-        i.state = "errored";
+        i.lifecycle = "errored";
       });
       console.warn(`agent ${info.agent}: exited ${MAX_EXIT_RESTARTS} times without completing a turn; waiting for new input`);
       return;
@@ -1308,7 +1338,10 @@ export class AgentDO extends DurableObject<Env> {
   async hostReport(host: string, state: AgentState): Promise<void> {
     if (!this.exists()) return;
     const info = this.update((i) => {
-      if (i.brain?.host === host && i.brain.phase !== "condemned" && i.state === "detached") i.state = state;
+      if (i.brain?.host === host && i.brain.phase !== "condemned" && agentState(i) === "detached") {
+        i.lifecycle = "ready";
+        i.activity = state;
+      }
     });
     if (info.brain?.host === host) return;
     console.error(`agent ${info.agent}: ${host} reports a brain the record doesn't place there; killing it`);
@@ -1604,7 +1637,10 @@ export class AgentDO extends DurableObject<Env> {
         i.recv_session = hello.session;
         if (i.recv_base === i.base_gen && !i.session) i.session = hello.session;
       }
-      if (i.state === "starting" || i.state === "detached" || i.state === "errored") i.state = "ready";
+      if (["starting", "detached", "errored"].includes(agentState(i))) {
+        i.lifecycle = "ready";
+        i.activity = null;
+      }
       if (i.brain && i.brain.phase === "starting") i.brain = { ...i.brain, phase: "live" };
       i.start_timeouts = 0;
     });
@@ -1694,7 +1730,7 @@ export class AgentDO extends DurableObject<Env> {
     if (after.received_bytes - after.recv_durable >= FLUSH_BYTES) {
       await this.flush();
     } else {
-      const delay = WORKING_STATES.includes(after.state) ? FLUSH_WORKING_MS : FLUSH_IDLE_MS;
+      const delay = WORKING_STATES.includes(agentState(after)) ? FLUSH_WORKING_MS : FLUSH_IDLE_MS;
       await this.deadlines.set("flush", Date.now() + delay, true);
     }
   }
@@ -1851,13 +1887,13 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.update((i) => {
       switch (ev.type) {
         case "turn_started":
-          if (!stale) i.state = "working";
+          if (!stale) i.activity = "working";
           break;
         case "state_changed":
-          if (!stale) i.state = ev.state;
+          if (!stale) i.activity = ev.state;
           break;
         case "rate_limited":
-          i.state = "quota_parked";
+          i.activity = "quota_parked";
           break;
         case "capabilities":
           i.capabilities = ev.capabilities;
@@ -1866,7 +1902,7 @@ export class AgentDO extends DurableObject<Env> {
           if (completed) {
             this.queue.complete(ev.turn!);
             i.current_turn = null;
-            i.state = "idle";
+            i.activity = "idle";
             i.exit_restarts = 0;
           }
           break;
@@ -1926,7 +1962,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!next) return;
     const info = this.update((i) => {
       i.current_turn = next.turn;
-      i.state = "working";
+      i.activity = "working";
     });
     const { turn, recovers } = next;
     const continued = recovers ? this.queue.startOf(recovers) : undefined;
@@ -2790,7 +2826,7 @@ export class AgentDO extends DurableObject<Env> {
           const stopped = stoppedBrain(info, info.brain.epoch);
           if (!stopped) {
             this.update((i) => {
-              i.state = "errored";
+              i.lifecycle = "errored";
               i.start_timeouts = (i.start_timeouts ?? 0) + 1;
               i.exit_restarts = (i.exit_restarts ?? 0) + 1;
             });
