@@ -16,7 +16,7 @@ use tokio::process::Child;
 use super::{CallCtx, text};
 use crate::exec::{self, Leaf, Spawn};
 use crate::framed::err;
-use crate::output::{OutputSink, read_output, tail_chars};
+use crate::output::{OutputSink, OutputView, read_output, tail_chars};
 use crate::state::{Guest, now_ms};
 use crate::tasks::{self, Adopt, Task};
 
@@ -117,7 +117,7 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
     if input.run_in_background {
         return start_background(guest, agent, input, ctx).await;
     }
-    let timeout = input.timeout.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS);
+    let timeout_ms = input.timeout.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS);
     let name = safe_name(&ctx.call_id);
     let out = guest.agent_dir(agent).join("calls").join(format!("{name}.out"));
     let mut r = spawn_shell(guest, agent, &input.command, &out, "calls", &name, true)?;
@@ -132,106 +132,41 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
     let end = tokio::select! {
         s = r.child.wait() => End::Exited(s.map_err(|e| err(error_code::INTERNAL, e.to_string(), false))?),
         _ = ctx.cancel.cancelled() => End::Cancelled,
-        _ = tokio::time::sleep(Duration::from_millis(timeout)) => End::TimedOut,
+        _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => End::TimedOut,
     };
 
-    match end {
+    let mut cwd = before_cwd;
+    let ending = match end {
         End::Exited(status) => {
             let _ = r.sink.wait_eof(Duration::from_millis(200)).await;
-            let mut cwd = before_cwd;
             if let Some(p) = r.pwd.as_mut()
-                && let Some(new) = read_pwd(p).await.filter(|d| Path::new(d).is_dir()) {
-                    if new != cwd {
-                        guest.set_cwd(agent, &new);
-                    }
-                    cwd = new;
+                && let Some(new) = read_pwd(p).await.filter(|d| Path::new(d).is_dir())
+            {
+                if new != cwd {
+                    guest.set_cwd(agent, &new);
                 }
+                cwd = new;
+            }
             r.leaf.release();
-            let view = read_output(&out);
             if let Some(dir) = out.parent() {
                 crate::output::prune_dir(dir, crate::output::KEEP_CALL_OUTPUTS, crate::output::CALL_OUTPUT_BUDGET, &out);
             }
-            let output = view.text.clone();
-            let code = status.code();
-            let success = code == Some(0) || (code == Some(1) && lenient_exit_one(&input.command));
-            let (body, truncated) = if success {
-                success_text(&view, &out)
-            } else {
-                let mut t = excerpt(&output, FAILURE_EXCERPT_CHARS);
-                if !t.is_empty() && !t.ends_with('\n') {
-                    t.push('\n');
-                }
-                match (code, status.signal()) {
-                    (Some(c), _) => t.push_str(&format!("Exit code {c}")),
-                    (None, Some(s)) => t.push_str(&format!("Killed by signal {s}")),
-                    _ => t.push_str("Exit status unknown"),
-                }
-                (t, output.chars().count() > FAILURE_EXCERPT_CHARS)
-            };
-            Ok(text(
-                !success,
-                body,
-                HandsDetail::Bash {
-                    exit_code: code,
-                    signal: status.signal(),
-                    interrupted: false,
-                    task_id: None,
-                    output_path: out.display().to_string(),
-                    output_bytes: r.sink.total(),
-                    truncated,
-                    cwd,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                },
-            ))
+            Ending::Exited(status)
         }
         End::Cancelled => {
             r.leaf.kill();
             let status = tokio::time::timeout(Duration::from_secs(2), r.child.wait()).await.ok().and_then(|s| s.ok());
             let _ = r.sink.wait_eof(Duration::from_millis(200)).await;
             r.leaf.release();
-            let mut t = excerpt(&read_output(&out).text, FAILURE_EXCERPT_CHARS);
-            if !t.is_empty() && !t.ends_with('\n') {
-                t.push('\n');
-            }
-            t.push_str("[Command interrupted]");
-            Ok(text(
-                true,
-                t,
-                HandsDetail::Bash {
-                    exit_code: status.and_then(|s| s.code()),
-                    signal: status.and_then(|s| s.signal()),
-                    interrupted: true,
-                    task_id: None,
-                    output_path: out.display().to_string(),
-                    output_bytes: r.sink.total(),
-                    truncated: false,
-                    cwd: before_cwd,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                },
-            ))
+            Ending::Interrupted(status)
+        }
+        End::TimedOut if starts_with_sleep(&input.command) => {
+            r.leaf.kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), r.child.wait()).await;
+            r.leaf.release();
+            Ending::Killed
         }
         End::TimedOut => {
-            let secs = timeout as f64 / 1000.0;
-            if starts_with_sleep(&input.command) {
-                r.leaf.kill();
-                let _ = tokio::time::timeout(Duration::from_secs(2), r.child.wait()).await;
-                r.leaf.release();
-                return Ok(text(
-                    true,
-                    format!("Command timed out after {secs}s and was killed."),
-                    HandsDetail::Bash {
-                        exit_code: None,
-                        signal: Some(libc::SIGKILL),
-                        interrupted: false,
-                        task_id: None,
-                        output_path: out.display().to_string(),
-                        output_bytes: r.sink.total(),
-                        truncated: false,
-                        cwd: before_cwd,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    },
-                ));
-            }
             let id = tasks::new_task_id();
             // A task's output lives in tasks/, kept per task: calls/ keeps only the newest call
             // outputs and would delete it while it runs. Same tmpfs, so the sink's open fd follows.
@@ -240,7 +175,13 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
                 Ok(()) => r.sink.path = moved,
                 Err(e) => tracing::warn!(error = %e, "could not move {} to tasks/", out.display()),
             }
-            let total = r.sink.total.clone();
+            let report = Report {
+                output_path: r.sink.path.clone(),
+                output_bytes: r.sink.total(),
+                cwd,
+                timeout_ms,
+                duration_ms: started.elapsed().as_millis() as u64,
+            };
             // Keep the $PWD pipe open: the shell's EXIT trap writes to it, and a closed reader
             // would kill the shell with SIGPIPE and lose its exit status.
             if let Some(mut p) = r.pwd.take() {
@@ -249,7 +190,7 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
                     let _ = p.read_to_end(&mut sink).await;
                 });
             }
-            let task = tasks::adopt(
+            tasks::adopt(
                 guest,
                 Adopt {
                     id: id.clone(),
@@ -262,27 +203,102 @@ pub async fn run(guest: &Arc<Guest>, input: BashInput, ctx: &CallCtx) -> Result<
                     time_limit: Duration::from_millis(DEFAULT_BG_LIMIT_MS),
                 },
             );
-            Ok(text(
-                false,
-                format!(
-                    "Command did not complete within its {secs}s timeout and was moved to the background with ID: {id}. \
-                     Output is being written to: {}. Use TaskOutput to check on it. Session cwd remains {before_cwd}.",
-                    task.output_path.display()
-                ),
-                HandsDetail::Bash {
-                    exit_code: None,
-                    signal: None,
-                    interrupted: false,
-                    task_id: Some(id),
-                    output_path: task.output_path.display().to_string(),
-                    output_bytes: total.load(std::sync::atomic::Ordering::Relaxed),
-                    truncated: false,
-                    cwd: before_cwd,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                },
-            ))
+            return Ok(bash_result(Ending::Moved(id), &OutputView::default(), &input.command, report));
         }
-    }
+    };
+    let view = read_output(&out);
+    let report = Report {
+        output_path: out,
+        output_bytes: r.sink.total(),
+        cwd,
+        timeout_ms,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    Ok(bash_result(ending, &view, &input.command, report))
+}
+
+/// How a foreground call ended.
+#[derive(Debug)]
+enum Ending {
+    Exited(std::process::ExitStatus),
+    /// Cancelled (interrupt or hangup) and killed; its status if it was reaped in time.
+    Interrupted(Option<std::process::ExitStatus>),
+    /// Timed out running `sleep`: killed.
+    Killed,
+    /// Timed out: moved to the background as this task.
+    Moved(String),
+}
+
+/// What a result reports besides how the call ended.
+struct Report {
+    output_path: PathBuf,
+    output_bytes: u64,
+    /// The session cwd after the call (unchanged unless it exited).
+    cwd: String,
+    timeout_ms: u64,
+    duration_ms: u64,
+}
+
+/// Pure: the Bash result the model sees, following Claude Code's Bash tool. Exit 0 (or 1 from a
+/// search or diff) is success, shown whole when small, else a preview and the saved path; a
+/// failure shows a head-and-tail excerpt and its exit code; an interrupt or a killed `sleep`
+/// is an error; a call moved to the background names its task.
+fn bash_result(ending: Ending, view: &OutputView, command: &str, r: Report) -> HandsResult {
+    let path = r.output_path.display().to_string();
+    let secs = r.timeout_ms as f64 / 1000.0;
+    let with_excerpt = |end: &str| {
+        let mut t = excerpt(&view.text, FAILURE_EXCERPT_CHARS);
+        if !t.is_empty() && !t.ends_with('\n') {
+            t.push('\n');
+        }
+        t.push_str(end);
+        t
+    };
+    let (is_error, body, status, interrupted, task_id, truncated) = match ending {
+        Ending::Exited(status) => {
+            let code = status.code();
+            if code == Some(0) || (code == Some(1) && lenient_exit_one(command)) {
+                let (body, truncated) = success_text(view, &r.output_path);
+                (false, body, Some(status), false, None, truncated)
+            } else {
+                let end = match (code, status.signal()) {
+                    (Some(c), _) => format!("Exit code {c}"),
+                    (None, Some(s)) => format!("Killed by signal {s}"),
+                    _ => "Exit status unknown".to_string(),
+                };
+                let truncated = view.text.chars().count() > FAILURE_EXCERPT_CHARS;
+                (true, with_excerpt(&end), Some(status), false, None, truncated)
+            }
+        }
+        Ending::Interrupted(status) => (true, with_excerpt("[Command interrupted]"), status, true, None, false),
+        Ending::Killed => {
+            let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+            (true, format!("Command timed out after {secs}s and was killed."), Some(killed), false, None, false)
+        }
+        Ending::Moved(id) => {
+            let body = format!(
+                "Command did not complete within its {secs}s timeout and was moved to the background with ID: {id}. \
+                 Output is being written to: {path}. Use TaskOutput to check on it. Session cwd remains {}.",
+                r.cwd
+            );
+            (false, body, None, false, Some(id), false)
+        }
+    };
+    text(
+        is_error,
+        body,
+        HandsDetail::Bash {
+            exit_code: status.and_then(|s| s.code()),
+            signal: status.and_then(|s| s.signal()),
+            interrupted,
+            task_id,
+            output_path: path,
+            output_bytes: r.output_bytes,
+            truncated,
+            cwd: r.cwd,
+            duration_ms: r.duration_ms,
+        },
+    )
 }
 
 async fn start_background(
@@ -392,7 +408,7 @@ async fn read_pwd(p: &mut pipe::Receiver) -> Option<String> {
     s.lines().next().map(|l| l.to_string()).filter(|l| l.starts_with('/'))
 }
 
-fn success_text(view: &crate::output::OutputView, path: &Path) -> (String, bool) {
+fn success_text(view: &OutputView, path: &Path) -> (String, bool) {
     let output = &view.text;
     let n = output.chars().count();
     if view.total_bytes == 0 || n == 0 {
@@ -460,6 +476,42 @@ mod tests {
         let s = "a".repeat(30);
         let e = excerpt(&s, 10);
         assert!(e.starts_with("aaaaa\n... [20 characters truncated] ...\naaaaa"));
+    }
+
+    /// Claude Code's Bash results (host-guest "Bash"), one row per way a call ends.
+    #[test]
+    fn bash_results_follow_claude_codes_bash() {
+        let exited = |code: i32| Ending::Exited(std::process::ExitStatus::from_raw(code << 8));
+        let big = "y".repeat(INLINE_SUCCESS_CHARS + 1);
+        let rows: Vec<(Ending, &str, &str, bool, &str)> = vec![
+            // (ending, output, command, is_error, the body contains)
+            (exited(0), "hi\n", "echo hi", false, "hi\n"),
+            (exited(0), "", "true", false, "(no output)"),
+            (exited(0), &big, "yes", false, "Output too large"),
+            (exited(1), "", "grep x f", false, "(no output)"),
+            (exited(1), "boom\n", "npm test", true, "boom\nExit code 1"),
+            (Ending::Exited(std::process::ExitStatus::from_raw(libc::SIGKILL)), "", "x", true, "Killed by signal 9"),
+            (Ending::Interrupted(None), "partial", "x", true, "partial\n[Command interrupted]"),
+            (Ending::Killed, "", "sleep 30", true, "timed out after 0.2s and was killed"),
+            (Ending::Moved("bg_1".into()), "", "npm run dev", false, "moved to the background with ID: bg_1"),
+        ];
+        let mut seen = [false; 4];
+        for (ending, out, command, is_error, contains) in rows {
+            seen[match &ending {
+                Ending::Exited(_) => 0,
+                Ending::Interrupted(_) => 1,
+                Ending::Killed => 2,
+                Ending::Moved(_) => 3,
+            }] = true;
+            let label = format!("{ending:?} {command}");
+            let view = OutputView { text: out.into(), total_bytes: out.len() as u64, complete: true };
+            let report = Report { output_path: "/o.out".into(), output_bytes: 0, cwd: "/w".into(), timeout_ms: 200, duration_ms: 1 };
+            let r = bash_result(ending, &view, command, report);
+            let nest_protocol::guest::ToolContent::Text { text } = &r.content[0] else { panic!("{label}") };
+            assert_eq!(r.is_error, is_error, "{label}: {text}");
+            assert!(text.contains(contains), "{label}: {text}");
+        }
+        assert!(seen.iter().all(|s| *s), "every ending has a row");
     }
 
     #[test]

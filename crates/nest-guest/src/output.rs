@@ -80,6 +80,7 @@ impl OutputSink {
 
 /// A command's captured output as shown to the model: the whole file when it's small, otherwise
 /// its first and last [`VIEW_HALF`] bytes around a marker (never the whole 64 MiB in memory).
+#[derive(Default)]
 pub struct OutputView {
     pub text: String,
     pub total_bytes: u64,
