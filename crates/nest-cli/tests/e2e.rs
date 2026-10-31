@@ -288,6 +288,8 @@ impl Harness {
         let fake = dir.path().join("claude");
         // Not `std::fs::copy`: a parallel test's fork could hold it open and fail its exec (ETXTBSY).
         nest_runner::test_support::install_executable(&fake, include_str!("fake_claude.py"));
+        // The fake runs hooks as these wire them, as Claude Code does.
+        std::fs::write(dir.path().join("managed-settings.json"), include_str!("../../../protocol/claude-code/managed-settings.json")).unwrap();
         let cwd = dir.path().join("empty");
         std::fs::create_dir_all(&cwd).unwrap();
         let nestd = FakeNestd::start(&dir.path().join("runner.sock")).await;
@@ -430,7 +432,8 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
                 _ => None,
             })
             .collect();
-        // Step 1: Bash + notify + text; Stop hook delivers the inbox → step 2: Bash + text.
+        // Step 1: Bash (its PostToolUse hands the model the inbox) + notify + text → step 2, on the
+        // message: Bash + text. Nothing is left for Stop.
         assert_eq!(
             kinds,
             ["turn_started", "tool_call", "tool_result", "tool_call", "tool_result", "text", "tool_call", "tool_result", "text", "turn_completed"]
@@ -506,6 +509,10 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
     assert_eq!(names, ["Bash", "TaskOutput", "TaskStop", "Read", "Write", "Edit", "Glob", "Grep", "notify"]);
     let notify = events.iter().find(|e| e["kind"] == "tool" && e["name"] == "notify").unwrap();
     assert_eq!(notify["text"], "Notified captain.");
+    // The inbox reached the model once, at the first tool boundary; nothing was left for Stop.
+    let contexts: Vec<&str> = events.iter().filter_map(|e| e["context"].as_str()).collect();
+    assert!(matches!(contexts[..], [c] if c.contains("please also run the tests")), "{contexts:?}");
+    assert!(events.iter().all(|e| e["event"] != "Stop" || e["output"].get("decision").is_none()));
     assert!(events.iter().all(|e| e["kind"] != "hook" || e["exit"] == 0), "nest hook always exits 0");
 }
 

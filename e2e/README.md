@@ -12,10 +12,10 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
   │    └─ nest-gateway  (ws://127.0.0.1:18790; its own uid (1001 in the namespace), no capabilities; fed by nestd over gateway.sock; forwards hands calls to the guest's vsock port)
   └─ brain host (brun/, bstate/)
        ├─ nestd         (role `controller`, a brain host; its own token; no driver, proxy, gateway or netns)
-       └─ nest-runner   (brains = e2e/fake_claude.py, or real `claude`; hands through the real `nest mcp` bridge and the hands client)
+       └─ nest-runner   (brains = the fake Claude Code, or real `claude`; hands through the real `nest mcp` bridge and the hands client)
 ```
 
-**By default the real `claude` binary is never invoked.** `fake_claude.py`, adapted from `crates/nest-cli/tests/fake_claude.py`, speaks stream-json, runs hooks through `nest hook`, and drives `nest mcp`. A turn whose text is `E2E <scenario.json>` runs scripted tool calls and appends each result to a JSONL file immediately. The real binary is used only by [real-Claude mode](#real-claude-code) and `claude-verify/`.
+**By default the real `claude` binary is never invoked.** `crates/nest-cli/tests/fake_claude.py`, the runner's own end-to-end fake, speaks stream-json, runs hooks through `nest hook` as the managed settings wire them, and drives `nest mcp`. A turn whose text is `E2E <scenario.json>` runs scripted tool calls and appends each result to a JSONL file immediately. The real binary is used only by [real-Claude mode](#real-claude-code) and `claude-verify/`.
 
 ## What it checks
 

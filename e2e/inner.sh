@@ -3,7 +3,7 @@
 # shared, so nest-proxy reaches the internet and nestd reaches the local control plane on 127.0.0.1;
 # nestd creates the per-sandbox netns (owned by this user namespace) itself.
 set -euo pipefail
-: "${WORK:?}" "${BIN:?}" "${E2E:?}" "${NEST_E2E_GATEWAY_PORT:?}" "${NEST_E2E_GATEWAY_UID:?}" "${NEST_E2E_GATEWAY_BIN:?}"
+: "${WORK:?}" "${BIN:?}" "${E2E:?}" "${NEST_E2E_GATEWAY_PORT:?}" "${NEST_E2E_GATEWAY_UID:?}" "${NEST_E2E_GATEWAY_BIN:?}" "${NEST_E2E_FAKE_CLAUDE:?}"
 mkdir -p "$WORK/logs"
 trap 'kill $(jobs -p) 2>/dev/null; wait' EXIT TERM INT
 
@@ -56,7 +56,7 @@ env NEST_RUNNER_NESTD_SOCK="$WORK/brun/runner.sock" \
     NEST_RUNNER_HOOK_DGRAM="$WORK/runner/hook.dgram" \
     NEST_RUNNER_HOOK_SOCK="$WORK/runner/hook.sock" \
     NEST_RUNNER_MCP_SOCK="$WORK/runner/mcp.sock" \
-    NEST_RUNNER_CLAUDE_BIN="${NEST_E2E_CLAUDE_BIN:-$E2E/fake_claude.py}" \
+    NEST_RUNNER_CLAUDE_BIN="${NEST_E2E_CLAUDE_BIN:-$NEST_E2E_FAKE_CLAUDE}" \
     NEST_RUNNER_NEST_BIN="$BIN/nest" \
     NEST_RUNNER_CWD="${NEST_E2E_RUNNER_CWD:-$WORK/runner/cwd}" \
     NEST_RUNNER_IDLE_GRACE_MS=600000 \

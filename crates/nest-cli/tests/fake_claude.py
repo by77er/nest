@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Fake Claude Code for nest end-to-end tests. Never talks to any model.
+"""Fake Claude Code for nest's end-to-end tests (`cargo test -p nest-cli` and e2e/). Never talks
+to any model.
 
 Emulates what the runner relies on (docs/interfaces/host-internal/runner-claude/):
 `auth status`, `--version`, stream-json on stdio (shapes from protocol/claude-code/),
-the session JSONL file, hooks via `nest hook [--sync]`, and an MCP client for `nest mcp`.
+the session JSONL file, an MCP client for `nest mcp`, and hooks as nest's managed settings wire
+them (`managed-settings.json` beside this file, else the repo's protocol/claude-code/ copy):
+which events run `nest hook`, synchronously (`--sync`) or not, within each hook's timeout.
 
 Turn behavior (by user text):
 - contains SLOW     → mcp__nest__Bash `sleep 30`; honors stream-json interrupts
 - contains PLATFORM → also calls the `notify` platform tool
+- `E2E <scenario.json>` → the scripted tool calls in that file ({"results": path, "steps":
+  [{"tool", "args", "label"}]}), each result appended to `results` at once (JSONL, flushed)
 - otherwise         → mcp__nest__Bash `echo <text>`
-After each step the Stop hook runs; `decision: block` continues the turn with the reason.
+As the model would, it reads a `PostToolUse` hook's `additionalContext` and works on it before
+stopping (another step, with that text), and a `Stop` hook's `decision: block` continues the turn
+with the reason; neither emits a `result` before the turn ends.
 
 Everything observable is appended to $HOME/fake-claude-runs.jsonl (HOME == config dir).
 """
@@ -65,13 +72,34 @@ def transcript(obj):
     with open(TRANSCRIPT, "a") as f:
         f.write(json.dumps(obj) + "\n")
 
-def hook(sync, payload):
+def managed_hooks():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, "managed-settings.json"),
+              os.path.join(here, "..", "..", "..", "protocol", "claude-code", "managed-settings.json")):
+        if os.path.exists(p):
+            return json.load(open(p))["hooks"]
+    sys.exit("fake_claude: no managed-settings.json")
+
+HOOKS = managed_hooks()
+
+def hook(payload):
+    """Run the managed hooks for `payload`'s event, with `nest` from the MCP config standing in for
+    the installed path; the output of a synchronous one (`--sync`) is returned."""
     payload = dict(payload, session_id=SESSION, transcript_path=TRANSCRIPT, cwd=os.getcwd())
-    p = subprocess.run([NEST, "hook"] + (["--sync"] if sync else []), input=json.dumps(payload).encode(),
-                       capture_output=True, env=os.environ.copy(), timeout=20)
-    text = p.stdout.decode().strip()
-    out = json.loads(text) if text else {}
-    log("hook", event=payload["hook_event_name"], sync=sync, exit=p.returncode, output=out)
+    out = {}
+    for group in HOOKS.get(payload["hook_event_name"], []):
+        for h in group["hooks"]:
+            args = h["command"].split()[1:]
+            try:
+                p = subprocess.run([NEST] + args, input=json.dumps(payload).encode(), capture_output=True,
+                                   env=os.environ.copy(), timeout=h.get("timeout", 60))
+                text, code = p.stdout.decode().strip(), p.returncode
+            except subprocess.TimeoutExpired:
+                text, code = "", "timeout"
+            sync = "--sync" in args
+            if sync and text:
+                out = json.loads(text)
+            log("hook", event=payload["hook_event_name"], sync=sync, exit=code, output=json.loads(text) if text else {})
     return out
 
 class Mcp:
@@ -124,7 +152,7 @@ emit({"type": "system", "subtype": "init", "cwd": os.getcwd(), "tools": ["TodoWr
       "mcp_servers": [{"name": "nest", "status": "connected"}], "model": "claude-opus-5-5", "permissionMode": "dontAsk",
       "apiKeySource": "ANTHROPIC_API_KEY" if TOKEN.startswith("apisrc") else "none", "claude_code_version": "2.1.296",
       "capabilities": ["interrupt_receipt_v1", "interrupt_cancel_queued_v1"], "uuid": str(uuid.uuid4())})
-hook(True, {"hook_event_name": "SessionStart", "source": "resume" if resume_path else "startup"})
+hook({"hook_event_name": "SessionStart", "source": "resume" if resume_path else "startup"})
 mcp = Mcp()
 mcp.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}})
 mcp.send("notifications/initialized", notify=True)
@@ -163,7 +191,7 @@ def tool(name, args):
     tid = "toolu_" + uuid.uuid4().hex[:12]
     emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": tid, "name": "mcp__nest__" + name, "input": args}]}, "parent_tool_use_id": None})
     transcript({"type": "assistant", "tool_use": {"id": tid, "name": name, "input": args}})
-    pre = hook(True, {"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__" + name, "tool_input": args, "tool_use_id": tid})
+    pre = hook({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__" + name, "tool_input": args, "tool_use_id": tid})
     decision = pre.get("hookSpecificOutput", {}).get("permissionDecision")
     interrupted = False
     if decision != "allow":
@@ -180,18 +208,54 @@ def tool(name, args):
         is_error = result.get("isError", False)
     emit({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": [{"type": "text", "text": text}], "is_error": is_error}]}, "parent_tool_use_id": None})
     transcript({"type": "user", "tool_result": {"id": tid, "text": text, "is_error": is_error}})
-    hook(False, {"hook_event_name": "PostToolUse", "tool_name": "mcp__nest__" + name, "tool_input": args, "tool_response": {"text": text}})
-    log("tool", name=name, args=args, decision=decision, text=text, is_error=is_error, interrupted=interrupted)
-    return interrupted
+    post = hook({"hook_event_name": "PostToolUse", "tool_name": "mcp__nest__" + name, "tool_input": args, "tool_response": {"text": text}, "tool_use_id": tid})
+    context = post.get("hookSpecificOutput", {}).get("additionalContext")
+    if context:
+        transcript({"type": "attachment", "hook_additional_context": context})
+    log("tool", name=name, args=args, decision=decision, text=text, is_error=is_error, interrupted=interrupted, context=context)
+    return interrupted, context
+
+def say(text):
+    emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}, "parent_tool_use_id": None})
+    transcript({"type": "assistant", "text": text})
+
+def stop_chain():
+    """The Stop hook, again for every `block` (whose reason the model reads and answers)."""
+    active = False
+    while True:
+        stop = hook({"hook_event_name": "Stop", "stop_hook_active": active})
+        if stop.get("decision") != "block":
+            return
+        transcript({"type": "user", "message": {"role": "user", "content": stop.get("reason", "")}})
+        say("noted: " + stop.get("reason", "")[:40])
+        active = True
+
+def scripted(path):
+    sc = json.load(open(path))
+    for step in sc["steps"]:
+        name, args = step["tool"], step["args"]
+        tool(name, args)
+        last = RUN["events"][-1]
+        with open(sc["results"], "a") as f:
+            f.write(json.dumps({"label": step.get("label", name), "tool": name, "text": last.get("text"),
+                                "is_error": last.get("is_error"), "decision": last.get("decision")}) + "\n")
+            f.flush()
+    say("scenario done")
+    stop_chain()
+    emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": len(sc["steps"]), "duration_ms": 12, "total_cost_usd": 0.0,
+          "usage": {"input_tokens": 100, "output_tokens": 20}, "stop_reason": "end_turn", "result": "done"})
 
 def turn(text):
-    hook(False, {"hook_event_name": "UserPromptSubmit", "prompt": text})
+    if text.startswith("E2E "):
+        return scripted(text[4:].strip())
+    hook({"hook_event_name": "UserPromptSubmit", "prompt": text})
     stop_active, steps = False, 0
     while True:
         steps += 1
         transcript({"type": "user", "message": {"role": "user", "content": text}})
         cmd = "sleep 30" if "SLOW" in text else "echo " + text.split("\n")[0][:40]
-        if tool("Bash", {"command": cmd}):
+        interrupted, context = tool("Bash", {"command": cmd})
+        if interrupted:
             for m in pending_interrupt:
                 emit({"type": "control_response", "response": {"subtype": "success", "request_id": m["request_id"], "response": {"still_queued": []}}})
             pending_interrupt.clear()
@@ -199,10 +263,13 @@ def turn(text):
                   "total_cost_usd": 0.0, "usage": {"input_tokens": 1, "output_tokens": 1}, "stop_reason": "interrupted", "result": "interrupted"})
             return
         if "PLATFORM" in text:
-            tool("notify", {"to": "captain", "message": "hello from fake claude"})
-        emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "done: " + text[:40]}]}, "parent_tool_use_id": None})
-        transcript({"type": "assistant", "text": "done: " + text[:40]})
-        stop = hook(True, {"hook_event_name": "Stop", "stop_hook_active": stop_active})
+            more = tool("notify", {"to": "captain", "message": "hello from fake claude"})[1]
+            context = "\n".join(c for c in (context, more) if c)
+        say("done: " + text[:40])
+        if context:
+            text = context
+            continue
+        stop = hook({"hook_event_name": "Stop", "stop_hook_active": stop_active})
         if stop.get("decision") == "block":
             text, stop_active = stop.get("reason", ""), True
             continue
@@ -222,7 +289,7 @@ try:
             turn(text)
         elif m.get("type") == "control_request":
             emit({"type": "control_response", "response": {"subtype": "success", "request_id": m["request_id"], "response": {"still_queued": []}}})
-    hook(False, {"hook_event_name": "SessionEnd", "reason": "stdin closed"})
+    hook({"hook_event_name": "SessionEnd", "reason": "stdin closed"})
     delay = os.path.join(HOME, "fake-exit-delay-ms")
     if os.path.exists(delay):
         time.sleep(int(open(delay).read().strip() or "0") / 1000)
