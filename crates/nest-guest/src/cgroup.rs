@@ -28,10 +28,6 @@ impl Cgroups {
         Cgroups { root: Some(root.to_path_buf()) }
     }
 
-    pub fn disabled() -> Cgroups {
-        Cgroups { root: None }
-    }
-
     pub fn enabled(&self) -> bool {
         self.root.is_some()
     }

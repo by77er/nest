@@ -219,7 +219,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 - **PDFs:** `pages` (max 20) are rendered with `pdftotext -layout` (capability `pdf`). Without `pages`, PDFs of 10 pages or fewer are read whole. Otherwise `is_error` asking for `pages`.
 - **Helpers** (`pdftotext`, `pdfinfo`, `vips`, `convert`) run as the sandbox user in the agent's environment and a `calls/` cgroup, with a 30 s deadline and an output cap (8 MiB for text).
 - **Notebooks** (`.ipynb`): cells and outputs rendered as text. Over 256 KiB → `is_error`.
-- **Errors:** directories → `is_directory`; missing files → `is_error` text `File does not exist.`
+- **Errors:** directories, missing files and non-regular files → `is_error` text (e.g. `File does not exist.`).
 - **Read tracking:** a read that **wasn't partial** records `{mtime_ns, size, sha256}` per (agent, path).
 
 **`Write {file_path, content}`**
@@ -324,7 +324,6 @@ nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a flee
 | `unknown_task` | TaskOutput / TaskStop |
 | `busy` (retryable) | Before `configure`, during `prepare_snapshot` freeze, or (v2) over an admission cap or the frame-memory budget |
 | `sync_failed` (v2) | `flush` or `prepare_snapshot` hit a writeback error |
-| `not_found`, `is_directory`, `not_read`, `not_utf8`, `old_string_not_found`, `old_string_ambiguous`, `too_large` | Code names for tool-level failures. The model sees them as `is_error` text, and `error` frames use them only when the call couldn't run at all. |
 | `connect_refused` (retryable) | Ingress TCP |
 | `unknown_terminal` (v2) | Ingress `pty_attach` |
 | `internal` | Anything else |

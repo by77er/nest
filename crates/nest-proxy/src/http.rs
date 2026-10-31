@@ -80,34 +80,23 @@ pub async fn serve_https_transparent(ctx: Arc<ConnCtx>, mut s: TcpStream) {
     tls_flow(ctx, Prefixed::new(raw, s), host, 443, info).await;
 }
 
-/// `:80` via nft redirect: plaintext HTTP/1.1, routed per request by `Host`.
-pub async fn serve_http_transparent(ctx: Arc<ConnCtx>, s: TcpStream) {
+/// HTTP/1.1 listeners: `:80` via nft redirect (plaintext, routed per request by `Host`), or with
+/// `explicit`, `:3128 + slot`, the per-agent explicit proxy (CONNECT tunnels and absolute-form HTTP).
+pub async fn serve_h1(ctx: Arc<ConnCtx>, s: TcpStream, explicit: bool) {
     let drop = ctx.sandbox.drop.clone();
     let svc = service_fn(move |req| {
         let ctx = ctx.clone();
-        async move { Ok::<_, Infallible>(plain_request(ctx, req, false).await) }
+        async move {
+            let resp = if explicit { explicit_request(ctx, req).await } else { plain_request(ctx, req, false).await };
+            Ok::<_, Infallible>(resp)
+        }
     });
     let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_TIMEOUT)
         .serve_connection(TokioIo::new(s), svc)
         .with_upgrades();
-    tokio::select! { _ = drop.cancelled() => {}, r = conn => if let Err(e) = r { tracing::debug!("http transparent: {e}") } }
-}
-
-/// `:3128 + slot`: per-agent explicit proxy (CONNECT tunnels and absolute-form HTTP).
-pub async fn serve_explicit(ctx: Arc<ConnCtx>, s: TcpStream) {
-    let drop = ctx.sandbox.drop.clone();
-    let svc = service_fn(move |req| {
-        let ctx = ctx.clone();
-        async move { Ok::<_, Infallible>(explicit_request(ctx, req).await) }
-    });
-    let conn = hyper::server::conn::http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_TIMEOUT)
-        .serve_connection(TokioIo::new(s), svc)
-        .with_upgrades();
-    tokio::select! { _ = drop.cancelled() => {}, r = conn => if let Err(e) = r { tracing::debug!("explicit proxy: {e}") } }
+    tokio::select! { _ = drop.cancelled() => {}, r = conn => if let Err(e) = r { tracing::debug!(explicit, "http/1.1 listener: {e}") } }
 }
 
 /// `:20000 + n`: raw TCP to one `host:port`, only to addresses our resolver returned.

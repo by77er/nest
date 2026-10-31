@@ -100,9 +100,9 @@ async fn accept_loop(
         tokio::spawn(async move {
             match purpose {
                 ListenerPurpose::Dns => dns::serve_tcp_conn(ctx.session.clone(), ctx.sandbox.clone(), s).await,
-                ListenerPurpose::HttpTransparent => http::serve_http_transparent(ctx, s).await,
+                ListenerPurpose::HttpTransparent => http::serve_h1(ctx, s, false).await,
                 ListenerPurpose::HttpsTransparent => http::serve_https_transparent(ctx, s).await,
-                ListenerPurpose::Explicit { .. } => http::serve_explicit(ctx, s).await,
+                ListenerPurpose::Explicit { .. } => http::serve_h1(ctx, s, true).await,
                 ListenerPurpose::TcpException { rule } => http::serve_tcp_exception(ctx, s, rule).await,
             }
         });
