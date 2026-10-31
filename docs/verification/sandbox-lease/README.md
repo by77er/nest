@@ -1,6 +1,6 @@
 # Sandbox lease, epoch, fencing and salvage: inventory
 
-The protocol between SandboxDO, FleetDO and nestd that decides which host runs a sandbox, at which epoch, and whose commits move its head. Written as a reference for a model (TLA+ or similar). Every claim about code cites `file:line` on main (`edf6829`); `sandbox.ts` is `control-plane/src/do/sandbox.ts`, `fleet.ts` is `control-plane/src/do/fleet.ts`, `host.rs` is `crates/nestd/src/host.rs`. Design intent is in [fencing](../../sandbox/fencing/), [SandboxDO](../../control-plane/durable-objects/sandbox/), [FleetDO](../../control-plane/durable-objects/fleet/) and [nestd](../../compute/nestd/).
+The protocol between SandboxDO, FleetDO and nestd that decides which host runs a sandbox, at which epoch, and whose commits move its head. Written as a reference for a model (TLA+ or similar). Every claim about code cites `file:line` on main (`edf6829`), except SandboxDO's transitions, which cite the function in `control-plane/src/lib/sandbox-lease.ts` (the pure core, one function per action, checked by a seeded random walk in `control-plane/test/sandbox-lease-core.test.ts`); `sandbox.ts` is `control-plane/src/do/sandbox.ts`, `fleet.ts` is `control-plane/src/do/fleet.ts`, `host.rs` is `crates/nestd/src/host.rs`. Design intent is in [fencing](../../sandbox/fencing/), [SandboxDO](../../control-plane/durable-objects/sandbox/), [FleetDO](../../control-plane/durable-objects/fleet/) and [nestd](../../compute/nestd/).
 
 > **Since** (checked on `main` at b63c0a3): the bugs in §8 that the pilot confirmed (the no-capacity epoch rollback, destroy during placement, the double run after a lapse, L1 and L2) are still in the code. Salvage is now authorized against SandboxDO's full `epochs` table (#32), which doesn't change the rollback case: the rolled-back epoch is the current one.
 
@@ -20,22 +20,22 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 
 ### 2.1 SandboxDO (`info.state`, `host`, `placing`, `epoch`)
 
-`SandboxState` = creating, restoring, running, suspending, suspended, archiving, archived, fenced, destroyed, failed (`control-plane/src/protocol/model.ts:84-87`). There is no `paused`. The placement table in the SandboxDO doc (`unplaced/placing/placed/evacuating`) is not built; the code derives it: unplaced = `host = null ∧ placing = null`, placing = `placing ≠ null`, placed = `host ≠ null`. `ACTIVE_STATES` = creating, restoring, running, suspending, suspended (`sandbox.ts:82`).
+`SandboxState` = creating, restoring, running, suspending, suspended, archiving, archived, fenced, destroyed, failed (`control-plane/src/protocol/model.ts:84-87`). There is no `paused`. The placement table in the SandboxDO doc (`unplaced/placing/placed/evacuating`) is not built; the code derives it: unplaced = `host = null ∧ placing = null`, placing = `placing ≠ null`, placed = `host ≠ null`. `gone` = destroyed or archived (`lib/sandbox-lease.ts`): final, and the alarm places any unplaced sandbox that isn't gone (a suspended one only while someone works, `placeWanted`).
 
 | Transition | Trigger | Guard | Effect | Code |
 |---|---|---|---|---|
 | Create | operator | no `info` | epoch 0, `creating`, then Claim | `sandbox.ts:176-208` |
-| Claim | `placeCurrentEpoch` (create, wake, leaseLost, evicted with work, alarm `place`, retryPlacement) | after `reconcilePlacing`; not destroyed/archived; `host = null`; `placing = null` | `epoch := epoch+1; placing := epoch; placing_ms := now`; arm `place` at +60 s; **await** `FleetDO.place` | `259-297` |
-| Placed | place returned host h | `placing = e`, not destroyed/archived | `placing := null; host := h; state := restoring/creating; history += (e, h)`; clear `place`. Guard false: no effect and no follow-ups (B7), or Destroy's cleanup | `placeCurrentEpoch` |
-| NoCapacity | place returned null | `placing = e` | `placing := null`; **`epoch := e-1` if still e**; `place` at +30 s | `311-312`, `332` |
-| Refused | place threw FORBIDDEN | `placing = e` | as NoCapacity, but `place` cleared, error rethrown | `302-303`, `312`, `322` |
-| Unknown | place threw anything else, or this DO reset, or the answer was lost | — | marker stays; `place` deadline reconciles | `306-308` |
-| Reconcile | alarm `place`, `wake`, next Claim | `placing = e`, older than 60 s; else re-arm | **await** `leaseOf`; then if `placing` still e: clear it; adopt if lease `(h, e, ¬expired)`: `host := h; state := lease.state ?? ...; history += (e, h)` | `220-253` |
-| Report | `reportState(h, e, s)` via FleetDO | `e = epoch ∧ h = host` | `state := s` (any state, `fenced` included) | `361-374` |
+| Claim | `placeCurrentEpoch` (create, wake, leaseLost, evicted with work, alarm `place`, retryPlacement) | after `reconcilePlacing`; not destroyed/archived; `host = null`; `placing = null` | `epoch := epoch+1; placing := epoch; placing_ms := now`; arm `place` at +60 s; **await** `FleetDO.place` | `claim` |
+| Placed | place returned host h | `placing = e`, not destroyed/archived | `placing := null; host := h; state := restoring/creating; history += (e, h)`; clear `place`. Guard false: no effect and no follow-ups (B7), or Destroy's cleanup | `placeAnswered` |
+| NoCapacity | place returned null | `placing = e` | `placing := null`; **`epoch := e-1` if still e**; `place` at +30 s | `placeAnswered` |
+| Refused | place threw FORBIDDEN | `placing = e` | as NoCapacity, but `place` cleared, error rethrown | `placeAnswered` |
+| Unknown | place threw anything else, or this DO reset, or the answer was lost | — | marker stays; `place` deadline reconciles | `placeAnswered` |
+| Reconcile | alarm `place`, `wake`, next Claim | `placing = e`, older than 60 s; else re-arm | **await** `leaseOf`; then if `placing` still e: clear it; adopt if lease `(h, e, ¬expired)`: `host := h; state := lease.state ?? ...; history += (e, h)`; a gone sandbox clears the marker and adopts nothing | `reconciled` |
+| Report | `reportState(h, e, s)` via FleetDO | `e = epoch ∧ h = host` | `state := s` (any state, `fenced` included) | `reported` |
 | LeaseLost | FleetDO `processReassign` | not destroyed/archived; `(epoch = e ∧ (host = h ∨ (host = null ∧ placing = null)))`, or already handled `(host = null ∧ lost_from = h)` | `host := null; lost_from := h` (`working` kept: brains run elsewhere); Claim excluding h if `hostIsDead` | `leaseLost` |
-| Evicted | FleetDO `processEvictions` | `host = h ∧ epoch = e` | `host := null; state := suspended`; Claim (excluding h) if anyone works | `407-417` |
-| CreateFailed | `commandFailed(h, sandbox_create, e)` | `e = epoch ∧ h = host` | re-issue create at the **same** epoch up to 3 times, then `state := failed` | `435-454` |
-| Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseLease(e)` (not waiting for the fence), `host := null`, Claim | `341-355` |
+| Evicted | FleetDO `processEvictions` | `host = h ∧ epoch = e` | `host := null; state := suspended`; Claim (excluding h) if anyone works | `evicted` |
+| CreateFailed | `commandFailed(h, sandbox_create, e)` | `e = epoch ∧ h = host` | re-issue create at the **same** epoch up to 3 times, then `state := failed` | `createFailed` |
+| Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseLease(e)` (not waiting for the fence), `host := null`, Claim | `failedHolder`, `retried` |
 | Destroy | operator | — | `state := destroyed; host := null; placing := null` first (no await before it); then `sandbox_destroy` to the old host if any; **await** `releaseLease` (all epochs); clear `place`. A Placed or Reconcile continuation that then finds the sandbox gone releases the lease it got at e and sends `sandbox_destroy(e)` to its host (`discardPlacement`) | `destroy`, `discardPlacement` |
 | Commit | `commit(h, ev)` via FleetDO | see 2.4 | may move `head` | `552-611` |
 
@@ -169,18 +169,19 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 
 | Model action | Code |
 |---|---|
-| `Claim`, `PlaceReply`, `PlaceFail` | `SandboxDO.placeCurrentEpoch` (`sandbox.ts:259-335`) |
+| `Claim`, `PlaceReply`, `PlaceFail` | `claim`, `placeAnswered` in `control-plane/src/lib/sandbox-lease.ts`; the shell `SandboxDO.placeCurrentEpoch` |
 | `Grant` | `FleetDO.place` (`fleet.ts:1191-1260`) |
-| `Reconcile` | `SandboxDO.reconcilePlacing` + `FleetDO.leaseOf` (`sandbox.ts:220-253`, `fleet.ts:1268-1275`) |
+| `Reconcile` | `reconcileAt`, `reconciled` (`lib/sandbox-lease.ts`); the shell `SandboxDO.reconcilePlacing` + `FleetDO.leaseOf` (`fleet.ts:1268-1275`) |
 | `Expire`, `Terminate`, `Ec2Dead` | `tick`, `expireHost`, `pollStonith`, `confirmHostDead` (`fleet.ts:1304-1332`, `1749-1842`) |
 | `StonithFence`, `FenceResult` | `ensureStonithFence`, `onCommandResult` (`fleet.ts:1805-1825`, `1099-1121`) |
-| `Enqueue`, `Reassign`, `LeaseLost` | `queueReassign`, `processReassign`, `SandboxDO.leaseLost` (`fleet.ts:1845-1873`, `sandbox.ts:460-478`) |
+| `Enqueue`, `Reassign`, `LeaseLost` | `queueReassign`, `processReassign` (`fleet.ts:1845-1873`); `leaseLost` (`lib/sandbox-lease.ts`) |
 | `Hello` | `onHello`, `reconcileSandboxes`, `dropUnreported` (`fleet.ts:729-844`) |
 | `Heartbeat`, `Revoke` | `onHeartbeat` (`fleet.ts:941-956`), nestd `Revoked` (`host.rs:812-819`) |
 | `HostCreate`, `HostFence`, `SelfFence`, `Salvage`, `Retire`, `HostDestroy`, `HostCrash` | `host.rs:1404-1491`, `1097-1160`, `1056-1094`, `1170-1221`, `1825-1846`, `395-488` |
 | `Commit` | `SandboxDO.commit` (`sandbox.ts:552-611`) |
-| `Evict` | `evict`, `processEvictions`, `SandboxDO.evicted` (`fleet.ts:1561-1589`, `sandbox.ts:407-417`) |
-| `Destroy`, `Retry` | `sandbox.ts:507-519`, `341-355` |
+| `Evict` | `evict`, `processEvictions` (`fleet.ts:1561-1589`); `evicted` (`lib/sandbox-lease.ts`) |
+| `Destroy`, `Retry` | `destroyed`, `failedHolder` + `retried` (`lib/sandbox-lease.ts`); shells `SandboxDO.destroy`, `retryPlacement` |
+| `Report`, `CreateFailed`, alarm `place` | `reported`, `createFailed`, `placeWanted` (`lib/sandbox-lease.ts`); every host-event guard is `holds`, every finality check `gone` |
 | `ReapStale` | `fleet.ts:890-912` |
 
 **Invariants worth checking now, in code or tests:**
