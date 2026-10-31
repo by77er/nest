@@ -43,7 +43,6 @@ async function sharedHealth(env: Env): ReturnType<typeof checkHealth> {
 /** A host may reconnect its fleet channel this long after its token expired (and gets a fresh one). */
 const FLEET_TOKEN_GRACE_MS = 24 * 3_600_000;
 
-
 /** Cells are names of FleetDOs: well-formed, and from the configured list when there is one. */
 function checkCell(env: Env, cell: string): string {
   if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(cell)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "invalid cell name");
@@ -96,23 +95,19 @@ async function enroll(req: Request, env: Env): Promise<Response> {
   if (r.protocol_version !== PROTOCOL_VERSION) {
     throw new NestError(ErrorCodes.UNSUPPORTED_VERSION, `server speaks ${PROTOCOL_VERSION}`);
   }
-  let identity: InstanceIdentity | null = null;
   try {
-    return await enrollWith(r, env, identity);
+    let identity: InstanceIdentity | null = null;
+    if (r.proof.type === "aws_identity_document") {
+      if (!env.AWS_IDENTITY_CERT_PEM) throw new NestError(ErrorCodes.UNAUTHORIZED, "AWS identity enrollment is not configured", 401);
+      identity = await new CmsRsaIdentityVerifier(env.AWS_IDENTITY_CERT_PEM).verify(r.proof.document_b64, r.proof.pkcs7_b64);
+    }
+    return json(await fleet(env, checkCell(env, r.cell)).enroll(r, r.cell, identity));
   } catch (e) {
     // The refusal reaches only the host; log it so an operator can see why a host doesn't join.
     const err = asNestError(e);
     console.warn(`enroll refused (${r.proof.type}, cell ${r.cell}): ${err ? `${err.code}: ${err.message}` : String(e)}`);
     throw e;
   }
-}
-
-async function enrollWith(r: z.infer<typeof EnrollRequest>, env: Env, identity: InstanceIdentity | null): Promise<Response> {
-  if (r.proof.type === "aws_identity_document") {
-    if (!env.AWS_IDENTITY_CERT_PEM) throw new NestError(ErrorCodes.UNAUTHORIZED, "AWS identity enrollment is not configured", 401);
-    identity = await new CmsRsaIdentityVerifier(env.AWS_IDENTITY_CERT_PEM).verify(r.proof.document_b64, r.proof.pkcs7_b64);
-  }
-  return json(await fleet(env, checkCell(env, r.cell)).enroll(r, r.cell, identity));
 }
 
 /** A client's id for a submission (body `request_id` or `Idempotency-Key`): a retry with it is applied once. */
@@ -156,22 +151,20 @@ interface Ctx<P extends string, B> {
   /** A `host` route's verified token. */
   claims: HostClaims;
 }
-interface Route {
+interface RouteOf<P extends string, S, B> {
   method: Method;
-  path: string;
+  path: P;
   auth: Auth;
   graceMs?: number;
-  body?: z.ZodType;
+  body?: S;
   /** The body may be empty (parsed as `{}`). */
   optionalBody?: boolean;
   status?: number;
   /** A Response passes through; `undefined` answers `{ok: true}`; anything else is JSON with `status`. */
-  run(c: Ctx<string, unknown>): Promise<unknown>;
+  run(c: Ctx<P, B>): Promise<unknown>;
 }
-function route<P extends string, S extends z.ZodType | undefined = undefined>(r: {
-  method: Method; path: P; auth: Auth; graceMs?: number; body?: S; optionalBody?: boolean; status?: number;
-  run(c: Ctx<P, S extends z.ZodType ? z.output<S> : undefined>): Promise<unknown>;
-}): Route {
+type Route = RouteOf<string, z.ZodType, unknown>;
+function route<P extends string, S extends z.ZodType | undefined = undefined>(r: RouteOf<P, S, S extends z.ZodType ? z.output<S> : undefined>): Route {
   return r as unknown as Route;
 }
 
