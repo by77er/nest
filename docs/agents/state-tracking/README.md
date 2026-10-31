@@ -32,7 +32,10 @@ The runner owns the Claude Code process, so it sees the **stream-json output** d
 |---|---|
 | `PreToolUse` policy gate | Grant and policy cache in the runner, pushed down from AgentDO. A call no rule allows is held with `defer` and escalated as a question; it runs once approved (see [runner](../runner/#lifecycle)) |
 | `PermissionRequest` | Same cache |
-| `Stop` | **Local inbox mirror:** queued messages come back as `decision: "block"`, at most `max_stop_continuations` per stop chain (`stop_hook_active: false` starts a new chain) |
+| `PostToolUse` | **Local inbox mirror,** mid-turn: messages pending at a tool boundary go to the model as `additionalContext` (unverified that Claude Code shows it mid-turn under `-p`; `NEST_RUNNER_INBOX_AT_TOOL_BOUNDARY=0` leaves only `Stop`) |
+| `Stop` | **Local inbox mirror:** messages still pending come back as `decision: "block"`, at most `max_stop_continuations` per stop chain (`stop_hook_active: false` starts a new chain) |
+
+The mirror hands a message out only while a turn runs and isn't being interrupted, at most once (under the agent's lock), and confirms it (`inbox_delivered`) only once the hook's answer was written; otherwise it is pending again.
 
 Sync hooks are answered only for a peer process descending from the declared agent's Claude Code; others get the fail-safe fallback.
 

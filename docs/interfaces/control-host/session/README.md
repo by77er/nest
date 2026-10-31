@@ -27,7 +27,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `hello_ack` | first frame | `durable_bytes` for the stream currently being received (the committed base, or a new base or session in progress); the runner resends session bytes from here. `last_seq`. |
 | `segment_ack` | no | `durable_bytes`, sent after the bytes are durable in R2 |
 | `run_turn` | seq | `turn`, `input{kind, text}`, written to Claude Code's stdin as a user message |
-| `inbox` | seq | `InboxMessage`, delivered mid-turn through stdin or at `Stop` through the inbox mirror. `interrupt: true` interrupts first |
+| `inbox` | seq | `InboxMessage`, delivered through the inbox mirror at a tool boundary (`PostToolUse`) or at `Stop`, never through stdin. `interrupt: true` interrupts first |
 | `interrupt` | seq | The stream-json interrupt control message |
 | `cache_update` | seq | `AgentCache{version, rules, inbox, max_stop_continuations}` for answering hooks locally |
 | `tool_result` | seq | `outcome: ok{content} \| error{error} \| pending{ask, message}` |
@@ -60,7 +60,7 @@ runner                                      AgentDO                          R2
 ## Turns, inbox and caches
 
 - **One turn at a time.** AgentDO queues `run_turn`s and sends the next one after `turn_completed`.
-- **Inbox during a turn:** the runner writes it to stdin, where Claude Code queues it. When the turn ends, the `Stop` hook returns the pending mirror messages as `decision: "block"`, up to `max_stop_continuations` times.
+- **Inbox during a turn:** the runner hands it to the model at the next tool boundary, as `PostToolUse` `additionalContext` (unverified that Claude Code shows it mid-turn under `-p`). When the turn ends, the `Stop` hook returns messages still pending as `decision: "block"`, up to `max_stop_continuations` times per stop chain. A message no hook handed out stays in the mirror and AgentDO queues it as the next turn. stdin carries only `run_turn` text, one message per turn.
 - **Interrupts:** `interrupt` or `inbox{interrupt: true}` sends the stream-json interrupt control message. If the process has been unresponsive for 10 s, the runner falls back to SIGINT, then `cgroup.kill`.
 - **`cache_update`** replaces the rules and inbox mirror used by `PreToolUse`, `PermissionRequest` and `Stop`. The first matching rule wins; no match means `ask`: the runner emits an `escalation{call, tool, input}` event and denies the call with "pending approval (request `call`)". AgentDO records an async ask (captain's `needs_input`); the answer arrives as an `ask_answer` turn. Updates with a lower `version` are ignored.
 
