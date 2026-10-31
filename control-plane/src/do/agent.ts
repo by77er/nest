@@ -223,11 +223,6 @@ const CAPACITY_RETRY_MAX_MS = 5 * 60_000;
 /** The same record (a brain, an intent): equal as stored. */
 const same = <T>(a: T, b: T) => JSON.stringify(a) === JSON.stringify(b);
 
-/** A host a brain may start on: an active, connected brain host of this release (docs/compute/brain-hosts/). */
-function brainHostUsable(st: { status: string; connected: boolean; current: boolean; role: string } | null): boolean {
-  return !!st && st.status === "active" && st.connected && st.current && st.role === "brain";
-}
-
 export class AgentDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   // `!`: set in the constructor, except on the health instance, which serves only `health()`.
@@ -694,9 +689,10 @@ export class AgentDO extends DurableObject<Env> {
     return host;
   }
 
-  /** `host` is one a brain may start on (`brainHostUsable`), or the start is refused. */
+  /** `host` is an active, connected brain host of this release (docs/compute/brain-hosts/), or the start is refused. */
   private async requireBrainHost(cell: string, host: string): Promise<void> {
-    if (!brainHostUsable(await this.fleet(cell).hostStatus(host))) {
+    const st = await this.fleet(cell).hostStatus(host);
+    if (!(st && st.status === "active" && st.connected && st.current && st.role === "brain")) {
       throw new NestError(ErrorCodes.FORBIDDEN, `${host} is not an active, connected brain host of this release in ${cell}`, 409);
     }
   }
