@@ -2232,7 +2232,10 @@ impl Inner {
         timeout: Duration,
     ) -> (tokio::sync::MutexGuard<'a, Sbx>, Result<Option<GenerationRecord>, ErrorBody>) {
         // Recorded before it goes out: a restart asks again under this id rather than send another.
-        s.persist_or_log(Some(&c));
+        // Unrecorded, it doesn't go out (a crash would lose its id).
+        if let Err(e) = s.persist(Some(&c)) {
+            return (s, Err(error(error_codes::INTERNAL, format!("recording commit {}: {e}", c.request), true)));
+        }
         let (tx, rx) = oneshot::channel();
         self.pending_commits.lock().expect("pending").insert(c.request.clone(), tx);
         self.emit(HostEventBody::CommitRequest {

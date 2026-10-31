@@ -1715,6 +1715,26 @@ async fn a_drain_past_its_deadline_keeps_the_unanswered_commit() {
     assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Running));
 }
 
+/// N7: a commit whose request can't be recorded in `meta.json` first fails (retryable) and is
+/// never sent: sent unrecorded, a crash would lose its id, and the restart's salvage could not ask
+/// again under it. It used to be logged and sent anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_that_cant_be_recorded_is_not_sent() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let inc = h.dir.path().join("state/sandboxes/sbx_1/1");
+    std::fs::set_permissions(&inc, std::fs::Permissions::from_mode(0o555)).unwrap();
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: SandboxId("sbx_1".into()), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    let outcome = h.fleet.result("cmd_ck").await;
+    std::fs::set_permissions(&inc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(&outcome, CommandOutcome::Error { error } if error.retryable), "{outcome:?}");
+    let sent = h.fleet.log.lock().unwrap().events.iter().filter(|e| matches!(e.body, HostEventBody::CommitRequest { .. })).count();
+    assert_eq!(sent, 0, "nothing goes out unrecorded");
+    checkpoint(&h.fleet, "cmd_ck_2", "sbx_1", 1).await;
+}
+
 /// nestd review #5(b): an attach to a sandbox suspended to disk (no guest connection) must not
 /// bind the agent's explicit-proxy listener; otherwise every later attach, after resume
 /// included, hits EADDRINUSE on that port.
