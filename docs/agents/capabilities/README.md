@@ -20,7 +20,7 @@ prompt:  |                                  # added to the system prompt
 - **Parameters (built for `ledger` only):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. Until attenuation is built a spawner can't set one and its children get none (not even the template's defaults). A parameter naming several values (`tasks{ledgers}`) is the extension point.
 - **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
-- **Built so far:** `builtin` tools only, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)). The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `tasks` and `tasks-admin`; of the parameters only `ledger` is built (`peers: label:<key>`, `any` aren't), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
+- **Built so far:** `builtin` tools, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)), and the `mcp` source ([mcp/](mcp/): a bearer token, the allowlist, idempotency overrides and the trust flag; AgentDO is the MCP client). `api` isn't built. The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `tasks` and `tasks-admin`; of the parameters only `ledger` is built (`peers: label:<key>`, `any` aren't), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
 
 ## Sources
 
@@ -29,7 +29,7 @@ Every capability's tools run in the control plane or behind it, so credentials s
 | Source | Tools it surfaces | Credentials | Sinks |
 |---|---|---|---|
 | `builtin` | Platform tools from the registry (below) | None | Per tool |
-| `mcp{url, tools?}` | A remote MCP server's tools ([Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)), listed by the control plane and filtered by an allowlist | OAuth or a bearer token in BrokerDO; the control plane is the MCP client | A tool is a sink unless the server marks it `readOnlyHint` ([tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)) and the capability doesn't override it |
+| `mcp{url, auth, tools?, idempotent?, trusted?}` | A remote MCP server's tools ([Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)), listed by the control plane and filtered by an allowlist; see [mcp/](mcp/) | OAuth or a bearer token in BrokerDO; the control plane is the MCP client | A tool is a sink unless the server marks it `readOnlyHint` ([tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)) and the capability doesn't override it |
 | `api{base_url, mode, paths?, auth}` | One tool, `<capability>_request(method, path, query?, body?)` | In BrokerDO; the control plane attaches it to each request | `mode: ro` allows only `GET` and `HEAD` and isn't a sink; `mode: rw` is |
 
 ```yaml
@@ -38,13 +38,13 @@ source: api{base_url: https://api.github.com, mode: ro, paths: [/repos/me/], aut
 prompt: Read-only GitHub REST access to my repos, through `github_ro_request`.
 
 capability: tracker
-source: mcp{url: https://mcp.example.com/mcp, auth: cap:tracker, tools: [list_issues, get_issue, create_comment]}
+mcp: {url: https://mcp.example.com/mcp, auth: cap:tracker, tools: [list_issues, get_issue, create_comment]}   # built: the field is `mcp`
 sinks: {create_comment: approve}
 prompt: The issue tracker: read freely; comment only when asked.
 ```
 
 - **Same pipeline as brokered actions:** every call checks the grant and taint, rate-limits, scans arguments for secrets, gets approval if it's a sink from a tainted session, and is journaled.
-- **Results are untrusted:** every result from an `mcp` or `api` tool sets [taint](../tools/#taint-and-sinks), like web results.
+- **Results are untrusted:** every result from an `mcp` or `api` tool sets [taint](../tools/#taint-and-sinks), like web results, unless the operator marks the capability `trusted: true`. An untrusted `mcp` server's tool list taints too: its descriptions reach the model ([mcp/](mcp/#taint)).
 - **`ro` means no state changes, not no leaks:** requests go only to the configured base URL and path prefixes, so data can reach only that API's operator.
 - **Attenuation:** a spawner can pass on a narrower version of a capability (fewer tools, `ro` instead of `rw`, fewer paths), never a wider one.
 - **MCP servers are remote only.** Hosts never run third-party MCP servers, and neither do guest agents: brains reach these tools only through `nest mcp` → AgentDO → the server. A server that has to run locally (a browser, a database client) runs as a service in a sandbox and is exposed through [ingress](../../sandbox/networking/ingress/) as an `mcp{url}` endpoint. Tools appear to Claude Code as `mcp__nest__<capability>_<tool>`, and the allowlist keeps a large server from flooding the context.

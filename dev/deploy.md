@@ -84,6 +84,12 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Operator steps after the deploy:** add `tasks` to `worker`, and `tasks` and `tasks-admin` to `captain` (`GET /v1/admin/catalog`, then `PUT /v1/admin/templates/<name>` with the capability appended), then spawn with `overrides: {params: {ledger: <name>}}`.
 - **Cloud check:** create a task with `POST /v1/ledgers/<name>/tasks`, read it back, comment, assign it to a test agent spawned with that ledger and see the notice in its inbox. Ledgers aren't deleted, so use a throwaway name.
 
+**This release's rollout rule (remote MCP capabilities): not a one-way deploy.** No Durable Object class is added: AgentDO is the MCP client ([mcp capabilities](../docs/agents/capabilities/mcp/)), so `wrangler rollback` crosses it. No host change: remote tools reach a brain only through `tools_list`, and the new error code `tool_error` is an ordinary tool error to a runner of either release (it prints `code: message`).
+- **Stored data the previous code reads:** CatalogDO capabilities may carry an `mcp` field, which the previous schema strips: after a rollback such a capability gives no tools (a template listing it still expands). AgentDO's record gains `mcp` (ignored and kept), and new tables (`mcp_servers`, `mcp_forwards`) it never reads; a remote tool call after a rollback is `unknown_tool`. BrokerDO's `cap:<name>` secrets are plain rows it already stores and never resolves.
+- **Never set `ALLOW_LOOPBACK_MCP` in a deploy:** it lets a capability name a loopback URL (local dev and e2e only).
+- **Operator steps after the deploy:** store the server's token (`PUT /v1/admin/secrets/cap:<name>`), add the capability (`PUT /v1/admin/capabilities/<name> {"mcp": {"url", "auth": "cap:<name>", "tools": [...]}}`), add it to a template; only later spawns get it.
+- **Cloud check:** with the MCP test Worker (`mcp-test/`) deployed and its token stored as `cap:<name>`, spawn an agent from a template listing the capability and call `echo`, `note_put`/`note_get` and `counter_add`; `GET /calls` on the server shows each call once, with `_meta` (`nest/agent`, `nest/epoch`, `nest/call`, `nest/taint`).
+
 ## Host role names (expand/contract)
 
 The host kinds' rename (`burst` → `sandbox`, `controller` → `brain`) spans two releases, so `wrangler rollback` (and the automatic rollback above) to the previous Worker keeps working.

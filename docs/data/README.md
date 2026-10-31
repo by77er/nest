@@ -47,6 +47,7 @@ Every DO table that would otherwise only grow has one retention rule, a named co
 | SandboxDO | `epochs` (which host held which epoch) | The sandbox's life. `info().history` is read from it, never stored. | Salvage from any older epoch is authorized against it; one small row per placement. |
 | WorkstreamDO | `events`, `user_notifications`, `applied` | The latest 5,000 and 1,000 rows; idempotency keys 7 days. | Bounded history. |
 | AgentDO | `tool_calls`, `asks`, `turns`, `inbox` | Finished rows 7 days; `events` the latest 500; `seg_buffer` until its bytes are acked. | Bounded history. |
+| AgentDO | `mcp_servers`, `mcp_forwards` ([mcp capabilities](../agents/capabilities/mcp/#data)) | `mcp_servers` one row per mcp capability of its spec; `mcp_forwards` settled rows 7 days. | A server's session and cached tool list; each forwarded call's state and outcome, so a call key is forwarded once and a new epoch waits for an older one's forwards. |
 | AgentDO | `segments` (the transcript's R2 segment index) | The agent's life; rows of a superseded base aren't dropped yet (a gap). | The transcript is rebuilt from them. |
 | SandboxDO | `grants` | Until each expires (the `grants` deadline deletes it). | Bounded by live grants. |
 | SandboxDO | `generations` | All of them: generation retention isn't built. | Every generation is a GC root. |
