@@ -2641,13 +2641,12 @@ export class FleetDO extends DurableObject<Env> {
    * STONITH by fence is done once nothing on the host is expired but what a successful fence just
    * covered (`fenced`): a reachable `stonith_pending` host serves again (or drains again: `hostStep`).
    * Never earlier (a hello doesn't do it), so a host that dies before its fence result is still
-   * polled until EC2 confirms it gone. Never for a host whose instance FleetDO is terminating (EC2
-   * and an instance id): its fence frees its sandboxes, but only EC2's answer ends its STONITH.
+   * polled until EC2 confirms it gone. Never for a wedged host (D5), nor one whose instance FleetDO
+   * is terminating (EC2 and an instance id): its fence frees its sandboxes, but only its confirmed
+   * death ends its STONITH.
    */
   private stonithDoneIfClear(host: string, fenced = new Set<string>()): void {
     if (this.leasesOf(host).some((l) => l.expired && !fenced.has(l.sandbox)) || !this.socketFor(host)) return;
-    // A wedged host is done only when STONITH confirms it dead (D5), never by a fence it runs itself;
-    // a drained one (a spot notice, a previous-release nestd: N21) drains again.
     this.move(host, "fence_done");
   }
 

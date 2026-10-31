@@ -30,7 +30,7 @@ A TLA+ model of placement, leases, epochs, fencing, STONITH, salvage and commit 
 
 The B2 tests hold SandboxDO's `await fleet.place` open by wrapping the instance's FleetDO stub; the SandboxDO and FleetDO code is unchanged. Without that, miniflare answers too fast to interleave in 12 attempts.
 
-**Since:** B2 is fixed (`destroy` clears `placing`; a placement answer for a destroyed sandbox releases its lease and destroys the VM, `SandboxDO.discardPlacement`). Its two cases left the repro file and are regression tests, with the assertions inverted, in `control-plane/test/lifecycle.test.ts` ("the lease's guards").
+**Since:** B2 is fixed as next step 3 says (`destroy` marks the sandbox destroyed and clears `placing` before any await, tells FleetDO, whose `place` then refuses it, and a placement answer for a destroyed sandbox releases its lease and destroys the VM, `SandboxDO.discardPlacement`). Its two cases left the repro file and are regression tests in `control-plane/test/lifecycle.test.ts` ("the lease's guards"). The model follows the code: `FixDestroy` is that fix, `MCFixedB2` checks it, and the fence result, like `StonithClear`, no longer reactivates a host whose instance FleetDO is terminating (MCFixedS2 now reaches 4,147,530 distinct states; MCFixedB2 holds over 14,984,623, TLC 1.7.4).
 
 ## What is modelled
 
@@ -134,7 +134,7 @@ Each first counterexample was checked line by line against the code; these were 
 
 1. Fix B1/B1b: check a salvage against FleetDO's lease grants (FleetDO keeps a grant log; `onCommitRequest` attaches "this host held E"), and accept it as an orphan also at the current epoch from a non-holder. Dropping the rollback alone does not fix B1b.
 2. Fix B-B1: in retire, a STALE_EPOCH answer to the resent `unanswered` request must fall through to preparing the salvage (host.rs:2052-2058).
-3. Fix B2: mark `destroying` before the first await and check it in every placement continuation; have FleetDO.place refuse a destroyed sandbox (the registry already records `destroyed_ms`).
+3. Fix B2: mark `destroying` before the first await and check it in every placement continuation; have FleetDO.place refuse a destroyed sandbox (the registry already records `destroyed_ms`). Done on refactor/all.
 4. Fix D1: a create under a lapsed host lease starts fenced (or the watchdog re-checks every new incarnation); and/or STONITH waits for `terminated`, not `shutting-down`.
 5. Fix L1: a lease lost at the epoch still being placed clears the marker and claims again.
 6. Fix L2, O1 and O2: key reassign_queue rows, and ensureStonithFence's skip, by (sandbox, host, epoch); filter placement candidates by `last_rx`. L2 and O1 are fixed on refactor/fleet as modelled (`FixQueue`, `FixStonithFence`): the `reassignments` table, keyed by (sandbox, host, epoch), and the skip matching the lease's own host and epoch.

@@ -1,6 +1,6 @@
 # SandboxLease (TLA+)
 
-A model of the sandbox placement / lease / epoch / fencing / STONITH / salvage / commit protocol as main implements it (edf6829): one sandbox, one FleetDO, two hosts. `SandboxLease.tla` maps each action to code in its header; constants switch each modelled fix or mutation on. The report is in [docs/verification/sandbox-lease/pilot/](../../../docs/verification/sandbox-lease/pilot/).
+A model of the sandbox placement / lease / epoch / fencing / STONITH / salvage / commit protocol as main implements it (edf6829): one sandbox, one FleetDO, two hosts. `SandboxLease.tla` maps each action to code in its header; constants switch each modelled fix or mutation on. The code as refactored (refactor/all) is main with `FixDestroy` (as built: destroyed before any await, FleetDO told first and refusing to place it, a late grant discarded), `FixStonithFence` and `FixQueue` on, and neither `StonithClear` nor a fence result reactivating a host whose instance FleetDO is terminating. The report is in [docs/verification/sandbox-lease/pilot/](../../../docs/verification/sandbox-lease/pilot/).
 
 ## Running
 
@@ -35,6 +35,7 @@ A run that holds prints `Model checking completed. No error has been found.` A v
 | MCMutNoEpochCheck | mutation: commit without the epoch/host check | violates SingleWriter |
 | MCMutHistory | sensitivity: HISTORY_MAX = 1 | violates SalvageNeverDropped |
 | MCFixedS2 | all fixes, F = 1, E = 2, epochs ≤ 2, one disconnect | holds |
+| MCFixedB2 | as MCFixedS2, with one destroy and no disconnect | holds |
 | MCFixedS1, S3, S4, S5 | all fixes, small bounds, other fault classes (S5: no rollback, EpochMonotone) | holds (not completed) |
 | MCDoubleRunNoShutting | main, but STONITH waits for `terminated` | holds (not completed) |
 | MCLive | liveness, all fixes | holds (not completed) |
