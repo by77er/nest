@@ -3,7 +3,7 @@
 // or a throttle, and EC2's instance state never reads an unparseable answer as "gone".
 import { describe, expect, it } from "vitest";
 import { AwsApi } from "../src/lib/aws";
-import { AwsEc2, isDead } from "../src/lib/ec2";
+import { AwsEc2, isDead, type InstanceState } from "../src/lib/ec2";
 import { AwsKms } from "../src/lib/kms";
 import { AwsSsm } from "../src/lib/ssm";
 
@@ -70,6 +70,13 @@ describe("AwsEc2.state", () => {
 
   it("throws on an answer it can't read: a wrong region or account must never confirm a host dead (B-10)", async () => {
     await expect(ec2("<html>a captive portal</html>").state("i-0a")).rejects.toThrow(/no state/);
+  });
+
+  it("only terminated, or an instance EC2 no longer knows, proves a host dead", () => {
+    const dead: Record<InstanceState, boolean> = {
+      pending: false, running: false, "shutting-down": false, terminated: true, stopping: false, stopped: false, unknown: false,
+    };
+    for (const [s, want] of Object.entries(dead)) expect([s, isDead(s as InstanceState)]).toEqual([s, want]);
     expect(isDead(null)).toBe(true);
   });
 });

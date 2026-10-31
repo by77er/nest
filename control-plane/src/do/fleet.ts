@@ -2081,7 +2081,8 @@ export class FleetDO extends DurableObject<Env> {
           // EC2 confirms a retired host's instance gone: now its death is proof (A6).
           this.sql.exec("UPDATE hosts SET lost = 1 WHERE instance_id = ? AND status = ?", r.instance_id, "dead" satisfies HostStatus);
         }
-        else await ec2.terminate(r.instance_id);
+        // Shutting down: already terminating, polled again next tick.
+        else if (state !== "shutting-down") await ec2.terminate(r.instance_id);
       } catch (e) {
         console.error(`FleetDO: terminating ${r.instance_id} failed; will retry`, e);
       }
@@ -2446,6 +2447,7 @@ export class FleetDO extends DurableObject<Env> {
       else if (state === "running" || state === "pending" || state === "stopping" || state === "stopped") {
         await ec2.terminate(h.instance_id);
       }
+      // `shutting-down` (its VMs may still run) or `unknown`: polled again next tick.
     } catch (e) {
       console.error("FleetDO: STONITH poll failed; will retry", e);
     }

@@ -95,7 +95,7 @@ host                                           FleetDO                       EC2
  ╳ partition                                   │
  │ t0+20s: SELF-FENCE                          │ t_rx+30s: lease expired
  │  stop brains, pause VMs,                    │ TerminateInstances(host) ──►│
- │  drop proxy listeners + netns               │◄── state shutting-down ─────│
+ │  drop proxy listeners + netns               │◄── state terminated ────────│
  │                                             │ epoch+1 → sandbox_create{from=head} on another host
  │ (if it ever reconnects) hello{sandboxes}───►│ stale epochs → commands[fence] / revoked
 ```
