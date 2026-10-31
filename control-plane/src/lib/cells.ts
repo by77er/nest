@@ -5,8 +5,7 @@
 //   has no autoscaling: its hosts are added by hand and never retired.
 // - `AWS_CELL_CREDENTIALS` (a secret): JSON object of cell → the access key of that cell's
 //   `nest-<cell>-control-plane` IAM user.
-// A cell missing from either falls back, for one release, to the legacy globals (`AWS_ACCESS_KEY_ID`,
-// `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID`); `cellAws` says which source it used.
+// A cell missing from either has no AWS access for what it lacks: no global fallback.
 import { z } from "zod";
 import type { Env } from "../env";
 
@@ -50,10 +49,7 @@ const AwsCell = z.object({
   sandbox_reserve_mib: z.number().int().positive().default(768),
   /** At most this many sandboxes per host on regular pages; 0 is no cap (memory decides). */
   max_sandboxes_per_host: z.number().int().nonnegative().default(0),
-  /**
-   * The cell's proxy root CA key (the stack's own KMS key), in the cell's region. Optional for one
-   * release: an entry written before the stack carried it falls back to `ROOT_CA_KMS_KEY_ID`.
-   */
+  /** The cell's proxy root CA key (the stack's own KMS key), in the cell's region; without one, the development root. */
   proxy_root_key_arn: z.string().regex(KMS_KEY_ARN).optional(),
   /** Optional for one release: an entry written before brain hosts has none. */
   brain: BrainHosts.optional(),
@@ -123,51 +119,33 @@ export function parseCellCredentials(json: string): Record<string, AwsCredential
   return out;
 }
 
-/** A setting and where it came from: the cell's own entry, the legacy global, or nowhere. */
-export type Sourced<T> = { source: "cell" | "legacy"; value: T } | { source: "none" };
-export type AwsSource = Sourced<unknown>["source"];
-
-export const valueOf = <T>(s: Sourced<T>): T | null => (s.source === "none" ? null : s.value);
-
-/** What FleetDO uses to reach AWS for one cell. */
+/** What FleetDO uses to reach AWS for one cell; each `null` when the cell lacks it. */
 export interface CellAws {
-  region: Sourced<string>;
-  credentials: Sourced<AwsCredentials>;
-  /** The proxy root CA key: an ARN, or for the legacy global any id or alias KMS accepts. */
-  kmsKey: Sourced<string>;
-  /** Why the cell's own credentials were passed over (fields named, never values). */
+  region: string | null;
+  credentials: AwsCredentials | null;
+  /** The proxy root CA key's ARN. */
+  kmsKey: string | null;
+  /** Why the cell's credentials entry was passed over (fields named, never values). */
   credentialsError?: string;
 }
 
-export type AwsEnv = Pick<Env, "AWS_CELL_CREDENTIALS" | "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_REGION" | "ROOT_CA_KMS_KEY_ID">;
-
-function pick<T>(mine: T | null | undefined, global: T | null | undefined): Sourced<T> {
-  if (mine) return { source: "cell", value: mine };
-  if (global) return { source: "legacy", value: global };
-  return { source: "none" };
-}
-
 /**
- * A cell's AWS access: its `AWS_CELLS` entry (`config`) and its `AWS_CELL_CREDENTIALS` entry first,
- * each setting falling back to its legacy global on its own. A malformed credentials entry falls back
- * too, with the error kept for the operator view. `cell` is `null` when FleetDO has no name, so only
- * the legacy globals can apply.
+ * A cell's AWS access: its `AWS_CELLS` entry (`config`) and its `AWS_CELL_CREDENTIALS` entry. A
+ * malformed credentials entry counts as none, with the error kept for the operator view. `cell` is
+ * `null` when FleetDO has no name: no credentials.
  */
-export function cellAws(env: AwsEnv, cell: string | null, config: AwsCellConfig | null): CellAws {
-  let own: AwsCredentials | null = null;
+export function cellAws(env: Pick<Env, "AWS_CELL_CREDENTIALS">, cell: string | null, config: AwsCellConfig | null): CellAws {
+  let credentials: AwsCredentials | null = null;
   let credentialsError: string | undefined;
   try {
-    own = cell ? cellCredentials(env.AWS_CELL_CREDENTIALS, cell) : null;
+    credentials = cell ? cellCredentials(env.AWS_CELL_CREDENTIALS, cell) : null;
   } catch (e) {
     credentialsError = (e as Error).message;
   }
-  const legacy = env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY
-    ? { access_key_id: env.AWS_ACCESS_KEY_ID, secret_access_key: env.AWS_SECRET_ACCESS_KEY }
-    : null;
   return {
-    region: pick(config?.region, env.AWS_REGION),
-    credentials: pick(own, legacy),
-    kmsKey: pick(config?.proxy_root_key_arn, env.ROOT_CA_KMS_KEY_ID),
+    region: config?.region ?? null,
+    credentials,
+    kmsKey: config?.proxy_root_key_arn ?? null,
     ...(credentialsError ? { credentialsError } : {}),
   };
 }

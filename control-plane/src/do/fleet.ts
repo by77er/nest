@@ -15,7 +15,7 @@ import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
-import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, valueOf, type AwsCellConfig, type AwsSource, type CellAws } from "../lib/cells";
+import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
 import { brainHostNeeded, idleStep, maxBrains, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
@@ -37,7 +37,7 @@ import {
   type CapacityView, type FleetView, HOST_STATUSES, type HostStatus, type HostView, type ImagesView, LAUNCH_END_REASONS, type LaunchEndReason,
   type LaunchView, type SandboxView, type TemplateView,
   type HostRole as AdminHostRole, type SandboxState as AdminSandboxState, type TunnelState as AdminTunnelState,
-  type AwsSource as AdminAwsSource, type AwsView,
+  type AwsView,
 } from "../../../protocol/admin/view";
 
 // Closed unions for every status/kind column (docs/data/#enums): written through these types, read
@@ -64,8 +64,8 @@ const LIVE_STATUSES = ["active", "draining", "stonith_pending"] as const satisfi
 // without zod; they must be the same sets.
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 export const ADMIN_ENUMS_AGREE: [
-  Same<AdminSandboxState, SandboxState>, Same<AdminHostRole, HostKind>, Same<AdminTunnelState, TunnelState>, Same<AdminAwsSource, AwsSource>,
-] = [true, true, true, true];
+  Same<AdminSandboxState, SandboxState>, Same<AdminHostRole, HostKind>, Same<AdminTunnelState, TunnelState>,
+] = [true, true, true];
 
 /**
  * Where a host's sandbox gateway is reached (`hostGatewayUrl`): through its tunnel (Cloudflare
@@ -674,7 +674,7 @@ export class FleetDO extends DurableObject<Env> {
     return counts;
   }
 
-  /** The cell's AWS access (`lib/cells.ts`): its own region, credentials and KMS key, else the legacy globals. */
+  /** The cell's AWS access (`lib/cells.ts`): its own region, credentials and KMS key. */
   private aws(): CellAws {
     return cellAws(this.env, this.cellName(), this.cellConfig());
   }
@@ -685,9 +685,7 @@ export class FleetDO extends DurableObject<Env> {
       if (!this.kmsOverride) throw new NestError(ErrorCodes.INTERNAL, "AWS credentials not configured", 500);
       return this.kmsOverride;
     }
-    const a = this.aws();
-    const credentials = valueOf(a.credentials);
-    const region = valueOf(a.region);
+    const { credentials, region } = this.aws();
     if (!credentials || !region) {
       throw new NestError(ErrorCodes.INTERNAL, `AWS credentials or region not configured for cell ${this.cellName() ?? "(unnamed)"}`, 500);
     }
@@ -696,7 +694,7 @@ export class FleetDO extends DurableObject<Env> {
 
   /** The root CA: the cell's KMS key, else a PEM key (development, and before KMS). */
   private async rootCa(): Promise<RootCa> {
-    const keyId = valueOf(this.aws().kmsKey);
+    const keyId = this.aws().kmsKey;
     if (keyId) return this.kmsRootCa(keyId);
     if (this.env.ROOT_CA_CERT_PEM && this.env.ROOT_CA_KEY_PEM) return localRoot(this.env.ROOT_CA_CERT_PEM, this.env.ROOT_CA_KEY_PEM);
     if (this.env.ALLOW_DEV_CA !== "1") {
@@ -719,9 +717,9 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * The cell's root in KMS, its certificate kept in `kv.root_ca`: adopted the first time from the
-   * legacy `ROOT_CA_CERT_PEM` (images trust it), else self-signed through KMS. A certificate for any
-   * other key is refused, so nothing issues intermediates baked images don't trust.
+   * The cell's root in KMS, its certificate kept in `kv.root_ca`: self-signed through KMS the first
+   * time. A kept certificate for any other key is refused, so nothing issues intermediates baked
+   * images don't trust.
    */
   private async kmsRootCa(keyId: string): Promise<RootCa> {
     if (this.kmsRoot?.keyId === keyId) return this.kmsRoot.root;
@@ -734,14 +732,12 @@ export class FleetDO extends DurableObject<Env> {
     const load = () => this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'root_ca'").toArray()[0]?.value ?? null;
     let certPem = load();
     if (certPem === null) {
-      const legacy = this.env.ROOT_CA_CERT_PEM;
-      if (legacy && !(await forKey(legacy))) throw refuse("ROOT_CA_CERT_PEM");
-      const candidate = legacy ?? (await createRootCertificate(keySpki, kmsRoot("", kms, keyId).sign, `CN=nest ${cell ? `${cell} ` : ""}proxy root CA`, ROOT_CA_TTL_MS));
+      const candidate = await createRootCertificate(keySpki, kmsRoot("", kms, keyId).sign, `CN=nest ${cell ? `${cell} ` : ""}proxy root CA`, ROOT_CA_TTL_MS);
       // The awaits above yield, so another call may have kept one meanwhile; no await from here to the insert.
       certPem = load() ?? candidate;
       if (certPem === candidate) {
         this.sql.exec("INSERT INTO kv (key, value) VALUES ('root_ca', ?)", certPem);
-        console.log(`FleetDO: cell ${cell}: root CA certificate ${legacy ? "adopted from ROOT_CA_CERT_PEM" : "self-signed through KMS"}`);
+        console.log(`FleetDO: cell ${cell}: root CA certificate self-signed through KMS`);
       }
     }
     if (!(await forKey(certPem))) throw refuse("the root certificate the cell keeps");
@@ -1887,9 +1883,7 @@ export class FleetDO extends DurableObject<Env> {
   private ec2(): Ec2 | null {
     if (this.ec2Override !== undefined) return this.ec2Override;
     const a = this.awsOrNull();
-    const c = a && valueOf(a.credentials);
-    const region = a && valueOf(a.region);
-    return c && region ? new AwsEc2(c.access_key_id, c.secret_access_key, region) : null;
+    return a?.credentials && a.region ? new AwsEc2(a.credentials.access_key_id, a.credentials.secret_access_key, a.region) : null;
   }
 
   /**
@@ -2305,14 +2299,13 @@ export class FleetDO extends DurableObject<Env> {
     }));
   }
 
-  /** Operator view: where the cell's AWS settings come from (its own, legacy globals, none), never their values. */
+  /** Operator view: the cell's region and which of its AWS settings it has, never their values. */
   private awsView(): AwsView {
     const cell = this.cellName();
     try {
       const a = this.aws();
       return {
-        cell, region: valueOf(a.region),
-        sources: { region: a.region.source, credentials: a.credentials.source, kms_key: a.kmsKey.source },
+        cell, region: a.region, credentials: a.credentials !== null, kms_key: a.kmsKey !== null,
         ...(a.credentialsError ? { error: a.credentialsError } : {}),
       };
     } catch (e) {
@@ -2340,9 +2333,7 @@ export class FleetDO extends DurableObject<Env> {
   private ssm(): Ssm | null {
     if (this.ssmOverride !== undefined) return this.ssmOverride;
     const a = this.awsOrNull();
-    const c = a && valueOf(a.credentials);
-    const region = a && valueOf(a.region);
-    return c && region ? new AwsSsm(c.access_key_id, c.secret_access_key, region) : null;
+    return a?.credentials && a.region ? new AwsSsm(a.credentials.access_key_id, a.credentials.secret_access_key, a.region) : null;
   }
 
   /** CP-side lease expiry: no sandbox on this host may run anywhere else until STONITH is confirmed. */

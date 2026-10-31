@@ -7,10 +7,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/../control-plane"
 var() { aws ssm get-parameter --region us-east-1 --name "/nest/control-plane/vars/$1" --query Parameter.Value --output text 2>/dev/null; }
-# Optional: passed only when the parameter exists. SANDBOX_SUSPEND_IDLE_MS is a test override;
-# ROOT_CA_KMS_KEY_ID is the legacy KMS key, for one release, for a cell whose AWS_CELLS entry has none.
+# Optional: passed only when the parameter exists. SANDBOX_SUSPEND_IDLE_MS is a test override.
 optional=()
-for name in SANDBOX_SUSPEND_IDLE_MS ROOT_CA_KMS_KEY_ID; do
+for name in SANDBOX_SUSPEND_IDLE_MS; do
   if value=$(var "$name"); then optional+=(--var "$name:$value"); fi
 done
 # Required: a missing or empty parameter fails the deploy here, since a `$(var …)` inside an argument

@@ -26,13 +26,9 @@ export interface Env {
   /**
    * Root CA for nest-proxy intermediates, development form: PEM certificate and PKCS#8 ECDSA P-256
    * key. A cell with a KMS key uses that instead, and FleetDO keeps the cell's root certificate.
-   * Legacy (one release): for a cell with a KMS key, a `ROOT_CA_CERT_PEM` for that key is
-   * adopted as the cell's certificate rather than minting a new one; one for another key is refused.
    */
   ROOT_CA_CERT_PEM?: string;
   ROOT_CA_KEY_PEM?: string;
-  /** Legacy (one release): the KMS key for cells whose `AWS_CELLS` entry carries no `proxy_root_key_arn`. */
-  ROOT_CA_KMS_KEY_ID?: string;
   /** "1" lets FleetDO mint and persist a development root CA when none is configured. */
   ALLOW_DEV_CA?: string;
   /** AWS public certificate for the RSA-2048 instance identity signature (region-specific). */
@@ -41,10 +37,6 @@ export interface Env {
   AWS_CELLS?: string;
   /** Per-cell AWS credentials (a secret): JSON object of cell → `{access_key_id, secret_access_key}` of `nest-<cell>-control-plane`. */
   AWS_CELL_CREDENTIALS?: string;
-  /** Legacy (one release): the credentials and region for a cell missing from `AWS_CELL_CREDENTIALS` / `AWS_CELLS`. */
-  AWS_ACCESS_KEY_ID?: string;
-  AWS_SECRET_ACCESS_KEY?: string;
-  AWS_REGION?: string;
 
   PUBLIC_BASE_URL: string;
   ASK_SYNC_WINDOW_MS: string;
