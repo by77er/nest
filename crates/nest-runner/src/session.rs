@@ -332,7 +332,10 @@ impl Session {
                 a.resolve_hands(&request, HandsOutcome::from_wire(outcome, hands, error, retry_after_ms).into());
             }
             AgentToRunner::Ack { up_to } => st.unacked.retain(|(s, _)| *s > up_to.0),
-            AgentToRunner::SegmentAck { durable_bytes, .. } => st.durable = st.durable.max(durable_bytes),
+            AgentToRunner::SegmentAck { durable_bytes, .. } => {
+                st.durable = st.durable.max(durable_bytes);
+                self.tailer.confirm();
+            }
             AgentToRunner::HelloAck { .. } => {}
             AgentToRunner::Error { error } => {
                 tracing::warn!(agent = %a.id, code = %error.code, "AgentDO error: {}", error.message);

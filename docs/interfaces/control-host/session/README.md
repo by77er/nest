@@ -50,6 +50,7 @@ runner                                      AgentDO                          R2
 ```
 
 - **Offsets are the ordering and deduplication key.** AgentDO ignores bytes it already has and rejects a gap (`invalid_message`). The runner then resends from `durable_bytes`.
+- **A base goes again until acknowledged.** After a reconnect the runner resends from `durable_bytes`, unless it sent a base (a rewritten file) and no `segment_ack` has come since: `durable_bytes` may then still describe the old file, so the base goes again (AgentDO takes a repeated base as a fresh one). Residual: an ack for the old file crossing the base on the wire counts as confirming it.
 - **Brain lineage:** `hello.instance_id` is random per brain process. When it differs from the previous connection's, AgentDO resets the channel's seq lineage and event dedup, and re-queues an interrupted turn as a **recovery** turn. A reconnect of the same process resumes as usual.
 - **In-order delivery:** a reliable message must carry `seq == last + 1`. A gap or a processing failure **closes the socket**, and the runner resends everything unacked after reconnecting. A later batch's ack never covers an earlier failed one.
 - **Stale connections:** a runner whose `hello.epoch` is stale gets `hello_ack` (with `durable_bytes` = its own `local_bytes`) followed by `error{stale_epoch}`. Its segments are stored under `sessions/<agent>/orphan/e<epoch>/<offset>` and acknowledged, never written to the live session. Nothing else (turns, tool calls, events) flows on that connection.
