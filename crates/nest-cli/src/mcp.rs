@@ -5,13 +5,14 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nest_protocol::host::mcp::{McpBridgeRequest, McpBridgeResponse, ToolCallResult};
 use nest_protocol::host::{env, frame, paths};
 use nest_protocol::model::AgentId;
+use nest_protocol::model::error_codes::OUTCOME_UNKNOWN;
 use serde_json::{Value, json};
 
 /// MCP protocol revision we answer with when the client doesn't ask for one.
@@ -26,35 +27,49 @@ enum Kind {
 struct Pending {
     rpc_id: Value,
     kind: Kind,
+    /// The runner connection the request went out on.
+    conn: u64,
+}
+
+/// Requests waiting for the runner, and which connection is live, under one lock: a reader that
+/// sees its connection end fails only its own requests, never one sent on the next connection.
+#[derive(Default)]
+struct Link {
+    /// The live connection's number; 0 when there is none.
+    conn: u64,
+    pending: HashMap<u64, Pending>,
 }
 
 /// The runner connection; (re)opened lazily on the next request after it drops.
 struct Bridge {
     sock: String,
     agent: AgentId,
-    stream: Option<UnixStream>,
+    stream: Option<(u64, UnixStream)>,
+    connects: u64,
 }
 
 impl Bridge {
-    fn get(&mut self, shared: &Shared) -> Option<&mut UnixStream> {
-        if !shared.connected.load(Ordering::SeqCst) {
+    /// The live connection, opening one if the last one dropped.
+    fn get(&mut self, shared: &Shared) -> Option<(u64, &mut UnixStream)> {
+        let live = shared.link.lock().unwrap().conn;
+        if self.stream.as_ref().is_none_or(|(n, _)| *n != live) {
             self.stream = None;
-            match connect(&self.sock, &self.agent, shared) {
-                Ok(s) => self.stream = Some(s),
+            self.connects += 1;
+            match connect(&self.sock, &self.agent, shared, self.connects) {
+                Ok(s) => self.stream = Some((self.connects, s)),
                 Err(e) => eprintln!("nest mcp: runner unavailable: {e}"),
             }
         }
-        self.stream.as_mut()
+        self.stream.as_mut().map(|(n, s)| (*n, s))
     }
 }
 
 #[derive(Clone)]
 struct Shared {
-    out: Arc<Mutex<std::io::Stdout>>,
-    pending: Arc<Mutex<HashMap<u64, Pending>>>,
+    out: Arc<Mutex<Box<dyn Write + Send>>>,
+    link: Arc<Mutex<Link>>,
     /// JSON-RPC id (as a string) → bridge id, for `notifications/cancelled`; removed on completion.
     by_rpc: Arc<Mutex<HashMap<String, u64>>>,
-    connected: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -77,14 +92,9 @@ impl Shared {
 pub fn main() -> i32 {
     let agent = AgentId(std::env::var(env::AGENT_ID).unwrap_or_else(|_| "agt_unknown".into()));
     let sock = std::env::var(env::MCP_SOCK).unwrap_or_else(|_| paths::MCP_SOCK.into());
-    let shared = Shared {
-        out: Arc::new(Mutex::new(std::io::stdout())),
-        pending: Default::default(),
-        by_rpc: Default::default(),
-        connected: Default::default(),
-    };
+    let shared = Shared { out: Arc::new(Mutex::new(Box::new(std::io::stdout()))), link: Default::default(), by_rpc: Default::default() };
     let next = AtomicU64::new(1);
-    let mut bridge = Bridge { sock, agent, stream: None };
+    let mut bridge = Bridge { sock, agent, stream: None, connects: 0 };
 
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -130,7 +140,7 @@ pub fn main() -> i32 {
             ("notifications/cancelled", None) => {
                 let rid = params.get("requestId").map(|v| v.to_string()).unwrap_or_default();
                 let bid = shared.by_rpc.lock().unwrap().remove(&rid);
-                if let (Some(bid), Some(s)) = (bid, bridge.stream.as_mut()) {
+                if let (Some(bid), Some((_, s))) = (bid, bridge.stream.as_mut()) {
                     let _ = frame::write(s, &McpBridgeRequest::Cancel { id: bid });
                 }
             }
@@ -141,8 +151,8 @@ pub fn main() -> i32 {
     0
 }
 
-/// Connect, say hello, wait for `hello_ack`, start the response reader.
-fn connect(sock: &str, agent: &AgentId, shared: &Shared) -> std::io::Result<UnixStream> {
+/// Connect, say hello, wait for `hello_ack`, start the response reader for connection `conn`.
+fn connect(sock: &str, agent: &AgentId, shared: &Shared, conn: u64) -> std::io::Result<UnixStream> {
     let mut s = UnixStream::connect(sock)?;
     frame::write(&mut s, &McpBridgeRequest::Hello { v: 1, agent: agent.clone() })?;
     let mut r = s.try_clone()?;
@@ -153,30 +163,57 @@ fn connect(sock: &str, agent: &AgentId, shared: &Shared) -> std::io::Result<Unix
         other => return Err(std::io::Error::other(format!("unexpected {other:?}"))),
     }
     r.set_read_timeout(None)?;
-    shared.connected.store(true, Ordering::SeqCst);
+    shared.link.lock().unwrap().conn = conn;
     let sh = shared.clone();
     std::thread::spawn(move || {
         while let Ok(Some(m)) = frame::read::<_, McpBridgeResponse>(&mut r) {
             deliver(&sh, m);
         }
-        sh.connected.store(false, Ordering::SeqCst);
-        // Fail everything still waiting.
-        for (_, p) in sh.pending.lock().unwrap().drain() {
-            fail(&sh, &p, "nest runner disconnected");
-        }
+        disconnected(&sh, conn);
     });
     Ok(s)
 }
 
+/// Connection `conn` ended: fail what was sent on it. A call may still run in the runner (a
+/// platform call is not cancelled by the hangup), so it is reported as `outcome_unknown`.
+fn disconnected(shared: &Shared, conn: u64) {
+    let lost: Vec<Pending> = {
+        let mut link = shared.link.lock().unwrap();
+        if link.conn == conn {
+            link.conn = 0;
+        }
+        let ids: Vec<u64> = link.pending.iter().filter(|(_, p)| p.conn == conn).map(|(id, _)| *id).collect();
+        ids.into_iter().filter_map(|id| link.pending.remove(&id)).collect()
+    };
+    for p in lost {
+        let msg = match p.kind {
+            Kind::Call => format!(
+                "{OUTCOME_UNKNOWN}: the connection to the nest runner closed while the call ran; it may or may not have \
+                 taken effect. Check before retrying anything with side effects."
+            ),
+            Kind::List => "nest runner disconnected".to_string(),
+        };
+        fail(shared, &p, &msg);
+    }
+}
+
 fn forward(shared: &Shared, bridge: &mut Bridge, bid: u64, rpc_id: Value, kind: Kind, req: &McpBridgeRequest) {
-    let pending = Pending { rpc_id, kind };
-    let Some(s) = bridge.get(shared) else {
-        fail(shared, &pending, "nest runner unavailable");
+    let Some((conn, s)) = bridge.get(shared) else {
+        fail(shared, &Pending { rpc_id, kind, conn: 0 }, "nest runner unavailable");
         return;
     };
-    shared.pending.lock().unwrap().insert(bid, pending);
+    {
+        let mut link = shared.link.lock().unwrap();
+        if link.conn != conn {
+            // Its reader saw it end after `get`: nothing was sent.
+            drop(link);
+            fail(shared, &Pending { rpc_id, kind, conn }, "nest runner unavailable");
+            return;
+        }
+        link.pending.insert(bid, Pending { rpc_id, kind, conn });
+    }
     if let Err(e) = frame::write(s, req)
-        && let Some(p) = shared.pending.lock().unwrap().remove(&bid)
+        && let Some(p) = shared.link.lock().unwrap().pending.remove(&bid)
     {
         fail(shared, &p, &format!("nest runner unavailable: {e}"));
     }
@@ -191,7 +228,7 @@ fn fail(shared: &Shared, p: &Pending, msg: &str) {
 }
 
 fn deliver(shared: &Shared, m: McpBridgeResponse) {
-    let take = |id: u64| shared.pending.lock().unwrap().remove(&id);
+    let take = |id: u64| shared.link.lock().unwrap().pending.remove(&id);
     match m {
         McpBridgeResponse::ToolsList { id, tools } => {
             if let Some(p) = take(id) {
@@ -229,6 +266,42 @@ fn tool_use_id_from_meta(meta: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod meta_tests {
     use super::*;
+
+    /// Captures what `nest mcp` writes to Claude Code.
+    #[derive(Clone, Default)]
+    struct Out(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Out {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// R9: when a connection ends, only the calls sent on it fail, as `outcome_unknown`; a call
+    /// sent on the next connection (the main thread reconnected first) is left to its answer.
+    #[test]
+    fn a_dropped_connection_fails_only_its_own_calls_as_outcome_unknown() {
+        let out = Out::default();
+        let shared = Shared { out: Arc::new(Mutex::new(Box::new(out.clone()))), link: Default::default(), by_rpc: Default::default() };
+        {
+            let mut link = shared.link.lock().unwrap();
+            link.conn = 2;
+            link.pending.insert(1, Pending { rpc_id: json!(10), kind: Kind::Call, conn: 1 });
+            link.pending.insert(2, Pending { rpc_id: json!(11), kind: Kind::Call, conn: 2 });
+        }
+        disconnected(&shared, 1);
+        let link = shared.link.lock().unwrap();
+        assert_eq!(link.conn, 2, "the live connection stays live");
+        assert_eq!(link.pending.keys().collect::<Vec<_>>(), [&2], "the new connection's call still waits");
+        let written = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let reply: Value = serde_json::from_str(written.trim()).unwrap();
+        assert_eq!(reply["id"], 10);
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(reply["result"]["content"][0]["text"].as_str().unwrap().starts_with(OUTCOME_UNKNOWN), "{reply}");
+    }
 
     #[test]
     fn tool_use_id_from_meta_keys() {
