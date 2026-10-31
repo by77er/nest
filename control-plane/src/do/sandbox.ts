@@ -13,6 +13,7 @@ import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { asNestError, b64url, NestError, newId } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
+import * as slots from "../lib/slots";
 import { storedEnum } from "../lib/stored";
 import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "../protocol/control";
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
@@ -39,42 +40,20 @@ export interface WorkstreamPolicyLayer {
 
 const EMPTY_LAYER: WorkstreamPolicyLayer = { allow: [], passthrough: [], inject: [], tcp: [] };
 
-export interface SandboxInfo {
+/** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
+export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
   workstream: string;
   cell: string;
   image: string;
   resources: Resources;
-  epoch: number;
-  host: string | null;
-  state: SandboxState;
-  head: string | null;
   policy_version: number;
-  attached: string[];
-  working: string[];
   ports: { port: number; url: string }[];
-  /** Epoch currently being placed (FleetDO.place in flight), and since when. */
-  placing: number | null;
-  placing_ms: number | null;
   /**
    * The last `HISTORY_MAX` epochs and the host that held each, read from the `epochs` table (which
    * keeps every one: salvage commits are checked against it); also saved in the blob for one release.
    */
   history: { epoch: number; host: string }[];
-  /** Host whose lease was lost, while the sandbox waits for a new placement. */
-  lost_from: string | null;
-  /** `sandbox_create` re-issues after retryable failures at the current epoch. */
-  create_attempts: number;
-  /** The guest's version and capabilities, from the host's last `running` report (null until then). */
-  guest: GuestInfo | null;
-  /** Each attached agent's slot cwd (null: the default), re-sent to every new placement. */
-  attach_cwd: Record<string, string | null>;
-  /** Agents whose `agent_attach` at the current placement has no `ok` yet: no binding for them. */
-  attach_pending: string[];
-  /** The `agent_attach` command in flight per agent; a result for any other command is stale. */
-  attach_inflight: Record<string, string>;
-  /** Failed attempts at the current placement, per agent (drives the retry backoff). */
-  attach_attempts: Record<string, number>;
 }
 
 export interface CreateSandbox {
@@ -105,9 +84,6 @@ const HISTORY_MAX = 50;
 const COMMIT_RECORD_RETENTION_MS = 7 * 86_400_000;
 /** Commit records are pruned from a deadline at most this often, never on the commit path. */
 const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
-/** A failed `agent_attach` is retried with this backoff (doubling), capped, for as long as the sandbox is placed. */
-const ATTACH_RETRY_MS = 2_000;
-const ATTACH_RETRY_MAX_MS = 30_000;
 /** Previews and share links without NEST_DOMAIN (the harness, tests): never routed, only named. */
 const LOCAL_DOMAIN = "nest.localhost";
 
@@ -336,12 +312,6 @@ export class SandboxDO extends DurableObject<Env> {
     let claimed!: ReturnType<typeof lease.claim>;
     const before = this.update((i) => {
       claimed = lease.claim(i, now);
-      // A new placement is a new VM: the old slots mean nothing to it.
-      if (claimed.ok) {
-        i.attach_pending = [...i.attached];
-        i.attach_inflight = {};
-        i.attach_attempts = {};
-      }
     });
     if (!claimed.ok) throw claimed.error;
     const epoch = claimed.epoch;
@@ -553,7 +523,7 @@ export class SandboxDO extends DurableObject<Env> {
         console.error(`sandbox ${info.sandbox}: notifying ${agent} of the move failed; retrying`, e);
       }
     }
-    if (failed) await this.deadlines.set("notify_moved", Date.now() + ATTACH_RETRY_MS, true);
+    if (failed) await this.deadlines.set("notify_moved", Date.now() + slots.ATTACH_RETRY_MS, true);
   }
 
   /**
@@ -845,51 +815,34 @@ export class SandboxDO extends DurableObject<Env> {
    * until that command's `ok`, so a first hands call never beats the slot. Idempotent.
    */
   async attach(agent: string, cwd?: string): Promise<SandboxInfo> {
-    const before = this.info_();
-    const wanted = cwd ?? null;
-    // Already attached and confirmed with this cwd: nothing to re-send, and no pending mark to re-set.
-    if (before.attached.includes(agent) && !before.attach_pending.includes(agent) && before.attach_cwd[agent] === wanted) return before;
+    let send = false;
     const info = this.update((i) => {
-      if (!i.attached.includes(agent)) i.attached.push(agent);
-      i.attach_cwd[agent] = wanted;
-      i.attach_attempts[agent] = 0;
-      if (i.host && !i.attach_pending.includes(agent)) i.attach_pending.push(agent);
+      send = slots.attach(i, agent, cwd ?? null, i.host !== null);
     });
-    if (info.host) await this.issueAttachCommands([agent]);
+    if (send) await this.issueAttachCommands([agent]);
     return info;
   }
 
   /** Remove the agent's slot (killing its processes); its bindings are refused from then on. */
   async detach(agent: string): Promise<void> {
-    const info = this.update((i) => {
-      i.attached = i.attached.filter((a) => a !== agent);
-      i.working = i.working.filter((a) => a !== agent);
-      i.attach_pending = i.attach_pending.filter((a) => a !== agent);
-      delete i.attach_cwd[agent];
-      delete i.attach_inflight[agent];
-      delete i.attach_attempts[agent];
-    });
+    const info = this.update((i) => slots.detach(i, agent));
     if (info.host) {
       await this.command([{ type: "agent_detach", sandbox: info.sandbox, epoch: info.epoch, agent, kill_processes: true }]);
     }
     await this.armIdle();
   }
 
-  private attachBody(info: SandboxInfo, agent: string): CommandBody {
-    const cwd = info.attach_cwd[agent];
-    return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}) };
-  }
-
   /** Send `agent_attach` for these agents and remember each command as the agent's one in flight. */
   private async issueAttachCommands(agents: string[]): Promise<void> {
     const info = this.info_();
     if (!info.host || !agents.length) return;
-    const cmds = await this.fleet(info.cell).issueCommands(info.host, agents.map((a) => this.attachBody(info, a)));
+    const bodies = agents.map((agent): CommandBody => {
+      const cwd = info.attach_cwd[agent];
+      return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}) };
+    });
+    const cmds = await this.fleet(info.cell).issueCommands(info.host, bodies);
     this.update((i) => {
-      if (i.host !== info.host || i.epoch !== info.epoch) return;
-      agents.forEach((a, n) => {
-        if (i.attached.includes(a)) i.attach_inflight[a] = cmds[n]!;
-      });
+      if (i.host === info.host && i.epoch === info.epoch) slots.sent(i, agents, cmds);
     });
   }
 
@@ -898,96 +851,75 @@ export class SandboxDO extends DurableObject<Env> {
    * A failure to send is logged and retried from the alarm, so the placement's other follow-ups run.
    */
   private async issueAttachesOrRetry(): Promise<void> {
+    let agents: string[] = [];
     const info = this.update((i) => {
-      i.attach_pending = [...i.attached];
-      i.attach_inflight = {};
-      for (const a of i.attached) i.attach_attempts[a] = 0;
+      agents = slots.newPlacement(i);
     });
-    if (!info.host || !info.attached.length) return;
+    if (!info.host || !agents.length) return;
     try {
-      await this.issueAttachCommands(info.attached);
+      await this.issueAttachCommands(agents);
     } catch (e) {
       console.error(`sandbox ${info.sandbox}: issuing agent_attach failed; retrying`, e);
-      await this.deadlines.set("attach_retry", Date.now() + ATTACH_RETRY_MS, true);
+      await this.deadlines.set("attach_retry", Date.now() + slots.ATTACH_RETRY_MS, true);
     }
   }
 
   /** Re-send `agent_attach` for pending agents with no command in flight (after a failure, or a guest coming up). */
-  private async reissuePendingAttaches(resetAttempts: boolean): Promise<void> {
+  private async reissuePendingAttaches(fresh: boolean): Promise<void> {
+    let agents: string[] = [];
     const info = this.update((i) => {
-      if (resetAttempts) for (const a of i.attach_pending) i.attach_attempts[a] = 0;
+      agents = slots.due(i, fresh);
     });
-    if (!info.host) return;
-    const due = info.attach_pending.filter((a) => !(a in info.attach_inflight));
-    if (due.length) await this.issueAttachCommands(due);
+    if (info.host) await this.issueAttachCommands(agents);
   }
 
   /**
-   * FleetDO routes each `agent_attach` result here. Only the command in flight for the agent counts:
-   * `ok` confirms the slot; an error schedules a retry with a doubling backoff (2 s … 30 s) for as
-   * long as the sandbox is placed, or, for a non-retryable error, waits for the next `running`.
+   * FleetDO routes each `agent_attach` result here, from the holder at the current epoch only; the
+   * slot core decides what it means (`slots.attachResult`).
    */
   async attachResult(host: string, epoch: number, agent: string, cmd: string, outcome: CommandOutcome): Promise<void> {
-    const info = this.get<SandboxInfo>("info") ? this.info_() : undefined;
-    if (!info || epoch !== info.epoch || host !== info.host || !info.attached.includes(agent)) return;
-    if (info.attach_inflight[agent] !== cmd) return; // a superseded attempt's result
-    if (outcome.status === "ok") {
-      this.update((i) => {
-        i.attach_pending = i.attach_pending.filter((a) => a !== agent);
-        delete i.attach_inflight[agent];
-        i.attach_attempts[agent] = 0;
-      });
-      return;
-    }
-    const attempts = (info.attach_attempts[agent] ?? 0) + 1;
+    const info = this.tryInfo();
+    if (!info || !lease.holds(info, host, epoch)) return;
+    let r!: ReturnType<typeof slots.attachResult>;
     this.update((i) => {
-      delete i.attach_inflight[agent];
-      i.attach_attempts[agent] = attempts;
+      r = slots.attachResult(i, agent, cmd, outcome.status === "ok", outcome.status !== "ok" && outcome.error.retryable);
     });
-    if (outcome.error.retryable) {
-      const delay = Math.min(ATTACH_RETRY_MS * 2 ** (attempts - 1), ATTACH_RETRY_MAX_MS);
-      await this.deadlines.set("attach_retry", Date.now() + delay, true);
-      return;
+    if (r.kind === "retry") {
+      await this.deadlines.set("attach_retry", Date.now() + r.delayMs, true);
+    } else if (r.kind === "failed" && outcome.status !== "ok") {
+      // The agent stays pending (no binding the gateway would refuse); the next `running` report
+      // re-issues it, and `resolve` keeps answering not-ready meanwhile.
+      console.warn(`sandbox ${info.sandbox}: attaching ${agent} failed: ${outcome.error.code} ${outcome.error.message}`);
     }
-    // The agent stays pending (no binding the gateway would refuse); the next `running` report
-    // re-issues it, and `resolve` keeps answering not-ready meanwhile.
-    console.warn(`sandbox ${info.sandbox}: attaching ${agent} failed: ${outcome.error.code} ${outcome.error.message}`);
   }
 
   /**
    * A fresh binding and the sandbox's current gateway for an attached agent. Not-ready (retryable)
-   * while the sandbox has no host, is being placed, or the agent's slot isn't confirmed; a suspended
-   * sandbox on a host is resumed first. The token is minted by BrokerDO and never stored here.
+   * until `slots.unbindable` allows it and the host's gateway is reachable; a suspended sandbox on a
+   * host is resumed first. The token is minted by BrokerDO and never stored here.
    */
   async resolve(agent: string): Promise<HandsTarget> {
     let info = this.info_();
     const notReady = (why: string) => new NestError(ErrorCodes.SANDBOX_NOT_READY, why, 503, true);
-    if (!info.attached.includes(agent)) throw new NestError(ErrorCodes.NOT_BOUND, `${agent} is not attached to this sandbox`, 409);
-    if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
-    if (info.host && info.state === "suspended") {
+    if (info.attached.includes(agent) && info.host && info.state === "suspended") {
       await this.wake();
       info = this.info_();
     }
-    if (!info.host || info.placing !== null) throw notReady("sandbox is not placed yet");
-    // nestd forgets a suspended sandbox's gateway entry and re-adds it before it reports `running`,
-    // so a target minted during a resume would only ever be refused as `moved`.
-    if (info.state !== "running") throw notReady(`sandbox is ${info.state}`);
-    if (info.attach_pending.includes(agent)) throw notReady(`${agent}'s slot is not configured yet`);
-    const gateway = await this.fleet(info.cell).hostGatewayUrl(info.host);
+    const refused = slots.unbindable(info, agent);
+    if (refused) throw refused;
+    const host = info.host!;
+    const gateway = await this.fleet(info.cell).hostGatewayUrl(host);
     // The host may advertise one on its next hello (a restart, an upgrade): not an error, not yet.
-    if (!gateway) throw notReady(`host ${info.host} advertises no gateway yet`);
+    if (!gateway) throw notReady(`host ${host} advertises no gateway yet`);
     // Its cloudflared has no ready connection yet (the host just started, or the tunnel is
     // reconnecting): a target now would only fail at the edge. The runner retries.
-    if (gateway.kind === "connecting") throw notReady(`host ${info.host}'s tunnel is connecting`);
+    if (gateway.kind === "connecting") throw notReady(`host ${host}'s tunnel is connecting`);
     // A tunnel host serving no tunnel (an old nestd, no cloudflared) is unreachable: its hello URL is
     // its own loopback, and a runner never shares its sandbox's host.
     if (gateway.kind === "down") {
-      console.error(`SandboxDO: host ${info.host} has the tunnel ${gateway.tunnel} but serves none; ${info.sandbox} is unreachable until it does`);
-      throw notReady(`host ${info.host} serves no tunnel`);
+      console.error(`SandboxDO: host ${host} has the tunnel ${gateway.tunnel} but serves none; ${info.sandbox} is unreachable until it does`);
+      throw notReady(`host ${host} serves no tunnel`);
     }
-    // The guest's version comes from the host's report; it is never guessed.
-    if (!info.guest) throw notReady("the guest has not reported its version yet");
-    const url = gateway.url;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const binding = await broker.signBinding(info.cell, {
       sandbox: info.sandbox, epoch: info.epoch, client: agent, scope: "hands", exp_ms: Date.now() + BINDING_LIFETIME_MS,
@@ -1000,25 +932,21 @@ export class SandboxDO extends DurableObject<Env> {
     if (gateway.kind === "tunnel" && !edge) {
       throw new NestError(ErrorCodes.INTERNAL, "access:gateway is not stored; a tunnel target cannot be used without it", 500, false);
     }
-    // Across the awaits the sandbox may have moved, or the agent been detached: never hand out a
-    // token the gateway would refuse, or one for an agent that is no longer attached.
+    // Across the awaits the sandbox may have moved, suspended, or the agent been detached: the same
+    // rule again, at the epoch and host the binding names. Never a token the gateway would refuse.
     const fresh = this.info_();
-    if (!fresh.attached.includes(agent)) throw new NestError(ErrorCodes.NOT_BOUND, `${agent} was detached while resolving`, 409);
-    if (fresh.epoch !== info.epoch || fresh.host !== info.host || fresh.attach_pending.includes(agent)) {
-      throw notReady("sandbox moved while resolving");
-    }
-    if (fresh.state !== "running") throw notReady(`sandbox is ${fresh.state}`);
-    if (!fresh.guest) throw notReady("sandbox moved while resolving");
+    const now = slots.unbindable(fresh, agent);
+    if (now) throw now;
+    if (fresh.epoch !== info.epoch || fresh.host !== host) throw notReady("sandbox moved while resolving");
     // `sandbox` and `epoch`: unsigned copies of the claims, for clients of the previous release only.
-    return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest, ...(edge ? { edge } : {}) };
+    return { url: gateway.url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest!, ...(edge ? { edge } : {}) };
   }
 
   /** Agent activity feeds the idle refcount: the sandbox may suspend only when nobody is working. */
   async agentActivity(agent: string, working: boolean): Promise<{ idle: boolean }> {
-    const turnEnded = !working && this.info_().working.includes(agent);
+    let turnEnded = false;
     const info = this.update((i) => {
-      i.working = i.working.filter((a) => a !== agent);
-      if (working && i.attached.includes(agent)) i.working.push(agent);
+      ({ turnEnded } = slots.setWorking(i, agent, working));
     });
     await this.armIdle();
     if (turnEnded) await this.turnEndCheckpoint();
