@@ -35,6 +35,9 @@ pub struct Config {
     /// How long a commit waits for `commit_result`.
     #[serde(default = "default_commit_timeout_ms")]
     pub commit_timeout_ms: u64,
+    /// How long a booting VM's guest agent has to come up.
+    #[serde(default = "default_guest_ready_timeout_ms")]
+    pub guest_ready_timeout_ms: u64,
     /// Component versions reported in the fleet hello.
     #[serde(default)]
     pub versions: VersionsConfig,
@@ -267,6 +270,9 @@ impl Config {
     pub fn commit_timeout(&self) -> Duration {
         Duration::from_millis(self.commit_timeout_ms)
     }
+    pub fn guest_ready_timeout(&self) -> Duration {
+        Duration::from_millis(self.guest_ready_timeout_ms)
+    }
     /// `paths::PROXY_SOCK`, under `run_dir` (which tests and dev runs move).
     pub fn proxy_sock(&self) -> PathBuf {
         self.in_run_dir(paths::PROXY_SOCK)
@@ -323,6 +329,9 @@ fn default_flush_ms() -> u64 {
     1_000
 }
 fn default_commit_timeout_ms() -> u64 {
+    60_000
+}
+fn default_guest_ready_timeout_ms() -> u64 {
     60_000
 }
 fn default_imds_url() -> String {

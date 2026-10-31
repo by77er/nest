@@ -59,8 +59,9 @@ pub struct GuestCtl {
 }
 
 impl GuestCtl {
-    pub fn spawn(uds: PathBuf, sandbox: SandboxId, epoch: Epoch, hostname: String, events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>) -> GuestCtl {
-        let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots: vec![] }));
+    /// Connect to the guest behind `uds`; every `configure` carries `slots` and those attached since.
+    pub fn spawn(uds: PathBuf, sandbox: SandboxId, epoch: Epoch, hostname: String, slots: Vec<AgentSlot>, events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>) -> GuestCtl {
+        let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots }));
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = watch::channel(false);
         let ctl = GuestCtl { cfg, reqs: tx, ready: ready_rx, pending_resume: Arc::new(Mutex::new(None)), stop: Arc::new(tokio::sync::Notify::new()), guest: Arc::new(Mutex::new(None)) };
@@ -445,7 +446,7 @@ pub(crate) mod tests {
         let fake = FakeGuest::start(&guest_dir, "boot-1");
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, mut erx) = mpsc::unbounded_channel();
-        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), etx);
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![], etx);
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
         assert!(matches!(erx.recv().await, Some((_, GuestEvent::Ready { resumed: false, guest })) if guest.protocol_version == PROTOCOL_VERSION));
         assert!(matches!(erx.recv().await, Some((_, GuestEvent::Ports(p))) if p[0].port == 5173));
@@ -511,7 +512,7 @@ pub(crate) mod tests {
         });
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, mut erx) = mpsc::unbounded_channel();
-        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(1), "h".into(), etx);
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(1), "h".into(), vec![], etx);
         ctl.expect_resume(None);
         let (mut saw_cli, mut saw_task, mut ready) = (false, false, false);
         while !(saw_cli && saw_task && ready) {

@@ -58,7 +58,6 @@ use crate::tombstones::Tombstones;
 use crate::util::{error, new_id, now_ms};
 
 const MAX_AGENT_SLOTS: u16 = 64;
-const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a non-`ask` guest CLI relay waits for `guest_cli_result`. The guest gives up after
 /// 30 s; nestd answers 3 s earlier so the caller gets nestd's error, not a bare guest timeout.
 const CLI_RELAY_TIMEOUT_S: u64 = 27;
@@ -172,6 +171,23 @@ impl Sbx {
 
     fn disk_path(&self) -> PathBuf {
         self.state_dir.join("disk.img")
+    }
+
+    fn vm_spec(&self) -> VmSpec {
+        VmSpec {
+            sandbox: self.id.clone(),
+            epoch: self.epoch,
+            image: self.image.clone(),
+            resources: self.resources,
+            vm_dir: self.vm_dir.clone(),
+            disk_path: self.disk_path(),
+            netns: self.netns.clone(),
+        }
+    }
+
+    /// The attached agents' slots, as the guest's `configure` carries them.
+    fn agent_slots(&self) -> Vec<AgentSlot> {
+        self.slots.iter().map(|(agent, (slot, _))| slot_for(agent, *slot, self.slot_cwds.get(agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into()))).collect()
     }
 
     /// What `meta.json` records about this incarnation (see `recovery.rs`), with `inflight` as the
@@ -772,6 +788,14 @@ impl Inner {
         }
     }
 
+    /// A boot step's check: fail if `s`'s incarnation was fenced before `what`.
+    fn unless_fenced(&self, s: &Sbx, what: &str) -> anyhow::Result<()> {
+        if self.fenced(&s.id, s.epoch) {
+            anyhow::bail!("{}@{} fenced before {what}", s.id, s.epoch.0);
+        }
+        Ok(())
+    }
+
     fn ensure_not_fenced(&self, sbx: &SandboxId, epoch: Epoch) -> Result<(), ErrorBody> {
         if self.fenced(sbx, epoch) {
             return Err(error(error_codes::STALE_EPOCH, format!("{sbx}@{} was fenced during the operation", epoch.0), false));
@@ -1205,19 +1229,14 @@ impl Inner {
 
         let Some(entry) = self.sandbox(id) else { return };
         let this = self.clone();
-        let id = id.clone();
         tokio::spawn(async move {
             let mut s = entry.lock().await;
-            if let Some(g) = s.guest.take() {
-                g.shutdown();
+            if s.epoch != epoch {
+                return; // a newer incarnation took the entry meanwhile (S7)
             }
             // `Fenced` is terminal: this VM never runs again. Stop it now so its memory goes back
             // to the host; salvage needs only the disk.
-            this.pausers.remove(&id, epoch);
-            if let Some(mut vm) = s.vm.take() {
-                let _ = vm.stop().await;
-            }
-            s.paused = false;
+            this.stop_vm(&mut s).await;
             s.netns = None; // drops (and unmounts) the namespace
             drop(s);
             if salvage {
@@ -1531,7 +1550,6 @@ impl Inner {
         self.sandboxes.lock().expect("sandboxes").insert(sandbox.clone(), entry);
         let r = self.boot(&mut guard, from.as_ref(), fork).await;
         if r.is_ok() {
-            guard.guest_info = guard.guest.as_ref().and_then(|g| g.guest());
             if let Some(s) = self.summary.lock().expect("summary").get_mut(&sandbox) {
                 s.guest = guard.guest_info.clone();
             }
@@ -1572,13 +1590,6 @@ impl Inner {
     /// Disk, network, VM, guest control. Leaves `sbx` populated even on error (for teardown).
     /// Re-checks for a fence after every await and before every externally visible step.
     async fn boot(self: &Arc<Self>, sbx: &mut Sbx, from: Option<&GenerationRecord>, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
-        let (id, epoch) = (sbx.id.clone(), sbx.epoch);
-        let check = |what: &str| -> anyhow::Result<()> {
-            if self.fenced(&id, epoch) {
-                anyhow::bail!("{id}@{} fenced before {what}", epoch.0);
-            }
-            Ok(())
-        };
         // Disk.
         let disk = sbx.disk_path();
         let store = self.store.clone();
@@ -1617,39 +1628,56 @@ impl Inner {
         sbx.persist(None).context("write meta.json")?;
 
         // Network (pushes listeners to the proxy).
-        check("network setup")?;
+        self.unless_fenced(sbx, "network setup")?;
         self.setup_network(sbx).context("sandbox network")?;
 
-        // VM.
-        check("VM start")?;
-        let spec = VmSpec {
-            sandbox: sbx.id.clone(),
-            epoch: sbx.epoch,
-            image: sbx.image.clone(),
-            resources: sbx.resources,
-            vm_dir: sbx.vm_dir.clone(),
-            disk_path: sbx.disk_path(),
-            netns: sbx.netns.clone(),
-        };
-        let mut vm = self.driver.create(spec).await.context("create VM")?;
-        // A VM writes to the disk from here on: recorded first, so a restart salvages it.
-        sbx.disk_clean = false;
-        sbx.persist(None).context("write meta.json")?;
-        vm.start().await.context("start VM")?;
-        let uds = vm.vsock_uds_path();
-        self.register_pauser(&sbx.id, sbx.epoch, vm.as_ref());
-        sbx.vm = Some(vm);
-        sbx.paused = false;
-        check("guest connection")?;
+        self.launch(sbx, fork).await
+    }
 
-        // Guest control.
-        let guest = GuestCtl::spawn(uds, sbx.id.clone(), sbx.epoch, hostname(&sbx.id), self.guest_events.clone());
+    /// Start a VM on `s`'s disk and connect its guest (with `s`'s agent slots, and `fork`'s
+    /// identity on a fork's first boot), then wait for the guest to come up. A VM writes to the
+    /// disk from the moment it starts, so `clean = false` is persisted just before (a restart
+    /// salvages it). On any error after the VM was created it is stopped again: no started VM is
+    /// left without an owner (a stranded one would share the disk with the next boot).
+    async fn launch(&self, s: &mut Sbx, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
+        s.vm = Some(self.driver.create(s.vm_spec()).await.context("create VM")?);
+        let r = self.start_vm(s, fork).await;
+        if r.is_err() {
+            self.stop_vm(s).await;
+        }
+        r
+    }
+
+    async fn start_vm(&self, s: &mut Sbx, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
+        self.unless_fenced(s, "VM start")?;
+        s.disk_clean = false;
+        s.persist(None).context("write meta.json")?;
+        let vm = s.vm.as_mut().expect("created");
+        vm.start().await.context("start VM")?;
+        self.register_pauser(&s.id, s.epoch, vm.as_ref());
+        let uds = vm.vsock_uds_path();
+        self.unless_fenced(s, "guest connection")?;
+        let guest = GuestCtl::spawn(uds, s.id.clone(), s.epoch, hostname(&s.id), s.agent_slots(), self.guest_events.clone());
         if fork.is_some() {
             guest.expect_resume(fork);
         }
-        sbx.guest = Some(guest.clone());
-        guest.wait_ready(GUEST_READY_TIMEOUT).await.context("guest agent")?;
+        s.guest = Some(guest.clone());
+        guest.wait_ready(self.cfg.guest_ready_timeout()).await.context("guest agent")?;
+        s.guest_info = guest.guest();
         Ok(())
+    }
+
+    /// Stop `s`'s VM, if it has one, with what exists only while it runs: its guest connection and
+    /// its pause handle.
+    async fn stop_vm(&self, s: &mut Sbx) {
+        if let Some(g) = s.guest.take() {
+            g.shutdown();
+        }
+        self.pausers.remove(&s.id, s.epoch);
+        if let Some(mut vm) = s.vm.take() {
+            let _ = vm.stop().await;
+        }
+        s.paused = false;
     }
 
     fn register_pauser(&self, id: &SandboxId, epoch: Epoch, vm: &dyn Vm) {
@@ -1719,12 +1747,7 @@ impl Inner {
         let entry = self.sandboxes.lock().expect("sandboxes").remove(id);
         if let Some(entry) = &entry {
             let mut s = entry.lock().await;
-            if let Some(g) = s.guest.take() {
-                g.shutdown();
-            }
-            if let Some(mut vm) = s.vm.take() {
-                let _ = vm.stop().await;
-            }
+            self.stop_vm(&mut s).await;
             s.netns = None;
             let _ = std::fs::remove_dir_all(&s.vm_dir);
         }
@@ -1770,14 +1793,7 @@ impl Inner {
         let mut detail = None;
         if matches!(mode, SuspendMode::DiskOnly) {
             // Disk-only: release the VM; resume is a cold boot.
-            if let Some(g) = s.guest.take() {
-                g.shutdown();
-            }
-            if let Some(mut vm) = s.vm.take() {
-                let _ = vm.stop().await;
-            }
-            self.pausers.remove(id, epoch);
-            s.paused = false;
+            self.stop_vm(&mut s).await;
         } else if !self.driver.supports_memory_snapshots() {
             detail = Some("driver keeps memory by pausing locally; generation is disk-only".to_string());
         }
@@ -1800,44 +1816,23 @@ impl Inner {
         if state != Some(SandboxState::Suspended) {
             return Err(error(error_codes::INVALID_MESSAGE, format!("{id} is {state:?}, not suspended"), false));
         }
-        // A VM runs on the disk again: from here on it may differ from its head. Recorded first,
-        // or a restart would delete work as clean.
-        s.disk_clean = false;
-        s.persist(None).map_err(internal)?;
         if s.vm.is_some() && s.paused {
+            // A VM runs on the disk again: from here on it may differ from its head. Recorded
+            // first, or a restart would delete work as clean.
+            s.disk_clean = false;
+            s.persist(None).map_err(internal)?;
             self.ensure_not_fenced(id, epoch)?;
             s.vm.as_mut().expect("checked").resume().await.map_err(internal)?;
             s.paused = false;
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
             }
-            self.gateway_upsert(&s);
-        } else {
-            // Cold boot from the local disk.
-            let spec = VmSpec {
-                sandbox: s.id.clone(),
-                epoch: s.epoch,
-                image: s.image.clone(),
-                resources: s.resources,
-                vm_dir: s.vm_dir.clone(),
-                disk_path: s.disk_path(),
-                netns: s.netns.clone(),
-            };
-            let mut vm = self.driver.create(spec).await.map_err(internal)?;
+        } else if let Err(e) = self.launch(&mut s, None).await {
+            // Cold boot from the local disk failed (its VM was stopped).
             self.ensure_not_fenced(id, epoch)?;
-            vm.start().await.map_err(internal)?;
-            self.register_pauser(id, epoch, vm.as_ref());
-            let guest = GuestCtl::spawn(vm.vsock_uds_path(), s.id.clone(), s.epoch, hostname(&s.id), self.guest_events.clone());
-            s.vm = Some(vm);
-            for (agent, (slot, _)) in s.slots.clone() {
-                let cwd = s.slot_cwds.get(&agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into());
-                let _ = guest.attach(slot_for(&agent, slot, cwd)).await;
-            }
-            guest.wait_ready(GUEST_READY_TIMEOUT).await.map_err(internal)?;
-            s.guest_info = guest.guest();
-            s.guest = Some(guest);
-            self.gateway_upsert(&s);
+            return Err(internal(format!("resume {id}: {e:#}")));
         }
+        self.gateway_upsert(&s);
         let guest = s.guest_info.clone();
         self.with_row(id, epoch, |x| {
             x.dirty = true;

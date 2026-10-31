@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,15 +50,20 @@ struct AttachLatch {
     release: tokio::sync::Notify,
 }
 
+#[derive(Default)]
 struct FakeDriver {
     seen: Seen,
     latch: Option<Arc<AttachLatch>>,
     /// The next VM start fails (a create that fails, to be retried at the same epoch).
     fail_next_start: Arc<AtomicBool>,
+    /// The next VM starts, but its guest agent never comes up.
+    mute_next_guest: Arc<AtomicBool>,
     /// Sandboxes whose VM was stopped, in order.
     stopped: Arc<Mutex<Vec<String>>>,
     /// Lock-free pauses, as (sandbox, epoch).
     paused: Arc<Mutex<Vec<(String, u64)>>>,
+    /// VMs started and not yet stopped.
+    live: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -78,7 +83,10 @@ impl Driver for FakeDriver {
             seen: self.seen.clone(),
             latch: self.latch.clone(),
             fail_next_start: self.fail_next_start.clone(),
+            mute_next_guest: self.mute_next_guest.clone(),
             stopped: self.stopped.clone(),
+            live: self.live.clone(),
+            running: false,
             emu: None,
             guest: None,
         }))
@@ -91,7 +99,10 @@ struct FakeVm {
     seen: Seen,
     latch: Option<Arc<AttachLatch>>,
     fail_next_start: Arc<AtomicBool>,
+    mute_next_guest: Arc<AtomicBool>,
     stopped: Arc<Mutex<Vec<String>>>,
+    live: Arc<AtomicUsize>,
+    running: bool,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
 }
@@ -131,7 +142,11 @@ impl Vm for FakeVm {
         std::fs::write(gdir.join("marker"), b"x")?;
         let mut f = std::fs::OpenOptions::new().write(true).open(&self.spec.disk_path)?;
         std::io::Write::write_all(&mut f, b"guest data")?;
-        self.guest = Some(fake_guest(&gdir, self.seen.clone(), self.latch.clone()));
+        self.running = true;
+        self.live.fetch_add(1, Ordering::SeqCst);
+        if !self.mute_next_guest.swap(false, Ordering::SeqCst) {
+            self.guest = Some(fake_guest(&gdir, self.seen.clone(), self.latch.clone()));
+        }
         self.emu = Some(Emulator::start(&self.vsock_uds_path(), &gdir)?);
         Ok(())
     }
@@ -143,6 +158,9 @@ impl Vm for FakeVm {
     }
     async fn stop(&mut self) -> std::io::Result<()> {
         self.stopped.lock().unwrap().push(self.spec.sandbox.0.clone());
+        if std::mem::take(&mut self.running) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
         if let Some(g) = self.guest.take() {
             g.abort();
         }
@@ -592,7 +610,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let run_dir = dir.path().join("run");
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), ..Default::default() }))).await.unwrap();
     let runner = fake_runner(&run_dir.join("runner.sock")).await;
     let proxy = fake_proxy(run_dir.join("proxy.sock"));
     let gw = fake_gateway(&run_dir.join("gateway.sock")).await;
@@ -790,8 +808,7 @@ impl Driver for NetnsCapture {
     }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         *self.0.lock().unwrap() = spec.netns.clone();
-        std::fs::create_dir_all(&spec.vm_dir)?;
-        Ok(Box::new(FakeVm { spec, seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default(), emu: None, guest: None }))
+        FakeDriver::default().create(spec).await
     }
 }
 
@@ -921,9 +938,16 @@ struct Started {
     stopped: Arc<Mutex<Vec<String>>>,
     /// Set it to make the next VM start fail.
     fail_next_start: Arc<AtomicBool>,
+    /// Set it to make the next VM start without a guest agent.
+    mute_next_guest: Arc<AtomicBool>,
     /// Lock-free pauses, as (sandbox, epoch).
     paused: Arc<Mutex<Vec<(String, u64)>>>,
+    /// VMs started and not yet stopped.
+    live: Arc<AtomicUsize>,
 }
+
+/// How long the harness's nestd waits for a guest agent to come up (the fake guest is in-process).
+const GUEST_READY_TIMEOUT_MS: u64 = 3000;
 
 async fn start_host() -> Started {
     start_host_opts(None, 5000).await
@@ -942,19 +966,19 @@ async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
         "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": commit_timeout_ms,
+        "guest_ready_timeout_ms": GUEST_READY_TIMEOUT_MS,
     }))
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
-    let (seen, stopped): (Seen, Arc<Mutex<Vec<String>>>) = (Arc::default(), Arc::default());
-    let fail_next_start: Arc<AtomicBool> = Arc::default();
-    let paused: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
-    let driver = FakeDriver { seen: seen.clone(), latch: None, fail_next_start: fail_next_start.clone(), stopped: stopped.clone(), paused: paused.clone() };
+    let driver = FakeDriver::default();
+    let (seen, stopped, fail_next_start, mute_next_guest, paused, live) =
+        (driver.seen.clone(), driver.stopped.clone(), driver.fail_next_start.clone(), driver.mute_next_guest.clone(), driver.paused.clone(), driver.live.clone());
     let host = Host::start(cfg, enrolled, Some(Arc::new(driver))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
-    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped, fail_next_start, paused }
+    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, seen, stopped, fail_next_start, mute_next_guest, paused, live }
 }
 
 /// Whether `pid` is still a live process (a zombie counts as dead: it has been killed).
@@ -1056,7 +1080,7 @@ async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
     // The configured user: the test's own, the only one an unprivileged test can switch to.
     let me = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
     let cfg = tunnel_config_with_metrics(dir.path(), &fleet.url, &bin, Some(me), &metrics);
-    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver::default()))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("cloudflared spawned", || log.exists()).await;
@@ -1084,7 +1108,7 @@ async fn a_missing_cloudflared_binary_is_logged_and_does_not_stop_the_host() {
     let fleet = mock_fleet().await;
     let bin = dir.path().join("no-such-cloudflared");
     let cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
-    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
+    let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver::default()))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
@@ -1108,7 +1132,7 @@ async fn a_failed_start_leaves_no_tunnel_child() {
     install_executable(&bin, format!("#!/bin/sh\necho pid=$$ >> {}\nexit 0\n", log.display()));
     let mut cfg = tunnel_config(dir.path(), &fleet.url, &bin, None);
     cfg.run_dir = "/proc/no-such-dir/run".into();
-    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.err().unwrap();
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver::default()))).await.err().unwrap();
     assert!(!err.to_string().contains("cloudflared"), "the failure is elsewhere: {err:#}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!log.exists(), "cloudflared was started although the host did not");
@@ -1120,7 +1144,7 @@ async fn an_unknown_cloudflared_user_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet().await;
     let cfg = tunnel_config(dir.path(), &fleet.url, Path::new("/opt/nest/bin/cloudflared"), Some("no-such-user-nest".into()));
-    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.err().unwrap();
+    let err = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver::default()))).await.err().unwrap();
     assert!(err.to_string().contains("no-such-user-nest"), "{err}");
 }
 
@@ -1157,7 +1181,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let seen: Seen = Arc::new(Mutex::new(vec![]));
     let latch = Arc::new(AttachLatch::default());
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: seen.clone(), latch: Some(latch.clone()), ..Default::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
@@ -1204,7 +1228,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
     let fail = Arc::new(AtomicBool::new(true));
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::new(Mutex::new(vec![])), latch: None, fail_next_start: fail.clone(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { fail_next_start: fail.clone(), ..Default::default() }))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
@@ -1452,7 +1476,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     }))
     .unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
-    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { seen: Arc::default(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() }))).await.unwrap();
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver::default()))).await.unwrap();
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
     let sock = dir.path().join("run/runner.sock");
     let connect = || async {
@@ -1584,6 +1608,35 @@ async fn a_commit_whose_answer_was_lost_is_asked_again_under_the_same_id() {
     assert!(!events.iter().any(|e| matches!(e.body, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })), "fenced after a lost commit answer");
 }
 
+fn suspend_cmd(id: &str, sandbox: &str, mode: SuspendMode) -> Command {
+    cmd(id, CommandBody::SandboxSuspend { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), mode })
+}
+
+fn resume_cmd(id: &str, sandbox: &str) -> Command {
+    cmd(id, CommandBody::SandboxResume { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1) })
+}
+
+/// A cold resume whose guest never comes up fails, and stops the VM it started: no VM is left
+/// running under `suspended`, and the next resume boots the only VM on the disk. It used to keep
+/// running, and the next resume started a second VM on the same disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_cold_resume_stops_its_vm() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1"), suspend_cmd("cmd_suspend", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_suspend").await));
+    assert_eq!(h.live.load(Ordering::SeqCst), 0, "a disk-only suspend stops the VM");
+
+    h.mute_next_guest.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![resume_cmd("cmd_resume_1", "sbx_1")]).unwrap();
+    // Outlasts the guest-ready timeout (GUEST_READY_TIMEOUT_MS): fleet.result waits WAIT.
+    assert!(!is_ok(&h.fleet.result("cmd_resume_1").await), "no guest: the resume fails");
+    assert_eq!(h.live.load(Ordering::SeqCst), 0, "the failed resume's VM was stopped");
+
+    h.fleet.commands.send(vec![resume_cmd("cmd_resume_2", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_resume_2").await));
+    assert_eq!(h.live.load(Ordering::SeqCst), 1, "one VM on the disk");
+}
+
 /// nestd review #5(b): an attach to a sandbox suspended to disk (no guest connection) must not
 /// bind the agent's explicit-proxy listener; otherwise every later attach, after resume
 /// included, hits EADDRINUSE on that port.
@@ -1663,7 +1716,7 @@ async fn nestd_process(dir: &Path, fleet: MockFleet, commit_timeout_ms: u64, dri
 }
 
 fn fake_driver() -> Arc<dyn Driver> {
-    Arc::new(FakeDriver { seen: Arc::default(), latch: None, fail_next_start: Arc::default(), stopped: Arc::default(), paused: Arc::default() })
+    Arc::new(FakeDriver::default())
 }
 
 fn runtime() -> tokio::runtime::Runtime {
