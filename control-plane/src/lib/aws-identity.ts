@@ -133,7 +133,6 @@ export class CmsRsaIdentityVerifier implements IdentityVerifier {
       signedBytes = content;
     }
 
-    x509.cryptoProvider.set(crypto);
     const cert = new x509.X509Certificate(this.certPem);
     const alg = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
     const key = await cert.publicKey.export(alg, ["verify"]);

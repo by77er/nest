@@ -29,9 +29,11 @@ export function kmsRoot(certPem: string, kms: Kms, keyId: string): RootCa {
 
 /**
  * @peculiar/x509 signs through WebCrypto with a CryptoKey. This gives it one whose signatures come
- * from `sign` instead: a placeholder key, recognized by identity, routed to the root's signer.
+ * from `sign` instead: a placeholder key, recognized by identity, routed to the root's signer by a
+ * `Crypto` passed to that one signing call (never set as the library's global provider, which a
+ * concurrent signing would see across an await).
  */
-async function withSigner<T>(sign: RootCa["sign"], f: (signingKey: CryptoKey) => Promise<T>): Promise<T> {
+async function signer(sign: RootCa["sign"]): Promise<{ key: CryptoKey; crypto: Crypto }> {
   const placeholder = ((await crypto.subtle.generateKey(EC, false, ["sign", "verify"])) as CryptoKeyPair).privateKey;
   const subtle = new Proxy(crypto.subtle, {
     get(target, prop) {
@@ -43,12 +45,7 @@ async function withSigner<T>(sign: RootCa["sign"], f: (signingKey: CryptoKey) =>
       return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
     },
   });
-  x509.cryptoProvider.set({ subtle, getRandomValues: crypto.getRandomValues.bind(crypto), randomUUID: crypto.randomUUID.bind(crypto) } as Crypto);
-  try {
-    return await f(placeholder);
-  } finally {
-    x509.cryptoProvider.set(crypto);
-  }
+  return { key: placeholder, crypto: { subtle, getRandomValues: crypto.getRandomValues.bind(crypto), randomUUID: crypto.randomUUID.bind(crypto) } as Crypto };
 }
 
 /** A P-256 SubjectPublicKeyInfo re-encoded through WebCrypto, so two encodings of one key compare equal. */
@@ -59,14 +56,14 @@ export async function canonicalSpki(spki: Uint8Array): Promise<Uint8Array> {
 
 /** The certificate's public key, as canonical DER SubjectPublicKeyInfo. */
 export async function certificateSpki(certPem: string): Promise<Uint8Array> {
-  x509.cryptoProvider.set(crypto);
   return canonicalSpki(new Uint8Array(new x509.X509Certificate(certPem).publicKey.rawData));
 }
 
 /** A self-signed root certificate for a key held elsewhere (KMS): its public key and signer. */
 export async function createRootCertificate(publicKeySpki: Uint8Array, sign: RootCa["sign"], name: string, ttlMs: number, nowMs = Date.now()): Promise<string> {
   const publicKey = await crypto.subtle.importKey("spki", publicKeySpki, EC, true, ["verify"]);
-  const cert = await withSigner(sign, async (signingKey) => x509.X509CertificateGenerator.create({
+  const root = await signer(sign);
+  const cert = await x509.X509CertificateGenerator.create({
     serialNumber: "01",
     subject: name,
     issuer: name,
@@ -74,19 +71,18 @@ export async function createRootCertificate(publicKeySpki: Uint8Array, sign: Roo
     notAfter: new Date(nowMs + ttlMs),
     signingAlgorithm: SIGN,
     publicKey,
-    signingKey,
+    signingKey: root.key,
     extensions: [
       new x509.BasicConstraintsExtension(true, 1, true),
       new x509.KeyUsagesExtension(x509.KeyUsageFlags.keyCertSign | x509.KeyUsageFlags.cRLSign, true),
       await x509.SubjectKeyIdentifierExtension.create(publicKey),
     ],
-  }));
+  }, root.crypto);
   if (!(await cert.verify({ publicKey }))) throw new Error("the new root's self-signature does not verify");
   return cert.toString("pem") + "\n";
 }
 
 export async function signIntermediate(root: RootCa, csrPem: string, ttlMs: number, nowMs = Date.now()): Promise<CaCertificate> {
-  x509.cryptoProvider.set(crypto);
   let csr: x509.Pkcs10CertificateRequest;
   try {
     csr = new x509.Pkcs10CertificateRequest(csrPem);
@@ -100,7 +96,8 @@ export async function signIntermediate(root: RootCa, csrPem: string, ttlMs: numb
   const notAfter = new Date(nowMs + ttlMs);
   const serial = crypto.getRandomValues(new Uint8Array(16));
   serial[0] = serial[0]! & 0x7f;
-  const cert = await withSigner(root.sign, async (signingKey) => x509.X509CertificateGenerator.create({
+  const rootSigner = await signer(root.sign);
+  const cert = await x509.X509CertificateGenerator.create({
     serialNumber: [...serial].map((b) => b.toString(16).padStart(2, "0")).join(""),
     subject: csr.subject,
     issuer: rootCert.subject,
@@ -108,7 +105,7 @@ export async function signIntermediate(root: RootCa, csrPem: string, ttlMs: numb
     notAfter,
     signingAlgorithm: SIGN,
     publicKey: csr.publicKey,
-    signingKey,
+    signingKey: rootSigner.key,
     extensions: [
       // Intermediate that may only sign leaves.
       new x509.BasicConstraintsExtension(true, 0, true),
@@ -116,7 +113,7 @@ export async function signIntermediate(root: RootCa, csrPem: string, ttlMs: numb
       await x509.SubjectKeyIdentifierExtension.create(csr.publicKey),
       await x509.AuthorityKeyIdentifierExtension.create(rootCert),
     ],
-  }));
+  }, rootSigner.crypto);
   // A wrong key (or a KMS key that isn't the root's) must never produce a chain that looks valid.
   if (!(await cert.verify({ publicKey: rootCert.publicKey }))) throw new NestError(ErrorCodes.INTERNAL, "intermediate does not verify against the root", 500);
   const certPem = cert.toString("pem") + "\n";
@@ -125,7 +122,6 @@ export async function signIntermediate(root: RootCa, csrPem: string, ttlMs: numb
 
 /** Development root (only when ALLOW_DEV_CA=1 and no root is configured): certificate and PKCS#8 key. */
 export async function generateDevRoot(nowMs = Date.now()): Promise<{ certPem: string; keyPem: string }> {
-  x509.cryptoProvider.set(crypto);
   const keys = (await crypto.subtle.generateKey(EC, true, ["sign", "verify"])) as CryptoKeyPair;
   const cert = await x509.X509CertificateGenerator.createSelfSigned({
     serialNumber: "01",
