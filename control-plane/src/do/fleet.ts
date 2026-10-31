@@ -405,7 +405,8 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * `identity` is set when the Worker verified an AWS identity document; otherwise the proof must be
-   * an enrollment token. The CSR is validated (signed) before the one-time proof is consumed.
+   * an enrollment token. The proof is checked before anything costs a call (KMS, Cloudflare), and
+   * consumed only after the CSR is signed and the tunnel made.
    */
   async enroll(req: EnrollRequest, cell: string, identity: InstanceIdentity | null): Promise<EnrollResponse> {
     // Only a sandbox host runs nest-proxy, so only it needs (and must ask for) the intermediate CA.
@@ -414,13 +415,13 @@ export class FleetDO extends DurableObject<Env> {
     if (hostKind(req.role) === SANDBOX_ROLE && !req.proxy_ca_csr_pem) {
       throw new NestError(ErrorCodes.INVALID_MESSAGE, "a sandbox host must send proxy_ca_csr_pem", 400);
     }
-    const proxyCa = req.proxy_ca_csr_pem ? await this.signProxyCa(req.proxy_ca_csr_pem) : undefined;
     const hash = req.proof.type === "enrollment_token" ? hex(await sha256(req.proof.token)) : "";
     const host = newId("hst_");
-    // The proof is checked twice: once here, so an unauthenticated caller costs no Cloudflare call,
-    // and once more when it is consumed atomically with the row. A failure in between fails the
-    // enrollment (the host retries with the same proof) and the tunnel just created is deleted.
+    // The proof is checked twice: first, so an unauthenticated caller costs no KMS or Cloudflare
+    // call, and again when it is consumed atomically with the row, so a bad CSR or a failure in
+    // between never uses it up (the host retries with the same proof; a tunnel just made is deleted).
     this.checkProof(req, identity, hash);
+    const proxyCa = req.proxy_ca_csr_pem ? await this.signProxyCa(req.proxy_ca_csr_pem) : undefined;
     const tunnel = hostKind(req.role) === SANDBOX_ROLE ? await this.createTunnel(host) : null;
     try {
       return await this.enrollRecord(req, cell, identity, hash, host, proxyCa, tunnel);
