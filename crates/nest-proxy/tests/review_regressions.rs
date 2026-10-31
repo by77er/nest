@@ -336,3 +336,17 @@ async fn an_expired_grant_is_denied_on_a_held_connection() {
     tokio::time::sleep(Duration::from_millis((expires_ms - now_ms() + 200).max(0) as u64)).await;
     assert_eq!(held.get("api.stripe.test").await, 403);
 }
+
+/// B8: a re-placement at a newer epoch starts a fresh view. Until nestd sends that epoch's
+/// secrets, the previous epoch's must not substitute.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newer_epoch_never_injects_the_previous_epochs_secret() {
+    let mut env = env().await;
+    let p = policy(1, env.echo_addr.port());
+    env.conn.send(&ProxyCommand::SandboxUpsert { sandbox: sandbox(), epoch: Epoch(5), workstream: None, policy: p }, &[]);
+    link_alive(&mut env).await;
+    let auth = format!("Bearer {PLACEHOLDER}");
+    let r = https_get(&env, "api.github.test", "api.github.test", &[("authorization", &auth)], false).await;
+    assert_eq!(r.status, 403, "{:?}", r.body);
+    assert_eq!(r.body["error"], "credential_unavailable");
+}

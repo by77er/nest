@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
 use nest_protocol::host::proxy::{AlertKind, DropReason, ProxyEvent};
 use nest_protocol::model::{AgentId, EgressPolicy, Epoch, InjectionSecret, SandboxId, WorkstreamId};
+use nestd_core::incarnation::TombstoneMap;
 
 use crate::resolve::Resolve;
 use crate::tls::{Ca, UpstreamTls};
@@ -70,8 +71,9 @@ pub struct Session {
     ca: RwLock<Option<Arc<Ca>>>,
     sandboxes: RwLock<HashMap<SandboxId, Arc<Sandbox>>>,
     /// Sandboxes nestd fenced, with the epoch: state for that epoch (or older) is refused even
-    /// if a late upsert/listener push arrives after the drop (fence racing setup).
-    dropped: Mutex<HashMap<SandboxId, Epoch>>,
+    /// if a late upsert/listener push arrives after the drop (fence racing setup). nestd's own
+    /// mirror keeps the same map with the same rules.
+    dropped: Mutex<TombstoneMap<SandboxId>>,
     pub events: mpsc::UnboundedSender<ProxyEvent>,
     pub audit_tx: mpsc::Sender<EgressAuditRecord>,
 }
@@ -88,7 +90,7 @@ impl Session {
             lease_until: AtomicI64::new(0),
             ca: RwLock::new(None),
             sandboxes: RwLock::new(HashMap::new()),
-            dropped: Mutex::new(HashMap::new()),
+            dropped: Mutex::new(TombstoneMap::default()),
             events,
             audit_tx,
         })
@@ -120,13 +122,10 @@ impl Session {
     pub fn sandbox_for(&self, id: &SandboxId, epoch: Epoch) -> Option<Arc<Sandbox>> {
         {
             let mut dropped = self.dropped.lock().unwrap();
-            match dropped.get(id) {
-                Some(d) if epoch <= *d => return None,
-                Some(_) => {
-                    dropped.remove(id); // re-placed at a newer epoch
-                }
-                None => {}
+            if dropped.refuses(id, epoch.0) {
+                return None;
             }
+            dropped.prune_below(id, epoch.0); // re-placed at a newer epoch
         }
         let mut map = self.sandboxes.write().unwrap();
         Some(
@@ -142,9 +141,7 @@ impl Session {
     /// at the same epoch and must get its egress back.
     pub fn drop_sandbox(&self, id: &SandboxId, epoch: Epoch, reason: DropReason) -> Option<Arc<Sandbox>> {
         if reason.tombstones() {
-            let mut dropped = self.dropped.lock().unwrap();
-            let e = dropped.entry(id.clone()).or_insert(epoch);
-            *e = (*e).max(epoch);
+            self.dropped.lock().unwrap().fence(id, epoch.0);
         }
         let mut map = self.sandboxes.write().unwrap();
         if map.get(id).is_some_and(|sb| sb.accepts_epoch(epoch)) { map.remove(id) } else { None }
@@ -156,7 +153,7 @@ impl Session {
         for s in old {
             s.drop.cancel();
         }
-        self.dropped.lock().unwrap().clear();
+        *self.dropped.lock().unwrap() = TombstoneMap::default();
         *self.ca.write().unwrap() = None;
         self.set_lease(0);
     }
@@ -182,6 +179,12 @@ pub struct SandboxView {
     pub workstream: Option<WorkstreamId>,
     pub policy: Option<Arc<EgressPolicy>>,
     pub secrets: Arc<HashMap<String, InjectionSecret>>,
+}
+
+impl SandboxView {
+    fn empty(epoch: Epoch) -> Self {
+        SandboxView { epoch, workstream: None, policy: None, secrets: Arc::new(HashMap::new()) }
+    }
 }
 
 pub struct Sandbox {
@@ -232,7 +235,7 @@ impl Sandbox {
         Sandbox {
             id,
             drop,
-            view: RwLock::new(SandboxView { epoch, workstream: None, policy: None, secrets: Arc::new(HashMap::new()) }),
+            view: RwLock::new(SandboxView::empty(epoch)),
             listeners: Mutex::new(HashMap::new()),
             active: AtomicU32::new(0),
             dns: Mutex::new(HashMap::new()),
@@ -282,27 +285,33 @@ impl Sandbox {
         epoch >= self.view.read().unwrap().epoch
     }
 
-    /// Apply a policy push; returns false if ignored (stale epoch or not-newer version).
-    pub fn upsert(&self, epoch: Epoch, workstream: Option<WorkstreamId>, policy: EgressPolicy) -> bool {
+    /// The view a push at `epoch` applies to, or `None` if the push is stale. A newer epoch (a
+    /// re-placement) starts from an empty view: nothing of the old epoch's policy or secrets
+    /// carries over until nestd pushes that epoch's own.
+    fn view_for(&self, epoch: Epoch) -> Option<std::sync::RwLockWriteGuard<'_, SandboxView>> {
         let mut v = self.view.write().unwrap();
         if epoch < v.epoch {
+            return None;
+        }
+        if epoch > v.epoch {
+            *v = SandboxView::empty(epoch);
+        }
+        Some(v)
+    }
+
+    /// Apply a policy push; returns false if ignored (stale epoch or not-newer version).
+    pub fn upsert(&self, epoch: Epoch, workstream: Option<WorkstreamId>, policy: EgressPolicy) -> bool {
+        let Some(mut v) = self.view_for(epoch) else { return false };
+        if v.policy.as_ref().is_some_and(|p| policy.version <= p.version) {
             return false;
         }
-        if epoch == v.epoch && v.policy.as_ref().is_some_and(|p| policy.version <= p.version) {
-            return false;
-        }
-        v.epoch = epoch;
         v.workstream = workstream;
         v.policy = Some(Arc::new(policy));
         true
     }
 
     pub fn set_secrets(&self, epoch: Epoch, secrets: Vec<InjectionSecret>) -> bool {
-        let mut v = self.view.write().unwrap();
-        if epoch < v.epoch {
-            return false;
-        }
-        v.epoch = epoch;
+        let Some(mut v) = self.view_for(epoch) else { return false };
         v.secrets = Arc::new(secrets.into_iter().map(|s| (s.binding.clone(), s)).collect());
         true
     }

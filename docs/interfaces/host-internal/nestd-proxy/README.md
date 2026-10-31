@@ -11,11 +11,11 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 | `hello_ack` | 0 | Starts a resync |
 | `ca_install` | 0 | `ca: control::CaCertificate` (the intermediate: pathLen 0, about 7 days) + `key_pem` (nestd generated the key for the enrollment CSR). Memory only |
 | `lease_update` | 0 | `valid_until_ms`, every heartbeat. Past it: refuse new connections and stop injecting for all sandboxes |
-| `sandbox_upsert` | 0 | `{sandbox, epoch, workstream?, policy: model::EgressPolicy}`. Ignored unless `version` is newer. Precedes the sandbox's first `listeners_add`. Not acknowledged ([below](#policy-acknowledgement)) |
+| `sandbox_upsert` | 0 | `{sandbox, epoch, workstream?, policy: model::EgressPolicy}`. Ignored for an older epoch, or unless `version` is newer. A newer epoch (or a `secrets_set` at one) starts the sandbox's view afresh: nothing of the older epoch's policy or secrets carries over. Precedes the sandbox's first `listeners_add`. Not acknowledged ([below](#policy-acknowledgement)) |
 | `secrets_set` | 0 | `{sandbox, epoch, secrets: model::InjectionSecret[]}`, replace all; checked against the epoch only. Memory only |
 | `listeners_add` | **= `listeners.len()`**, same order, ≤ 32 per packet | `ListenerSpec{id, transport, addr, purpose}` |
 | `listeners_remove` | 0 | Close listeners; established connections finish |
-| `sandbox_drop` | 0 | `reason: teardown \| fence \| moved`. Close listeners **and established connections**, forget policy and secrets. Only `fence` tombstones the epoch: later pushes at or below it are refused, by nestd (its one tombstone map, recorded before the drop is sent) and by the proxy alike (`DropReason::tombstones`). A teardown or move leaves none, so a create retried at the same epoch gets its egress back |
+| `sandbox_drop` | 0 | `reason: teardown \| fence \| moved`. Close listeners **and established connections**, forget policy and secrets. Only `fence` tombstones the epoch: later pushes at or below it are refused, by nestd (its one tombstone map, recorded before the drop is sent) and by the proxy alike (`DropReason::tombstones`, over the same `nestd_core` `TombstoneMap`). A teardown or move leaves none, so a create retried at the same epoch gets its egress back |
 | `resync_complete` | 0 | Counts, so the proxy can verify |
 | `ping` | 0 | Health |
 

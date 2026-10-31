@@ -1216,6 +1216,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "nest-protocol",
+ "nestd-core",
  "nix",
  "rcgen",
  "rustls",
