@@ -3,12 +3,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{CliResult, ControlBody, ControlFrame, PROTOCOL_VERSION, error_code};
 use nest_protocol::model::ErrorBody;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::framed::{FramedReader, err, parse_json, write_json};
+use crate::framed::{err, parse_json};
 use crate::events::event;
 use crate::state::{Guest, Identity};
 use crate::sys;

@@ -11,10 +11,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::guest::frame::{self, Decoder, Kind};
+use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{AgentSlot, CliCommand, CliResult, ControlBody, ControlFrame, ForkIdentity, PORT_CONTROL, PROTOCOL_VERSION};
 use nest_protocol::model::{AgentId, Epoch, SandboxId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::util::{error, now_ms, random_hex};
@@ -263,8 +262,7 @@ impl Task {
         // 3. steady state
         loop {
             tokio::select! {
-                // Cancel-safe: a frame already decoded is returned without awaiting.
-                f = c.next() => {
+                f = c.rd.next_json() => {
                     let Some(f) = f? else { return Ok(()) };
                     self.route(c, f);
                 }
@@ -334,13 +332,10 @@ impl Task {
 /// How long a handshake read waits for the guest.
 const HANDSHAKE_READ: Duration = Duration::from_secs(10);
 
-/// One control connection: its two halves, the decoder over what was read, and the requests
-/// awaiting a reply.
+/// One control connection: its reader, its writer, and the requests awaiting a reply.
 struct Session {
-    rd: tokio::net::unix::OwnedReadHalf,
+    rd: FramedReader<tokio::net::unix::OwnedReadHalf>,
     wr: tokio::net::unix::OwnedWriteHalf,
-    dec: Decoder,
-    buf: Vec<u8>,
     next_id: u64,
     pending: HashMap<u64, oneshot::Sender<io::Result<ControlBody>>>,
     /// Where a relayed CLI command's answer goes, to be written back by the session.
@@ -349,33 +344,15 @@ struct Session {
 
 impl Session {
     fn new(conn: Conn, cli_tx: mpsc::UnboundedSender<(u64, CliResult)>) -> Session {
-        let mut dec = Decoder::new();
         // Any bytes buffered after the handshake line belong to the frame stream.
-        dec.push(conn.buffer());
+        let buffered = conn.buffer().to_vec();
         let (rd, wr) = conn.into_inner().into_split();
-        Session { rd, wr, dec, buf: vec![0u8; 64 << 10], next_id: 1, pending: HashMap::new(), cli_tx }
-    }
-
-    /// The next control frame, or `None` at the end of the stream. Cancel-safe.
-    async fn next(&mut self) -> io::Result<Option<ControlFrame>> {
-        loop {
-            if let Some(f) = self.dec.next_frame().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? {
-                if f.kind != Kind::Json {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "DATA frame on control channel"));
-                }
-                return serde_json::from_slice(&f.payload).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
-            }
-            let n = self.rd.read(&mut self.buf).await?;
-            if n == 0 {
-                return Ok(None);
-            }
-            self.dec.push(&self.buf[..n]);
-        }
+        Session { rd: FramedReader::with_buffered(rd, &buffered), wr, next_id: 1, pending: HashMap::new(), cli_tx }
     }
 
     /// The next control frame within `limit`; the end of the stream is an error.
     async fn next_within(&mut self, limit: Duration) -> io::Result<ControlFrame> {
-        tokio::time::timeout(limit, self.next())
+        tokio::time::timeout(limit, self.rd.next_json())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "guest control read timed out"))??
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "guest closed control connection"))
@@ -390,8 +367,7 @@ impl Session {
     }
 
     async fn write(&mut self, f: &ControlFrame) -> io::Result<()> {
-        let bytes = frame::encode_json(f).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        self.wr.write_all(&bytes).await
+        write_json(&mut self.wr, f).await
     }
 }
 
@@ -403,6 +379,8 @@ pub fn new_machine_id() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use nest_protocol::guest::frame::{self, Decoder};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::path::Path;
     use tokio::net::UnixListener;
 

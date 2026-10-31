@@ -3,10 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use nest_guest::framed::{FramedReader, parse_json, write_data, write_json};
+use nest_guest::framed::parse_json;
 use nest_guest::transport::emulator::{self, Emulator};
 use nest_guest::{Config, ListenSpec};
 use nest_protocol::guest::frame::Kind;
+use nest_protocol::guest::framed::{self, FramedReader, write_json};
 use nest_protocol::guest::*;
 use nest_protocol::model::{AgentId, Epoch, SandboxId};
 use serde_json::json;
@@ -590,7 +591,7 @@ async fn ingress_pty() {
                 out.push_str(&String::from_utf8_lossy(&f.payload));
                 if !sent && out.contains("hello-pty") {
                     write_json(&mut w, &PtyControl::Resize { cols: 100, rows: 30 }).await.unwrap();
-                    write_data(&mut w, b"abc\n").await.unwrap();
+                    framed::write(&mut w, Kind::Data, b"abc\n").await.unwrap();
                     sent = true;
                 }
             }

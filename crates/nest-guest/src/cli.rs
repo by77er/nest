@@ -4,11 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{CliCommand, CliRequest, CliResponse, CliResult};
 use tokio::net::UnixListener;
 use tracing::warn;
 
-use crate::framed::{FramedReader, write_json};
+use crate::framed::parse_json;
 use crate::state::{Gate, Guest};
 
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
@@ -39,16 +40,11 @@ pub async fn accept_loop(guest: Arc<Guest>, listener: UnixListener) {
 
 async fn handle(guest: Arc<Guest>, stream: tokio::net::UnixStream) {
     let mut reader = FramedReader::new(stream);
-    let req: CliRequest = match reader.next_json().await {
-        Ok(Some(Ok(r))) => r,
-        Ok(Some(Err(e))) => {
-            let (mut s, _) = reader.into_parts();
-            let _ = write_json(&mut s, &CliResponse { result: CliResult::Error { error: e } }).await;
-            return;
-        }
-        _ => return,
+    let Ok(Some(f)) = reader.next().await else { return };
+    let result = match parse_json::<CliRequest>(&f) {
+        Ok(req) => execute(&guest, req).await,
+        Err(error) => CliResult::Error { error },
     };
-    let result = execute(&guest, req).await;
     let (mut s, _) = reader.into_parts();
     let _ = write_json(&mut s, &CliResponse { result }).await;
 }

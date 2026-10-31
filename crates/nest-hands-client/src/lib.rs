@@ -18,7 +18,7 @@ use nest_protocol::gateway::{
     MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code,
     parse_binding,
 };
-use nest_protocol::guest::frame::{self, Kind, MAX_FRAME_LEN};
+use nest_protocol::guest::frame::{self, Kind};
 use nest_protocol::model::{Epoch, ErrorBody};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -386,10 +386,9 @@ fn transport(e: WsError) -> OpenError {
 }
 
 fn ws_config() -> WebSocketConfig {
-    let max = MAX_FRAME_LEN as usize + 4;
     WebSocketConfig::default()
-        .max_message_size(Some(max))
-        .max_frame_size(Some(max))
+        .max_message_size(Some(frame::MAX_WS_MESSAGE))
+        .max_frame_size(Some(frame::MAX_WS_MESSAGE))
 }
 
 /// TLS for `wss://`: the process's installed rustls provider if there is one (the runner installs
@@ -576,31 +575,6 @@ pub async fn open(target: &HandsTarget, opts: &OpenOptions) -> Result<HandsConn,
     }
 }
 
-/// Exactly one frame: `len == message_len - 4`, a known kind, within the frame limit.
-fn one_frame(bytes: &[u8]) -> Result<(Kind, &[u8]), RecvError> {
-    if bytes.len() < 5 {
-        return Err(RecvError::Protocol(format!(
-            "binary message of {} bytes is not a frame",
-            bytes.len()
-        )));
-    }
-    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if len > MAX_FRAME_LEN {
-        return Err(RecvError::Protocol(
-            frame::FrameError::TooLarge(len).to_string(),
-        ));
-    }
-    if len as usize != bytes.len() - 4 {
-        return Err(RecvError::Protocol(format!(
-            "frame length {len} does not match a message of {} bytes",
-            bytes.len()
-        )));
-    }
-    let kind = Kind::from_u8(bytes[4])
-        .ok_or_else(|| RecvError::Protocol(frame::FrameError::UnknownKind(bytes[4]).to_string()))?;
-    Ok((kind, &bytes[5..]))
-}
-
 impl HandsConn {
     /// The guest's version and capabilities as the gateway reported them in `bound` (authoritative).
     pub fn guest(&self) -> &GuestInfo {
@@ -639,7 +613,8 @@ impl HandsConn {
             match self.ws.next().await {
                 None => return Ok(None),
                 Some(Ok(Message::Binary(b))) => {
-                    let (kind, payload) = one_frame(&b)?;
+                    let (kind, payload) =
+                        frame::one_frame(&b).map_err(|e| RecvError::Protocol(e.to_string()))?;
                     if kind != Kind::Json {
                         return Err(RecvError::Protocol(
                             "data frame on the hands channel".into(),
