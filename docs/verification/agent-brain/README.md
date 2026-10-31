@@ -83,7 +83,7 @@ Paths: `agent.ts`, `fleet.ts` and `sandbox.ts` are under `control-plane/src/do/`
 | Q3 | complete | event from the current lineage, `ev.epoch` = session epoch, `ev.turn = current_turn`, not seen before | `done`; `current_turn:=⊥`; `exit_restarts:=0`; mirrored inbox messages never confirmed come back as one queued turn (Q1's effect); pump. An event stamped with another turn changes no state (a finished turn's trailing `idle`) | `AgentDO.applyEvent`, `TurnQueue.complete` |
 | Q4 | recover | a hello from a new lineage while `current_turn = X` | X becomes `interrupted`; a new `recovery` turn R (with X's original text) is queued at the front. The channel is reset, so `run_turn X` is never resent. All in the hello's step that clears `current_turn`; whether the sandbox moved during X is decided when R starts (Q2, `moveNoteDue`) | `AgentDO.onHello`, `TurnQueue.recover` |
 | Q5 | undeliverable | runner stdin closed (stopping) | an error event; the turn stays `active` until Q4 | `Actor::handle` (nest-runner `agent.rs`) |
-| Q6 | crash guard | 3 exit-restarts without a Q3 | `errored`; each new input gets exactly one more start (the counter isn't reset) | `AgentDO.wake`, `RESTART_ON_EXIT`, `MAX_EXIT_RESTARTS` |
+| Q6 | crash guard | 3 exit-restarts without a Q3 | `errored`; each new input gets exactly one more start (the counter isn't reset) | `AgentDO.wake`; lib/brain.ts `wakeDecision`, `RESTART_ON_EXIT`, `MAX_EXIT_RESTARTS` |
 
 There is no `failed` status: a turn ends as `done`, or as `interrupted` with a successor. `instance_id` is per brain session (`session.rs:409`), so every brain start is a new lineage. The AgentDO doc says "runner process" (`docs/control-plane/durable-objects/agent/README.md`).
 
