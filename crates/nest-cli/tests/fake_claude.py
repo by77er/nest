@@ -249,7 +249,7 @@ def turn(text):
     if text.startswith("E2E "):
         return scripted(text[4:].strip())
     hook({"hook_event_name": "UserPromptSubmit", "prompt": text})
-    stop_active, steps = False, 0
+    steps = 0
     while True:
         steps += 1
         transcript({"type": "user", "message": {"role": "user", "content": text}})
@@ -266,14 +266,10 @@ def turn(text):
             more = tool("notify", {"to": "captain", "message": "hello from fake claude"})[1]
             context = "\n".join(c for c in (context, more) if c)
         say("done: " + text[:40])
-        if context:
-            text = context
-            continue
-        stop = hook({"hook_event_name": "Stop", "stop_hook_active": stop_active})
-        if stop.get("decision") == "block":
-            text, stop_active = stop.get("reason", ""), True
-            continue
-        break
+        if not context:
+            break
+        text = context
+    stop_chain()
     emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": steps, "duration_ms": 12, "total_cost_usd": 0.01,
           "usage": {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 50}, "stop_reason": "end_turn", "result": "done"})
 

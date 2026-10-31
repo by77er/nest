@@ -219,7 +219,7 @@ fn parent_pid(pid: i32) -> Option<i32> {
 pub enum AgentCmd {
     RunTurn { turn: TurnId, input: TurnInput },
     Inbox(InboxMessage),
-    /// AgentDO's `interrupt`, for `turn` (`None` from an older AgentDO: whatever runs).
+    /// AgentDO's `interrupt`, for `turn` (`None`: whatever runs).
     Interrupt { turn: Option<TurnId> },
     /// The `Stop` hook answered, `blocked` = the turn continues with inbox messages. Sent before
     /// the answer is written, so it reaches the actor before the `result` that follows it.
@@ -246,7 +246,7 @@ pub enum Outbound {
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
     SetSession(SessionId),
-    /// Re-handshake (the brain adopted a newer agent epoch).
+    /// Re-handshake: AgentDO refused something (most likely a segment gap), so resend from what it has.
     Reconnect,
     /// A platform tool call timed out: never (re)send it.
     AbandonCall(CallId),
