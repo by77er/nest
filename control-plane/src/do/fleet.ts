@@ -1878,7 +1878,7 @@ export class FleetDO extends DurableObject<Env> {
       await this.scaleUp(BRAIN_ROLE);
     }
     // A launch whose answer was lost is repeated until EC2 answers it, so its instance is recorded.
-    for (const role of [SANDBOX_ROLE, BRAIN_ROLE]) if (this.launchIntent(role)) await this.scaleUp(role);
+    for (const role of [SANDBOX_ROLE, BRAIN_ROLE]) if (this.launchIntent(role)) await this.scaleUp(role, false);
     await this.scaleDown(now);
     await this.confirmTerminations();
     const busy = this.hostsBy({ status: LIVE_STATUSES }).length
@@ -2064,8 +2064,9 @@ export class FleetDO extends DurableObject<Env> {
    * repeat with the instance the first call launched, so one whose answer was lost (a timeout, a
    * reset) is recorded and can enroll, never launched twice
    * ([idempotency](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-idempotency.html)).
+   * Only demand (`onDemand`: a placement or a waiting brain) plans a new launch; the tick only repeats.
    */
-  private async scaleUp(role: HostKind = SANDBOX_ROLE): Promise<void> {
+  private async scaleUp(role: HostKind = SANDBOX_ROLE, onDemand = true): Promise<void> {
     const cfg = this.cellConfig();
     const ec2 = this.ec2();
     const s = cfg ? this.scaleSettings(cfg, role) : null;
@@ -2077,6 +2078,7 @@ export class FleetDO extends DurableObject<Env> {
     }
     // Too old to repeat (its token may no longer be honoured): an instance it launched never enrolls.
     if (unfinished) this.endLaunchIntent(role, unfinished.token);
+    if (!onDemand) return;
     const pending = this.sql.exec(`SELECT 1 FROM launched WHERE host IS NULL AND reason IS NULL AND role IN (${sqlIn([roleName(role), role])})`).toArray().length;
     // A brain host of the previous release (its hello lacked `brain_epochs`) never gets a brain and
     // is drained on sight: it isn't capacity, so it doesn't count toward the cap.
