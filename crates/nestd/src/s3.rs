@@ -16,7 +16,7 @@ use ring::{digest, hmac};
 use serde::Deserialize;
 
 use crate::storage::{LocalFsStore, ObjectStore};
-use crate::util::{amz_date, parse_http_date_ms, parse_rfc3339_utc_ms};
+use crate::util::{amz_date, par_try_for_each, parse_http_date_ms, parse_rfc3339_utc_ms};
 
 /// Refresh role credentials this long before they expire.
 const REFRESH_BEFORE_MS: i64 = 5 * 60_000;
@@ -416,31 +416,12 @@ impl S3Store {
 
     fn upload_parts(&self, key: &str, upload: &str, parts: &[&[u8]]) -> io::Result<Vec<String>> {
         let etags: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; parts.len()]);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let failed: Mutex<Option<io::Error>> = Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..PART_PARALLELISM.min(parts.len()) {
-                scope.spawn(|| {
-                    while failed.lock().unwrap().is_none() {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(part) = parts.get(i) else { return };
-                        let n = (i + 1).to_string();
-                        let r = self.request(reqwest::Method::PUT, key, &[("partNumber", &n), ("uploadId", upload)], Some(part)).and_then(|r| {
-                            r.and_then(|r| r.etag).ok_or_else(|| io::Error::other(format!("{key} part {n}: no ETag")))
-                        });
-                        match r {
-                            Ok(etag) => etags.lock().unwrap()[i] = Some(etag),
-                            Err(e) => {
-                                failed.lock().unwrap().get_or_insert(e);
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(e) = failed.into_inner().unwrap() {
-            return Err(e);
-        }
+        par_try_for_each(parts.iter().enumerate().map(Ok::<_, io::Error>), PART_PARALLELISM, |(i, part)| {
+            let n = (i + 1).to_string();
+            let r = self.request(reqwest::Method::PUT, key, &[("partNumber", &n), ("uploadId", upload)], Some(part))?;
+            etags.lock().unwrap()[i] = Some(r.and_then(|r| r.etag).ok_or_else(|| io::Error::other(format!("{key} part {n}: no ETag")))?);
+            Ok(())
+        })?;
         Ok(etags.into_inner().unwrap().into_iter().map(|e| e.expect("every part uploaded")).collect())
     }
 

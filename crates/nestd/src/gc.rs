@@ -13,13 +13,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nest_protocol::model::Manifest;
 use serde::{Deserialize, Serialize};
 
 use crate::s3::{ObjectVersion, S3Store};
+use crate::util::par_try_for_each;
 
 /// What FleetDO hands a host for one pass (`POST /v1/hosts/gc/claim`).
 #[derive(Clone, Debug, Deserialize)]
@@ -127,34 +127,26 @@ fn sweep(store: &S3Store, claim: &Claim, now: &(dyn Fn() -> i64 + Sync), report:
         report.stopped = Some(format!("capped at {} deletes of {}", claim.max_deletes, doomed.len()));
         doomed.truncate(claim.max_deletes as usize);
     }
-    let next = AtomicUsize::new(0);
     let (deleted, errors) = (AtomicU64::new(0), AtomicU64::new(0));
-    let late = Mutex::new(false);
-    std::thread::scope(|scope| {
-        for _ in 0..DELETE_PARALLELISM.min(doomed.len()) {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(v) = doomed.get(i) else { return };
-                    // The reuse rule only covers deletes within 12 h of the mark.
-                    if now() >= claim.deadline_ms {
-                        *late.lock().unwrap() = true;
-                        return;
-                    }
-                    match store.delete_version(&v.key, &v.version_id) {
-                        Ok(()) => deleted.fetch_add(1, Ordering::Relaxed),
-                        Err(e) => {
-                            tracing::warn!(key = %v.key, version = %v.version_id, "GC delete failed: {e}");
-                            errors.fetch_add(1, Ordering::Relaxed)
-                        }
-                    };
-                }
-            });
+    struct Late;
+    let late = par_try_for_each(doomed.iter().map(Ok), DELETE_PARALLELISM, |v| {
+        // The reuse rule only covers deletes within 12 h of the mark.
+        if now() >= claim.deadline_ms {
+            return Err(Late);
         }
-    });
+        match store.delete_version(&v.key, &v.version_id) {
+            Ok(()) => deleted.fetch_add(1, Ordering::Relaxed),
+            Err(e) => {
+                tracing::warn!(key = %v.key, version = %v.version_id, "GC delete failed: {e}");
+                errors.fetch_add(1, Ordering::Relaxed)
+            }
+        };
+        Ok(())
+    })
+    .is_err();
     report.deleted = deleted.into_inner();
     report.delete_errors = errors.into_inner();
-    if late.into_inner().unwrap() {
+    if late {
         report.stopped = Some("past the deadline (12 h after the mark)".into());
     }
     Ok(())
