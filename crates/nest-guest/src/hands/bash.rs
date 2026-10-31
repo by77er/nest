@@ -14,7 +14,7 @@ use tokio::net::unix::pipe;
 use tokio::process::Child;
 
 use super::{CallCtx, text};
-use crate::exec::{self, Spawn, agent_env, kill_tree};
+use crate::exec::{self, Spawn, kill_tree};
 use crate::framed::err;
 use crate::output::{OutputSink, read_output, tail_chars};
 use crate::state::{Guest, now_ms};
@@ -67,11 +67,7 @@ fn spawn_shell(
     cg_name: &str,
     want_pwd: bool,
 ) -> Result<Running, ErrorBody> {
-    let (slot, cwd) = {
-        let inner = guest.inner.lock().unwrap();
-        let rt = inner.agents.get(agent).ok_or_else(|| err(error_code::UNKNOWN_AGENT, "agent detached", false))?;
-        (rt.slot.clone(), rt.cwd.clone())
-    };
+    let ctx = guest.exec_ctx(agent)?;
     let internal = |e: std::io::Error| err(error_code::INTERNAL, e.to_string(), false);
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir).map_err(internal)?;
@@ -84,7 +80,7 @@ fn spawn_shell(
         (None, None)
     };
     let cgroup = guest.cgroups.leaf(&agent.0, cg_kind, cg_name);
-    let spawn_dir = if Path::new(&cwd).is_dir() { PathBuf::from(&cwd) } else { PathBuf::from("/") };
+    let spawn_dir = if Path::new(&ctx.cwd).is_dir() { PathBuf::from(&ctx.cwd) } else { PathBuf::from("/") };
     let child = exec::spawn(Spawn {
         argv: vec![
             bash_path().display().to_string(),
@@ -93,12 +89,12 @@ fn spawn_shell(
             "-c".into(),
             SCRIPT.into(),
             "nest-bash".into(),
-            cwd.clone(),
+            ctx.cwd,
             command.to_string(),
-            slot.cwd.clone(),
+            ctx.slot.cwd,
         ],
         cwd: &spawn_dir,
-        env: agent_env(&slot, guest.config.run_as),
+        env: ctx.env,
         output: Some(out_w),
         fd3: pwd_w,
         cgroup: cgroup.clone(),

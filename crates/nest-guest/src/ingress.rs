@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::exec::{PreExec, agent_env};
+use crate::exec::PreExec;
 use crate::framed::{FramedReader, err, parse_json, write_data, write_json};
 use crate::state::{Gate, Guest};
 use crate::transport::Conn;
@@ -181,17 +181,10 @@ async fn pty(
 ) -> io::Result<()> {
     let (rd, mut wr) = tokio::io::split(conn);
     // Agent context, if any.
-    let ctx = match &agent_id {
-        Some(a) => {
-            let inner = guest.inner.lock().unwrap();
-            inner.agents.get(a).map(|rt| (agent_env(&rt.slot, guest.config.run_as), Some(rt.cwd.clone())))
-        }
-        None => Some((crate::exec::base_env(guest.config.run_as), None)),
-    };
-    let Some((mut envs, agent_cwd)) = ctx else {
-        let a = agent_id.as_ref().map(|a| a.0.clone()).unwrap_or_default();
-        let e = err(error_code::UNKNOWN_AGENT, format!("agent {a} is not attached"), false);
-        return write_json(&mut wr, &IngressResponse::Rejected { error: e }).await;
+    let (mut envs, agent_cwd) = match agent_id.as_ref().map(|a| guest.exec_ctx(a)) {
+        Some(Ok(ctx)) => (ctx.env, Some(ctx.cwd)),
+        Some(Err(error)) => return write_json(&mut wr, &IngressResponse::Rejected { error }).await,
+        None => (crate::exec::base_env(guest.config.run_as), None),
     };
     if !envs.iter().any(|(k, _)| k == "TERM") {
         envs.push(("TERM".into(), "xterm-256color".into()));

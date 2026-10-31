@@ -14,9 +14,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::{CallCtx, resolve, text};
-use crate::exec::{PreExec, agent_env, kill_tree, which};
+use crate::exec::{PreExec, kill_tree, which};
 use crate::framed::err;
-use crate::state::Guest;
+use crate::state::{ExecCtx, Guest};
 
 pub const DEFAULT_HEAD_LIMIT: u32 = 250;
 pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -33,14 +33,7 @@ pub async fn run(guest: &Arc<Guest>, agent: &AgentId, input: GrepInput, ctx: &Ca
         Some(rg) => (rg, rg_args(&input, mode, &path)),
         None => (which("grep").unwrap_or_else(|| PathBuf::from("grep")), grep_args(&input, mode, &path)),
     };
-    let (cwd, env) = {
-        let inner = guest.inner.lock().unwrap();
-        let rt = inner.agents.get(agent);
-        (
-            rt.map(|r| r.cwd.clone()).unwrap_or_else(|| "/".into()),
-            rt.map(|r| agent_env(&r.slot, guest.config.run_as)).unwrap_or_else(|| crate::exec::base_env(guest.config.run_as)),
-        )
-    };
+    let ExecCtx { cwd, env, .. } = guest.exec_ctx(agent)?;
     let mut cmd = Command::new(&prog);
     cmd.args(&args).env_clear().envs(env).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if std::path::Path::new(&cwd).is_dir() {

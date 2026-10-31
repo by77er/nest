@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{require_absolute, text};
-use crate::exec::{PreExec, agent_env, run_helper, which};
+use crate::exec::{PreExec, run_helper, which};
 use crate::hands::files::{Refusal, open_regular, record_digest, record_read};
 use crate::state::Guest;
 
@@ -221,17 +221,10 @@ pub fn image_type(b: &[u8]) -> Option<&'static str> {
 }
 
 /// Environment and pre-exec settings for a helper run on the agent's behalf.
-fn helper_ctx(guest: &Guest, agent: &AgentId) -> (Vec<(String, String)>, PreExec) {
-    let env = guest
-        .inner
-        .lock()
-        .unwrap()
-        .agents
-        .get(agent)
-        .map(|rt| agent_env(&rt.slot, guest.config.run_as))
-        .unwrap_or_else(|| crate::exec::base_env(guest.config.run_as));
+fn helper_ctx(guest: &Guest, agent: &AgentId) -> Result<(Vec<(String, String)>, PreExec), ErrorBody> {
+    let env = guest.exec_ctx(agent)?.env;
     let cgroup = guest.cgroups.leaf(&agent.0, "calls", &format!("helper-{}", crate::state::random_hex(4)));
-    (env, PreExec { tty: None, cgroup, fd3: None, run_as: guest.config.run_as })
+    Ok((env, PreExec { tty: None, cgroup, fd3: None, run_as: guest.config.run_as }))
 }
 
 fn cleanup(pre: &PreExec) {
@@ -289,7 +282,7 @@ fn read_image(guest: &Guest, agent: &AgentId, path: &Path, file: File, meta: &Me
 }
 
 fn shrink_image(guest: &Guest, agent: &AgentId, path: &Path, file: &File) -> Option<Vec<u8>> {
-    let (env, pre) = helper_ctx(guest, agent);
+    let (env, pre) = helper_ctx(guest, agent).ok()?;
     let p = path.to_string_lossy().into_owned();
     let out = if which("vips").is_some() {
         run_helper(
@@ -346,7 +339,7 @@ fn read_pdf(guest: &Guest, agent: &AgentId, path: &Path, pages: Option<&str>) ->
             (1, n.max(1), false)
         }
     };
-    let (env, pre) = helper_ctx(guest, agent);
+    let (env, pre) = helper_ctx(guest, agent)?;
     let p = path.to_string_lossy().into_owned();
     let (f, l) = (first.to_string(), last.to_string());
     let out = run_helper(&["pdftotext", "-layout", "-f", &f, "-l", &l, &p, "-"], None, env, pre.clone(), HELPER_TIMEOUT, PDF_TEXT_CAP);
@@ -370,7 +363,7 @@ fn parse_pages(r: &str) -> Option<(u32, u32)> {
 }
 
 fn pdf_page_count(guest: &Guest, agent: &AgentId, path: &Path) -> Option<u32> {
-    let (env, pre) = helper_ctx(guest, agent);
+    let (env, pre) = helper_ctx(guest, agent).ok()?;
     let p = path.to_string_lossy().into_owned();
     let o = run_helper(&["pdfinfo", &p], None, env, pre.clone(), HELPER_TIMEOUT, 64 * 1024);
     cleanup(&pre);

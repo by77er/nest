@@ -10,6 +10,7 @@ use nest_protocol::model::{AgentId, Epoch, ErrorBody, SandboxId};
 
 use crate::cgroup::Cgroups;
 use crate::events::Events;
+use crate::exec::agent_env;
 use crate::framed::err;
 use crate::tasks::Task;
 use crate::transport::ListenSpec;
@@ -94,6 +95,13 @@ impl Identity {
     }
 }
 
+/// An agent's slot, its current Bash cwd and the environment its processes get.
+pub struct ExecCtx {
+    pub slot: AgentSlot,
+    pub cwd: String,
+    pub env: Vec<(String, String)>,
+}
+
 pub struct Inner {
     pub identity: Option<Identity>,
     pub agents: HashMap<AgentId, AgentRt>,
@@ -173,6 +181,13 @@ impl Guest {
                 );
             }
         }
+    }
+
+    /// What a process started on `agent`'s behalf runs with, read once from its slot.
+    pub fn exec_ctx(&self, agent: &AgentId) -> Result<ExecCtx, ErrorBody> {
+        let inner = self.inner.lock().unwrap();
+        let rt = inner.agents.get(agent).ok_or_else(|| err(error_code::UNKNOWN_AGENT, format!("agent {agent} is not attached"), false))?;
+        Ok(ExecCtx { env: agent_env(&rt.slot, self.config.run_as), slot: rt.slot.clone(), cwd: rt.cwd.clone() })
     }
 
     pub fn set_cwd(&self, agent: &AgentId, cwd: &str) {
