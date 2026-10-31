@@ -135,5 +135,5 @@ Each first counterexample was checked line by line against the code; these were 
 3. Fix B2: mark `destroying` before the first await and check it in every placement continuation; have FleetDO.place refuse a destroyed sandbox (the registry already records `destroyed_ms`).
 4. Fix D1: a create under a lapsed host lease starts fenced (or the watchdog re-checks every new incarnation); and/or STONITH waits for `terminated`, not `shutting-down`.
 5. Fix L1: a lease lost at the epoch still being placed clears the marker and claims again.
-6. Fix L2, O1 and O2: key reassign_queue rows, and ensureStonithFence's skip, by (sandbox, host, epoch); filter placement candidates by `last_rx`.
+6. Fix L2, O1 and O2: key reassign_queue rows, and ensureStonithFence's skip, by (sandbox, host, epoch); filter placement candidates by `last_rx`. L2 and O1 are fixed on refactor/fleet as modelled (`FixQueue`, `FixStonithFence`): the `reassignments` table, keyed by (sandbox, host, epoch), and the skip matching the lease's own host and epoch.
 7. Turn the vitest reproductions into regression tests with the fixes; add a CI job that runs the "holds" and "violates" configurations listed in the spec README.

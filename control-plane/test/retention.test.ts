@@ -487,7 +487,7 @@ describe("a host that never connected and whose proof enrolls again", () => {
         ...env,
         AGENT: { idFromName: (n: string) => n, get: () => ({
           onHostLost: async () => {
-            seen.push(st.storage.sql.exec("SELECT 1 FROM reassign_queue WHERE host = ?", first).toArray().length);
+            seen.push(st.storage.sql.exec("SELECT 1 FROM reassignments WHERE host = ?", first).toArray().length);
           },
         }) },
       };
@@ -503,7 +503,7 @@ describe("a dead host's row", () => {
   it.each([
     ["a lease", "INSERT INTO leases (sandbox, host, epoch, expired) VALUES ('sbx_guard', ?, 1, 1)"],
     ["a stale incarnation", "INSERT INTO stale_incarnations (sandbox, host, epoch, first_seen_ms) VALUES ('sbx_guard', ?, 1, 0)"],
-    ["a queued reassignment", "INSERT INTO reassign_queue (sandbox, host, epoch, host_dead) VALUES ('sbx_guard', ?, 1, 1)"],
+    ["a queued reassignment", "INSERT INTO reassignments (sandbox, host, epoch, host_dead) VALUES ('sbx_guard', ?, 1, 1)"],
     ["an eviction", "INSERT INTO evictions (sandbox, host, epoch) VALUES ('sbx_guard', ?, 1)"],
   ])("is kept while %s names it", async (_what, insert) => {
     const cell = uniqueCell();

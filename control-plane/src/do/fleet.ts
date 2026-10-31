@@ -297,8 +297,17 @@ export class FleetDO extends DurableObject<Env> {
       result TEXT, result_ms INTEGER)`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS commands_host_result ON commands (host, result)");
     this.createHostAgents();
+    // One row per lost lease, keyed by the lease (sandbox, host, epoch): a loss at a newer epoch is
+    // queued while an older one of the same sandbox is still retrying (sandbox-lease L2).
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS reassignments (sandbox TEXT NOT NULL, host TEXT NOT NULL,
+      epoch INTEGER NOT NULL, host_dead INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (sandbox, host, epoch))`);
+    // Its predecessor, keyed by sandbox alone: what an earlier release left is moved over. The table
+    // stays, so a rolled-back Worker still finds one.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS reassign_queue (sandbox TEXT PRIMARY KEY, host TEXT NOT NULL,
       epoch INTEGER NOT NULL, host_dead INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`);
+    this.sql.exec(`INSERT OR IGNORE INTO reassignments (sandbox, host, epoch, host_dead, attempts)
+      SELECT sandbox, host, epoch, host_dead, attempts FROM reassign_queue`);
+    this.sql.exec("DELETE FROM reassign_queue");
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     // Every host this cell created a tunnel for, written before the first Cloudflare call: what the
     // sweep may delete. A row goes with its dead host's row, or, without one, once a sweep's
@@ -1905,7 +1914,7 @@ export class FleetDO extends DurableObject<Env> {
       || this.hostsBy({ status: "expired", where: "instance_id IS NOT NULL" }).length
       || this.sql.exec(LOST_WITH_BRAINS).toArray().length
       || this.sql.exec("SELECT 1 FROM host_agents WHERE gone = 1").toArray().length
-      || this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length
+      || this.sql.exec("SELECT 1 FROM reassignments").toArray().length
       || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND host IS NULL AND reason IS NULL").toArray().length
       || (this.ec2() && this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND reason IS NOT NULL").toArray().length)
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length
@@ -1946,7 +1955,7 @@ export class FleetDO extends DurableObject<Env> {
       status: "dead",
       where: `dead_ms < ? AND tunnel_id IS NULL AND dns_record_id IS NULL
         AND host NOT IN (SELECT host FROM leases) AND host NOT IN (SELECT host FROM stale_incarnations)
-        AND host NOT IN (SELECT host FROM reassign_queue) AND host NOT IN (SELECT host FROM evictions)
+        AND host NOT IN (SELECT host FROM reassignments) AND host NOT IN (SELECT host FROM evictions)
         AND host NOT IN (SELECT host FROM host_agents) AND lost = 1`,
     }, now - DEAD_HOST_RETENTION_MS);
     for (const { host } of dead) {
@@ -2622,8 +2631,11 @@ export class FleetDO extends DurableObject<Env> {
    * every hello, every tick and after a failed fence until one succeeds.
    */
   private async ensureStonithFence(host: string): Promise<void> {
-    const queued = new Set(this.sql.exec<{ sandbox: string }>("SELECT sandbox FROM reassign_queue").toArray().map((r) => r.sandbox));
-    const expired = this.leasesOf(host).filter((l) => l.expired && !queued.has(l.sandbox)).map((l) => l.sandbox);
+    // A lease already queued for reassignment needs no fence; a queued row of another lease of the
+    // same sandbox (an older epoch, still retrying) doesn't cover this one (sandbox-lease O1).
+    const queued = new Set(this.sql.exec<{ sandbox: string; epoch: number }>("SELECT sandbox, epoch FROM reassignments WHERE host = ?", host)
+      .toArray().map((r) => `${r.sandbox}/${r.epoch}`));
+    const expired = this.leasesOf(host).filter((l) => l.expired && !queued.has(`${l.sandbox}/${l.epoch}`)).map((l) => l.sandbox);
     if (!expired.length) {
       this.stonithDoneIfClear(host);
       return;
@@ -2665,29 +2677,29 @@ export class FleetDO extends DurableObject<Env> {
     for (const sandbox of sandboxes) {
       const lease = this.lease(sandbox);
       if (!lease || lease.host !== host) continue;
-      this.sql.exec("INSERT OR IGNORE INTO reassign_queue (sandbox, host, epoch, host_dead) VALUES (?, ?, ?, ?)",
+      this.sql.exec("INSERT OR IGNORE INTO reassignments (sandbox, host, epoch, host_dead) VALUES (?, ?, ?, ?)",
         sandbox, host, lease.epoch, hostDead ? 1 : 0);
     }
     await this.processReassign();
   }
 
-  /** Idempotent per sandbox: drop the old lease, then have SandboxDO grant a new one elsewhere. */
+  /** Idempotent per lost lease: drop it if it is still the sandbox's, then have SandboxDO grant a new one elsewhere. */
   private async processReassign(): Promise<void> {
     const rows = this.sql
-      .exec<{ sandbox: string; host: string; epoch: number; host_dead: number }>("SELECT sandbox, host, epoch, host_dead FROM reassign_queue")
+      .exec<{ sandbox: string; host: string; epoch: number; host_dead: number }>("SELECT sandbox, host, epoch, host_dead FROM reassignments ORDER BY epoch")
       .toArray();
     for (const r of rows) {
       try {
         const lease = this.lease(r.sandbox);
         if (lease && lease.host === r.host && lease.epoch === r.epoch) this.sql.exec("DELETE FROM leases WHERE sandbox = ?", r.sandbox);
         await this.sandbox(r.sandbox).leaseLost(r.host, r.epoch, r.host_dead === 1);
-        this.sql.exec("DELETE FROM reassign_queue WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
+        this.sql.exec("DELETE FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
       } catch (e) {
-        this.sql.exec("UPDATE reassign_queue SET attempts = attempts + 1 WHERE sandbox = ?", r.sandbox);
+        this.sql.exec("UPDATE reassignments SET attempts = attempts + 1 WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
         console.error(`FleetDO: reassigning ${r.sandbox} failed; will retry`, e);
       }
     }
-    if (this.sql.exec("SELECT 1 FROM reassign_queue").toArray().length && !this.deadlines.has(ALARM_TICK)) {
+    if (this.sql.exec("SELECT 1 FROM reassignments").toArray().length && !this.deadlines.has(ALARM_TICK)) {
       await this.deadlines.set(ALARM_TICK, Date.now() + DEFAULT_LEASE_TIMING.heartbeat_ms);
     }
   }

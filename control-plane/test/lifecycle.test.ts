@@ -214,6 +214,63 @@ describe("STONITH is not undone by a hello", () => {
   });
 });
 
+/** SandboxDO runs FleetDO's next `count` leaseLost calls, but FleetDO never hears the answers. */
+async function loseLeaseLostAnswers(cell: string, count: number) {
+  await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+    const real = (inst as any).sandbox.bind(inst);
+    (inst as any).sandbox = (id: string) => new Proxy(real(id), {
+      get: (stub, prop) => prop !== "leaseLost" ? Reflect.get(stub, prop) : async (...args: unknown[]) => {
+        const r = await stub.leaseLost(...args);
+        if (count-- > 0) throw new Error("answer lost");
+        return r;
+      },
+    });
+  });
+}
+
+describe("every lost lease is reassigned, however its losses overlap", () => {
+  it("an older loss still retrying never stands in for the fence of a newer lease (B-4, O1)", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const b = await connectHost(cell);
+    await loseLeaseLostAnswers(cell, 100);
+    a.ws.close();
+    await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 2, host: b.host });
+    await nextCommands(b.ws, (c) => c.type === "sandbox_create");
+    // The new holder goes silent and comes back: it must fence its expired lease first.
+    await expireNow(cell, b.host, null);
+    const ws = await Ws.connect("/v1/fleet", b.host_token);
+    ws.send(hostHello(b.host, cell, { sandboxes: [{ sandbox: sbx.sandbox, epoch: 2, state: "fenced", dirty: false }] }));
+    await ws.next("hello_ack");
+    const fence = await nextCommands(ws, (c) => c.type === "fence" && c.reason === "lease expired");
+    expect(fence.find((c) => c.type === "fence")!.sandboxes).toEqual([sbx.sandbox]);
+  });
+
+
+  it("a loss at a newer epoch is queued while an older loss of the same sandbox is still retrying (B-4, L2)", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const others = [await connectHost(cell), await connectHost(cell)];
+    // SandboxDO takes the first reassignment, but its answer is lost: FleetDO keeps the row and retries.
+    await loseLeaseLostAnswers(cell, 1);
+    a.ws.close();
+    await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const second = await sandboxStub(sbx.sandbox).info();
+    expect(second.epoch).toBe(2);
+    // Its new holder dies before the tick retries the first row.
+    const holder = others.find((h) => h.host === second.host)!;
+    holder.ws.close();
+    await adminJson(`/v1/admin/hosts/${holder.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const last = others.find((h) => h !== holder)!;
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ epoch: 3, host: last.host });
+  });
+});
+
 describe("a host FleetDO is terminating never serves again", () => {
   it("its fence ok re-places its sandboxes elsewhere but leaves it stonith_pending until EC2 confirms it gone (B-2)", async () => {
     const cell = uniqueCell();

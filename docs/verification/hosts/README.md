@@ -31,7 +31,7 @@ Design docs: [FleetDO](../../control-plane/durable-objects/fleet/), [autoscaling
 | `commands` | `cmd`, `host`, `type`, `sandbox`, `agent`, `epoch`, `purpose` ∈ {null, `stonith_fence`} (`:110`), `body`, `result`, `result_ms` | Answered rows pruned after 24 h (`:1323`); unanswered rows never pruned. |
 | `rel_out`, `rel_state` | per host: unacked command batches by `seq`; `next_out`, `last_in` | `reliable.ts:11-14`. |
 | `leases` | `sandbox` (PK), `host`, `epoch`, `expired`, `state` | Drives busy/idle and STONITH. |
-| `reassign_queue` | `sandbox` (**PK alone**), `host`, `epoch`, `host_dead`, `attempts` | `:195-196`. |
+| `reassign_queue` | `sandbox` (**PK alone**), `host`, `epoch`, `host_dead`, `attempts` | `:195-196`. Replaced on refactor/fleet by `reassignments`, PK (`sandbox`, `host`, `epoch`); old rows are moved over at construction. |
 | `evictions` | (`sandbox`, `host`, `epoch`) | SandboxDO told `evicted`, retried (`:1580-1589`). |
 | `host_agents`, `stale_incarnations` | brains per host; incarnations awaiting `sandbox_destroy` | Busy check and dead-host cleanup. |
 
