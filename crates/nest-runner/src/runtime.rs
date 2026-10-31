@@ -324,8 +324,9 @@ pub struct Agent {
     /// Held while one caller resolves the target, so N parallel first calls send one
     /// `hands_resolve` and the rest find the cached target.
     pub resolve_gate: tokio::sync::Mutex<()>,
-    /// In-flight hands calls (bridge-scoped key → cancel), cancelled on hard interrupt.
-    pub hands_inflight: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    /// Parent of every hands call's cancel token: a hard interrupt or kill cancels it and starts
+    /// a fresh one for later calls.
+    hands_cancel: Mutex<CancellationToken>,
     event_seq: AtomicU64,
     call_n: AtomicU64,
     /// Values redacted from anything leaving the host (session segments).
@@ -362,7 +363,7 @@ impl Agent {
             pending_lists: Mutex::new(HashMap::new()),
             pending_resolves: Mutex::new(HashMap::new()),
             resolve_gate: tokio::sync::Mutex::new(()),
-            hands_inflight: Mutex::new(HashMap::new()),
+            hands_cancel: Mutex::new(CancellationToken::new()),
             event_seq: AtomicU64::new(0),
             call_n: AtomicU64::new(0),
             secrets,
@@ -554,11 +555,14 @@ impl Agent {
         }
     }
 
+    /// A cancel token for one hands call, cancelled by the next [`Agent::cancel_hands`].
+    pub fn hands_token(&self) -> CancellationToken {
+        self.hands_cancel.lock().unwrap().child_token()
+    }
+
     /// Cancel every in-flight hands call (hard interrupt / kill).
     pub fn cancel_hands(&self) {
-        for (_, tx) in self.hands_inflight.lock().unwrap().drain() {
-            let _ = tx.send(());
-        }
+        std::mem::take(&mut *self.hands_cancel.lock().unwrap()).cancel();
     }
 }
 
@@ -570,6 +574,20 @@ mod registry_tests {
         let (cmd, _crx) = mpsc::unbounded_channel();
         let (out, _orx) = mpsc::unbounded_channel();
         Agent::new(AgentId("agt_r".into()), Epoch(epoch), PathBuf::from("/tmp"), None, None, vec![], rt.current_gen(), cmd, out)
+    }
+
+    /// A hard interrupt cancels every hands call in flight (each a child of the agent's token),
+    /// and only those: a call started after it runs.
+    #[test]
+    fn cancel_hands_cancels_the_calls_in_flight_and_no_later_one() {
+        let rt = Runtime::new(Config::default());
+        let a = agent(&rt, 1);
+        let (one, two) = (a.hands_token(), a.hands_token());
+        two.cancel();
+        assert!(!one.is_cancelled(), "a bridge's cancel of one call leaves the others");
+        a.cancel_hands();
+        assert!(one.is_cancelled());
+        assert!(!a.hands_token().is_cancelled(), "a later call gets a fresh token");
     }
 
     /// N9: a call id outside a turn carries 128 random bits.

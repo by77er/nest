@@ -14,7 +14,6 @@ use nest_protocol::host::mcp::McpContent;
 use nest_protocol::model::{AgentEventBody, AgentState, MessageId};
 use serde_json::{Value, json};
 use tokio::net::{UnixDatagram, UnixListener};
-use tokio::sync::oneshot;
 
 use crate::framing;
 use crate::hands;
@@ -277,8 +276,8 @@ async fn session_start(rt: &Runtime, agent: &Arc<Agent>, input: &Value) -> HookO
         Ok(op) => op,
         Err(_) => return HookOutput::default(),
     };
-    let (_tx, rx) = oneshot::channel();
-    let call = hands::call(agent, format!("ss-{}", uuid::Uuid::new_v4().simple()), op, rx);
+    // A kill or hard interrupt cancels the read like any hands call.
+    let call = hands::call(agent, format!("ss-{}", uuid::Uuid::new_v4().simple()), op, agent.hands_token());
     // With a target cached the read itself is bounded; without one the call first waits for
     // AgentDO (the sandbox may still be placing), which takes as long as the resolve budget.
     let limit = match agent.hands_target() {

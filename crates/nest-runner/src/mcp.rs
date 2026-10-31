@@ -8,7 +8,8 @@ use nest_protocol::guest::HANDS_TOOLS;
 use nest_protocol::host::mcp::{McpBridgeRequest, McpBridgeResponse, McpToolDef, ToolCallResult};
 use nest_protocol::model::{ErrorBody, error_codes};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::framing;
 use crate::hands;
@@ -76,7 +77,8 @@ async fn connection(rt: Arc<Runtime>, stream: UnixStream) {
             }
         }
     });
-    let inflight: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>> = Default::default();
+    // Each call's cancel, a child of the agent's hands token (so a hard interrupt cancels it too).
+    let inflight: Arc<Mutex<HashMap<u64, CancellationToken>>> = Default::default();
     while let Ok(Some(req)) = framing::read_host::<_, McpBridgeRequest>(&mut rd).await {
         match req {
             McpBridgeRequest::Hello { .. } => {}
@@ -88,24 +90,24 @@ async fn connection(rt: Arc<Runtime>, stream: UnixStream) {
                 });
             }
             McpBridgeRequest::ToolsCall { id, name, arguments, tool_use_id } => {
-                let (cancel_tx, cancel_rx) = oneshot::channel();
-                inflight.lock().unwrap().insert(id, cancel_tx);
+                let cancel = agent.hands_token();
+                inflight.lock().unwrap().insert(id, cancel.clone());
                 let (rt, agent, tx, inflight) = (rt.clone(), agent.clone(), tx.clone(), inflight.clone());
                 tokio::spawn(async move {
-                    let resp = call(&rt, &agent, id, &name, arguments, tool_use_id, cancel_rx).await;
+                    let resp = call(&rt, &agent, id, &name, arguments, tool_use_id, cancel).await;
                     inflight.lock().unwrap().remove(&id);
                     let _ = tx.send(resp);
                 });
             }
             McpBridgeRequest::Cancel { id } => {
                 if let Some(c) = inflight.lock().unwrap().remove(&id) {
-                    let _ = c.send(());
+                    c.cancel();
                 }
             }
         }
     }
     for (_, c) in inflight.lock().unwrap().drain() {
-        let _ = c.send(());
+        c.cancel();
     }
     drop(tx);
     let _ = writer.await;
@@ -119,7 +121,7 @@ async fn call(
     name: &str,
     arguments: serde_json::Value,
     tool_use_id: Option<String>,
-    cancel: oneshot::Receiver<()>,
+    cancel: CancellationToken,
 ) -> McpBridgeResponse {
     if HANDS_TOOLS.contains(&name) {
         if !has_hands(agent) {
@@ -130,22 +132,10 @@ async fn call(
             Ok(op) => op,
             Err(msg) => return McpBridgeResponse::ToolsCall { id, result: ToolCallResult::error(msg) },
         };
-        // Hard interrupts cancel through the agent too.
-        let key = format!("{}-{id}", uuid::Uuid::new_v4().simple());
-        let (agent_cancel_tx, agent_cancel_rx) = oneshot::channel::<()>();
-        agent.hands_inflight.lock().unwrap().insert(key.clone(), agent_cancel_tx);
-        let (merged_tx, merged_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            tokio::select! {
-                r = cancel => if r.is_ok() { let _ = merged_tx.send(()); },
-                r = agent_cancel_rx => if r.is_ok() { let _ = merged_tx.send(()); },
-            }
-        });
         // The guest call id is Claude Code's tool_use id when `nest mcp` found one in the
         // request's `_meta` (UNVERIFIED that Claude Code sends it); otherwise a generated id.
-        let call_id = tool_use_id.unwrap_or_else(|| format!("hc_{}", &key[..12]));
-        let result = hands::call(agent, call_id, op, merged_rx).await;
-        agent.hands_inflight.lock().unwrap().remove(&key);
+        let call_id = tool_use_id.unwrap_or_else(|| format!("hc_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+        let result = hands::call(agent, call_id, op, cancel).await;
         McpBridgeResponse::ToolsCall { id, result }
     } else {
         let result = agent.platform_call(name, arguments, rt.cfg.tool_call_timeout).await;
