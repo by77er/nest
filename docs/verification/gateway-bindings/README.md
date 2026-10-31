@@ -30,7 +30,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | P3 | attachResult error | SandboxDO | same | retryable: backoff 2–30 s; else wait for next `running` | `sandbox.ts:814-828` |
 | P4 | new placement | SandboxDO | — | `pending := attached`, `inflight := {}`; reissue all | `sandbox.ts:770-786` |
 | P5 | detach(a) | SandboxDO | — | remove `a` everywhere; issue `agent_detach{kill_processes}` | `sandbox.ts:736-749` |
-| P6 | resolve(a) | SandboxDO | attached; not destroyed/archived; placed, not placing; `running`; `a ∉ pending`; gateway URL; tunnel connected; guest known | mint `{sandbox, epoch, client: a, hands, now+1h}`; after the awaits re-check attached, epoch, host, pending, guest | `sandbox.ts:835-882` |
+| P6 | resolve(a) | SandboxDO | attached; not destroyed/archived; placed, not placing; `running`; `a ∉ pending`; gateway URL; tunnel connected; guest known | mint `{sandbox, epoch, client: a, hands, now+1h}`; after the awaits re-check attached, epoch, host, pending, `running`, guest | `sandbox.ts:835-882` |
 | P7 | hands_resolve | AgentDO | socket is the current runner and epoch (checked **before** the await only) | answer `hands_resolved` | `agent.ts:651-658,568-579` |
 | K1 | keys | BrokerDO → FleetDO → nestd → gateway | hello, or a heartbeat while `keysSent` lacks the host | `binding_key{keys}` (one key); nestd mirrors and sends `key_update`, which replaces the set | `broker.ts:124-127`, `fleet.ts:773-774,951-954,1341-1349`, `crates/nestd/src/fleet.rs:415-417`, `gateway_link.rs:138-141` |
 

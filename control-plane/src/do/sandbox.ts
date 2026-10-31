@@ -1053,6 +1053,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (fresh.epoch !== info.epoch || fresh.host !== info.host || fresh.attach_pending.includes(agent)) {
       throw notReady("sandbox moved while resolving");
     }
+    if (fresh.state !== "running") throw notReady(`sandbox is ${fresh.state}`);
     if (!fresh.guest) throw notReady("sandbox moved while resolving");
     // `sandbox` and `epoch`: unsigned copies of the claims, for clients of the previous release only.
     return { url, sandbox: info.sandbox, epoch: info.epoch, binding, guest: fresh.guest, ...(edge ? { edge } : {}) };
