@@ -172,8 +172,6 @@ export interface PlaceRequest {
   policy: EgressPolicy;
   from?: GenerationRecord;
   excludeHost?: string;
-  /** The cell this FleetDO serves; lets it launch a sandbox host when none can take the sandbox. */
-  cell?: string;
 }
 
 /** An instance this control plane launched, with what it may enroll as. */
@@ -1102,7 +1100,7 @@ export class FleetDO extends DurableObject<Env> {
       }
       this.recordState(host, s.sandbox, s.epoch, s.state, s.guest);
       try {
-        await this.sandbox(s.sandbox).reportState(host, s.epoch, s.state, null, "reported in hello", s.guest ?? null);
+        await this.sandbox(s.sandbox).reportState(host, s.epoch, s.state, "reported in hello", s.guest ?? null);
       } catch (e) {
         console.error(`FleetDO: reconciling ${s.sandbox} failed`, e);
       }
@@ -1351,7 +1349,7 @@ export class FleetDO extends DurableObject<Env> {
           return;
         }
         this.recordState(host, ev.sandbox, ev.epoch, ev.state, ev.guest);
-        await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.suspend_mode ?? null, ev.detail ?? null, ev.guest ?? null);
+        await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.detail ?? null, ev.guest ?? null);
         if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false);
         // A draining host's sandboxes leave as soon as they're safely suspended.
         else if (ev.state === "suspended" && this.host(host)?.status === "draining") await this.evict(host, [ev.sandbox]);

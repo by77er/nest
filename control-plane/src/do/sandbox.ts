@@ -319,7 +319,6 @@ export class SandboxDO extends DurableObject<Env> {
       const host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
         workstream: before.workstream,
-        cell: before.cell,
         epoch,
         image: before.image,
         resources: before.resources,
@@ -390,7 +389,7 @@ export class SandboxDO extends DurableObject<Env> {
    * report carries the guest's version, which `resolve` hands to clients.
    */
   async reportState(
-    host: string, epoch: number, state: SandboxState, _mode: string | null, detail: string | null, guest: GuestInfo | null = null,
+    host: string, epoch: number, state: SandboxState, detail: string | null, guest: GuestInfo | null = null,
   ): Promise<void> {
     const info = this.tryInfo();
     if (!info || !lease.holds(info, host, epoch)) return;

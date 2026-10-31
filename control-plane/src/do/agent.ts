@@ -12,7 +12,7 @@ import { z } from "zod";
 import { num, type Env } from "../env";
 import {
   type Caller, type ChannelDelivery, clip, type DeliveryOutcome, envelopeText, EVENT_TEXT_BYTES, Filter,
-  parseChannel, type PostInput, sessionTaint, SubscribeInput,
+  parseChannel, type PostInput, sessionTaint, SubscribeInput, takeBatch,
 } from "../lib/channels";
 import { admitDelivery, channelRequestId, inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import type { ReadResult } from "./channel";
@@ -1995,23 +1995,12 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     const reads = info.tools.includes("read");
     // A notice tells the model to `read`. An agent without the tool takes a batch only as far as
-    // its user messages arrive inline (`inline_to`; the first always does), with an envelope of
-    // those alone; the rest of the range comes as the next batch. Other posters' messages it can't
-    // act on are taken without a notice, and counted (`skipped`, `skipped_to`) so stage 2, which
-    // gives every agent `read` on its own built-ins, can point it at them.
-    const upTo = reads ? d.batch.to_seq : Math.min(d.batch.inline_to ?? d.batch.to_seq, d.batch.to_seq);
+    // its user messages arrive inline, and counts the rest as skipped (`takeBatch`).
+    const { up_to: upTo, shown, skipped } = takeBatch(d, reads);
     const ack: DeliveryOutcome = upTo < d.batch.to_seq ? { status: "ok", up_to: upTo } : { status: "ok" };
     // Deduplicated first (a retry of a batch already taken is acknowledged whatever the guards say).
     const hw = this.sql.exec<{ hw: number }>("SELECT hw FROM channel_subs WHERE channel = ? AND sub = ?", d.channel, d.subscription).toArray()[0]?.hw;
     if (hw !== undefined && hw >= upTo) return ack;
-    const shown: ChannelDelivery = reads ? d : {
-      ...d,
-      batch: {
-        ...d.batch, to_seq: upTo, count: d.batch.inline.length, first_seq: d.batch.inline[0]?.seq ?? upTo, last_seq: d.batch.inline.at(-1)?.seq ?? upTo,
-        senders: d.batch.inline.length ? [{ from: "user", n: d.batch.inline.length }] : [], kinds: [], tainted: 0,
-      },
-    };
-    const skipped = !reads && d.batch.count > d.batch.inline.length;
     const take = () => {
       this.sql.exec(`INSERT INTO channel_subs (channel, sub, hw, created_ms, ended, skipped, skipped_to) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(channel, sub) DO UPDATE SET hw = excluded.hw, ended = excluded.ended, skipped = skipped + excluded.skipped,
