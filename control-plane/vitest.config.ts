@@ -16,6 +16,8 @@ export default defineConfig({
           MCP_LIST_TIMEOUT_MS: "1500",
           // https, so nest offers its client ID metadata document (test/mcp-oauth.test.ts).
           PUBLIC_BASE_URL: "https://nest.test",
+          // A brokered request's budget, short so a lost answer is quick to provoke (test/brokered.test.ts).
+          BROKERED_TIMEOUT_MS: "1500",
         },
       },
     }),

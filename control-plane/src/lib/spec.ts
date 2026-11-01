@@ -8,6 +8,7 @@ import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protoco
 import { LedgerName, TASK_ADMIN_TOOLS, TASK_TOOLS } from "./tasks";
 import { ChannelGrant } from "./channels";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
+import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry } from "./brokered";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -44,6 +45,8 @@ export const Capability = z.object({
   grants: z.array(ChannelGrant).default([]),
   /** A remote MCP server whose tools it gives, as `<capability>_<tool>` (docs/agents/capabilities/mcp/). */
   mcp: McpSource.optional(),
+  /** Brokered actions it grants, each scoped (docs/agents/capabilities/#brokered-actions): GitHub actions to repos, http profiles. */
+  brokered: BrokeredSource.optional(),
 });
 export type Capability = z.output<typeof Capability>;
 
@@ -107,6 +110,8 @@ export interface AgentSpec {
   channel_grants: ChannelGrant[];
   /** Its mcp capabilities' servers, in capability order; absent when it has none (as is every stored spec before them). */
   mcp?: McpGrant[];
+  /** Its brokered action grants, in capability order; absent when it has none (as is every stored spec before them). */
+  brokered?: BrokeredGrant[];
 }
 
 export interface Catalog {
@@ -194,6 +199,17 @@ export const TASK_CAPABILITIES: Readonly<Record<string, Capability>> = {
 };
 
 /**
+ * Version 4: widening its own sandbox's egress, a sink (docs/sandbox/networking/egress/policy/#rules).
+ * Not added to the seed templates: giving it to a template is the operator's step.
+ */
+export const EGRESS_CAPABILITIES: Readonly<Record<string, Capability>> = {
+  egress: cap(["egress_policy"], [], [
+    "To reach a host your sandbox's egress refuses (a 403 egress_denied), ask for it with mcp__nest__egress_policy {allow: [{host}], ttl_s}.",
+    "From a session that read untrusted content the operator approves it first: end your turn and the decision arrives as your next input.",
+  ].join(" ")),
+};
+
+/**
  * The built-ins a new catalog's `worker` launches with (docs/agents/runner/#launch): the task tools and
  * the web tools. No `TodoWrite` (inert beside the task tools) and no `Agent` (`Task` before Claude Code
  * 2.1): in `-p` mode a subagent's result arrives in a later turn, which turn tracking doesn't model.
@@ -212,6 +228,7 @@ export const SEED_CATALOG: Catalog = {
     management: { ...SEED_CATALOG_V1.capabilities.management!, tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => t !== "delegate") },
     ...CHANNEL_CAPABILITIES,
     ...TASK_CAPABILITIES,
+    ...EGRESS_CAPABILITIES,
   },
   templates: {
     worker: {
@@ -234,6 +251,7 @@ export const SEED_CATALOG: Catalog = {
 export const SEED_STEPS: readonly { version: number; capabilities: Readonly<Record<string, Capability>>; templates: Readonly<Record<string, Template>> }[] = [
   { version: 2, capabilities: CHANNEL_CAPABILITIES, templates: {} },
   { version: 3, capabilities: TASK_CAPABILITIES, templates: {} },
+  { version: 4, capabilities: EGRESS_CAPABILITIES, templates: {} },
 ];
 export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
 
@@ -261,7 +279,9 @@ export function seedMigration(have: { capabilities: readonly string[]; templates
  * (`allowLoopback`: local development only), a name no platform tool starts with, and its allowlist and
  * overrides name each tool once.
  */
-export function checkCapability(cap: Capability, registry: readonly string[], mcp?: { name: string; allowLoopback: boolean }): Result<Capability> {
+export function checkCapability(
+  cap: Capability, registry: readonly string[], mcp?: { name: string; allowLoopback: boolean; allowLoopbackBrokered?: boolean },
+): Result<Capability> {
   const seen = new Set<string>();
   for (const t of cap.tools) {
     if (!registry.includes(t)) return err(`unknown platform tool ${t}`);
@@ -272,7 +292,8 @@ export function checkCapability(cap: Capability, registry: readonly string[], mc
     if (!mcp) return err("an mcp capability is checked with its name");
     const url = checkMcpUrl(cap.mcp.url, mcp.allowLoopback);
     if (!url.ok) return err(`mcp.url: ${url.error}`);
-    const clash = capabilityNameClash(mcp.name, registry);
+    // Brokered actions' tools (`github_comment`, …) are platform tools too.
+    const clash = capabilityNameClash(mcp.name, [...registry, ...BROKERED_TOOL_NAMES]);
     if (clash) return err(clash);
     const tools = cap.mcp.tools ?? [];
     if (new Set(tools).size !== tools.length) return err("mcp.tools lists a tool twice");
@@ -280,6 +301,10 @@ export function checkCapability(cap: Capability, registry: readonly string[], mc
     if (Array.isArray(idem) && new Set(idem).size !== idem.length) return err("mcp.idempotent lists a tool twice");
     const auth = cap.mcp.auth;
     if (typeof auth !== "string" && auth.client === auth.oauth) return err("mcp.auth: the client secret and the token record must be different names");
+  }
+  if (cap.brokered) {
+    const b = checkBrokered(cap.brokered, mcp?.allowLoopbackBrokered ?? false);
+    if (!b.ok) return err(`brokered: ${b.error}`);
   }
   return ok(cap);
 }
@@ -323,11 +348,16 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   const tpl = catalog.templates[name]!;
   const caps: Capability[] = [];
   const mcp: McpGrant[] = [];
+  const brokered: BrokeredGrant[] = [];
   for (const c of tpl.capabilities) {
     if (!Object.hasOwn(catalog.capabilities, c)) return err(`template ${name}: unknown capability ${c}`);
     const cap = catalog.capabilities[c]!;
     caps.push(cap);
     if (cap.mcp) mcp.push(grantOf(c, cap.mcp));
+    for (const e of cap.brokered ?? []) {
+      const g = grantOfEntry(c, e);
+      if (g) brokered.push(g);
+    }
   }
   // A stored capability may name a tool the registry no longer has (`delegate`, in catalogs seeded
   // before it went): ignored, not a failed spawn. Writes still refuse one (`checkCapability`).
@@ -348,6 +378,7 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     channel_grants: dedupeGrants(caps.flatMap((c) => c.grants)),
     params: params.value,
     ...(mcp.length ? { mcp } : {}),
+    ...(brokered.length ? { brokered } : {}),
   });
 }
 
@@ -370,16 +401,23 @@ const capsOf = (catalog: Catalog, name: string): Capability[] => catalog.templat
 
 /**
  * A spec's tools narrowed to `subset`, which must not name a tool the spec lacks: platform tools by
- * name, a remote tool as `<capability>_<tool>`. A given subset narrows each mcp grant's allowlist to
- * the remote tools it names, and drops a grant it names none of.
+ * name, a remote tool as `<capability>_<tool>`, a brokered action by its tool (`github_comment`). A
+ * given subset narrows each mcp grant's allowlist to the remote tools it names, and drops a grant it
+ * names none of; it keeps only the brokered grants of the actions it names.
  */
-function narrowTools(name: string, spec: AgentSpec, subset: readonly string[] | undefined): Result<Pick<AgentSpec, "tools" | "mcp">> {
-  if (!subset) return ok({ tools: spec.tools, ...(spec.mcp ? { mcp: spec.mcp } : {}) });
+function narrowTools(name: string, spec: AgentSpec, subset: readonly string[] | undefined): Result<Pick<AgentSpec, "tools" | "mcp" | "brokered">> {
+  if (!subset) return ok({ tools: spec.tools, ...(spec.mcp ? { mcp: spec.mcp } : {}), ...(spec.brokered ? { brokered: spec.brokered } : {}) });
   const grants = spec.mcp ?? [];
   const remote = new Map<string, string[]>();
+  const actions = new Set<string>();
   const wider: string[] = [];
   for (const t of subset) {
     if (spec.tools.includes(t)) continue;
+    const action = actionOfTool(t);
+    if (action && (spec.brokered ?? []).some((g) => g.action === action)) {
+      actions.add(action);
+      continue;
+    }
     const g = grants.find((x) => t.startsWith(`${x.capability}_`));
     const tool = g ? t.slice(g.capability.length + 1) : "";
     if (!g || !tool || (g.tools && !g.tools.includes(tool))) {
@@ -390,7 +428,8 @@ function narrowTools(name: string, spec: AgentSpec, subset: readonly string[] | 
   }
   if (wider.length) return err(`template ${name} doesn't give ${wider.join(", ")}`);
   const mcp = grants.filter((g) => remote.has(g.capability)).map((g) => ({ ...g, tools: [...new Set(remote.get(g.capability))] }));
-  return ok({ tools: spec.tools.filter((t) => subset.includes(t)), ...(mcp.length ? { mcp } : {}) });
+  const brokered = (spec.brokered ?? []).filter((g) => actions.has(g.action));
+  return ok({ tools: spec.tools.filter((t) => subset.includes(t)), ...(mcp.length ? { mcp } : {}), ...(brokered.length ? { brokered } : {}) });
 }
 
 /**
@@ -417,7 +456,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     if (!tools.ok) return tools;
     // No parameters, not even the template's defaults: a spawner would otherwise reach whatever ledger a
     // template names. A child's parameters wait for attenuation against the spawner's own.
-    const { mcp: _mcp, ...rest } = base.value;
+    const { mcp: _mcp, brokered: _brokered, ...rest } = base.value;
     return ok({ ...rest, ...tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} });
   }
   const o = spec.overrides ?? {};
@@ -425,7 +464,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
   if (!tools.ok) return tools;
   const params = checkParams(`template ${spec.template}`, capsOf(catalog, spec.template), { ...base.value.params, ...o.params });
   if (!params.ok) return params;
-  const { mcp: _mcp, ...rest } = base.value;
+  const { mcp: _mcp, brokered: _brokered, ...rest } = base.value;
   return ok({
     ...rest,
     ...tools.value,

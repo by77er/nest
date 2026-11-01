@@ -5,6 +5,9 @@
 import { z } from "zod";
 import type { ToolContent, ToolDef } from "../protocol/control";
 import { CapRef, OAuthAuth, type OAuthGrant } from "./mcp-auth";
+import { gated } from "./sinks";
+
+export { approves, argsDigest } from "./sinks";
 
 /** The MCP version nest asks for, and the ones it accepts a server answering with. */
 export const MCP_PROTOCOL_VERSION = "2025-11-25";
@@ -185,29 +188,15 @@ export function isIdempotent(grant: McpGrant, tool: string, listed: ListedTool |
 }
 
 /**
- * Whether a call needs the operator's approval first (docs/agents/tools/#taint-and-sinks): a sink (a tool
- * not read-only) called from a tainted session, unless the capability allows it. Read-only is the
+ * Whether a call needs the operator's approval first (the sink gate, lib/sinks.ts): a sink (a tool not
+ * read-only) called from a tainted session, unless the capability allows it. Read-only is the
  * operator's mark, else a trusted server's `readOnlyHint`: an untrusted server's annotations don't count
  * ("clients MUST consider tool annotations to be untrusted unless they come from trusted servers").
  */
 export function needsApproval(grant: McpGrant, tool: string, listed: ListedTool | undefined, tainted: boolean): boolean {
-  if (!tainted || grant.when_tainted === "allow") return false;
   const marked = grant.read_only?.[tool];
   const readOnly = marked ?? (grant.trusted && listed?.annotations.readOnlyHint === true);
-  return !readOnly;
-}
-
-/** An approval binds to exactly these arguments: SHA-256 of their canonical JSON (keys sorted). */
-export async function argsDigest(args: unknown): Promise<string> {
-  const canon = (v: unknown): unknown => Array.isArray(v) ? v.map(canon)
-    : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon((v as Record<string, unknown>)[k])])) : v;
-  const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(canon(args)))));
-  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** An answer to an approval approves only when it says so; anything else denies. */
-export function approves(answer: string): boolean {
-  return /^(approve[ds]?|allow(ed)?|yes|y|ok(ay)?)\b/i.test(answer.trim());
+  return gated({ sink: !readOnly, when_tainted: grant.when_tainted ?? "approve", tainted });
 }
 
 /** A `tools/call` result as nest's tool content, or null when it isn't a CallToolResult. */

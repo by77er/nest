@@ -20,7 +20,7 @@ prompt:  |                                  # added to the system prompt
 - **Parameters (built for `ledger` only):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. Until attenuation is built a spawner can't set one and its children get none (not even the template's defaults). A parameter naming several values (`tasks{ledgers}`) is the extension point.
 - **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
-- **Built so far:** `builtin` tools, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)), and the `mcp` source ([mcp/](mcp/): a bearer token, the allowlist, idempotency overrides and the trust flag; AgentDO is the MCP client). `api` isn't built. The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `tasks` and `tasks-admin`; of the parameters only `ledger` is built (`peers: label:<key>`, `any` aren't), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
+- **Built so far:** `builtin` tools, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token, the allowlist, idempotency overrides and the trust flag; AgentDO is the MCP client) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `tasks`, `tasks-admin` and `egress`; of the parameters only `ledger` is built (`peers: label:<key>`, `any` aren't), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
 
 ## Sources
 
@@ -31,6 +31,7 @@ Every capability's tools run in the control plane or behind it, so credentials s
 | `builtin` | Platform tools from the registry (below) | None | Per tool |
 | `mcp{url, auth, tools?, idempotent?, read_only?, trusted?, when_tainted?}` | A remote MCP server's tools ([Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)), listed by the control plane and filtered by an allowlist; see [mcp/](mcp/) | A bearer token or [OAuth](mcp/#oauth) tokens in BrokerDO; the control plane is the MCP client | A tool is a sink unless the operator marks it `read_only`, or a `trusted` server marks it `readOnlyHint` ([tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools), which clients must treat as untrusted from an untrusted server); see [mcp/](mcp/#sinks) |
 | `api{base_url, mode, paths?, auth}` | One tool, `<capability>_request(method, path, query?, body?)` | In BrokerDO; the control plane attaches it to each request | `mode: ro` allows only `GET` and `HEAD` and isn't a sink; `mode: rw` is |
+| `brokered[{action, repos? \| profile…, when_tainted?, per_hour?}]` | One tool per granted action (`github_comment`, `http_request`, …) and `brokered{action, args}`; see [brokered/](brokered/) | The GitHub App (`github_app`) mints a token per call's repo; a profile's `http:<name>` secret is attached by the control plane | GitHub writes are sinks: `allow` when tainted if scoped to repos, `approve` if not (the defaults); a profile is a sink unless it allows only `GET`/`HEAD` |
 
 ```yaml
 capability: github_ro
@@ -57,12 +58,12 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `channels` | `channel_create`, `post`, `read`, `subscribe`, `unsubscribe` | its own channels; others by extra grants |
 | `memory` | `post` and `read` on its private keyed channel | that channel; the key index (at most 200 keys) is injected at session start, and a weekly wake asks for consolidation. **Only for long-lived agents** (see [continuity](../#continuity)) |
 | `spawning{budget}` | `agent_spawn`, `agent_stop`, `attach`, `adopt`, `list` | spawning within the budget |
-| `sandboxes` | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | its own sandboxes |
+| `sandboxes` | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | its own sandboxes; built: `egress_policy` on the bound sandbox, seeded alone as `egress` (no seed template lists it) |
 | `authority` | `grant`, `revoke` | granting what it holds; sink grants are `approve` when tainted |
 | `transcripts` | `read_transcript` | agents it owns |
 | `hooks` | `hook_create(channel, verify, filter?, map?)` → URL, `hook_delete`, `list` | hooks posting to channels it can post to; it never sees their secrets (see [sources](../../channels/sources/)) |
 | `schedules` | `wake_at(at \| every, note)` → id, `wake_cancel(id)` | waking itself, within its turn budget |
-| `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding |
+| `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding; built as the `brokered` source ([brokered/](brokered/)) |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
 | `metrics` | `metrics_query(sql)` over nest's own [runtime metrics](../../control-plane/metrics/) | reading them; results hold only numbers, enums and ids, so they don't taint |
 | `tasks{ledger}` | `task_list`, `task_get`, `task_create`, `task_update`, `task_claim`, `task_comment` | reading the [task ledger](../../control-plane/durable-objects/tasks/) `ledger`, creating in it, claiming unassigned tasks, updating its own tasks, commenting |

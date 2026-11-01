@@ -199,8 +199,9 @@ def prepare_work():
     shutil.copy(os.path.join(BIN, "nest-gateway"), GW_BIN)
     os.chmod(GW_BIN, 0o755)
     with open(os.open(os.path.join(WORK, "dev.vars"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        # ALLOW_LOOPBACK_MCP: the mcp capability names the local MCP test server on 127.0.0.1.
-        f.write(f"ADMIN_TOKEN={ADMIN}\nHOST_TOKEN_SECRET=e2e-host-token-secret-0123456789abcdef\nALLOW_DEV_CA=1\nALLOW_LOOPBACK_MCP=1\n")
+        # ALLOW_LOOPBACK_MCP / _BROKERED: the mcp capability and the http profile name local servers on 127.0.0.1.
+        f.write(f"ADMIN_TOKEN={ADMIN}\nHOST_TOKEN_SECRET=e2e-host-token-secret-0123456789abcdef\nALLOW_DEV_CA=1\nALLOW_LOOPBACK_MCP=1\n"
+                "ALLOW_LOOPBACK_BROKERED=1\n")
 
 
 def ancestors(path):
@@ -561,6 +562,13 @@ def run_scenario():
     # The brain host must be connected before the agent starts (otherwise its start waits for one).
     wait_for(lambda: any(h["role"] == "brain" and h["connected"] for h in (api("GET", "/v1/admin/fleet?cell=local")[1] or {}).get("hosts", [])),
              30, 0.5, "the brain host connected")
+    # The worker may widen its own egress (`egress`, run_brokered): added before it's spawned (specs are copied then).
+    st, cat = api("GET", "/v1/admin/catalog")
+    worker_tpl = dict((cat or {}).get("templates", {}).get("worker") or {})
+    if worker_tpl and "egress" not in worker_tpl.get("capabilities", []):
+        worker_tpl["capabilities"] = [*worker_tpl["capabilities"], "egress"]
+        st, r = api("PUT", "/v1/admin/templates/worker", worker_tpl)
+        check("worker template gains the egress capability", st == 200, json.dumps(r)[:200])
     body = {"template": "worker", "workstream": wsid, "sandbox": sbxid, "cell": "local"}
     if REAL:
         body["launch"] = REAL_LAUNCH
@@ -964,6 +972,129 @@ def run_mcp_oauth(ids):
     blobs = "\n".join(r2_blobs())
     check("mcp oauth: the broker audited the flow in R2", all(e in blobs for e in ("oauth_start", "oauth_authorized", "oauth_refreshed", "oauth_refresh_failed")),
           "missing audit events")
+# ---------------------------------------------------------------------------------- sinks: brokered actions, egress
+# A local HTTP server stands in for an http profile's API: an agent's fake brain calls `http_request` through
+# `nest mcp` -> the runner -> AgentDO's brokered pipeline, which attaches the profile's credential; a tainted
+# session's call waits for the operator. The worker (hands, so tainted) widens its own sandbox's egress the
+# same way, and nest-proxy applies it live.
+BROKERED_SECRET = "-".join(["e2e", "profile", uuid.uuid4().hex[:12]])  # built at run time: no literal for the secret scan
+
+
+class _ProfileStub:
+    def __init__(self):
+        import http.server, threading
+        stub = self
+        self.requests = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                n = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(n).decode() if n else ""
+                stub.requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("authorization"), "body": body})
+                out = json.dumps({"got": self.command, "auth": self.headers.get("authorization"), "n": len(stub.requests)}).encode()
+                self.send_response(201 if self.command == "POST" else 200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            do_GET = do_POST = _answer
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+def sink_turn(agid, name, steps, wait_s=120):
+    path = os.path.join(WORK, f"sink-{name}.json")
+    out = os.path.join(WORK, f"sink-{name}.jsonl")
+    with open(path, "w") as fh:
+        json.dump({"results": out, "steps": [{"label": l, "tool": t, "args": a} for l, t, a in steps]}, fh, indent=2)
+    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
+    check(f"sinks: {name} turn enqueued", st == 201, json.dumps(t)[:200])
+    try:
+        wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, wait_s, 0.5, f"sinks {name} results")
+    except TimeoutError as e:
+        check(f"sinks: all {name} results returned", False, str(e)[:200])
+    res = results_by_label(out)
+    return (lambda k: (res.get(k) or {}).get("text") or ""), (lambda k: (res.get(k) or {}).get("is_error"))
+
+
+def pending_ask(text):
+    m = re.search(r"\(pending: (ask_[a-z0-9]+)\)", text)
+    return m.group(1) if m else None
+
+
+def run_brokered(ids):
+    if REAL:
+        skip("brokered actions and egress widening", "fake mode only: the calls are scripted")
+        return
+    stub = _ProfileStub()
+    try:
+        st, _ = api("PUT", "/v1/admin/secrets/http:e2e", {"value": BROKERED_SECRET})
+        check("brokered: profile credential stored in BrokerDO", st in (200, 204), str(st))
+        cap = {"brokered": [{"action": "http.request", "profile": "stub", "base_url": f"http://127.0.0.1:{stub.port}/api",
+                             "methods": ["GET", "POST"], "paths": ["/items"], "auth": {"secret": "http:e2e"}}],
+               "prompt": "The stub API."}
+        st, r = api("PUT", "/v1/admin/capabilities/stubapi", cap)
+        check("brokered: http profile configured (a loopback URL, local dev only)", st == 200, json.dumps(r)[:200])
+        tpl = {"capabilities": ["nest", "stubapi"], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
+               "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
+        st, r = api("PUT", "/v1/admin/templates/brokered-worker", tpl)
+        check("brokered: template configured", st == 200, json.dumps(r)[:200])
+        st, ag = api("POST", "/v1/agents", {"template": "brokered-worker", "workstream": ids["workstream"], "cell": "local"})
+        check("brokered: agent created", st == 201, json.dumps(ag)[:200])
+        agid = ag.get("agent")
+        post = {"profile": "stub", "method": "POST", "path": "/items", "body": json.dumps({"note": "from e2e"})}
+        # Untainted at first: sent. Its answer (an untrusted API's text) taints the session, so the same POST
+        # next is held for the operator and never reaches the stub.
+        text, err = sink_turn(agid, "brokered", [("first", "http_request", post), ("second", "http_request", post)])
+        reqs = list(stub.requests)
+        check("brokered: an untainted call goes out with the profile's credential attached",
+              not err("first") and len(reqs) >= 1 and reqs[0]["auth"] == f"Bearer {BROKERED_SECRET}" and reqs[0]["path"] == "/api/items",
+              json.dumps([{k: v for k, v in q.items() if k != "auth"} for q in reqs])[:200])
+        check("brokered: the credential never reaches the model (masked where the API reflects it)",
+              BROKERED_SECRET not in text("first") and "*" * len(BROKERED_SECRET) in text("first"), text("first")[:200])
+        ask = pending_ask(text("second"))
+        check("brokered: the tainted session's sink call is held for approval", ask and len(stub.requests) == 1, text("second")[:200])
+        if ask:
+            st, r = api("POST", f"/v1/agents/{agid}/asks/{ask}/answer", {"answer": "approve"})
+            check("brokered: operator approves", st == 200 and r.get("delivered") == "async", json.dumps(r)[:200])
+            text, err = sink_turn(agid, "brokered-approved", [("again", "http_request", post), ("spent", "http_request", post)])
+            check("brokered: the approved call goes out once; the next identical one is held again",
+                  not err("again") and pending_ask(text("spent")) and len(stub.requests) == 2, f"{text('again')[:100]!r} {text('spent')[:100]!r}")
+        st, j = api("GET", f"/v1/agents/{agid}/brokered")
+        check("brokered: the journal shows the two sent calls", st == 200 and [e.get("status") for e in j or []] == ["done", "done"],
+              json.dumps(j)[:300])
+    finally:
+        stub.server.shutdown()
+
+    # Egress widening: the worker (hands: tainted) asks for example.com, which its policy denies.
+    agid = ids["agent"]
+    ca = os.path.join(WORK, "root-ca.pem")
+    # The policy reaches nest-proxy a moment after the tool answers (SandboxDO -> FleetDO -> nestd): each curl
+    # tries for up to 10 s until the answer is the one expected (`want`: 403 or not).
+    def curl(want_denied):
+        until = '[ "$c" = 403 ]' if want_denied else '[ "$c" != 403 ] && [ "$c" != 000 ]'
+        return {"command": f"for i in $(seq 10); do c=$(curl -s -m 8 --cacert {ca} https://example.com/ -o /dev/null -w '%{{http_code}}'); "
+                           f"{until} && break; sleep 0.5; done; echo http=$c"}
+    widen = {"allow": [{"host": "example.com", "ports": [443]}], "ttl_s": 600}
+    text, err = sink_turn(agid, "egress", [("widen", "egress_policy", widen)])
+    ask = pending_ask(text("widen"))
+    check("egress: widening from a tainted session is held for approval", ask is not None, text("widen")[:200])
+    if not ask:
+        return
+    st, r = api("POST", f"/v1/agents/{agid}/asks/{ask}/answer", {"answer": "approve"})
+    check("egress: operator approves", st == 200 and r.get("delivered") == "async", json.dumps(r)[:200])
+    text, err = sink_turn(agid, "egress-approved", [("widen", "egress_policy", widen), ("curl", "Bash", curl(False)),
+                                                     ("revoke", "egress_policy", {"revoke": ["example.com"]}), ("curl2", "Bash", curl(True))])
+    check("egress: the approved widening applies", not err("widen") and "Allowed example.com" in text("widen"), text("widen")[:200])
+    check("egress: nest-proxy lets the sandbox reach the host now", re.search(r"http=[1-5]\d\d", text("curl")) and "http=403" not in text("curl"), text("curl")[:200])
+    check("egress: narrowing isn't gated, and the proxy denies the host again", not err("revoke") and "http=403" in text("curl2"),
+          f"{text('revoke')[:100]!r} {text('curl2')[:100]!r}")
 
 
 def run_fencing(ids):
@@ -1039,6 +1170,7 @@ def main():
         ids = run_scenario()
         run_mcp(ids)
         run_mcp_oauth(ids)
+        run_brokered(ids)
         # After the turns: the token has been handed to the brains by now.
         check_token_not_in("the Claude token is not in the gateway's environment or command line", children_named(GW_BIN))
         run_fencing(ids)

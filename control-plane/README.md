@@ -9,9 +9,9 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/index.ts` | Worker: enrollment, WebSocket routing (host-token auth), signed blob URLs, admin API |
 | `src/do/fleet.ts` | **FleetDO** (one per cell): enrollment, fleet channel, leases, expiry, STONITH, placement, commands |
 | `src/do/sandbox.ts` | **SandboxDO**: epoch, commit compare-and-set, generations, layered policy and expiring grants, idle refcount, ports |
-| `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay, and the MCP client of its mcp capabilities (`src/lib/mcp-proxy.ts` over `src/lib/mcp.ts`; docs/agents/capabilities/mcp/) |
+| `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay, the sink gate (`src/lib/sinks.ts`), the MCP client of its mcp capabilities (`src/lib/mcp-proxy.ts` over `src/lib/mcp.ts`; docs/agents/capabilities/mcp/), brokered actions and their journal (`src/lib/brokered.ts`; docs/agents/capabilities/brokered/) and `egress_policy` |
 | `src/do/workstream.ts` | **WorkstreamDO**: the interim workstream channel: event log, batched wakes of its one subscriber, user-notification queue |
-| `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), MCP OAuth tokens (`OAuthStore`, `src/lib/mcp-auth.ts`), GitHub App minter (interface only) |
+| `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), MCP OAuth tokens (`OAuthStore`, `src/lib/mcp-auth.ts`), http profile credentials (`http:<name>`), the argument secret scan, the GitHub App minter (`github_app`; `src/lib/github.ts`), and the issuance audit in R2 |
 | `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries only); expansion is `src/lib/spec.ts` (pure) |
 | `src/do/channel.ts` | **ChannelDO** (one per channel, plus `~directory`): the log, keyed view, grant list, subscriptions and their cursors, fan-out from the alarm, retention and tiering. Every decision is `src/lib/channels.ts` (pure) |
 | `src/do/tasks.ts` | **TaskLedgerDO** (one per ledger name): tasks, comments, history, watcher, inbox notices from its alarm; its decisions are `src/lib/tasks.ts` (pure) |
@@ -108,6 +108,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      `POST /v1/admin/capabilities/<name>/oauth {scopes?}` (answers `authorize_url`: open it and approve), which lands on the public
      `GET /v1/oauth/callback`; `GET /v1/admin/capabilities/<name>/oauth` shows the state, never a token. nest's client ID metadata
      document is the public `GET /v1/oauth/client.json` (`docs/agents/capabilities/mcp/#oauth`)
+   - Brokered actions (`docs/agents/capabilities/brokered/`): the GitHub App with `PUT /v1/admin/secrets/github_app {"value": "{\"app_id\": \"…\", \"private_key\": \"-----BEGIN RSA PRIVATE KEY-----…\"}"}`,
+     a profile's credential with `PUT /v1/admin/secrets/http:<name>`, then a capability `{"brokered": [{"action": "github.create_pr", "repos": ["owner/name"]}, …]}`
+     added to a template. `GET /v1/agents/<id>/brokered?limit=&before=` is the agent's journal, newest first
 
 ## Secrets and vars
 
@@ -122,6 +125,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `WAKE_BATCH_MS` | Batching window of the workstream channel's subscriber wakes; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
 | `ALLOW_LOOPBACK_MCP` | `1` lets an mcp capability name a loopback URL (`http://127.0.0.1:…`): tests and local dev (the e2e harness) only; never set in a deploy |
+| `ALLOW_LOOPBACK_BROKERED` | `1` lets an http profile and `GITHUB_API_URL` name a loopback URL: tests and local dev only; never set in a deploy |
+| `GITHUB_API_URL`, `BROKERED_TIMEOUT_MS` | The REST API GitHub actions use (default `https://api.github.com`; a fake in e2e) and one brokered request's budget (default 30000) |
 | `MCP_CALL_TIMEOUT_MS`, `MCP_LIST_TIMEOUT_MS` | The MCP proxy's budget for one forwarded `tools/call` (default 45000) and for listing one server's tools, `initialize` included (default 4000) |
 | `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname (a tunnel host that serves none is not ready, never its loopback `gateway_url`). `NEST_DOMAIN` also names previews (`<port>-<sandbox>-preview-<label>.<zone>`) and share links (`<token>-share-<label>.<zone>`). The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url`, and preview names use `nest.localhost` |
 | `AWS_CELLS` | Per-cell AWS settings, written by the cell stacks: JSON object of cell → `{region, launch_template_id, subnet_ids, instance_types, spot?, max_hosts?, idle_grace_ms?, enroll_timeout_ms?, sandbox_reserve_mib?, max_sandboxes_per_host?, proxy_root_key_arn?, brain?}` (`src/lib/cells.ts`); `brain` is the brain hosts' `{launch_template_id, instance_types, spot?, max_hosts?, idle_grace_ms?, max_brains_per_host?}`. A cell without an entry is never scaled, and one without `brain` launches no brain host |
@@ -176,17 +181,17 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   decides on a role; `agent_start.role` and `ToolDef.roles` are still sent for one release. WorkstreamDO is the
   interim workstream channel (`WorkstreamEvent`, one subscriber woken with batches), and there is a `workstream`
   egress policy layer. Taint is a conservative stand-in (an agent with hands or a web built-in, or one that read a
-  tainted message, is tainted); sinks, budgets and the hands journal aren't built.
+  tainted message, is tainted). The sink gate covers remote MCP tools, brokered actions and `egress_policy`; budgets and the hands journal aren't built.
   Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
   commit and flushes at turn boundaries. The contract changes are listed in `docs/interfaces/README.md`.
 - **Built: placement** packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox
   reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
-  `attach`, `checkpoint`, `brokered`, and the seeded `management` and `memory` capabilities' tools.
-- **GitHub App installation-token minting** is an interface only; the `github.*` brokered actions aren't built.
+  `attach`, `checkpoint`, and the seeded `management` and `memory` capabilities' tools; of the brokered actions, `email.send`.
+- **GitHub App installation tokens** are minted for brokered actions only; sandbox injection still takes a static `inject:github` secret.
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`. Built: `/v1/health` makes one read-only round trip to each DO class (`src/lib/health.ts`).
 - **Catalogs seeded before this release** keep `delegate` in `management` (ignored on expansion: the registry no longer has it) and the old `worker` (`subagents`, `TodoWrite`, `Task`, `WebSearch`) until the operator edits them; a new catalog gets the design's (`docs/control-plane/durable-objects/catalog/`).
-- **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO has no issuance audit.
+- **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO audits GitHub mints only (not secret pushes or binding mints).
 - **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, generation retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
 - **Built:** the autoscaler, per host kind (`AWS_CELLS`: `RunInstances` from the cell's launch template, or the `brain` section's for brain hosts; idle retirement, enroll timeouts).
 - **Not built:** Discord, Cloudflare Access applications from the control plane (the `edge` inframe stack manages
