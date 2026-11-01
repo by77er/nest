@@ -62,6 +62,14 @@ Built: every host installs `releases/current/` at boot, so a release reaches hos
 
 The same 10-minute health window applies per host version, with the probe as its gate. `rollback.yml` sets a desired version back, and the same replacement rolls the old version forward again. A release that changes the gateway protocol's `min_supported` or (once memory snapshots exist) the restore ABI is one-way and ships alone, like a Durable Object class change.
 
+## Pruning images
+
+Old images cost money (EBS snapshots for host AMIs, S3 for guest builds), so `deploy.yml` runs `scripts/prune-images.sh use1 <bucket>` before each new host AMI. It keeps the AMI the launch template resolves to (the SSM parameter), the two newest, and any AMI a live instance runs; it deregisters the rest and deletes their snapshots and Image Builder records. Of the guest builds under `images/guest/`, it keeps the two newest finished ones and every `previous-*` backup, and it removes the builder's staging files. The bucket expires noncurrent versions after a day.
+
+**Why not Image Builder's lifecycle policy alone:** it counts images "per recipe version", and every recipe change is a new version, so each old version kept its two newest images forever: 20 AMIs had piled up by 2026-11-01 ([lifecycle rules](https://docs.aws.amazon.com/imagebuilder/latest/userguide/image-lifecycle-rules.html)). An age rule can't replace it either: one without a minimum could delete the current AMI after an idle spell, and its `retainAtLeast` is per version too.
+
+`DRY_RUN=1` prints what it would delete. After building a guest image by hand, run it the same way (with the deploy role, or credentials that may deregister images).
+
 ## Rollout rules
 
 The deploy order is the pipeline's: the cell stack applies, then the Worker deploys, then the release is published, and hosts pick it up only as they are replaced. So the Worker always meets hosts one release behind.

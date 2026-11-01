@@ -191,6 +191,10 @@ jobs:
         id: publish
         if: steps.seen.outputs.cache-hit != 'true'
         run: scripts/publish-release.sh "$BUCKET" "${SHA::7}" >> "$GITHUB_OUTPUT"
+      # Before each new host AMI: dangling AMIs, their snapshots and old guest builds go (scripts/prune-images.sh).
+      - name: Prune images
+        if: steps.publish.outputs.changed == 'true'
+        run: scripts/prune-images.sh use1 "$BUCKET"
       # Hosts install a newer release at boot anyway; the AMI makes that boot fast again.
       - name: Host AMI
         if: steps.publish.outputs.changed == 'true'
