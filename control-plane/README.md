@@ -52,16 +52,17 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      An agent reaches a ledger only if it was spawned with `overrides.params.ledger` and a template listing `tasks` (and `tasks-admin` to administer)
    - `POST /v1/workstreams {goal}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent of that
      workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
-   - `POST /v1/sandboxes {workstream, cell, policy?}`: placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
-     workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`
+   - `POST /v1/sandboxes {workstream, cell, policy?, idle_ttl_ms?}`: placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
+     workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`. `idle_ttl_ms`: destroyed once dormant this long
+     (no agent attached, no VM up; default the cell's, 30 days); `PUT /v1/sandboxes/<id>/lifetime {idle_ttl_ms | null}` changes it ([lifetime](../docs/control-plane/durable-objects/sandbox/#lifetime))
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
      (409 if it's placed)
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
      the only way to mint a public share link (agents can't)
    - `POST /v1/agents {template, workstream?, sandbox?, owner?, overrides?, cell?, start?}`: expands the template
-     (operator overrides: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`, `params` (e.g. `{ledger}`); an agent's own
-     spawn will take only `SpawnerOverrides`, which narrow) and sends `agent_start` to
+     (operator overrides: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`, `params` (e.g. `{ledger}`), `ephemeral`; an agent's own
+     spawn, `agent_spawn`, takes only `SpawnerOverrides`, which narrow) and sends `agent_start` to
      the host; an agent with a sandbox takes its workstream and cell (a mismatch is refused with 409), and an
      `owner` must be an agent of the same workstream. For one release `role` is read as the same-named template,
      `captain` as `owner`, top-level `launch` and `rules` as overrides, and `grants` intersects the tools silently.
@@ -169,8 +170,11 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   `idleStep`; `test/brain-hosts.test.ts`). A brain host enrolls without a proxy CA. AgentDO issues an agent
   epoch per start (a sandbox move doesn't restart a brain), and `agent_start.hands` carries the sandbox id only
   (the runner fetches its target). Not built: key rotation, the three desired versions, and gentle drains.
-- **Agent removal** isn't built, so `SandboxDO.detach` has no caller yet: a stopped agent keeps its slot, proxy port
-  and gateway client entry, and revocation by detach is exercised only by tests.
+- **Agent lifetimes** (`docs/agents/#lifetimes`, `src/lib/lifetimes.ts`): `agent_spawn`, `agent_stop` and `exit`; ephemeral
+  agents; an end's cascade, turn drop, sandbox release (`SandboxDO.release`) and record pruning; sandboxes' idle TTL. An
+  operator's plain stop is unchanged (its next input lifts it) and keeps the agent's slot; `POST /v1/agents/<id>/stop
+  {end: true, destroy_sandbox?}` ends it for good. `GET /v1/agents/<id>/children` lists what it spawned. Not built:
+  adoption and parking, budgets (fixed depth and live-children caps stand in), ending an agent's channels with it.
 - **Channels** (`docs/channels/`) are built as the design's subset listed in
   `docs/control-plane/durable-objects/channel/`: ChannelDO, subscriptions delivered through AgentDO's turn queue
   and inbox, the built-in channels, channel grants on capabilities (`channels`, `messaging-tree`), and the tools.
@@ -178,7 +182,7 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   envelope, and moving the workstream channel, `notify`, `ask` and the user-notification queue onto channels
   (stage 2 of removing workstreams).
 - **Behind the design** (`docs/agents/`): webhooks (HookDO), grants with attenuation beyond channel grants,
-  capability sources (`mcp`, `api`) and parameters, `agent_spawn`, and labels aren't built.
+  capability sources (`api`) and parameters beyond `ledger`, and labels aren't built.
   Templates and capabilities are data (CatalogDO), an agent stores its expanded spec and `owner`, and nothing
   decides on a role; `agent_start.role` and `ToolDef.roles` are still sent for one release. WorkstreamDO is the
   interim workstream channel (`WorkstreamEvent`, one subscriber woken with batches), and there is a `workstream`
@@ -188,11 +192,11 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   commit and flushes at turn boundaries. The contract changes are listed in `docs/interfaces/README.md`.
 - **Built: placement** packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox
   reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one.
-- **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
+- **Platform tools without implementations** return `not_implemented`: `fork_sandbox`,
   `attach`, `checkpoint`, and the seeded `management` and `memory` capabilities' tools; of the brokered actions, `email.send`.
 - **GitHub App installation tokens** are minted for brokered actions and for a sandbox's push allowlist (`docs/control-plane/durable-objects/broker/#injection-minting`); the rule constructors are in `src/lib/rules/` (GitHub's only).
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`. Built: `/v1/health` makes one read-only round trip to each DO class (`src/lib/health.ts`).
-- **Catalogs seeded before this release** keep `delegate` in `management` (ignored on expansion: the registry no longer has it) and the old `worker` (`subagents`, `TodoWrite`, `Task`, `WebSearch`) until the operator edits them; a new catalog gets the design's (`docs/control-plane/durable-objects/catalog/`).
+- **Catalogs seeded before this release** keep `delegate`, `spawn_agent` and `kill` in `management` (ignored on expansion: the registry no longer has them), get the `spawning` capability without a template listing it, and the old `worker` (`subagents`, `TodoWrite`, `Task`, `WebSearch`) until the operator edits them; a new catalog gets the design's (`docs/control-plane/durable-objects/catalog/`).
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO audits GitHub mints only (not secret pushes or binding mints).
 - **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, generation retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
 - **Built:** the autoscaler, per host kind (`AWS_CELLS`: `RunInstances` from the cell's launch template, or the `brain` section's for brain hosts; idle retirement, enroll timeouts).

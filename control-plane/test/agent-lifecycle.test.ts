@@ -310,9 +310,9 @@ describe("agent_stop", () => {
     expect((await agentStub(c.agent).info()).brain).toMatchObject({ phase: "condemned" });
     const statuses = async () => Object.fromEntries((await agentStub(c.agent).turns()).map((t) => [t.input.text, t.status]));
     expect(Object.values(await statuses())).toEqual(["active", "dropped"]);
-    // Nothing more comes in.
-    expect((await adminJson(`/v1/agents/${c.agent}/turns`, { body: { text: "more" } }, 409)).error.message).toContain("has ended");
-    expect((await adminJson(`/v1/agents/${c.agent}/inbox`, { body: { text: "hi", from: "user" } }, 409)).error.code).toBe("forbidden");
+    // Nothing more comes in: as a recipient it is gone (what every sender reads as "drop it"), though its record stays.
+    expect((await adminJson(`/v1/agents/${c.agent}/turns`, { body: { text: "more" } }, 404)).error.message).toContain("has ended");
+    expect((await adminJson(`/v1/agents/${c.agent}/inbox`, { body: { text: "hi", from: "user" } }, 404)).error.code).toBe("unknown_agent");
     await expect(Promise.resolve().then(async () => { await agentStub(c.agent).deliverChannel({ channel: "x", subscription: "sub_x", batch: {} } as never); }))
       .rejects.toThrow("has ended");
     await expect(Promise.resolve().then(async () => { await agentStub(c.agent).start(); })).rejects.toThrow("has ended");
@@ -511,8 +511,13 @@ describe("a dormant sandbox's idle TTL", () => {
     const s = await suspended();
     const armed = () => runInDurableObject(sandboxStub(s.sandbox), (_i: SandboxDO, st) =>
       st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'expiry'").toArray().length > 0);
-    // As the previous release left it: no check armed, and FleetDO's row never confirmed.
-    await runInDurableObject(sandboxStub(s.sandbox), (_i: SandboxDO, st) => { st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'expiry'"); });
+    // As the previous release left it: no check armed, no dormancy recorded, and FleetDO's row never confirmed.
+    await runInDurableObject(sandboxStub(s.sandbox), (_i: SandboxDO, st) => {
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'expiry'");
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      delete info.dormant_since_ms;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
     expect(await armed()).toBe(false);
     await runInDurableObject(fleetStub(s.cell), (_i: FleetDO, st) => {
       st.storage.sql.exec("UPDATE sandboxes SET lifetime_ms = NULL");
@@ -523,6 +528,12 @@ describe("a dormant sandbox's idle TTL", () => {
     const row = await runInDurableObject(fleetStub(s.cell), (_i: FleetDO, st) =>
       st.storage.sql.exec<{ lifetime_ms: number | null }>("SELECT lifetime_ms FROM sandboxes WHERE sandbox = ?", s.sandbox).one());
     expect(row.lifetime_ms).toBeGreaterThan(0);
+    // Its first check starts its clock, durably (a later check counts from it, not from itself).
+    await runDurableObjectAlarm(sandboxStub(s.sandbox));
+    const since = await until(async () => (await sandboxStub(s.sandbox).info()).dormant_since_ms, "its clock started");
+    await runInDurableObject(sandboxStub(s.sandbox), (_i: SandboxDO, st) => { st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'expiry'"); });
+    await runDurableObjectAlarm(sandboxStub(s.sandbox));
+    expect((await sandboxStub(s.sandbox).info()).dormant_since_ms).toBe(since);
   });
 });
 

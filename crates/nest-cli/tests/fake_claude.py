@@ -11,7 +11,7 @@ which events run `nest hook`, synchronously (`--sync`) or not, within each hook'
 Turn behavior (by user text):
 - contains SLOW     → mcp__nest__Bash `sleep 30`; honors stream-json interrupts
 - contains PLATFORM → also calls the `notify` platform tool
-- `E2E <scenario.json>` → the scripted tool calls in that file ({"results": path, "steps":
+- `E2E <scenario.json>` (alone, or as an agent's message: `Message from <sender>: E2E …`) → the scripted tool calls in that file ({"results": path, "steps":
   [{"tool", "args", "label"}]}), each result appended to `results` at once (JSONL, flushed); a step
   {"await_tool": name, "absent"?: bool, "timeout_s"?: n, "label"} instead waits until the tool list
   has (or lacks) `<name>` (as `nest mcp` lists it) and records `listed`/`unlisted` or `timeout`
@@ -24,7 +24,7 @@ with the reason; neither emits a `result` before the turn ends.
 
 Everything observable is appended to $HOME/fake-claude-runs.jsonl (HOME == config dir).
 """
-import json, os, queue, subprocess, sys, threading, time, uuid
+import json, os, queue, re, subprocess, sys, threading, time, uuid
 
 ARGS = sys.argv[1:]
 HOME = os.environ.get("HOME", "/tmp")
@@ -274,6 +274,10 @@ def scripted(path):
           "usage": {"input_tokens": 100, "output_tokens": 20}, "stop_reason": "end_turn", "result": "done"})
 
 def turn(text):
+    # An agent's message (a spawn's task: "Message from <sender>: E2E <path>") runs a scenario too.
+    msg = re.match(r"Message from [^:\n]+: (E2E .*)$", text, re.S)
+    if msg:
+        text = msg.group(1)
     if text.startswith("E2E "):
         return scripted(text[4:].strip())
     hook({"hook_event_name": "UserPromptSubmit", "prompt": text})

@@ -206,8 +206,9 @@ const PRUNE_INTERVAL_MS = 3_600_000;
 /** Its own deadline, so a quiet cell (no tick, no tunnels) still prunes: armed on every start. */
 const ALARM_PRUNE = "prune";
 const PRUNE_DAILY_MS = 24 * 3_600_000;
-/** Sandboxes whose lifetime check `armLifetimes` arms per daily run. */
+/** Sandboxes whose lifetime check `armLifetimes` arms per daily run, and how often each is asked again. */
 const LIFETIME_BACKFILL_PER_RUN = 200;
+const LIFETIME_RECHECK_MS = 7 * 86_400_000;
 /** A brain waiter not seen again for this long has stopped waiting (it retries at least every 5 min). */
 const BRAIN_WAIT_TTL_MS = 12 * 60_000;
 /** Lost hosts (expired or dead) whose brains' agents haven't all acknowledged the loss yet. */
@@ -2187,12 +2188,14 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * Sandboxes created before lifetimes have no `expiry` check armed, and a dormant one gets no call
-   * that would arm it: each live registered sandbox is asked once (`ensureLifetime`), at most
-   * `LIFETIME_BACKFILL_PER_RUN` a day. A failure is asked again the next day.
+   * that would arm it (nor does one whose check a rolled-back release dropped): each live registered
+   * sandbox is asked (`ensureLifetime`, idempotent) once, then again every `LIFETIME_RECHECK_MS`, at
+   * most `LIFETIME_BACKFILL_PER_RUN` a day, never-asked first. A failure is asked again the next day.
    */
   private async armLifetimes(): Promise<void> {
     const rows = this.sql.exec<{ sandbox: string }>(
-      "SELECT sandbox FROM sandboxes WHERE destroyed_ms IS NULL AND lifetime_ms IS NULL ORDER BY registered_ms LIMIT ?", LIFETIME_BACKFILL_PER_RUN).toArray();
+      `SELECT sandbox FROM sandboxes WHERE destroyed_ms IS NULL AND (lifetime_ms IS NULL OR lifetime_ms < ?)
+        ORDER BY lifetime_ms IS NOT NULL, lifetime_ms, registered_ms LIMIT ?`, Date.now() - LIFETIME_RECHECK_MS, LIFETIME_BACKFILL_PER_RUN).toArray();
     for (const { sandbox } of rows) {
       try {
         await this.sandbox(sandbox).ensureLifetime();

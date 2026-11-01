@@ -6,7 +6,7 @@
 |---|---|---|
 | **[Hands](../hands/)** | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | In the bound sandbox, through its [gateway](../../sandbox/gateway/) |
 | **Channels** | `channel_create`, `post` (optionally awaiting a reply), `read` (optionally waiting up to 120 s), `subscribe`, `unsubscribe`, `message` (post to an agent's inbox) | ChannelDO. See [../../channels/](../../channels/) |
-| **Agents** | `agent_spawn`, `agent_stop`, `attach`, `adopt` (take ownership of a parked resource), `wake_at` and `wake_cancel` (scheduled wakes on itself), `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
+| **Agents** | `agent_spawn`, `agent_stop`, `exit` (end itself; every agent's, never gated), `attach`, `adopt` (take ownership of a parked resource), `wake_at` and `wake_cancel` (scheduled wakes on itself), `read_transcript`, `list` (any resource kind, filtered by labels) | Control plane |
 | **Sandboxes** | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | Control plane |
 | **Authority** | `grant`, `revoke` | Control plane |
 | **Hooks** | `hook_create`, `hook_delete` (external events into a channel; see [sources](../../channels/sources/)) | HookDO |
@@ -14,7 +14,7 @@
 | **Metrics** | `metrics_query` (see [metrics](../../control-plane/metrics/)) | Control plane → Analytics Engine |
 | **Tasks** | `task_list`, `task_get`, `task_create`, `task_update`, `task_claim`, `task_comment`; admin: `task_assign`, `task_update_any`, `task_cancel`, `task_set_watcher` | [TaskLedgerDO](../../control-plane/durable-objects/tasks/), on the ledger the agent's spec names |
 
-**Built:** the table is the design. The registry (`protocol/schemas/control/platform-tools.json`) holds interim tools that predate channels and grants: `notify`, `ask`, `emit`, `read_transcript`, `expose_port` and `egress_policy` work; `fork_sandbox`, `spawn_agent`, `attach`, `checkpoint` and the seeded `management` and `memory` capabilities' tools answer `not_implemented`. Brokered actions are built except `github.review_check`, `github.dispatch_workflow`, `github.create_webhook` and `email.send` ([brokered](../capabilities/brokered/)). Hands are built ([hands](../hands/)).
+**Built:** the table is the design. The registry (`protocol/schemas/control/platform-tools.json`) holds interim tools that predate channels and grants: `notify`, `ask`, `emit`, `read_transcript`, `expose_port` and `egress_policy` work; `fork_sandbox`, `attach`, `checkpoint` and the seeded `management` and `memory` capabilities' tools answer `not_implemented`. `agent_spawn`, `agent_stop` and `exit` are built ([lifetimes](../#lifetimes)); the stubs `spawn_agent` and `kill` are gone. Brokered actions are built except `github.review_check`, `github.dispatch_workflow`, `github.create_webhook` and `email.send` ([brokered](../capabilities/brokered/)). Hands are built ([hands](../hands/)).
 
 **Messaging and memory are channel operations.** Messaging an agent is `message` (a `post` to its inbox, through the [messaging capability](../capabilities/#messaging)); notifying me is `post` to `user`. An event is a `post` with a `kind`. Asking is `post` with `await_reply_s`. Waiting for events is `subscribe`, or `read` with a wait. Memory is a private channel read by key.
 
@@ -24,7 +24,7 @@ A grant is `(principal, action, resource, limits?, expires?, parent)`. A resourc
 
 - **Attenuation:** an agent can grant, or put in a spawn spec, only grants it holds, with equal or tighter limits. I hold the root, so authority flows down from me and only shrinks.
 - **The chain is the revocation list:** each grant records its `parent` and is valid only while every ancestor is. Limits intersect down the chain. Revoking a grant revokes everything derived from it, and the grants an agent issued end when it's removed. Every call is checked online against one store, so no signed tokens are needed; attenuable tokens ([Biscuit](https://doc.biscuitsec.org/reference/specifications), the [IETF attenuating agent tokens draft](https://www.ietf.org/archive/id/draft-niyikiza-oauth-attenuating-agent-tokens-01.html)) solve offline and cross-domain checks, which nest doesn't have.
-- **Ownership:** creating a resource gives its creator every grant on it.
+- **Ownership:** creating a resource gives its creator every grant on it. Built for agents only: the child's `owner`, checked transitively by `agent_stop` ([spawning](../#spawning)). A sandbox `agent_spawn` makes is owned by the child it is made for.
 - **Budgets shrink like grants:** see [spawning](../#spawning). An agent over budget is parked and escalates.
 - **Checked twice:** AgentDO filters `tools_list` by grants, then checks every `tool_call` again.
 - **Approval:** a sink call from a tainted session under `when_tainted: approve` first posts a `question` to the agent's escalation channel (see [taint and sinks](#taint-and-sinks)).

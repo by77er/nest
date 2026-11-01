@@ -943,9 +943,16 @@ export class AgentDO extends DurableObject<Env> {
     return this.env.AGENT.get(this.env.AGENT.idFromName(id));
   }
 
-  /** An ended agent takes no more `what` (409). */
-  private refuseEnded(info: AgentInfo, what: string): void {
-    if (info.ended) throw new NestError(ErrorCodes.FORBIDDEN, `${info.agent} has ended (${info.ended.reason}); it takes no more ${what}`, 409);
+  /**
+   * An ended agent takes no more `what`. As a recipient (turns, messages) it is gone, `unknown_agent`
+   * (404), which every sender already reads as "drop it" (a channel subscription, a ledger notice, a
+   * workstream wake); a start or a spawn it would make is refused (409).
+   */
+  private refuseEnded(info: AgentInfo, what: "turns" | "messages" | "starts" | "spawns"): void {
+    if (!info.ended) return;
+    const message = `${info.agent} has ended (${info.ended.reason}); it takes no more ${what}`;
+    if (what === "turns" || what === "messages") throw new NestError(ErrorCodes.UNKNOWN_AGENT, message, 404);
+    throw new NestError(ErrorCodes.FORBIDDEN, message, 409);
   }
 
   /** End this agent for good: `agent_stop` from an agent that owns it, its owner's end, or the operator. Idempotent. */

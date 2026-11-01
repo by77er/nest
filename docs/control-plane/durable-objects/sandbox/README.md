@@ -11,6 +11,7 @@ The authority for one sandbox.
 - Policy layers: base (image), sandbox (allow, passthrough, injection bindings, TCP exceptions, the push allowlist `repos`, request guards; set by whoever holds `egress_policy` on it, and inherited by forks), temporary grants. The effective policy adds what the rule constructors build from the push allowlist ([repo allowlists](../../../sandbox/networking/egress/policy/#repo-allowlists)): the layer's `repos` plus each attached agent's (kv `agent_repos`, by agent). Built: the middle layer is still the `workstream` layer, set by the operator API ([pending contract changes](../../../interfaces/README.md#pending-contract-changes)).
 - Exposed ports
 - The channels programs inside it may post to (`sandbox_create{channels}`; by default its own `events`)
+- Its `owner` (the agent an `agent_spawn` made it for; none for the operator's), its idle TTL, and its dormancy ([lifetime](#lifetime))
 
 ## Placement
 
@@ -84,6 +85,16 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 
 - **Changes:** set by the operator (`PUT /v1/sandboxes/<id>/policy`), by a holder of `egress_policy` on it, or by a temporary grant, and pushed live as `policy_update`, with its version and sha256, and with its injection secrets in the same push. The VM starts or resumes only after nest-proxy acknowledges that exact policy ([policy changes](../../../sandbox/networking/egress/policy/#changes)).
 - **Injection secrets:** pushed as BrokerDO references, resolved only when FleetDO sends them.
+
+## Lifetime
+
+**A sandbox nobody uses is destroyed, through `destroy`** (so FleetDO's registry marks it and its generations stop being GC roots, [commit-gc](../../../verification/commit-gc/)). Built (`checkExpiry`, `release`; rules in `lib/lifetimes.ts`):
+- **Dormant:** no agent attached, no placement in flight, and no VM up (`creating`, `restoring`, `running` or `suspending` on a host): suspended, unplaced or failed. `decide`, the step every mutation goes through, keeps `dormant_since_ms`: set at the first dormant change, cleared at once by one that isn't (a wake, a placement, an attach), so a sandbox used again starts its clock over.
+- **Idle TTL:** its own (`idle_ttl_ms` at create, from the operator's `POST /v1/sandboxes` or `agent_spawn`; `PUT /v1/sandboxes/<id>/lifetime` sets or clears it), else the cell default: the cell's `sandbox_idle_ttl_ms` in `AWS_CELLS`, else `SANDBOX_IDLE_TTL_MS`, else **30 days**. At least a minute.
+- **The `expiry` deadline** checks it (armed at create and on every check, at most an hour apart, sooner for a short TTL): dormant for its TTL → destroyed. A TTL over a day posts a `sandbox_expiring` notice on `user` a day before (saying how to keep it), and destruction never comes less than a day after that notice: a late check posts it and waits. A shorter TTL (an ephemeral worker's, say) gets no notice: whoever set it chose it.
+- **Owner release:** an ending agent's `release(agent, destroy)` detaches it and, with `destroy`, destroys the sandbox in the same step if the agent owns it and no other agent is attached. A sandbox attached to an agent that hasn't ended (even one stopped by the operator) is never dormant, so never destroyed by its TTL.
+- **Older sandboxes:** FleetDO's daily `prune` asks each live registered sandbox to arm its check if it isn't (`ensureLifetime`): first those never asked (`sandboxes.lifetime_ms` null), then each again weekly, 200 a day. So a sandbox from before this release, suspended and called by nobody, gets its TTL too, counted from the first check, and one whose check a rolled-back release dropped gets it back.
+- A destroyed sandbox refuses `attach`.
 
 ## Ports
 

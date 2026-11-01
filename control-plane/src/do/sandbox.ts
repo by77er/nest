@@ -907,6 +907,8 @@ export class SandboxDO extends DurableObject<Env> {
       await this.destroy(`dormant past its idle TTL of ${days(ttl)}`);
       return;
     }
+    // A sandbox dormant since before it was recorded (stored by the previous release): its clock starts now, durably.
+    if (step.kind !== "awake" && s.dormant_since_ms === undefined) this.update(() => {});
     if (step.kind === "notice") {
       this.update((i) => {
         i.expiry_notice_ms = now;

@@ -40,12 +40,25 @@ labels:        {workstream: auth}
 credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:captain
 ```
 
-- **Built so far:** the admin API's spawn is `{template, sandbox?, workstream?, owner?, overrides?}`, expanded by [CatalogDO](../control-plane/durable-objects/catalog/) (the fields above that aren't built: backend, grants, budget, subscriptions, report schema, priority, labels; `escalate_to` is `user` or `workstream` until channels exist). An agent's own spawn may only narrow.
+- **Built so far:** the admin API's spawn is `{template, sandbox?, workstream?, owner?, overrides?}`, expanded by [CatalogDO](../control-plane/durable-objects/catalog/) (the fields above that aren't built: backend, grants, budget, subscriptions, report schema, priority, labels; `escalate_to` is `user` or `workstream` until channels exist). An agent's own spawn is the `agent_spawn` tool: `{template, task, sandbox?: new | share, ephemeral?, sandbox_idle_ttl_s?, tools?, repos?}`, from a template one of its capabilities names in `spawn` (the spawn grant; the seeded `spawning` capability names `worker`), its overrides only narrowing; `task` is the child's first input. The child gets its spawner's workstream and cell, its taint (sticky, and on the task), and depth plus one. Its ids (and a new sandbox's) come from the call's key, so a re-run makes nothing twice.
+- **Interim limits, until budgets:** spawn depth at most 3 (the operator's agents are 0) and at most 8 children that haven't ended, per spawner (`lib/lifetimes.ts`). The design's budgets replace them.
 - **Templates** are named specs stored in the control plane and edited by me, mostly a list of [capabilities](capabilities/). `captain` and `worker` are just the two I start with. See [../orchestration/](../orchestration/).
 - **Brain placement is by backend and capacity, never by sandbox:** a `claude-code` brain starts on any [brain host](../compute/brain-hosts/) with capacity, preferring the host that ran the agent last (a warm session file), a preference and not a rule; an `api-loop` brain needs no host. Hands are a binding to one sandbox, reached through its [gateway](../sandbox/gateway/) from wherever the brain runs.
-- **Ownership:** the spawner owns the new agent and holds every grant on it: post to its inbox, stop it, attach it, read its transcript. It's subscribed to the new agent's `events` by default, so the agent's final text comes back when it finishes.
+- **Ownership:** the spawner owns the new agent and holds every grant on it: post to its inbox, stop it, attach it, read its transcript. It's subscribed to the new agent's `events` by default, so the agent's final text comes back when it finishes. **Built:** recorded once, as the child's `owner` (the deciding record; the spawner's `children` table is an index of it), and transitive: an owner holds the same grants on what its children own. Today only `agent_stop` checks it (by walking the target's owner chain); the grants system takes it over as `(spawner, *, child)` grants derived from the spawner's own.
 - **Budgets shrink like grants:** a child's budget is carved from its spawner's remaining budget and enforced per owner subtree. That bounds spawn depth, fan-out and quota, the runaway modes seen in practice ([Anthropic's research system](https://www.anthropic.com/engineering/multi-agent-research-system) once spawned 50 subagents for a simple query). An agent over budget is parked and escalates.
 - **Fencing:** AgentDO issues an **agent epoch** per brain start. Platform tool calls and brokered actions carry it, and a brain host whose lease lapses kills its brains, which AgentDO restarts on another brain host after 30 s with `--resume`. Hands calls carry the **sandbox epoch** inside the binding, checked by the gateway and again by the guest. Brokered actions don't carry it yet: see [the runner](runner/).
+
+## Lifetimes
+
+An agent lives until it **ends**: stopped for good, as opposed to an operator's stop, which its next input lifts. Built (`lib/lifetimes.ts`, [AgentDO](../control-plane/durable-objects/agent/#ending)):
+- **`agent_stop {agent, destroy_sandbox?}`** ends an agent the caller owns, directly or through the agents it owns. Its brain is killed, its queued turns are dropped (`dropped`), and the agents it owns end too (each killed). The operator's `POST /v1/agents/<id>/stop {end: true}` does the same.
+- **`exit {destroy_sandbox?}`** ends the caller once its current turn is done. Every agent has it, outside its spec: it only gives up authority, so it is never gated.
+- **Ephemeral** agents (`ephemeral: true` in the template, or set by the spawn; a spawn can't clear the template's) end themselves when they are **done: a turn completes with no turn queued and no open ask or approval** (whose answer would be its next turn). Background hands tasks aren't waited for. A one-shot worker's task is its first turn, so it ends when that turn does, unless its owner sent more meanwhile.
+- **An ended agent takes nothing:** to senders it is gone (`unknown_agent`, so channel subscriptions to it end and ledger notices are dropped), no start or wake runs, and its owner hears its `exited` event (with the last text, its `ended` reason and who ended it).
+- **Its sandbox:** an ended agent is detached from it. With `destroy_sandbox` (always for an ephemeral agent), the sandbox made for it (`agent_spawn{sandbox: new}`, which it owns) is destroyed once its brain is gone, unless another agent is still attached. Any other sandbox it leaves behind is destroyed by its [idle TTL](../control-plane/durable-objects/sandbox/#lifetime) once nobody is attached.
+- **Its records** (AgentDO's storage and its R2 session segments) go 30 days after it ended.
+
+**Why the end cascades** (where an operator's stop and interrupt don't): an ended agent can no longer manage what it owns, and nobody else does, so leaving them would leak; its owner chain still reaches them meanwhile.
 
 ## Continuity
 
@@ -66,6 +79,8 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 - **Inspecting without hands** is left to agents. The platform offers read-only forks and report schemas, and no `delegate` tool or reader template, so how to inspect is the model's call.
 
 ## Removal
+
+**Built:** removal is the [end](#lifetimes): the agents it owns end with it (not parked), and its sandboxes are detached and left to their idle TTL (not archived at once). Labels, `orphaned_from`, adoption and read-only channels below are designed, not built.
 
 When an agent is removed for good, **what it owns is parked, then expires**:
 - Owned agents stop with their state kept; owned sandboxes suspend and are archived to S3; owned channels become read-only. Parked resources cost almost nothing (see [scale to zero](../compute/autoscaling/)).
