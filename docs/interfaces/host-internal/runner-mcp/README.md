@@ -8,7 +8,7 @@
 | `tools/list` | `tools_list{id}` | `tools_list{id, tools: McpToolDef[]}` |
 | `tools/call` | `tools_call{id, name, arguments, tool_use_id?}`, with `tool_use_id` from the request's `_meta["claudecode/toolUseId"]` (undocumented; observed on 2.1.301, matching `PreToolUse.tool_use_id`) | `tools_call{id, result: {content, isError}}` |
 | `notifications/cancelled` | `cancel{id}` | (the call's `tools_call` arrives as an error, or never). On interrupt it reaches the MCP server within milliseconds (observed on 2.1.301) |
-| — | — | `tools_changed{}` → `notifications/tools/list_changed`, sent on every connection of the agent when AgentDO's `tools_changed` arrives ([session](../../control-host/session/)); Claude Code then lists again (documented for `-p`; unverified on the real binary) |
+| — | — | `tools_changed{}` → `notifications/tools/list_changed`, sent on every connection of the agent when AgentDO's `tools_changed` arrives ([session](../../control-host/session/)); Claude Code then lists again (observed on 2.1.316 by `claude-verify` item 13: within 10 ms, mid-turn too) |
 
 **Peer binding:** the runner accepts `hello{agent}` only from a process (`SO_PEERCRED`) descending from that agent's Claude Code process; otherwise `error{unknown_agent}`.
 

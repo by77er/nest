@@ -3,7 +3,7 @@ Code binary" list (plus the `forceLoginMethod` item above it). Each returns `har
 
 Items 1-5, 7 and the short-cwd half of 8 share one baseline session (one short turn with one
 `mcp__nest__echo` call), so the whole run stays at about a dozen small model requests; items 11 and 12
-add three short sessions of their own."""
+add three short sessions of their own, and item 13 two (a stdio server whose tool list grows)."""
 import glob, json, os, shutil, subprocess, sys, time, traceback, uuid
 
 import harness as h
@@ -32,6 +32,7 @@ ITEMS = [
     (10, "compaction", "SessionStart fires after compaction"),
     (11, "post_tool_context", "PostToolUse additionalContext reaches the model mid-turn (MCP, built-in, subagent)"),
     (12, "stop_block", "Stop hook `block`: result lines, Stop again after the continuation, the reason reaches the model"),
+    (13, "list_changed", "A stdio server's tools/list_changed: Claude Code lists again and the model can call the new tool in the same session"),
 ]
 
 
@@ -71,8 +72,8 @@ class Context:
         self.bwrap_info = info
         return info
 
-    def workspace(self, name, cwd=None):
-        return Workspace(self, name, cwd)
+    def workspace(self, name, cwd=None, mcp_args=()):
+        return Workspace(self, name, cwd, mcp_args)
 
     def temp_cwd(self, *parts):
         """Working directories live outside the repo, so no CLAUDE.md above them is picked up."""
@@ -97,9 +98,9 @@ class Context:
 
 class Workspace:
     """Per-probe config dir (CLAUDE_CONFIG_DIR = HOME), cwd, logs and the managed settings that wire
-    hooks to `hook_logger.py`."""
+    hooks to `hook_logger.py`. `mcp_args` are extra `mcp_logger.py` options."""
 
-    def __init__(self, ctx, name, cwd=None):
+    def __init__(self, ctx, name, cwd=None, mcp_args=()):
         self.ctx, self.name = ctx, name
         self.dir = os.path.join(ctx.work, "probes", name)
         self.config, self.tmp = os.path.join(self.dir, "config"), os.path.join(self.dir, "tmp")
@@ -111,7 +112,7 @@ class Workspace:
         self.decisions = os.path.join(self.dir, "decisions.json")
         with open(os.path.join(self.config, "nest-system-prompt.md"), "w") as f:
             f.write(PROBE_SYSTEM_PROMPT + "\n")
-        cfg = h.mcp_config(ctx.python, [os.path.join(h.HERE, "mcp_logger.py"), "--log", self.mcp_log, "--state-dir", self.state],
+        cfg = h.mcp_config(ctx.python, [os.path.join(h.HERE, "mcp_logger.py"), "--log", self.mcp_log, "--state-dir", self.state, *mcp_args],
                            {"NEST_AGENT_ID": AGENT, "NEST_MCP_SOCK": f"{self.sock}/mcp.sock"})
         with open(os.path.join(self.config, "nest-mcp.json"), "w") as f:
             json.dump(cfg, f, indent=2)
@@ -972,11 +973,104 @@ def probe_stop_block(ctx, n, key, title):
     return h.result(n, key, title, FAIL, summary, ev)
 
 
+# ---------------------------------------------------------------------------------- 13. tools/list_changed
+LATE_TOOL = "late_echo"  # what mcp_logger.py --grow-after-call adds after its first tools/call
+LC_FIRST_PROMPT = 'Call the mcp__nest__echo tool exactly once with text "lc-first". After it returns, reply with the single word DONE.'
+
+
+def lc_late_prompt(token):
+    return f'Call the mcp__nest__{LATE_TOOL} tool exactly once with text "{token}". After it returns, reply with the single word DONE.'
+
+
+def lc_mid_prompt(token):
+    return (f'Call the mcp__nest__echo tool exactly once with text "lc-mid". When it returns, a new tool named '
+            f'mcp__nest__{LATE_TOOL} will have been added: call it exactly once with text "{token}", then reply with the single word DONE. '
+            f'If it is not available, reply with the single word MISSING.')
+
+
+def mcp_timeline(ws, t0):
+    """The logger's tools/list requests, its list_changed and its tools/call requests, seconds after t0."""
+    out = []
+    for e in ws.mcp():
+        m = e.get("msg") or {}
+        if e.get("event") == "list_changed":
+            out.append({"t": round(e["ts"] - t0, 2), "what": "list_changed sent"})
+        elif e.get("dir") == "in" and m.get("method") in ("tools/list", "tools/call"):
+            v = {"t": round(e["ts"] - t0, 2), "what": m["method"], "_ts": e["ts"]}
+            if m["method"] == "tools/call":
+                v["tool"] = (m.get("params") or {}).get("name")
+            out.append(v)
+    return out
+
+
+def lc_turn_view(objs, token):
+    inits = [o for o in objs if is_init(o)]
+    late = f"mcp__nest__{LATE_TOOL}"
+    uses = [b for b in h.tool_uses(objs) if b.get("name") == late]
+    errors = [str(b.get("content"))[:200] for o in objs if o.get("type") == "user" for b in blocks(o, "tool_result") if b.get("is_error")]
+    return {"inits": [{"mcp_tools": sorted(t for t in (o.get("tools") or []) if t.startswith("mcp__"))} for o in inits],
+            "late_tool_in_init": any(late in (o.get("tools") or []) for o in inits) if inits else None,
+            "late_tool_uses": [pick(b, "name", "input") for b in uses], "tool_errors": errors,
+            "token_in_output": token in json.dumps(objs), "final_text": last_text(objs),
+            "result": result_view(next((o for o in reversed(objs) if is_result(o)), None)), "stream": stream_view(objs)[:30]}
+
+
+def lc_lists(timeline):
+    lists = [x for x in timeline if x["what"] == "tools/list"]
+    sent = next((x for x in timeline if x["what"] == "list_changed sent"), None)
+    return lists, sent, [x for x in lists if sent and x["t"] >= sent["t"]]
+
+
+def probe_list_changed(ctx, n, key, title):
+    ws = ctx.workspace("list_changed", mcp_args=("--grow-after-call", LATE_TOOL))
+    token = probe_token()
+    s = ws.start(("session-id", str(uuid.uuid4())), "list-changed")
+    objs1, t1 = run_turn(ctx, s, LC_FIRST_PROMPT, grace=4.0)
+    objs2, t2 = run_turn(ctx, s, lc_late_prompt(token))
+    s.finish()
+    timeline = mcp_timeline(ws, s.t0)
+    lists, sent, relists = lc_lists(timeline)
+    late_calls = [c for c in ws.tool_calls(LATE_TOOL) if token in json.dumps(c["msg"].get("params") or {})]
+    for x in relists:
+        x["when"] = "after list_changed, before turn 2" if x["_ts"] < t2 else "during turn 2"
+    ev = {"late_tool": LATE_TOOL, "token": token, "turn1_sent_t": round(t1 - s.t0, 2), "turn2_sent_t": round(t2 - s.t0, 2),
+          "mcp_timeline": timeline, "turn1": lc_turn_view(objs1, token), "turn2": lc_turn_view(objs2, token),
+          "late_calls_at_server": len(late_calls)}
+
+    # Mid-turn: one turn, the list grows between its two calls.
+    wm = ctx.workspace("list_changed_midturn", mcp_args=("--grow-after-call", LATE_TOOL))
+    mtoken = probe_token()
+    sm = wm.start(("session-id", str(uuid.uuid4())), "list-changed-midturn")
+    objsm, tm = run_turn(ctx, sm, lc_mid_prompt(mtoken))
+    sm.finish()
+    mtl = mcp_timeline(wm, sm.t0)
+    _, msent, mrelists = lc_lists(mtl)
+    ev["midturn"] = {"token": mtoken, "turn_sent_t": round(tm - sm.t0, 2), "mcp_timeline": mtl, "turn": lc_turn_view(objsm, mtoken),
+                     "late_calls_at_server": sum(1 for c in wm.tool_calls(LATE_TOOL) if mtoken in json.dumps(c["msg"].get("params") or {}))}
+    for tl in (timeline, mtl):
+        for x in tl:
+            x.pop("_ts", None)
+
+    if sent is None:
+        return h.result(n, key, title, INCONCLUSIVE, no_turn("The model never called mcp__nest__echo, so the list never changed", objs1) + ".", ev)
+    mid = ev["midturn"]
+    mid_say = (f"mid-turn: {len(mrelists)} tools/list after the notification, the model "
+               + (f"called {LATE_TOOL} in the same turn" if mid["late_calls_at_server"] else f"did not call {LATE_TOOL} (final text {mid['turn']['final_text']!r})")
+               if msent else "mid-turn: not exercised (no first call)")
+    summary = (f"{len(lists)} tools/list in all, {len(relists)} after list_changed "
+               f"({', '.join(x['when'] + ' at +' + str(x['t']) + ' s' for x in relists) or 'none'}); "
+               f"turn 2 init lists {LATE_TOOL}: {ev['turn2']['late_tool_in_init']}; "
+               f"the model called it: {bool(ev['turn2']['late_tool_uses'])} ({len(late_calls)} call(s) at the server with the token); {mid_say}.")
+    if relists and late_calls:
+        return h.result(n, key, title, PASS, summary, ev)
+    return h.result(n, key, title, FAIL, summary, ev)
+
+
 PROBES = {
     "auth": probe_auth, "init_order": probe_init_order, "user_shape": probe_user_shape, "meta_tool_use_id": probe_meta_tool_use_id,
     "restricted_tools": probe_restricted_tools, "cancel": probe_cancel, "env_scrub": probe_env_scrub,
     "transcript_path": probe_transcript_path, "resume_defer": probe_resume_defer, "compaction": probe_compaction,
-    "post_tool_context": probe_post_tool_context, "stop_block": probe_stop_block,
+    "post_tool_context": probe_post_tool_context, "stop_block": probe_stop_block, "list_changed": probe_list_changed,
 }
 
 

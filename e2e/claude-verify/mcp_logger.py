@@ -2,7 +2,7 @@
 """Logging stdio MCP server for the claude-verify probes (configured as server `nest`, so its tools
 appear as `mcp__nest__echo` and `mcp__nest__sleep`).
 
-    mcp_logger.py --log <mcp.jsonl> [--state-dir <dir>]
+    mcp_logger.py --log <mcp.jsonl> [--state-dir <dir>] [--grow-after-call <name>]
 
 Newline-delimited JSON-RPC on stdio, like `nest mcp`. Every inbound message is logged in full
 (`{"ts", "dir": "in", "msg"}`), every outbound one as `"dir": "out"`, plus a `start` line with the
@@ -13,6 +13,11 @@ Tools:
 - `sleep {seconds}` waits (max 600 s) and returns `slept`, unless `<state-dir>/fast` exists, in which
   case it returns at once. `notifications/cancelled` for its request id stops it without a response
   (MCP: a cancelled request gets no response) and is logged as `{"event": "cancelled"}`.
+
+`--grow-after-call <name>` (the list_changed probe): the server declares `tools.listChanged: true`,
+and once it has answered its first `tools/call` it adds `<name>` (it echoes like `echo`, as
+`<name>: <text>`) to its list and sends `notifications/tools/list_changed`, logged as
+`{"event": "list_changed"}`. Without it the list never changes and `listChanged` is false.
 """
 import json, os, sys, threading, time
 
@@ -29,9 +34,11 @@ MAX_SLEEP_S = 600
 
 
 class Server:
-    def __init__(self, log_path, state_dir=None, out=None):
+    def __init__(self, log_path, state_dir=None, out=None, grow_tool=None):
         self.log_path = log_path
         self.state_dir = state_dir
+        self.grow_tool = grow_tool  # added after the first tools/call (see the module doc)
+        self.tools = list(TOOLS)
         self.out = out or sys.stdout
         self.lock = threading.Lock()
         self.running = {}  # json.dumps(request id) -> threading.Event (set = cancelled)
@@ -80,20 +87,30 @@ class Server:
             return
         if method == "initialize":
             self.result(rid, {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
-                              "capabilities": {"tools": {"listChanged": False}},
+                              "capabilities": {"tools": {"listChanged": bool(self.grow_tool)}},
                               "serverInfo": {"name": "claude-verify-mcp", "version": "0"}})
         elif method == "ping":
             self.result(rid, {})
         elif method == "tools/list":
-            self.result(rid, {"tools": TOOLS})
+            self.result(rid, {"tools": self.tools})
         elif method == "tools/call":
             self.call(rid, params.get("name"), params.get("arguments") or {})
+            self.grow()
         else:
             self.error(rid, -32601, f"method not found: {method}")
 
+    def grow(self):
+        """After the first tools/call's answer (a sleep's comes later): add the tool, announce it."""
+        if not self.grow_tool or any(t["name"] == self.grow_tool for t in self.tools):
+            return
+        self.tools.append({"name": self.grow_tool, "description": "Echo the given text back (a tool added after the session started).",
+                           "inputSchema": TOOLS[0]["inputSchema"]})
+        self.log(event="list_changed", added=self.grow_tool)
+        self.send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+
     def call(self, rid, name, args):
-        if name == "echo":
-            self.result(rid, {"content": [{"type": "text", "text": f"echo: {args.get('text', '')}"}], "isError": False})
+        if name == "echo" or (name == self.grow_tool and any(t["name"] == name for t in self.tools)):
+            self.result(rid, {"content": [{"type": "text", "text": f"{name}: {args.get('text', '')}"}], "isError": False})
         elif name == "sleep":
             if self.fast():
                 self.log(event="sleep_fast", request_id=rid)
@@ -118,17 +135,19 @@ class Server:
 
 
 def main(argv):
-    log_path, state_dir = None, None
+    log_path, state_dir, grow_tool = None, None, None
     it = iter(argv[1:])
     for a in it:
         if a == "--log":
             log_path = next(it)
         elif a == "--state-dir":
             state_dir = next(it)
+        elif a == "--grow-after-call":
+            grow_tool = next(it)
     if not log_path:
-        print("usage: mcp_logger.py --log <mcp.jsonl> [--state-dir <dir>]", file=sys.stderr)
+        print("usage: mcp_logger.py --log <mcp.jsonl> [--state-dir <dir>] [--grow-after-call <name>]", file=sys.stderr)
         return 2
-    srv = Server(log_path, state_dir)
+    srv = Server(log_path, state_dir, grow_tool=grow_tool)
     srv.log(event="start", pid=os.getpid(), ppid=os.getppid(), argv=argv, cwd=os.getcwd(), env=env_summary(dict(os.environ)))
     for line in sys.stdin:
         srv.handle_line(line)

@@ -1,0 +1,301 @@
+{
+ "$comment": "Observed with e2e/claude-verify/run.py --only list_changed against the real Claude Code binary (owner's setup token, haiku), 2026-11-01 UTC. Evidence as the probe wrote it to report.json. mcp_timeline times are seconds after the claude process started; the logger answered the first tools/call, then sent notifications/tools/list_changed.",
+ "runs": [
+  {
+   "meta": {
+    "claude_version": "2.1.316 (Claude Code)",
+    "model": "haiku",
+    "started": "2026-11-01T05:22:25Z",
+    "duration_s": 18.2,
+    "total_cost_usd": 0.005135,
+    "turns_sent": 3
+   },
+   "result": {
+    "n": 13,
+    "item": "list_changed",
+    "title": "A stdio server's tools/list_changed: Claude Code lists again and the model can call the new tool in the same session",
+    "status": "pass",
+    "summary": "2 tools/list in all, 1 after list_changed (after list_changed, before turn 2 at +1.84 s); turn 2 init lists late_echo: True; the model called it: True (1 call(s) at the server with the token); mid-turn: 1 tools/list after the notification, the model called late_echo in the same turn.",
+    "evidence": {
+     "late_tool": "late_echo",
+     "token": "nest-095220020922",
+     "turn1_sent_t": 0.0,
+     "turn2_sent_t": 6.94,
+     "mcp_timeline": [
+      {
+       "t": 0.73,
+       "what": "tools/list"
+      },
+      {
+       "t": 1.83,
+       "what": "tools/call",
+       "tool": "echo"
+      },
+      {
+       "t": 1.83,
+       "what": "list_changed sent"
+      },
+      {
+       "t": 1.84,
+       "what": "tools/list",
+       "when": "after list_changed, before turn 2"
+      },
+      {
+       "t": 7.72,
+       "what": "tools/call",
+       "tool": "late_echo"
+      }
+     ],
+     "turn1": {
+      "inits": [
+       {
+        "mcp_tools": [
+         "mcp__nest__echo",
+         "mcp__nest__sleep"
+        ]
+       }
+      ],
+      "late_tool_in_init": false,
+      "late_tool_uses": [],
+      "tool_errors": [],
+      "token_in_output": false,
+      "final_text": "DONE",
+      "result": {
+       "subtype": "success",
+       "is_error": false,
+       "stop_reason": "end_turn",
+       "terminal_reason": "completed",
+       "num_turns": 2,
+       "total_cost_usd": 0.00211814,
+       "result": "DONE"
+      },
+      "stream": [
+       {
+        "type": "system",
+        "subtype": "hook_started"
+       },
+       {
+        "type": "system",
+        "subtype": "hook_response"
+       },
+       {
+        "type": "system",
+        "subtype": "init"
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "mcp__nest__echo"
+        ]
+       },
+       {
+        "type": "rate_limit_event"
+       },
+       {
+        "type": "user",
+        "blocks": [
+         "tool_result"
+        ]
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "DONE"
+        ]
+       },
+       {
+        "type": "result",
+        "subtype": "success",
+        "stop_reason": "end_turn",
+        "num_turns": 2,
+        "is_error": false,
+        "result": "DONE"
+       }
+      ]
+     },
+     "turn2": {
+      "inits": [
+       {
+        "mcp_tools": [
+         "mcp__nest__echo",
+         "mcp__nest__late_echo",
+         "mcp__nest__sleep"
+        ]
+       }
+      ],
+      "late_tool_in_init": true,
+      "late_tool_uses": [
+       {
+        "name": "mcp__nest__late_echo",
+        "input": {
+         "text": "nest-095220020922"
+        }
+       }
+      ],
+      "tool_errors": [],
+      "token_in_output": true,
+      "final_text": "DONE",
+      "result": {
+       "subtype": "success",
+       "is_error": false,
+       "stop_reason": "end_turn",
+       "terminal_reason": "completed",
+       "num_turns": 2,
+       "total_cost_usd": 0.0023873400000000004,
+       "result": "DONE"
+      },
+      "stream": [
+       {
+        "type": "system",
+        "subtype": "init"
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "mcp__nest__late_echo"
+        ]
+       },
+       {
+        "type": "user",
+        "blocks": [
+         "tool_result"
+        ]
+       },
+       {
+        "type": "assistant",
+        "blocks": [
+         "DONE"
+        ]
+       },
+       {
+        "type": "result",
+        "subtype": "success",
+        "stop_reason": "end_turn",
+        "num_turns": 2,
+        "is_error": false,
+        "result": "DONE"
+       }
+      ]
+     },
+     "late_calls_at_server": 1,
+     "midturn": {
+      "token": "nest-5135eeb74466",
+      "turn_sent_t": 0.0,
+      "mcp_timeline": [
+       {
+        "t": 0.59,
+        "what": "tools/list"
+       },
+       {
+        "t": 1.67,
+        "what": "tools/call",
+        "tool": "echo"
+       },
+       {
+        "t": 1.67,
+        "what": "list_changed sent"
+       },
+       {
+        "t": 1.68,
+        "what": "tools/list"
+       },
+       {
+        "t": 2.43,
+        "what": "tools/call",
+        "tool": "late_echo"
+       }
+      ],
+      "turn": {
+       "inits": [
+        {
+         "mcp_tools": [
+          "mcp__nest__echo",
+          "mcp__nest__sleep"
+         ]
+        }
+       ],
+       "late_tool_in_init": false,
+       "late_tool_uses": [
+        {
+         "name": "mcp__nest__late_echo",
+         "input": {
+          "text": "nest-5135eeb74466"
+         }
+        }
+       ],
+       "tool_errors": [],
+       "token_in_output": true,
+       "final_text": "DONE",
+       "result": {
+        "subtype": "success",
+        "is_error": false,
+        "stop_reason": "end_turn",
+        "terminal_reason": "completed",
+        "num_turns": 3,
+        "total_cost_usd": 0.00062927,
+        "result": "DONE"
+       },
+       "stream": [
+        {
+         "type": "system",
+         "subtype": "hook_started"
+        },
+        {
+         "type": "system",
+         "subtype": "hook_response"
+        },
+        {
+         "type": "system",
+         "subtype": "init"
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "mcp__nest__echo"
+         ]
+        },
+        {
+         "type": "rate_limit_event"
+        },
+        {
+         "type": "user",
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "mcp__nest__late_echo"
+         ]
+        },
+        {
+         "type": "user",
+         "blocks": [
+          "tool_result"
+         ]
+        },
+        {
+         "type": "assistant",
+         "blocks": [
+          "DONE"
+         ]
+        },
+        {
+         "type": "result",
+         "subtype": "success",
+         "stop_reason": "end_turn",
+         "num_turns": 3,
+         "is_error": false,
+         "result": "DONE"
+        }
+       ]
+      },
+      "late_calls_at_server": 1
+     }
+    },
+    "duration_s": 18.2
+   }
+  }
+ ]
+}

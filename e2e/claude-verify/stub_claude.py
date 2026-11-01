@@ -6,7 +6,8 @@ documented behavior the probes check for (`_meta` tool-use id, cancellation, def
 SessionStart after `/compact`) and what 2.1.316 did with hook answers (PostToolUse context followed by
 the main loop and declined by a subagent; a blocked Stop continues, fires Stop again and ends with one
 result), so every probe except init_order takes its pass path. STUB_IGNORE_CONTEXT=1 drops PostToolUse
-context, for the probe's failure path.
+context, for the probe's failure path. On `notifications/tools/list_changed` it lists again (as the
+docs say Claude Code does); a prompt naming an MCP tool it doesn't have ends the turn with MISSING.
 """
 import json, os, queue, re, subprocess, sys, threading, time, uuid
 
@@ -118,29 +119,40 @@ class Mcp:
         env = {"PATH": ENV.get("PATH", "/usr/bin:/bin")} if ENV.get("CLAUDE_CODE_MCP_ALLOWLIST_ENV") == "1" else sub_env()
         env.update(cfg.get("env", {}))
         self.p = subprocess.Popen([cfg["command"]] + cfg.get("args", []), stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, text=True)
-        self.n, self.resp, self.cv = 0, {}, threading.Condition()
+        self.n, self.resp, self.cv, self.lock = 0, {}, threading.Condition(), threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
         self.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "stub", "version": "0"}})
         self.send("notifications/initialized", None)
+        self.relist()
+
+    def relist(self):
         self.tools = [t["name"] for t in self.call("tools/list")["result"]["tools"]]
 
     def _read(self):
         for line in self.p.stdout:
             m = json.loads(line)
+            if m.get("method") == "notifications/tools/list_changed":
+                threading.Thread(target=self.relist, daemon=True).start()
+                continue
             with self.cv:
                 self.resp[m.get("id")] = m
                 self.cv.notify_all()
+
+    def next_id(self):
+        with self.lock:
+            self.n += 1
+            return self.n
 
     def send(self, method, params, rid=None):
         m = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         if rid is not None:
             m["id"] = rid
-        self.p.stdin.write(json.dumps(m) + "\n")
-        self.p.stdin.flush()
+        with self.lock:
+            self.p.stdin.write(json.dumps(m) + "\n")
+            self.p.stdin.flush()
 
     def call(self, method, params=None):
-        self.n += 1
-        rid = self.n
+        rid = self.next_id()
         self.send(method, params, rid)
         return self.wait(rid, 30)
 
@@ -217,8 +229,7 @@ def call(name, args, tid=None, parent=None, agent=None):
         result(stop_reason="tool_deferred", deferred_tool_use={"id": tid, "name": full, "input": args})
         return "deferred", None
     if mcp_tool:
-        mcp.n += 1
-        rid = mcp.n
+        rid = mcp.next_id()
         mcp.send("tools/call", {"name": name, "arguments": args, "_meta": {"claudecode/toolUseId": tid, "progressToken": rid}}, rid)
         r = mcp.wait(rid, 600, abort=interrupted)
         if r is None and pending:
@@ -308,12 +319,14 @@ def turn(text):
         return tool("Agent", {"subagent_type": "general-purpose", "prompt": text})
     if "TaskList" in text:
         return tool("TaskList", {})
-    m = re.search(r"mcp__nest__(echo|sleep)", text)
+    m = re.search(r"mcp__nest__(\w+)", text)
     if not m:
         w = re.search(r"single word (\w+)", text)
         return end_turn(w.group(1) if w else "OK")
+    if m.group(1) not in mcp.tools:
+        return end_turn("MISSING")
     q = re.search(r'"([^"]+)"', text)
-    return tool(m.group(1), {"text": q.group(1) if q else "x"} if m.group(1) == "echo" else {"seconds": 120})
+    return tool(m.group(1), {"seconds": 120} if m.group(1) == "sleep" else {"text": q.group(1) if q else "x"})
 
 
 # A resumed session with an unfinished tool call: a deferred one re-runs; an interrupted one
