@@ -1,4 +1,4 @@
-// What the control plane's two read routes return: the admin view contract in
+// What the control plane's read routes return: the admin view contract in
 // protocol/admin/view.ts, which the control plane's `fleetView` and `images` are typed by too. The
 // dashboard imports nothing from the control plane, and only types from protocol/: it stays an
 // independent Worker, and `npm run typecheck` fails when the page reads a field the view lacks.
@@ -7,8 +7,13 @@ export type {
   LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
   TunnelState,
 } from "../../protocol/admin/view";
+export type {
+  AgentLifetimeKind, LifetimeAgentView as LifetimeAgent, LifetimeSandboxView as LifetimeSandbox, LifetimesView as Lifetimes, SandboxLifetimeKind,
+} from "../../protocol/admin/view";
 export type { AgentRow, AgentsResponse, AgentSummary } from "./agents";
+export type { LifetimesResponse } from "./lifetimes";
 import { errorMessage, type AgentsResponse } from "./agents";
+import type { LifetimesResponse } from "./lifetimes";
 import type { AwsView, FleetView, HostRole, HostView, ImagesView, SandboxState, SandboxView, TunnelState } from "../../protocol/admin/view";
 
 /**
@@ -78,4 +83,5 @@ export const api = {
   fleet: async (cell: string) => normalizeFleet(await get<FleetResponse>(`/api/fleet?cell=${encodeURIComponent(cell)}`)),
   images: (cell: string) => get<ImagesView>(`/api/images?cell=${encodeURIComponent(cell)}`),
   agents: (cell: string) => get<AgentsResponse>(`/api/agents?cell=${encodeURIComponent(cell)}`),
+  lifetimes: (cell: string) => get<LifetimesResponse>(`/api/lifetimes?cell=${encodeURIComponent(cell)}`),
 };

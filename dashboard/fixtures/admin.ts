@@ -1,4 +1,4 @@
-// Recorded responses of the control plane's two read routes, held to the control plane's view
+// Recorded responses of the control plane's read routes, held to the control plane's view
 // types (src/api.ts re-exports them): `npm run typecheck` fails when a field is missing, extra or of
 // another type.
 // Recorded once from the control plane's test pool (a throwaway vitest case in control-plane/test
@@ -7,7 +7,7 @@
 // `agent`, at the end, is the one other route the Worker reads (GET /v1/agents/:agent), untyped by
 // the view.
 import type { AgentInfoResponse } from "../src/agents";
-import type { Fleet, Images } from "../src/api";
+import type { Fleet, Images, Lifetimes } from "../src/api";
 
 export const fleet = {
   "hosts": [
@@ -187,3 +187,108 @@ export const agent = {
 };
 // It has the fields the page reads, with their types (the rest of the record is not checked).
 agent satisfies AgentInfoResponse;
+
+// Recorded from the control plane's test pool (a throwaway vitest case in control-plane/test, with
+// test/lifetimes-view.test.ts's helpers: a sandbox host; one sandbox suspended with nothing attached;
+// another suspended with a `worker` bound to it, its last turn three days old, stopped by the
+// operator; that worker's owner, an agent with no sandbox; then GET /v1/admin/lifetimes), its cell
+// and template names replaced. Re-record when `lifetimes` changes.
+export const lifetimes = {
+  "cell": "use1",
+  "now_ms": 1793538892229,
+  "quiet_ms": 86400000,
+  "cell_idle_ttl_ms": 86400000,
+  "sandboxes": [
+    {
+      "sandbox": "sbx_01m6bkz8bcy73g7rrvgfggpgfh",
+      "kind": "dormant",
+      "registered_ms": 1793538892144,
+      "state": "suspended",
+      "host": "hst_01m6bkz8aaap56a16tbgjd63n9",
+      "owner": null,
+      "attached": [],
+      "idle_ttl_ms": 86400000,
+      "own_ttl": false,
+      "dormant_since_ms": 1793538892157,
+      "expiry_notice_ms": null,
+      "destroy_at_ms": 1793625292157,
+      "generations": 0,
+      "memory_generations": 0,
+      "error": null
+    },
+    {
+      "sandbox": "sbx_01m6bkz8c36t7knvgd3k2zcjys",
+      "kind": "held",
+      "registered_ms": 1793538892169,
+      "state": "suspended",
+      "host": "hst_01m6bkz8aaap56a16tbgjd63n9",
+      "owner": null,
+      "attached": [
+        "agt_01m6bkz8dcfjdhvb67rwrty02t"
+      ],
+      "idle_ttl_ms": 86400000,
+      "own_ttl": false,
+      "dormant_since_ms": null,
+      "expiry_notice_ms": null,
+      "destroy_at_ms": null,
+      "generations": 0,
+      "memory_generations": 0,
+      "error": null
+    }
+  ],
+  "agents": [
+    {
+      "agent": "agt_01m6bkz8dcfjdhvb67rwrty02t",
+      "kind": "quiet",
+      "template": "worker",
+      "owner": "agt_01m6bkz8d14e57s4kkhjxhvm9s",
+      "sandbox": "sbx_01m6bkz8c36t7knvgd3k2zcjys",
+      "last_turn_ms": 1793279692222,
+      "stopped_by_operator": true,
+      "live_children": [],
+      "subscriptions": 0,
+      "ended_ms": null,
+      "ended_reason": null,
+      "found_via": "sandbox",
+      "error": null
+    },
+    {
+      "agent": "agt_01m6bkz8d14e57s4kkhjxhvm9s",
+      "kind": "quiet",
+      "template": "lead",
+      "owner": null,
+      "sandbox": null,
+      "last_turn_ms": null,
+      "stopped_by_operator": false,
+      "live_children": [
+        "agt_01m6bkz8dcfjdhvb67rwrty02t"
+      ],
+      "subscriptions": 0,
+      "ended_ms": null,
+      "ended_reason": null,
+      "found_via": "owner",
+      "error": null
+    }
+  ],
+  "counts": {
+    "sandboxes": {
+      "dormant": 1,
+      "held": 1,
+      "unknown": 0,
+      "in_use": 0,
+      "destroyed": 0,
+      "unreadable": 0
+    },
+    "agents": {
+      "quiet": 2,
+      "ending": 0,
+      "gone": 0,
+      "unreadable": 0,
+      "active": 0,
+      "recent": 0,
+      "ended": 0
+    }
+  },
+  "next_cursor": null,
+  "agents_omitted": 0
+} satisfies Lifetimes;
