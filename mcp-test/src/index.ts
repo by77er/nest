@@ -6,10 +6,12 @@
 //   GET    /calls?since=n  every tools/call received after seq n, in order
 //   POST   /reset          clears notes, counters and the call log
 //
-// Every route needs `Authorization: Bearer <MCP_TEST_TOKEN>`.
+// Every route needs `Authorization: Bearer <MCP_TEST_TOKEN>`. With MCP_TEST_OAUTH=1 (off by default), the
+// OAuth routes of src/oauth.ts are added, and /mcp also takes an access token they issued.
 
 import { classify, failure, INVALID_REQUEST, isRpcError, type Message, PARSE_ERROR, PROTOCOL_VERSIONS, type RpcError } from "./jsonrpc";
 import { type CallRecord, McpState, type Reply } from "./state";
+import { oauthEnabled, prmUrl, resourceOf } from "./oauth";
 
 export { McpState };
 
@@ -19,6 +21,10 @@ declare global {
     MCP_TEST_TOKEN?: string;
     /** Comma-separated Origins admitted; a request carrying any other Origin gets 403. */
     ALLOWED_ORIGINS?: string;
+    /** "1" turns on OAuth mode (src/oauth.ts): this Worker is also an authorization server, and /mcp takes its tokens. */
+    MCP_TEST_OAUTH?: string;
+    /** OAuth mode: seconds an access token lasts (default 3600). */
+    MCP_TEST_OAUTH_TTL_S?: string;
   }
 }
 
@@ -29,6 +35,8 @@ const jsonResponse = (status: number, body: unknown, headers: Record<string, str
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 const rpcError = (status: number, error: RpcError, headers: Record<string, string> = {}): Response =>
   jsonResponse(status, failure(undefined, error), headers);
+
+const bearerOf = (req: Request) => /^Bearer (.+)$/i.exec(req.headers.get("authorization") ?? "")?.[1] ?? null;
 
 async function authorized(req: Request, token: string): Promise<boolean> {
   const header = req.headers.get("authorization") ?? "";
@@ -120,8 +128,25 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (!originAllowed(req, env)) return rpcError(403, { code: INVALID_REQUEST, message: "origin not allowed" });
     if (!env.MCP_TEST_TOKEN) return jsonResponse(500, { error: "MCP_TEST_TOKEN is not set" });
-    if (!(await authorized(req, env.MCP_TEST_TOKEN))) {
-      return jsonResponse(401, { error: "unauthorized" }, { "www-authenticate": 'Bearer realm="nest-mcp-test"' });
+    const login = await authorized(req, env.MCP_TEST_TOKEN);
+    const url = new URL(req.url);
+    if (oauthEnabled(env) && (url.pathname.startsWith("/oauth/") || url.pathname.startsWith("/.well-known/"))) {
+      // The AS routes: the DO decides which need the static bearer (told here, never by the client).
+      const headers = new Headers(req.headers);
+      headers.set("x-mcp-test-login", login ? "1" : "0");
+      // `manual`: the authorize route's 302 is for the client to follow, not this hop.
+      return state(env).fetch(new Request(req, { headers, redirect: "manual" }));
+    }
+    if (!login) {
+      const token = bearerOf(req);
+      const oauthOk = oauthEnabled(env) && url.pathname === "/mcp" && token !== null && (await state(env).oauthAccessValid(token, resourceOf(url.origin)));
+      if (!oauthOk) {
+        // RFC 9728 §5.1: in OAuth mode the challenge names the metadata (and RFC 6750 §3.1 why a token failed).
+        const challenge = oauthEnabled(env)
+          ? `Bearer resource_metadata="${prmUrl(url.origin)}", scope="mcp"${token ? ', error="invalid_token"' : ""}`
+          : 'Bearer realm="nest-mcp-test"';
+        return jsonResponse(401, { error: "unauthorized" }, { "www-authenticate": challenge });
+      }
     }
     return route(req, env);
   },

@@ -4,6 +4,7 @@
 // (sessions, the tool cache, the forward ledger, fencing and retries) is lib/mcp-proxy.ts.
 import { z } from "zod";
 import type { ToolContent, ToolDef } from "../protocol/control";
+import { CapRef, OAuthAuth, type OAuthGrant } from "./mcp-auth";
 
 /** The MCP version nest asks for, and the ones it accepts a server answering with. */
 export const MCP_PROTOCOL_VERSION = "2025-11-25";
@@ -30,7 +31,7 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
 
 /**
  * The `mcp` source of a capability (docs/agents/capabilities/#sources). `auth` names the BrokerDO secret
- * holding the bearer token; `tools` is the allowlist (absent: every tool the server lists); `idempotent`
+ * holding the bearer token (`cap:<name>`), or is the oauth form (`{oauth, client?, scopes?}`, lib/mcp-auth.ts); `tools` is the allowlist (absent: every tool the server lists); `idempotent`
  * overrides the server's annotations (a list of tools that are, or a map of tool → whether it is);
  * `read_only` likewise marks the tools that aren't sinks; `trusted` (default false) means its list and
  * results don't taint the session (and its annotations count); `when_tainted` is what a sink call from a
@@ -38,7 +39,7 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
  */
 export const McpSource = z.object({
   url: z.string().min(1).max(2048),
-  auth: z.string().regex(/^cap:[A-Za-z0-9_.:-]{1,128}$/, "auth names a BrokerDO secret, cap:<name>"),
+  auth: z.union([CapRef, OAuthAuth]),
   tools: z.array(McpToolName).max(MAX_TOOLS_PER_CAPABILITY).optional(),
   idempotent: ToolFlags.optional(),
   read_only: ToolFlags.optional(),
@@ -51,7 +52,10 @@ export type McpSource = z.output<typeof McpSource>;
 export interface McpGrant {
   capability: string;
   url: string;
+  /** The BrokerDO record of its credential: the bearer secret, or (with `oauth`) where its OAuth tokens are kept. */
   auth: string;
+  /** Present when the credential is OAuth (absent in specs written before it, and for a static bearer). */
+  oauth?: OAuthGrant;
   /** The allowlist; null: whatever the server lists. */
   tools: string[] | null;
   /** The operator's idempotency overrides, by tool. */
@@ -67,7 +71,8 @@ export function grantOf(capability: string, src: McpSource): McpGrant {
   return {
     capability,
     url: src.url,
-    auth: src.auth,
+    auth: typeof src.auth === "string" ? src.auth : src.auth.oauth,
+    ...(typeof src.auth === "string" ? {} : { oauth: { client: src.auth.client ?? null, scopes: src.auth.scopes ? [...src.auth.scopes] : null } }),
     tools: src.tools ? [...src.tools] : null,
     idempotent: flags(src.idempotent),
     read_only: flags(src.read_only),
@@ -245,7 +250,7 @@ export type RpcAnswer =
   /** A JSON-RPC error response: the server refused or failed the request. */
   | { kind: "rpc_error"; code: number; message: string }
   /** An HTTP refusal (4xx; a redirect, which nest doesn't follow): the request wasn't processed. */
-  | { kind: "refused"; status: number; text: string; retry_after_ms?: number }
+  | { kind: "refused"; status: number; text: string; retry_after_ms?: number; challenge?: string }
   /** 404 to a request that named a session: the session ended, nothing was processed; initialize again. */
   | { kind: "session_gone" }
   /** The server answered, but more than `MAX_ANSWER_BYTES`. */
@@ -333,7 +338,8 @@ export async function rpc(url: string, message: { method: string; params?: unkno
     if (res.status >= 300 && res.status < 500) {
       const text = ((await readCapped(res)) ?? "").slice(0, 300);
       const ra = retryAfterMs(res.headers.get("retry-after"));
-      return { kind: "refused", status: res.status, text, ...(ra !== undefined ? { retry_after_ms: ra } : {}) };
+      const challenge = res.headers.get("www-authenticate")?.slice(0, 1000);
+      return { kind: "refused", status: res.status, text, ...(ra !== undefined ? { retry_after_ms: ra } : {}), ...(challenge ? { challenge } : {}) };
     }
     if (res.status >= 500) {
       await res.body?.cancel().catch(() => undefined);

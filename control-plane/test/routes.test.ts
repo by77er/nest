@@ -14,6 +14,10 @@ const NOT_ADMIN = {
   "POST /v1/hosts/gc/report": "host",
   "GET /v1/fleet": "host",
   "GET /v1/agents/:agent/session": "host",
+  // A browser follows an authorization server's redirect here; the single-use state is the proof (test/mcp-oauth.test.ts).
+  "GET /v1/oauth/callback": "none",
+  // nest's client ID metadata document, fetched by authorization servers: public by design.
+  "GET /v1/oauth/client.json": "none",
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */
 const concrete = (path: string) => path.replace(/[:*]([a-z]+)/g, (_m, k: string) =>

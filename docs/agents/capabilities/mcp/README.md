@@ -11,7 +11,7 @@ prompt: The notes server.
 ```
 
 - **`url`:** `https` only, no credentials or fragment. A loopback host (`127.0.0.1`, `localhost`, `[::1]`, `http` or `https`) only where the Worker has `ALLOW_LOOPBACK_MCP=1` (tests and local dev, as in e2e). Checked when the capability is written and again at each use.
-- **`auth`:** the BrokerDO secret holding the bearer token, `cap:<name>`, stored with `PUT /v1/admin/secrets/cap:<name>`. Only AgentDO reads it (`BrokerDO.capabilityToken`); `cap:` never resolves into a host command.
+- **`auth`:** the BrokerDO secret holding the bearer token, `cap:<name>`, stored with `PUT /v1/admin/secrets/cap:<name>`. Only AgentDO reads it (`BrokerDO.capabilityToken`); `cap:` never resolves into a host command. Or the [oauth form](#oauth), `{oauth: cap:<name>, client?: cap:<name>, scopes?: [...]}`.
 - **`tools`:** the allowlist. Absent: whatever the server lists (at most 128 per capability).
 - **`idempotent`:** the operator's override of the server's annotations: a list of tools that are idempotent, or a map of tool to whether it is. Otherwise a tool is idempotent when the server marks it `readOnlyHint` or `idempotentHint` ([annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)), else not.
 - **`read_only`:** the tools that aren't [sinks](#sinks), as a list or a map like `idempotent`.
@@ -61,12 +61,68 @@ prompt: The notes server.
 - **Its tool list taints too:** an untrusted server's descriptions and schemas are its text in the model's context ([tool poisoning](https://invariantlabs.ai/blog/mcp-security-notification-tool-poisoning-attacks), 2025-04), so a `tools_list` that hands out any of its tools taints the session. In practice an agent with an untrusted mcp capability is tainted from its brain's start, like one with a web built-in.
 - **`trusted: true`** (an operator's choice in the catalog): neither its list nor its results taint.
 
+## OAuth
+
+For a server that follows the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) (2025-11-25). Code: `control-plane/src/lib/mcp-auth.ts`; the tokens live in BrokerDO.
+
+```yaml
+mcp: {url: https://mcp.example.com/mcp, auth: {oauth: cap:notes, client: cap:notes-client, scopes: [notes.read]}}
+```
+
+- **`oauth`** (required) names the BrokerDO record that holds this capability's tokens; nest writes it, the operator doesn't. It is not in BrokerDO's `secrets`, so a previous release, reading `auth` as a static secret, finds nothing and sends nothing.
+- **`client`** (optional) names a BrokerDO secret holding a pre-registered client, `{"client_id", "client_secret"?, "token_endpoint_auth_method"?}`. It must differ from `oauth`.
+- **`scopes`** (optional) is what to ask for. Without it, nest asks for the 401 challenge's `scope`, then the resource metadata's `scopes_supported`, then nothing, as the spec's scope selection says. The start route's `{"scopes": [...]}` overrides both, for a step-up.
+- **Authorizing (the operator, once):**
+  1. `POST /v1/admin/capabilities/<name>/oauth` discovers the server and answers `{authorize_url, expires_ms, client, resource, issuer, scopes}`.
+  2. The operator opens `authorize_url` and approves.
+  3. The authorization server redirects the browser to `<PUBLIC_BASE_URL>/v1/oauth/callback`, which exchanges the code and answers a page that holds no token.
+  4. `GET /v1/admin/capabilities/<name>/oauth` shows the state (`authorized` or `reauthorize`, expiry, scope, issuer, client kind), never a token.
+- **Discovery:**
+  - An unauthenticated `initialize` reads the 401's `WWW-Authenticate` `resource_metadata` and `scope`; without them nest tries the path-inserted well-known URL, then the root one ([RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) §3.1, §5.1).
+  - The metadata's `resource` must be the server URL or a path prefix of it on the same origin, else nest refuses. RFC 9728 §3.3 requires identity with the URL it was derived from, and a prefix is what the root fallback produces.
+  - Of `authorization_servers`, the first is used (§7.6 leaves the choice to the client). Its metadata comes from the spec's order of RFC 8414 and OIDC URLs; its `issuer` must match ([RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) §3.3); without `S256` in `code_challenge_methods_supported`, nest refuses to proceed, as the spec requires.
+  - Every URL is `https` (loopback `http` only with `ALLOW_LOOPBACK_MCP=1`); redirects aren't followed; each exchange has 10 s and 64 KiB.
+- **Client identity, in the spec's order:**
+  1. The pre-registered `client`. It authenticates with `client_secret_basic`, or with `client_secret_post` when the server lists only that.
+  2. **nest's client ID metadata document**, when the server advertises `client_id_metadata_document_supported` and `PUBLIC_BASE_URL` is https. The Worker serves it at `/v1/oauth/client.json`, and that URL is the client id: a public client (`none`), with the callback as its only redirect URI ([draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00)).
+  3. [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) registration as a public client, once per authorization server, kept in BrokerDO.
+  4. Otherwise the start fails and says to register a client by hand.
+
+  **Why all three:** the spec makes metadata documents the SHOULD for clients with no prior relationship and registration a MAY "for backwards compatibility". Servers built against the 2025-06-18 spec offer only registration (unverified how many still do), so leaving it out would lock them out.
+- **The flow:**
+  - PKCE S256 with a 32-byte verifier ([RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)), kept in BrokerDO's flow row and never in the URL.
+  - `resource` (the metadata's `resource`) in the authorization request and in every token request ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html)), and `state` (32 random bytes).
+  - When the server advertises `authorization_response_iss_parameter_supported`, the response's `iss` must match ([RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207)), and a mismatched `iss` is always refused.
+  - Only `Bearer` tokens are accepted.
+- **The callback needs no admin token (decided).** A browser can't carry one, so the state is the proof. It is single use (deleted as it's read), lasts 10 minutes, and names a flow only the operator's admin call could start. A stolen code is useless without the verifier, which never leaves BrokerDO.
+  - `nest.bitcru.sh` has no Cloudflare Access application (Access fronts only the gateways, the dashboard and previews: `deploy/lean/Edge/Stack.lean`), so the callback and the metadata document are reachable. If Access ever fronts the Worker, both paths need a bypass policy: the authorization server fetches the document, and the browser lands on the callback.
+  - Cloudflare logs request URLs, and the callback's query carries the code and state. Both are spent by then. The page sends `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+  - Whoever completes the authorize URL binds their account to the capability, so the URL is the operator's alone.
+- **Use (`mcpBearer`, the proxy's one call for a bearer):**
+  - An access token with more than 60 s left is sent as is; an older one is refreshed first.
+  - A 401 means the request wasn't processed, so the proxy renews the bearer and sends it again, once per request. A tools/call is sent again only after the epoch check and the write-ahead row, as for any forward. A server that refuses the refreshed token too costs one refresh per call, never a loop.
+  - **One refresh at a time per record:** BrokerDO is a single instance, so concurrent callers share the refresh in flight, and a rotated refresh token ([OAuth 2.1](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-13) §4.3.1, required for public clients) is spent once. A rotated refresh token replaces the spent one; otherwise the old one stays.
+  - An authorization the operator completes during a refresh wins over it.
+  - **A refused refresh** (any 400 or 401 from the token endpoint, such as `invalid_grant`) marks the record `reauthorize` and clears its tokens. Every call then fails at once with `unauthorized` (not retryable), naming `POST /v1/admin/capabilities/<name>/oauth`, and asks neither the authorization server nor the MCP server. A refresh with no answer (timeout, 5xx) is `internal` (retryable) and changes nothing.
+  - A 403 `insufficient_scope` is `forbidden`, naming the scopes the challenge asks for.
+  - **Bound to the server:** the record keeps the URL it was authorized for, and a grant naming another URL gets no token. The spec says clients "MUST NOT send tokens to the MCP server other than ones issued by the MCP server's authorization server".
+  - The access token reaches AgentDO's memory for the request only. The refresh token, the verifier and any client secret never leave BrokerDO.
+- **Audit:** BrokerDO writes `oauth_start`, `oauth_registered`, `oauth_authorized`, `oauth_callback_refused`, `oauth_refreshed`, `oauth_refresh_failed` and `oauth_token_refused` to R2 under `audit/broker/<day>/`. Each record holds the capability, record, resource, issuer, client id, scope, expiry, caller and reason, never a token, code, verifier or state ([issuance audit](../../../control-plane/durable-objects/broker/#issuance-audit)).
+- **Not built:**
+  - token revocation at the authorization server ([RFC 7009](https://datatracker.ietf.org/doc/html/rfc7009)) and deleting a record;
+  - telling the operator unprompted when a record needs re-authorizing (the agent's error and the status route say so);
+  - `private_key_jwt`;
+  - choosing among several `authorization_servers`;
+  - OIDC-only metadata without `code_challenge_methods_supported` (refused, as the spec says).
+
+  A rotated refresh token lost to a BrokerDO crash between the authorization server's answer and the write needs re-authorizing.
+
 ## Data
 
-AgentDO's `mcp_servers` (per capability: URL, session id, negotiated version, cached tool list and when it was fetched), `mcp_forwards` (per call key: epoch, tool, `forwarded` or `settled`, attempts, deadline, outcome) and `approvals` (per ask: tool, arguments digest, `pending`, `approved` or `denied`, expiry, the call key it was spent on); settled forwards and decided approvals are pruned after 7 days with the call ledger.
+BrokerDO's `oauth_grants` (per token record: server URL, resource, issuer, token endpoint, client, scope, tokens and expiry, `authorized` or `reauthorize`), `oauth_flows` (per state: a started authorization, 10 minutes) and `oauth_clients` (registrations, per authorization server and redirect URI). AgentDO's `mcp_servers` (per capability: URL, session id, negotiated version, cached tool list and when it was fetched), `mcp_forwards` (per call key: epoch, tool, `forwarded` or `settled`, attempts, deadline, outcome) and `approvals` (per ask: tool, arguments digest, `pending`, `approved` or `denied`, expiry, the call key it was spent on); settled forwards and decided approvals are pruned after 7 days with the call ledger.
 
 ## Open questions
 
 - **A shared connector per server:** one session, a shared tool cache and a per-server rate limit or concurrency cap would need a DO per server, with the epoch fence still decided in AgentDO.
-- **OAuth** for servers that need it (the design's "OAuth or a bearer token"): only a static bearer is built.
+- **OAuth step-up by agents:** a 403 `insufficient_scope` needs the operator to authorize again with more scopes; an agent can't ask for that itself, and nothing notifies the operator unprompted.
 - **`list_changed`:** a server's changed tool list reaches a brain only after the cache expires and the brain restarts.

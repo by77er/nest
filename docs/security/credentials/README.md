@@ -26,6 +26,8 @@
 | R2 | DO bindings | Control plane | Hosts use Worker-signed URLs only (no R2 S3 credentials exist) |
 | Webhook secrets (`hook:<hk_…>`) | BrokerDO | Control plane only | BrokerDO verifies signatures itself; brokered actions send the secret straight to the provider |
 | MCP server and API credentials (`cap:<name>`) | BrokerDO | Control plane only | One per `mcp` or `api` capability; attached per call |
+| MCP OAuth tokens (access and refresh, per `auth.oauth` record) | BrokerDO's `oauth_grants`, never `secrets` | Refresh token: BrokerDO only. Access token: AgentDO's memory, for the requests to the one server it was issued for | Obtained by the operator's authorization; refreshed by BrokerDO, one refresh at a time; a refused refresh clears both and the capability needs authorizing again. See [mcp OAuth](../../agents/capabilities/mcp/#oauth) |
+| MCP OAuth client: a pre-registered client's secret (`cap:<name>`), or a registration (RFC 7591) | BrokerDO (`secrets`, or `oauth_clients`) | BrokerDO only, sent to the token endpoint | nest's client ID metadata document (`/v1/oauth/client.json`) is public and holds no secret |
 | api-loop API key (deferred) | BrokerDO | Control plane only | For the `api-loop` backend, once the API credits are picked up |
 | Cloudflare Analytics read token | BrokerDO (`cap:metrics`) | Control plane only | Account Analytics Read only; see [metrics](../../control-plane/metrics/) |
 

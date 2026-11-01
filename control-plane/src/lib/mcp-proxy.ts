@@ -8,8 +8,9 @@
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
 import { ErrorCodes } from "../protocol/model";
-import { errorBody, NestError } from "./util";
+import { asNestError, errorBody, NestError } from "./util";
 import { storedEnum } from "./stored";
+import { bearerChallenge } from "./mcp-auth";
 import {
   callResultContent, checkMcpUrl, isIdempotent, type ListedTool, MCP_PROTOCOL_VERSION, MCP_SUPPORTED_VERSIONS, type McpGrant, parseListedTools,
   rpc, type RpcAnswer,
@@ -30,8 +31,12 @@ type ForwardStatus = z.output<typeof ForwardStatus>;
 
 export interface ProxyDeps {
   sql: SqlStorage;
-  /** The bearer token a grant's `auth` names (BrokerDO), or null when none is stored. */
-  token(ref: string): Promise<string | null>;
+  /**
+   * The bearer to send to a grant's server (`mcpBearer`, lib/mcp-auth.ts: a static secret or an OAuth
+   * access token): null when none is stored. With `refused`, the bearer the server just answered 401
+   * to: a replacement, or null when there is none.
+   */
+  bearer(g: McpGrant, refused?: string): Promise<string | null>;
   callTimeoutMs: number;
   listTimeoutMs: number;
   allowLoopback: boolean;
@@ -64,6 +69,22 @@ interface ServerRow {
   listed_ms: number;
 }
 
+/**
+ * The bearer for one request sequence. A 401 means the request wasn't processed, so it may be sent
+ * again with a replacement, once (`renewed`): a server that refuses the fresh one too is refused.
+ */
+interface Bearer {
+  value: string;
+  renewed: boolean;
+}
+
+/** `initialize` was answered 401 (nothing was processed): the caller may renew the bearer and try again. */
+class BearerRefused extends Error {
+  constructor(readonly error: NestError) {
+    super(error.message);
+  }
+}
+
 interface ForwardRow {
   key: string;
   epoch: number;
@@ -81,10 +102,20 @@ const platformError = (code: string, message: string, retryable = false): McpCal
   ({ outcome: { status: "error", error: errorBody(code, message, retryable) }, from_server: false });
 
 /** An HTTP refusal (nothing was processed) as a platform error. */
-function refusal(cap: string, a: Extract<RpcAnswer, { kind: "refused" }>): McpCallOutcome {
+function refusal(cap: string, a: Extract<RpcAnswer, { kind: "refused" }>, oauth = false): McpCallOutcome {
   const what = `the MCP server of ${cap} answered HTTP ${a.status}`;
-  if (a.status === 401) return platformError(ErrorCodes.UNAUTHORIZED, `${what}: it refused nest's credential`);
-  if (a.status === 403) return platformError(ErrorCodes.FORBIDDEN, `${what}: forbidden`);
+  const again = `POST /v1/admin/capabilities/${cap}/oauth`;
+  if (a.status === 401) {
+    return platformError(ErrorCodes.UNAUTHORIZED, `${what}: it refused nest's credential${oauth ? ` (a fresh OAuth token too); the operator may need to authorize it again (${again})` : ""}`);
+  }
+  if (a.status === 403) {
+    // RFC 6750 §3.1 / the spec's step-up: the challenge names the scopes this request needs.
+    const c = bearerChallenge(a.challenge ?? null);
+    if (oauth && c?.error === "insufficient_scope") {
+      return platformError(ErrorCodes.FORBIDDEN, `${what}: insufficient_scope${c.scope ? `; it needs ${c.scope}` : ""}. The operator authorizes it again with those scopes (${again} {"scopes": [...]})`);
+    }
+    return platformError(ErrorCodes.FORBIDDEN, `${what}: forbidden`);
+  }
   if (a.status === 429) {
     return platformError(ErrorCodes.RATE_LIMITED, `${what}: rate limited${a.retry_after_ms !== undefined ? `; retry after ${Math.ceil(a.retry_after_ms / 1000)} s` : ""}`, true);
   }
@@ -135,10 +166,21 @@ export class McpProxy {
     return g.url;
   }
 
-  private async tokenOf(g: McpGrant): Promise<string> {
-    const t = await this.d.token(g.auth);
+  /** The one place the proxy gets a server's bearer (lib/mcp-auth.ts decides what it is). */
+  private async bearerOf(g: McpGrant): Promise<Bearer> {
+    const t = await this.d.bearer(g);
     if (!t) throw new NestError(ErrorCodes.FORBIDDEN, `capability ${g.capability}: no credential stored as ${g.auth}`, 409);
-    return t;
+    return { value: t, renewed: false };
+  }
+
+  /** After a 401: a replacement bearer, once per request sequence; false when there is none (the 401 stands). */
+  private async renew(g: McpGrant, b: Bearer): Promise<boolean> {
+    if (b.renewed) return false;
+    b.renewed = true;
+    const t = await this.d.bearer(g, b.value);
+    if (!t) return false;
+    b.value = t;
+    return true;
   }
 
   /** An initialized session (`initialize` once, then `notifications/initialized`), reused until it ends. */
@@ -158,6 +200,7 @@ export class McpProxy {
       id: 1, method: "initialize",
       params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: "nest", version: "1" } },
     }, { token, session: null, version: null, timeoutMs });
+    if (a.kind === "refused" && a.status === 401) throw new BearerRefused(this.setupError(g, "initialize", a));
     if (a.kind !== "result") throw this.setupError(g, "initialize", a);
     const version = (a.result as { protocolVersion?: unknown } | null)?.protocolVersion;
     if (typeof version !== "string" || !MCP_SUPPORTED_VERSIONS.includes(version)) {
@@ -175,7 +218,7 @@ export class McpProxy {
     const m = `the MCP server of ${g.capability} failed ${what}`;
     switch (a.kind) {
       case "refused": {
-        const r = refusal(g.capability, a).outcome as Extract<ToolOutcome, { status: "error" }>;
+        const r = refusal(g.capability, a, !!g.oauth).outcome as Extract<ToolOutcome, { status: "error" }>;
         return new NestError(r.error.code, r.error.message, 502, r.error.retryable);
       }
       case "rpc_error":
@@ -203,18 +246,30 @@ export class McpProxy {
   }
 
   private async fetchList(g: McpGrant, deadline: number): Promise<ListedTool[]> {
-    const token = await this.tokenOf(g);
+    const bearer = await this.bearerOf(g);
     const left = () => Math.max(1, deadline - Date.now());
-    for (let reinit = 0; ; reinit++) {
-      const s = await this.session(g, token, left());
+    for (let reinit = 0; ;) {
+      let s: ServerRow;
+      try {
+        s = await this.session(g, bearer.value, left());
+      } catch (e) {
+        if (!(e instanceof BearerRefused)) throw e;
+        if (await this.renew(g, bearer)) continue;
+        throw e.error;
+      }
       const tools: ListedTool[] = [];
       let cursor: string | null = null;
       let gone = false;
+      let refused = false;
       for (let page = 0; page < MAX_LIST_PAGES; page++) {
         const a = await rpc(this.url(g), { id: 2 + page, method: "tools/list", ...(cursor ? { params: { cursor } } : {}) },
-          { token, session: s.session, version: s.version, timeoutMs: left() });
+          { token: bearer.value, session: s.session, version: s.version, timeoutMs: left() });
         if (a.kind === "session_gone") {
           gone = true;
+          break;
+        }
+        if (a.kind === "refused" && a.status === 401 && await this.renew(g, bearer)) {
+          refused = true;
           break;
         }
         if (a.kind !== "result") throw this.setupError(g, "tools/list", a);
@@ -223,9 +278,10 @@ export class McpProxy {
         cursor = p.next;
         if (!cursor) break;
       }
+      if (refused) continue;
       if (gone) {
         this.dropSession(g, s.session);
-        if (reinit >= 1) throw new NestError(ErrorCodes.INTERNAL, `the MCP server of ${g.capability} ended two sessions in a row`, 502, true);
+        if (reinit++ >= 1) throw new NestError(ErrorCodes.INTERNAL, `the MCP server of ${g.capability} ended two sessions in a row`, 502, true);
         continue;
       }
       this.saveServer(g, { ...this.server(g), tools, listed_ms: Date.now() });
@@ -304,13 +360,19 @@ export class McpProxy {
         : "the answer to an earlier delivery of this call was lost and the tool isn't idempotent, so it wasn't sent again"));
     }
     await this.fenceWait(ctx.epoch);
-    const token = await this.tokenOf(g);
+    const bearer = await this.bearerOf(g);
     let attempts = prior?.attempts ?? 0;
     let reinitialized = false;
     for (;;) {
       let s: ServerRow;
       try {
-        s = await this.session(g, token, this.d.callTimeoutMs);
+        try {
+          s = await this.session(g, bearer.value, this.d.callTimeoutMs);
+        } catch (e) {
+          if (!(e instanceof BearerRefused)) throw e;
+          if (await this.renew(g, bearer)) continue;
+          throw e.error;
+        }
         await ctx.live();
       } catch (e) {
         // An earlier attempt (lost answer) is still unsettled: it settles as unknown.
@@ -322,7 +384,7 @@ export class McpProxy {
       this.recordForward(ctx, g, tool, attempts);
       const meta = { "nest/agent": ctx.agent, "nest/epoch": ctx.epoch, "nest/call": ctx.key, "nest/taint": ctx.tainted() };
       const a = await rpc(this.url(g), { id: 100 + attempts, method: "tools/call", params: { name: tool, arguments: args, _meta: meta } },
-        { token, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs });
+        { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs });
       switch (a.kind) {
         case "result": {
           const r = callResultContent(a.result);
@@ -335,8 +397,24 @@ export class McpProxy {
         }
         case "rpc_error":
           return this.settle(ctx.key, { outcome: { status: "error", error: errorBody(ErrorCodes.INVALID_MESSAGE, `MCP error ${a.code}: ${a.message}`) }, from_server: true });
-        case "refused":
-          return this.settle(ctx.key, refusal(g.capability, a));
+        case "refused": {
+          if (a.status === 401 && !bearer.renewed) {
+            // The server processed nothing: with a replacement bearer it is sent again (fenced again first).
+            let renewed: boolean;
+            try {
+              renewed = await this.renew(g, bearer);
+            } catch (e) {
+              const ne = asNestError(e);
+              if (!ne) throw e;
+              return this.settle(ctx.key, platformError(ne.code, ne.detail, ne.retryable));
+            }
+            if (renewed) {
+              attempts--;
+              continue;
+            }
+          }
+          return this.settle(ctx.key, refusal(g.capability, a, !!g.oauth));
+        }
         case "too_large":
           return this.settle(ctx.key, platformError(ErrorCodes.INVALID_MESSAGE, `the call ran, but its answer is over 1 MiB, which nest doesn't relay`));
         case "session_gone":

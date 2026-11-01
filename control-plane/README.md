@@ -11,7 +11,7 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/sandbox.ts` | **SandboxDO**: epoch, commit compare-and-set, generations, layered policy and expiring grants, idle refcount, ports |
 | `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay, and the MCP client of its mcp capabilities (`src/lib/mcp-proxy.ts` over `src/lib/mcp.ts`; docs/agents/capabilities/mcp/) |
 | `src/do/workstream.ts` | **WorkstreamDO**: the interim workstream channel: event log, batched wakes of its one subscriber, user-notification queue |
-| `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), GitHub App minter (interface only) |
+| `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), MCP OAuth tokens (`OAuthStore`, `src/lib/mcp-auth.ts`), GitHub App minter (interface only) |
 | `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries only); expansion is `src/lib/spec.ts` (pure) |
 | `src/do/channel.ts` | **ChannelDO** (one per channel, plus `~directory`): the log, keyed view, grant list, subscriptions and their cursors, fan-out from the alarm, retention and tiering. Every decision is `src/lib/channels.ts` (pure) |
 | `src/do/tasks.ts` | **TaskLedgerDO** (one per ledger name): tasks, comments, history, watcher, inbox notices from its alarm; its decisions are `src/lib/tasks.ts` (pure) |
@@ -104,6 +104,10 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - A remote MCP server: its bearer token with `PUT /v1/admin/secrets/cap:<name>`, then
      `PUT /v1/admin/capabilities/<name> {"mcp": {"url": "https://…/mcp", "auth": "cap:<name>", "tools": [...]}}` and the capability
      added to a template (`docs/agents/capabilities/mcp/`)
+   - Over OAuth: `"auth": {"oauth": "cap:<name>", "client"?: "cap:<name>-client", "scopes"?: [...]}`, then
+     `POST /v1/admin/capabilities/<name>/oauth {scopes?}` (answers `authorize_url`: open it and approve), which lands on the public
+     `GET /v1/oauth/callback`; `GET /v1/admin/capabilities/<name>/oauth` shows the state, never a token. nest's client ID metadata
+     document is the public `GET /v1/oauth/client.json` (`docs/agents/capabilities/mcp/#oauth`)
 
 ## Secrets and vars
 

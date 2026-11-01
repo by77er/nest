@@ -18,6 +18,7 @@ import {
   success,
 } from "./jsonrpc";
 import { findTool, runTool, type Store, TOOLS, type ToolResult } from "./tools";
+import { OAuthTables, publicOAuthRoute, testOAuthRoute } from "./oauth";
 
 /** What the Worker turns into an HTTP response: a status, an optional JSON body, a new session id. */
 export interface Reply {
@@ -48,6 +49,8 @@ const parse = (s: unknown): unknown => (typeof s === "string" ? JSON.parse(s) : 
 
 export class McpState extends DurableObject<Env> implements Store {
   private readonly sql: SqlStorage;
+  /** The OAuth mode's authorization server state (src/oauth.ts); its tables stay empty unless MCP_TEST_OAUTH=1. */
+  private readonly oauth: OAuthTables;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -59,6 +62,29 @@ export class McpState extends DurableObject<Env> implements Store {
       CREATE TABLE IF NOT EXISTS calls (seq INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, session TEXT NOT NULL, tool TEXT, arguments TEXT, meta TEXT, outcome TEXT);
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
     `);
+    this.oauth = new OAuthTables(this.sql);
+  }
+
+  // --- OAuth mode (src/oauth.ts) ---------------------------------------------------------------
+
+  /**
+   * The OAuth routes, forwarded by the Worker once it has checked the Origin (and, for the test routes,
+   * the static bearer). `x-mcp-test-login` is the Worker's verdict on the static bearer: the authorize
+   * route's stand-in for the user's login.
+   */
+  override async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const open = await publicOAuthRoute(req, this.env, url, this.oauth, async () => req.headers.get("x-mcp-test-login") === "1");
+    if (open) return open;
+    if (req.headers.get("x-mcp-test-login") === "1") {
+      const test = testOAuthRoute(req, url, this.oauth);
+      if (test) return test;
+    }
+    return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
+  }
+
+  oauthAccessValid(token: string, resource: string): boolean {
+    return this.oauth.oauthAccessValid(token, resource);
   }
 
   // --- Store -------------------------------------------------------------------------------------
