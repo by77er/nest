@@ -5,7 +5,7 @@
 import { z } from "zod";
 import type { ToolContent, ToolDef } from "../protocol/control";
 import { CapRef, OAuthAuth, type OAuthGrant } from "./mcp-auth";
-import { gated } from "./sinks";
+import { argsDigest, gated } from "./sinks";
 
 export { approves, argsDigest } from "./sinks";
 
@@ -23,6 +23,11 @@ export const MAX_TOOLS_PER_CAPABILITY = 128;
 export const MAX_DESCRIPTION = 2_000;
 /** A server's answer (one HTTP body) is read up to this many bytes. */
 export const MAX_ANSWER_BYTES = 1024 * 1024;
+/** Admission per server (the connector's, docs/agents/capabilities/mcp/#the-connector): calls in flight at once, and calls per minute. */
+export const MCP_DEFAULT_MAX_CONCURRENT = 8;
+export const MCP_DEFAULT_PER_MINUTE = 120;
+/** The notification a server sends when its tool list changed. */
+export const LIST_CHANGED = "notifications/tools/list_changed";
 
 /** A remote tool's name as nest admits it: characters a model tool name may hold. */
 export const McpToolName = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "MCP tool names here are letters, digits, '_' and '-'");
@@ -38,7 +43,8 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
  * overrides the server's annotations (a list of tools that are, or a map of tool → whether it is);
  * `read_only` likewise marks the tools that aren't sinks; `trusted` (default false) means its list and
  * results don't taint the session (and its annotations count); `when_tainted` is what a sink call from a
- * tainted session needs.
+ * tainted session needs; `max_concurrent` and `per_minute` cap this server's calls across every agent
+ * (the connector's admission; defaults `MCP_DEFAULT_MAX_CONCURRENT`, `MCP_DEFAULT_PER_MINUTE`).
  */
 export const McpSource = z.object({
   url: z.string().min(1).max(2048),
@@ -48,6 +54,8 @@ export const McpSource = z.object({
   read_only: ToolFlags.optional(),
   trusted: z.boolean().default(false),
   when_tainted: z.enum(["approve", "allow"]).default("approve"),
+  max_concurrent: z.number().int().min(1).max(64).optional(),
+  per_minute: z.number().int().min(1).max(6000).optional(),
 });
 export type McpSource = z.output<typeof McpSource>;
 
@@ -68,7 +76,13 @@ export interface McpGrant {
   trusted: boolean;
   /** Absent in older specs: `approve`. */
   when_tainted?: "approve" | "allow";
+  /** The connector's admission caps; absent: the defaults. */
+  max_concurrent?: number;
+  per_minute?: number;
 }
+
+/** The connector a grant's server is shared through: one per server and credential (docs/agents/capabilities/mcp/#the-connector). */
+export const connectorName = (g: Pick<McpGrant, "url" | "auth">): string => JSON.stringify(["mcp", g.url, g.auth]);
 
 export function grantOf(capability: string, src: McpSource): McpGrant {
   return {
@@ -81,6 +95,8 @@ export function grantOf(capability: string, src: McpSource): McpGrant {
     read_only: flags(src.read_only),
     trusted: src.trusted ?? false,
     when_tainted: src.when_tainted ?? "approve",
+    ...(src.max_concurrent !== undefined ? { max_concurrent: src.max_concurrent } : {}),
+    ...(src.per_minute !== undefined ? { per_minute: src.per_minute } : {}),
   };
 }
 
@@ -199,6 +215,9 @@ export function needsApproval(grant: McpGrant, tool: string, listed: ListedTool 
   return gated({ sink: !readOnly, when_tainted: grant.when_tainted ?? "approve", tainted });
 }
 
+/** A tool list's identity (SHA-256 of its canonical JSON): two lists with the same digest are the same list. */
+export const toolsDigest = (tools: readonly ListedTool[]): Promise<string> => argsDigest(tools);
+
 /** A `tools/call` result as nest's tool content, or null when it isn't a CallToolResult. */
 export function callResultContent(result: unknown): { content: ToolContent[]; isError: boolean } | null {
   if (!result || typeof result !== "object") return null;
@@ -234,10 +253,13 @@ export function callResultContent(result: unknown): { content: ToolContent[]; is
 
 /** What one JSON-RPC exchange came to. */
 export type RpcAnswer =
-  /** A response with a result (`session`: the `Mcp-Session-Id` header it carried, if any). */
-  | { kind: "result"; result: unknown; session: string | null }
+  /**
+   * A response with a result (`session`: the `Mcp-Session-Id` header it carried, if any;
+   * `list_changed`: the SSE stream also carried `notifications/tools/list_changed`).
+   */
+  | { kind: "result"; result: unknown; session: string | null; list_changed?: true }
   /** A JSON-RPC error response: the server refused or failed the request. */
-  | { kind: "rpc_error"; code: number; message: string }
+  | { kind: "rpc_error"; code: number; message: string; list_changed?: true }
   /** An HTTP refusal (4xx; a redirect, which nest doesn't follow): the request wasn't processed. */
   | { kind: "refused"; status: number; text: string; retry_after_ms?: number; challenge?: string }
   /** 404 to a request that named a session: the session ended, nothing was processed; initialize again. */
@@ -352,14 +374,62 @@ export async function rpc(url: string, message: { method: string; params?: unkno
     const reply = candidates.find((m) => !!m && typeof m === "object" && (m as { id?: unknown }).id === message.id) as
       { result?: unknown; error?: { code?: unknown; message?: unknown } } | undefined;
     if (!reply) return { kind: "lost", why: `HTTP ${res.status} without a response to request ${message.id}` };
+    // A server may send notifications on a request's SSE stream before its response (transports).
+    const changed = candidates.some((m) => !!m && typeof m === "object" && (m as { method?: unknown }).method === LIST_CHANGED)
+      ? { list_changed: true as const } : {};
     if (reply.error) {
-      return { kind: "rpc_error", code: typeof reply.error.code === "number" ? reply.error.code : 0, message: String(reply.error.message ?? "error").slice(0, 2000) };
+      return { kind: "rpc_error", code: typeof reply.error.code === "number" ? reply.error.code : 0, message: String(reply.error.message ?? "error").slice(0, 2000), ...changed };
     }
     if (!("result" in reply)) return { kind: "lost", why: "a response with neither result nor error" };
-    return { kind: "result", result: reply.result, session };
+    return { kind: "result", result: reply.result, session, ...changed };
   } catch (e) {
     return { kind: "lost", why: ctl.signal.aborted ? `no answer within ${o.timeoutMs} ms` : `network: ${e instanceof Error ? e.message : String(e)}` };
   } finally {
     clearTimeout(timer);
   }
+}
+
+// --- Sessions and listing (AgentDO's proxy and the connector both open sessions) ------------------------
+
+/** What opening a session came to. */
+export type Opened =
+  | { kind: "open"; session: string | null; version: string }
+  | { kind: "failed"; answer: RpcAnswer }
+  | { kind: "unsupported"; version: unknown };
+
+/** `initialize`, then `notifications/initialized` (lifecycle); the session id, if the server gave one. */
+export async function openSession(url: string, token: string, timeoutMs: number, client: string): Promise<Opened> {
+  const a = await rpc(url, {
+    id: 1, method: "initialize",
+    params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: client, version: "1" } },
+  }, { token, session: null, version: null, timeoutMs });
+  if (a.kind !== "result") return { kind: "failed", answer: a };
+  const version = (a.result as { protocolVersion?: unknown } | null)?.protocolVersion;
+  if (typeof version !== "string" || !MCP_SUPPORTED_VERSIONS.includes(version)) return { kind: "unsupported", version };
+  const n = await rpc(url, { method: "notifications/initialized" }, { token, session: a.session, version, timeoutMs });
+  if (n.kind !== "result") console.warn(`mcp ${new URL(url).host}: notifications/initialized: ${n.kind}`);
+  return { kind: "open", session: a.session, version };
+}
+
+/** At most this many `tools/list` pages. */
+const MAX_LIST_PAGES = 10;
+
+/** Every `tools/list` page over one session, within `deadline` (epoch ms). */
+export async function listAll(url: string, token: string, s: { session: string | null; version: string }, deadline: number):
+  Promise<{ kind: "listed"; tools: ListedTool[]; list_changed: boolean } | { kind: "session_gone" } | { kind: "failed"; answer: RpcAnswer }> {
+  const tools: ListedTool[] = [];
+  let cursor: string | null = null;
+  let changed = false;
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    const a = await rpc(url, { id: 2 + page, method: "tools/list", ...(cursor ? { params: { cursor } } : {}) },
+      { token, session: s.session, version: s.version, timeoutMs: Math.max(1, deadline - Date.now()) });
+    if (a.kind === "session_gone") return a;
+    if (a.kind !== "result") return { kind: "failed", answer: a };
+    changed ||= a.list_changed === true;
+    const p = parseListedTools(a.result);
+    tools.push(...p.tools);
+    cursor = p.next;
+    if (!cursor) break;
+  }
+  return { kind: "listed", tools, list_changed: changed };
 }

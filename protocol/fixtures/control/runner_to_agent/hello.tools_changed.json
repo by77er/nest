@@ -1,0 +1,12 @@
+{
+  "type": "hello",
+  "protocol_version": 1,
+  "agent": "agt_01jb7n0w1e",
+  "host": "hst_01jb7k3x9q",
+  "instance_id": "rin_4f1c9a7e2b3d",
+  "epoch": 4,
+  "session": "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73",
+  "local_bytes": 280455,
+  "last_seq": 17,
+  "tools_changed": true
+}

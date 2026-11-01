@@ -17,15 +17,14 @@ import { admitDelivery, channelRequestId, inboxTurnText, moveNoteDue, TurnQueue,
 import type { ReadResult } from "./channel";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
-import { mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
+import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
 import { approves, argsDigest, gated, type SinkCall } from "../lib/sinks";
 import {
   actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
   type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, secretKinds, stringsOf,
 } from "../lib/brokered";
 import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
-import { McpProxy } from "../lib/mcp-proxy";
-import { mcpBearer } from "../lib/mcp-auth";
+import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
 import {
@@ -171,9 +170,13 @@ interface Attachment {
   helloed: boolean;
   stale: boolean;
   instance: string;
+  /** The runner acts on `tools_changed` (its hello said so); absent on older attachments. */
+  tools_changed?: boolean;
 }
 
 type DispatchResult = ToolOutcome | "wait";
+/** When the brain of `epoch` last asked for its tool list (`kv.tools_listed`); a change at or after `ms` isn't in it. */
+interface ToolsListed { epoch: number; ms: number }
 /** What `start()` did: issued, waiting for the condemned brain on `waiting_for` to be released, or nothing. */
 export type StartResult =
   | { kind: "started"; host: string; cmd: string }
@@ -262,9 +265,13 @@ export class AgentDO extends DurableObject<Env> {
     addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
     this.mcp = new McpProxy({
       sql: this.sql,
-      bearer: (g, refused) => mcpBearer(env.BROKER.get(env.BROKER.idFromName("broker")), g, refused),
+      agent: () => this.load().agent,
+      bearer: (g, refused) => mcpToken(env, g, refused),
+      // The stub's RPC types can't see that ListedTool's `unknown` schema is plain JSON; it is.
+      connector: (g) => env.MCP_CONNECTOR.get(env.MCP_CONNECTOR.idFromName(connectorName(g))) as unknown as McpConnector,
+      background: (p) => ctx.waitUntil(p),
       callTimeoutMs: num(env.MCP_CALL_TIMEOUT_MS, 45_000),
-      listTimeoutMs: num(env.MCP_LIST_TIMEOUT_MS, 4_000),
+      admitWaitMs: num(env.MCP_ADMIT_WAIT_MS, 10_000),
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
     });
     this.journal = new BrokeredJournal(this.sql);
@@ -1146,8 +1153,15 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (msg.type === "tools_list_request") {
       const info = this.load();
+      const start = Date.now();
       const remote = await this.mcpToolDefs(info);
       this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(info.tools), ...brokeredToolDefs(info.brokered ?? []), ...remote] });
+      const att = ws.deserializeAttachment() as Attachment;
+      if (this.current(att)) {
+        this.kvPut("tools_listed", { epoch: att.epoch, ms: start } satisfies ToolsListed);
+        // A change that landed while this list was being made may not be in it: list again.
+        if ((this.kvGet<number>("mcp_changed_ms") ?? 0) >= start) this.sendToolsChanged(ws);
+      }
       return;
     }
     if (msg.type === "hands_resolve") {
@@ -1251,7 +1265,9 @@ export class AgentDO extends DurableObject<Env> {
     }
     // A stale epoch is still accepted, but its segments go to the orphan branch and nothing else flows.
     const stale = !this.isCurrent(before, hello.epoch);
-    ws.serializeAttachment({ host: att.host, epoch: hello.epoch, helloed: true, stale, instance: hello.instance_id } satisfies Attachment);
+    ws.serializeAttachment({
+      host: att.host, epoch: hello.epoch, helloed: true, stale, instance: hello.instance_id, ...(hello.tools_changed ? { tools_changed: true } : {}),
+    } satisfies Attachment);
     if (stale) {
       this.send(ws, {
         type: "hello_ack", protocol_version: PROTOCOL_VERSION, durable_bytes: hello.local_bytes ?? 0,
@@ -1299,6 +1315,8 @@ export class AgentDO extends DurableObject<Env> {
     });
     if (!newLineage && hello.last_seq !== undefined) this.rel.ack(CHAN, hello.last_seq);
     for (const m of this.rel.pendingAfter(CHAN, newLineage ? undefined : hello.last_seq)) this.send(ws, m as AgentToRunner);
+    // A tool list change this brain wasn't told of (it was disconnected): tell it now.
+    if (this.toolsOwed(info)) this.sendToolsChanged(ws);
     this.pushCache();
     await armed;
     // Re-assert working to SandboxDO: a call lost before this session must not outlive it.
@@ -1679,7 +1697,7 @@ export class AgentDO extends DurableObject<Env> {
    * are its text in the model's context, so handing them out taints the session.
    */
   private async mcpToolDefs(info: AgentInfo): Promise<ToolDef[]> {
-    const lists = await Promise.all((info.mcp ?? []).map(async (g) => ({ g, listed: await this.mcp.list(g).catch(() => null) })));
+    const lists = await Promise.all((info.mcp ?? []).map(async (g) => ({ g, listed: await this.mcp.list(g, true).catch(() => null) })));
     const out: ToolDef[] = [];
     for (const { g, listed } of lists) {
       const defs = listed ? mcpToolDefs(g, listed, [...PLATFORM_TOOL_NAMES, ...BROKERED_TOOL_NAMES]) : [];
@@ -1687,6 +1705,37 @@ export class AgentDO extends DurableObject<Env> {
       out.push(...defs);
     }
     return out;
+  }
+
+  /**
+   * A connector's notice (docs/agents/capabilities/mcp/#list_changed): the tool list of a server this
+   * agent's brain was handed changed (`changed`), or a probe (`!changed`) asking whether it still wants
+   * notices. Answers whether it does: it has a brain and that server is still in its spec. Synchronous
+   * (the connector awaits this from its alarm): it records the change and tells the runner, which has
+   * Claude Code list again; it never calls the connector back.
+   */
+  async mcpToolsChanged(server: Pick<McpGrant, "url" | "auth">, changed: boolean): Promise<boolean> {
+    if (!this.exists()) return false;
+    const info = this.load();
+    if (!info.brain || !(info.mcp ?? []).some((g) => g.url === server.url && g.auth === server.auth)) return false;
+    if (changed) {
+      this.kvPut("mcp_changed_ms", Date.now());
+      const ws = this.socket();
+      if (ws) this.sendToolsChanged(ws);
+    }
+    return true;
+  }
+
+  /** Whether the current brain listed its tools before the last change it was told of (or should have been). */
+  private toolsOwed(info: AgentInfo): boolean {
+    const listed = this.kvGet<ToolsListed>("tools_listed");
+    if (!listed || listed.epoch !== info.agent_epoch) return false; // this brain hasn't listed yet: its first list is current
+    return (this.kvGet<number>("mcp_changed_ms") ?? 0) >= listed.ms;
+  }
+
+  /** `tools_changed`, to a runner that said it acts on it (an older one lists again at its next start). */
+  private sendToolsChanged(ws: WebSocket): void {
+    if ((ws.deserializeAttachment() as Attachment).tools_changed) this.send(ws, { type: "tools_changed" });
   }
 
   /** This agent as a channel caller, from its own record, never from a tool's arguments. */

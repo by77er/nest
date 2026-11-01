@@ -18,6 +18,8 @@ export default defineConfig({
           PUBLIC_BASE_URL: "https://nest.test",
           // A brokered request's budget, short so a lost answer is quick to provoke (test/brokered.test.ts).
           BROKERED_TIMEOUT_MS: "1500",
+          // How long a call waits for a call slot on its server (test/mcp.test.ts "admission").
+          MCP_ADMIT_WAIT_MS: "2000",
         },
       },
     }),

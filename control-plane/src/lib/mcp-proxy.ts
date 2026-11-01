@@ -4,26 +4,59 @@
 // leaves, a forward is recorded before it leaves (write-ahead), and a call key the proxy forwarded
 // once is never forwarded again unless the tool is idempotent.
 //
+// What is shared per server is the connector's (do/mcp-connector.ts): the tool list, and admission (a
+// lease on one of the server's call slots, taken before the epoch check). The connector never forwards
+// a call and never decides the fence.
+//
 // `McpProxy` is the only code that touches the `mcp_servers` and `mcp_forwards` tables.
 import { z } from "zod";
+import type { Env } from "../env";
 import type { ToolOutcome } from "../protocol/control";
 import { ErrorCodes } from "../protocol/model";
 import { asNestError, errorBody, NestError } from "./util";
 import { storedEnum } from "./stored";
-import { bearerChallenge } from "./mcp-auth";
+import { bearerChallenge, mcpBearer } from "./mcp-auth";
 import {
-  callResultContent, checkMcpUrl, isIdempotent, type ListedTool, MCP_PROTOCOL_VERSION, MCP_SUPPORTED_VERSIONS, type McpGrant, parseListedTools,
-  rpc, type RpcAnswer,
+  callResultContent, checkMcpUrl, isIdempotent, type ListedTool, MCP_DEFAULT_MAX_CONCURRENT, MCP_DEFAULT_PER_MINUTE, MCP_SUPPORTED_VERSIONS,
+  type McpGrant, openSession, rpc, type RpcAnswer,
 } from "./mcp";
 
-/** A server's tool list is reused this long; an older one is fetched again (and served if that fails). */
+/** A server's tool list is reused this long (by the connector); an older one is fetched again (and served if that fails). */
 export const MCP_LIST_TTL_MS = 5 * 60_000;
 /** A call is forwarded at most this many times in all (an idempotent tool's lost answer is retried once). */
 export const MCP_MAX_ATTEMPTS = 2;
-/** At most this many `tools/list` pages. */
-const MAX_LIST_PAGES = 10;
 /** How often a call waiting on an older epoch's unsettled forward looks again. */
 const FENCE_POLL_MS = 50;
+/** How often a call refused admission (no slot free) asks again, at most. */
+const ADMIT_POLL_MS = 250;
+
+/**
+ * The bearer to send to a grant's server (`mcpBearer`: its static secret or its OAuth access token);
+ * with `refused`, a replacement for the bearer the server just answered 401 to, or null. The one place
+ * nest obtains an MCP credential: AgentDO's proxy (calls) and the connector (listing) both come here.
+ */
+export function mcpToken(env: Env, g: McpGrant, refused?: string): Promise<string | null> {
+  return mcpBearer(env.BROKER.get(env.BROKER.idFromName("broker")), g, refused);
+}
+
+/** What the connector hands out (do/mcp-connector.ts). */
+export interface ConnectorList {
+  /** The server's tools, or null when it has never been listed. */
+  tools: ListedTool[] | null;
+  listed_ms: number;
+}
+/** A lease on one of the server's call slots, or when to ask again. */
+export type Admission = { lease: string } | { retry_after_ms: number };
+
+/** The connector of a grant's server, as the proxy uses it. */
+export interface McpConnector {
+  /** The shared list; `subscriber`: the agent whose brain is handed it (told when it changes). */
+  list(g: McpGrant, subscriber: string | null): Promise<ConnectorList>;
+  /** The server said its list changed (`notifications/tools/list_changed` on a call's stream). */
+  changed(g: McpGrant): Promise<void>;
+  acquire(g: McpGrant, agent: string, holdMs: number): Promise<Admission>;
+  release(lease: string): Promise<void>;
+}
 
 /** `mcp_forwards.status`: sent and not yet settled, or settled (answered, refused, or given up on). */
 const ForwardStatus = z.enum(["forwarded", "settled"]);
@@ -31,14 +64,21 @@ type ForwardStatus = z.output<typeof ForwardStatus>;
 
 export interface ProxyDeps {
   sql: SqlStorage;
+  /** This agent's id. */
+  agent(): string;
   /**
-   * The bearer to send to a grant's server (`mcpBearer`, lib/mcp-auth.ts: a static secret or an OAuth
-   * access token): null when none is stored. With `refused`, the bearer the server just answered 401
-   * to: a replacement, or null when there is none.
+   * The bearer to send to a grant's server (`mcpToken` → `mcpBearer`, lib/mcp-auth.ts: a static secret
+   * or an OAuth access token): null when none is stored. With `refused`, the bearer the server just
+   * answered 401 to: a replacement, or null when there is none.
    */
   bearer(g: McpGrant, refused?: string): Promise<string | null>;
+  /** The connector of a grant's server. */
+  connector(g: McpGrant): McpConnector;
+  /** Work that outlives the call (a release, a change report). */
+  background(p: Promise<unknown>): void;
   callTimeoutMs: number;
-  listTimeoutMs: number;
+  /** How long a call waits for admission before it is refused (`rate_limited`, nothing sent). */
+  admitWaitMs: number;
   allowLoopback: boolean;
 }
 
@@ -123,6 +163,23 @@ function refusal(cap: string, a: Extract<RpcAnswer, { kind: "refused" }>, oauth 
   return platformError(ErrorCodes.INVALID_MESSAGE, `${what}: ${a.text}`);
 }
 
+/** A failure before any tool was called (initialize, tools/list), as a platform error: nothing ran. */
+export function setupError(g: McpGrant, what: string, a: RpcAnswer): NestError {
+  const m = `the MCP server of ${g.capability} failed ${what}`;
+  switch (a.kind) {
+    case "refused": {
+      const r = refusal(g.capability, a, !!g.oauth).outcome as Extract<ToolOutcome, { status: "error" }>;
+      return new NestError(r.error.code, r.error.message, 502, r.error.retryable);
+    }
+    case "rpc_error":
+      return new NestError(ErrorCodes.INVALID_MESSAGE, `${m}: ${a.message}`, 502);
+    case "lost":
+      return new NestError(ErrorCodes.INTERNAL, `${m}: ${a.why}`, 502, true);
+    default:
+      return new NestError(ErrorCodes.INTERNAL, `${m}: ${a.kind}`, 502, true);
+  }
+}
+
 export class McpProxy {
   /** Initializations in flight, by capability (one per server at a time). */
   private readonly initializing = new Map<string, Promise<ServerRow>>();
@@ -195,101 +252,37 @@ export class McpProxy {
   }
 
   private async initialize(g: McpGrant, token: string, timeoutMs: number): Promise<ServerRow> {
-    const url = this.url(g);
-    const a = await rpc(url, {
-      id: 1, method: "initialize",
-      params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: "nest", version: "1" } },
-    }, { token, session: null, version: null, timeoutMs });
-    if (a.kind === "refused" && a.status === 401) throw new BearerRefused(this.setupError(g, "initialize", a));
-    if (a.kind !== "result") throw this.setupError(g, "initialize", a);
-    const version = (a.result as { protocolVersion?: unknown } | null)?.protocolVersion;
-    if (typeof version !== "string" || !MCP_SUPPORTED_VERSIONS.includes(version)) {
-      throw new NestError(ErrorCodes.UNSUPPORTED_VERSION, `the MCP server of ${g.capability} speaks ${String(version)}; nest speaks ${MCP_SUPPORTED_VERSIONS.join(", ")}`, 502);
+    const o = await openSession(this.url(g), token, timeoutMs, "nest");
+    if (o.kind === "failed" && o.answer.kind === "refused" && o.answer.status === 401) throw new BearerRefused(setupError(g, "initialize", o.answer));
+    if (o.kind === "failed") throw setupError(g, "initialize", o.answer);
+    if (o.kind === "unsupported") {
+      throw new NestError(ErrorCodes.UNSUPPORTED_VERSION, `the MCP server of ${g.capability} speaks ${String(o.version)}; nest speaks ${MCP_SUPPORTED_VERSIONS.join(", ")}`, 502);
     }
-    const n = await rpc(url, { method: "notifications/initialized" }, { token, session: a.session, version, timeoutMs });
-    if (n.kind !== "result") console.warn(`mcp ${g.capability}: notifications/initialized: ${n.kind}`);
-    const s = { ...this.server(g), url: g.url, session: a.session, version };
+    const s = { ...this.server(g), url: g.url, session: o.session, version: o.version };
     this.saveServer(g, s);
     return s;
   }
 
-  /** A failure before any tool was called (initialize, tools/list), as a platform error: nothing ran. */
-  private setupError(g: McpGrant, what: string, a: RpcAnswer): NestError {
-    const m = `the MCP server of ${g.capability} failed ${what}`;
-    switch (a.kind) {
-      case "refused": {
-        const r = refusal(g.capability, a, !!g.oauth).outcome as Extract<ToolOutcome, { status: "error" }>;
-        return new NestError(r.error.code, r.error.message, 502, r.error.retryable);
-      }
-      case "rpc_error":
-        return new NestError(ErrorCodes.INVALID_MESSAGE, `${m}: ${a.message}`, 502);
-      case "lost":
-        return new NestError(ErrorCodes.INTERNAL, `${m}: ${a.why}`, 502, true);
-      default:
-        return new NestError(ErrorCodes.INTERNAL, `${m}: ${a.kind}`, 502, true);
-    }
-  }
-
   /**
-   * The server's tools, from the cache while it's fresh (`MCP_LIST_TTL_MS`), else fetched again within
-   * the list timeout; a failed fetch serves the stale list, or null when there is none.
+   * The server's tools, from its connector (which keeps one list per server and credential); `brain`:
+   * the list is handed to this agent's brain, which the connector then tells when the list changes.
+   * The list is also kept here, so a call can read its tool's annotations without a round trip; when
+   * the connector can't answer, that copy is served (at any age), or null when there is none.
    */
-  async list(g: McpGrant): Promise<ListedTool[] | null> {
-    const cached = this.server(g);
-    if (cached.tools && Date.now() - cached.listed_ms < MCP_LIST_TTL_MS) return cached.tools;
+  async list(g: McpGrant, brain = false): Promise<ListedTool[] | null> {
     try {
-      return await this.fetchList(g, Date.now() + this.d.listTimeoutMs);
+      const r = await this.d.connector(g).list(g, brain ? this.d.agent() : null);
+      if (!r.tools) return this.server(g).tools;
+      this.saveServer(g, { ...this.server(g), url: g.url, tools: r.tools, listed_ms: r.listed_ms });
+      return r.tools;
     } catch (e) {
-      console.warn(`mcp ${g.capability}: tools/list failed${cached.tools ? "; serving the cached list" : ""}`, e);
-      return cached.tools;
+      const cached = this.server(g).tools;
+      console.warn(`mcp ${g.capability}: the connector couldn't list${cached ? "; serving the copy kept here" : ""}`, e);
+      return cached;
     }
   }
 
-  private async fetchList(g: McpGrant, deadline: number): Promise<ListedTool[]> {
-    const bearer = await this.bearerOf(g);
-    const left = () => Math.max(1, deadline - Date.now());
-    for (let reinit = 0; ;) {
-      let s: ServerRow;
-      try {
-        s = await this.session(g, bearer.value, left());
-      } catch (e) {
-        if (!(e instanceof BearerRefused)) throw e;
-        if (await this.renew(g, bearer)) continue;
-        throw e.error;
-      }
-      const tools: ListedTool[] = [];
-      let cursor: string | null = null;
-      let gone = false;
-      let refused = false;
-      for (let page = 0; page < MAX_LIST_PAGES; page++) {
-        const a = await rpc(this.url(g), { id: 2 + page, method: "tools/list", ...(cursor ? { params: { cursor } } : {}) },
-          { token: bearer.value, session: s.session, version: s.version, timeoutMs: left() });
-        if (a.kind === "session_gone") {
-          gone = true;
-          break;
-        }
-        if (a.kind === "refused" && a.status === 401 && await this.renew(g, bearer)) {
-          refused = true;
-          break;
-        }
-        if (a.kind !== "result") throw this.setupError(g, "tools/list", a);
-        const p = parseListedTools(a.result);
-        tools.push(...p.tools);
-        cursor = p.next;
-        if (!cursor) break;
-      }
-      if (refused) continue;
-      if (gone) {
-        this.dropSession(g, s.session);
-        if (reinit++ >= 1) throw new NestError(ErrorCodes.INTERNAL, `the MCP server of ${g.capability} ended two sessions in a row`, 502, true);
-        continue;
-      }
-      this.saveServer(g, { ...this.server(g), tools, listed_ms: Date.now() });
-      return tools;
-    }
-  }
-
-  /** A tool's listing (for its annotations): the cache at any age, else a fetch; undefined when unknown. */
+  /** A tool's listing (for its annotations): the copy kept here at any age, else the connector's; undefined when unknown. */
   async listed(g: McpGrant, tool: string): Promise<ListedTool | undefined> {
     const tools = this.server(g).tools ?? (await this.list(g));
     return tools?.find((t) => t.name === tool);
@@ -345,8 +338,9 @@ export class McpProxy {
    * Call `tool` on the grant's server for the call `ctx.key` (docs/agents/capabilities/mcp/):
    * - a key already settled gets its stored outcome, never a second request;
    * - a key forwarded by an earlier incarnation and never answered is `outcome_unknown` unless the tool is idempotent;
-   * - each forward waits for older epochs' forwards to settle, then checks the epoch (`ctx.live`) and
-   *   is recorded in the same synchronous step as it leaves;
+   * - each forward waits for older epochs' forwards to settle, then for a call slot on the server (the
+   *   connector's admission), then checks the epoch (`ctx.live`) and is recorded in the same synchronous
+   *   step as it leaves;
    * - a lost answer (timeout, network, 5xx) is `outcome_unknown`, retried once only when idempotent;
    * - an ended session (404) is initialized again and the call resent: the server processed nothing.
    */
@@ -360,8 +354,56 @@ export class McpProxy {
         : "the answer to an earlier delivery of this call was lost and the tool isn't idempotent, so it wasn't sent again"));
     }
     await this.fenceWait(ctx.epoch);
-    const bearer = await this.bearerOf(g);
-    let attempts = prior?.attempts ?? 0;
+    const attempts = prior?.attempts ?? 0;
+    let lease: string;
+    let bearer: Bearer;
+    try {
+      bearer = await this.bearerOf(g);
+      lease = await this.admit(g);
+    } catch (e) {
+      // An earlier attempt (lost answer) is still unsettled: it settles as unknown.
+      if (attempts > 0) this.settle(ctx.key, unknown("an earlier attempt's answer was lost, and it couldn't be sent again"));
+      throw e;
+    }
+    try {
+      return await this.forwardAdmitted(g, tool, args, ctx, bearer, attempts, idempotent);
+    } finally {
+      this.d.background(this.d.connector(g).release(lease).catch((e) => console.warn(`mcp ${g.capability}: releasing a call slot failed (it expires)`, e)));
+    }
+  }
+
+  /**
+   * A call slot on the grant's server (its connector's admission: `max_concurrent` at once, `per_minute`
+   * a minute, across every agent), waited for up to `admitWaitMs`. Taken before the epoch check, which
+   * still comes after every await. Refused: `rate_limited`, and nothing was sent.
+   */
+  private async admit(g: McpGrant): Promise<string> {
+    const until = Date.now() + this.d.admitWaitMs;
+    const hold = this.d.callTimeoutMs * (MCP_MAX_ATTEMPTS + 2);
+    let failure: unknown = null;
+    for (;;) {
+      let wait = ADMIT_POLL_MS;
+      try {
+        const a = await this.d.connector(g).acquire(g, this.d.agent(), hold);
+        if ("lease" in a) return a.lease;
+        wait = Math.max(10, Math.min(a.retry_after_ms, ADMIT_POLL_MS));
+        failure = null;
+      } catch (e) {
+        failure = e;
+      }
+      if (Date.now() + wait > until) {
+        if (failure) {
+          console.warn(`mcp ${g.capability}: the connector couldn't admit the call`, failure);
+          throw new NestError(ErrorCodes.INTERNAL, `the call to the MCP server of ${g.capability} couldn't be admitted (nest's connector didn't answer); nothing was sent`, 503, true);
+        }
+        throw new NestError(ErrorCodes.RATE_LIMITED, `the MCP server of ${g.capability} is at nest's cap (${g.max_concurrent ?? MCP_DEFAULT_MAX_CONCURRENT} calls at once, ${g.per_minute ?? MCP_DEFAULT_PER_MINUTE} a minute, across agents); nothing was sent`, 429, true);
+      }
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+
+  private async forwardAdmitted(g: McpGrant, tool: string, args: Record<string, unknown>, ctx: CallContext, bearer: Bearer, attempts: number,
+    idempotent: boolean): Promise<McpCallOutcome> {
     let reinitialized = false;
     for (;;) {
       let s: ServerRow;
@@ -385,6 +427,9 @@ export class McpProxy {
       const meta = { "nest/agent": ctx.agent, "nest/epoch": ctx.epoch, "nest/call": ctx.key, "nest/taint": ctx.tainted() };
       const a = await rpc(this.url(g), { id: 100 + attempts, method: "tools/call", params: { name: tool, arguments: args, _meta: meta } },
         { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs });
+      if ((a.kind === "result" || a.kind === "rpc_error") && a.list_changed) {
+        this.d.background(this.d.connector(g).changed(g).catch((e) => console.warn(`mcp ${g.capability}: reporting a changed tool list failed`, e)));
+      }
       switch (a.kind) {
         case "result": {
           const r = callResultContent(a.result);
