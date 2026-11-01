@@ -719,6 +719,21 @@ def mcp_api(method, path):
         return json.loads(text) if text else None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def get_no_redirect(url, headers=None):
+    """GET without following a redirect: (status, Location, body)."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(urllib.request.Request(url, headers=headers or {}), timeout=15) as r:
+            return r.status, r.headers.get("location"), r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("location"), e.read().decode()
+
+
 def mcp_calls():
     return (mcp_api("GET", "/calls?since=0") or {}).get("calls", [])
 
@@ -729,7 +744,9 @@ def start_mcp_server():
         subprocess.run(["npm", "install", "--silent"], cwd=MCP_DIR, check=True)
     vars_path = os.path.join(WORK, "mcp.vars")
     with open(os.open(vars_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        f.write(f"MCP_TEST_TOKEN={MCP_TOKEN}\n")
+        # OAuth mode on (mcp-test/README.md): the static bearer still opens every route, and run_mcp_oauth
+        # authorizes against the server's own authorization server.
+        f.write(f"MCP_TEST_TOKEN={MCP_TOKEN}\nMCP_TEST_OAUTH=1\n")
     logf = open(os.path.join(WORK, "logs", "mcp-test.log"), "w")
     PROCS["mcp"] = subprocess.Popen(
         ["npx", "wrangler", "dev", "--local", "--port", str(MCP_PORT), "--ip", "127.0.0.1",
@@ -750,12 +767,12 @@ def stop_mcp_server():
             os.killpg(p.pid, signal.SIGKILL)
 
 
-def mcp_turn(agid, name, steps, wait_s=90):
+def mcp_turn(agid, name, steps, wait_s=90, cap=MCP_CAP):
     """One fake-brain turn of scripted calls to `<cap>_<tool>`; returns the results by label."""
     path = os.path.join(WORK, f"mcp-{name}.json")
     out = os.path.join(WORK, f"mcp-{name}.jsonl")
     with open(path, "w") as fh:
-        json.dump({"results": out, "steps": [{"label": l, "tool": f"{MCP_CAP}_{t}", "args": a} for l, t, a in steps]}, fh, indent=2)
+        json.dump({"results": out, "steps": [{"label": l, "tool": f"{cap}_{t}", "args": a} for l, t, a in steps]}, fh, indent=2)
     st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
     check(f"mcp: {name} turn enqueued", st == 201, json.dumps(t)[:200])
     return path, out
@@ -853,6 +870,102 @@ def run_mcp(ids):
           json.dumps([(c.get("_meta") or {}).get("nest/call") for c in slow]))
 
 
+MCP_OAUTH_CAP = "onotes"
+
+
+def run_mcp_oauth(ids):
+    """An oauth capability on the MCP test server's own authorization server (its OAuth mode), run headlessly:
+    the operator's start, the harness as the browser (it follows the authorize URL, presenting the server's
+    static token as the user's login), nest's callback, then calls that refresh on a 401, a revoked refresh
+    token that needs the operator, and a second authorization that recovers."""
+    if not os.path.isdir(MCP_DIR) or REAL or "mcp" not in PROCS:
+        skip("remote MCP capability over OAuth", "needs the MCP test server, fake mode (as run_mcp)")
+        return
+    mcp_api("POST", "/reset")
+    cap = {"mcp": {"url": f"{MCP_URL}/mcp", "auth": {"oauth": f"cap:{MCP_OAUTH_CAP}"}, "tools": ["echo", "counter_add"],
+                   "read_only": ["echo"], "when_tainted": "allow"}, "prompt": "The notes server, over OAuth."}
+    st, r = api("PUT", f"/v1/admin/capabilities/{MCP_OAUTH_CAP}", cap)
+    check("mcp oauth: capability configured with auth {oauth}", st == 200, json.dumps(r)[:200])
+
+    def authorize(what):
+        st, start = api("POST", f"/v1/admin/capabilities/{MCP_OAUTH_CAP}/oauth")
+        if not check(f"mcp oauth: {what}: the operator's start answers an authorize URL", st == 200 and "authorize_url" in start, json.dumps(start)[:300]):
+            return None
+        status, location, body = get_no_redirect(start["authorize_url"], {"authorization": f"Bearer {MCP_TOKEN}"})
+        if not check(f"mcp oauth: {what}: the authorization server redirects to nest's callback", status == 302 and (location or "").startswith(f"{BASE}/v1/oauth/callback?"),
+                     f"{status} {location} {body[:200]}"):
+            return None
+        status, _, page = get_no_redirect(location)
+        check(f"mcp oauth: {what}: the callback exchanges the code (no admin token)", status == 200 and "is authorized" in page, f"{status} {page[:200]}")
+        return start, location
+
+    got = authorize("first")
+    if not got:
+        return
+    start, location = got
+    check("mcp oauth: discovery found the server's metadata and chose nest's client ID metadata document",
+          start.get("client") == "metadata" and start.get("resource") == f"{MCP_URL}/mcp" and start.get("issuer") == f"{MCP_URL}/oauth",
+          json.dumps({k: start.get(k) for k in ("client", "resource", "issuer", "scopes")}))
+    log_ = mcp_api("GET", "/oauth/log") or {}
+    check("mcp oauth: the server fetched the metadata document and accepted the PKCE exchange",
+          log_.get("metadata_fetches", 0) >= 1 and [e.get("outcome") for e in log_.get("token_requests", [])] == ["ok"], json.dumps(log_)[:300])
+    status, _, page = get_no_redirect(location)
+    check("mcp oauth: the callback's state works once", status == 400 and "state" in page, f"{status} {page[:200]}")
+    st, view = api("GET", f"/v1/admin/capabilities/{MCP_OAUTH_CAP}/oauth")
+    check("mcp oauth: the operator's view says authorized and names no token",
+          st == 200 and view.get("status") == "authorized" and view.get("refreshable") is True and not any("token" in k for k in view if k != "refreshable"),
+          json.dumps(view)[:300])
+
+    tpl = {"capabilities": ["nest", MCP_OAUTH_CAP], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
+           "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
+    api("PUT", "/v1/admin/templates/mcp-oauth-worker", tpl)
+    st, ag = api("POST", "/v1/agents", {"template": "mcp-oauth-worker", "workstream": ids["workstream"], "cell": "local"})
+    check("mcp oauth: agent created", st == 201, json.dumps(ag)[:200])
+    agid = ag.get("agent")
+
+    def run_steps(name, steps):
+        _, out = mcp_turn(agid, name, steps, cap=MCP_OAUTH_CAP)
+        try:
+            wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, 120, 0.5, f"mcp oauth {name} results")
+        except TimeoutError as e:
+            check(f"mcp oauth: all {name} results returned", False, str(e)[:200])
+        res = results_by_label(out)
+        return (lambda k: (res.get(k) or {}).get("text") or ""), (lambda k: (res.get(k) or {}).get("is_error"))
+
+    text, err = run_steps("oauth-calls", [("echo", "echo", {"text": "hello over oauth"})])
+    check("mcp oauth: a call carries the access token", text("echo") == "hello over oauth" and not err("echo"), text("echo")[:200])
+
+    # The server expires every access token: the next call is refused (401), refreshed once and sent again.
+    mcp_api("POST", "/oauth/expire")
+    text, err = run_steps("oauth-refresh", [("add", "counter_add", {"name": "o", "n": 5})])
+    log_ = mcp_api("GET", "/oauth/log") or {}
+    refreshes = [e for e in log_.get("token_requests", []) if e.get("grant_type") == "refresh_token"]
+    check("mcp oauth: an expired token is refreshed once and the call goes through",
+          text("add") == "5" and not err("add") and [e.get("outcome") for e in refreshes] == ["ok"], f"{text('add')!r} {json.dumps(refreshes)}")
+    check("mcp oauth: the refused call ran once at the server", [c.get("tool") for c in mcp_calls()] == ["echo", "counter_add"],
+          json.dumps([c.get("tool") for c in mcp_calls()]))
+
+    # Every token revoked: the refresh fails, and the agent gets a platform error naming the operator's step.
+    mcp_api("POST", "/oauth/expire")
+    mcp_api("POST", "/oauth/revoke")
+    text, err = run_steps("oauth-revoked", [("r1", "echo", {"text": "x"}), ("r2", "echo", {"text": "y"})])
+    check("mcp oauth: a revoked refresh token is a platform error naming re-authorization",
+          err("r1") and "unauthorized" in text("r1") and f"/v1/admin/capabilities/{MCP_OAUTH_CAP}/oauth" in text("r1"), text("r1")[:300])
+    log_ = mcp_api("GET", "/oauth/log") or {}
+    refreshes = [e for e in log_.get("token_requests", []) if e.get("grant_type") == "refresh_token"]
+    check("mcp oauth: no refresh loop: the second call didn't ask the authorization server again",
+          err("r2") and [e.get("outcome") for e in refreshes] == ["ok", "invalid_grant"], json.dumps(refreshes))
+    st, view = api("GET", f"/v1/admin/capabilities/{MCP_OAUTH_CAP}/oauth")
+    check("mcp oauth: the operator's view says reauthorize", view.get("status") == "reauthorize", json.dumps(view)[:300])
+
+    if authorize("again"):
+        text, err = run_steps("oauth-again", [("echo", "echo", {"text": "back"})])
+        check("mcp oauth: after the operator authorizes again, calls work", text("echo") == "back" and not err("echo"), text("echo")[:200])
+    blobs = "\n".join(r2_blobs())
+    check("mcp oauth: the broker audited the flow in R2", all(e in blobs for e in ("oauth_start", "oauth_authorized", "oauth_refreshed", "oauth_refresh_failed")),
+          "missing audit events")
+
+
 def run_fencing(ids):
     brains = real_brains() if REAL else children_named(FAKE_CLAUDE)
     guests = children_named(os.path.join(BIN, "nest-guest"))
@@ -925,6 +1038,7 @@ def main():
         check_gateway_unprivileged()
         ids = run_scenario()
         run_mcp(ids)
+        run_mcp_oauth(ids)
         # After the turns: the token has been handed to the brains by now.
         check_token_not_in("the Claude token is not in the gateway's environment or command line", children_named(GW_BIN))
         run_fencing(ids)
