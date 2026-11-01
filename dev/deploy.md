@@ -90,6 +90,17 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Operator steps after the deploy:** store the server's token (`PUT /v1/admin/secrets/cap:<name>`), add the capability (`PUT /v1/admin/capabilities/<name> {"mcp": {"url", "auth": "cap:<name>", "tools": [...]}}`), add it to a template; only later spawns get it.
 - **Cloud check:** with the MCP test Worker (`mcp-test/`) deployed and its token stored as `cap:<name>`, spawn an agent from a template listing the capability and call `echo`, `note_put`/`note_get` and `counter_add`; `GET /calls` on the server shows each call once, with `_meta` (`nest/agent`, `nest/epoch`, `nest/call`, `nest/taint`).
 
+**This release's rollout rule (MCP OAuth): not a one-way deploy.** No Durable Object class is added (BrokerDO gains three tables), and no host change.
+- **Stored data the previous code reads:**
+  - A capability whose `auth` is the oauth form doesn't parse under the previous schema, so CatalogDO skips it (logged) and templates listing it no longer expand until it's restored.
+  - An agent spawned with one keeps a grant whose `auth` is the token record's name. The previous code reads that name as a static secret, and none exists (the tokens are in `oauth_grants`, not `secrets`), so its calls are `forbidden` and no token goes out.
+  - BrokerDO's new tables are never read by it. The two public routes (`/v1/oauth/callback`, `/v1/oauth/client.json`) become 401 after a rollback, so an authorization in progress fails and is started again after the roll forward.
+- **Operator steps to authorize a real server:** see [mcp OAuth](../docs/agents/capabilities/mcp/#oauth).
+  1. Put the capability with `auth: {oauth: cap:<name>}` (plus `client` if the server needs a pre-registered client, stored first as `PUT /v1/admin/secrets/cap:<name>-client {"value": "{\"client_id\": …, \"client_secret\": …}"}` with the redirect URI `https://nest.bitcru.sh/v1/oauth/callback` registered at the server).
+  2. `POST /v1/admin/capabilities/<name>/oauth`, open the `authorize_url` within 10 minutes and approve.
+  3. Check `GET /v1/admin/capabilities/<name>/oauth` says `authorized`, then add the capability to a template.
+- **Cloud check (not run):** the MCP test Worker in its OAuth mode (`MCP_TEST_OAUTH=1`, mcp-test/README.md) would exercise the flow against production as `e2e` does locally. The deployed test Worker runs in bearer mode, which `mcp_check.py` uses.
+
 ## Host role names (expand/contract)
 
 The host kinds' rename (`burst` → `sandbox`, `controller` → `brain`) spans two releases, so `wrangler rollback` (and the automatic rollback above) to the previous Worker keeps working.

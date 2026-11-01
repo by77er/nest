@@ -8,6 +8,7 @@
 - **Host authentication:**
   - A signed instance identity document (or a one-time enrollment token) is exchanged for a rotating host token. See [../../compute/provisioning/](../../compute/provisioning/).
   - The fleet channel accepts a token up to 24 h past expiry, so a reconnecting host can get a fresh one. The session channel accepts no grace period.
+- **Two public routes for MCP OAuth** ([mcp OAuth](../../agents/capabilities/mcp/#oauth)): `GET /v1/oauth/callback`, where an authorization server sends the operator's browser (its single-use state is the proof), and `GET /v1/oauth/client.json`, nest's client ID metadata document. Every other non-host route needs the operator's token (`test/routes.test.ts` holds the list).
 - **Operator API:** endpoints are listed in `control-plane/README.md`.
   - **Includes:** egress policy layers (`PUT /v1/sandboxes/<id>/policy`), ports and public share links (operator-only), paged transcripts, a sandbox's hands target for a person or a harness (`POST /v1/sandboxes/<id>/resolve`), starting a brain on a named host (`POST /v1/agents/<id>/start {host}`), and the Access service token for the gateways (`PUT /v1/admin/secrets/access:gateway`).
   - **Cells:** must be well-formed names, and must be in `CELLS` when that's set.
