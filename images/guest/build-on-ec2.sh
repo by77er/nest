@@ -12,6 +12,7 @@ HERE=$(dirname "$(realpath "$0")")
 BID=$(date -u +%Y%m%d%H%M%S)
 aws s3 cp --only-show-errors "$HERE/build.sh" "s3://$BUCKET/builder/$BID/build.sh"
 aws s3 cp --only-show-errors "$HERE/init" "s3://$BUCKET/builder/$BID/init"
+aws s3 cp --only-show-errors "$HERE/git-credential-nest" "s3://$BUCKET/builder/$BID/git-credential-nest"
 aws s3 cp --only-show-errors "$ROOT_CA" "s3://$BUCKET/builder/$BID/root-ca.pem"
 USERDATA=$(mktemp)
 cat > "$USERDATA" <<EOF
@@ -23,6 +24,7 @@ dnf install -y -q squashfs-tools e2fsprogs util-linux zstd
 mkdir -p /opt/build/images/guest && cd /opt/build
 aws s3 cp --region $REGION s3://$BUCKET/builder/$BID/build.sh images/guest/build.sh
 aws s3 cp --region $REGION s3://$BUCKET/builder/$BID/init images/guest/init
+aws s3 cp --region $REGION s3://$BUCKET/builder/$BID/git-credential-nest images/guest/git-credential-nest
 aws s3 cp --region $REGION s3://$BUCKET/releases/current/nest-guest ./nest-guest
 aws s3 cp --region $REGION s3://$BUCKET/builder/$BID/root-ca.pem ./root-ca.pem
 chmod +x images/guest/build.sh images/guest/init
