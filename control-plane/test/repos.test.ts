@@ -268,6 +268,15 @@ describe("a sandbox's push allowlist", () => {
     expect(records.find((x) => x.target?.sandbox === sandbox)).toMatchObject({ repos: [r], refused: "the GitHub App isn't installed on these repos" });
   });
 
+  it("guards the operator writes by hand are layered with the constructed ones, in the same policy push", async () => {
+    const { sandbox, ws } = await placed({});
+    const mine = { name: "registry-publish", hosts: ["registry.npmjs.org"], scope: [{ methods: ["PUT"] }], reason: "no publishing" };
+    const policy = await sandboxStub(sandbox).setWorkstreamPolicy({ guards: [mine] });
+    expect(policy.guards!.map((g) => g.name)).toEqual([...githubGuards([]).map((g) => g.name), "registry-publish"]);
+    const [update] = (await nextCommands(ws, (c) => c.type === "policy_update")).filter((c) => c.type === "policy_update");
+    expect(update.policy.guards.at(-1)).toEqual(mine);
+  });
+
   it("static injection secrets are keyed by sandbox first, then the old workstream key, then the binding", async () => {
     const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
     const b = `svc-${rand()}`;
