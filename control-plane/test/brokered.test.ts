@@ -69,6 +69,8 @@ class FakeGitHub {
   readonly reviews = new Map<string, Item[]>();
   /** The next write requests' behaviour, in order. */
   readonly next: Behaviour[] = [];
+  /** The next pull request listings show nothing (one made meanwhile, not yet listed). */
+  hidePulls = 0;
   private n = 0;
 
   async handle(req: Request): Promise<Response> {
@@ -122,6 +124,10 @@ class FakeGitHub {
     }
     if (rest === "/pulls") {
       const items = list(this.pulls, repo);
+      if (req.method === "GET" && this.hidePulls > 0) {
+        this.hidePulls--;
+        return json(200, []);
+      }
       if (req.method === "GET") {
         const head = u.searchParams.get("head");
         const base = u.searchParams.get("base");
@@ -411,6 +417,12 @@ describe("github actions", () => {
     const second = await run(s.ws, "github_create_pr", { ...args, title: "Fix (retry)" });
     expect(second.content[1].value).toEqual({ ...first.content[1].value, existing: true });
     expect(gh.writes.filter((w) => w.path === `/repos/${r}/pulls`)).toHaveLength(1);
+    // Not listed yet when read, refused with 422 when made: read again, it's that one.
+    gh.hidePulls = 1;
+    const third = await run(s.ws, "github_create_pr", args);
+    expect(third.content[1].value).toEqual({ ...first.content[1].value, existing: true });
+    expect(gh.writes.filter((w) => w.path === `/repos/${r}/pulls`)).toHaveLength(2);
+    expect(gh.pulls.get(r)).toHaveLength(1);
   });
 
   it("an answer lost after GitHub made it is found by its marker (one comment); lost before, the outcome is unknown; a redelivered call reads GitHub before sending", async () => {

@@ -2197,7 +2197,8 @@ export class AgentDO extends DurableObject<Env> {
     const key = `${info.agent}/${epoch}/${call}`;
     const prior = this.journal.get(key);
     if (prior?.outcome) return prior.outcome;
-    if (prior?.status === "refused") throw secretRefusal(prior.detail ?? "");
+    // Refused before: the same refusal (the journal's detail names stored secrets, which the model isn't told).
+    if (prior?.status === "refused") throw secretRefusal("a credential");
     const kd = await keyDigest(key);
     const row: JournalRow = {
       key, action, target: auth.value.target, idem: naturalKey(action as BrokeredAction, a, kd), digest: await argsDigest(a),
