@@ -13,7 +13,7 @@ import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { signShare } from "../lib/tokens";
-import { asNestError, NestError, newId } from "../lib/util";
+import { asNestError, hex, NestError, newId, sha256 } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -652,6 +652,33 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO grants (id, host, ports, expires_ms) VALUES (?, ?, ?, ?)", newId("grt_"), host, JSON.stringify(ports), expires);
     await this.deadlines.set("grants", expires, true);
     return this.policyChanged(false);
+  }
+
+  /**
+   * Temporary grants an agent's `egress_policy` asked for (docs/sandbox/networking/egress/policy/#rules),
+   * one policy version for all of them. Each grant's id is derived from `request` (the call key), so a
+   * re-run of the same call adds nothing.
+   */
+  async widenEgress(request: string, rules: { host: string; ports?: number[] }[], ttlMs: number): Promise<EgressPolicy> {
+    const ids = await Promise.all(rules.map(async (r) => `grt_${hex(await sha256(`${request}|${r.host}`)).slice(0, 24)}`));
+    this.info_(); // an unknown sandbox gets no row and no alarm
+    const expires = Date.now() + ttlMs;
+    let added = 0;
+    rules.forEach((r, i) => {
+      added += this.sql.exec("INSERT OR IGNORE INTO grants (id, host, ports, expires_ms) VALUES (?, ?, ?, ?)",
+        ids[i]!, r.host, JSON.stringify(r.ports ?? WEB_PORTS), expires).rowsWritten;
+    });
+    if (!added) return this.effectivePolicy();
+    await this.deadlines.set("grants", expires, true);
+    return this.policyChanged(false);
+  }
+
+  /** Drop every temporary grant for these hosts (narrowing is never gated). */
+  async narrowEgress(hosts: string[]): Promise<EgressPolicy> {
+    this.info_();
+    let removed = 0;
+    for (const h of hosts) removed += this.sql.exec("DELETE FROM grants WHERE host = ?", h).rowsWritten;
+    return removed ? this.policyChanged(false) : this.effectivePolicy();
   }
 
   override async alarm(): Promise<void> {

@@ -3,7 +3,7 @@
 
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
-import { storedEnum } from "./stored";
+import { addColumn, storedEnum } from "./stored";
 
 // Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
 /** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
@@ -25,11 +25,16 @@ export interface StoredCall {
   outcome: ToolOutcome | null;
 }
 
-/** A sink call's approval (docs/agents/tools/#taint-and-sinks): for one tool with exactly these arguments. */
+/**
+ * A sink call's approval (docs/agents/tools/#taint-and-sinks): for one sink (`name`: a remote MCP tool
+ * `<capability>_<tool>`, a brokered action, `egress_policy`) with exactly these arguments. `tool` is the
+ * model-facing tool to call again (null in rows written before it was kept: a remote MCP tool's).
+ */
 export interface Approval {
   ask: string;
   name: string;
   digest: string;
+  tool: string | null;
   status: z.output<typeof ApprovalStatusEnum>;
 }
 
@@ -51,6 +56,8 @@ export class CallLedger {
     // `used_by`: the call key an approval was spent on (its redelivery may use it again, nothing else).
     sql.exec(`CREATE TABLE IF NOT EXISTS approvals (ask TEXT PRIMARY KEY, name TEXT NOT NULL, digest TEXT NOT NULL,
       status TEXT NOT NULL, expires_ms INTEGER, used_by TEXT, created_ms INTEGER NOT NULL)`);
+    // The tool the model calls again once approved (null: a remote MCP tool's, `mcp__nest__<name>`).
+    addColumn(sql, "approvals", "tool", "TEXT");
   }
 
   /** By call id: one first seen at an earlier epoch keeps that epoch's row and key, so its writes never run twice. */
@@ -117,8 +124,9 @@ export class CallLedger {
     return this.approvalWhere("ask = ?", ask);
   }
 
-  requestApproval(ask: string, name: string, digest: string): void {
-    this.sql.exec(`INSERT INTO approvals (ask, name, digest, status, created_ms) VALUES (?, ?, ?, '${APPROVAL.pending}', ?)`, ask, name, digest, Date.now());
+  requestApproval(ask: string, name: string, digest: string, tool: string | null = null): void {
+    this.sql.exec(`INSERT INTO approvals (ask, name, digest, status, created_ms, tool) VALUES (?, ?, ?, '${APPROVAL.pending}', ?, ?)`,
+      ask, name, digest, Date.now(), tool);
   }
 
   decide(ask: string, approved: boolean, expiresMs: number): void {
@@ -147,7 +155,7 @@ export class CallLedger {
 
   private approvalWhere(where: string, ...args: SqlStorageValue[]): Approval | undefined {
     const r = this.sql.exec<Omit<Approval, "status"> & { status: string }>(
-      `SELECT ask, name, digest, status FROM approvals WHERE ${where} LIMIT 1`, ...args).toArray()[0];
+      `SELECT ask, name, digest, status, tool FROM approvals WHERE ${where} LIMIT 1`, ...args).toArray()[0];
     return r && { ...r, status: storedEnum(ApprovalStatusEnum, r.status, "approvals.status") };
   }
 

@@ -17,7 +17,13 @@ import { admitDelivery, channelRequestId, inboxTurnText, moveNoteDue, TurnQueue,
 import type { ReadResult } from "./channel";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
-import { approves, argsDigest, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
+import { mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
+import { approves, argsDigest, gated, type SinkCall } from "../lib/sinks";
+import {
+  actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
+  type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, secretKinds, stringsOf,
+} from "../lib/brokered";
+import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
 import { McpProxy } from "../lib/mcp-proxy";
 import { mcpBearer } from "../lib/mcp-auth";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
@@ -28,6 +34,7 @@ import {
 import { signBlobUrl } from "../lib/tokens";
 import { ledgerStub, type TaskView } from "./tasks";
 import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
+import type { EgressPolicy } from "../protocol/model";
 import { addColumn, storedEnum } from "../lib/stored";
 import { askRoute, CallLedger } from "../lib/calls";
 import {
@@ -260,6 +267,7 @@ export class AgentDO extends DurableObject<Env> {
       listTimeoutMs: num(env.MCP_LIST_TIMEOUT_MS, 4_000),
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
     });
+    this.journal = new BrokeredJournal(this.sql);
     this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
       async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
@@ -269,6 +277,8 @@ export class AgentDO extends DurableObject<Env> {
   private readonly calls!: CallLedger;
   /** The client of its mcp capabilities' servers (docs/agents/capabilities/mcp/). */
   private readonly mcp!: McpProxy;
+  /** Every brokered action it ran or was refused (docs/agents/tools/#taint-and-sinks). */
+  private readonly journal!: BrokeredJournal;
 
   // ---------------------------------------------------------------------------------------------
   // State
@@ -1137,7 +1147,7 @@ export class AgentDO extends DurableObject<Env> {
     if (msg.type === "tools_list_request") {
       const info = this.load();
       const remote = await this.mcpToolDefs(info);
-      this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(info.tools), ...remote] });
+      this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(info.tools), ...brokeredToolDefs(info.brokered ?? []), ...remote] });
       return;
     }
     if (msg.type === "hands_resolve") {
@@ -1672,7 +1682,7 @@ export class AgentDO extends DurableObject<Env> {
     const lists = await Promise.all((info.mcp ?? []).map(async (g) => ({ g, listed: await this.mcp.list(g).catch(() => null) })));
     const out: ToolDef[] = [];
     for (const { g, listed } of lists) {
-      const defs = listed ? mcpToolDefs(g, listed, PLATFORM_TOOL_NAMES) : [];
+      const defs = listed ? mcpToolDefs(g, listed, [...PLATFORM_TOOL_NAMES, ...BROKERED_TOOL_NAMES]) : [];
       if (defs.length && !g.trusted) this.kvPut("read_tainted", true);
       out.push(...defs);
     }
@@ -1983,7 +1993,12 @@ export class AgentDO extends DurableObject<Env> {
     const guest = sandboxEpoch !== undefined;
     const info = this.load();
     const def = toolDef(name);
-    if (!def) return await this.mcpTool(info, epoch, call, name, args, guest, fence);
+    if (!def) {
+      // A brokered action's own tool, when its spec grants that action; else a remote MCP tool.
+      const action = actionOfTool(name);
+      if (action && (info.brokered ?? []).some((g) => g.action === action)) return await this.brokeredTool(info, epoch, call, action, args, guest, fence);
+      return await this.mcpTool(info, epoch, call, name, args, guest, fence);
+    }
     if (!info.tools.includes(name)) {
       throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not granted to this agent`, 403);
     }
@@ -2089,6 +2104,10 @@ export class AgentDO extends DurableObject<Env> {
       case "unsubscribe":
       case "message":
         return await this.channelTool(info, name, a, key, live);
+      case "brokered":
+        return await this.brokeredTool(info, epoch, call, String(a.action), a.args, guest, fence);
+      case "egress_policy":
+        return await this.egressTool(info, epoch, call, a, guest, fence, live);
       default:
         throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${name} is not implemented yet`, 501);
     }
@@ -2108,9 +2127,8 @@ export class AgentDO extends DurableObject<Env> {
     const key = `${info.agent}/${epoch}/${call}`;
     if (!this.mcp.forwarded(key)
       && needsApproval(target.grant, target.tool, await this.mcp.listed(target.grant, target.tool), this.tainted(this.load()))) {
-      const digest = await argsDigest(args);
-      // Spent here, before the forward's awaits: a call fenced before it leaves wastes its approval.
-      if (!this.calls.takeApproval(name, digest, key, Date.now())) return await this.askApproval(info, epoch, call, name, target.grant.url, args, digest, fence);
+      const held = await this.sinkGate(info, epoch, call, key, { name, tool: `${NEST_TOOL_PREFIX}${name}`, what: `${name} to ${new URL(target.grant.url).host}`, args }, fence);
+      if (held) return held;
     }
     const r = await this.mcp.call(target.grant, target.tool, args as Record<string, unknown>, {
       agent: info.agent, epoch, key,
@@ -2125,23 +2143,253 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
+   * The sink gate (lib/sinks.ts) for a call `gated` holds: an unexpired approval of exactly this call
+   * lets it through (spent on `key`, before the call's own awaits: a call fenced before it leaves
+   * wastes its approval); otherwise the operator is asked and the call answers `pending`.
+   */
+  private async sinkGate(info: AgentInfo, epoch: number, call: string, key: string, s: SinkCall, fence: number): Promise<ToolOutcome | null> {
+    const digest = await argsDigest(s.args);
+    if (this.calls.takeApproval(s.name, digest, key, Date.now())) return null;
+    return await this.askApproval(info, epoch, call, s, digest, fence);
+  }
+
+  /**
    * A sink call from a tainted session (docs/agents/tools/#taint-and-sinks): it isn't sent; the operator
    * is asked, once per exact call, and the decision comes as a turn. An approval lets one call with the
-   * same tool and arguments through within `APPROVAL_TTL_MS`.
+   * same sink and arguments through within `APPROVAL_TTL_MS`.
    */
-  private async askApproval(info: AgentInfo, epoch: number, call: string, name: string, url: string, args: unknown, digest: string, fence: number): Promise<ToolOutcome> {
-    const pending = this.calls.pendingApproval(name, digest);
+  private async askApproval(info: AgentInfo, epoch: number, call: string, s: SinkCall, digest: string, fence: number): Promise<ToolOutcome> {
+    const pending = this.calls.pendingApproval(s.name, digest);
     let ask = pending?.ask;
     if (!ask) {
-      const json = JSON.stringify(args);
+      const json = JSON.stringify(s.args);
       const shown = json.length > APPROVAL_ARGS_SHOWN ? `${json.slice(0, APPROVAL_ARGS_SHOWN)}… (${json.length} bytes in all)` : json;
-      const question = `Approve ${name} to ${new URL(url).host} from a tainted session? arguments: ${shown} (options: approve | deny)`;
-      ask = await this.postAsk(info, call, epoch, question, "async", "escalation", undefined, fence, { name, digest });
+      const question = `Approve ${s.what} from a tainted session? arguments: ${shown} (options: approve | deny)`;
+      ask = await this.postAsk(info, call, epoch, question, "async", "escalation", undefined, fence, { name: s.name, digest, tool: s.tool });
     }
     return {
       status: "pending", ask,
-      message: `Not sent: ${name} from a tainted session needs the operator's approval (${ask}). End your turn; the decision arrives as your next input.`,
+      message: `Not sent: ${s.tool} from a tainted session needs the operator's approval (${ask}). End your turn; the decision arrives as your next input.`,
     };
+  }
+
+  // Brokered actions and egress widening (docs/agents/tools/#taint-and-sinks)
+  // ---------------------------------------------------------------------------------------------
+
+  private broker() {
+    return this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+  }
+
+  /**
+   * A brokered action, through the pipeline: the grant (an action its spec's capabilities give, for the
+   * repo or profile asked for) → the hourly cap → the secret scan → the sink gate → the current
+   * external state → the request under the action's natural idempotency key → the journal. Never from
+   * a sandbox. A redelivered call key skips the checks it passed already and reads the provider first.
+   */
+  private async brokeredTool(info: AgentInfo, epoch: number, call: string, action: string, args: unknown, guest: boolean, fence: number): Promise<ToolOutcome> {
+    if (guest) throw new NestError(ErrorCodes.FORBIDDEN, "brokered actions aren't callable from a sandbox", 403);
+    const def = actionDef(action);
+    if (!def) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown brokered action ${action}`);
+    if (def.kind === "none") throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${action} is not implemented: no provider is configured`, 501);
+    const a = validateArgs(def.input_schema, args);
+    const auth = authorize(info.brokered ?? [], action as BrokeredAction, a);
+    if (!auth.ok) throw new NestError(ErrorCodes.FORBIDDEN, auth.error, 403);
+    const key = `${info.agent}/${epoch}/${call}`;
+    const prior = this.journal.get(key);
+    if (prior?.outcome) return prior.outcome;
+    if (prior?.status === "refused") throw secretRefusal(prior.detail ?? "");
+    const kd = await keyDigest(key);
+    const row: JournalRow = {
+      key, action, target: auth.value.target, idem: naturalKey(action as BrokeredAction, a, kd), digest: await argsDigest(a),
+      args: JSON.stringify(a), tainted: this.tainted(this.load()),
+    };
+    if (!prior) {
+      const since = Date.now() - 3_600_000;
+      if (this.journal.sentSince(action, since) >= auth.value.per_hour) {
+        const frees = (this.journal.oldestSince(action, since) ?? Date.now()) + 3_600_000;
+        throw new NestError(ErrorCodes.RATE_LIMITED, `${action}: at most ${auth.value.per_hour} an hour for this agent; the next one is free at ${iso(frees)}`, 429, true);
+      }
+      const strings = stringsOf(a);
+      const kinds = secretKinds(strings);
+      const names = await this.broker().scanSecrets(strings);
+      if (kinds.length || names.length) {
+        // The journal names what matched (for the operator); the model is told only the kind.
+        const why = [...kinds, ...names.map((n) => `the value of ${n}`)].join(", ");
+        this.journal.refuse(row, why);
+        throw secretRefusal(kinds.length ? kinds.join(", ") : "a credential nest holds");
+      }
+      if (gated({ sink: auth.value.sink, when_tainted: auth.value.when_tainted, tainted: this.tainted(this.load()) })) {
+        const held = await this.sinkGate(info, epoch, call, key, {
+          name: action, tool: `${NEST_TOOL_PREFIX}${def.tool}`, what: `${action} on ${auth.value.target}`, args: a,
+        }, fence);
+        if (held) return held;
+      }
+    }
+    const live = async () => {
+      await this.hook("dispatch:beforeWrite");
+      this.assertEpoch(fence);
+    };
+    return def.kind === "github"
+      ? await this.runGithub(info, action as GithubAction, a, auth.value, row, kd, !!prior, live)
+      : await this.runHttp(a, auth.value, row, kd, !!prior, live);
+  }
+
+  /** A `github.*` action with an installation token narrowed to its repo and permissions (BrokerDO). */
+  private async runGithub(
+    info: AgentInfo, action: GithubAction, a: Record<string, unknown>, auth: Authorized, row: JournalRow, kd: string, redelivered: boolean,
+    live: () => Promise<void>,
+  ): Promise<ToolOutcome> {
+    const { token } = await this.broker().githubToken(auth.target, BROKERED_ACTIONS[action].permissions, { agent: info.agent, call: row.key });
+    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000));
+    const made = (m: GhMade): ToolOutcome => {
+      const what = m.existing ? `Already open: ${m.url}` : `Done: ${m.url}`;
+      const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: what }, { type: "json", value: m }] };
+      this.journal.settle(row, "done", outcome, JSON.stringify(m));
+      return outcome;
+    };
+    const look = async (): Promise<GhMade | null | "unreadable"> => {
+      const r = await api.request(token, "GET", stateQuery(action, a));
+      return r.kind === "ok" ? foundInState(action, r.json, kd) : "unreadable";
+    };
+    // The current external state: a pull request from the same head to the same base, or what an
+    // earlier attempt of this very call posted (its marker).
+    if (action === "github.create_pr" || redelivered) {
+      const found = await look();
+      if (found && found !== "unreadable") return made(found);
+      if (found === "unreadable" && redelivered) return this.unknownOutcome(row, `${action}: an earlier attempt's result couldn't be checked on GitHub`);
+    }
+    const req = actionRequest(action, a, kd);
+    await live();
+    this.journal.sending(row);
+    const r = await api.request(token, req.method, req.path, req.body);
+    if (r.kind === "ok") {
+      const m = createdOf(r.json);
+      if (m) return made(m);
+      return this.unknownOutcome(row, `${action}: GitHub answered HTTP ${r.status} without the created resource`);
+    }
+    if (r.kind === "lost" || (r.kind === "refused" && r.status === 422 && action === "github.create_pr")) {
+      // Lost: it may have been made. 422 on a pull request: often one from that head to that base already exists.
+      const found = await look();
+      if (found && found !== "unreadable") return made(found);
+      if (r.kind === "lost") return this.unknownOutcome(row, `${action}: ${r.why}`);
+    }
+    const e = ghError(r, action);
+    const outcome: ToolOutcome = { status: "error", error: e.body() };
+    this.journal.settle(row, "failed", outcome, e.detail);
+    return outcome;
+  }
+
+  private unknownOutcome(row: JournalRow, why: string): ToolOutcome {
+    const outcome: ToolOutcome = {
+      status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, `${why}; it may or may not have taken effect. Check before calling again.`),
+    };
+    this.journal.settle(row, "unknown", outcome, why);
+    return outcome;
+  }
+
+  /**
+   * `http.request` through an operator's profile: the base URL, methods and paths it allows, its
+   * credential attached here. Redirects aren't followed (the credential never goes elsewhere), and a
+   * reflected credential is masked. A lost answer is retried once for an idempotent method (or a
+   * profile with an idempotency header). Its answer taints unless the profile is trusted.
+   */
+  private async runHttp(a: Record<string, unknown>, auth: Authorized, row: JournalRow, kd: string, redelivered: boolean, live: () => Promise<void>): Promise<ToolOutcome> {
+    const g = auth.profile!;
+    // Checked again at each use, as when the capability was written.
+    const base = checkBaseUrl(g.base_url, this.env.ALLOW_LOOPBACK_BROKERED === "1");
+    if (!base.ok) throw new NestError(ErrorCodes.FORBIDDEN, `profile ${g.profile}: ${base.error}`, 403);
+    const method = String(a.method);
+    const body = typeof a.body === "string" ? a.body : undefined;
+    if (body !== undefined && (method === "GET" || method === "HEAD")) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${method} takes no body`);
+    if (body !== undefined && body.length > HTTP_BODY_MAX) throw new NestError(ErrorCodes.INVALID_MESSAGE, `body is over ${HTTP_BODY_MAX} bytes`);
+    const query = new URLSearchParams();
+    for (const [k, v] of Object.entries((a.query ?? {}) as Record<string, unknown>)) {
+      if (!["string", "number", "boolean"].includes(typeof v)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `query.${k} must be a string, number or boolean`);
+      query.append(k, String(v));
+    }
+    const secret = g.auth ? await this.broker().brokeredSecret(g.auth.secret) : null;
+    if (g.auth && secret === null) throw new NestError(ErrorCodes.FORBIDDEN, `profile ${g.profile}: no credential is stored (${g.auth.secret})`, 409);
+    const retryable = IDEMPOTENT_METHODS.has(method) || g.idempotency_header !== null;
+    if (redelivered && !retryable) return this.unknownOutcome(row, `http.request ${g.profile}: an earlier attempt of this call left with no answer`);
+    const url = `${g.base_url}${String(a.path)}${query.size ? `?${query}` : ""}`;
+    const headers: Record<string, string> = { accept: "*/*", "user-agent": "nest-control-plane" };
+    if (body !== undefined) headers["content-type"] = typeof a.content_type === "string" ? a.content_type.slice(0, 128) : "application/json";
+    if (g.auth && secret !== null) headers[g.auth.header.toLowerCase()] = g.auth.scheme ? `${g.auth.scheme} ${secret}` : secret;
+    if (g.idempotency_header) headers[g.idempotency_header.toLowerCase()] = kd;
+    const timeoutMs = num(this.env.BROKERED_TIMEOUT_MS, 30_000);
+    let why = "";
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await live();
+      this.journal.sending(row);
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), timeoutMs);
+      try {
+        // The global fetch, called as a plain function (as a method of another object it throws in workerd).
+        const res = await fetch(url, { method, headers, ...(body !== undefined ? { body } : {}), redirect: "manual", signal: ctl.signal });
+        const answer = await readText(res, HTTP_ANSWER_MAX);
+        const text = { text: mask(answer.text, secret), truncated: answer.truncated };
+        if (!g.trusted) this.kvPut("read_tainted", true);
+        const value = {
+          status: res.status, content_type: res.headers.get("content-type") ?? null,
+          ...(res.headers.get("location") ? { location: mask(res.headers.get("location")!, secret) } : {}),
+          ...(text.truncated ? { truncated: true } : {}),
+        };
+        const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: text.text }, { type: "json", value }] };
+        this.journal.settle(row, "done", outcome, `HTTP ${res.status}`);
+        return outcome;
+      } catch (e) {
+        why = ctl.signal.aborted ? `no answer within ${timeoutMs} ms` : `network: ${e instanceof Error ? e.message : String(e)}`;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!retryable) break;
+    }
+    return this.unknownOutcome(row, `http.request ${g.profile}: ${why}`);
+  }
+
+  /**
+   * `egress_policy` on its own bound sandbox: read it, widen it (temporary grants, a sink: gated), or
+   * narrow it (revoke hosts it was widened to: never gated). SandboxDO's grant machinery applies it.
+   */
+  private async egressTool(info: AgentInfo, epoch: number, call: string, a: Record<string, unknown>, guest: boolean, fence: number, live: () => Promise<void>): Promise<ToolOutcome> {
+    if (!info.hands) throw new NestError(ErrorCodes.NOT_BOUND, "agent has no sandbox", 409);
+    if (guest) throw new NestError(ErrorCodes.FORBIDDEN, "egress_policy isn't callable from a sandbox", 403);
+    const stub = this.sandboxStub(info.hands.sandbox);
+    const allow = (a.allow ?? []) as unknown[];
+    const revoke = (a.revoke ?? []) as unknown[];
+    if (allow.length && revoke.length) throw new NestError(ErrorCodes.INVALID_MESSAGE, "widen (allow) and narrow (revoke) in separate calls");
+    const shown = (p: EgressPolicy, what: string): ToolOutcome => ({
+      status: "ok",
+      content: [{ type: "text", text: what }, {
+        type: "json", value: { version: p.version, allow: p.allow.map((r) => ({ host: r.host, ports: r.ports, layer: r.layer, ...(r.expires_ms ? { expires_ms: r.expires_ms } : {}) })) },
+      }],
+    });
+    if (revoke.length) {
+      const hosts = revoke.map((h) => egressHost(h));
+      await live();
+      return shown(await stub.narrowEgress(hosts), `Revoked ${hosts.join(", ")}.`);
+    }
+    if (!allow.length) return shown(await stub.policy(), "The effective egress policy.");
+    const rules = allow.map(egressRule);
+    const ttl = typeof a.ttl_s === "number" ? a.ttl_s : EGRESS_DEFAULT_TTL_S;
+    const request = { allow: rules, ttl_s: ttl };
+    const key = `${info.agent}/${epoch}/${call}`;
+    // Widening is a sink, `approve` when tainted (the template default; docs/agents/tools/#taint-and-sinks).
+    if (gated({ sink: true, when_tainted: "approve", tainted: this.tainted(this.load()) })) {
+      const held = await this.sinkGate(info, epoch, call, key, {
+        name: "egress_policy", tool: `${NEST_TOOL_PREFIX}egress_policy`,
+        what: `egress_policy widening ${info.hands.sandbox}'s egress to ${rules.map((r) => r.host).join(", ")} for ${ttl} s`, args: request,
+      }, fence);
+      if (held) return held;
+    }
+    await live();
+    const p = await stub.widenEgress(key, rules, ttl * 1000);
+    return shown(p, `Allowed ${rules.map((r) => r.host).join(", ")} for ${ttl} s.`);
+  }
+
+  /** The operator's view of its brokered actions, newest first (`GET /v1/agents/:agent/brokered`). */
+  async brokeredJournal(limit = 100, before?: number): Promise<JournalEntry[]> {
+    return this.journal.list(limit, before);
   }
 
   /**
@@ -2257,7 +2505,7 @@ export class AgentDO extends DurableObject<Env> {
    */
   private async postAsk(
     info: AgentInfo, call: string, epoch: number, question: string, status: "sync" | "cli" | "async", to: "escalation" | "user",
-    sandboxEpoch?: number, fence: number = epoch, approval?: { name: string; digest: string },
+    sandboxEpoch?: number, fence: number = epoch, approval?: { name: string; digest: string; tool: string },
   ): Promise<string> {
     // A re-run for the same call routes the same ask again, under the same key.
     const prior = this.calls.askOf(call, epoch);
@@ -2267,7 +2515,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!prior) {
       this.calls.recordAsk({ ask, call, epoch, question, status, deadline });
       // Before routing's awaits: an answer that comes meanwhile finds the approval it decides.
-      if (approval) this.calls.requestApproval(ask, approval.name, approval.digest);
+      if (approval) this.calls.requestApproval(ask, approval.name, approval.digest, approval.tool);
     }
     if ((prior?.status ?? status) === "sync") await this.deadlines.set(`${ASK_DEADLINE}${ask}`, deadline);
     const q = prior?.question ?? question;
@@ -2372,7 +2620,8 @@ export class AgentDO extends DurableObject<Env> {
     if (approval) {
       const ok = approves(answer);
       this.calls.decide(ask, ok, Date.now() + APPROVAL_TTL_MS);
-      const tool = `${NEST_TOOL_PREFIX}${approval.name}`;
+      // Rows written before `tool` was kept are remote MCP tools'.
+      const tool = approval.tool ?? `${NEST_TOOL_PREFIX}${approval.name}`;
       await this.enqueueTurn({
         kind: "ask_answer",
         text: ok
@@ -2462,6 +2711,7 @@ export class AgentDO extends DurableObject<Env> {
     const cutoff = Date.now() - RETENTION_MS;
     this.calls.prune(cutoff);
     this.mcp.prune(cutoff);
+    this.journal.prune(cutoff);
     this.queue.prune(cutoff);
     this.sql.exec("DELETE FROM channel_subs WHERE ended = 1 AND created_ms < ?", cutoff);
   }
@@ -2505,4 +2755,60 @@ export function validateArgs(schema: unknown, args: unknown): Record<string, unk
     }
   }
   return a;
+}
+
+/** The refusal of a call whose arguments hold a credential: names the kind, never the value. */
+function secretRefusal(kind: string): NestError {
+  return new NestError(ErrorCodes.FORBIDDEN, `Not sent: the arguments contain ${kind}. Remove it and call again.`, 403);
+}
+
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "PUT", "DELETE"]);
+const HTTP_BODY_MAX = 1024 * 1024;
+/** How much of an http profile's answer reaches the model. */
+const HTTP_ANSWER_MAX = 64 * 1024;
+const EGRESS_DEFAULT_TTL_S = 3600;
+const EGRESS_HOST = /^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/;
+
+/** A host an agent may widen its egress to: a DNS name or `*.` and one, lowercase (no IP literals). */
+function egressHost(h: unknown): string {
+  const v = typeof h === "string" ? h.trim().toLowerCase() : "";
+  if (v.length > 253 || !EGRESS_HOST.test(v)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${String(h)} isn't a host name (a DNS name or *.domain)`);
+  return v;
+}
+
+function egressRule(r: unknown): { host: string; ports?: number[] } {
+  const o = (r && typeof r === "object" ? r : {}) as { host?: unknown; ports?: unknown };
+  const host = egressHost(o.host);
+  if (o.ports === undefined) return { host };
+  if (!Array.isArray(o.ports) || o.ports.length > 8 || !o.ports.every((p) => Number.isInteger(p) && p >= 1 && p <= 65535)) {
+    throw new NestError(ErrorCodes.INVALID_MESSAGE, `${host}: ports must be up to 8 integers 1-65535`);
+  }
+  return { host, ports: [...new Set(o.ports as number[])].sort((x, y) => x - y) };
+}
+
+/** A body as text, at most `max` bytes. */
+async function readText(res: Response, max: number): Promise<{ text: string; truncated: boolean }> {
+  if (!res.body) return { text: "", truncated: false };
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  let truncated = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (n + value.byteLength > max) {
+      chunks.push(value.subarray(0, max - n));
+      truncated = true;
+      await reader.cancel().catch(() => undefined);
+      break;
+    }
+    n += value.byteLength;
+    chunks.push(value);
+  }
+  return { text: new TextDecoder().decode(concatBytes(chunks)), truncated };
+}
+
+/** A credential the answer reflects, replaced with `*` of its length. */
+function mask(v: string, secret: string | null): string {
+  return secret ? v.split(secret).join("*".repeat(secret.length)) : v;
 }

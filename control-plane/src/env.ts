@@ -59,6 +59,12 @@ export interface Env {
   MCP_CALL_TIMEOUT_MS?: string;
   /** The budget of listing one MCP server's tools, initialize included (default 4 s; the runner waits 10 s for a tool list). */
   MCP_LIST_TIMEOUT_MS?: string;
+  /** "1" lets a brokered http profile, and `GITHUB_API_URL`, name a loopback URL: tests and local development only. */
+  ALLOW_LOOPBACK_BROKERED?: string;
+  /** The GitHub REST API the App's actions use (default https://api.github.com); a local fake in the e2e harness. */
+  GITHUB_API_URL?: string;
+  /** How long one brokered request may take (default 30 s; below the runner's 150 s platform call timeout). */
+  BROKERED_TIMEOUT_MS?: string;
 }
 
 export const num = (v: string | undefined, fallback: number): number => {
