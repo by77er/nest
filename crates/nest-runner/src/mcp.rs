@@ -59,6 +59,8 @@ async fn connection(rt: Arc<Runtime>, stream: UnixStream) {
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<McpBridgeResponse>();
     let _ = tx.send(McpBridgeResponse::HelloAck { v: 1 });
+    // AgentDO's `tools_changed` → `tools_changed{}` → Claude Code's `notifications/tools/list_changed`.
+    let changes = tokio::spawn(forward_tool_changes(agent.watch_tools(), tx.clone()));
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             if framing::write_host(&mut wr, &m).await.is_err() {
@@ -98,8 +100,18 @@ async fn connection(rt: Arc<Runtime>, stream: UnixStream) {
     for (_, c) in inflight.lock().unwrap().drain() {
         c.cancel();
     }
+    changes.abort();
     drop(tx);
     let _ = writer.await;
+}
+
+/// One `tools_changed{}` per change seen (changes in a burst may coalesce into one: Claude Code lists once).
+async fn forward_tool_changes(mut seen: tokio::sync::watch::Receiver<u64>, tx: mpsc::UnboundedSender<McpBridgeResponse>) {
+    while seen.changed().await.is_ok() {
+        if tx.send(McpBridgeResponse::ToolsChanged {}).is_err() {
+            return;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,6 +179,25 @@ mod tests {
         want.extend(["spawn_agent".to_string(), "notify".to_string()]);
         assert_eq!(names(list(&rt, &agent(bound, &["spawn_agent", "Bash", "notify"])).await), want);
         assert_eq!(names(list(&rt, &agent(None, &["emit"])).await), vec!["emit".to_string()]);
+    }
+
+    /// Every change is passed to the bridge connection as `tools_changed{}` (what `nest mcp` turns
+    /// into `notifications/tools/list_changed`); the forwarder ends with the connection.
+    #[tokio::test]
+    async fn each_tools_change_becomes_a_tools_changed_frame() {
+        let (ctx, _) = mpsc::unbounded_channel();
+        let (otx, _) = mpsc::unbounded_channel();
+        let a = Agent::new(nest_protocol::model::AgentId("agt_w".into()), nest_protocol::model::Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fwd = tokio::spawn(forward_tool_changes(a.watch_tools(), tx));
+        for _ in 0..2 {
+            a.tools_changed();
+            let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.ok().flatten();
+            assert!(matches!(got, Some(McpBridgeResponse::ToolsChanged {})), "{got:?}");
+        }
+        drop(rx);
+        a.tools_changed();
+        tokio::time::timeout(std::time::Duration::from_secs(2), fwd).await.expect("the forwarder ends when its connection does").unwrap();
     }
 
     #[test]

@@ -60,6 +60,13 @@ function tool(name: string, title: string, description: string, inputSchema: Sch
   return { name, title, description, inputSchema, annotations: { title, ...hints } };
 }
 
+/** An added tool's name (`POST /tools?name=`): `extra_` and lowercase letters, digits or `_`. */
+export const EXTRA_TOOL = /^extra_[a-z0-9_]{1,32}$/;
+
+/** A tool added at run time (the list changing): read-only, echoes its text. */
+export const extraTool = (name: string): Tool =>
+  tool(name, name, "An added tool: returns the text it is given, prefixed with its name.", schema({ text: str("Text to return", MAX_TEXT) }), readOnly);
+
 export const TOOLS: Tool[] = [
   tool("echo", "Echo", "Returns the text it is given.", schema({ text: str("Text to return", MAX_TEXT) }), readOnly),
   tool(
@@ -82,7 +89,8 @@ export const TOOLS: Tool[] = [
 ];
 
 const byName = new Map(TOOLS.map((t) => [t.name, t]));
-export const findTool = (name: string): Tool | undefined => byName.get(name);
+export const findTool = (name: string, extra: readonly string[] = []): Tool | undefined =>
+  byName.get(name) ?? (extra.includes(name) ? extraTool(name) : undefined);
 
 /** Checks arguments against a tool's schema (the subset of JSON Schema these schemas use). */
 export function checkArguments(s: Schema, args: Record<string, unknown>): string | null {
@@ -112,6 +120,7 @@ const text = (t: string, isError = false): ToolResult => ({ content: [{ type: "t
 export async function runTool(t: Tool, args: Record<string, unknown>, store: Store, sleep: (ms: number) => Promise<void>): Promise<ToolResult> {
   const bad = checkArguments(t.inputSchema, args);
   if (bad !== null) return text(`invalid arguments: ${bad}`, true);
+  if (EXTRA_TOOL.test(t.name)) return text(`${t.name}: ${args.text as string}`);
   switch (t.name) {
     case "echo":
       return text(args.text as string);

@@ -17,14 +17,18 @@ import {
   type RpcError,
   success,
 } from "./jsonrpc";
-import { findTool, runTool, type Store, TOOLS, type ToolResult } from "./tools";
+import { EXTRA_TOOL, findTool, runTool, type Store, TOOLS, type ToolResult } from "./tools";
 import { OAuthTables, publicOAuthRoute, testOAuthRoute } from "./oauth";
 
-/** What the Worker turns into an HTTP response: a status, an optional JSON body, a new session id. */
+/**
+ * What the Worker turns into an HTTP response: a status, an optional JSON body, a new session id, and
+ * notifications to send first (then the response is an SSE stream: transports, "sending messages").
+ */
 export interface Reply {
   status: number;
   body?: unknown;
   session?: string;
+  notices?: unknown[];
 }
 
 /** One logged tools/call; result_or_error is null while the call is still running. */
@@ -61,7 +65,11 @@ export class McpState extends DurableObject<Env> implements Store {
       CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, total INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS calls (seq INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, session TEXT NOT NULL, tool TEXT, arguments TEXT, meta TEXT, outcome TEXT);
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS extra_tools (name TEXT PRIMARY KEY);
     `);
+    // A session owes `notifications/tools/list_changed` once the list changed after it last got one.
+    const cols = this.sql.exec<{ name: string }>("PRAGMA table_info(sessions)").toArray().map((c) => c.name);
+    if (!cols.includes("list_owed")) this.sql.exec("ALTER TABLE sessions ADD COLUMN list_owed INTEGER NOT NULL DEFAULT 0");
     this.oauth = new OAuthTables(this.sql);
   }
 
@@ -85,6 +93,28 @@ export class McpState extends DurableObject<Env> implements Store {
 
   oauthAccessValid(token: string, resource: string): boolean {
     return this.oauth.oauthAccessValid(token, resource);
+  }
+
+  // --- The tool list changing ----------------------------------------------------------------------
+
+  private extras(): string[] {
+    return this.sql.exec<{ name: string }>("SELECT name FROM extra_tools ORDER BY name").toArray().map((r) => r.name);
+  }
+
+  /** Adds (`add`) or removes a tool; a change owes every session `notifications/tools/list_changed`. */
+  setTool(name: string, add: boolean): { changed: boolean; tools: string[] } {
+    if (!EXTRA_TOOL.test(name)) throw new Error(`a tool name here matches ${EXTRA_TOOL}`);
+    const changed = (add
+      ? this.sql.exec("INSERT INTO extra_tools (name) VALUES (?) ON CONFLICT DO NOTHING", name)
+      : this.sql.exec("DELETE FROM extra_tools WHERE name = ?", name)).rowsWritten > 0;
+    if (changed) this.sql.exec("UPDATE sessions SET list_owed = 1");
+    return { changed, tools: [...TOOLS.map((t) => t.name), ...this.extras()] };
+  }
+
+  /** The notification a session is owed, taken (it goes on this request's SSE stream). */
+  private takeNotices(session: string): unknown[] {
+    const owed = this.sql.exec("UPDATE sessions SET list_owed = 0 WHERE id = ? AND list_owed = 1", session).rowsWritten > 0;
+    return owed ? [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] : [];
   }
 
   // --- Store -------------------------------------------------------------------------------------
@@ -126,6 +156,12 @@ export class McpState extends DurableObject<Env> implements Store {
     }
     if (msg.kind === "response") return { status: 202 }; // this server sends no requests, so nothing awaits one
 
+    const reply = await this.request(msg, sessionId);
+    const notices = this.takeNotices(sessionId);
+    return notices.length ? { ...reply, notices } : reply;
+  }
+
+  private async request(msg: Extract<Message, { kind: "request" }>, sessionId: string): Promise<Reply> {
     const { id, method, params } = msg;
     switch (method) {
       case "ping":
@@ -133,7 +169,7 @@ export class McpState extends DurableObject<Env> implements Store {
       case "tools/list":
         // One page: any cursor is one this server never issued.
         if (params?.cursor !== undefined) return { status: 200, body: failure(id, { code: INVALID_PARAMS, message: "invalid cursor" }) };
-        return { status: 200, body: success(id, { tools: TOOLS }) };
+        return { status: 200, body: success(id, { tools: [...TOOLS, ...this.extras().map((n) => findTool(n, [n])!)] }) };
       case "tools/call":
         return this.callTool(id, params, sessionId);
       default:
@@ -172,7 +208,7 @@ export class McpState extends DurableObject<Env> implements Store {
     return {
       status: 200,
       session,
-      body: success(id, { protocolVersion: version, capabilities: { tools: { listChanged: false } }, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS }),
+      body: success(id, { protocolVersion: version, capabilities: { tools: { listChanged: true } }, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS }),
     };
   }
 
@@ -193,7 +229,7 @@ export class McpState extends DurableObject<Env> implements Store {
     );
 
     let outcome: { result: ToolResult } | { error: RpcError };
-    const tool = typeof name === "string" ? findTool(name) : undefined;
+    const tool = typeof name === "string" ? findTool(name, this.extras()) : undefined;
     if (typeof name !== "string" || (args !== undefined && !isObject(args)) || (meta !== undefined && !isObject(meta))) {
       outcome = { error: { code: INVALID_PARAMS, message: "tools/call needs name (a string), and arguments and _meta as objects if present" } };
     } else if (tool === undefined) {
@@ -237,8 +273,9 @@ export class McpState extends DurableObject<Env> implements Store {
       }));
   }
 
-  /** Clears notes, counters and the call log. Sessions and the sequence survive. */
+  /** Clears notes, counters, the call log and added tools (owing list_changed if there were any). Sessions and the sequence survive. */
   reset(): void {
     this.sql.exec("DELETE FROM notes; DELETE FROM counters; DELETE FROM calls;");
+    if (this.sql.exec("DELETE FROM extra_tools").rowsWritten > 0) this.sql.exec("UPDATE sessions SET list_owed = 1");
   }
 }

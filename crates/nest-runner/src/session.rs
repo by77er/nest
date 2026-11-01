@@ -184,6 +184,7 @@ impl Session {
             session: self.session.clone(),
             local_bytes: self.tailer.local_bytes(),
             last_seq: (st.last_in > 0).then_some(Seq(st.last_in)),
+            tools_changed: true,
         });
         tx.send(text(&hello)?).await?;
         let ack = loop {
@@ -309,6 +310,7 @@ impl Session {
             AgentToRunner::CacheUpdate { cache, .. } => a.set_cache(cache),
             AgentToRunner::ToolResult { call, outcome, .. } => a.resolve_call(&call, outcome),
             AgentToRunner::ToolsList { request, tools } => a.resolve_tools(&request, tools),
+            AgentToRunner::ToolsChanged {} => a.tools_changed(),
             // Only `outcome`: every AgentDO since #30 sends it (the other fields are the previous
             // release's shape).
             AgentToRunner::HandsResolved { request, outcome, .. } => {
@@ -584,5 +586,39 @@ mod resolve_tests {
             other => panic!("{other:?}"),
         }
         assert!(server.await.unwrap(), "AgentDO received the queued hands_resolve");
+    }
+    /// The hello says the runner acts on `tools_changed`, and AgentDO's `tools_changed` reaches
+    /// the agent's watchers (each `nest mcp` connection), so Claude Code is told to list again.
+    #[tokio::test]
+    async fn tools_changed_from_agentdo_reaches_the_mcp_bridge_watchers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/agents/agt_tc/session", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let (mut wtx, mut wrx) = ws.split();
+            while let Some(Ok(m)) = wrx.next().await {
+                let Message::Text(t) = m else { continue };
+                if let RunnerToAgent::Hello(h) = serde_json::from_str::<RunnerToAgent>(&t).unwrap() {
+                    for m in [AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None }, AgentToRunner::ToolsChanged {}] {
+                        wtx.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await.unwrap();
+                    }
+                    // Keep the connection open until the runner side has seen it.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    return h.tools_changed;
+                }
+            }
+            false
+        });
+        let rt = Runtime::new(Config { batch_interval: Duration::from_millis(50), tail_interval: Duration::from_millis(50), ..Config::default() });
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, orx) = mpsc::unbounded_channel();
+        let agent = Agent::new(AgentId("agt_tc".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
+        let mut watch = agent.watch_tools();
+        let transcript = std::env::temp_dir().join(format!("nest-session-test-{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
+        rt.host_token.send_replace(Some(Secret("tok".into())));
+        tokio::time::timeout(Duration::from_secs(5), watch.changed()).await.expect("tools_changed reached the watcher").unwrap();
+        assert!(server.await.unwrap(), "the hello advertised tools_changed");
     }
 }

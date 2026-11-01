@@ -750,6 +750,10 @@ pub struct RunnerHello {
     /// Highest reliable `AgentToRunner` seq processed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seq: Option<Seq>,
+    /// This runner acts on [`AgentToRunner::ToolsChanged`] (Claude Code lists its tools again).
+    /// Absent (false) from runners of the previous release, which are never sent it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tools_changed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -789,6 +793,10 @@ pub enum AgentToRunner {
     CacheUpdate { seq: Seq, cache: AgentCache },
     ToolResult { seq: Seq, call: CallId, outcome: ToolOutcome },
     ToolsList { request: RequestId, tools: Vec<ToolDef> },
+    /// The agent's tool list changed (a remote MCP server's did): `nest mcp` tells Claude Code
+    /// `notifications/tools/list_changed`, and it lists again. Sent only to a runner whose hello
+    /// has `tools_changed`.
+    ToolsChanged {},
     /// Answer to `hands_resolve`: `outcome` is a fresh target or the reason there is none.
     ///
     /// `hands`, `error` and `retry_after_ms` are the previous release's shape of the same answer
@@ -1069,6 +1077,7 @@ mod tests {
             AgentToRunner::CacheUpdate { .. } => "cache_update",
             AgentToRunner::ToolResult { .. } => "tool_result",
             AgentToRunner::ToolsList { .. } => "tools_list",
+            AgentToRunner::ToolsChanged {} => "tools_changed",
             AgentToRunner::HandsResolved { .. } => "hands_resolved",
             AgentToRunner::Ack { .. } => "ack",
             AgentToRunner::Error { .. } => "error",
@@ -1076,7 +1085,7 @@ mod tests {
     }
     const AGENT_TO_RUNNER: &[&str] = &[
         "hello_ack", "segment_ack", "run_turn", "inbox", "interrupt", "cache_update", "tool_result",
-        "tools_list", "hands_resolved", "ack", "error",
+        "tools_list", "tools_changed", "hands_resolved", "ack", "error",
     ];
 
     fn agent_event(e: &crate::model::AgentEvent) -> &'static str {
