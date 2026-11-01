@@ -42,6 +42,8 @@ class StubMcp {
   readonly extra = new Set<string>();
   /** The next tools/call answers as an SSE stream carrying `notifications/tools/list_changed` first. */
   noticeNext = false;
+  /** This many next tools/list requests answer HTTP 503. */
+  listFails = 0;
   private n = 0;
   /** Per tool: the next calls' behaviour, consumed in order. */
   readonly next: Record<string, Behaviour[]> = {};
@@ -78,6 +80,10 @@ class StubMcp {
     if (!this.sessions.has(sid)) return json(404, { error: "unknown session" });
     if (msg.method === "notifications/initialized") return new Response(null, { status: 202 });
     if (msg.method === "tools/list") {
+      if (this.listFails > 0) {
+        this.listFails--;
+        return json(503, { error: "scripted" });
+      }
       const tools = [...Object.entries(ANN), ...[...this.extra].map((n) => [n, { readOnlyHint: true }] as const)].map(([name, annotations]) => ({
         name, description: `the ${name} tool`, annotations,
         inputSchema: { type: "object", properties: { text: { type: "string" } }, additionalProperties: true },
@@ -575,6 +581,16 @@ describe("a server's changed tool list reaches live brains", () => {
     const ws2 = await runner(s.agent, s.host.host, s.host.host_token, 1, "rin_one", true);
     await ws2.next("tools_changed", () => true, 3000);
     expect((await listTools(ws2)).map((t) => t.name)).not.toContain(s.t("relisted"));
+  });
+
+  it("a reported change whose re-list fails stays reported: the next list fetches it", async () => {
+    const s = await setup({ trusted: true, tools: null });
+    await listTools(s.ws);
+    s.stub.extra.add("late");
+    await runInDurableObject(s.connector(), (_: McpConnectorDO, st) => st.storage.sql.exec("UPDATE kv SET value = 'true' WHERE key = 'stale'"));
+    s.stub.listFails = 1;
+    expect((await listTools(s.ws)).map((t) => t.name)).not.toContain(s.t("late")); // the cached list, served
+    expect((await listTools(s.ws)).map((t) => t.name)).toContain(s.t("late"));
   });
 
   it("an agent answers a notice for a server it doesn't have, or with no brain, with 'drop me'", async () => {

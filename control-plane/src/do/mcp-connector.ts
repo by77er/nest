@@ -131,8 +131,19 @@ export class McpConnectorDO extends DurableObject<Env> {
     if (!u.ok) throw new Error(u.error);
     const token = await mcpToken(this.env, g);
     if (!token) throw new Error(`no credential stored as ${g.auth}`);
-    // Cleared before the fetch: a change reported while it runs marks the list stale again.
+    // Cleared before the fetch: a change reported while it runs marks the list stale again; a failed
+    // fetch leaves it stale as it was.
+    const wasStale = this.kv<boolean>("stale") ?? false;
     this.kvPut("stale", false);
+    try {
+      return await this.fetchPages(g, token, deadline);
+    } catch (e) {
+      if (wasStale) this.kvPut("stale", true);
+      throw e;
+    }
+  }
+
+  private async fetchPages(g: McpGrant, token: string, deadline: number): Promise<ConnectorList> {
     for (let reinit = 0; ; reinit++) {
       let s = this.kv<{ session: string | null; version: string }>("session");
       if (!s) {
