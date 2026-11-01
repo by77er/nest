@@ -278,6 +278,8 @@ export function checkCapability(cap: Capability, registry: readonly string[], mc
     if (new Set(tools).size !== tools.length) return err("mcp.tools lists a tool twice");
     const idem = cap.mcp.idempotent;
     if (Array.isArray(idem) && new Set(idem).size !== idem.length) return err("mcp.idempotent lists a tool twice");
+    const auth = cap.mcp.auth;
+    if (typeof auth !== "string" && auth.client === auth.oauth) return err("mcp.auth: the client secret and the token record must be different names");
   }
   return ok(cap);
 }

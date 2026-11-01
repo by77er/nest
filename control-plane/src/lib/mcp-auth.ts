@@ -39,8 +39,6 @@ export const OAUTH_HTTP_TIMEOUT_MS = 10_000;
 export const OAUTH_FLOW_TTL_MS = 10 * 60_000;
 /** An access token this close to its expiry is refreshed before use. */
 export const OAUTH_REFRESH_SKEW_MS = 60_000;
-/** A token issued this recently that the server refuses is not refreshed again (no refresh loop). */
-export const OAUTH_MIN_REFRESH_INTERVAL_MS = 30_000;
 /** Metadata and token answers are read up to this many bytes. */
 const MAX_OAUTH_BYTES = 64 * 1024;
 
@@ -665,8 +663,8 @@ export class OAuthStore {
    * The access token to send to `serverUrl` for the record `ref`: the stored one while it has more than
    * a minute left, else refreshed (one refresh at a time per record; concurrent callers share it). With
    * `refused` (the token the server just answered 401 to): a replacement, refreshing unless one is already
-   * stored, or null when that token was issued under 30 s ago (the server refuses fresh tokens: no loop).
-   * Throws a platform error naming what the operator must do when there is no usable authorization.
+   * stored. The proxy asks with `refused` once per request, so a server that refuses every token costs one
+   * refresh per call, never a loop. Throws a platform error naming what the operator must do when there is no usable authorization.
    */
   async token(ref: string, serverUrl: string, refused: string | undefined, caller: string): Promise<string | null> {
     const row = this.grant(ref);
@@ -682,7 +680,6 @@ export class OAuthStore {
     const now = Date.now();
     const fresh = row.access_token !== null && (row.access_expires_ms === null || row.access_expires_ms - now > OAUTH_REFRESH_SKEW_MS);
     if (fresh && row.access_token !== refused) return row.access_token;
-    if (refused !== undefined && row.access_token === refused && now - (row.access_issued_ms ?? 0) < OAUTH_MIN_REFRESH_INTERVAL_MS) return null;
     let p = this.refreshing.get(ref);
     if (!p) {
       p = this.refresh(ref, caller).finally(() => this.refreshing.delete(ref));

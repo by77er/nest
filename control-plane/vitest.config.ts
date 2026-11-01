@@ -14,6 +14,8 @@ export default defineConfig({
           // The MCP proxy's timeouts, short so lost answers are quick to provoke (test/mcp.test.ts).
           MCP_CALL_TIMEOUT_MS: "1500",
           MCP_LIST_TIMEOUT_MS: "1500",
+          // https, so nest offers its client ID metadata document (test/mcp-oauth.test.ts).
+          PUBLIC_BASE_URL: "https://nest.test",
         },
       },
     }),
