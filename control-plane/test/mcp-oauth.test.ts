@@ -7,6 +7,8 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { BrokerDO } from "../src/do/broker";
+import type { McpConnectorDO } from "../src/do/mcp-connector";
+import { connectorName } from "../src/lib/mcp";
 import { authServerMetadataUrls, bearerChallenge, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
 import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
@@ -498,6 +500,25 @@ describe("refresh", () => {
     expect(f.counter).toBe(3);
     // A 401 at initialize (the session is renewed with the token) is renewed the same way.
     expect(f.rsLog.filter((r) => r.status === 401 && r.token !== null).map((r) => r.method)).toEqual(["tools/call"]);
+  });
+
+  it("the connector's listing, refused a revoked token, refreshes once and lists again", async () => {
+    const { f, cap, ref } = await capability({ rotate: true });
+    await authorize(cap);
+    const a = await agentWith(cap);
+    const list = async () => {
+      a.ws.send({ type: "tools_list_request", request: `req_${rand()}` });
+      return ((await a.ws.next("tools_list", () => true, 8000)).tools as { name: string }[]).map((t) => t.name);
+    };
+    expect(await list()).toContain(`${cap}_echo`);
+    f.revokeAccess();
+    // Stale, so the next list goes to the server over the connector's session (the access token now refused).
+    const connector = env.MCP_CONNECTOR.get(env.MCP_CONNECTOR.idFromName(connectorName({ url: f.server, auth: ref })));
+    await runInDurableObject(connector, (_: McpConnectorDO, st) => st.storage.sql.exec("UPDATE kv SET value = '0' WHERE key = 'listed_ms'"));
+    const before = f.rsLog.filter((r) => r.method === "tools/list" && r.status === 200).length;
+    expect(await list()).toContain(`${cap}_echo`);
+    expect(f.refreshes).toBe(1);
+    expect(f.rsLog.filter((r) => r.method === "tools/list" && r.status === 200).length).toBe(before + 1);
   });
 
   it("coalesces concurrent refreshes into one request, so a rotating refresh token is spent once", async () => {

@@ -14,7 +14,7 @@ import type { Env } from "../env";
 import { num } from "../env";
 import { healthRead, isHealthInstance } from "../lib/health";
 import {
-  checkMcpUrl, listAll, type ListedTool, MCP_DEFAULT_MAX_CONCURRENT, MCP_DEFAULT_PER_MINUTE, type McpGrant, openSession, toolsDigest,
+  checkMcpUrl, listAll, type ListedTool, type RpcAnswer, MCP_DEFAULT_MAX_CONCURRENT, MCP_DEFAULT_PER_MINUTE, type McpGrant, openSession, toolsDigest,
 } from "../lib/mcp";
 import { type Admission, type ConnectorList, MCP_LIST_TTL_MS, mcpToken, setupError } from "../lib/mcp-proxy";
 import { Deadlines, withTimeout } from "../lib/reliable";
@@ -136,18 +136,32 @@ export class McpConnectorDO extends DurableObject<Env> {
     const wasStale = this.kv<boolean>("stale") ?? false;
     this.kvPut("stale", false);
     try {
-      return await this.fetchPages(g, token, deadline);
+      return await this.fetchPages(g, { value: token, renewed: false }, deadline);
     } catch (e) {
       if (wasStale) this.kvPut("stale", true);
       throw e;
     }
   }
 
-  private async fetchPages(g: McpGrant, token: string, deadline: number): Promise<ConnectorList> {
-    for (let reinit = 0; ; reinit++) {
+  /**
+   * A 401 (to `initialize` or `tools/list`) means nothing was processed: the bearer is renewed once
+   * (`mcpToken` with the refused one: an OAuth refresh) and the list asked again.
+   */
+  private async fetchPages(g: McpGrant, bearer: { value: string; renewed: boolean }, deadline: number): Promise<ConnectorList> {
+    const renew = async (a: RpcAnswer): Promise<boolean> => {
+      if (a.kind !== "refused" || a.status !== 401 || bearer.renewed) return false;
+      bearer.renewed = true;
+      const t = await mcpToken(this.env, g, bearer.value);
+      if (!t) return false;
+      bearer.value = t;
+      return true;
+    };
+    for (let reinit = 0; ;) {
+      const token = bearer.value;
       let s = this.kv<{ session: string | null; version: string }>("session");
       if (!s) {
         const o = await openSession(g.url, token, Math.max(1, deadline - Date.now()), "nest-connector");
+        if (o.kind === "failed" && (await renew(o.answer))) continue;
         if (o.kind === "failed") throw setupError(g, "initialize", o.answer);
         if (o.kind === "unsupported") throw new Error(`the server speaks ${String(o.version)}`);
         s = { session: o.session, version: o.version };
@@ -157,9 +171,10 @@ export class McpConnectorDO extends DurableObject<Env> {
       if (r.kind === "session_gone") {
         // Only the session that failed: one opened meanwhile stays.
         if (this.kv<{ session: string | null }>("session")?.session === s.session) this.sql.exec("DELETE FROM kv WHERE key = 'session'");
-        if (reinit >= 1) throw new Error("the server ended two sessions in a row");
+        if (reinit++ >= 1) throw new Error("the server ended two sessions in a row");
         continue;
       }
+      if (r.kind === "failed" && (await renew(r.answer))) continue;
       if (r.kind === "failed") throw setupError(g, "tools/list", r.answer);
       const digest = await toolsDigest(r.tools);
       const now = Date.now();
