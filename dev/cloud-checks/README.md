@@ -135,3 +135,39 @@ python3 -I dev/cloud-checks/brokered_check.py
 **Leftovers after an interrupted run:** search the repo's issues and pull requests for `nest brokered check <run>`, close them, delete `nest-check/brokered-<run>`, and stop the agent from the last line.
 
 **Checked offline (2026-10-31):** the JWT the script signs with `openssl` verifies with the key's public half and has GitHub's claims; the fake credential matches nest's GitHub-token pattern; the journal and approval checks pass a well-formed run and fail on a missing refusal, the fake value in a row, an untainted issue call, an approval asked after the issue went out, and an extra approval; with nothing set it exits naming the missing settings. It has not been run against GitHub or the cloud.
+
+## `push_check.py`
+
+[Push allowlists](../../docs/sandbox/networking/egress/) end to end on the current guest image: a real Claude Code worker on a fresh sandbox allowed to push only to `REPO` pushes a throwaway branch there, and nest-proxy refuses push requests to any other repo. The probes to other repos carry no data and no real credential.
+
+```bash
+# NEST_ADMIN_TOKEN as above; the App's id and PEM key as for brokered_check.py (never echo them)
+REPO=by77er/nest OTHER_REPO=by77er/<another repo the App is installed on> python3 -I dev/cloud-checks/push_check.py
+```
+
+| | |
+|---|---|
+| **Creates** | the template `push-check` (`nest`, `hands`; Haiku); one workstream, one sandbox and one agent with `overrides.repos: [REPO]`, given one turn that writes and runs a script: clone `REPO`, commit `dev/cloud-checks/.scratch/<run>.md` on `nest-check/push-<run>`, `git push`, then three `curl` probes (push discovery for `OTHER_REPO` and for a repo that doesn't exist, and a `git-receive-pack` POST to `OTHER_REPO` with a dummy Basic credential), and `gh api repos/<REPO>` |
+| **Passes when** | `gh` and `git-credential-nest` are in the image and `GITHUB_TOKEN` is the placeholder; the push exits 0 and GitHub has the branch; all three probes answer 403 from the proxy; `OTHER_REPO` has no such branch; `gh api` answers through the placeholder |
+| **Cleans up** | deletes the branch (with an installation token it mints itself), ends the agent and destroys the sandbox, on every exit path |
+| **Costs** | a few minutes of a spot sandbox host and brain host from a cold cell, one short Haiku turn |
+
+**Run (2026-11-01, `use1`, guest build `20261101092412`):** 9/9 passed.
+
+## `lifecycle_check.py`
+
+[Agent and sandbox lifetimes](../../docs/agents/#lifetimes) end to end: a real Claude Code parent spawns children with `agent_spawn`, and their sandboxes go when they end.
+
+```bash
+python3 -I dev/cloud-checks/lifecycle_check.py
+```
+
+| | |
+|---|---|
+| **Creates** | the capability `lcspawn` (`agent_spawn`, `agent_stop`; spawns `lc-child`), the templates `lc-child` (`nest`, `hands`; Haiku) and `lc-parent` (`nest`, `lcspawn`; no hands); one workstream and the parent; through the parent, an ephemeral child on a new sandbox that runs `echo lifetimes-check-ok`, then a second, non-ephemeral child on a new sandbox |
+| **Passes when** | the first child is the parent's, ends itself (`done`, by itself) once its turn finishes, its events show its output and `exited`, its sandbox is `destroyed` and the GC registry's live count returns to where it was, the parent's `children` index has it ended, and a turn to it is refused (404); the parent's `agent_stop` ends the second child (by the parent), destroys its sandbox and leaves it no brain; the operator's `stop {end: true}` ends the parent and its brain goes |
+| **Cleans up** | on every exit path: ends the parent (which ends its children) and destroys any sandbox of the run not yet destroyed |
+| **Leaves** | the capability and templates (kept for reruns), the workstream, and the ended agents' records, which prune themselves 30 days after they end |
+| **Costs** | a few minutes of a spot sandbox host and brain host from a cold cell, and four short Haiku turns |
+
+**Run (2026-11-01, `use1`, after #82's deploy):** 20/20 passed in under three minutes; live sandboxes 0 before and after.
