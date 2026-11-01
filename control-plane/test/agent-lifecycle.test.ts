@@ -566,9 +566,18 @@ describe("a dormant sandbox's idle TTL", () => {
     expect(await userNotices(s.sandbox)).toBeNull();
   });
 
-  it("the cell default (30 days): a notice on `user` a day before, then destroyed no sooner than a day after it", async () => {
+  it("the cell default (a day): no notice, destroyed a day after it became dormant", async () => {
     const s = await suspended();
     expect((await sandboxStub(s.sandbox).info()).idle_ttl_ms).toBeUndefined();
+    await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - DAY + 60_000; });
+    expect((await sandboxStub(s.sandbox).info()).state).toBe("suspended");
+    await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - DAY - 1; });
+    expect((await sandboxStub(s.sandbox).info()).state).toBe("destroyed");
+    expect(await userNotices(s.sandbox)).toBeNull();
+  });
+
+  it("a TTL over a day (30 days): a notice on `user` a day before, then destroyed no sooner than a day after it", async () => {
+    const s = await suspended(30 * DAY);
     await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - 29 * DAY + 60_000; });
     expect(await userNotices(s.sandbox)).toBeNull();
     await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - 29 * DAY - 60_000; });

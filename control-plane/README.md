@@ -54,7 +54,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
    - `POST /v1/sandboxes {workstream, cell, policy?, idle_ttl_ms?}`: placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`. `idle_ttl_ms`: destroyed once dormant this long
-     (no agent attached, no VM up; default the cell's, 30 days); `PUT /v1/sandboxes/<id>/lifetime {idle_ttl_ms | null}` changes it ([lifetime](../docs/control-plane/durable-objects/sandbox/#lifetime))
+     (no agent attached, no VM up; default the cell's, 1 day); `PUT /v1/sandboxes/<id>/lifetime {idle_ttl_ms | null}` changes it ([lifetime](../docs/control-plane/durable-objects/sandbox/#lifetime))
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
      (409 if it's placed)

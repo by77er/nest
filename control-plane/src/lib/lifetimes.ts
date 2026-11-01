@@ -49,8 +49,11 @@ export const MAX_LIVE_CHILDREN = 8;
 export const MAX_OWNER_HOPS = MAX_SPAWN_DEPTH + 1;
 /** The shortest idle TTL a sandbox may be given. */
 export const MIN_IDLE_TTL_MS = 60_000;
-/** The cell default idle TTL of a sandbox (`SANDBOX_IDLE_TTL_MS`, or the cell's `sandbox_idle_ttl_ms`). */
-export const DEFAULT_SANDBOX_IDLE_TTL_MS = 30 * 86_400_000;
+/**
+ * The cell default idle TTL of a sandbox (`SANDBOX_IDLE_TTL_MS`, or the cell's `sandbox_idle_ttl_ms`): a day, so the
+ * sandboxes of many short-lived agents don't pile up; one to keep gets its own TTL.
+ */
+export const DEFAULT_SANDBOX_IDLE_TTL_MS = 86_400_000;
 /** A sandbox destroyed by an idle TTL longer than this gets a notice on `user` this long first. */
 export const EXPIRY_NOTICE_MS = 86_400_000;
 /** How often a live sandbox re-checks whether it is dormant, at most. */

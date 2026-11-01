@@ -49,7 +49,7 @@ export interface Env {
   CELLS?: string;
   /** A placed, running sandbox with no agent working is suspended after this long (default 11 min). */
   SANDBOX_SUSPEND_IDLE_MS?: string;
-  /** A sandbox without its own idle TTL is destroyed after it was dormant this long (default 30 days; a cell's `sandbox_idle_ttl_ms` wins). */
+  /** A sandbox without its own idle TTL is destroyed after it was dormant this long (default 1 day; a cell's `sandbox_idle_ttl_ms` wins). */
   SANDBOX_IDLE_TTL_MS?: string;
   /** Batching window of the workstream channel's subscriber wakes. */
   WAKE_BATCH_MS?: string;
