@@ -162,6 +162,33 @@ export const EgressLimits = z.object({
 });
 export type EgressLimits = z.output<typeof EgressLimits>;
 
+/** A query parameter (decoded name) whose decoded value is one of `values` (any value when absent). */
+export const QueryMatch = z.object({ name: z.string(), values: z.array(z.string()).optional() });
+/** The JSON body's string at `pointer` (RFC 6901) is one of `values`. */
+export const JsonFieldMatch = z.object({ pointer: z.string(), values: z.array(z.string()) });
+/** One request matcher: every field given must match (docs/sandbox/networking/egress/policy/#request-guards). */
+export const RequestMatch = z.object({
+  methods: z.array(z.string()).optional(),
+  methods_except: z.array(z.string()).optional(),
+  /** `/`-separated segments: a literal, `*` (one segment) or `**` (any number). */
+  path: z.string().optional(),
+  query: z.array(QueryMatch).optional(),
+  body_json: JsonFieldMatch.optional(),
+  /** The proxy substituted this binding's credential into the request. */
+  injected: z.string().optional(),
+});
+export type RequestMatch = z.output<typeof RequestMatch>;
+/** On its hosts, a request a `scope` matcher covers is refused unless an `allow` matcher covers it too. */
+export const RequestGuard = z.object({
+  name: z.string(),
+  hosts: z.array(HostPattern),
+  scope: z.array(RequestMatch),
+  allow: z.array(RequestMatch).optional(),
+  reason: z.string().optional(),
+  ignore_case: z.boolean().optional(),
+});
+export type RequestGuard = z.output<typeof RequestGuard>;
+
 export const EgressPolicy = z.object({
   version: U64,
   allow: z.array(AllowRule),
@@ -169,6 +196,8 @@ export const EgressPolicy = z.object({
   inject: z.array(InjectionBinding).default([]),
   tcp: z.array(TcpException).default([]),
   limits: EgressLimits,
+  /** Absent when there are none (an old proxy ignores the field). */
+  guards: z.array(RequestGuard).optional(),
 });
 export type EgressPolicy = z.output<typeof EgressPolicy>;
 
