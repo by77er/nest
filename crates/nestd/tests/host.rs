@@ -496,6 +496,7 @@ fn policy() -> EgressPolicy {
         inject: vec![],
         tcp: vec![],
         limits: EgressLimits { max_connections: 16, bandwidth_mbps: 10, max_inspected_body_bytes: 1 << 20 },
+        guards: vec![],
     }
 }
 

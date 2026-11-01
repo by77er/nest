@@ -296,7 +296,7 @@ mod tests {
 
     fn test_policy() -> nest_protocol::model::EgressPolicy {
         use nest_protocol::model::EgressLimits;
-        nest_protocol::model::EgressPolicy { version: 1, allow: vec![], passthrough: vec![], inject: vec![], tcp: vec![], limits: EgressLimits { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 } }
+        nest_protocol::model::EgressPolicy { version: 1, allow: vec![], passthrough: vec![], inject: vec![], tcp: vec![], guards: vec![], limits: EgressLimits { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 } }
     }
 
     fn entry(epoch: u64, clients: &[&str], guest: Option<GuestInfo>) -> Entry {

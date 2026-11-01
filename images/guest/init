@@ -25,6 +25,13 @@ ip link set eth0 up
 ip route add default via 172.16.0.1
 
 mkdir -p /workspace && chown 1000:1000 /workspace
+# The image's environment (GITHUB_TOKEN's placeholder, NODE_EXTRA_CA_CERTS) reaches every command through
+# nest-guest's own environment: it isn't a login, so nothing else reads /etc/environment.
+if [ -r /etc/environment ]; then
+  set -a
+  . /etc/environment
+  set +a
+fi
 log "up; starting nest-guest"
 while true; do
   /usr/local/bin/nest-guest

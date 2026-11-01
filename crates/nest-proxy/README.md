@@ -21,6 +21,7 @@ NEST_LOG=debug   # tracing filter
 | `tls` | Leaf certificates minted on the fly from the installed intermediate (ECDSA P-256, cached); upstream verification against webpki roots plus extra roots |
 | `sni` | Minimal ClientHello parser (SNI + ALPN, fragmented records) |
 | `inject` | Placeholder substitution (bearer / basic password / named header). Blocks on wrong host, expired or fenced secret, or plaintext. |
+| `guard` | Request guards: generic host / method / path / query / JSON-field / injected-binding rules, evaluated after injection; knows no service ([request guards](../../docs/sandbox/networking/egress/policy/#request-guards)) |
 | `audit` | Per-request and per-connection records, batched ≤1 s / 128, split to fit one packet; string caps for every event |
 | `state` | Per-session and per-sandbox state: policy, secrets, listeners, connection limit, DNS record, drop tombstones, deny/alert aggregation, bounded upstream resolution |
 
@@ -67,6 +68,7 @@ CARGO_TARGET_DIR=target/nest-proxy cargo test -p nest-proxy
     - stale policy pushes ignored
     - WebSocket through inspection
     - h2 multiplexing
+- **Request guards:** the evaluator with made-up rules (`guard.rs` unit tests; `tests/guards.rs` through the real proxy: refusal before the upstream, a judged body replayed whole, the injected-credential exception, guarded hosts never spliced or TCP exceptions), and the seam with the control plane's GitHub constructor (`tests/github_rules.rs` evaluates its output, the fixture `egress_policy.github.json`, against GitHub's request shapes).
 - **Security regression tests (`tests/review_regressions.rs`):** absolute-form/Host fronting with injection, duplicate Host, upstream Host rewrite, explicit-proxy fronting, plaintext CONNECT tunnels (incl. passthrough hosts), denied CONNECT answered in-tunnel, a 70 KB Host not breaking the nestd link, pushes after `sandbox_drop`, DNS-flood aggregation, TRACE with a credential, `te: trailers` over h2.
 
 ## Gaps

@@ -8,9 +8,11 @@ base:        # image defaults
           index.crates.io, github.com, "*.githubusercontent.com", deb.debian.org]
 sandbox:     # set by whoever holds egress_policy on the sandbox (its owner, or me); forks inherit it
   allow: [api.stripe.com]
-  inject: [github]   # needs a grant on the binding
+  inject: [stripe]   # needs a grant on the binding
   passthrough: []
   tcp: []      # e.g. ["db.example.com:5432"]
+  repos: [by77er/nest]   # the push allowlist: the GitHub constructor turns it into guards, a binding, a token
+  guards: []   # request guards written by hand, layered with the constructed ones
 grants:
   allow: [{host: example.com, expires: 2h}]   # temporary
 limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
@@ -52,6 +54,57 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 **Policy is per sandbox:** forks inherit it, and an owner updates each of its sandboxes itself. There are no shared policy objects: the blast radius of an edit is one sandbox, and a loop over sandboxes is the agent's job.
 
+## Request guards
+
+**Built.** A request guard is a generic rule nest-proxy evaluates on every inspected or plaintext request, after credential injection and before anything goes upstream (`crates/nest-proxy/src/guard.rs`; the wire type is `RequestGuard` in [models](../../../../interfaces/control-host/models/)):
+
+```yaml
+- name: store-write          # 403 {"error": "request_denied", "guard": name, "reason"}; audited as `guard: <name>`
+  hosts: [files.example.com]
+  scope: [{methods_except: [GET, HEAD]}]        # what it covers: any matcher
+  allow:                                        # exceptions inside the scope: any matcher
+    - {path: /store/mine/**}
+    - {methods: [POST], path: /batch, body_json: {pointer: /op, values: [read]}}
+    - {methods: [POST], path: /query, injected: svc}   # only with the proxy's own credential for binding `svc`
+  ignore_case: true
+```
+
+- **A matcher** is `methods`, `methods_except`, `path` (segments: a literal, `*` for one segment, `**` for any number), `query` (`[{name, values}]`), `body_json` (`{pointer, values}`, RFC 6901) and `injected` (the binding whose credential the proxy substituted). Every field given must match.
+- **Every guard must let a request through.** Guards only take away, so layers compose by intersection and no layer can undo another's guard.
+- **Scopes err towards refusing; exceptions towards not matching.** A scope matches the path as sent *or* decoded and normalized (percent-decoding up to three rounds, `\` as `/`, `;params` cut, empty and dot segments applied), and query names and values decoded. An exception matches only a clean path as sent ([injection](../injection/#scope)'s safe-path rules, plus no segment that decodes to a dot segment), compared as sent, so an encoded or `;`-suffixed name never equals a literal. A body the proxy can't read (encoded, over 64 KiB, slower than 30 s, not JSON, or the field missing) is in a `body_json` scope and never a `body_json` exception. The body is read only when a matcher on the request's host needs it, then replayed to the upstream whole.
+- **A guarded host is always inspected:** never spliced (a passthrough entry for it is ignored) and never a TCP exception, so no layer can route around a guard.
+- **Decided (2026-11-01, the owner): rules are built by constructors that sit apart from the evaluator.** The proxy knows hosts, methods, paths, queries, one body field and bindings, never a service. What a service's rules mean is a constructor's: a pure function in the control plane (`control-plane/src/lib/rules/`) that turns an intent into generic guards, layered into the policy like any operator-written rule. **Why:** another git host or a registry's publish endpoint is a new constructor, with no change to the proxy; an operator can write the same rules by hand and get the same enforcement; and the evaluator is tested with made-up rules, the constructors from intent to rules, and one seam test through both ([testing](#tests)).
+
+## Repo allowlists
+
+**Built.** A sandbox may push only to repos explicitly on its **push allowlist**, enforced by nest-proxy whatever credential a push carries, so a prompt-injected agent can't push to an attacker's repo with the attacker's own token.
+
+- **What it is:** exact `owner/name` names, compared without case (`control-plane/src/lib/repos.ts`). **No `owner/*`:** a wildcard covers repos created later, forks an agent made included, and can't narrow a token (GitHub's token request names repos). No name ending in `.git` (git's URL suffix). Default: none, so no push anywhere.
+- **Where it comes from:** the sandbox layer's `repos` (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), plus the `repos` of every agent attached to the sandbox while attached (its spec's: the template's, replaced by the operator's `overrides.repos`). Everything in a sandbox shares a trust domain, so its agents share the union. An agent spawning another may only narrow it (`SpawnerOverrides.repos`, a subset of the template's; the spawner's own once `spawn_agent` is built). An operator-approved [`github.fork`](../../../../agents/capabilities/brokered/#forks) adds the fork to the forking agent's part. Not keyed on workstreams. Forks of a sandbox inherit the layer (fork isn't built).
+- **Read access** to public repos is unchanged. Private repos are readable only with the sandbox's token, which covers only allowed repos.
+- **What it builds,** through the GitHub constructor (`lib/rules/github.ts`, [below](#github)): the guards always, and with any repo `api.github.com` in the allow list and the `github` [injection binding](../injection/#github) whose token BrokerDO mints for exactly those repos ([BrokerDO](../../../../control-plane/durable-objects/broker/#injection-minting)).
+
+## GitHub
+
+The constructor's guards (`githubGuards`), each with `ignore_case`:
+
+| Guard | Hosts | Refuses | Except |
+|---|---|---|---|
+| `github-push` | `github.com` | `/**/git-receive-pack`, and its discovery `/**/info/refs?service=git-receive-pack` ([git smart HTTP](https://git-scm.com/docs/http-protocol)) | `/<repo>/**`, `/<repo>.git/**` |
+| `github-write` | `github.com` | every method but `GET`/`HEAD`: web forms (someone's cookie), LFS uploads and locks | `POST /**/git-upload-pack` (a fetch is a POST); `POST /**/info/lfs/objects/batch` with `operation: download` ([LFS batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md)); the allowed repos |
+| `github-api-write` | `*.github.com` (api, uploads, www, …) | every method but `GET`/`HEAD` | `/repos/<repo>/**`; `POST /graphql` only with the sandbox's own token |
+| `gist-write` | `gist.github.com` | writes and push discovery (each gist is a git repo) | none |
+| `githubusercontent-write` | `*.githubusercontent.com` | writes (signed upload URLs) | none |
+
+- **GraphQL decided:** one POST endpoint whose target isn't in the path, so the guard can't scope it by repo. It is let through only with the proxy's own substituted credential (`injected: github`), which is minted for the allowed repos only, so GitHub's own scoping confines its writes; any other credential, or none, is refused. Refusing all mutations would need a GraphQL parser in the proxy and break `gh pr create`.
+- **Redirects:** the proxy never follows them; each hop is a new request, checked again. A renamed allowed repo that redirects elsewhere is refused at the new name until that is allowed.
+- **Other git hosts and ssh: out of scope, and closed by default.** Only GitHub has a constructor. Another forge is reachable only after its host is allowed (an approved widening); its pushes are then not guarded until a constructor exists for it (an open question). Raw ssh has no route: base ports are 80 and 443, `:443` must be TLS with SNI, and a guarded host can't be a TCP exception.
+- **LFS uploads to an allowed repo** go where GitHub's batch answer points. If that is a `*.githubusercontent.com` host, the content-host guard refuses them (unverified where GitHub's upload URLs point).
+
+### Tests
+
+The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` through the real proxy: refusals before the upstream, body replay, the injected-credential exception, passthrough and TCP); the constructor from allowlist to rules (`test/repos.test.ts`); the seam: the constructor's output for two repos is the fixture `egress_policy.github.json`, which a vitest asserts the constructor still produces and `tests/github_rules.rs` evaluates against GitHub's real request shapes; and the e2e harness's `run_repos` (a refused `git push` and receive-pack, an allowed discovery reaching GitHub, the audit record).
+
 ## Audit
 
 - **Every connection or request is logged** with sandbox, agent (if known), entry point (`via`), SNI/host, method, path (no query string), status, bytes, the decision, and the *name* of any binding used (never its value). Records are batched through nestd to the control plane and written to R2. Denials and alerts are also posted to the sandbox's `events` channel.
@@ -61,4 +114,11 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
   - when a new minute starts, a summary record (host `*`, reason `suppressed: …`) reports what was dropped
 
   Allowed traffic isn't aggregated; it's bounded by the connection limit.
-- **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `dns_non_public`, `connection_limit`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `injection_out_of_scope`, `injection_upgrade`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors. The wire list is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).
+- **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `dns_non_public`, `connection_limit`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `injection_out_of_scope`, `injection_upgrade`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `guard: <name>`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors. The wire list is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).
+
+## Open questions
+
+- **Other forges:** a push to another git host is possible once its host is allowed (an approved widening) and unguarded until it has a constructor.
+- **Publishing as exfiltration:** an allowed package registry takes uploads with someone else's token (`npm publish`, PyPI uploads). A constructor for registries' publish endpoints is the next candidate.
+- **GraphQL** writes rest on GitHub applying the installation token's repo scope to GraphQL mutations (unverified). Refusing mutations outright needs a GraphQL parser in the proxy.
+- **LFS uploads** to an allowed repo: where GitHub's batch answer points them is unverified; if at `*.githubusercontent.com`, the content-host guard refuses them.

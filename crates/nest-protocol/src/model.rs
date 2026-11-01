@@ -381,6 +381,66 @@ pub struct EgressLimits {
     pub max_inspected_body_bytes: u64,
 }
 
+/// A request guard (docs/sandbox/networking/egress/policy/#request-guards): on its hosts, a request
+/// that any `scope` matcher covers is refused unless an `allow` matcher covers it too. Generic: the
+/// proxy knows hosts, methods, paths, queries, a JSON body field and whether a binding was
+/// substituted, nothing about the services behind them. Guards only take away: every guard in the
+/// policy must let a request through.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestGuard {
+    /// Shown in the 403 and audited as reason `guard: <name>`.
+    pub name: String,
+    /// Hosts it applies to. A guarded host is always inspected: never spliced, never a TCP exception.
+    pub hosts: Vec<HostPattern>,
+    pub scope: Vec<RequestMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<RequestMatch>,
+    /// Human-readable reason for the 403.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// Path literals and query names and values compare without ASCII case.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_case: bool,
+}
+
+/// One request matcher: every field given must match (an empty one matches anything).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestMatch {
+    /// Any of these methods (compared without case).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// Any method but these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods_except: Vec<String>,
+    /// A path pattern: `/`-separated segments, each a literal, `*` (one segment) or `**` (any number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Query parameters, all of which must match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query: Vec<QueryMatch>,
+    /// A field of a JSON request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_json: Option<JsonFieldMatch>,
+    /// The request had this binding's credential substituted by the proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected: Option<String>,
+}
+
+/// A query parameter `name` (decoded) whose decoded value is one of `values` (any value when empty).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryMatch {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+/// The JSON body's string at `pointer` (RFC 6901) is one of `values`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonFieldMatch {
+    pub pointer: String,
+    pub values: Vec<String>,
+}
+
 /// Effective egress policy for one sandbox, merged from all layers by SandboxDO. `version`
 /// increases monotonically per sandbox; consumers ignore pushes with a version they've seen.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +455,9 @@ pub struct EgressPolicy {
     #[serde(default)]
     pub tcp: Vec<TcpException>,
     pub limits: EgressLimits,
+    /// Request guards, evaluated by nest-proxy on every inspected or plaintext request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<RequestGuard>,
 }
 
 /// Outcome of evaluating `EgressPolicy` for one HTTP(S) destination.
@@ -413,7 +476,7 @@ impl EgressPolicy {
         let allowed = self.allow.iter().any(|r| r.host.matches(host) && r.ports.contains(&port) && r.active(now_ms));
         if !allowed {
             EgressDecision::Deny
-        } else if self.passthrough.iter().any(|p| p.matches(host)) {
+        } else if !self.guarded(host) && self.passthrough.iter().any(|p| p.matches(host)) {
             EgressDecision::Passthrough
         } else {
             EgressDecision::Inspect
@@ -428,7 +491,13 @@ impl EgressPolicy {
 
     /// Whether a TCP exception allows raw TCP to `host:port`.
     pub fn tcp_exception(&self, host: &str, port: u16) -> bool {
-        self.tcp.iter().any(|t| t.is_for(host) && t.port == port)
+        !self.guarded(host) && self.tcp.iter().any(|t| t.is_for(host) && t.port == port)
+    }
+
+    /// Whether a request guard names `host`: its traffic must be inspected, so it is never spliced
+    /// (passthrough) and never a raw TCP exception, whatever the other layers say.
+    pub fn guarded(&self, host: &str) -> bool {
+        self.guards.iter().any(|g| g.hosts.iter().any(|h| h.matches(host)))
     }
 }
 
@@ -694,6 +763,7 @@ mod tests {
             inject: vec![],
             tcp: vec![],
             limits: EgressLimits { max_connections: 256, bandwidth_mbps: 200, max_inspected_body_bytes: 512 << 20 },
+            guards: vec![],
         };
         assert_eq!(p.decide("github.com", 443, 0), EgressDecision::Inspect);
         assert_eq!(p.decide("github.com", 80, 0), EgressDecision::Deny);
@@ -715,6 +785,7 @@ mod tests {
             inject: vec![],
             tcp: vec![TcpException { host: "DB.example.com.".into(), port: 5432 }],
             limits: EgressLimits { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 },
+            guards: vec![],
         };
         for (name, now, resolves) in [
             ("raw.githubusercontent.com", 0, true),

@@ -1149,6 +1149,53 @@ def run_brokered(ids):
           f"{text('revoke')[:100]!r} {text('curl2')[:100]!r}")
 
 
+# ---------------------------------------------------------------------------------- push allowlists
+# A sandbox may push only to repos on its allowlist (docs/sandbox/networking/egress/policy/#repo-allowlists):
+# SandboxDO's GitHub rule constructor turns the allowlist into generic request guards, and nest-proxy refuses
+# a push anywhere else before anything reaches GitHub, whatever credential it carries. No real push: the
+# refused ones never leave the proxy, and the allowed one is only git's discovery request, which GitHub
+# answers itself (401 without a credential: the harness has no GitHub App, so no token is minted).
+E2E_ATTACKER_REPO = "nest-e2e-not-allowed/x"
+
+def run_repos(ids):
+    if REAL:
+        skip("push allowlists", "fake mode only: the calls are scripted")
+        return
+    agid, sbx = ids["agent"], ids["sandbox"]
+    ca = os.path.join(WORK, "root-ca.pem")
+    st, p = api("PUT", f"/v1/sandboxes/{sbx}/policy", {**E2E_POLICY, "repos": ["by77er/nest"]})
+    push = next((g for g in (p or {}).get("guards", []) if g.get("name") == "github-push"), {}) if st == 200 else {}
+    check("repos: the push allowlist becomes a github-push guard excepting by77er/nest",
+          {"path": "/by77er/nest/**"} in push.get("allow", []), json.dumps(push)[:300])
+    # The policy reaches nest-proxy a moment after the API answers: each request tries for up to 10 s.
+    def until_guarded(url, method="GET"):
+        return {"command": f"for i in $(seq 10); do out=$(curl -s -m 15 --cacert {ca} -X {method} '{url}' -w '\nhttp=%{{http_code}}'); "
+                           f"echo \"$out\" | grep -q request_denied && break; sleep 0.5; done; echo \"$out\""}
+    allowed = (f"curl -s -m 15 --cacert {ca} 'https://github.com/by77er/nest.git/info/refs?service=git-receive-pack' -o {WORK}/allowed.body "
+               f"-w 'http=%{{http_code}}'; echo; grep -c request_denied {WORK}/allowed.body || true")
+    git = (f"d=$(mktemp -d) && cd $d && git init -q && git -c user.email=e2e@nest.test -c user.name=e2e commit -q --allow-empty -m x && "
+           f"GIT_SSL_CAINFO={ca} GIT_TERMINAL_PROMPT=0 git push https://github.com/{E2E_ATTACKER_REPO}.git HEAD:main 2>&1; echo rc=$?")
+    text, err = sink_turn(agid, "repos", [
+        ("receive", "Bash", until_guarded(f"https://github.com/{E2E_ATTACKER_REPO}.git/git-receive-pack", "POST")),
+        ("discovery", "Bash", until_guarded(f"https://github.com/{E2E_ATTACKER_REPO}.git/info/refs?service=git-receive-pack")),
+        ("allowed", "Bash", {"command": allowed}),
+        ("git", "Bash", {"command": git}),
+    ])
+    for label in ("receive", "discovery"):
+        check(f"repos: nest-proxy refuses a {label} request for a repo not on the allowlist (403, github-push)",
+              "http=403" in text(label) and '"guard":"github-push"' in text(label).replace(" ", ""), text(label).replace("\n", " | ")[:300])
+    code = re.search(r"http=(\d+)", text("allowed"))
+    check("repos: the allowed repo's push discovery passes the guard and reaches GitHub",
+          code and code.group(1) not in ("000", "403") and text("allowed").strip().endswith("0"), text("allowed").replace("\n", " | ")[:200])
+    check("repos: a real `git push` to a repo not on the allowlist fails at the proxy",
+          "403" in text("git") and "rc=0" not in text("git"), text("git").replace("\n", " | ")[:300])
+    try:
+        wait_for(lambda: any("guard: github-push" in b for b in r2_blobs()) or None, 20, 1.0, "guard refusal in the egress audit")
+        check("repos: the refusal is in the egress audit (reason guard: github-push)", True)
+    except TimeoutError as e:
+        check("repos: the refusal is in the egress audit (reason guard: github-push)", False, str(e)[:200])
+
+
 def run_fencing(ids):
     brains = real_brains() if REAL else children_named(FAKE_CLAUDE)
     guests = children_named(os.path.join(BIN, "nest-guest"))
@@ -1223,6 +1270,7 @@ def main():
         run_mcp(ids)
         run_mcp_oauth(ids)
         run_brokered(ids)
+        run_repos(ids)
         # After the turns: the token has been handed to the brains by now.
         check_token_not_in("the Claude token is not in the gateway's environment or command line", children_named(GW_BIN))
         run_fencing(ids)

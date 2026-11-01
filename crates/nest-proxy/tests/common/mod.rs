@@ -369,6 +369,7 @@ pub fn policy(version: u64, db_port: u16) -> EgressPolicy {
         }],
         tcp: vec![TcpException { host: "db.test".into(), port: db_port }],
         limits: EgressLimits { max_connections: 64, bandwidth_mbps: 100, max_inspected_body_bytes: 1 << 20 },
+        guards: vec![],
     }
 }
 
@@ -451,6 +452,14 @@ pub async fn http_over<S>(io: S, h2: bool, method: &str, host: &str, path: &str,
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    http_over_body(io, h2, method, host, path, headers, Bytes::from_static(b"hello")).await
+}
+
+/// [`http_over`] with a body of its own.
+pub async fn http_over_body<S>(io: S, h2: bool, method: &str, host: &str, path: &str, headers: &[(&str, &str)], body: Bytes) -> Resp
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let mut b = hyper::Request::builder().method(method);
     if h2 {
         b = b.uri(format!("https://{host}{path}"));
@@ -460,7 +469,7 @@ where
     for (k, v) in headers {
         b = b.header(*k, *v);
     }
-    let req = b.body(Full::new(Bytes::from_static(b"hello"))).unwrap();
+    let req = b.body(Full::new(body)).unwrap();
     let resp = if h2 {
         let (mut s, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await.unwrap();
         tokio::spawn(conn);
@@ -509,4 +518,11 @@ pub async fn connect_tunnel(env: &Env, authority: &str) -> (TcpStream, String) {
     }
     let text = String::from_utf8_lossy(&head).to_string();
     (s, text)
+}
+
+/// One transparent HTTPS request with any method, path and body.
+pub async fn https_req(env: &Env, host: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8], h2: bool) -> Resp {
+    let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
+    let tls = tls_connect(env.net.https_addr(), host, std::slice::from_ref(&env.pki.proxy_root), alpn).await.expect("tls to proxy");
+    http_over_body(tls, h2, method, host, path, headers, Bytes::copy_from_slice(body)).await
 }

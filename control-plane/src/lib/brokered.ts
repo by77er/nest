@@ -21,7 +21,8 @@ const BODY = (what: string) => ({ type: "string", description: `${what} (Markdow
 interface ActionDef {
   /** The model-facing tool (`mcp__nest__<tool>`): API tool names allow no `.`. */
   tool: string;
-  kind: "github" | "http" | "none";
+  /** `github`: an App installation token; `github_user`: the owner's own token (`github_user`); `http`: a profile; `none`: no provider. */
+  kind: "github" | "github_user" | "http" | "none";
   description: string;
   input_schema: Record<string, unknown>;
   /** github: what the installation token is narrowed to. */
@@ -79,6 +80,14 @@ export const BROKERED_ACTIONS = {
       required: ["repo", "pull_number", "commit_id", "path", "line", "body"], additionalProperties: false,
     },
     permissions: { pull_requests: "write", contents: "read" },
+  },
+  "github.fork": {
+    tool: "github_fork", kind: "github_user",
+    description: "Fork a public repository into the operator's GitHub account (default branch only). Always needs the operator's approval. "
+      + "The fork joins your sandbox's push allowlist; push your branch there, then hand the operator the compare link in the result to open the upstream pull request.",
+    input_schema: {
+      type: "object", properties: { repo: { ...REPO, description: "The upstream repository, owner/name." } }, required: ["repo"], additionalProperties: false,
+    },
   },
   "http.request": {
     tool: "http_request", kind: "http",
@@ -157,13 +166,16 @@ const HttpEntry = z.object({
 
 const EmailEntry = z.object({ action: z.literal("email.send") });
 
-export const BrokeredEntry = z.union([GithubEntry, HttpEntry, EmailEntry]);
+/** `github.fork`: the upstreams it may fork (absent: any public repo). Always `approve`, from any session: it widens the push allowlist. */
+const ForkEntry = z.object({ action: z.literal("github.fork"), repos: z.array(Repo).min(1).max(100).optional(), per_hour: PerHour.optional() });
+
+export const BrokeredEntry = z.union([GithubEntry, HttpEntry, EmailEntry, ForkEntry]);
 export type BrokeredEntry = z.output<typeof BrokeredEntry>;
 export const BrokeredSource = z.array(BrokeredEntry).max(64);
 
 /** What a spec keeps of one entry, copied at spawn: defaults resolved, repos lowercased. */
 export type BrokeredGrant =
-  | { capability: string; action: GithubAction; repos: string[] | null; when_tainted: WhenTainted; per_hour: number }
+  | { capability: string; action: GithubAction | "github.fork"; repos: string[] | null; when_tainted: WhenTainted; per_hour: number }
   | {
     capability: string; action: "http.request"; profile: string; base_url: string; methods: string[]; paths: string[] | null;
     auth: { secret: string; header: string; scheme: string } | null; trusted: boolean; when_tainted: WhenTainted; per_hour: number;
@@ -187,10 +199,24 @@ export function grantOfEntry(capability: string, e: BrokeredEntry): BrokeredGran
       when_tainted: e.when_tainted ?? "approve", per_hour: e.per_hour ?? DEFAULT_PER_HOUR.http, idempotency_header: e.idempotency_header ?? null,
     };
   }
+  if (e.action === "github.fork") {
+    return { capability, action: e.action, repos: e.repos ? [...new Set(e.repos.map((r) => r.toLowerCase()))] : null, when_tainted: "approve", per_hour: e.per_hour ?? 5 };
+  }
   return {
     capability, action: e.action, repos: e.repos ? [...new Set(e.repos.map((r) => r.toLowerCase()))] : null,
     when_tainted: e.when_tainted ?? (e.repos ? "allow" : "approve"), per_hour: e.per_hour ?? DEFAULT_PER_HOUR.github,
   };
+}
+
+/**
+ * A spec's grants under a push allowlist (docs/agents/capabilities/brokered/#repo-allowlists): an unscoped
+ * GitHub grant ("any repo the App is installed on") reaches only the allowlist's repos; a scoped one keeps
+ * the repos the catalog named. No allowlist: unchanged.
+ */
+export function scopeToRepos(grants: readonly BrokeredGrant[], repos: readonly string[]): BrokeredGrant[] {
+  if (!repos.length) return [...grants];
+  // A fork's repos are upstreams, never on a push allowlist: it keeps its own scope.
+  return grants.map((g) => (g.action !== "http.request" && g.action !== "github.fork" && g.repos === null ? { ...g, repos: [...repos] } : g));
 }
 
 type Result<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -342,6 +368,7 @@ export function naturalKey(action: BrokeredAction, args: Record<string, unknown>
     case "github.review_comment": return `review:${repo}#${String(args.pull_number)}:${keyDig}`;
     case "github.create_issue": return `issue:${repo}:${keyDig}`;
     case "http.request": return `http:${String(args.profile)}:${keyDig}`;
+    case "github.fork": return `fork:${repo}`;
     case "email.send": return `email:${keyDig}`;
   }
 }

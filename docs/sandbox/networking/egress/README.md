@@ -13,7 +13,8 @@ accept (listener ⇒ sandbox [, agent])
                     no inspection)
       inspect     → terminate TLS → the request target and the single Host must name the routed
                     host (no domain fronting) → strip routing overrides, reject smuggling →
-                    credential injection → re-check policy → upstream with a Host the proxy sets
+                    credential injection → request guards → re-check policy → upstream with a Host
+                    the proxy sets
                     (proxy re-resolves the name, refuses non-public addresses and verifies the
                     upstream certificate)
   open connections: re-checked on every policy version and grant expiry; closed once denied
@@ -30,7 +31,7 @@ accept (listener ⇒ sandbox [, agent])
 | Resolver: allowlisted names only, filtered and bounded answers | [dns/](dns/) |
 | CA chain (root in KMS), on-the-fly leaf certificates, handshake fairness, upstream verification | [tls/](tls/) |
 | Request checks after decryption: routed name, routing overrides, smuggling, limits, final re-check | [inspection/](inspection/) |
-| Hard deny, policy layers, live re-checks, temporary grants, TCP exceptions, limits, audit | [policy/](policy/) |
+| Hard deny, policy layers, live re-checks, temporary grants, TCP exceptions, request guards, repo allowlists, limits, audit | [policy/](policy/) |
 | Placeholder credential injection, binding scope, GitHub App | [injection/](injection/) |
 
 **Late pushes can't revive a dropped sandbox:** the proxy remembers `sandbox_drop` per epoch and refuses policy, secrets and listeners for that epoch or older, so a fence racing sandbox setup stays fenced. A newer epoch (re-placement) is accepted.
