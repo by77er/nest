@@ -28,6 +28,7 @@ use nest_protocol::host::proxy::AlertKind;
 use nest_protocol::model::EgressDecision;
 
 use crate::audit::Audit;
+use crate::guard;
 use crate::inject::{self, Verdict};
 use crate::sni::{ClientHelloInfo, read_client_hello};
 use crate::state::ConnCtx;
@@ -360,8 +361,10 @@ pub struct Target {
     pub tls: bool,
 }
 
-async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req: Request<Incoming>) -> Response<Body> {
-    let mk_audit = |req: &Request<Incoming>, v: EgressVerdict| Audit::new(&target.host, target.port, v).request(req.method(), req.uri());
+async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Request<Incoming>) -> Response<Body> {
+    // Boxed now: a guard that reads the body puts back a replaying one.
+    let mut req: Request<Body> = req.map(|b| b.map_err(|e| Box::new(e) as BoxError).boxed());
+    let mk_audit = |req: &Request<Body>, v: EgressVerdict| Audit::new(&target.host, target.port, v).request(req.method(), req.uri());
 
     // Decided per request: a push or a grant's expiry since admission may have revoked the host,
     // or made it passthrough-only, which an inspected connection can't honour.
@@ -418,6 +421,36 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
             return deny_response(StatusCode::FORBIDDEN, "credential_requires_tls", &target.host, target.port, "credentials are only injected over HTTPS");
         }
         Verdict::Clean | Verdict::Substituted(_) => {}
+    }
+    // Request guards (docs/sandbox/networking/egress/policy/#request-guards): generic rules, after
+    // injection (a guard can ask whether a binding was substituted) and before anything goes upstream.
+    if !policy.guards.is_empty() {
+        let (method, path, query) = (req.method().as_str().to_owned(), uri.path().to_owned(), uri.query().map(str::to_owned));
+        let greq = guard::Req { host: &target.host, method: &method, path: &path, query: query.as_deref(), injected: match &verdict {
+            Verdict::Substituted(b) => Some(b.as_str()),
+            _ => None,
+        } };
+        let json: Option<serde_json::Value>;
+        let body_view = if guard::needs_body(&policy.guards, &greq) {
+            let (parts, body) = req.into_parts();
+            let Ok((read, replay)) = read_guard_body(&parts.headers, body).await else {
+                return simple(StatusCode::BAD_REQUEST, "the request body could not be read");
+            };
+            req = Request::from_parts(parts, replay);
+            json = read;
+            json.as_ref().map_or(guard::BodyView::Unknown, guard::BodyView::Json)
+        } else {
+            guard::BodyView::Unread
+        };
+        if let Some(g) = guard::refusing(&policy.guards, &greq, &body_view) {
+            let mut a = mk_audit(&req, EgressVerdict::Deny).reason(format!("guard: {}", clip(&g.name, 64)));
+            a.binding = verdict.binding().map(str::to_string);
+            ctx.audit(a);
+            let reason = if g.reason.is_empty() { "a request guard in this sandbox's egress policy refuses this request" } else { g.reason.as_str() };
+            let mut v = deny_json("request_denied", &target.host, target.port, &clip(reason, 512));
+            v["guard"] = serde_json::Value::String(clip(&g.name, 64));
+            return json_response(StatusCode::FORBIDDEN, v);
+        }
     }
     // Secrets the upstream might echo back (TRACE, header-reflecting endpoints, error pages).
     let mut needles: Vec<Vec<u8>> = Vec::new();
@@ -521,7 +554,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, mut req:
 
 /// The routed host must be the only name in the request: the request-target authority (if
 /// any) and the single `Host` header (if any) must both normalize to `target.host`.
-fn check_request_host(req: &Request<Incoming>, target: &Target) -> Result<(), (&'static str, String)> {
+fn check_request_host<B>(req: &Request<B>, target: &Target) -> Result<(), (&'static str, String)> {
     let hosts: Vec<&http::HeaderValue> = req.headers().get_all(HOST).iter().collect();
     if hosts.len() > 1 {
         return Err(("duplicate_host", format!("{} Host headers", hosts.len())));
@@ -929,6 +962,82 @@ fn deny_json(code: &str, host: &str, port: u16, reason: &str) -> serde_json::Val
         "reason": reason,
         "hint": "nest-proxy blocked this request. Ask for access with the `ask` tool or `nest ask \"allow egress to <host>?\"`; a captain or the owner can approve it.",
     })
+}
+
+/// A request body a guard may read: at most this much is buffered.
+const GUARD_BODY_MAX: usize = 64 * 1024;
+
+/// Read up to [`GUARD_BODY_MAX`] of a request body for a guard: its JSON (`None` when it is encoded,
+/// larger than that, slower than the header timeout, or not JSON), and a body that replays what was
+/// read and then the rest. `Err` when the client's body fails.
+async fn read_guard_body(headers: &HeaderMap, mut body: Body) -> Result<(Option<serde_json::Value>, Body), ()> {
+    let encoded = headers.get(http::header::CONTENT_ENCODING).is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
+    if encoded {
+        return Ok((None, body));
+    }
+    let mut frames: std::collections::VecDeque<Frame<Bytes>> = std::collections::VecDeque::new();
+    let mut data: Vec<u8> = Vec::new();
+    let read = tokio::time::timeout(HEADER_TIMEOUT, async {
+        while data.len() <= GUARD_BODY_MAX {
+            match body.frame().await {
+                None => return Ok(true),
+                Some(Err(_)) => return Err(()),
+                Some(Ok(f)) => {
+                    if let Some(d) = f.data_ref() {
+                        data.extend_from_slice(d);
+                    }
+                    frames.push_back(f);
+                }
+            }
+        }
+        Ok(false)
+    })
+    .await;
+    let complete = match read {
+        Ok(r) => r?,
+        Err(_) => false,
+    };
+    let json = if complete && data.len() <= GUARD_BODY_MAX { serde_json::from_slice(&data).ok() } else { None };
+    let queued = data.len() as u64;
+    let rest = if complete { None } else { Some(body) };
+    Ok((json, Replay { frames, queued, rest }.boxed()))
+}
+
+/// Frames already read, then the rest of the body.
+struct Replay {
+    frames: std::collections::VecDeque<Frame<Bytes>>,
+    queued: u64,
+    rest: Option<Body>,
+}
+
+impl HttpBody for Replay {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        if let Some(f) = self.frames.pop_front() {
+            if let Some(d) = f.data_ref() {
+                self.queued -= d.len() as u64;
+            }
+            return Poll::Ready(Some(Ok(f)));
+        }
+        match self.rest.as_mut() {
+            Some(r) => Pin::new(r).poll_frame(cx),
+            None => Poll::Ready(None),
+        }
+    }
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty() && self.rest.as_ref().is_none_or(|r| r.is_end_stream())
+    }
+    fn size_hint(&self) -> SizeHint {
+        let rest = self.rest.as_ref().map_or_else(|| SizeHint::with_exact(0), |r| r.size_hint());
+        let mut h = SizeHint::new();
+        h.set_lower(rest.lower() + self.queued);
+        if let Some(u) = rest.upper() {
+            h.set_upper(u + self.queued);
+        }
+        h
+    }
 }
 
 /// Counts bytes passing through a body.

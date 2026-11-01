@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod control;
 pub mod dns;
+pub mod guard;
 pub mod http;
 pub mod inject;
 pub mod listener;
