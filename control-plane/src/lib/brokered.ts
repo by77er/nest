@@ -193,6 +193,16 @@ export function grantOfEntry(capability: string, e: BrokeredEntry): BrokeredGran
   };
 }
 
+/**
+ * A spec's grants under a push allowlist (docs/agents/capabilities/brokered/#repo-allowlists): an unscoped
+ * GitHub grant ("any repo the App is installed on") reaches only the allowlist's repos; a scoped one keeps
+ * the repos the catalog named. No allowlist: unchanged.
+ */
+export function scopeToRepos(grants: readonly BrokeredGrant[], repos: readonly string[]): BrokeredGrant[] {
+  if (!repos.length) return [...grants];
+  return grants.map((g) => (g.action !== "http.request" && g.repos === null ? { ...g, repos: [...repos] } : g));
+}
+
 type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
 

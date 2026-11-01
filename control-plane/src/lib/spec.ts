@@ -8,7 +8,8 @@ import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protoco
 import { LedgerName, TASK_ADMIN_TOOLS, TASK_TOOLS } from "./tasks";
 import { ChannelGrant } from "./channels";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
-import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry } from "./brokered";
+import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry, scopeToRepos } from "./brokered";
+import { canonicalRepos, narrowRepos, Repos } from "./repos";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -62,6 +63,11 @@ export const Template = z.object({
   subscribe: z.array(Subscription).default([]),
   /** Default capability parameters (a spawn's operator overrides replace each one it names). */
   params: SpecParams.default({}),
+  /**
+   * The repos its agents may push to (docs/sandbox/networking/egress/policy/#repo-allowlists): joined to
+   * its sandbox's allowlist while attached, and the scope of its unscoped GitHub brokered actions.
+   */
+  repos: Repos.optional(),
 });
 export type Template = z.output<typeof Template>;
 
@@ -77,6 +83,8 @@ export const OperatorOverrides = z.object({
   credential: Credential.optional(),
   /** Capability parameters, each replacing the template's (e.g. the agent's task `ledger`). */
   params: SpecParams.optional(),
+  /** The push allowlist, replacing the template's. */
+  repos: Repos.optional(),
 });
 export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 
@@ -90,6 +98,8 @@ export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 export const SpawnerOverrides = z.strictObject({
   tools: z.array(z.string()).optional(),
   rules: z.array(ToolRule.extend({ decision: z.enum(["deny", "ask"]) })).optional(),
+  /** A subset of the template's push allowlist (attenuation; the spawner's own once `spawn_agent` is built). */
+  repos: Repos.optional(),
 });
 export type SpawnerOverrides = z.output<typeof SpawnerOverrides>;
 
@@ -112,6 +122,8 @@ export interface AgentSpec {
   mcp?: McpGrant[];
   /** Its brokered action grants, in capability order; absent when it has none (as is every stored spec before them). */
   brokered?: BrokeredGrant[];
+  /** Its push allowlist, canonical; absent when empty (as is every stored spec before it). */
+  repos?: string[];
 }
 
 export interface Catalog {
@@ -379,7 +391,16 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     params: params.value,
     ...(mcp.length ? { mcp } : {}),
     ...(brokered.length ? { brokered } : {}),
+    ...(tpl.repos?.length ? { repos: canonicalRepos(tpl.repos) } : {}),
   });
+}
+
+/** The spec with this push allowlist: recorded, and its unscoped GitHub grants narrowed to it (`scopeToRepos`). */
+function withRepos(spec: AgentSpec, repos: readonly string[]): AgentSpec {
+  const { repos: _, brokered, ...rest } = spec;
+  const r = canonicalRepos(repos);
+  const scoped = brokered ? scopeToRepos(brokered, r) : undefined;
+  return { ...rest, ...(scoped?.length ? { brokered: scoped } : {}), ...(r.length ? { repos: r } : {}) };
 }
 
 /** `params`, each of which a capability in `caps` must take (`what`: the template, in a refusal). */
@@ -456,8 +477,10 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     if (!tools.ok) return tools;
     // No parameters, not even the template's defaults: a spawner would otherwise reach whatever ledger a
     // template names. A child's parameters wait for attenuation against the spawner's own.
+    const repos = narrowRepos(base.value.repos ?? [], o.data.repos ?? base.value.repos ?? []);
+    if (!repos.ok) return err(`template ${spec.template}: ${repos.error}`);
     const { mcp: _mcp, brokered: _brokered, ...rest } = base.value;
-    return ok({ ...rest, ...tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} });
+    return ok(withRepos({ ...rest, ...tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} }, repos.value));
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);
@@ -465,7 +488,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
   const params = checkParams(`template ${spec.template}`, capsOf(catalog, spec.template), { ...base.value.params, ...o.params });
   if (!params.ok) return params;
   const { mcp: _mcp, brokered: _brokered, ...rest } = base.value;
-  return ok({
+  return ok(withRepos({
     ...rest,
     ...tools.value,
     params: params.value,
@@ -473,7 +496,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     rules: o.rules ?? base.value.rules,
     credential: o.credential ?? base.value.credential,
     escalate_to: o.escalate_to ?? base.value.escalate_to,
-  });
+  }, o.repos ?? base.value.repos ?? []));
 }
 
 // --- Records stored with a role (the previous release) ----------------------------------------------

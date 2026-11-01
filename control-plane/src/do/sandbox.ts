@@ -21,8 +21,10 @@ import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
-  InjectionBinding, type Resources, SandboxState,
+  InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
 } from "../protocol/model";
+import { canonicalRepos, Repos, unionRepos } from "../lib/repos";
+import { GITHUB_BINDING, githubEgress } from "../lib/rules/github";
 
 export const DEFAULT_IMAGE = "nest-base:latest";
 export const DEFAULT_RESOURCES: Resources = { vcpus: 2, memory_mib: 4096, disk_gib: 32 };
@@ -36,14 +38,23 @@ export const BASE_ALLOW = [
 /** The ports an allow rule (or a grant) covers when it names none. */
 const WEB_PORTS = [80, 443];
 export const Port = z.number().int().min(1).max(65535);
-/** Workstream egress policy layer (docs/sandbox/networking/egress/policy/), as the API takes it. */
+/**
+ * The operator's egress policy layer for one sandbox (docs/sandbox/networking/egress/policy/), as the API
+ * takes it (named for the workstreams it was once set per; it is per sandbox). `repos`: the push
+ * allowlist (#repo-allowlists), which the GitHub rule constructor turns into guards; `guards`: request
+ * guards written by hand, layered with the constructed ones.
+ */
 export const WorkstreamPolicyLayer = z.object({
   allow: z.array(z.object({ host: z.string().min(1), ports: z.array(Port).optional() })).default([]),
   passthrough: z.array(z.string().min(1)).default([]),
   inject: z.array(InjectionBinding).default([]),
   tcp: z.array(z.object({ host: z.string().min(1), port: Port })).default([]),
+  repos: Repos.default([]),
+  guards: z.array(RequestGuard).max(64).default([]),
 });
 export type WorkstreamPolicyLayer = z.output<typeof WorkstreamPolicyLayer>;
+/** What a caller may pass: the fields with defaults may be left out. */
+export type WorkstreamPolicyInput = z.input<typeof WorkstreamPolicyLayer>;
 const EMPTY_LAYER: WorkstreamPolicyLayer = WorkstreamPolicyLayer.parse({});
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
@@ -65,7 +76,7 @@ export interface CreateSandbox {
   cell: string;
   image?: string;
   resources?: Resources;
-  workstreamPolicy?: WorkstreamPolicyLayer;
+  workstreamPolicy?: WorkstreamPolicyInput;
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
@@ -80,6 +91,12 @@ const HISTORY_MAX = 50;
 const COMMIT_RECORD_RETENTION_MS = 7 * 86_400_000;
 /** Commit records are pruned from a deadline at most this often, never on the commit path. */
 const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
+/** A minted injection secret is pushed again this long before it expires (BrokerDO reuses one only with 20 minutes left). */
+const INJECT_REFRESH_BEFORE_MS = 15 * 60_000;
+/** A mint that failed for now (GitHub didn't answer) is tried again after this long. */
+const INJECT_RETRY_MS = 2 * 60_000;
+/** Nothing mintable (no App, not installed): tried again after this long, or at the next policy change. */
+const INJECT_IDLE_RETRY_MS = 60 * 60_000;
 /** Previews and share links without NEST_DOMAIN (the harness, tests): never routed, only named. */
 const LOCAL_DOMAIN = "nest.localhost";
 
@@ -235,7 +252,8 @@ export class SandboxDO extends DurableObject<Env> {
       ports: [],
     };
     this.put("info", info);
-    this.put("ws_layer", req.workstreamPolicy ?? EMPTY_LAYER);
+    const layer = WorkstreamPolicyLayer.parse(req.workstreamPolicy ?? {});
+    this.put("ws_layer", { ...layer, repos: canonicalRepos(layer.repos) });
     try {
       await this.placeCurrentEpoch();
     } catch (e) {
@@ -489,6 +507,8 @@ export class SandboxDO extends DurableObject<Env> {
     await fleet.releaseLease(before.sandbox);
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
+    await this.deadlines.clear("inject_refresh");
+    await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).forgetInjections(before.sandbox);
   }
 
   /** `sandbox_create` for the current epoch, from the head if there is one. */
@@ -609,13 +629,19 @@ export class SandboxDO extends DurableObject<Env> {
 
   // --- egress policy --------------------------------------------------------------------------------
 
-  /** Effective policy merged from the base, workstream and sandbox (temporary grant) layers. */
+  /**
+   * Effective policy merged from the base, workstream and sandbox (temporary grant) layers, plus what the
+   * rule constructors build from the push allowlist (lib/rules/github.ts): its guards always, layered
+   * with the operator's own. An operator binding named `github` wins over the constructed one.
+   */
   private effectivePolicy(now = Date.now()): EgressPolicy {
     const info = this.info_();
     const ws = this.wsLayer();
+    const gh = githubEgress(this.pushRepos());
+    const inject = [...ws.inject, ...gh.inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
     const allow: AllowRule[] = [
       ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
-      ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: "workstream" as const })),
+      ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: "workstream" as const })),
       ...this.sql
         .exec<{ host: string; ports: string; expires_ms: number }>("SELECT host, ports, expires_ms FROM grants WHERE expires_ms > ? ORDER BY expires_ms", now)
         .toArray()
@@ -625,23 +651,27 @@ export class SandboxDO extends DurableObject<Env> {
       version: info.policy_version,
       allow,
       passthrough: ws.passthrough,
-      inject: ws.inject,
+      inject,
       tcp: ws.tcp,
       limits: DEFAULT_LIMITS,
+      guards: [...gh.guards, ...(ws.guards ?? [])],
     };
   }
 
+  /** The operator's layer; one stored before `repos` and `guards` reads as having none. */
   private wsLayer(): WorkstreamPolicyLayer {
-    return this.get<WorkstreamPolicyLayer>("ws_layer") ?? EMPTY_LAYER;
+    const l = this.get<Partial<WorkstreamPolicyLayer>>("ws_layer");
+    return { ...EMPTY_LAYER, ...l, repos: l?.repos ?? [], guards: l?.guards ?? [] };
   }
 
   async policy(): Promise<EgressPolicy> {
     return this.effectivePolicy();
   }
 
-  async setWorkstreamPolicy(layer: WorkstreamPolicyLayer): Promise<EgressPolicy> {
+  async setWorkstreamPolicy(input: WorkstreamPolicyInput): Promise<EgressPolicy> {
     this.info_();
-    this.put("ws_layer", layer);
+    const layer = WorkstreamPolicyLayer.parse(input);
+    this.put("ws_layer", { ...layer, repos: canonicalRepos(layer.repos) });
     return this.policyChanged(true);
   }
 
@@ -694,6 +724,9 @@ export class SandboxDO extends DurableObject<Env> {
         // An unfinished placement is reconciled first (or the deadline re-armed until it goes stale).
         await this.reconcilePlacing();
         if (lease.placeWanted(this.info_())) await this.placeCurrentEpoch();
+      } else if (key === "inject_refresh") {
+        const info = this.info_();
+        if (info.host && ACTIVE_STATES.includes(info.state)) await this.pushSecrets(true);
       } else if (key === "turn_checkpoint") {
         await this.turnEndCheckpoint();
       } else if (key === "idle") {
@@ -720,37 +753,93 @@ export class SandboxDO extends DurableObject<Env> {
     const policy = this.effectivePolicy();
     if (info.host && ACTIVE_STATES.includes(info.state)) {
       await this.command({ type: "policy_update", policy });
-      if (injectionChanged) await this.pushSecrets();
+      if (injectionChanged) await this.pushSecrets(true);
     }
     return policy;
   }
 
-  /** Injection secrets for the policy's bindings, as BrokerDO references (FleetDO resolves them when it sends). */
-  private async pushSecrets(): Promise<void> {
-    const info = this.info_();
+  /**
+   * Injection secrets for the policy's bindings, as BrokerDO references (FleetDO resolves them when it
+   * sends): the operator's static ones (`inject:<binding>[:<sandbox>]`), and for a push allowlist a
+   * GitHub installation token BrokerDO mints for exactly those repos. `secrets_update` replaces the
+   * proxy's set, so `force` sends it even when empty (an allowlist emptied takes the token away).
+   *
+   * Checked twice: whatever arrives while BrokerDO minted (a fence, a move, an allowlist change) makes
+   * this push stale, and it is dropped; the change that did it pushes again.
+   */
+  private async pushSecrets(force = false): Promise<void> {
+    const before = this.info_();
     const ws = this.wsLayer();
-    if (!info.host || !ws.inject.length) return;
-    const secrets = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).injectionSecretRefs(
-      ws.inject.map((b) => b.name), info.workstream);
-    if (secrets.length) await this.command({ type: "secrets_update", secrets });
+    const repos = this.pushRepos();
+    const mint = repos.length > 0 && !ws.inject.some((b) => b.name === GITHUB_BINDING);
+    if (!before.host || (!ws.inject.length && !mint && !force)) return;
+    const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    const secrets: InjectionSecret[] = ws.inject.length
+      ? await broker.injectionSecretRefs(ws.inject.map((b) => b.name), { sandbox: before.sandbox, workstream: before.workstream })
+      : [];
+    let next: number | null = null;
+    if (!mint && force) await broker.forgetInjections(before.sandbox);
+    if (mint) {
+      try {
+        const t = await broker.injectionSecret({ sandbox: before.sandbox, epoch: before.epoch },
+          { kind: "github_app", binding: GITHUB_BINDING, repos }, "SandboxDO");
+        if (t) {
+          secrets.push({ binding: t.binding, value: t.value, ...(t.expires_ms !== undefined ? { expires_ms: t.expires_ms } : {}) });
+          next = (t.expires_ms ?? Date.now() + INJECT_IDLE_RETRY_MS) - INJECT_REFRESH_BEFORE_MS;
+        } else {
+          next = Date.now() + INJECT_IDLE_RETRY_MS;
+        }
+      } catch (e) {
+        console.warn(`sandbox ${before.sandbox}: minting its GitHub token failed; retrying`, e);
+        next = Date.now() + INJECT_RETRY_MS;
+      }
+    }
+    const after = this.info_();
+    if (after.epoch !== before.epoch || after.host !== before.host || this.pushRepos().join() !== repos.join()) return;
+    if (secrets.length || force || mint) await this.command({ type: "secrets_update", secrets });
+    if (next !== null) await this.deadlines.set("inject_refresh", next);
+    else await this.deadlines.clear("inject_refresh");
   }
 
   // --- agents, bindings and idleness (docs/control-plane/durable-objects/sandbox/#attach-and-bindings) --
 
-  /** Attach an agent's hands: its slot is configured with `agent_attach`, and no binding is minted before its `ok`. */
-  async attach(agent: string, cwd?: string): Promise<SandboxInfo> {
+  /**
+   * Attach an agent's hands: its slot is configured with `agent_attach`, and no binding is minted before its
+   * `ok`. `repos`: its spec's push allowlist, which joins the sandbox's while it is attached (everything in
+   * one sandbox shares a trust domain).
+   */
+  async attach(agent: string, cwd?: string, repos?: string[]): Promise<SandboxInfo> {
+    const widened = this.setAgentRepos(agent, repos ?? []);
     const [send, info] = this.decide((i) => slots.attach(i, agent, cwd ?? null, i.host !== null));
     if (send) await this.issueAttachCommands([agent]);
+    if (widened) await this.policyChanged(true);
     return info;
   }
 
   /** Remove the agent's slot (killing its processes); its bindings are refused from then on. */
   async detach(agent: string): Promise<void> {
     const info = this.update((i) => slots.detach(i, agent));
+    const narrowed = this.setAgentRepos(agent, []);
     if (info.host) {
       await this.command({ type: "agent_detach", agent, kill_processes: true });
     }
+    if (narrowed) await this.policyChanged(true);
     await this.armIdle();
+  }
+
+  /** Record an attached agent's push allowlist; whether the sandbox's allowlist changed. */
+  private setAgentRepos(agent: string, repos: string[]): boolean {
+    const before = this.pushRepos();
+    const all = { ...(this.get<Record<string, string[]>>("agent_repos") ?? {}) };
+    if (repos.length) all[agent] = canonicalRepos(repos);
+    else delete all[agent];
+    this.put("agent_repos", all);
+    return this.pushRepos().join() !== before.join();
+  }
+
+  /** The push allowlist: the operator's layer and every attached agent's spec (docs/sandbox/networking/egress/policy/#repo-allowlists). */
+  pushRepos(): string[] {
+    return unionRepos(this.wsLayer().repos, ...Object.values(this.get<Record<string, string[]>>("agent_repos") ?? {}));
   }
 
   /** Send `agent_attach` for these agents, each as the agent's one in flight. */

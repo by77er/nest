@@ -14,6 +14,12 @@ import { ErrorCodes } from "../protocol/model";
 import { checkBaseUrl, type GithubAction, type GithubPermissions, marker } from "./brokered";
 
 export const GITHUB_API = "https://api.github.com";
+/**
+ * What a sandbox's injected token may do in its allowed repos: push (`contents: write`, which includes
+ * the `contents: read` pull requests need: docs/agents/capabilities/brokered/#github-permissions) and
+ * open pull requests (`gh pr create`).
+ */
+export const SANDBOX_TOKEN_PERMISSIONS: GithubPermissions = { contents: "write", pull_requests: "write" };
 /** GitHub's REST version header (docs.github.com/en/rest/about-the-rest-api/api-versions). */
 const API_VERSION = "2022-11-28";
 /** An answer's body is read up to this many bytes. */
@@ -135,13 +141,17 @@ export class GitHubApi {
     throw ghError(r, `looking up the App's installation on ${repo}`);
   }
 
-  /** An installation token for one repo (by name, without the owner) with these permissions only. */
-  async mint(jwt: string, installation: number, repoName: string, permissions: GithubPermissions): Promise<{ token: string; expires_ms: number }> {
-    const r = await this.request(jwt, "POST", `/app/installations/${installation}/access_tokens`, { repositories: [repoName], permissions });
+  /**
+   * An installation token for these repos (by name, without the owner: one installation is one account)
+   * with these permissions only.
+   */
+  async mint(jwt: string, installation: number, repoNames: string | readonly string[], permissions: GithubPermissions): Promise<{ token: string; expires_ms: number }> {
+    const repositories = typeof repoNames === "string" ? [repoNames] : [...repoNames];
+    const r = await this.request(jwt, "POST", `/app/installations/${installation}/access_tokens`, { repositories, permissions });
     const j = r.kind === "ok" ? (r.json as { token?: unknown; expires_at?: unknown } | null) : null;
     const expires = typeof j?.expires_at === "string" ? Date.parse(j.expires_at) : NaN;
     if (j && typeof j.token === "string" && Number.isFinite(expires)) return { token: j.token, expires_ms: expires };
-    throw ghError(r, `minting an installation token for ${repoName}`);
+    throw ghError(r, `minting an installation token for ${repositories.join(", ")}`);
   }
 }
 

@@ -390,7 +390,7 @@ export class AgentDO extends DurableObject<Env> {
         throw new NestError(ErrorCodes.INVALID_MESSAGE,
           `${req.sandbox} is in cell ${cur.cell}, workstream ${cur.workstream}; the agent must be too`, 409);
       }
-      await stub.attach(req.agent);
+      await stub.attach(req.agent, undefined, req.spec.repos ?? []);
       hands = { sandbox: req.sandbox };
     }
     if (this.exists()) return this.load();
