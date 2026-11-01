@@ -64,7 +64,7 @@ export const BROKERED_ACTIONS = {
       },
       required: ["repo", "title", "head", "base"], additionalProperties: false,
     },
-    permissions: { pull_requests: "write" },
+    permissions: { pull_requests: "write", contents: "read" },
   },
   "github.review_comment": {
     tool: "github_review_comment", kind: "github",
@@ -78,7 +78,7 @@ export const BROKERED_ACTIONS = {
       },
       required: ["repo", "pull_number", "commit_id", "path", "line", "body"], additionalProperties: false,
     },
-    permissions: { pull_requests: "write" },
+    permissions: { pull_requests: "write", contents: "read" },
   },
   "http.request": {
     tool: "http_request", kind: "http",
