@@ -70,6 +70,9 @@ chmod 1777 "$R/tmp"
 # The agent user (nest-guest runs commands as 1000:1000), init, nest-guest.
 # (The CI rootfs may already have a uid-1000 user; that one is the agent's then.)
 chroot "$R" bash -c 'getent passwd 1000 >/dev/null || useradd -m -u 1000 -U -s /bin/bash nest'
+# Its home must be its own: Firecracker's CI rootfs ships /home/ubuntu as root's (0750), so git and gh
+# couldn't read their configuration under $HOME.
+chroot "$R" bash -c 'h=$(getent passwd 1000 | cut -d: -f6); mkdir -p "$h" && chown -R 1000:1000 "$h" && [ "$(stat -c %u "$h")" = 1000 ]'
 install -m 0755 "$GUEST_BIN" "$R/usr/local/bin/nest-guest"
 install -m 0755 "$HERE/init" "$R/sbin/nest-init"
 ln -sf /sbin/nest-init "$R/sbin/init"
