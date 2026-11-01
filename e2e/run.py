@@ -1196,6 +1196,127 @@ def run_repos(ids):
         check("repos: the refusal is in the egress audit (reason guard: github-push)", False, str(e)[:200])
 
 
+# ---------------------------------------------------------------------------------- agent lifetimes
+# docs/agents/#lifetimes: a parent agent spawns children that own new sandboxes; one exits itself, the
+# parent stops the other; each sandbox is destroyed through SandboxDO's destroy, so FleetDO's GC
+# registry drops it; then the operator ends the parent for good.
+
+def lifecycle_turn(agid, name, steps, wait_s=120):
+    """One fake-brain turn of `agent_*` calls; returns text(label)."""
+    path = os.path.join(WORK, f"life-{name}.json")
+    out = os.path.join(WORK, f"life-{name}.jsonl")
+    with open(path, "w") as fh:
+        json.dump({"results": out, "steps": [{"label": l, "tool": t, "args": a} for l, t, a in steps]}, fh, indent=2)
+    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
+    check(f"lifetimes: {name} turn enqueued", st == 201, json.dumps(t)[:200])
+    try:
+        wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, wait_s, 0.5, f"lifetimes {name} results")
+    except TimeoutError as e:
+        check(f"lifetimes: all {name} results returned", False, str(e)[:200])
+    res = results_by_label(out)
+    return lambda k: (res.get(k) or {}).get("text") or ""
+
+
+def child_scenario(name, steps):
+    """A scenario file a spawned child runs as its task (`E2E <path>`); returns (task, results path)."""
+    path = os.path.join(WORK, f"life-{name}.json")
+    out = os.path.join(WORK, f"life-{name}.jsonl")
+    with open(path, "w") as fh:
+        json.dump({"results": out, "steps": [{"label": l, "tool": t, "args": a} for l, t, a in steps]}, fh, indent=2)
+    return f"E2E {path}", out
+
+
+def live_sandboxes():
+    st, gc = api("GET", "/v1/admin/gc?cell=local")
+    return gc.get("sandboxes") if st == 200 else None
+
+
+def run_lifecycle(ids):
+    if REAL:
+        skip("agent lifetimes", "fake mode only: the calls are scripted")
+        return
+    for path, body in (("capabilities/e2e-spawn", {"tools": ["agent_spawn", "agent_stop"], "spawn": ["e2e-child"]}),
+                       ("templates/e2e-child", {"capabilities": ["nest"], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
+                                                "hands": "optional", "credential": "claude_oauth_token", "escalate_to": "user"}),
+                       ("templates/e2e-parent", {"capabilities": ["nest", "e2e-spawn"], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
+                                                 "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"})):
+        st, r = api("PUT", f"/v1/admin/{path}", body)
+        check(f"lifetimes: {path} configured", st == 200, json.dumps(r)[:200])
+    st, parent = api("POST", "/v1/agents", {"template": "e2e-parent", "workstream": ids["workstream"], "cell": "local"})
+    check("lifetimes: parent agent created", st == 201, json.dumps(parent)[:200])
+    pid = parent.get("agent")
+    def spawned(t):
+        return (re.search(r"Spawned (agt_[a-z0-9]+)", t) or [None, None])[1], (re.search(r"sandbox (sbx_[a-z0-9]+)", t) or [None, None])[1]
+    before = live_sandboxes()
+
+    # 1. A child with a new sandbox runs a hands call, then exits itself, destroying its sandbox.
+    task, out1 = child_scenario("child1", [("bash", "Bash", {"command": "echo child-at-work"}), ("exit", "exit", {"destroy_sandbox": True, "reason": "e2e done"})])
+    text = lifecycle_turn(pid, "spawn1", [("spawn", "agent_spawn", {"template": "e2e-child", "task": task, "sandbox": "new"})])
+    c1, s1 = spawned(text("spawn"))
+    check("lifetimes: agent_spawn made a child owning a new sandbox", c1 and s1, text("spawn")[:300])
+    if not (c1 and s1):
+        return
+    st, info = api("GET", f"/v1/agents/{c1}")
+    check("lifetimes: the child is the parent's", st == 200 and info.get("owner") == pid and (info.get("hands") or {}).get("sandbox") == s1, json.dumps(info)[:300])
+    check("lifetimes: its sandbox is registered (a GC root)", live_sandboxes() == (before or 0) + 1, f"{before} -> {live_sandboxes()}")
+    try:
+        wait_for(lambda: len(results_by_label(out1)) >= 2 or None, 120, 0.5, "the child's task")
+    except TimeoutError as e:
+        check("lifetimes: the child ran its task", False, str(e)[:200])
+    res = results_by_label(out1)
+    check("lifetimes: the child's hands call ran in its sandbox", "child-at-work" in ((res.get("bash") or {}).get("text") or ""), json.dumps(res.get("bash"))[:200])
+    check("lifetimes: exit answered", not (res.get("exit") or {}).get("is_error", True), json.dumps(res.get("exit"))[:200])
+    try:
+        wait_for(lambda: (api("GET", f"/v1/sandboxes/{s1}")[1] or {}).get("state") == "destroyed" or None, 90, 0.5, "the child's sandbox destroyed")
+        check("lifetimes: after exit, the child's sandbox is destroyed", True)
+    except TimeoutError as e:
+        check("lifetimes: after exit, the child's sandbox is destroyed", False, str(e)[:200])
+    st, info = api("GET", f"/v1/agents/{c1}")
+    check("lifetimes: the child ended (exited, by itself), no brain left", (info.get("ended") or {}).get("reason") == "exited"
+          and info["ended"].get("by") == c1 and info.get("brain") is None, json.dumps(info.get("ended"))[:300])
+    check("lifetimes: the GC registry dropped its sandbox", live_sandboxes() == before, f"{before} -> {live_sandboxes()}")
+    st, evs = api("GET", f"/v1/admin/channels/{c1}%2Fevents/messages")
+    check("lifetimes: its events say it exited", st == 200 and any(m.get("kind") == "exited" and (m.get("data") or {}).get("ended") == "exited"
+          for m in (evs or {}).get("messages", [])), json.dumps(evs)[:300])
+    st, r = api("POST", f"/v1/agents/{c1}/turns", {"text": "more"})
+    check("lifetimes: an ended agent takes no turn", st == 404, json.dumps(r)[:200])
+
+    # 2. A child the parent stops: its brain is killed and its sandbox destroyed.
+    task, out2 = child_scenario("child2", [("bash", "Bash", {"command": "echo second-child"})])
+    text = lifecycle_turn(pid, "spawn2", [("spawn", "agent_spawn", {"template": "e2e-child", "task": task, "sandbox": "new"})])
+    c2, s2 = spawned(text("spawn"))
+    check("lifetimes: a second child", c2 and s2, text("spawn")[:300])
+    if not (c2 and s2):
+        return
+    try:
+        wait_for(lambda: results_by_label(out2).get("bash") or None, 120, 0.5, "the second child's task")
+    except TimeoutError as e:
+        check("lifetimes: the second child ran its task", False, str(e)[:200])
+    text = lifecycle_turn(pid, "stop", [("stop", "agent_stop", {"agent": c2, "destroy_sandbox": True, "reason": "e2e"})])
+    check("lifetimes: agent_stop answered", c2 in text("stop") and "stopped" in text("stop"), text("stop")[:200])
+    try:
+        wait_for(lambda: (api("GET", f"/v1/sandboxes/{s2}")[1] or {}).get("state") == "destroyed" or None, 120, 0.5, "the stopped child's sandbox destroyed")
+        check("lifetimes: the stopped child's sandbox is destroyed once its brain is gone", True)
+    except TimeoutError as e:
+        check("lifetimes: the stopped child's sandbox is destroyed once its brain is gone", False, str(e)[:200])
+    st, info = api("GET", f"/v1/agents/{c2}")
+    check("lifetimes: the stopped child ended (stopped, by the parent)", (info.get("ended") or {}).get("by") == pid and info.get("brain") is None,
+          json.dumps({k: info.get(k) for k in ("ended", "brain")})[:300])
+    check("lifetimes: the GC registry dropped the second sandbox", live_sandboxes() == before, f"{before} -> {live_sandboxes()}")
+    st, kids = api("GET", f"/v1/agents/{pid}/children")
+    check("lifetimes: the parent's index has both, ended", st == 200 and sorted(k["agent"] for k in kids) == sorted([c1, c2]) and all(k["ended"] for k in kids),
+          json.dumps(kids)[:300])
+
+    # 3. The operator ends the parent for good (freeing its brain slot).
+    st, r = api("POST", f"/v1/agents/{pid}/stop", {"end": True})
+    check("lifetimes: the operator ends the parent", st == 200 and r.get("status") == "stopped", json.dumps(r)[:200])
+    try:
+        wait_for(lambda: (api("GET", f"/v1/agents/{pid}")[1] or {}).get("brain") is None or None, 90, 0.5, "the parent's brain gone")
+        check("lifetimes: the parent's brain is gone", True)
+    except TimeoutError as e:
+        check("lifetimes: the parent's brain is gone", False, str(e)[:200])
+
+
 def run_fencing(ids):
     brains = real_brains() if REAL else children_named(FAKE_CLAUDE)
     guests = children_named(os.path.join(BIN, "nest-guest"))
@@ -1271,6 +1392,7 @@ def main():
         run_mcp_oauth(ids)
         run_brokered(ids)
         run_repos(ids)
+        run_lifecycle(ids)
         # After the turns: the token has been handed to the brains by now.
         check_token_not_in("the Claude token is not in the gateway's environment or command line", children_named(GW_BIN))
         run_fencing(ids)

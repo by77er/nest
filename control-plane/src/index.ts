@@ -10,6 +10,7 @@ import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
 import { Capability, CatalogName, OperatorOverrides, Template } from "./lib/spec";
+import { MIN_IDLE_TTL_MS } from "./lib/lifetimes";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { type Actor, LedgerName, type SpecGrant, type TaskOp, TaskPriority, TaskStatus } from "./lib/tasks";
 import { LIST_DEFAULT_LIMIT, ledgerStub } from "./do/tasks";
@@ -536,13 +537,15 @@ export const ROUTES: Route[] = [
     body: z.object({
       workstream: z.string().startsWith("ws_"), image: z.string().optional(), resources: Resources.optional(), policy: WorkstreamPolicyLayer.optional(),
       cell: z.string().default(DEFAULT_CELL),
+      // Destroyed after being dormant this long (absent: the cell default; docs/control-plane/durable-objects/sandbox/#lifetime).
+      idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
     }),
     run: async ({ env, body: r }) => {
       const id = newId("sbx_");
       const info = await sandbox(env, id).create({
         sandbox: id, workstream: r.workstream, cell: checkCell(env, r.cell),
         ...(r.image ? { image: r.image } : {}), ...(r.resources ? { resources: r.resources } : {}),
-        ...(r.policy ? { workstreamPolicy: r.policy } : {}),
+        ...(r.policy ? { workstreamPolicy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
       });
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
@@ -557,6 +560,9 @@ export const ROUTES: Route[] = [
   route({ method: "DELETE", path: "/v1/sandboxes/:sandbox/ports/:port", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).unexposePort(Number(p.port)) }),
   route({ method: "GET", path: "/v1/sandboxes/:sandbox", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).info() }),
   route({ method: "DELETE", path: "/v1/sandboxes/:sandbox", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).destroy() }),
+  // Its own idle TTL (null: the cell default); a long one keeps a sandbox nobody attaches to.
+  route({ method: "PUT", path: "/v1/sandboxes/:sandbox/lifetime", auth: "admin", body: z.object({ idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).nullable() }),
+    run: ({ env, p, body: r }) => sandbox(env, p.sandbox).setLifetime(r.idle_ttl_ms) }),
   // A person's (or a test harness's) way to a sandbox's hands: the same target an agent gets.
   route({ method: "POST", path: "/v1/sandboxes/:sandbox/resolve", auth: "admin", body: z.object({ client: z.string().min(1) }),
     run: ({ env, p, body: r }) => sandbox(env, p.sandbox).resolve(r.client) }),
@@ -663,7 +669,20 @@ export const ROUTES: Route[] = [
     body: z.object({ host: HostId.optional(), restart: z.boolean().optional() }),
     run: ({ env, p, body: r }) => agent(env, p.agent).start(r.host, undefined, r.restart ?? false),
   }),
-  route({ method: "POST", path: "/v1/agents/:agent/stop", auth: "admin", run: ({ env, p }) => agent(env, p.agent).stop("requested") }),
+  route({
+    // A stop the agent's next input lifts; with `end`, for good (docs/agents/#lifetimes): its brain killed, its
+    // queued turns dropped, the agents it owns ended too, and with `destroy_sandbox` the sandbox created for it.
+    method: "POST", path: "/v1/agents/:agent/stop", auth: "admin", optionalBody: true,
+    body: z.strictObject({ end: z.boolean().optional(), destroy_sandbox: z.boolean().optional(), reason: z.string().max(500).optional() }),
+    run: async ({ env, p, body: r }) => {
+      if (!r.end) {
+        if (r.destroy_sandbox) throw new NestError(ErrorCodes.INVALID_MESSAGE, "destroy_sandbox needs end: true");
+        return agent(env, p.agent).stop("requested");
+      }
+      return agent(env, p.agent).end({ by: "user", reason: "stopped", kill: true, destroy_sandbox: r.destroy_sandbox ?? false, ...(r.reason ? { note: r.reason } : {}) });
+    },
+  }),
+  route({ method: "GET", path: "/v1/agents/:agent/children", auth: "admin", run: ({ env, p }) => agent(env, p.agent).children() }),
   route({ method: "PUT", path: "/v1/agents/:agent/rules", auth: "admin", body: z.array(ToolRule), run: ({ env, p, body }) => agent(env, p.agent).setRules(body) }),
   // The agent's brokered-action journal, newest first; `before` pages by an earlier page's last created_ms.
   route({ method: "GET", path: "/v1/agents/:agent/brokered", auth: "admin", run: ({ env, url, p }) =>

@@ -206,6 +206,9 @@ const PRUNE_INTERVAL_MS = 3_600_000;
 /** Its own deadline, so a quiet cell (no tick, no tunnels) still prunes: armed on every start. */
 const ALARM_PRUNE = "prune";
 const PRUNE_DAILY_MS = 24 * 3_600_000;
+/** Sandboxes whose lifetime check `armLifetimes` arms per daily run, and how often each is asked again. */
+const LIFETIME_BACKFILL_PER_RUN = 200;
+const LIFETIME_RECHECK_MS = 7 * 86_400_000;
 /** A brain waiter not seen again for this long has stopped waiting (it retries at least every 5 min). */
 const BRAIN_WAIT_TTL_MS = 12 * 60_000;
 /** Lost hosts (expired or dead) whose brains' agents haven't all acknowledged the loss yet. */
@@ -355,6 +358,8 @@ export class FleetDO extends DurableObject<Env> {
     // the roots); SandboxDO registers in `create`, before anything is written for the sandbox.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS sandboxes (sandbox TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL,
       destroyed_ms INTEGER)`);
+    // When its SandboxDO confirmed its lifetime check is armed (null: not yet; `armLifetimes` backfills it).
+    addColumn(this.sql, "sandboxes", "lifetime_ms", "INTEGER");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS gc_runs (run TEXT PRIMARY KEY, host TEXT NOT NULL, marked_ms INTEGER NOT NULL,
       dry_run INTEGER NOT NULL, mark_version INTEGER NOT NULL, roots INTEGER NOT NULL, finished_ms INTEGER, report TEXT)`);
     // Agents whose last start found no brain host with room: poked when room appears, and the tick
@@ -1712,7 +1717,10 @@ export class FleetDO extends DurableObject<Env> {
     this.prune(Date.now());
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === ALARM_TICK) await this.tick();
-      if (key === ALARM_PRUNE) await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
+      if (key === ALARM_PRUNE) {
+        await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
+        await this.armLifetimes();
+      }
       if (key === ALARM_TUNNEL_SWEEP) {
         try {
           await this.tunnelSweep();
@@ -2176,6 +2184,26 @@ export class FleetDO extends DurableObject<Env> {
   async registerSandboxes(sandboxes: string[]): Promise<number> {
     for (const s of sandboxes) this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", s, Date.now());
     return this.sql.exec("SELECT 1 FROM sandboxes WHERE destroyed_ms IS NULL").toArray().length;
+  }
+
+  /**
+   * Sandboxes created before lifetimes have no `expiry` check armed, and a dormant one gets no call
+   * that would arm it (nor does one whose check a rolled-back release dropped): each live registered
+   * sandbox is asked (`ensureLifetime`, idempotent) once, then again every `LIFETIME_RECHECK_MS`, at
+   * most `LIFETIME_BACKFILL_PER_RUN` a day, never-asked first. A failure is asked again the next day.
+   */
+  private async armLifetimes(): Promise<void> {
+    const rows = this.sql.exec<{ sandbox: string }>(
+      `SELECT sandbox FROM sandboxes WHERE destroyed_ms IS NULL AND (lifetime_ms IS NULL OR lifetime_ms < ?)
+        ORDER BY lifetime_ms IS NOT NULL, lifetime_ms, registered_ms LIMIT ?`, Date.now() - LIFETIME_RECHECK_MS, LIFETIME_BACKFILL_PER_RUN).toArray();
+    for (const { sandbox } of rows) {
+      try {
+        await this.sandbox(sandbox).ensureLifetime();
+        this.sql.exec("UPDATE sandboxes SET lifetime_ms = ? WHERE sandbox = ?", Date.now(), sandbox);
+      } catch (e) {
+        console.warn(`FleetDO: arming ${sandbox}'s lifetime check failed; tried again tomorrow`, e);
+      }
+    }
   }
 
   /** Operator: make the next claim start a run now (it still follows the dry-run rule). */

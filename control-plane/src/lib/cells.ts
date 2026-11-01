@@ -53,6 +53,8 @@ const AwsCell = z.object({
   proxy_root_key_arn: z.string().regex(KMS_KEY_ARN).optional(),
   /** Optional for one release: an entry written before brain hosts has none. */
   brain: BrainHosts.optional(),
+  /** The idle TTL of this cell's sandboxes that have none of their own (docs/control-plane/durable-objects/sandbox/#lifetime); absent: `SANDBOX_IDLE_TTL_MS`. */
+  sandbox_idle_ttl_ms: z.number().int().min(60_000).optional(),
 }).refine((c) => c.proxy_root_key_arn === undefined || KMS_KEY_ARN.exec(c.proxy_root_key_arn)?.[1] === c.region, {
   message: "proxy_root_key_arn must be a key in the cell's region",
   path: ["proxy_root_key_arn"],

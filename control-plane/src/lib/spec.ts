@@ -10,6 +10,7 @@ import { ChannelGrant } from "./channels";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
 import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry, scopeToRepos } from "./brokered";
 import { canonicalRepos, narrowRepos, Repos } from "./repos";
+import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -48,6 +49,8 @@ export const Capability = z.object({
   mcp: McpSource.optional(),
   /** Brokered actions it grants, each scoped (docs/agents/capabilities/#brokered-actions): GitHub actions to repos, http profiles. */
   brokered: BrokeredSource.optional(),
+  /** The templates its `agent_spawn` may spawn from (the spawn grant; docs/agents/#spawning). */
+  spawn: z.array(CatalogName).optional(),
 });
 export type Capability = z.output<typeof Capability>;
 
@@ -68,6 +71,12 @@ export const Template = z.object({
    * its sandbox's allowlist while attached, and the scope of its unscoped GitHub brokered actions.
    */
   repos: Repos.optional(),
+  /** Its agents stop themselves once their work is done (docs/agents/#lifetimes); a spawn may set it, never clear it. */
+  ephemeral: z.boolean().optional(),
+  /** The idle TTL of a sandbox `agent_spawn` creates for its agents (a spawn may only shorten it); absent: the cell default. */
+  sandbox_idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
+  /** A spawner may attach an agent of this template to the spawner's own sandbox (`agent_spawn{sandbox: share}`). */
+  share_sandbox: z.boolean().optional(),
 });
 export type Template = z.output<typeof Template>;
 
@@ -85,6 +94,8 @@ export const OperatorOverrides = z.object({
   params: SpecParams.optional(),
   /** The push allowlist, replacing the template's. */
   repos: Repos.optional(),
+  /** Replaces the template's. */
+  ephemeral: z.boolean().optional(),
 });
 export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 
@@ -93,13 +104,20 @@ export type OperatorOverrides = z.output<typeof OperatorOverrides>;
  * template's, and `rules` only `deny` or `ask`, placed before the template's (first match wins), so
  * they can only take permissions away. No launch, built-in tools, credential or escalation: those
  * stay the template's, and so do capability parameters (giving a child a ledger the spawner holds
- * waits for `agent_spawn`). Anything else is refused (`strict`).
+ * waits for grants). Lifetimes only shorten: `ephemeral` can be set, never cleared, and the sandbox's
+ * idle TTL only lowered. Anything else is refused (`strict`).
  */
 export const SpawnerOverrides = z.strictObject({
   tools: z.array(z.string()).optional(),
   rules: z.array(ToolRule.extend({ decision: z.enum(["deny", "ask"]) })).optional(),
-  /** A subset of the template's push allowlist (attenuation; the spawner's own once `spawn_agent` is built). */
+  /**
+   * A subset of the template's push allowlist. Narrowed against the template, not the spawner's own:
+   * the spawn grant on the template (a capability's `spawn`) is the operator's authorization for what
+   * it gives, as for tools (a captain holds no repos, yet spawns workers that push).
+   */
   repos: Repos.optional(),
+  ephemeral: z.literal(true).optional(),
+  sandbox_idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
 });
 export type SpawnerOverrides = z.output<typeof SpawnerOverrides>;
 
@@ -124,6 +142,12 @@ export interface AgentSpec {
   brokered?: BrokeredGrant[];
   /** Its push allowlist, canonical; absent when empty (as is every stored spec before it). */
   repos?: string[];
+  /** The templates it may spawn from: the union of its capabilities' `spawn`; absent when none. */
+  spawn?: string[];
+  /** It stops itself once its work is done (docs/agents/#lifetimes); absent: it doesn't. */
+  ephemeral?: true;
+  /** The idle TTL of a sandbox created for it at spawn; absent: the cell default. */
+  sandbox_idle_ttl_ms?: number;
 }
 
 export interface Catalog {
@@ -222,6 +246,22 @@ export const EGRESS_CAPABILITIES: Readonly<Record<string, Capability>> = {
 };
 
 /**
+ * Version 5: spawning and stopping agents (docs/agents/#spawning, docs/agents/#lifetimes). Spawns from
+ * `worker` only; adding it to a template, or another template to its `spawn`, is the operator's step.
+ */
+export const SPAWNING_CAPABILITIES: Readonly<Record<string, Capability>> = {
+  spawning: {
+    ...cap(["agent_spawn", "agent_stop"], [], [
+      "Spawn an agent with mcp__nest__agent_spawn {template, task, sandbox?: new | share, ephemeral?}. It is yours: its",
+      "events (its final text, its exit) reach you, and you stop it, and the agents it spawned, with mcp__nest__agent_stop",
+      "{agent, destroy_sandbox?}. Say in every task when the work counts as done. An ephemeral agent stops itself once a",
+      "turn ends with nothing waiting for it, destroying the sandbox it was given.",
+    ].join(" ")),
+    spawn: ["worker"],
+  },
+};
+
+/**
  * The built-ins a new catalog's `worker` launches with (docs/agents/runner/#launch): the task tools and
  * the web tools. No `TodoWrite` (inert beside the task tools) and no `Agent` (`Task` before Claude Code
  * 2.1): in `-p` mode a subagent's result arrives in a later turn, which turn tracking doesn't model.
@@ -229,18 +269,26 @@ export const EGRESS_CAPABILITIES: Readonly<Record<string, Capability>> = {
 export const WORKER_BUILTIN_TOOLS: readonly string[] = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
 
 /**
+ * Tools the registry no longer has: `delegate` (inspecting without hands is a pattern,
+ * docs/orchestration/captains/), `spawn_agent` and `kill` (stubs, replaced by `agent_spawn` and
+ * `agent_stop`). A stored capability or spec naming one is read without it.
+ */
+export const RETIRED_TOOLS: readonly string[] = ["delegate", "spawn_agent", "kill"];
+
+/**
  * The seed of an empty catalog (the current version). Beyond version 1 it adds the later steps'
  * capabilities and, for new catalogs only (a seed step never edits an entry a catalog already holds):
- * `management` without `delegate` (no such tool: inspecting without hands is a pattern,
- * docs/orchestration/captains/), and `worker` without `subagents` and with {@link WORKER_BUILTIN_TOOLS}.
+ * `management` without the {@link RETIRED_TOOLS}, `captain` with `spawning`, and `worker` without
+ * `subagents` and with {@link WORKER_BUILTIN_TOOLS}.
  */
 export const SEED_CATALOG: Catalog = {
   capabilities: {
     ...SEED_CATALOG_V1.capabilities,
-    management: { ...SEED_CATALOG_V1.capabilities.management!, tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => t !== "delegate") },
+    management: { ...SEED_CATALOG_V1.capabilities.management!, tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => !RETIRED_TOOLS.includes(t)) },
     ...CHANNEL_CAPABILITIES,
     ...TASK_CAPABILITIES,
     ...EGRESS_CAPABILITIES,
+    ...SPAWNING_CAPABILITIES,
   },
   templates: {
     worker: {
@@ -248,7 +296,7 @@ export const SEED_CATALOG: Catalog = {
       capabilities: [...SEED_CATALOG_V1.templates.worker!.capabilities.filter((c) => c !== "subagents"), "tasks"],
       launch: { ...SEED_CATALOG_V1.templates.worker!.launch, builtin_tools: [...WORKER_BUILTIN_TOOLS] },
     },
-    captain: { ...SEED_CATALOG_V1.templates.captain!, capabilities: [...SEED_CATALOG_V1.templates.captain!.capabilities, "tasks", "tasks-admin"] },
+    captain: { ...SEED_CATALOG_V1.templates.captain!, capabilities: [...SEED_CATALOG_V1.templates.captain!.capabilities, "tasks", "tasks-admin", "spawning"] },
   },
 };
 
@@ -264,6 +312,7 @@ export const SEED_STEPS: readonly { version: number; capabilities: Readonly<Reco
   { version: 2, capabilities: CHANNEL_CAPABILITIES, templates: {} },
   { version: 3, capabilities: TASK_CAPABILITIES, templates: {} },
   { version: 4, capabilities: EGRESS_CAPABILITIES, templates: {} },
+  { version: 5, capabilities: SPAWNING_CAPABILITIES, templates: {} },
 ];
 export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
 
@@ -361,11 +410,13 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   const caps: Capability[] = [];
   const mcp: McpGrant[] = [];
   const brokered: BrokeredGrant[] = [];
+  const spawn: string[] = [];
   for (const c of tpl.capabilities) {
     if (!Object.hasOwn(catalog.capabilities, c)) return err(`template ${name}: unknown capability ${c}`);
     const cap = catalog.capabilities[c]!;
     caps.push(cap);
     if (cap.mcp) mcp.push(grantOf(c, cap.mcp));
+    for (const t of cap.spawn ?? []) if (!spawn.includes(t)) spawn.push(t);
     for (const e of cap.brokered ?? []) {
       const g = grantOfEntry(c, e);
       if (g) brokered.push(g);
@@ -392,6 +443,9 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     ...(mcp.length ? { mcp } : {}),
     ...(brokered.length ? { brokered } : {}),
     ...(tpl.repos?.length ? { repos: canonicalRepos(tpl.repos) } : {}),
+    ...(spawn.length ? { spawn } : {}),
+    ...(tpl.ephemeral ? { ephemeral: true as const } : {}),
+    ...(tpl.sandbox_idle_ttl_ms !== undefined ? { sandbox_idle_ttl_ms: tpl.sandbox_idle_ttl_ms } : {}),
   });
 }
 
@@ -459,7 +513,11 @@ function narrowTools(name: string, spec: AgentSpec, subset: readonly string[] | 
  */
 export type SpawnSpec =
   | { template: string; hands: boolean; by: "operator"; overrides?: OperatorOverrides }
-  | { template: string; hands: boolean; by: "spawner"; overrides?: SpawnerOverrides };
+  /**
+   * `share`: the hands are the spawner's own sandbox (the template must allow it: `share_sandbox`).
+   * `cell_idle_ttl_ms`: the cell default a spawn's idle TTL may not exceed when the template sets none.
+   */
+  | { template: string; hands: boolean; by: "spawner"; share?: boolean; cell_idle_ttl_ms?: number; overrides?: SpawnerOverrides };
 
 /** Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make. */
 export function expandSpec(catalog: Catalog, registry: readonly string[], spec: SpawnSpec): Result<AgentSpec> {
@@ -470,6 +528,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
   const base = expandTemplate(catalog, registry, spec.template);
   if (!base.ok) return base;
   if (spec.by === "spawner") {
+    if (spec.share && !tpl.share_sandbox) return err(`template ${spec.template} doesn't share its spawner's sandbox`);
     // Parsed again: a caller's object that carries anything else is refused, whatever its type said.
     const o = SpawnerOverrides.safeParse(spec.overrides ?? {});
     if (!o.success) return err(`a spawner can only narrow tools and add deny or ask rules: ${o.error.issues.map((i) => i.message).join("; ")}`);
@@ -479,18 +538,27 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     // template names. A child's parameters wait for attenuation against the spawner's own.
     const repos = narrowRepos(base.value.repos ?? [], o.data.repos ?? base.value.repos ?? []);
     if (!repos.ok) return err(`template ${spec.template}: ${repos.error}`);
-    const { mcp: _mcp, brokered: _brokered, ...rest } = base.value;
-    return ok(withRepos({ ...rest, ...tools.value, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} }, repos.value));
+    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, ...rest } = base.value;
+    // Lifetimes only shorten: ephemeral once set stays, and the shorter TTL wins.
+    const ephemeral = base.value.ephemeral || o.data.ephemeral;
+    // The template's TTL (an operator's choice, longer than the cell's or not), else the cell default, bounds the spawn's.
+    const asked = o.data.sandbox_idle_ttl_ms;
+    const tplTtl = base.value.sandbox_idle_ttl_ms;
+    const ttl = asked !== undefined ? narrowTtl(tplTtl ?? spec.cell_idle_ttl_ms ?? Infinity, asked) : tplTtl;
+    const lifetimes = { ...(ephemeral ? { ephemeral: true as const } : {}), ...(ttl !== undefined ? { sandbox_idle_ttl_ms: ttl } : {}) };
+    return ok(withRepos({ ...rest, ...tools.value, ...lifetimes, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), params: {} }, repos.value));
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);
   if (!tools.ok) return tools;
   const params = checkParams(`template ${spec.template}`, capsOf(catalog, spec.template), { ...base.value.params, ...o.params });
   if (!params.ok) return params;
-  const { mcp: _mcp, brokered: _brokered, ...rest } = base.value;
+  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, ...rest } = base.value;
+  const ephemeral = o.ephemeral ?? base.value.ephemeral ?? false;
   return ok(withRepos({
     ...rest,
     ...tools.value,
+    ...(ephemeral ? { ephemeral: true as const } : {}),
     params: params.value,
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,
@@ -514,10 +582,10 @@ export const ROLE_SPECS: Readonly<Record<"worker" | "captain", Omit<AgentSpec, "
   },
   captain: {
     template: "captain",
-    // Without `delegate`, which no handler ever served and the registry no longer has (a stored
-    // record naming it lists a tool its runner is never offered).
-    tools: ["notify", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
-      "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "memory_read", "memory_write",
+    // Without the retired tools (`delegate`, `spawn_agent`, `kill`), which no handler ever served and
+    // the registry no longer has (a stored record naming one lists a tool its runner is never offered).
+    tools: ["notify", "ask", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
+      "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "memory_read", "memory_write",
       "notify_user"],
     credential: setupTokenSecret("captain"),
     escalate_to: "user",

@@ -607,7 +607,7 @@ describe("channel tools through the dispatch path", () => {
   it("lists the channel tools and runs them: create, post, read, keyed CAS, subscribe, unsubscribe, message", async () => {
     const s = await setup();
     s.ws.send({ type: "tools_list_request", request: "req_c" });
-    expect((await s.ws.next("tools_list")).tools.map((t: any) => t.name)).toEqual(["notify", "ask", "read_transcript", "channel_create", "post", "read", "subscribe", "unsubscribe", "message"]);
+    expect((await s.ws.next("tools_list")).tools.map((t: any) => t.name)).toEqual(["notify", "ask", "exit", "read_transcript", "channel_create", "post", "read", "subscribe", "unsubscribe", "message"]);
     const name = `team/${uniq("t")}`;
     expect((await s.call("channel_create", { channel: name })).status).toBe("ok");
     expect(s.value(await s.call("post", { channel: name, text: "hello", kind: "progress", data: { from: "user", taint: false } }))).toEqual({ status: "posted", seq: 1 });

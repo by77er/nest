@@ -25,6 +25,7 @@ import {
 } from "../protocol/model";
 import { canonicalRepos, Repos, unionRepos } from "../lib/repos";
 import { GITHUB_BINDING, githubEgress } from "../lib/rules/github";
+import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 
 export const DEFAULT_IMAGE = "nest-base:latest";
 export const DEFAULT_RESOURCES: Resources = { vcpus: 2, memory_mib: 4096, disk_gib: 32 };
@@ -68,6 +69,16 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
   ports: { port: number; url: string }[];
   /** The last `HISTORY_MAX` epochs and their hosts (the `epochs` table keeps every one). */
   history: { epoch: number; host: string }[];
+  /** The agent it was created for (`agent_spawn{sandbox: new}`), which may destroy it when it ends; absent: the operator's. */
+  owner?: string;
+  /** Destroyed after being dormant this long (docs/control-plane/durable-objects/sandbox/#lifetime); absent: the cell default. */
+  idle_ttl_ms?: number;
+  /** Since when it has been dormant (no agent attached, no VM up); kept by every mutation (`decide`). */
+  dormant_since_ms?: number;
+  /** When the notice that it will be destroyed went to `user`, for this dormancy. */
+  expiry_notice_ms?: number;
+  /** When the lifetime check last ran (a gap over `EXPIRY_GAP_MS` restarts the clock). */
+  expiry_checked_ms?: number;
 }
 
 export interface CreateSandbox {
@@ -77,6 +88,9 @@ export interface CreateSandbox {
   image?: string;
   resources?: Resources;
   workstreamPolicy?: WorkstreamPolicyInput;
+  /** The agent it is created for (it owns it). */
+  owner?: string;
+  idle_ttl_ms?: number;
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
@@ -108,6 +122,8 @@ export function portHostname(kind: "preview" | "share", domain: string, port: nu
   const { label, zone } = splitDomain(domain);
   return `${port}-${sandbox.replace(/^sbx_/, "")}-${kind}-${label}.${zone}`;
 }
+
+const days = (ms: number) => (ms % 86_400_000 === 0 ? `${ms / 86_400_000} days` : `${Math.round(ms / 1000)} s`);
 
 /** What a stored record written before these fields lacks, and a new one starts with. */
 const newFields = () => ({
@@ -209,6 +225,13 @@ export class SandboxDO extends DurableObject<Env> {
   private decide<T>(fn: (info: SandboxInfo) => T): [T, SandboxInfo] {
     const info = this.info_();
     const r = fn(info);
+    // Dormancy is kept in the step of every change: it starts at the first and ends at once (a wake, an attach).
+    if (!dormant(info)) {
+      delete info.dormant_since_ms;
+      delete info.expiry_notice_ms;
+    } else if (info.dormant_since_ms === undefined) {
+      info.dormant_since_ms = Date.now();
+    }
     info.history = this.recentEpochs();
     const { history: _derived, ...stored } = info;
     this.put("info", stored);
@@ -250,8 +273,11 @@ export class SandboxDO extends DurableObject<Env> {
       attached: [],
       working: [],
       ports: [],
+      ...(req.owner ? { owner: req.owner } : {}),
+      ...(req.idle_ttl_ms !== undefined ? { idle_ttl_ms: req.idle_ttl_ms } : {}),
     };
     this.put("info", info);
+    await this.deadlines.set("expiry", Date.now() + 60_000, true);
     const layer = WorkstreamPolicyLayer.parse(req.workstreamPolicy ?? {});
     this.put("ws_layer", { ...layer, repos: canonicalRepos(layer.repos) });
     try {
@@ -497,10 +523,15 @@ export class SandboxDO extends DurableObject<Env> {
    * the sandbox gone, and discards what it got. FleetDO is told before the lease is released, so it
    * grants nothing afterwards (and its generations stop being GC roots). A retry repeats the cleanup.
    */
-  async destroy(): Promise<void> {
+  async destroy(reason = "requested"): Promise<void> {
     const before = this.info_();
     this.update(lease.destroyed);
-    this.report("destroyed", "destroyed", { epoch: before.epoch }, `${before.sandbox}/destroyed`);
+    await this.afterDestroyed(before, reason);
+  }
+
+  /** What follows the decision that it is destroyed (`before`: the record just before it). A retry repeats it. */
+  private async afterDestroyed(before: SandboxInfo, reason: string): Promise<void> {
+    this.report("destroyed", `destroyed (${reason})`, { epoch: before.epoch, reason }, `${before.sandbox}/destroyed`);
     const fleet = this.fleet(before.cell);
     await fleet.sandboxDestroyed(before.sandbox);
     if (before.host) await fleet.issueCommands(before.host, [{ type: "sandbox_destroy", sandbox: before.sandbox, epoch: before.epoch }]);
@@ -508,6 +539,7 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
     await this.deadlines.clear("inject_refresh");
+    await this.deadlines.clear("expiry");
     await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).forgetInjections(before.sandbox);
   }
 
@@ -740,6 +772,8 @@ export class SandboxDO extends DurableObject<Env> {
         await this.pruneCommitRecords();
       } else if (key === "notify_moved") {
         await this.sendMoveNotices();
+      } else if (key === "expiry") {
+        await this.checkExpiry();
       } else if (key === OUTBOX_DEADLINE) {
         await this.outbox.flush();
       }
@@ -809,6 +843,8 @@ export class SandboxDO extends DurableObject<Env> {
    * one sandbox shares a trust domain).
    */
   async attach(agent: string, cwd?: string, repos?: string[]): Promise<SandboxInfo> {
+    const cur = this.info_();
+    if (lease.gone(cur.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${cur.state}`, 409);
     const widened = this.setAgentRepos(agent, repos ?? []);
     const [send, info] = this.decide((i) => slots.attach(i, agent, cwd ?? null, i.host !== null));
     if (send) await this.issueAttachCommands([agent]);
@@ -818,13 +854,105 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Remove the agent's slot (killing its processes); its bindings are refused from then on. */
   async detach(agent: string): Promise<void> {
-    const info = this.update((i) => slots.detach(i, agent));
+    await this.release(agent, false);
+  }
+
+  /**
+   * An agent ended for good: its slot goes (`detach`), and with `destroy` the sandbox too, in the same
+   * step, if it was created for that agent and no other agent is attached. Idempotent: a retry after
+   * the destroy repeats its cleanup.
+   */
+  async release(agent: string, destroy: boolean): Promise<{ destroyed: boolean }> {
+    const before = this.tryInfo();
+    if (!before) return { destroyed: false };
+    const mine = destroy && before.owner === agent;
+    if (before.state === "destroyed") {
+      if (mine) await this.afterDestroyed(before, `its agent ${agent} ended`);
+      return { destroyed: mine };
+    }
+    const [destroyed, info] = this.decide((i) => {
+      slots.detach(i, agent);
+      const d = mine && i.attached.length === 0;
+      if (d) lease.destroyed(i);
+      return d;
+    });
     const narrowed = this.setAgentRepos(agent, []);
+    if (destroyed) {
+      await this.afterDestroyed(before, `its agent ${agent} ended`);
+      return { destroyed: true };
+    }
     if (info.host) {
       await this.command({ type: "agent_detach", agent, kill_processes: true });
     }
     if (narrowed) await this.policyChanged(true);
     await this.armIdle();
+    return { destroyed: false };
+  }
+
+  // --- lifetime (docs/control-plane/durable-objects/sandbox/#lifetime) --------------------------------
+
+  /**
+   * The `expiry` deadline: a sandbox dormant for its idle TTL is destroyed (`expiryStep`); one with a
+   * TTL over a day gets a notice on `user` a day first. Re-armed on every check while it lives.
+   */
+  private async checkExpiry(): Promise<void> {
+    const now = Date.now();
+    const before = this.tryInfo();
+    if (!before || before.state === "destroyed") return;
+    // Recorded with the check; after missed checks the dormancy clock (and any notice) starts again.
+    const gap = before.expiry_checked_ms !== undefined && now - before.expiry_checked_ms > EXPIRY_GAP_MS;
+    const s = this.update((i) => {
+      i.expiry_checked_ms = now;
+      if (gap && i.dormant_since_ms !== undefined) {
+        i.dormant_since_ms = now;
+        delete i.expiry_notice_ms;
+      }
+    });
+    const ttl = s.idle_ttl_ms ?? cellIdleTtlMs(this.env, s.cell);
+    const step = expiryStep({
+      dormant: dormant(s), ttl, now, ...(s.dormant_since_ms !== undefined ? { since: s.dormant_since_ms } : {}),
+      ...(s.expiry_notice_ms !== undefined ? { noticed: s.expiry_notice_ms } : {}),
+    });
+    if (step.kind === "destroy") {
+      console.log(`sandbox ${s.sandbox}: dormant since ${new Date(step.since).toISOString()}, past its idle TTL (${ttl} ms); destroying`);
+      await this.destroy(`dormant past its idle TTL of ${days(ttl)}`);
+      return;
+    }
+    if (step.kind === "notice") {
+      this.update((i) => {
+        i.expiry_notice_ms = now;
+      });
+      const at = new Date(step.destroy_at).toISOString();
+      this.outbox.push("user", {
+        kind: "sandbox_expiring",
+        text: `Sandbox ${s.sandbox} (cell ${s.cell}) has had no agent attached and no VM up since ${new Date(step.since).toISOString()}; it will be ` +
+          `destroyed at ${at} (idle TTL ${days(ttl)}). To keep it, wake it (POST /v1/sandboxes/${s.sandbox}/place), attach an agent, or give it ` +
+          `a longer TTL (PUT /v1/sandboxes/${s.sandbox}/lifetime).`,
+        data: { sandbox: s.sandbox, cell: s.cell, dormant_since_ms: step.since, destroy_at_ms: step.destroy_at, idle_ttl_ms: ttl },
+        idem_key: `${s.sandbox}/expiry/${step.since}`,
+      }, { tainted: false });
+    }
+    await this.deadlines.set("expiry", step.at);
+  }
+
+  /** FleetDO's backfill for sandboxes created before lifetimes: arm the check if it isn't. */
+  async ensureLifetime(): Promise<boolean> {
+    const s = this.tryInfo();
+    if (!s || s.state === "destroyed") return false;
+    if (!this.deadlines.has("expiry")) await this.deadlines.set("expiry", Date.now());
+    return true;
+  }
+
+  /** The operator's: this sandbox's own idle TTL (null: back to the cell default). Checked again at once. */
+  async setLifetime(idleTtlMs: number | null): Promise<SandboxInfo> {
+    const info = this.update((i) => {
+      if (idleTtlMs === null) delete i.idle_ttl_ms;
+      else i.idle_ttl_ms = idleTtlMs;
+      // A new TTL warns again before it ends.
+      delete i.expiry_notice_ms;
+    });
+    if (!lease.gone(info.state)) await this.deadlines.set("expiry", Date.now());
+    return info;
   }
 
   /**

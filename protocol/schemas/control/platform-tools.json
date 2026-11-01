@@ -102,32 +102,100 @@
     "requires_approval": false
   },
   {
-    "name": "spawn_agent",
-    "description": "Start a new worker agent in a workstream, optionally bound to a sandbox.",
+    "name": "agent_spawn",
+    "description": "Spawn an agent from a template your capabilities allow. You own it: its events (its final text, its exit) reach you, and you can stop it (agent_stop). It gets the task as its first input.",
     "input_schema": {
       "type": "object",
       "properties": {
-        "workstream": {
+        "template": {
           "type": "string",
-          "description": "Workstream id (ws_...)."
+          "description": "Template name (one your spawning capability lists)."
         },
         "task": {
           "type": "string",
-          "description": "Initial instructions."
+          "description": "Its first input: what to do, and when the work counts as done."
         },
         "sandbox": {
           "type": "string",
-          "description": "Sandbox to bind hands to (sbx_...); omit to create one."
+          "enum": [
+            "new",
+            "share"
+          ],
+          "description": "new: a sandbox created for it (it owns it); share: your own sandbox (if the template allows sharing); omit for none."
         },
-        "fork_session_of": {
-          "type": "string",
-          "description": "Fork the conversation of this agent (agt_...)."
+        "ephemeral": {
+          "type": "boolean",
+          "description": "true: it stops itself once a turn ends with nothing waiting for it, destroying the sandbox created for it. A template's ephemeral can't be turned off."
+        },
+        "sandbox_idle_ttl_s": {
+          "type": "integer",
+          "minimum": 60,
+          "description": "A new sandbox is destroyed after it has been idle (suspended, with no agent attached) this long; at most the template's or the cell's default."
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Narrow its tools to these (a subset of the template's)."
+        },
+        "repos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Narrow its push allowlist to these owner/repo names (a subset of the template's)."
         }
       },
       "required": [
-        "workstream",
+        "template",
         "task"
       ],
+      "additionalProperties": false
+    },
+    "requires_approval": false
+  },
+  {
+    "name": "agent_stop",
+    "description": "Stop an agent you own (one you spawned, or one they spawned) for good: its brain is killed, its queued turns are dropped, and the agents it owns are stopped too. With yourself as agent it is exit.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "description": "Agent id (agt_...)."
+        },
+        "destroy_sandbox": {
+          "type": "boolean",
+          "description": "Also destroy the sandbox created for it, unless another agent is attached to it."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why (shown in its exit event)."
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "additionalProperties": false
+    },
+    "requires_approval": false
+  },
+  {
+    "name": "exit",
+    "description": "End yourself for good once this turn finishes: no more turns, wakes or messages; your queued turns are dropped and the agents you own are stopped. Your owner hears your final text and that you exited.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "destroy_sandbox": {
+          "type": "boolean",
+          "description": "Also destroy the sandbox created for you, unless another agent is attached to it."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why (shown in your exit event)."
+        }
+      },
       "additionalProperties": false
     },
     "requires_approval": false
@@ -520,29 +588,6 @@
       "additionalProperties": false
     },
     "requires_approval": true
-  },
-  {
-    "name": "kill",
-    "description": "Stop a workstream: stop its agents and archive its sandboxes.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "workstream": {
-          "type": "string",
-          "description": "Workstream id."
-        },
-        "reason": {
-          "type": "string",
-          "description": "Why."
-        }
-      },
-      "required": [
-        "workstream",
-        "reason"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
   },
   {
     "name": "memory_read",

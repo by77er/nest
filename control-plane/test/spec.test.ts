@@ -7,17 +7,18 @@ import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
   SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES,
-  TASK_CAPABILITIES, EGRESS_CAPABILITIES,
+  TASK_CAPABILITIES, EGRESS_CAPABILITIES, SPAWNING_CAPABILITIES,
 } from "../src/lib/spec";
 import { TASK_ADMIN_TOOLS, TASK_TOOLS } from "../src/lib/tasks";
 import { Credential, type ToolRule } from "../src/protocol/control";
 import type { ChannelGrant } from "../src/lib/channels";
 
 // What the roles gave (the role-filtered `platform-tools.json` and AgentDO's defaults before templates),
-// less `delegate`, which the registry no longer has: the first seed still lists it, and expansion ignores it.
+// less `delegate`, `spawn_agent` and `kill`, which the registry no longer has: the first seed still
+// lists them, and expansion ignores them.
 const WORKER_TOOLS = ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"];
-const CAPTAIN_TOOLS = ["notify", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
-  "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "kill", "memory_read", "memory_write", "notify_user"];
+const CAPTAIN_TOOLS = ["notify", "ask", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
+  "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "memory_read", "memory_write", "notify_user"];
 const NEST_ALLOW: ToolRule = { pattern: "mcp__nest__*", decision: "allow" };
 const WORKER_LAUNCH = {
   builtin_tools: ["TodoWrite", "Task", "WebSearch"],
@@ -135,9 +136,11 @@ describe("expansion refuses what it can't give", () => {
   });
 
   it("a stored capability naming a tool the registry dropped still expands, without it; a write still refuses it", () => {
-    // Catalogs seeded with the first seed hold `management` with `delegate`: their captains must still spawn.
-    expect(SEED_CATALOG_V1.capabilities.management!.tools).toContain("delegate");
-    expect(PLATFORM_TOOL_NAMES).not.toContain("delegate");
+    // Catalogs seeded with the first seed hold `management` with the retired tools: their captains must still spawn.
+    for (const t of ["delegate", "spawn_agent", "kill"]) {
+      expect(SEED_CATALOG_V1.capabilities.management!.tools).toContain(t);
+      expect(PLATFORM_TOOL_NAMES).not.toContain(t);
+    }
     expect(expand(SEED_CATALOG_V1, "captain", false).tools).toEqual(CAPTAIN_TOOLS);
     const stale: Catalog = { capabilities: { old: { tools: ["notify", "gone_tool"], rules: [], prompt: "", grants: [], params: [] } },
       templates: { t: { ...SEED_CATALOG.templates.captain!, capabilities: ["old"] } } };
@@ -171,14 +174,16 @@ describe("the current seed adds the task ledger (seed version 3) and drops what 
     const w = expand(SEED_CATALOG, "worker", true);
     const c = expand(SEED_CATALOG, "captain", false);
     expect(w.tools).toEqual([...WORKER_TOOLS, ...TASK_TOOLS]);
-    expect(c.tools).toEqual([...CAPTAIN_TOOLS, ...TASK_TOOLS, ...TASK_ADMIN_TOOLS]);
+    // The registry's order: the spawning tools sit where the stubs they replace were.
+    expect(c.tools).toEqual(PLATFORM_TOOL_NAMES.filter((t) => [...CAPTAIN_TOOLS, ...TASK_TOOLS, ...TASK_ADMIN_TOOLS, "agent_spawn", "agent_stop"].includes(t)));
+    expect(c.spawn).toEqual(["worker"]);
     // docs/agents/runner/: the task and web tools, no `TodoWrite` and no `Agent` (nor its old name `Task`),
     // so no rule letting subagents run either.
     expect(w.launch.builtin_tools).toEqual(["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"]);
     expect(w.rules).toEqual([NEST_ALLOW]);
     expect(c.launch.builtin_tools).toEqual([]);
     for (const [v1, v2] of [[v1w, w], [v1c, c]] as const) {
-      expect({ ...v2, tools: [], launch: null, rules: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [] });
+      expect({ ...v2, tools: [], launch: null, rules: [], spawn: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [], spawn: [] });
       expect(v2.launch.system_prompt.text.startsWith(v1.launch.system_prompt.text)).toBe(true);
     }
     // No ledger unless the spawn names one; a spawn may name one, because `tasks` declares it.
@@ -227,7 +232,7 @@ describe("the current seed adds the task ledger (seed version 3) and drops what 
 
   it("seed steps: versions strictly increase, the last is the seed version, and every step's entries are the current seed's", () => {
     const versions = SEED_STEPS.map((s) => s.version);
-    expect(versions).toEqual([2, 3, 4]);
+    expect(versions).toEqual([2, 3, 4, 5]);
     for (let i = 1; i < versions.length; i++) expect(versions[i]!, String(i)).toBeGreaterThan(versions[i - 1]!);
     expect(SEED_VERSION).toBe(versions.at(-1));
     // No two steps name the same entry (one would never be applied to a catalog the other already reached).
@@ -235,19 +240,20 @@ describe("the current seed adds the task ledger (seed version 3) and drops what 
     expect(new Set(names).size).toBe(names.length);
   });
 
-  it("seedMigration: a catalog at version 2 (channels applied) gains exactly the task and egress capabilities", () => {
+  it("seedMigration: a catalog at version 2 (channels applied) gains exactly the task, egress and spawning capabilities", () => {
     const v2 = { capabilities: [...Object.keys(SEED_CATALOG_V1.capabilities), ...Object.keys(CHANNEL_CAPABILITIES)], templates: Object.keys(SEED_CATALOG_V1.templates) };
     const m = seedMigration(v2, 2);
-    expect(Object.keys(m.capabilities).sort()).toEqual(["egress", "tasks", "tasks-admin"]);
-    expect(m.capabilities).toEqual({ ...TASK_CAPABILITIES, ...EGRESS_CAPABILITIES });
+    expect(Object.keys(m.capabilities).sort()).toEqual(["egress", "spawning", "tasks", "tasks-admin"]);
+    expect(m.capabilities).toEqual({ ...TASK_CAPABILITIES, ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES });
     expect(m.templates).toEqual({});
-    expect(m.version).toBe(4);
-    // A catalog at version 3 gains only egress.
-    expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "tasks", "tasks-admin"] }, 3).capabilities).toEqual(EGRESS_CAPABILITIES);
+    expect(m.version).toBe(5);
+    // A catalog at version 3 gains egress and spawning; one at 4, spawning.
+    expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "tasks", "tasks-admin"] }, 3).capabilities).toEqual({ ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES });
+    expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "tasks", "tasks-admin", "egress"] }, 4).capabilities).toEqual(SPAWNING_CAPABILITIES);
     // Even with channels' entries since deleted: version 2's step doesn't run again.
-    expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 2).capabilities).sort()).toEqual(["egress", "tasks", "tasks-admin"]);
+    expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 2).capabilities).sort()).toEqual(["egress", "spawning", "tasks", "tasks-admin"]);
     // An operator's own `tasks` stays theirs.
-    expect(Object.keys(seedMigration({ ...v2, capabilities: [...v2.capabilities, "tasks"] }, 2).capabilities)).toEqual(["tasks-admin", "egress"]);
+    expect(Object.keys(seedMigration({ ...v2, capabilities: [...v2.capabilities, "tasks"] }, 2).capabilities)).toEqual(["tasks-admin", "egress", "spawning"]);
     // Once it reached a version it adds nothing, whatever is missing: deleted entries stay deleted.
     expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION)).toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION });
     // Every step's entries are what the current seed holds.
@@ -399,11 +405,12 @@ describe("seed migration (pure)", () => {
   it("a version-1 catalog gains each later step's entries whose names are free; a current one gains nothing", () => {
     const all = { capabilities: Object.keys(SEED_CATALOG_V1.capabilities), templates: Object.keys(SEED_CATALOG_V1.templates) };
     const m = seedMigration(all, 1);
-    expect(Object.keys(m.capabilities).sort()).toEqual([...Object.keys(CHANNEL_CAPABILITIES), ...Object.keys(TASK_CAPABILITIES), ...Object.keys(EGRESS_CAPABILITIES)].sort());
+    expect(Object.keys(m.capabilities).sort()).toEqual([...Object.keys(CHANNEL_CAPABILITIES), ...Object.keys(TASK_CAPABILITIES), ...Object.keys(EGRESS_CAPABILITIES),
+      ...Object.keys(SPAWNING_CAPABILITIES)].sort());
     expect(m.templates).toEqual({});
     expect(m.version).toBe(SEED_VERSION);
     // A name the operator already uses is left alone (never overwritten).
-    expect(Object.keys(seedMigration({ ...all, capabilities: [...all.capabilities, "channels"] }, 1).capabilities)).toEqual(["messaging-tree", "tasks", "tasks-admin", "egress"]);
+    expect(Object.keys(seedMigration({ ...all, capabilities: [...all.capabilities, "channels"] }, 1).capabilities)).toEqual(["messaging-tree", "tasks", "tasks-admin", "egress", "spawning"]);
     // Nothing for a catalog at the current version, so a deleted entry never comes back.
     expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION)).toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION });
     // The version never goes back.

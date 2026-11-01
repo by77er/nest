@@ -1180,16 +1180,19 @@ mod tests {
             assert!(t.roles.is_none(), "{}: the catalog has no roles (an agent's spec picks its tools)", t.name);
         }
         for required in [
-            "notify", "emit", "ask", "spawn_agent", "fork_sandbox", "attach", "read_transcript", "checkpoint",
+            "notify", "emit", "ask", "agent_spawn", "agent_stop", "exit", "fork_sandbox", "attach", "read_transcript", "checkpoint",
             "expose_port", "brokered", "spawn_workstream", "send", "list_workstreams", "get_status", "wait_events",
-            "approve", "deny", "merge", "kill", "memory_read", "memory_write", "notify_user",
+            "approve", "deny", "merge", "memory_read", "memory_write", "notify_user",
             "task_list", "task_get", "task_create", "task_update", "task_claim", "task_comment", "task_assign", "task_update_any",
             "task_cancel", "task_set_watcher",
         ] {
             assert!(names.contains(required), "missing platform tool {required}");
         }
-        // Inspecting without hands is a pattern, not a tool (docs/orchestration/captains/).
-        assert!(!names.contains("delegate"), "the registry has no `delegate` tool");
+        // Inspecting without hands is a pattern, not a tool (docs/orchestration/captains/); the stubs
+        // `spawn_agent` and `kill` were replaced by `agent_spawn` and `agent_stop`.
+        for retired in ["delegate", "spawn_agent", "kill"] {
+            assert!(!names.contains(retired), "the registry has no `{retired}` tool");
+        }
     }
 
     fn fixture_json<T: serde::de::DeserializeOwned>(rel: &str) -> T {

@@ -575,7 +575,7 @@ describe("the catalog's seed migration", () => {
     expect(cat.templates.captain!.capabilities).toEqual(SEED_CATALOG.templates.captain!.capabilities);
   });
 
-  it("a catalog at version 2 gains the task (and egress) capabilities once, keeps its templates, and never brings back what the operator deleted", async () => {
+  it("a catalog at version 2 gains the task (and egress and spawning) capabilities once, keeps its templates, and never brings back what the operator deleted", async () => {
     const stub = catalogStub();
     await runInDurableObject(stub, async (_i: CatalogDO, st) => {
       asV2(st);
@@ -584,7 +584,8 @@ describe("the catalog's seed migration", () => {
       st.storage.sql.exec("DELETE FROM templates WHERE name = 'captain'");
       const after = await restart(st).catalog();
       expect(Object.keys(after.capabilities).sort()).toEqual(
-        [...Object.keys(SEED_CATALOG_V1.capabilities).filter((n) => n !== "memory"), "channels", "tasks", "tasks-admin", "egress"].sort());
+        [...Object.keys(SEED_CATALOG_V1.capabilities).filter((n) => n !== "memory"), "channels", "tasks", "tasks-admin", "egress", "spawning"].sort());
+      expect(after.capabilities.spawning).toEqual(SEED_CATALOG.capabilities.spawning);
       expect(after.capabilities.tasks).toEqual(SEED_CATALOG.capabilities.tasks);
       expect(Object.keys(after.templates)).toEqual(["worker"]);
       expect(after.templates.worker!.capabilities).toEqual(SEED_CATALOG_V1.templates.worker!.capabilities);

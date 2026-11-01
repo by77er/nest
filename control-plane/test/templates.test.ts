@@ -100,7 +100,8 @@ describe("an agent is its expanded spec", () => {
 
     const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     const tools = await toolNames(ws);
-    expect(tools.map((t) => t.name)).toEqual(["notify", "read_transcript"]);
+    // Its capabilities' tools, and `exit`, which every agent has (docs/agents/#lifetimes).
+    expect(tools.map((t) => t.name)).toEqual(["notify", "exit", "read_transcript"]);
     // `roles: []` on every definition, for runners of the previous release (they require the field).
     expect(tools.every((t) => Array.isArray(t.roles) && (t.roles as unknown[]).length === 0)).toBe(true);
     ws.send({ type: "tool_call", seq: 1, call: "cal_tpl-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "x" } });
@@ -226,7 +227,7 @@ describe("records stored with a role (the previous release)", () => {
 
     await nextCommands(s.brain.ws, isStartOf(w.agent));
     const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
-    expect((await toolNames(ws)).map((t) => t.name)).toEqual(["notify", "emit"]);
+    expect((await toolNames(ws)).map((t) => t.name)).toEqual(["notify", "emit", "exit"]);
   });
 });
 
