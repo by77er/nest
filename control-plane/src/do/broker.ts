@@ -5,10 +5,27 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
 import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
-import { b64url, newId, NestError } from "../lib/util";
+import { b64url, bytesToB64, NestError, newId } from "../lib/util";
+import { appJwt, githubApiOf, importAppKey, parseAppSecret } from "../lib/github";
+import type { GithubPermissions } from "../lib/brokered";
+import { canonicalJson } from "../lib/sinks";
 import { Credential } from "../protocol/control";
 import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
 import { ErrorCodes, type InjectionSecret } from "../protocol/model";
+
+/** An installation token is reused while it has this long left (tokens last an hour: reused for 50 minutes). */
+const GITHUB_TOKEN_REUSE_MS = 10 * 60_000;
+/** A repo's installation id is looked up again after this long. */
+const INSTALLATION_TTL_MS = 24 * 3_600_000;
+/** Values shorter than this aren't scanned for (they'd match ordinary text). */
+const SCAN_MIN_LENGTH = 8;
+
+/** Who asked for a credential, for the issuance audit. */
+export interface CredentialCaller {
+  agent: string;
+  /** The call key (`<agent>/<epoch>/<call>`). */
+  call: string;
+}
 
 /** The per-cell binding signing key, stored as a secret named `binding_key:<cell>`. */
 type StoredBindingKey = { kid: string; public_key: string; private_jwk: JsonWebKey };
@@ -32,6 +49,10 @@ export class BrokerDO extends DurableObject<Env> {
     if (isHealthInstance(ctx, env.BROKER)) return;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL,
       expires_ms INTEGER, updated_ms INTEGER NOT NULL)`);
+    // Minted GitHub installation tokens, by (repo, permissions): reused while they have 10 minutes left.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS github_tokens (key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_ms INTEGER NOT NULL,
+      installation INTEGER NOT NULL, minted_ms INTEGER NOT NULL)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS github_installations (repo TEXT PRIMARY KEY, installation INTEGER NOT NULL, fetched_ms INTEGER NOT NULL)`);
     this.oauth = new OAuthStore({
       sql: this.sql,
       secret: (name) => this.secret(name)?.value ?? null,
@@ -170,6 +191,91 @@ export class BrokerDO extends DurableObject<Env> {
     return this.secret(ref)?.value ?? null;
   }
 
+  /**
+   * An http profile's credential (`http:<name>`, docs/agents/capabilities/#brokered-actions), for
+   * AgentDO's brokered pipeline, the only caller. Never resolvable into a host command. Null when none is stored.
+   */
+  async brokeredSecret(ref: string): Promise<string | null> {
+    if (!/^http:./.test(ref)) throw new NestError(ErrorCodes.FORBIDDEN, `${ref} is not a brokered-action credential`, 403);
+    return this.secret(ref)?.value ?? null;
+  }
+
+  /**
+   * The names of stored secrets whose value appears in any of `strings` (a brokered action's
+   * arguments): the value itself, its base64, or (for a JSON value) any string in it of 16 characters
+   * or more. Names only: no value leaves here. Values under 8 characters aren't looked for.
+   */
+  async scanSecrets(strings: string[]): Promise<string[]> {
+    const rows = this.sql.exec<{ name: string; value: string }>("SELECT name, value FROM secrets").toArray();
+    const hits: string[] = [];
+    for (const { name, value } of rows) {
+      if (secretNeedles(value).some((n) => strings.some((s) => s.includes(n)))) hits.push(name);
+    }
+    return hits;
+  }
+
+  /**
+   * An installation token for one repo with exactly these permissions, minted with the GitHub App
+   * (`github_app`: `{"app_id", "private_key"}`) and cached until it has 10 minutes left. Every mint and
+   * every refusal is audited to R2 before the token is handed out (never the value).
+   */
+  async githubToken(repo: string, permissions: GithubPermissions, caller: CredentialCaller): Promise<{ token: string; expires_ms: number }> {
+    const r = repo.toLowerCase();
+    const key = `${r}|${canonicalJson(permissions)}`;
+    const cached = this.sql.exec<{ token: string; expires_ms: number }>("SELECT token, expires_ms FROM github_tokens WHERE key = ?", key).toArray()[0];
+    if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS) return cached;
+    const audit = { event: "github_installation_token", repos: [r], permissions, caller };
+    let audited = false;
+    const refuse = async (e: NestError, installation?: number): Promise<never> => {
+      audited = true;
+      await this.auditMint({ ...audit, ...(installation !== undefined ? { installation } : {}), refused: e.detail });
+      throw e;
+    };
+    const app = this.secret("github_app");
+    const creds = app ? parseAppSecret(app.value) : null;
+    if (!creds) {
+      return refuse(new NestError(ErrorCodes.FORBIDDEN, app ? "github_app isn't {\"app_id\", \"private_key\"} JSON" : "no GitHub App is configured (github_app)", 409));
+    }
+    const api = githubApiOf(this.env);
+    let jwt: string;
+    try {
+      jwt = await appJwt(creds.app_id, await importAppKey(creds.private_key));
+    } catch {
+      return refuse(new NestError(ErrorCodes.FORBIDDEN, "github_app's private_key isn't an RSA private key (PKCS#1 or PKCS#8 PEM)", 409));
+    }
+    const known = this.sql.exec<{ installation: number; fetched_ms: number }>("SELECT installation, fetched_ms FROM github_installations WHERE repo = ?", r).toArray()[0];
+    let installation = known && Date.now() - known.fetched_ms < INSTALLATION_TTL_MS ? known.installation : null;
+    try {
+      if (installation === null) {
+        installation = await api.installation(jwt, r);
+        if (installation === null) return await refuse(new NestError(ErrorCodes.FORBIDDEN, `the GitHub App isn't installed on ${r}`, 403));
+        this.sql.exec(`INSERT INTO github_installations (repo, installation, fetched_ms) VALUES (?, ?, ?)
+          ON CONFLICT(repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, r, installation, Date.now());
+      }
+      const t = await api.mint(jwt, installation, r.split("/")[1]!, permissions);
+      // Audited before anyone holds it: a mint whose record can't be written is never handed out.
+      await this.auditMint({ ...audit, installation, expires_ms: t.expires_ms });
+      this.sql.exec(`INSERT INTO github_tokens (key, token, expires_ms, installation, minted_ms) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET token = excluded.token, expires_ms = excluded.expires_ms, installation = excluded.installation, minted_ms = excluded.minted_ms`,
+      key, t.token, t.expires_ms, installation, Date.now());
+      return t;
+    } catch (e) {
+      // A refusal (e.g. permissions the installation lacks) is audited; a lost answer isn't a refusal.
+      if (e instanceof NestError && !e.retryable && !audited) await refuse(e, installation ?? undefined);
+      throw e;
+    }
+  }
+
+  /**
+   * A GitHub mint's (or refusal's) issuance audit record, in the same place as {@link audit}'s, but
+   * awaited: a mint whose record can't be written is never handed out. Never a value.
+   */
+  private async auditMint(record: Record<string, unknown>): Promise<void> {
+    const ts = Date.now();
+    await this.env.BUCKET.put(`audit/broker/${new Date(ts).toISOString().slice(0, 10)}/${ts}-${newId("")}.json`,
+      JSON.stringify({ ts_ms: ts, ...record }), { httpMetadata: { contentType: "application/json" } });
+  }
+
   /** Every key a gateway in `cell` must accept (one today; the list is what a rotation extends). */
   async bindingPublicKeys(cell: string): Promise<BindingKey[]> {
     const k = await this.bindingKey(cell);
@@ -244,10 +350,34 @@ export function commandRefSlots(cmd: Record<string, unknown>): RefSlot[] {
 }
 
 /** Never resolvable into a command, whatever the purpose: they never leave the control plane. */
-export const NEVER_RESOLVED = ["binding_key:", "access:", "cap:", "hook:"] as const;
+export const NEVER_RESOLVED = ["binding_key:", "access:", "cap:", "hook:", "http:", "github_app"] as const;
 
 /** An entry ending in `:` admits that prefix; any other admits the name itself and `<name>:…`. */
 export function nameAllowed(name: string, allow: readonly string[]): boolean {
   if (NEVER_RESOLVED.some((p) => name.startsWith(p))) return false;
   return allow.some((p) => (p.endsWith(":") ? name.startsWith(p) && name.length > p.length : name === p || name.startsWith(`${p}:`)));
+}
+
+/** What `scanSecrets` looks for of one stored value: it, its base64, and a JSON value's long strings. */
+export function secretNeedles(value: string): string[] {
+  const out = new Set<string>();
+  const add = (v: string) => {
+    if (v.length < SCAN_MIN_LENGTH) return;
+    out.add(v);
+    out.add(bytesToB64(new TextEncoder().encode(v)));
+  };
+  add(value);
+  try {
+    const walk = (x: unknown): void => {
+      if (typeof x === "string" && x.length >= 16) add(x);
+      else if (Array.isArray(x)) x.forEach(walk);
+      else if (x && typeof x === "object") Object.values(x).forEach(walk);
+    };
+    walk(JSON.parse(value));
+  } catch {
+    // not JSON: the value as a whole
+  }
+  // A PEM's body lines: a key pasted without its armour is still the key.
+  for (const line of value.split(/\r?\n/)) if (/^[A-Za-z0-9+/=]{40,}$/.test(line.trim())) out.add(line.trim());
+  return [...out];
 }

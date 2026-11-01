@@ -263,8 +263,41 @@
     "requires_approval": false
   },
   {
+    "name": "egress_policy",
+    "description": "Your bound sandbox's egress: with no arguments, the effective policy; `allow` widens it to more hosts for `ttl_s` (from a session that read untrusted content, the operator approves first: the call answers pending); `revoke` removes hosts it widened to (never needs approval).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "type": "array",
+          "description": "Hosts to allow: {host, ports?} (a DNS name, or *.domain; ports default to 80 and 443).",
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 16
+        },
+        "ttl_s": {
+          "type": "integer",
+          "description": "How long the widening lasts, in seconds (default 3600, at most 86400).",
+          "minimum": 60,
+          "maximum": 86400
+        },
+        "revoke": {
+          "type": "array",
+          "description": "Hosts to stop allowing (temporary grants only).",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        }
+      },
+      "additionalProperties": false
+    },
+    "requires_approval": false
+  },
+  {
     "name": "brokered",
-    "description": "Run a brokered action (e.g. github.create_pr, email.send, http.request) executed outside the sandbox with secrets the sandbox never sees. Available actions depend on your grants; tools/list may also expose them as dedicated tools.",
+    "description": "Run a brokered action (github.comment, github.create_issue, github.create_pr, github.review_comment, http.request) outside the sandbox, with credentials you never see. Your grants say which actions, repos and profiles; each action is also its own tool (github_comment, ..., http_request) with its schema.",
     "input_schema": {
       "type": "object",
       "properties": {

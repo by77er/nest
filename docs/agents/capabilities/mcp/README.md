@@ -48,6 +48,8 @@ prompt: The notes server.
 
 ## Sinks
 
+The gate below is the one every sink uses (`lib/sinks.ts`; brokered actions and `egress_policy` go through it too: [taint and sinks](../../tools/#taint-and-sinks)).
+
 - **A remote tool is a sink unless it's read-only:** the operator's `read_only` mark, else, for a `trusted` server only, its `readOnlyHint`. An untrusted server's annotations don't count: "clients **MUST** consider tool annotations to be untrusted unless they come from trusted servers" ([tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)). A read-only call still carries its arguments to the server; marking a tool `read_only` accepts that.
 - **A sink call from a tainted session isn't sent** under `when_tainted: approve`: the call answers `pending` with an ask id, and the operator is asked on the agent's escalation route with the tool, the server's host and the arguments (the first 2,000 characters). The same tool with the same arguments asked again before a decision gets the same ask.
 - **The decision is a turn.** An answer whose first word is `approve(d)`, `allow(ed)`, `yes`, `y`, `ok` or `okay` approves; anything else denies, and the agent is told the answer. An approval lets through **one** call of that tool with exactly those arguments (SHA-256 of their canonical JSON, keys sorted) within an hour; the model calls again. A redelivery of the call it was spent on uses it again; nothing else does.
@@ -119,7 +121,7 @@ mcp: {url: https://mcp.example.com/mcp, auth: {oauth: cap:notes, client: cap:not
 
 ## Data
 
-BrokerDO's `oauth_grants` (per token record: server URL, resource, issuer, token endpoint, client, scope, tokens and expiry, `authorized` or `reauthorize`), `oauth_flows` (per state: a started authorization, 10 minutes) and `oauth_clients` (registrations, per authorization server and redirect URI). AgentDO's `mcp_servers` (per capability: URL, session id, negotiated version, cached tool list and when it was fetched), `mcp_forwards` (per call key: epoch, tool, `forwarded` or `settled`, attempts, deadline, outcome) and `approvals` (per ask: tool, arguments digest, `pending`, `approved` or `denied`, expiry, the call key it was spent on); settled forwards and decided approvals are pruned after 7 days with the call ledger.
+BrokerDO's `oauth_grants` (per token record: server URL, resource, issuer, token endpoint, client, scope, tokens and expiry, `authorized` or `reauthorize`), `oauth_flows` (per state: a started authorization, 10 minutes) and `oauth_clients` (registrations, per authorization server and redirect URI). AgentDO's `mcp_servers` (per capability: URL, session id, negotiated version, cached tool list and when it was fetched), `mcp_forwards` (per call key: epoch, tool, `forwarded` or `settled`, attempts, deadline, outcome) and `approvals` (per ask: the sink's name, the arguments digest, `pending`, `approved` or `denied`, expiry, the call key it was spent on, and `tool`, the model-facing tool to call again, null in rows written before it was kept: a remote tool's); settled forwards and decided approvals are pruned after 7 days with the call ledger.
 
 ## Open questions
 
