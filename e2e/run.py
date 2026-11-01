@@ -775,6 +775,12 @@ def stop_mcp_server():
             os.killpg(p.pid, signal.SIGKILL)
 
 
+def release_agent(agid, what):
+    """Stop a scenario's agent when it's done: a CI runner's brain host holds only 4 brains (2 vCPUs)."""
+    st, r = api("POST", f"/v1/agents/{agid}/stop")
+    check(f"{what}: agent stopped, freeing its brain slot", st == 200, json.dumps(r)[:200])
+
+
 def mcp_turn(agid, name, steps, wait_s=90, cap=MCP_CAP):
     """One fake-brain turn of scripted calls to `<cap>_<tool>` (a dict step is passed as is, e.g. an
     `await_tool`); returns the results by label."""
@@ -878,6 +884,7 @@ def run_mcp(ids):
     slow = [c for c in mcp_calls() if c.get("tool") == "slow"]
     check("mcp: the redelivered call reached the server once", len(slow) == 1,
           json.dumps([(c.get("_meta") or {}).get("nest/call") for c in slow]))
+    release_agent(agid, "mcp")
     run_mcp_list_changed(ids)
 
 
@@ -917,6 +924,7 @@ def run_mcp_list_changed(ids):
     res = turn("live-removed", [("poke", "echo", {"text": "again"}),
                                 {"label": "gone", "await_tool": f"{cap}_extra_live", "absent": True, "timeout_s": 30}])
     check("mcp list_changed: a removed tool leaves the brain's tool list", (res.get("gone") or {}).get("text") == "unlisted", json.dumps(res)[:300])
+    release_agent(agid, "mcp list_changed")
 
 
 MCP_OAUTH_CAP = "onotes"
@@ -1013,6 +1021,9 @@ def run_mcp_oauth(ids):
     blobs = "\n".join(r2_blobs())
     check("mcp oauth: the broker audited the flow in R2", all(e in blobs for e in ("oauth_start", "oauth_authorized", "oauth_refreshed", "oauth_refresh_failed")),
           "missing audit events")
+    release_agent(agid, "mcp oauth")
+
+
 # ---------------------------------------------------------------------------------- sinks: brokered actions, egress
 # A local HTTP server stands in for an http profile's API: an agent's fake brain calls `http_request` through
 # `nest mcp` -> the runner -> AgentDO's brokered pipeline, which attaches the profile's credential; a tainted
