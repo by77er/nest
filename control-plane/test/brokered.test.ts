@@ -339,8 +339,8 @@ describe("authority and the scan (pure)", () => {
     expect(secretKinds(stringsOf({ [`AKIA${"A".repeat(16)}`]: 1 }))).toEqual(["an AWS access key id"]);
     expect(secretKinds(stringsOf({ x: ["-----BEGIN RSA PRIVATE KEY-----"] }))).toEqual(["a private key"]);
     expect(secretKinds(stringsOf({ body: "ghp_short, sk-ant-, an ordinary comment" }))).toEqual([]);
-    const n = secretNeedles(JSON.stringify({ client_id: "short", client_secret: "0123456789abcdef-secret" }));
-    expect(n).toContain("0123456789abcdef-secret");
+    const n = secretNeedles(JSON.stringify({ client_id: "short", client_secret: "aaaaaaaaaaaaaaaa-secret" }));
+    expect(n).toContain("aaaaaaaaaaaaaaaa-secret");
     expect(n).not.toContain("short");
     expect(secretNeedles("tiny")).toEqual([]);
     expect(secretNeedles("a-long-enough-value")).toContain(btoa("a-long-enough-value"));

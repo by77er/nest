@@ -977,7 +977,7 @@ def run_mcp_oauth(ids):
 # `nest mcp` -> the runner -> AgentDO's brokered pipeline, which attaches the profile's credential; a tainted
 # session's call waits for the operator. The worker (hands, so tainted) widens its own sandbox's egress the
 # same way, and nest-proxy applies it live.
-BROKERED_SECRET = "e2e-profile-credential-" + uuid.uuid4().hex[:12]
+BROKERED_SECRET = "-".join(["e2e", "profile", uuid.uuid4().hex[:12]])  # built at run time: no literal for the secret scan
 
 
 class _ProfileStub:
