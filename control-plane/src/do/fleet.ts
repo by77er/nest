@@ -23,6 +23,7 @@ import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
+import { gcMarkVersion, retentionMode } from "../lib/retention";
 import {
   Capacity, type CommandBody, CommandBodyVariants, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
   type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
@@ -232,7 +233,10 @@ const GC_INTERVAL_MS = 24 * 3_600_000;
 const GC_WINDOW_MS = 12 * 3_600_000;
 const GC_GRACE_MS = 24 * 3_600_000;
 const GC_MAX_DELETES = 10_000;
-/** Bump when the marking rules change: the next run is then a dry run again. */
+/**
+ * Bump when the marking rules change: the next run is then a dry run again. Retention `on` marks with
+ * the next version (`gcMarkVersion`): switching it on makes the next run dry.
+ */
 const GC_MARK_VERSION = 1;
 /** A finished run of the marking version bound to `?` that completed: the next run of that version may delete. */
 const GC_PROVEN = `mark_version = ? AND finished_ms IS NOT NULL AND report NOT LIKE '%"abandoned"%' AND report NOT LIKE '%"error"%'`;
@@ -1829,7 +1833,7 @@ export class FleetDO extends DurableObject<Env> {
       `DELETE FROM gc_runs WHERE finished_ms IS NOT NULL AND finished_ms < ?
          AND run NOT IN (SELECT run FROM gc_runs ORDER BY marked_ms DESC LIMIT 1)
          AND run NOT IN (SELECT run FROM gc_runs WHERE ${GC_PROVEN} ORDER BY marked_ms DESC LIMIT 1)`,
-      now - GC_RUN_RETENTION_MS, GC_MARK_VERSION);
+      now - GC_RUN_RETENTION_MS, gcMarkVersion(GC_MARK_VERSION, retentionMode(this.env)));
     this.sql.exec("DELETE FROM sandboxes WHERE destroyed_ms < ?", now - DESTROYED_SANDBOX_RETENTION_MS);
     if (dead.length) console.log(`FleetDO: pruned ${dead.length} dead host(s)`);
   }
@@ -2225,12 +2229,13 @@ export class FleetDO extends DurableObject<Env> {
     const requested = this.sql.exec("SELECT 1 FROM kv WHERE key = 'gc_requested'").toArray().length > 0;
     if (!requested && now - last < GC_INTERVAL_MS) return null;
     // Dry unless a completed (not abandoned) run of this marking version has already reported.
-    const proven = this.sql.exec(`SELECT 1 FROM gc_runs WHERE ${GC_PROVEN}`, GC_MARK_VERSION).toArray().length > 0;
+    const markVersion = gcMarkVersion(GC_MARK_VERSION, retentionMode(this.env));
+    const proven = this.sql.exec(`SELECT 1 FROM gc_runs WHERE ${GC_PROVEN}`, markVersion).toArray().length > 0;
     // Take the run before collecting roots: the calls below let another claim in.
     const run = newId("gc_");
     this.sql.exec("DELETE FROM kv WHERE key = 'gc_requested'");
     this.sql.exec("INSERT INTO gc_runs (run, host, marked_ms, dry_run, mark_version, roots) VALUES (?, ?, ?, ?, ?, 0)",
-      run, host, now, proven ? 0 : 1, GC_MARK_VERSION);
+      run, host, now, proven ? 0 : 1, markVersion);
     const live = this.sql.exec<{ sandbox: string }>("SELECT sandbox FROM sandboxes WHERE destroyed_ms IS NULL").toArray();
     const roots = new Set<string>();
     try {
