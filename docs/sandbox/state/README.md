@@ -63,7 +63,7 @@ Restore sources and turn ends are kept; everything else is thinned by age.
 | Everything else | Newest 5 at 1-min spacing, then 1 at 5 min, 6 at 10 min, 6 hourly and 4 six-hourly; older ones go (about 24 h). SPACE uses the same tiers ([snapshot_scheduler.rs](https://github.com/perplexityai/space/blob/main/crates/libs/sbx/mgr/server/src/snapshot_scheduler.rs)) |
 | The memory of a checkpoint that's no longer a restore source | Not kept: the restore rule never loads it, so it stops being a GC root |
 
-SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting. **Not built:** every generation is kept. **Built:** a whole sandbox nobody uses goes: dormant (no agent attached, no VM up) for its idle TTL, 30 days by default, it is destroyed, and its generations stop being roots ([lifetime](../../control-plane/durable-objects/sandbox/#lifetime)).
+SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting. **Not built:** every generation is kept. **Built:** a whole sandbox nobody uses goes: dormant (no agent attached, no VM up) for its idle TTL, a day by default, it is destroyed, and its generations stop being roots ([lifetime](../../control-plane/durable-objects/sandbox/#lifetime)).
 
 ## Spot notice (2 minutes)
 
