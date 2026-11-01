@@ -36,6 +36,15 @@ describe("the GitHub rule constructor", () => {
     expect(f.allow).toEqual([]);
   });
 
+  it("uses the placeholder the guest image's credential helper and GITHUB_TOKEN carry", () => {
+    const files = import.meta.glob(["../../images/guest/git-credential-nest", "../../images/guest/build.sh"], { eager: true, query: "?raw", import: "default" }) as Record<string, string>;
+    const helper = files["../../images/guest/git-credential-nest"]!;
+    const build = files["../../images/guest/build.sh"]!;
+    expect(helper).toContain(`password=${GITHUB_PLACEHOLDER}\n`);
+    expect(build).toContain(`GITHUB_TOKEN=${GITHUB_PLACEHOLDER}"`);
+    expect(githubEgress(["a/b"]).inject[0]!.placeholder).toBe(GITHUB_PLACEHOLDER);
+  });
+
   it("names repos exactly: no wildcard, no .git, case folded", () => {
     for (const bad of ["by77er/*", "by77er", "by77er/nest.git", "by77er/..", "-x/y", "a/b/c"]) expect(Repo.safeParse(bad).success, bad).toBe(false);
     expect(canonicalRepos(["B/X", "b/x", "a/y"])).toEqual(["a/y", "b/x"]);

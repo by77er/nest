@@ -63,7 +63,7 @@ mkdir -p "$R/var/cache/apt/archives/partial" "$R/var/lib/apt/lists/partial" "$R/
   "$R/var/lib/dpkg/updates" "$R/var/lib/dpkg/info" "$R/var/cache/debconf"
 cp -L /etc/resolv.conf "$R/etc/resolv.conf"
 chroot "$R" env DEBIAN_FRONTEND=noninteractive \
-  bash -c 'apt-get update -q && apt-get install -y -q --no-install-recommends git openssh-client less jq unzip xz-utils make build-essential python3 python3-venv python3-pip && apt-get clean && rm -rf /var/lib/apt/lists/*'
+  bash -c 'apt-get update -q && apt-get install -y -q --no-install-recommends git gh openssh-client less jq unzip xz-utils make build-essential python3 python3-venv python3-pip && apt-get clean && rm -rf /var/lib/apt/lists/*'
 umount -R "$R/dev" "$R/proc" "$R/tmp"
 chmod 1777 "$R/tmp"
 
@@ -73,6 +73,13 @@ chroot "$R" bash -c 'getent passwd 1000 >/dev/null || useradd -m -u 1000 -U -s /
 install -m 0755 "$GUEST_BIN" "$R/usr/local/bin/nest-guest"
 install -m 0755 "$HERE/init" "$R/sbin/nest-init"
 ln -sf /sbin/nest-init "$R/sbin/init"
+# GitHub through nest-proxy's injection (docs/sandbox/networking/egress/injection/#github): git's credential
+# helper and `gh`'s GITHUB_TOKEN carry the placeholder; the proxy substitutes the sandbox's own token,
+# minted for its push allowlist. Keep the placeholder in step with GITHUB_PLACEHOLDER in
+# control-plane/src/lib/rules/github.ts.
+install -m 0755 "$HERE/git-credential-nest" "$R/usr/local/bin/git-credential-nest"
+chroot "$R" git config --system credential.https://github.com.helper nest
+echo "GITHUB_TOKEN=nest-ph-github" >> "$R/etc/environment"
 # Sandboxes trust nest-proxy's root: TLS to the outside is re-signed by the host's intermediate.
 if [ -n "$ROOT_CA" ]; then
   install -m 0644 "$ROOT_CA" "$R/usr/local/share/ca-certificates/nest-proxy-root.crt"
