@@ -221,7 +221,7 @@ def start_control_plane():
     PROCS["wrangler"] = subprocess.Popen(
         ["npx", "wrangler", "dev", "--local", "--port", str(PORT), "--ip", "127.0.0.1",
          "--persist-to", os.path.join(WORK, "wrangler-state"), "--env-file", os.path.join(WORK, "dev.vars"),
-         "--var", f"PUBLIC_BASE_URL:{BASE}", "--var", "ASK_SYNC_WINDOW_MS:5000",
+         "--var", f"PUBLIC_BASE_URL:{BASE}", "--var", "ASK_SYNC_WINDOW_MS:5000", "--var", "SANDBOX_RETENTION:on",
          "--show-interactive-dev-session=false", "--log-level", "info"],
         cwd=os.path.join(ROOT, "control-plane"), stdout=logf, stderr=subprocess.STDOUT, env=env,
         start_new_session=True)
@@ -1317,6 +1317,28 @@ def run_lifecycle(ids):
         check("lifetimes: the parent's brain is gone", False, str(e)[:200])
 
 
+def run_retention(ids):
+    """Generation retention, `on` in this harness: the sandbox's real commits (turn ends from nestd) are listed
+    with their state and why each is kept, its head is a ready restore source, no turn end was dropped (there are
+    fewer than 20), and no placement found its head refused."""
+    sbx = ids["sandbox"]
+    st, info = api("GET", f"/v1/sandboxes/{sbx}")
+    head = (info or {}).get("head") if st == 200 else None
+    st, gens = api("GET", f"/v1/sandboxes/{sbx}/generations")
+    ok = check("retention: generations listed with their state and keep reason",
+               st == 200 and isinstance(gens, list) and len(gens) > 0
+               and all(g.get("state") in ("ready", "deleting") and "retained" in g for g in gens), json.dumps(gens)[:300])
+    if not ok:
+        return
+    by = {g["record"]["id"]: g for g in gens}
+    check("retention: the head is a ready restore source", head in by and by[head]["state"] == "ready" and by[head]["retained"] == "restore_source",
+          json.dumps({"head": head, "row": by.get(head)})[:300])
+    ends = [g for g in gens if g["record"]["reason"] == "turn_end"]
+    check("retention: every turn end is kept", ends and all(g["state"] == "ready" and g["retained"] for g in ends),
+          f"{len(ends)} turn ends: {[(g['state'], g['retained']) for g in ends]}"[:300])
+    check("retention: no placement refused its head", "is not a restore source" not in read(os.path.join(WORK, "logs", "wrangler.log")))
+
+
 def run_fencing(ids):
     brains = real_brains() if REAL else children_named(FAKE_CLAUDE)
     guests = children_named(os.path.join(BIN, "nest-guest"))
@@ -1393,6 +1415,7 @@ def main():
         run_brokered(ids)
         run_repos(ids)
         run_lifecycle(ids)
+        run_retention(ids)
         # After the turns: the token has been handed to the brains by now.
         check_token_not_in("the Claude token is not in the gateway's environment or command line", children_named(GW_BIN))
         run_fencing(ids)
