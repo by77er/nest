@@ -38,7 +38,7 @@ They are cheap and catch drift that the models can't see. Each throws in tests a
 | 2 | The brain record's remaining assurance, on a dedicated machine: the epochs ≤ 3 sweep and the drain run to exhaustion (both stopped at 15-min cuts on a shared box), liveness with faults, more than 2 hosts, and epoch-less exits ([pilot](../agent-brain/pilot/#next-steps)). Re-run the conformance check over what merged after the checked heads: #36's final head (later than fe7b0d0) and #39's FleetDO send chain | TLA+/TLC; conformance review | The sweep is depth-bounded at 34-44; C6 shows epochs ≤ 3 still finds things |
 | 3 | Extend the sandbox lease model with host lifecycle and STONITH by fence (stonith_pending, re-activation, drain) | TLA+/TLC | Most of the hosts inventory's suspected bugs sit on that boundary |
 | 4 | Gateway bindings: detach window, attach/detach ordering, the ghost fenced epoch | TLA+ | Bounded windows of a second binding are the remaining one-brain gap for hands |
-| 5 | GC with retention and `isRestoreSource` once retention lands | Lean (extend the pilot) | Deletion of generations becomes possible; the pilot's invariant carries over |
+| 5 | ~~GC with retention and `isRestoreSource` once retention lands~~ Done 2026-11-01 ([commit-gc: retention](../commit-gc/#retention)); left: memory unrooting and "a former restore source never returns", property-tested only | Lean (extend the pilot) | Deletion of generations becomes possible; the pilot's invariant carries over |
 | 6 | DO await interleavings: `Deadlines`, `SerialQueue`, `ReliableChannels` | fast-check `fc.scheduler`, `fc.commands` | Lessons 2 and 6; unit-level. Pure cores for the DOs would replace this for the logic they hold (open question) |
 
 ## Conformance

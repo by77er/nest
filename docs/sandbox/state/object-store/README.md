@@ -28,8 +28,8 @@ Mark and sweep. It runs on a sandbox host, because the control plane holds no S3
 - **Incomplete multipart uploads** are aborted by a lifecycle rule.
 - **Built** (nestd `gc`, FleetDO):
   - **Scheduling:** FleetDO keeps the cell's sandbox registry (added by SandboxDO's `create`, before anything is written for the sandbox, and marked destroyed by SandboxDO) and runs. A sandbox host on S3 offers hourly (`POST /v1/hosts/gc/claim`, host token); a run is due daily or when an operator asks (`POST /v1/admin/gc/run`), one at a time. A run unreported 12 h after its mark is abandoned. The host reports to `POST /v1/hosts/gc/report`; `GET /v1/admin/gc` shows the last runs.
-  - **Roots:** every generation of every live sandbox (retention isn't built, so nothing ages out yet). Base generations aren't built. FleetDO snapshots them at the mark.
-  - **Dry run** until one run of the current marking version (`GC_MARK_VERSION`) has completed; the next due run then deletes. At most 10k versions per pass.
+  - **Roots:** every ready generation of every live sandbox (SandboxDO's `gcRootsOf`): never a `deleting` one, and a checkpoint's memory only until retention marks it unrooted, once it is no longer a restore source ([retention](../#retention)). Roots follow those durable marks only, so a change of `SANDBOX_RETENTION` never roots again what a sweep may have taken. Base generations aren't built. FleetDO snapshots them at the mark.
+  - **Dry run** until one run of the current marking version (`GC_MARK_VERSION`) has completed, and, while retention is `on`, one marked after FleetDO first saw it on (kv `retention_on_ms`, cleared when it isn't), so switching it on, or on again, makes the next run dry; the next due run then deletes. At most 10k versions per pass.
   - **Sweep** lists with ListObjectVersions under `store/chunks/` and `store/manifests/`, not Inventory: at today's scale a pass is a few LIST requests. An object goes, all its versions by id, when it's unmarked and its newest version is older than the grace. Keys that aren't `chunks/<hex>` or `manifests/<hex>` are never touched.
   - **Fails closed:** a root manifest that's missing, doesn't match its hash or doesn't parse stops the pass before any delete.
-  - **Not built:** Inventory, `deleting` generations and retention.
+  - **Not built:** Inventory.

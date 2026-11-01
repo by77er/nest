@@ -20,6 +20,8 @@ export default defineConfig({
           BROKERED_TIMEOUT_MS: "1500",
           // How long a call waits for a call slot on its server (test/mcp.test.ts "admission").
           MCP_ADMIT_WAIT_MS: "2000",
+          // Generation retention marks for real (production's default is `report`; test/generation-retention.test.ts covers both).
+          SANDBOX_RETENTION: "on",
         },
       },
     }),

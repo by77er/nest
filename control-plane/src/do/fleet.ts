@@ -23,6 +23,7 @@ import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
+import { retentionMode } from "../lib/retention";
 import {
   Capacity, type CommandBody, CommandBodyVariants, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
   type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
@@ -240,7 +241,10 @@ const GC_INTERVAL_MS = 24 * 3_600_000;
 const GC_WINDOW_MS = 12 * 3_600_000;
 const GC_GRACE_MS = 24 * 3_600_000;
 const GC_MAX_DELETES = 10_000;
-/** Bump when the marking rules change: the next run is then a dry run again. */
+/**
+ * Bump when the marking rules change: the next run is then a dry run again. Switching generation
+ * retention on (kv `retention_on_ms`) also makes the next run dry: only a run marked after it proves.
+ */
 const GC_MARK_VERSION = 1;
 /** A finished run of the marking version bound to `?` that completed: the next run of that version may delete. */
 const GC_PROVEN = `mark_version = ? AND finished_ms IS NOT NULL AND report NOT LIKE '%"abandoned"%' AND report NOT LIKE '%"error"%'`;
@@ -2233,7 +2237,12 @@ export class FleetDO extends DurableObject<Env> {
     const requested = this.sql.exec("SELECT 1 FROM kv WHERE key = 'gc_requested'").toArray().length > 0;
     if (!requested && now - last < GC_INTERVAL_MS) return null;
     // Dry unless a completed (not abandoned) run of this marking version has already reported.
-    const proven = this.sql.exec(`SELECT 1 FROM gc_runs WHERE ${GC_PROVEN}`, GC_MARK_VERSION).toArray().length > 0;
+    // Since when generation retention is on (recorded at the first claim that sees it; cleared when it
+    // isn't): runs marked before then prove nothing, so switching it on (again) makes the next run dry.
+    if (retentionMode(this.env) === "on") this.sql.exec("INSERT OR IGNORE INTO kv (key, value) VALUES ('retention_on_ms', ?)", String(now));
+    else this.sql.exec("DELETE FROM kv WHERE key = 'retention_on_ms'");
+    const since = Number(this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'retention_on_ms'").toArray()[0]?.value ?? 0);
+    const proven = this.sql.exec(`SELECT 1 FROM gc_runs WHERE ${GC_PROVEN} AND marked_ms >= ?`, GC_MARK_VERSION, since).toArray().length > 0;
     // Take the run before collecting roots: the calls below let another claim in.
     const run = newId("gc_");
     this.sql.exec("DELETE FROM kv WHERE key = 'gc_requested'");

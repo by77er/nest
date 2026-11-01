@@ -38,6 +38,16 @@ If your default elan toolchain differs and you run lake from outside this direct
 | `b1_pending_lost` | the same trace loses a pending request's chunk before its evaluation |
 | `a1_not_vacuous` | under A1 a commit becomes head and a pass still deletes garbage (the guarded model is not vacuous) |
 
+`Nest/Retention.lean` adds generation retention to the GC model: `deleting` generations (one-way), pins, and a `retire` step guarded by "not the head, not pinned" (`isRestoreSource`, `control-plane/src/lib/retention.ts`); a pass marks only generations that aren't `deleting` ([commit-gc: retention](../../docs/verification/commit-gc/README.md#retention)):
+
+| Theorem | Says |
+|---|---|
+| `safe` | under A1, every key of every generation that isn't `deleting` is present, so is every key of every eligible pending request, and the head and pinned generations are never `deleting` |
+| `source_present` | a restore source's keys are present |
+| `load_never_deleting` | what a placement loads (the head or a pinned generation) is a restore source |
+| `unguarded_unsafe` | **counterexample (mutation):** without the guard, retention marks the head and a pass deletes its chunk |
+| `retention_not_vacuous` | with the guard, a dropped generation's chunk is deleted while the head's survives |
+
 ## Axioms
 
 Every theorem above depends on at most `propext`, `Classical.choice` and `Quot.sound` (the standard axioms); the counterexamples use `decide` and the kernel only, without `Classical.choice`.

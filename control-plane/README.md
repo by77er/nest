@@ -130,6 +130,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `PUBLIC_BASE_URL`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
 | `WAKE_BATCH_MS` | Batching window of the workstream channel's subscriber wakes; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
+| `SANDBOX_RETENTION` | Generation retention (`src/lib/retention.ts`; docs/sandbox/state/#retention): `report` (the default: records what it would drop), `on` (marks generations `deleting` and non-source memory unrooted; GC's next run is dry) or `off` |
 | `ALLOW_LOOPBACK_MCP` | `1` lets an mcp capability name a loopback URL (`http://127.0.0.1:…`): tests and local dev (the e2e harness) only; never set in a deploy |
 | `ALLOW_LOOPBACK_BROKERED` | `1` lets an http profile and `GITHUB_API_URL` name a loopback URL: tests and local dev only; never set in a deploy |
 | `GITHUB_API_URL`, `BROKERED_TIMEOUT_MS` | The REST API GitHub actions use (default `https://api.github.com`; a fake in e2e) and one brokered request's budget (default 30000) |
@@ -174,6 +175,9 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   `idleStep`; `test/brain-hosts.test.ts`). A brain host enrolls without a proxy CA. AgentDO issues an agent
   epoch per start (a sandbox move doesn't restart a brain), and `agent_start.hands` carries the sandbox id only
   (the runner fetches its target). Not built: key rotation, the three desired versions, and gentle drains.
+- **Generation retention** (`docs/sandbox/state/#restore-sources`, `#retention`; `src/lib/retention.ts`, pure): the one
+  `isRestoreSource` predicate, the placement pin, the retention tiers and the bounded turn ends, `deleting` generations
+  and the GC roots they leave; SandboxDO's `retention` deadline applies it, behind `SANDBOX_RETENTION`. Not built: fork pins.
 - **Agent lifetimes** (`docs/agents/#lifetimes`, `src/lib/lifetimes.ts`): `agent_spawn`, `agent_stop` and `exit`; ephemeral
   agents; an end's cascade, turn drop, sandbox release (`SandboxDO.release`) and record pruning; sandboxes' idle TTL. An
   operator's plain stop is unchanged (its next input lifts it) and keeps the agent's slot; `POST /v1/agents/<id>/stop
@@ -202,7 +206,7 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`. Built: `/v1/health` makes one read-only round trip to each DO class (`src/lib/health.ts`).
 - **Catalogs seeded before this release** keep `delegate`, `spawn_agent` and `kill` in `management` (ignored on expansion: the registry no longer has them), get the `spawning` capability without a template listing it, and the old `worker` (`subagents`, `TodoWrite`, `Task`, `WebSearch`) until the operator edits them; a new catalog gets the design's (`docs/control-plane/durable-objects/catalog/`).
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO audits GitHub mints only (not secret pushes or binding mints).
-- **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, pins, `isRestoreSource`, generation retention, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
+- **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, fork pins, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
 - **Built:** the autoscaler, per host kind (`AWS_CELLS`: `RunInstances` from the cell's launch template, or the `brain` section's for brain hosts; idle retirement, enroll timeouts).
 - **Not built:** Discord, Cloudflare Access applications from the control plane (the `edge` inframe stack manages
   them; the control plane only stores the service token), the preview/share Worker routes, the api-loop backend (deferred), budgets. Preview and

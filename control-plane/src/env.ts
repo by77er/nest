@@ -51,6 +51,8 @@ export interface Env {
   SANDBOX_SUSPEND_IDLE_MS?: string;
   /** A sandbox without its own idle TTL is destroyed after it was dormant this long (default 1 day; a cell's `sandbox_idle_ttl_ms` wins). */
   SANDBOX_IDLE_TTL_MS?: string;
+  /** Generation retention (src/lib/retention.ts): `off`, `report` (the default: reports what it would drop) or `on`. */
+  SANDBOX_RETENTION?: string;
   /** Batching window of the workstream channel's subscriber wakes. */
   WAKE_BATCH_MS?: string;
   /** The nest domain, `<label>.<zone>` (e.g. `nest.bitcru.sh`): sandbox hosts get `<host>-gw-<label>.<zone>`, previews `<port>-<sandbox>-preview-<label>.<zone>`, share links `<port>-<sandbox>-share-<label>.<zone>`. Unset: no tunnels, and preview names use `nest.localhost`. */

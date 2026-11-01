@@ -26,6 +26,10 @@ import {
 import { canonicalRepos, Repos, unionRepos } from "../lib/repos";
 import { GITHUB_BINDING, githubEgress } from "../lib/rules/github";
 import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
+import {
+  chainView, type ChainView, type GenRow, gcRootsOf, isRestoreSource, livePins, memoryToUnroot, type Pin, retention, retentionMode,
+  type RootRow,
+} from "../lib/retention";
 
 export const DEFAULT_IMAGE = "nest-base:latest";
 export const DEFAULT_RESOURCES: Resources = { vcpus: 2, memory_mib: 4096, disk_gib: 32 };
@@ -79,6 +83,8 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
   expiry_notice_ms?: number;
   /** When the lifetime check last ran (a gap over `EXPIRY_GAP_MS` restarts the clock). */
   expiry_checked_ms?: number;
+  /** The generation the claim at `epoch` restores, pinned by id in the claim's step (`livePins` says while it holds). */
+  restore_pin?: Pin | null;
 }
 
 export interface CreateSandbox {
@@ -105,6 +111,19 @@ const HISTORY_MAX = 50;
 const COMMIT_RECORD_RETENTION_MS = 7 * 86_400_000;
 /** Commit records are pruned from a deadline at most this often, never on the commit path. */
 const COMMIT_PRUNE_INTERVAL_MS = 3_600_000;
+/** Retention runs this long after a commit (one pass covers a burst of them). */
+const RETENTION_AFTER_COMMIT_MS = 60_000;
+/** And at least this often while the sandbox lives, so age limits apply without commits. */
+const RETENTION_RECHECK_MS = 6 * 3_600_000;
+/** At most this many generations are marked `deleting` per pass; the rest in the next, a second later. */
+const RETENTION_MAX_MARKS = 500;
+const RETENTION_CONTINUE_MS = 1_000;
+/**
+ * A main-chain `deleting` row is kept this long after it was marked, then pruned (its commit record
+ * goes with it). An orphan's row is never pruned: a salvage has no parent check, so its record must
+ * answer a late re-ask, and orphans are few.
+ */
+const DELETING_ROW_RETENTION_MS = 7 * 86_400_000;
 /** A minted injection secret is pushed again this long before it expires (BrokerDO reuses one only with 20 minutes left). */
 const INJECT_REFRESH_BEFORE_MS = 15 * 60_000;
 /** A mint that failed for now (GitHub didn't answer) is tried again after this long. */
@@ -128,7 +147,7 @@ const days = (ms: number) => (ms % 86_400_000 === 0 ? `${ms / 86_400_000} days` 
 /** What a stored record written before these fields lacks, and a new one starts with. */
 const newFields = () => ({
   placing: null, placing_ms: null, history: [], lost_from: null, create_attempts: 0, guest: null, attach_cwd: {},
-  attach_pending: [], attach_inflight: {}, attach_attempts: {},
+  attach_pending: [], attach_inflight: {}, attach_attempts: {}, restore_pin: null,
 });
 
 type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
@@ -155,6 +174,12 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS generations (id TEXT PRIMARY KEY, record TEXT NOT NULL,
       orphaned INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL)`);
+    // `state`: null is ready, 'deleting' is one-way (retention marked it; it is no longer a GC root).
+    addColumn(this.sql, "generations", "state", "TEXT");
+    addColumn(this.sql, "generations", "deleting_ms", "INTEGER");
+    // When its memory manifest stopped being a GC root (one-way; null: still a root).
+    addColumn(this.sql, "generations", "mem_unrooted_ms", "INTEGER");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS generations_deleting ON generations (deleting_ms) WHERE state = 'deleting'");
     this.sql.exec("CREATE TABLE IF NOT EXISTS commits (request TEXT PRIMARY KEY, outcome TEXT NOT NULL)");
     // When the request was answered, and the generation it committed (null: rejected), so
     // retention needs no JSON scan.
@@ -323,12 +348,18 @@ export class SandboxDO extends DurableObject<Env> {
   async placeCurrentEpoch(excludeHost?: string): Promise<string | null> {
     await this.reconcilePlacing();
     const now = Date.now();
-    const [claimed, before] = this.decide((i) => lease.claim(i, now));
+    // The source is chosen and pinned by id in the claim's step: retention, in this same single
+    // writer, can't mark it `deleting` while the placement restores it.
+    const from = this.restoreSource(this.info_(), now);
+    const [claimed, before] = this.decide((i) => {
+      const c = lease.claim(i, now);
+      if (c.ok) i.restore_pin = from ? { generation: from.id, epoch: c.epoch } : null;
+      return c;
+    });
     if (!claimed.ok) throw claimed.error;
     const epoch = claimed.epoch;
     // If this call never finishes (a reset, a lost answer), the marker is reconciled when it goes stale.
     await this.deadlines.set("place", now + lease.PLACING_STALE_MS, true);
-    const from = before.head ? this.generation(before.head) : undefined;
     let answer: lease.PlaceAnswer;
     let failure: unknown = null;
     try {
@@ -506,16 +537,11 @@ export class SandboxDO extends DurableObject<Env> {
     if (failed) await this.deadlines.set("notify_moved", Date.now() + slots.ATTACH_RETRY_MS, true);
   }
 
-  /** The manifests GC must keep: every generation's (retention isn't built). */
+  /** The manifests GC must keep (`gcRootsOf`, from durable marks only): none once destroyed; never a `deleting` generation's. */
   async gcRoots(): Promise<string[]> {
-    if (!this.get<SandboxInfo>("info") || this.info_().state === "destroyed") return [];
-    const roots = new Set<string>();
-    for (const { record } of this.sql.exec<{ record: string }>("SELECT record FROM generations").toArray()) {
-      const g = JSON.parse(record) as GenerationRecord;
-      roots.add(g.disk_manifest);
-      if (g.mem_manifest) roots.add(g.mem_manifest);
-    }
-    return [...roots];
+    const info = this.tryInfo();
+    if (!info || info.state === "destroyed") return [];
+    return gcRootsOf(this.readyRows());
   }
 
   /**
@@ -540,12 +566,13 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.clear("place");
     await this.deadlines.clear("inject_refresh");
     await this.deadlines.clear("expiry");
+    await this.deadlines.clear("retention");
     await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).forgetInjections(before.sandbox);
   }
 
   /** `sandbox_create` for the current epoch, from the head if there is one. */
   private createBody(info: SandboxInfo): CommandBody {
-    const from = info.head ? this.generation(info.head) : undefined;
+    const from = this.restoreSource(info, Date.now());
     return {
       type: "sandbox_create", sandbox: info.sandbox, workstream: info.workstream, epoch: info.epoch, image: info.image,
       resources: info.resources, policy: this.effectivePolicy(), ...(from ? { from } : {}),
@@ -578,11 +605,106 @@ export class SandboxDO extends DurableObject<Env> {
     return row ? (JSON.parse(row.record) as GenerationRecord) : undefined;
   }
 
-  async generations(): Promise<{ record: GenerationRecord; orphaned: boolean }[]> {
+  /**
+   * Every recorded generation, oldest first, with its state and, for a ready one, why retention keeps
+   * it (`null`: the next pass drops it, or would in `report` mode).
+   */
+  async generations(): Promise<{ record: GenerationRecord; orphaned: boolean; state: "ready" | "deleting"; retained: string | null }[]> {
+    const info = this.tryInfo();
+    const rows = this.sql
+      .exec<{ record: string; orphaned: number; state: string | null }>("SELECT record, orphaned, state FROM generations ORDER BY created_ms, id")
+      .toArray();
+    const kept = info ? retention(this.readyRows(), this.chain(info, Date.now())).kept : new Map<string, string>();
+    return rows.map((r) => {
+      const record = JSON.parse(r.record) as GenerationRecord;
+      const deleting = r.state === "deleting";
+      return { record, orphaned: r.orphaned === 1, state: deleting ? "deleting" : "ready", retained: deleting ? null : kept.get(record.id) ?? null };
+    });
+  }
+
+  /** The ready generations, as retention reads them. */
+  private readyRows(): RootRow[] {
     return this.sql
-      .exec<{ record: string; orphaned: number }>("SELECT record, orphaned FROM generations ORDER BY created_ms, id")
+      .exec<{ record: string; orphaned: number; created_ms: number; mem_unrooted_ms: number | null }>(
+        "SELECT record, orphaned, created_ms, mem_unrooted_ms FROM generations WHERE state IS NULL")
       .toArray()
-      .map((r) => ({ record: JSON.parse(r.record) as GenerationRecord, orphaned: r.orphaned === 1 }));
+      .map((r) => {
+        const g = JSON.parse(r.record) as GenerationRecord;
+        return {
+          id: g.id, parent: g.parent ?? null, orphaned: r.orphaned === 1, reason: g.reason, created_ms: r.created_ms, deleting: false,
+          disk_manifest: g.disk_manifest, ...(g.mem_manifest ? { mem_manifest: g.mem_manifest } : {}), mem_unrooted: r.mem_unrooted_ms !== null,
+        };
+      });
+  }
+
+  /** What `isRestoreSource` reads: the head, the live pins, and every orphan's parent (`deleting` orphans' too). */
+  private chain(info: SandboxInfo, now: number): ChainView {
+    const parents = this.sql.exec<{ record: string }>("SELECT record FROM generations WHERE orphaned = 1").toArray()
+      .map((r) => (JSON.parse(r.record) as GenerationRecord).parent)
+      .filter((p): p is string => p !== undefined);
+    return chainView(info.head, livePins(info), parents, now);
+  }
+
+  /**
+   * What a placement restores: the head, which must be a restore source. It always is (only a commit
+   * moves the head, to a new generation, and retention never marks a restore source), so a head that
+   * isn't is a broken invariant: refused, never restored and never replaced by an older generation.
+   */
+  private restoreSource(info: SandboxInfo, now: number): GenerationRecord | undefined {
+    if (!info.head) return undefined;
+    const row = this.sql.exec<{ record: string; orphaned: number; created_ms: number; state: string | null }>(
+      "SELECT record, orphaned, created_ms, state FROM generations WHERE id = ?", info.head).toArray()[0];
+    if (!row) throw new NestError(ErrorCodes.INTERNAL, `sandbox ${info.sandbox}: its head ${info.head} is not recorded`, 500);
+    const g = JSON.parse(row.record) as GenerationRecord;
+    const gen: GenRow = { id: g.id, parent: g.parent ?? null, orphaned: row.orphaned === 1, reason: g.reason, created_ms: row.created_ms, deleting: row.state === "deleting" };
+    if (!isRestoreSource(gen, chainView(info.head, livePins(info), [], now))) {
+      console.error(`sandbox ${info.sandbox}: its head ${g.id} is not a restore source (${row.state ?? "ready"}); not restoring it`);
+      throw new NestError(ErrorCodes.INTERNAL, `sandbox ${info.sandbox}: its head is not a restore source`, 500);
+    }
+    return g;
+  }
+
+  /**
+   * The `retention` deadline (`retention()`): in `on` mode, marks what it drops `deleting`, at most
+   * `RETENTION_MAX_MARKS` a pass, and marks the memory of checkpoints that are no longer restore
+   * sources unrooted, all in one synchronous step with the read, so a claim's pin and a commit's new
+   * head are seen; `report` mode records what it would do. Then prunes old main-chain `deleting` rows.
+   * Re-armed while the sandbox lives.
+   */
+  private async runRetention(): Promise<void> {
+    const mode = retentionMode(this.env);
+    const info = this.tryInfo();
+    if (mode === "off" || !info || info.state === "destroyed") return;
+    const now = Date.now();
+    const rows = this.readyRows();
+    const view = this.chain(info, now);
+    const d = retention(rows, view);
+    const dropSet = new Set(d.drop);
+    const memory = memoryToUnroot(rows, view).filter((id) => !dropSet.has(id));
+    let marked = 0;
+    let unrooted = 0;
+    if (mode === "on") {
+      // `rowsWritten` counts index rows too: one or more means this row changed.
+      for (const id of d.drop.slice(0, RETENTION_MAX_MARKS)) {
+        if (this.sql.exec("UPDATE generations SET state = 'deleting', deleting_ms = ? WHERE id = ? AND state IS NULL", now, id).rowsWritten > 0) marked += 1;
+      }
+      for (const id of memory.slice(0, RETENTION_MAX_MARKS)) {
+        if (this.sql.exec("UPDATE generations SET mem_unrooted_ms = ? WHERE id = ? AND state IS NULL AND mem_unrooted_ms IS NULL", now, id).rowsWritten > 0) unrooted += 1;
+      }
+    }
+    const old = this.sql.exec<{ id: string }>("SELECT id FROM generations WHERE state = 'deleting' AND orphaned = 0 AND deleting_ms < ? LIMIT ?",
+      now - DELETING_ROW_RETENTION_MS, RETENTION_MAX_MARKS).toArray();
+    for (const { id } of old) this.sql.exec("DELETE FROM generations WHERE id = ? AND state = 'deleting' AND orphaned = 0", id);
+    const pruned = old.length;
+    this.put("retention_report", {
+      at: now, mode, ready: rows.length, drop: d.drop.length, marked, memory_to_unroot: memory.length, memory_unrooted: unrooted, pruned,
+    });
+    if (d.drop.length || memory.length || pruned) {
+      console.log(`sandbox ${info.sandbox}: retention (${mode}): ${rows.length} ready, ${d.drop.length} to drop and ${memory.length} checkpoints' memory to unroot` +
+        `${mode === "on" ? ` (${marked} marked deleting, ${unrooted} unrooted)` : " (report only)"}, ${pruned} old rows pruned`);
+    }
+    const more = mode === "on" && (d.drop.length > marked || memory.length > unrooted);
+    await this.deadlines.set("retention", now + (more ? RETENTION_CONTINUE_MS : RETENTION_RECHECK_MS));
   }
 
   /** Compare-and-set the head (`lease.decideCommit`), idempotent per `request`. */
@@ -624,6 +746,7 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO commits (request, outcome, created_ms, generation_id) VALUES (?, ?, ?, ?)",
       ev.request, JSON.stringify(outcome), Date.now(), outcome.status === "rejected" ? null : outcome.generation.id);
     await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
+    if (outcome.status !== "rejected") await this.deadlines.set("retention", Date.now() + RETENTION_AFTER_COMMIT_MS, true);
     if (outcome.status === "orphaned") await this.noticeOrphan(ev, outcome.generation);
     return outcome;
   }
@@ -770,6 +893,8 @@ export class SandboxDO extends DurableObject<Env> {
         await this.reissuePendingAttaches(false);
       } else if (key === "commit_prune") {
         await this.pruneCommitRecords();
+      } else if (key === "retention") {
+        await this.runRetention();
       } else if (key === "notify_moved") {
         await this.sendMoveNotices();
       } else if (key === "expiry") {
@@ -932,6 +1057,8 @@ export class SandboxDO extends DurableObject<Env> {
         idem_key: `${s.sandbox}/expiry/${step.since}`,
       }, { tainted: false });
     }
+    // Sandboxes from before retention (and any whose deadline a rolled-back release dropped) get it here.
+    if (!this.deadlines.has("retention")) await this.deadlines.set("retention", now);
     await this.deadlines.set("expiry", step.at);
   }
 
