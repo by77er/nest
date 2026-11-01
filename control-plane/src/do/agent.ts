@@ -43,8 +43,9 @@ import { addColumn, storedEnum } from "../lib/stored";
 import { askRoute, CallLedger } from "../lib/calls";
 import {
   agentState, type Brain, type BrainFields, type BrainPatch, brainRelease, epochlessExit, escalation, liveBrainStart, mergeIntent, NO_INTENT,
-  phaseDeadlines, type PhaseDeadline, splitState, startFailure, type StartIntent, stoppedBrain, unresponsive, wakeDecision,
+  phaseDeadlines, type PhaseDeadline, quietSinceStop, splitState, startFailure, type StartIntent, stoppedBrain, unresponsive, wakeDecision,
 } from "../lib/brain";
+import type { AgentFacts } from "../lib/abandoned";
 import {
   type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage,
   RunnerToAgent, type SegmentRef, type ToolDef, type ToolOutcome, type ToolRule, type TurnInput,
@@ -1078,6 +1079,28 @@ export class AgentDO extends DurableObject<Env> {
   async children(): Promise<{ agent: string; ended: boolean }[]> {
     return this.sql.exec<{ agent: string; ended: number }>("SELECT agent, ended FROM children ORDER BY created_ms").toArray()
       .map((r) => ({ agent: r.agent, ended: r.ended === 1 }));
+  }
+
+  /** What the operator's lifetimes view reads (lib/abandoned.ts `AgentFacts`): a read, never a decision. */
+  async lifetimeFacts(): Promise<AgentFacts> {
+    const info = this.load();
+    const e = info.ended;
+    return {
+      agent: info.agent,
+      template: info.template ?? null,
+      owner: info.owner,
+      sandbox: info.hands?.sandbox ?? null,
+      brain: info.brain !== null,
+      starting: info.intent !== null,
+      current_turn: info.current_turn !== null,
+      queued: this.queue.queuedCount(),
+      // A row from before `created_ms` reads 0: unknown, so counted as none.
+      last_turn_ms: this.queue.lastTurnMs() || null,
+      stopped_by_operator: !e && quietSinceStop(info),
+      live_children: this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0 ORDER BY created_ms").toArray().map((r) => r.agent),
+      subscriptions: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM channel_subs WHERE ended = 0").one().n,
+      ended: e ? { ms: e.ms, reason: e.reason, done_ms: e.done_ms ?? null } : null,
+    };
   }
 
   /**

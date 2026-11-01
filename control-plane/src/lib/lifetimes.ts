@@ -154,3 +154,20 @@ export function expiryStep(f: ExpiryFacts): ExpiryStep {
   const destroyAt = Math.max(due, f.noticed + EXPIRY_NOTICE_MS);
   return f.now >= destroyAt ? { kind: "destroy", since } : { kind: "wait", since, at: next(destroyAt) };
 }
+
+/**
+ * When `expiryStep` will destroy a dormant sandbox if nothing changes and its checks keep running
+ * (each at its `at`); null while its dormancy clock hasn't started (the next check starts it). A
+ * check missed for over `EXPIRY_GAP_MS` (`checked`: the last) restarts the clock and any notice, as
+ * `checkExpiry` does, so the answer counts from `now`. For the operator's view, never a decision.
+ */
+export function destroyAtMs(f: Omit<ExpiryFacts, "dormant"> & { checked?: number }): number | null {
+  // After a gap the clock restarts now, so any earlier notice is too early to matter.
+  const gap = f.checked !== undefined && f.now - f.checked > EXPIRY_GAP_MS;
+  const since = gap && f.since !== undefined ? f.now : f.since;
+  if (since === undefined) return null;
+  const due = since + f.ttl;
+  if (f.ttl <= EXPIRY_NOTICE_MS) return due;
+  // Not noticed yet: the notice comes at `due - EXPIRY_NOTICE_MS`, or at the next check if that is past.
+  return Math.max(due, (f.noticed ?? Math.max(f.now, due - EXPIRY_NOTICE_MS)) + EXPIRY_NOTICE_MS);
+}

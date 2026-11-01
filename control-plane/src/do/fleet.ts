@@ -37,8 +37,11 @@ import {
   type CapacityView, type FleetView, HOST_STATUSES, type HostStatus, type HostView, type ImagesView, LAUNCH_END_REASONS, type LaunchEndReason,
   type LaunchView, type SandboxView, type TemplateView,
   type HostRole as AdminHostRole, type SandboxState as AdminSandboxState, type TunnelState as AdminTunnelState,
-  type AwsView,
+  type AwsView, AGENT_LIFETIME_KINDS, type AgentLifetimeKind, type LifetimeAgentView, type LifetimeSandboxView, type LifetimesView,
+  SANDBOX_LIFETIME_KINDS, type SandboxLifetimeKind,
 } from "../../../protocol/admin/view";
+import { type AgentRead, classifyAgent, classifySandbox, cursorOf, DEFAULT_QUIET_MS, mapBounded, parseCursor } from "../lib/abandoned";
+import { cellIdleTtlMs } from "../lib/lifetimes";
 
 // Closed unions for every status/kind column (docs/data/#enums): written through these types, read
 // back through `storedEnum` (a value outside the union is logged as an error).
@@ -209,6 +212,11 @@ const PRUNE_DAILY_MS = 24 * 3_600_000;
 /** Sandboxes whose lifetime check `armLifetimes` arms per daily run, and how often each is asked again. */
 const LIFETIME_BACKFILL_PER_RUN = 200;
 const LIFETIME_RECHECK_MS = 7 * 86_400_000;
+/** The lifetimes view's page of sandboxes (default and most), agents read per page, and reads at a time. */
+const LIFETIMES_PAGE = 50;
+const LIFETIMES_MAX_PAGE = 100;
+const LIFETIMES_MAX_AGENTS = 200;
+const LIFETIMES_CONCURRENCY = 8;
 /** A brain waiter not seen again for this long has stopped waiting (it retries at least every 5 min). */
 const BRAIN_WAIT_TTL_MS = 12 * 60_000;
 /** Lost hosts (expired or dead) whose brains' agents haven't all acknowledged the loss yet. */
@@ -2325,6 +2333,117 @@ export class FleetDO extends DurableObject<Env> {
         return { ...base, sandbox_state: null, image: null, workstream: null, info_error: true };
       }
     }));
+  }
+
+  /**
+   * Operator view (docs/control-plane/dashboard/#abandoned): a page of the registry's live sandboxes
+   * (after `cursor`, in registration order), each read from SandboxDO with its generation counts,
+   * and the agents they lead to (attached, or made for), followed through owners and live children,
+   * read from AgentDO; classified by lib/abandoned.ts, the in-use and the recent counted, the rest
+   * listed. Reads are bounded: `limit` sandboxes, `LIFETIMES_MAX_AGENTS` agents a page,
+   * `LIFETIMES_CONCURRENCY` at a time; one that can't be read is a row with its error.
+   */
+  async lifetimes(q: { cursor?: string; limit?: number; quiet_ms?: number } = {}): Promise<LifetimesView> {
+    const now = Date.now();
+    const cell = this.cellName() ?? "";
+    const quietMs = q.quiet_ms ?? DEFAULT_QUIET_MS;
+    const limit = Math.max(1, Math.min(LIFETIMES_MAX_PAGE, q.limit ?? LIFETIMES_PAGE));
+    const after = q.cursor ? parseCursor(q.cursor) : null;
+    if (q.cursor && !after) throw new NestError(ErrorCodes.INVALID_MESSAGE, `bad cursor ${q.cursor}`, 400);
+    const rows = this.sql.exec<{ sandbox: string; registered_ms: number }>(
+      `SELECT sandbox, registered_ms FROM sandboxes WHERE destroyed_ms IS NULL AND (registered_ms > ? OR (registered_ms = ? AND sandbox > ?))
+        ORDER BY registered_ms, sandbox LIMIT ?`, after?.registered_ms ?? -1, after?.registered_ms ?? -1, after?.sandbox ?? "", limit + 1).toArray();
+    const page = rows.slice(0, limit);
+    const read = await mapBounded(page, LIFETIMES_CONCURRENCY, async (r) => {
+      try {
+        const stub = this.sandbox(r.sandbox);
+        const [info, gens] = await Promise.all([stub.info(), stub.generations()]);
+        return { ...r, info, gens: gens.length, mem: gens.filter((g) => g.record.mem_manifest).length };
+      } catch (e) {
+        console.error(`FleetDO: reading ${r.sandbox} for the lifetimes view failed`, e);
+        return { ...r, error: String(e) };
+      }
+    });
+
+    // The agents they lead to, then their owners and live children, breadth first up to the cap.
+    const found = new Map<string, LifetimeAgentView["found_via"]>();
+    const attached = new Set<string>();
+    const find = (agent: string | null | undefined, via: LifetimeAgentView["found_via"]) => {
+      if (agent && !found.has(agent)) found.set(agent, via);
+    };
+    for (const r of read) {
+      if (!("info" in r)) continue;
+      for (const a of r.info.attached) {
+        attached.add(a);
+        find(a, "sandbox");
+      }
+      find(r.info.owner, "sandbox");
+    }
+    const agents = new Map<string, AgentRead>();
+    for (let frontier = [...found.keys()]; frontier.length && agents.size < LIFETIMES_MAX_AGENTS;) {
+      const batch = frontier.slice(0, LIFETIMES_MAX_AGENTS - agents.size);
+      const got = await mapBounded(batch, LIFETIMES_CONCURRENCY, async (agent): Promise<AgentRead> => {
+        try {
+          return { facts: await this.agentStub(agent).lifetimeFacts() };
+        } catch (e) {
+          if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return { gone: true };
+          console.error(`FleetDO: reading ${agent} for the lifetimes view failed`, e);
+          return { error: String(e) };
+        }
+      });
+      batch.forEach((agent, i) => {
+        const r = got[i]!;
+        agents.set(agent, r);
+        if (!("facts" in r)) return;
+        find(r.facts.owner, "owner");
+        for (const c of r.facts.live_children) find(c, "child");
+      });
+      frontier = [...found.keys()].filter((a) => !agents.has(a));
+    }
+
+    const counts = {
+      sandboxes: Object.fromEntries(SANDBOX_LIFETIME_KINDS.map((k) => [k, 0])) as Record<SandboxLifetimeKind, number>,
+      agents: Object.fromEntries(AGENT_LIFETIME_KINDS.map((k) => [k, 0])) as Record<AgentLifetimeKind, number>,
+    };
+    const kindOf = new Map([...agents].map(([a, r]) => [a, classifyAgent(r, now, quietMs)]));
+    const agentViews: LifetimeAgentView[] = [];
+    for (const [agent, r] of agents) {
+      const kind = kindOf.get(agent)!;
+      counts.agents[kind]++;
+      // Listed: what nobody will use. A pruned agent is noise unless a sandbox still has it attached.
+      if (!(kind === "quiet" || kind === "ending" || kind === "unreadable" || (kind === "gone" && attached.has(agent)))) continue;
+      const f = "facts" in r ? r.facts : null;
+      agentViews.push({
+        agent, kind, template: f?.template ?? null, owner: f?.owner ?? null, sandbox: f?.sandbox ?? null, last_turn_ms: f?.last_turn_ms ?? null,
+        stopped_by_operator: f?.stopped_by_operator ?? false, live_children: f?.live_children ?? [], subscriptions: f?.subscriptions ?? 0,
+        ended_ms: f?.ended?.ms ?? null, ended_reason: f?.ended?.reason ?? null, found_via: found.get(agent)!, error: "error" in r ? r.error : null,
+      });
+    }
+    const sandboxes: LifetimeSandboxView[] = [];
+    for (const r of read) {
+      if (!("info" in r)) {
+        counts.sandboxes.unreadable++;
+        sandboxes.push({
+          sandbox: r.sandbox, kind: "unreadable", registered_ms: r.registered_ms, state: null, host: null, owner: null, attached: [],
+          idle_ttl_ms: null, own_ttl: false, dormant_since_ms: null, expiry_notice_ms: null, destroy_at_ms: null, generations: null,
+          memory_generations: null, error: r.error,
+        });
+        continue;
+      }
+      const i = r.info;
+      const c = classifySandbox(i, (a) => kindOf.get(a), now, cellIdleTtlMs(this.env, i.cell));
+      counts.sandboxes[c.kind]++;
+      if (c.kind === "in_use") continue;
+      sandboxes.push({
+        sandbox: r.sandbox, kind: c.kind, registered_ms: r.registered_ms, state: i.state, host: i.host, owner: i.owner ?? null, attached: i.attached,
+        idle_ttl_ms: c.ttl, own_ttl: i.idle_ttl_ms !== undefined, dormant_since_ms: i.dormant_since_ms ?? null,
+        expiry_notice_ms: i.expiry_notice_ms ?? null, destroy_at_ms: c.destroy_at, generations: r.gens, memory_generations: r.mem, error: null,
+      });
+    }
+    return {
+      cell, now_ms: now, quiet_ms: quietMs, cell_idle_ttl_ms: cellIdleTtlMs(this.env, cell), sandboxes, agents: agentViews, counts,
+      next_cursor: rows.length > limit ? cursorOf(page[page.length - 1]!) : null, agents_omitted: found.size - agents.size,
+    };
   }
 
   /** Operator view: the cell's region and which of its AWS settings it has, never their values. */

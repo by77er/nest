@@ -81,6 +81,10 @@ export class TurnQueue {
     return this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
   }
 
+  queuedCount(): number {
+    return this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM turns WHERE status = '${TURN.queued}'`).one().n;
+  }
+
   /** Q2: the oldest queued turn becomes active (synchronously, so it is claimed once). */
   claimNext(now = Date.now()): QueuedTurn | undefined {
     const next = this.sql.exec<{ turn: string; input: string; recovers: string | null }>(
