@@ -39,6 +39,8 @@ interface AsOpts {
   preRegistered?: { client_id: string; client_secret: string };
   /** Milliseconds each refresh takes (to hold refreshes in flight). */
   refreshDelayMs?: number;
+  /** The protected resource metadata names this resource instead of the server (RFC 9728 §3.3: nest must refuse). */
+  prmResource?: string;
 }
 
 interface Code { client_id: string; redirect_uri: string; challenge: string; resource: string; scope: string | null }
@@ -195,7 +197,7 @@ class FakeAuth {
 
   private async rs(req: Request, u: URL): Promise<Response> {
     if (u.href === this.prm && req.method === "GET") {
-      return this.json(200, { resource: this.server, authorization_servers: [this.issuer], scopes_supported: ["notes", "extra"] });
+      return this.json(200, { resource: this.o.prmResource ?? this.server, authorization_servers: [this.issuer], scopes_supported: ["notes", "extra"] });
     }
     if (u.href !== this.server) return this.json(404, {});
     const msg = (await req.json()) as { id?: number; method: string; params?: any };
@@ -428,11 +430,13 @@ describe("authorization", () => {
     expect(f.tokenRequests).toEqual([]);
   });
 
-  it("falls back to the well-known URLs when the 401 names no metadata, and refuses a server without S256", async () => {
+  it("falls back to the well-known URLs when the 401 names no metadata, and refuses a server without S256 or whose metadata names another resource", async () => {
     const plain = await capability({ challengeNamesMetadata: false });
     expect((await authorize(plain.cap)).callback.status).toBe(200);
     const none = await capability({ s256: false });
     expect((await adminJson(`/v1/admin/capabilities/${none.cap}/oauth`, { method: "POST" }, 502)).error.message).toContain("S256");
+    const other = await capability({ prmResource: "https://elsewhere.test/mcp" });
+    expect((await adminJson(`/v1/admin/capabilities/${other.cap}/oauth`, { method: "POST" }, 502)).error.message).toContain("names https://elsewhere.test/mcp");
   });
 
   it("uses a pre-registered client first (Basic auth with its secret), else registers once (RFC 7591) where there's no metadata document", async () => {
