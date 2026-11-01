@@ -25,6 +25,7 @@ import {
 } from "../lib/brokered";
 import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
 import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
+import { Repo } from "../lib/repos";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
 import {
@@ -2268,7 +2269,8 @@ export class AgentDO extends DurableObject<Env> {
         this.journal.refuse(row, why);
         throw secretRefusal(kinds.length ? kinds.join(", ") : "a credential nest holds");
       }
-      if (gated({ sink: auth.value.sink, when_tainted: auth.value.when_tainted, tainted: this.tainted(this.load()) })) {
+      // A fork widens the push allowlist: the operator approves it from any session, tainted or not.
+      if (def.kind === "github_user" || gated({ sink: auth.value.sink, when_tainted: auth.value.when_tainted, tainted: this.tainted(this.load()) })) {
         const held = await this.sinkGate(info, epoch, call, key, {
           name: action, tool: `${NEST_TOOL_PREFIX}${def.tool}`, what: `${action} on ${auth.value.target}`, args: a,
         }, fence);
@@ -2279,9 +2281,49 @@ export class AgentDO extends DurableObject<Env> {
       await this.hook("dispatch:beforeWrite");
       this.assertEpoch(fence);
     };
+    if (def.kind === "github_user") return await this.runFork(info, auth.value, row, live);
     return def.kind === "github"
       ? await this.runGithub(info, action as GithubAction, a, auth.value, row, kd, !!prior, live)
       : await this.runHttp(a, auth.value, row, kd, !!prior, live);
+  }
+
+  /**
+   * `github.fork` (docs/agents/capabilities/brokered/#forks): forks a public upstream into the operator's
+   * account with their own token (`github_user`; the App can't fork from an account it isn't installed
+   * on), then adds the fork to its sandbox's push allowlist while it is attached. The upstream pull
+   * request is the operator's: the result carries the compare link. GitHub answers an existing fork
+   * for a repeated request (unverified), so a lost answer or a redelivery asks again.
+   */
+  private async runFork(info: AgentInfo, auth: Authorized, row: JournalRow, live: () => Promise<void>): Promise<ToolOutcome> {
+    const upstream = auth.target;
+    if (!Repo.safeParse(upstream).success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${upstream} isn't owner/name`);
+    const token = await this.broker().githubUserToken();
+    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000));
+    let r: Awaited<ReturnType<typeof api.request>> = { kind: "lost", why: "not sent" };
+    for (let attempt = 1; attempt <= 2 && r.kind !== "ok" && !(r.kind === "refused"); attempt++) {
+      await live();
+      this.journal.sending(row);
+      r = await api.request(token, "POST", `/repos/${upstream}/forks`, { default_branch_only: true });
+    }
+    if (r.kind !== "ok") {
+      if (r.kind === "lost") return this.unknownOutcome(row, `github.fork ${upstream}: ${r.why}`);
+      const e = ghError(r, "github.fork");
+      const outcome: ToolOutcome = { status: "error", error: e.body() };
+      this.journal.settle(row, "failed", outcome, e.detail);
+      return outcome;
+    }
+    const j = (r.json ?? {}) as { full_name?: unknown; html_url?: unknown; default_branch?: unknown; parent?: { default_branch?: unknown } };
+    const fork = typeof j.full_name === "string" && Repo.safeParse(j.full_name).success ? j.full_name.toLowerCase() : null;
+    if (!fork || typeof j.html_url !== "string") return this.unknownOutcome(row, `github.fork ${upstream}: GitHub answered HTTP ${r.status} without the fork`);
+    if (info.hands) await this.sandboxStub(info.hands.sandbox).allowAgentRepos(info.agent, [fork]);
+    const base = typeof j.parent?.default_branch === "string" ? j.parent.default_branch : typeof j.default_branch === "string" ? j.default_branch : "main";
+    const [fo, fn] = fork.split("/");
+    const value = { fork, url: j.html_url, compare: `https://github.com/${upstream}/compare/${encodeURIComponent(base)}...${fo}:${fn}:<branch>`, push_allowed: !!info.hands };
+    const outcome: ToolOutcome = {
+      status: "ok", content: [{ type: "text", text: `Forked ${upstream} to ${fork}${info.hands ? "; it's on your sandbox's push allowlist" : ""}.` }, { type: "json", value }],
+    };
+    this.journal.settle(row, "done", outcome, fork);
+    return outcome;
   }
 
   /** A `github.*` action with an installation token narrowed to its repo and permissions (BrokerDO). */

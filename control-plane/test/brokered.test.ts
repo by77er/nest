@@ -14,6 +14,8 @@ import { b64url, b64urlToBytes, bytesToB64 } from "../src/lib/util";
 import { adminJson, connectHost, nextCommands, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
+/** The operator's GitHub user token, as `github.fork` uses it (low entropy: not a real token's shape). */
+const GITHUB_USER_TOKEN = "operator-user-token-for-tests";
 const APP_ID = "424242";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
@@ -61,6 +63,7 @@ class FakeGitHub {
   readonly installs = new Map<string, number>();
   readonly mints: { installation: number; repositories: string[]; permissions: Record<string, string> }[] = [];
   readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
+  readonly forks: { upstream: string; body: unknown }[] = [];
   /** Every write (non-GET) request: method and path. */
   readonly writes: { method: string; path: string; body: any }[] = [];
   readonly comments = new Map<string, Item[]>();
@@ -95,6 +98,12 @@ class FakeGitHub {
       const token = `ghs_fake${String(++this.n).padStart(32, "0")}`;
       this.tokens.set(token, { repo, permissions: body.permissions });
       return json(201, { token, expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: body.permissions });
+    }
+    // A fork, with the operator's own token (the App can't fork from an account it isn't on).
+    if ((m = u.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/forks$/)) && req.method === "POST") {
+      if (auth !== GITHUB_USER_TOKEN) return json(401, { message: "Bad credentials" });
+      this.forks.push({ upstream: `${m[1]}/${m[2]}`, body });
+      return json(202, { full_name: `Operator/${m[2]}`, html_url: `https://github.com/Operator/${m[2]}`, default_branch: "trunk", parent: { default_branch: "trunk" } });
     }
     // Everything else needs an installation token for exactly this repo.
     const r = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)$/);
@@ -551,6 +560,39 @@ describe("the sink gate for brokered actions", () => {
     expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "a" })).status).toBe("ok");
     await taint(s.agent);
     expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "b" })).status).toBe("pending");
+  });
+});
+
+describe("github.fork", () => {
+  it("always waits for the operator, even untainted; then forks with the operator's token and puts the fork on the sandbox's push allowlist", async () => {
+    await adminJson("/v1/admin/secrets/github_user", { method: "PUT", body: { value: GITHUB_USER_TOKEN } });
+    const up = `up${rand()}/lib`;
+    // Untainted (no hands): still asked.
+    const plain = await setup([{ action: "github.fork" }]);
+    expect(await tainted(plain.agent)).toBe(false);
+    expect((await run(plain.ws, "github_fork", { repo: up })).status).toBe("pending");
+    expect(gh.forks.filter((f) => f.upstream === up)).toEqual([]);
+
+    const s = await setup([{ action: "github.fork", repos: [up] }], { hands: true });
+    expect((await run(s.ws, "github_fork", { repo: `other${rand()}/x` })).status).toBe("error");
+    const p = await run(s.ws, "github_fork", { repo: up });
+    expect(p.status).toBe("pending");
+    await answer(s.agent, p.ask, "approve");
+    const done = await run(s.ws, "github_fork", { repo: up });
+    expect(done.status, JSON.stringify(done)).toBe("ok");
+    expect(done.content[1].value).toEqual({
+      fork: "operator/lib", url: "https://github.com/Operator/lib", compare: `https://github.com/${up}/compare/trunk...operator:lib:<branch>`, push_allowed: true,
+    });
+    expect(gh.forks.filter((f) => f.upstream === up)).toEqual([{ upstream: up, body: { default_branch_only: true } }]);
+    const sbx = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox!));
+    expect(await sbx.pushRepos()).toContain("operator/lib");
+    const policy = await sbx.policy();
+    expect(policy.guards!.find((g) => g.name === "github-push")!.allow).toEqual([{ path: "/operator/lib/**" }, { path: "/operator/lib.git/**" }]);
+  });
+
+  it("the operator's token never resolves into a host command", async () => {
+    const r = await env.BROKER.get(env.BROKER.idFromName("broker")).resolveRefs(["$nest-secret:github_user"], ["github_user", "inject:"]);
+    expect(r).toEqual({ "$nest-secret:github_user": null });
   });
 });
 

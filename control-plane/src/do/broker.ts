@@ -336,6 +336,16 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /**
+   * The operator's own GitHub token (`github_user`), for AgentDO's `github.fork`, the only caller: the
+   * App can't fork from an account it isn't installed on. Never resolvable into a host command.
+   */
+  async githubUserToken(): Promise<string> {
+    const s = this.secret("github_user");
+    if (!s) throw new NestError(ErrorCodes.FORBIDDEN, "no GitHub user token is configured (github_user): forks need one", 409);
+    return s.value;
+  }
+
+  /**
    * An http profile's credential (`http:<name>`, docs/agents/capabilities/#brokered-actions), for
    * AgentDO's brokered pipeline, the only caller. Never resolvable into a host command. Null when none is stored.
    */
@@ -494,7 +504,7 @@ export function commandRefSlots(cmd: Record<string, unknown>): RefSlot[] {
 }
 
 /** Never resolvable into a command, whatever the purpose: they never leave the control plane. */
-export const NEVER_RESOLVED = ["binding_key:", "access:", "cap:", "hook:", "http:", "github_app"] as const;
+export const NEVER_RESOLVED = ["binding_key:", "access:", "cap:", "hook:", "http:", "github_app", "github_user"] as const;
 
 /** An entry ending in `:` admits that prefix; any other admits the name itself and `<name>:…`. */
 export function nameAllowed(name: string, allow: readonly string[]): boolean {
