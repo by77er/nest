@@ -234,12 +234,17 @@ export class McpProxy {
   }
 
   /** A tool's listing (for its annotations): the cache at any age, else a fetch; undefined when unknown. */
-  private async listed(g: McpGrant, tool: string): Promise<ListedTool | undefined> {
+  async listed(g: McpGrant, tool: string): Promise<ListedTool | undefined> {
     const tools = this.server(g).tools ?? (await this.list(g));
     return tools?.find((t) => t.name === tool);
   }
 
   // --- Forwards -------------------------------------------------------------------------------------------
+
+  /** Whether this call key was forwarded already (its redelivery isn't gated again). */
+  forwarded(key: string): boolean {
+    return this.forward(key) !== undefined;
+  }
 
   private forward(key: string): ForwardRow | undefined {
     const r = this.d.sql.exec<{ key: string; epoch: number; status: string; attempts: number; deadline: number; outcome: string | null }>(

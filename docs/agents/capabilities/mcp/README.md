@@ -6,7 +6,7 @@ A capability with an `mcp` source gives an agent a remote MCP server's tools. Th
 
 ```yaml
 capability: notes
-mcp: {url: https://mcp.example.com/mcp, auth: cap:notes, tools: [echo, note_get, note_put], idempotent: {echo: false}, trusted: false}
+mcp: {url: https://mcp.example.com/mcp, auth: cap:notes, tools: [echo, note_get, note_put], idempotent: {echo: false}, read_only: [echo, note_get], trusted: false, when_tainted: approve}
 prompt: The notes server.
 ```
 
@@ -14,7 +14,9 @@ prompt: The notes server.
 - **`auth`:** the BrokerDO secret holding the bearer token, `cap:<name>`, stored with `PUT /v1/admin/secrets/cap:<name>`. Only AgentDO reads it (`BrokerDO.capabilityToken`); `cap:` never resolves into a host command.
 - **`tools`:** the allowlist. Absent: whatever the server lists (at most 128 per capability).
 - **`idempotent`:** the operator's override of the server's annotations: a list of tools that are idempotent, or a map of tool to whether it is. Otherwise a tool is idempotent when the server marks it `readOnlyHint` or `idempotentHint` ([annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)), else not.
+- **`read_only`:** the tools that aren't [sinks](#sinks), as a list or a map like `idempotent`.
 - **`trusted`** (default `false`): see [taint](#taint).
+- **`when_tainted`** (`approve`, the default, or `allow`): what a sink call from a tainted session needs.
 - **Names:** a capability's name has no `_`, so `<capability>_<tool>` splits back unambiguously. A capability whose name a platform tool starts with (`task_…`, `channel_…`) is refused; a later platform tool with a clashing name wins, and the remote one is left out of the list. A remote tool name is letters, digits, `_` and `-`, and `mcp__nest__<capability>_<tool>` at most 64 characters (the Messages API's tool name limit; unverified for Claude Code's MCP names, so conservative); others aren't listed.
 - **Spawn:** the expanded spec copies each mcp capability's source (`AgentSpec.mcp`), like everything else in it: editing the capability changes later spawns only. `overrides.tools` narrows remote tools too, by their `<capability>_<tool>` names: a given list keeps only the remote tools it names (and drops a capability it names none of), and never widens an allowlist.
 
@@ -43,7 +45,15 @@ prompt: The notes server.
   - A lost answer (timeout, network, HTTP 5xx, an unparseable body) is `outcome_unknown`, retried once only when the tool is idempotent. At most two forwards per call in all.
 - **Errors:** a tool's `isError: true` is a tool error to the model with its text (code `tool_error`). Everything else is a platform error from the existing table: a JSON-RPC error `invalid_message`, HTTP 401 `unauthorized`, 403 `forbidden`, 429 `rate_limited` (retryable), other 4xx and a too-large answer `invalid_message`, no credential stored `forbidden`, a failed `initialize` `internal` (retryable: nothing was sent) or `unsupported_version`.
 - **`_meta`** on every `tools/call`: `nest/agent`, `nest/epoch`, `nest/call` (the call key `<agent>/<epoch>/<call>`, the same on a retry) and `nest/taint` (the session's taint as the request leaves).
-- **Sinks:** a remote tool is a sink unless the server marks it `readOnlyHint`, as the [sources table](../#sources) says; like every other sink rule, nothing enforces it yet ([taint and sinks](../../tools/#taint-and-sinks)).
+
+## Sinks
+
+- **A remote tool is a sink unless it's read-only:** the operator's `read_only` mark, else, for a `trusted` server only, its `readOnlyHint`. An untrusted server's annotations don't count: "clients **MUST** consider tool annotations to be untrusted unless they come from trusted servers" ([tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)). A read-only call still carries its arguments to the server; marking a tool `read_only` accepts that.
+- **A sink call from a tainted session isn't sent** under `when_tainted: approve`: the call answers `pending` with an ask id, and the operator is asked on the agent's escalation route with the tool, the server's host and the arguments (the first 2,000 characters). The same tool with the same arguments asked again before a decision gets the same ask.
+- **The decision is a turn.** An answer whose first word is `approve(d)`, `allow(ed)`, `yes`, `y`, `ok` or `okay` approves; anything else denies, and the agent is told the answer. An approval lets through **one** call of that tool with exactly those arguments (SHA-256 of their canonical JSON, keys sorted) within an hour; the model calls again. A redelivery of the call it was spent on uses it again; nothing else does.
+- **Always:** a call from an untainted session, `when_tainted: allow`, a read-only tool, and a call key already forwarded (its redelivery) aren't gated.
+- **Who approves:** only the operator (`POST /v1/agents/:agent/asks/:ask/answer`, admin); no agent can answer an ask.
+- **Why async, not held:** an approval inside the call would have to fit the operator's answer and the forward under the runner's 150 s call timeout, and a late answer would have to run the call outside its brain's epoch fence. Asking again keeps every forward on a current brain's call.
 
 ## Taint
 
@@ -53,11 +63,10 @@ prompt: The notes server.
 
 ## Data
 
-AgentDO's `mcp_servers` (per capability: URL, session id, negotiated version, cached tool list and when it was fetched) and `mcp_forwards` (per call key: epoch, tool, `forwarded` or `settled`, attempts, deadline, outcome); settled forwards are pruned after 7 days with the call ledger.
+AgentDO's `mcp_servers` (per capability: URL, session id, negotiated version, cached tool list and when it was fetched), `mcp_forwards` (per call key: epoch, tool, `forwarded` or `settled`, attempts, deadline, outcome) and `approvals` (per ask: tool, arguments digest, `pending`, `approved` or `denied`, expiry, the call key it was spent on); settled forwards and decided approvals are pruned after 7 days with the call ledger.
 
 ## Open questions
 
 - **A shared connector per server:** one session, a shared tool cache and a per-server rate limit or concurrency cap would need a DO per server, with the epoch fence still decided in AgentDO.
-- **Sink enforcement** for remote tools (approval from a tainted session) waits for sinks generally.
 - **OAuth** for servers that need it (the design's "OAuth or a bearer token"): only a static bearer is built.
 - **`list_changed`:** a server's changed tool list reaches a brain only after the cache expires and the brain restarts.

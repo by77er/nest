@@ -5,18 +5,22 @@ this directory).
 Real Claude Code agents on AWS use tools from the MCP test server (mcp-test/, its own Worker) through
 nest's MCP proxy, and the platform's guarantees are checked against the server's own call log:
   1. setup    - `POST /reset` on the server; its token stored in BrokerDO as `cap:mcp-check`; the
-                capability `mcp-check` (untrusted, all five tools allowed, only note_put idempotent)
+                capability `mcp-check` (untrusted, all five tools allowed, only note_put idempotent,
+                echo, note_get and slow marked read-only, so note_put and counter_add are sinks)
                 and the template `mcp-check` (nest + mcp-check, no hands, MCP_MODEL, Haiku by default).
   2. turns    - one workstream (an agent without a sandbox still needs one) and MCP_AGENTS agents, each
                 given one turn: echo a phrase holding its id, note_put `<agent>/k` = a random value,
-                note_get it back, counter_add `<agent>` by 1 twice, then reply with what it got.
+                note_get it back, counter_add `<agent>` by 1 twice, then by 100, then reply. Each sink
+                call is held for approval (the session is tainted): the check approves every one but
+                the n 100 call, which it denies; each answer is a turn in which the agent carries on.
   3. verify   - when every turn is done (MCP_TIMEOUT_S): the server's `GET /calls`, per agent: every
                 call carries `_meta` with `nest/agent` = the agent, `nest/epoch` = an epoch its brain
                 was seen with, `nest/call` starting `<agent>/<that epoch>/`, and `nest/taint` true;
                 epochs never go back; no call key reaches the server twice (only note_put, the one
                 idempotent tool, may be retried once under its key); the counter is exactly 2;
                 note_get returned what note_put stored; the session is tainted (the turn's
-                `turn_completed` event on `<agent>/events` carries the session's taint).
+                `turn_completed` event on `<agent>/events` carries the session's taint); no more sink
+                calls reach the server than were approved, and the denied one never does.
   4. sleep    - until every brain has idle-exited (MCP_IDLE_S).
   5. cleanup  - stop every agent (on every exit path; SIGINT or SIGTERM), check no brain of the run is
                 left on a host, then optionally (MCP_DRAIN_S > 0) watch until no host of the cell is live.
@@ -61,11 +65,18 @@ TOOLS = ["echo", "note_put", "note_get", "counter_add", "slow"]
 # note_get and slow are read-only there): a lost answer to any other tool is never sent again.
 IDEMPOTENT = {t: t == "note_put" for t in TOOLS}
 CAPABILITY = {
-    "mcp": {"url": MCP_URL, "auth": f"cap:{CAP}", "tools": TOOLS, "idempotent": IDEMPOTENT, "trusted": False},
+    # Untrusted, so the server's readOnlyHint doesn't count: the reads are marked here, and note_put and
+    # counter_add are sinks, held for the operator's approval (this check answers it).
+    "mcp": {"url": MCP_URL, "auth": f"cap:{CAP}", "tools": TOOLS, "idempotent": IDEMPOTENT, "read_only": ["echo", "note_get", "slow"],
+            "trusted": False, "when_tainted": "approve"},
     "prompt": "The mcp-check server: echo, notes and counters (an automated check's test server).",
 }
 SYSTEM = ("You are an agent in an automated check of a remote MCP server. Do exactly the steps your turn gives, "
-          "each tool call once and in order, with exactly the arguments given; use no other tool. Then reply with one line.")
+          "each tool call once and in order, with exactly the arguments given; use no other tool. Some calls need the "
+          "operator's approval: when a call says so, end your turn at once. When the decision arrives, carry on from that "
+          "step: if approved, make that call again with the same arguments; if denied, skip it. Reply with one line at the end.")
+# The step the operator denies (its arguments are unique to it): it must never reach the server.
+DENIED_N = 100
 TEMPLATE = {
     # `nest` lets every mcp__nest__* tool run without asking (remote tools included): an unanswered
     # approval would end the turn.
@@ -86,7 +97,8 @@ def turn_text(agent, value):
             f"3. Call {tool('note_get')} with key \"{agent}/k\".\n"
             f"4. Call {tool('counter_add')} with name \"{agent}\" and n 1.\n"
             f"5. Call {tool('counter_add')} with name \"{agent}\" and n 1 again.\n"
-            "Then reply with one line: the echoed text, the value note_get returned, and the two counter totals.")
+            f"6. Call {tool('counter_add')} with name \"{agent}\" and n {DENIED_N}.\n"
+            "Then reply with one line: the echoed text, the value note_get returned, and the counter totals.")
 
 
 def api(method, path, body=None, raw=False, timeout=60):
@@ -189,6 +201,33 @@ def live_hosts():
     return [(h["host"][-6:], h.get("role"), h["status"]) for h in f.get("hosts", []) if h["status"] in ("active", "draining")]
 
 
+def needs_input(ws):
+    """The workstream's `needs_input` events (approvals and asks), oldest first; None: no answer."""
+    s, v = api("GET", f"/v1/workstreams/{ws}/events?limit=500")
+    return [e for e in reversed(v) if e.get("type") == "needs_input"] if s == 200 and isinstance(v, list) else None
+
+
+def decide(ws, answered):
+    """Answer every new approval: deny the call with n DENIED_N, approve the rest. Returns how many are unanswered."""
+    evs = needs_input(ws)
+    if evs is None:
+        return 1
+    left = 0
+    for e in evs:
+        ask, agent, q = e.get("ask"), e.get("agent"), e.get("question", "")
+        if ask in answered:
+            continue
+        verdict = "deny: this check denies it" if f'"n":{DENIED_N}' in q.replace(" ", "") else "approve"
+        s, v = api("POST", f"/v1/agents/{agent}/asks/{ask}/answer", {"answer": verdict})
+        if s == 200:
+            answered[ask] = {"agent": agent, "approved": verdict == "approve", "question": q}
+            record("decision", ask=ask, agent=agent, approved=verdict == "approve", question=q[:300])
+            log(f"  {agent[-6:]} {ask}: {verdict.split(':')[0]} ({q[:90]!r})")
+        else:
+            left += 1
+    return left
+
+
 def result_text(call):
     """A logged call's answer: (text, is_error); (None, True) for a JSON-RPC error or no answer yet."""
     roe = call.get("result_or_error") or {}
@@ -199,7 +238,7 @@ def result_text(call):
     return text, bool(res.get("isError"))
 
 
-def verify(agent, value, epochs, calls):
+def verify(agent, value, epochs, calls, decisions):
     """The server-side checks for one agent over its calls (in log order): [(check, ok, detail)]."""
     out = []
     meta = lambda c: c.get("_meta") or {}
@@ -250,6 +289,14 @@ def verify(agent, value, epochs, calls):
                and [t for t, _ in totals] == ["1", "2"] and not any(e for _, e in totals))
     check("the agent's counter is exactly 2 (two counter_add calls of 1: totals 1 then 2)", ok_adds,
           short([((c.get("arguments") or {}).get("n"), t) for c, t in zip(adds, totals)]))
+    # Sinks: only approved calls go out, each approval at most once; the denied one never.
+    mine = [d for d in decisions.values() if d["agent"] == agent]
+    approved, denied = [d for d in mine if d["approved"]], [d for d in mine if not d["approved"]]
+    sent = [c for c in calls if c.get("tool") in ("note_put", "counter_add")]
+    check("every sink call waited for an approval (one approval per call sent)", sent and len(sent) <= len(approved),
+          f"{len(sent)} sink calls sent, {len(approved)} approvals")
+    check(f"the denied call (counter_add n {DENIED_N}) was asked for and never reached the server",
+          denied and not [c for c in adds if (c.get("arguments") or {}).get("n") != 1], short([d["question"][:120] for d in denied]))
     return out
 
 
@@ -280,7 +327,8 @@ def main():
         expect(s == 200, f"PUT capability {CAP}", v)
         s, v = api("PUT", f"/v1/admin/templates/{TEMPLATE_NAME}", TEMPLATE)
         expect(s == 200, f"PUT template {TEMPLATE_NAME} (needs the nest capability)", v)
-        mark("configured", capability=CAP, template=TEMPLATE_NAME, idempotent=[t for t, i in IDEMPOTENT.items() if i])
+        mark("configured", capability=CAP, template=TEMPLATE_NAME, idempotent=[t for t, i in IDEMPOTENT.items() if i],
+             read_only=CAPABILITY["mcp"]["read_only"])
 
         # 2. A workstream, the agents (not started: the turn wakes each), one turn each.
         s, v = api("POST", "/v1/workstreams", {"goal": f"remote MCP check {RUN}: {AGENTS} agents"})
@@ -298,9 +346,11 @@ def main():
             plan[a] = {"value": value, "turn": v["turn"], "epochs": set()}
         mark("turns sent", workstream=ws, agents=agents)
 
-        # 3. Wait for every turn, noting each brain's epoch while it runs.
+        # 3. Wait for every turn, answering approvals and noting each brain's epoch while it runs. Done
+        # means every turn done and no approval unanswered (each answer is a new turn).
         t0 = time.time()
         ever_live = set()
+        decisions = {}
 
         def note_epochs():
             for a in agents:
@@ -310,9 +360,11 @@ def main():
                     plan[a]["epochs"].add(info["brain"]["epoch"])
         while True:
             note_epochs()
+            decide(ws, decisions)
             st = {a: turn_statuses(a) for a in agents}
-            log(f"turns {({a[-6:]: v for a, v in st.items()})}; brains seen {len(ever_live)}/{len(agents)}")
-            if all(v and all(x == "done" for x in v) for v in st.values()):
+            log(f"turns {({a[-6:]: v for a, v in st.items()})}; brains seen {len(ever_live)}/{len(agents)}; decisions {len(decisions)}")
+            if all(v and all(x == "done" for x in v) for v in st.values()) and decide(ws, decisions) == 0 \
+                    and all(x == "done" for a in agents for x in turn_statuses(a)):
                 break
             if any("interrupted" in v for v in st.values()):
                 ok = False
@@ -328,7 +380,8 @@ def main():
             info = agent_info(a)
             if info and isinstance(info.get("agent_epoch"), int) and (info.get("agent_epoch") or 0) > 0:
                 plan[a]["epochs"].add(info["agent_epoch"])
-        mark("turns ended", wall_s=round(time.time() - t0), epochs={a[-6:]: sorted(p["epochs"]) for a, p in plan.items()})
+        mark("turns ended", wall_s=round(time.time() - t0), epochs={a[-6:]: sorted(p["epochs"]) for a, p in plan.items()},
+             approved=sum(d["approved"] for d in decisions.values()), denied=sum(not d["approved"] for d in decisions.values()))
 
         # The server's log: every call must belong to one of this run's agents (the log was reset).
         calls = server_calls()
@@ -344,7 +397,7 @@ def main():
             ok = False
         for a in agents:
             mine = [c for c in calls if (c.get("_meta") or {}).get("nest/agent") == a]
-            results = verify(a, plan[a]["value"], plan[a]["epochs"], mine)
+            results = verify(a, plan[a]["value"], plan[a]["epochs"], mine, decisions)
             # Taint as the platform records it: the turn_completed event carries the session's taint.
             evs = events(a)
             done = [m for m in (evs or []) if m.get("kind") == "turn_completed"]

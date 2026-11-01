@@ -17,7 +17,7 @@ import { admitDelivery, channelRequestId, inboxTurnText, moveNoteDue, TurnQueue,
 import type { ReadResult } from "./channel";
 import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
-import { mcpTarget, mcpToolDefs } from "../lib/mcp";
+import { approves, argsDigest, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
 import { McpProxy } from "../lib/mcp-proxy";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
@@ -135,6 +135,10 @@ interface PreviousReleaseFields {
 type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | typeof OUTBOX_DEADLINE;
 /** A `sync` ask's window: `ask:<ask id>`. */
 const ASK_DEADLINE = "ask:";
+/** An approved sink call may be made once within this long. */
+const APPROVAL_TTL_MS = 60 * 60_000;
+/** How much of a sink call's arguments the approval question shows. */
+const APPROVAL_ARGS_SHOWN = 2000;
 type AskDeadline = `${typeof ASK_DEADLINE}${string}`;
 
 /** Points where a test can force an interleaving (`testHooks`). */
@@ -2100,8 +2104,15 @@ export class AgentDO extends DurableObject<Env> {
     if (target === "forbidden") throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not on its capability's allowlist`, 403);
     if (guest) throw new NestError(ErrorCodes.FORBIDDEN, "remote MCP tools aren't callable from a sandbox", 403);
     if (typeof args !== "object" || args === null || Array.isArray(args)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "arguments must be an object");
+    const key = `${info.agent}/${epoch}/${call}`;
+    if (!this.mcp.forwarded(key)
+      && needsApproval(target.grant, target.tool, await this.mcp.listed(target.grant, target.tool), this.tainted(this.load()))) {
+      const digest = await argsDigest(args);
+      // Spent here, before the forward's awaits: a call fenced before it leaves wastes its approval.
+      if (!this.calls.takeApproval(name, digest, key, Date.now())) return await this.askApproval(info, epoch, call, name, target.grant.url, args, digest, fence);
+    }
     const r = await this.mcp.call(target.grant, target.tool, args as Record<string, unknown>, {
-      agent: info.agent, epoch, key: `${info.agent}/${epoch}/${call}`,
+      agent: info.agent, epoch, key,
       live: async () => {
         await this.hook("dispatch:beforeWrite");
         this.assertEpoch(fence);
@@ -2110,6 +2121,26 @@ export class AgentDO extends DurableObject<Env> {
     });
     if (r.from_server && !target.grant.trusted) this.kvPut("read_tainted", true);
     return r.outcome;
+  }
+
+  /**
+   * A sink call from a tainted session (docs/agents/tools/#taint-and-sinks): it isn't sent; the operator
+   * is asked, once per exact call, and the decision comes as a turn. An approval lets one call with the
+   * same tool and arguments through within `APPROVAL_TTL_MS`.
+   */
+  private async askApproval(info: AgentInfo, epoch: number, call: string, name: string, url: string, args: unknown, digest: string, fence: number): Promise<ToolOutcome> {
+    const pending = this.calls.pendingApproval(name, digest);
+    let ask = pending?.ask;
+    if (!ask) {
+      const json = JSON.stringify(args);
+      const shown = json.length > APPROVAL_ARGS_SHOWN ? `${json.slice(0, APPROVAL_ARGS_SHOWN)}… (${json.length} bytes in all)` : json;
+      const question = `Approve ${name} to ${new URL(url).host} from a tainted session? arguments: ${shown} (options: approve | deny)`;
+      ask = await this.postAsk(info, call, epoch, question, "async", "escalation", undefined, fence, { name, digest });
+    }
+    return {
+      status: "pending", ask,
+      message: `Not sent: ${name} from a tainted session needs the operator's approval (${ask}). End your turn; the decision arrives as your next input.`,
+    };
   }
 
   /**
@@ -2225,14 +2256,18 @@ export class AgentDO extends DurableObject<Env> {
    */
   private async postAsk(
     info: AgentInfo, call: string, epoch: number, question: string, status: "sync" | "cli" | "async", to: "escalation" | "user",
-    sandboxEpoch?: number, fence: number = epoch,
+    sandboxEpoch?: number, fence: number = epoch, approval?: { name: string; digest: string },
   ): Promise<string> {
     // A re-run for the same call routes the same ask again, under the same key.
     const prior = this.calls.askOf(call, epoch);
     if (prior?.status === "answered") return prior.ask;
     const ask = prior?.ask ?? newId("ask_");
     const deadline = prior?.deadline ?? Date.now() + num(this.env.ASK_SYNC_WINDOW_MS, 120_000);
-    if (!prior) this.calls.recordAsk({ ask, call, epoch, question, status, deadline });
+    if (!prior) {
+      this.calls.recordAsk({ ask, call, epoch, question, status, deadline });
+      // Before routing's awaits: an answer that comes meanwhile finds the approval it decides.
+      if (approval) this.calls.requestApproval(ask, approval.name, approval.digest);
+    }
     if ((prior?.status ?? status) === "sync") await this.deadlines.set(`${ASK_DEADLINE}${ask}`, deadline);
     const q = prior?.question ?? question;
     if (sandboxEpoch === undefined) this.assertEpoch(fence);
@@ -2332,6 +2367,19 @@ export class AgentDO extends DurableObject<Env> {
     if (route === "already_answered") return route;
     this.calls.answer(ask, answer);
     this.cliWaiters.delete(ask);
+    const approval = this.calls.approvalOf(ask);
+    if (approval) {
+      const ok = approves(answer);
+      this.calls.decide(ask, ok, Date.now() + APPROVAL_TTL_MS);
+      const tool = `${NEST_TOOL_PREFIX}${approval.name}`;
+      await this.enqueueTurn({
+        kind: "ask_answer",
+        text: ok
+          ? `Approved (${ask}): call ${tool} again with exactly the same arguments. The approval is for that one call, within ${APPROVAL_TTL_MS / 60_000} minutes.`
+          : `Denied (${ask}): ${tool} with those arguments wasn't sent and won't be. The operator answered: ${answer}`,
+      });
+      return "async";
+    }
     if (route === "waiter") {
       waiter!(answer);
       return "sync";

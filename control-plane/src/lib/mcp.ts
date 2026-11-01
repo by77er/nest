@@ -23,18 +23,27 @@ export const MAX_ANSWER_BYTES = 1024 * 1024;
 /** A remote tool's name as nest admits it: characters a model tool name may hold. */
 export const McpToolName = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, "MCP tool names here are letters, digits, '_' and '-'");
 
+/** Per-tool flags: a list of the tools that have it, or a map of tool → whether it has it. */
+const ToolFlags = z.union([z.array(McpToolName), z.record(McpToolName, z.boolean())]);
+const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolean> =>
+  Array.isArray(f) ? Object.fromEntries(f.map((t) => [t, true])) : { ...(f ?? {}) };
+
 /**
  * The `mcp` source of a capability (docs/agents/capabilities/#sources). `auth` names the BrokerDO secret
  * holding the bearer token; `tools` is the allowlist (absent: every tool the server lists); `idempotent`
  * overrides the server's annotations (a list of tools that are, or a map of tool → whether it is);
- * `trusted` (default false) means its results don't taint the session.
+ * `read_only` likewise marks the tools that aren't sinks; `trusted` (default false) means its list and
+ * results don't taint the session (and its annotations count); `when_tainted` is what a sink call from a
+ * tainted session needs.
  */
 export const McpSource = z.object({
   url: z.string().min(1).max(2048),
   auth: z.string().regex(/^cap:[A-Za-z0-9_.:-]{1,128}$/, "auth names a BrokerDO secret, cap:<name>"),
   tools: z.array(McpToolName).max(MAX_TOOLS_PER_CAPABILITY).optional(),
-  idempotent: z.union([z.array(McpToolName), z.record(McpToolName, z.boolean())]).optional(),
+  idempotent: ToolFlags.optional(),
+  read_only: ToolFlags.optional(),
   trusted: z.boolean().default(false),
+  when_tainted: z.enum(["approve", "allow"]).default("approve"),
 });
 export type McpSource = z.output<typeof McpSource>;
 
@@ -47,18 +56,23 @@ export interface McpGrant {
   tools: string[] | null;
   /** The operator's idempotency overrides, by tool. */
   idempotent: Record<string, boolean>;
+  /** The operator's read-only marks, by tool (absent in specs written before sinks were enforced). */
+  read_only?: Record<string, boolean>;
   trusted: boolean;
+  /** Absent in older specs: `approve`. */
+  when_tainted?: "approve" | "allow";
 }
 
 export function grantOf(capability: string, src: McpSource): McpGrant {
-  const idem = src.idempotent;
   return {
     capability,
     url: src.url,
     auth: src.auth,
     tools: src.tools ? [...src.tools] : null,
-    idempotent: Array.isArray(idem) ? Object.fromEntries(idem.map((t) => [t, true])) : { ...(idem ?? {}) },
+    idempotent: flags(src.idempotent),
+    read_only: flags(src.read_only),
     trusted: src.trusted ?? false,
+    when_tainted: src.when_tainted ?? "approve",
   };
 }
 
@@ -163,6 +177,32 @@ export function isIdempotent(grant: McpGrant, tool: string, listed: ListedTool |
   const o = grant.idempotent[tool];
   if (o !== undefined) return o;
   return listed?.annotations.readOnlyHint === true || listed?.annotations.idempotentHint === true;
+}
+
+/**
+ * Whether a call needs the operator's approval first (docs/agents/tools/#taint-and-sinks): a sink (a tool
+ * not read-only) called from a tainted session, unless the capability allows it. Read-only is the
+ * operator's mark, else a trusted server's `readOnlyHint`: an untrusted server's annotations don't count
+ * ("clients MUST consider tool annotations to be untrusted unless they come from trusted servers").
+ */
+export function needsApproval(grant: McpGrant, tool: string, listed: ListedTool | undefined, tainted: boolean): boolean {
+  if (!tainted || grant.when_tainted === "allow") return false;
+  const marked = grant.read_only?.[tool];
+  const readOnly = marked ?? (grant.trusted && listed?.annotations.readOnlyHint === true);
+  return !readOnly;
+}
+
+/** An approval binds to exactly these arguments: SHA-256 of their canonical JSON (keys sorted). */
+export async function argsDigest(args: unknown): Promise<string> {
+  const canon = (v: unknown): unknown => Array.isArray(v) ? v.map(canon)
+    : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon((v as Record<string, unknown>)[k])])) : v;
+  const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(canon(args)))));
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** An answer to an approval approves only when it says so; anything else denies. */
+export function approves(answer: string): boolean {
+  return /^(approve[ds]?|allow(ed)?|yes|y|ok(ay)?)\b/i.test(answer.trim());
 }
 
 /** A `tools/call` result as nest's tool content, or null when it isn't a CallToolResult. */

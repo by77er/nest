@@ -773,9 +773,10 @@ def run_mcp(ids):
     st, _ = api("PUT", f"/v1/admin/secrets/cap:{MCP_CAP}", {"value": MCP_TOKEN})
     check("mcp: credential stored in BrokerDO", st in (200, 204), str(st))
     # `slow` is read-only (so idempotent by its annotation); the operator overrides it here, so a lost
-    # answer to it must never be sent again.
+    # answer to it must never be sent again. The server is untrusted, so its annotations don't make a
+    # tool read-only: the operator marks the reads, and note_put and counter_add stay sinks.
     cap = {"mcp": {"url": f"{MCP_URL}/mcp", "auth": f"cap:{MCP_CAP}", "tools": ["echo", "note_put", "note_get", "counter_add", "slow"],
-                   "idempotent": {"slow": False}},
+                   "idempotent": {"slow": False}, "read_only": ["echo", "note_get", "slow"]},
            "prompt": "The notes server: echo, notes and counters."}
     st, r = api("PUT", f"/v1/admin/capabilities/{MCP_CAP}", cap)
     check("mcp: capability configured (a loopback URL, local dev only)", st == 200, json.dumps(r)[:200])
@@ -787,28 +788,42 @@ def run_mcp(ids):
     check("mcp: agent created", st == 201, json.dumps(ag)[:200])
     agid = ag.get("agent")
 
-    steps = [("echo", "echo", {"text": "hello over mcp"}), ("put", "note_put", {"key": "k1", "value": "v1"}),
-             ("get", "note_get", {"key": "k1"}), ("missing", "note_get", {"key": "nope"}),
-             ("add2", "counter_add", {"name": "c", "n": 2}), ("add3", "counter_add", {"name": "c", "n": 3})]
-    _, out = mcp_turn(agid, "calls", steps)
-    try:
-        wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, 120, 0.5, "mcp tool results")
-    except TimeoutError as e:
-        check("mcp: all tool results returned", False, str(e)[:200])
-    res = results_by_label(out)
-    text = lambda k: (res.get(k) or {}).get("text") or ""
-    err = lambda k: (res.get(k) or {}).get("is_error")
+    def run_steps(name, steps):
+        _, out = mcp_turn(agid, name, steps)
+        try:
+            wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, 120, 0.5, f"mcp {name} results")
+        except TimeoutError as e:
+            check(f"mcp: all {name} results returned", False, str(e)[:200])
+        res = results_by_label(out)
+        return (lambda k: (res.get(k) or {}).get("text") or ""), (lambda k: (res.get(k) or {}).get("is_error"))
+
+    # The listing (untrusted server: descriptions in the model's context) taints the session first, so
+    # every sink call is held for the operator: none reaches the server.
+    sinks = [("put", "note_put", {"key": "k1", "value": "v1"}), ("add2", "counter_add", {"name": "c", "n": 2}),
+             ("add3", "counter_add", {"name": "c", "n": 3})]
+    text, err = run_steps("calls", [("echo", "echo", {"text": "hello over mcp"}), ("missing", "note_get", {"key": "nope"}), *sinks])
     check("mcp: echo through mcp__nest__notes_echo", text("echo") == "hello over mcp" and not err("echo"), text("echo")[:200])
-    check("mcp: note_put then note_get", not err("put") and text("get") == "v1" and not err("get"), f"{text('put')!r} {text('get')!r}")
     check("mcp: a tool's isError reaches the model as a tool error", err("missing") and "tool_error" in text("missing"), text("missing")[:200])
-    check("mcp: counter_add totals", text("add2") == "2" and text("add3") == "5", f"{text('add2')!r} {text('add3')!r}")
+    asks = {k: (re.search(r"\(pending: (ask_[a-z0-9]+)\)", text(k)) or [None, None])[1] for k, _, _ in sinks}
+    check("mcp: a tainted session's sink calls are held for approval", all(asks.values()) and not any(err(k) for k in asks),
+          json.dumps({k: text(k)[:120] for k in asks}))
+    check("mcp: a held sink call never reaches the server", [c.get("tool") for c in mcp_calls()] == ["echo", "note_get"],
+          json.dumps([c.get("tool") for c in mcp_calls()]))
+    for k, a in (("put", "approve"), ("add2", "yes"), ("add3", "deny")):
+        st, r = api("POST", f"/v1/agents/{agid}/asks/{asks[k]}/answer", {"answer": a})
+        check(f"mcp: operator answers {k}'s approval ({a})", st == 200 and r.get("delivered") == "async", json.dumps(r)[:200])
+
+    # Approved calls go through once each, as asked again; the denied one stays held.
+    text, err = run_steps("approved", [sinks[0], ("get", "note_get", {"key": "k1"}), *sinks[1:]])
+    check("mcp: approved note_put then note_get", not err("put") and "pending" not in text("put") and text("get") == "v1", f"{text('put')!r} {text('get')!r}")
+    check("mcp: approved counter_add runs; the denied one doesn't", text("add2") == "2" and "pending" in text("add3"), f"{text('add2')!r} {text('add3')!r}")
     calls = mcp_calls()
     keys = [(c.get("_meta") or {}).get("nest/call") for c in calls]
     metas_ok = all((c.get("_meta") or {}).get("nest/agent") == agid and isinstance((c.get("_meta") or {}).get("nest/epoch"), int)
                    and str((c.get("_meta") or {}).get("nest/call", "")).startswith(f"{agid}/") for c in calls)
-    check("mcp: the server saw each call once, with nest's _meta", len(calls) == len(steps) and metas_ok and len(set(keys)) == len(keys),
+    check("mcp: the server saw each sent call once, with nest's _meta",
+          [c.get("tool") for c in calls] == ["echo", "note_get", "note_put", "note_get", "counter_add"] and metas_ok and len(set(keys)) == len(keys),
           json.dumps([{k: c.get(k) for k in ("tool", "_meta")} for c in calls])[:400])
-    # The listing (untrusted server: descriptions in the model's context) tainted the session first.
     check("mcp: untrusted server: every call says the session is tainted",
           calls and all((c.get("_meta") or {}).get("nest/taint") is True for c in calls), json.dumps([(c.get("_meta") or {}).get("nest/taint") for c in calls]))
 

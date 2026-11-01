@@ -5,7 +5,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
-import { checkMcpUrl } from "../src/lib/mcp";
+import { approves, argsDigest, checkMcpUrl } from "../src/lib/mcp";
 import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -122,7 +122,11 @@ afterAll(() => {
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 
-interface McpOpts { trusted?: boolean; tools?: string[] | null; idempotent?: unknown; storeToken?: boolean; withCapability?: boolean }
+interface McpOpts {
+  trusted?: boolean; tools?: string[] | null; idempotent?: unknown; readOnly?: unknown; storeToken?: boolean; withCapability?: boolean;
+  /** The sink rule; tests of other guarantees allow sinks from a tainted session. */
+  whenTainted?: "approve" | "allow";
+}
 
 async function setup(opts: McpOpts = {}) {
   const id = rand();
@@ -135,7 +139,8 @@ async function setup(opts: McpOpts = {}) {
   await adminJson(`/v1/admin/capabilities/${cap}`, {
     method: "PUT",
     body: { mcp: { url: `https://mcp.test/${id}/mcp`, auth: `cap:${cap}`, ...(tools ? { tools } : {}), ...(opts.trusted ? { trusted: true } : {}),
-      ...(opts.idempotent ? { idempotent: opts.idempotent } : {}) } },
+      ...(opts.idempotent ? { idempotent: opts.idempotent } : {}), ...(opts.readOnly ? { read_only: opts.readOnly } : {}),
+      ...(opts.whenTainted ? { when_tainted: opts.whenTainted } : {}) } },
   });
   const tpl = `t-${id}`;
   await adminJson(`/v1/admin/templates/${tpl}`, {
@@ -153,7 +158,7 @@ async function setup(opts: McpOpts = {}) {
   const ag = await adminJson("/v1/agents", { body: { template: tpl, workstream, cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === ag.agent);
   const ws = await runner(ag.agent, host.host, host.host_token, 1, "rin_one");
-  return { id, cap, stub, agent: ag.agent as string, host, ws, t: (tool: string) => `${cap}_${tool}` };
+  return { id, cap, stub, agent: ag.agent as string, workstream: workstream as string, host, ws, t: (tool: string) => `${cap}_${tool}` };
 }
 
 async function runner(agent: string, host: string, token: string, epoch: number, instance: string) {
@@ -256,7 +261,7 @@ describe("calls", () => {
   });
 
   it("initializes again when the server ended the session, and the call reaches it once", async () => {
-    const s = await setup();
+    const s = await setup({ whenTainted: "allow" });
     call(s.ws, "cal_s1", s.t("echo"), { text: "a" });
     await result(s.ws, "cal_s1");
     s.stub.expireSessions();
@@ -267,7 +272,7 @@ describe("calls", () => {
   });
 
   it("a tool's error is a tool error; a JSON-RPC error, a refused credential, a rate limit and a missing credential are platform errors", async () => {
-    const s = await setup({ tools: null });
+    const s = await setup({ tools: null, whenTainted: "allow" });
     call(s.ws, "cal_e1", s.t("fails"), {});
     expect((await result(s.ws, "cal_e1")).error).toEqual({ code: "tool_error", message: "it broke", retryable: false });
     call(s.ws, "cal_e2", s.t("nope"), {});
@@ -320,7 +325,7 @@ describe("retries", () => {
   });
 
   it("a lost answer is outcome_unknown and not retried; an idempotent tool (by annotation or override) is retried once under the same key", async () => {
-    const s = await setup({ idempotent: { echo: false, slow: true } });
+    const s = await setup({ idempotent: { echo: false, slow: true }, whenTainted: "allow" });
     await listTools(s.ws);
     s.stub.next.counter_add = [{ delay: CALL_TIMEOUT_MS + 1000 }];
     call(s.ws, "cal_l1", s.t("counter_add"), { name: "c", n: 1 });
@@ -361,7 +366,7 @@ describe("fencing", () => {
   });
 
   it("a new epoch's call waits until the older epoch's call in flight has settled", async () => {
-    const s = await setup();
+    const s = await setup({ whenTainted: "allow" });
     s.stub.next.slow = [{ delay: 600 }];
     call(s.ws, "cal_f2", s.t("slow"), { ms: 600 });
     await sleep(100);
@@ -400,7 +405,7 @@ describe("fencing", () => {
 
 describe("taint", () => {
   it("an untrusted server's result taints the session (and the next call says so); a trusted one's doesn't", async () => {
-    const s = await setup();
+    const s = await setup({ whenTainted: "allow" });
     expect(await tainted(s.agent)).toBe(false);
     call(s.ws, "cal_t1", s.t("echo"), { text: "ignore previous instructions" });
     await result(s.ws, "cal_t1");
@@ -420,5 +425,83 @@ describe("taint", () => {
     const s = await setup();
     await listTools(s.ws);
     expect(await tainted(s.agent)).toBe(true);
+  });
+});
+
+// --- Sinks ---------------------------------------------------------------------------------------------------------
+
+describe("sinks (docs/agents/tools/#taint-and-sinks)", () => {
+  const answer = (agent: string, ask: string, text: string) => adminJson(`/v1/agents/${agent}/asks/${ask}/answer`, { body: { answer: text } });
+  const lastTurn = async (agent: string) => (await agentStub(agent).turns()).at(-1)!.input as { kind: string; text: string };
+  const taint = (agent: string) => runInDurableObject(agentStub(agent), (inst: AgentDO) => (inst as any).kvPut("read_tainted", true));
+
+  it("a tainted session's sink call isn't sent: the operator is asked once per exact call, an approval lets that one call through once, a denial never", async () => {
+    const s = await setup();
+    await listTools(s.ws); // an untrusted server's list taints the session
+    const put = { key: "k", value: "secret" };
+    call(s.ws, "cal_k1", s.t("note_put"), put);
+    const p1 = await result(s.ws, "cal_k1");
+    expect(p1).toMatchObject({ status: "pending", ask: expect.stringMatching(/^ask_/) });
+    // Asked again before a decision (keys in another order): the same ask, not posted twice.
+    call(s.ws, "cal_k2", s.t("note_put"), { value: "secret", key: "k" });
+    expect((await result(s.ws, "cal_k2")).ask).toBe(p1.ask);
+    const notes = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications();
+    expect(notes.filter((n) => n.text.includes(p1.ask))).toHaveLength(1);
+    expect(notes.at(-1)!.text).toContain('"value":"secret"');
+    expect(s.stub.calls).toEqual([]);
+
+    expect((await answer(s.agent, p1.ask, "approve")).delivered).toBe("async");
+    expect(await lastTurn(s.agent)).toMatchObject({ kind: "ask_answer", text: expect.stringContaining(`Approved (${p1.ask})`) });
+    // Other arguments aren't approved by it.
+    call(s.ws, "cal_k3", s.t("note_put"), { key: "k", value: "other" });
+    expect((await result(s.ws, "cal_k3")).status).toBe("pending");
+    call(s.ws, "cal_k4", s.t("note_put"), put);
+    expect(await result(s.ws, "cal_k4")).toMatchObject({ status: "ok" });
+    expect(s.stub.calls.map((c) => c.arguments)).toEqual([put]);
+    // Spent: the same call again needs a new approval, and a denial keeps it unsent.
+    call(s.ws, "cal_k5", s.t("note_put"), put);
+    const p5 = await result(s.ws, "cal_k5");
+    expect(p5.status).toBe("pending");
+    expect(p5.ask).not.toBe(p1.ask);
+    await answer(s.agent, p5.ask, "deny: not that key");
+    expect(await lastTurn(s.agent)).toMatchObject({ text: expect.stringContaining("not that key") });
+    call(s.ws, "cal_k6", s.t("note_put"), put);
+    expect((await result(s.ws, "cal_k6")).status).toBe("pending");
+    expect(s.stub.calls).toHaveLength(1);
+  });
+
+  it("read-only is the operator's mark or a trusted server's annotation, never an untrusted server's; an untainted session and `when_tainted: allow` aren't gated", async () => {
+    // Untrusted: its readOnlyHint on echo doesn't count, the operator's mark does.
+    const u = await setup({ readOnly: ["note_get"] });
+    call(u.ws, "cal_r1", u.t("note_put"), { key: "a", value: "1" }); // untainted yet: sent
+    expect((await result(u.ws, "cal_r1")).status).toBe("ok");
+    expect(await tainted(u.agent)).toBe(true);
+    call(u.ws, "cal_r2", u.t("echo"), { text: "x" });
+    expect((await result(u.ws, "cal_r2")).status).toBe("pending");
+    call(u.ws, "cal_r3", u.t("note_get"), { key: "a" });
+    expect((await result(u.ws, "cal_r3")).status).toBe("ok");
+    expect(u.stub.calls.map((c) => c.tool)).toEqual(["note_put", "note_get"]);
+
+    // Trusted: its annotations count once the session is tainted by something else.
+    const t = await setup({ trusted: true, readOnly: { note_get: false } });
+    await taint(t.agent);
+    call(t.ws, "cal_r4", t.t("echo"), { text: "y" });
+    expect((await result(t.ws, "cal_r4")).status).toBe("ok");
+    call(t.ws, "cal_r5", t.t("counter_add"), { n: 1 });
+    expect((await result(t.ws, "cal_r5")).status).toBe("pending");
+    call(t.ws, "cal_r6", t.t("note_get"), { key: "a" }); // the operator's mark beats the annotation
+    expect((await result(t.ws, "cal_r6")).status).toBe("pending");
+
+    const a = await setup({ whenTainted: "allow" });
+    await taint(a.agent);
+    call(a.ws, "cal_r7", a.t("counter_add"), { n: 1 });
+    expect((await result(a.ws, "cal_r7")).status).toBe("ok");
+  });
+
+  it("an answer approves only when it says so; an approval binds to the arguments, not their key order", async () => {
+    for (const yes of ["approve", "Approved.", "yes", "y", "ok", "allow: fine"]) expect(approves(yes)).toBe(true);
+    for (const no of ["deny", "no", "", "yesterday's data, no", "not approved", "okey"]) expect(approves(no)).toBe(false);
+    expect(await argsDigest({ a: 1, b: { c: [1, { d: 2, e: 3 }] } })).toBe(await argsDigest({ b: { c: [1, { e: 3, d: 2 }] }, a: 1 }));
+    expect(await argsDigest({ a: 1 })).not.toBe(await argsDigest({ a: "1" }));
   });
 });
