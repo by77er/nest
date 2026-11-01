@@ -29,7 +29,7 @@ Every capability's tools run in the control plane or behind it, so credentials s
 | Source | Tools it surfaces | Credentials | Sinks |
 |---|---|---|---|
 | `builtin` | Platform tools from the registry (below) | None | Per tool |
-| `mcp{url, auth, tools?, idempotent?, trusted?}` | A remote MCP server's tools ([Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)), listed by the control plane and filtered by an allowlist; see [mcp/](mcp/) | OAuth or a bearer token in BrokerDO; the control plane is the MCP client | A tool is a sink unless the server marks it `readOnlyHint` ([tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)) and the capability doesn't override it |
+| `mcp{url, auth, tools?, idempotent?, read_only?, trusted?, when_tainted?}` | A remote MCP server's tools ([Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)), listed by the control plane and filtered by an allowlist; see [mcp/](mcp/) | OAuth or a bearer token in BrokerDO; the control plane is the MCP client | A tool is a sink unless the operator marks it `read_only`, or a `trusted` server marks it `readOnlyHint` ([tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools), which clients must treat as untrusted from an untrusted server); see [mcp/](mcp/#sinks) |
 | `api{base_url, mode, paths?, auth}` | One tool, `<capability>_request(method, path, query?, body?)` | In BrokerDO; the control plane attaches it to each request | `mode: ro` allows only `GET` and `HEAD` and isn't a sink; `mode: rw` is |
 
 ```yaml
@@ -38,8 +38,7 @@ source: api{base_url: https://api.github.com, mode: ro, paths: [/repos/me/], aut
 prompt: Read-only GitHub REST access to my repos, through `github_ro_request`.
 
 capability: tracker
-mcp: {url: https://mcp.example.com/mcp, auth: cap:tracker, tools: [list_issues, get_issue, create_comment]}   # built: the field is `mcp`
-sinks: {create_comment: approve}
+mcp: {url: https://mcp.example.com/mcp, auth: cap:tracker, tools: [list_issues, get_issue, create_comment], read_only: [list_issues, get_issue]}
 prompt: The issue tracker: read freely; comment only when asked.
 ```
 

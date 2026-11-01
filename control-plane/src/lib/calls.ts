@@ -1,5 +1,5 @@
 // An agent's platform tool calls and asks (docs/control-plane/durable-objects/agent/, "Tool relay").
-// `CallLedger` is the only code that touches the `tool_calls` and `asks` tables.
+// `CallLedger` is the only code that touches the `tool_calls`, `asks` and `approvals` tables.
 
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
@@ -12,14 +12,25 @@ export type CallStatus = z.output<typeof CallStatusEnum>;
 /** `asks.status`: inside its sync window, a guest CLI's, answered as a turn later, or answered. */
 const AskStatusEnum = z.enum(["sync", "cli", "async", "answered"]);
 export type AskStatus = z.output<typeof AskStatusEnum>;
+/** `approvals.status`: a sink call waiting for the operator, or the operator's decision. */
+const ApprovalStatusEnum = z.enum(["pending", "approved", "denied"]);
 const CALL = CallStatusEnum.enum;
 const ASK = AskStatusEnum.enum;
+const APPROVAL = ApprovalStatusEnum.enum;
 
 /** A call as stored: the epoch whose row and idempotency key it keeps. */
 export interface StoredCall {
   epoch: number;
   status: CallStatus;
   outcome: ToolOutcome | null;
+}
+
+/** A sink call's approval (docs/agents/tools/#taint-and-sinks): for one tool with exactly these arguments. */
+export interface Approval {
+  ask: string;
+  name: string;
+  digest: string;
+  status: z.output<typeof ApprovalStatusEnum>;
 }
 
 export interface StoredAsk {
@@ -37,6 +48,9 @@ export class CallLedger {
       status TEXT NOT NULL DEFAULT 'dispatching', outcome TEXT, created_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (epoch, call))`);
     sql.exec(`CREATE TABLE IF NOT EXISTS asks (ask TEXT PRIMARY KEY, call TEXT NOT NULL, epoch INTEGER NOT NULL,
       question TEXT NOT NULL, status TEXT NOT NULL, deadline INTEGER NOT NULL, answer TEXT, created_ms INTEGER NOT NULL DEFAULT 0)`);
+    // `used_by`: the call key an approval was spent on (its redelivery may use it again, nothing else).
+    sql.exec(`CREATE TABLE IF NOT EXISTS approvals (ask TEXT PRIMARY KEY, name TEXT NOT NULL, digest TEXT NOT NULL,
+      status TEXT NOT NULL, expires_ms INTEGER, used_by TEXT, created_ms INTEGER NOT NULL)`);
   }
 
   /** By call id: one first seen at an earlier epoch keeps that epoch's row and key, so its writes never run twice. */
@@ -94,9 +108,47 @@ export class CallLedger {
     this.sql.exec(`UPDATE asks SET status = '${ASK.answered}', answer = ? WHERE ask = ?`, text, ask);
   }
 
+  /** The undecided approval of this exact call, if one was asked for already (asked again, it's not posted again). */
+  pendingApproval(name: string, digest: string): Approval | undefined {
+    return this.approvalWhere(`name = ? AND digest = ? AND status = '${APPROVAL.pending}'`, name, digest);
+  }
+
+  approvalOf(ask: string): Approval | undefined {
+    return this.approvalWhere("ask = ?", ask);
+  }
+
+  requestApproval(ask: string, name: string, digest: string): void {
+    this.sql.exec(`INSERT INTO approvals (ask, name, digest, status, created_ms) VALUES (?, ?, ?, '${APPROVAL.pending}', ?)`, ask, name, digest, Date.now());
+  }
+
+  decide(ask: string, approved: boolean, expiresMs: number): void {
+    this.sql.exec(`UPDATE approvals SET status = ?, expires_ms = ? WHERE ask = ? AND status = '${APPROVAL.pending}'`,
+      approved ? APPROVAL.approved : APPROVAL.denied, expiresMs, ask);
+  }
+
+  /**
+   * Spend an unexpired approval of exactly this call on the call key `key`; true when there is one (or it
+   * was already spent on `key`: a redelivery). One approval, one call.
+   */
+  takeApproval(name: string, digest: string, key: string, nowMs: number): boolean {
+    const r = this.sql.exec<{ ask: string }>(
+      `SELECT ask FROM approvals WHERE name = ? AND digest = ? AND status = '${APPROVAL.approved}' AND expires_ms > ?
+       AND (used_by IS NULL OR used_by = ?) ORDER BY used_by IS NULL LIMIT 1`, name, digest, nowMs, key).toArray()[0];
+    if (!r) return false;
+    this.sql.exec("UPDATE approvals SET used_by = ? WHERE ask = ?", key, r.ask);
+    return true;
+  }
+
   prune(cutoff: number): void {
     this.sql.exec(`DELETE FROM tool_calls WHERE status = '${CALL.done}' AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
+    this.sql.exec(`DELETE FROM approvals WHERE status != '${APPROVAL.pending}' AND created_ms < ?`, cutoff);
+  }
+
+  private approvalWhere(where: string, ...args: SqlStorageValue[]): Approval | undefined {
+    const r = this.sql.exec<Omit<Approval, "status"> & { status: string }>(
+      `SELECT ask, name, digest, status FROM approvals WHERE ${where} LIMIT 1`, ...args).toArray()[0];
+    return r && { ...r, status: storedEnum(ApprovalStatusEnum, r.status, "approvals.status") };
   }
 
   private askWhere(where: string, ...args: SqlStorageValue[]): StoredAsk | undefined {

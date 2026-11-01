@@ -412,7 +412,7 @@ describe("seed migration (pure)", () => {
 describe("mcp capabilities in a spec (docs/agents/capabilities/mcp/)", () => {
   const mcpCap = (tools?: string[]): Capability => ({
     tools: [], rules: [], prompt: "", grants: [], params: [],
-    mcp: { url: "https://mcp.example.com/mcp", auth: "cap:tracker", ...(tools ? { tools } : {}), idempotent: ["get"], trusted: false },
+    mcp: { url: "https://mcp.example.com/mcp", auth: "cap:tracker", ...(tools ? { tools } : {}), idempotent: ["get"], read_only: { get: true, comment: false }, trusted: false, when_tainted: "approve" },
   });
   const tpl: Template = {
     capabilities: ["tracker", "messaging"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
@@ -420,10 +420,11 @@ describe("mcp capabilities in a spec (docs/agents/capabilities/mcp/)", () => {
   };
   const cat: Catalog = { capabilities: { tracker: mcpCap(["get", "comment"]), messaging: SEED_CATALOG.capabilities.messaging! }, templates: { t: tpl } };
 
-  it("the spec copies the server, allowlist, overrides and trust; a spec without one has no mcp field", () => {
+  it("the spec copies the server, allowlist, overrides, trust and sink rule; a spec without one has no mcp field", () => {
     const r = expandTemplate(cat, PLATFORM_TOOL_NAMES, "t");
     expect(r.ok && r.value.mcp).toEqual([{
-      capability: "tracker", url: "https://mcp.example.com/mcp", auth: "cap:tracker", tools: ["get", "comment"], idempotent: { get: true }, trusted: false,
+      capability: "tracker", url: "https://mcp.example.com/mcp", auth: "cap:tracker", tools: ["get", "comment"], idempotent: { get: true },
+      read_only: { get: true, comment: false }, trusted: false, when_tainted: "approve",
     }]);
     const plain = expandTemplate(SEED_CATALOG, PLATFORM_TOOL_NAMES, "worker");
     expect(plain.ok && plain.value).not.toHaveProperty("mcp");
