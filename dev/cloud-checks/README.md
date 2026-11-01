@@ -95,6 +95,22 @@ python3 -I dev/cloud-checks/mcp_check.py      # MCP_DRAIN_S=2700: also watch the
 
 **Sanity-checked locally (2026-10-31)** against `wrangler dev` control plane (`ALLOW_LOOPBACK_MCP=1`, no hosts, `NEST_CELL=local`) and a local `mcp-test`: the reset, secret, capability, template, workstream, agent, turn and events calls answer as the script expects, and the timeout, SIGINT and SIGTERM paths stopped the agents and printed the ids. The log checks were run over the local server's real log after calls sent with crafted `_meta`: a well-behaved agent passed every check, and a repeated non-idempotent key, an older epoch after a newer one, an untainted call and a counter of 3 each failed. No brain ran (no hosts, no Claude), so that is no evidence for the cloud run.
 
+
+## `list_changed_check.py`
+
+A tool added on the MCP test server reaches live brains without a restart ([list_changed](../../docs/agents/capabilities/mcp/#list_changed)). It needs `mcp-test/` deployed with its `/tools` route, and the `cap:mcp-check` secret that `mcp_check.py` stores.
+
+```bash
+# NEST_ADMIN_TOKEN, MCP_TEST_URL and MCP_TEST_TOKEN as for mcp_check.py
+python3 -I dev/cloud-checks/list_changed_check.py      # LC_GAP_S=75: the wait between the notice and the ask
+```
+
+| | |
+|---|---|
+| **Does** | `POST /reset`; a trusted capability `mcplive` with no allowlist and a Haiku template `mcplive`; two agents each call `echo`; it adds `extra_live` on the server; each calls `echo` again (that call's answer carries the notice); after `LC_GAP_S` each is asked to call `extra_live` |
+| **Passes when** | both agents call `extra_live` and get its answer, with the brain epoch unchanged across the three turns and on every call (no restart) |
+| **Cleans up** | removes `extra_live` and stops both agents; it keeps the capability and template |
+
 ## `brokered_check.py`
 
 [Brokered actions](../../docs/agents/capabilities/brokered/) end to end, **posting on a real repo** (`REPO`, default `by77er/nest`; run it only with the owner's OK): a real Claude Code agent opens an issue, comments on it and opens a draft pull request through nest's GitHub App, from a session the untrusted `mcp-check` capability taints, and nest refuses a comment holding a fake credential.
