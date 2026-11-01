@@ -7,9 +7,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/../control-plane"
 var() { aws ssm get-parameter --region us-east-1 --name "/nest/control-plane/vars/$1" --query Parameter.Value --output text 2>/dev/null; }
-# Optional: passed only when the parameter exists. SANDBOX_SUSPEND_IDLE_MS is a test override.
+# Optional: passed only when the parameter exists. SANDBOX_SUSPEND_IDLE_MS is a test override;
+# SANDBOX_RETENTION switches generation retention (off|report|on; unset: report; dev/deploy.md).
 optional=()
-for name in SANDBOX_SUSPEND_IDLE_MS; do
+for name in SANDBOX_SUSPEND_IDLE_MS SANDBOX_RETENTION; do
   if value=$(var "$name"); then optional+=(--var "$name:$value"); fi
 done
 # Required: a missing or empty parameter fails the deploy here, since a `$(var …)` inside an argument

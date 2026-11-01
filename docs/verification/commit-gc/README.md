@@ -16,6 +16,8 @@ Inventory for modelling: the generation chain in SandboxDO, FleetDO's GC registr
 
 Constants: `R = REUSE_MS = 12 h` (`s3.rs:54`), `G = GC_GRACE_MS = 24 h`, `W = GC_WINDOW_MS = 12 h`, interval 24 h, cap 10k, `GC_MARK_VERSION = 1` (`fleet.ts:128-134`). A test pins `G > R` (`s3.rs:690-704`).
 
+> **Since** (branch `build/retention`, 2026-11-01): `isRestoreSource`, `deleting` generations, the placement pin and retention are built; see [Retention](#retention) below for the model and the conformance map. B2 is closed. The paragraph below describes main before it.
+
 **Not in code (docs only):** the `isRestoreSource` predicate (no match for `isRestoreSource`/`is_restore_source` anywhere), `deleting` generations, retention, pins, base generations, forks in SandboxDO (nestd has `fork`, `host.rs:1849`, but the control plane never issues `sandbox_fork`). Today resume loads `head` (`sandbox.ts:282`, `:442`), GC keeps every recorded generation (`sandbox.ts:496-505`) and the drain gate is "suspended then evicted" (`fleet.ts:1017-1018`). The single-predicate rule is a docs claim with nothing to drift yet; it becomes load-bearing when retention lands.
 
 ## State machines
@@ -99,7 +101,7 @@ Let `cl(m)` = `{manifests/m} ∪ {chunks/c | c ∈ m}`; `Live` = generations of 
 
 **B1 (real, by code reading; medium confidence it triggers): no age bound between chunk verification and a commit's first evaluation.** `unanswered` is persisted before the send (`host.rs:2084`), survives restarts (`recovery.rs` `SentCommit`) and is re-sent with its original manifest, unbounded in time, before every later commit and every salvage retry (`host.rs:2052-2058`, `:1184-1203`); the outbox resends unacked events whenever it reconnects. SandboxDO checks no age (`sandbox.ts:552-598`). Interleaving: prepare at `v` reusing a chunk last uploaded at `v − 11 h`; the request is lost (crash, or a partition while STONITH is unconfirmed, so `info.epoch/host` don't move); a GC mark lands at `T > v + 12 h` and deletes the chunk (`LM < T − 24 h`); the re-sent request is then evaluated: committed as **head** (same epoch and host) or as an **orphan** (salvage). Broken: S1 and S2; the generation's restore fails, and as a root it makes every later pass fail closed (L1). Repro: unit test with the fake S3 (`s3.rs` tests, `age_all`): prepare, age the objects 25 h, run `gc::run` with no roots, then evaluate the saved request in a SandboxDO test and mark again; expect a missing root. Fix direction (not applied): carry `prepared_ms` and refuse a commit older than `G − R` minus a margin, or have nestd drop an `unanswered` older than that and prepare afresh. The retention branch makes it reachable more often: once an orphan's `commits` row is pruned, a late re-ask creates a second orphan from an old manifest.
 
-**B2 (docs and code disagree, low):** docs name one `isRestoreSource` predicate, `deleting` generations, retention and pins. None exist. Nothing deletes a generation today, so nothing is wrong yet.
+**B2 (closed by retention, 2026-11-01):** docs name one `isRestoreSource` predicate, `deleting` generations, retention and pins. None exist. Nothing deletes a generation today, so nothing is wrong yet.
 
 **B3 (low):** orphans accepted after destroy and with an unchecked parent (`sandbox.ts:575-584`). Harmless to GC. It does break S3 if nestd ever sends a foreign parent, for example a fork's head from another sandbox (`host.rs:1849-1872`).
 
@@ -133,3 +135,39 @@ Let `cl(m)` = `{manifests/m} ∪ {chunks/c | c ∈ m}`; `Live` = generations of 
 - nestd: log or refuse re-sending an `unanswered` older than `G − R − 1 h`. A test: restart with an old `unanswered`.
 - GC: a test that an object reused at `R − ε` and committed `ε'` later survives a pass marked at the worst `T`; plus a test documenting the B1 counterexample.
 - FleetDO: `gcClaim` asserts `live` ⊇ every sandbox with a lease; a test that a sandbox registered during root collection is protected by the reuse rule.
+
+## Retention
+
+Checked on branch `build/retention` (2026-11-01, on main `180f46a`). Code: `control-plane/src/lib/retention.ts` (pure) and `src/do/sandbox.ts`. Model: [`verification/lean/Nest/Retention.lean`](../../../verification/lean/Nest/Retention.lean), the GC model above with `deleting`, pins and a guarded `retire`.
+
+**Proved (Lean, unbounded, under A1):**
+
+| Theorem | Says |
+|---|---|
+| `Retention.safe` | every key of every generation that isn't `deleting` is present; so is every key of every eligible pending request; the head and every pinned generation are never `deleting` |
+| `Retention.source_present` | GC and retention never delete a restore source's keys |
+| `Retention.load_never_deleting` | what a placement loads (the head, or a pinned generation) is a restore source, never `deleting` |
+| `Retention.unguarded_unsafe` | **mutation:** without retention's guard (it may mark the head), a 7-step trace deletes the head's chunk |
+| `Retention.retention_not_vacuous` | with the guard, a dropped generation's own chunk is deleted and the head's survives |
+
+Mutations of the proof: dropping the `pins` half of the guard breaks the `pins` clause (build fails); a pass that marks nothing breaks `cover`.
+
+**Conformance map (by hand):**
+
+| Model | Code | Conforms |
+|---|---|---|
+| `World.deleting`, one-way (only `retire` adds) | `generations.state = 'deleting'`, set only by `runRetention` (`sandbox.ts:667`) with `AND state IS NULL`; nothing clears it | yes |
+| `Step.retire g`, guard `head ≠ g ∧ g ∉ pins` | `runRetention` marks `retention(...).drop` (`retention.ts:142`), which excludes every `isRestoreSource` generation (`retention.ts:97`); read and marked in one synchronous step, no await | yes; the code's guard is stronger (tiers, turn ends, orphan heads) |
+| `Step.claim T` marks `liveKeys` | `SandboxDO.gcRoots` → `gcRootsOf` (`sandbox.ts:535`, `retention.ts:177`) skips `deleting` rows; FleetDO snapshots after inserting the run (`fleet.ts:2232`) | partly: with `on`, the code also unroots a non-source checkpoint's memory, which the model doesn't split out (below) |
+| `Step.pin`: pins the head | `placeCurrentEpoch` reads the source with `restoreSource` and records `restore_pin` in the claim's `decide` (`sandbox.ts:347-350`), before any await | yes |
+| `Step.unpin` (any time) | `livePins` (`retention.ts:110`) ends the pin on running, suspend, failure, destroy or a newer epoch | yes (the model allows more) |
+| a placement loads the head or a pin | `restoreSource` (`sandbox.ts:647`) checks `isRestoreSource` and refuses otherwise; used by `placeCurrentEpoch` and `createBody` (`:570`) | yes |
+| new generations are never `deleting` (`fresh`) | a commit inserts a row with `state` null under a fresh random id | yes, assuming ids don't collide |
+
+**Mapped by hand, not modelled:**
+- **Memory unrooting:** the model's `Gen.keys` covers both manifests. The code unroots the memory of a ready generation that isn't a restore source. Safe because only a restore source's memory is loaded (the restore rule) and a generation that stops being a restore source never becomes one again; the latter is property-tested (`test/retention-core.test.ts`, 60 seeded walks), not proved.
+- **Orphan heads:** not restore sources in the model (it may retire any orphan). The code keeps an orphan branch's head 30 days; that only keeps more.
+- **`deleting` row pruning** (a week; an orphan's 31 days): removes rows whose keys GC no longer protects anyway. An orphan child's row outlives its parent's expiry, so pruning it never makes a parent an orphan head again.
+- **Rollback:** a previous release ignores `state` and roots every row, `deleting` ones too. If GC has already swept a `deleting` generation's manifest, that release's passes fail closed (a missing root manifest stops the pass before any delete): no loss, GC stalls until the roll forward. It never restores a `deleting` generation: it restores only the head.
+
+**Tests that fail without each guard** (mutation-checked, vitest): dropping the pin clause, the head clause, the `deleting` check in the predicate or in `gcRootsOf`, the turn-end keep, the orphan-parent check, the claim's pin, the placement's predicate check, or the pin's end; and keeping a non-source's memory with `on`.

@@ -15,6 +15,7 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 - **Verified before commit:** every chunk a generation adds over its parent must have been uploaded less than 12 h before the commit, by this commit's PUT or as a HEAD shows, with the manifest's length; anything older is uploaded again ([GC](object-store/#garbage-collection)). The parent's chunks are protected as a GC root. A committed generation is therefore `ready`: every chunk is present.
 - **`reason`:** `turn_end`, `periodic`, `pressure`, `pause`, `suspend`, `drain`, `spot`, `fork` or `salvage`. Retention and rollback notices read it.
 - **`deleting` is one-way.** A generation is marked `deleting` before any of its bytes can go, and never returns to `ready`, because a previous pass may already have removed some of them.
+- **A manifest is self-contained.** It lists every chunk of its file (`null` for an all-zero one), not a delta over its parent, and a restore reads only that manifest (`storage.rs` `commit_file`, `restore_file`). So a kept generation never needs its parent: retention can drop a parent and keep the child.
 
 ## Writeback cadence
 
@@ -41,7 +42,13 @@ Its users:
 
 If these drifted apart, GC could delete exactly what a resume would load. It compares generation ids, never timestamps: an upload that lands late is still a different generation.
 
-**Not built:** there is no single predicate in code yet. Nothing is deleted, so nothing can drift: retention isn't built, SandboxDO's `gcRoots` returns every generation it records, and placement restores the head.
+**Built** (`control-plane/src/lib/retention.ts`, pure, with SandboxDO as its shell):
+- **One function, `isRestoreSource(gen, view)`**, over the head, the live pins and every orphan's parent. An orphan is its branch's head when no orphan (even a `deleting` one) names it as parent; it expires 30 days after its commit.
+- **Pins:** the only in-flight claim built is a placement's. It pins the head it restores by id, in the same synchronous step that claims the epoch (`restore_pin`), and the pin lasts while that epoch is being placed or its VM is being created or restored; running, suspending, failing, a destroy or a newer claim end it. Forks aren't built.
+- **Resume and placement** restore the head only through the predicate: a head that isn't a restore source is refused (an error, logged), never restored and never replaced by an older generation. It can't happen: only a commit moves the head, to a new generation.
+- **Retention** marks only what the predicate rejects, and **GC's roots** leave out every `deleting` generation and, with retention on, the memory of every generation that isn't a restore source.
+- **The drain gate** doesn't use it yet: the gate built is "suspended, then evicted" ([FleetDO](../../control-plane/durable-objects/fleet/)), and a suspended sandbox's last commit is its head by construction.
+- **A restore source never becomes one again once it stops being one** (the head moves only to a new generation; a pin takes the head; an orphan head's child is newer and expires later). That makes unrooting memory safe; it is property-tested, not proved.
 
 ## Restore rule
 
@@ -58,12 +65,27 @@ Restore sources and turn ends are kept; everything else is thinned by age.
 | Generations | Kept |
 |---|---|
 | Restore sources (above) | Always |
-| Turn ends (`reason: turn_end`) | Always: they're the rewind points and carry the session offset |
+| Turn ends (`reason: turn_end`) | The newest 20 always, and up to the newest 200 while under 7 days old: they're the rewind points and carry the session offset |
 | Orphaned sibling heads | 30 days, like other parked work |
 | Everything else | Newest 5 at 1-min spacing, then 1 at 5 min, 6 at 10 min, 6 hourly and 4 six-hourly; older ones go (about 24 h). SPACE uses the same tiers ([snapshot_scheduler.rs](https://github.com/perplexityai/space/blob/main/crates/libs/sbx/mgr/server/src/snapshot_scheduler.rs)) |
+| An orphan that isn't its branch's head | Not kept: nothing loads it |
 | The memory of a checkpoint that's no longer a restore source | Not kept: the restore rule never loads it, so it stops being a GC root |
 
-SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting. **Not built:** every generation is kept. **Built:** a whole sandbox nobody uses goes: dormant (no agent attached, no VM up) for its idle TTL, a day by default, it is destroyed, and its generations stop being roots ([lifetime](../../control-plane/durable-objects/sandbox/#lifetime)).
+SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting.
+
+**Turn ends are bounded** (decided 2026-11-01, to confirm with the owner): kept "always", a sandbox that lives for months would root every turn's dirty chunks forever. A turn dirties whole 4 MB chunks, so a generation's own bytes are likely tens of MB (unverified); at Standard's $0.023/GB-month, 200 of 50 MB is about $0.23 a month per sandbox, where 50 turns a day kept for a year would be over $20 and growing. Rewinding isn't built, git keeps the code's history, and a week matches the commit records' retention. The newest 20 stay at any age, so a sandbox idle for a while keeps its recent turns.
+
+**The tiers** follow SPACE: each tier keeps its own newest slots and the tiers overlap. A slot is a wall-clock interval of the tier's spacing, aligned to the Unix epoch (so slots nest), represented by its newest generation; the slots counted are those with a generation. A busy sandbox keeps about 18 tier generations spanning 24 h; a sparse one keeps its newest 6 at any age. Orphans take no main-chain slot.
+
+**Built** (`retention()` in `control-plane/src/lib/retention.ts`; SandboxDO's `retention` deadline):
+- A pass runs a minute after a commit, every 6 hours while the sandbox lives, and from the lifetime check for a sandbox that never commits again. It reads the ready rows, decides, and marks at most 500 `deleting` in one synchronous step (no await between), so a claim's pin and a commit's new head are always seen; more continue a second later.
+- It is stable: what it drops never changes what it keeps, and a generation it stops keeping is never kept again, so a second pass marks nothing new.
+- Bytes go only through GC, after its grace and its dry run. `deleting` rows are kept a week after they were marked (an orphan's 31 days, past any orphan head's life), then pruned.
+- **`SANDBOX_RETENTION`:** `report` (the default) decides and records what it would drop (`kv.retention_report`, a log line, and `retained` in `GET /v1/sandboxes/<id>/generations`) without marking; `on` marks, and unroots non-source memory; `off` does nothing. `on` marks GC with the next marking version, so the first GC run after switching it on is dry ([dev/deploy.md](../../../dev/deploy.md)).
+- Destroyed sandboxes are unchanged: no pass runs, and all their generations stopped being roots at the destroy.
+- Proved over the GC model ([commit-gc](../../verification/commit-gc/#retention)): a pass never deletes a key of a generation that isn't `deleting`, and the head and pinned generations never are.
+
+**Also built:** a whole sandbox nobody uses goes: dormant (no agent attached, no VM up) for its idle TTL, a day by default, it is destroyed, and its generations stop being roots ([lifetime](../../control-plane/durable-objects/sandbox/#lifetime)).
 
 ## Spot notice (2 minutes)
 

@@ -73,7 +73,7 @@ The inventories list more suspected bugs, each with what would confirm it.
 1. "An epoch is never retried" vs. the no-capacity rollback in `SandboxDO.placeCurrentEpoch`.
 2. Hands-call journaling is a settled decision ([hands](../agents/hands/)) but isn't built: the guest keeps no call records and nothing answers `call_status`. Only the gateway's refusal before `bound` carries `executed: false`.
 3. "A gap closes the socket" now holds for FleetDO's receivers and nestd's command receiver (#39), not for the runner's session receiver, which drops duplicates but accepts a higher seq.
-4. The single `isRestoreSource` predicate doesn't exist in code: generation retention isn't built, so every generation is kept and is a GC root.
+4. ~~The single `isRestoreSource` predicate doesn't exist in code~~: built with generation retention (`control-plane/src/lib/retention.ts`); retention's safety is proved over the GC model ([commit-gc](commit-gc/#retention)).
 
 ## What the methods would and wouldn't have caught
 
