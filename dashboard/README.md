@@ -3,13 +3,15 @@
 A read-only page of what is live in one cell: agents with a brain (template, state, lifecycle,
 activity, current turn, brain host and phase, bound sandbox; an agent without a brain is not
 listed), sandboxes and the host each runs on (a sandbox suspended to S3 is counted, not listed),
-live hosts with their residents, and the sandbox templates. History (retired hosts, launches) and
+live hosts with their residents, the sandbox templates, and what is left lying around (dormant
+sandboxes and when their TTL takes them, sandboxes held by agents nobody uses, quiet agents). History (retired hosts, launches) and
 AMIs stay off it. Vite + React, served by its own Worker (`src/worker.ts`), which proxies exactly
 two routes of the control plane's admin API (`GET /v1/admin/fleet`, `GET /v1/admin/images`) with the
-admin token it holds as a secret, and answers `/api/agents` by reading `GET /v1/agents/:agent` for
+admin token it holds as a secret, answers `/api/agents` by reading `GET /v1/agents/:agent` for
 each agent the fleet view lists (`src/agents.ts`: at most 100, 4 at a time, narrowed to the page's
-fields, an unreadable one a row with its error). Nothing is shared with the control plane but that
-API; the page refreshes every 10 s.
+fields, an unreadable one a row with its error), and answers `/api/lifetimes` by following
+`GET /v1/admin/lifetimes` page by page (`src/lifetimes.ts`: at most 10 pages, merged). Nothing is
+shared with the control plane but that API; the page refreshes every 10 s (the lifetimes view, every 60 s).
 
 ```bash
 npm install
@@ -34,6 +36,6 @@ imports, which the control plane is typed by too) as types only, so the build ca
 outside `dashboard/`; `test/api.test.ts` holds that nothing imports the control plane and every
 import from `protocol/` is type-only.
 `fixtures/admin.ts` holds responses recorded from the control plane's test pool and must satisfy
-those types (`npm run typecheck`): re-record it when `fleetView` or `images` change. Its `agent`,
+those types (`npm run typecheck`): re-record it when `fleetView`, `images` or `lifetimes` change. Its `agent`,
 a recorded `GET /v1/agents/:agent`, is outside the view contract and holds only the names and types
 of the fields `src/agents.ts` reads. Design: [docs/control-plane/dashboard/](../docs/control-plane/dashboard/README.md).
