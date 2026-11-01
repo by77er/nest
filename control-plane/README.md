@@ -16,7 +16,7 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries only); expansion is `src/lib/spec.ts` (pure) |
 | `src/do/channel.ts` | **ChannelDO** (one per channel, plus `~directory`): the log, keyed view, grant list, subscriptions and their cursors, fan-out from the alarm, retention and tiering. Every decision is `src/lib/channels.ts` (pure) |
 | `src/do/tasks.ts` | **TaskLedgerDO** (one per ledger name): tasks, comments, history, watcher, inbox notices from its alarm; its decisions are `src/lib/tasks.ts` (pure) |
-| `src/lib/` | Channels core (`channels.ts`: names, validation, permissions, post guards, filters, batching, envelopes) and the channel outbox (`outbox.ts`), the task ledger core (`tasks.ts`), reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry |
+| `src/lib/` | Channels core (`channels.ts`: names, validation, permissions, post guards, filters, batching, envelopes) and the channel outbox (`outbox.ts`), the task ledger core (`tasks.ts`), reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry, repo allowlists (`repos.ts`) and the egress rule constructors (`rules/`: GitHub's push allowlist to request guards; docs/sandbox/networking/egress/policy/#request-guards) |
 | `test/regressions.test.ts` | One regression test per finding of the control-plane review |
 
 ## Commands
@@ -190,7 +190,7 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`, `spawn_agent`,
   `attach`, `checkpoint`, and the seeded `management` and `memory` capabilities' tools; of the brokered actions, `email.send`.
-- **GitHub App installation tokens** are minted for brokered actions only; sandbox injection still takes a static `inject:github` secret.
+- **GitHub App installation tokens** are minted for brokered actions and for a sandbox's push allowlist (`docs/control-plane/durable-objects/broker/#injection-minting`); the rule constructors are in `src/lib/rules/` (GitHub's only).
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`. Built: `/v1/health` makes one read-only round trip to each DO class (`src/lib/health.ts`).
 - **Catalogs seeded before this release** keep `delegate` in `management` (ignored on expansion: the registry no longer has it) and the old `worker` (`subagents`, `TodoWrite`, `Task`, `WebSearch`) until the operator edits them; a new catalog gets the design's (`docs/control-plane/durable-objects/catalog/`).
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO audits GitHub mints only (not secret pushes or binding mints).

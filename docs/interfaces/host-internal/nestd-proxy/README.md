@@ -102,6 +102,7 @@ FleetDO         nestd (root)                                      nest-proxy    
 | `injection_upgrade` | deny | Protocol upgrade on a request that had a placeholder substituted |
 | `tcp_exception_not_in_policy` | deny | A TCP exception listener whose rule is no longer in policy |
 | `non_tls_tunnel` | deny | CONNECT tunnel to an inspected host that didn't start TLS |
+| `guard: <name>` | deny | A [request guard](../../../sandbox/networking/egress/policy/#request-guards) refused the request (403 `request_denied`, with `guard` and `reason`) |
 | `upgraded` | allow | Connection upgraded (WebSocket) and spliced after the handshake |
 | `tcp_exception` | allow | Spliced TCP exception |
 | `upstream: …` / `connect: …` / `resolve: …` | deny | Upstream failure (TLS verification, connect or resolution), with detail |
