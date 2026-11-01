@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Abandoned } from "./Abandoned";
 import { type AgentsResponse, api, ApiError, type Fleet, type Host, type Images, type SandboxState } from "./api";
 
 const REFRESH_MS = 10_000;
@@ -251,6 +252,8 @@ export function App() {
           </p>
         )}
       </section>
+
+      <Abandoned cell={cell} now={now} />
 
       <section>
         <h2>Hosts</h2>

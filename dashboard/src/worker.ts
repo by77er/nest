@@ -1,12 +1,14 @@
 // The dashboard's Worker: serves the built page and proxies two read-only admin routes of the
 // control plane with the admin token it holds, plus `GET /v1/agents/:agent` for the agents the fleet
-// view lists (src/agents.ts), narrowed. Nothing else is reachable through it, and the token never
+// view lists (src/agents.ts), narrowed, and `GET /v1/admin/lifetimes` page by page (src/lifetimes.ts).
+// Nothing else is reachable through it, and the token never
 // reaches the browser. Every request, page and API alike, must carry a valid Cloudflare
 // Access token for the dashboard's application (src/access.ts); without one the answer is 403, so
 // the token stays private even on a path that does not pass through Access.
 
 import { verifyAccessJwt } from "./access";
 import { AGENT_CONCURRENCY, type AgentRow, type AgentsResponse, errorMessage, listedAgents, mapBounded, MAX_AGENTS, summarizeAgent } from "./agents";
+import { collectLifetimes } from "./lifetimes";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -19,7 +21,7 @@ export interface Env {
   NEST_ADMIN_TOKEN?: string;
 }
 
-/** The control-plane routes the page reads as they are, by the path it asks for (and `/api/agents`). */
+/** The control-plane routes the page reads as they are, by the path it asks for (and `/api/agents`, `/api/lifetimes`). */
 const ROUTES: Record<string, string> = {
   "/api/fleet": "/v1/admin/fleet",
   "/api/images": "/v1/admin/images",
@@ -59,6 +61,19 @@ async function agents(env: Env & { NEST_ADMIN_TOKEN: string }, cell: string): Pr
   return json({ agents: rows, omitted: ids.length - read.length } satisfies AgentsResponse);
 }
 
+/** `GET /api/lifetimes`: the cell's lifetimes view, every page up to the cap, merged; a failed page's answer passed on. */
+async function lifetimes(env: Env & { NEST_ADMIN_TOKEN: string }, cell: string): Promise<Response> {
+  const r = await collectLifetimes((cursor) =>
+    upstream(env, `/v1/admin/lifetimes?cell=${encodeURIComponent(cell)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`));
+  return "failed" in r ? passThrough(r.failed) : json(r.ok);
+}
+
+/** The routes the Worker answers itself, from control-plane reads of its own. */
+const ANSWERED: Record<string, (env: Env & { NEST_ADMIN_TOKEN: string }, cell: string) => Promise<Response>> = {
+  "/api/agents": agents,
+  "/api/lifetimes": lifetimes,
+};
+
 /** Whether the request carries a valid Access token for this application; fails closed. */
 async function admitted(request: Request, env: Env): Promise<boolean> {
   // `vite dev` only: there is no Access in front of localhost. `vite build` replaces the flag with
@@ -82,13 +97,14 @@ export default {
     const cells = env.NEST_CELLS.split(",").map((c) => c.trim()).filter(Boolean);
     if (url.pathname === "/api/cells") return json({ cells, control_plane: env.NEST_CONTROL_PLANE });
     const target = ROUTES[url.pathname];
-    if (!target && url.pathname !== "/api/agents") return json({ error: "unknown route" }, 404);
+    const answer = ANSWERED[url.pathname];
+    if (!target && !answer) return json({ error: "unknown route" }, 404);
     const cell = url.searchParams.get("cell") ?? "";
     if (!cells.includes(cell)) return json({ error: `unknown cell ${cell}` }, 400);
     const token = env.NEST_ADMIN_TOKEN;
     if (!token) return json({ error: "NEST_ADMIN_TOKEN is not set on this Worker" }, 503);
     const authed = { ...env, NEST_ADMIN_TOKEN: token };
-    if (!target) return agents(authed, cell);
+    if (answer) return answer(authed, cell);
     return passThrough(await upstream(authed, `${target}?cell=${encodeURIComponent(cell)}`));
   },
 } satisfies ExportedHandler<Env>;

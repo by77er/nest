@@ -100,6 +100,10 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `GET /v1/admin/fleet?cell=<cell>`: hosts (status, tunnel state, capacity, resident sandboxes and brains, idle since),
      launched instances (outcome) and every live sandbox with its lease; `GET /v1/admin/images?cell=<cell>`: the
      cell's host AMIs and the one the launch template resolves to (the dashboard reads both)
+   - `GET /v1/admin/lifetimes?cell=<cell>[&cursor=&limit=&quiet_ms=]`: what is left lying around, a page of the
+     registry at a time (`next_cursor`): dormant sandboxes and when their TTL destroys them, sandboxes held only by
+     agents nobody uses, quiet or stuck-ending agents with what they hold, the rest counted
+     ([what counts](../docs/control-plane/dashboard/#abandoned); the dashboard reads it)
    - `POST /v1/admin/launched {instance_id, role, account_id?, region?, cell}`: record an instance we
      launched so it may enroll with its AWS identity document (as that role, from that account and region)
    - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<workstream>`)

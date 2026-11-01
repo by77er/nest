@@ -321,6 +321,21 @@ export const ROUTES: Route[] = [
   route({ method: "GET", path: "/v1/admin/hosts/:host", auth: "admin", run: ({ env, cell, p }) => fleet(env, cell).hostStatus(p.host) }),
   route({ method: "GET", path: "/v1/admin/fleet", auth: "admin", run: ({ env, cell }) => fleet(env, cell).fleetView() }),
   route({ method: "GET", path: "/v1/admin/images", auth: "admin", run: ({ env, cell }) => fleet(env, cell).images() }),
+  // What is left lying around: dormant sandboxes, sandboxes held by agents nobody uses, quiet agents (docs/control-plane/dashboard/#abandoned).
+  route({ method: "GET", path: "/v1/admin/lifetimes", auth: "admin", run: ({ env, cell, url }) => {
+    const q = url.searchParams;
+    const int = (k: string, min: number) => {
+      if (!q.has(k)) return undefined;
+      const v = Number(q.get(k));
+      if (!Number.isSafeInteger(v) || v < min) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${k} must be an integer of at least ${min}`, 400);
+      return v;
+    };
+    const limit = int("limit", 1);
+    const quiet = int("quiet_ms", 0);
+    return fleet(env, cell).lifetimes({
+      ...(q.has("cursor") ? { cursor: q.get("cursor")! } : {}), ...(limit !== undefined ? { limit } : {}), ...(quiet !== undefined ? { quiet_ms: quiet } : {}),
+    });
+  } }),
   // The daily tunnel sweep, now (after a Cloudflare outage, or to see what the account holds).
   route({ method: "POST", path: "/v1/admin/tunnels/sweep", auth: "admin", run: ({ env, cell }) => fleet(env, cell).tunnelSweep() }),
   route({ method: "GET", path: "/v1/admin/gc", auth: "admin", run: ({ env, cell }) => fleet(env, cell).gcStatus() }),

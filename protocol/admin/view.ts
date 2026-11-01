@@ -1,8 +1,8 @@
-// The admin API's read views (`GET /v1/admin/fleet`, `GET /v1/admin/images`): the contract between
-// the control plane (FleetDO's `fleetView` and `images` return these types) and the dashboard
-// (which checks its client against them). It lives in protocol/, which both depend on, so neither
-// imports the other; it imports nothing, so the dashboard needs only `import type` and carries no
-// code from here. The enum lists must equal the control plane's zod enums
+// The admin API's read views (`GET /v1/admin/fleet`, `/v1/admin/images`, `/v1/admin/lifetimes`): the
+// contract between the control plane (FleetDO's `fleetView`, `images` and `lifetimes` return these
+// types) and the dashboard (which checks its client against them). It lives in protocol/, which both
+// depend on, so neither imports the other; it imports nothing, so the dashboard needs only `import
+// type` and carries no code from here. The enum lists must equal the control plane's zod enums
 // (control-plane/src/do/fleet.ts asserts that at compile time).
 
 /** protocol/model.ts `SandboxState`. */
@@ -142,4 +142,94 @@ export interface ImagesView {
   current_since_ms: number | null;
   images: ImageView[];
   templates: TemplateView[];
+}
+
+// --- `GET /v1/admin/lifetimes`: what is left lying around (docs/control-plane/dashboard/#abandoned) ---
+
+/**
+ * A live registered sandbox's lifetime class: `dormant` (no agent attached, no VM up: its idle TTL
+ * runs), `held` (attached only to agents that are quiet, ending, ended or gone: never dormant, so no
+ * TTL takes it), `unknown` (an attached agent could not be read, none is active), `in_use` (counted,
+ * not listed), `destroyed` (SandboxDO says destroyed but the registry still lists it), `unreadable`
+ * (SandboxDO did not answer).
+ */
+export const SANDBOX_LIFETIME_KINDS = ["dormant", "held", "unknown", "in_use", "destroyed", "unreadable"] as const;
+export type SandboxLifetimeKind = (typeof SANDBOX_LIFETIME_KINDS)[number];
+
+/**
+ * An agent's lifetime class: `quiet` (not ended, no brain, no start wanted, no turn current or
+ * queued, and none for `quiet_ms`), `ending` (ended, its steps unfinished past `ENDING_STUCK_MS`),
+ * `gone` (its records are pruned, yet a sandbox or owner still names it), `unreadable`; counted,
+ * not listed: `active` (a brain, a start wanted, or a turn current or queued), `recent` (quiet for
+ * less than `quiet_ms`), `ended` (its end done, its records awaiting their prune).
+ */
+export const AGENT_LIFETIME_KINDS = ["quiet", "ending", "gone", "unreadable", "active", "recent", "ended"] as const;
+export type AgentLifetimeKind = (typeof AGENT_LIFETIME_KINDS)[number];
+
+/** A sandbox the lifetimes view lists (any kind but `in_use`). */
+export interface LifetimeSandboxView {
+  sandbox: string;
+  kind: SandboxLifetimeKind;
+  registered_ms: number;
+  /** SandboxDO's state; null when it could not be read (`error`). */
+  state: SandboxState | null;
+  host: string | null;
+  /** The agent it was made for (which may destroy it when it ends); null: the operator's. */
+  owner: string | null;
+  attached: string[];
+  /** The idle TTL that applies: its own (`own_ttl`), else the cell's. */
+  idle_ttl_ms: number | null;
+  own_ttl: boolean;
+  dormant_since_ms: number | null;
+  expiry_notice_ms: number | null;
+  /**
+   * When its lifetime check will destroy it if nothing changes (a dormant sandbox only); null while
+   * its dormancy clock has not started. Past checks missed for over 6 h restart the clock, as the
+   * check itself does.
+   */
+  destroy_at_ms: number | null;
+  /** Its generation records, and how many carry a memory snapshot: counts, not bytes (the control plane has no sizes). */
+  generations: number | null;
+  memory_generations: number | null;
+  error: string | null;
+}
+
+/** An agent the lifetimes view lists (`quiet`, `ending`, `gone`, `unreadable`). */
+export interface LifetimeAgentView {
+  agent: string;
+  kind: AgentLifetimeKind;
+  template: string | null;
+  owner: string | null;
+  /** The sandbox it is bound to, by id. */
+  sandbox: string | null;
+  /** When its latest turn started (or was queued); null: it never had one. */
+  last_turn_ms: number | null;
+  /** The operator stopped it and nothing has started it since. */
+  stopped_by_operator: boolean;
+  /** Agents it spawned that haven't ended. */
+  live_children: string[];
+  /** Channel subscriptions still open (a post to one would wake it). */
+  subscriptions: number;
+  ended_ms: number | null;
+  ended_reason: string | null;
+  /** How it was found: bound to a listed sandbox, or as the owner or a child of an agent read. */
+  found_via: "sandbox" | "owner" | "child";
+  error: string | null;
+}
+
+export interface LifetimesView {
+  cell: string;
+  now_ms: number;
+  /** An agent with no turn for this long is `quiet` (else `recent`). */
+  quiet_ms: number;
+  /** The cell's default idle TTL (a sandbox without its own gets it). */
+  cell_idle_ttl_ms: number;
+  sandboxes: LifetimeSandboxView[];
+  agents: LifetimeAgentView[];
+  /** Everything this page read, by kind (the listed and the counted). */
+  counts: { sandboxes: Record<SandboxLifetimeKind, number>; agents: Record<AgentLifetimeKind, number> };
+  /** The registry's next page (pass as `cursor`); null: this was the last. */
+  next_cursor: string | null;
+  /** Agents found on this page but not read (over the per-page cap). */
+  agents_omitted: number;
 }
