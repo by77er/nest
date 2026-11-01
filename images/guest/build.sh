@@ -62,8 +62,10 @@ rm -f "$R/etc/apt/sources.list"
 mkdir -p "$R/var/cache/apt/archives/partial" "$R/var/lib/apt/lists/partial" "$R/var/log/apt" \
   "$R/var/lib/dpkg/updates" "$R/var/lib/dpkg/info" "$R/var/cache/debconf"
 cp -L /etc/resolv.conf "$R/etc/resolv.conf"
+# IPv4 only (the builder's subnet has no IPv6 route, and a mirror that resolves AAAA first failed the whole
+# update), with retries; an index that can't be fetched fails the build instead of installing nothing.
 chroot "$R" env DEBIAN_FRONTEND=noninteractive \
-  bash -c 'apt-get update -q && apt-get install -y -q --no-install-recommends git gh openssh-client less jq unzip xz-utils make build-essential python3 python3-venv python3-pip && apt-get clean && rm -rf /var/lib/apt/lists/*'
+  bash -c 'APT="-o Acquire::ForceIPv4=true -o Acquire::Retries=3" && apt-get $APT update -q -o APT::Update::Error-Mode=any && apt-get $APT install -y -q --no-install-recommends git gh openssh-client less jq unzip xz-utils make build-essential python3 python3-venv python3-pip && apt-get clean && rm -rf /var/lib/apt/lists/*'
 umount -R "$R/dev" "$R/proc" "$R/tmp"
 chmod 1777 "$R/tmp"
 
