@@ -134,6 +134,8 @@ class FakeGitHub {
         return json(200, items.filter((p) => p.state === "open" && (!head || `${repo.split("/")[0]}:${p.head}` === head.toLowerCase() || p.head === head) && (!base || p.base === base)));
       }
       if (t.permissions.pull_requests !== "write") return json(403, { message: "permissions" });
+      // GitHub reads both refs with the token: without contents read it answers this (observed 2026-10-31).
+      if (!t.permissions.contents) return json(422, { message: "Validation Failed", errors: [{ message: "not all refs are readable" }] });
       if (items.some((p) => p.state === "open" && p.head === body.head && p.base === body.base)) {
         return json(422, { message: "Validation Failed", errors: [{ message: `A pull request already exists for ${body.head}.` }] });
       }
