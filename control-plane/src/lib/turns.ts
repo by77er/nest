@@ -9,7 +9,8 @@ import { addColumn, storedEnum } from "./stored";
 import { newId } from "./util";
 
 // Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
-const TurnStatusEnum = z.enum(["queued", "active", "done", "interrupted"]);
+/** `dropped`: never run, or cut off, because the agent ended for good (docs/agents/#lifetimes). */
+const TurnStatusEnum = z.enum(["queued", "active", "done", "interrupted", "dropped"]);
 export type TurnStatus = z.output<typeof TurnStatusEnum>;
 /** `inbox.status`: mirrored to the running turn, or consumed (by a turn, or as its own turn). */
 const InboxStatusEnum = z.enum(["delivered", "consumed"]);
@@ -125,6 +126,17 @@ export class TurnQueue {
     this.insert(recoveryInput(JSON.parse(row.input) as TurnInput, notes), this.ord("MIN") - 1, null, turn, now);
   }
 
+  /**
+   * The agent ended for good: every queued turn, and `active` (the turn it was in, once its brain is
+   * gone), is dropped, and mirrored messages with them. How many turns went.
+   */
+  dropAll(active: string | null = null): number {
+    const n = this.sql.exec(`UPDATE turns SET status = '${TURN.dropped}' WHERE status = '${TURN.queued}' OR (status = '${TURN.active}' AND turn = ?)`,
+      active ?? "").rowsWritten;
+    this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
+    return n;
+  }
+
   list(): { turn: string; status: TurnStatus; input: TurnInput }[] {
     return this.sql.exec<{ turn: string; status: string; input: string }>("SELECT turn, status, input FROM turns ORDER BY ord")
       .toArray()
@@ -189,7 +201,7 @@ export class TurnQueue {
   }
 
   prune(cutoff: number): void {
-    this.sql.exec(`DELETE FROM turns WHERE status IN ('${TURN.done}', '${TURN.interrupted}') AND created_ms < ?`, cutoff);
+    this.sql.exec(`DELETE FROM turns WHERE status IN ('${TURN.done}', '${TURN.interrupted}', '${TURN.dropped}') AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM inbox WHERE status = '${INBOX.consumed}' AND created_ms < ?`, cutoff);
   }
 

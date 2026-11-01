@@ -115,6 +115,11 @@ export class CallLedger {
     this.sql.exec(`UPDATE asks SET status = '${ASK.answered}', answer = ? WHERE ask = ?`, text, ask);
   }
 
+  /** Asks (approvals included) not yet answered: each answer would be a turn. */
+  openAsks(): number {
+    return this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM asks WHERE status != '${ASK.answered}'`).one().n;
+  }
+
   /** The undecided approval of this exact call, if one was asked for already (asked again, it's not posted again). */
   pendingApproval(name: string, digest: string): Approval | undefined {
     return this.approvalWhere(`name = ? AND digest = ? AND status = '${APPROVAL.pending}'`, name, digest);

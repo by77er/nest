@@ -27,13 +27,17 @@ import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApi
 import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
 import { Repo } from "../lib/repos";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
-import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
+import { type AgentSpec, EscalateTo, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
+import {
+  AGENT_RECORD_RETENTION_MS, cellIdleTtlMs, END_GRACE_MS, END_RETRY_MS, type Ended, type EndReason, ephemeralDone, MAX_OWNER_HOPS, narrowTtl, ownsVia,
+  spawnRefusal,
+} from "../lib/lifetimes";
 import {
   type Actor, ALL_TASK_TOOLS, type SpecGrant, type TaskFilter, type TaskOp, type TaskPriority, type TaskStatus, type TaskTool, TOOL_OPS,
 } from "../lib/tasks";
 import { signBlobUrl } from "../lib/tokens";
 import { ledgerStub, type TaskView } from "./tasks";
-import { asNestError, b64ToBytes, concatBytes, errorBody, NestError, newId } from "../lib/util";
+import { asNestError, b64ToBytes, concatBytes, errorBody, keyedId, NestError, newId } from "../lib/util";
 import type { EgressPolicy } from "../protocol/model";
 import { addColumn, storedEnum } from "../lib/stored";
 import { askRoute, CallLedger } from "../lib/calls";
@@ -122,7 +126,16 @@ export interface AgentInfo extends Omit<AgentSpec, "subscribe">, BrainFields {
   activity_sent?: boolean;
   /** The sandbox epoch the brain was last told of: a turn starting at another begins with what the move lost. */
   told_sandbox_epoch?: number;
+  /** Stopped for good (docs/agents/#lifetimes): no turn, start or wake after it. Absent: it hasn't ended. */
+  ended?: Ended;
+  /** How many spawns deep: 0 for the operator's agents (absent: 0), its spawner's plus one. */
+  depth?: number;
 }
+
+/** Tools that spawn or end agents: never from a sandbox. */
+const LIFECYCLE_TOOLS = ["agent_spawn", "agent_stop", "exit"];
+/** The tools an agent is offered: its spec's, and `exit`, which every agent has (it only gives up authority). */
+const offered = (info: Pick<AgentSpec, "tools">): string[] => (info.tools.includes("exit") ? info.tools : [...info.tools, "exit"]);
 
 /** The sender of the platform's own notes about an agent's work (not input: see `stop_quiet`). */
 const SYSTEM_SENDER = "system";
@@ -140,7 +153,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | typeof OUTBOX_DEADLINE;
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | typeof OUTBOX_DEADLINE;
 /** A `sync` ask's window: `ask:<ask id>`. */
 const ASK_DEADLINE = "ask:";
 /** An approved sink call may be made once within this long. */
@@ -163,6 +176,27 @@ export interface CreateAgent {
   spec: AgentSpec;
   owner?: string | null;
   sandbox?: string | null;
+  /** The owner is the caller (`agent_spawn`): of this workstream by construction, so not asked (it awaits this call). */
+  owner_is_caller?: boolean;
+  /** Spawn depth (`agent_spawn`: its spawner's plus one). */
+  depth?: number;
+  /** It starts with its spawner's taint (docs/agents/tools/#taint-and-sinks). */
+  tainted?: boolean;
+}
+
+/** How an agent is ended (`Ended` without the steps it records later). */
+export interface EndOptions {
+  by: string;
+  reason: EndReason;
+  kill: boolean;
+  destroy_sandbox: boolean;
+  note?: string;
+}
+
+/** What ending an agent did: it ended now, or had already. */
+export interface EndResult {
+  status: "stopped" | "already_stopped";
+  ended: Ended;
 }
 
 interface Attachment {
@@ -264,6 +298,8 @@ export class AgentDO extends DurableObject<Env> {
     // Notices taken without delivery (no `read` tool): how many, and up to which seq.
     addColumn(this.sql, "channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
     addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
+    // The agents it spawned (an index: each child's `owner` decides), and whether each has ended.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS children (agent TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0)");
     this.mcp = new McpProxy({
       sql: this.sql,
       agent: () => this.load().agent,
@@ -376,7 +412,7 @@ export class AgentDO extends DurableObject<Env> {
     if (this.exists()) return this.load();
     // The owner must be an agent (`info()` refuses one never created) of this workstream.
     const owner = req.owner ?? null;
-    if (owner !== null) {
+    if (owner !== null && !req.owner_is_caller) {
       const o = await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info();
       if (o.workstream !== req.workstream) {
         throw new NestError(ErrorCodes.INVALID_MESSAGE, `owner ${owner} is in workstream ${o.workstream}, not ${req.workstream}`, 409);
@@ -419,8 +455,10 @@ export class AgentDO extends DurableObject<Env> {
       received_bytes: 0,
       runner_instance: null,
       start_attempts: 0,
+      ...(req.depth ? { depth: req.depth } : {}),
     };
     this.save(info);
+    if (req.tainted) this.kvPut("read_tainted", true);
     await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS, true);
     return info;
   }
@@ -507,6 +545,7 @@ export class AgentDO extends DurableObject<Env> {
   /** An operator's start (optionally on a chosen host), recorded as the intent and run. */
   async start(hostHint?: string, avoid?: string, restart = false): Promise<StartResult> {
     const info = this.load();
+    this.refuseEnded(info, "starts");
     // Hands still go through the sandbox's gateway, wherever the brain runs.
     if (hostHint) await this.requireBrainHost(info.cell, hostHint);
     await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), ...(avoid ? { avoid } : {}), reason: restart ? "restart" : "operator" });
@@ -531,6 +570,8 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Merge a start request into the intent, with a backstop alarm in the same step (an eviction mid-start). */
   private async setIntent(patch: StartIntent): Promise<void> {
+    // Nothing starts an agent that ended for good.
+    if (this.load().ended) return;
     this.update((i) => {
       i.intent = mergeIntent(i.intent, patch);
     });
@@ -856,11 +897,18 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.update((i) => {
       d = brainRelease(i, host, epoch, reason, this.hasWork(i));
       if (d) Object.assign(i, d.patch);
+      // Ended for good: the turn it was in is dropped with it (no brain will recover it).
+      if (d && i.ended && i.current_turn) {
+        this.queue.dropAll(i.current_turn);
+        i.current_turn = null;
+      }
     });
     if (!d) return false;
     const { wakes, next } = d as NonNullable<typeof d>;
     this.reportExit(info, host, epoch, reason, !wakes);
-    const armed = Promise.all([this.armPhase(null), next ? this.deadlines.set(next, Date.now(), true) : undefined]);
+    // An ended agent's remaining steps (its sandbox, its owner) wait for this release.
+    const armed = Promise.all([this.armPhase(null), next ? this.deadlines.set(next, Date.now(), true) : undefined,
+      info.ended && !info.ended.done_ms ? this.deadlines.set("end", Date.now(), true) : undefined]);
     await this.hook("release:afterCommit");
     await armed;
     console.log(`agent ${info.agent}: brain on ${host}@${epoch} released (${reason})`);
@@ -882,6 +930,264 @@ export class AgentDO extends DurableObject<Env> {
     const b = info.brain;
     if (!b || b.phase === "condemned") return;
     await this.fleet(info.cell).issueCommands(b.host, [{ type: "agent_stop", agent: info.agent, reason, mode: "graceful", epoch: b.epoch }]);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Ending for good (docs/agents/#lifetimes; lib/lifetimes.ts). An end is recorded in one synchronous
+  // step with the `end` deadline: it is a stop (`stop_epoch`, quiet) that no input lifts, its queued
+  // turns dropped. The steps after it (the brain, the agents it owns, its sandbox, its owner) run
+  // from that deadline, each recorded once done, until `done_ms`; its records go after the retention.
+  // ---------------------------------------------------------------------------------------------
+
+  private agentStub(id: string) {
+    return this.env.AGENT.get(this.env.AGENT.idFromName(id));
+  }
+
+  /** An ended agent takes no more `what` (409). */
+  private refuseEnded(info: AgentInfo, what: string): void {
+    if (info.ended) throw new NestError(ErrorCodes.FORBIDDEN, `${info.agent} has ended (${info.ended.reason}); it takes no more ${what}`, 409);
+  }
+
+  /** End this agent for good: `agent_stop` from an agent that owns it, its owner's end, or the operator. Idempotent. */
+  async end(o: EndOptions): Promise<EndResult> {
+    return this.endAgent(o);
+  }
+
+  private async endAgent(o: EndOptions): Promise<EndResult> {
+    const before = this.load();
+    if (before.ended) return { status: "already_stopped", ended: before.ended };
+    const now = Date.now();
+    const ended: Ended = {
+      ms: now, by: o.by, reason: o.reason, kill: o.kill, destroy_sandbox: o.destroy_sandbox || !!before.ephemeral,
+      ...(o.note ? { note: clip(o.note, 500) } : {}),
+    };
+    let dropped = 0;
+    // One step: the stop that nothing lifts, its queued turns (and with no brain, the turn it was in), and its deadline.
+    const info = this.update((i) => {
+      Object.assign(i, NO_INTENT, { stop_epoch: i.agent_epoch, stop_quiet: true, ended });
+      dropped = this.queue.dropAll(i.brain ? null : i.current_turn);
+      if (!i.brain) i.current_turn = null;
+    });
+    const armed = Promise.all([this.deadlines.clear("intent"), this.deadlines.clear("wake"), this.deadlines.clear("wake_after_exit"), this.deadlines.set("end", now)]);
+    // With no brain there is no release to report its exit: reported here, once.
+    if (!info.brain) {
+      this.report(info, {
+        kind: "exited", text: this.kvGet<string>("last_text") || `ended (${o.reason})`,
+        data: { reason: "stopped", ended: o.reason, by: o.by, ...(ended.note ? { note: ended.note } : {}) }, idem_key: `${info.agent}/ended`,
+      }, this.tainted(info));
+    }
+    await armed;
+    console.log(`agent ${info.agent}: ended (${o.reason}) by ${o.by}${dropped ? `; ${dropped} turns dropped` : ""}`);
+    if (before.intent !== null) await this.brainWaitEnded(info);
+    await this.endBrain();
+    return { status: "stopped", ended };
+  }
+
+  /**
+   * An ended agent's brain: killed (condemned) for a kill; for a graceful end, stopped once its turn
+   * is done (or killed past `END_GRACE_MS`). Its release carries the end on.
+   */
+  private async endBrain(): Promise<void> {
+    const info = this.load();
+    const e = info.ended;
+    const b = info.brain;
+    if (!e || !b || b.phase === "condemned") return;
+    if (e.kill || Date.now() - e.ms >= END_GRACE_MS) {
+      await this.condemn(`ended (${e.reason})`, b.epoch);
+      return;
+    }
+    if (info.current_turn || e.stop_sent === b.epoch) return;
+    await this.fleet(info.cell).issueCommands(b.host, [{ type: "agent_stop", agent: info.agent, reason: `ended (${e.reason})`, mode: "graceful", epoch: b.epoch }]);
+    this.update((i) => {
+      if (i.ended) i.ended.stop_sent = b.epoch;
+    });
+  }
+
+  /** The `end` deadline: each remaining step of an end, recorded once done; re-armed until all are. */
+  private async finishEnd(): Promise<void> {
+    const e = this.load().ended;
+    if (!e || e.done_ms) return;
+    await this.endBrain();
+    const childrenLeft = await this.endChildren(e);
+    const info = this.load();
+    // Its sandbox and its owner wait for the brain to be gone (a graceful end's turn still uses its hands).
+    if (info.brain) {
+      await this.deadlines.set("end", Date.now() + END_RETRY_MS, true);
+      return;
+    }
+    if (info.hands && !info.ended!.sandbox) {
+      const r = await this.sandboxStub(info.hands.sandbox).release(info.agent, info.ended!.destroy_sandbox);
+      this.update((i) => {
+        if (i.ended) i.ended.sandbox = r.destroyed ? "destroyed" : "detached";
+      });
+    }
+    if (info.owner && !info.ended!.owner_told) {
+      try {
+        await this.agentStub(info.owner).childEnded(info.agent);
+      } catch (err) {
+        // An owner that is gone (its records pruned) has nobody to tell.
+        if (asNestError(err)?.code !== ErrorCodes.UNKNOWN_AGENT) throw err;
+      }
+      this.update((i) => {
+        if (i.ended) i.ended.owner_told = true;
+      });
+    }
+    if (childrenLeft) {
+      await this.deadlines.set("end", Date.now() + END_RETRY_MS, true);
+      return;
+    }
+    const done = this.update((i) => {
+      if (i.ended) i.ended.done_ms = Date.now();
+    });
+    await this.deadlines.set("reap", done.ended!.ms + AGENT_RECORD_RETENTION_MS);
+  }
+
+  /** End every agent it owns that hasn't ended (each ends its own in turn). How many are left to try again. */
+  private async endChildren(e: Ended): Promise<number> {
+    const me = this.load().agent;
+    const rows = this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0").toArray();
+    const results = await Promise.allSettled(rows.map(async ({ agent }) => {
+      try {
+        await this.agentStub(agent).end({ by: me, reason: "owner_ended", kill: true, destroy_sandbox: e.destroy_sandbox });
+      } catch (err) {
+        // Indexed but never created (its spawn failed), or pruned: nothing to end.
+        if (asNestError(err)?.code !== ErrorCodes.UNKNOWN_AGENT) throw err;
+      }
+      this.sql.exec("UPDATE children SET ended = 1 WHERE agent = ?", agent);
+    }));
+    const failed = results.filter((r) => r.status === "rejected");
+    for (const r of failed) console.warn(`agent ${me}: ending an agent it owns failed; retrying`, (r as PromiseRejectedResult).reason);
+    return failed.length;
+  }
+
+  /** An agent it owns finished ending (its end's last steps): it no longer counts against `MAX_LIVE_CHILDREN`. */
+  async childEnded(child: string): Promise<void> {
+    if (!this.exists()) return;
+    this.sql.exec("UPDATE children SET ended = 1 WHERE agent = ?", child);
+  }
+
+  /** The agents it spawned, with whether each has ended (display, tests). */
+  async children(): Promise<{ agent: string; ended: boolean }[]> {
+    return this.sql.exec<{ agent: string; ended: number }>("SELECT agent, ended FROM children ORDER BY created_ms").toArray()
+      .map((r) => ({ agent: r.agent, ended: r.ended === 1 }));
+  }
+
+  /**
+   * The `reap` deadline, `AGENT_RECORD_RETENTION_MS` after the end: its R2 session segments, then its
+   * storage. A brain never proven gone holds it (its release still needs the record).
+   */
+  private async reap(): Promise<void> {
+    const info = this.load();
+    const e = info.ended;
+    if (!e?.done_ms) return;
+    if (info.brain || Date.now() < e.ms + AGENT_RECORD_RETENTION_MS) {
+      await this.deadlines.set("reap", Math.max(Date.now() + END_RETRY_MS, e.ms + AGENT_RECORD_RETENTION_MS));
+      return;
+    }
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.BUCKET.list({ prefix: `sessions/${info.agent}/`, limit: 1000, ...(cursor ? { cursor } : {}) });
+      if (page.objects.length) await this.env.BUCKET.delete(page.objects.map((o) => o.key));
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    console.log(`agent ${info.agent}: records pruned ${Math.round((Date.now() - e.ms) / 86_400_000)} days after it ended`);
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    // Empty again but readable: `load()` answers `unknown_agent`, and the alarm run that called this ends cleanly.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
+  }
+
+  /** `agent`'s owner, that owner's owner, and so on (`MAX_OWNER_HOPS` at most), stopping at this agent. */
+  private async ownerChain(agent: string): Promise<(string | null)[]> {
+    const me = this.load().agent;
+    const chain: (string | null)[] = [];
+    let cur = agent;
+    for (let hop = 0; hop < MAX_OWNER_HOPS; hop++) {
+      let owner: string | null;
+      try {
+        owner = (await this.agentStub(cur).info()).owner;
+      } catch (e) {
+        // The target itself must exist; a pruned ancestor ends the chain.
+        if (hop === 0 || asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
+        break;
+      }
+      chain.push(owner);
+      if (!owner || owner === me) break;
+      cur = owner;
+    }
+    return chain;
+  }
+
+  /** `exit`, or `agent_stop` on itself: ended once this turn finishes. Never gated: it only gives up authority. */
+  private async exitTool(info: AgentInfo, destroySandbox: boolean, note: string | undefined, live: () => Promise<void>): Promise<ToolOutcome> {
+    await live();
+    const r = await this.endAgent({ by: info.agent, reason: "exited", kill: false, destroy_sandbox: destroySandbox, ...(note ? { note } : {}) });
+    const t = r.status === "already_stopped"
+      ? "You have already ended."
+      : "Ended: finish this turn and stop. No more turns, wakes or messages will come; the agents you own are stopped.";
+    return { status: "ok", content: [{ type: "text", text: t }] };
+  }
+
+  /**
+   * `agent_spawn` (docs/agents/#spawning): from a template its capabilities spawn from (`spec.spawn`),
+   * with overrides that only narrow, a sandbox created for it (it owns it), the spawner's own (the
+   * template allowing it), or none. The caller owns the child. Every id is derived from the call key,
+   * so a re-run creates nothing twice.
+   */
+  private async spawnTool(info: AgentInfo, a: Record<string, unknown>, key: string, live: () => Promise<void>): Promise<ToolOutcome> {
+    this.refuseEnded(info, "spawns");
+    const template = String(a.template);
+    if (!(info.spawn ?? []).includes(template)) throw new NestError(ErrorCodes.FORBIDDEN, `your capabilities don't spawn from template ${template}`, 403);
+    const mode = a.sandbox === "new" || a.sandbox === "share" ? a.sandbox : null;
+    if (mode === "share" && !info.hands) throw new NestError(ErrorCodes.INVALID_MESSAGE, "you have no sandbox to share");
+    const child = await keyedId("agt_", key);
+    const known = this.sql.exec("SELECT 1 FROM children WHERE agent = ?", child).toArray().length > 0;
+    if (!known) {
+      const live_ = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM children WHERE ended = 0").one().n;
+      const refusal = spawnRefusal(info.depth ?? 0, live_);
+      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `can't spawn: ${refusal}`, 403);
+    }
+    const overrides: SpawnerOverrides = {
+      ...(Array.isArray(a.tools) ? { tools: a.tools.map(String) } : {}),
+      ...(Array.isArray(a.repos) ? { repos: a.repos.map(String) } : {}),
+      ...(a.ephemeral === true ? { ephemeral: true as const } : {}),
+      ...(typeof a.sandbox_idle_ttl_s === "number" ? { sandbox_idle_ttl_ms: a.sandbox_idle_ttl_s * 1000 } : {}),
+    };
+    const catalog = this.env.CATALOG.get(this.env.CATALOG.idFromName("catalog"));
+    const spec = await catalog.expand({
+      template, hands: mode !== null, by: "spawner", share: mode === "share", overrides, cell_idle_ttl_ms: cellIdleTtlMs(this.env, info.cell),
+    });
+    // Indexed before anything is made: the index may name a child that never was (its end finds none), never miss one.
+    this.sql.exec("INSERT OR IGNORE INTO children (agent, created_ms) VALUES (?, ?)", child, Date.now());
+    const tainted = this.tainted(info);
+    let sandbox: string | null = null;
+    if (mode === "new") {
+      sandbox = await keyedId("sbx_", key);
+      await live();
+      await this.sandboxStub(sandbox).create({
+        sandbox, workstream: info.workstream, cell: info.cell, owner: child,
+        ...(spec.sandbox_idle_ttl_ms !== undefined ? { idle_ttl_ms: spec.sandbox_idle_ttl_ms } : {}),
+      });
+    } else if (mode === "share") {
+      sandbox = info.hands!.sandbox;
+    }
+    await live();
+    const stub = this.agentStub(child);
+    await stub.create({
+      agent: child, workstream: info.workstream, cell: info.cell, spec, owner: info.agent, sandbox, owner_is_caller: true,
+      depth: (info.depth ?? 0) + 1, tainted,
+    });
+    await live();
+    await stub.postInbox(`${info.template}:${info.agent}`, String(a.task), false, `spawn/${key}`, tainted);
+    const value = { agent: child, template, ...(sandbox ? { sandbox } : {}), ...(spec.ephemeral ? { ephemeral: true } : {}) };
+    return {
+      status: "ok",
+      content: [
+        { type: "text", text: `Spawned ${child} from ${template}${sandbox ? ` with sandbox ${sandbox}` : ""}${spec.ephemeral ? " (ephemeral)" : ""}. Its events reach you.` },
+        { type: "json", value },
+      ],
+    };
   }
 
   /** Best effort: a row left behind lapses when this agent no longer retries (12 min). */
@@ -977,7 +1283,8 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Input from outside the agent arrived (never the platform's `system` notes): a stop before it no longer quiets wakes. */
   private inputArrived(): void {
-    if (this.load().stop_quiet) {
+    const info = this.load();
+    if (info.stop_quiet && !info.ended) {
       this.update((i) => {
         delete i.stop_quiet;
       });
@@ -987,6 +1294,7 @@ export class AgentDO extends DurableObject<Env> {
   /** Start a brain for waiting work through the intent (`wakeDecision`). Never throws: the work stays queued. */
   private async wake(afterExit = false): Promise<void> {
     const info = this.load();
+    if (info.ended) return;
     const decided = wakeDecision(info, this.hasWork(info), afterExit);
     if (decided === "none") return;
     if (decided === "errored") {
@@ -1156,7 +1464,7 @@ export class AgentDO extends DurableObject<Env> {
       const info = this.load();
       const start = Date.now();
       const remote = await this.mcpToolDefs(info);
-      this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(info.tools), ...brokeredToolDefs(info.brokered ?? []), ...remote] });
+      this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(offered(info)), ...brokeredToolDefs(info.brokered ?? []), ...remote] });
       const att = ws.deserializeAttachment() as Attachment;
       if (this.current(att)) {
         this.kvPut("tools_listed", { epoch: att.epoch, ms: start } satisfies ToolsListed);
@@ -1562,7 +1870,17 @@ export class AgentDO extends DurableObject<Env> {
       await this.postAsk(info, ev.call, ev.epoch, question, "async", "escalation");
     }
     await this.syncActivity();
-    if (completed) await this.pump();
+    if (completed) {
+      // An ephemeral agent whose turn ended with nothing waiting is done (docs/agents/#lifetimes).
+      const now = this.load();
+      if (ephemeralDone({ ephemeral: !!now.ephemeral, ended: !!now.ended, queued: this.queue.hasQueued(), openAsks: this.calls.openAsks() })) {
+        await this.endAgent({ by: now.agent, reason: "done", kill: false, destroy_sandbox: true });
+      } else if (now.ended) {
+        // A graceful end waited for this turn.
+        await this.endBrain();
+      }
+      await this.pump();
+    }
     this.sql.exec("INSERT OR IGNORE INTO events (seq, body) VALUES (?, ?)", ev.seq, JSON.stringify(ev));
     this.sql.exec("DELETE FROM events WHERE seq < ?", ev.seq - 500);
   }
@@ -1573,9 +1891,10 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Queue a turn, once per `requestId`. */
   async enqueueTurn(input: TurnInput, requestId?: string, tainted = false, external = true): Promise<string> {
-    this.load(); // an agent never created (a subscriber id naming nobody) is refused
+    const info = this.load(); // an agent never created (a subscriber id naming nobody) is refused
     const prior = requestId ? this.queue.turnFor(requestId) : undefined;
     if (prior) return prior;
+    this.refuseEnded(info, "turns");
     const turn = this.queue.enqueue(input, requestId);
     if (tainted) this.kvPut("read_tainted", true);
     if (external) this.inputArrived();
@@ -1633,6 +1952,11 @@ export class AgentDO extends DurableObject<Env> {
     const prior = requestId ? this.queue.messageFor(requestId) : undefined;
     if (prior) return prior;
     const info = this.load();
+    if (info.ended) {
+      // The platform's own notes about its work (a task's exit, a move) have nobody to tell any more.
+      if (from === SYSTEM_SENDER) return "";
+      this.refuseEnded(info, "messages");
+    }
     const message: InboxMessage = { id: newId("msg_"), from, text, interrupt, ts_ms: Date.now() };
     // Another agent's text reaches the model inline: when it may be tainted, so is the session.
     if (tainted) this.kvPut("read_tainted", true);
@@ -1792,7 +2116,8 @@ export class AgentDO extends DurableObject<Env> {
   private reportExit(info: AgentInfo, host: string, epoch: number, reason: AgentExitReason, ends: boolean): void {
     const idem_key = `${info.agent}/exit/${host}/${epoch}`;
     if (ends && !info.intent) {
-      this.report(info, { kind: "exited", text: this.kvGet<string>("last_text") || `stopped (${reason})`, data: { reason, epoch, host }, idem_key },
+      const ended = info.ended ? { ended: info.ended.reason, by: info.ended.by } : {};
+      this.report(info, { kind: "exited", text: this.kvGet<string>("last_text") || `stopped (${reason})`, data: { reason, epoch, host, ...ended }, idem_key },
         this.tainted(info));
     } else {
       this.report(info, { kind: "brain_released", text: `brain released (${reason})`, data: { reason, epoch, host }, idem_key });
@@ -1823,6 +2148,8 @@ export class AgentDO extends DurableObject<Env> {
   async deliverChannel(d: ChannelDelivery): Promise<DeliveryOutcome> {
     const now = Date.now();
     const info = this.load();
+    // Ended for good: no longer a subscriber, so ChannelDO drops the subscription (as for an id naming nobody).
+    if (info.ended) throw new NestError(ErrorCodes.UNKNOWN_AGENT, `${info.agent} has ended; its subscriptions end with it`, 404);
     const reads = info.tools.includes("read");
     const { up_to: upTo, shown, skipped } = takeBatch(d, reads);
     const ack: DeliveryOutcome = upTo < d.batch.to_seq ? { status: "ok", up_to: upTo } : { status: "ok" };
@@ -2049,9 +2376,11 @@ export class AgentDO extends DurableObject<Env> {
       if (action && (info.brokered ?? []).some((g) => g.action === action)) return await this.brokeredTool(info, epoch, call, action, args, guest, fence);
       return await this.mcpTool(info, epoch, call, name, args, guest, fence);
     }
-    if (!info.tools.includes(name)) {
+    if (!offered(info).includes(name)) {
       throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not granted to this agent`, 403);
     }
+    // Spawning and ending need a brain: nothing inside a sandbox may ask for them.
+    if (guest && LIFECYCLE_TOOLS.includes(name)) throw new NestError(ErrorCodes.FORBIDDEN, `${name} isn't callable from a sandbox`, 403);
     const a = validateArgs(def.input_schema, args);
     const text = (t: string): ToolOutcome => ({ status: "ok", content: [{ type: "text", text: t }] });
     // A guest call is keyed by the sandbox lease it was relayed under.
@@ -2154,6 +2483,21 @@ export class AgentDO extends DurableObject<Env> {
       case "unsubscribe":
       case "message":
         return await this.channelTool(info, name, a, key, live);
+      case "agent_spawn":
+        return await this.spawnTool(info, a, key, live);
+      case "agent_stop": {
+        const target = String(a.agent);
+        if (!/^agt_[a-z0-9]+$/.test(target)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${target} is not an agent id`);
+        const reason = typeof a.reason === "string" ? a.reason : undefined;
+        if (target === info.agent) return await this.exitTool(info, a.destroy_sandbox === true, reason, live);
+        // Ownership is transitive (the grant on an agent covers what it owns): the target's owner chain must reach the caller.
+        if (!ownsVia(info.agent, await this.ownerChain(target))) throw new NestError(ErrorCodes.FORBIDDEN, `${target} isn't an agent you own`, 403);
+        await live();
+        const r = await this.agentStub(target).end({ by: info.agent, reason: "stopped", kill: true, destroy_sandbox: a.destroy_sandbox === true, ...(reason ? { note: reason } : {}) });
+        return text(r.status === "already_stopped" ? `${target} had already ended (${r.ended.reason}).` : `${target} stopped${a.destroy_sandbox === true ? "; its sandbox is destroyed once its brain is gone, unless another agent is attached" : ""}.`);
+      }
+      case "exit":
+        return await this.exitTool(info, a.destroy_sandbox === true, typeof a.reason === "string" ? a.reason : undefined, live);
       case "brokered":
         return await this.brokeredTool(info, epoch, call, String(a.action), a.args, guest, fence);
       case "egress_policy":
@@ -2763,6 +3107,8 @@ export class AgentDO extends DurableObject<Env> {
         this.prune();
         await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
       },
+      end: () => this.finishEnd(),
+      reap: () => this.reap(),
     };
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key.startsWith(ASK_DEADLINE)) return this.askWindowLapsed(key.slice(ASK_DEADLINE.length));

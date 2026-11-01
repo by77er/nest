@@ -16,6 +16,18 @@ export function newId(prefix: string, nowMs = Date.now()): string {
   return `${prefix}${time}${r}`;
 }
 
+/**
+ * A prefixed id derived from `key` (26 Crockford base32 chars of its SHA-256, the length of
+ * {@link newId}'s): the same key always names the same object, so a re-run of a call that created one
+ * creates the same one again (an idempotent create finds it).
+ */
+export async function keyedId(prefix: string, key: string): Promise<string> {
+  const digest = await sha256(`nest-id/${prefix}/${key}`);
+  let r = "";
+  for (let i = 0; i < 26; i++) r += CROCKFORD[digest[i]! % 32];
+  return `${prefix}${r}`;
+}
+
 export function errorBody(code: string, message: string, retryable = false): ErrorBody {
   return { code, message, retryable };
 }
