@@ -25,7 +25,7 @@ import {
 } from "../protocol/model";
 import { canonicalRepos, Repos, unionRepos } from "../lib/repos";
 import { GITHUB_BINDING, githubEgress } from "../lib/rules/github";
-import { cellIdleTtlMs, dormant, expiryStep } from "../lib/lifetimes";
+import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 
 export const DEFAULT_IMAGE = "nest-base:latest";
 export const DEFAULT_RESOURCES: Resources = { vcpus: 2, memory_mib: 4096, disk_gib: 32 };
@@ -77,6 +77,8 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
   dormant_since_ms?: number;
   /** When the notice that it will be destroyed went to `user`, for this dormancy. */
   expiry_notice_ms?: number;
+  /** When the lifetime check last ran (a gap over `EXPIRY_GAP_MS` restarts the clock). */
+  expiry_checked_ms?: number;
 }
 
 export interface CreateSandbox {
@@ -894,10 +896,19 @@ export class SandboxDO extends DurableObject<Env> {
    * TTL over a day gets a notice on `user` a day first. Re-armed on every check while it lives.
    */
   private async checkExpiry(): Promise<void> {
-    const s = this.tryInfo();
-    if (!s || s.state === "destroyed") return;
-    const ttl = s.idle_ttl_ms ?? cellIdleTtlMs(this.env, s.cell);
     const now = Date.now();
+    const before = this.tryInfo();
+    if (!before || before.state === "destroyed") return;
+    // Recorded with the check; after missed checks the dormancy clock (and any notice) starts again.
+    const gap = before.expiry_checked_ms !== undefined && now - before.expiry_checked_ms > EXPIRY_GAP_MS;
+    const s = this.update((i) => {
+      i.expiry_checked_ms = now;
+      if (gap && i.dormant_since_ms !== undefined) {
+        i.dormant_since_ms = now;
+        delete i.expiry_notice_ms;
+      }
+    });
+    const ttl = s.idle_ttl_ms ?? cellIdleTtlMs(this.env, s.cell);
     const step = expiryStep({
       dormant: dormant(s), ttl, now, ...(s.dormant_since_ms !== undefined ? { since: s.dormant_since_ms } : {}),
       ...(s.expiry_notice_ms !== undefined ? { noticed: s.expiry_notice_ms } : {}),
@@ -907,8 +918,6 @@ export class SandboxDO extends DurableObject<Env> {
       await this.destroy(`dormant past its idle TTL of ${days(ttl)}`);
       return;
     }
-    // A sandbox dormant since before it was recorded (stored by the previous release): its clock starts now, durably.
-    if (step.kind !== "awake" && s.dormant_since_ms === undefined) this.update(() => {});
     if (step.kind === "notice") {
       this.update((i) => {
         i.expiry_notice_ms = now;

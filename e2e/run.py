@@ -1245,7 +1245,8 @@ def run_lifecycle(ids):
     st, parent = api("POST", "/v1/agents", {"template": "e2e-parent", "workstream": ids["workstream"], "cell": "local"})
     check("lifetimes: parent agent created", st == 201, json.dumps(parent)[:200])
     pid = parent.get("agent")
-    spawned = lambda t: (re.search(r"Spawned (agt_[a-z0-9]+)", t) or [None, None])[1], (re.search(r"sandbox (sbx_[a-z0-9]+)", t) or [None, None])[1]
+    def spawned(t):
+        return (re.search(r"Spawned (agt_[a-z0-9]+)", t) or [None, None])[1], (re.search(r"sandbox (sbx_[a-z0-9]+)", t) or [None, None])[1]
     before = live_sandboxes()
 
     # 1. A child with a new sandbox runs a hands call, then exits itself, destroying its sandbox.

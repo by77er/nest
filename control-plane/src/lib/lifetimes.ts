@@ -55,6 +55,11 @@ export const DEFAULT_SANDBOX_IDLE_TTL_MS = 30 * 86_400_000;
 export const EXPIRY_NOTICE_MS = 86_400_000;
 /** How often a live sandbox re-checks whether it is dormant, at most. */
 export const EXPIRY_CHECK_MAX_MS = 3_600_000;
+/**
+ * Checks this far apart were missed (a rolled-back release ran meanwhile, which keeps but never
+ * updates the dormancy clock): the clock starts again, so a missed wake can't shorten a TTL.
+ */
+export const EXPIRY_GAP_MS = 6 * EXPIRY_CHECK_MAX_MS;
 
 /** The idle TTL a sandbox without its own gets in `cell`. */
 export function cellIdleTtlMs(env: Pick<Env, "AWS_CELLS" | "SANDBOX_IDLE_TTL_MS">, cell: string): number {
@@ -85,12 +90,13 @@ export function spawnRefusal(depth: number, liveChildren: number): string | null
 }
 
 /**
- * An ephemeral agent is done when a turn completes with nothing waiting for it: no queued turn (an
- * unconfirmed inbox message is one by then) and no open ask or approval (whose answer would be its
- * next turn). Background hands tasks aren't waited for.
+ * An ephemeral agent is done when a turn completes with nothing waiting for it: no turn current or
+ * queued (an unconfirmed inbox message is one by then), no open ask or approval (whose answer would be
+ * its next turn), and no agent it spawned that hasn't ended (whose result would be). Background hands
+ * tasks aren't waited for.
  */
-export const ephemeralDone = (f: { ephemeral: boolean; ended: boolean; queued: boolean; openAsks: number }): boolean =>
-  f.ephemeral && !f.ended && !f.queued && f.openAsks === 0;
+export const ephemeralDone = (f: { ephemeral: boolean; ended: boolean; current: boolean; queued: boolean; openAsks: number; liveChildren: number }): boolean =>
+  f.ephemeral && !f.ended && !f.current && !f.queued && f.openAsks === 0 && f.liveChildren === 0;
 
 /** Narrowing only: the shortest of the given TTLs, else the fallback. */
 export function narrowTtl(fallback: number, ...given: (number | undefined)[]): number {

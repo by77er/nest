@@ -73,7 +73,7 @@ async function world() {
     capabilities: ["nest", cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
     hands, credential: "claude_oauth_token", escalate_to: "user", ...extra,
   });
-  await adminJson(`/v1/admin/templates/${kid}`, { method: "PUT", body: tpl("optional") });
+  await adminJson(`/v1/admin/templates/${kid}`, { method: "PUT", body: tpl("optional", { share_sandbox: true }) });
   await adminJson(`/v1/admin/templates/par-${id}`, { method: "PUT", body: tpl("forbidden") });
   return { id, cell, sbxHost, brain, workstream: workstream as string, kid, par: `par-${id}` };
 }
@@ -125,10 +125,12 @@ describe("lifetime rules (pure)", () => {
     expect(spawnRefusal(0, MAX_LIVE_CHILDREN)).toContain("haven't ended");
   });
 
-  it("an ephemeral agent is done only with nothing queued and no open ask", () => {
-    const f = { ephemeral: true, ended: false, queued: false, openAsks: 0 };
+  it("an ephemeral agent is done only with no turn current or queued, no open ask, and no child that hasn't ended", () => {
+    const f = { ephemeral: true, ended: false, current: false, queued: false, openAsks: 0, liveChildren: 0 };
     expect(ephemeralDone(f)).toBe(true);
-    for (const k of [{ ephemeral: false }, { ended: true }, { queued: true }, { openAsks: 1 }]) expect(ephemeralDone({ ...f, ...k }), JSON.stringify(k)).toBe(false);
+    for (const k of [{ ephemeral: false }, { ended: true }, { current: true }, { queued: true }, { openAsks: 1 }, { liveChildren: 1 }]) {
+      expect(ephemeralDone({ ...f, ...k }), JSON.stringify(k)).toBe(false);
+    }
   });
 
   it("dormant: no agent attached, no placement in flight, no VM up; never once destroyed", () => {
@@ -248,6 +250,42 @@ describe("agent_spawn", () => {
     const outcome = await runInDurableObject(agentStub(p.agent), (inst: AgentDO) =>
       (inst as any).dispatch(p.epoch, "cal_guest", "exit", {}, 1).catch((e: any) => e.code));
     expect(outcome).toBe("forbidden");
+  });
+
+  it("a spawn whose caller stopped being current before its first write makes nothing and indexes nothing", async () => {
+    const w = await world();
+    const p = await operatorAgent(w, w.par);
+    await runInDurableObject(agentStub(p.agent), (inst: AgentDO) => {
+      inst.testHooks["dispatch:beforeWrite"] = async () => {
+        delete inst.testHooks["dispatch:beforeWrite"];
+        (inst as any).update((i: any) => {
+          i.agent_epoch += 1;
+          i.brain.epoch = i.agent_epoch;
+        });
+      };
+    });
+    const id = p.call("agent_spawn", { template: w.kid, task: "x", sandbox: "new" });
+    const outcome = await until(() => runInDurableObject(agentStub(p.agent), (inst: AgentDO) => (inst as any).calls.call(id)?.outcome), "the call's outcome");
+    expect(outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
+    expect(await agentStub(p.agent).children()).toEqual([]);
+  });
+
+  it("a spawner that ends while its child is being made ends the child too, before it gets its task", async () => {
+    const w = await world();
+    const p = await operatorAgent(w, w.par);
+    await runInDurableObject(agentStub(p.agent), (inst: AgentDO) => {
+      inst.testHooks["dispatch:beforeWrite"] = async () => {
+        delete inst.testHooks["dispatch:beforeWrite"];
+        // Its end lands between the fence and the child's creation (its brain left to finish, so the fence passes).
+        (inst as any).update((i: any) => { i.ended = { ms: Date.now(), by: "user", reason: "stopped", kill: false, destroy_sandbox: false }; });
+      };
+    });
+    const out = await p.run("agent_spawn", { template: w.kid, task: "never seen" });
+    expect(out).toMatchObject({ status: "error", error: { code: "forbidden" } });
+    const [row] = await agentStub(p.agent).children();
+    expect(row).toBeDefined();
+    await until(async () => (await ended(row!.agent))?.reason === "owner_ended", "the child ended");
+    expect(await agentStub(row!.agent).turns()).toEqual([]);
   });
 });
 
@@ -387,6 +425,58 @@ describe("agent_stop", () => {
   });
 });
 
+describe("ends that wait for what they own", () => {
+  it("an end with destroy_sandbox waits for the agents it owns that share its sandbox to finish ending, then destroys it", async () => {
+    const w = await world();
+    const p = await operatorAgent(w, w.par);
+    const c = await spawn(p, { template: w.kid, sandbox: "new" });
+    const cs = await session(w, c.agent);
+    const g = await spawn(cs, { template: w.kid, sandbox: "share" });
+    const gs = await session(w, g.agent);
+    expect((await sandboxStub(c.sandbox!).info()).attached.sort()).toEqual([c.agent, g.agent].sort());
+    await p.run("agent_stop", { agent: c.agent, destroy_sandbox: true });
+    await until(async () => !!(await ended(g.agent)), "the cascade");
+    await exited(w, cs);
+    // C's brain is gone, but G (in its sandbox) hasn't finished ending: nothing is decided about the sandbox yet.
+    await sleep(300);
+    expect((await ended(c.agent))?.sandbox).toBeUndefined();
+    expect((await sandboxStub(c.sandbox!).info()).state).not.toBe("destroyed");
+    await exited(w, gs);
+    await until(async () => (await sandboxStub(c.sandbox!).info()).state === "destroyed", "the shared sandbox destroyed");
+    expect(await ended(c.agent)).toMatchObject({ sandbox: "destroyed" });
+    expect(await ended(g.agent)).toMatchObject({ sandbox: "detached" });
+  });
+
+  it("an ephemeral agent that spawned doesn't end while its child lives", async () => {
+    const w = await world();
+    const p = await operatorAgent(w, w.par);
+    const c = await spawn(p, { template: w.kid, ephemeral: true });
+    const cs = await session(w, c.agent);
+    const first = (await cs.ws.next("run_turn")).turn as string;
+    const g = await spawn(cs, { template: w.kid });
+    await cs.events([{ type: "turn_completed", turn: first, stop_reason: "end_turn" }]);
+    expect(await ended(c.agent)).toBeUndefined();
+    expect(await ended(g.agent)).toBeUndefined();
+  });
+
+  it("an end whose deadline a rolled-back release dropped is picked up again by the next alarm", async () => {
+    const w = await world();
+    const p = await operatorAgent(w, w.par);
+    await adminJson(`/v1/agents/${p.agent}/stop`, { body: { end: true } });
+    // The brain hasn't exited, so the end isn't done; the previous release dropped its `end` key.
+    await runInDurableObject(agentStub(p.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'end'");
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('prune', 0)");
+    });
+    await runDurableObjectAlarm(agentStub(p.agent));
+    // Armed again, before anything else (here, its brain's exit) would.
+    expect(await runInDurableObject(agentStub(p.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'end'").toArray().length)).toBe(1);
+    await exited(w, p);
+    await until(async () => (await ended(p.agent))?.done_ms, "the end done");
+  });
+});
+
 // --- exit and ephemeral agents ----------------------------------------------------------------------------
 
 describe("exit and ephemeral agents", () => {
@@ -505,6 +595,14 @@ describe("a dormant sandbox's idle TTL", () => {
     await adminJson(`/v1/sandboxes/${s.sandbox}/lifetime`, { method: "PUT", body: { idle_ttl_ms: 365 * DAY } });
     await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - 31 * DAY; });
     expect((await sandboxStub(s.sandbox).info()).state).toBe("suspended");
+  });
+
+  it("after missed checks (a rolled-back release ran meanwhile) the clock starts again: a stale dormancy never destroys", async () => {
+    const s = await suspended(10 * 60_000);
+    await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - 31 * DAY; i.expiry_checked_ms = Date.now() - 7 * 3_600_000; });
+    const info = await sandboxStub(s.sandbox).info();
+    expect(info.state).toBe("suspended");
+    expect(info.dormant_since_ms).toBeGreaterThan(Date.now() - 60_000);
   });
 
   it("a sandbox from before lifetimes gets its check armed by FleetDO's daily backfill", async () => {

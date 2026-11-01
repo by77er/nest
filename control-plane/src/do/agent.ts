@@ -300,6 +300,8 @@ export class AgentDO extends DurableObject<Env> {
     addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
     // The agents it spawned (an index: each child's `owner` decides), and whether each has ended.
     this.sql.exec("CREATE TABLE IF NOT EXISTS children (agent TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0)");
+    // Its end was asked for (`ended` comes with the child's `childEnded`, once its end is done).
+    addColumn(this.sql, "children", "asked", "INTEGER NOT NULL DEFAULT 0");
     this.mcp = new McpProxy({
       sql: this.sql,
       agent: () => this.load().agent,
@@ -1015,10 +1017,12 @@ export class AgentDO extends DurableObject<Env> {
     const e = this.load().ended;
     if (!e || e.done_ms) return;
     await this.endBrain();
-    const childrenLeft = await this.endChildren(e);
+    await this.endChildren(e);
     const info = this.load();
-    // Its sandbox and its owner wait for the brain to be gone (a graceful end's turn still uses its hands).
-    if (info.brain) {
+    // Its sandbox and its owner wait for the brain to be gone (a graceful end's turn still uses its hands),
+    // and for the agents it owns to finish ending (one sharing its sandbox detaches only then).
+    const waiting = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM children WHERE ended = 0").one().n;
+    if (info.brain || waiting) {
       await this.deadlines.set("end", Date.now() + END_RETRY_MS, true);
       return;
     }
@@ -1039,38 +1043,35 @@ export class AgentDO extends DurableObject<Env> {
         if (i.ended) i.ended.owner_told = true;
       });
     }
-    if (childrenLeft) {
-      await this.deadlines.set("end", Date.now() + END_RETRY_MS, true);
-      return;
-    }
     const done = this.update((i) => {
       if (i.ended) i.ended.done_ms = Date.now();
     });
     await this.deadlines.set("reap", done.ended!.ms + AGENT_RECORD_RETENTION_MS);
   }
 
-  /** End every agent it owns that hasn't ended (each ends its own in turn). How many are left to try again. */
-  private async endChildren(e: Ended): Promise<number> {
+  /** Ask every agent it owns that hasn't ended to end (each ends its own in turn, and says so: `childEnded`). */
+  private async endChildren(e: Ended): Promise<void> {
     const me = this.load().agent;
-    const rows = this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0").toArray();
+    const rows = this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0 AND asked = 0").toArray();
     const results = await Promise.allSettled(rows.map(async ({ agent }) => {
       try {
         await this.agentStub(agent).end({ by: me, reason: "owner_ended", kill: true, destroy_sandbox: e.destroy_sandbox });
+        this.sql.exec("UPDATE children SET asked = 1 WHERE agent = ?", agent);
       } catch (err) {
-        // Indexed but never created (its spawn failed), or pruned: nothing to end.
+        // Indexed but never created (its spawn failed; one still being made checks again: `spawnChild`), or pruned.
         if (asNestError(err)?.code !== ErrorCodes.UNKNOWN_AGENT) throw err;
+        this.sql.exec("UPDATE children SET ended = 1 WHERE agent = ?", agent);
       }
-      this.sql.exec("UPDATE children SET ended = 1 WHERE agent = ?", agent);
     }));
-    const failed = results.filter((r) => r.status === "rejected");
-    for (const r of failed) console.warn(`agent ${me}: ending an agent it owns failed; retrying`, (r as PromiseRejectedResult).reason);
-    return failed.length;
+    for (const r of results) if (r.status === "rejected") console.warn(`agent ${me}: ending an agent it owns failed; retrying`, r.reason);
   }
 
-  /** An agent it owns finished ending (its end's last steps): it no longer counts against `MAX_LIVE_CHILDREN`. */
+  /** An agent it owns finished ending (its end's last steps): it no longer counts against `MAX_LIVE_CHILDREN`, and an end waiting for it goes on. */
   async childEnded(child: string): Promise<void> {
     if (!this.exists()) return;
     this.sql.exec("UPDATE children SET ended = 1 WHERE agent = ?", child);
+    const e = this.load().ended;
+    if (e && !e.done_ms) await this.deadlines.set("end", Date.now(), true);
   }
 
   /** The agents it spawned, with whether each has ended (display, tests). */
@@ -1165,28 +1166,60 @@ export class AgentDO extends DurableObject<Env> {
     const spec = await catalog.expand({
       template, hands: mode !== null, by: "spawner", share: mode === "share", overrides, cell_idle_ttl_ms: cellIdleTtlMs(this.env, info.cell),
     });
-    // Indexed before anything is made: the index may name a child that never was (its end finds none), never miss one.
-    this.sql.exec("INSERT OR IGNORE INTO children (agent, created_ms) VALUES (?, ?)", child, Date.now());
     const tainted = this.tainted(info);
-    let sandbox: string | null = null;
-    if (mode === "new") {
-      sandbox = await keyedId("sbx_", key);
-      await live();
+    const sandbox = mode === "new" ? await keyedId("sbx_", key) : mode === "share" ? info.hands!.sandbox : null;
+    await live();
+    // Indexed (in the fence's step) before anything is made: the index may name a child that never was
+    // (its end finds none), never miss one. A refusal for good before the child exists takes the row back.
+    if (!known && this.sql.exec("SELECT 1 FROM children WHERE agent = ?", child).toArray().length === 0) {
+      // Checked again in the insert's step: two spawns in flight can't both take the last place.
+      const refusal = spawnRefusal(info.depth ?? 0, this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM children WHERE ended = 0").one().n);
+      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `can't spawn: ${refusal}`, 403);
+    }
+    this.sql.exec("INSERT OR IGNORE INTO children (agent, created_ms) VALUES (?, ?)", child, Date.now());
+    try {
+      return await this.spawnChild(info, child, sandbox, mode === "new", template, spec, String(a.task), key, tainted, live);
+    } catch (e) {
+      if (!asNestError(e)?.retryable && !(await this.agentExists(child))) this.sql.exec("DELETE FROM children WHERE agent = ? AND ended = 0", child);
+      throw e;
+    }
+  }
+
+  /** Whether `agent` was created (its `info()` answers); a failure to ask counts as yes, so nothing is forgotten. */
+  private async agentExists(agent: string): Promise<boolean> {
+    try {
+      await this.agentStub(agent).info();
+      return true;
+    } catch (e) {
+      return asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT;
+    }
+  }
+
+  /** `agent_spawn`'s writes, each behind the epoch fence: the sandbox (owned by the child), the child, its task. */
+  private async spawnChild(
+    info: AgentInfo, child: string, sandbox: string | null, fresh: boolean, template: string, spec: AgentSpec, task: string, key: string, tainted: boolean,
+    live: () => Promise<void>,
+  ): Promise<ToolOutcome> {
+    if (sandbox && fresh) {
       await this.sandboxStub(sandbox).create({
         sandbox, workstream: info.workstream, cell: info.cell, owner: child,
         ...(spec.sandbox_idle_ttl_ms !== undefined ? { idle_ttl_ms: spec.sandbox_idle_ttl_ms } : {}),
       });
-    } else if (mode === "share") {
-      sandbox = info.hands!.sandbox;
+      await live();
     }
-    await live();
     const stub = this.agentStub(child);
     await stub.create({
       agent: child, workstream: info.workstream, cell: info.cell, spec, owner: info.agent, sandbox, owner_is_caller: true,
       depth: (info.depth ?? 0) + 1, tainted,
     });
+    // Ended meanwhile (its owner's end may have looked for this child before it existed): the child ends too.
+    if (this.load().ended) {
+      this.sql.exec("UPDATE children SET ended = 0, asked = 0 WHERE agent = ?", child);
+      await this.deadlines.set("end", Date.now(), true);
+      throw new NestError(ErrorCodes.FORBIDDEN, `${info.agent} ended while spawning ${child}; it ends too`, 409);
+    }
     await live();
-    await stub.postInbox(`${info.template}:${info.agent}`, String(a.task), false, `spawn/${key}`, tainted);
+    await stub.postInbox(`${info.template}:${info.agent}`, task, false, `spawn/${key}`, tainted);
     const value = { agent: child, template, ...(sandbox ? { sandbox } : {}), ...(spec.ephemeral ? { ephemeral: true } : {}) };
     return {
       status: "ok",
@@ -1880,7 +1913,10 @@ export class AgentDO extends DurableObject<Env> {
     if (completed) {
       // An ephemeral agent whose turn ended with nothing waiting is done (docs/agents/#lifetimes).
       const now = this.load();
-      if (ephemeralDone({ ephemeral: !!now.ephemeral, ended: !!now.ended, queued: this.queue.hasQueued(), openAsks: this.calls.openAsks() })) {
+      const liveChildren = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM children WHERE ended = 0").one().n;
+      if (ephemeralDone({
+        ephemeral: !!now.ephemeral, ended: !!now.ended, current: now.current_turn !== null, queued: this.queue.hasQueued(), openAsks: this.calls.openAsks(), liveChildren,
+      })) {
         await this.endAgent({ by: now.agent, reason: "done", kill: false, destroy_sandbox: true });
       } else if (now.ended) {
         // A graceful end waited for this turn.
@@ -3117,6 +3153,13 @@ export class AgentDO extends DurableObject<Env> {
       end: () => this.finishEnd(),
       reap: () => this.reap(),
     };
+    // An end's deadlines a rolled-back release dropped (it has no handler for them) come back here: the
+    // hourly `prune` keeps the alarm running.
+    if (this.exists()) {
+      const e = this.load().ended;
+      if (e && !e.done_ms && !this.deadlines.has("end")) await this.deadlines.set("end", Date.now());
+      if (e?.done_ms && !this.deadlines.has("reap")) await this.deadlines.set("reap", e.ms + AGENT_RECORD_RETENTION_MS);
+    }
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key.startsWith(ASK_DEADLINE)) return this.askWindowLapsed(key.slice(ASK_DEADLINE.length));
       const run = handlers[key as AgentDeadline] as (() => Promise<void>) | undefined;
