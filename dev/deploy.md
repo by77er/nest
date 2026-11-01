@@ -101,6 +101,12 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
   3. Check `GET /v1/admin/capabilities/<name>/oauth` says `authorized`, then add the capability to a template.
 - **Cloud check (not run):** the MCP test Worker in its OAuth mode (`MCP_TEST_OAUTH=1`, mcp-test/README.md) would exercise the flow against production as `e2e` does locally. The deployed test Worker runs in bearer mode, which `mcp_check.py` uses.
 
+**This release's rollout rule (the MCP connector): a one-way deploy.** It adds a Durable Object class, `McpConnectorDO` (migration tag `mcp-connectors`, after `tasks`), so `wrangler rollback` can't cross it; recovering is a forward revert that keeps the class, its binding and its migration. It ships alone. Hosts may follow later in either order: the session channel gains `tools_changed`, sent only to a runner whose hello says `tools_changed: true` ([session](../docs/interfaces/control-host/session/)).
+- **Stored data the previous code reads:** AgentDO's `mcp_servers` keeps its columns; `tools` and `listed_ms` now hold the connector's list and when the connector fetched it, which the previous code would reuse for 5 minutes as its own cache. New `kv` keys (`mcp_changed_ms`, `tools_listed`) it never reads. Capabilities may carry `max_concurrent` and `per_minute`, which the previous schema strips.
+- **What changes for existing agents:** listing goes through the connector (one `tools/list` per server and credential), and every call takes a slot first: at most 8 at once and 120 a minute per server across agents unless the capability says otherwise. A busy server's calls beyond that are `rate_limited` after 10 s, with nothing sent.
+- **Runners of the previous release:** never sent `tools_changed`; their brains see a changed list at their next start, as before.
+- **Cloud check (the lead's):** with `mcp-test/` deployed (its new `POST /tools?name=extra_<x>` route), spawn two agents on one capability without an allowlist: `GET /calls` and the server's log show one `tools/list` for both; add a tool, have one agent call `echo` (the answer's stream carries `list_changed`), and see both brains' next `tools/list` include it without a restart (with real Claude Code this also answers the open question in [mcp capabilities](../docs/agents/capabilities/mcp/#open-questions)).
+
 ## Host role names (expand/contract)
 
 The host kinds' rename (`burst` → `sandbox`, `controller` → `brain`) spans two releases, so `wrangler rollback` (and the automatic rollback above) to the previous Worker keeps working.

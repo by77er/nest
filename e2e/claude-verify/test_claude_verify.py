@@ -47,7 +47,10 @@ class McpLoggerTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.log = os.path.join(self.dir, "mcp.jsonl")
-        self.p = subprocess.Popen([PY, os.path.join(HERE, "mcp_logger.py"), "--log", self.log, "--state-dir", self.dir],
+        self.spawn()
+
+    def spawn(self, *extra):
+        self.p = subprocess.Popen([PY, os.path.join(HERE, "mcp_logger.py"), "--log", self.log, "--state-dir", self.dir, *extra],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                                   env={"PATH": "/usr/bin:/bin", "NEST_AGENT_ID": "agt_t", "NEST_MCP_SOCK": "/x.sock"})
         self.out = Lines(self.p.stdout)
@@ -108,6 +111,40 @@ class McpLoggerTest(unittest.TestCase):
         cancel = next(e for e in events if e["event"] == "cancelled")
         self.assertEqual((cancel["request_id"], cancel["reason"], cancel["was_running"]), (7, "interrupted", True))
         self.assertIn("sleep_cancelled", [e["event"] for e in events])
+
+    def test_list_never_changes_by_default(self):
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.assertFalse(self.out.get()["result"]["capabilities"]["tools"]["listChanged"])
+        self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "a"}}})
+        self.out.get()
+        self.assertTrue(self.out.empty_for(0.3))  # no list_changed
+        self.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "late_echo", "arguments": {"text": "b"}}})
+        self.assertTrue(self.out.get()["result"]["isError"])
+
+    def test_grow_after_call_adds_the_tool_and_announces_it_once(self):
+        self.p.kill()  # restart with the option
+        self.p.wait()
+        self.p.stdin.close()
+        self.p.stdout.close()
+        self.spawn("--grow-after-call", "late_echo")
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.assertTrue(self.out.get()["result"]["capabilities"]["tools"]["listChanged"])
+        self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        self.assertEqual([t["name"] for t in self.out.get()["result"]["tools"]], ["echo", "sleep"])
+        # Before the list grows the new tool is unknown.
+        self.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "late_echo", "arguments": {"text": "early"}}})
+        r = self.out.get()
+        self.assertEqual((r["id"], r["result"]["isError"]), (3, True))
+        # That first call grew the list: the answer first, then the notification.
+        self.assertEqual(self.out.get(), {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        self.send({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
+        self.assertEqual([t["name"] for t in self.out.get()["result"]["tools"]], ["echo", "sleep", "late_echo"])
+        self.send({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "late_echo", "arguments": {"text": "hi"}}})
+        r = self.out.get()
+        self.assertEqual((r["result"]["content"][0]["text"], r["result"]["isError"]), ("late_echo: hi", False))
+        self.assertTrue(self.out.empty_for(0.3))  # announced once
+        events = [e for e in self.close() if e.get("event") == "list_changed"]
+        self.assertEqual([e["added"] for e in events], ["late_echo"])
 
     def test_sleep_fast_mode(self):
         open(os.path.join(self.dir, "fast"), "w").close()

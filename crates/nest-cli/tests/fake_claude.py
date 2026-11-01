@@ -12,7 +12,11 @@ Turn behavior (by user text):
 - contains SLOW     → mcp__nest__Bash `sleep 30`; honors stream-json interrupts
 - contains PLATFORM → also calls the `notify` platform tool
 - `E2E <scenario.json>` → the scripted tool calls in that file ({"results": path, "steps":
-  [{"tool", "args", "label"}]}), each result appended to `results` at once (JSONL, flushed)
+  [{"tool", "args", "label"}]}), each result appended to `results` at once (JSONL, flushed); a step
+  {"await_tool": name, "absent"?: bool, "timeout_s"?: n, "label"} instead waits until the tool list
+  has (or lacks) `<name>` (as `nest mcp` lists it) and records `listed`/`unlisted` or `timeout`
+As Claude Code does under `-p` (docs: "Dynamic tool updates"), `notifications/tools/list_changed` from
+`nest mcp` makes it list the tools again.
 - otherwise         → mcp__nest__Bash `echo <text>`
 As the model would, it reads a `PostToolUse` hook's `additionalContext` and works on it before
 stopping (another step, with that text), and a `Stop` hook's `decision: block` continues the turn
@@ -122,6 +126,9 @@ class Mcp:
                 else:
                     self.notifications.append(msg)
                 self.cv.notify_all()
+            if msg.get("method") == "notifications/tools/list_changed":
+                # Not on this thread: it reads the answer.
+                threading.Thread(target=relist, args=("list_changed",), daemon=True).start()
 
     def send(self, method, params=None, notify=False):
         msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
@@ -156,8 +163,17 @@ hook({"hook_event_name": "SessionStart", "source": "resume" if resume_path else 
 mcp = Mcp()
 mcp.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}})
 mcp.send("notifications/initialized", notify=True)
-tools = mcp.call("tools/list")
-log("tools", names=[t["name"] for t in tools["result"]["tools"]] if tools and "result" in tools else None)
+TOOL_NAMES = []  # the latest tools/list, as Claude Code would hold it
+
+def relist(trigger):
+    global TOOL_NAMES
+    r = mcp.call("tools/list")
+    names = [t["name"] for t in r["result"]["tools"]] if r and "result" in r else None
+    if names is not None:
+        TOOL_NAMES = names
+    log("tools", names=names, trigger=trigger)
+
+relist("start")
 save_lock = threading.Lock()
 
 # ---- stdin reader --------------------------------------------------------------------------
@@ -233,6 +249,18 @@ def stop_chain():
 def scripted(path):
     sc = json.load(open(path))
     for step in sc["steps"]:
+        if "await_tool" in step:
+            name, absent = step["await_tool"], step.get("absent", False)
+            deadline = time.time() + step.get("timeout_s", 30)
+            while (name in TOOL_NAMES) == absent and time.time() < deadline:
+                time.sleep(0.1)
+            ok = (name in TOOL_NAMES) != absent
+            text = ("unlisted" if absent else "listed") if ok else "timeout"
+            log("await_tool", name=name, absent=absent, text=text, names=TOOL_NAMES)
+            with open(sc["results"], "a") as f:
+                f.write(json.dumps({"label": step.get("label", name), "tool": name, "text": text, "is_error": not ok}) + "\n")
+                f.flush()
+            continue
         name, args = step["tool"], step["args"]
         tool(name, args)
         last = RUN["events"][-1]

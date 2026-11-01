@@ -3,6 +3,7 @@ import type { BrokerDO } from "./do/broker";
 import type { CatalogDO } from "./do/catalog";
 import type { ChannelDO } from "./do/channel";
 import type { FleetDO } from "./do/fleet";
+import type { McpConnectorDO } from "./do/mcp-connector";
 import type { SandboxDO } from "./do/sandbox";
 import type { TaskLedgerDO } from "./do/tasks";
 import type { WorkstreamDO } from "./do/workstream";
@@ -17,6 +18,8 @@ export interface Env {
   CHANNEL: DurableObjectNamespace<ChannelDO>;
   /** Task ledgers, one per name (`ledger/<name>`). */
   TASKS: DurableObjectNamespace<TaskLedgerDO>;
+  /** One per remote MCP server and credential (`connectorName`): the shared tool list and admission. */
+  MCP_CONNECTOR: DurableObjectNamespace<McpConnectorDO>;
   BUCKET: R2Bucket;
 
   /** Bearer token for the admin API (Cloudflare Access replaces this later). */
@@ -65,6 +68,10 @@ export interface Env {
   GITHUB_API_URL?: string;
   /** How long one brokered request may take (default 30 s; below the runner's 150 s platform call timeout). */
   BROKERED_TIMEOUT_MS?: string;
+  /** How long an MCP call waits for one of its server's call slots before `rate_limited` (default 10 s). */
+  MCP_ADMIT_WAIT_MS?: string;
+  /** While brains use an MCP server's list, its connector lists it again this often (default 60 s). */
+  MCP_RELIST_MS?: string;
 }
 
 export const num = (v: string | undefined, fallback: number): number => {

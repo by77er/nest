@@ -4,7 +4,9 @@
 //   POST   /mcp            one JSON-RPC message (initialize, notifications/initialized, ping, tools/list, tools/call)
 //   DELETE /mcp            ends the session named by Mcp-Session-Id
 //   GET    /calls?since=n  every tools/call received after seq n, in order
-//   POST   /reset          clears notes, counters and the call log
+//   POST   /reset          clears notes, counters, the call log and added tools
+//   POST   /tools?name=    adds a tool (extra_<name>); DELETE removes it. Either owes every session
+//                          notifications/tools/list_changed, sent on its next request's SSE stream
 //
 // Every route needs `Authorization: Bearer <MCP_TEST_TOKEN>`. With MCP_TEST_OAUTH=1 (off by default), the
 // OAuth routes of src/oauth.ts are added, and /mcp also takes an access token they issued.
@@ -12,6 +14,7 @@
 import { classify, failure, INVALID_REQUEST, isRpcError, type Message, PARSE_ERROR, PROTOCOL_VERSIONS, type RpcError } from "./jsonrpc";
 import { type CallRecord, McpState, type Reply } from "./state";
 import { oauthEnabled, prmUrl, resourceOf } from "./oauth";
+import { EXTRA_TOOL } from "./tools";
 
 export { McpState };
 
@@ -95,6 +98,11 @@ async function mcpPost(req: Request, env: Env): Promise<Response> {
   const reply = await send(env, msg, req.headers.get(SESSION_HEADER));
   const headers: Record<string, string> = reply.session === undefined ? {} : { [SESSION_HEADER]: reply.session };
   if (reply.body === undefined) return new Response(null, { status: reply.status, headers });
+  if (reply.notices?.length) {
+    // Notifications first, then the response, on one SSE stream that ends with it.
+    const events = [...reply.notices, reply.body].map((m) => `event: message\ndata: ${JSON.stringify(m)}\n\n`).join("");
+    return new Response(events, { status: reply.status, headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...headers } });
+  }
   return jsonResponse(reply.status, reply.body, headers);
 }
 
@@ -116,11 +124,18 @@ async function route(req: Request, env: Env): Promise<Response> {
     case "POST /reset":
       await state(env).reset();
       return jsonResponse(200, { ok: true });
+    case "POST /tools":
+    case "DELETE /tools": {
+      const name = url.searchParams.get("name") ?? "";
+      if (!EXTRA_TOOL.test(name)) return jsonResponse(400, { error: `name must match ${EXTRA_TOOL}` });
+      return jsonResponse(200, await state(env).setTool(name, req.method === "POST"));
+    }
   }
   // No SSE stream is offered, so GET on the MCP endpoint is 405 (Streamable HTTP, listening for messages).
   if (url.pathname === "/mcp") return new Response(null, { status: 405, headers: { allow: "POST, DELETE" } });
   if (url.pathname === "/calls") return new Response(null, { status: 405, headers: { allow: "GET" } });
   if (url.pathname === "/reset") return new Response(null, { status: 405, headers: { allow: "POST" } });
+  if (url.pathname === "/tools") return new Response(null, { status: 405, headers: { allow: "POST, DELETE" } });
   return jsonResponse(404, { error: "not found" });
 }
 

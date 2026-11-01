@@ -6,7 +6,8 @@ that nest agents reach as an external `mcp{url}` capability. It is plain MCP; it
 
 **Spec:** MCP [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) (the version
 `docs/agents/capabilities/` cites), [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
-with JSON responses only (no SSE). `initialize` also negotiates `2025-06-18`; any other requested
+with JSON responses, except that a request from a session owed `notifications/tools/list_changed`
+is answered with an SSE stream carrying the notification, then the response. `initialize` also negotiates `2025-06-18`; any other requested
 version gets `2025-11-25`, per [version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation).
 
 ## Routes
@@ -19,7 +20,8 @@ header not listed in the optional var `ALLOWED_ORIGINS` gets 403 (DNS-rebinding 
 | `POST /mcp` | One JSON-RPC message. `initialize` (returns `Mcp-Session-Id`), `notifications/initialized` (202), `ping`, `tools/list`, `tools/call`. Every later request must carry the session id (400 without, 404 if unknown or ended). Needs `Content-Type: application/json` (415) and `Accept` listing `application/json` and `text/event-stream` (406). An unsupported `MCP-Protocol-Version` is 400. Batches, malformed JSON and non-JSON-RPC bodies are HTTP 400 with an id-less error; unknown methods are `-32601`. |
 | `DELETE /mcp` | Ends the session (204; 404 if unknown). `GET /mcp` is 405: no SSE stream. |
 | `GET /calls?since=<seq>` | `{calls: [{seq, ts_ms, session, tool, arguments, _meta, result_or_error}]}`, every `tools/call` after `seq`, in arrival order, at most 1000 per page. Logged on arrival: `result_or_error` is `null` while the call runs, then `{result}` (the `CallToolResult`) or `{error}` (the JSON-RPC error). `seq` never repeats, across resets too. |
-| `POST /reset` | Clears notes, counters and the call log. Sessions survive. |
+| `POST /reset` | Clears notes, counters, the call log and added tools. Sessions survive. |
+| `POST /tools?name=extra_<x>` / `DELETE` | Adds (removes) a tool `extra_<x>` (`<x>`: lowercase letters, digits, `_`, at most 32): read-only, `{text}`, answers `extra_<x>: <text>`. Answers `{changed, tools}`. A change owes every session one `notifications/tools/list_changed` (`initialize` says `listChanged: true`), sent first on the SSE stream of its next request; there is no GET stream. |
 
 ## OAuth mode (off by default)
 

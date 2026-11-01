@@ -2,10 +2,11 @@
 // pool: the admin API configures an mcp capability, a runner session calls `<capability>_<tool>`, and a
 // stub MCP server (a fetch handler for https://mcp.test/<id>/mcp, installed over the global fetch the
 // proxy calls) records every request. Each guarantee has a test that fails without it.
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
-import { approves, argsDigest, checkMcpUrl } from "../src/lib/mcp";
+import type { McpConnectorDO } from "../src/do/mcp-connector";
+import { approves, argsDigest, checkMcpUrl, connectorName } from "../src/lib/mcp";
 import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -35,9 +36,22 @@ class StubMcp {
   readonly notes = new Map<string, string>();
   counter = 0;
   sessions = new Set<string>();
+  /** The `clientInfo.name` each session was opened by (nest's proxy: `nest`; the connector: `nest-connector`). */
+  readonly clients = new Map<string, string>();
+  /** Tools listed beyond ANN (the server's list changing). */
+  readonly extra = new Set<string>();
+  /** The next tools/call answers as an SSE stream carrying `notifications/tools/list_changed` first. */
+  noticeNext = false;
+  /** This many next tools/list requests answer HTTP 503. */
+  listFails = 0;
   private n = 0;
   /** Per tool: the next calls' behaviour, consumed in order. */
   readonly next: Record<string, Behaviour[]> = {};
+
+  /** Sessions opened by `client`. */
+  opened(client: string): number {
+    return [...this.clients.values()].filter((c) => c === client).length;
+  }
 
   constructor(readonly token: string) {}
 
@@ -57,6 +71,7 @@ class StubMcp {
     if (msg.method === "initialize") {
       const sid = `sess-${++this.n}`;
       this.sessions.add(sid);
+      this.clients.set(sid, msg.params?.clientInfo?.name);
       return json(200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "stub", version: "0" } } },
         { "mcp-session-id": sid });
     }
@@ -65,7 +80,11 @@ class StubMcp {
     if (!this.sessions.has(sid)) return json(404, { error: "unknown session" });
     if (msg.method === "notifications/initialized") return new Response(null, { status: 202 });
     if (msg.method === "tools/list") {
-      const tools = Object.entries(ANN).map(([name, annotations]) => ({
+      if (this.listFails > 0) {
+        this.listFails--;
+        return json(503, { error: "scripted" });
+      }
+      const tools = [...Object.entries(ANN), ...[...this.extra].map((n) => [n, { readOnlyHint: true }] as const)].map(([name, annotations]) => ({
         name, description: `the ${name} tool`, annotations,
         inputSchema: { type: "object", properties: { text: { type: "string" } }, additionalProperties: true },
       }));
@@ -98,6 +117,11 @@ class StubMcp {
       default: out = { jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `Unknown tool: ${name}` } };
     }
     entry.done = Date.now();
+    if (this.noticeNext) {
+      this.noticeNext = false;
+      const sse = [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }, out].map((m) => `data: ${JSON.stringify(m)}\n\n`).join("");
+      return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
     return json(200, out);
   }
 }
@@ -126,6 +150,9 @@ interface McpOpts {
   trusted?: boolean; tools?: string[] | null; idempotent?: unknown; readOnly?: unknown; storeToken?: boolean; withCapability?: boolean;
   /** The sink rule; tests of other guarantees allow sinks from a tainted session. */
   whenTainted?: "approve" | "allow";
+  maxConcurrent?: number; perMinute?: number;
+  /** The runner's hello says it acts on `tools_changed`. */
+  toolsChanged?: boolean;
 }
 
 async function setup(opts: McpOpts = {}) {
@@ -140,7 +167,8 @@ async function setup(opts: McpOpts = {}) {
     method: "PUT",
     body: { mcp: { url: `https://mcp.test/${id}/mcp`, auth: `cap:${cap}`, ...(tools ? { tools } : {}), ...(opts.trusted ? { trusted: true } : {}),
       ...(opts.idempotent ? { idempotent: opts.idempotent } : {}), ...(opts.readOnly ? { read_only: opts.readOnly } : {}),
-      ...(opts.whenTainted ? { when_tainted: opts.whenTainted } : {}) } },
+      ...(opts.whenTainted ? { when_tainted: opts.whenTainted } : {}), ...(opts.maxConcurrent ? { max_concurrent: opts.maxConcurrent } : {}),
+      ...(opts.perMinute ? { per_minute: opts.perMinute } : {}) } },
   });
   const tpl = `t-${id}`;
   await adminJson(`/v1/admin/templates/${tpl}`, {
@@ -157,13 +185,25 @@ async function setup(opts: McpOpts = {}) {
   const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "mcp" } }, 201);
   const ag = await adminJson("/v1/agents", { body: { template: tpl, workstream, cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === ag.agent);
-  const ws = await runner(ag.agent, host.host, host.host_token, 1, "rin_one");
-  return { id, cap, stub, agent: ag.agent as string, workstream: workstream as string, host, ws, t: (tool: string) => `${cap}_${tool}` };
+  const ws = await runner(ag.agent, host.host, host.host_token, 1, "rin_one", opts.toolsChanged);
+  const url = `https://mcp.test/${id}/mcp`;
+  /** Another agent of the same template (so the same server and credential), with its runner. */
+  const another = async (toolsChanged = opts.toolsChanged) => {
+    const b = await adminJson("/v1/agents", { body: { template: tpl, workstream, cell } }, 201);
+    await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === b.agent);
+    return { agent: b.agent as string, ws: await runner(b.agent, host.host, host.host_token, 1, `rin_${rand()}`, toolsChanged) };
+  };
+  return {
+    id, cap, stub, agent: ag.agent as string, workstream: workstream as string, host, ws, t: (tool: string) => `${cap}_${tool}`, another,
+    connector: () => connectorStub(url, `cap:${cap}`),
+  };
 }
 
-async function runner(agent: string, host: string, token: string, epoch: number, instance: string) {
+const connectorStub = (url: string, auth: string) => env.MCP_CONNECTOR.get(env.MCP_CONNECTOR.idFromName(connectorName({ url, auth })));
+
+async function runner(agent: string, host: string, token: string, epoch: number, instance: string, toolsChanged?: boolean) {
   const ws = await Ws.connect(`/v1/agents/${agent}/session`, token);
-  ws.send({ type: "hello", protocol_version: 1, agent, host, instance_id: instance, epoch, session: SESSION });
+  ws.send({ type: "hello", protocol_version: 1, agent, host, instance_id: instance, epoch, session: SESSION, ...(toolsChanged ? { tools_changed: true } : {}) });
   await ws.next("hello_ack");
   return ws;
 }
@@ -215,7 +255,7 @@ describe("the mcp capability source", () => {
 // --- Listing and authority -----------------------------------------------------------------------------------
 
 describe("tool listing and authority", () => {
-  it("lists the allowlisted tools as <capability>_<tool> with the server's schemas, from a cached tools/list", async () => {
+  it("lists the allowlisted tools as <capability>_<tool> with the server's schemas, from one cached tools/list per server and credential", async () => {
     const s = await setup({ trusted: true });
     const tools = await listTools(s.ws);
     const remote = tools.filter((t) => t.name.startsWith(`${s.cap}_`));
@@ -223,10 +263,34 @@ describe("tool listing and authority", () => {
     expect(remote.find((t) => t.name === s.t("echo"))).toMatchObject({ description: "the echo tool", input_schema: { type: "object", properties: { text: { type: "string" } } } });
     expect(tools.map((t) => t.name)).not.toContain(s.t("hidden"));
     await listTools(s.ws);
+    // Another agent on the same server and credential gets the same list, not a tools/list of its own.
+    const b = await s.another();
+    expect((await listTools(b.ws)).map((t) => t.name)).toEqual(tools.map((t) => t.name));
     expect(s.stub.methods.filter((m) => m === "tools/list")).toHaveLength(1);
+    expect(s.stub.opened("nest-connector")).toBe(1);
     // A stale list is fetched again.
-    await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) => st.storage.sql.exec("UPDATE mcp_servers SET listed_ms = 0"));
+    await runInDurableObject(s.connector(), (_: McpConnectorDO, st) => st.storage.sql.exec("UPDATE kv SET value = '0' WHERE key = 'listed_ms'"));
     await listTools(s.ws);
+    expect(s.stub.methods.filter((m) => m === "tools/list")).toHaveLength(2);
+  });
+
+  it("a different credential for the same server is another connector, with its own list", async () => {
+    const s = await setup({ trusted: true });
+    await listTools(s.ws);
+    const other = `n${s.id}`;
+    await adminJson(`/v1/admin/secrets/cap:${other}`, { method: "PUT", body: { value: s.stub.token } });
+    await adminJson(`/v1/admin/capabilities/${other}`, { method: "PUT", body: { mcp: { url: `https://mcp.test/${s.id}/mcp`, auth: `cap:${other}`, trusted: true } } });
+    await adminJson(`/v1/admin/templates/t2-${s.id}`, {
+      method: "PUT",
+      body: { capabilities: ["nest", other], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token", escalate_to: "user" },
+    });
+    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "mcp2" } }, 201);
+    const cell = uniqueCell();
+    const host = await connectHost(cell, "brain");
+    const ag = await adminJson("/v1/agents", { body: { template: `t2-${s.id}`, workstream, cell } }, 201);
+    await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === ag.agent);
+    const ws = await runner(ag.agent, host.host, host.host_token, 1, "rin_cred");
+    expect((await listTools(ws)).map((t) => t.name)).toContain(`${other}_echo`);
     expect(s.stub.methods.filter((m) => m === "tools/list")).toHaveLength(2);
   });
 
@@ -252,9 +316,12 @@ describe("calls", () => {
     await result(s.ws, "cal_m2");
     call(s.ws, "cal_m3", s.t("note_get"), { key: "k" });
     expect((await result(s.ws, "cal_m3")).content[0].text).toBe("v");
-    expect(s.stub.methods.filter((m) => m === "initialize")).toHaveLength(1);
+    // One session of its own for the calls (the connector lists over another, for every agent).
+    expect(s.stub.opened("nest")).toBe(1);
     expect(s.stub.methods).toContain("notifications/initialized");
-    expect(new Set(s.stub.calls.map((c) => c.session))).toEqual(new Set(["sess-1"]));
+    const sessions = new Set(s.stub.calls.map((c) => c.session));
+    expect(sessions.size).toBe(1);
+    expect(s.stub.clients.get([...sessions][0]!)).toBe("nest");
     const req = s.stub.requests.find((r) => r.method === "tools/call")!;
     expect(req.headers["mcp-protocol-version"]).toBe("2025-11-25");
     expect(s.stub.calls[0]!._meta).toEqual({ "nest/agent": s.agent, "nest/epoch": 1, "nest/call": `${s.agent}/1/cal_m1`, "nest/taint": false });
@@ -267,7 +334,7 @@ describe("calls", () => {
     s.stub.expireSessions();
     call(s.ws, "cal_s2", s.t("counter_add"), { name: "c", n: 1 });
     expect(await result(s.ws, "cal_s2")).toMatchObject({ status: "ok", content: [{ text: "1" }] });
-    expect(s.stub.methods.filter((m) => m === "initialize")).toHaveLength(2);
+    expect(s.stub.opened("nest")).toBe(2);
     expect(s.stub.calls.filter((c) => c.tool === "counter_add")).toHaveLength(1);
   });
 
@@ -398,6 +465,140 @@ describe("fencing", () => {
       st.storage.sql.exec<{ status: string; outcome: string }>("SELECT status, outcome FROM mcp_forwards WHERE key = ?", `${s.agent}/1/cal_lost`).one());
     expect(row.status).toBe("settled");
     expect(JSON.parse(row.outcome).outcome.error.code).toBe("outcome_unknown");
+  });
+});
+
+// --- Admission (the connector) ------------------------------------------------------------------------------
+
+/** vitest.config.ts: MCP_ADMIT_WAIT_MS. */
+const ADMIT_WAIT_MS = 2000;
+
+describe("admission: a per-server cap across agents", () => {
+  it("with max_concurrent 1, a second agent's call reaches the server only after the first agent's has answered", async () => {
+    const s = await setup({ maxConcurrent: 1, whenTainted: "allow" });
+    const b = await s.another();
+    s.stub.next.slow = [{ delay: 600 }];
+    call(s.ws, "cal_c1", s.t("slow"), { ms: 600 });
+    await sleep(100);
+    call(b.ws, "cal_c2", s.t("echo"), { text: "second" });
+    expect((await result(b.ws, "cal_c2")).status).toBe("ok");
+    expect((await result(s.ws, "cal_c1")).status).toBe("ok");
+    const [first, second] = s.stub.calls;
+    expect(first!.tool).toBe("slow");
+    expect(second!.at).toBeGreaterThanOrEqual(first!.done!);
+  });
+
+  it("over per_minute, a call is rate_limited (retryable) and never sent", async () => {
+    const s = await setup({ perMinute: 2, whenTainted: "allow" });
+    for (const c of ["cal_p1", "cal_p2"]) {
+      call(s.ws, c, s.t("echo"), { text: c });
+      expect((await result(s.ws, c)).status).toBe("ok");
+    }
+    call(s.ws, "cal_p3", s.t("echo"), { text: "cal_p3" });
+    expect((await result(s.ws, "cal_p3")).error).toMatchObject({ code: "rate_limited", retryable: true, message: expect.stringContaining("nothing was sent") });
+    expect(s.stub.calls.map((c) => c.arguments.text)).toEqual(["cal_p1", "cal_p2"]);
+  });
+
+  it("a call whose brain stopped being current while it waited for a slot never reaches the server", async () => {
+    const s = await setup({ maxConcurrent: 1, whenTainted: "allow" });
+    const b = await s.another();
+    s.stub.next.slow = [{ delay: 800 }];
+    call(b.ws, "cal_w1", s.t("slow"), { ms: 800 }); // holds the one slot
+    await sleep(100);
+    call(s.ws, "cal_w2", s.t("counter_add"), { name: "c", n: 1 });
+    await sleep(200); // waiting for admission now
+    await bumpEpoch(s.agent);
+    const outcome = await (async () => {
+      for (let i = 0; i < 60; i++) {
+        const o = await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).calls.call("cal_w2")?.outcome);
+        if (o) return o;
+        await sleep(50);
+      }
+    })();
+    expect(outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
+    expect(s.stub.calls.map((c) => c.tool)).toEqual(["slow"]);
+  });
+
+  it("a slot an earlier incarnation never released is free again once its lease expires", async () => {
+    const s = await setup({ maxConcurrent: 1, whenTainted: "allow" });
+    const expires = Date.now() + 700;
+    await runInDurableObject(s.connector(), (_: McpConnectorDO, st) =>
+      st.storage.sql.exec("INSERT INTO leases (id, agent, expires_ms) VALUES ('mls_dead', 'agt_dead', ?)", expires));
+    call(s.ws, "cal_x9", s.t("echo"), { text: "after" });
+    expect((await result(s.ws, "cal_x9")).status).toBe("ok");
+    expect(s.stub.calls[0]!.at).toBeGreaterThanOrEqual(expires);
+    expect(expires - Date.now()).toBeLessThan(ADMIT_WAIT_MS);
+  });
+});
+
+// --- list_changed ------------------------------------------------------------------------------------------------
+
+describe("a server's changed tool list reaches live brains", () => {
+  /** Fire the connector's re-list now (its interval is a minute). */
+  const relistNow = async (s: Awaited<ReturnType<typeof setup>>) => {
+    await runInDurableObject(s.connector(), (_: McpConnectorDO, st) => st.storage.sql.exec("UPDATE deadlines SET at = 1 WHERE key = 'relist'"));
+    await runDurableObjectAlarm(s.connector());
+  };
+
+  it("list_changed on a call's stream: the connector lists again and each live brain is told tools_changed, an older runner isn't, and re-listing shows the tool", async () => {
+    const s = await setup({ trusted: true, toolsChanged: true, tools: null });
+    const old = await s.another(false);
+    await listTools(s.ws);
+    await listTools(old.ws);
+    expect(s.stub.methods.filter((m) => m === "tools/list")).toHaveLength(1);
+    s.stub.extra.add("added");
+    s.stub.noticeNext = true;
+    call(s.ws, "cal_n1", s.t("echo"), { text: "x" });
+    expect((await result(s.ws, "cal_n1")).status).toBe("ok");
+    await s.ws.next("tools_changed", () => true, 5000);
+    expect((await listTools(s.ws)).map((t) => t.name)).toContain(s.t("added"));
+    expect(s.stub.methods.filter((m) => m === "tools/list")).toHaveLength(2);
+    // The older runner was told nothing (it would not act on it), but the notice reached its AgentDO.
+    expect(await old.ws.none("tools_changed", 300)).toBe(true);
+    const owed = await runInDurableObject(s.connector(), (_: McpConnectorDO, st) =>
+      st.storage.sql.exec("SELECT COUNT(*) AS n FROM subscribers WHERE digest IS NOT (SELECT json_extract(value, '$') FROM kv WHERE key = 'digest')").one().n);
+    expect(owed).toBe(0);
+  });
+
+  it("without any notification, the connector's re-list finds the change and tells the brain; a brain that was disconnected is told at its next hello", async () => {
+    const s = await setup({ trusted: true, toolsChanged: true, tools: null });
+    await listTools(s.ws);
+    s.stub.extra.add("relisted");
+    await relistNow(s);
+    await s.ws.next("tools_changed", () => true, 5000);
+    expect((await listTools(s.ws)).map((t) => t.name)).toContain(s.t("relisted"));
+    // Nothing more is owed once the brain listed again.
+    expect(await s.ws.none("tools_changed", 300)).toBe(true);
+
+    // Disconnected when the next change lands: told when it says hello again.
+    s.ws.close();
+    await sleep(100);
+    s.stub.extra.delete("relisted");
+    await relistNow(s);
+    const notified = async () => runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).kvGet("mcp_changed_ms") as number | undefined);
+    for (let i = 0; i < 60 && !(await notified()); i++) await sleep(50);
+    expect(await notified()).toBeTruthy();
+    const ws2 = await runner(s.agent, s.host.host, s.host.host_token, 1, "rin_one", true);
+    await ws2.next("tools_changed", () => true, 3000);
+    expect((await listTools(ws2)).map((t) => t.name)).not.toContain(s.t("relisted"));
+  });
+
+  it("a reported change whose re-list fails stays reported: the next list fetches it", async () => {
+    const s = await setup({ trusted: true, tools: null });
+    await listTools(s.ws);
+    s.stub.extra.add("late");
+    await runInDurableObject(s.connector(), (_: McpConnectorDO, st) => st.storage.sql.exec("UPDATE kv SET value = 'true' WHERE key = 'stale'"));
+    s.stub.listFails = 1;
+    expect((await listTools(s.ws)).map((t) => t.name)).not.toContain(s.t("late")); // the cached list, served
+    expect((await listTools(s.ws)).map((t) => t.name)).toContain(s.t("late"));
+  });
+
+  it("an agent answers a notice for a server it doesn't have, or with no brain, with 'drop me'", async () => {
+    const s = await setup({ trusted: true });
+    const server = { url: `https://mcp.test/${s.id}/mcp`, auth: `cap:${s.cap}` };
+    expect(await agentStub(s.agent).mcpToolsChanged(server, false)).toBe(true);
+    expect(await agentStub(s.agent).mcpToolsChanged({ ...server, auth: "cap:other" }, false)).toBe(false);
+    expect(await agentStub(`agt_${rand()}`).mcpToolsChanged(server, true)).toBe(false);
   });
 });
 

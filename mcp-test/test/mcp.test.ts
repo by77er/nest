@@ -303,3 +303,51 @@ describe("the test surface", () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe("the tool list changing (POST/DELETE /tools)", () => {
+  const tools = (method: "POST" | "DELETE", name: string) =>
+    SELF.fetch(`${BASE}/tools?name=${name}`, { method, headers: { authorization: `Bearer ${TOKEN}` } });
+  /** One SSE body's JSON-RPC messages, in order. */
+  const sse = async (r: Response) => (await r.text()).split("\n\n").filter(Boolean)
+    .map((e) => JSON.parse(e.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("\n")));
+
+  it("initialize says the list can change", async () => {
+    const body: any = await (await post("/mcp", request("initialize", initParams()))).json();
+    expect(body.result.capabilities.tools.listChanged).toBe(true);
+  });
+
+  it("adding a tool lists it and owes each session one list_changed, sent before the response on its next request's SSE stream", async () => {
+    const a = await connect();
+    const b = await connect();
+    const added = await tools("POST", "extra_one");
+    expect(added.status).toBe(200);
+    expect(((await added.json()) as any).tools).toContain("extra_one");
+    for (const s of [a, b]) {
+      const r = await post("/mcp", request("tools/list"), s.headers);
+      expect(r.headers.get("content-type")).toMatch(/^text\/event-stream/);
+      const [notice, reply] = await sse(r);
+      expect(notice).toEqual({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+      expect(reply.result.tools.map((t: any) => t.name)).toContain("extra_one");
+      // Once: the next request is plain JSON again.
+      expect((await s.rpc("ping")).result).toEqual({});
+    }
+    expect(text(await a.call("extra_one", { text: "hi" }))).toBe("extra_one: hi");
+    // No change, no notice; removing it owes another and unlists it.
+    expect((await tools("POST", "extra_one")).status).toBe(200);
+    expect((await pingType(a))).toMatch(/^application\/json/);
+    expect((await tools("DELETE", "extra_one")).status).toBe(200);
+    const [notice, reply] = await sse(await post("/mcp", request("tools/list"), a.headers));
+    expect(notice.method).toBe("notifications/tools/list_changed");
+    expect(reply.result.tools.map((t: any) => t.name)).not.toContain("extra_one");
+  });
+
+  it("refuses a name outside extra_<name>", async () => {
+    expect((await tools("POST", "echo")).status).toBe(400);
+    expect((await tools("POST", "extra_UPPER")).status).toBe(400);
+  });
+});
+
+/** The content type of a ping on a session (JSON unless a notice is owed). */
+async function pingType(s: { headers: Record<string, string> }): Promise<string> {
+  return (await post("/mcp", request("ping"), s.headers)).headers.get("content-type") ?? "";
+}

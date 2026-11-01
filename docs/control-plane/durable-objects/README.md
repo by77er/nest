@@ -13,6 +13,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
 | WorkstreamDO (interim) | The [workstream channel](../../orchestration/workstreams/#the-interim-workstream-channel) until ChannelDO exists |
 | [tasks/](tasks/) | One named task ledger: tasks, comments, history, its watcher, and the inbox notices its changes owe |
+| [mcp-connector/](mcp-connector/) | One remote MCP server and credential: the shared tool list, its change notices to agents, and call admission |
 
 ## Conventions
 

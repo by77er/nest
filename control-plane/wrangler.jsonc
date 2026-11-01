@@ -16,14 +16,17 @@
       { "name": "BROKER", "class_name": "BrokerDO" },
       { "name": "CATALOG", "class_name": "CatalogDO" },
       { "name": "CHANNEL", "class_name": "ChannelDO" },
-      { "name": "TASKS", "class_name": "TaskLedgerDO" }
+      { "name": "TASKS", "class_name": "TaskLedgerDO" },
+      { "name": "MCP_CONNECTOR", "class_name": "McpConnectorDO" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["FleetDO", "SandboxDO", "AgentDO", "WorkstreamDO", "BrokerDO"] },
     { "tag": "catalog", "new_sqlite_classes": ["CatalogDO"] },
     { "tag": "channels", "new_sqlite_classes": ["ChannelDO"] },
-    { "tag": "tasks", "new_sqlite_classes": ["TaskLedgerDO"] }
+    { "tag": "tasks", "new_sqlite_classes": ["TaskLedgerDO"] },
+    // One-way: a new class (docs/agents/capabilities/mcp/#the-connector, dev/deploy.md).
+    { "tag": "mcp-connectors", "new_sqlite_classes": ["McpConnectorDO"] }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "nest-control" }],
   // Production hostname (a Workers Custom Domain on the bitcru.sh zone; Cloudflare issues its certificate).

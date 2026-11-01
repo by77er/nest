@@ -304,6 +304,9 @@ pub struct Agent {
     /// Parent of every hands call's cancel token: a hard interrupt or kill cancels it and starts
     /// a fresh one for later calls.
     hands_cancel: Mutex<CancellationToken>,
+    /// Bumped on every `tools_changed` from AgentDO; each `nest mcp` connection watches it and
+    /// tells Claude Code `notifications/tools/list_changed`.
+    tools_gen: tokio::sync::watch::Sender<u64>,
     event_seq: AtomicU64,
     call_n: AtomicU64,
     /// Values redacted from anything leaving the host (session segments).
@@ -340,6 +343,7 @@ impl Agent {
             pending_resolves: Mutex::new(HashMap::new()),
             resolve_gate: tokio::sync::Mutex::new(()),
             hands_cancel: Mutex::new(CancellationToken::new()),
+            tools_gen: tokio::sync::watch::Sender::new(0),
             event_seq: AtomicU64::new(0),
             call_n: AtomicU64::new(0),
             secrets,
@@ -528,6 +532,16 @@ impl Agent {
         if let Some(tx) = self.pending_lists.lock().unwrap().remove(req) {
             let _ = tx.send(tools);
         }
+    }
+
+    /// AgentDO says the agent's tool list changed: every `nest mcp` connection tells Claude Code.
+    pub fn tools_changed(&self) {
+        self.tools_gen.send_modify(|g| *g += 1);
+    }
+
+    /// Changes from now on (a connection opened later lists afresh anyway).
+    pub fn watch_tools(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.tools_gen.subscribe()
     }
 
     /// A cancel token for one hands call, cancelled by the next [`Agent::cancel_hands`].

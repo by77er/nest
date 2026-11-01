@@ -775,12 +775,20 @@ def stop_mcp_server():
             os.killpg(p.pid, signal.SIGKILL)
 
 
+def release_agent(agid, what):
+    """Stop a scenario's agent when it's done: a CI runner's brain host holds only 4 brains (2 vCPUs)."""
+    st, r = api("POST", f"/v1/agents/{agid}/stop")
+    check(f"{what}: agent stopped, freeing its brain slot", st == 200, json.dumps(r)[:200])
+
+
 def mcp_turn(agid, name, steps, wait_s=90, cap=MCP_CAP):
-    """One fake-brain turn of scripted calls to `<cap>_<tool>`; returns the results by label."""
+    """One fake-brain turn of scripted calls to `<cap>_<tool>` (a dict step is passed as is, e.g. an
+    `await_tool`); returns the results by label."""
     path = os.path.join(WORK, f"mcp-{name}.json")
     out = os.path.join(WORK, f"mcp-{name}.jsonl")
     with open(path, "w") as fh:
-        json.dump({"results": out, "steps": [{"label": l, "tool": f"{cap}_{t}", "args": a} for l, t, a in steps]}, fh, indent=2)
+        json.dump({"results": out, "steps": [st if isinstance(st, dict) else {"label": st[0], "tool": f"{cap}_{st[1]}", "args": st[2]}
+                                             for st in steps]}, fh, indent=2)
     st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
     check(f"mcp: {name} turn enqueued", st == 201, json.dumps(t)[:200])
     return path, out
@@ -876,6 +884,47 @@ def run_mcp(ids):
     slow = [c for c in mcp_calls() if c.get("tool") == "slow"]
     check("mcp: the redelivered call reached the server once", len(slow) == 1,
           json.dumps([(c.get("_meta") or {}).get("nest/call") for c in slow]))
+    release_agent(agid, "mcp")
+    run_mcp_list_changed(ids)
+
+
+def run_mcp_list_changed(ids):
+    """A server's changed tool list reaches a live brain: the server owes its sessions list_changed
+    (sent on a call's SSE stream), AgentDO reports it to the connector, which lists again and tells
+    the brain's AgentDO; `tools_changed` reaches the runner, `nest mcp` sends list_changed, and the
+    fake brain lists again. Same server and credential as `notes` (one connector), no allowlist."""
+    cap = "live"
+    st, r = api("PUT", f"/v1/admin/capabilities/{cap}", {"mcp": {"url": f"{MCP_URL}/mcp", "auth": f"cap:{MCP_CAP}", "trusted": True}})
+    check("mcp list_changed: capability without an allowlist", st == 200, json.dumps(r)[:200])
+    tpl = {"capabilities": ["nest", cap], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
+           "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
+    st, r = api("PUT", "/v1/admin/templates/mcp-live", tpl)
+    st, ag = api("POST", "/v1/agents", {"template": "mcp-live", "workstream": ids["workstream"], "cell": "local"})
+    check("mcp list_changed: agent created", st == 201, json.dumps(ag)[:200])
+    agid = ag.get("agent")
+
+    def turn(name, steps):
+        _, out = mcp_turn(agid, name, steps, cap=cap)
+        try:
+            wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, 120, 0.5, f"mcp {name} results")
+        except TimeoutError as e:
+            check(f"mcp list_changed: all {name} results returned", False, str(e)[:200])
+        return results_by_label(out)
+
+    res = turn("live-before", [("echo", "echo", {"text": "before"}), {"label": "absent", "await_tool": f"{cap}_extra_live", "absent": True, "timeout_s": 1}])
+    check("mcp list_changed: the brain starts without the tool", (res.get("absent") or {}).get("text") == "unlisted", json.dumps(res)[:300])
+    mcp_api("POST", "/tools?name=extra_live")
+    res = turn("live-added", [("poke", "echo", {"text": "carries the notice"}),
+                              {"label": "listed", "await_tool": f"{cap}_extra_live", "timeout_s": 30},
+                              ("new", "extra_live", {"text": "hi"})])
+    check("mcp list_changed: the added tool reaches the brain's tool list without a restart", (res.get("listed") or {}).get("text") == "listed",
+          json.dumps(res)[:300])
+    check("mcp list_changed: and the brain can call it", (res.get("new") or {}).get("text") == "extra_live: hi", json.dumps(res.get("new"))[:200])
+    mcp_api("DELETE", "/tools?name=extra_live")
+    res = turn("live-removed", [("poke", "echo", {"text": "again"}),
+                                {"label": "gone", "await_tool": f"{cap}_extra_live", "absent": True, "timeout_s": 30}])
+    check("mcp list_changed: a removed tool leaves the brain's tool list", (res.get("gone") or {}).get("text") == "unlisted", json.dumps(res)[:300])
+    release_agent(agid, "mcp list_changed")
 
 
 MCP_OAUTH_CAP = "onotes"
@@ -972,6 +1021,9 @@ def run_mcp_oauth(ids):
     blobs = "\n".join(r2_blobs())
     check("mcp oauth: the broker audited the flow in R2", all(e in blobs for e in ("oauth_start", "oauth_authorized", "oauth_refreshed", "oauth_refresh_failed")),
           "missing audit events")
+    release_agent(agid, "mcp oauth")
+
+
 # ---------------------------------------------------------------------------------- sinks: brokered actions, egress
 # A local HTTP server stands in for an http profile's API: an agent's fake brain calls `http_request` through
 # `nest mcp` -> the runner -> AgentDO's brokered pipeline, which attaches the profile's credential; a tainted

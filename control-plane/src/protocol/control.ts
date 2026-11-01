@@ -413,6 +413,8 @@ export const RunnerHello = z.object({
   session: SessionId.optional(),
   local_bytes: U64.optional(),
   last_seq: Seq.optional(),
+  /** The runner acts on `tools_changed` (has Claude Code list again); absent from older runners, which are never sent it. */
+  tools_changed: z.boolean().optional(),
 });
 
 export const ToolCall = z.object({
@@ -513,6 +515,8 @@ export const AgentToRunnerVariants = [
   z.object({ type: z.literal("cache_update"), seq: Seq, cache: AgentCache }),
   z.object({ type: z.literal("tool_result"), seq: Seq, call: CallId, outcome: ToolOutcome }),
   z.object({ type: z.literal("tools_list"), request: RequestId, tools: z.array(ToolDef) }),
+  /** The agent's tool list changed (a remote MCP server's did): list again. Sent only to a runner whose hello has `tools_changed`. */
+  z.object({ type: z.literal("tools_changed") }),
   /**
    * Answer to `hands_resolve`: `outcome`. `hands` / `error` / `retry_after_ms` are the previous
    * release's shape of the same answer, sent alongside it for one release (see `handsResolved`).
