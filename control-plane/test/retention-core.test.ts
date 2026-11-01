@@ -5,7 +5,7 @@
 // generation that stops being a restore source never becomes one again (so unrooting its memory is safe).
 import { describe, expect, it } from "vitest";
 import {
-  chainView, gcMarkVersion, gcRootsOf, type GenRow, isRestoreSource, livePins, ORPHAN_HEAD_TTL_MS, retention, retentionMode,
+  chainView, gcRootsOf, type GenRow, isRestoreSource, livePins, memoryToUnroot, ORPHAN_HEAD_TTL_MS, retention, retentionMode,
   type RootRow, TURN_END_MAX_AGE_MS,
 } from "../src/lib/retention";
 
@@ -159,17 +159,21 @@ describe("retention", () => {
   });
 });
 
-describe("gcRootsOf", () => {
-  const row = (id: string, created: number, mem: boolean, extra: Partial<GenRow> = {}): RootRow => ({
-    ...gen(id, created, extra), disk_manifest: `disk:${id}`, ...(mem ? { mem_manifest: `mem:${id}` } : {}),
+describe("gcRootsOf and memoryToUnroot", () => {
+  const row = (id: string, created: number, mem: boolean, extra: Partial<RootRow> = {}): RootRow => ({
+    ...gen(id, created), disk_manifest: `disk:${id}`, ...(mem ? { mem_manifest: `mem:${id}` } : {}), mem_unrooted: false, ...extra,
   });
-  const rows = [row("head", NOW, true), row("old_ckpt", NOW - MIN, true), row("old_disk", NOW - 2 * MIN, false), row("gone", NOW - 3 * MIN, true, { deleting: true })];
-  it("on: a deleting generation's manifests go; a checkpoint's memory only while it is a restore source", () => {
-    expect(gcRootsOf(rows, view("head"), "on").sort()).toEqual(["disk:head", "disk:old_ckpt", "disk:old_disk", "mem:head"]);
-    expect(gcRootsOf(rows, view("head", ["old_ckpt"]), "on")).toContain("mem:old_ckpt");
+  const rows = [
+    row("head", NOW, true), row("old_ckpt", NOW - MIN, true), row("old_disk", NOW - 2 * MIN, false),
+    row("gone", NOW - 3 * MIN, true, { deleting: true }), row("unrooted", NOW - 4 * MIN, true, { mem_unrooted: true }),
+  ];
+  it("roots every ready generation's disk, and its memory unless marked unrooted; nothing of a deleting one", () => {
+    expect(gcRootsOf(rows).sort()).toEqual(["disk:head", "disk:old_ckpt", "disk:old_disk", "disk:unrooted", "mem:head", "mem:old_ckpt"]);
   });
-  it.each(["report", "off"] as const)("%s: every ready generation's manifests, never a deleting one's", (mode) => {
-    expect(gcRootsOf(rows, view("head"), mode).sort()).toEqual(["disk:head", "disk:old_ckpt", "disk:old_disk", "mem:head", "mem:old_ckpt"]);
+  it("marks unrooted only the memory of ready checkpoints that aren't restore sources, once", () => {
+    expect(memoryToUnroot(rows, view("head"))).toEqual(["old_ckpt"]);
+    expect(memoryToUnroot(rows, view("head", ["old_ckpt"]))).toEqual([]);
+    expect(memoryToUnroot(rows, view("old_ckpt"))).toEqual(["head"]);
   });
 });
 
@@ -178,69 +182,88 @@ describe("the switch", () => {
     "SANDBOX_RETENTION=%s is %s", (v, want) => {
       expect(retentionMode({ SANDBOX_RETENTION: v })).toBe(want);
     });
-  it("on marks with the next GC marking version, so its first run is dry", () => {
-    expect([gcMarkVersion(1, "off"), gcMarkVersion(1, "report"), gcMarkVersion(1, "on")]).toEqual([1, 1, 2]);
-  });
 });
 
 describe("random histories", () => {
   // One sandbox's chain as SandboxDO drives it: commits move the head (or add an orphan), a claim
-  // pins the head, a pin ends, time passes, and retention marks what it drops.
-  interface W { rows: GenRow[]; head: string | null; pins: string[]; now: number; n: number }
+  // pins the head, a pin ends, time passes, retention marks what it drops and unroots memory, and
+  // old main-chain `deleting` rows are pruned (orphan rows never are).
+  interface W { rows: RootRow[]; head: string | null; pins: string[]; now: number; n: number }
   const orphanParents = (w: W) => w.rows.filter((g) => g.orphaned && g.parent).map((g) => g.parent!);
   const viewOf = (w: W) => view(w.head, w.pins, orphanParents(w), w.now);
   const sources = (w: W) => new Set(w.rows.filter((g) => isRestoreSource(g, viewOf(w))).map((g) => g.id));
-  let pinnedNonHead = 0;
 
-  for (let seed = 1; seed <= 60; seed++) {
-    it(`seed ${seed}: never drops a restore source, is stable, and a former restore source never returns`, () => {
-      const r = rng(seed);
-      const w: W = { rows: [], head: null, pins: [], now: NOW, n: 0 };
-      const ever = new Set<string>();
-      const former = new Set<string>();
-      const reasons = ["turn_end", "timer", "suspend", "drain"];
-      // Not vacuous: generations are dropped, and some while a pin protects a former head.
-      let marked = 0;
-      for (let step = 0; step < 300; step++) {
-        const x = r();
-        if (x < 0.4) {
-          const id = `g${w.n++}`;
-          w.rows.push(gen(id, w.now, { reason: reasons[Math.floor(r() * reasons.length)]!, parent: w.head }));
-          w.head = id;
-        } else if (x < 0.47) {
-          // A salvage: an orphan whose parent is an older orphan or a main-chain generation.
-          const orphans = w.rows.filter((g) => g.orphaned);
-          const parent = orphans.length && r() < 0.5 ? orphans[orphans.length - 1]!.id : w.head;
-          w.rows.push(gen(`o${w.n++}`, w.now, { orphaned: true, reason: "salvage", parent }));
-        } else if (x < 0.55) {
-          if (w.head) w.pins = [w.head]; // a claim pins the head it restores
-        } else if (x < 0.6) {
-          w.pins = [];
-        } else if (x < 0.9) {
-          w.now += Math.floor(r() * (r() < 0.1 ? 10 * DAY : 30 * MIN));
-        } else {
-          const v = viewOf(w);
-          const d = retention(w.rows, v);
-          marked += d.drop.length;
-          if (w.pins.some((p) => p !== w.head)) pinnedNonHead += 1;
-          for (const id of d.drop) {
-            const g = w.rows.find((x) => x.id === id)!;
-            expect(isRestoreSource(g, v), `${id} is a restore source`).toBe(false);
-            g.deleting = true;
-          }
-          // Stable: the same view drops nothing more.
-          expect(retention(w.rows, v).drop).toEqual([]);
-          if (w.head) expect(w.rows.find((g) => g.id === w.head)!.deleting).toBe(false);
-        }
-        const now = sources(w);
-        for (const id of now) expect(former.has(id), `${id} became a restore source again`).toBe(false);
-        for (const id of ever) if (!now.has(id)) former.add(id);
-        for (const id of now) ever.add(id);
-      }
-      expect(marked).toBeGreaterThan(0);
+  /** One walk; throws on a broken property. Returns how often the properties were exercised. */
+  function walk(seed: number): { marked: number; pinnedNonHead: number; unrooted: number; pruned: number } {
+    const r = rng(seed);
+    const w: W = { rows: [], head: null, pins: [], now: NOW, n: 0 };
+    const ever = new Set<string>();
+    const former = new Set<string>();
+    const reasons = ["turn_end", "timer", "suspend", "drain"];
+    const stats = { marked: 0, pinnedNonHead: 0, unrooted: 0, pruned: 0 };
+    const root = (id: string, orphaned: boolean, reason: string, parent: string | null): RootRow => ({
+      ...gen(id, w.now, { orphaned, reason, parent }), disk_manifest: `disk:${id}`, ...(r() < 0.3 ? { mem_manifest: `mem:${id}` } : {}), mem_unrooted: false,
     });
+    for (let step = 0; step < 300; step++) {
+      const x = r();
+      if (x < 0.4) {
+        const id = `g${w.n++}`;
+        w.rows.push(root(id, false, reasons[Math.floor(r() * reasons.length)]!, w.head));
+        w.head = id;
+      } else if (x < 0.47) {
+        // A salvage: an orphan whose parent is an older orphan or a main-chain generation.
+        const orphans = w.rows.filter((g) => g.orphaned);
+        const parent = orphans.length && r() < 0.5 ? orphans[orphans.length - 1]!.id : w.head;
+        w.rows.push(root(`o${w.n++}`, true, "salvage", parent));
+      } else if (x < 0.55) {
+        if (w.head) w.pins = [w.head]; // a claim pins the head it restores
+      } else if (x < 0.6) {
+        w.pins = [];
+      } else if (x < 0.85) {
+        w.now += Math.floor(r() * (r() < 0.1 ? 10 * DAY : 30 * MIN));
+      } else if (x < 0.88) {
+        // Prune main-chain deleting rows (SandboxDO does after a week; any time here).
+        const before = w.rows.length;
+        w.rows = w.rows.filter((g) => !(g.deleting && !g.orphaned));
+        stats.pruned += before - w.rows.length;
+      } else {
+        const v = viewOf(w);
+        const d = retention(w.rows, v);
+        const mem = memoryToUnroot(w.rows, v);
+        stats.marked += d.drop.length;
+        stats.unrooted += mem.length;
+        if (w.pins.some((p) => p !== w.head)) stats.pinnedNonHead += 1;
+        for (const id of [...d.drop, ...mem]) {
+          expect(isRestoreSource(w.rows.find((x) => x.id === id)!, v), `${id} is a restore source`).toBe(false);
+        }
+        for (const id of d.drop) w.rows.find((x) => x.id === id)!.deleting = true;
+        for (const id of mem) w.rows.find((x) => x.id === id)!.mem_unrooted = true;
+        // Stable: the same view drops nothing more.
+        expect(retention(w.rows, v).drop).toEqual([]);
+      }
+      const now = sources(w);
+      for (const id of now) expect(former.has(id), `${id} became a restore source again`).toBe(false);
+      // Every restore source's manifests are GC roots.
+      const roots = new Set(gcRootsOf(w.rows));
+      for (const g of w.rows.filter((g) => now.has(g.id))) {
+        expect(roots.has(g.disk_manifest) && (!g.mem_manifest || roots.has(g.mem_manifest)), `${g.id}'s manifests are roots`).toBe(true);
+      }
+      for (const id of ever) if (!now.has(id)) former.add(id);
+      for (const id of now) ever.add(id);
+    }
+    return stats;
   }
-  it("the walks reached retention passes while a former head was pinned", () => {
-    expect(pinnedNonHead).toBeGreaterThan(10);
+
+  const seeds = Array.from({ length: 60 }, (_, i) => i + 1);
+  it.each(seeds)("seed %i: never drops or unroots a restore source, is stable, and a former restore source never returns", (seed) => {
+    expect(walk(seed).marked).toBeGreaterThan(0);
+  });
+  it("the walks are not vacuous: drops while a former head was pinned, memory unrooted, rows pruned", () => {
+    const total = seeds.map(walk).reduce((a, b) => ({
+      marked: a.marked + b.marked, pinnedNonHead: a.pinnedNonHead + b.pinnedNonHead, unrooted: a.unrooted + b.unrooted, pruned: a.pruned + b.pruned,
+    }));
+    expect(total.pinnedNonHead).toBeGreaterThan(10);
+    expect(total.unrooted).toBeGreaterThan(10);
+    expect(total.pruned).toBeGreaterThan(10);
   });
 });

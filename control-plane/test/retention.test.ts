@@ -9,7 +9,6 @@ import { FleetDO } from "../src/do/fleet";
 import { SandboxDO } from "../src/do/sandbox";
 import type { FleetView } from "../../protocol/admin/view";
 import type { CommitRequestEvent } from "../src/protocol/control";
-import { gcMarkVersion, retentionMode } from "../src/lib/retention";
 import { storedEnum } from "../src/lib/stored";
 import { SandboxState } from "../src/protocol/model";
 import type { AgentDO } from "../src/do/agent";
@@ -108,8 +107,6 @@ describe("pruning", () => {
     const cell = uniqueCell();
     const live = await connectHost(cell);
     const old = Date.now() - 40 * DAY;
-    // The current marking version (generation retention `on` marks with the next one).
-    const markVersion = gcMarkVersion(1, retentionMode(env));
     await fleetSql(cell, (sql) => {
       const launch = (id: string, host: string | null, reason: string | null, ended: number | null) =>
         sql.exec("INSERT INTO launched (instance_id, launched_ms, host, role, reason, ended_ms) VALUES (?, ?, ?, 'sandbox', ?, ?)", id, old, host, reason, ended);
@@ -119,8 +116,8 @@ describe("pruning", () => {
       launch("i-host-pruned", "hst_gone000000000000000000", null, null);
       launch("i-host-live", live.host, null, null);
       const run = (id: string, marked: number, report: string | null) =>
-        sql.exec("INSERT INTO gc_runs (run, host, marked_ms, dry_run, mark_version, roots, finished_ms, report) VALUES (?, 'h', ?, 0, ?, 0, ?, ?)",
-          id, marked, markVersion, report === null ? null : marked + 1, report);
+        sql.exec("INSERT INTO gc_runs (run, host, marked_ms, dry_run, mark_version, roots, finished_ms, report) VALUES (?, 'h', ?, 0, 1, 0, ?, ?)",
+          id, marked, report === null ? null : marked + 1, report);
       run("gc_proven_old", old - 3, "{}");
       run("gc_proven_latest", old - 2, "{}");
       run("gc_abandoned", old - 1, '{"abandoned":true}');

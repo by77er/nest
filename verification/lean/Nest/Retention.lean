@@ -25,7 +25,7 @@ Over-approximations, on top of `Nest.Gc`'s: `retire` may mark any recorded gener
 restore source, at any time (the code marks only what the tiers, the turn-end bound and orphan expiry
 drop, so the theorem holds for any retention policy); pins may end at any time; orphan branch heads
 are not restore sources in the model (the code keeps them 30 days, which only keeps more); `deleting`
-rows are never pruned (the code prunes them after a week, which removes no live generation's keys).
+rows are never pruned (the code prunes main-chain ones a week after marking, which removes no live generation's keys, and never an orphan's).
 
 Not modelled: memory manifests. `Gen.keys` is the closure of both manifests, so the model roots a
 kept checkpoint's memory; the code unroots the memory of a ready generation that isn't a restore

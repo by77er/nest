@@ -8,8 +8,9 @@ import type { SandboxState } from "../protocol/model";
 
 /**
  * `SANDBOX_RETENTION`: `off` marks nothing; `report` (the default) computes and reports what it would
- * mark, and changes nothing; `on` marks generations `deleting` and stops rooting the memory of
- * checkpoints that are no longer restore sources. A `deleting` generation is never a root in any mode.
+ * mark, and changes nothing; `on` marks generations `deleting` and marks the memory of checkpoints that
+ * are no longer restore sources unrooted. Both marks are durable and one-way, and GC's roots follow
+ * them in every mode, so switching back never roots again what a sweep may already have taken.
  */
 export type RetentionMode = "off" | "report" | "on";
 export const RETENTION_MODES: readonly RetentionMode[] = ["off", "report", "on"];
@@ -21,11 +22,6 @@ export function retentionMode(env: Pick<Env, "SANDBOX_RETENTION">): RetentionMod
   if ((RETENTION_MODES as readonly string[]).includes(v)) return v as RetentionMode;
   console.error(`SANDBOX_RETENTION=${v} is not one of ${RETENTION_MODES.join("|")}; using ${DEFAULT_RETENTION_MODE}`);
   return DEFAULT_RETENTION_MODE;
-}
-
-/** GC's marking version (FleetDO's `GC_MARK_VERSION`) for a mode: `on` marks differently, so its first run is dry. */
-export function gcMarkVersion(base: number, mode: RetentionMode): number {
-  return mode === "on" ? base + 1 : base;
 }
 
 /** An orphaned sibling's head is a restore source this long after it was committed ("like other parked work"). */
@@ -64,6 +60,8 @@ export interface GenRow {
 export interface RootRow extends GenRow {
   disk_manifest: string;
   mem_manifest?: string;
+  /** Its memory was marked unrooted (`mem_unrooted_ms`): one-way, like `deleting`. */
+  mem_unrooted: boolean;
 }
 
 /** An in-flight claim's pin: the generation a placement at `epoch` restores (`SandboxInfo.restore_pin`). */
@@ -170,16 +168,26 @@ export function retention(rows: readonly GenRow[], v: ChainView): RetentionDecis
 }
 
 /**
- * The manifests GC must keep for one live sandbox: every ready generation's disk manifest, and its
- * memory manifest unless retention is `on` and it is no longer a restore source (the restore rule
- * loads memory only with its own head, so nothing can load it). `deleting` generations: none.
+ * The ready checkpoints whose memory retention (`on`) marks unrooted: no longer restore sources, so
+ * nothing will load their memory again (the restore rule loads memory only with its own head, and a
+ * generation that stops being a restore source never becomes one again). Oldest first.
  */
-export function gcRootsOf(rows: readonly RootRow[], v: ChainView, mode: RetentionMode): string[] {
+export function memoryToUnroot(rows: readonly RootRow[], v: ChainView): string[] {
+  return rows.filter((g) => !g.deleting && g.mem_manifest && !g.mem_unrooted && !isRestoreSource(g, v))
+    .sort((a, b) => -newestFirst(a, b)).map((g) => g.id);
+}
+
+/**
+ * The manifests GC must keep for one live sandbox: every ready generation's disk manifest, and its
+ * memory manifest unless it was marked unrooted. `deleting` generations: none. It reads only durable
+ * marks, never the mode or the clock, so a mode switch or a rollback of the switch roots nothing again.
+ */
+export function gcRootsOf(rows: readonly RootRow[]): string[] {
   const roots = new Set<string>();
   for (const g of rows) {
     if (g.deleting) continue;
     roots.add(g.disk_manifest);
-    if (g.mem_manifest && (mode !== "on" || isRestoreSource(g, v))) roots.add(g.mem_manifest);
+    if (g.mem_manifest && !g.mem_unrooted) roots.add(g.mem_manifest);
   }
   return [...roots];
 }

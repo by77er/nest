@@ -126,7 +126,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `PUBLIC_BASE_URL`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
 | `WAKE_BATCH_MS` | Batching window of the workstream channel's subscriber wakes; defaults to 2000 in code (not in `wrangler.jsonc`) |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
-| `SANDBOX_RETENTION` | Generation retention (`src/lib/retention.ts`; docs/sandbox/state/#retention): `report` (the default: records what it would drop), `on` (marks generations `deleting`; GC's next run is dry) or `off` |
+| `SANDBOX_RETENTION` | Generation retention (`src/lib/retention.ts`; docs/sandbox/state/#retention): `report` (the default: records what it would drop), `on` (marks generations `deleting` and non-source memory unrooted; GC's next run is dry) or `off` |
 | `ALLOW_LOOPBACK_MCP` | `1` lets an mcp capability name a loopback URL (`http://127.0.0.1:…`): tests and local dev (the e2e harness) only; never set in a deploy |
 | `ALLOW_LOOPBACK_BROKERED` | `1` lets an http profile and `GITHUB_API_URL` name a loopback URL: tests and local dev only; never set in a deploy |
 | `GITHUB_API_URL`, `BROKERED_TIMEOUT_MS` | The REST API GitHub actions use (default `https://api.github.com`; a fake in e2e) and one brokered request's budget (default 30000) |

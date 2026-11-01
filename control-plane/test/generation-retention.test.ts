@@ -145,7 +145,7 @@ describe("the retention alarm", () => {
     expect(await deadline(sandbox, "retention")).toBeGreaterThan(Date.now() + 5 * HOUR);
   });
 
-  it("prunes deleting rows a week after they were marked, an orphan's after 31 days", async () => {
+  it("prunes main-chain deleting rows a week after they were marked, and never an orphan's", async () => {
     const { h, sandbox } = await placedSandbox();
     await commitChain(sandbox, h.host, [{ reason: "timer", age: 0 }]);
     await runInDurableObject(sandboxStub(sandbox), (_i: SandboxDO, st) => {
@@ -159,7 +159,8 @@ describe("the retention alarm", () => {
     });
     await runSandboxAlarm(sandbox, "retention");
     const left = Object.keys(await states(sandbox)).filter((id) => id.includes("_main_") || id.includes("_orph_")).sort();
-    expect(left).toEqual(["gen_main_recent0000000000", "gen_orph_recent0000000000"]);
+    // An orphan's row keeps its commit record: a salvage has no parent check, so a late re-ask must find it.
+    expect(left).toEqual(["gen_main_recent0000000000", "gen_orph_old000000000000000", "gen_orph_recent0000000000"]);
   });
 
   it("is armed by the lifetime check for a sandbox that never commits again", async () => {
@@ -265,9 +266,22 @@ describe("the switch", () => {
     const ids = await history(sandbox, h.host);
     const out = await inMode(sandbox, "report");
     expect(Object.values(await states(sandbox)).every((s) => s === "ready")).toBe(true);
-    expect(out.report).toMatchObject({ mode: "report", ready: 9, drop: 3, marked: 0, memory_not_source: 1 });
+    expect(out.report).toMatchObject({ mode: "report", ready: 9, drop: 3, marked: 0, memory_to_unroot: 1, memory_unrooted: 0 });
     expect(out.roots).toContain(mf(seqOf(ids, 5), "m"));
     expect(out.roots).toContain(mf(seqOf(ids, 0), "d"));
+  });
+
+  it("switching back from on roots nothing again: what was marked deleting or unrooted stays out of the roots", async () => {
+    const { h, sandbox } = await placedSandbox();
+    const ids = await history(sandbox, h.host);
+    const on = await inMode(sandbox, "on");
+    expect(on.report).toMatchObject({ marked: 3, memory_unrooted: 1 });
+    for (const mode of ["report", "off"]) {
+      const out = await inMode(sandbox, mode);
+      expect(out.roots, mode).not.toContain(mf(seqOf(ids, 5), "m"));
+      expect(out.roots, mode).not.toContain(mf(seqOf(ids, 0), "d"));
+      expect(out.roots.sort(), mode).toEqual(on.roots.sort());
+    }
   });
 
   it("off: marks and records nothing", async () => {
@@ -291,6 +305,33 @@ describe("the switch", () => {
 });
 
 describe("stored data", () => {
+  it("an orphan's commit record outlives retention: a salvage re-asked months later gets its first answer", async () => {
+    const { h, sandbox } = await placedSandbox();
+    await commitChain(sandbox, h.host, [{ reason: "timer", age: 0 }]);
+    await runInDurableObject(sandboxStub(sandbox), (_i: SandboxDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify({ ...info, epoch: 2, host: "hst_other00000000000000000" }));
+    });
+    const salvage = {
+      ts_ms: Date.now(), type: "commit_request", request: "req_late_salvage", sandbox, epoch: 1, kind: "disk_only", disk_manifest: mf(77, "d"), reason: "salvage",
+    } as CommitRequestEvent;
+    const first = await sandboxStub(sandbox).commit(h.host, salvage);
+    expect(first).toMatchObject({ status: "orphaned" });
+    const orphan = (first as { generation: GenerationRecord }).generation.id;
+    // Two months on: expired, marked deleting, and every prune has run.
+    await age(sandbox, orphan, 60 * DAY);
+    await runInDurableObject(sandboxStub(sandbox), (_i: SandboxDO, st) => st.storage.sql.exec("UPDATE commits SET created_ms = ?", Date.now() - 60 * DAY));
+    await runSandboxAlarm(sandbox, "retention");
+    expect((await states(sandbox))[orphan]).toBe("deleting");
+    await runInDurableObject(sandboxStub(sandbox), (_i: SandboxDO, st) => st.storage.sql.exec("UPDATE generations SET deleting_ms = ? WHERE id = ?", Date.now() - 60 * DAY, orphan));
+    await runSandboxAlarm(sandbox, "retention");
+    await runSandboxAlarm(sandbox, "commit_prune");
+    const again = await sandboxStub(sandbox).commit(h.host, salvage);
+    expect(again).toMatchObject({ status: "orphaned", generation: { id: orphan } });
+    expect(Object.keys(await states(sandbox))).toHaveLength(2); // the head and the one orphan: no second orphan
+  });
+
+
   it("rows stored before the state column read as ready restore points", async () => {
     const { h, sandbox } = await placedSandbox();
     const [head] = await commitChain(sandbox, h.host, [{ reason: "timer", age: 0 }]);
@@ -312,18 +353,32 @@ describe("stored data", () => {
 });
 
 describe("FleetDO's GC marking", () => {
-  it("retention on marks with the next version: its first run is dry even after a proven run of the old marking", async () => {
+  it("switching retention on makes the next run dry, even after a proven run, and again after it was off", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
-      st.storage.sql.exec(`INSERT INTO gc_runs (run, host, marked_ms, dry_run, mark_version, roots, finished_ms, report)
-        VALUES ('gc_proven_v1', 'h', ?, 0, 1, 0, ?, '{}')`, Date.now() - 2 * DAY, Date.now() - 2 * DAY);
+    const claim = async () => {
+      await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => st.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('gc_requested', '1')"));
+      const r = await SELF.fetch("http://cp.test/v1/hosts/gc/claim", { method: "POST", headers: { authorization: `Bearer ${h.host_token}` } });
+      const c = await r.json<{ run: string; dry_run: boolean }>();
+      const rep = await SELF.fetch("http://cp.test/v1/hosts/gc/report", { method: "POST",
+        headers: { authorization: `Bearer ${h.host_token}`, "content-type": "application/json" }, body: JSON.stringify({ run: c.run, report: {} }) });
+      expect(rep.status).toBe(200);
+      return c.dry_run;
+    };
+    const mode = (m: string) => runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      const self = inst as unknown as { env: typeof env };
+      self.env = { ...self.env, SANDBOX_RETENTION: m };
     });
-    const r = await SELF.fetch("http://cp.test/v1/hosts/gc/claim", { method: "POST", headers: { authorization: `Bearer ${h.host_token}` } });
-    expect(await r.json()).toMatchObject({ dry_run: true });
-    const v = await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) =>
-      st.storage.sql.exec<{ mark_version: number }>("SELECT mark_version FROM gc_runs WHERE run != 'gc_proven_v1'").one().mark_version);
-    expect(v).toBe(2);
+    await mode("report");
+    expect(await claim()).toBe(true); // a cell's first run
+    expect(await claim()).toBe(false);
+    await mode("on");
+    expect(await claim()).toBe(true); // the proven run predates switching on
+    expect(await claim()).toBe(false);
+    await mode("report");
+    expect(await claim()).toBe(false); // off is the old marking, already proven
+    await mode("on");
+    expect(await claim()).toBe(true); // on again: dry again
   });
 });
 
