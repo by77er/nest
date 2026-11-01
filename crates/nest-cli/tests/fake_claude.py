@@ -275,7 +275,7 @@ def scripted(path):
 
 def turn(text):
     # An agent's message (a spawn's task: "Message from <sender>: E2E <path>") runs a scenario too.
-    msg = re.match(r"Message from [^:\n]+: (E2E .*)$", text, re.S)
+    msg = re.match(r"Message from \S+: (E2E .*)$", text, re.S)
     if msg:
         text = msg.group(1)
     if text.startswith("E2E "):
