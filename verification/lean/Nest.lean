@@ -1,5 +1,6 @@
 import Nest.CommitChain
 import Nest.Gc
+import Nest.Retention
 
 /-! Axioms check: every main theorem uses only the standard axioms (or none). -/
 
@@ -16,3 +17,8 @@ import Nest.Gc
 #print axioms Nest.Gc.b1_unsafe
 #print axioms Nest.Gc.b1_pending_lost
 #print axioms Nest.Gc.a1_not_vacuous
+#print axioms Nest.Retention.safe
+#print axioms Nest.Retention.source_present
+#print axioms Nest.Retention.load_never_deleting
+#print axioms Nest.Retention.unguarded_unsafe
+#print axioms Nest.Retention.retention_not_vacuous
