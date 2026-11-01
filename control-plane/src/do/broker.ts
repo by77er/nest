@@ -4,7 +4,8 @@ import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
-import { b64url, NestError } from "../lib/util";
+import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
+import { b64url, newId, NestError } from "../lib/util";
 import { Credential } from "../protocol/control";
 import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
 import { ErrorCodes, type InjectionSecret } from "../protocol/model";
@@ -16,6 +17,8 @@ export class BrokerDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   /** Imported signing keys by kid (memory only; rebuilt from the stored JWK after an eviction). */
   private readonly bindingSigners = new Map<string, Promise<CryptoKey>>();
+  /** MCP servers' OAuth tokens (lib/mcp-auth.ts); its tables are read by nothing else. */
+  private readonly oauth!: OAuthStore;
 
   /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
   async health(): Promise<true> {
@@ -29,6 +32,51 @@ export class BrokerDO extends DurableObject<Env> {
     if (isHealthInstance(ctx, env.BROKER)) return;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL,
       expires_ms INTEGER, updated_ms INTEGER NOT NULL)`);
+    this.oauth = new OAuthStore({
+      sql: this.sql,
+      secret: (name) => this.secret(name)?.value ?? null,
+      audit: (r) => this.audit(r),
+      publicBaseUrl: env.PUBLIC_BASE_URL,
+      allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
+    });
+  }
+
+  /**
+   * One issuance audit record to R2 (`audit/broker/<day>/<ms>-<id>.json`, #issuance-audit): never a value.
+   * Written in the background; a failed write is logged and doesn't fail what it records.
+   */
+  private audit(r: OAuthAudit): void {
+    const ts = Date.now();
+    const key = `audit/broker/${new Date(ts).toISOString().slice(0, 10)}/${ts}-${newId("")}.json`;
+    this.ctx.waitUntil(this.env.BUCKET.put(key, JSON.stringify({ ts_ms: ts, ...r })).then(() => undefined, (e: unknown) => {
+      console.error(`BrokerDO: audit write failed (${r.event})`, e);
+    }));
+  }
+
+  // --- MCP OAuth (docs/agents/capabilities/mcp/#oauth) --------------------------------------------
+
+  /** The operator starts authorizing an mcp capability: the URL to open (admin route only). */
+  async oauthStart(input: StartInput): Promise<StartAnswer> {
+    return await this.oauth.start(input, "operator");
+  }
+
+  /** The authorization server's redirect through the Worker's callback route (no admin token: the state is the proof). */
+  async oauthCallback(q: { state?: string; code?: string; error?: string; iss?: string }): Promise<{ ok: boolean; capability: string | null; message: string }> {
+    return await this.oauth.callback(q, "callback");
+  }
+
+  /**
+   * An mcp capability's OAuth access token, for AgentDO's MCP client (the only caller): refreshed as
+   * needed; the refresh token never leaves BrokerDO. See `OAuthStore.token`.
+   */
+  async mcpOAuthToken(ref: string, serverUrl: string, refused?: string): Promise<string | null> {
+    if (!/^cap:./.test(ref)) throw new NestError(ErrorCodes.FORBIDDEN, `${ref} is not a capability credential`, 403);
+    return await this.oauth.token(ref, serverUrl, refused, "AgentDO");
+  }
+
+  /** What the operator may see of an OAuth authorization: never a token. */
+  async oauthStatus(ref: string): Promise<OAuthStatus> {
+    return this.oauth.status(ref);
   }
 
   async putSecret(name: string, value: string, expiresMs?: number): Promise<void> {

@@ -10,6 +10,7 @@ import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
 import { Capability, CatalogName, OperatorOverrides, Template } from "./lib/spec";
+import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { type Actor, LedgerName, type SpecGrant, type TaskOp, TaskPriority, TaskStatus } from "./lib/tasks";
 import { LIST_DEFAULT_LIMIT, ledgerStub } from "./do/tasks";
 import { DIRECTORY } from "./do/channel";
@@ -234,6 +235,18 @@ async function channelOf(env: Env, encoded: string): Promise<string> {
   return name;
 }
 
+/** An mcp capability whose `auth` is the oauth form (404 for an unknown one, 409 for any other). */
+async function oauthCapability(env: Env, raw: string) {
+  const name = catalogName(raw);
+  const cap = (await catalog(env).catalog()).capabilities[name];
+  if (!cap) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown capability ${name}`, 404);
+  const mcp = cap.mcp;
+  if (!mcp || typeof mcp.auth === "string") throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name} is not an mcp capability with auth {oauth: cap:<name>}`, 409);
+  return { name, mcp: { ...mcp, auth: mcp.auth } };
+}
+
+const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
 function catalogName(raw: string): string {
   const name = CatalogName.safeParse(raw);
   if (!name.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, name.error.message);
@@ -332,6 +345,33 @@ export const ROUTES: Route[] = [
   route({ method: "PUT", path: "/v1/admin/capabilities/:name", auth: "admin", body: Capability, run: ({ env, p, body }) => catalog(env).putCapability(catalogName(p.name), body) }),
   route({ method: "PUT", path: "/v1/admin/templates/:name", auth: "admin", body: Template, run: ({ env, p, body }) => catalog(env).putTemplate(catalogName(p.name), body) }),
   route({ method: "DELETE", path: "/v1/admin/capabilities/:name", auth: "admin", run: ({ env, p }) => catalog(env).deleteCapability(catalogName(p.name)) }),
+
+  // OAuth for an mcp capability (docs/agents/capabilities/mcp/#oauth): the operator starts it here and
+  // opens the URL it answers; the authorization server redirects the browser to the callback.
+  route({
+    method: "POST", path: "/v1/admin/capabilities/:name/oauth", auth: "admin", optionalBody: true, body: z.strictObject({ scopes: Scopes.optional() }),
+    run: async ({ env, p, body: r }) => {
+      const { name, mcp } = await oauthCapability(env, p.name);
+      return broker(env).oauthStart({ capability: name, url: mcp.url, auth: mcp.auth, ...(r.scopes ? { scopes: r.scopes } : {}) });
+    },
+  }),
+  route({ method: "GET", path: "/v1/admin/capabilities/:name/oauth", auth: "admin", run: async ({ env, p }) =>
+    broker(env).oauthStatus((await oauthCapability(env, p.name)).mcp.auth.oauth) }),
+  // No admin token: a browser follows the authorization server's redirect here. The single-use, 10-minute
+  // state names the flow the operator started, and the code is useless without that flow's PKCE verifier.
+  route({ method: "GET", path: "/v1/oauth/callback", auth: "none", run: async ({ env, url }) => {
+    const q = url.searchParams;
+    const opt = (k: string) => (q.has(k) ? { [k]: q.get(k)! } : {});
+    const r = await broker(env).oauthCallback({ ...opt("state"), ...opt("code"), ...opt("error"), ...opt("iss") });
+    const page = `<!doctype html><meta charset="utf-8"><title>nest</title><p>${escapeHtml(r.ok ? `${r.message}. You can close this tab.` : `Not authorized: ${r.message}`)}</p>`;
+    // The query held a code: never sent on as a Referer, never cached.
+    return new Response(page, {
+      status: r.ok ? 200 : 400, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer" },
+    });
+  } }),
+  // nest's client ID metadata document: its URL is the client id an authorization server fetches.
+  route({ method: "GET", path: "/v1/oauth/client.json", auth: "none", run: async ({ env }) =>
+    json(clientMetadataDocument(env.PUBLIC_BASE_URL), 200, { "cache-control": "public, max-age=300" }) }),
   route({ method: "DELETE", path: "/v1/admin/templates/:name", auth: "admin", run: ({ env, p }) => catalog(env).deleteTemplate(catalogName(p.name)) }),
 
   // Channels (docs/channels/): the operator is `user`, the root.

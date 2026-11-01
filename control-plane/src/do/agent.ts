@@ -19,6 +19,7 @@ import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { approves, argsDigest, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
 import { McpProxy } from "../lib/mcp-proxy";
+import { mcpBearer } from "../lib/mcp-auth";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, EscalateTo, type RoleRecord, specFromRole } from "../lib/spec";
 import {
@@ -254,7 +255,7 @@ export class AgentDO extends DurableObject<Env> {
     addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
     this.mcp = new McpProxy({
       sql: this.sql,
-      token: (ref) => env.BROKER.get(env.BROKER.idFromName("broker")).capabilityToken(ref),
+      bearer: (g, refused) => mcpBearer(env.BROKER.get(env.BROKER.idFromName("broker")), g, refused),
       callTimeoutMs: num(env.MCP_CALL_TIMEOUT_MS, 45_000),
       listTimeoutMs: num(env.MCP_LIST_TIMEOUT_MS, 4_000),
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
