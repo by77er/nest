@@ -11,7 +11,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello` | first frame | agent, host, `instance_id` (random per brain process), epoch (the agent epoch), `session?`, `local_bytes?`, `last_seq?` |
+| `hello` | first frame | agent, host, `instance_id` (random per brain process), epoch (the agent epoch), `session?`, `local_bytes?`, `last_seq?`, `tools_changed?` (true: the runner acts on `tools_changed`; absent from older runners, which are never sent it) |
 | `segment` | by offset | Raw JSONL bytes `[offset, offset+len)` of the native session file, base64. `base: true` means the file was rewritten (it shrank or its inode changed): discard earlier segments; this one starts at offset 0 |
 | `events` | seq | A batch of `model::AgentEvent` (each with its own per-agent `seq`), coalesced. Each event's `epoch` is the one this connection's hello presented; AgentDO drops any other |
 | `tool_call` | seq | A platform tool call relayed from nest-mcp: `call`, `turn?`, `name`, `arguments` |
@@ -32,6 +32,7 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 | `cache_update` | seq | `AgentCache{version, rules, inbox, max_stop_continuations}` for answering hooks locally |
 | `tool_result` | seq | `outcome: ok{content} \| error{error} \| pending{ask, message}` |
 | `tools_list` | no | `ToolDef[]` (MCP `tools/list` plus nest metadata) |
+| `tools_changed` | no | The agent's tool list changed (a remote MCP server's did: [list_changed](../../../agents/capabilities/mcp/#list_changed)): the runner has `nest mcp` send Claude Code `notifications/tools/list_changed`, and Claude Code lists again. Only to a runner whose hello had `tools_changed: true`. Not reliable: AgentDO sends it again at the next hello when the brain's last `tools_list_request` came before the last change, and after a `tools_list` made while one landed. An older runner would log and skip it (it ignores what it can't parse) |
 | `hands_resolved` | no (`request`) | `outcome`: `{status: ok, hands{url, binding, guest, edge?}}` or `{status: error, error, retry_after_ms?}`: `not_bound` (no hands, or not attached), `sandbox_not_ready` with `retry_after_ms` (no host, placing, the slot not confirmed, no gateway advertised), `stale_epoch` (not the current runner process or epoch). The binding travels only here, never in a command. For one release AgentDO also sends the previous shape (exactly one of `hands` and `error`, and `retry_after_ms`); runners read only `outcome`, and one without it is an `invalid_message` error; `hands` still carries unsigned `sandbox` and `epoch` copies for those runners |
 | `ack` / `error` | — | |
 
