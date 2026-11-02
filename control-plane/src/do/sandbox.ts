@@ -23,6 +23,7 @@ import {
   InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
 } from "../protocol/model";
 import { canonicalRepos, Repos, unionRepos } from "../lib/repos";
+import type { Labels } from "../lib/clients";
 import { GITHUB_BINDING, githubEgress } from "../lib/rules/github";
 import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
@@ -87,8 +88,12 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
   ports: { port: number; url: string }[];
   /** The last `HISTORY_MAX` epochs and their hosts (the `epochs` table keeps every one). */
   history: { epoch: number; host: string }[];
-  /** The agent it was created for (`agent_spawn{sandbox: new}`), which may destroy it when it ends; absent: the operator's. */
+  /** The agent it was created for (`agent_spawn{sandbox: new}`), which may destroy it when it ends; absent: the operator's or its client's. */
   owner?: string;
+  /** The API client whose subtree it is in (docs/control-plane/api/clients/); absent: the operator's. */
+  client?: string;
+  /** Set by its creator and fixed after. Absent: none. */
+  labels?: Labels;
   /** Destroyed after being dormant this long (docs/control-plane/durable-objects/sandbox/#lifetime); absent: the cell default. */
   idle_ttl_ms?: number;
   /** Since when it has been dormant (no agent attached, no VM up); kept by every mutation (`decide`). */
@@ -111,6 +116,9 @@ export interface CreateSandbox {
   /** The agent it is created for (it owns it). */
   owner?: string;
   idle_ttl_ms?: number;
+  /** The client whose subtree it joins (it was admitted there first). */
+  client?: string;
+  labels?: Labels;
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
@@ -286,7 +294,10 @@ export class SandboxDO extends DurableObject<Env> {
     // before anything can be written for the sandbox, and again on a retried create, but never
     // again once destroyed (its registry row may already be pruned).
     const existing = this.get<SandboxInfo>("info");
-    if (existing?.state !== "destroyed") await this.fleet(req.cell).registerSandbox(req.sandbox);
+    const labels = req.labels && Object.keys(req.labels).length ? req.labels : undefined;
+    if (existing?.state !== "destroyed") {
+      await this.fleet(req.cell).registerSandbox(req.sandbox, req.client || labels ? { client: req.client ?? null, labels: labels ?? null } : undefined);
+    }
     if (existing) return this.view();
     const info: SandboxInfo = {
       ...newFields(),
@@ -304,9 +315,13 @@ export class SandboxDO extends DurableObject<Env> {
       working: [],
       ports: [],
       ...(req.owner ? { owner: req.owner } : {}),
+      ...(req.client ? { client: req.client } : {}),
+      ...(labels ? { labels } : {}),
       ...(req.idle_ttl_ms !== undefined ? { idle_ttl_ms: req.idle_ttl_ms } : {}),
     };
     this.put("info", info);
+    // Its client's registry hears that it lives (and, from `afterDestroyed`, that it was destroyed).
+    if (info.client) await this.deadlines.set("client", Date.now());
     await this.deadlines.set("expiry", Date.now() + 60_000, true);
     const layer = SandboxPolicyLayer.parse(req.policy ?? {});
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos) });
@@ -328,7 +343,7 @@ export class SandboxDO extends DurableObject<Env> {
   /** The record as the API shows it: without the compat `workstream`. */
   private view(): SandboxInfo {
     const { workstream: _, ...info } = this.info_();
-    return info;
+    return { ...info, labels: info.labels ?? {} };
   }
 
   /** A placement that never finished leaves `placing` set: once stale, FleetDO's lease decides. */
@@ -564,6 +579,8 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** What follows the decision that it is destroyed (`before`: the record just before it). A retry repeats it. */
   private async afterDestroyed(before: SandboxInfo, reason: string): Promise<void> {
+    // In the destroy decision's step (no await before it): its client's count frees the place.
+    if (before.client) await this.deadlines.set("client", Date.now());
     console.log(`sandbox ${before.sandbox}: destroyed (${reason})`);
     const fleet = this.fleet(before.cell);
     await fleet.sandboxDestroyed(before.sandbox);
@@ -899,6 +916,8 @@ export class SandboxDO extends DurableObject<Env> {
         await this.sendMoveNotices();
       } else if (key === "expiry") {
         await this.checkExpiry();
+      } else if (key === "client") {
+        await this.reportToClient();
       }
     });
   }
@@ -1010,6 +1029,27 @@ export class SandboxDO extends DurableObject<Env> {
     if (narrowed) await this.policyChanged(true);
     await this.armIdle();
     return { destroyed: false };
+  }
+
+  /**
+   * The `client` deadline: tell its client's ClientDO it lives, or was destroyed (what `max_sandboxes`
+   * counts), unless it was told that already. A failure is retried by the deadline.
+   */
+  private async reportToClient(): Promise<void> {
+    const info = this.tryInfo();
+    if (!info?.client) return;
+    const ended = info.state === "destroyed";
+    const want = ended ? "ended" : "live";
+    if (this.get<string>("client_reported") === want) return;
+    await this.env.CLIENT.get(this.env.CLIENT.idFromName(info.client)).report({
+      kind: "sandbox", id: info.sandbox, cell: info.cell, owner: info.owner ?? info.client, labels: info.labels ?? {}, ended_ms: ended ? Date.now() : null,
+    });
+    this.put("client_reported", want);
+  }
+
+  /** Whose subtree it is in (a client's routes answer 404 outside its own). */
+  async subtree(): Promise<{ client: string | null }> {
+    return { client: this.info_().client ?? null };
   }
 
   // --- lifetime (docs/control-plane/durable-objects/sandbox/#lifetime) --------------------------------

@@ -43,6 +43,15 @@
             "type": "string"
           },
           "description": "Narrow its push allowlist to these owner/repo names (a subset of the template's)."
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "maxProperties": 16,
+          "description": "Labels for it (and a sandbox created for it): up to 16 key: value pairs, keys lowercase letters, digits, '_', '.' and '-'. Fixed once set; not inherited from you."
         }
       },
       "required": [

@@ -10,6 +10,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [broker/](broker/) | Claude setup tokens, injected secrets, capability credentials, GitHub App token minting |
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
 | [mcp-connector/](mcp-connector/) | One remote MCP server and credential: the shared tool list, its change notices to agents, and call admission |
+| [client/](client/) | One API client: its record, grant and token hash, and the registry of its subtree (what its maximums count and it lists); plus the directory of client names |
 
 ## Conventions
 

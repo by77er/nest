@@ -16,7 +16,7 @@ export type EndReason = "stopped" | "exited" | "done" | "owner_ended";
  */
 export interface Ended {
   ms: number;
-  /** Who ended it: an agent id (itself, an owner), or `user`. */
+  /** Who ended it: an agent id (itself, an owner), a client id (`cli_…`), or `user`. */
   by: string;
   reason: EndReason;
   /** Its brain is killed (condemned) rather than left to finish its turn. */

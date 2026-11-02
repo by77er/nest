@@ -43,6 +43,29 @@ import {
 } from "../../../protocol/admin/view";
 import { AGENTS_CURSOR, agentCursorOf, type AgentRead, classifyAgent, classifySandbox, cursorOf, DEFAULT_QUIET_MS, mapBounded, parseCursor } from "../lib/abandoned";
 import { cellIdleTtlMs } from "../lib/lifetimes";
+import { labelWhere, type Labels } from "../lib/clients";
+
+/** What an agent or sandbox registers beside its id: its API client and labels (fixed at creation). */
+export interface RegistryMeta {
+  client: string | null;
+  labels: Labels | null;
+}
+export interface RegistryQuery {
+  labels?: [string, string][];
+  client?: string;
+  state?: "live" | "ended" | "all";
+  limit?: number;
+  cursor?: string;
+}
+/** A row of a cell's agent or sandbox registry, as listed. */
+export interface RegistryRow {
+  id: string;
+  client: string | null;
+  labels: Labels;
+  created_ms: number;
+  /** When its end was done, or it was destroyed; null while it lives. */
+  ended_ms: number | null;
+}
 
 // Closed unions for every status/kind column (docs/data/#enums): written through these types, read
 // back through `storedEnum` (a value outside the union is logged as an error).
@@ -378,6 +401,12 @@ export class FleetDO extends DurableObject<Env> {
     // and its end once done; its reap removes it.
     this.sql.exec("CREATE TABLE IF NOT EXISTS agent_registry (agent TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL, ended_ms INTEGER)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS agent_registry_page ON agent_registry (registered_ms, agent)");
+    // The listing's filters (`GET /v1/agents`, `GET /v1/sandboxes`): each one's API client and labels,
+    // copied from its record at registration (both are fixed at creation). Null: none, or registered before.
+    addColumn(this.sql, "agent_registry", "client", "TEXT");
+    addColumn(this.sql, "agent_registry", "labels", "TEXT");
+    addColumn(this.sql, "sandboxes", "client", "TEXT");
+    addColumn(this.sql, "sandboxes", "labels", "TEXT");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS gc_runs (run TEXT PRIMARY KEY, host TEXT NOT NULL, marked_ms INTEGER NOT NULL,
       dry_run INTEGER NOT NULL, mark_version INTEGER NOT NULL, roots INTEGER NOT NULL, finished_ms INTEGER, report TEXT)`);
     // Agents whose last start found no brain host with room: poked when room appears, and the tick
@@ -2197,8 +2226,9 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** SandboxDO's `create`, before anything is written for the sandbox. A destroyed one stays destroyed. */
-  async registerSandbox(sandbox: string): Promise<void> {
+  async registerSandbox(sandbox: string, meta?: RegistryMeta): Promise<void> {
     this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", sandbox, Date.now());
+    if (meta) this.sql.exec("UPDATE sandboxes SET client = ?, labels = ? WHERE sandbox = ?", meta.client, meta.labels ? JSON.stringify(meta.labels) : null, sandbox);
   }
 
   /** Operator: register sandboxes created before the registry existed, so GC keeps their data. */
@@ -2354,9 +2384,52 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** An agent of this cell exists (and since when its end is done, if it is): AgentDO keeps this current. */
-  async registerAgent(agent: string, ended_ms: number | null): Promise<void> {
+  async registerAgent(agent: string, ended_ms: number | null, meta?: RegistryMeta): Promise<void> {
     this.sql.exec(`INSERT INTO agent_registry (agent, registered_ms, ended_ms) VALUES (?, ?, ?)
       ON CONFLICT(agent) DO UPDATE SET ended_ms = excluded.ended_ms`, agent, Date.now(), ended_ms);
+    if (meta) this.sql.exec("UPDATE agent_registry SET client = ?, labels = ? WHERE agent = ?", meta.client, meta.labels ? JSON.stringify(meta.labels) : null, agent);
+  }
+
+  /**
+   * A page of this cell's agents or sandboxes from its registries, oldest first (`GET /v1/agents`,
+   * `GET /v1/sandboxes` for the operator): filtered by labels (each must hold), client, and state
+   * (`live`: not ended or destroyed). The registries are indexes of the records, kept by each object.
+   */
+  async listRegistry(kind: "agent" | "sandbox", q: RegistryQuery = {}): Promise<{ items: RegistryRow[]; next_cursor: string | null }> {
+    const t = kind === "agent"
+      ? { table: "agent_registry", id: "agent", ended: "ended_ms" }
+      : { table: "sandboxes", id: "sandbox", ended: "destroyed_ms" };
+    const limit = Math.min(Math.max(q.limit ?? 100, 1), 500);
+    const where: string[] = [];
+    const args: (string | number)[] = [];
+    const state = q.state ?? "live";
+    if (state === "live") where.push(`${t.ended} IS NULL`);
+    else if (state === "ended") where.push(`${t.ended} IS NOT NULL`);
+    if (q.client) {
+      where.push("client = ?");
+      args.push(q.client);
+    }
+    if (q.cursor) {
+      const m = /^(\d+):(.+)$/.exec(q.cursor);
+      if (!m) throw new NestError(ErrorCodes.INVALID_MESSAGE, "bad cursor");
+      where.push(`(registered_ms > ? OR (registered_ms = ? AND ${t.id} > ?))`);
+      args.push(Number(m[1]), Number(m[1]), m[2]!);
+    }
+    const lw = labelWhere("labels", q.labels ?? []);
+    where.push(lw.sql);
+    args.push(...lw.args);
+    const rows = this.sql.exec<{ id: string; registered_ms: number; ended: number | null; client: string | null; labels: string | null }>(
+      `SELECT ${t.id} AS id, registered_ms, ${t.ended} AS ended, client, labels FROM ${t.table} WHERE ${where.join(" AND ")}
+        ORDER BY registered_ms, ${t.id} LIMIT ?`, ...args, limit + 1).toArray();
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    return {
+      items: page.map((r) => ({
+        id: r.id, client: r.client, labels: r.labels ? JSON.parse(r.labels) as Labels : {},
+        created_ms: r.registered_ms, ended_ms: r.ended,
+      })),
+      next_cursor: rows.length > limit && last ? `${last.registered_ms}:${last.id}` : null,
+    };
   }
 
   /** Its records are pruned: no longer an agent of this cell. */

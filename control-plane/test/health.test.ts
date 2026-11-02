@@ -45,18 +45,9 @@ describe("GET /v1/health", () => {
     }
   });
 
-  it("ClientDO, declared ahead of the release that builds clients, is probed and stores nothing", async () => {
+  it("ClientDO is probed", async () => {
     const res = await SELF.fetch(`${BASE}/v1/health`);
     expect((await res.json<{ durable_objects: Record<string, string> }>()).durable_objects.ClientDO).toBe("ok");
-    // Any instance, not only the health one: the stub has no schema and arms no alarm.
-    const stub = env.CLIENT.get(env.CLIENT.idFromName("cli_anything"));
-    expect(await stub.health()).toBe(true);
-    const found = await runInDurableObject(stub, async (_i, state) => ({
-      tables: state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")
-        .toArray().map((r) => r.name),
-      alarm: await state.storage.getAlarm(),
-    }));
-    expect(found).toEqual({ tables: [], alarm: null });
   });
 
   it("no name a user can give reaches the health instance", () => {

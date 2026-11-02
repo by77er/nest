@@ -8,8 +8,11 @@ import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } f
 import { checkHealth, healthProbes } from "./lib/health";
 import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
-import { Capability, CatalogName, OperatorOverrides, Template } from "./lib/spec";
-import { MIN_IDLE_TTL_MS } from "./lib/lifetimes";
+import { Capability, CatalogName, EntryName, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
+import { cellIdleTtlMs, MIN_IDLE_TTL_MS } from "./lib/lifetimes";
+import { CLIENT_ID, ClientName, Grant, isAgentId, Labels, newClientToken, parseClientToken, parseLabelFilters, tokenHash } from "./lib/clients";
+import type { ClientScope } from "./do/catalog";
+import { CLIENT_DIRECTORY } from "./do/client";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
@@ -55,6 +58,8 @@ const sandbox = (env: Env, id: string) => env.SANDBOX.get(env.SANDBOX.idFromName
 const agent = (env: Env, id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const broker = (env: Env) => env.BROKER.get(env.BROKER.idFromName("broker"));
 const catalog = (env: Env) => env.CATALOG.get(env.CATALOG.idFromName("catalog"));
+const clientDO = (env: Env, id: string) => env.CLIENT.get(env.CLIENT.idFromName(id));
+const directory = (env: Env) => env.CLIENT.get(env.CLIENT.idFromName(CLIENT_DIRECTORY));
 
 /** Parse the JSON body against `schema`; an `optional` body may be empty (parsed as `{}`). */
 async function body<T extends z.ZodType>(req: Request, schema: T, optional = false): Promise<z.output<T>> {
@@ -70,12 +75,51 @@ async function body<T extends z.ZodType>(req: Request, schema: T, optional = fal
   return r.data;
 }
 
-function requireAdmin(req: Request, env: Env): void {
-  const token = bearer(req);
+const isAdminToken = (token: string | null, env: Env): boolean => {
   const enc = new TextEncoder();
-  if (!token || !env.ADMIN_TOKEN || !timingSafeEqual(enc.encode(token), enc.encode(env.ADMIN_TOKEN))) {
-    throw new NestError(ErrorCodes.UNAUTHORIZED, "admin token required", 401);
-  }
+  return !!token && !!env.ADMIN_TOKEN && timingSafeEqual(enc.encode(token), enc.encode(env.ADMIN_TOKEN));
+};
+
+function requireAdmin(req: Request, env: Env): void {
+  if (!isAdminToken(bearer(req), env)) throw new NestError(ErrorCodes.UNAUTHORIZED, "admin token required", 401);
+}
+
+/**
+ * Who called an `owner` route (docs/control-plane/api/clients/): the operator (the admin token), or an
+ * API client (its token), which acts only on its own subtree.
+ */
+export type Caller = { kind: "operator" } | ({ kind: "client" } & ClientScope);
+
+async function ownerCaller(req: Request, env: Env): Promise<Caller> {
+  const token = bearer(req);
+  if (isAdminToken(token, env)) return { kind: "operator" };
+  const parsed = token ? parseClientToken(token) : null;
+  if (!parsed) throw new NestError(ErrorCodes.UNAUTHORIZED, "admin or client token required", 401);
+  // Only the token's hash leaves the Worker; ClientDO compares it in constant time.
+  return { kind: "client", ...(await clientDO(env, parsed.client).authenticate(await tokenHash(token!))) };
+}
+
+/** What a missing agent answers: a client gets the same for one outside its subtree, so ids reveal nothing. */
+const unknownAgent = () => new NestError(ErrorCodes.UNKNOWN_AGENT, "unknown agent", 404);
+const unknownSandbox = () => new NestError(ErrorCodes.UNKNOWN_SANDBOX, "unknown sandbox", 404);
+
+/** The agent, if the caller may act on it: the operator any, a client only its subtree's (404 otherwise). */
+async function ownAgent(c: { env: Env; caller: Caller }, id: string) {
+  const stub = agent(c.env, id);
+  if (c.caller.kind === "client" && (await stub.subtree()).client !== c.caller.client) throw unknownAgent();
+  return stub;
+}
+
+/** The sandbox, if the caller may act on it (as for agents). */
+async function ownSandbox(c: { env: Env; caller: Caller }, id: string) {
+  const stub = sandbox(c.env, id);
+  if (c.caller.kind === "client" && (await stub.subtree()).client !== c.caller.client) throw unknownSandbox();
+  return stub;
+}
+
+/** A client refused something only the operator does. */
+function operatorOnly(c: { caller: Caller }, what: string): void {
+  if (c.caller.kind !== "operator") throw new NestError(ErrorCodes.FORBIDDEN, `${what} is the operator's`, 403);
 }
 
 const isUpgrade = (req: Request) => req.headers.get("upgrade")?.toLowerCase() === "websocket";
@@ -114,9 +158,10 @@ function requestId(req: Request, fromBody: string | undefined): string | undefin
 
 /**
  * Who may call a route, a required field of each: `none` (health, enrollment, signed blob URLs),
- * `host` (a host token; `graceMs` admits a recently expired one), or `admin` (the operator's token).
+ * `host` (a host token; `graceMs` admits a recently expired one), `admin` (the operator's token), or
+ * `owner` (the operator's token, or an API client's, which acts only on its own subtree: `Ctx.caller`).
  */
-type Auth = "none" | "host" | "admin";
+type Auth = "none" | "host" | "admin" | "owner";
 type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 /** `:name` segments of a route's path, as an object type. */
 type Params<P extends string> = P extends `${string}:${infer K}/${infer Rest}` ? { [k in K]: string } & Params<`/${Rest}`>
@@ -131,6 +176,8 @@ interface Ctx<P extends string, B> {
   cell: string;
   /** A `host` route's verified token. */
   claims: HostClaims;
+  /** An `owner` route's caller (the operator on an `admin` route). */
+  caller: Caller;
 }
 interface RouteOf<P extends string, S, B> {
   method: Method;
@@ -155,6 +202,9 @@ const PARAM: Record<string, RegExp> = {
   sandbox: /^sbx_[A-Za-z0-9]+$/,
   host: /^hst_[A-Za-z0-9]+$/,
   ask: /^ask_[A-Za-z0-9]+$/,
+  client: /^cli_[A-Za-z0-9]+$/,
+  ns: /^[a-z][a-z0-9-]{1,30}$/,
+  entry: /^[a-z][a-z0-9-]{0,62}$/,
   sub: /^sub_[a-z0-9_]+$/,
   port: /^\d+$/,
   secret: /^[A-Za-z0-9_:.-]+$/,
@@ -216,6 +266,68 @@ function catalogName(raw: string): string {
   const name = CatalogName.safeParse(raw);
   if (!name.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, name.error.message);
   return name.data;
+}
+
+/**
+ * A create in a client's subtree, after its place was admitted: a failure for good gives the place back
+ * (the object, if it was made after all, reports itself and takes it again).
+ */
+async function createOrRelease<T>(env: Env, client: string | null, id: string, create: () => Promise<T>): Promise<T> {
+  try {
+    return await create();
+  } catch (e) {
+    if (client && !asNestError(e)?.retryable) await clientDO(env, client).release(id).catch(() => undefined);
+    throw e;
+  }
+}
+
+/**
+ * The scope writes and reads in catalog namespace `ns` are held to: its client's (a client only its own,
+ * 403 elsewhere; the operator any client's, 404 for a name no client has).
+ */
+async function namespaceScope(c: { env: Env; caller: Caller }, ns: string): Promise<ClientScope> {
+  if (c.caller.kind === "client") {
+    if (ns !== c.caller.name) throw new NestError(ErrorCodes.FORBIDDEN, `${ns} is not your namespace (${c.caller.name})`, 403);
+    return c.caller;
+  }
+  const id = await directory(c.env).lookup(ns);
+  if (!id) throw new NestError(ErrorCodes.NOT_FOUND, `no client is named ${ns}`, 404);
+  return clientDO(c.env, id).scope();
+}
+
+/**
+ * `GET /v1/agents` and `GET /v1/sandboxes`: a client's subtree from its registry (ClientDO), or, for the
+ * operator, a client's (`?client=`) or the cell's (`?cell=`, FleetDO's registries). Filters: `label=k=v`
+ * (repeated: each must hold), `state=live|ended|all` (default live); paged by `limit` and `cursor`.
+ */
+async function listing(c: Ctx<string, unknown>, kind: "agent" | "sandbox"): Promise<unknown> {
+  const q = c.url.searchParams;
+  let labels: [string, string][];
+  try {
+    labels = parseLabelFilters(q.getAll("label"));
+  } catch (e) {
+    throw new NestError(ErrorCodes.INVALID_MESSAGE, (e as Error).message);
+  }
+  const state = q.get("state") ?? "live";
+  if (state !== "live" && state !== "ended" && state !== "all") throw new NestError(ErrorCodes.INVALID_MESSAGE, "state is live, ended or all");
+  const limit = q.has("limit") ? Number(q.get("limit")) : undefined;
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "limit must be a positive integer");
+  const page = { labels, state, ...(limit !== undefined ? { limit } : {}), ...(q.has("cursor") ? { cursor: q.get("cursor")! } : {}) } as const;
+  const key = kind === "agent" ? "agents" : "sandboxes";
+  const client = c.caller.kind === "client" ? c.caller.client : q.get("client");
+  if (client !== null) {
+    if (!CLIENT_ID.test(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "client is a cli_ id");
+    const r = await clientDO(c.env, client).list(kind, { ...page, ...(q.has("cell") ? { cell: c.cell } : {}) });
+    return {
+      [key]: r.items.map((m) => ({ [kind]: m.id, cell: m.cell, client, owner: m.owner, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms })),
+      next_cursor: r.next_cursor,
+    };
+  }
+  const r = await fleet(c.env, c.cell).listRegistry(kind, page);
+  return {
+    [key]: r.items.map((m) => ({ [kind]: m.id, cell: c.cell, client: m.client, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms })),
+    next_cursor: r.next_cursor,
+  };
 }
 
 export const ROUTES: Route[] = [
@@ -350,7 +462,7 @@ export const ROUTES: Route[] = [
 
   // Sandboxes.
   route({
-    method: "POST", path: "/v1/sandboxes", auth: "admin",
+    method: "POST", path: "/v1/sandboxes", auth: "owner",
     body: z.object({
       // Workstreams left the platform: for one release a `workstream` is accepted and ignored (old clients send it).
       workstream: z.string().optional(),
@@ -358,18 +470,28 @@ export const ROUTES: Route[] = [
       cell: z.string().default(DEFAULT_CELL),
       // Destroyed after being dormant this long (absent: the cell default; docs/control-plane/durable-objects/sandbox/#lifetime).
       idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
+      labels: Labels.optional(),
     }),
-    run: async ({ env, body: r }) => {
+    run: async (c) => {
+      const { env, body: r, caller } = c;
+      // The policy layer (egress, injected credentials) is the operator's: no grant field covers it.
+      if (r.policy) operatorOnly(c, "a sandbox's policy layer");
+      const cell = checkCell(env, r.cell);
       const id = newId("sbx_");
-      const info = await sandbox(env, id).create({
-        sandbox: id, cell: checkCell(env, r.cell),
+      const labels = r.labels ?? {};
+      const client = caller.kind === "client" ? caller.client : null;
+      // A client's place first (its grant's cells and max_sandboxes, counted across its subtree).
+      if (client) await clientDO(env, client).admit({ kind: "sandbox", id, cell, owner: client, labels });
+      const info = await createOrRelease(env, client, id, () => sandbox(env, id).create({
+        sandbox: id, cell, labels, ...(client ? { client } : {}),
         ...(r.image ? { image: r.image } : {}), ...(r.resources ? { resources: r.resources } : {}),
         ...(r.policy ? { policy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
-      });
+      }));
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
     },
   }),
+  route({ method: "GET", path: "/v1/sandboxes", auth: "owner", run: (c) => listing(c, "sandbox") }),
   route({
     // Operator path: the only place public share links are minted.
     method: "POST", path: "/v1/sandboxes/:sandbox/ports", auth: "admin",
@@ -377,15 +499,15 @@ export const ROUTES: Route[] = [
     run: ({ env, p, body: r }) => sandbox(env, p.sandbox).exposePort(r.port, r.share, r.host_header),
   }),
   route({ method: "DELETE", path: "/v1/sandboxes/:sandbox/ports/:port", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).unexposePort(Number(p.port)) }),
-  route({ method: "GET", path: "/v1/sandboxes/:sandbox", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).info() }),
-  route({ method: "DELETE", path: "/v1/sandboxes/:sandbox", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).destroy() }),
+  route({ method: "GET", path: "/v1/sandboxes/:sandbox", auth: "owner", run: async (c) => (await ownSandbox(c, c.p.sandbox)).info() }),
+  route({ method: "DELETE", path: "/v1/sandboxes/:sandbox", auth: "owner", run: async (c) => (await ownSandbox(c, c.p.sandbox)).destroy() }),
   // Its own idle TTL (null: the cell default); a long one keeps a sandbox nobody attaches to.
-  route({ method: "PUT", path: "/v1/sandboxes/:sandbox/lifetime", auth: "admin", body: z.object({ idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).nullable() }),
-    run: ({ env, p, body: r }) => sandbox(env, p.sandbox).setLifetime(r.idle_ttl_ms) }),
+  route({ method: "PUT", path: "/v1/sandboxes/:sandbox/lifetime", auth: "owner", body: z.object({ idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).nullable() }),
+    run: async (c) => (await ownSandbox(c, c.p.sandbox)).setLifetime(c.body.idle_ttl_ms) }),
   // A person's (or a test harness's) way to a sandbox's hands: the same target an agent gets.
   route({ method: "POST", path: "/v1/sandboxes/:sandbox/resolve", auth: "admin", body: z.object({ client: z.string().min(1) }),
     run: ({ env, p, body: r }) => sandbox(env, p.sandbox).resolve(r.client) }),
-  route({ method: "GET", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).policy() }),
+  route({ method: "GET", path: "/v1/sandboxes/:sandbox/policy", auth: "owner", run: async (c) => (await ownSandbox(c, c.p.sandbox)).policy() }),
   route({ method: "PUT", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", body: SandboxPolicyLayer, run: ({ env, p, body }) => sandbox(env, p.sandbox).setPolicy(body) }),
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/generations", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).generations() }),
   route({ method: "POST", path: "/v1/sandboxes/:sandbox/place", auth: "admin", run: async ({ env, p }) => ({ host: await sandbox(env, p.sandbox).retryPlacement() }) }),
@@ -395,52 +517,78 @@ export const ROUTES: Route[] = [
     run: ({ env, p, body: r }) => sandbox(env, p.sandbox).grant(r.host, r.ttl_ms, r.ports),
   }),
 
-  // Agents.
+  // Agents. Under `owner` auth a client acts only on its own subtree (docs/control-plane/api/clients/).
   route({
-    // A spawn spec from the operator (the root: `OperatorOverrides`; an agent's spawn may only narrow,
-    // `SpawnerOverrides`): a template, a sandbox (hands) or none, and overrides. For one release the
-    // previous release's fields are accepted: `role` (the same-named template), `captain` (`owner`), and
-    // top-level `launch` and `rules` (overrides).
-    method: "POST", path: "/v1/agents", auth: "admin",
+    // A spawn spec from the operator (the root: `OperatorOverrides`) or a client (which only narrows, like an
+    // agent's spawn: `SpawnerOverrides`, and stays within its grant): a template, a sandbox (hands) or none, and
+    // overrides. For one release the previous release's fields are accepted from the operator: `role` (the
+    // same-named template), `captain` (`owner`), and top-level `launch` and `rules` (overrides).
+    method: "POST", path: "/v1/agents", auth: "owner",
     body: z.object({
-      template: CatalogName.optional(),
+      template: EntryName.optional(),
       role: AgentRole.optional(),
       // Workstreams left the platform: for one release a `workstream` is accepted and ignored (old clients send it).
       workstream: z.string().optional(),
       sandbox: z.string().startsWith("sbx_").optional(),
-      owner: z.string().startsWith("agt_").optional(),
+      // A principal: an agent (`agt_…`), or `user` (the operator; the default for the operator's).
+      owner: z.string().refine((o) => o === "user" || isAgentId(o), "owner is an agent id or user").optional(),
       captain: z.string().startsWith("agt_").optional(),
-      // `params` is gone (the task ledger's `ledger` was the only one): refused, not silently dropped, for one release.
-      overrides: OperatorOverrides.extend({
-        params: z.never({ error: "overrides.params is no longer accepted: the task ledger left the platform" }).optional(),
-      }).optional(),
+      // Parsed by who asks: the operator's `OperatorOverrides`, a client's `SpawnerOverrides`.
+      overrides: z.unknown().optional(),
       launch: LaunchConfig.optional(),
       rules: z.array(ToolRule).optional(),
       // Gone: a client still sending it must not silently get the template's wider tool set.
       grants: z.never({ error: "grants is no longer accepted: narrow the tools with overrides.tools" }).optional(),
       cell: z.string().optional(),
       start: z.boolean().default(true),
+      labels: Labels.optional(),
     }),
-    run: async ({ env, body: r }) => {
+    run: async (c) => {
+      const { env, body: r, caller } = c;
       if (r.template && r.role && r.template !== r.role) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template and role differ");
       const template = r.template ?? r.role;
       if (!template) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template is required");
       if (r.owner && r.captain && r.owner !== r.captain) throw new NestError(ErrorCodes.INVALID_MESSAGE, "owner and captain differ");
-      const overrides: OperatorOverrides = { ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...r.overrides };
+      const ownerAgent = [r.owner, r.captain].find(isAgentId) ?? null;
+      // An agent owner given by a client must be its own; a sandbox too (404 otherwise, as for any id outside it).
+      const ownerSubtree = ownerAgent ? await (await ownAgent(c, ownerAgent)).subtree() : null;
       // An agent's cell is its sandbox's: optional, and refused when it differs.
       let cellName = r.cell ?? DEFAULT_CELL;
       if (r.sandbox) {
-        const sbx = await sandbox(env, r.sandbox).info();
+        const sbx = await (await ownSandbox(c, r.sandbox)).info();
         if (r.cell && r.cell !== sbx.cell) {
           throw new NestError(ErrorCodes.INVALID_MESSAGE, `${r.sandbox} is in cell ${sbx.cell}; an agent takes its sandbox's`, 409);
         }
         cellName = sbx.cell;
       }
       checkCell(env, cellName);
-      const spec = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides });
+      // Its client: the caller's, or (the operator naming an owner) its owner's. Everything in a client's
+      // subtree is held to its grant, whoever creates it.
+      const client = caller.kind === "client" ? caller.client : ownerSubtree?.client ?? null;
+      const scope = caller.kind === "client" ? caller : client ? await clientDO(env, client).scope() : undefined;
+      let spec;
+      if (caller.kind === "client") {
+        if (r.launch || r.rules) throw new NestError(ErrorCodes.INVALID_MESSAGE, "launch and rules are the operator's: write a template in your namespace");
+        spec = await catalog(env).expand({
+          template, hands: !!r.sandbox, by: "spawner", overrides: r.overrides as SpawnerOverrides | undefined, cell_idle_ttl_ms: cellIdleTtlMs(env, cellName),
+        }, scope);
+      } else {
+        const o = OperatorOverrides.extend({
+          // `params` is gone (the task ledger's `ledger` was the only one): refused, not silently dropped, for one release.
+          params: z.never({ error: "overrides.params is no longer accepted: the task ledger left the platform" }).optional(),
+        }).optional().safeParse(r.overrides);
+        if (!o.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, o.error.message);
+        const overrides: OperatorOverrides = { ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...o.data };
+        spec = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides }, scope);
+      }
       const id = newId("agt_");
+      const labels = r.labels ?? {};
+      const owner = ownerAgent ?? (caller.kind === "client" ? caller.client : null);
+      if (client) await clientDO(env, client).admit({ kind: "agent", id, cell: cellName, owner, labels });
       const a = agent(env, id);
-      await a.create({ agent: id, cell: cellName, spec, owner: r.owner ?? r.captain ?? null, sandbox: r.sandbox ?? null });
+      await createOrRelease(env, client, id, () => a.create({
+        agent: id, cell: cellName, spec, owner, sandbox: r.sandbox ?? null, labels, ...(client ? { client } : {}),
+      }));
       // The agent exists now: a start that can't run yet (no brain host, a cold cell) keeps its intent and
       // runs when room appears, so the create still answers 201 with the agent and why its start waits.
       let started: Awaited<ReturnType<typeof a.start>> | null = null;
@@ -457,58 +605,144 @@ export const ROUTES: Route[] = [
       return json({ ...(await a.info()), started, ...(start_waiting ? { start_waiting } : {}) }, 201);
     },
   }),
-  route({ method: "GET", path: "/v1/agents/:agent", auth: "admin", run: ({ env, p }) => agent(env, p.agent).info() }),
-  route({ method: "GET", path: "/v1/agents/:agent/turns", auth: "admin", run: ({ env, p }) => agent(env, p.agent).turns() }),
-  route({ method: "GET", path: "/v1/agents/:agent/transcript", auth: "admin", run: async ({ env, url, p }) => {
-    const a = agent(env, p.agent);
-    const q = url.searchParams;
+  route({ method: "GET", path: "/v1/agents", auth: "owner", run: (c) => listing(c, "agent") }),
+  route({ method: "GET", path: "/v1/agents/:agent", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).info() }),
+  route({ method: "GET", path: "/v1/agents/:agent/turns", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).turns() }),
+  route({ method: "GET", path: "/v1/agents/:agent/transcript", auth: "owner", run: async (c) => {
+    const a = await ownAgent(c, c.p.agent);
+    const q = c.url.searchParams;
     if (!q.has("since")) return new Response(await a.transcript(), { headers: { "content-type": "application/x-ndjson" } });
     const base = q.get("base");
     return a.readTranscript(num(q.get("since") ?? undefined, 0), num(q.get("limit") ?? undefined, 200), base === null ? undefined : num(base, 0));
   } }),
   route({
-    method: "POST", path: "/v1/agents/:agent/turns", auth: "admin", status: 201,
+    method: "POST", path: "/v1/agents/:agent/turns", auth: "owner", status: 201,
     body: z.object({ text: z.string(), kind: z.enum(["user", "recovery"]).default("user"), request_id: RequestIdField }),
-    run: async ({ env, req, p, body: r }) => ({ turn: await agent(env, p.agent).enqueueTurn({ kind: r.kind, text: r.text }, requestId(req, r.request_id)) }),
+    run: async (c) => ({ turn: await (await ownAgent(c, c.p.agent)).enqueueTurn({ kind: c.body.kind, text: c.body.text }, requestId(c.req, c.body.request_id)) }),
   }),
   route({
-    method: "POST", path: "/v1/agents/:agent/inbox", auth: "admin", status: 201,
-    body: z.object({ text: z.string(), from: z.string().default("user"), interrupt: z.boolean().default(false), request_id: RequestIdField }),
-    // The operator speaking as `user` is trusted; text it relays under another name may not be (it taints).
-    run: async ({ env, req, p, body: r }) => ({
-      message: await agent(env, p.agent).postInbox(r.from, r.text, r.interrupt, requestId(req, r.request_id), r.from !== "user"),
-    }),
+    method: "POST", path: "/v1/agents/:agent/inbox", auth: "owner", status: 201,
+    body: z.object({ text: z.string(), from: z.string().optional(), interrupt: z.boolean().default(false), request_id: RequestIdField }),
+    // The caller speaking as itself (`user` for the operator, its id for a client) is trusted; text it relays
+    // under another name may not be (it taints).
+    run: async (c) => {
+      const self = c.caller.kind === "client" ? c.caller.client : "user";
+      const from = c.body.from ?? self;
+      const a = await ownAgent(c, c.p.agent);
+      return { message: await a.postInbox(from, c.body.text, c.body.interrupt, requestId(c.req, c.body.request_id), from !== self) };
+    },
   }),
-  route({ method: "POST", path: "/v1/agents/:agent/interrupt", auth: "admin", run: ({ env, p }) => agent(env, p.agent).interrupt() }),
+  route({ method: "POST", path: "/v1/agents/:agent/interrupt", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).interrupt() }),
   route({
-    // An optional host: a brain on a chosen enrolled host (hands still reach the sandbox's gateway).
-    method: "POST", path: "/v1/agents/:agent/start", auth: "admin", optionalBody: true,
+    // An optional host: a brain on a chosen enrolled host (hands still reach the sandbox's gateway); the operator's only.
+    method: "POST", path: "/v1/agents/:agent/start", auth: "owner", optionalBody: true,
     body: z.object({ host: HostId.optional(), restart: z.boolean().optional() }),
-    run: ({ env, p, body: r }) => agent(env, p.agent).start(r.host, undefined, r.restart ?? false),
+    run: async (c) => {
+      if (c.body.host) operatorOnly(c, "choosing a brain's host");
+      return (await ownAgent(c, c.p.agent)).start(c.body.host, undefined, c.body.restart ?? false);
+    },
   }),
   route({
     // A stop the agent's next input lifts; with `end`, for good (docs/agents/#lifetimes): its brain killed, its
     // queued turns dropped, the agents it owns ended too, and with `destroy_sandbox` the sandbox created for it.
-    method: "POST", path: "/v1/agents/:agent/stop", auth: "admin", optionalBody: true,
+    method: "POST", path: "/v1/agents/:agent/stop", auth: "owner", optionalBody: true,
     body: z.strictObject({ end: z.boolean().optional(), destroy_sandbox: z.boolean().optional(), reason: z.string().max(500).optional() }),
-    run: async ({ env, p, body: r }) => {
+    run: async (c) => {
+      const r = c.body;
+      const a = await ownAgent(c, c.p.agent);
       if (!r.end) {
         if (r.destroy_sandbox) throw new NestError(ErrorCodes.INVALID_MESSAGE, "destroy_sandbox needs end: true");
-        return agent(env, p.agent).stop("requested");
+        return a.stop("requested");
       }
-      return agent(env, p.agent).end({ by: "user", reason: "stopped", kill: true, destroy_sandbox: r.destroy_sandbox ?? false, ...(r.reason ? { note: r.reason } : {}) });
+      const by = c.caller.kind === "client" ? c.caller.client : "user";
+      return a.end({ by, reason: "stopped", kill: true, destroy_sandbox: r.destroy_sandbox ?? false, ...(r.reason ? { note: r.reason } : {}) });
     },
   }),
-  route({ method: "GET", path: "/v1/agents/:agent/children", auth: "admin", run: ({ env, p }) => agent(env, p.agent).children() }),
+  route({ method: "GET", path: "/v1/agents/:agent/children", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).children() }),
   route({ method: "PUT", path: "/v1/agents/:agent/rules", auth: "admin", body: z.array(ToolRule), run: ({ env, p, body }) => agent(env, p.agent).setRules(body) }),
   // The agent's brokered-action journal, newest first; `before` pages by an earlier page's last created_ms.
-  route({ method: "GET", path: "/v1/agents/:agent/brokered", auth: "admin", run: ({ env, url, p }) =>
-    agent(env, p.agent).brokeredJournal(num(url.searchParams.get("limit") ?? undefined, 100), url.searchParams.has("before") ? num(url.searchParams.get("before")!, Date.now()) : undefined) }),
-  // Its approvals (and questions) waiting for the operator, oldest first; each is answered below and the
-  // decision reaches the agent as its next turn (docs/agents/tools/#taint-and-sinks).
-  route({ method: "GET", path: "/v1/agents/:agent/asks", auth: "admin", run: ({ env, p }) => agent(env, p.agent).openAsks() }),
-  route({ method: "POST", path: "/v1/agents/:agent/asks/:ask/answer", auth: "admin", body: z.object({ answer: z.string() }),
-    run: async ({ env, p, body: r }) => ({ delivered: await agent(env, p.agent).answerAsk(p.ask, r.answer) }) }),
+  route({ method: "GET", path: "/v1/agents/:agent/brokered", auth: "owner", run: async (c) => {
+    const q = c.url.searchParams;
+    return (await ownAgent(c, c.p.agent)).brokeredJournal(num(q.get("limit") ?? undefined, 100), q.has("before") ? num(q.get("before")!, Date.now()) : undefined);
+  } }),
+  // Its approvals (and questions) waiting for the operator or its client, oldest first; each is answered below
+  // and the decision reaches the agent as its next turn (docs/agents/tools/#taint-and-sinks).
+  route({ method: "GET", path: "/v1/agents/:agent/asks", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).openAsks() }),
+  route({ method: "POST", path: "/v1/agents/:agent/asks/:ask/answer", auth: "owner", body: z.object({ answer: z.string() }),
+    run: async (c) => ({ delivered: await (await ownAgent(c, c.p.agent)).answerAsk(c.p.ask, c.body.answer) }) }),
+
+  // API clients (docs/control-plane/api/clients/): the operator's. The token is shown once, at create and rotate.
+  route({
+    method: "POST", path: "/v1/admin/clients", auth: "admin", status: 201, body: z.strictObject({ name: ClientName, grant: Grant }),
+    run: async ({ env, body: r }) => {
+      for (const cell of r.grant.cells) checkCell(env, cell);
+      const id = newId("cli_");
+      const token = newClientToken(id);
+      const view = await clientDO(env, id).create({ client: id, name: r.name, grant: r.grant, token_hash: await tokenHash(token) });
+      try {
+        await directory(env).claimName(r.name, id);
+      } catch (e) {
+        // The name is taken: this record never had a usable token out; it goes.
+        await clientDO(env, id).markDeleted();
+        await clientDO(env, id).purge();
+        throw e;
+      }
+      return { ...view, token };
+    },
+  }),
+  route({ method: "GET", path: "/v1/admin/clients", auth: "admin", run: async ({ env }) => ({
+    clients: await Promise.all((await directory(env).names()).map(async (n) => {
+      try {
+        return await clientDO(env, n.client).info();
+      } catch {
+        // A delete that stopped half-way (its DELETE, run again, finishes it).
+        return { client: n.client, name: n.name, deleted: true };
+      }
+    })),
+  }) }),
+  route({ method: "GET", path: "/v1/admin/clients/:client", auth: "admin", run: ({ env, p }) => clientDO(env, p.client).info() }),
+  route({
+    method: "PATCH", path: "/v1/admin/clients/:client", auth: "admin", body: z.strictObject({ grant: Grant }),
+    run: ({ env, p, body: r }) => {
+      for (const cell of r.grant.cells) checkCell(env, cell);
+      return clientDO(env, p.client).setGrant(r.grant);
+    },
+  }),
+  route({ method: "POST", path: "/v1/admin/clients/:client/rotate", auth: "admin", run: async ({ env, p }) => {
+    const token = newClientToken(p.client);
+    return { ...(await clientDO(env, p.client).rotate(await tokenHash(token))), token };
+  } }),
+  route({ method: "DELETE", path: "/v1/admin/clients/:client", auth: "admin", run: async ({ env, p }) => {
+    // Refused while its subtree lives; then its token stops, its catalog namespace and name go, and its record.
+    const { name } = await clientDO(env, p.client).markDeleted();
+    const entries = await catalog(env).deleteNamespace(name);
+    await directory(env).releaseName(name, p.client);
+    await clientDO(env, p.client).purge();
+    return { deleted: p.client, name, catalog_entries: entries };
+  } }),
+
+  // The catalog as an owner sees it: the operator all of it, a client the operator's entries and its own
+  // namespace, `<client-name>/<entry>`, which it alone (and the operator) writes.
+  route({ method: "GET", path: "/v1/catalog", auth: "owner", run: ({ env, caller }) => catalog(env).catalog(caller.kind === "client" ? caller : undefined) }),
+  ...(["templates", "capabilities"] as const).flatMap((kind) => [
+    route({ method: "GET", path: `/v1/catalog/${kind}/:ns/:entry`, auth: "owner", run: async (c) => {
+      await namespaceScope(c, c.p.ns);
+      return catalog(c.env).entry(kind, `${c.p.ns}/${c.p.entry}`);
+    } }),
+    route({
+      method: "PUT", path: `/v1/catalog/${kind}/:ns/:entry`, auth: "owner", body: kind === "templates" ? Template : Capability,
+      run: async (c) => {
+        const scope = await namespaceScope(c, c.p.ns);
+        const name = `${c.p.ns}/${c.p.entry}`;
+        return kind === "templates" ? catalog(c.env).putTemplate(name, c.body as Template, scope) : catalog(c.env).putCapability(name, c.body as Capability, scope);
+      },
+    }),
+    route({ method: "DELETE", path: `/v1/catalog/${kind}/:ns/:entry`, auth: "owner", run: async (c) => {
+      await namespaceScope(c, c.p.ns);
+      const name = `${c.p.ns}/${c.p.entry}`;
+      return kind === "templates" ? catalog(c.env).deleteTemplate(name) : catalog(c.env).deleteCapability(name);
+    } }),
+  ]),
 ];
 
 async function dispatch(req: Request, env: Env): Promise<Response> {
@@ -517,9 +751,12 @@ async function dispatch(req: Request, env: Env): Promise<Response> {
     if (r.method !== req.method) continue;
     const p = match(r.path, url.pathname);
     if (!p) continue;
-    const c = { req, env, url, p, body: undefined as unknown, cell: DEFAULT_CELL, claims: undefined as unknown as HostClaims };
+    const c = { req, env, url, p, body: undefined as unknown, cell: DEFAULT_CELL, claims: undefined as unknown as HostClaims, caller: { kind: "operator" } as Caller };
     if (r.auth === "admin") {
       requireAdmin(req, env);
+      c.cell = checkCell(env, url.searchParams.get("cell") ?? DEFAULT_CELL);
+    } else if (r.auth === "owner") {
+      c.caller = await ownerCaller(req, env);
       c.cell = checkCell(env, url.searchParams.get("cell") ?? DEFAULT_CELL);
     } else if (r.auth === "host") {
       c.claims = await hostClaims(req, env, r.graceMs);

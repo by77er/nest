@@ -2,12 +2,12 @@
 // pool: the admin API configures an mcp capability, a runner session calls `<capability>_<tool>`, and a
 // stub MCP server (a fetch handler for https://mcp.test/<id>/mcp, installed over the global fetch the
 // proxy calls) records every request. Each guarantee has a test that fails without it.
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { McpConnectorDO } from "../src/do/mcp-connector";
 import { approves, argsDigest, checkMcpUrl, connectorName } from "../src/lib/mcp";
-import { adminJson, connectHost, eventually, nextCommands, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 import { fetchJwks, verifyIdentity } from "./jwt";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -205,7 +205,7 @@ async function setup(opts: McpOpts = {}) {
     return { agent: b.agent as string, ws: await runner(b.agent, host.host, host.host_token, 1, `rin_${rand()}`, toolsChanged) };
   };
   return {
-    id, cap, stub, agent: ag.agent as string, host, ws, t: (tool: string) => `${cap}_${tool}`, another,
+    id, cap, cell, stub, agent: ag.agent as string, host, ws, t: (tool: string) => `${cap}_${tool}`, another,
     connector: () => connectorStub(url, `cap:${cap}`),
   };
 }
@@ -751,6 +751,35 @@ describe("caller identity (Nest-Identity, docs/control-plane/api/clients/#caller
     await result(s.ws, "cal_i9");
     const [c] = await identities(s, "tools/call");
     expect(c!.claims).toMatchObject({ sub: s.agent, client: "cli_board", labels: { task: "t-17", project: "board" } });
+  });
+
+  it("an API client's agent, created with its token and labels, is named as its own: owner and client the client's id, labels as set", async () => {
+    const s = await setup({ trusted: true });
+    const name = `idc-${rand()}`;
+    const c = await adminJson("/v1/admin/clients", {
+      body: { name, grant: { cells: [s.cell], credentials: ["claude_oauth_token", `cap:${s.cap}`], mcp_urls: [`https://mcp.test/${s.id}/`], max_agents: 1 } },
+    }, 201);
+    const asClient = async (method: string, path: string, body: unknown) => {
+      const res = await SELF.fetch(`${BASE}${path}`, {
+        method, headers: { authorization: `Bearer ${c.token}`, "content-type": "application/json" }, body: JSON.stringify(body),
+      });
+      const text = await res.text();
+      expect(res.status, text).toBeLessThan(300);
+      return JSON.parse(text);
+    };
+    // Its own template, listing the operator's capability (within its grant: the URL and the credential).
+    await asClient("PUT", `/v1/catalog/templates/${name}/t`, {
+      capabilities: ["nest", s.cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
+    });
+    const a = await asClient("POST", "/v1/agents", { template: `${name}/t`, cell: s.cell, labels: { task: "t-17" } });
+    await nextCommands(s.host.ws, (x) => x.type === "agent_start" && x.agent === a.agent);
+    const ws = await runner(a.agent, s.host.host, s.host.host_token, 1, `rin_${rand()}`);
+    call(ws, "cal_ic1", s.t("echo"), { text: "x" });
+    expect((await result(ws, "cal_ic1")).status).toBe("ok");
+    const mine = (await identities(s, "tools/call")).filter((x) => x.claims.sub === a.agent);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.claims).toMatchObject({ sub: a.agent, owner: c.client, client: c.client, labels: { task: "t-17" } });
+    ws.close();
   });
 });
 
