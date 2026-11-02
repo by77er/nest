@@ -198,6 +198,20 @@ describe("the webhook", () => {
     // Set again: a new secret.
     expect((await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/x" } })).secret).not.toBe(set.secret);
   });
+
+  it("answers a retryable 503 while ClientDO still runs a release without setWebhook (the minutes after a deploy)", async () => {
+    const c = await newClient(null);
+    const proto = ClientDO.prototype as unknown as Record<string, unknown>;
+    const method = proto.setWebhook;
+    delete proto.setWebhook;
+    try {
+      const e = await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/y" } }, 503);
+      expect(e.error).toMatchObject({ code: "internal", retryable: true });
+    } finally {
+      proto.setWebhook = method;
+    }
+    await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/y" } });
+  });
 });
 
 // --- What a client hears ----------------------------------------------------------------------------------
