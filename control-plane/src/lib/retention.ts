@@ -7,14 +7,14 @@ import { gone } from "./sandbox-lease";
 import type { SandboxState } from "../protocol/model";
 
 /**
- * `SANDBOX_RETENTION`: `off` marks nothing; `report` (the default) computes and reports what it would
- * mark, and changes nothing; `on` marks generations `deleting` and marks the memory of checkpoints that
- * are no longer restore sources unrooted. Both marks are durable and one-way, and GC's roots follow
- * them in every mode, so switching back never roots again what a sweep may already have taken.
+ * `SANDBOX_RETENTION`: `on` (the default) marks generations `deleting` and marks the memory of
+ * checkpoints that are no longer restore sources unrooted; `off`, an emergency stop, marks nothing more.
+ * Both marks are durable and one-way, and GC's roots follow them in either mode, so switching off never
+ * roots again what a sweep may already have taken.
  */
-export type RetentionMode = "off" | "report" | "on";
-export const RETENTION_MODES: readonly RetentionMode[] = ["off", "report", "on"];
-export const DEFAULT_RETENTION_MODE: RetentionMode = "report";
+export type RetentionMode = "off" | "on";
+export const RETENTION_MODES: readonly RetentionMode[] = ["off", "on"];
+export const DEFAULT_RETENTION_MODE: RetentionMode = "on";
 
 export function retentionMode(env: Pick<Env, "SANDBOX_RETENTION">): RetentionMode {
   const v = env.SANDBOX_RETENTION;

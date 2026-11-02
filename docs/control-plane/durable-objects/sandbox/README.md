@@ -64,7 +64,7 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 - A commit whose `kind` disagrees with its memory manifest (`checkpoint` without `mem_manifest`, or `disk_only` with one) is rejected (`invalid_message`): the chain is immutable, and a checkpoint without memory would restore without it.
 - **Pins:** a claim pins the generation it restores, and a fork pins its source, by id, until completion or abandon (for a fork, until the child has recorded it as its head). Built for placement: `restore_pin {generation, epoch}`, set in the claim's step, live while that epoch is placing, creating or restoring (`livePins`).
 - **`isRestoreSource`** lives here and is the only answer to "may this be loaded or deleted" for resume selection, the drain gate and GC ([restore sources](../../../sandbox/state/#restore-sources)).
-- **Retention** runs from the alarm: it thins generations and marks them `deleting`, which is one-way ([retention](../../../sandbox/state/#retention)). Built, behind `SANDBOX_RETENTION` (`report` by default); the decisions are a pure core (`control-plane/src/lib/retention.ts`).
+- **Retention** runs from the alarm: it thins generations and marks them `deleting`, which is one-way ([retention](../../../sandbox/state/#retention)). Built and on by default (`SANDBOX_RETENTION=off` stops it); the decisions are a pure core (`control-plane/src/lib/retention.ts`).
 - **The single writer serializes** fork admission, sandbox destruction and retention: a fork can't pin a `deleting` generation, retention can't delete a pinned one, and a destroy keeps pinned generations until their forks finish.
 
 ## Activity and idle

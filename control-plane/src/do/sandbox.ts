@@ -665,11 +665,11 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * The `retention` deadline (`retention()`): in `on` mode, marks what it drops `deleting`, at most
+   * The `retention` deadline (`retention()`): marks what it drops `deleting`, at most
    * `RETENTION_MAX_MARKS` a pass, and marks the memory of checkpoints that are no longer restore
    * sources unrooted, all in one synchronous step with the read, so a claim's pin and a commit's new
-   * head are seen; `report` mode records what it would do. Then prunes old main-chain `deleting` rows.
-   * Re-armed while the sandbox lives.
+   * head are seen; `off` does nothing. Then prunes old main-chain `deleting` rows, and records the
+   * pass (`retention_report`). Re-armed while the sandbox lives.
    */
   private async runRetention(): Promise<void> {
     const mode = retentionMode(this.env);
@@ -683,14 +683,12 @@ export class SandboxDO extends DurableObject<Env> {
     const memory = memoryToUnroot(rows, view).filter((id) => !dropSet.has(id));
     let marked = 0;
     let unrooted = 0;
-    if (mode === "on") {
-      // `rowsWritten` counts index rows too: one or more means this row changed.
-      for (const id of d.drop.slice(0, RETENTION_MAX_MARKS)) {
-        if (this.sql.exec("UPDATE generations SET state = 'deleting', deleting_ms = ? WHERE id = ? AND state IS NULL", now, id).rowsWritten > 0) marked += 1;
-      }
-      for (const id of memory.slice(0, RETENTION_MAX_MARKS)) {
-        if (this.sql.exec("UPDATE generations SET mem_unrooted_ms = ? WHERE id = ? AND state IS NULL AND mem_unrooted_ms IS NULL", now, id).rowsWritten > 0) unrooted += 1;
-      }
+    // `rowsWritten` counts index rows too: one or more means this row changed.
+    for (const id of d.drop.slice(0, RETENTION_MAX_MARKS)) {
+      if (this.sql.exec("UPDATE generations SET state = 'deleting', deleting_ms = ? WHERE id = ? AND state IS NULL", now, id).rowsWritten > 0) marked += 1;
+    }
+    for (const id of memory.slice(0, RETENTION_MAX_MARKS)) {
+      if (this.sql.exec("UPDATE generations SET mem_unrooted_ms = ? WHERE id = ? AND state IS NULL AND mem_unrooted_ms IS NULL", now, id).rowsWritten > 0) unrooted += 1;
     }
     const old = this.sql.exec<{ id: string }>("SELECT id FROM generations WHERE state = 'deleting' AND orphaned = 0 AND deleting_ms < ? LIMIT ?",
       now - DELETING_ROW_RETENTION_MS, RETENTION_MAX_MARKS).toArray();
@@ -700,10 +698,10 @@ export class SandboxDO extends DurableObject<Env> {
       at: now, mode, ready: rows.length, drop: d.drop.length, marked, memory_to_unroot: memory.length, memory_unrooted: unrooted, pruned,
     });
     if (d.drop.length || memory.length || pruned) {
-      console.log(`sandbox ${info.sandbox}: retention (${mode}): ${rows.length} ready, ${d.drop.length} to drop and ${memory.length} checkpoints' memory to unroot` +
-        `${mode === "on" ? ` (${marked} marked deleting, ${unrooted} unrooted)` : " (report only)"}, ${pruned} old rows pruned`);
+      console.log(`sandbox ${info.sandbox}: retention: ${rows.length} ready, ${d.drop.length} to drop and ${memory.length} checkpoints' memory to unroot` +
+        ` (${marked} marked deleting, ${unrooted} unrooted), ${pruned} old rows pruned`);
     }
-    const more = mode === "on" && (d.drop.length > marked || memory.length > unrooted);
+    const more = d.drop.length > marked || memory.length > unrooted;
     await this.deadlines.set("retention", now + (more ? RETENTION_CONTINUE_MS : RETENTION_RECHECK_MS));
   }
 

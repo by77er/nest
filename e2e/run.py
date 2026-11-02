@@ -221,7 +221,7 @@ def start_control_plane():
     PROCS["wrangler"] = subprocess.Popen(
         ["npx", "wrangler", "dev", "--local", "--port", str(PORT), "--ip", "127.0.0.1",
          "--persist-to", os.path.join(WORK, "wrangler-state"), "--env-file", os.path.join(WORK, "dev.vars"),
-         "--var", f"PUBLIC_BASE_URL:{BASE}", "--var", "ASK_SYNC_WINDOW_MS:5000", "--var", "SANDBOX_RETENTION:on",
+         "--var", f"PUBLIC_BASE_URL:{BASE}", "--var", "ASK_SYNC_WINDOW_MS:5000"
          "--show-interactive-dev-session=false", "--log-level", "info"],
         cwd=os.path.join(ROOT, "control-plane"), stdout=logf, stderr=subprocess.STDOUT, env=env,
         start_new_session=True)

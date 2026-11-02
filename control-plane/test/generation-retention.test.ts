@@ -261,14 +261,14 @@ describe("the switch", () => {
     });
   }
 
-  it("report: marks nothing, records what it would drop, and roots every memory", async () => {
+  it("unset is on: marks what it drops and records the pass", async () => {
     const { h, sandbox } = await placedSandbox();
     const ids = await history(sandbox, h.host);
-    const out = await inMode(sandbox, "report");
-    expect(Object.values(await states(sandbox)).every((s) => s === "ready")).toBe(true);
-    expect(out.report).toMatchObject({ mode: "report", ready: 9, drop: 3, marked: 0, memory_to_unroot: 1, memory_unrooted: 0 });
-    expect(out.roots).toContain(mf(seqOf(ids, 5), "m"));
-    expect(out.roots).toContain(mf(seqOf(ids, 0), "d"));
+    const out = await inMode(sandbox, "");
+    expect(out.report).toMatchObject({ mode: "on", ready: 9, drop: 3, marked: 3, memory_to_unroot: 1, memory_unrooted: 1 });
+    expect(Object.values(await states(sandbox)).filter((s) => s === "deleting")).toHaveLength(3);
+    expect(out.roots).not.toContain(mf(seqOf(ids, 5), "m"));
+    expect(out.roots).not.toContain(mf(seqOf(ids, 0), "d"));
   });
 
   it("switching back from on roots nothing again: what was marked deleting or unrooted stays out of the roots", async () => {
@@ -276,12 +276,10 @@ describe("the switch", () => {
     const ids = await history(sandbox, h.host);
     const on = await inMode(sandbox, "on");
     expect(on.report).toMatchObject({ marked: 3, memory_unrooted: 1 });
-    for (const mode of ["report", "off"]) {
-      const out = await inMode(sandbox, mode);
-      expect(out.roots, mode).not.toContain(mf(seqOf(ids, 5), "m"));
-      expect(out.roots, mode).not.toContain(mf(seqOf(ids, 0), "d"));
-      expect(out.roots.sort(), mode).toEqual(on.roots.sort());
-    }
+    const off = await inMode(sandbox, "off");
+    expect(off.roots).not.toContain(mf(seqOf(ids, 5), "m"));
+    expect(off.roots).not.toContain(mf(seqOf(ids, 0), "d"));
+    expect(off.roots.sort()).toEqual(on.roots.sort());
   });
 
   it("off: marks and records nothing", async () => {
@@ -369,13 +367,13 @@ describe("FleetDO's GC marking", () => {
       const self = inst as unknown as { env: typeof env };
       self.env = { ...self.env, SANDBOX_RETENTION: m };
     });
-    await mode("report");
+    await mode("off");
     expect(await claim()).toBe(true); // a cell's first run
     expect(await claim()).toBe(false);
     await mode("on");
     expect(await claim()).toBe(true); // the proven run predates switching on
     expect(await claim()).toBe(false);
-    await mode("report");
+    await mode("off");
     expect(await claim()).toBe(false); // off is the old marking, already proven
     await mode("on");
     expect(await claim()).toBe(true); // on again: dry again
