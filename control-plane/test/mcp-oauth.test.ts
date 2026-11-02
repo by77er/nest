@@ -289,13 +289,12 @@ async function agentWith(cap: string) {
   const tpl = `t-${cap}`;
   await adminJson(`/v1/admin/templates/${tpl}`, {
     method: "PUT",
-    body: { capabilities: ["nest", cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token", escalate_to: "user" },
+    body: { capabilities: ["nest", cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token" },
   });
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
   const host = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "oauth" } }, 201);
-  const ag = await adminJson("/v1/agents", { body: { template: tpl, workstream, cell } }, 201);
+  const ag = await adminJson("/v1/agents", { body: { template: tpl, cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === ag.agent);
   const ws = await Ws.connect(`/v1/agents/${ag.agent}/session`, host.host_token);
   ws.send({ type: "hello", protocol_version: 1, agent: ag.agent, host: host.host, instance_id: "rin_one", epoch: 1, session: SESSION });

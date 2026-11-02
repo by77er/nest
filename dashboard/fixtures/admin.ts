@@ -68,7 +68,6 @@ export const fleet = {
       "lease_state": "running",
       "sandbox_state": "running",
       "image": "nest-base:latest",
-      "workstream": "ws_01m5pv1581hvrmhfbravczqzf3",
       "info_error": false
     }
   ],
@@ -112,9 +111,6 @@ export const images = {
 export const agent = {
   "template": "worker",
   "tools": [
-    "notify",
-    "emit",
-    "ask",
     "fork_sandbox",
     "read_transcript",
     "checkpoint",
@@ -142,9 +138,7 @@ export const agent = {
     }
   ],
   "credential": "claude_oauth_token:worker",
-  "escalate_to": "workstream",
   "agent": "agt_01jbx8k2m9qv3t7w5y4n6p0r1s",
-  "workstream": "ws_01m5pv1581hvrmhfbravczqzf3",
   "cell": "use1",
   "owner": null,
   "hands": {

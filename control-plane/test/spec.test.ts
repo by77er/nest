@@ -1,23 +1,22 @@
 // Templates, capabilities and spawn-spec expansion (lib/spec.ts): pure functions, checked directly.
 // The first seed must give exactly what the `worker` and `captain` roles gave, and the current one
-// that plus spawning, without the task ledger's capabilities version 6 removed or the channels' version 7
-// removed; the properties
+// that plus spawning, without the task ledger's capabilities version 6 removed, the channels' version 7
+// removed or the messaging and workstream tools version 8 removed; the properties
 // below hold for any catalog and spec (a seeded generator, not fast-check: it isn't a dependency).
 import { describe, expect, it } from "vitest";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
   SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES_REMOVED,
-  CHANNEL_TOOLS_REMOVED, EGRESS_CAPABILITIES, pruneCapability, pruneTemplate, REMOVED_CAPABILITIES, rewritePrompt, SPAWNING_CAPABILITIES, SPAWNING_PROMPT_V5,
+  CHANNEL_TOOLS_REMOVED, EGRESS_CAPABILITIES, MESSAGING_CAPABILITIES_REMOVED, MESSAGING_TOOLS_REMOVED, pruneCapability, pruneTemplate, REMOVED_CAPABILITIES, rewritePrompt, SPAWNING_CAPABILITIES, SPAWNING_PROMPT_V5,
 } from "../src/lib/spec";
 import { Credential, type ToolRule } from "../src/protocol/control";
 
 // What the roles gave (the role-filtered `platform-tools.json` and AgentDO's defaults before templates),
-// less `delegate`, `spawn_agent` and `kill`, which the registry no longer has: the first seed still
-// lists them, and expansion ignores them.
-const WORKER_TOOLS = ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"];
-const CAPTAIN_TOOLS = ["notify", "ask", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
-  "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "memory_read", "memory_write", "notify_user"];
+// less the tools the registry no longer has (`delegate`, `spawn_agent` and `kill`; `notify`, `emit`, `ask`
+// and the workstream tools): the first seed still lists them, and expansion ignores them.
+const WORKER_TOOLS = ["fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"];
+const CAPTAIN_TOOLS = ["fork_sandbox", "attach", "read_transcript", "brokered", "approve", "deny", "memory_read", "memory_write"];
 const NEST_ALLOW: ToolRule = { pattern: "mcp__nest__*", decision: "allow" };
 const WORKER_LAUNCH = {
   builtin_tools: ["TodoWrite", "Task", "WebSearch"],
@@ -35,27 +34,23 @@ const expand = (catalog: Catalog, template: string, hands: boolean, overrides = 
 };
 
 describe("the first seed catalog is what the roles were", () => {
-  it("worker: the worker tools, launch, rules and token; escalates to the workstream channel", () => {
+  it("worker: the worker tools, launch, rules and token", () => {
     expect(expand(SEED_CATALOG_V1, "worker", true)).toEqual({
       template: "worker",
       tools: WORKER_TOOLS,
       launch: WORKER_LAUNCH,
       rules: [NEST_ALLOW, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }],
       credential: "claude_oauth_token:worker",
-      escalate_to: "workstream",
-      subscribe: [],
     });
   });
 
-  it("captain: the captain tools, launch, rules and token; subscribes to its workstream, escalates to the user", () => {
+  it("captain: the captain tools, launch, rules and token", () => {
     expect(expand(SEED_CATALOG_V1, "captain", false)).toEqual({
       template: "captain",
       tools: CAPTAIN_TOOLS,
       launch: CAPTAIN_LAUNCH,
       rules: [NEST_ALLOW],
       credential: "claude_oauth_token:captain",
-      escalate_to: "user",
-      subscribe: ["workstream"],
     });
   });
 
@@ -68,9 +63,9 @@ describe("the first seed catalog is what the roles were", () => {
 
   it("a record stored with a role gets that role's spec, its stored launch and rules, and its grants as a narrowing", () => {
     const launch = { builtin_tools: [], system_prompt: { mode: "append" as const, text: "custom" } };
-    const s = specFromRole({ role: "worker", grants: ["notify", "merge", "emit"], launch, rules: [NEST_ALLOW] });
-    // `merge` was never a worker tool: ignored, as the role filter ignored it.
-    expect(s).toMatchObject({ template: "worker", tools: ["notify", "emit"], launch, rules: [NEST_ALLOW], credential: "claude_oauth_token:worker" });
+    const s = specFromRole({ role: "worker", grants: ["checkpoint", "merge", "read_transcript", "notify"], launch, rules: [NEST_ALLOW] });
+    // `merge` was never a worker tool, and `notify` left the registry: ignored.
+    expect(s).toMatchObject({ template: "worker", tools: ["read_transcript", "checkpoint"], launch, rules: [NEST_ALLOW], credential: "claude_oauth_token:worker" });
     expect(specFromRole({ role: "captain", grants: null, launch: CAPTAIN_LAUNCH as never, rules: [NEST_ALLOW] }).tools)
       .toEqual(CAPTAIN_TOOLS);
   });
@@ -79,7 +74,7 @@ describe("the first seed catalog is what the roles were", () => {
 describe("records stored with a role read through a frozen table, not the seed", () => {
   it("the first seed still expands to what ROLE_SPECS freezes (so a seed edit can't change it unnoticed)", () => {
     for (const role of ["worker", "captain"] as const) {
-      const { launch: _l, rules: _r, subscribe: _s, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
+      const { launch: _l, rules: _r, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
       expect(rest, role).toEqual(ROLE_SPECS[role]);
     }
   });
@@ -106,11 +101,11 @@ describe("a spawner's overrides can only narrow", () => {
   });
 
   it("narrows tools, and puts deny and ask rules first (first match wins), keeping launch and credential", () => {
-    const r = spawn({ tools: ["notify", "ask"], rules: [{ pattern: "mcp__nest__Bash(rm *)", decision: "deny" }, { pattern: "WebSearch", decision: "ask" }] });
+    const r = spawn({ tools: ["checkpoint", "read_transcript"], rules: [{ pattern: "mcp__nest__Bash(rm *)", decision: "deny" }, { pattern: "WebSearch", decision: "ask" }] });
     if (!r.ok) throw new Error(r.error);
-    expect(r.value.tools).toEqual(["notify", "ask"]);
+    expect(r.value.tools).toEqual(["read_transcript", "checkpoint"]);
     expect(r.value.rules).toEqual([{ pattern: "mcp__nest__Bash(rm *)", decision: "deny" }, { pattern: "WebSearch", decision: "ask" }, ...base.rules]);
-    expect([r.value.launch, r.value.credential, r.value.escalate_to]).toEqual([base.launch, base.credential, base.escalate_to]);
+    expect([r.value.launch, r.value.credential]).toEqual([base.launch, base.credential]);
     expect(spawn({ tools: ["merge"] }).ok).toBe(false);
   });
 });
@@ -125,8 +120,8 @@ describe("expansion refuses what it can't give", () => {
   });
 
   it("tools: an override narrows and never widens", () => {
-    expect(expand(SEED_CATALOG, "worker", true, { tools: ["emit", "notify"] }).tools).toEqual(["notify", "emit"]);
-    expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "worker", hands: true, by: "operator", overrides: { tools: ["notify", "merge"] } }))
+    expect(expand(SEED_CATALOG, "worker", true, { tools: ["checkpoint", "read_transcript"] }).tools).toEqual(["read_transcript", "checkpoint"]);
+    expect(expandSpec(SEED_CATALOG, PLATFORM_TOOL_NAMES, { template: "worker", hands: true, by: "operator", overrides: { tools: ["read_transcript", "merge"] } }))
       .toEqual({ ok: false, error: "template worker doesn't give merge" });
   });
 
@@ -137,10 +132,11 @@ describe("expansion refuses what it can't give", () => {
       expect(PLATFORM_TOOL_NAMES).not.toContain(t);
     }
     expect(expand(SEED_CATALOG_V1, "captain", false).tools).toEqual(CAPTAIN_TOOLS);
-    const stale: Catalog = { capabilities: { old: { tools: ["notify", "gone_tool"], rules: [], prompt: "" } },
+    // As one naming a tool that left with workstreams (`notify`) still expands.
+    const stale: Catalog = { capabilities: { old: { tools: ["notify", "read_transcript", "gone_tool"], rules: [], prompt: "" } },
       templates: { t: { ...SEED_CATALOG.templates.captain!, capabilities: ["old"] } } };
-    expect(expand(stale, "t", false).tools).toEqual(["notify"]);
-    expect(checkCapability(stale.capabilities.old!, PLATFORM_TOOL_NAMES)).toEqual({ ok: false, error: "unknown platform tool gone_tool" });
+    expect(expand(stale, "t", false).tools).toEqual(["read_transcript"]);
+    expect(checkCapability(stale.capabilities.old!, PLATFORM_TOOL_NAMES)).toEqual({ ok: false, error: "unknown platform tool notify" });
   });
 
   it("unknown names, and inherited object keys, are unknown", () => {
@@ -149,7 +145,7 @@ describe("expansion refuses what it can't give", () => {
     const broken: Catalog = { ...SEED_CATALOG, templates: { b: { ...SEED_CATALOG.templates.captain!, capabilities: ["toString"] } } };
     expect(expandSpec(broken, PLATFORM_TOOL_NAMES, { template: "b", hands: false, by: "operator" })).toEqual({ ok: false, error: "template b: unknown capability toString" });
     expect(checkCapability({ tools: ["nope"], rules: [], prompt: "" }, PLATFORM_TOOL_NAMES).ok).toBe(false);
-    expect(checkCapability({ tools: ["notify", "notify"], rules: [], prompt: "" }, PLATFORM_TOOL_NAMES).ok).toBe(false);
+    expect(checkCapability({ tools: ["read_transcript", "read_transcript"], rules: [], prompt: "" }, PLATFORM_TOOL_NAMES).ok).toBe(false);
     expect(checkTemplate({ ...SEED_CATALOG.templates.worker!, capabilities: ["hands", "hands"] }, SEED_CATALOG.capabilities).ok).toBe(false);
     expect(templatesUsing(SEED_CATALOG, "hands")).toEqual(["worker"]);
   });
@@ -162,7 +158,7 @@ describe("expansion refuses what it can't give", () => {
   });
 });
 
-describe("the current seed: spawning added, the task ledger and the channels removed (seed versions 6 and 7)", () => {
+describe("the current seed: spawning added, the task ledger, the channels and the messaging tools removed (seed versions 6 to 8)", () => {
   it("worker drops `subagents` and launches with the design's built-ins; captain gains spawning; nothing else changes", () => {
     const v1w = expand(SEED_CATALOG_V1, "worker", true);
     const v1c = expand(SEED_CATALOG_V1, "captain", false);
@@ -181,19 +177,20 @@ describe("the current seed: spawning added, the task ledger and the channels rem
       expect({ ...v2, tools: [], launch: null, rules: [], spawn: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [], spawn: [] });
       expect(v2.launch.system_prompt.text.startsWith(v1.launch.system_prompt.text)).toBe(true);
     }
-    for (const name of [...REMOVED_CAPABILITIES, ...CHANNEL_CAPABILITIES_REMOVED]) {
+    for (const name of [...REMOVED_CAPABILITIES, ...CHANNEL_CAPABILITIES_REMOVED, ...MESSAGING_CAPABILITIES_REMOVED]) {
       expect(SEED_CATALOG.capabilities, name).not.toHaveProperty(name);
       expect(templatesUsing(SEED_CATALOG, name), name).toEqual([]);
     }
-    // The channel tools are gone from the registry and from every seed capability.
-    for (const t of CHANNEL_TOOLS_REMOVED) expect(PLATFORM_TOOL_NAMES, t).not.toContain(t);
-    for (const [n, c] of Object.entries(SEED_CATALOG.capabilities)) expect(c.tools.filter((t) => CHANNEL_TOOLS_REMOVED.includes(t)), n).toEqual([]);
+    // The channel and messaging tools are gone from the registry and from every seed capability.
+    const gone = [...CHANNEL_TOOLS_REMOVED, ...MESSAGING_TOOLS_REMOVED];
+    for (const t of gone) expect(PLATFORM_TOOL_NAMES, t).not.toContain(t);
+    for (const [n, c] of Object.entries(SEED_CATALOG.capabilities)) expect(c.tools.filter((t) => gone.includes(t)), n).toEqual([]);
     expect(SEED_CATALOG.capabilities.spawning!.prompt).not.toContain("reach you");
   });
 
   it("seed steps: versions strictly increase, the last is the seed version, and every step's entries are the current seed's", () => {
     const versions = SEED_STEPS.map((s) => s.version);
-    expect(versions).toEqual([2, 3, 4, 5, 6, 7]);
+    expect(versions).toEqual([2, 3, 4, 5, 6, 7, 8]);
     for (let i = 1; i < versions.length; i++) expect(versions[i]!, String(i)).toBeGreaterThan(versions[i - 1]!);
     expect(SEED_VERSION).toBe(versions.at(-1));
     // No two steps name the same entry (one would never be applied to a catalog the other already reached).
@@ -204,20 +201,25 @@ describe("the current seed: spawning added, the task ledger and the channels rem
     expect(names.filter((n) => removed.includes(n))).toEqual([]);
   });
 
-  it("seedMigration: catalogs at versions 2 to 6 gain the steps they lack and lose the task ledger's and the channels' entries", () => {
+  it("seedMigration: catalogs at versions 2 to 7 gain the steps they lack and lose the task ledger's, the channels' and the messaging entries", () => {
     const v2 = { capabilities: [...Object.keys(SEED_CATALOG_V1.capabilities), "channels", "messaging-tree"], templates: Object.keys(SEED_CATALOG_V1.templates) };
-    const channels = { capabilities: ["channels", "messaging-tree"], params: [], tools: [...CHANNEL_TOOLS_REMOVED], fields: ["grants"] };
+    const messaging = { capabilities: ["messaging", "events"], params: [], tools: [...MESSAGING_TOOLS_REMOVED], fields: [] };
+    const channels = {
+      capabilities: ["channels", "messaging-tree", ...messaging.capabilities], params: [], tools: [...CHANNEL_TOOLS_REMOVED, ...messaging.tools], fields: ["grants"],
+    };
     const removes = { ...channels, capabilities: ["tasks", "tasks-admin", ...channels.capabilities], params: ["ledger"] };
     const prompts = [{ capability: "spawning", was: SPAWNING_PROMPT_V5, now: SPAWNING_CAPABILITIES.spawning!.prompt }];
     const m = seedMigration(v2, 2);
-    expect(m).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES }, templates: {}, version: 7, removes, prompts });
+    expect(m).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES }, templates: {}, version: 8, removes, prompts });
     const v3 = [...v2.capabilities, "tasks", "tasks-admin"];
-    expect(seedMigration({ ...v2, capabilities: v3 }, 3)).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES }, templates: {}, version: 7, removes, prompts });
-    expect(seedMigration({ ...v2, capabilities: [...v3, "egress"] }, 4)).toEqual({ capabilities: SPAWNING_CAPABILITIES, templates: {}, version: 7, removes, prompts });
-    expect(seedMigration({ ...v2, capabilities: [...v3, "egress", "spawning"] }, 5)).toEqual({ capabilities: {}, templates: {}, version: 7, removes, prompts });
-    // The live catalog before this release: only the channels' removal and the spawning prompt.
+    expect(seedMigration({ ...v2, capabilities: v3 }, 3)).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES }, templates: {}, version: 8, removes, prompts });
+    expect(seedMigration({ ...v2, capabilities: [...v3, "egress"] }, 4)).toEqual({ capabilities: SPAWNING_CAPABILITIES, templates: {}, version: 8, removes, prompts });
+    expect(seedMigration({ ...v2, capabilities: [...v3, "egress", "spawning"] }, 5)).toEqual({ capabilities: {}, templates: {}, version: 8, removes, prompts });
     expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 6))
-      .toEqual({ capabilities: {}, templates: {}, version: 7, removes: channels, prompts });
+      .toEqual({ capabilities: {}, templates: {}, version: 8, removes: channels, prompts });
+    // The live catalog before this release: only the messaging capabilities and tools.
+    expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 7))
+      .toEqual({ capabilities: {}, templates: {}, version: 8, removes: messaging, prompts: [] });
     // Version 2's step adds nothing now (its channels would only be removed again), and doesn't run twice.
     expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 1).capabilities).sort()).toEqual(["egress", "spawning"]);
     expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 2).capabilities).sort()).toEqual(["egress", "spawning"]);
@@ -298,8 +300,6 @@ function genCatalog(r: () => number): { catalog: Catalog; template: string; hand
     launch: { builtin_tools: [], system_prompt: { mode: pick(["append", "replace"] as const), text: r() < 0.5 ? "base" : "" } },
     hands,
     credential: "claude_oauth_token",
-    escalate_to: pick(["user", "workstream"] as const),
-    subscribe: r() < 0.5 ? ["workstream"] : [],
   };
   const given = [...new Set(template.capabilities.flatMap((c) => capabilities[c]!.tools))];
   const overrides: { tools?: string[]; rules?: ToolRule[] } = {};
@@ -341,7 +341,7 @@ describe("expansion properties (500 generated catalogs)", () => {
       // Prompt: the template's text, then every non-empty capability prompt.
       const parts = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter(Boolean);
       expect(spec.launch.system_prompt, ctx).toEqual({ mode: tpl.launch.system_prompt.mode, text: parts.join("\n\n") });
-      expect([spec.credential, spec.escalate_to, spec.subscribe], ctx).toEqual([tpl.credential, tpl.escalate_to, tpl.subscribe]);
+      expect(spec.credential, ctx).toEqual(tpl.credential);
       // Hands: the template's rule decides.
       if (tpl.hands === "required") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: false, by: "operator" }).ok, ctx).toBe(false);
       if (tpl.hands === "forbidden") expect(expandSpec(g.catalog, PLATFORM_TOOL_NAMES, { template: g.template, hands: true, by: "operator" }).ok, ctx).toBe(false);
@@ -371,7 +371,7 @@ describe("expansion properties (500 generated catalogs)", () => {
       expect(allows(res.value.rules), ctx).toEqual(allows(base.value.rules));
       const baseKeys = new Set(base.value.rules.map(key));
       expect(res.value.rules.filter((x) => !baseKeys.has(key(x))).every((x) => x.decision !== "allow"), ctx).toBe(true);
-      expect([res.value.launch, res.value.credential, res.value.escalate_to], ctx).toEqual([base.value.launch, base.value.credential, base.value.escalate_to]);
+      expect([res.value.launch, res.value.credential], ctx).toEqual([base.value.launch, base.value.credential]);
     }
   });
 
@@ -409,10 +409,10 @@ describe("mcp capabilities in a spec (docs/agents/capabilities/mcp/)", () => {
     mcp: { url: "https://mcp.example.com/mcp", auth: "cap:tracker", ...(tools ? { tools } : {}), idempotent: ["get"], read_only: { get: true, comment: false }, trusted: false, when_tainted: "approve" },
   });
   const tpl: Template = {
-    capabilities: ["tracker", "messaging"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
-    hands: "optional", credential: "claude_oauth_token", escalate_to: "user", subscribe: [],
+    capabilities: ["tracker", "transcripts"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
+    hands: "optional", credential: "claude_oauth_token",
   };
-  const cat: Catalog = { capabilities: { tracker: mcpCap(["get", "comment"]), messaging: SEED_CATALOG.capabilities.messaging! }, templates: { t: tpl } };
+  const cat: Catalog = { capabilities: { tracker: mcpCap(["get", "comment"]), transcripts: SEED_CATALOG.capabilities.transcripts! }, templates: { t: tpl } };
 
   it("the spec copies the server, allowlist, overrides, trust and sink rule; a spec without one has no mcp field", () => {
     const r = expandTemplate(cat, PLATFORM_TOOL_NAMES, "t");
@@ -427,9 +427,9 @@ describe("mcp capabilities in a spec (docs/agents/capabilities/mcp/)", () => {
   it("an override naming tools narrows the allowlist to the remote tools it names, drops it when it names none, and never widens", () => {
     const narrow = (tools: string[], by: "operator" | "spawner" = "operator") =>
       expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "t", hands: false, by, overrides: { tools } } as never);
-    const a = narrow(["tracker_get", "notify"]);
-    expect(a.ok && [a.value.tools, a.value.mcp?.[0]?.tools]).toEqual([["notify"], ["get"]]);
-    const b = narrow(["notify"], "spawner");
+    const a = narrow(["tracker_get", "read_transcript"]);
+    expect(a.ok && [a.value.tools, a.value.mcp?.[0]?.tools]).toEqual([["read_transcript"], ["get"]]);
+    const b = narrow(["read_transcript"], "spawner");
     expect(b.ok && b.value).not.toHaveProperty("mcp");
     expect(narrow(["tracker_delete"])).toEqual({ ok: false, error: "template t doesn't give tracker_delete" });
     // With no allowlist the capability gives whatever the server lists, so any remote name narrows.

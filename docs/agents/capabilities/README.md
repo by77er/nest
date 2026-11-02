@@ -75,7 +75,7 @@ assistant: [spawning{budget}, memory, schedules, web]  # long-lived
 
 ## Messaging
 
-Messaging between agents is an external integration ([principle 9](../../README.md#principles)): an MCP server the agents share, which delivers to an agent through its inbox (`POST /v1/agents/<id>/inbox`, carrying the sender's taint). Reach, threading, loop guards and rate limits are the integration's. Until stage 3, the interim `notify` (in the seeded `messaging` capability) posts to an agent of the same workstream directly.
+Messaging between agents is an external integration ([principle 9](../../README.md#principles)): an MCP server the agents share, which delivers to an agent through its inbox (`POST /v1/agents/<id>/inbox`, carrying the sender's taint). Reach, threading, loop guards and rate limits are the integration's.
 
 ## Schedules
 

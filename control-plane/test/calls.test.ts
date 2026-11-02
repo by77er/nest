@@ -14,14 +14,13 @@ const unknown: ToolOutcome = { status: "error", error: { code: "outcome_unknown"
 
 describe("askRoute: an answer reaches the model whatever happened to the brain that asked", () => {
   it.each([
-    ["answered", true, true, "already_answered"],
-    ["cli", true, true, "waiter"],
-    ["cli", false, true, "turn"],
-    ["sync", false, true, "result"],
-    ["sync", false, false, "turn"],
-    ["async", false, true, "turn"],
-  ] as const)("%s, waiter %s, call current %s: %s", (status, waiter, current, route) => {
-    expect(askRoute(status, waiter, current)).toBe(route);
+    ["answered", true, "already_answered"],
+    ["cli", true, "turn"],
+    ["sync", true, "result"],
+    ["sync", false, "turn"],
+    ["async", true, "turn"],
+  ] as const)("%s, call current %s: %s", (status, current, route) => {
+    expect(askRoute(status, current)).toBe(route);
   });
 });
 

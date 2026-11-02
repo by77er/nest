@@ -171,8 +171,7 @@ async function cellWithHost() {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-lifetimes" } });
   const host = await connectHost(cell);
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "lifetimes" } }, 201);
-  return { cell, host, workstream: workstream as string };
+  return { cell, host };
 }
 type Cell = Awaited<ReturnType<typeof cellWithHost>>;
 
@@ -181,7 +180,7 @@ type Cell = Awaited<ReturnType<typeof cellWithHost>>;
  * `suspended`: then reported suspended by its host.
  */
 async function sandboxIn(c: Cell, opts: { suspended?: boolean; idle_ttl_ms?: number } = {}): Promise<string> {
-  const res = await admin("/v1/sandboxes", { body: { workstream: c.workstream, cell: c.cell, ...(opts.idle_ttl_ms ? { idle_ttl_ms: opts.idle_ttl_ms } : {}) } });
+  const res = await admin("/v1/sandboxes", { body: { cell: c.cell, ...(opts.idle_ttl_ms ? { idle_ttl_ms: opts.idle_ttl_ms } : {}) } });
   const { sandbox } = await res.json<{ sandbox: string }>();
   expect([201, 202]).toContain(res.status);
   if (res.status === 202) return sandbox;
@@ -275,9 +274,9 @@ describe("GET /v1/admin/lifetimes", () => {
     const sandbox = await sandboxIn(c, { suspended: true });
     const tpl = `lead-${crypto.randomUUID().slice(0, 8)}`;
     await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: {
-      capabilities: ["nest"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token", escalate_to: "user",
+      capabilities: ["nest"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
     } });
-    const captain = (await adminJson<{ agent: string }>("/v1/agents", { body: { template: tpl, workstream: c.workstream, cell: c.cell, start: false } }, 201)).agent;
+    const captain = (await adminJson<{ agent: string }>("/v1/agents", { body: { template: tpl, cell: c.cell, start: false } }, 201)).agent;
     await registered(c.cell, captain);
     const worker = await workerOn(sandbox);
     const v = await view(c.cell);

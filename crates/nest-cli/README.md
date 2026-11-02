@@ -6,7 +6,7 @@ One binary, installed at `/usr/lib/nest/nest` on hosts and in guest images.
 |---|---|---|
 | `nest hook [--sync]` | host (Claude Code hooks) | async: one datagram to the runner (spool on failure); `--sync`: one decision request (8 s, 18 s for `SessionStart`), prints the hook JSON; runner unreachable ⇒ spec'd fallback. **Always exits 0.** Spec: `docs/interfaces/host-internal/runner-hooks/` |
 | `nest mcp` | host (spawned by Claude Code) | stdio MCP server (newline-delimited JSON-RPC) forwarding `tools/list`, `tools/call`, cancellations to the runner, reconnecting lazily if the runner connection drops; `notifications/tools/list_changed` on rebind. Spec: `runner-mcp/` |
-| `nest notify\|emit\|ask\|expose\|unexpose\|whoami` | guest | One `CliRequest` to the guest agent (`NEST_GUEST_SOCK`, default `/run/nest/guest.sock`); attributed by `NEST_AGENT_ID`. Spec: `docs/interfaces/host-guest/` |
+| `nest expose\|unexpose\|whoami` | guest | One `CliRequest` to the guest agent (`NEST_GUEST_SOCK`, default `/run/nest/guest.sock`); attributed by `NEST_AGENT_ID`. Spec: `docs/interfaces/host-guest/` |
 
 `tests/e2e.rs` drives the real runner end to end with `tests/fake_claude.py` standing in for
 Claude Code (including a turn arriving during an idle exit, and hooks from processes outside the

@@ -107,13 +107,10 @@ PROMPT = ("This is the owner's automated test of nest's sandbox network policy, 
 ok, made = True, {"sandbox": None, "agent": None}
 try:
     s, v = api("PUT", f"/v1/admin/templates/{TPL}", {
-        "capabilities": ["nest", "hands"], "hands": "required", "credential": "claude_oauth_token:worker", "escalate_to": "workstream",
-        "subscribe": [], "params": {},
+        "capabilities": ["nest", "hands"], "hands": "required", "credential": "claude_oauth_token:worker",
         "launch": {"model": "haiku", "builtin_tools": [], "system_prompt": {"mode": "append", "text": "You run exactly the commands an automated check gives you."}}})
     assert s == 200, ("template", s, v)
-    s, v = api("POST", "/v1/workstreams", {"goal": f"push check {RUN}"})
-    ws = v["workstream"]
-    s, v = api("POST", "/v1/sandboxes", {"workstream": ws, "cell": CELL})
+    s, v = api("POST", "/v1/sandboxes", {"cell": CELL})
     assert s in (200, 201, 202), v
     made["sandbox"] = v["sandbox"]
     s, v = api("POST", "/v1/agents", {"template": TPL, "sandbox": made["sandbox"], "cell": CELL, "start": False, "overrides": {"repos": [ALLOWED]}})

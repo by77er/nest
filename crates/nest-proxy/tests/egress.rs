@@ -70,7 +70,7 @@ async fn deny_is_a_readable_403() {
     assert_eq!(r.status, 403);
     assert_eq!(r.body["error"], "egress_denied");
     assert_eq!(r.body["host"], "evil.test");
-    assert!(r.body["hint"].as_str().unwrap().contains("ask"));
+    assert!(r.body["hint"].as_str().unwrap().contains("egress_policy"));
     env.conn.wait(|e| audit_with(e, |r| r.host == "evil.test" && r.verdict == EgressVerdict::Deny)).await;
 }
 
@@ -245,7 +245,7 @@ async fn explicit_proxy_connect_inject_deny_and_absolute_form() {
     let r = http_over(tls, false, "GET", "evil.test", "/", &[]).await;
     assert_eq!(r.status, 403);
     assert_eq!(r.body["error"], "egress_denied");
-    assert!(r.body["hint"].as_str().unwrap().contains("ask"));
+    assert!(r.body["hint"].as_str().unwrap().contains("egress_policy"));
     env.conn.wait(|e| audit_with(e, |r| r.host == "evil.test" && r.verdict == EgressVerdict::Deny)).await;
 
     // Absolute-form plaintext HTTP.

@@ -16,8 +16,7 @@ const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const GUEST = { protocol_version: 1, capabilities: [] };
 
 async function createSandbox(cell: string, status = 201) {
-  const { workstream } = await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "lifecycle" } }, 201);
-  return adminJson<{ sandbox: string; host: string | null; workstream: string }>("/v1/sandboxes", { body: { workstream, cell } }, status);
+  return adminJson<{ sandbox: string; host: string | null }>("/v1/sandboxes", { body: { cell } }, status);
 }
 
 async function events(ws: Ws, evs: unknown[], at?: number) {
@@ -128,7 +127,7 @@ describe("an unfinished placement is reconciled against the lease", () => {
     const unplaced = await createSandbox(cell, 202); // no host yet: epoch 0, nothing leased
     const a = await connectHost(cell);
     const req = {
-      sandbox: unplaced.sandbox, workstream: unplaced.workstream, epoch: 1, image: "nest-base:latest",
+      sandbox: unplaced.sandbox, workstream: `ws_${unplaced.sandbox.slice(4)}`, epoch: 1, image: "nest-base:latest",
       resources: { vcpus: 2, memory_mib: 4096, disk_gib: 32 }, policy: await sandboxStub(unplaced.sandbox).policy(),
     };
     expect(await fleetStub(cell).place(req)).toBe(a.host);
@@ -580,7 +579,7 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
       const self = inst as unknown as { fleet: (cell: string) => any };
       const real = self.fleet.bind(inst);
       self.fleet = (c: string) => ({ ...real(c), registerSandbox: (x: string) => real(c).registerSandbox(x), place: async () => { throw new Error("Network connection lost."); } });
-      const info = await inst.create({ sandbox: id, workstream: "ws_lifecycle", cell }).catch((e: Error) => e.message);
+      const info = await inst.create({ sandbox: id, cell }).catch((e: Error) => e.message);
       return { info, deadline: st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'place'").toArray().length };
     });
     // A 500 here would make a client retry the POST, and the retry mints a second sandbox.

@@ -5,15 +5,8 @@ import { CapacityError, type Ec2, type InstanceState, type LaunchSpec, type Imag
 import type { AwsCellConfig } from "../src/lib/cells";
 import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
-async function workstream(goal = "test") {
-  return adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal } }, 201);
-}
-
 async function createSandbox(cell: string, status = 201) {
-  const ws = await workstream();
-  const info = await adminJson<{ sandbox: string; epoch: number; host: string; workstream: string }>(
-    `/v1/sandboxes`, { body: { workstream: ws.workstream, cell } }, status);
-  return info;
+  return adminJson<{ sandbox: string; epoch: number; host: string }>(`/v1/sandboxes`, { body: { cell } }, status);
 }
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
@@ -36,6 +29,9 @@ describe("fleet channel", () => {
     expect(sbx.host).toBe(h.host);
     const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     expect(create).toMatchObject({ type: "sandbox_create", sandbox: sbx.sandbox, epoch: 1 });
+    // Compat for one release: hosts of the previous release require a `ws_` value; the API shows none.
+    expect(create.workstream).toBe(`ws_${sbx.sandbox.slice("sbx_".length)}`);
+    expect(sbx).not.toHaveProperty("workstream");
     expect(create.policy.allow.some((r: any) => r.host === "github.com" && r.layer === "base")).toBe(true);
 
     await okResult(h.ws, create.cmd);
@@ -104,29 +100,28 @@ describe("fleet channel", () => {
     expect((await ws2.next("ack")).up_to).toBe(1);
   });
 
-  it("relays guest nest CLI commands to the attributed agent and answers with guest_cli_result", async () => {
+  it("relays guest nest CLI commands to the attributed agent; notify, emit and ask (a previous release's guest) answer unknown_tool", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
     const h = await connectHost(cell);
     const brain = await connectHost(cell, "brain");
     const sbx = await createSandbox(cell);
     await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const worker = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", workstream: sbx.workstream, sandbox: sbx.sandbox, cell } }, 201);
+    const worker = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell } }, 201);
     await nextCommands(brain.ws, (c) => c.type === "agent_start");
     const base = { ts_ms: Date.now(), sandbox: sbx.sandbox, epoch: 1, agent: worker.agent };
     sendEvents(h.ws, [
       { ...base, type: "guest_cli", request: "req_cli1", command: { command: "emit", event: "progress", payload: { summary: "half done" } } },
-      { ...base, type: "guest_cli", request: "req_cli2", command: { command: "notify", to: "nobody", message: "x", urgency: "normal" } },
+      { ...base, type: "guest_cli", request: "req_cli2", command: { command: "notify", to: "user", message: "x", urgency: "normal" } },
+      { ...base, type: "guest_cli", request: "req_cli3", command: { command: "ask", question: "q?", options: [], wait_s: 1 } },
+      { ...base, type: "guest_cli", request: "req_cli4", command: { command: "expose", port: 0, exposed: true } },
     ], 7);
-    const results = [
-      ...(await nextCommands(h.ws, (c) => c.type === "guest_cli_result")),
-      ...(await nextCommands(h.ws, (c) => c.type === "guest_cli_result")),
-    ];
+    const results: any[] = [];
+    while (results.length < 4) results.push(...(await nextCommands(h.ws, (c) => c.type === "guest_cli_result")));
     const byReq = Object.fromEntries(results.map((c) => [c.request, c.result]));
-    expect(byReq["req_cli1"]).toMatchObject({ status: "ok" });
-    expect(byReq["req_cli2"]).toMatchObject({ status: "error", error: { code: "invalid_message" } });
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(sbx.workstream)).events();
-    expect(events.some((e) => e.type === "progress" && (e as { summary: string }).summary === "half done")).toBe(true);
+    for (const r of ["req_cli1", "req_cli2", "req_cli3"]) expect(byReq[r], r).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
+    // A command that still exists reaches the agent (which refuses port 0).
+    expect(byReq["req_cli4"]).toMatchObject({ status: "error", error: { code: "invalid_message" } });
   });
 
   it("heartbeats renew leases and revoke claims the control plane doesn't honor", async () => {
@@ -195,8 +190,6 @@ describe("commit compare-and-set", () => {
     const r5 = await result("req_5");
     expect(r5.status).toBe("orphaned");
     expect((await sandboxStub(sbx.sandbox).info()).head).toBe(r4.generation.id);
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(sbx.workstream)).events();
-    expect(events.some((e) => e.type === "orphaned_work" && e.generation === r5.generation.id && e.stale_epoch === 1)).toBe(true);
   });
 });
 

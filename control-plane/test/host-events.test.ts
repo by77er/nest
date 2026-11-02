@@ -43,10 +43,9 @@ describe("agent_exited reasons", () => {
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-exit" } });
     const sbxHost = await connectHost(cell);
     const host = await connectHost(cell, "brain");
-    const ws = (await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "x" } }, 201)).workstream;
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
-    const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream: ws, sandbox: sbx.sandbox, cell } }, 201);
+    const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell } }, 201);
     await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
     return { host, agent: worker.agent as string };
   }

@@ -85,7 +85,7 @@ def main():
         "reason": "turn_end",
     })
     write("meta_json", "unanswered", json.dumps(meta2, indent=2).encode())
-    minimal = {k: meta[k] for k in ("version", "sandbox", "workstream", "epoch", "image", "resources")}
+    minimal = {k: meta[k] for k in ("version", "sandbox", "epoch", "image", "resources")}  # `workstream` is optional
     write("meta_json", "minimal", json.dumps(minimal).encode())
 
 

@@ -960,7 +960,7 @@ fn deny_json(code: &str, host: &str, port: u16, reason: &str) -> serde_json::Val
         "host": clip(host, 256),
         "port": port,
         "reason": reason,
-        "hint": "nest-proxy blocked this request. Ask for access with the `ask` tool or `nest ask \"allow egress to <host>?\"`; a captain or the owner can approve it.",
+        "hint": "nest-proxy blocked this request. Ask for access with the `egress_policy` tool (`allow: [{host}]`) if you have it (from a tainted session the operator approves it first); otherwise tell your owner.",
     })
 }
 

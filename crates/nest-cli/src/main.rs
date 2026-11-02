@@ -13,14 +13,14 @@ fn main() {
     let code = match args.first().map(String::as_str) {
         Some("hook") => hook::main(&args[1..]),
         Some("mcp") => mcp::main(),
-        Some("notify" | "emit" | "ask" | "expose" | "unexpose" | "whoami") => guest_cli::main(&args),
+        Some("expose" | "unexpose" | "whoami") => guest_cli::main(&args),
         Some("--version") => {
             println!("nest {}", env!("CARGO_PKG_VERSION"));
             0
         }
         _ => {
             eprintln!(
-                "usage: nest hook [--sync] | nest mcp\n       nest notify [--to captain|user|agt_…] [--urgency low|normal|high] <message>\n       nest emit <event> [--payload JSON]\n       nest ask <question> [--option O]… [--wait SECONDS]\n       nest expose|unexpose <port>\n       nest whoami"
+                "usage: nest hook [--sync] | nest mcp\n       nest expose|unexpose <port>\n       nest whoami"
             );
             2
         }

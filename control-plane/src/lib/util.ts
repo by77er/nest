@@ -2,6 +2,16 @@ import { ErrorCodes, type ErrorBody } from "../protocol/model";
 
 const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
 
+/**
+ * Compat, for one release (docs/interfaces/#pending-contract-changes): a `ws_` value derived from a
+ * sandbox's or an agent's own id. Hosts and runners of the previous release require one in
+ * `sandbox_create`, `sandbox_fork` and `agent_start`, and its records hold one; workstreams left the
+ * platform and nothing here reads it.
+ */
+export function compatWorkstream(id: string): string {
+  return `ws_${id.slice(id.indexOf("_") + 1)}`;
+}
+
 /** Sortable, prefixed id: 10 chars of millisecond time + 16 random chars (Crockford base32). */
 export function newId(prefix: string, nowMs = Date.now()): string {
   let t = nowMs;

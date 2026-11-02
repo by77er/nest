@@ -483,21 +483,22 @@ pub struct CliResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum CliCommand {
-    /// `nest notify [--to captain|user|agt_…] [--urgency …] <message>`
+    /// `notify`, `emit` and `ask` are no longer offered by the `nest` CLI: the tools behind them left
+    /// the platform. Kept so a guest of the previous release still parses; the control plane answers
+    /// each with `unknown_tool`. Removed once no guest of that release runs.
     Notify {
         to: String,
         message: String,
         #[serde(default)]
         urgency: Urgency,
     },
-    /// `nest emit <event> [--payload JSON]`
+    /// See `Notify`.
     Emit {
         event: String,
         #[serde(default)]
         payload: serde_json::Value,
     },
-    /// `nest ask <question> [--option …] [--wait 120]`. Blocks at most `wait_s` (≤ 120);
-    /// after that the answer is `pending`.
+    /// See `Notify`.
     Ask {
         question: String,
         #[serde(default)]

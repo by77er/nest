@@ -18,6 +18,8 @@ grants:
 limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
 ```
 
+**Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's historical wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`.
+
 ## Hard deny
 
 **Non-public addresses are refused before policy is consulted.** No allow rule, grant, TCP exception or IP-literal host can override this:

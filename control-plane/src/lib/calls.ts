@@ -9,7 +9,11 @@ import { addColumn, storedEnum } from "./stored";
 /** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
 const CallStatusEnum = z.enum(["dispatching", "waiting", "done"]);
 export type CallStatus = z.output<typeof CallStatusEnum>;
-/** `asks.status`: inside its sync window, a guest CLI's, answered as a turn later, or answered. */
+/**
+ * `asks.status`: waiting for the operator (answered as a turn), or answered. `sync` (a call waiting inside
+ * its window) and `cli` (a guest `nest ask` waiting) were the `ask` tool's, which left the platform: only
+ * rows the previous release wrote have them.
+ */
 const AskStatusEnum = z.enum(["sync", "cli", "async", "answered"]);
 export type AskStatus = z.output<typeof AskStatusEnum>;
 /** `approvals.status`: a sink call waiting for the operator, or the operator's decision. */
@@ -45,6 +49,15 @@ export interface StoredAsk {
   question: string;
   status: AskStatus;
   deadline: number;
+}
+
+/** An ask waiting for the operator, as `GET /v1/agents/:agent/asks` lists it. */
+export interface OpenAsk {
+  ask: string;
+  question: string;
+  created_ms: number;
+  /** For an approval: the sink and the model-facing tool it holds (`tool` null in rows from before it was kept). */
+  approval?: { name: string; tool: string | null };
 }
 
 export class CallLedger {
@@ -115,6 +128,14 @@ export class CallLedger {
     this.sql.exec(`UPDATE asks SET status = '${ASK.answered}', answer = ? WHERE ask = ?`, text, ask);
   }
 
+  /** Asks not yet answered, oldest first, with the approval each one decides (if any). */
+  open(): OpenAsk[] {
+    return this.sql.exec<{ ask: string; question: string; created_ms: number; name: string | null; tool: string | null }>(
+      `SELECT a.ask, a.question, a.created_ms, p.name, p.tool FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
+        WHERE a.status != '${ASK.answered}' ORDER BY a.created_ms, a.ask`).toArray()
+      .map((r) => ({ ask: r.ask, question: r.question, created_ms: r.created_ms, ...(r.name !== null ? { approval: { name: r.name, tool: r.tool } } : {}) }));
+  }
+
   /** Asks (approvals included) not yet answered: each answer would be a turn. */
   openAsks(): number {
     return this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM asks WHERE status != '${ASK.answered}'`).one().n;
@@ -171,16 +192,15 @@ export class CallLedger {
   }
 }
 
-export type AskRoute = "already_answered" | "waiter" | "result" | "turn";
+export type AskRoute = "already_answered" | "result" | "turn";
 
 /**
- * An answer reaches the model whatever happened to the brain that asked: the guest CLI's waiter (lost
- * with an eviction), the call's result while it waits on the brain that asked (`callCurrent`: a new
- * lineage drops what the old one was sent), else the next turn.
+ * An answer reaches the model whatever happened to the brain that asked: the next turn, or, for a `sync`
+ * ask the previous release left, the call's result while it waits on the brain that asked
+ * (`callCurrent`: a new lineage drops what the old one was sent).
  */
-export function askRoute(status: AskStatus, waiter: boolean, callCurrent: boolean): AskRoute {
+export function askRoute(status: AskStatus, callCurrent: boolean): AskRoute {
   if (status === "answered") return "already_answered";
-  if (status === "cli" && waiter) return "waiter";
   if (status === "sync" && callCurrent) return "result";
   return "turn";
 }

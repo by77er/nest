@@ -107,8 +107,7 @@ export interface SandboxView {
   /** SandboxDO's own state; null when it could not be read (`info_error`). */
   sandbox_state: SandboxState | null;
   image: string | null;
-  workstream: string | null;
-  /** SandboxDO did not answer: `sandbox_state`, `image` and `workstream` are null. */
+  /** SandboxDO did not answer: `sandbox_state` and `image` are null. */
   info_error: boolean;
 }
 

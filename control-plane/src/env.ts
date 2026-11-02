@@ -43,7 +43,6 @@ export interface Env {
   AWS_CELL_CREDENTIALS?: string;
 
   PUBLIC_BASE_URL: string;
-  ASK_SYNC_WINDOW_MS: string;
   HOST_TOKEN_TTL_MS: string;
   PROXY_CA_TTL_MS: string;
   /** Comma-separated list of valid cells; when set, others are refused (no stray FleetDOs). */
@@ -54,8 +53,6 @@ export interface Env {
   SANDBOX_IDLE_TTL_MS?: string;
   /** Generation retention (src/lib/retention.ts): `off`, `report` (the default: reports what it would drop) or `on`. */
   SANDBOX_RETENTION?: string;
-  /** Batching window of the workstream channel's subscriber wakes. */
-  WAKE_BATCH_MS?: string;
   /** The nest domain, `<label>.<zone>` (e.g. `nest.bitcru.sh`): sandbox hosts get `<host>-gw-<label>.<zone>`, previews `<port>-<sandbox>-preview-<label>.<zone>`, share links `<port>-<sandbox>-share-<label>.<zone>`. Unset: no tunnels, and preview names use `nest.localhost`. */
   NEST_DOMAIN?: string;
   /** The Cloudflare account that holds the tunnels (a var) and a token with Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit (a secret). */

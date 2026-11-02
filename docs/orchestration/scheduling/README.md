@@ -12,4 +12,4 @@ All agents share one Claude subscription. Its limits assume "ordinary, individua
 
 **No quota shares.** Subscription windows aren't published for individual plans, and how cache reads count is unknown, so the scheduler doesn't estimate shares: the concurrency cap and priority classes divide capacity, and a rate limit parks agents until quota returns. Usage from `usage` events is recorded for display only.
 
-**Built:** a rate limit marks the agent `quota_parked` and posts it to the workstream channel. **Not built:** the concurrency cap, priority classes, budgets and cache-aware waking.
+**Built:** a rate limit marks the agent `quota_parked` and logs it. **Not built:** the concurrency cap, priority classes, budgets and cache-aware waking.

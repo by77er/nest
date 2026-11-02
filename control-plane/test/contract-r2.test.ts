@@ -11,44 +11,26 @@ async function setup() {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
   const sbxHost = await connectHost(cell);
   const host = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "ship it" } }, 201);
-  const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
-  const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, captain } }, 201);
+  const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell, captain } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
   const ws = await Ws.connect(`/v1/agents/${worker.agent}/session`, host.host_token);
   ws.send({ type: "hello", protocol_version: 1, agent: worker.agent, host: host.host, instance_id: "rin_r2", epoch: 1, session: SESSION });
   await ws.next("hello_ack");
-  return { workstream, agent: worker.agent as string, captain, ws };
+  return { agent: worker.agent as string, captain, ws };
 }
 
 describe("cancel_call", () => {
-  it("stops an ask's sync wait without a tool_result; a later answer arrives as a turn", async () => {
-    const s = await setup();
-    s.ws.send({ type: "tool_call", seq: 1, call: "cal_c1-1", turn: "trn_x", name: "ask", arguments: { question: "Deploy?", to: "user" } });
-    expect((await s.ws.next("ack")).up_to).toBe(1);
-    s.ws.send({ type: "cancel_call", seq: 2, call: "cal_c1-1", reason: "timed out" });
-    expect((await s.ws.next("ack")).up_to).toBe(2);
-    // The sync window lapsing (made due, if it is still armed) sends nothing: the wait was cancelled.
-    await runInDurableObject(agentStub(s.agent), (_i, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key LIKE 'ask:%'"));
-    await runDue(agentStub(s.agent));
-    expect(await s.ws.none("tool_result", 100)).toBe(true);
-    const note = await eventually("the ask's notification", async () =>
-      (await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications()).at(-1));
-    const ask = /\[(ask_[A-Za-z0-9]+)\]/.exec(note.text)![1];
-    expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
-    expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer" });
-  });
-
   it("a call cancelled before it arrives never runs; the same call id gets outcome_unknown", async () => {
     const s = await setup();
     s.ws.send({ type: "cancel_call", seq: 1, call: "cal_c2-1", reason: "timed out" });
     expect((await s.ws.next("ack")).up_to).toBe(1);
-    s.ws.send({ type: "tool_call", seq: 2, call: "cal_c2-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "should never arrive" } });
+    s.ws.send({ type: "tool_call", seq: 2, call: "cal_c2-1", turn: "trn_x", name: "exit", arguments: { reason: "should never happen" } });
     const r = await s.ws.next("tool_result", (m) => m.call === "cal_c2-1");
     expect(r.outcome).toMatchObject({ status: "error", error: { code: "outcome_unknown" } });
-    expect(await agentStub(s.captain).turns()).toEqual([]);
+    expect((await agentStub(s.agent).info()).ended).toBeUndefined();
   });
 });
 

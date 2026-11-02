@@ -8,7 +8,7 @@ nest runs many long-lived Claude Code agents at once. Each agent's brain is an u
 
 - **Parallel agents in isolated VMs.** Fork a sandbox to give an agent its own copy of the work.
 - **Durable by default.** Sessions and workspaces outlive hosts; idle agents cost nothing and wake when a message arrives.
-- **Any agent structure.** Captains running workstreams, reviewers, pipelines and swarms are built by agents from three primitives (sandboxes, agents, channels), not hard-coded.
+- **Any agent structure.** Captains, reviewers, pipelines and swarms are built by agents and external apps from the kernel's primitives (sandboxes and agents), not hard-coded.
 - **Safe by construction.**
   - The subscription token never enters a VM, and sandboxes hold no secrets.
   - Egress is allowlisted, with credentials injected at the proxy.

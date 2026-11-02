@@ -44,9 +44,9 @@ pub enum EventKind {
     Audit { records: usize },
     /// A `capacity` report.
     Capacity,
-    /// A workstream `egress_denied` event.
+    /// A sandbox `egress_denied` event.
     EgressDenied,
-    /// A workstream `port_opened` event.
+    /// A sandbox `port_opened` event.
     PortOpened,
     /// Anything else: never shed, never merged.
     Other,

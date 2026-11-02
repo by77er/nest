@@ -11,7 +11,7 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 | `hello_ack` | 0 | Starts a resync |
 | `ca_install` | 0 | `ca: control::CaCertificate` (the intermediate: pathLen 0, about 7 days) + `key_pem` (nestd generated the key for the enrollment CSR). Memory only |
 | `lease_update` | 0 | `valid_until_ms`, every heartbeat. Past it: refuse new connections and stop injecting for all sandboxes |
-| `sandbox_upsert` | 0 | `{sandbox, epoch, workstream?, policy: model::EgressPolicy}`. Ignored for an older epoch, or unless `version` is newer. A newer epoch (or a `secrets_set` at one) starts the sandbox's view afresh: nothing of the older epoch's policy or secrets carries over. Precedes the sandbox's first `listeners_add`. Not acknowledged ([below](#policy-acknowledgement)) |
+| `sandbox_upsert` | 0 | `{sandbox, epoch, workstream?, policy: model::EgressPolicy}` (`workstream`: the compat `ws_` value nestd got, unused). Ignored for an older epoch, or unless `version` is newer. A newer epoch (or a `secrets_set` at one) starts the sandbox's view afresh: nothing of the older epoch's policy or secrets carries over. Precedes the sandbox's first `listeners_add`. Not acknowledged ([below](#policy-acknowledgement)) |
 | `secrets_set` | 0 | `{sandbox, epoch, secrets: model::InjectionSecret[]}`, replace all; checked against the epoch only. Memory only |
 | `listeners_add` | **= `listeners.len()`**, same order, ≤ 32 per packet | `ListenerSpec{id, transport, addr, purpose}` |
 | `listeners_remove` | 0 | Close listeners; established connections finish |
@@ -21,7 +21,7 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 
 **proxy → nestd (`ProxyEvent`, never fds)**: `hello`, `resync_ack`, `audit{records: control::EgressAuditRecord[]}` (≤1 s / 128 records; each sets `via`), `alert{kind: placeholder_wrong_host \| domain_fronting \| injection_after_expiry}` (immediate), `listener_failed`, `pong`, `error` (then close). `domain_fronting` covers both `Host` ≠ SNI and a CONNECT tunnel whose SNI ≠ the CONNECT authority.
 
-**Aggregate audit records** have `port: 0`: a window's suppression summary (`host: "*"`, `count` set, `reason: "suppressed: …"`) and `connection_limit` (`host: ""`). nestd raises a `egress_denied` workstream event only for one request's denial (deny, no `count`, a real port); aggregates go to the audit log only.
+**Aggregate audit records** have `port: 0`: a window's suppression summary (`host: "*"`, `count` set, `reason: "suppressed: …"`) and `connection_limit` (`host: ""`). nestd raises an `egress_denied` sandbox event only for one request's denial (deny, no `count`, a real port); aggregates go to the audit log only.
 
 **Listener purposes** (`purpose` is flattened into the spec):
 

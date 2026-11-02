@@ -80,11 +80,11 @@ pub struct Ev(pub HostEvent);
 
 impl core::OutboxEvent for Ev {
     fn kind(&self) -> EventKind {
-        use nest_protocol::model::WorkstreamEventKind as K;
+        use nest_protocol::model::SandboxEventKind as K;
         match &self.0.body {
             HostEventBody::EgressAudit { records } => EventKind::Audit { records: records.len() },
             HostEventBody::Capacity { .. } => EventKind::Capacity,
-            HostEventBody::Workstream { event } => match event.kind {
+            HostEventBody::SandboxEvent { event } => match event.kind {
                 K::EgressDenied { .. } => EventKind::EgressDenied,
                 K::PortOpened { .. } => EventKind::PortOpened,
                 _ => EventKind::Other,
@@ -385,16 +385,17 @@ mod tests {
             assert_eq!((e.kind(), shed_rank(e.kind())), (kind, rank), "{name}");
         }
         let host_event = fixture("host_event", "workstream");
-        for (name, w) in fixtures("workstream_event") {
+        for (name, w) in fixtures("sandbox_event") {
             let mut v = host_event.clone();
             v["event"] = w;
-            let (kind, rank) = match name.as_str() {
+            // `<variant>.<case>`: the variant decides.
+            let (kind, rank) = match name.split('.').next().unwrap() {
                 "egress_denied" => (EventKind::EgressDenied, Some(1)),
                 "port_opened" => (EventKind::PortOpened, Some(1)),
                 _ => (EventKind::Other, None),
             };
             let e = event(v);
-            assert_eq!((e.kind(), shed_rank(e.kind())), (kind, rank), "workstream {name}");
+            assert_eq!((e.kind(), shed_rank(e.kind())), (kind, rank), "sandbox event {name}");
         }
     }
 

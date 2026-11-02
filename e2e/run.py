@@ -221,7 +221,7 @@ def start_control_plane():
     PROCS["wrangler"] = subprocess.Popen(
         ["npx", "wrangler", "dev", "--local", "--port", str(PORT), "--ip", "127.0.0.1",
          "--persist-to", os.path.join(WORK, "wrangler-state"), "--env-file", os.path.join(WORK, "dev.vars"),
-         "--var", f"PUBLIC_BASE_URL:{BASE}", "--var", "ASK_SYNC_WINDOW_MS:5000"
+         "--var", f"PUBLIC_BASE_URL:{BASE}",
          "--show-interactive-dev-session=false", "--log-level", "info"],
         cwd=os.path.join(ROOT, "control-plane"), stdout=logf, stderr=subprocess.STDOUT, env=env,
         start_new_session=True)
@@ -517,7 +517,7 @@ def scenario(sbx_dir):
         ("reread", "Read", {"file_path": f}),
         ("pyscript", "Write", {"file_path": os.path.join(WORK, "files", "fib.py"), "content": FIB_PY}),
         ("pyrun", "Bash", {"command": f"python3 {os.path.join(WORK, 'files', 'fib.py')}"}),
-        ("notify", "notify", {"to": "user", "message": "hello from the e2e fake claude"}),
+        ("platform", "egress_policy", {}),
     ]
     path = os.path.join(WORK, "scenario.json")
     with open(path, "w") as fh:
@@ -549,10 +549,7 @@ def r2_blobs():
 def run_scenario():
     st, _ = api("PUT", "/v1/admin/secrets/inject:httpbin", {"value": INJECT_SECRET})
     check("injection secret stored", st in (200, 201, 204), str(st))
-    st, ws = api("POST", "/v1/workstreams", {"goal": "e2e"})
-    assert st == 201, (st, ws)
-    wsid = ws.get("workstream") or ws.get("id")
-    sbx = wait_for(lambda: (lambda r: r[1] if r[0] == 201 else None)(api("POST", "/v1/sandboxes", {"workstream": wsid, "cell": "local", "policy": E2E_POLICY})),
+    sbx = wait_for(lambda: (lambda r: r[1] if r[0] == 201 else None)(api("POST", "/v1/sandboxes", {"cell": "local", "policy": E2E_POLICY})),
                    60, 1.0, "sandbox placed on a connected host")
     sbxid = sbx.get("sandbox") or sbx.get("id")
     check("sandbox placed", sbx.get("host"), f"{sbxid} on {sbx.get('host')}")
@@ -569,7 +566,7 @@ def run_scenario():
         worker_tpl["capabilities"] = [*worker_tpl["capabilities"], "egress"]
         st, r = api("PUT", "/v1/admin/templates/worker", worker_tpl)
         check("worker template gains the egress capability", st == 200, json.dumps(r)[:200])
-    body = {"template": "worker", "workstream": wsid, "sandbox": sbxid, "cell": "local"}
+    body = {"template": "worker", "sandbox": sbxid, "cell": "local"}
     if REAL:
         body["launch"] = REAL_LAUNCH
     st, ag = api("POST", "/v1/agents", body)
@@ -585,7 +582,7 @@ def run_scenario():
 
     if REAL:
         nhands = run_real_turn(agid)
-        skip("scripted hands, egress, notify and audit checks", "fake mode only: they need scripted tool calls; real mode checks hands through a natural-language turn")
+        skip("scripted hands, egress, platform tool and audit checks", "fake mode only: they need scripted tool calls; real mode checks hands through a natural-language turn")
     else:
         spath, nsteps, nhands = scenario(os.path.join(WORK, "files"))
         st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {spath}"})
@@ -615,7 +612,7 @@ def run_scenario():
         check("Read after Edit", "edited line" in text("reread"), text("reread").strip()[:200])
         check("Write a Python program", res.get("pyscript") and not res["pyscript"]["is_error"], text("pyscript").strip()[:200])
         check("Bash runs it: python3 prints F(90)", text("pyrun").strip() == FIB_EXPECTED, text("pyrun").strip()[:200])
-        check("platform tool notify", res.get("notify") and not res["notify"]["is_error"], text("notify").strip()[:300])
+        check("platform tool egress_policy (the effective policy)", res.get("platform") and not res["platform"]["is_error"], text("platform").strip()[:300])
 
     # Direct connect from inside the sandbox netns (outside the guest's own tools).
     p = in_userns(["bash", "-c", "ip route; timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' && echo CONNECTED || echo BLOCKED"], netns=netns)
@@ -659,13 +656,10 @@ def run_scenario():
     check("turn completed", st == 200 and '"status": "done"' in json.dumps(turns), json.dumps(turns)[:300])
     st, info = api("GET", f"/v1/agents/{agid}")
     check("agent info", st == 200, json.dumps(info)[:300])
-    st, evs = api("GET", f"/v1/workstreams/{wsid}/events")
-    evs_s = json.dumps(evs)
-    check("workstream events visible", st == 200, evs_s[:300])
+    st, asks = api("GET", f"/v1/agents/{agid}/asks")
+    check("the agent's open asks are listable (approvals)", st == 200 and isinstance(asks, list), json.dumps(asks)[:300])
     if REAL:
-        return {"workstream": wsid, "sandbox": sbxid, "agent": agid, "netns": netns, "target": ids_target}
-    st, notes = api("GET", f"/v1/workstreams/{wsid}/notifications")
-    check("notify reached the user-notification queue", st == 200 and "hello from the e2e fake claude" in json.dumps(notes), json.dumps(notes)[:300])
+        return {"sandbox": sbxid, "agent": agid, "netns": netns, "target": ids_target}
 
     # Egress audit records (FleetDO writes them to R2 under audit/…).
     def audit():
@@ -680,7 +674,7 @@ def run_scenario():
     except TimeoutError as e:
         check("egress audit: allowed + denied records", False, str(e)[:200])
 
-    return {"workstream": wsid, "sandbox": sbxid, "agent": agid, "netns": netns, "target": ids_target}
+    return {"sandbox": sbxid, "agent": agid, "netns": netns, "target": ids_target}
 
 
 def gateway_log():
@@ -817,7 +811,7 @@ def run_mcp(ids):
            "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
     st, r = api("PUT", "/v1/admin/templates/mcp-worker", tpl)
     check("mcp: template configured", st == 200, json.dumps(r)[:200])
-    st, ag = api("POST", "/v1/agents", {"template": "mcp-worker", "workstream": ids["workstream"], "cell": "local"})
+    st, ag = api("POST", "/v1/agents", {"template": "mcp-worker", "cell": "local"})
     check("mcp: agent created", st == 201, json.dumps(ag)[:200])
     agid = ag.get("agent")
 
@@ -899,7 +893,7 @@ def run_mcp_list_changed(ids):
     tpl = {"capabilities": ["nest", cap], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
            "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
     st, r = api("PUT", "/v1/admin/templates/mcp-live", tpl)
-    st, ag = api("POST", "/v1/agents", {"template": "mcp-live", "workstream": ids["workstream"], "cell": "local"})
+    st, ag = api("POST", "/v1/agents", {"template": "mcp-live", "cell": "local"})
     check("mcp list_changed: agent created", st == 201, json.dumps(ag)[:200])
     agid = ag.get("agent")
 
@@ -976,7 +970,7 @@ def run_mcp_oauth(ids):
     tpl = {"capabilities": ["nest", MCP_OAUTH_CAP], "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}},
            "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
     api("PUT", "/v1/admin/templates/mcp-oauth-worker", tpl)
-    st, ag = api("POST", "/v1/agents", {"template": "mcp-oauth-worker", "workstream": ids["workstream"], "cell": "local"})
+    st, ag = api("POST", "/v1/agents", {"template": "mcp-oauth-worker", "cell": "local"})
     check("mcp oauth: agent created", st == 201, json.dumps(ag)[:200])
     agid = ag.get("agent")
 
@@ -1097,7 +1091,7 @@ def run_brokered(ids):
                "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"}
         st, r = api("PUT", "/v1/admin/templates/brokered-worker", tpl)
         check("brokered: template configured", st == 200, json.dumps(r)[:200])
-        st, ag = api("POST", "/v1/agents", {"template": "brokered-worker", "workstream": ids["workstream"], "cell": "local"})
+        st, ag = api("POST", "/v1/agents", {"template": "brokered-worker", "cell": "local"})
         check("brokered: agent created", st == 201, json.dumps(ag)[:200])
         agid = ag.get("agent")
         post = {"profile": "stub", "method": "POST", "path": "/items", "body": json.dumps({"note": "from e2e"})}
@@ -1242,7 +1236,7 @@ def run_lifecycle(ids):
                                                  "hands": "forbidden", "credential": "claude_oauth_token", "escalate_to": "user"})):
         st, r = api("PUT", f"/v1/admin/{path}", body)
         check(f"lifetimes: {path} configured", st == 200, json.dumps(r)[:200])
-    st, parent = api("POST", "/v1/agents", {"template": "e2e-parent", "workstream": ids["workstream"], "cell": "local"})
+    st, parent = api("POST", "/v1/agents", {"template": "e2e-parent", "cell": "local"})
     check("lifetimes: parent agent created", st == 201, json.dumps(parent)[:200])
     pid = parent.get("agent")
     def spawned(t):

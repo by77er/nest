@@ -193,15 +193,14 @@ const storeAccessToken = () => adminJson("/v1/admin/secrets/access:gateway", { m
 async function attached(cell: string, hello: Record<string, unknown> = {}) {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-tunnel" } });
   const host = Object.keys(hello).length ? await connectHostWith(cell, hello) : await connectHost(cell);
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "tunnel" } }, 201);
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "sandbox_create");
-  const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, start: false } }, 201);
+  const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell, start: false } }, 201);
   const [attach] = await nextCommands(host.ws, (c) => c.type === "agent_attach" && c.agent === worker.agent);
   const seq = sendEvents(host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "running", guest: { protocol_version: 1, capabilities: [] } }]);
   await host.ws.next("ack", (m) => m.up_to >= seq);
   await okResult(host.ws, attach.cmd);
-  return { host, workstream, sandbox: sbx.sandbox as string, agent: worker.agent as string };
+  return { host, sandbox: sbx.sandbox as string, agent: worker.agent as string };
 }
 
 describe("enrollment creates the host's tunnel", () => {
@@ -669,10 +668,9 @@ describe("starting a brain on a chosen host", () => {
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-start" } });
     const sandboxHost = await connectHost(cell);
     const brainHost = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "chosen host" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(sandboxHost.ws, (c) => c.type === "sandbox_create");
-    const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, start: false } }, 201);
+    const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell, start: false } }, 201);
     await nextCommands(sandboxHost.ws, (c) => c.type === "agent_attach" && c.agent === worker.agent);
     await adminJson(`/v1/agents/${worker.agent}/start`, { body: { host: "hst_nosuchhost0000000000000" } }, 409);
     await adminJson(`/v1/agents/${worker.agent}/start`, { body: { host: "not-a-host-id" } }, 400);
@@ -686,7 +684,7 @@ describe("starting a brain on a chosen host", () => {
     expect(start).toMatchObject({ epoch: 1, hands: { sandbox: sbx.sandbox } });
     await sandboxHost.ws.none("commands", 200);
     // A sandbox host never runs a brain, named or not (docs/compute/brain-hosts/).
-    const captain = await adminJson("/v1/agents", { body: { role: "captain", workstream, cell, start: false } }, 201);
+    const captain = await adminJson("/v1/agents", { body: { role: "captain", cell, start: false } }, 201);
     const refused = await adminJson(`/v1/agents/${captain.agent}/start`, { body: { host: sandboxHost.host } }, 409);
     // Refused before anything is recorded: no agent epoch issued, no brain record to condemn.
     expect(JSON.stringify(refused)).toContain("not an active, connected brain host");

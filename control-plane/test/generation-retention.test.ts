@@ -28,8 +28,7 @@ interface Private {
 async function placedSandbox() {
   const cell = uniqueCell();
   const h = await connectHost(cell);
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "retention" } }, 201);
-  const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(h.ws, (c) => c.type === "sandbox_create");
   return { cell, h, sandbox };
 }

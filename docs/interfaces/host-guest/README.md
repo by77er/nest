@@ -103,7 +103,7 @@ A memory snapshot keeps the guest agent it was taken with ([guest agent](../../s
 | Hands `error` frames without `executed` | Treated as possibly executed: never retried | 2 |
 | `HandsDetail::Bash` without `exit` | `exit` derived from `exit_code` and `signal` | 2 |
 | No `flush` | `prepare_snapshot{}` (a plain `sync`, which reports no writeback error) stands in for it | 2 |
-| CLI `notify`, `emit`, `ask` | Relayed to the control plane as `guest_cli` events | 2 |
+| CLI `notify`, `emit`, `ask` | Relayed to the control plane as `guest_cli` events, which answers `unknown_tool` | 2 |
 
 **Release gate:** each release resumes a retained memory snapshot taken with the previous release's guest on the new host and runs every hands tool once (needs KVM). Without KVM, the host's decoders keep passing the fixtures of every version from `min_supported` up.
 
@@ -295,7 +295,7 @@ Field names, defaults and limits mirror Claude Code's built-in tools ([tools ref
 
 ## CLI relay
 
-> **Implemented contract.** The design replaces `notify`/`emit`/`ask` with `nest post`/`nest read`; see [pending contract changes](../README.md#pending-contract-changes).
+> **Implemented contract.** The design adds `nest hold`; see [pending contract changes](../README.md#pending-contract-changes).
 
 Programs in the sandbox run the `nest` binary, which connects to `/run/nest/guest.sock` (same framing) and sends one `CliRequest{agent_id?, command}`.
 - `agent_id` comes from `NEST_AGENT_ID` when set (**attribution only**).
@@ -304,13 +304,12 @@ Programs in the sandbox run the `nest` binary, which connects to `/run/nest/gues
 
 | Command | Fields | Result |
 |---|---|---|
-| `notify` | `to` (`captain`, `user`, `agt_…`), `message`, `urgency` (`low`, `normal`, `high`) | `ok` |
-| `emit` | `event`, `payload` (JSON) | `ok` |
-| `ask` | `question`, `options[]`, `wait_s` (≤ 120, default 120) | `answered{answer}` within the wait, else `pending{question_id}` (the answer arrives as the agent's next turn input) |
 | `expose` | `port`, `exposed` | `ok`, or `error` (policy refusal) |
 | `whoami` | — | `ok{data: {sandbox_id, agent_id?, epoch}}`. After a fork `resume` it reports `new_sandbox_id` |
 
-nestd relays `notify`, `emit`, `ask` and `expose` to the control plane as a fleet `guest_cli` event, and the control plane runs them as the platform tools of the same name (`expose` → `expose_port`; `emit` takes `payload.summary`, `payload.url`, `payload.title`). See [fleet](../control-host/fleet/).
+nestd relays `expose` to the control plane as a fleet `guest_cli` event, and the control plane runs it as `expose_port`. See [fleet](../control-host/fleet/).
+
+**Compat (one release):** `CliCommand` still has `notify`, `emit` and `ask` (a previous release's guest sends them; nestd relays them, waiting `wait_s` + 15 s for an `ask`); the control plane answers each `unknown_tool`, and the `nest` CLI no longer offers them.
 
 ## Error codes
 
@@ -385,6 +384,5 @@ guest ─► ports{…}   (re-announced)
   - v2: checks the version range, passes the guest's version and capabilities to the gateway (and, through SandboxDO, to `resolve`), sends `flush` before every commit, and drains log-site counts into its metrics.
 - **Gateway:** owns every port-1025 and port-10000 connection, one per client call or stream, and does the `Host` rewrite for previews.
 - **Control plane:**
-  - `ports` → nestd emits a `port_opened` workstream event for each newly listening port (closed ports aren't reported).
-  - CLI `notify`/`emit`/`ask`/`expose` map onto the platform tools of the same names.
-  - `ask` follows the 120 s rule.
+  - `ports` → nestd emits a `port_opened` sandbox event for each newly listening port (closed ports aren't reported); the control plane logs it.
+  - CLI `expose` maps onto `expose_port`.

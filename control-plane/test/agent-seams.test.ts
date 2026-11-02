@@ -17,7 +17,8 @@ const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const isStartOf = (agent: string) => (c: any) => c.type === "agent_start" && c.agent === agent;
 const isKillOf = (agent: string) => (c: any) => c.type === "agent_stop" && c.agent === agent && c.mode === "kill";
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
-const wsStub = (id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
+const openAsks = (agent: string) => agentStub(agent).openAsks();
+const ports = async (sandbox: string) => (await sandboxStub(sandbox).info()).ports.map((p) => p.port);
 const WORKER_SPEC = (() => {
   const r = expandTemplate(SEED_CATALOG, PLATFORM_TOOL_NAMES, "worker");
   if (!r.ok) throw new Error(r.error);
@@ -30,18 +31,17 @@ async function setup(opts: { captain?: boolean; launch?: unknown } = {}) {
   // The sandbox's host and the brain host: never the same machine (docs/compute/brain-hosts/).
   const sbxHost = await connectHost(cell);
   const host = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "seams" } }, 201);
   let captain: string | undefined;
   if (opts.captain) {
-    captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
+    captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent;
   }
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   const worker = await adminJson("/v1/agents", {
     body: { role: "worker", sandbox: sbx.sandbox, ...(opts.launch ? { launch: opts.launch } : {}), ...(captain ? { captain } : {}) },
   }, 201);
   const [start] = await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { cell, host, sbxHost, workstream: workstream as string, sandbox: sbx.sandbox as string, agent: worker.agent as string, start, captain };
+  return { cell, host, sbxHost, sandbox: sbx.sandbox as string, agent: worker.agent as string, start, captain };
 }
 
 async function runner(agent: string, host: string, token: string, instance = "rin_one", epoch = 1) {
@@ -79,27 +79,6 @@ async function runDeadline(agent: string, key: string) {
 }
 
 describe("an event's side effects survive a failure", () => {
-  it("an escalation whose routing failed is routed when the batch is resent", async () => {
-    const s = await setup({ captain: true });
-    const ws1 = await runner(s.agent, s.host.host, s.host.host_token);
-    const restore = await breakSandbox(s.sandbox);
-    const batch = { type: "events", seq: 1, events: [
-      { agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), type: "escalation", call: "cal_esc-1", tool: "WebFetch", input: { url: "https://x.test" } },
-    ] };
-    ws1.send(batch);
-    expect((await ws1.next("error")).error.code).toBe("unknown_sandbox");
-    expect((await ws1.whenClosed())?.code).toBe(4500);
-    expect((await wsStub(s.workstream).events()).some((e) => e.type === "needs_input")).toBe(false);
-
-    await restore();
-    const ws2 = await runner(s.agent, s.host.host, s.host.host_token);
-    ws2.send(batch);
-    expect((await ws2.next("ack")).up_to).toBe(1);
-    const needs = (await wsStub(s.workstream).events()).filter((e) => e.type === "needs_input");
-    expect(needs.length).toBe(1);
-    expect(needs[0]).toMatchObject({ sandbox: s.sandbox, epoch: 1 });
-  });
-
   it("a failed agentActivity is retried from the alarm, and a new session re-asserts a lost one", async () => {
     const s = await setup();
     const ws = await runner(s.agent, s.host.host, s.host.host_token);
@@ -171,13 +150,13 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     expect(claims).toMatchObject({ sandbox: s.sandbox, epoch: 2, client: s.agent });
 
     // Host-relayed calls are fenced by FleetDO's lease check, not by a copy here: the guest CLI and
-    // task exits work, and events about the sandbox carry SandboxDO's epoch.
+    // task exits work.
     await editAgent(s.agent, (i) => {
       i.current_turn = "trn_moved";
     });
-    const cli = await agentStub(s.agent).guestCli(s.sandbox, 2, { command: "emit", event: "progress", payload: { summary: "after the move" } });
+    const cli = await agentStub(s.agent).guestCli(s.sandbox, 2, { command: "expose", port: 3000, exposed: true });
     expect(cli.status).toBe("ok");
-    expect((await wsStub(s.workstream).events()).at(-1)).toMatchObject({ type: "progress", sandbox: s.sandbox, epoch: 2 });
+    expect(await ports(s.sandbox)).toContain(3000);
     await agentStub(s.agent).onTaskExited(s.sandbox, 2, {
       task_id: "tsk_1", status: "exited", exit_code: 0, output_path: "/tmp/o", output_bytes: 0, started_ms: Date.now(),
     });
@@ -331,8 +310,7 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const ctl = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "legacy" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     const [start] = await nextCommands(ctl.ws, (c) => c.type === "agent_start" && c.agent === captain);
     expect(start.epoch).toBe(1);
     const c0 = await Ws.connect(`/v1/agents/${captain}/session`, ctl.host_token);
@@ -404,8 +382,7 @@ describe("one brain per agent: the brain record", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "expiry" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     await nextCommands(a.ws, isStartOf(captain));
     const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
@@ -420,8 +397,7 @@ describe("one brain per agent: the brain record", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "wedge" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     const [start1] = await nextCommands(a.ws, isStartOf(captain));
     await okResult(a.ws, start1.cmd);
     const b = await connectHost(cell, "brain");
@@ -753,14 +729,14 @@ describe("one brain per agent: the brain record", () => {
       i.agent_epoch = 2;
       i.brain.epoch = 2;
     });
-    ws.send({ type: "tool_call", seq: 1, call: "cal_old-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "from the old brain" } });
+    ws.send({ type: "tool_call", seq: 1, call: "cal_old-1", turn: "trn_x", name: "expose_port", arguments: { port: 3000 } });
     ws.send({ type: "events", seq: 2, events: [{ agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), type: "state_changed", state: "working" }] });
     ws.send({ type: "hands_resolve", request: "req_old" });
     const r = await ws.next("hands_resolved", (m) => m.request === "req_old");
     expect(r.outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
     expect(await ws.none("tool_result", 200)).toBe(true);
     expect(await ws.none("ack", 50)).toBe(true);
-    expect((await wsStub(s.workstream).events()).some((e: any) => e.type === "progress")).toBe(false);
+    expect(await ports(s.sandbox)).toEqual([]);
     expect((await agentStub(s.agent).info()).state).not.toBe("working");
   });
 
@@ -778,9 +754,9 @@ describe("one brain per agent: the brain record", () => {
     ws2.send({ type: "hands_resolve", request: "req_zombie" });
     const r = await ws2.next("hands_resolved", (m) => m.request === "req_zombie");
     expect(r.outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
-    ws2.send({ type: "tool_call", seq: 1, call: "cal_old-2", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "late" } });
+    ws2.send({ type: "tool_call", seq: 1, call: "cal_old-2", turn: "trn_x", name: "expose_port", arguments: { port: 3000 } });
     expect(await ws2.none("tool_result", 200)).toBe(true);
-    expect((await wsStub(s.workstream).events()).some((e: any) => e.type === "progress")).toBe(false);
+    expect(await ports(s.sandbox)).toEqual([]);
   });
 
   it("rule 1: an answer resolved while a newer start was issued is not handed out (re-check after the resolve)", async () => {
@@ -816,19 +792,19 @@ describe("one brain per agent: the brain record", () => {
       };
     });
     await newer();
-    ws.send({ type: "tool_call", seq: 1, call: "cal_mid-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "mid" } });
+    ws.send({ type: "tool_call", seq: 1, call: "cal_mid-1", turn: "trn_x", name: "expose_port", arguments: { port: 3001 } });
     // The call's ack comes once it ran (after any tool_result to this socket): no long wait for a result never sent.
     await ws.next("ack", (m) => m.up_to >= 1);
     expect(ws.drain().filter((m) => m.type === "tool_result" && m.call === "cal_mid-1" && m.outcome.status !== "error")).toEqual([]);
     const outcome = await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).calls.call("cal_mid-1")?.outcome);
     expect(outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
-    expect((await wsStub(s.workstream).events()).some((e: any) => e.type === "progress" && e.summary === "mid")).toBe(false);
-    // The guest's `nest emit` with a newer record landing mid-call still goes through.
+    expect(await ports(s.sandbox)).not.toContain(3001);
+    // The guest's `nest expose` with a newer record landing mid-call still goes through.
     await newer();
-    const cli = await agentStub(s.agent).guestCli(s.sandbox, 1, { command: "emit", event: "progress", payload: { summary: "guest" } });
+    const cli = await agentStub(s.agent).guestCli(s.sandbox, 1, { command: "expose", port: 3002, exposed: true });
     expect(cli.status).toBe("ok");
     expect((await agentStub(s.agent).info()).agent_epoch).toBe(3);
-    expect((await wsStub(s.workstream).events()).some((e: any) => e.type === "progress" && e.summary === "guest")).toBe(true);
+    expect(await ports(s.sandbox)).toContain(3002);
   });
 
   it("probe 1 (H2): a start back on the old host while it is condemned starts there once released, and nothing wedges", async () => {
@@ -920,8 +896,7 @@ describe("one brain per agent: the brain record", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "lost" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     await nextCommands(a.ws, isStartOf(captain));
     const b = await connectHost(cell, "brain");
     await agentStub(captain).start(b.host);
@@ -965,8 +940,7 @@ describe("one brain per agent: the brain record", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "a3" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     // start{1} went to a, which never acked or answered it; its lease lapses before the brain runs.
     const batch = await a.ws.next("commands", (m) => (m.commands as any[]).some(isStartOf(captain)));
     const start1 = (batch.commands as any[]).find(isStartOf(captain));
@@ -1287,9 +1261,15 @@ describe("one brain per agent: the brain record", () => {
 
   it("a platform call cut short and redelivered under a newer epoch keeps its first key (no double side effect)", async () => {
     const s = await setup();
+    // `agent_spawn` derives the child's id from the call key: a second key would spawn a second child.
+    await editAgent(s.agent, (i) => {
+      i.tools = [...i.tools, "agent_spawn"];
+      i.spawn = ["captain"];
+    });
     const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
     await ws.next("cache_update");
-    ws.send({ type: "tool_call", seq: 1, call: "cal_keep-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "once" } });
+    const spawn = { template: "captain", task: "once" };
+    ws.send({ type: "tool_call", seq: 1, call: "cal_keep-1", turn: "trn_x", name: "agent_spawn", arguments: spawn });
     const first = await ws.next("tool_result", (m) => m.call === "cal_keep-1");
     // As if an eviction cut it short before its outcome was stored and its seq processed.
     await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
@@ -1301,11 +1281,11 @@ describe("one brain per agent: the brain record", () => {
       i.brain.epoch = 2; // the same runner's session now speaks for epoch 2
     });
     const ws2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 2);
-    ws2.send({ type: "tool_call", seq: 1, call: "cal_keep-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "once" } });
+    ws2.send({ type: "tool_call", seq: 1, call: "cal_keep-1", turn: "trn_x", name: "agent_spawn", arguments: spawn });
     // The re-run's own result (not the first one's, resent after the hello).
-    await ws2.next("tool_result", (m) => m.call === "cal_keep-1" && m.seq > first.seq);
-    const n = (await wsStub(s.workstream).events()).filter((e: any) => e.type === "progress" && e.summary === "once").length;
-    expect(n).toBe(1);
+    const again = await ws2.next("tool_result", (m) => m.call === "cal_keep-1" && m.seq > first.seq);
+    expect(again.outcome.content[1].value.agent).toBe(first.outcome.content[1].value.agent);
+    expect((await agentStub(s.agent).children()).map((c: any) => c.agent)).toEqual([first.outcome.content[1].value.agent]);
   });
 });
 
@@ -1584,8 +1564,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "esc" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     const [st1] = await nextCommands(a.ws, isStartOf(captain));
     await okResult(a.ws, st1.cmd);
     const b = await connectHost(cell, "brain");
@@ -1647,8 +1626,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "brain");
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "old" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     const [st1] = await nextCommands(a.ws, isStartOf(captain));
     await okResult(a.ws, st1.cmd);
     await runInDurableObject(fleet, (_i, st) => {
@@ -1678,8 +1656,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0 WHERE host = ?", a.host);
     });
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "pref" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     expect((await nextCommands(b.ws, isStartOf(captain))).find(isStartOf(captain))).toMatchObject({ epoch: 1 });
   });
 
@@ -1797,8 +1774,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET wedged_ms = ? WHERE host = ?", Date.now(), a.host);
     });
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "m1" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 202);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 202);
     expect(sbx.host ?? null).toBeNull();
     const view = (await fleet.fleetView()) as unknown as { hosts: Record<string, unknown>[] };
     const row = view.hosts.find((h) => h.host === a.host)!;
@@ -1824,8 +1800,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET brain_epochs = 0 WHERE host = ?", a.host);
     });
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "gate1" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell, start: false } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell, start: false } }, 201)).agent as string;
     expect(await startError(captain)).toMatch(/no brain host available/);
     expect(await a.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(captain)))).toBe(true);
     expect(await agentStub(captain).info()).toMatchObject({ brain: null, intent: { reason: "operator" } });
@@ -1899,8 +1874,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const n13 = true;
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "n13" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     const [st1] = await nextCommands(a.ws, isStartOf(captain));
     await okResult(a.ws, st1.cmd);
     const b = await connectHost(cell, "brain");
@@ -2359,8 +2333,7 @@ describe("secret references resolve only in their slot", () => {
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const sbxHost = await connectHost(cell); // the cell's binding key exists from here on
     const host = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "x" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
     const launch = { builtin_tools: [], system_prompt: { mode: "append", text: ref } };
     const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, launch } }, 201);
@@ -2386,23 +2359,24 @@ describe("secret references resolve only in their slot", () => {
   });
 });
 
-describe("a worker's cell and workstream are its sandbox's", () => {
-  it("are taken from the sandbox, and a mismatch is refused", async () => {
+describe("a worker's cell is its sandbox's", () => {
+  it("is taken from the sandbox, and a mismatch is refused; a `workstream` an old client sends is ignored", async () => {
     const cell = uniqueCell();
     await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "a" } }, 201);
-    const other = (await adminJson("/v1/workstreams", { body: { goal: "b" } }, 201)).workstream;
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell, workstream: "ws_oldclient" } }, 201);
+    expect(sbx).not.toHaveProperty("workstream");
     const base = { role: "worker", sandbox: sbx.sandbox, start: false };
-    expect((await adminJson("/v1/agents", { body: { ...base, workstream: other } }, 409)).error.code).toBe("invalid_message");
     expect((await adminJson("/v1/agents", { body: { ...base, cell: uniqueCell() } }, 409)).error.code).toBe("invalid_message");
-    const w = await adminJson("/v1/agents", { body: base }, 201);
-    expect(w).toMatchObject({ cell, workstream });
-    // AgentDO checks it too, for any caller.
+    const w = await adminJson("/v1/agents", { body: { ...base, workstream: "ws_anything" } }, 201);
+    expect(w).toMatchObject({ cell });
+    expect(w).not.toHaveProperty("workstream");
+    // An agent without a sandbox needs no workstream either.
+    expect(await adminJson("/v1/agents", { body: { role: "captain", cell, start: false } }, 201)).toMatchObject({ cell, hands: null });
+    // AgentDO checks the cell too, for any caller.
     // Wrapped: an RPC thenable that rejects is otherwise also reported as unhandled.
     await expect(Promise.resolve().then(() => agentStub("agt_direct0000000000000000000").create({
-      agent: "agt_direct0000000000000000000", spec: WORKER_SPEC, workstream: other, cell, sandbox: sbx.sandbox,
-    }))).rejects.toThrow(/workstream/);
+      agent: "agt_direct0000000000000000000", spec: WORKER_SPEC, cell: uniqueCell(), sandbox: sbx.sandbox,
+    }))).rejects.toThrow(/cell/);
   });
 });
 
@@ -2427,26 +2401,19 @@ describe("`starting` has a deadline", () => {
 });
 
 describe("captains named in several places", () => {
-  it("an owner in another workstream is refused at spawn, so it can never be notified", async () => {
-    const other = await setup({ captain: true });
+  it("an owner that names no agent is refused at spawn", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-seams" } });
     const sbxHost = await connectHost(cell);
-    const host = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "mine" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
-    const refused = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, captain: other.captain } }, 409);
-    expect(refused.error.message).toMatch(/owner .* is in workstream/);
-    expect(await agentStub(other.captain!).turns()).toEqual([]);
-    // An owner that names no agent is refused too.
     expect((await adminJson("/v1/agents", { body: { template: "worker", sandbox: sbx.sandbox, owner: "agt_nobody00000000000000000000" } }, 404))
       .error.code).toBe("unknown_agent");
   });
 
   it("a turn for an agent that was never created is refused and writes nothing", async () => {
     const ghost = agentStub("agt_ghost00000000000000000000");
-    await expect(Promise.resolve().then(() => ghost.enqueueTurn({ kind: "event_batch", text: "x" }))).rejects.toThrow(/unknown agent/);
+    await expect(Promise.resolve().then(() => ghost.enqueueTurn({ kind: "user", text: "x" }))).rejects.toThrow(/unknown agent/);
     const rows = await runInDurableObject(ghost, (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM turns").toArray().length);
     expect(rows).toBe(0);
   });

@@ -1,13 +1,13 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { WORKSTREAM_ALARM_MS, type WorkstreamDO } from "../src/do/workstream";
 import { admin, adminJson, connectHost, nextCommands, runDue, sleep, uniqueCell } from "./helpers";
 
 describe("egress policy layers", () => {
   it("a temporary grant pushes a newer policy and is withdrawn when it expires", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "x" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     expect(create.policy.version).toBe(1);
 
@@ -31,11 +31,10 @@ describe("egress policy layers", () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
     await adminJson("/v1/admin/secrets/inject:github", { method: "PUT", body: { value: "ghs_realtoken" } });
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "x" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sbx.sandbox));
-    const policy = await stub.setWorkstreamPolicy({
+    const policy = await stub.setPolicy({
       allow: [{ host: "api.stripe.com" }],
       passthrough: [],
       inject: [{ name: "github", hosts: ["github.com", "api.github.com"], placeholder: "nest-ph-github-7f3a", locations: [{ type: "authorization_bearer" }] }],
@@ -49,35 +48,48 @@ describe("egress policy layers", () => {
   });
 });
 
-describe("workstreams and captain wakes", () => {
-  it("batches decision events into one event_batch turn for the captain; progress alone doesn't wake", async () => {
-    const cell = uniqueCell();
-    await connectHost(cell, "brain");
-    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk" } });
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "dark mode" } }, 201);
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
-    const ws = env.WORKSTREAM.get(env.WORKSTREAM.idFromName(workstream));
-    const cap = env.AGENT.get(env.AGENT.idFromName(captain));
-
-    await ws.ingest({ workstream, ts_ms: Date.now(), type: "progress", summary: "tests green" });
-    expect(await runDurableObjectAlarm(ws)).toBe(false);
-    expect((await cap.turns()).length).toBe(0);
-
-    await ws.ingest({ workstream, ts_ms: Date.now(), type: "pr_opened", url: "https://github.com/x/y/pull/2", title: "Dark mode" });
-    await ws.ingest({ workstream, ts_ms: Date.now(), type: "blocked", reason: "needs design review" });
-    expect(await runDurableObjectAlarm(ws)).toBe(true);
-    const turns = await cap.turns();
-    expect(turns.length).toBe(1);
-    expect(turns[0]!.input.kind).toBe("event_batch");
-    expect(turns[0]!.input.text).toContain("2 event(s)");
-    expect(turns[0]!.input.text).toContain("tests green");
+describe("the WorkstreamDO stub (workstreams left the platform)", () => {
+  it("wakes nobody, leaves the previous release's rows alone and keeps an alarm while decision events wait, so a rollback's wake still comes", async () => {
+    const workstream = (id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
+    // A workstream as the previous release left it: an unwoken decision event for its subscriber, alarm armed.
+    const old = workstream(`ws_old${crypto.randomUUID().slice(0, 8)}`);
+    await runInDurableObject(old, async (_i: WorkstreamDO, st) => {
+      st.storage.sql.exec("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      st.storage.sql.exec(`CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, type TEXT NOT NULL,
+        decision INTEGER NOT NULL, body TEXT NOT NULL, woke INTEGER NOT NULL DEFAULT 0)`);
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?)", JSON.stringify({ workstream: "ws_old", goal: "g", subscriber: "agt_nobody", created_ms: 1 }));
+      st.storage.sql.exec("INSERT INTO events (ts_ms, type, decision, body) VALUES (1, 'blocked', 1, '{}')");
+      await st.storage.setAlarm(Date.now() + 60_000);
+    });
+    const before = Date.now();
+    expect(await runDurableObjectAlarm(old)).toBe(true);
+    await runInDurableObject(old, async (_i: WorkstreamDO, st) => {
+      expect(await st.storage.getAlarm()).toBeGreaterThanOrEqual(before + WORKSTREAM_ALARM_MS);
+      expect(st.storage.sql.exec("SELECT type, woke FROM events").toArray()).toEqual([{ type: "blocked", woke: 0 }]);
+    });
+    // Woken already, or progress only, or nothing stored at all: no alarm.
+    for (const rows of ["woken", "progress", null] as const) {
+      const w = workstream(`ws_x${crypto.randomUUID().slice(0, 8)}`);
+      await runInDurableObject(w, async (_i: WorkstreamDO, st) => {
+        if (rows) {
+          st.storage.sql.exec(`CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, type TEXT NOT NULL,
+            decision INTEGER NOT NULL, body TEXT NOT NULL, woke INTEGER NOT NULL DEFAULT 0)`);
+          st.storage.sql.exec("INSERT INTO events (ts_ms, type, decision, body, woke) VALUES (1, ?, ?, '{}', ?)",
+            rows === "woken" ? "blocked" : "progress", rows === "woken" ? 1 : 0, rows === "woken" ? 1 : 0);
+        }
+        await st.storage.setAlarm(Date.now() + 60_000);
+      });
+      expect(await runDurableObjectAlarm(w)).toBe(true);
+      expect(await runInDurableObject(w, (_i: WorkstreamDO, st) => st.storage.getAlarm()), String(rows)).toBeNull();
+    }
+    // The routes went with it.
+    expect((await adminJson("/v1/workstreams", { body: { goal: "g" } }, 404)).error.code).toBe("invalid_message");
   });
 });
 
 describe("temporary grants are checked before anything is stored", () => {
   it("a port outside 1-65535 is refused: nestd's u16 couldn't parse the policy it would join", async () => {
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "x" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell: uniqueCell() } }, 202);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell: uniqueCell() } }, 202);
     for (const ports of [[70000], [0], [-1]]) {
       const r = await admin(`/v1/sandboxes/${sbx.sandbox}/grants`, { body: { host: "example.com", ttl_ms: 60_000, ports } });
       expect(r.status, JSON.stringify(ports)).toBe(400);

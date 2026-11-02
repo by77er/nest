@@ -17,7 +17,6 @@ export default defineConfig({
           HOST_TOKEN_SECRET: "test-host-token-secret-0123456789abcdef",
           // Wide enough that an answer "within the window" never races a loaded runner; a test that needs it to
           // lapse fires its deadline (test/session.test.ts).
-          ASK_SYNC_WINDOW_MS: "5000",
           ALLOW_DEV_CA: "1",
           // The MCP proxy's timeouts, short so lost answers are quick to provoke (test/mcp.test.ts).
           MCP_CALL_TIMEOUT_MS: "1500",

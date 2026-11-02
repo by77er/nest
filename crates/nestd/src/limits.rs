@@ -24,13 +24,13 @@ impl Rate {
     }
 }
 
-/// Egress-denied workstream events (each may wake a captain).
+/// Egress-denied sandbox events.
 pub const DENIED: Rate = Rate::per_min(30.0, 30.0);
-/// Egress-alert workstream events.
+/// Egress-alert sandbox events.
 pub const ALERTS: Rate = Rate::per_min(10.0, 10.0);
 /// Audit records forwarded to the control plane.
 pub const AUDIT_RECORDS: Rate = Rate::per_min(2000.0, 2000.0);
-/// Port-opened workstream events.
+/// Port-opened sandbox events.
 pub const PORTS: Rate = Rate::per_min(20.0, 20.0);
 /// `nest` CLI relays started.
 pub const CLI: Rate = Rate { per_sec: 5.0, burst: 20.0 };

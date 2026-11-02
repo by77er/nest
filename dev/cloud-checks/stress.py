@@ -47,8 +47,7 @@ TEMPLATE = {
     # every agent's turn before its first command.
     "capabilities": ["nest", "hands"] if HANDS else ["nest"],
     "launch": {"model": MODEL, "builtin_tools": [], "system_prompt": {"mode": "append", "text": SYSTEM}},
-    "hands": "required" if HANDS else "forbidden", "credential": "claude_oauth_token:worker", "escalate_to": "workstream",
-    "subscribe": [], "params": {},
+    "hands": "required" if HANDS else "forbidden", "credential": "claude_oauth_token:worker",
 }
 
 _out_lock = threading.Lock()
@@ -141,17 +140,11 @@ def main():
     threading.Thread(target=sampler, daemon=True).start()
     try:
         mark("start", base=BASE, cell=CELL, n=N, phases=PHASES, model=MODEL, hands=HANDS, fleet=live_summary(snapshot()))
-        ws = None
-        if "sandboxes" in PHASES or "turns" in PHASES:
-            s, v = api("POST", "/v1/workstreams", {"goal": f"stress test {RUN}: {N} agents"})
-            if s != 201:
-                raise SystemExit(f"FAIL: create workstream: {s} {v}")
-            ws = made["workstream"] = v["workstream"]
 
         if HANDS and "sandboxes" in PHASES:
             mark("sandboxes create")
             t0 = time.time()
-            res = pmap(lambda _: api("POST", "/v1/sandboxes", {"workstream": ws, "cell": CELL}), range(N))
+            res = pmap(lambda _: api("POST", "/v1/sandboxes", {"cell": CELL}), range(N))
             for s, v in res:
                 if s in (201, 202):
                     made["sandboxes"].append(v["sandbox"])
@@ -183,7 +176,7 @@ def main():
 
             mark("agents create")
             t0 = time.time()
-            spawn = [{"template": "stress", "workstream": ws, "cell": CELL, "start": False, **({"sandbox": x} if x else {})}
+            spawn = [{"template": "stress", "cell": CELL, "start": False, **({"sandbox": x} if x else {})}
                      for x in (made["sandboxes"] if HANDS else [None] * N)]
             res = pmap(lambda b: api("POST", "/v1/agents", b), spawn)
             for s, v in res:

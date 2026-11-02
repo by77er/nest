@@ -6,8 +6,8 @@ import type { Env } from "../env";
 
 /**
  * The health instance's name in every namespace. `~` appears in no name anything else derives an
- * instance from (cells, agent, sandbox and workstream ids, `broker`, `catalog`, MCP connector names,
- * which start `["mcp",`; the previous release's ChannelDO directory was `~directory`), so no user input reaches it.
+ * instance from (cells, agent and sandbox ids, `broker`, `catalog`, MCP connector names,
+ * which start `["mcp",`; the previous releases' ChannelDO directory was `~directory` and workstream ids `ws_…`), so no user input reaches it.
  */
 export const HEALTH_INSTANCE = "~health";
 

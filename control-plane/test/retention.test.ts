@@ -42,12 +42,11 @@ async function workerOnHost(cell: string) {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-retention" } });
   const sbxHost = await connectHost(cell);
   const host = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "retention" } }, 201);
-  const sbx = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const sbx = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
-  const worker = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell } }, 201);
+  const worker = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { host, sbxHost, sandbox: sbx.sandbox, agent: worker.agent, workstream };
+  return { host, sbxHost, sandbox: sbx.sandbox, agent: worker.agent };
 }
 
 describe("a host's death", () => {
@@ -162,21 +161,9 @@ describe("stored enums", () => {
     expect(error).toHaveBeenCalledWith(expect.stringContaining("hosts.status"));
   });
 
-  it("WorkstreamDO logs an event row whose type is outside the union", async () => {
-    const { workstream } = await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "types" } }, 201);
-    const stub = env.WORKSTREAM.get(env.WORKSTREAM.idFromName(workstream));
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await runInDurableObject(stub, (_inst, st) => {
-      st.storage.sql.exec("UPDATE events SET type = 'kickoff'");
-    });
-    expect((await stub.events()).map((e) => e.type)).toEqual(["started"]);
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("events.type"));
-  });
-
   it("AgentDO logs a turn whose status is outside the union", async () => {
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-enum" } });
-    const { workstream } = await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "agent enums" } }, 201);
-    const { agent } = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", workstream, cell: uniqueCell(), start: false } }, 201);
+    const { agent } = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", cell: uniqueCell(), start: false } }, 201);
     await adminJson(`/v1/agents/${agent}/turns`, { body: { text: "hello" } });
     const stub = env.AGENT.get(env.AGENT.idFromName(agent));
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -192,8 +179,7 @@ describe("the fleet view", () => {
   it("keeps the lease's state and the sandbox's own apart", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "view" } }, 201);
-    const placed = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const placed = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     h.ws.close();
     await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
@@ -225,7 +211,7 @@ describe("the GC registry", () => {
     await runInDurableObject(sandboxStub(sandbox), async (inst: SandboxDO) => {
       (inst as unknown as { env: unknown }).env = { ...env, FLEET: { idFromName: () => "x", get: () => fakeFleet } };
       // The answer is unknown: the sandbox exists, and its place deadline will finish the placement.
-      expect(await inst.create({ sandbox, workstream: "ws_01registry0000000000000000", cell })).toMatchObject({ placing: 1, host: null });
+      expect(await inst.create({ sandbox, cell })).toMatchObject({ placing: 1, host: null });
     });
     expect(registered).toEqual([sandbox]);
   });
@@ -241,49 +227,17 @@ describe("the GC registry", () => {
       (inst as unknown as { env: unknown }).env = {
         ...env, FLEET: { idFromName: () => "x", get: () => ({ registerSandbox: async (s: string) => { registered.push(s); } }) },
       };
-      expect((await inst.create({ sandbox, workstream: "ws_01registry0000000000000000", cell: "c" })).state).toBe("destroyed");
+      expect((await inst.create({ sandbox, cell: "c" })).state).toBe("destroyed");
     });
     expect(registered).toEqual([]);
   });
 });
 
 describe("salvage authorization", () => {
-  it("an orphan's orphaned_work notice survives a failed post: the resent request posts it, once", async () => {
-    const cell = uniqueCell();
-    const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "salvage" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
-    await nextCommands(h.ws, (c) => c.type === "sandbox_create");
-    const salvage = {
-      ts_ms: Date.now(), type: "commit_request", request: "req_orphan_1", sandbox, epoch: 1, kind: "disk_only", disk_manifest: manifest("6"), reason: "salvage",
-    } as CommitRequestEvent;
-    const outcomes = await runInDurableObject(sandboxStub(sandbox), async (inst: SandboxDO, st) => {
-      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one();
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify({ ...JSON.parse(row.value), epoch: 2, host: "hst_other00000000000000000" }));
-      // WorkstreamDO fails the first post (a reset, a lost reply); FleetDO resends the request.
-      let fail = true;
-      const self = inst as unknown as { env: typeof env };
-      const real = self.env.WORKSTREAM;
-      self.env = { ...self.env, WORKSTREAM: { idFromName: (n: string) => real.idFromName(n), get: (id: DurableObjectId) => {
-        const ws = real.get(id);
-        return { ingest: async (...a: Parameters<typeof ws.ingest>) => {
-          if (fail) { fail = false; throw new Error("Network connection lost."); }
-          return ws.ingest(...a);
-        } };
-      } } as unknown as typeof env.WORKSTREAM };
-      const first = await inst.commit(h.host, salvage).then((o) => o.status, (e: Error) => e.message);
-      return [first, (await inst.commit(h.host, salvage)).status, (await inst.commit(h.host, salvage)).status];
-    });
-    expect(outcomes).toEqual(["Network connection lost.", "orphaned", "orphaned"]);
-    const notices = (await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(workstream)).events()).filter((e) => e.type === "orphaned_work");
-    expect(notices).toHaveLength(1);
-  });
-
   it("holds for an epoch older than the 50 that info().history shows", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "salvage" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     // 60 placements later (epochs 2..61 on other hosts), the host of epoch 1 salvages.
     await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) => {
@@ -306,8 +260,7 @@ describe("commit records", () => {
   it("drop after their retention unless their generation is still in the chain", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "commits" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     const commit = (request: string, parent?: string) => sandboxStub(sandbox).commit(h.host, {
       ts_ms: Date.now(), type: "commit_request", request, sandbox, epoch: 1, kind: "disk_only", disk_manifest: manifest("6"), reason: "timer",
@@ -394,8 +347,7 @@ describe("a dead host's brains", () => {
 describe("a host that never connected and whose proof enrolls again", () => {
   it("gives up its sandboxes before its brains are moved", async () => {
     const cell = uniqueCell();
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "retire" } }, 201);
-    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 202);
+    const { sandbox } = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { cell } }, 202);
     const { token } = await adminJson<{ token: string }>("/v1/admin/enrollment-tokens", { body: { role: "sandbox", cell } });
     const enroll = async () => {
       const res = await SELF.fetch(`${BASE}/v1/hosts/enroll`, {
@@ -481,8 +433,7 @@ describe("a kill FleetDO answered itself", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-killed" } });
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "kill answered by fleet" } }, 201);
-    const captain = (await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
+    const captain = (await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", cell } }, 201)).agent;
     const [start] = await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
     await okResult(a.ws, start.cmd);
     const b = await connectHost(cell, "brain");
@@ -641,8 +592,7 @@ describe("FleetDO's own answers are no evidence that a host processes commands",
   it("nor are the answers to what an old nestd process left: a kill it never ran is not processed", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "restart answers" } }, 201);
-    const sbx = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson<{ sandbox: string }>("/v1/sandboxes", { body: { cell } }, 201);
     const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     await okResult(h.ws, create.cmd);
     const agent = "agt_01restartkill000000000000";
