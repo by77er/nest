@@ -2,7 +2,7 @@
 
 **Decided (2026-11-02, the owner's):** external systems (an app with its own Worker and Durable Objects, such as a task board) use nest only through this interface. An app never gets the admin token, and nest gets nothing specific to any app. **An app that seems to need a special case in nest means this interface is wrong:** fix the interface, generically ([principle 9](../../../README.md#principles)).
 
-**Built (2026-11-02), all of it:** clients and grants (with [read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos)), ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`.
+**Built (2026-11-02), all of it:** clients and grants (with [read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos)), ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), the [live trace](#live-trace) (`control-plane/src/lib/trace.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`.
 
 **How the built parts read the grant** (each a choice the design left open):
 - **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
@@ -28,7 +28,7 @@
 ## Ownership and visibility
 
 - **Owner** is a principal: `user` (the operator), `cli_…`, or `agt_…`. A client owns what it creates, and transitively what those agents create.
-- **A client sees and acts only on its subtree:** listing, reading, inbox and turns, approvals, stop and end, transcripts, its sandboxes. Anything else answers `404`, never `403`, so ids outside it reveal nothing.
+- **A client sees and acts only on its subtree:** listing, reading, inbox and turns, approvals, stop and end, transcripts and live traces, its sandboxes. Anything else answers `404`, never `403`, so ids outside it reveal nothing.
 - **The routes are the operator's, under client auth:** the same paths and bodies (`POST /v1/agents`, `POST /v1/sandboxes`, `/v1/agents/<id>/inbox`, `…/stop`, `…/asks`, …), filtered to the subtree. No route exists for one client's use only.
 - **No `?cell=`** on any of them but a listing's filter: a cell goes in a create's body, and everything else reaches its object by id ([which routes take a cell](../#which-routes-take-a-cell), 2026-11-02).
 - **Creates take an `Idempotency-Key`**, scoped to the client ([idempotency keys](../#idempotency-keys), 2026-11-02).
@@ -88,6 +88,14 @@
 - **No webhook set:** events are dropped on arrival (nobody would hear them), not queued for later.
 - **Redirects aren't followed** (a 3xx is a failure). The retry wait runs from the failure, so an attempt cut off at 10 s is retried 1 s after that.
 - **The record** shows `events: {webhook, backlog, dropped, failures, last_error}`, never the secret: the client reads its own with `GET /v1/clients/self` (its grant and live counts too), so it sees when `dropped` rises; the operator with `GET /v1/admin/clients/<id>`.
+
+## Live trace
+
+**Built (2026-11-02):** a client watches an agent in its subtree as it works with `GET /v1/agents/<id>/trace?after=<seq>`, a WebSocket that AgentDO holds hibernated. The message shape, resume (`after`, and the `gap` when the ring no longer reaches back), bounds, redaction and keepalive are the same for the operator: see [live trace](../#live-trace).
+- **Who:** the client's token, on its own subtree; any other agent answers 404, as an unknown one does. An agent's caller identity and host tokens are refused (401).
+- **From a browser:** the client's own Worker checks its user, connects with the client token (`fetch` with `Upgrade: websocket` and `Authorization`), and returns the socket. The token never reaches the browser, and the app holds no state for it.
+- **Never in an agent's way:** sends are fire-and-forget after the event is recorded, a failed send closes that socket, and at most 8 trace sockets per agent are open (the oldest closes). A client that falls behind reconnects with `after`.
+- **Events vs. trace:** [events to the owner](#events-to-the-owner) are durable and delivered at least once, for acting on; the trace is for watching, and a client that wasn't connected reads what it missed from the ring or the transcript.
 
 ## GitHub tokens
 

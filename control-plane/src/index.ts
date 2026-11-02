@@ -20,6 +20,7 @@ import { idempotencyKey, type KeyClaim, requestDigest } from "./lib/idempotency"
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
+import { TRACE_HEADER } from "./do/agent";
 import { parseAppSecret } from "./lib/github";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
@@ -698,6 +699,20 @@ export const ROUTES: Route[] = [
     if (!q.has("since")) return new Response(await a.transcript(), { headers: { "content-type": "application/x-ndjson" } });
     const base = q.get("base");
     return a.readTranscript(num(q.get("since") ?? undefined, 0), num(q.get("limit") ?? undefined, 200), base === null ? undefined : num(base, 0));
+  } }),
+  // The live trace (docs/control-plane/api/#live-trace): a WebSocket AgentDO holds hibernated.
+  route({ method: "GET", path: "/v1/agents/:agent/trace", auth: "owner", run: async (c) => {
+    if (!isUpgrade(c.req)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "expected a WebSocket upgrade", 426);
+    const after = c.url.searchParams.get("after");
+    if (after !== null && !/^\d{1,15}$/.test(after)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "after must be a non-negative integer");
+    const stub = await ownAgent(c, c.p.agent);
+    // Only the upgrade goes on: no header of the caller's reaches the object (`x-nest-host` is the session route's).
+    const u = new URL(`https://agent.internal/v1/agents/${c.p.agent}/trace`);
+    if (after !== null) u.searchParams.set("after", after);
+    const res = await stub.fetch(new Request(u, { headers: { upgrade: "websocket" } }));
+    if (res.status === 101 || res.headers.has(TRACE_HEADER)) return res;
+    // An AgentDO still on the previous release (minutes after a deploy) has no trace: it answers its session route's 400.
+    throw new NestError(ErrorCodes.INTERNAL, "the live trace isn't running yet after a deploy: try again in a few minutes", 503, true);
   } }),
   route({
     method: "POST", path: "/v1/agents/:agent/turns", auth: "owner", status: 201,

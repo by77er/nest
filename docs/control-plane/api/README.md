@@ -15,6 +15,36 @@
   - **Creates take an [`Idempotency-Key`](#idempotency-keys).**
   - **Compat (one release):** `POST /v1/sandboxes` and `POST /v1/agents` accept a `workstream` field and ignore it (old clients and scripts send it).
 
+## Live trace
+
+**Decided (2026-11-02):** `GET /v1/agents/<id>/trace?after=<seq>` is a WebSocket upgrade that streams an agent's turns as they happen. It's an owner route: the operator, or an [API client](clients/) for an agent in its subtree (anything else answers 404, as an unknown agent does). The Worker checks the caller before it forwards the upgrade. A browser can't set `Authorization` on a WebSocket, so an app's own Worker connects with its token and proxies the socket. Code: `control-plane/src/lib/trace.ts`, and the trace sockets in [AgentDO](../durable-objects/agent/#live-trace).
+- **Why a WebSocket, not SSE:** AgentDO accepts the socket with the [hibernation API](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), so an idle watched agent costs no duration between events ("Billable Duration (GB-s) charges do not accrue during hibernation"). An SSE stream would keep the request, and the object, alive and billed.
+- **Messages** are JSON text frames. An event has `seq` (per agent, from 1, monotonic, durable), `ts_ms`, `turn` (within a turn), `type` and its fields:
+
+  | `type` | Fields | From |
+  |---|---|---|
+  | `turn_started` | `input_kind` (`user`, `inbox`, `ask_answer`, `recovery`) | the runner |
+  | `assistant_text` | `text` | the runner (Claude Code's text blocks) |
+  | `tool_call` | `call_id`, `name`, `input` (the input as compact JSON, redacted, bounded) | the runner (each `tool_use` block) |
+  | `tool_result` | `call_id`, `is_error`, `summary?` (the result's first 200 characters, redacted) | the runner |
+  | `turn_completed` | `stop_reason`, `usage?` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) | the runner |
+  | `rate_limited` | `retry_after_ms?`, `detail` | the runner |
+  | `error` | `code`, `message` | the runner (a failed Claude Code result) |
+  | `task_exited` | `task_id`, `status`, `exit_code?` | the runner (a background hands task) |
+  | `state` | `state` (as `GET /v1/agents/<id>` shows it) | AgentDO, at each change |
+  | `ask` | `ask`, `question` | AgentDO (an approval or a tool rule in `ask` mode) |
+  | `ask_answered` | `ask` | AgentDO |
+  | `ended` | `reason` | AgentDO, once the agent's end is done; the socket then closes (1000) |
+
+  Two messages have no `seq`: `{type: "gap", from, to}` (below), and `ended` sent again to a client that connects after the end having already read it. A client ignores a `type` it doesn't know.
+- **Order:** the order AgentDO recorded them, one seq each. A runner event comes before the state change it causes (`turn_completed`, then `state: idle`). A `state: working` comes when the turn is sent to the brain, before its `turn_started`.
+- **Not streamed:** the runner's `state_changed` (it streams as `state`), `escalation` (it streams as its `ask`), `usage`, `capabilities` and `inbox_delivered`, and everything that isn't an event (session bytes, hands calls' output). The full transcript is `GET /v1/agents/<id>/transcript`.
+- **Resume:** AgentDO keeps the newest 1,000 events of the last 24 h. A client connects with `after` (the last `seq` it has; omitted means 0) and gets the events after it, then live ones. If events after `after` are gone from the ring, it first gets `{type: "gap", from, to}` (inclusive seqs) and can page the transcript for them. An `after` beyond the newest gets nothing until new events.
+- **Bounds and redaction:** the live path has no list of secrets (the runner redacts its own secret, the setup token, from session bytes only, and the model never sees it). Every string field is redacted, then cut: tool inputs, results, questions and messages to 4 KiB, assistant text to 16 KiB (UTF-8, marked `…` when cut). Redaction replaces the values of credential-named keys in a tool's input (`token`, `secret`, `password`, `authorization`, `api_key`, `credential`, `cookie`, `private_key`, …) and credential shapes in any string (nest client tokens and webhook secrets, `sk-ant-…`, GitHub and Slack tokens, AWS access key ids, PEM private keys, `Bearer`/`Basic` values) with `[redacted]`. A secret of another shape in a tool's input passes, bounded, as it does in the stored transcript.
+- **Keepalive:** send the text `ping` (not JSON) at least every 30 s; the runtime answers `pong` without waking AgentDO ([`setWebSocketAutoResponse`](https://developers.cloudflare.com/durable-objects/api/state/)). AgentDO never pings.
+- **Closes:** `1000` when the agent ended; `4008` when a newer trace socket took its place (8 per agent at most, the oldest goes); `1011` when a send to it failed. A client reconnects with `after=<last seq>` and a backoff, except after `ended`.
+- **Answers to the upgrade:** `101`; `426` without `Upgrade: websocket`; `400` for an `after` that isn't a non-negative integer; `401`/`404` as for any owner route; `503` (`internal`, `retryable: true`) while AgentDO still runs a release without the trace, in the minutes after a deploy ([rollout](../../../dev/deploy.md)).
+
 ## Which routes take a cell
 
 **Decided (2026-11-02):** only a route about one cell's FleetDO reads `?cell=`. It is checked when that route reads it (default `local`), never by the router for every route (`Ctx.cell` in `control-plane/src/index.ts`), so in a deployment whose `CELLS` doesn't name `local` an external app needs no cell on the others.
