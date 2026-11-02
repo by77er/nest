@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
-import type { ChannelDO } from "../src/do/channel";
+import { type ChannelDO, DIRECTORY, MAX_OWNED_CHANNELS } from "../src/do/channel";
 import type { Caller } from "../src/lib/channels";
 import { SEED_CATALOG_V1, SEED_VERSION } from "../src/lib/spec";
 import { admin, adminJson, connectHost, nextCommands, runDue, sleep, uniqueCell, Ws } from "./helpers";
@@ -1158,5 +1158,111 @@ describe("catalog seed migration", () => {
     const cat = await stub.catalog();
     expect(cat.capabilities.channels?.grants).toEqual([{ action: "post", channel: "user" }]);
     expect(Object.keys(cat.templates).sort()).toEqual(["captain", "worker"]);
+  });
+});
+
+describe("garbage collection", () => {
+  const USER_CALLER: Caller = { principal: "user" };
+  const goneAgent = () => `agt_gone${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  /** Every message past any retention, then the maintenance run. */
+  const expireAll = async (name: string) => {
+    await runInDurableObject(chStub(name), (_i: ChannelDO, st) => { st.storage.sql.exec("UPDATE messages SET ts_ms = 0"); });
+    await chStub(name).maintain(name);
+  };
+  const stored = (name: string) => runInDurableObject(chStub(name), (_i: ChannelDO, st) =>
+    st.storage.sql.exec("SELECT 1 FROM kv WHERE key = 'meta'").toArray().length > 0);
+  const listed = async (name: string) => (await adminJson(`/v1/admin/channels?prefix=${enc(name)}`)).channels.length as number;
+  const registered = (name: string) => until(() => listed(name), (n) => n === 1, 10_000, `${name} registered`);
+  const nextMaintenance = (name: string) => runInDurableObject(chStub(name), (_i: ChannelDO, st) =>
+    st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'maintenance'").toArray()[0]?.at ?? null);
+
+  it("an agent's built-in channels go once its records are gone and their log has expired; a live agent's empty one is checked weekly", async () => {
+    const { agent } = await idleAgent();
+    const live = `${agent}/inbox`;
+    const gone = `${goneAgent()}/events`;
+    await postAs(live, { text: "hello" }, 201);
+    await chStub(gone).post(gone, USER_CALLER, { text: "an old event" });
+    await registered(live);
+    await registered(gone);
+    await env.BUCKET.put(`channels/${gone}/b/blb_leftover`, "{}");
+
+    await expireAll(gone);
+    expect(await stored(gone)).toBe(false);
+    expect(await listed(gone)).toBe(0);
+    expect(await env.BUCKET.get(`channels/${gone}/b/blb_leftover`)).toBeNull();
+    expect(await nextMaintenance(gone)).toBeNull();
+
+    await expireAll(live);
+    expect(await stored(live)).toBe(true);
+    expect(await listed(live)).toBe(1);
+    expect(await nextMaintenance(live)).toBeGreaterThan(Date.now() + 6 * 86_400_000);
+  });
+
+  it("a channel with messages left is kept whatever its subject, and the operator's channels and user never go", async () => {
+    const gone = `${goneAgent()}/inbox`;
+    await chStub(gone).post(gone, USER_CALLER, { text: "fresh" });
+    await chStub(gone).maintain(gone);
+    expect(await stored(gone)).toBe(true);
+
+    const mine = await newChannel();
+    await postAs(mine, { text: "x" }, 201);
+    await expireAll(mine);
+    expect(await stored(mine)).toBe(true);
+    expect(await nextMaintenance(mine)).toBeGreaterThan(Date.now() + 6 * 86_400_000);
+  });
+
+  it("a free channel goes once its owning agent and every subscriber are gone", async () => {
+    const owner = goneAgent();
+    const kept = `team/${uniq("owned")}`;
+    const dropped = `team/${uniq("owned")}`;
+    for (const name of [kept, dropped]) {
+      await chStub(name).create(name, asAgent(owner));
+      await chStub(name).post(name, USER_CALLER, { text: "m" });
+    }
+    const { agent } = await idleAgent();
+    await adminJson(`/v1/admin/channels/${enc(kept)}/subscriptions`, { body: { agent, delivery: "none" } }, 201);
+    await expireAll(kept);
+    await expireAll(dropped);
+    expect(await stored(kept)).toBe(true);
+    expect(await stored(dropped)).toBe(false);
+  });
+
+  it("a post that lands while the channel is being dropped keeps it, listed again", async () => {
+    const name = `${goneAgent()}/events`;
+    await chStub(name).post(name, USER_CALLER, { text: "old" });
+    await registered(name);
+    await runInDurableObject(chStub(name), (_i: ChannelDO, st) => { st.storage.sql.exec("UPDATE messages SET ts_ms = 0"); });
+    await runInDurableObject(chStub(name), async (inst: ChannelDO) => {
+      inst.testHooks["drop:beforeDelete"] = async () => {
+        delete inst.testHooks["drop:beforeDelete"];
+        await inst.post(name, USER_CALLER, { text: "late" });
+      };
+      await inst.maintain(name);
+    });
+    expect(await stored(name)).toBe(true);
+    expect(await runInDurableObject(chStub(name), (_i: ChannelDO, st) => st.storage.sql.exec<{ text: string }>("SELECT text FROM messages").toArray().map((r) => r.text)))
+      .toEqual(["late"]);
+    await registered(name);
+  });
+
+  it(`an agent owns at most ${MAX_OWNED_CHANNELS} free channels; its own re-create still answers, and the operator is uncapped`, async () => {
+    const owner = `agt_quota${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    await runInDurableObject(chStub(DIRECTORY), (_i: ChannelDO, st) => {
+      for (let i = 0; i < MAX_OWNED_CHANNELS - 1; i++) {
+        st.storage.sql.exec("INSERT INTO directory (name, kind, owner, created_ms) VALUES (?, 'free', ?, 0)", `q/${owner}/${i}`, owner);
+      }
+    });
+    const last = `team/${uniq("last")}`;
+    await chStub(last).create(last, asAgent(owner));
+    await chStub(DIRECTORY).dirRegister({ name: last, kind: "free", owner, created_ms: 0 });
+    const over = `team/${uniq("over")}`;
+    await expect(attempt(() => chStub(over).create(over, asAgent(owner)))).rejects.toThrow(/at most 100/);
+    expect(await stored(over)).toBe(false);
+    expect((await chStub(last).create(last, asAgent(owner))).owner).toBe(owner);
+    const op = `team/${uniq("op")}`;
+    await runInDurableObject(chStub(DIRECTORY), (_i: ChannelDO, st) => {
+      for (let i = 0; i < MAX_OWNED_CHANNELS; i++) st.storage.sql.exec("INSERT INTO directory (name, kind, owner, created_ms) VALUES (?, 'free', 'user', 0)", `q/op/${op}/${i}`);
+    });
+    expect((await adminJson("/v1/admin/channels", { body: { name: op } }, 201)).owner).toBe("user");
   });
 });

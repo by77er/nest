@@ -30,6 +30,10 @@ export const DIRECTORY = "~directory";
 const DAY_MS = 86_400_000;
 /** Retention and tiering run this often. */
 const MAINTENANCE_EVERY_MS = DAY_MS;
+/** An empty channel whose subject lives checks this often whether it has gone (a post re-arms the daily run). */
+const EMPTY_RECHECK_MS = 7 * DAY_MS;
+/** Free channels one agent may own at once (`channel_create`); the operator's are uncapped. */
+export const MAX_OWNED_CHANNELS = 100;
 /** Pages of expired rows deleted per maintenance run (the rest a minute later). */
 const EXPIRE_PAGES = 10;
 /** Rows tiered to R2 per maintenance run (the rest wait for the next). */
@@ -112,7 +116,7 @@ export interface CallFacts {
   spawner_reads?: boolean;
 }
 
-type HookPoint = "post:enter" | "post:afterPut" | "fanout:beforeDeliver" | "fanout:afterDeliver";
+type HookPoint = "post:enter" | "post:afterPut" | "fanout:beforeDeliver" | "fanout:afterDeliver" | "drop:beforeDelete";
 
 type MsgRow = {
   seq: number; ts_ms: number; from_p: string; taint: number; kind: string | null; text: string | null; data: string | null;
@@ -157,6 +161,11 @@ export class ChannelDO extends DurableObject<Env> {
     this.sql = ctx.storage.sql;
     // The health instance (`GET /v1/health`) stores nothing: no schema, no alarm.
     if (isHealthInstance(ctx, env.CHANNEL)) return;
+    this.schema();
+    this.deadlines = new Deadlines(this.sql, ctx.storage);
+  }
+
+  private schema(): void {
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, from_p TEXT NOT NULL,
       taint INTEGER NOT NULL, kind TEXT, text TEXT, data TEXT, reply_to INTEGER, key TEXT, mentions TEXT, body_ref TEXT,
@@ -172,7 +181,7 @@ export class ChannelDO extends DurableObject<Env> {
     this.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS subs_idem ON subs (agent, idem_key) WHERE idem_key IS NOT NULL");
     this.sql.exec("CREATE TABLE IF NOT EXISTS acl (principal TEXT NOT NULL, action TEXT NOT NULL, PRIMARY KEY (principal, action))");
     this.sql.exec("CREATE TABLE IF NOT EXISTS directory (name TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT, created_ms INTEGER NOT NULL)");
-    this.deadlines = new Deadlines(this.sql, ctx.storage);
+    this.sql.exec("CREATE INDEX IF NOT EXISTS directory_owner ON directory (owner)");
   }
 
   private async hook(point: HookPoint): Promise<void> {
@@ -283,10 +292,22 @@ export class ChannelDO extends DurableObject<Env> {
     if (kind.value.kind !== "free") throw invalid(`${name} is a built-in channel: it exists with its owner`, 409);
     if (caller.principal === "platform") throw forbidden("the platform creates no free channels");
     if (!(retentionDays >= 1 && retentionDays <= MAX_RETENTION_DAYS && Number.isInteger(retentionDays))) throw invalid(`retention_days is 1-${MAX_RETENTION_DAYS}`);
-    const cur = this.meta();
-    if (cur) {
+    const existing = (): ChannelInfo | null => {
+      const cur = this.meta();
+      if (!cur) return null;
       if (cur.owner === caller.principal) return this.infoOf(cur);
       throw invalid(`channel ${name} exists`, 409);
+    };
+    const before = existing();
+    if (before) return before;
+    // An agent's quota, counted by the directory (a channel registers just after it is made, so a burst can pass it by a few).
+    if (isAgentCaller(caller)) {
+      const owned = await this.env.CHANNEL.get(this.env.CHANNEL.idFromName(DIRECTORY)).dirOwned(caller.principal);
+      if (owned >= MAX_OWNED_CHANNELS) {
+        throw new NestError(ErrorCodes.CAPACITY_EXHAUSTED, `${caller.principal} already owns ${owned} channels (at most ${MAX_OWNED_CHANNELS})`, 429, false);
+      }
+      const after = existing(); // made meanwhile, by this caller or another
+      if (after) return after;
     }
     const meta = this.init(name, kind.value, caller.principal, retentionDays);
     return this.infoOf(meta);
@@ -668,7 +689,77 @@ export class ChannelDO extends DurableObject<Env> {
       const n = this.sql.exec("UPDATE messages SET text = NULL, data = NULL, body_ref = ? WHERE seq = ? AND body_ref IS NULL", ref, r.seq).rowsWritten;
       if (n === 0) await this.env.BUCKET.delete(ref);
     }
-    await this.deadlines.set("maintenance", Date.now() + (old.length === TIER_BATCH || backlog ? 60_000 : MAINTENANCE_EVERY_MS));
+    if (old.length === TIER_BATCH || backlog) {
+      await this.deadlines.set("maintenance", Date.now() + 60_000);
+      return;
+    }
+    if (!this.empty()) {
+      await this.deadlines.set("maintenance", Date.now() + MAINTENANCE_EVERY_MS);
+      return;
+    }
+    // Empty: dropped once what it belongs to is gone, else checked again weekly.
+    const gone = await this.subjectGone(meta);
+    if (gone && this.empty()) await this.drop(meta);
+    else await this.deadlines.set("maintenance", Date.now() + (this.empty() ? EMPTY_RECHECK_MS : MAINTENANCE_EVERY_MS));
+  }
+
+  /** No message left (retention took them; a keyed message is never taken, so a keyed channel never empties). */
+  private empty(): boolean {
+    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one().n === 0;
+  }
+
+  /**
+   * Whether nothing will post to this channel or read it again: an agent's built-in channels once its
+   * records are pruned (`unknown_agent`), a sandbox's once it is destroyed, a free channel once its owning
+   * agent and every subscriber are gone. `user` and the operator's free channels never go.
+   */
+  private async subjectGone(meta: Meta): Promise<boolean> {
+    const agentGone = async (agent: string) => {
+      try {
+        await this.env.AGENT.get(this.env.AGENT.idFromName(agent)).info();
+        return false;
+      } catch (e) {
+        return asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT;
+      }
+    };
+    const k = meta.kind;
+    if (k.kind === "inbox" || k.kind === "events") return agentGone(k.agent);
+    if (k.kind === "sandbox_events") {
+      try {
+        return (await this.env.SANDBOX.get(this.env.SANDBOX.idFromName(k.sandbox)).info()).state === "destroyed";
+      } catch (e) {
+        return asNestError(e)?.code === ErrorCodes.UNKNOWN_SANDBOX;
+      }
+    }
+    if (k.kind === "user" || !meta.owner?.startsWith("agt_")) return false;
+    if (!(await agentGone(meta.owner))) return false;
+    for (const s of this.subs()) if (!(await agentGone(s.agent))) return false;
+    return true;
+  }
+
+  /** Delete the channel: its R2 bodies, its directory row, then its storage (a later permitted use makes it afresh). */
+  private async drop(meta: Meta): Promise<void> {
+    let cursor: string | undefined;
+    do {
+      const page = await this.env.BUCKET.list({ prefix: `channels/${meta.name}/`, limit: 1000, ...(cursor ? { cursor } : {}) });
+      if (page.objects.length) await this.env.BUCKET.delete(page.objects.map((o) => o.key));
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    await this.env.CHANNEL.get(this.env.CHANNEL.idFromName(DIRECTORY)).dirRemove(meta.name);
+    await this.hook("drop:beforeDelete");
+    // A post that landed during those awaits keeps the channel.
+    if (!this.empty()) {
+      await this.deadlines.set("maintenance", Date.now() + MAINTENANCE_EVERY_MS);
+      this.putKv("meta", { ...this.meta()!, registered: false });
+      await this.deadlines.set("register", Date.now(), true);
+      return;
+    }
+    console.log(`channel ${meta.name}: dropped (empty, and what it belonged to is gone)`);
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    // Empty again but usable, as the constructor leaves it (`Deadlines` made its table there).
+    this.schema();
+    this.sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
   }
 
   /** Run maintenance now (operator and tests). */
@@ -699,6 +790,15 @@ export class ChannelDO extends DurableObject<Env> {
 
   async dirRegister(e: DirectoryEntry): Promise<void> {
     this.sql.exec("INSERT OR IGNORE INTO directory (name, kind, owner, created_ms) VALUES (?, ?, ?, ?)", e.name, e.kind, e.owner, e.created_ms);
+  }
+
+  async dirRemove(name: string): Promise<void> {
+    this.sql.exec("DELETE FROM directory WHERE name = ?", name);
+  }
+
+  /** Free channels `owner` has in the directory (its `channel_create` quota). */
+  async dirOwned(owner: string): Promise<number> {
+    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM directory WHERE owner = ? AND kind = 'free'", owner).one().n;
   }
 
   async dirList(prefix = "", after = "", limit = 200): Promise<{ channels: DirectoryEntry[]; more: boolean }> {
