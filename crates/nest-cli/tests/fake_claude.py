@@ -14,7 +14,9 @@ Turn behavior (by user text):
 - `E2E <scenario.json>` (alone, or as an agent's message: `Message from <sender>: E2E …`) → the scripted tool calls in that file ({"results": path, "steps":
   [{"tool", "args", "label"}]}), each result appended to `results` at once (JSONL, flushed); a step
   {"await_tool": name, "absent"?: bool, "timeout_s"?: n, "label"} instead waits until the tool list
-  has (or lacks) `<name>` (as `nest mcp` lists it) and records `listed`/`unlisted` or `timeout`
+  has (or lacks) `<name>` (as `nest mcp` lists it) and records `listed`/`unlisted` or `timeout`; a step
+  {"await_file": path, "timeout_s"?: n, "label"} creates `<path>.waiting`, waits until that file exists (the
+  harness's cue) and records `present` or `timeout`
 As Claude Code does under `-p` (docs: "Dynamic tool updates"), `notifications/tools/list_changed` from
 `nest mcp` makes it list the tools again.
 - otherwise         → mcp__nest__Bash `echo <text>`
@@ -259,6 +261,17 @@ def scripted(path):
             log("await_tool", name=name, absent=absent, text=text, names=TOOL_NAMES)
             with open(sc["results"], "a") as f:
                 f.write(json.dumps({"label": step.get("label", name), "tool": name, "text": text, "is_error": not ok}) + "\n")
+                f.flush()
+            continue
+        if "await_file" in step:
+            open(step["await_file"] + ".waiting", "w").close()  # the harness's sign that this turn is blocked here
+            deadline = time.time() + step.get("timeout_s", 30)
+            while not os.path.exists(step["await_file"]) and time.time() < deadline:
+                time.sleep(0.05)
+            ok = os.path.exists(step["await_file"])
+            log("await_file", path=step["await_file"], present=ok)
+            with open(sc["results"], "a") as f:
+                f.write(json.dumps({"label": step.get("label", "await_file"), "tool": "await_file", "text": "present" if ok else "timeout", "is_error": not ok}) + "\n")
                 f.flush()
             continue
         name, args = step["tool"], step["args"]
