@@ -1,15 +1,15 @@
 // A project's settings: whether ready tasks are assigned automatically, how many workers may run, and
 // whether task PRs merge automatically once their review passes (with the repo's setting behind it).
 
-import { Alert, Badge, Button, Group, NumberInput, Select, Stack, Switch, Text } from "@mantine/core";
+import { Badge, Button, NumberInput, Select, Switch, Text } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
-import { IconAlertTriangle } from "@tabler/icons-react";
-import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
 import { Settings as SettingsSchema } from "../../../requests";
 import { useRetryRepoAutoMerge, useUpdateSettings } from "../../api/queries";
 import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
+import { FieldGroup, MetaItem, Notice, Row, Stack } from "../../layout";
+import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
 
 const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", merge: "Merge commit", rebase: "Rebase and merge" };
 
@@ -33,7 +33,20 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
           },
         }))}
     >
-      <Stack gap="md">
+      <FieldGroup
+        actions={
+          <>
+            {onDone && (
+              <Button variant="subtle" color="danger" onClick={onDone}>
+                Cancel
+              </Button>
+            )}
+            <Button type="submit" loading={update.isPending} disabled={!form.isDirty()}>
+              Save settings
+            </Button>
+          </>
+        }
+      >
         <Switch
           label="Assign ready tasks automatically"
           description="In board order, while the project's live workers are fewer than the cap."
@@ -61,17 +74,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
           {...form.getInputProps("merge_method")}
         />
         <RepoAutoMergeStatus projectId={projectId} status={settings.repo_auto_merge} />
-        <Group justify="flex-end" gap="xs">
-          {onDone && (
-            <Button variant="subtle" color="danger" onClick={onDone}>
-              Cancel
-            </Button>
-          )}
-          <Button type="submit" loading={update.isPending} disabled={!form.isDirty()}>
-            Save settings
-          </Button>
-        </Group>
-      </Stack>
+      </FieldGroup>
     </form>
   );
 }
@@ -90,46 +93,44 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
   const s = STATE[status.state];
   const allows = status.repo === null ? null : status.repo ? "allows" : "doesn't allow";
   const action = (label: string) => (
-    <Button size="xs" variant="default" loading={retry.isPending} onClick={() => retry.mutate()}>
-      {label}
-    </Button>
+    <Row>
+      <Button size="xs" variant="default" loading={retry.isPending} onClick={() => retry.mutate()}>
+        {label}
+      </Button>
+    </Row>
   );
   return (
-    <Stack gap="xs" aria-live="polite">
-      <Group gap="xs">
-        <Text size="sm" fw={500}>
+    <Stack gap="sm" aria-live="polite">
+      <Row gap="sm">
+        <Text size="sm" fw="medium">
           Repo setting
         </Text>
         <Badge color={s.color} variant="light">
           {s.label}
         </Badge>
         {allows && status.at_ms !== null && (
-          <Text size="xs" c="dimmed" title={exact(status.at_ms)}>
+          <MetaItem title={exact(status.at_ms)}>
             The repo {allows} auto-merge, {ago(status.at_ms)}
-          </Text>
+          </MetaItem>
         )}
-      </Group>
+      </Row>
       {status.state === "error" && (
-        <Alert color="danger" variant="light" icon={<IconAlertTriangle size={18} />} title="GitHub refused the repo setting">
-          <Stack gap="xs" align="flex-start">
+        <Notice tone="danger" title="GitHub refused the repo setting">
+          <Stack gap="sm">
             <Text size="sm">{status.error}</Text>
             {action("Try again")}
           </Stack>
-        </Alert>
+        </Notice>
       )}
       {status.state === "drifted" && (
-        <Alert color="warning" variant="light" icon={<IconAlertTriangle size={18} />} title="Changed on GitHub">
-          <Stack gap="xs" align="flex-start">
+        <Notice tone="warning" title="Changed on GitHub">
+          <Stack gap="sm">
             <Text size="sm">Someone changed the repo's “Allow auto-merge” since the app set it.</Text>
             {action(status.want ? "Allow it again" : "Disallow it again")}
           </Stack>
-        </Alert>
+        </Notice>
       )}
-      {status.state === "pending" && status.error && (
-        <Text size="xs" c="dimmed">
-          Retrying: {status.error}
-        </Text>
-      )}
+      {status.state === "pending" && status.error && <MetaItem>Retrying: {status.error}</MetaItem>}
     </Stack>
   );
 }

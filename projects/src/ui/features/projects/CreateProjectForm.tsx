@@ -1,11 +1,12 @@
 // A new project: its name, its GitHub repo, and how it assigns work. Checked with the Worker's own
 // schema (src/requests.ts) before it's sent.
 
-import { Button, Group, NumberInput, Stack, Switch, TextInput } from "@mantine/core";
+import { Button, NumberInput, Switch, TextInput } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { CreateProject } from "../../../requests";
 import { useCreateProject } from "../../api/queries";
 import type { CreatedProject } from "../../api/types";
+import { FieldGroup } from "../../layout";
 
 export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: CreatedProject) => void; onCancel?: () => void }) {
   const create = useCreateProject();
@@ -17,7 +18,20 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
 
   return (
     <form onSubmit={form.onSubmit((v) => create.mutate({ ...v, repo: v.repo.trim() }, { onSuccess: onCreated }))}>
-      <Stack gap="sm">
+      <FieldGroup
+        actions={
+          <>
+            {onCancel && (
+              <Button variant="subtle" color="danger" onClick={onCancel}>
+                Cancel
+              </Button>
+            )}
+            <Button type="submit" loading={create.isPending}>
+              Create project
+            </Button>
+          </>
+        }
+      >
         <TextInput label="Name" withAsterisk data-autofocus key={form.key("name")} {...form.getInputProps("name")} />
         <TextInput
           label="Repository"
@@ -36,17 +50,7 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
           {...form.getInputProps("auto_assign", { type: "checkbox" })}
         />
         <NumberInput label="Max workers" min={0} max={20} allowDecimal={false} clampBehavior="strict" key={form.key("max_workers")} {...form.getInputProps("max_workers")} />
-        <Group justify="flex-end" mt="xs">
-          {onCancel && (
-            <Button variant="subtle" color="danger" onClick={onCancel}>
-              Cancel
-            </Button>
-          )}
-          <Button type="submit" loading={create.isPending}>
-            Create project
-          </Button>
-        </Group>
-      </Stack>
+      </FieldGroup>
     </form>
   );
 }

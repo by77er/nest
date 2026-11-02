@@ -1,0 +1,17 @@
+/* The few rules that apply to the whole page and have no Mantine prop. */
+
+/* Inter turns an "x" between digits into "×" (its contextual alternates): wrong in ids like agt_w8x2m4. */
+body {
+  font-feature-settings: "calt" 0;
+}
+
+/* Reduced motion: no transforms move, transitions are instant (Mantine's own honour
+   data-respect-reduced-motion; this covers the rest, dnd-kit's drop included). A spinner keeps turning. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}

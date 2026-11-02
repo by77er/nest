@@ -1,11 +1,10 @@
 // A task, opened from the board (`?task=` in the URL): its text, its spec, its history and what the
 // owner can do to it.
 
-import { Alert, Anchor, Badge, Divider, Drawer, Group, Stack, Text } from "@mantine/core";
-import { useMediaQuery } from "@mantine/hooks";
-import { IconAlertTriangle, IconGitPullRequest, IconRobot } from "@tabler/icons-react";
+import { Anchor, Badge } from "@mantine/core";
+import { IconGitPullRequest, IconRobot } from "@tabler/icons-react";
 import { useTask } from "../../api/queries";
-import { Loading, LoadError } from "../../common/QueryStates";
+import { ErrorState, LoadingState, MetaItem, MetaRow, Notice, Row, Section, Sheet, Stack } from "../../layout";
 import { ago, exact } from "../../common/time";
 import { StateBadge } from "../board/StateBadge";
 import { TERMINAL } from "../../../tasks";
@@ -21,86 +20,82 @@ function AutoMerge({ task }: { task: Task }) {
   if (!a) return null;
   if (a.state === "failed") {
     return (
-      <Alert color="warning" variant="light" icon={<IconAlertTriangle size={18} />} title="Auto-merge wasn't changed on its PR">
+      <Notice tone="warning" title="Auto-merge wasn't changed on its PR">
         {a.error}
-      </Alert>
+      </Notice>
     );
   }
   const label = a.state === "enabled" ? `Auto-merge on${a.method ? ` (${a.method})` : ""}` : a.state === "pending" ? "Auto-merge pending" : "Auto-merge off";
   return (
-    <Group gap="xs">
+    <Row gap="sm">
       <Badge color={a.state === "enabled" ? "success" : "gray"} variant="light">
         {label}
       </Badge>
-      <Text size="xs" c="dimmed" title={exact(a.at_ms)}>
-        {a.state === "enabled" ? "Merges once its review passes" : a.error ? `Retrying: ${a.error}` : ago(a.at_ms)}
-      </Text>
-    </Group>
+      <MetaItem title={exact(a.at_ms)}>{a.state === "enabled" ? "Merges once its review passes" : a.error ? `Retrying: ${a.error}` : ago(a.at_ms)}</MetaItem>
+    </Row>
   );
 }
 
 export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: string; repo: string; taskId: string | undefined; onClose: () => void }) {
   const task = useTask(projectId, taskId);
-  const phone = useMediaQuery("(max-width: 48em)");
   const t = task.data;
 
   return (
-    <Drawer opened={taskId !== undefined} onClose={onClose} position="right" size={phone ? "100%" : "xl"} title="Task">
+    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task">
       {task.isPending ? (
-        <Loading label="Loading the task" />
+        <LoadingState label="Loading the task" />
       ) : task.isError ? (
-        <LoadError what="The task" error={task.error} onRetry={() => void task.refetch()} />
+        <ErrorState title="The task couldn't be loaded" error={task.error} onRetry={() => void task.refetch()} />
       ) : t ? (
-        <Stack gap="lg">
-          <Stack gap="xs">
-            <Group gap="xs">
-              <StateBadge state={t.state} />
-              {t.tainted && (
-                <Badge color="gray" variant="outline">
-                  Tainted
-                </Badge>
-              )}
-              <Text size="xs" c="dimmed" title={exact(t.updated_ms)}>
-                Updated {ago(t.updated_ms)}
-              </Text>
-            </Group>
-            <Group gap="md">
-              {t.assignee && (
-                <Group gap={4}>
-                  <IconRobot size={14} aria-hidden />
-                  <Text size="sm">{t.assignee}</Text>
-                </Group>
-              )}
-              {t.pr !== null && (
-                <Anchor href={`https://github.com/${repo}/pull/${t.pr}`} target="_blank" rel="noreferrer" size="sm">
-                  <Group gap={4}>
-                    <IconGitPullRequest size={14} aria-hidden />
-                    PR #{t.pr}
-                  </Group>
-                </Anchor>
-              )}
-            </Group>
+        <Stack gap="2xl">
+          <Stack gap="lg">
+            <Stack gap="sm">
+              <Row gap="xs">
+                <StateBadge state={t.state} />
+                {t.tainted && (
+                  <Badge color="gray" variant="outline">
+                    Tainted
+                  </Badge>
+                )}
+              </Row>
+              <MetaRow>
+                {t.assignee && (
+                  <MetaItem icon={IconRobot} mono>
+                    {t.assignee}
+                  </MetaItem>
+                )}
+                {t.pr !== null && (
+                  <MetaItem icon={IconGitPullRequest}>
+                    <Anchor href={`https://github.com/${repo}/pull/${t.pr}`} target="_blank" rel="noreferrer" inherit>
+                      PR #{t.pr}
+                    </Anchor>
+                  </MetaItem>
+                )}
+                <MetaItem title={exact(t.updated_ms)}>Updated {ago(t.updated_ms)}</MetaItem>
+              </MetaRow>
+            </Stack>
+            <AutoMerge task={t} />
+            {t.start_error && (
+              <Notice tone="warning" title={t.state === "stalled" ? "Its worker didn't start" : "Its worker is being retried"}>
+                {t.start_error}
+              </Notice>
+            )}
+            <TaskActions projectId={projectId} task={t} onDeleted={onClose} />
           </Stack>
 
-          <AutoMerge task={t} />
+          <Section title="Description" region={false}>
+            <TaskEditForm key={t.id} projectId={projectId} task={t} readOnly={TERMINAL.has(t.state)} />
+          </Section>
 
-          {t.start_error && (
-            <Alert color="warning" variant="light" icon={<IconAlertTriangle size={18} />} title={t.state === "stalled" ? "Its worker didn't start" : "Its worker is being retried"}>
-              {t.start_error}
-            </Alert>
-          )}
+          <Section title="Spec" region={false}>
+            <SpecView spec={t.spec} />
+          </Section>
 
-          <TaskActions projectId={projectId} task={t} onDeleted={onClose} />
-
-          <TaskEditForm key={t.id} projectId={projectId} task={t} readOnly={TERMINAL.has(t.state)} />
-
-          <Divider label="Spec" labelPosition="left" />
-          <SpecView spec={t.spec} />
-
-          <Divider label="History" labelPosition="left" />
-          <HistoryList history={t.history} />
+          <Section title="History" count={t.history.length} region={false}>
+            <HistoryList history={t.history} />
+          </Section>
         </Stack>
       ) : null}
-    </Drawer>
+    </Sheet>
   );
 }

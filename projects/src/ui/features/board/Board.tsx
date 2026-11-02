@@ -1,15 +1,14 @@
 // The board: a column per stage of a task's life, cancelled ones behind a switch. It polls while the
 // tab is visible, except while a card is being dragged.
 
-import { Button, Card, EmptyState, Group, Modal, Stack, Switch, Title } from "@mantine/core";
+import { Button, Modal, Switch } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconLayoutKanban, IconPlus } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import { useAsks, useReorderTask, useTasks } from "../../api/queries";
 import type { Task } from "../../api/types";
-import { Loading, LoadError } from "../../common/QueryStates";
+import { ColumnGrid, EmptyState, ErrorState, icon, LoadingState, Panel, Section, Toolbar } from "../../layout";
 import { CANCELLED_COLUMN, COLUMNS } from "../../status";
-import classes from "./Board.module.css";
 import { BoardColumn } from "./BoardColumn";
 import { CreateTaskForm } from "./CreateTaskForm";
 
@@ -31,33 +30,27 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
   const byColumn = (states: readonly string[], all: Task[]) => all.filter((t) => states.includes(t.state));
 
   return (
-    <Stack gap="sm">
-      <Group justify="space-between" wrap="wrap" gap="sm">
-        <Title order={2} size="h4">
-          Board
-        </Title>
-        <Group gap="md">
-          <Switch size="sm" label="Show cancelled" checked={showCancelled} onChange={(e) => setShowCancelled(e.currentTarget.checked)} />
-          <Button leftSection={<IconPlus size={16} />} onClick={open}>
+    <Section
+      title="Board"
+      actions={
+        <Toolbar>
+          <Switch label="Show cancelled" checked={showCancelled} onChange={(e) => setShowCancelled(e.currentTarget.checked)} />
+          <Button leftSection={<IconPlus size={icon.md} />} onClick={open}>
             New task
           </Button>
-        </Group>
-      </Group>
-
+        </Toolbar>
+      }
+    >
       {tasks.isPending ? (
-        <Loading label="Loading the board" />
+        <LoadingState label="Loading the board" />
       ) : tasks.isError ? (
-        <LoadError what="The board" error={tasks.error} onRetry={() => void tasks.refetch()} />
+        <ErrorState title="The board couldn't be loaded" error={tasks.error} onRetry={() => void tasks.refetch()} />
       ) : tasks.data.length === 0 ? (
-        <Card withBorder padding="xl">
-          <EmptyState icon={<IconLayoutKanban size={28} />} withIndicatorBackground title="No tasks yet" description="Create one, or ask the manager in the chat to plan some.">
-            <EmptyState.Actions>
-              <Button onClick={open}>Create a task</Button>
-            </EmptyState.Actions>
-          </EmptyState>
-        </Card>
+        <Panel>
+          <EmptyState icon={IconLayoutKanban} title="No tasks yet" description="Create one, or ask the manager in the chat to plan some." action={<Button onClick={open}>Create a task</Button>} />
+        </Panel>
       ) : (
-        <div className={classes.columns} data-columns={columns.length}>
+        <ColumnGrid columns={columns.length}>
           {columns.map((c) => (
             <BoardColumn
               key={c.id}
@@ -70,16 +63,12 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
               onDragging={setDragging}
             />
           ))}
-        </div>
+        </ColumnGrid>
       )}
 
       <Modal opened={creating} onClose={close} title="New task" size="lg">
-        <CreateTaskForm
-          projectId={projectId}
-          onCancel={close}
-          onCreated={close}
-        />
+        <CreateTaskForm projectId={projectId} onCancel={close} onCreated={close} />
       </Modal>
-    </Stack>
+    </Section>
   );
 }
