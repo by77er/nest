@@ -1,0 +1,31 @@
+// The Worker's bindings, vars and secrets (wrangler.jsonc).
+import type { DirectoryDO } from "./do/directory";
+import type { ProjectDO } from "./do/project";
+import type { ReviewDO } from "./do/review";
+
+export interface Env {
+  ASSETS: Fetcher;
+  DIRECTORY: DurableObjectNamespace<DirectoryDO>;
+  PROJECT: DurableObjectNamespace<ProjectDO>;
+  REVIEW: DurableObjectNamespace<ReviewDO>;
+  /** nest's base URL: its client API, and the `iss` of Nest-Identity tokens. */
+  NEST_CONTROL_PLANE: string;
+  /** The cell the app's agents and sandboxes run in: a create's `cell`, and a listing's filter. */
+  NEST_CELL: string;
+  /** This Worker's base URL; the MCP servers are `${PUBLIC_BASE_URL}/mcp/<server>`. */
+  PUBLIC_BASE_URL: string;
+  /** The Zero Trust team's domain: the Access token's issuer. */
+  ACCESS_TEAM_DOMAIN?: string;
+  /** The projects Access application's audience tag. */
+  PROJECTS_AUD?: string;
+  /** Secret: the `projects` API client's token. */
+  NEST_CLIENT_TOKEN?: string;
+  /** Secret: signs nest's webhooks to /hooks/nest. */
+  NEST_WEBHOOK_SECRET?: string;
+  /** Secret: signs GitHub's webhooks to /hooks/github (the review PR). */
+  GITHUB_WEBHOOK_SECRET?: string;
+}
+
+export const directory = (env: Env) => env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+export const project = (env: Env, id: string) => env.PROJECT.get(env.PROJECT.idFromName(id));
+export const review = (env: Env, id: string) => env.REVIEW.get(env.REVIEW.idFromName(id));

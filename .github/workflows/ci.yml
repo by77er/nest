@@ -47,6 +47,7 @@ jobs:
       rust: ${{ steps.jobs.outputs.rust }}
       control-plane: ${{ steps.jobs.outputs.control-plane }}
       dashboard: ${{ steps.jobs.outputs.dashboard }}
+      projects: ${{ steps.jobs.outputs.projects }}
       e2e: ${{ steps.jobs.outputs.e2e }}
       infra: ${{ steps.jobs.outputs.infra }}
       verify-nestd: ${{ steps.jobs.outputs.verify-nestd }}
@@ -220,6 +221,28 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  projects:
+    needs: plan
+    if: needs.plan.outputs.projects == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: projects
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: projects/package-lock.json
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
@@ -431,7 +454,7 @@ jobs:
   # request's pass leaves `ci-passed-<tree>` for the push of its squash merge (see `plan`).
   ci-ok:
     if: always()
-    needs: [plan, rust, control-plane, dashboard, e2e, infra, verify-nestd, kani-nestd, fuzz-nestd]
+    needs: [plan, rust, control-plane, dashboard, projects, e2e, infra, verify-nestd, kani-nestd, fuzz-nestd]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

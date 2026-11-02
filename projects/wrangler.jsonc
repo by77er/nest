@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nest-projects",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // Every request reaches the Worker first, so the page is served only after the Access check.
+    "run_worker_first": true
+  },
+  "routes": [{ "pattern": "projects-nest.bitcru.sh", "custom_domain": true }],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      { "name": "DIRECTORY", "class_name": "DirectoryDO" },
+      { "name": "PROJECT", "class_name": "ProjectDO" },
+      { "name": "REVIEW", "class_name": "ReviewDO" }
+    ]
+  },
+  "migrations": [
+    // One-way: new classes (README.md#pieces). Their tables are versioned in code (src/sql.ts).
+    { "tag": "v1", "new_sqlite_classes": ["DirectoryDO", "ProjectDO", "ReviewDO"] }
+  ],
+  "vars": {
+    // nest's public client interface (docs/control-plane/api/clients/): its base URL, which is also the
+    // `iss` of every Nest-Identity token and where its JWKS is, and the cell the app's agents run in.
+    "NEST_CONTROL_PLANE": "https://nest.bitcru.sh",
+    "NEST_CELL": "use1",
+    // This Worker's own base URL: its MCP servers are `${PUBLIC_BASE_URL}/mcp/<board|task|review>`,
+    // exactly as the catalog names them (a Nest-Identity token's `aud`).
+    "PUBLIC_BASE_URL": "https://projects-nest.bitcru.sh",
+    // Every path but /hooks/* and /mcp/* needs a Cloudflare Access token (Cf-Access-Jwt-Assertion)
+    // issued by this team for the app's Access application (src/access.ts).
+    "ACCESS_TEAM_DOMAIN": "https://bitcrush.cloudflareaccess.com",
+    // A placeholder until the edge stack (deploy/lean/Edge/) owns the projects application and
+    // `inframe output --stack edge` prints its audience tag: until then every Access check fails closed.
+    "PROJECTS_AUD": "unset-until-the-edge-stack-creates-the-application"
+  }
+  // Secrets (wrangler secret put / .dev.vars), never in this file:
+  // - NEST_CLIENT_TOKEN: the `projects` API client's token (`POST /v1/admin/clients`, shown once).
+  // - NEST_WEBHOOK_SECRET: the secret `PUT /v1/clients/self/webhook` showed (signs /hooks/nest).
+  // - GITHUB_WEBHOOK_SECRET: the GitHub App webhook's secret (signs /hooks/github; the review PR).
+}

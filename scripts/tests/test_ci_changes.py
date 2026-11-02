@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "ci-changes.py"
-ALL = {"rust", "control-plane", "dashboard", "e2e", "infra", "verify-nestd", "fuzz-nestd"}
+ALL = {"rust", "control-plane", "dashboard", "projects", "e2e", "infra", "verify-nestd", "fuzz-nestd"}
 
 
 def jobs(*paths, args=()):
@@ -62,6 +62,10 @@ class CiChanges(unittest.TestCase):
     def test_union(self):
         self.assertEqual(jobs("dashboard/src/App.tsx", "deploy/lean/Cell/Stack.lean"), {"dashboard", "infra"})
         self.assertEqual(jobs("mcp-test/src/index.ts"), {"e2e"})
+
+    def test_projects_runs_only_its_own_job(self):
+        self.assertEqual(jobs("projects/src/worker.ts", "projects/package-lock.json"), {"projects"})
+        self.assertEqual(jobs("projects/README.md"), {"projects"})
 
     def test_flags(self):
         self.assertEqual(jobs(args=["--all"]), ALL)
