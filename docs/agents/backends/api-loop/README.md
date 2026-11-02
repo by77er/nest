@@ -24,4 +24,4 @@ until end_turn
 | Sonnet 5.5 | ~$150 |
 | Haiku 5.5 | ~$10 |
 
-Narrow subscription filters, delegating reading, and a triage agent all cut this substantially. This cost is why `claude-code` is the current backend.
+Fewer wakes, delegating reading, and a triage agent all cut this substantially. This cost is why `claude-code` is the current backend.

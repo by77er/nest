@@ -5,9 +5,10 @@ import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
+import { CHANNEL_ALARM_MS, type ChannelDO } from "../src/do/channel";
 import { LEDGER_ALARM_MS, type TaskLedgerDO } from "../src/do/tasks";
-import { SEED_CATALOG } from "../src/lib/spec";
-import { adminJson, connectHost, nextCommands, uniqueCell, Ws } from "./helpers";
+import { SEED_CATALOG, SEED_VERSION, SPAWNING_PROMPT_V5 } from "../src/lib/spec";
+import { adminJson, connectHost, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -361,7 +362,7 @@ describe("the task ledger's removal", () => {
       expect(read()).toEqual(once);
       return { templates: once, version: sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value };
     });
-    expect(rows.version).toBe("6");
+    expect(rows.version).toBe(String(SEED_VERSION));
     const cat = await stub.catalog();
     expect(Object.keys(cat.capabilities).sort()).toEqual([...Object.keys(SEED_CATALOG.capabilities), "mine"].sort());
     expect(cat.templates.worker!.capabilities).toEqual(SEED_CATALOG.templates.worker!.capabilities);
@@ -427,5 +428,157 @@ describe("the task ledger's removal", () => {
     await runInDurableObject(empty, (_i: TaskLedgerDO, st) => st.storage.setAlarm(Date.now() + 60_000));
     expect(await runDurableObjectAlarm(empty)).toBe(true);
     expect(await runInDurableObject(empty, (_i: TaskLedgerDO, st) => st.storage.getAlarm())).toBeNull();
+  });
+});
+
+// Channels left the platform (docs/README.md#principles): seed version 7 takes their capabilities, tools
+// and grants out of stored catalogs, and an agent spawned with them still starts.
+describe("the channels' removal", () => {
+  const catalogStub = (name: string) => env.CATALOG.get(env.CATALOG.idFromName(name));
+  /** The previous release's channel capabilities, as it stored them. */
+  const OLD_CHANNELS = {
+    channels: { tools: ["channel_create", "post", "read", "subscribe", "unsubscribe"], rules: [], prompt: "Channels.", grants: [{ action: "post", channel: "user" }] },
+    "messaging-tree": { tools: ["message"], rules: [], prompt: "Message.", grants: [{ action: "post", channel: "{owner}/inbox" }] },
+  };
+
+  it("a catalog at version 6 loses them, their tools and grants everywhere, and the spawning prompt that promised events; everything else stays", async () => {
+    const stub = catalogStub(uniqueName("catalog-v6"));
+    const worker = SEED_CATALOG.templates.worker!;
+    const captain = SEED_CATALOG.templates.captain!;
+    const untouched = JSON.stringify({ ...worker, capabilities: ["nest", "hands"], later_field: 1 });
+    const mineAfter = { tools: ["notify"], rules: [{ pattern: "mcp__nest__*", decision: "allow" }], prompt: "Mine.", later_field: 2 };
+    const rows = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
+      const sql = st.storage.sql;
+      // As the previous release left the live catalog: the seed with spawning's old prompt, the channel
+      // capabilities, an operator's capability mixing channel tools and grants with others, operator
+      // templates listing the channel capabilities, and rows that don't parse.
+      sql.exec("DELETE FROM capabilities");
+      sql.exec("DELETE FROM templates");
+      sql.exec("UPDATE kv SET value = '6' WHERE key = 'seed_version'");
+      const caps: Record<string, unknown> = {
+        ...Object.fromEntries(Object.entries(SEED_CATALOG.capabilities).map(([n, c]) => [n, { ...c, grants: [] }])),
+        spawning: { ...SEED_CATALOG.capabilities.spawning!, prompt: SPAWNING_PROMPT_V5, grants: [] },
+        ...OLD_CHANNELS,
+        mine: { ...mineAfter, tools: ["post", "notify", "read"], grants: [{ action: "read", channel: "team/*" }] },
+      };
+      for (const [n, c] of Object.entries(caps)) sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", n, JSON.stringify(c));
+      sql.exec("INSERT INTO capabilities (name, body) VALUES ('garbled', 'not json')");
+      const tpl = (name: string, body: unknown) => sql.exec("INSERT INTO templates (name, body) VALUES (?, ?)", name, typeof body === "string" ? body : JSON.stringify(body));
+      tpl("worker", { ...worker, capabilities: [...worker.capabilities, "channels", "messaging-tree"] });
+      tpl("captain", { ...captain, capabilities: ["channels", ...captain.capabilities, "mine"] });
+      tpl("untouched", untouched);
+      new CatalogDO(st, env as never);
+      const read = (table: string) => Object.fromEntries(sql.exec<{ name: string; body: string }>(`SELECT name, body FROM ${table}`).toArray().map((r) => [r.name, r.body]));
+      const once = { templates: read("templates"), capabilities: read("capabilities") };
+      // Applied once: a restart rewrites nothing.
+      new CatalogDO(st, env as never);
+      expect({ templates: read("templates"), capabilities: read("capabilities") }).toEqual(once);
+      return { ...once, version: sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value };
+    });
+    expect(rows.version).toBe("7");
+    expect(Object.keys(rows.capabilities).sort()).toEqual([...Object.keys(SEED_CATALOG.capabilities), "garbled", "mine"].sort());
+    // Raw rows: the channel tools and grants gone from each, every other field kept.
+    expect(JSON.parse(rows.capabilities.mine!)).toEqual(mineAfter);
+    for (const [n, body] of Object.entries(rows.capabilities)) if (n !== "garbled") expect(JSON.parse(body), n).not.toHaveProperty("grants");
+    expect(rows.capabilities.garbled).toBe("not json");
+    expect(JSON.parse(rows.capabilities.spawning!).prompt).toBe(SEED_CATALOG.capabilities.spawning!.prompt);
+    expect(rows.templates.untouched).toBe(untouched);
+    const cat = await stub.catalog();
+    expect(cat.templates.worker!.capabilities).toEqual(worker.capabilities);
+    expect(cat.templates.captain!.capabilities).toEqual([...captain.capabilities, "mine"]);
+    for (const [name, hands] of [["worker", true], ["captain", false], ["untouched", true]] as const) {
+      const spec = await stub.expand({ template: name, hands, by: "operator" });
+      expect(spec.tools.filter((t) => ["channel_create", "post", "read", "subscribe", "unsubscribe", "message"].includes(t)), name).toEqual([]);
+      expect(spec, name).not.toHaveProperty("channel_grants");
+    }
+  });
+
+  it("an operator's edited spawning prompt is kept", async () => {
+    const stub = catalogStub(uniqueName("catalog-v6-edited"));
+    const edited = `${SPAWNING_PROMPT_V5} Report back to me.`;
+    const prompt = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
+      const sql = st.storage.sql;
+      sql.exec("UPDATE kv SET value = '6' WHERE key = 'seed_version'");
+      sql.exec("UPDATE capabilities SET body = ? WHERE name = 'spawning'", JSON.stringify({ ...SEED_CATALOG.capabilities.spawning!, prompt: edited }));
+      new CatalogDO(st, env as never);
+      return (JSON.parse(sql.exec<{ body: string }>("SELECT body FROM capabilities WHERE name = 'spawning'").one().body) as { prompt: string }).prompt;
+    });
+    expect(prompt).toBe(edited);
+  });
+
+  it("an agent whose stored spec names the channel tools and grants still starts; its runner isn't offered them, and calling one is an unknown tool", async () => {
+    const s = await cellWithSandbox();
+    const a = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false } }, 201);
+    const grants = [{ action: "post", channel: "user" }];
+    await editAgent(a.agent, (i) => {
+      i.tools = [...i.tools, "post", "read", "message"];
+      i.channel_grants = grants;
+    });
+    await agentStub(a.agent).start();
+    await nextCommands(s.brain.ws, isStartOf(a.agent));
+    const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
+    const names = (await toolNames(ws)).map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(["notify", "checkpoint"]));
+    expect(names.filter((n) => ["post", "read", "message"].includes(n))).toEqual([]);
+    ws.send({ type: "tool_call", seq: 1, call: "cal_post", turn: "trn_x", name: "post", arguments: { channel: "user", text: "hi" } });
+    const outcome = (await ws.next("tool_result", (m) => m.call === "cal_post")).outcome;
+    expect(outcome).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
+    // The stored grants stay in its record, for a rollback to read.
+    const stored = await runInDurableObject(agentStub(a.agent), (_i: AgentDO, st) =>
+      JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
+    expect(stored.channel_grants).toEqual(grants);
+  });
+
+  it("an agent's queued event posts and its channel subscriptions are left for a rollback; their deadline no longer runs", async () => {
+    const s = await cellWithSandbox();
+    const a = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false } }, 201);
+    // As the previous release left it: an unposted event and a subscription, the outbox's deadline due.
+    await runInDurableObject(agentStub(a.agent), (_i: AgentDO, st) => {
+      const sql = st.storage.sql;
+      sql.exec(`CREATE TABLE chan_out (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL, tainted INTEGER NOT NULL,
+        agent_owner TEXT, has_owner INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, refusals INTEGER NOT NULL DEFAULT 0)`);
+      sql.exec("INSERT INTO chan_out (channel, body, tainted, created_ms) VALUES (?, '{}', 0, 1)", `${a.agent}/events`);
+      sql.exec("CREATE TABLE channel_subs (channel TEXT NOT NULL, sub TEXT NOT NULL, hw INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0)");
+      sql.exec("INSERT INTO channel_subs (channel, sub, created_ms) VALUES ('team/x', 'sub_1', 1)");
+      sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('chan_out', 0)");
+    });
+    await runDue(agentStub(a.agent));
+    const left = await runInDurableObject(agentStub(a.agent), (_i: AgentDO, st) => ({
+      deadline: st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'chan_out'").toArray().length,
+      out: st.storage.sql.exec("SELECT channel FROM chan_out").toArray().length,
+      subs: st.storage.sql.exec("SELECT sub FROM channel_subs").toArray().length,
+    }));
+    expect(left).toEqual({ deadline: 0, out: 1, subs: 1 });
+    expect((await agentStub(a.agent).lifetimeFacts())).not.toHaveProperty("subscriptions");
+  });
+
+  it("the stub channel leaves the previous release's rows alone and keeps an alarm while it has deadlines, so a rollback's alarm still comes", async () => {
+    const channel = (name: string) => env.CHANNEL.get(env.CHANNEL.idFromName(name));
+    // A channel as the previous release left it: an undelivered message, its subscription and the fan-out deadline, alarm armed.
+    const old = channel(`team/${uniqueName("old")}`);
+    await runInDurableObject(old, async (_i: ChannelDO, st) => {
+      st.storage.sql.exec("CREATE TABLE deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
+      st.storage.sql.exec("CREATE TABLE subs (id TEXT PRIMARY KEY, agent TEXT NOT NULL, body TEXT NOT NULL)");
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('fanout', 1)");
+      st.storage.sql.exec("INSERT INTO subs (id, agent, body) VALUES ('sub_1', 'agt_x', '{}')");
+      await st.storage.setAlarm(Date.now() + 60_000);
+    });
+    const before = Date.now();
+    expect(await runDurableObjectAlarm(old)).toBe(true);
+    await runInDurableObject(old, async (_i: ChannelDO, st) => {
+      expect(await st.storage.getAlarm()).toBeGreaterThanOrEqual(before + CHANNEL_ALARM_MS);
+      expect(st.storage.sql.exec("SELECT key, at FROM deadlines").toArray()).toEqual([{ key: "fanout", at: 1 }]);
+      expect(st.storage.sql.exec("SELECT id FROM subs").toArray()).toEqual([{ id: "sub_1" }]);
+    });
+    // One with no deadlines left, or none stored at all, is left with no alarm.
+    for (const table of [true, false]) {
+      const empty = channel(`team/${uniqueName("empty")}`);
+      await runInDurableObject(empty, async (_i: ChannelDO, st) => {
+        if (table) st.storage.sql.exec("CREATE TABLE deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
+        await st.storage.setAlarm(Date.now() + 60_000);
+      });
+      expect(await runDurableObjectAlarm(empty)).toBe(true);
+      expect(await runInDurableObject(empty, (_i: ChannelDO, st) => st.storage.getAlarm()), `deadlines table: ${table}`).toBeNull();
+    }
   });
 });

@@ -208,8 +208,6 @@ export interface LifetimeAgentView {
   stopped_by_operator: boolean;
   /** Agents it spawned that haven't ended. */
   live_children: string[];
-  /** Channel subscriptions still open (a post to one would wake it). */
-  subscriptions: number;
   ended_ms: number | null;
   ended_reason: string | null;
   /** Where it was read: the cell's agent registry, or (once its records are gone) attached to a listed sandbox. */

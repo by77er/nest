@@ -1,7 +1,7 @@
-// WorkstreamDO: the interim workstream channel, one per workstream label, until channels (ChannelDO)
-// exist (docs/orchestration/workstreams/#the-interim-workstream-channel). A log of events with one
-// subscriber, woken with batches of decision events, and the user-notification queue. It knows no
-// roles: its subscriber is whichever agent subscribed.
+// WorkstreamDO: one per workstream label, until stage 3 of the microkernel removal takes it out of the
+// platform (docs/orchestration/workstreams/). A log of events with one subscriber, woken with batches
+// of decision events, and the user-notification queue. It knows no roles: its subscriber is whichever
+// agent subscribed.
 import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { z } from "zod";

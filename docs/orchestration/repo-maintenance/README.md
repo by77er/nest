@@ -6,19 +6,19 @@ Agents maintaining a code repository: they pick up work, change code, review eac
 
 | Agent | Template | Lifetime | Capabilities |
 |---|---|---|---|
-| **Maintainer** | `maintainer` (a [captain](../captains/) plus GitHub) | Long-lived, no hands | channels, messaging{tree}, spawning{budget}, sandboxes, authority, memory, schedules, hooks, `github_ro`, brokered{`github.create_issue`, `github.comment`} |
-| **Worker** | `worker` | One task, until its PR merges or closes | hands on a fork of the repo sandbox, with a GitHub binding injected; messaging{tree}, `github_ro`, brokered{`github.create_pr`}. **No `web`.** |
+| **Maintainer** | `maintainer` (a [captain](../captains/) plus GitHub) | Long-lived, no hands | coordination, spawning{budget}, sandboxes, authority, memory, schedules, `github_ro`, brokered{`github.create_issue`, `github.comment`} |
+| **Worker** | `worker` | One task, until its PR merges or closes | hands on a fork of the repo sandbox, with a GitHub binding injected; coordination, `github_ro`, brokered{`github.create_pr`}. **No `web`.** |
 | **Reviewer** | `reviewer` | One PR head, fresh session | hands on a fork at the PR head, `github_ro`, brokered{`github.review_check`, `github.review_comment`} |
-| **Monitor** | `monitor` | Long-lived, no hands | what it watches (e.g. `metrics`, or the deployed app's metrics API as an `api` capability), channels, messaging{tree}, memory, schedules, `github_ro`, brokered{`github.dispatch_workflow{<rollback>}`, `github.create_issue`} |
+| **Monitor** | `monitor` | Long-lived, no hands | what it watches (e.g. `metrics`, or the deployed app's metrics API as an `api` capability), coordination, memory, schedules, `github_ro`, brokered{`github.dispatch_workflow{<rollback>}`, `github.create_issue`} |
 
 I spawn the maintainer and the monitor; the maintainer spawns workers and reviewers. GitHub access is a GitHub App whose tokens [BrokerDO](../../control-plane/durable-objects/broker/) narrows per binding: workers can push and open PRs, only reviewers can post the review check, and only the maintainer and monitor can file issues and dispatch workflows.
 
-## Channels
+## GitHub events
 
-- **`repo/<name>/github`:** the App's webhook [hook](../../channels/sources/) posts every event here as `github.<event>`, keyed by branch (`ref/<branch>`) when the event has one.
-- **The maintainer** subscribes to it, batched, for issues, PR opens, updates and closes, and `deployment_status`.
-- **Each worker** subscribes to its own branch's events (`keys: [ref/<branch>]`), so it sleeps at no cost while CI runs.
-- **The monitor** subscribes to `deployment_status` and schedules its own checks with `wake_at`.
+The App's webhooks reach agents through the coordination integration ([principle 9](../../README.md#principles)), which delivers each event, tainted, to the inboxes that asked for it:
+- **The maintainer:** issues, PR opens, updates and closes, and `deployment_status`, batched.
+- **Each worker:** its own branch's events only, so it sleeps at no cost while CI runs.
+- **The monitor:** `deployment_status`; it schedules its own checks with `wake_at`.
 
 ## The loop
 
@@ -45,7 +45,7 @@ Agents change the code, so the checks on their changes must be the repo's, enfor
 - The [captain conventions](../captains/#conventions-in-its-prompt) apply: one worker per task, one writer per sandbox, parallel workers only on independent areas, and every spawn prompt says when the work is done.
 - **The reviewer is never the author.** It's a separate agent with a clean context, because agents grade their own work too kindly.
 - **Small PRs:** one concern each, so a review and a revert are both cheap.
-- **What goes to me** (`user`):
+- **What goes to me:**
   - dependency additions;
   - changes that can't be rolled back;
   - a task that fails review three times;

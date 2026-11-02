@@ -17,7 +17,7 @@ One App, owned by me and installed only on `by77er/nest`.
 | Deployments: read | See deploy outcomes and the pause |
 | Metadata: read | Required |
 
-- **Webhook:** the App's one webhook points at a [hook](../docs/channels/sources/), with the secret shown to me once. Events: `pull_request`, `pull_request_review`, `pull_request_review_comment`, `issues`, `issue_comment`, `check_run`, `check_suite`, `workflow_run`, `push`, `deployment_status`. It covers every repo the App is installed on, so no per-repo webhook permission is needed.
+- **Webhook:** the App's one webhook points at the coordination integration that delivers GitHub events to agents ([principle 9](../docs/README.md#principles); not built), with the secret shown to me once. Events: `pull_request`, `pull_request_review`, `pull_request_review_comment`, `issues`, `issue_comment`, `check_run`, `check_suite`, `workflow_run`, `push`, `deployment_status`. It covers every repo the App is installed on, so no per-repo webhook permission is needed.
 - **No Administration permission:** the App can't change branch protection, environments or secrets.
 - **Commits** are authored as the App's bot user, so history shows which changes agents made.
 

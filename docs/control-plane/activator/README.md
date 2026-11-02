@@ -12,8 +12,6 @@ turn for agent A → AgentDO: no brain running → agent_start on a brain host w
   no capacity           → stays unplaced while FleetDO launches a sandbox host; its alarm claims again every 30 s
 ```
 
-**External events:** a webhook posts to a channel, and a subscriber's wake starts its brain, which resumes its sandbox if it has one. Nothing runs between events. See [sources](../../channels/sources/).
-
 **Brains:** a turn for an agent whose brain isn't running (it went idle, crashed or lost its host) starts one, resumed or fresh per the [continuity](../../agents/#continuity) rule. See [AgentDO](../durable-objects/agent/).
 
 **Previews:** a request to `<port>-<sandbox>-preview-nest.<zone>` for a paused or suspended sandbox is **held** at the Worker or the sandbox host's [gateway](../../sandbox/gateway/) while the sandbox resumes. Waiting doesn't use CPU time. While the response is in flight it's an ingress guard, so the sandbox can't be paused under it ([idle rule](../durable-objects/sandbox/#activity-and-idle)).

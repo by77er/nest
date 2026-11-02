@@ -24,7 +24,6 @@ export interface AgentFacts {
   last_turn_ms: number | null;
   stopped_by_operator: boolean;
   live_children: string[];
-  subscriptions: number;
   ended: { ms: number; reason: string; done_ms: number | null } | null;
 }
 

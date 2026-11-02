@@ -45,7 +45,7 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 ## Rules
 
-- **Agents can ask for more access.** A denial comes back as a 403 with a readable reason. The agent posts a question to its escalation channel; I, or an untainted holder of `egress_policy` on the sandbox (its owner or a captain), can approve, and the rule is added live, optionally with an expiry.
+- **Agents can ask for more access.** A denial comes back as a 403 with a readable reason. The agent asks for it (`egress_policy`, a sink); I, or an untainted holder of `egress_policy` on the sandbox (its owner or a captain), can approve, and the rule is added live, optionally with an expiry.
 - **Built: `egress_policy` on the agent's own bound sandbox** (the `egress` capability). No arguments: the effective policy. `allow: [{host, ports?}]` with `ttl_s` (60 s to 24 h, default 1 h) adds expiring grants (the `grants` layer, one policy version per call, ids derived from the call key so a re-run adds nothing). Widening is a [sink](../../../../agents/tools/#taint-and-sinks): from a tainted session it waits for my approval of that exact request (always `approve`; any agent with hands is tainted, so in practice every widening). `revoke: [host]` drops that host's temporary grants and is never gated. Hosts are DNS names or `*.` and one, lowercased; no IP literals. Approving an untainted holder's answer, method and path rules, and the `sandbox` layer by an owner (only the operator's `PUT /v1/sandboxes/:id/policy` sets it) aren't built.
 - **Inspected hosts can carry method and path rules** (e.g. `GET` only, or `/repos/me/*`), since the proxy already decrypts them. Vercel's sandbox firewall offers the same matchers ([docs](https://vercel.com/docs/vercel-sandbox/concepts/firewall)); its plain allow rules match SNI only, while nest-proxy also requires Host to equal SNI.
 - **Passthrough is SNI-only.** The proxy can't see `Host` inside a spliced connection, so a passthrough host on a shared CDN allows fronting to anything on that CDN that accepts a `Host` different from the SNI. Use it only for pinned clients that need it.
@@ -107,7 +107,7 @@ The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` throu
 
 ## Audit
 
-- **Every connection or request is logged** with sandbox, agent (if known), entry point (`via`), SNI/host, method, path (no query string), status, bytes, the decision, and the *name* of any binding used (never its value). Records are batched through nestd to the control plane and written to R2. Denials and alerts are also posted to the sandbox's `events` channel.
+- **Every connection or request is logged** with sandbox, agent (if known), entry point (`via`), SNI/host, method, path (no query string), status, bytes, the decision, and the *name* of any binding used (never its value). Records are batched through nestd to the control plane and written to R2.
 - **Deny and alert records are aggregated per sandbox,** so a guest can't flood nestd, the control plane or its subscribers:
   - one record per distinct `(host, port, reason)` per minute, at most 128 distinct ones per minute
   - one alert per distinct `(kind, host, binding)` per minute, at most 32 per minute

@@ -30,21 +30,21 @@ python3 -I dev/cloud-checks/brain_hosts_check.py
 
 ## `stress.py`
 
-A stress test of a cell: the control plane alone, then many agents and sandboxes at once, timed phase by phase, with the fleet view sampled throughout so a cell's limits can be read afterwards.
+A stress test of a cell: many sandboxes and agents at once, timed phase by phase, with the fleet view sampled throughout so a cell's limits can be read afterwards.
 
 ```bash
-STRESS_AGENTS=50 python3 -I dev/cloud-checks/stress.py      # STRESS_HANDS=0: brains and channels only
+STRESS_AGENTS=50 python3 -I dev/cloud-checks/stress.py      # STRESS_HANDS=0: brains only
 ```
 
 | | |
 |---|---|
-| **Phases** (`STRESS_PHASES`) | `flood`: `FLOOD_POSTERS` concurrent operator posters × `FLOOD_POSTS` to one channel (latency percentiles, errors). `sandboxes`: `STRESS_AGENTS` sandboxes at once (placement and host launches). `ring`: one `stress` agent per sandbox (Haiku; `STRESS_MODEL`), each posting a ping to `stress/<run>` that mentions the next and woken by the one that mentions it (a `once` subscription) to post a pong. `idle`: until every brain has exited. `cleanup`: stop and destroy, then watch until no host is live (`STRESS_DRAIN_S`) |
-| **Creates** | one workstream; the sandboxes and agents; the `stress` template and `stress-chat` capability (kept, for reruns); channels `stress/<run>` and `stress/<run>/flood` (no delete route) |
+| **Phases** (`STRESS_PHASES`) | `sandboxes`: `STRESS_AGENTS` sandboxes at once (placement and host launches). `turns`: one `stress` agent per sandbox (Haiku; `STRESS_MODEL`), each given one turn that runs `hostname` through hands and replies (time to every turn done). `idle`: until every brain has exited. `cleanup`: stop and destroy, then watch until no host is live (`STRESS_DRAIN_S`) |
+| **Creates** | one workstream; the sandboxes and agents; the `stress` template (kept, for reruns) |
 | **Records** | `STRESS_OUT` (JSONL): every `STRESS_SAMPLE_S` the fleet (hosts by kind, brains and sandboxes per host, each host's free memory, open launches), and the phase marks with their timings |
 | **Cleans up** | stops every agent and destroys every sandbox on every exit path (interrupt it with SIGINT, not SIGTERM); the last line is the JSON of the ids it made |
-| **Costs** | at 50 agents on `use1`: about $0.20 of spot EC2 for a run, plus two short Haiku turns per agent on the subscription |
+| **Costs** | at 50 agents on `use1`: about $0.20 of spot EC2 for a run, plus one short Haiku turn per agent on the subscription |
 
-**First run (2026-10-31, `use1`, caps raised by #54):** the findings are in [the stress test notes](stress-2026-10-31.md).
+**First run (2026-10-31, `use1`, caps raised by #54; with the channel phases since removed):** the findings are in [the stress test notes](stress-2026-10-31.md).
 
 ## `mcp_check.py`
 
@@ -61,7 +61,7 @@ python3 -I dev/cloud-checks/mcp_check.py      # MCP_DRAIN_S=2700: also watch the
 |---|---|
 | **Settings** | `NEST_ADMIN_TOKEN`, `MCP_TEST_URL` (the server's `/mcp` URL), `MCP_TEST_TOKEN` (all required; no token is printed), `NEST_BASE_URL` (default `https://nest.bitcru.sh`), `NEST_CELL` (`use1`), `MCP_AGENTS` (2), `MCP_MODEL` (`haiku`), `MCP_TIMEOUT_S` (1200, for the turns), `MCP_IDLE_S` (900, for the brains to exit), `MCP_DRAIN_S` (0: not watched), `MCP_OUT` (`mcp-check-<run>.jsonl`: the marks, every logged call and each agent's checks and reply) |
 | **Creates** | `POST /reset` on the server first; the server's token in BrokerDO as `cap:mcp-check`; the capability `mcp-check` (`mcp{url: MCP_TEST_URL, auth: cap:mcp-check}`, untrusted, all five tools allowed, `idempotent` stating every tool so only `note_put` is idempotent, `read_only: [echo, note_get, slow]` so `note_put` and `counter_add` are [sinks](../../docs/agents/capabilities/mcp/#sinks)) and the template `mcp-check` (`nest`, `mcp-check`; hands forbidden, so no sandbox; `MCP_MODEL`); one workstream (an agent without a sandbox still needs one); `MCP_AGENTS` agents created with `start: false`, each sent one turn (which wakes it): `echo` a phrase holding its id, `note_put` key `<agent>/k` = a random value, `note_get` it, `counter_add` name `<agent>` by 1 twice, then reply with what it got. In a cold cell, the autoscaler launches a brain host (spot EC2) |
-| **Passes when** | every turn is `done` with no approval unanswered (the check approves every sink call but `counter_add` with n 100, which it denies); no more of an agent's sink calls reach the server than it had approvals, and the denied one never does; every call in the server's log names one of the run's agents in `_meta`; per agent: every call's `_meta` has `nest/agent` = the agent, `nest/epoch` = an epoch its brain was seen with (polled while the turn ran, plus its last `agent_epoch`), `nest/call` starting `<agent>/<that epoch>/` and `nest/taint` true; epochs never go back in log order; no call key reaches the server twice (bar one retry of `note_put`, the idempotent tool); `echo` answered with its id; `note_get` returned the value `note_put` stored; the counter is exactly 2 (two `counter_add` of 1, totals 1 then 2); the session is tainted, as its `turn_completed` event on `<agent>/events` records (the agent's record exposes no taint field); every brain then idle-exits with no turn queued or active, within `MCP_IDLE_S`; after cleanup no brain of the run is on any host; with `MCP_DRAIN_S` set, no host of the cell is live within it. Whether the reply names the value is logged, not checked (the model's words) |
+| **Passes when** | every turn is `done` with no approval unanswered (the check approves every sink call but `counter_add` with n 100, which it denies); no more of an agent's sink calls reach the server than it had approvals, and the denied one never does; every call in the server's log names one of the run's agents in `_meta`; per agent: every call's `_meta` has `nest/agent` = the agent, `nest/epoch` = an epoch its brain was seen with (polled while the turn ran, plus its last `agent_epoch`), `nest/call` starting `<agent>/<that epoch>/` and `nest/taint` true; epochs never go back in log order; no call key reaches the server twice (bar one retry of `note_put`, the idempotent tool); `echo` answered with its id; `note_get` returned the value `note_put` stored; the counter is exactly 2 (two `counter_add` of 1, totals 1 then 2); every brain then idle-exits with no turn queued or active, within `MCP_IDLE_S`; after cleanup no brain of the run is on any host; with `MCP_DRAIN_S` set, no host of the cell is live within it. Whether the reply (the last assistant text in its transcript) names the value is logged, not checked (the model's words) |
 | **Exit** | 0 on PASS, 1 on FAIL. The last line is the JSON of the run, capability, template, workstream and agent ids |
 | **Cleans up** | stops every agent on every exit path, SIGINT and SIGTERM included |
 | **Leaves** | the server's state (notes, counters, call log: `POST /reset` clears it); the capability, its secret and the template (kept for reruns: a rerun overwrites them); the workstream and the stopped agents' records; the brain host it caused to launch, which retires after the cell's idle grace |
@@ -141,7 +141,7 @@ python3 -I dev/cloud-checks/lifecycle_check.py
 | | |
 |---|---|
 | **Creates** | the capability `lcspawn` (`agent_spawn`, `agent_stop`; spawns `lc-child`), the templates `lc-child` (`nest`, `hands`; Haiku) and `lc-parent` (`nest`, `lcspawn`; no hands); one workstream and the parent; through the parent, an ephemeral child on a new sandbox that runs `echo lifetimes-check-ok`, then a second, non-ephemeral child on a new sandbox |
-| **Passes when** | the first child is the parent's, ends itself (`done`, by itself) once its turn finishes, its events show its output and `exited`, its sandbox is `destroyed` and the GC registry's live count returns to where it was, the parent's `children` index has it ended, and a turn to it is refused (404); the parent's `agent_stop` ends the second child (by the parent), destroys its sandbox and leaves it no brain; the operator's `stop {end: true}` ends the parent and its brain goes |
+| **Passes when** | the first child is the parent's, ends itself (`done`, by itself) once its turn finishes, its transcript shows its output, its sandbox is `destroyed` and the GC registry's live count returns to where it was, the parent's `children` index has it ended, and a turn to it is refused (404); the parent's `agent_stop` ends the second child (by the parent), destroys its sandbox and leaves it no brain; the operator's `stop {end: true}` ends the parent and its brain goes |
 | **Cleans up** | on every exit path: ends the parent (which ends its children) and destroys any sandbox of the run not yet destroyed |
 | **Leaves** | the capability and templates (kept for reruns), the workstream, and the ended agents' records, which prune themselves 30 days after they end |
 | **Costs** | a few minutes of a spot sandbox host and brain host from a cold cell, and four short Haiku turns |

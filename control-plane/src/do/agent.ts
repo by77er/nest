@@ -9,16 +9,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
-import {
-  type Caller, type ChannelDelivery, clip, type DeliveryOutcome, envelopeText, EVENT_TEXT_BYTES, Filter,
-  parseChannel, type PostInput, sessionTaint, SubscribeInput, takeBatch,
-} from "../lib/channels";
-import { admitDelivery, channelRequestId, inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
-import type { ReadResult } from "./channel";
-import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
+import { inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
-import { approves, argsDigest, gated, type SinkCall } from "../lib/sinks";
+import { approves, argsDigest, gated, sessionTaint, type SinkCall } from "../lib/sinks";
 import {
   actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
   type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, secretKinds, stringsOf,
@@ -33,7 +27,7 @@ import {
   spawnRefusal,
 } from "../lib/lifetimes";
 import { signBlobUrl } from "../lib/tokens";
-import { asNestError, b64ToBytes, concatBytes, errorBody, keyedId, NestError, newId } from "../lib/util";
+import { asNestError, b64ToBytes, clip, concatBytes, errorBody, keyedId, NestError, newId } from "../lib/util";
 import type { EgressPolicy } from "../protocol/model";
 import { addColumn, storedEnum } from "../lib/stored";
 import { askRoute, CallLedger } from "../lib/calls";
@@ -78,8 +72,6 @@ const WAKE_RETRY_MS = 30_000;
 /** `hands_resolved{error}` hint when the sandbox isn't ready: how long the runner waits before asking again. */
 const HANDS_RETRY_MS = 2_000;
 const RETENTION_MS = 7 * 86_400_000;
-/** How long an owner without `read` is remembered as such. */
-const OWNER_READS_NO_MS = 10 * 60_000;
 
 const PRUNE_EVERY_MS = 3_600_000;
 /** read_transcript: entries per call by default / at most, and a response size cap. */
@@ -150,7 +142,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | typeof OUTBOX_DEADLINE;
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry";
 /** A `sync` ask's window: `ask:<ask id>`. */
 const ASK_DEADLINE = "ask:";
 /** An approved sink call may be made once within this long. */
@@ -289,12 +281,6 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
-    // This agent's channel subscriptions, with each one's delivery high-water seq (dedup).
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS channel_subs (channel TEXT NOT NULL, sub TEXT NOT NULL, hw INTEGER NOT NULL DEFAULT 0,
-      created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (channel, sub))`);
-    // Notices taken without delivery (no `read` tool): how many, and up to which seq.
-    addColumn(this.sql, "channel_subs", "skipped", "INTEGER NOT NULL DEFAULT 0");
-    addColumn(this.sql, "channel_subs", "skipped_to", "INTEGER");
     // The agents it spawned (an index: each child's `owner` decides), and whether each has ended.
     this.sql.exec("CREATE TABLE IF NOT EXISTS children (agent TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0)");
     // Its end was asked for (`ended` comes with the child's `childEnded`, once its end is done).
@@ -311,11 +297,8 @@ export class AgentDO extends DurableObject<Env> {
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
     });
     this.journal = new BrokeredJournal(this.sql);
-    this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.load().agent,
-      async (owner) => ({ spawner_reads: await this.ownerReads(owner) }));
   }
 
-  private readonly outbox!: ChannelOutbox;
   private readonly queue!: TurnQueue;
   private readonly calls!: CallLedger;
   /** The client of its mcp capabilities' servers (docs/agents/capabilities/mcp/). */
@@ -363,8 +346,6 @@ export class AgentDO extends DurableObject<Env> {
       ...rest,
       ...spec,
       escalate_to: storedEnum(EscalateTo, (spec ?? rest).escalate_to, "kv.info.escalate_to"),
-      // Stored before channels: no channel grants (only the built-in rules apply).
-      channel_grants: (spec ?? rest).channel_grants ?? [],
       owner: info.owner !== undefined ? info.owner : captain ?? null,
       brain,
       intent: info.intent ?? null,
@@ -902,8 +883,7 @@ export class AgentDO extends DurableObject<Env> {
       }
     });
     if (!d) return false;
-    const { wakes, next } = d as NonNullable<typeof d>;
-    this.reportExit(info, host, epoch, reason, !wakes);
+    const { next } = d as NonNullable<typeof d>;
     // An ended agent's remaining steps (its sandbox, its owner) wait for this release.
     const armed = Promise.all([this.armPhase(null), next ? this.deadlines.set(next, Date.now(), true) : undefined,
       info.ended && !info.ended.done_ms ? this.deadlines.set("end", Date.now(), true) : undefined]);
@@ -943,8 +923,8 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * An ended agent takes no more `what`. As a recipient (turns, messages) it is gone, `unknown_agent`
-   * (404), which every sender already reads as "drop it" (a channel subscription or a
-   * workstream wake); a start or a spawn it would make is refused (409).
+   * (404), which every sender already reads as "drop it" (a workstream wake); a start or a spawn it
+   * would make is refused (409).
    */
   private refuseEnded(info: AgentInfo, what: "turns" | "messages" | "starts" | "spawns"): void {
     if (!info.ended) return;
@@ -973,15 +953,7 @@ export class AgentDO extends DurableObject<Env> {
       dropped = this.queue.dropAll(i.brain ? null : i.current_turn);
       if (!i.brain) i.current_turn = null;
     });
-    const armed = Promise.all([this.deadlines.clear("intent"), this.deadlines.clear("wake"), this.deadlines.clear("wake_after_exit"), this.deadlines.set("end", now)]);
-    // With no brain there is no release to report its exit: reported here, once.
-    if (!info.brain) {
-      this.report(info, {
-        kind: "exited", text: this.kvGet<string>("last_text") || `ended (${o.reason})`,
-        data: { reason: "stopped", ended: o.reason, by: o.by, ...(ended.note ? { note: ended.note } : {}) }, idem_key: `${info.agent}/ended`,
-      }, this.tainted(info));
-    }
-    await armed;
+    await Promise.all([this.deadlines.clear("intent"), this.deadlines.clear("wake"), this.deadlines.clear("wake_after_exit"), this.deadlines.set("end", now)]);
     console.log(`agent ${info.agent}: ended (${o.reason}) by ${o.by}${dropped ? `; ${dropped} turns dropped` : ""}`);
     if (before.intent !== null) await this.brainWaitEnded(info);
     await this.endBrain();
@@ -1094,7 +1066,6 @@ export class AgentDO extends DurableObject<Env> {
       last_turn_ms: this.queue.lastTurnMs() || null,
       stopped_by_operator: !e && quietSinceStop(info),
       live_children: this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0 ORDER BY created_ms").toArray().map((r) => r.agent),
-      subscriptions: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM channel_subs WHERE ended = 0").one().n,
       ended: e ? { ms: e.ms, reason: e.reason, done_ms: e.done_ms ?? null } : null,
     };
   }
@@ -1933,7 +1904,6 @@ export class AgentDO extends DurableObject<Env> {
           break;
       }
     });
-    this.reportEvent(info, ev, completed, stale);
     // The emptied mirror goes before any later `run_turn` (one may start while this awaits): a requeued
     // message must not be shown again from the runner's old cache.
     if (completed) this.pushCache();
@@ -2083,7 +2053,7 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Channels (docs/channels/): deliveries in, as any other input, and `<agt>/events` out.
+  // Taint and remote MCP tool lists
   // ---------------------------------------------------------------------------------------------
 
   private kvGet<T>(key: string): T | undefined {
@@ -2145,227 +2115,6 @@ export class AgentDO extends DurableObject<Env> {
   /** `tools_changed`, to a runner that said it acts on it (an older one lists again at its next start). */
   private sendToolsChanged(ws: WebSocket): void {
     if ((ws.deserializeAttachment() as Attachment).tools_changed) this.send(ws, { type: "tools_changed" });
-  }
-
-  /** This agent as a channel caller, from its own record, never from a tool's arguments. */
-  private channelCaller(info: AgentInfo): Caller {
-    return { principal: info.agent, owner: info.owner, sandbox: info.hands?.sandbox ?? null, grants: info.channel_grants, tainted: this.tainted(info) };
-  }
-
-  /** For an agent's built-in channel, that agent's owner and whether it reads (for `{child}` grants and a spawner's read). */
-  private async channelFacts(info: AgentInfo, channel: string): Promise<{ agent_owner?: string | null; target_reads?: boolean }> {
-    const k = parseChannel(channel);
-    if (!k.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, k.error);
-    if (k.value.kind !== "inbox" && k.value.kind !== "events") return {};
-    if (k.value.agent === info.agent) return { agent_owner: info.owner, target_reads: info.tools.includes("read") };
-    const other = await this.env.AGENT.get(this.env.AGENT.idFromName(k.value.agent)).info();
-    return { agent_owner: other.owner, target_reads: other.tools.includes("read") };
-  }
-
-  private channelStub(name: string) {
-    return this.env.CHANNEL.get(this.env.CHANNEL.idFromName(name));
-  }
-
-  /** Queue a post on `<agt>/events` (synchronous; posted from the alarm). Model text carries the session's taint. */
-  private report(info: AgentInfo, post: PostInput, tainted = false): void {
-    this.outbox.push(`${info.agent}/events`, post, { tainted, agent_owner: info.owner });
-  }
-
-  /** A runner event's report, idempotent per lineage and event. A finished turn's state change (`stale`) changed nothing. */
-  private reportEvent(info: AgentInfo, ev: AgentEvent, completed: boolean, stale: boolean): void {
-    const idem_key = `${info.agent}/ev/${info.runner_instance ?? ""}/${ev.seq}`;
-    if (ev.type === "assistant_text") {
-      this.kvPut("last_text", clip(ev.text, EVENT_TEXT_BYTES));
-    } else if (ev.type === "turn_started") {
-      // A turn without text of its own never reports the previous turn's.
-      this.kvPut("last_text", "");
-    } else if (ev.type === "state_changed" && !stale) {
-      this.report(info, { kind: "state_changed", text: `state: ${ev.state}`, data: { state: ev.state, epoch: ev.epoch }, idem_key });
-    } else if (ev.type === "turn_completed" && completed) {
-      this.report(info, {
-        kind: "turn_completed", text: this.kvGet<string>("last_text") || `turn ${ev.turn} completed (${ev.stop_reason})`,
-        data: { turn: ev.turn, stop_reason: ev.stop_reason, ...(ev.usage ? { usage: ev.usage } : {}) }, idem_key,
-      }, this.tainted(info));
-    } else if (ev.type === "escalation") {
-      this.report(info, { kind: "escalation", text: `asked to approve ${ev.tool} (request ${ev.call})`, idem_key });
-    } else if (ev.type === "rate_limited") {
-      this.report(info, { kind: "quota_parked", text: "parked by a rate limit", idem_key });
-    }
-  }
-
-  /**
-   * A brain release's report: `exited` (with the last text) when the agent stopped (nothing restarts
-   * and no start is wanted); else `brain_released`, housekeeping outside the spawner's default filter.
-   */
-  private reportExit(info: AgentInfo, host: string, epoch: number, reason: AgentExitReason, ends: boolean): void {
-    const idem_key = `${info.agent}/exit/${host}/${epoch}`;
-    if (ends && !info.intent) {
-      const ended = info.ended ? { ended: info.ended.reason, by: info.ended.by } : {};
-      this.report(info, { kind: "exited", text: this.kvGet<string>("last_text") || `stopped (${reason})`, data: { reason, epoch, host, ...ended }, idem_key },
-        this.tainted(info));
-    } else {
-      this.report(info, { kind: "brain_released", text: `brain released (${reason})`, data: { reason, epoch, host }, idem_key });
-    }
-  }
-
-  /** Whether `owner`'s spec has the `read` tool (its spec is fixed at spawn, so the answer is kept). */
-  private async ownerReads(owner: string): Promise<boolean> {
-    // A no is kept only for `OWNER_READS_NO_MS`, so a later grant of `read` (stage 2) is seen.
-    const cached = this.kvGet<{ owner: string; reads: boolean; ms?: number }>("owner_reads");
-    if (cached?.owner === owner && (cached.reads || Date.now() - (cached.ms ?? 0) < OWNER_READS_NO_MS)) return cached.reads;
-    let reads = false;
-    try {
-      reads = (await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info()).tools.includes("read");
-    } catch (e) {
-      // An owner that isn't an agent can't read anything; anything else is retried with the row.
-      if (asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
-    }
-    this.kvPut("owner_reads", { owner, reads, ms: Date.now() });
-    return reads;
-  }
-
-  /**
-   * A ChannelDO delivers one subscription's batch (at least once, the same range on every retry),
-   * deduplicated by the high-water seq and admitted as a notice (`admitDelivery`). The high-water
-   * mark and the turn or inbox row are written in one synchronous step.
-   */
-  async deliverChannel(d: ChannelDelivery): Promise<DeliveryOutcome> {
-    const now = Date.now();
-    const info = this.load();
-    // Ended for good: no longer a subscriber, so ChannelDO drops the subscription (as for an id naming nobody).
-    if (info.ended) throw new NestError(ErrorCodes.UNKNOWN_AGENT, `${info.agent} has ended; its subscriptions end with it`, 404);
-    const reads = info.tools.includes("read");
-    const { up_to: upTo, shown, skipped } = takeBatch(d, reads);
-    const ack: DeliveryOutcome = upTo < d.batch.to_seq ? { status: "ok", up_to: upTo } : { status: "ok" };
-    // Deduplicated first: a retry of a batch already taken is acknowledged whatever the guards say.
-    const hw = this.sql.exec<{ hw: number }>("SELECT hw FROM channel_subs WHERE channel = ? AND sub = ?", d.channel, d.subscription).toArray()[0]?.hw;
-    if (hw !== undefined && hw >= upTo) return ack;
-    const take = () => {
-      this.sql.exec(`INSERT INTO channel_subs (channel, sub, hw, created_ms, ended, skipped, skipped_to) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(channel, sub) DO UPDATE SET hw = excluded.hw, ended = excluded.ended, skipped = skipped + excluded.skipped,
-          skipped_to = COALESCE(excluded.skipped_to, skipped_to)`,
-      d.channel, d.subscription, upTo, now, d.batch.ends && upTo >= d.batch.to_seq ? 1 : 0, skipped ? 1 : 0, skipped ? upTo : null);
-    };
-    if (!shown.batch.inline.length && !reads) {
-      take();
-      return ack;
-    }
-    const text = envelopeText(shown, now, this.queue.lastTurnMs(), reads);
-    const requestId = channelRequestId(d.channel, d.subscription, upTo);
-    const admit = admitDelivery({
-      midTurnInbox: !!info.current_turn && d.channel === `${info.agent}/inbox`,
-      load: this.queue.load(now), waiting: this.queue.waitingChannelTurn(), text, now,
-    });
-    if (admit.kind === "defer") return { status: "defer", retry_after_ms: admit.retry_after_ms };
-    // Each admits before its first await; a merge or a queued turn wakes the agent as any input does (Q1/Q6).
-    take();
-    if (admit.kind === "join") {
-      await this.postInbox("platform", text, false, requestId);
-    } else if (admit.kind === "merge") {
-      this.queue.merge(admit.turn, admit.input, now);
-      this.inputArrived();
-      await this.wake();
-    } else {
-      await this.enqueueTurn({ kind: "event_batch", text }, requestId);
-    }
-    return ack;
-  }
-
-  /** This agent's channel subscriptions (display). */
-  async channelSubscriptions(): Promise<{ channel: string; subscription: string; hw: number; ended: boolean; skipped: number; skipped_to: number | null }[]> {
-    return this.sql.exec<{ channel: string; sub: string; hw: number; ended: number; skipped: number; skipped_to: number | null }>(
-      "SELECT channel, sub, hw, ended, skipped, skipped_to FROM channel_subs ORDER BY created_ms")
-      .toArray().map((r) => ({ channel: r.channel, subscription: r.sub, hw: r.hw, ended: r.ended === 1, skipped: r.skipped, skipped_to: r.skipped_to }));
-  }
-
-  /** The channel tools (`channel_create`, `post`, `read`, `subscribe`, `unsubscribe`, `message`). */
-  private async channelTool(info: AgentInfo, name: string, a: Record<string, unknown>, key: string, live: () => Promise<void>): Promise<ToolOutcome> {
-    const json = (text: string, value: unknown): ToolOutcome => ({ status: "ok", content: [{ type: "text", text }, { type: "json", value }] });
-    const caller = this.channelCaller(info);
-    if (name === "message") {
-      const target = String(a.agent);
-      if (!/^agt_[a-z0-9]+$/.test(target)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "agent must be an agent id (agt_...)");
-      if (target === info.agent) throw new NestError(ErrorCodes.INVALID_MESSAGE, "that is you");
-      const channel = `${target}/inbox`;
-      const { target_reads, ...facts } = await this.channelFacts(info, channel);
-      // A message only reaches an agent that can `read` it: refused rather than posted unseen.
-      if (target_reads === false) {
-        throw new NestError(ErrorCodes.INVALID_MESSAGE,
-          `${target} can't read channel messages (its template has no \`read\`): nothing was posted; reach it another way (e.g. notify)`);
-      }
-      const post: PostInput = {
-        text: String(a.text), ...(typeof a.kind === "string" ? { kind: a.kind } : {}), ...(typeof a.reply_to === "number" ? { reply_to: a.reply_to } : {}),
-        idem_key: key,
-      };
-      await live();
-      const r = await this.channelStub(channel).post(channel, this.channelCaller(this.load()), post, facts);
-      if (r.status === "conflict") throw new NestError(ErrorCodes.INVALID_MESSAGE, "unexpected conflict");
-      return json(`Delivered to ${target} (seq ${r.seq}).`, r);
-    }
-    const channel = String(a.channel);
-    const { target_reads: _reads, ...facts } = await this.channelFacts(info, channel);
-    const stub = this.channelStub(channel);
-    switch (name) {
-      case "channel_create": {
-        await live();
-        const r = await stub.create(channel, caller, typeof a.retention_days === "number" ? a.retention_days : undefined);
-        return json(`Channel ${channel} is yours.`, r);
-      }
-      case "post": {
-        const post: PostInput = {
-          text: String(a.text),
-          ...(typeof a.kind === "string" ? { kind: a.kind } : {}), ...(a.data !== undefined ? { data: a.data } : {}),
-          ...(typeof a.reply_to === "number" ? { reply_to: a.reply_to } : {}), ...(typeof a.key === "string" ? { key: a.key } : {}),
-          ...(typeof a.if_seq === "number" ? { if_seq: a.if_seq } : {}), ...(Array.isArray(a.mentions) ? { mentions: a.mentions as string[] } : {}),
-          idem_key: key,
-        };
-        await live();
-        // Taint is read now, after the awaits: a read that tainted the session meanwhile counts.
-        const r = await stub.post(channel, this.channelCaller(this.load()), post, facts);
-        if (r.status === "conflict") {
-          throw new NestError(ErrorCodes.CONFLICT, `conflict: key ${r.key} is at seq ${r.current_seq}, not ${post.if_seq}; read it and try again`, 409);
-        }
-        return json(r.status === "repeat" ? `Not stored: identical to your previous message (seq ${r.seq}).` : `Posted (seq ${r.seq}).`, r);
-      }
-      case "read": {
-        await live();
-        // Typed here: RPC typing drops a result holding `unknown` (a message's `data`).
-        const r = (await stub.read(channel, caller, {
-          ...(typeof a.since === "number" ? { since: a.since } : {}), ...(typeof a.limit === "number" ? { limit: a.limit } : {}),
-          ...(a.latest_by_key === true ? { latest_by_key: true } : {}), ...(typeof a.prefix === "string" ? { prefix: a.prefix } : {}),
-          ...(a.keys_only === true ? { keys_only: true } : {}), ...(typeof a.after_key === "string" ? { after_key: a.after_key } : {}),
-          idem_key: key,
-        }, facts)) as unknown as ReadResult;
-        // Reading tainted content taints the session (sticky; docs/agents/tools/#taint-and-sinks).
-        if (r.tainted) this.kvPut("read_tainted", true);
-        const n = r.messages?.length ?? r.keys?.length ?? 0;
-        return json(`${n} ${r.keys ? "keys" : "messages"} from ${channel} (head ${r.head})${r.more ? "; more remain" : ""}.`, r);
-      }
-      case "subscribe": {
-        const filter = Filter.parse({
-          ...(Array.isArray(a.kinds) ? { kinds: a.kinds } : {}), ...(Array.isArray(a.from) ? { from: a.from } : {}),
-          ...(Array.isArray(a.keys) ? { keys: a.keys } : {}), ...(a.mentions_me === true ? { mentions_me: true } : {}),
-          ...(typeof a.reply_to === "number" ? { reply_to: a.reply_to } : {}),
-        });
-        const input = SubscribeInput.safeParse({
-          filter, ...(typeof a.delivery === "string" ? { delivery: a.delivery } : {}), ...(typeof a.batch_ms === "number" ? { batch_ms: a.batch_ms } : {}),
-          ...(typeof a.once === "boolean" ? { once: a.once } : {}), idem_key: key,
-        });
-        if (!input.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, input.error.issues.map((i) => i.message).join("; "));
-        await live();
-        const s = await stub.subscribe(channel, caller, info.agent, input.data, facts);
-        this.sql.exec("INSERT OR IGNORE INTO channel_subs (channel, sub, hw, created_ms) VALUES (?, ?, 0, ?)", channel, s.id, Date.now());
-        return json(`Subscribed to ${channel} (${s.id}, from seq ${s.cursor}).`, { subscription: s.id, cursor: s.cursor, delivery: s.delivery });
-      }
-      case "unsubscribe": {
-        await live();
-        const r = await stub.unsubscribe(channel, caller, String(a.subscription));
-        this.sql.exec("DELETE FROM channel_subs WHERE channel = ? AND sub = ?", channel, String(a.subscription));
-        return json(r.removed ? "Unsubscribed." : "No such subscription.", r);
-      }
-      default:
-        throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${name} is not implemented yet`, 501);
-    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -2558,13 +2307,6 @@ export class AgentDO extends DurableObject<Env> {
           Number(a.port), false, a.host_header === "preserve" ? "preserve" : "localhost");
         return { status: "ok", content: [{ type: "text", text: r.url }, { type: "json", value: r }] };
       }
-      case "channel_create":
-      case "post":
-      case "read":
-      case "subscribe":
-      case "unsubscribe":
-      case "message":
-        return await this.channelTool(info, name, a, key, live);
       case "agent_spawn":
         return await this.spawnTool(info, a, key, live);
       case "agent_stop": {
@@ -3084,7 +2826,6 @@ export class AgentDO extends DurableObject<Env> {
           console.warn(`agent ${this.load().agent}: running the start intent failed`, e);
         }
       },
-      [OUTBOX_DEADLINE]: () => this.outbox.flush(),
       prune: async () => {
         this.prune();
         await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
@@ -3107,7 +2848,7 @@ export class AgentDO extends DurableObject<Env> {
       const run = handlers[key as AgentDeadline] as (() => Promise<void>) | undefined;
       if (run) await run();
       else console.error(`agent ${this.load().agent}: no handler for deadline ${key}; dropped`);
-    }, 5_000, [OUTBOX_DEADLINE]);
+    });
   }
 
   /** No hello within the start deadline, or no session for `NO_SESSION_MS`: condemned (`unresponsive`). */
@@ -3143,7 +2884,6 @@ export class AgentDO extends DurableObject<Env> {
     this.mcp.prune(cutoff);
     this.journal.prune(cutoff);
     this.queue.prune(cutoff);
-    this.sql.exec("DELETE FROM channel_subs WHERE ended = 1 AND created_ms < ?", cutoff);
   }
 }
 

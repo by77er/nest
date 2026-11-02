@@ -31,6 +31,28 @@ def api(method, path, body=None):
                                        headers={"authorization": f"Bearer {ADMIN}", "content-type": "application/json", "user-agent": "nest-cloud-check/1"}))
 
 
+def assistant_texts(agent):
+    """The text blocks of the agent's assistant messages, in order, from its session transcript (None: no answer)."""
+    texts, since, base = [], 0, None
+    for _ in range(50):
+        s, v = api("GET", f"/v1/agents/{agent}/transcript?since={since}&limit=500" + (f"&base={base}" if base is not None else ""))
+        if s != 200 or not isinstance(v, dict):
+            return None
+        for line in v.get("lines", []):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("type") == "assistant":
+                for b in (e.get("message") or {}).get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                        texts.append(b["text"])
+        if not v.get("more"):
+            return texts
+        since, base = v.get("next_seq", since), v.get("base")
+    return texts
+
+
 def log(m):
     print(time.strftime("%H:%M:%S"), m, flush=True)
 
@@ -108,9 +130,7 @@ try:
             break
         time.sleep(15)
     log(f"turn {st.get(turn)} after {int(time.time() - t0)} s")
-    ch = made["agent"] + "%2Fevents"
-    s, v = api("GET", f"/v1/admin/channels/{ch}/messages?since=0&limit=100")
-    out = ([m.get("text", "") for m in v.get("messages", []) if m.get("kind") == "turn_completed"] or [""])[-1] if s == 200 else ""
+    out = ((assistant_texts(made["agent"]) or [""]))[-1]
     print(out)
     kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l and l.split("=", 1)[0].replace("_", "").isupper())
     nest_gh = app_token(ALLOWED)

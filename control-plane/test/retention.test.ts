@@ -334,14 +334,6 @@ describe("commit records", () => {
 });
 
 async function runSandboxAlarm(sandbox: string, key: string): Promise<void> {
-  // Let the sandbox's `<sbx>/events` posts (queued with its placement, sent from its alarm) drain
-  // first: their alarm would otherwise run the forced deadline below before this does.
-  const end = Date.now() + 10_000;
-  while (await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) =>
-    st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'chan_out' UNION ALL SELECT 1 FROM chan_out").toArray().length > 0)) {
-    if (Date.now() > end) throw new Error("the sandbox's channel outbox didn't drain");
-    await new Promise((r) => setTimeout(r, 50));
-  }
   await runInDurableObject(sandboxStub(sandbox), async (_inst: SandboxDO, st) => {
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES (?, 0)", key);
     await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime

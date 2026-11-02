@@ -8,7 +8,7 @@ A read-only page of what is live in one cell: agents with a brain (template, `st
 - **Typed by a shared contract.** `fleetView`, `images` and `lifetimes` return the types in `protocol/admin/view.ts`, a module that imports nothing, in the contract directory both sides depend on; the page imports them as types only (`src/api.ts`) and never imports the control plane, so its build carries no outside code and a field the page reads but the view lacks fails `npm run typecheck`. A test holds both rules, and the control plane asserts that the view's enums equal its protocol's. `fixtures/admin.ts`, a recorded response, must satisfy the same types. `GET /v1/agents/:agent` is not in that contract, so the page's agent fields (`src/agents.ts`) are unchecked against the control plane: each is read as optional and shown as unknown when absent, and a recorded response in the fixture holds their names. A sandbox row keeps the lease's state (`lease_state`) apart from SandboxDO's own (`sandbox_state`, null with `info_error` when it could not be read).
 - **Reads only.** Operator actions stay with the API and the `nest` CLI; the page shows state and changes none.
 
-**Not built:** per-agent detail (turns, transcripts), channels, cost, a second cell, an agent index (agents without a sandbox, owner or child in view), S3 bytes.
+**Not built:** per-agent detail (turns, transcripts), cost, a second cell, an agent index (agents without a sandbox, owner or child in view), S3 bytes.
 
 ## Abandoned
 
@@ -18,7 +18,7 @@ A read-only page of what is live in one cell: agents with a brain (template, `st
   - **Held:** attached only to agents that will never use it (quiet, stuck ending, ended, or gone). Never dormant, so no TTL takes it: **the real leak**. Listed with its attached agents.
   - Unknown (an attached agent could not be read and none is active), destroyed (SandboxDO destroyed, the registry not marked) and unreadable are listed too. In use (no attached agent but a VM up or a placement in flight, or an attached agent active or recent) is counted.
 - **Agents** (found as below, each read from AgentDO's `lifetimeFacts`):
-  - **Quiet:** not ended, no brain, no start wanted, no turn current or queued, and no turn started for `quiet_ms` (default **a day**, the sandbox TTL's default; one that never had a turn is quiet). Listed with what it holds: its sandbox, its live children, its open channel subscriptions (a post would wake it), and whether the operator's stop is why it is quiet. A quiet agent may be a durable one waiting for input; the view does not guess intent.
+  - **Quiet:** not ended, no brain, no start wanted, no turn current or queued, and no turn started for `quiet_ms` (default **a day**, the sandbox TTL's default; one that never had a turn is quiet). Listed with what it holds: its sandbox, its live children, and whether the operator's stop is why it is quiet. A quiet agent may be a durable one waiting for input; the view does not guess intent.
   - **Ending:** ended, its steps unfinished for over an hour (they retry every minute: stuck). Listed.
   - **Gone:** its records pruned yet a listed sandbox still has it attached. Listed; one named only as an owner is counted.
   - **Ended** (its end done, its records awaiting the 30-day prune) is **noise: counted, not listed**. It holds nothing (its end detached it from its sandbox and ended what it owned), and its prune is already scheduled. Active and recent are counted.

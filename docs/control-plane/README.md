@@ -43,8 +43,8 @@ Hosts upgrade by replacement, brain hosts before sandbox hosts, each kind behind
 
 ## Components
 
-- [durable-objects/](durable-objects/): one DO per entity (fleet, sandbox, agent, channel, hook, broker, catalog)
-- [api/](api/): HTTP API, dashboard, auth, webhook and email routes, user surfaces
+- [durable-objects/](durable-objects/): one DO per entity (fleet, sandbox, agent, broker, catalog, mcp-connector)
+- [api/](api/): HTTP API, dashboard, auth, user surfaces
 - [dashboard/](dashboard/): the read-only page of a cell's hosts, sandboxes, brains and images, a Worker of its own
 - [activator/](activator/): turns "X is needed" into "X is running"
 - [metrics/](metrics/): runtime metrics in Workers Analytics Engine, read through the `metrics` capability

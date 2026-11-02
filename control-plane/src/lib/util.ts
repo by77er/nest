@@ -115,3 +115,18 @@ export async function sha256(data: Uint8Array | string): Promise<Uint8Array> {
 }
 
 export const hex = (bytes: Uint8Array) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+const utf8 = (s: string) => new TextEncoder().encode(s).length;
+
+/** `text` cut to at most `max` UTF-8 bytes (on a character boundary), marked when cut. */
+export function clip(text: string, max: number): string {
+  if (utf8(text) <= max) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (utf8(text.slice(0, mid)) <= max - 3) lo = mid;
+    else hi = mid - 1;
+  }
+  return `${text.slice(0, lo)}…`;
+}

@@ -58,7 +58,7 @@ describe("push allowlists in specs", () => {
   const catalog: Catalog = {
     capabilities: {
       ...SEED_CATALOG.capabilities,
-      gh: { tools: [], rules: [], prompt: "", grants: [], brokered: [{ action: "github.create_pr" }, { action: "github.comment", repos: ["other/repo"] }] },
+      gh: { tools: [], rules: [], prompt: "", brokered: [{ action: "github.create_pr" }, { action: "github.comment", repos: ["other/repo"] }] },
     },
     templates: { coder: { ...SEED_CATALOG.templates.worker!, capabilities: ["nest", "hands", "gh"], repos: ["Me/App", "me/lib"] } },
   };

@@ -1,8 +1,7 @@
 # API and surfaces
 
 - **Worker HTTP API,** authenticated by [operator tokens](#operator-tokens). The read-only [dashboard](../dashboard/) is a Worker of its own behind Cloudflare Access.
-- **External events:** webhooks at `POST /v1/hooks/<hk_…>` and Email Routing to an Email Worker, both turned into channel posts (see [sources](../../channels/sources/)). Agents schedule their own wakes with `wake_at`.
-- **Live views:** live tails and agents' waiting `read`s follow channels (ChannelDO), including each agent's and sandbox's `events`.
+- **External events** (webhooks, email) are external integrations, not platform routes ([principle 9](../../README.md#principles)): one delivers to an agent through its inbox. Agents schedule their own wakes with `wake_at`.
 - **Approvals and escalations** go through the **[Discord bot](discord/)**.
 - **`nest` CLI on my machine:** `login` (the Access service token, and a binding per sandbox from SandboxDO's `resolve`), `attach` (a terminal: a WebSocket to the sandbox host's [gateway](../../sandbox/gateway/), then vsock), `logs -f`, `port-forward` (TCP over the same path), `diff <a> <b>`. The CLI reaches a sandbox the way a brain does, by hostname and binding. Not built: these commands (the CLI has only `hook`, `mcp` and the in-sandbox commands).
 - **Host authentication:**

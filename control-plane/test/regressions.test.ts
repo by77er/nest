@@ -136,11 +136,6 @@ describe("a finished turn's trailing events", () => {
     ws.send({ type: "events", seq: 3, events: [ev(4, t2, { type: "state_changed", state: "waiting_permission" })] });
     await ws.next("ack", (m) => m.up_to === 3);
     expect((await agentStub(s.agent).info()).state).toBe("waiting_permission");
-    // Nor is it reported on `<agt>/events` (posted in order: once the running turn's change is there, any earlier one is).
-    const read = () => adminJson(`/v1/admin/channels/${encodeURIComponent(`${s.agent}/events`)}/messages`);
-    let msgs: any[] = [];
-    for (let n = 0; n < 100 && !msgs.some((m) => m.data?.state === "waiting_permission"); n++, await sleep(50)) msgs = (await read()).messages;
-    expect(msgs.filter((m) => m.kind === "state_changed").map((m) => m.data.state)).toEqual(["waiting_permission"]);
   });
 });
 
@@ -532,7 +527,7 @@ describe("#21 a deadline re-armed while it runs isn't dropped", () => {
     });
   });
 
-  // A bare object with a deadlines table (a ChannelDO no channel uses).
+  // A bare object with a deadlines table (ChannelDO: a stub that stores nothing of its own).
   const bare = () => env.CHANNEL.get(env.CHANNEL.idFromName(`~deadlines-${crypto.randomUUID()}`));
 
   it("the arm-if-absent idiom inside the key's own handler re-arms it (a running key isn't armed)", async () => {

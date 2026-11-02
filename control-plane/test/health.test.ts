@@ -3,7 +3,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { checkHealth, HEALTH_INSTANCE } from "../src/lib/health";
-import { ChannelName } from "../src/lib/channels";
+import { CatalogName } from "../src/lib/spec";
 import { BASE } from "./helpers";
 import wrangler from "../wrangler.jsonc?raw";
 
@@ -46,7 +46,7 @@ describe("GET /v1/health", () => {
   });
 
   it("no name a user can give reaches the health instance", () => {
-    expect(ChannelName.safeParse(HEALTH_INSTANCE).success).toBe(false);
+    expect(CatalogName.safeParse(HEALTH_INSTANCE).success).toBe(false);
   });
 });
 

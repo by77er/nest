@@ -15,6 +15,7 @@ export interface Env {
   WORKSTREAM: DurableObjectNamespace<WorkstreamDO>;
   BROKER: DurableObjectNamespace<BrokerDO>;
   CATALOG: DurableObjectNamespace<CatalogDO>;
+  /** Channels' class, kept declared until stage 4 of their removal deletes it (do/channel.ts): serves only health. */
   CHANNEL: DurableObjectNamespace<ChannelDO>;
   /** The task ledger's class, kept declared until stage 4 of its removal deletes it (do/tasks.ts): serves only health. */
   TASKS: DurableObjectNamespace<TaskLedgerDO>;

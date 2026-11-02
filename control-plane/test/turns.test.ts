@@ -1,8 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
-import { MAX_WAITING_DELIVERIES, WAKE_CAP_PER_HOUR } from "../src/lib/channels";
-import { admitDelivery, channelRequestId, MERGED_TURN_BYTES, moveNoteDue, recoveryInput, TurnQueue } from "../src/lib/turns";
+import { moveNoteDue, recoveryInput, TurnQueue } from "../src/lib/turns";
 import type { InboxMessage } from "../src/protocol/control";
 
 /** A fresh queue on a real Durable Object's SQLite (an AgentDO's storage: its own queue's tables). */
@@ -52,21 +51,17 @@ describe("TurnQueue (the model's Q1-Q4)", () => {
       q.enqueue(user("work"));
       const t = q.claimNext()!.turn;
       q.mirror(msg("msg_seen", "seen"), t, "inbox/req-1");
-      q.mirror(msg("msg_note", "notice one"), t, channelRequestId("team/x", "sub_1", 3));
-      q.mirror(msg("msg_note2", "notice two"), t, channelRequestId("team/x", "sub_1", 4));
+      q.mirror(msg("msg_note", "note one"), t, "inbox/req-2");
+      q.mirror({ ...msg("msg_note2", "note two"), from: "agt_x" }, t);
       expect(q.confirm("msg_seen")).toBe(true);
       expect(q.confirm("msg_seen")).toBe(false);
       expect(q.mirrored().map((m) => m.id)).toEqual(["msg_note", "msg_note2"]);
       q.complete(t);
       expect(q.mirrored()).toEqual([]);
+      // As one turn, each shown as its own turn would show it, keyed by the first so it is queued once.
       const next = q.claimNext()!;
-      expect(next.input).toEqual({ kind: "event_batch", text: "notice one\n\nnotice two" });
-      expect(q.turnFor(`${channelRequestId("team/x", "sub_1", 3)}/requeued`)).toBe(next.turn);
-      // Any message, not only a channel's: a direct one comes back as its own turn would show it.
-      q.mirror({ ...msg("msg_direct", "ping"), from: "agt_x" }, next.turn);
-      q.mirror(msg("msg_note3", "notice three"), next.turn, channelRequestId("team/x", "sub_1", 5));
-      q.complete(next.turn);
-      expect(q.claimNext()!.input).toEqual({ kind: "inbox", text: "Message from agt_x: ping\n\nnotice three" });
+      expect(next.input).toEqual({ kind: "inbox", text: "Message from platform: note one\n\nMessage from agt_x: note two" });
+      expect(q.turnFor("inbox/req-2/requeued")).toBe(next.turn);
     });
   });
 
@@ -101,20 +96,6 @@ describe("TurnQueue (the model's Q1-Q4)", () => {
       expect(q.claimNext(17)!.input.text).toBe("Message from platform: early");
     });
   });
-
-  it("counts channel turns and merges into the one still waiting", async () => {
-    await withQueue((q) => {
-      const now = Date.now();
-      q.enqueue(user("plain"));
-      const c = q.enqueue({ kind: "event_batch", text: "n1" }, channelRequestId("team/x", "sub_1", 1), now);
-      expect(q.load(now)).toEqual({ hour: 1, oldest: now, waiting: 1 });
-      expect(q.waitingChannelTurn()).toEqual({ turn: c, input: { kind: "event_batch", text: "n1" } });
-      q.merge(c, { kind: "event_batch", text: "n1\n\nn2" }, now + 1);
-      expect(q.load(now + 2)).toMatchObject({ hour: 2, waiting: 1 });
-      // A merge's wake leaves the hour's count after an hour.
-      expect(q.load(now + 3_600_002).hour).toBe(0);
-    });
-  });
 });
 
 describe("recoveryInput", () => {
@@ -124,32 +105,6 @@ describe("recoveryInput", () => {
     expect(recoveryInput(once, ["C."]).text).toBe("C.\nThe turn was:\ndo it");
     // A user's text that happens to contain the mark is kept whole (only a recovery turn is split).
     expect(recoveryInput(user("x\nThe turn was:\ny"), ["N."]).text).toBe("N.\nThe turn was:\nx\nThe turn was:\ny");
-  });
-});
-
-describe("admitDelivery", () => {
-  const now = 10_000_000;
-  const idle = { hour: 0, oldest: null, waiting: 0 };
-  const waiting = { turn: "trn_w", input: { kind: "event_batch" as const, text: "earlier" } };
-
-  it("joins the running turn only for the agent's own inbox", () => {
-    // Even past the guards: a message to the agent mid-turn always reaches it.
-    expect(admitDelivery({ midTurnInbox: true, load: { hour: 999, oldest: now, waiting: 999 }, waiting, text: "t", now })).toEqual({ kind: "join" });
-    expect(admitDelivery({ midTurnInbox: false, load: idle, waiting: undefined, text: "t", now })).toEqual({ kind: "queue" });
-  });
-
-  it("merges into a waiting channel turn, up to the size cap", () => {
-    expect(admitDelivery({ midTurnInbox: false, load: idle, waiting, text: "later", now }))
-      .toEqual({ kind: "merge", turn: "trn_w", input: { kind: "event_batch", text: "earlier\n\nlater" } });
-    expect(admitDelivery({ midTurnInbox: false, load: idle, waiting, text: "x".repeat(MERGED_TURN_BYTES), now }).kind).toBe("defer");
-  });
-
-  it("defers past the hourly cap until the oldest wake ages out, and past the waiting cap", () => {
-    expect(admitDelivery({ midTurnInbox: false, load: { hour: WAKE_CAP_PER_HOUR, oldest: now - 3_000_000, waiting: 0 }, waiting: undefined, text: "t", now }))
-      .toEqual({ kind: "defer", retry_after_ms: 600_000 });
-    expect(admitDelivery({ midTurnInbox: false, load: { hour: WAKE_CAP_PER_HOUR, oldest: now - 3_599_999, waiting: 0 }, waiting: undefined, text: "t", now }))
-      .toEqual({ kind: "defer", retry_after_ms: 1_000 });
-    expect(admitDelivery({ midTurnInbox: false, load: { hour: 0, oldest: null, waiting: MAX_WAITING_DELIVERIES }, waiting, text: "t", now }).kind).toBe("defer");
   });
 });
 

@@ -53,7 +53,7 @@ export const ErrorCodes = {
   /** The operation exists in the contract but has no implementation yet (passed through as a tool error). */
   NOT_IMPLEMENTED: "not_implemented",
   OUTCOME_UNKNOWN: "outcome_unknown",
-  /** A compare-and-set lost (e.g. a channel key's `if_seq`): read the current state and decide again. HTTP 409. */
+  /** A compare-and-set lost: read the current state and decide again. HTTP 409. */
   CONFLICT: "conflict",
   /** The named object doesn't exist. HTTP 404. */
   NOT_FOUND: "not_found",

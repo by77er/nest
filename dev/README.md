@@ -58,9 +58,9 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 1. **CI, `CODEOWNERS`, guards and agent skills.** Done.
 2. **Me:** the GitHub and Cloudflare steps in [setup.md](setup.md), and stages 1–3 of the [platform setup](../docs/setup/) (a Claude token, the control plane on Cloudflare, cell hosts). Done, except `nest/review` as a required check, which waits for the hand-over.
 3. **Build the minimum platform slice,** in this order. Each step is a PR through the gates above, with me as reviewer until step 4:
-   1. ChannelDO with posts, reads, subscriptions and wakes; the `user` channel through the API.
-   2. Grants (taint included), and a channel in place of WorkstreamDO. Spawn specs, templates and capabilities are built.
-   3. HookDO with GitHub verification, and `wake_at`.
+   1. ChannelDO with posts, reads, subscriptions and wakes. Built, then taken out of the platform (principle 9, [microkernel](../docs/README.md#principles)): coordination, GitHub webhooks included, is an external integration over MCP and the public API.
+   2. Grants (taint included). Spawn specs, templates and capabilities are built.
+   3. A coordination integration (messaging, GitHub events into inboxes), and `wake_at`.
    4. BrokerDO's GitHub App minting and the `github.*` brokered actions.
    5. A dev sandbox image: git, `gh`, Rust, Node, Python, nftables, with a warm build cache.
    6. Metrics emitters, the `metrics` capability, and the rest of `deploy.yml` (the health window).

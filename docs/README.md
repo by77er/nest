@@ -2,7 +2,7 @@
 
 A personal platform built as two systems with one seam: a **sandbox system** that runs isolated VMs on commodity cloud compute, and an **agent system** that runs long-lived Claude Code agents on my own subscription. Brains run on brain hosts (or, later, inside the control plane) and act on sandboxes only over the network, through each sandbox host's gateway; neither system knows where the other runs. Agents organize themselves: captains, teams and pipelines are structures they build from a few primitives, not platform features. Everything scales to zero.
 
-**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales sandbox hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Sandboxes run in Firecracker on nested-virtualization hosts (jailed, guest memory on regular pages capped per VM, the proxy root CA in KMS): a real Claude Code turn ran in a VM, its disk was committed at turn end, and after a host reboot the sandbox came back with the file (EC2, 2026-10-18; see [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/)). Hosts without `/dev/kvm` fall back to the process driver. The seam between the two systems is built (the [gateway](sandbox/gateway/), bindings, the runner's hands client, each sandbox host's tunnel), proven on the harness with the gateway on loopback and verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13). Templates and capabilities are data (CatalogDO, seeded with `worker` and `captain`), agents store their expanded spawn spec, and nothing decides on an agent role. Every brain runs on a [brain host](compute/brain-hosts/), never on a sandbox host: built, run on the harness as two hosts, and on AWS since 2026-10-29 (two workers' brains on a brain host driving their sandboxes on a sandbox host). The one-brain rule is model-checked, and nestd's fleet link is a pure core checked as the shipped code ([verification](verification/)). Channels are built (ChannelDO, subscriptions waking agents through AgentDO's turn queue, the built-in channels, channel grants on capabilities; [what isn't](control-plane/durable-objects/channel/)). They leave the platform in stage 2 of the microkernel removal (principle 9). Designed but not built: the rest of the coordination layer (hooks, grants beyond channels and their attenuation, capability sources and parameters, scheduled wakes) and the Discord bot; `control-plane/README.md` lists the gaps.
+**Status:** early implementation. The runtime (control plane, nestd, nest-proxy, guest agent, agent runner, `nest` CLI) exists and is tested locally; each crate or package README says what is built and what is missing. A local end-to-end harness (`e2e/`) runs the real components together. It runs on AWS: the `use1` cell scales sandbox hosts from zero and back, suspends idle sandboxes to S3, wakes them lazily, survives spot interruptions and nestd restarts (verified on EC2; see [compute/autoscaling/](compute/autoscaling/)). Sandboxes run in Firecracker on nested-virtualization hosts (jailed, guest memory on regular pages capped per VM, the proxy root CA in KMS): a real Claude Code turn ran in a VM, its disk was committed at turn end, and after a host reboot the sandbox came back with the file (EC2, 2026-10-18; see [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/)). Hosts without `/dev/kvm` fall back to the process driver. The seam between the two systems is built (the [gateway](sandbox/gateway/), bindings, the runner's hands client, each sandbox host's tunnel), proven on the harness with the gateway on loopback and verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13). Templates and capabilities are data (CatalogDO, seeded with `worker` and `captain`), agents store their expanded spawn spec, and nothing decides on an agent role. Every brain runs on a [brain host](compute/brain-hosts/), never on a sandbox host: built, run on the harness as two hosts, and on AWS since 2026-10-29 (two workers' brains on a brain host driving their sandboxes on a sandbox host). The one-brain rule is model-checked, and nestd's fleet link is a pure core checked as the shipped code ([verification](verification/)). Channels and the task ledger have left the platform (principle 9, stages 1 and 2). Designed but not built: grants and their attenuation, capability sources and parameters, scheduled wakes, and the Discord bot; `control-plane/README.md` lists the gaps.
 
 **Start with [architecture/](architecture/)** for how the pieces fit and how a turn flows. Everything needed to bring nest up (accounts, credentials, where they go) is in [setup/](setup/).
 
@@ -24,7 +24,7 @@ A personal platform built as two systems with one seam: a **sandbox system** tha
 6. **Each piece of data lives next to its main reader.** Metadata lives in Durable Objects, bookkeeping in R2 and sandbox bytes in S3.
 7. **One writer per entity, fenced by epochs.** Each entity has a single Durable Object, and stale writers are rejected.
 8. **Claude Code runs unmodified, on brain hosts that never share a machine with a sandbox.** The subscription token never enters a sandbox or a sandbox host. Agents act on sandboxes only through RPC hands, over the network, through the gateway.
-9. **nest is a microkernel** (decided 2026-11-02). The kernel keeps what needs the root or the seam: sandboxes (with the gateway and hands); agents (the loop, the input queue, lifecycle, spawning, ownership); the credential broker and egress policy; MCP tool attachment; and, not built yet, scoped API clients, labels, and agent events delivered to owners. Everything else is an external integration that agents reach over MCP and the public API. Channels, the task ledger, WorkstreamDO and the built-in `notify`, `ask` and `emit` tools leave the platform. A small kernel keeps the trusted, fenced and model-checked surface small, and coordination tools can change without a platform release. The removal is staged: (1) the task ledger (done), (2) channels, (3) workstreams and `notify`/`ask`/`emit`, (4) deleting their Durable Object classes, in a deploy of its own because that step is one-way.
+9. **nest is a microkernel** (decided 2026-11-02). The kernel keeps what needs the root or the seam: sandboxes (with the gateway and hands); agents (the loop, the input queue, lifecycle, spawning, ownership); the credential broker and egress policy; MCP tool attachment; and, not built yet, scoped API clients, labels, and agent events delivered to owners. Everything else is an external integration that agents reach over MCP and the public API. Channels, the task ledger, WorkstreamDO and the built-in `notify`, `ask` and `emit` tools leave the platform. A small kernel keeps the trusted, fenced and model-checked surface small, and coordination tools can change without a platform release. The removal is staged: (1) the task ledger (done), (2) channels (done), (3) workstreams and `notify`/`ask`/`emit`, (4) deleting their Durable Object classes, in a deploy of its own because that step is one-way.
 
 ## Implementation
 
@@ -57,12 +57,11 @@ UFFD memory snapshots and the ublk lazy disk are designed but not built (see `cr
 | Primitive | What | Doc |
 |---|---|---|
 | **Sandbox** | A machine: volumes, processes, network | [sandbox/](sandbox/) |
-| **Agent** | A brain with optional hands in one sandbox, plus capabilities, grants and subscriptions | [agents/](agents/) |
-| **Channel** | A named, durable, append-only log that agents, sandbox programs, the platform and I post to, read and subscribe to. Leaving the platform (principle 9, stage 2) | [channels/](channels/) |
+| **Agent** | A brain with optional hands in one sandbox, plus capabilities and grants | [agents/](agents/) |
 
-- **Operations:** create, **attach** (bind an agent's hands to a sandbox), **fork** (copy a sandbox; the only isolation primitive), **spawn** (an agent creates an agent), **post / read / subscribe**, **grant / revoke**.
+- **Operations:** create, **attach** (bind an agent's hands to a sandbox), **fork** (copy a sandbox; the only isolation primitive), **spawn** (an agent creates an agent), **grant / revoke**.
 - **On every resource:** an **owner** (the agent that created it, or me) and **labels** (free-form key/values).
-- **Capabilities:** pluggable bundles of tools, grants and prompt instructions (messaging, channels, spawning, memory, …).
+- **Capabilities:** pluggable bundles of tools, grants and prompt instructions (messaging, spawning, MCP servers, brokered actions, …).
 - **Templates:** named spawn specs, mostly a list of capabilities, stored as data. `captain` and `worker` are templates.
 
 Captains, workstreams and teams are patterns built from these. See [orchestration/](orchestration/).
@@ -72,7 +71,6 @@ Captains, workstreams and teams are patterns built from these. See [orchestratio
 ```
 patterns        captains · workstreams (templates + conventions) · quota scheduling  orchestration/
 agents          backends · capabilities · runner · hands · sessions · state tracking · tools  agents/
-channels        logs · subscriptions · wakes · external sources (leaving: stage 2)      channels/
 sandbox         drivers · state · fencing · networking · gateway · guest agent         sandbox/
 compute         cells · sandbox hosts · brain hosts · nestd · autoscaling · provisioning  compute/
 control plane   Cloudflare Workers + Durable Objects · API · activator                 control-plane/
@@ -81,14 +79,14 @@ cross-cutting   security (authority, model access, identity, credentials) · dat
 contracts       boundary interfaces (wire protocols, the gateway contract, tool schemas) interfaces/
 ```
 
-See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [channels/](channels/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [verification/](verification/), [interfaces/](interfaces/) and [setup/](setup/).
+See [architecture/](architecture/) for the system diagram, components, a turn end to end, failure handling, state and trust boundaries. The layers in detail: [orchestration/](orchestration/), [agents/](agents/), [sandbox/](sandbox/), [compute/](compute/), [control-plane/](control-plane/), [security/](security/), [data/](data/), [verification/](verification/), [interfaces/](interfaces/) and [setup/](setup/).
 
 ## Glossary
 
 | Term | Meaning |
 |---|---|
 | Sandbox | A VM: volumes, processes, network. Holds 0..N attached agents. |
-| Agent | A brain (Claude Code on a brain host, on my subscription; later, a Messages API loop inside AgentDO) plus optional hands, grants and subscriptions. There are no agent roles. |
+| Agent | A brain (Claude Code on a brain host, on my subscription; later, a Messages API loop inside AgentDO) plus optional hands and grants. There are no agent roles. |
 | Agent runner | Brain-host component that starts, drives and tails Claude Code processes, and carries their hands calls to a sandbox's gateway |
 | Hands | `nest` MCP tools modeled on Claude Code's built-ins, executed in a sandbox by the guest agent, reached through the sandbox host's gateway |
 | Gateway | The one network door into a sandbox: an unprivileged process per sandbox host, behind the host's Cloudflare Tunnel, that checks a binding and forwards hands, terminal and ingress connections to the guest over vsock |
@@ -96,12 +94,9 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Agent epoch | Fencing token for a brain, issued by AgentDO at each brain start; platform tool calls and brokered actions carry it |
 | Attach | Bind an agent's hands to a sandbox |
 | Fork | Copy-on-write copy of a sandbox (disk only, or live with memory) |
-| Channel | A named, durable, append-only message log. Inboxes, platform events, questions, shared state and memory are all channels. Leaving the platform (principle 9, stage 2). |
-| Hook | A verified webhook (or email address) that turns each external event into a tainted post on a channel |
-| Subscription | An agent's wake rule on a channel: a filter plus how matches are delivered |
 | Grant | Permission for a principal to do an action on a resource. Passed on only by someone who holds it. |
 | Owner | Whoever created a resource. Holds every grant on it. |
-| Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, MCP and API results, transcripts, tainted posts) |
+| Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, MCP and API results, transcripts) |
 | Sink | An action that can send data out or widen authority; from a tainted session it needs approval |
 | Capability | A pluggable bundle of tools, the grants they need and prompt instructions, listed in spawn specs |
 | Template | A named spawn spec, stored as data in CatalogDO: capabilities, launch settings (model, built-in tools, base prompt), whether it takes a sandbox, the credential, where it escalates and what it subscribes to (grants and the backend choice are designed, not built) |
@@ -111,7 +106,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Sandbox host | A spot VM with nested virtualization running Firecracker sandboxes, nestd, nest-proxy, cloudflared and the gateway. Every sandbox lives here; no brain does. |
 | Brain host | A cheap host with no KVM running nestd (supervisor duties only), the agent runner and Claude Code processes. Every brain lives here; no sandbox does. Capacity is counted in brains; scales to zero. |
 | Captain | A pattern, not a platform concept: an agent without hands, spawned from the `captain` template, that manages other agents and escalates to me |
-| Workstream | A pattern, not a platform concept: a goal plus the channel, sandboxes and agents set up for it, grouped by a label |
+| Workstream | A pattern, not a platform concept: a goal plus the sandboxes and agents set up for it, grouped by a label |
 | nestd | Per-host daemon |
 | nest-proxy | Per-host egress proxy |
 | Guest agent | Hands server inside each sandbox VM. Holds no credentials. |
@@ -127,28 +122,23 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | No agent roles. Where a brain runs and where its sandbox runs are unrelated: brains run on brain hosts (later, inside AgentDO) and reach a sandbox only through the gateway; an agent without hands needs no sandbox. The brain backend is pluggable (`claude-code`, and `api-loop` inside the control plane later). | [agents/](agents/) |
 | Captains and workstreams are patterns (templates plus conventions), not code | [orchestration/](orchestration/) |
 | Agent features are pluggable capabilities: named bundles of tools, grants and prompt, composed by templates | [agents/capabilities/](agents/capabilities/) |
-| Agents message each other through the messaging capability; by default an agent reaches its owner and its label group | [agents/capabilities/](agents/capabilities/) |
+| Agents message each other through an external integration that posts to the recipient's inbox (principle 9); `notify` stands in until stage 3 | [agents/capabilities/](agents/capabilities/#messaging) |
 | Remote MCP servers and HTTP APIs (`ro` or `rw`) plug in as capabilities, as data: the control plane calls them with credentials from BrokerDO and surfaces them as tools | [agents/capabilities/](agents/capabilities/) |
 | nest is a microkernel: sandboxes, agents, the credential broker and egress policy, and MCP tool attachment stay; channels, the task ledger, WorkstreamDO and `notify`/`ask`/`emit` become external integrations over MCP and the public API, removed in four stages (principle 9) | this file |
-| Coordination is one primitive: channels. Inboxes, platform events, questions, shared state and memory are channels. Until stage 2 of the microkernel removal takes channels out of the platform | [channels/](channels/) |
 | Authority is grants, attenuated from me and revoked down the chain; there's no built-in scoping unit | [agents/tools/](agents/tools/) |
 | When an agent is removed, what it owns is parked (stopped, archived, read-only), adoptable, and destroyed after 30 days | [agents/](agents/) |
 | An agent ends for good by `agent_stop` from an owner (transitively), by `exit`, or, if ephemeral, when a turn completes with nothing waiting; an end kills or finishes its brain, drops its queued turns, ends what it owns and may destroy the sandbox made for it. An ended agent's records go after 30 days | [agents/](agents/#lifetimes) |
-| A sandbox dormant (no agent attached, no VM up) for its idle TTL is destroyed, a day by default per cell (a longer TTL gets a notice on `user` a day first) | [control-plane/durable-objects/sandbox/](control-plane/durable-objects/sandbox/#lifetime) |
+| A sandbox dormant (no agent attached, no VM up) for its idle TTL is destroyed, a day by default per cell (a longer TTL gets a notice a day first, shown in the lifetimes view) | [control-plane/durable-objects/sandbox/](control-plane/durable-objects/sandbox/#lifetime) |
 | Inspection without hands is a pure pattern: no `delegate` tool or reader template | [orchestration/captains/](orchestration/captains/) |
 | Memory is a capability for long-lived agents only (monitors, personal assistants, captains); ephemeral agents have none and always resume | [agents/](agents/) |
 | The memory key index injected at session start is capped at 200 keys, newest first; agents tidy memory as they go, plus a weekly consolidation wake | [agents/](agents/) |
 | Agents schedule their own wakes with `wake_at` (once or repeating), a capability backed by AgentDO alarms | [agents/capabilities/](agents/capabilities/) |
 | MCP servers are remote only; a local server runs as a sandbox service exposed through ingress | [agents/capabilities/](agents/capabilities/) |
-| External events (webhooks, email) become tainted channel posts through verified hooks; polling is an agent's job, not a platform source | [channels/sources/](channels/sources/) |
 | An agent with memory resumes if its last turn was under an hour ago or its session is under ~50k tokens, otherwise starts fresh from memory | [agents/](agents/) |
-| Channel message bodies older than 7 days move to R2; the index and keyed view stay in SQLite | [channels/](channels/) |
 | Egress policy is per sandbox (forks inherit); no shared policy objects | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/) |
 | A sandbox pushes only to repos on its push allowlist (exact `owner/name`; none by default), enforced by nest-proxy whatever credential a push carries. nest-proxy evaluates only generic request guards; what a service's rules mean is a control-plane constructor's (GitHub's today) | [sandbox/networking/egress/policy/](sandbox/networking/egress/policy/#request-guards) |
 | Public repos the owner doesn't own are worked on through forks in the owner's account (`github.fork`, always approved; the upstream PR through a compare link) | [agents/capabilities/brokered/](agents/capabilities/brokered/#forks) |
-| Guardrails start "balanced": 60 subscription-started or scheduled turns an hour per agent, a 50-delivery backlog (deferred, never dropped), 30-day retention | [channels/](channels/) |
 | Taint is tracked per session by the platform; sink calls (egress widening, external brokered actions, MCP tools not marked read-only, `rw` APIs, granting sinks) from a tainted session need approval from me or an untainted holder | [agents/tools/](agents/tools/) |
-| A woken turn gets a platform notice; other agents' message bodies reach a model only as `read` results | [channels/](channels/) |
 | Budgets (depth, concurrency, spawns, turns) shrink like grants and are enforced per owner subtree; quota is divided by priority and the concurrency cap, not by estimated shares | [orchestration/scheduling/](orchestration/scheduling/) |
 | Hands calls are journaled, with intent written at the point of no return. A refusal before it says `executed: false` and the runner retries it; duplicate call ids are refused. After a crash, outcomes come from the guest's call records, and a call that may have run is never retried | [agents/hands/](agents/hands/) |
 | A hands call ends with its main process (pidfd, 1 s drain, cgroup kill), and a hangup cancels it. Write and Edit replace atomically when safe, otherwise in place | [agents/hands/](agents/hands/) |
@@ -173,7 +163,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Sandbox placement packs onto the fullest host that fits: by free memory less a per-sandbox reserve on regular pages (the default), by free hugepages and vCPUs on a hugepage host | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | Claude Code is the only harness; on a rate limit, park and wait for quota | [orchestration/scheduling/](orchestration/scheduling/) |
 | The harness runs on brain hosts; hands are RPC into the sandbox through the gateway; no credentials in VMs or on sandbox hosts | [agents/](agents/) |
-| I reach agents through a Discord bot that bridges Discord channels and threads to nest channels | [control-plane/api/discord/](control-plane/api/discord/) |
+| I reach agents through a Discord bot that bridges Discord threads to agents' inboxes and the notification queue | [control-plane/api/discord/](control-plane/api/discord/) |
 | No platform API-key proxy; apps bring their own keys | [security/model-access/](security/model-access/) |
 | One session artifact: the native session file, tailed on the host. No proxy decrypts OAuth traffic. | [agents/sessions/](agents/sessions/) |
 | Sandbox credentials are injected at the proxy by placeholder; GitHub through a GitHub App; OIDC deferred | [security/identity/](security/identity/) |
@@ -192,7 +182,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | GitHub access is a GitHub App; BrokerDO mints installation tokens narrowed per binding | [control-plane/durable-objects/broker/](control-plane/durable-objects/broker/) |
 | Control-plane upgrades: expand-only schemas, wire formats compatible one version back, deploys at 100%, DO class changes one-way. Hosts upgrade by replacement, brain hosts before sandbox hosts | [control-plane/](control-plane/#upgrades) |
 | Runtime metrics go to Workers Analytics Engine (numbers, enums and ids only), read through the `metrics` capability | [control-plane/metrics/](control-plane/metrics/) |
-| nest is two systems with one seam: the sandbox system (hosts, VMs, state, fencing, egress, the gateway) and the agent system (agents, runners, channels). Only three protocols cross it: the SandboxDO control API, the gateway's hands data plane, and the sandbox's events on channels. Co-location is never assumed; there is one hands path, and it goes over the network | [architecture/](architecture/), [sandbox/gateway/](sandbox/gateway/) |
+| nest is two systems with one seam: the sandbox system (hosts, VMs, state, fencing, egress, the gateway) and the agent system (agents, runners). Only two protocols cross it: the SandboxDO control API (with its move notices to attached agents) and the gateway's hands data plane. Co-location is never assumed; there is one hands path, and it goes over the network | [architecture/](architecture/), [sandbox/gateway/](sandbox/gateway/) |
 | Sandbox hosts accept no inbound connections: each runs cloudflared, and the gateway sits behind the host's tunnel hostname with an Access service token at the edge, a binding at the gateway and the epoch check in the guest. Tunnel-only to start; a VPC endpoint only if a measurement asks for one | [sandbox/gateway/](sandbox/gateway/) |
 | The control plane owns each sandbox host's tunnel and DNS record: created at enrollment before the host exists in the fleet, deleted when the host dies, swept daily, matched only by nest's own names; the Access applications are created by hand | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | A brain has its own epoch, issued by AgentDO at each start; platform tool calls and brokered actions carry it, and hands calls carry the sandbox epoch inside the binding | [control-plane/durable-objects/agent/](control-plane/durable-objects/agent/) |

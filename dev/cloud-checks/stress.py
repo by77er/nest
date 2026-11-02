@@ -2,22 +2,19 @@
 """Stress test of a cell, against the live Worker (README.md in this directory).
 
 Phases, each timed:
-  1. flood    - the control plane alone: FLOOD_POSTERS concurrent operator posters, FLOOD_POSTS each,
-                to one channel; latency percentiles and errors. No hosts, no subscription use.
-  2. sandboxes - STRESS_AGENTS sandboxes created at once, in a cold or warm cell: how fast hosts
+  1. sandboxes - STRESS_AGENTS sandboxes created at once, in a cold or warm cell: how fast hosts
                 launch, how many sandboxes a host takes, what a launch past the quota does.
-  3. ring     - one `stress` agent per sandbox (Haiku). Each runs `hostname` through hands, posts a
-                ping to a shared channel mentioning the next agent, and is woken by the ping that
-                mentions it (a `once` subscription) to post a pong. Brains pack onto brain hosts.
-  4. idle     - nothing more is sent: brains should exit at the runner's idle grace.
-  5. cleanup  - agents stopped, sandboxes destroyed; then the fleet is watched until no host of
+  2. turns    - one `stress` agent per sandbox (Haiku), each given one turn: run `hostname` through
+                hands and reply with it. Brains pack onto brain hosts.
+  3. idle     - nothing more is sent: brains should exit at the runner's idle grace.
+  4. cleanup  - agents stopped, sandboxes destroyed; then the fleet is watched until no host of
                 either kind is live (or STRESS_DRAIN_S passes).
 A sampler records the fleet view every STRESS_SAMPLE_S throughout (hosts, brains and sandboxes per
 host, each host's free memory, launches) to STRESS_OUT (JSONL), with the phase marks, so limits can
 be read afterwards. Cleanup runs on every exit path; the last line is the JSON of every id made.
 
 Reads NEST_ADMIN_TOKEN (required; never printed), NEST_BASE_URL, NEST_CELL (use1), STRESS_AGENTS
-(50), STRESS_PHASES (flood,sandboxes,ring,idle,cleanup), FLOOD_POSTERS (50), FLOOD_POSTS (20),
+(50), STRESS_PHASES (sandboxes,turns,idle,cleanup),
 STRESS_MODEL (haiku), STRESS_TIMEOUT_S (2400 per phase), STRESS_DRAIN_S (2700), STRESS_SAMPLE_S (15),
 STRESS_OUT (stress-<run>.jsonl).
 """
@@ -29,38 +26,26 @@ import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 BASE = os.environ.get("NEST_BASE_URL", "https://nest.bitcru.sh").rstrip("/")
 CELL = os.environ.get("NEST_CELL", "use1")
 ADMIN = os.environ.get("NEST_ADMIN_TOKEN", "")
 N = int(os.environ.get("STRESS_AGENTS", "50"))
-PHASES = os.environ.get("STRESS_PHASES", "flood,sandboxes,ring,idle,cleanup").split(",")
-FLOOD_POSTERS = int(os.environ.get("FLOOD_POSTERS", "50"))
-FLOOD_POSTS = int(os.environ.get("FLOOD_POSTS", "20"))
+PHASES = os.environ.get("STRESS_PHASES", "sandboxes,turns,idle,cleanup").split(",")
 MODEL = os.environ.get("STRESS_MODEL", "haiku")
-# STRESS_HANDS=0: agents without sandboxes (brains and channels only).
+# STRESS_HANDS=0: agents without sandboxes (brains only).
 HANDS = os.environ.get("STRESS_HANDS", "1") != "0"
 TIMEOUT_S = int(os.environ.get("STRESS_TIMEOUT_S", "2400"))
 DRAIN_S = int(os.environ.get("STRESS_DRAIN_S", "2700"))
 SAMPLE_S = int(os.environ.get("STRESS_SAMPLE_S", "15"))
 RUN = time.strftime("r%m%d%H%M")
 OUT = os.environ.get("STRESS_OUT", f"stress-{RUN}.jsonl")
-CHANNEL = f"stress/{RUN}"
-
-CAPABILITY = {
-    # Hands and channel tools run without asking (the worker template's rule): an unanswered approval
-    # would end every agent's turn before its first command.
-    "tools": ["post", "read"], "rules": [{"pattern": "mcp__nest__*", "decision": "allow"}], "params": [],
-    "prompt": "", "grants": [{"action": "post", "channel": "stress/**"}, {"action": "read", "channel": "stress/**"}],
-}
-SYSTEM = ("You are one agent in an automated load test. Keep every reply to one short line and use no tool "
-          "beyond what a step names. When a channel notice wakes you: read the channel it names with "
-          "mcp__nest__read, passing exactly the `since` the notice gives, find the message that mentions you, post one reply "
-          "to that channel with mcp__nest__post (reply_to its seq, text `pong`), then reply `done`.")
+SYSTEM = "You are one agent in an automated load test. Keep every reply to one short line and use no tool beyond what a step names."
 TEMPLATE = {
-    "capabilities": ["hands", "stress-chat"] if HANDS else ["stress-chat"],
+    # `nest` lets hands run without asking (the worker template's rule): an unanswered approval would end
+    # every agent's turn before its first command.
+    "capabilities": ["nest", "hands"] if HANDS else ["nest"],
     "launch": {"model": MODEL, "builtin_tools": [], "system_prompt": {"mode": "append", "text": SYSTEM}},
     "hands": "required" if HANDS else "forbidden", "credential": "claude_oauth_token:worker", "escalate_to": "workstream",
     "subscribe": [], "params": {},
@@ -148,52 +133,16 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, int(p / 100 * len(xs)))] if xs else None
 
 
-def flood():
-    name = f"{CHANNEL}/flood"
-    s, v = api("POST", "/v1/admin/channels", {"name": name})
-    if s not in (200, 201):
-        raise SystemExit(f"FAIL: create {name}: {s} {v}")
-    q = urllib.parse.quote(name, safe="")
-
-    def poster(i):
-        lat, errs = [], {}
-        for j in range(FLOOD_POSTS):
-            t0 = time.time()
-            s, v = api("POST", f"/v1/admin/channels/{q}/messages", {"text": f"flood {i}.{j}", "idem_key": f"f{i}.{j}"})
-            lat.append(time.time() - t0)
-            if s not in (200, 201):
-                errs[s] = errs.get(s, 0) + 1
-        return lat, errs
-
-    t0 = time.time()
-    res = pmap(poster, range(FLOOD_POSTERS), workers=FLOOD_POSTERS)
-    wall = time.time() - t0
-    lat = [x for l, _ in res for x in l]
-    errs = {}
-    for _, e in res:
-        for k, c in e.items():
-            errs[k] = errs.get(k, 0) + c
-    s, head = api("GET", f"/v1/admin/channels/{q}")
-    stats = {"posts": len(lat), "wall_s": round(wall, 1), "per_s": round(len(lat) / wall, 1),
-             "p50_ms": round(pct(lat, 50) * 1000), "p95_ms": round(pct(lat, 95) * 1000), "p99_ms": round(pct(lat, 99) * 1000),
-             "max_ms": round(max(lat) * 1000), "errors": errs, "head": head if s == 200 else s}
-    mark("flood done", **stats)
-    return stats
-
-
 def main():
     if not ADMIN:
         sys.exit("NEST_ADMIN_TOKEN is not set")
-    made = {"run": RUN, "channel": CHANNEL, "sandboxes": [], "agents": []}
+    made = {"run": RUN, "sandboxes": [], "agents": []}
     ok = True
     threading.Thread(target=sampler, daemon=True).start()
     try:
         mark("start", base=BASE, cell=CELL, n=N, phases=PHASES, model=MODEL, hands=HANDS, fleet=live_summary(snapshot()))
-        if "flood" in PHASES:
-            flood()
-
         ws = None
-        if "sandboxes" in PHASES or "ring" in PHASES:
+        if "sandboxes" in PHASES or "turns" in PHASES:
             s, v = api("POST", "/v1/workstreams", {"goal": f"stress test {RUN}: {N} agents"})
             if s != 201:
                 raise SystemExit(f"FAIL: create workstream: {s} {v}")
@@ -227,15 +176,10 @@ def main():
             mark("sandboxes placed", placed=len(ts), of=len(mine), first_s=ts and round(ts[0]), p50_s=ts and round(pct(ts, 50)),
                  last_s=ts and round(ts[-1]))
 
-        if "ring" in PHASES:
-            s, v = api("PUT", "/v1/admin/capabilities/stress-chat", CAPABILITY)
-            s2, v2 = api("PUT", "/v1/admin/templates/stress", TEMPLATE)
-            if s != 200 or s2 != 200:
-                raise SystemExit(f"FAIL: catalog: {s} {v} / {s2} {v2}")
-            s, v = api("POST", "/v1/admin/channels", {"name": CHANNEL})
-            if s not in (200, 201):
-                raise SystemExit(f"FAIL: create {CHANNEL}: {s} {v}")
-            q = urllib.parse.quote(CHANNEL, safe="")
+        if "turns" in PHASES:
+            s, v = api("PUT", "/v1/admin/templates/stress", TEMPLATE)
+            if s != 200:
+                raise SystemExit(f"FAIL: catalog: {s} {v}")
 
             mark("agents create")
             t0 = time.time()
@@ -249,42 +193,29 @@ def main():
                     log(f"agent create refused: {s} {json.dumps(v)[:200]}")
             agents = made["agents"]
             mark("agents created", n=len(agents), wall_s=round(time.time() - t0, 1))
-            subs = pmap(lambda a: api("POST", f"/v1/admin/channels/{q}/subscriptions",
-                                      {"agent": a, "filter": {"mentions_me": True}, "once": True, "batch_ms": 0}), agents)
-            mark("subscribed", ok=sum(1 for s, _ in subs if s in (200, 201)),
-                 errors=[json.dumps(v)[:160] for s, v in subs if s not in (200, 201)][:3])
             starts = pmap(lambda a: api("POST", f"/v1/agents/{a}/start"), agents)
             mark("starts sent", statuses={str(s): sum(1 for x, _ in starts if x == s) for s in {x for x, _ in starts}},
                  sample=[json.dumps(v)[:160] for s, v in starts if s != 200][:3])
             n = len(agents)
-
-            def first_turn(i):
-                me, nxt = agents[i], agents[(i + 1) % n]
-                where = "on <the hostname>" if HANDS else "(no sandbox)"
-                step1 = "Step 1: run `hostname` with mcp__nest__Bash. " if HANDS else "Step 1: nothing to run. "
-                text = (f"Your agent id is {me}. {step1}Step 2: post one message to channel {CHANNEL} with mcp__nest__post, "
-                        f"text `ping from {me} {where}`, mentions [\"{nxt}\"]. Step 3: reply `done`.")
-                return api("POST", f"/v1/agents/{me}/turns", {"text": text})
-
-            turns = pmap(first_turn, range(n))
+            text = ("Step 1: run `hostname` with mcp__nest__Bash. Step 2: reply with its output." if HANDS
+                    else "Reply with the word `done`.")
+            turns = pmap(lambda a: api("POST", f"/v1/agents/{a}/turns", {"text": text}), agents)
             mark("turns queued", ok=sum(1 for s, _ in turns if s in (200, 201, 202)))
 
             deadline = time.time() + TIMEOUT_S
+            done_at = {}
             while time.time() < deadline:
-                s, msgs = api("GET", f"/v1/admin/channels/{q}/messages?since=0&limit=500")
-                msgs = msgs.get("messages", msgs) if isinstance(msgs, dict) else (msgs or [])
-                pings = [m for m in msgs if isinstance(m, dict) and str(m.get("text", "")).startswith("ping")]
-                pongs = [m for m in msgs if isinstance(m, dict) and m.get("reply_to")]
-                log(f"pings {len(pings)}/{n} pongs {len(pongs)}/{n}; {live_summary(snapshot())}")
-                if len(pings) >= n and len(pongs) >= n:
+                states = pmap(lambda a: api("GET", f"/v1/agents/{a}/turns"), agents)
+                for a, (s, t) in zip(agents, states):
+                    if a not in done_at and isinstance(t, list) and t and all(x.get("status") in ("done", "interrupted", "dropped") for x in t):
+                        done_at[a] = time.time() - t0
+                log(f"turns done {len(done_at)}/{n}; {live_summary(snapshot())}")
+                if len(done_at) >= n:
                     break
                 time.sleep(20)
-            first = min((m["ts_ms"] for m in msgs if isinstance(m, dict)), default=None)
-            mark("ring done", pings=len(pings), pongs=len(pongs), n=n, wall_s=round(time.time() - t0),
-                 first_post_s=first and round(first / 1000 - t0),
-                 last_ping_s=pings and round(max(m["ts_ms"] for m in pings) / 1000 - t0),
-                 last_pong_s=pongs and round(max(m["ts_ms"] for m in pongs) / 1000 - t0))
-            ok &= len(pings) >= n and len(pongs) >= n
+            ts = sorted(done_at.values())
+            mark("turns done", done=len(ts), n=n, first_s=ts and round(ts[0]), p50_s=ts and round(pct(ts, 50)), last_s=ts and round(ts[-1]))
+            ok &= len(ts) >= n
             turn_states = pmap(lambda a: api("GET", f"/v1/agents/{a}/turns"), agents)
             st = {}
             for s, t in turn_states:

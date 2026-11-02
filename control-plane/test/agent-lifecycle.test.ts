@@ -334,7 +334,7 @@ describe("agent_stop", () => {
     expect(await ended(c.agent)).toBeUndefined();
   });
 
-  it("ends the target for good: its brain killed, its queued turns dropped, no more turns, messages or deliveries; idempotent", async () => {
+  it("ends the target for good: its brain killed, its queued turns dropped, no more turns or messages; idempotent", async () => {
     const w = await world();
     const p = await operatorAgent(w, w.par);
     const c = await spawn(p, { template: w.kid });
@@ -351,8 +351,6 @@ describe("agent_stop", () => {
     // Nothing more comes in: as a recipient it is gone (what every sender reads as "drop it"), though its record stays.
     expect((await adminJson(`/v1/agents/${c.agent}/turns`, { body: { text: "more" } }, 404)).error.message).toContain("has ended");
     expect((await adminJson(`/v1/agents/${c.agent}/inbox`, { body: { text: "hi", from: "user" } }, 404)).error.code).toBe("unknown_agent");
-    await expect(Promise.resolve().then(async () => { await agentStub(c.agent).deliverChannel({ channel: "x", subscription: "sub_x", batch: {} } as never); }))
-      .rejects.toThrow("has ended");
     await expect(Promise.resolve().then(async () => { await agentStub(c.agent).start(); })).rejects.toThrow("has ended");
     // Again: already ended, nothing new.
     expect((await p.run("agent_stop", { agent: c.agent })).content[0].text).toContain("had already ended");
@@ -545,17 +543,8 @@ describe("a dormant sandbox's idle TTL", () => {
     });
     await runDue(sandboxStub(sandbox));
   }
-  /** The `user` channel's expiry notices for `sandbox` (the channel is every test's: paged from the start). */
-  const userNotices = async (sandbox: string) => {
-    const found: any[] = [];
-    for (let since = 0, more = true; more;) {
-      const page = await adminJson(`/v1/admin/channels/user/messages?since=${since}&limit=500`);
-      found.push(...(page.messages as any[]).filter((m) => m.kind === "sandbox_expiring" && m.data?.sandbox === sandbox));
-      more = page.more;
-      since = page.next_seq;
-    }
-    return found.length ? found : null;
-  };
+  /** When `sandbox`'s expiry notice was given (null: not yet). */
+  const noticed = async (sandbox: string): Promise<number | null> => (await sandboxStub(sandbox).info()).expiry_notice_ms ?? null;
 
   it("a short TTL: destroyed once dormant that long, through destroy (the GC registry drops it); not a moment before", async () => {
     const s = await suspended(10 * 60_000);
@@ -566,7 +555,7 @@ describe("a dormant sandbox's idle TTL", () => {
     const row = await runInDurableObject(fleetStub(s.cell), (_i: FleetDO, st) =>
       st.storage.sql.exec<{ destroyed_ms: number | null }>("SELECT destroyed_ms FROM sandboxes WHERE sandbox = ?", s.sandbox).one());
     expect(row.destroyed_ms).toBeGreaterThan(0);
-    expect(await userNotices(s.sandbox)).toBeNull();
+    expect(await noticed(s.sandbox)).toBeNull();
   });
 
   it("the cell default (a day): no notice, destroyed a day after it became dormant", async () => {
@@ -576,24 +565,22 @@ describe("a dormant sandbox's idle TTL", () => {
     expect((await sandboxStub(s.sandbox).info()).state).toBe("suspended");
     await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - DAY - 1; });
     expect((await sandboxStub(s.sandbox).info()).state).toBe("destroyed");
-    expect(await userNotices(s.sandbox)).toBeNull();
+    expect(await noticed(s.sandbox)).toBeNull();
   });
 
-  it("a TTL over a day (30 days): a notice on `user` a day before, then destroyed no sooner than a day after it", async () => {
+  it("a TTL over a day (30 days): a notice a day before, then destroyed no sooner than a day after it", async () => {
     const s = await suspended(30 * DAY);
     await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - 29 * DAY + 60_000; });
-    expect(await userNotices(s.sandbox)).toBeNull();
+    expect(await noticed(s.sandbox)).toBeNull();
+    const before = Date.now();
     await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - 29 * DAY - 60_000; });
-    const [notice] = (await until(() => userNotices(s.sandbox), "the notice"))!;
-    expect(notice.text).toContain(`Sandbox ${s.sandbox}`);
-    expect(notice.data).toMatchObject({ idle_ttl_ms: 30 * DAY });
+    expect(await noticed(s.sandbox)).toBeGreaterThanOrEqual(before);
     expect((await sandboxStub(s.sandbox).info()).state).toBe("suspended");
     // Past the TTL but within a day of the notice: kept.
     await age(s.sandbox, (i) => { i.dormant_since_ms = Date.now() - 31 * DAY; i.expiry_notice_ms = Date.now() - DAY + 60_000; });
     expect((await sandboxStub(s.sandbox).info()).state).toBe("suspended");
     await age(s.sandbox, (i) => { i.expiry_notice_ms = Date.now() - DAY - 1; });
     expect((await sandboxStub(s.sandbox).info()).state).toBe("destroyed");
-    expect(await userNotices(s.sandbox)).toHaveLength(1);
   });
 
   it("an attach ends dormancy at once (the clock starts again), and an operator's longer TTL keeps it", async () => {

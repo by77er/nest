@@ -377,3 +377,17 @@ Tests: `brain-hosts.test.ts`, "a stop ends a start waiting for a brain host…",
 | The `end` and `reap` deadlines | agent.ts `finishEnd`, `endChildren`, `reap` | outside the model | Sandbox release, the cascade to owned agents (`end` on each child's AgentDO, never back into a caller awaiting it) and the owner's `childEnded` read the brain record but never write it. `reap` deletes the storage only with no brain record, so a condemned brain never proven gone keeps its record |
 
 Tests: `test/agent-lifecycle.test.ts` (an end kills, drops, refuses and doesn't restart after the release; `exit` waits for the turn; ephemeral ends only with nothing queued; the stale-epoch stop; the cascade). Mutations run: no turn drop, no input refusal, a graceful stop before the turn ends, no cascade, no epoch fence on `agent_stop`, each fails a test.
+
+## channels removed (kernel/remove-channels, author's map, 2026-11-02)
+
+**Head:** `kernel/remove-channels` (on main 621e493): microkernel stage 2 removes what the channels section above added to AgentDO. Only removals: no brain-record write, guard, await order or deadline of the model's transitions changes. Citations by function name. Unverified by a model run.
+
+| Change | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| No channel deliveries | agent.ts (`deliverChannel` gone); turns.ts (`admitDelivery`, `merge`, `chan_wakes` gone) | yes (Q1 only through the API, inbox, spawn, asks and WorkstreamDO) | One input path fewer; every remaining one enqueues as before |
+| `release` and `endAgent` report nothing | agent.ts `release`, `endAgent` | yes (A5/A6 unchanged) | The synchronous `chan_out` push after the commit is gone; `endAgent` awaits the same deadline writes it armed before |
+| `applyEvent` reports nothing | agent.ts `applyEvent` | yes (Q3 unchanged) | The synchronous `kv.last_text` and `chan_out` writes after the update are gone |
+| Requeued unseen messages | turns.ts `requeuedTurn` | yes (Q3 + Q1) | Always one `inbox` turn (no `event_batch` for channel notices) |
+| No `chan_out` deadline | agent.ts `alarm`; reliable.ts `Deadlines.runDue` | yes | The bounded background flush that ran after every other due key is gone (and `runDue`'s `last` with it): brain deadlines no longer wait behind it. A `chan_out` row left by the previous release is dropped as an unknown key (logged) |
+
+Tests: `test/templates.test.ts` ("the channels' removal": a stored spec naming channel tools starts and a call is `unknown_tool`; the `chan_out` deadline no longer runs). The full suite passes.

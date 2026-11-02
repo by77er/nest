@@ -6,13 +6,12 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 |---|---|
 | [fleet/](fleet/) | Hosts of both kinds, enrollment and tunnels, leases, sandbox placement, drains, STONITH, desired versions, the binding verification key, base generations, command delivery |
 | [sandbox/](sandbox/) | Placement claims and epochs, the generation chain (pins, retention, losses), attachments and bindings (`attach`, `resolve`, `detach`), activity and holds, policy, ports |
-| [agent/](agent/) | Turn queue, deliveries, scheduled wakes, brain placement and the agent epoch, hands setup through SandboxDO, session stream, state, spec, grants, taint and budget, tool relay |
-| [channel/](channel/) | Message log, subscriptions and cursors, fan-out |
-| [hook/](hook/) | One webhook: verification (through BrokerDO), mapping, dedup, posting to its channel |
-| [broker/](broker/) | Claude setup tokens, injected secrets, hook secrets, capability credentials, GitHub App token minting |
+| [agent/](agent/) | Turn queue and inbox, scheduled wakes, brain placement and the agent epoch, hands setup through SandboxDO, session stream, state, spec, grants, taint and budget, tool relay |
+| [broker/](broker/) | Claude setup tokens, injected secrets, capability credentials, GitHub App token minting |
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
 | WorkstreamDO (interim) | The [workstream channel](../../orchestration/workstreams/#the-interim-workstream-channel), until stage 3 of the microkernel removal ([principle 9](../../README.md#principles)) |
 | TaskLedgerDO (stub) | Nothing: the task ledger left the platform. The class stays declared, serving only the health probe and leaving the previous release's rows untouched, until stage 4 deletes it in a deploy of its own |
+| ChannelDO (stub) | Nothing: channels left the platform. Like TaskLedgerDO, it serves only the health probe, leaves its rows and its R2 bodies untouched, and re-arms a previous release's alarm daily while its deadlines remain, until stage 4 |
 | [mcp-connector/](mcp-connector/) | One remote MCP server and credential: the shared tool list, its change notices to agents, and call admission |
 
 ## Conventions
@@ -25,4 +24,4 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 - **Timers are alarms,** several deadlines multiplexed onto one. A deadline is removed only after its handler succeeds; a failing handler is retried. A key whose handler is running counts as unarmed, so a re-arm made meanwhile (even for the time being run) survives it, and each due key is read again just before it runs, so one cleared or moved by an earlier handler doesn't run.
 - **Repair loops:** every transient state carries an alarm deadline, and when it fires the DO re-derives the state from durable facts. An unreachable peer means defer, never destroy.
 - **Hosts connect over hibernatable WebSockets:** one control connection per host to FleetDO, plus one per active agent from a brain host's runner to its AgentDO. Hands bytes never pass through a DO: they go from the brain to the sandbox host's gateway. A new connection supersedes the old one only after a valid hello.
-- **Bounded growth:** finished commands, tool calls, reply waits and turns are pruned; channel messages follow their channel's retention.
+- **Bounded growth:** finished commands, tool calls, reply waits and turns are pruned.

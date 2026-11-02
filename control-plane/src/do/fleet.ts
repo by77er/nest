@@ -2396,7 +2396,7 @@ export class FleetDO extends DurableObject<Env> {
       const f = "facts" in r ? r.facts : null;
       return {
         agent, kind, template: f?.template ?? null, owner: f?.owner ?? null, sandbox: f?.sandbox ?? null, last_turn_ms: f?.last_turn_ms ?? null,
-        stopped_by_operator: f?.stopped_by_operator ?? false, live_children: f?.live_children ?? [], subscriptions: f?.subscriptions ?? 0,
+        stopped_by_operator: f?.stopped_by_operator ?? false, live_children: f?.live_children ?? [],
         ended_ms: f?.ended?.ms ?? null, ended_reason: f?.ended?.reason ?? null, found_via, error: "error" in r ? r.error : null,
       };
     };
