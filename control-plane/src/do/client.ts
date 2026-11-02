@@ -7,6 +7,9 @@
 // One more instance, named `directory`, holds the names: unique, each mapped to its client's id, and
 // the list of clients. Nothing else addresses it.
 //
+// Each principal's idempotency keys for creates (lib/idempotency.ts) live here too: a client's in its
+// own instance, the operator's in one more, named `operator`, which holds nothing else.
+//
 // Counting (docs/control-plane/durable-objects/client/): a create first `admit`s the new id, which
 // checks the count and records it as `reserved` in one synchronous step, so two creates can't both
 // take the last place. The agent or sandbox then reports itself from its own alarm (`report`), live
@@ -20,6 +23,7 @@ import { BACKLOG_MAX, checkWebhookUrl, retryDelayMs, signature, type StampedEven
 import { num } from "../env";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { Deadlines } from "../lib/reliable";
+import { IdempotencyKeys, type KeyClaim } from "../lib/idempotency";
 import { storedEnum } from "../lib/stored";
 import { asNestError, clip, hex, NestError, timingSafeEqual } from "../lib/util";
 import { z } from "zod";
@@ -28,6 +32,8 @@ import type { ClientScope } from "./catalog";
 
 /** The directory instance's name (client ids start `cli_`, the health instance `~`). */
 export const CLIENT_DIRECTORY = "directory";
+/** The instance holding the operator's idempotency keys, and nothing else. */
+export const CLIENT_OPERATOR = "operator";
 /** A reservation not reported by its object this long after `admit` is checked against the object. */
 export const RESERVE_CHECK_MS = 10 * 60_000;
 /** An ended agent or destroyed sandbox stays listed this long (an agent's records are kept as long). */
@@ -134,6 +140,9 @@ export class ClientDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private readonly deadlines!: Deadlines<Key>;
   private readonly directory: boolean = false;
+  /** The operator's instance: idempotency keys only. */
+  private readonly operatorKeys: boolean = false;
+  private keys!: IdempotencyKeys;
 
   /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
   async health(): Promise<true> {
@@ -150,6 +159,12 @@ export class ClientDO extends DurableObject<Env> {
       this.sql.exec("CREATE TABLE IF NOT EXISTS names (name TEXT PRIMARY KEY, client TEXT NOT NULL, created_ms INTEGER NOT NULL)");
       return;
     }
+    if (ctx.id.equals(env.CLIENT.idFromName(CLIENT_OPERATOR))) {
+      // Its expired keys go at its claims (no alarm).
+      this.operatorKeys = true;
+      this.keys = new IdempotencyKeys(this.sql);
+      return;
+    }
     this.schema();
     this.deadlines = new Deadlines(this.sql, ctx.storage);
   }
@@ -162,6 +177,29 @@ export class ClientDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
     // Events waiting for its webhook, in the order they were handed over; `id` is the event's (dedup).
     this.sql.exec("CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, body TEXT NOT NULL)");
+    this.keys = new IdempotencyKeys(this.sql);
+  }
+
+  // --- idempotency keys (lib/idempotency.ts): this principal's, in a client's instance or the operator's ---
+
+  private requireKeys(): IdempotencyKeys {
+    if (this.directory || !this.keys) throw new NestError(ErrorCodes.INTERNAL, "this instance holds no idempotency keys", 500);
+    return this.keys;
+  }
+
+  /** Claim `key` for a create whose request digest is `digest`; `id` is what a new object would be named. */
+  async claimKey(key: string, digest: string, id: string): Promise<KeyClaim> {
+    return this.requireKeys().claim(key, digest, id);
+  }
+
+  /** The create under `key` was answered `status`. */
+  async finishKey(key: string, status: number): Promise<void> {
+    this.requireKeys().finish(key, status);
+  }
+
+  /** The request holding `claim` failed; `free`: nothing was ever created under the key. */
+  async abandonKey(key: string, claim: string, free: boolean): Promise<void> {
+    this.requireKeys().abandon(key, claim, free);
   }
 
   // --- the directory -------------------------------------------------------------------------------
@@ -198,7 +236,7 @@ export class ClientDO extends DurableObject<Env> {
   // --- the record ----------------------------------------------------------------------------------
 
   private requireClient(): void {
-    if (this.directory) throw new NestError(ErrorCodes.INTERNAL, "the directory is not a client", 500);
+    if (this.directory || this.operatorKeys) throw new NestError(ErrorCodes.INTERNAL, "this instance is not a client", 500);
   }
 
   private record(): ClientRecord | null {
@@ -499,12 +537,13 @@ export class ClientDO extends DurableObject<Env> {
   // --- alarms --------------------------------------------------------------------------------------
 
   override async alarm(): Promise<void> {
-    if (this.directory) return;
+    if (this.directory || this.operatorKeys) return;
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === "reconcile") await this.reconcile();
       else if (key === "deliver") await this.deliver();
       else if (key === "prune") {
         this.sql.exec("DELETE FROM members WHERE state = 'ended' AND ended_ms < ?", Date.now() - ENDED_RETENTION_MS);
+        this.keys.prune();
         // A delivery a rolled-back release dropped (it has no handler for `deliver`) is armed again.
         if (this.backlog() && !this.deadlines.has("deliver")) await this.deadlines.set("deliver", Date.now());
         await this.recheckLive();

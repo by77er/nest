@@ -2,10 +2,10 @@
 
 **Decided (2026-11-02, the owner's):** external systems (an app with its own Worker and Durable Objects, such as a task board) use nest only through this interface. An app never gets the admin token, and nest gets nothing specific to any app. **An app that seems to need a special case in nest means this interface is wrong:** fix the interface, generically ([principle 9](../../../README.md#principles)).
 
-**Built (2026-11-02):** clients and grants, ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), and [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`). [GitHub tokens](#github-tokens) are built too. **Not built:** caller identity.
+**Built (2026-11-02), all of it:** clients and grants, ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`.
 
 **How the built parts read the grant** (each a choice the design left open):
-- **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own.
+- **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
 - **Brokered actions:** only GitHub actions scoped to repos in `repos` are within a grant. An http profile (a URL and a credential no field covers), a fork (it widens the push allowlist) and an unscoped GitHub action are refused.
 - **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's (403).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
@@ -29,6 +29,8 @@
 - **Owner** is a principal: `user` (the operator), `cli_…`, or `agt_…`. A client owns what it creates, and transitively what those agents create.
 - **A client sees and acts only on its subtree:** listing, reading, inbox and turns, approvals, stop and end, transcripts, its sandboxes. Anything else answers `404`, never `403`, so ids outside it reveal nothing.
 - **The routes are the operator's, under client auth:** the same paths and bodies (`POST /v1/agents`, `POST /v1/sandboxes`, `/v1/agents/<id>/inbox`, `…/stop`, `…/asks`, …), filtered to the subtree. No route exists for one client's use only.
+- **No `?cell=`** on any of them but a listing's filter: a cell goes in a create's body, and everything else reaches its object by id ([which routes take a cell](../#which-routes-take-a-cell), 2026-11-02).
+- **Creates take an `Idempotency-Key`**, scoped to the client ([idempotency keys](../#idempotency-keys), 2026-11-02).
 
 ## Labels
 
@@ -42,17 +44,17 @@
 
 ## Caller identity for MCP servers
 
-**Built (2026-11-02)**, except `client` and `labels`, which appear once agents carry them (the clients and labels work); the wire contract is [remote-mcp](../../../interfaces/remote-mcp/), the keys [BrokerDO](../../durable-objects/broker/#caller-identity-keys). `owner` is `user` for the operator's agents.
+**Built (2026-11-02)**, `client` and `labels` included: AgentDO names them from its record (`AgentDO.identitySubject`). The wire contract is [remote-mcp](../../../interfaces/remote-mcp/), the keys [BrokerDO](../../durable-objects/broker/#caller-identity-keys). `owner` is `user` for the operator's agents.
 
 - **Every request** AgentDO sends to a remote MCP server ([remote-mcp](../../../interfaces/remote-mcp/)) carries `Nest-Identity: <JWT>`. It's EdDSA (Ed25519), signed by the control plane, valid for 5 minutes, with these claims:
   - `aud`: the server's URL;
   - `sub`: the agent;
   - `owner`, `client` (or absent), `labels`, `epoch`, `tainted`, `iat`, `exp`;
   - `iss`: the Worker's public base URL.
-- **The connector's listing session** carries one with `sub: "nest:connector"`.
+- **The connector's listing session** carries one with `sub: "nest:connector"`, and `client` when the capability is in a client's namespace: such a capability has a connector of its own ([the connector](../../../agents/capabilities/mcp/#the-connector), 2026-11-02). An operator's capability's listing names no client, even when a client's agent uses it: its list is shared.
 - **The public keys** are at `GET /.well-known/jwks.json`, unauthenticated, with each key's `kid`. BrokerDO holds the private keys and rotates them, publishing the next key a day before it signs.
 - **Cost:** AgentDO and the connector cache a token per claim set (audience, epoch, taint, labels) for its first 4 minutes, so a call usually costs no BrokerDO round trip.
-- **What it's for:** a server knows which agent is calling and what labels its creator gave it, so it can scope each agent (a worker sees only its task) without trusting the bearer token alone. This builds the deferred [OIDC token](../../../security/identity/) for MCP servers.
+- **What it's for:** a server knows which agent is calling and what labels its creator gave it, so it can scope each agent (a worker sees only its task) without trusting the bearer token alone, or with no bearer at all ([no bearer](../../../agents/capabilities/mcp/#no-bearer)). This builds the deferred [OIDC token](../../../security/identity/) for MCP servers.
 
 ## Events to the owner
 

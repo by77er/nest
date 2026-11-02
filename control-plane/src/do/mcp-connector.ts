@@ -1,5 +1,6 @@
 // McpConnectorDO: one remote MCP server as nest shares it (docs/agents/capabilities/mcp/#the-connector),
-// keyed by `connectorName(grant)`: the server's URL and the credential it is called with. It owns what is
+// keyed by `connectorName(grant)`: the server's URL, the credential it is called with (if any), and for a
+// client's capability that client's namespace. It owns what is
 // per server rather than per agent:
 // - the tool list: one `tools/list` over the connector's own MCP session, cached for every agent;
 // - noticing that the list changed (`notifications/tools/list_changed` on any stream it or an AgentDO
@@ -37,7 +38,7 @@ const NOTICE_RETRY_MS = 5_000;
 type Key = "relist" | "notices";
 
 /** The AgentDO side of a notice (`AgentDO.mcpToolsChanged`): whether it still wants notices. */
-type Notify = (agent: string, server: Pick<McpGrant, "url" | "auth">, changed: boolean) => Promise<boolean>;
+type Notify = (agent: string, server: Pick<McpGrant, "url" | "auth" | "client">, changed: boolean) => Promise<boolean>;
 
 export class McpConnectorDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -132,14 +133,15 @@ export class McpConnectorDO extends DurableObject<Env> {
     const deadline = Date.now() + timeout;
     const u = checkMcpUrl(g.url, this.env.ALLOW_LOOPBACK_MCP === "1");
     if (!u.ok) throw new Error(u.error);
-    const token = await mcpToken(this.env, g);
-    if (!token) throw new Error(`no credential stored as ${g.auth}`);
+    // No credential named: no bearer, and the caller identity is the only credential.
+    const token = g.auth === undefined ? null : await mcpToken(this.env, g);
+    if (g.auth !== undefined && !token) throw new Error(`no credential stored as ${g.auth}`);
     // Cleared before the fetch: a change reported while it runs marks the list stale again; a failed
     // fetch leaves it stale as it was.
     const wasStale = this.kv<boolean>("stale") ?? false;
     this.kvPut("stale", false);
     try {
-      return await this.fetchPages(g, { value: token, renewed: false }, deadline);
+      return await this.fetchPages(g, { value: token, renewed: token === null }, deadline);
     } catch (e) {
       if (wasStale) this.kvPut("stale", true);
       throw e;
@@ -150,16 +152,17 @@ export class McpConnectorDO extends DurableObject<Env> {
    * A 401 (to `initialize` or `tools/list`) means nothing was processed: the bearer is renewed once
    * (`mcpToken` with the refused one: an OAuth refresh) and the list asked again.
    */
-  private async fetchPages(g: McpGrant, bearer: { value: string; renewed: boolean }, deadline: number): Promise<ConnectorList> {
+  private async fetchPages(g: McpGrant, bearer: { value: string | null; renewed: boolean }, deadline: number): Promise<ConnectorList> {
     const renew = async (a: RpcAnswer): Promise<boolean> => {
-      if (a.kind !== "refused" || a.status !== 401 || bearer.renewed) return false;
+      if (a.kind !== "refused" || a.status !== 401 || bearer.renewed || bearer.value === null) return false;
       bearer.renewed = true;
       const t = await mcpToken(this.env, g, bearer.value);
       if (!t) return false;
       bearer.value = t;
       return true;
     };
-    const identity = () => this.identities.token({ aud: g.url, sub: CONNECTOR_SUBJECT });
+    // A client's capability has a connector of its own (its namespace is in the name), which names that client.
+    const identity = () => this.identities.token({ aud: g.url, sub: CONNECTOR_SUBJECT, ...(g.client ? { client: g.client } : {}) });
     for (let reinit = 0; ;) {
       const token = bearer.value;
       let s = this.kv<{ session: string | null; version: string }>("session");
@@ -269,7 +272,8 @@ export class McpConnectorDO extends DurableObject<Env> {
    */
   private async tell(g: McpGrant, agent: string, seen: number, changed: boolean, digest: string | null): Promise<void> {
     try {
-      const keep = await withTimeout(this.notify(agent, { url: g.url, auth: g.auth }, changed), NOTICE_TIMEOUT_MS, "mcp notice");
+      const server = { url: g.url, ...(g.auth !== undefined ? { auth: g.auth } : {}), ...(g.client ? { client: g.client } : {}) };
+      const keep = await withTimeout(this.notify(agent, server, changed), NOTICE_TIMEOUT_MS, "mcp notice");
       if (!keep) this.sql.exec("DELETE FROM subscribers WHERE agent = ?", agent);
       else if (digest) this.sql.exec("UPDATE subscribers SET seen_ms = ?, digest = ?, next_ms = 0 WHERE agent = ?", Date.now(), digest, agent);
       else this.sql.exec("UPDATE subscribers SET seen_ms = ? WHERE agent = ?", Date.now(), agent);

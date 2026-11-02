@@ -15,7 +15,8 @@ import {
   parseLabelFilters, tokenHash,
 } from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
-import { CLIENT_DIRECTORY } from "./do/client";
+import { CLIENT_DIRECTORY, CLIENT_OPERATOR } from "./do/client";
+import { idempotencyKey, type KeyClaim, requestDigest } from "./lib/idempotency";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
@@ -196,8 +197,12 @@ interface Ctx<P extends string, B> {
   url: URL;
   p: Params<P>;
   body: B;
-  /** The admin API's `?cell=` (default `local`), checked. */
-  cell: string;
+  /**
+   * `?cell=` (default `local`), checked when a route reads it, and only then: a route about one cell's
+   * FleetDO (hosts, the fleet view, GC, the operator's listing) reads it; a route reaching an agent or
+   * sandbox by id, the catalog, clients or secrets never does, so it needs no cell and ignores one given.
+   */
+  readonly cell: string;
   /** A `host` route's verified token. */
   claims: HostClaims;
   /** An `owner` route's caller (the operator on an `admin` route). */
@@ -280,7 +285,9 @@ async function oauthCapability(env: Env, raw: string) {
   const cap = (await catalog(env).catalog()).capabilities[name];
   if (!cap) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown capability ${name}`, 404);
   const mcp = cap.mcp;
-  if (!mcp || typeof mcp.auth === "string") throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name} is not an mcp capability with auth {oauth: cap:<name>}`, 409);
+  if (!mcp || mcp.auth === undefined || typeof mcp.auth === "string") {
+    throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name} is not an mcp capability with auth {oauth: cap:<name>}`, 409);
+  }
   return { name, mcp: { ...mcp, auth: mcp.auth } };
 }
 
@@ -303,6 +310,43 @@ async function createOrRelease<T>(env: Env, client: string | null, id: string, c
     if (client && !asNestError(e)?.retryable) await clientDO(env, client).release(id).catch(() => undefined);
     throw e;
   }
+}
+
+/** A replayed create's answer says so (docs/control-plane/api/#idempotency-keys). */
+const REPLAYED = { "idempotent-replayed": "true" } as const;
+
+/**
+ * `POST /v1/agents` and `POST /v1/sandboxes` (docs/control-plane/api/#idempotency-keys). Without an
+ * `Idempotency-Key`, `create` runs under a new id. With one, the caller's key store (its ClientDO; the
+ * operator's `operator` instance) binds the key to this request and an id first: a key already answered
+ * replays (`replay`), one still being handled is a retryable 409, one used for another request a 409.
+ * `create` calls `begin()` just before it makes anything; a fresh key whose request failed before that is
+ * freed, and otherwise stays bound to its id, so a retry makes the same object (every create is
+ * idempotent by id) and never a second one.
+ */
+async function createOnce(c: Ctx<string, unknown>, kind: "agent" | "sandbox", create: (id: string, begin: () => void) => Promise<Response>,
+  replay: (id: string, status: number) => Promise<Response>): Promise<Response> {
+  const prefix = kind === "agent" ? "agt_" : "sbx_";
+  const key = idempotencyKey(c.req);
+  if (key === null) return create(newId(prefix), () => undefined);
+  const store = clientDO(c.env, c.caller.kind === "client" ? c.caller.client : CLIENT_OPERATOR);
+  const digest = await requestDigest(`POST /v1/${kind}s`, c.body);
+  // RPC's typing doesn't carry a union through: the answer is ClientDO's `KeyClaim`.
+  const claim = await newMethod("ClientDO.claimKey", async () => (await store.claimKey(key, digest, newId(prefix))) as unknown as KeyClaim);
+  if (claim.kind === "done") return replay(claim.id, claim.status);
+  let begun = false;
+  let res: Response;
+  try {
+    res = await create(claim.id, () => {
+      begun = true;
+    });
+  } catch (e) {
+    await store.abandonKey(key, claim.claim, claim.fresh && !begun).catch((x) => console.warn(`idempotency key: abandoning a claim failed (its lease lapses)`, x));
+    throw e;
+  }
+  // If this isn't recorded, the next request with the key waits out the lease, then makes the same object again (found, not duplicated).
+  await store.finishKey(key, res.status).catch((x) => console.warn(`idempotency key: recording the answer failed`, x));
+  return res;
 }
 
 /**
@@ -496,16 +540,16 @@ export const ROUTES: Route[] = [
       idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
       labels: Labels.optional(),
     }),
-    run: async (c) => {
+    run: (c) => createOnce(c, "sandbox", async (id, begin) => {
       const { env, body: r, caller } = c;
       // The policy layer (egress, injected credentials) is the operator's: no grant field covers it.
       if (r.policy) operatorOnly(c, "a sandbox's policy layer");
       const cell = checkCell(env, r.cell);
-      const id = newId("sbx_");
       const labels = r.labels ?? {};
       const client = caller.kind === "client" ? caller.client : null;
       // A client's place first (its grant's cells and max_sandboxes, counted across its subtree).
       if (client) await clientDO(env, client).admit({ kind: "sandbox", id, cell, owner: client, labels });
+      begin();
       const info = await createOrRelease(env, client, id, () => sandbox(env, id).create({
         sandbox: id, cell, labels, ...(client ? { client } : {}),
         ...(r.image ? { image: r.image } : {}), ...(r.resources ? { resources: r.resources } : {}),
@@ -513,7 +557,7 @@ export const ROUTES: Route[] = [
       }));
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
-    },
+    }, async (id, status) => json(await sandbox(c.env, id).info(), status, REPLAYED)),
   }),
   route({ method: "GET", path: "/v1/sandboxes", auth: "owner", run: (c) => listing(c, "sandbox") }),
   route({
@@ -567,7 +611,8 @@ export const ROUTES: Route[] = [
       start: z.boolean().default(true),
       labels: Labels.optional(),
     }),
-    run: async (c) => {
+    // Under an `Idempotency-Key`, everything runs inside its claim, so a replay never re-validates (`createOnce`).
+    run: (c) => createOnce(c, "agent", async (id, begin) => {
       const { env, body: r, caller } = c;
       if (r.template && r.role && r.template !== r.role) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template and role differ");
       const template = r.template ?? r.role;
@@ -605,10 +650,10 @@ export const ROUTES: Route[] = [
         const overrides: OperatorOverrides = { ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...o.data };
         spec = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides }, scope);
       }
-      const id = newId("agt_");
       const labels = r.labels ?? {};
       const owner = ownerAgent ?? (caller.kind === "client" ? caller.client : null);
       if (client) await clientDO(env, client).admit({ kind: "agent", id, cell: cellName, owner, labels });
+      begin();
       const a = agent(env, id);
       await createOrRelease(env, client, id, () => a.create({
         agent: id, cell: cellName, spec, owner, sandbox: r.sandbox ?? null, labels, ...(client ? { client } : {}),
@@ -627,7 +672,8 @@ export const ROUTES: Route[] = [
         }
       }
       return json({ ...(await a.info()), started, ...(start_waiting ? { start_waiting } : {}) }, 201);
-    },
+      // A replay doesn't start it again: `started` is null, and its state is as it is now.
+    }, async (id, status) => json({ ...(await agent(c.env, id).info()), started: null }, status, REPLAYED)),
   }),
   route({ method: "GET", path: "/v1/agents", auth: "owner", run: (c) => listing(c, "agent") }),
   route({ method: "GET", path: "/v1/agents/:agent", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).info() }),
@@ -796,13 +842,18 @@ async function dispatch(req: Request, env: Env): Promise<Response> {
     if (r.method !== req.method) continue;
     const p = match(r.path, url.pathname);
     if (!p) continue;
-    const c = { req, env, url, p, body: undefined as unknown, cell: DEFAULT_CELL, claims: undefined as unknown as HostClaims, caller: { kind: "operator" } as Caller };
+    let cell: string | undefined;
+    const c = {
+      req, env, url, p, body: undefined as unknown, claims: undefined as unknown as HostClaims, caller: { kind: "operator" } as Caller,
+      get cell(): string {
+        cell ??= checkCell(env, url.searchParams.get("cell") ?? DEFAULT_CELL);
+        return cell;
+      },
+    };
     if (r.auth === "admin") {
       requireAdmin(req, env);
-      c.cell = checkCell(env, url.searchParams.get("cell") ?? DEFAULT_CELL);
     } else if (r.auth === "owner") {
       c.caller = await ownerCaller(req, env);
-      c.cell = checkCell(env, url.searchParams.get("cell") ?? DEFAULT_CELL);
     } else if (r.auth === "host") {
       c.claims = await hostClaims(req, env, r.graceMs);
     }
