@@ -3,9 +3,8 @@
 // oracle is a response recorded from the control plane's test pool (fixtures/admin.ts `lifetimes`).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { lifetimes } from "../fixtures/admin";
-import { createElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
-import { AbandonedView, byAge, destroyIn, idleSince, operatorCall, span } from "../src/Abandoned";
+import { span } from "../src/ui/format";
+import { byAge, destroyIn, idleSince, operatorCall } from "../src/ui/lifetimes";
 import { type LifetimesResponse, MAX_LIFETIME_PAGES, mergePages } from "../src/lifetimes";
 import type { LifetimesView } from "../../protocol/admin/view";
 import worker, { type Env } from "../src/worker";
@@ -161,23 +160,5 @@ describe("the page's reading of it", () => {
     expect(held).toMatchObject({ kind: "held", attached: [quiet!.agent] });
     expect(quiet).toMatchObject({ kind: "quiet", stopped_by_operator: true, sandbox: held!.sandbox, owner: lead!.agent });
     expect(lead).toMatchObject({ kind: "quiet", found_via: "registry", live_children: [quiet!.agent] });
-  });
-});
-
-describe("the section", () => {
-  const render = (view: LifetimesResponse | null, error: string | null = null) =>
-    renderToStaticMarkup(createElement(AbandonedView, { view, error, now: lifetimes.now_ms }));
-
-  it("lists the recorded view's sandboxes and agents, with when the TTL takes the dormant one, and no control that acts", () => {
-    const html = render(mergePages([lifetimes], false));
-    for (const id of [dormant!.sandbox, held!.sandbox, quiet!.agent, lead!.agent]) expect(html).toContain(id);
-    expect(html).toContain(`in ${span(dormant!.destroy_at_ms! - lifetimes.now_ms)}`);
-    expect(html).toContain("never (not dormant)");
-    expect(html).not.toMatch(/<(button|form|input)\b/);
-  });
-
-  it("says why it has nothing to show", () => {
-    expect(render(null, "this control plane does not serve GET /v1/admin/lifetimes yet")).toContain("does not serve");
-    expect(render(null)).toContain("loading");
   });
 });

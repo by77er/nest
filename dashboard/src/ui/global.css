@@ -1,0 +1,17 @@
+/* What the theme object can't express: the page background (Mantine paints the body in its surface
+   color, which here is the panels'), and the font's tabular numbers wherever the mono face is used. */
+body {
+  background-color: var(--nest-page);
+}
+
+code,
+kbd,
+.mantine-Table-table {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A row the page moves the focus to (an attention item's "Show"). */
+[tabindex="-1"]:focus {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: -2px;
+}
