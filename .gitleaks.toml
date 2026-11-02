@@ -47,3 +47,10 @@ description = "The id (not the secret) of the Access service token the gateways 
 condition = "AND"
 paths = ['''^deploy/lean/Edge/Edges\.lean$''']
 regexes = ['''^3d8b66b9-bcd1-43a1-99db-5b2703a4c031$''']
+
+[[allowlists]]
+targetRules = ["aws-access-token", "curl-auth-header"]
+description = "Test fixtures, not credentials: an AWS-key-id shape and a curl bearer value the live trace's redaction tests used as literals in one earlier commit (678b1e0); the file now builds its samples at run time"
+condition = "AND"
+paths = ['''^control-plane/test/trace\.test\.ts$''']
+regexes = ['''^AKIAABCDEFGHIJKLMNOP$''', '''^abcdefghijk$''']
