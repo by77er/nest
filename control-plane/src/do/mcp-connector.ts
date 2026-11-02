@@ -18,6 +18,7 @@ import {
 } from "../lib/mcp";
 import { type Admission, type ConnectorList, MCP_LIST_TTL_MS, mcpToken, setupError } from "../lib/mcp-proxy";
 import { Deadlines, withTimeout } from "../lib/reliable";
+import { CONNECTOR_SUBJECT, IdentityTokens } from "../lib/identity";
 import { newId } from "../lib/util";
 
 /** While any brain uses the list, it is fetched again this often (`MCP_RELIST_MS`): a change no stream carried is seen within it. */
@@ -43,6 +44,8 @@ export class McpConnectorDO extends DurableObject<Env> {
   private readonly deadlines!: Deadlines<Key>;
   /** The fetch in flight: concurrent lists wait for one `tools/list`. */
   private fetching: Promise<ConnectorList> | null = null;
+  /** Its caller identity (`sub: nest:connector`), signed by BrokerDO and reused for most of its 5 minutes. */
+  private readonly identities = new IdentityTokens((s) => this.env.BROKER.get(this.env.BROKER.idFromName("broker")).signIdentity(s));
   /** Tests replace how a notice reaches an AgentDO. */
   notify: Notify = (agent, server, changed) => this.env.AGENT.get(this.env.AGENT.idFromName(agent)).mcpToolsChanged(server, changed);
 
@@ -156,18 +159,19 @@ export class McpConnectorDO extends DurableObject<Env> {
       bearer.value = t;
       return true;
     };
+    const identity = () => this.identities.token({ aud: g.url, sub: CONNECTOR_SUBJECT });
     for (let reinit = 0; ;) {
       const token = bearer.value;
       let s = this.kv<{ session: string | null; version: string }>("session");
       if (!s) {
-        const o = await openSession(g.url, token, Math.max(1, deadline - Date.now()), "nest-connector");
+        const o = await openSession(g.url, token, Math.max(1, deadline - Date.now()), "nest-connector", identity);
         if (o.kind === "failed" && (await renew(o.answer))) continue;
         if (o.kind === "failed") throw setupError(g, "initialize", o.answer);
         if (o.kind === "unsupported") throw new Error(`the server speaks ${String(o.version)}`);
         s = { session: o.session, version: o.version };
         this.kvPut("session", s);
       }
-      const r = await listAll(g.url, token, s, deadline);
+      const r = await listAll(g.url, token, s, deadline, identity);
       if (r.kind === "session_gone") {
         // Only the session that failed: one opened meanwhile stays.
         if (this.kv<{ session: string | null }>("session")?.session === s.session) this.sql.exec("DELETE FROM kv WHERE key = 'session'");

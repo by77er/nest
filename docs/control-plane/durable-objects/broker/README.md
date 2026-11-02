@@ -12,10 +12,21 @@ The only DO that stores secret values. Platform keys live elsewhere: the proxy r
 - **The operator's GitHub user token** (`github_user`), read only by AgentDO's `github.fork` (`githubUserToken`): the App can't fork from an account it isn't installed on ([forks](../../../agents/capabilities/brokered/#forks)). Never resolvable into a host command.
 - **Brokered-action credentials:** `http:<name>`, an http profile's secret, read only by AgentDO's brokered pipeline (`brokeredSecret`). `scanSecrets(strings)` answers which stored secrets' values (raw, base64, long strings inside a JSON value, a PEM's body lines; 8 characters at least) appear in a brokered call's arguments: names only, so no value leaves BrokerDO.
 - **The binding signing key** (`binding_key:<cell>`): an ECDSA P-256 private key per cell, generated on first use and stored as a JWK that rests nowhere else. BrokerDO signs every binding (`signBinding`) and hands FleetDO only the public keys (`bindingPublicKeys`); the admin secrets route refuses the `binding_key:` prefix, so the key can't be replaced from outside ([gateway](../../../interfaces/gateway/)). Rotation (a second listed key) isn't built.
+- **Caller identity keys** ([below](#caller-identity-keys)): the Ed25519 keys that sign `Nest-Identity`.
 - **The Access service token** (`access:gateway`) that fronts the sandbox hosts' tunnel hostnames: stored by me through the admin secrets route as JSON `{"client_id", "client_secret"}`, read by SandboxDO's `resolve` into the `edge` of every target that points at a host's tunnel, so a runner holds it only inside a target in memory. Never a sandbox ([gateway](../../../sandbox/gateway/)). Not built: a `nest` login that hands it to the CLI for terminals.
 - **The api-loop API key** (deferred), used only inside the control plane.
 
 The Cloudflare API token that creates and deletes per-host tunnels and DNS records is a Worker secret, like the other platform keys, not a BrokerDO secret.
+
+## Caller identity keys
+
+**Built (2026-11-02)** for [caller identity](../../api/clients/#caller-identity-for-mcp-servers) (`signIdentity`, `identityJwks`; `src/lib/identity.ts`):
+
+- **Algorithm: Ed25519 (EdDSA).** Workers' WebCrypto supports `Ed25519` for `sign`, `verify`, `generateKey`, `importKey` and `exportKey` ([Cloudflare](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/), as the Secure Curves API names it), so no ES256 fallback is needed.
+- **Storage:** `identity_keys`, one row per key: `kid` (RFC 7638 thumbprint), the private and public JWK, `signs_from_ms`. The private JWK never leaves BrokerDO; the admin secrets route can't reach the table.
+- **Schedule** (`keyPlan`, pure): the signer is the newest key whose `signs_from_ms` has come. A key signs 30 days. The next key is made a day before that and signs only after it has been published a day; if nothing signed or read the JWKS that day, it is made at the next use and the current key signs on until it has been published a day. A retired key stays published a day after the next one took over (a token lives 5 minutes, the JWKS is cacheable 5), then its row is deleted. The first key signs at once (no token can exist yet).
+- **No alarm:** every sign and JWKS read applies the schedule. A key generated across an await is inserted only if the re-read schedule still wants one, so concurrent first uses make one key.
+- **Signing:** the caller passes the subject (`aud`, `sub` and the optional claims, a strict schema); BrokerDO adds `iss` (`PUBLIC_BASE_URL`), `iat` and `exp` (5 minutes), so lifetime and issuer are decided here only.
 
 ## Injection minting
 
@@ -28,7 +39,7 @@ The Cloudflare API token that creates and deletes per-host tunnels and DNS recor
 - **Checked twice (built for this path):** SandboxDO reads the sandbox's epoch, host and allowlist before asking and again when the answer is in hand, and drops the push if any changed; BrokerDO stores nothing for a request a newer one for the same sandbox overtook while GitHub answered, so a slow, stale mint can't replace the value a newer push's reference resolves to. The general double check (the policy hash and the binding's grant) waits for the policy acknowledgement.
 - **Audited** like the brokered mints, before the value is stored: `event: github_installation_token`, `repos`, `permissions`, `installation`, `expires_ms`, `target: {sandbox, epoch}`, `binding`, `caller: SandboxDO`, or `refused` with the reason.
 
-**Built:** secret storage and references, purpose-scoped resolution, setup tokens, injected secrets (keyed by sandbox), the binding signing key, the Access service token, MCP OAuth, GitHub App minting for brokered actions and for sandbox injection, the operator's GitHub user token, http profile credentials, the argument scan, and the issuance audit of MCP OAuth and GitHub mints. **Not built:** the general double check when serving a secret, and the audit of static secret pushes and binding mints.
+**Built:** secret storage and references, purpose-scoped resolution, setup tokens, injected secrets (keyed by sandbox), the binding signing key, the caller identity keys, the Access service token, MCP OAuth, GitHub App minting for brokered actions and for sandbox injection, the operator's GitHub user token, http profile credentials, the argument scan, and the issuance audit of MCP OAuth and GitHub mints. **Not built:** the general double check when serving a secret, and the audit of static secret pushes and binding mints.
 
 ## Issuance audit
 

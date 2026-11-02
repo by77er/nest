@@ -20,6 +20,6 @@ Sandboxes only ever see **placeholders**. nest-proxy substitutes real credential
 
 ## OIDC tokens (deferred)
 
-The control plane's signing keys and JWKS arrive first for MCP servers: [caller identity](../../control-plane/api/clients/#caller-identity-for-mcp-servers) (being built). A sandbox's own `nest token` would reuse them.
+The control plane's signing keys and JWKS exist, for MCP servers: [caller identity](../../control-plane/api/clients/#caller-identity-for-mcp-servers) (built 2026-11-02). BrokerDO holds rotating Ed25519 keys ([keys](../../control-plane/durable-objects/broker/#caller-identity-keys)), and the Worker publishes them at `GET /.well-known/jwks.json`. A sandbox's own `nest token` would reuse them.
 
 `nest token --audience X` (through the guest agent and vsock) would return a short-lived JWT signed by the control plane. Its claims are sandbox, agent, labels and **epoch**, and the Worker would publish the public keys (JWKS). It's for services that verify identity themselves and issue their own short-lived credentials (AWS `AssumeRoleWithWebIdentity`, GCP, Vault). **Deferred** until an agent needs cloud deploy access. Placeholder injection covers token-based APIs.

@@ -19,6 +19,7 @@ import {
 } from "../lib/brokered";
 import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
 import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
+import { type IdentitySubject, IdentityTokens } from "../lib/identity";
 import { Repo } from "../lib/repos";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
@@ -300,6 +301,10 @@ export class AgentDO extends DurableObject<Env> {
       bearer: (g, refused) => mcpToken(env, g, refused),
       // The stub's RPC types can't see that ListedTool's `unknown` schema is plain JSON; it is.
       connector: (g) => env.MCP_CONNECTOR.get(env.MCP_CONNECTOR.idFromName(connectorName(g))) as unknown as McpConnector,
+      identity: {
+        ensure: (aud, epoch, tainted) => this.identities.ensure(this.identitySubject(aud, epoch, tainted)),
+        current: (aud, epoch, tainted) => this.identities.current(this.identitySubject(aud, epoch, tainted)),
+      },
       background: (p) => ctx.waitUntil(p),
       callTimeoutMs: num(env.MCP_CALL_TIMEOUT_MS, 45_000),
       admitWaitMs: num(env.MCP_ADMIT_WAIT_MS, 10_000),
@@ -312,6 +317,26 @@ export class AgentDO extends DurableObject<Env> {
   private readonly calls!: CallLedger;
   /** The client of its mcp capabilities' servers (docs/agents/capabilities/mcp/). */
   private readonly mcp!: McpProxy;
+  /** Its caller identities (`Nest-Identity`), signed by BrokerDO and reused for most of their 5 minutes. */
+  private readonly identities = new IdentityTokens((s) => this.env.BROKER.get(this.env.BROKER.idFromName("broker")).signIdentity(s));
+
+  /**
+   * What its caller identity to `aud` names (docs/control-plane/api/clients/#caller-identity-for-mcp-servers):
+   * the agent, its owner (`user`: the operator), its client and labels when its record has them, and
+   * the calling brain's epoch and the session's taint. Derived from the record as it is now, so a
+   * cached token never names state that has changed.
+   */
+  private identitySubject(aud: string, epoch: number, tainted: boolean): IdentitySubject {
+    const i = this.load() as AgentInfo & { client?: unknown; labels?: unknown };
+    const labels = i.labels && typeof i.labels === "object" && !Array.isArray(i.labels)
+      && Object.values(i.labels).every((v) => typeof v === "string") ? i.labels as Record<string, string> : undefined;
+    return {
+      aud, sub: i.agent, owner: i.owner ?? "user",
+      ...(typeof i.client === "string" ? { client: i.client } : {}),
+      ...(labels ? { labels } : {}),
+      epoch, tainted,
+    };
+  }
   /** Every brokered action it ran or was refused (docs/agents/tools/#taint-and-sinks). */
   private readonly journal!: BrokeredJournal;
 

@@ -34,6 +34,8 @@ Being built; this is the design the code follows.
 
 ## Caller identity for MCP servers
 
+**Built (2026-11-02)**, except `client` and `labels`, which appear once agents carry them (the clients and labels work); the wire contract is [remote-mcp](../../../interfaces/remote-mcp/), the keys [BrokerDO](../../durable-objects/broker/#caller-identity-keys). `owner` is `user` for the operator's agents.
+
 - **Every request** AgentDO sends to a remote MCP server ([remote-mcp](../../../interfaces/remote-mcp/)) carries `Nest-Identity: <JWT>`. It's EdDSA (Ed25519), signed by the control plane, valid for 5 minutes, with these claims:
   - `aud`: the server's URL;
   - `sub`: the agent;
@@ -41,6 +43,7 @@ Being built; this is the design the code follows.
   - `iss`: the Worker's public base URL.
 - **The connector's listing session** carries one with `sub: "nest:connector"`.
 - **The public keys** are at `GET /.well-known/jwks.json`, unauthenticated, with each key's `kid`. BrokerDO holds the private keys and rotates them, publishing the next key a day before it signs.
+- **Cost:** AgentDO and the connector cache a token per claim set (audience, epoch, taint, labels) for its first 4 minutes, so a call usually costs no BrokerDO round trip.
 - **What it's for:** a server knows which agent is calling and what labels its creator gave it, so it can scope each agent (a worker sees only its task) without trusting the bearer token alone. This builds the deferred [OIDC token](../../../security/identity/) for MCP servers.
 
 ## Events to the owner
