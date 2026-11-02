@@ -154,7 +154,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | typeof OUTBOX_DEADLINE;
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | typeof OUTBOX_DEADLINE;
 /** A `sync` ask's window: `ask:<ask id>`. */
 const ASK_DEADLINE = "ask:";
 /** An approved sink call may be made once within this long. */
@@ -463,6 +463,7 @@ export class AgentDO extends DurableObject<Env> {
     this.save(info);
     if (req.tainted) this.kvPut("read_tainted", true);
     await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS, true);
+    await this.deadlines.set("registry", Date.now(), true);
     return info;
   }
 
@@ -1048,6 +1049,7 @@ export class AgentDO extends DurableObject<Env> {
       if (i.ended) i.ended.done_ms = Date.now();
     });
     await this.deadlines.set("reap", done.ended!.ms + AGENT_RECORD_RETENTION_MS);
+    await this.deadlines.set("registry", Date.now(), true);
   }
 
   /** Ask every agent it owns that hasn't ended to end (each ends its own in turn, and says so: `childEnded`). */
@@ -1103,6 +1105,22 @@ export class AgentDO extends DurableObject<Env> {
     };
   }
 
+  /** What FleetDO's agent registry should hold for it: its cell, and when it ended once its end is done. */
+  private registryWanted(): string {
+    const info = this.load();
+    return JSON.stringify({ cell: info.cell, ended_ms: info.ended?.done_ms ? info.ended.ms : null });
+  }
+
+  /** The `registry` deadline: tell its cell's FleetDO it exists (and its end, once done), if it hasn't. */
+  private async register(): Promise<void> {
+    if (!this.exists()) return;
+    const want = this.registryWanted();
+    if (this.kvGet<string>("registry") === want) return;
+    const info = this.load();
+    await this.fleet(info.cell).registerAgent(info.agent, info.ended?.done_ms ? info.ended.ms : null);
+    this.kvPut("registry", want);
+  }
+
   /**
    * The `reap` deadline, `AGENT_RECORD_RETENTION_MS` after the end: its R2 session segments, then its
    * storage. A brain never proven gone holds it (its release still needs the record).
@@ -1121,6 +1139,12 @@ export class AgentDO extends DurableObject<Env> {
       if (page.objects.length) await this.env.BUCKET.delete(page.objects.map((o) => o.key));
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
+    try {
+      await this.fleet(info.cell).unregisterAgent(info.agent);
+    } catch (err) {
+      // The lifetimes view drops a registered agent it finds gone.
+      console.warn(`agent ${info.agent}: leaving FleetDO's agent registry failed`, err);
+    }
     console.log(`agent ${info.agent}: records pruned ${Math.round((Date.now() - e.ms) / 86_400_000)} days after it ended`);
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
@@ -3175,6 +3199,7 @@ export class AgentDO extends DurableObject<Env> {
       },
       end: () => this.finishEnd(),
       reap: () => this.reap(),
+      registry: () => this.register(),
     };
     // An end's deadlines a rolled-back release dropped (it has no handler for them) come back here: the
     // hourly `prune` keeps the alarm running.
@@ -3182,6 +3207,8 @@ export class AgentDO extends DurableObject<Env> {
       const e = this.load().ended;
       if (e && !e.done_ms && !this.deadlines.has("end")) await this.deadlines.set("end", Date.now());
       if (e?.done_ms && !this.deadlines.has("reap")) await this.deadlines.set("reap", e.ms + AGENT_RECORD_RETENTION_MS);
+      // An agent from before the registry (or whose registration failed) registers at its next alarm.
+      if (this.kvGet<string>("registry") !== this.registryWanted() && !this.deadlines.has("registry")) await this.deadlines.set("registry", Date.now());
     }
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key.startsWith(ASK_DEADLINE)) return this.askWindowLapsed(key.slice(ASK_DEADLINE.length));

@@ -212,8 +212,8 @@ export interface LifetimeAgentView {
   subscriptions: number;
   ended_ms: number | null;
   ended_reason: string | null;
-  /** How it was found: bound to a listed sandbox, or as the owner or a child of an agent read. */
-  found_via: "sandbox" | "owner" | "child";
+  /** Where it was read: the cell's agent registry, or (once its records are gone) attached to a listed sandbox. */
+  found_via: "registry" | "sandbox";
   error: string | null;
 }
 
