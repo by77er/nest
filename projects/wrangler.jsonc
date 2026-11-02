@@ -35,9 +35,9 @@
     // Every path but /hooks/* and /mcp/* needs a Cloudflare Access token (Cf-Access-Jwt-Assertion)
     // issued by this team for the app's Access application (src/access.ts).
     "ACCESS_TEAM_DOMAIN": "https://bitcrush.cloudflareaccess.com",
-    // A placeholder until the edge stack (deploy/lean/Edge/) owns the projects application and
-    // `inframe output --stack edge` prints its audience tag: until then every Access check fails closed.
-    "PROJECTS_AUD": "unset-until-the-edge-stack-creates-the-application"
+    // A placeholder until the app's own stack (deploy/, `inframe output --stack projects`, output
+    // `projects_aud`) has created the application: until then every Access check fails closed.
+    "PROJECTS_AUD": "unset-until-the-projects-stack-creates-the-application"
   }
   // Secrets (wrangler secret put / .dev.vars), never in this file:
   // - NEST_CLIENT_TOKEN: the `projects` API client's token (`POST /v1/admin/clients`, shown once).

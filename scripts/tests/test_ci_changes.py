@@ -67,6 +67,10 @@ class CiChanges(unittest.TestCase):
         self.assertEqual(jobs("projects/src/worker.ts", "projects/package-lock.json"), {"projects"})
         self.assertEqual(jobs("projects/README.md"), {"projects"})
 
+    def test_projects_stack_runs_only_infra(self):
+        self.assertEqual(jobs("projects/deploy/lean/Projects/Stack.lean"), {"infra"})
+        self.assertEqual(jobs("projects/deploy/inframe.toml", "projects/src/worker.ts"), {"infra", "projects"})
+
     def test_flags(self):
         self.assertEqual(jobs(args=["--all"]), ALL)
         self.assertEqual(jobs("crates/nestd/src/host.rs", args=["--none"]), set())

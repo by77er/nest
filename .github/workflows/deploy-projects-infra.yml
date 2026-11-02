@@ -1,0 +1,95 @@
+# Plans and applies the projects app's own inframe stack (projects/deploy/: Cloudflare Access in
+# front of projects-nest.bitcru.sh) on every push to main that touches it, apart from nest's deploy:
+# the app is not part of nest. The edge stack's credentials (deploy.yml): CLOUDFLARE_ACCESS_API_TOKEN
+# for Access, and the deploy role over OIDC for the S3 state. Without the Cloudflare token the stack
+# is tested but not planned or applied.
+name: deploy-projects-infra
+on:
+  push:
+    branches: [main]
+    paths: [projects/deploy/**, .github/workflows/deploy-projects-infra.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+# Serialized and never cancelled: an apply half done is worse than one queued.
+concurrency:
+  group: projects-infra
+  cancel-in-progress: false
+env:
+  AWS_REGION: us-east-1
+  DEPLOY_ROLE: arn:aws:iam::589531222691:role/nest-use1-deploy
+jobs:
+  projects-infra:
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: projects/deploy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        working-directory: .
+        run: rustup toolchain install
+      # The same cache as ci.yml's infra job.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            ~/.cargo/bin/inframe
+            ~/.cargo/bin/.inframe-rev
+            deploy/lean/.lake
+            deploy/lean/.generated
+            projects/deploy/lean/.lake
+            projects/deploy/lean/.generated
+          key: infra-v2-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json', 'deploy/cloudflare-schema.json', 'projects/deploy/lean/lean-toolchain', 'projects/deploy/lean/lake-manifest.json', 'projects/deploy/cloudflare-schema.json') }}
+          restore-keys: infra-v2-${{ runner.os }}-
+      - working-directory: .
+        run: scripts/infra-tools.sh
+      - name: Proofs and policies
+        run: |
+          inframe provider generate cloudflare --frontend lean --schema-json cloudflare-schema.json
+          inframe test --stack projects
+      - name: Cloudflare token
+        id: token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ACCESS_API_TOKEN }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::notice::CLOUDFLARE_ACCESS_API_TOKEN is not set; the projects stack was not planned or applied"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        if: steps.token.outputs.present == 'true'
+        with:
+          tofu_version: 1.10.7
+          tofu_wrapper: false
+      # The S3 state backend only.
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: steps.token.outputs.present == 'true'
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-projects-infra-${{ github.run_id }}
+      - name: Plan
+        if: steps.token.outputs.present == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ACCESS_API_TOKEN }}
+        run: |
+          inframe init --stack projects -- -input=false
+          inframe plan --stack projects -- -input=false -no-color -out=projects.plan | tee "$RUNNER_TEMP/plan.txt"
+          { echo '### Projects stack plan'; echo '```'; grep -E '^  # |^Plan:|^No changes' "$RUNNER_TEMP/plan.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Apply
+        if: steps.token.outputs.present == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ACCESS_API_TOKEN }}
+        run: |
+          inframe apply --stack projects -- -input=false -no-color projects.plan
+          # The Worker's PROJECTS_AUD (projects/wrangler.jsonc); an audience tag, not a secret.
+          aud=$(inframe output --stack projects | jq -r .projects_aud.value)
+          echo "projects_aud: \`$aud\` (the Worker's \`PROJECTS_AUD\`)" >> "$GITHUB_STEP_SUMMARY"
