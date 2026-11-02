@@ -48,6 +48,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `images/` | The Firecracker guest image (kernel and `nest-base` rootfs) and its EC2 builder |
 | `.github/`, `scripts/` | CI and `CODEOWNERS`; repo checks |
 | `verification/` | Formal models and proofs of the protocols (TLA+, Lean, Stateright) and their runner ([verification](verification/)) |
+| `projects/` | An app on nest, not part of it: a task board with agents for its GitHub repos, built only on the [API clients](control-plane/api/clients/) interface |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
 
 UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`); memory snapshots are deferred by decision until cold boot proves too slow ([memory](sandbox/state/memory/)).

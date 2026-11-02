@@ -590,8 +590,12 @@ describe("a server's changed tool list reaches live brains", () => {
     await relistNow(s);
     await s.ws.next("tools_changed", () => true, 5000);
     expect((await listTools(s.ws)).map((t) => t.name)).toContain(s.t("relisted"));
-    // Nothing more is owed once the brain listed again.
-    expect(await s.ws.none("tools_changed", 300)).toBe(true);
+    // Nothing more is owed once the brain listed again. (A notice may still arrive twice: one whose call
+    // timed out under load is retried though it got through. That is at-least-once, so the check is the
+    // connector's state, not the socket's silence.)
+    const owed = await runInDurableObject(s.connector(), (_: McpConnectorDO, st) =>
+      st.storage.sql.exec("SELECT COUNT(*) AS n FROM subscribers WHERE digest IS NOT (SELECT json_extract(value, '$') FROM kv WHERE key = 'digest')").one().n);
+    expect(owed).toBe(0);
 
     // Disconnected when the next change lands: told when it says hello again.
     s.ws.close();
