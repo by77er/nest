@@ -54,6 +54,7 @@ type Msg = Record<string, any> & { type: string };
 export class Ws {
   readonly received: Msg[] = [];
   private waiters: { pred: (m: Msg) => boolean; resolve: (m: Msg) => void }[] = [];
+  private closeWaiters: (() => void)[] = [];
   closed: { code: number; reason: string } | null = null;
 
   private constructor(readonly ws: WebSocket) {
@@ -65,6 +66,7 @@ export class Ws {
     });
     ws.addEventListener("close", (e) => {
       this.closed = { code: e.code, reason: e.reason };
+      for (const w of this.closeWaiters.splice(0)) w();
     });
   }
 
@@ -103,6 +105,20 @@ export class Ws {
     } catch {
       return true;
     }
+  }
+
+  /** The close, once this end has heard it (a server's close arrives after its last frame), or null after `ms`. */
+  async whenClosed(ms = 5000): Promise<{ code: number; reason: string } | null> {
+    if (!this.closed) {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, ms);
+        this.closeWaiters.push(() => {
+          clearTimeout(t);
+          resolve();
+        });
+      });
+    }
+    return this.closed;
   }
 
   drain(): Msg[] {

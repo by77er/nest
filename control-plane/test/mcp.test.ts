@@ -436,8 +436,7 @@ describe("fencing", () => {
     const s = await setup({ whenTainted: "allow" });
     s.stub.next.slow = [{ delay: 600 }];
     call(s.ws, "cal_f2", s.t("slow"), { ms: 600 });
-    await sleep(100);
-    expect(s.stub.calls).toHaveLength(1);
+    await atServer(s.stub, 1);
     // A newer brain (its predecessor gone) calls while the old call is still out.
     await bumpEpoch(s.agent);
     const ws2 = await runner(s.agent, s.host.host, s.host.host_token, 2, "rin_two");
@@ -470,6 +469,12 @@ describe("fencing", () => {
 
 // --- Admission (the connector) ------------------------------------------------------------------------------
 
+/** Wait until the stub server has received `n` calls (a call's way there takes its own time under load). */
+async function atServer(stub: { calls: unknown[] }, n: number) {
+  for (let i = 0; i < 200 && stub.calls.length < n; i++) await sleep(10);
+  expect(stub.calls).toHaveLength(n);
+}
+
 /** vitest.config.ts: MCP_ADMIT_WAIT_MS. */
 const ADMIT_WAIT_MS = 2000;
 
@@ -479,7 +484,7 @@ describe("admission: a per-server cap across agents", () => {
     const b = await s.another();
     s.stub.next.slow = [{ delay: 600 }];
     call(s.ws, "cal_c1", s.t("slow"), { ms: 600 });
-    await sleep(100);
+    await atServer(s.stub, 1);
     call(b.ws, "cal_c2", s.t("echo"), { text: "second" });
     expect((await result(b.ws, "cal_c2")).status).toBe("ok");
     expect((await result(s.ws, "cal_c1")).status).toBe("ok");
@@ -504,7 +509,7 @@ describe("admission: a per-server cap across agents", () => {
     const b = await s.another();
     s.stub.next.slow = [{ delay: 800 }];
     call(b.ws, "cal_w1", s.t("slow"), { ms: 800 }); // holds the one slot
-    await sleep(100);
+    await atServer(s.stub, 1);
     call(s.ws, "cal_w2", s.t("counter_add"), { name: "c", n: 1 });
     await sleep(200); // waiting for admission now
     await bumpEpoch(s.agent);

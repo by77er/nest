@@ -88,8 +88,7 @@ describe("an event's side effects survive a failure", () => {
     ] };
     ws1.send(batch);
     expect((await ws1.next("error")).error.code).toBe("unknown_sandbox");
-    await sleep(30);
-    expect(ws1.closed?.code).toBe(4500);
+    expect((await ws1.whenClosed())?.code).toBe(4500);
     expect((await wsStub(s.workstream).events()).some((e) => e.type === "needs_input")).toBe(false);
 
     await restore();
@@ -439,8 +438,7 @@ describe("one brain per agent: the brain record", () => {
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     expect(await wedgedMs(cell, a.host)).not.toBeNull();
     // Cut off at once (M1): its socket closed, a new hello refused, nothing placed on it ...
-    await sleep(50);
-    expect(a.ws.closed?.code).toBe(4408);
+    expect((await a.ws.whenClosed())?.code).toBe(4408);
     expect(await fleet.placeBrain({})).not.toBe(a.host);
     const back = await Ws.connect("/v1/fleet", a.host_token);
     back.send(hostHello(a.host, cell, { role: "brain" }));
@@ -771,8 +769,7 @@ describe("one brain per agent: the brain record", () => {
     const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
     const b = await connectHost(s.cell, "brain");
     await agentStub(s.agent).start(b.host);
-    await sleep(50);
-    expect(ws.closed?.code).toBe(4409);
+    expect((await ws.whenClosed())?.code).toBe(4409);
     // Its runner reconnects (same process, same epoch) before it dies.
     const ws2 = await Ws.connect(`/v1/agents/${s.agent}/session`, s.host.host_token);
     ws2.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.host.host, instance_id: "rin_one", epoch: 1, session: SESSION });
@@ -1221,15 +1218,15 @@ describe("one brain per agent: the brain record", () => {
     const s = await setup();
     const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
     ws.close();
-    await sleep(50);
-    expect(await deadlineAt(s.agent, "no_session")).not.toBeNull();
+    // AgentDO hears the close when workerd delivers it, not when the client closes: wait for it.
+    expect(await armed(s.agent, "no_session")).not.toBeNull();
     await runDeadline(s.agent, "no_session");
     expect((await agentStub(s.agent).info()).brain).toMatchObject({ phase: "condemned", epoch: 1 });
-    // A session that comes back in time clears it.
+    // A session that comes back in time clears it (once armed: a hello before the close lands arms nothing).
     const t = await setup();
     const w1 = await runner(t.agent, t.host.host, t.host.host_token, "rin_t", 1);
     w1.close();
-    await sleep(50);
+    expect(await armed(t.agent, "no_session")).not.toBeNull();
     await runner(t.agent, t.host.host, t.host.host_token, "rin_t", 1);
     expect(await deadlineAt(t.agent, "no_session")).toBeNull();
   });
@@ -1424,7 +1421,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const again = await Ws.connect("/v1/fleet", a.host_token);
     again.send(hostHello(a.host, cell, { role: "brain" }));
     expect(await again.none("hello_ack", 200)).toBe(true);
-    expect(again.closed?.code).toBe(4408);
+    expect((await again.whenClosed())?.code).toBe(4408);
   });
 
   it("A5: a host-loss (or gone) notice's acknowledgement deletes only the row it was for; a newer start's row stays", async () => {
@@ -2308,6 +2305,16 @@ async function wedgedMs(cell: string, host: string) {
 async function deadlineAt(agent: string, key: string) {
   return runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
     st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = ?", key).toArray()[0]?.at ?? null);
+}
+
+/** The deadline once it is armed, polling for up to `ms` (null if it never is). */
+async function armed(agent: string, key: string, ms = 5000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const at = await deadlineAt(agent, key);
+    if (at !== null || Date.now() > end) return at;
+    await sleep(20);
+  }
 }
 
 describe("FleetDO's brain index", () => {

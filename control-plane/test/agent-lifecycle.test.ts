@@ -409,8 +409,10 @@ describe("agent_stop", () => {
     // Not before its brain is gone.
     expect((await sandboxStub(c2.sandbox!).info()).state).not.toBe("destroyed");
     await exited(w, c2s);
-    await until(async () => (await sandboxStub(c2.sandbox!).info()).state === "destroyed", "c2's sandbox destroyed");
+    // AgentDO records the step once SandboxDO's release returns, so wait on that later write.
+    await until(async () => (await ended(c2.agent))?.sandbox, "c2's sandbox step");
     expect(await ended(c2.agent)).toMatchObject({ sandbox: "destroyed" });
+    expect((await sandboxStub(c2.sandbox!).info()).state).toBe("destroyed");
     expect((await registered(c2.sandbox!)).destroyed_ms).toBeGreaterThan(0);
     expect((await live())).toBe(before);
     expect(await sandboxStub(c2.sandbox!).gcRoots()).toEqual([]);
@@ -442,8 +444,9 @@ describe("ends that wait for what they own", () => {
     expect((await ended(c.agent))?.sandbox).toBeUndefined();
     expect((await sandboxStub(c.sandbox!).info()).state).not.toBe("destroyed");
     await exited(w, gs);
-    await until(async () => (await sandboxStub(c.sandbox!).info()).state === "destroyed", "the shared sandbox destroyed");
+    await until(async () => (await ended(c.agent))?.sandbox, "C's sandbox step");
     expect(await ended(c.agent)).toMatchObject({ sandbox: "destroyed" });
+    expect((await sandboxStub(c.sandbox!).info()).state).toBe("destroyed");
     expect(await ended(g.agent)).toMatchObject({ sandbox: "detached" });
   });
 
