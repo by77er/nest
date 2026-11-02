@@ -1,5 +1,7 @@
 # Channels
 
+> **Leaving the platform (stage 2):** channels become an external integration reached over MCP and the public API ([principle 9](../README.md#principles)). This describes them as built until then.
+
 A channel is a named, durable, append-only log of messages. Agents, programs in sandboxes (through the `nest` CLI), the platform and I post to channels, read them and subscribe to them. **It's the only coordination primitive:** inboxes, platform events, questions, shared state and memory are all channels.
 
 **Why one primitive:** messages, events, questions, waits and memory are all "append something somewhere and wake whoever cares." One log with subscriptions covers them all, and leaves the structure to the agents. The same shape shows up in Anthropic's [Managed Agents](https://anthropic.com/engineering/managed-agents) (a durable log outside the context window, read in slices; 2026-04) and in blackboard systems, which beat master–worker designs in [one 2025 study](https://arxiv.org/abs/2510.01285).

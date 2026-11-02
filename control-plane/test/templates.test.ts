@@ -5,6 +5,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
+import { SEED_CATALOG } from "../src/lib/spec";
 import { adminJson, connectHost, nextCommands, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -321,5 +322,78 @@ describe("CatalogDO storage", () => {
     expect(Object.keys(cat.templates).sort()).toEqual(["captain", "worker"]);
     expect(cat.capabilities).not.toHaveProperty("garbled");
     expect((await stub.expand({ template: "worker", hands: true, by: "operator" })).template).toBe("worker");
+  });
+});
+
+// The task ledger left the platform (docs/README.md#principles): seed version 6 takes its capabilities
+// out of stored catalogs, and an agent spawned with them still starts.
+describe("the task ledger's removal", () => {
+  const catalogStub = (name: string) => env.CATALOG.get(env.CATALOG.idFromName(name));
+  /** The previous release's `tasks` capability, as it stored it. */
+  const OLD_TASKS = { tools: ["task_list", "task_get", "task_create"], rules: [], prompt: "Your task ledger.", grants: [], params: ["ledger"] };
+
+  it("a catalog at version 5 loses tasks and tasks-admin, and every template keeps its other capabilities and still expands", async () => {
+    const stub = catalogStub(uniqueName("catalog-v5"));
+    const untouched = JSON.stringify({ ...SEED_CATALOG.templates.worker!, capabilities: ["nest", "hands"], later_field: 1 });
+    const rows = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
+      const sql = st.storage.sql;
+      // As the previous release left the live catalog: the seed with the ledger's capabilities in both
+      // templates, an operator's edits, an operator's ledger template, and a row that doesn't parse.
+      sql.exec("DELETE FROM capabilities");
+      sql.exec("DELETE FROM templates");
+      sql.exec("UPDATE kv SET value = '5' WHERE key = 'seed_version'");
+      const caps: Record<string, unknown> = { ...SEED_CATALOG.capabilities, tasks: OLD_TASKS, "tasks-admin": { ...OLD_TASKS, tools: ["task_assign"] }, mine: { tools: ["notify"] } };
+      for (const [n, c] of Object.entries(caps)) sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", n, JSON.stringify(c));
+      const tpl = (name: string, body: unknown) => sql.exec("INSERT INTO templates (name, body) VALUES (?, ?)", name, typeof body === "string" ? body : JSON.stringify(body));
+      const worker = SEED_CATALOG.templates.worker!;
+      const captain = SEED_CATALOG.templates.captain!;
+      tpl("worker", { ...worker, capabilities: [...worker.capabilities, "tasks"], params: {} });
+      tpl("captain", { ...captain, capabilities: ["tasks", ...captain.capabilities, "tasks-admin", "mine"], params: {} });
+      tpl("ledger-check", { ...worker, capabilities: ["nest", "hands", "tasks"], params: { ledger: "check-1" } });
+      tpl("untouched", untouched);
+      tpl("garbled", "not json");
+      new CatalogDO(st, env as never);
+      const read = () => Object.fromEntries(sql.exec<{ name: string; body: string }>("SELECT name, body FROM templates").toArray().map((r) => [r.name, r.body]));
+      const once = read();
+      // Applied once: a restart rewrites nothing.
+      new CatalogDO(st, env as never);
+      expect(read()).toEqual(once);
+      return { templates: once, version: sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value };
+    });
+    expect(rows.version).toBe("6");
+    const cat = await stub.catalog();
+    expect(Object.keys(cat.capabilities).sort()).toEqual([...Object.keys(SEED_CATALOG.capabilities), "mine"].sort());
+    expect(cat.templates.worker!.capabilities).toEqual(SEED_CATALOG.templates.worker!.capabilities);
+    expect(cat.templates.captain!.capabilities).toEqual([...SEED_CATALOG.templates.captain!.capabilities, "mine"]);
+    expect(cat.templates["ledger-check"]!.capabilities).toEqual(["nest", "hands"]);
+    // The ledger default goes with its capability: the previous release, after a rollback, refuses a
+    // parameter no listed capability declares.
+    expect(JSON.parse(rows.templates["ledger-check"]!).params).toEqual({});
+    expect(rows.templates.untouched).toBe(untouched);
+    expect(rows.templates.garbled).toBe("not json");
+    for (const [name, hands] of [["worker", true], ["captain", false], ["ledger-check", true], ["untouched", true]] as const) {
+      const spec = await stub.expand({ template: name, hands, by: "operator" });
+      expect(spec.tools.filter((t) => t.startsWith("task_")), name).toEqual([]);
+    }
+  });
+
+  it("an agent whose stored spec names the task tools and a ledger still starts; its runner isn't offered them, and calling one is an unknown tool", async () => {
+    const s = await cellWithSandbox();
+    const a = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false } }, 201);
+    await editAgent(a.agent, (i) => {
+      i.tools = [...i.tools, "task_list", "task_create"];
+      i.params = { ledger: "proj-a" };
+    });
+    await agentStub(a.agent).start();
+    await nextCommands(s.brain.ws, isStartOf(a.agent));
+    const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
+    const names = (await toolNames(ws)).map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(["notify", "checkpoint"]));
+    expect(names.filter((n) => n.startsWith("task_"))).toEqual([]);
+    ws.send({ type: "tool_call", seq: 1, call: "cal_task", turn: "trn_x", name: "task_list", arguments: {} });
+    const outcome = (await ws.next("tool_result", (m) => m.call === "cal_task")).outcome;
+    expect(outcome).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
+    // Its record still reads (the stored `params` is ignored).
+    expect((await adminJson(`/v1/agents/${a.agent}`)).agent).toBe(a.agent);
   });
 });

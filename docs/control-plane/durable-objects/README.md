@@ -11,8 +11,8 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [hook/](hook/) | One webhook: verification (through BrokerDO), mapping, dedup, posting to its channel |
 | [broker/](broker/) | Claude setup tokens, injected secrets, hook secrets, capability credentials, GitHub App token minting |
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
-| WorkstreamDO (interim) | The [workstream channel](../../orchestration/workstreams/#the-interim-workstream-channel) until ChannelDO exists |
-| [tasks/](tasks/) | One named task ledger: tasks, comments, history, its watcher, and the inbox notices its changes owe |
+| WorkstreamDO (interim) | The [workstream channel](../../orchestration/workstreams/#the-interim-workstream-channel), until stage 3 of the microkernel removal ([principle 9](../../README.md#principles)) |
+| TaskLedgerDO (stub) | Nothing: the task ledger left the platform. The class stays declared, serving only the health probe and leaving the previous release's rows untouched, until stage 4 deletes it in a deploy of its own |
 | [mcp-connector/](mcp-connector/) | One remote MCP server and credential: the shared tool list, its change notices to agents, and call admission |
 
 ## Conventions

@@ -32,11 +32,7 @@ import {
   AGENT_RECORD_RETENTION_MS, cellIdleTtlMs, END_GRACE_MS, END_RETRY_MS, type Ended, type EndReason, ephemeralDone, MAX_OWNER_HOPS, narrowTtl, ownsVia,
   spawnRefusal,
 } from "../lib/lifetimes";
-import {
-  type Actor, ALL_TASK_TOOLS, type SpecGrant, type TaskFilter, type TaskOp, type TaskPriority, type TaskStatus, type TaskTool, TOOL_OPS,
-} from "../lib/tasks";
 import { signBlobUrl } from "../lib/tokens";
-import { ledgerStub, type TaskView } from "./tasks";
 import { asNestError, b64ToBytes, concatBytes, errorBody, keyedId, NestError, newId } from "../lib/util";
 import type { EgressPolicy } from "../protocol/model";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -367,8 +363,6 @@ export class AgentDO extends DurableObject<Env> {
       ...rest,
       ...spec,
       escalate_to: storedEnum(EscalateTo, (spec ?? rest).escalate_to, "kv.info.escalate_to"),
-      // Stored before capability parameters: none.
-      params: (spec ?? rest).params ?? {},
       // Stored before channels: no channel grants (only the built-in rules apply).
       channel_grants: (spec ?? rest).channel_grants ?? [],
       owner: info.owner !== undefined ? info.owner : captain ?? null,
@@ -949,7 +943,7 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * An ended agent takes no more `what`. As a recipient (turns, messages) it is gone, `unknown_agent`
-   * (404), which every sender already reads as "drop it" (a channel subscription, a ledger notice, a
+   * (404), which every sender already reads as "drop it" (a channel subscription or a
    * workstream wake); a start or a spawn it would make is refused (409).
    */
   private refuseEnded(info: AgentInfo, what: "turns" | "messages" | "starts" | "spawns"): void {
@@ -2481,8 +2475,6 @@ export class AgentDO extends DurableObject<Env> {
       if (!guest) this.assertEpoch(fence);
     };
 
-    if (ALL_TASK_TOOLS.includes(name)) return await this.taskTool(info, name, a, key, live);
-
     switch (name) {
       case "notify": {
         const to = String(a.to);
@@ -2916,106 +2908,6 @@ export class AgentDO extends DurableObject<Env> {
   /** The operator's view of its brokered actions, newest first (`GET /v1/agents/:agent/brokered`). */
   async brokeredJournal(limit = 100, before?: number): Promise<JournalEntry[]> {
     return this.journal.list(limit, before);
-  }
-
-  /**
-   * The task ledger tools, on the one ledger the spec names. Privilege is the tool (`TOOL_OPS`). Other
-   * agents' specs are read here, so the ledger never calls into an AgentDO mid-call.
-   */
-  private async taskTool(info: AgentInfo, name: string, a: Record<string, unknown>, key: string, live: () => Promise<void>): Promise<ToolOutcome> {
-    const ledger = info.params.ledger;
-    if (!ledger) {
-      throw new NestError(ErrorCodes.FORBIDDEN, `${name}: this agent has no task ledger (it was spawned without its tasks capability's \`ledger\` param)`, 403);
-    }
-    if (a.ledger !== undefined && a.ledger !== ledger) {
-      throw new NestError(ErrorCodes.FORBIDDEN, `this agent may use only ledger ${ledger}, not ${String(a.ledger)}`, 403);
-    }
-    const tool = name as TaskTool;
-    /** Taint read now: a read that tainted the session meanwhile counts. */
-    const actor = (): Actor => ({ kind: "agent", agent: info.agent, ledger, tainted: this.tainted(this.load()) });
-    const stub = ledgerStub(this.env, ledger);
-    /** Text a tainted session wrote taints this one (sticky). */
-    const seen = <T extends { tainted: boolean }>(r: T): T => {
-      if (r.tainted) this.kvPut("read_tainted", true);
-      return r;
-    };
-    const str = (k: string) => (typeof a[k] === "string" ? (a[k] as string) : undefined);
-    const strOrNull = (k: string) => (a[k] === null ? null : str(k));
-    const int = (k: string) => (typeof a[k] === "number" ? (a[k] as number) : undefined);
-    const task = () => String(a.task);
-    const out = (line: string, value: unknown): ToolOutcome => ({ status: "ok", content: [{ type: "text", text: line }, { type: "json", value }] });
-    const line = (t: TaskView) => `${t.key} [${t.status}${t.priority === "none" ? "" : `, ${t.priority}`}] ${t.title}` +
-      `${t.assignee ? ` (${t.assignee})` : ""} v${t.version}`;
-    const grantOf = async (id: string | null): Promise<SpecGrant | null> => {
-      if (id === null) return null;
-      if (!id.startsWith("agt_")) throw new NestError(ErrorCodes.INVALID_MESSAGE, `expected an agent id (agt_...) or null, not ${id}`);
-      const other = id === info.agent ? info : await this.env.AGENT.get(this.env.AGENT.idFromName(id)).info();
-      return { agent: id, ledger: other.params?.ledger ?? null, tools: other.tools };
-    };
-    const write = async (op: TaskOp) => {
-      if (TOOL_OPS[tool] !== op.kind) throw new NestError(ErrorCodes.INTERNAL, `${name} asks for ${TOOL_OPS[tool]}, not ${op.kind}`, 500);
-      await live();
-      return seen(await stub.apply(ledger, actor(), op, key));
-    };
-    const edits = {
-      title: str("title"), description: str("description"), status: str("status") as TaskStatus | undefined,
-      labels: Array.isArray(a.labels) ? (a.labels as string[]) : undefined,
-    };
-    switch (tool) {
-      case "task_list": {
-        const assignee = strOrNull("assignee");
-        const filter: TaskFilter = {
-          status: str("status") as TaskStatus | undefined, label: str("label"), text: str("text"), parent: str("parent"),
-          assignee: assignee === "me" ? info.agent : assignee,
-        };
-        const page = seen(await stub.list(ledger, actor(), filter, int("cursor") ?? 0, int("limit")));
-        const text = page.tasks.length ? page.tasks.map(line).join("\n") : "No tasks match.";
-        return out(page.next_cursor === null ? text : `${text}\n(more: cursor ${page.next_cursor})`, page);
-      }
-      case "task_get": {
-        const d = seen(await stub.get(ledger, actor(), task()));
-        return out(`${line(d.task)}\n\n${d.task.description}`, d);
-      }
-      case "task_create": {
-        const r = await write({ kind: "create", ...edits, title: String(a.title), parent: str("parent") });
-        return out(`Created ${line(r.task!)}`, r.task);
-      }
-      case "task_update": {
-        const r = await write({ kind: "update", task: task(), expected_version: int("expected_version"), ...edits });
-        return out(`Updated ${line(r.task!)}`, r.task);
-      }
-      case "task_claim": {
-        const r = await write({ kind: "claim", task: task(), expected_version: int("expected_version") });
-        return out(`Claimed ${line(r.task!)}`, r.task);
-      }
-      case "task_comment": {
-        const r = await write({ kind: "comment", task: task(), body: String(a.body) });
-        return out(`Commented on ${r.task!.key}`, r);
-      }
-      case "task_assign": {
-        const assignee = await grantOf(strOrNull("assignee") ?? null);
-        const r = await write({ kind: "assign", task: task(), expected_version: int("expected_version"), assignee });
-        return out(`${r.task!.assignee ? "Assigned" : "Unassigned"} ${line(r.task!)}`, r.task);
-      }
-      case "task_update_any": {
-        const r = await write({
-          kind: "update_any", task: task(), expected_version: int("expected_version"), ...edits,
-          priority: str("priority") as TaskPriority | undefined, parent: strOrNull("parent"),
-        });
-        return out(`Updated ${line(r.task!)}`, r.task);
-      }
-      case "task_cancel": {
-        const r = await write({ kind: "cancel", task: task(), expected_version: int("expected_version"), reason: str("reason") });
-        return out(`Canceled ${line(r.task!)}`, r.task);
-      }
-      case "task_set_watcher": {
-        const watcher = await grantOf(strOrNull("watcher") ?? null);
-        const r = await write({ kind: "set_watcher", watcher });
-        return out(r.watcher ? `${r.watcher} watches ledger ${ledger}` : `Ledger ${ledger} has no watcher`, { ledger, watcher: r.watcher ?? null });
-      }
-      default:
-        throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${name} is not implemented yet`, 501);
-    }
   }
 
   /** Who `notify` to `captain` reaches: the owner, else the agent's escalation channel's reader. */

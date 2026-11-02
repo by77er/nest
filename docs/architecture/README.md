@@ -7,6 +7,8 @@ nest is two systems with one seam between them:
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
+> **Microkernel (decided 2026-11-02):** coordination leaves the platform. Channels, the task ledger, WorkstreamDO and the `notify`/`ask`/`emit` tools become external integrations that agents reach over MCP and the public API ([principle 9](../README.md#principles)). The task ledger is gone; channels (ChannelDO, HookDO, wake envelopes, events on channels) are described below as built until stage 2 removes them.
+
 > This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23, with Access in front on 2026-10-24: spike item 13); brain hosts, so every brain starts on a brain host, never on a sandbox host, and reaches the guest only through its gateway (on AWS since 2026-10-29); templates and capabilities as data in CatalogDO, with nothing deciding on an agent role. Channels are built (ChannelDO, subscriptions, the built-in channels, channel grants). **Not built:** the rest of the coordination layer (HookDO, grants beyond channels, taint beyond a conservative stand-in, `wake_at`; WorkstreamDO stands in for the workstream channel until its duties move onto channels), the Discord bot, memory snapshots, the hands journal's `call_status`, the 60 s dirty-disk commit and desired host versions. `control-plane/README.md` lists the gaps.
 
 ## At a glance

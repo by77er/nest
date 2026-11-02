@@ -149,10 +149,10 @@ pub mod error_codes {
     /// The caller gave up waiting (e.g. a platform tool call that timed out in the runner): the
     /// operation may or may not have taken effect. Not retryable under the same call id.
     pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
-    /// A compare-and-set lost: the state it was conditioned on changed (e.g. a channel key's `if_seq`,
-    /// a task's `expected_version`). The caller reads the current state and decides again. HTTP 409.
+    /// A compare-and-set lost: the state it was conditioned on changed (e.g. a channel key's `if_seq`).
+    /// The caller reads the current state and decides again. HTTP 409.
     pub const CONFLICT: &str = "conflict";
-    /// The named object doesn't exist (a task in a ledger). Passed through as an ordinary tool error.
+    /// The named object doesn't exist. Passed through as an ordinary tool error.
     pub const NOT_FOUND: &str = "not_found";
     /// A remote (MCP) tool ran and reported an error (`isError`); the message is its text. Passed
     /// through as an ordinary tool error.

@@ -240,7 +240,7 @@ describe("the mcp capability source", () => {
     expect((await put(`h-${rand()}`, { url: "http://mcp.example.com/mcp", auth: "cap:x" }, 400)).error.message).toContain("must be https");
     expect((await put(`l-${rand()}`, { url: "http://127.0.0.1:8788/mcp", auth: "cap:x" }, 400)).error.message).toContain("loopback");
     expect((await put(`c-${rand()}`, { url: "https://u:p@mcp.example.com/mcp", auth: "cap:x" }, 400)).error.message).toContain("credentials");
-    expect((await put("task", { url: "https://mcp.example.com/mcp", auth: "cap:x" }, 400)).error.message).toContain("shadow the platform tool task_");
+    expect((await put("memory", { url: "https://mcp.example.com/mcp", auth: "cap:x" }, 400)).error.message).toContain("shadow the platform tool memory_");
     expect((await put(`a-${rand()}`, { url: "https://mcp.example.com/mcp", auth: "the-token" }, 400)).error.code).toBe("invalid_message");
     // Loopback is local development's (ALLOW_LOOPBACK_MCP=1), and then plain http too.
     expect(checkMcpUrl("http://127.0.0.1:8788/mcp", true).ok).toBe(true);

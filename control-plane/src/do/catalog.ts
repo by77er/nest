@@ -1,14 +1,14 @@
 // CatalogDO (one, named "catalog"): templates and capabilities, stored as data and edited by the
 // operator (docs/control-plane/durable-objects/catalog/). Seeded once with `worker` and `captain` (and
-// migrated once per later seed version: new entries only);
+// migrated once per later seed version: new entries, and capabilities the platform removed);
 // expansion itself is pure (lib/spec.ts).
 import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
-  type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template,
-  templatesUsing,
+  type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, pruneTemplate, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec,
+  Template, templatesUsing,
 } from "../lib/spec";
 import { NestError } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
@@ -31,7 +31,9 @@ export class CatalogDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS templates (name TEXT PRIMARY KEY, body TEXT NOT NULL)");
     // Seeded once: an entry the operator deletes stays deleted. A catalog seeded by an earlier
     // version (no `seed_version`: version 1) gains each later version's new entries once, where the
-    // name is free; existing entries are never edited.
+    // name is free, and loses the capabilities a later version removed (from every template too, which
+    // keeps its other capabilities); existing entries are otherwise never edited. One synchronous step
+    // with the new version.
     const kv = (key: string) => this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray()[0]?.value;
     if (kv("seeded") === undefined) {
       this.insertSeed(SEED_CATALOG);
@@ -43,6 +45,7 @@ export class CatalogDO extends DurableObject<Env> {
         const names = (table: string) => this.sql.exec<{ name: string }>(`SELECT name FROM ${table}`).toArray().map((r) => r.name);
         const m = seedMigration({ capabilities: names("capabilities"), templates: names("templates") }, from);
         this.insertSeed(m);
+        this.removeSeed(m.removes);
         this.setSeedVersion(m.version);
       }
     }
@@ -54,6 +57,22 @@ export class CatalogDO extends DurableObject<Env> {
     }
     for (const [name, t] of Object.entries(c.templates)) {
       this.sql.exec("INSERT OR IGNORE INTO templates (name, body) VALUES (?, ?)", name, JSON.stringify(t));
+    }
+  }
+
+  /** Delete the removed capabilities and prune them (and the parameters they read) from every template row. */
+  private removeSeed(removes: { capabilities: readonly string[]; params: readonly string[] }): void {
+    if (!removes.capabilities.length) return;
+    for (const name of removes.capabilities) this.sql.exec("DELETE FROM capabilities WHERE name = ?", name);
+    for (const r of this.sql.exec<{ name: string; body: string }>("SELECT name, body FROM templates").toArray()) {
+      let body: unknown;
+      try {
+        body = JSON.parse(r.body);
+      } catch {
+        continue; // `load()` logs and skips it, as before.
+      }
+      const pruned = pruneTemplate(body, removes);
+      if (pruned) this.sql.exec("UPDATE templates SET body = ? WHERE name = ?", JSON.stringify(pruned), r.name);
     }
   }
 
