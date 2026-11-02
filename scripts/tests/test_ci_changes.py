@@ -71,6 +71,10 @@ class CiChanges(unittest.TestCase):
         self.assertEqual(jobs("projects/deploy/lean/Projects/Stack.lean"), {"infra"})
         self.assertEqual(jobs("projects/deploy/inframe.toml", "projects/src/worker.ts"), {"infra", "projects"})
 
+    def test_ui_design_skill_runs_both_apps(self):
+        self.assertEqual(jobs(".claude/skills/nest-ui-design/SKILL.md"), {"dashboard", "projects"})
+        self.assertEqual(jobs(".claude/skills/nest-tests/SKILL.md"), set())
+
     def test_flags(self):
         self.assertEqual(jobs(args=["--all"]), ALL)
         self.assertEqual(jobs("crates/nestd/src/host.rs", args=["--none"]), set())
