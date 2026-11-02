@@ -420,11 +420,17 @@ describe("preview and share names follow the hostname rule", () => {
  * FleetDO code; only the await's timing is controlled (miniflare answers too fast to interleave).
  * Holds stack: each wraps the stub the previous one returns.
  */
-function holdFleet(inst: SandboxDO, method: "place" | "releaseLease", served: boolean): { open: () => void } {
+/**
+ * Hold SandboxDO's next `method` call to FleetDO until `open()`: its request (`served` false) or its answer
+ * (`served` true). `reached` resolves once it is held there.
+ */
+function holdFleet(inst: SandboxDO, method: "place" | "releaseLease", served: boolean): { open: () => void; reached: Promise<void> } {
   const self = inst as unknown as { fleet: (cell: string) => any };
   const real = self.fleet.bind(inst);
   let open!: () => void;
   const gate = new Promise<void>((r) => (open = r));
+  let reach!: () => void;
+  const reached = new Promise<void>((r) => (reach = r));
   let held = false;
   self.fleet = (c: string) => {
     const f = real(c);
@@ -434,7 +440,8 @@ function holdFleet(inst: SandboxDO, method: "place" | "releaseLease", served: bo
         if (p === method && !held) {
           held = true;
           return async (...args: unknown[]) => {
-            if (served) { const r = await t[p](...args); await gate; return r; }
+            if (served) { const r = await t[p](...args); reach(); await gate; return r; }
+            reach();
             await gate;
             return t[p](...args);
           };
@@ -443,7 +450,7 @@ function holdFleet(inst: SandboxDO, method: "place" | "releaseLease", served: bo
       },
     });
   };
-  return { open };
+  return { open, reached };
 }
 
 describe("the lease's guards (docs/verification/sandbox-lease)", () => {
@@ -490,9 +497,9 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
       const a = await connectHost(cell);
       const stub = sandboxStub(s.sandbox);
       await runInDurableObject(stub, async (inst: SandboxDO) => {
-        const { open } = holdFleet(inst, "place", served);
+        const { open, reached } = holdFleet(inst, "place", served);
         const woke = inst.wake().catch((e: unknown) => e);
-        await sleep(20);
+        await reached;
         await inst.destroy();
         open();
         await woke;
@@ -522,10 +529,10 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
       const place = holdFleet(inst, "place", false);
       const release = holdFleet(inst, "releaseLease", true);
       const woke = inst.wake().catch((e: unknown) => e);
-      await sleep(20);
+      await place.reached;
       // destroy's releaseLease runs at FleetDO; its answer waits while the placement lands.
       const destroying = inst.destroy();
-      await sleep(20);
+      await release.reached;
       place.open();
       await woke;
       release.open();
@@ -544,9 +551,9 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
     const a = await connectHost(cell);
     const stub = sandboxStub(s.sandbox);
     const after = await runInDurableObject(stub, async (inst: SandboxDO, st) => {
-      const { open } = holdFleet(inst, "place", true);
+      const { open, reached } = holdFleet(inst, "place", true);
       const late = inst.wake();
-      await sleep(20); // FleetDO granted epoch 1; the answer is held
+      await reached; // FleetDO granted epoch 1; the answer is held
       // The answer is slower than PLACING_STALE_MS: the next wake reconciles and adopts the lease.
       const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one();
       st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify({ ...JSON.parse(row.value), placing_ms: Date.now() - 61_000 }));

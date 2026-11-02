@@ -5,9 +5,9 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
-import type { McpConnectorDO } from "../src/do/mcp-connector";
+import { McpConnectorDO } from "../src/do/mcp-connector";
 import { approves, argsDigest, checkMcpUrl, connectorName } from "../src/lib/mcp";
-import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, nextCommands, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -471,7 +471,7 @@ describe("fencing", () => {
 
 /** Wait until the stub server has received `n` calls (a call's way there takes its own time under load). */
 async function atServer(stub: { calls: unknown[] }, n: number) {
-  for (let i = 0; i < 200 && stub.calls.length < n; i++) await sleep(10);
+  await eventually(`${n} calls at the server`, () => stub.calls.length >= n);
   expect(stub.calls).toHaveLength(n);
 }
 
@@ -510,16 +510,24 @@ describe("admission: a per-server cap across agents", () => {
     s.stub.next.slow = [{ delay: 800 }];
     call(b.ws, "cal_w1", s.t("slow"), { ms: 800 }); // holds the one slot
     await atServer(s.stub, 1);
-    call(s.ws, "cal_w2", s.t("counter_add"), { name: "c", n: 1 });
-    await sleep(200); // waiting for admission now
-    await bumpEpoch(s.agent);
-    const outcome = await (async () => {
-      for (let i = 0; i < 60; i++) {
-        const o = await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).calls.call("cal_w2")?.outcome);
-        if (o) return o;
-        await sleep(50);
-      }
-    })();
+    // Count the connector's refusals (the class is shared by every instance in this file's isolate).
+    let refused = 0;
+    const acquire = McpConnectorDO.prototype.acquire;
+    McpConnectorDO.prototype.acquire = async function (this: McpConnectorDO, ...a: Parameters<typeof acquire>) {
+      const r = await acquire.apply(this, a);
+      if (!("lease" in r)) refused++;
+      return r;
+    };
+    let outcome: unknown;
+    try {
+      call(s.ws, "cal_w2", s.t("counter_add"), { name: "c", n: 1 });
+      await eventually("cal_w2 to be refused a slot", () => refused > 0); // waiting for admission now
+      await bumpEpoch(s.agent);
+      outcome = await eventually("cal_w2's outcome", () =>
+        runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).calls.call("cal_w2")?.outcome));
+    } finally {
+      McpConnectorDO.prototype.acquire = acquire;
+    }
     expect(outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
     expect(s.stub.calls.map((c) => c.tool)).toEqual(["slow"]);
   });
@@ -577,12 +585,11 @@ describe("a server's changed tool list reaches live brains", () => {
 
     // Disconnected when the next change lands: told when it says hello again.
     s.ws.close();
-    await sleep(100);
+    await sessionGone(s.agent);
     s.stub.extra.delete("relisted");
     await relistNow(s);
     const notified = async () => runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).kvGet("mcp_changed_ms") as number | undefined);
-    for (let i = 0; i < 60 && !(await notified()); i++) await sleep(50);
-    expect(await notified()).toBeTruthy();
+    await eventually("the change noted for the disconnected brain", notified);
     const ws2 = await runner(s.agent, s.host.host, s.host.host_token, 1, "rin_one", true);
     await ws2.next("tools_changed", () => true, 3000);
     expect((await listTools(ws2)).map((t) => t.name)).not.toContain(s.t("relisted"));

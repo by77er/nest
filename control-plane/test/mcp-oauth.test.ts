@@ -600,7 +600,8 @@ describe("audit", () => {
     await Promise.resolve().then(() => broker().mcpOAuthToken(ref, f.server)).catch(() => undefined);
     const row = await grantRow(ref);
     let records: any[] = [];
-    for (let i = 0; i < 50 && !records.some((r) => r.event === "oauth_refresh_failed"); i++) {
+    // Audit records are written in the background: poll for the last one.
+    for (const end = Date.now() + 10_000; !records.some((r) => r.event === "oauth_refresh_failed") && Date.now() < end;) {
       await sleep(20);
       const listed = await env.BUCKET.list({ prefix: "audit/broker/" });
       records = (await Promise.all(listed.objects.map(async (o) => JSON.parse(await (await env.BUCKET.get(o.key))!.text())))).filter((r) => r.ref === ref || r.capability === cap);

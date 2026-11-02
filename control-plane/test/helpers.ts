@@ -1,7 +1,8 @@
 import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
-import { SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { expect } from "vitest";
+import type { FleetDO } from "../src/do/fleet";
 import type { Kms } from "../src/lib/kms";
 import type { EnrollResponse, FleetToHost } from "../src/protocol/control";
 
@@ -189,6 +190,45 @@ export async function okResult(ws: Ws, cmd: string) {
 
 export const manifest = (c: string) => `blake3:${c.repeat(64)}`;
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * `fn`'s first truthy value, polled for up to `ms`. For what another DO, an alarm or workerd's socket
+ * delivery settles on its own time: wait for it rather than sleeping and hoping.
+ */
+export async function eventually<T>(what: string, fn: () => Promise<T> | T, ms = 10_000): Promise<NonNullable<T>> {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v as NonNullable<T>;
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(10);
+  }
+}
+
+const agentDO = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
+
+/** Wait until AgentDO has received `bytes` of the current stream (at `base`, when given): a sent segment lands when workerd delivers it. */
+export async function received(agent: string, bytes: number, base?: number): Promise<void> {
+  await eventually(`${bytes} bytes received`, async () => {
+    const i = await agentDO(agent).info();
+    return i.received_bytes >= bytes && (base === undefined || i.recv_base === base);
+  });
+}
+
+/** Wait until AgentDO holds no runner session socket (a client's close lands when workerd delivers it). */
+export async function sessionGone(agent: string): Promise<void> {
+  await eventually("the session socket to close", async () =>
+    (await runInDurableObject(agentDO(agent), (_i: unknown, st: DurableObjectState) => st.getWebSockets("session").length)) === 0);
+}
+
+/** Inbound items (hellos, event batches) submitted for `host` at FleetDO and not finished, the running one included. */
+export const inboundPending = (cell: string, host: string) => runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), (inst: FleetDO) =>
+  (inst as unknown as { inbound: Map<string, { pending: number }> }).inbound.get(host)?.pending ?? 0);
+
+/** Wait until FleetDO has finished everything it took from `host`: a hello's work goes on after its `hello_ack`. */
+export async function inboundSettled(cell: string, host: string): Promise<void> {
+  await eventually(`FleetDO to finish ${host}'s inbound`, async () => (await inboundPending(cell, host)) === 0);
+}
 export type { FleetToHost };
 
 const EC = { name: "ECDSA", namedCurve: "P-256" } as const;

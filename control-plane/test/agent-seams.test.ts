@@ -10,7 +10,7 @@ import { verifyBinding } from "../src/lib/binding";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { expandTemplate, SEED_CATALOG } from "../src/lib/spec";
 import { b64urlToBytes } from "../src/lib/util";
-import { adminJson, connectHost, hostHello, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, hostHello, inboundSettled, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -527,7 +527,7 @@ describe("one brain per agent: the brain record", () => {
     await sandboxStub(s.sandbox).evicted(s.sbxHost.host, 1);
     const started = await Promise.race([
       agentStub(s.agent).start(),
-      sleep(5_000).then(() => "deadlocked" as const),
+      sleep(10_000).then(() => "deadlocked" as const),
     ]);
     expect(started).not.toBe("deadlocked");
     expect(started).toMatchObject({ host: s.host.host });
@@ -995,7 +995,7 @@ describe("one brain per agent: the brain record", () => {
     const ws1 = await Ws.connect(`/v1/agents/${captain}/session`, a.host_token).catch(() => null);
     if (ws1) {
       ws1.send({ type: "hello", protocol_version: 1, agent: captain, host: a.host, instance_id: "rin_late", epoch: 1, session: SESSION });
-      const first = await Promise.race([ws1.next("error").then((m) => m.error.code), sleep(1500).then(() => "none")]);
+      const first = await ws1.next("error", () => true, 5_000).then((m) => m.error.code, () => "none");
       expect(first).not.toBe("none");
     }
     // The delayed notice finally lands: nothing it releases is a running brain.
@@ -1154,14 +1154,18 @@ describe("one brain per agent: the brain record", () => {
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
       let fails = 1;
       inst.testHooks["exited:enter"] = async () => {
-        if (fails-- > 0) throw new Error("onExited lost");
+        if (fails-- > 0) {
+          (inst as any).exitedLost = true;
+          throw new Error("onExited lost");
+        }
         delete inst.testHooks["exited:enter"];
       };
     });
     const again = await Ws.connect("/v1/fleet", s.host.host_token);
     again.send(hostHello(s.host.host, s.cell, { agents: [] }));
     await again.next("hello_ack");
-    await sleep(50);
+    await eventually("the reconcile's onExited to fail", () => runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).exitedLost));
+    await inboundSettled(s.cell, s.host.host);
     expect(await fleetRows(s.cell, s.agent)).toEqual([{ agent: s.agent, host: s.host.host }]);
     expect((await agentStub(s.agent).info()).brain).toMatchObject({ epoch: 1 });
     const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
@@ -1204,13 +1208,15 @@ describe("one brain per agent: the brain record", () => {
       inst.testHooks["event:afterApply"] = async () => {
         delete inst.testHooks["event:afterApply"];
         await inst.start(b.host); // condemned between two events of one batch
+        (inst as any).condemned = true;
       };
     });
     ws.send({ type: "events", seq: 1, events: [
       { agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), type: "state_changed", state: "working" },
       { agent: s.agent, epoch: 1, seq: 2, ts_ms: Date.now(), type: "capabilities", capabilities: ["late"] },
     ] });
-    await sleep(200);
+    await eventually("the condemning start mid-batch", () => runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).condemned));
+    await sleep(200); // room for the rest of the batch to apply, were it going to
     expect((await agentStub(s.agent).info()).capabilities).toBeUndefined();
   });
 
@@ -1704,7 +1710,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     back.send(hostHello(a.host, cell, { role: "brain" }));
     await back.next("hello_ack");
     // Written after the hello_ack goes out: wait for it.
-    for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "active"; n++) await sleep(25);
+    await eventually("the host active", async () => (await fleet.hostStatus(a.host))!.status === "active");
     expect(await fleet.hostStatus(a.host)).toMatchObject({ status: "active", lost: false });
   });
 
@@ -1838,7 +1844,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const old = await Ws.connect("/v1/fleet", s.host.host_token);
     old.send(hostHello(s.host.host, s.cell, { brain_epochs: false, agents: [{ agent: s.agent, state: "idle" }] }));
     await old.next("hello_ack");
-    for (let n = 0; n < 40 && (await fleet.hostStatus(s.host.host))!.status !== "draining"; n++) await sleep(25);
+    await eventually("the host draining", async () => (await fleet.hostStatus(s.host.host))!.status === "draining");
     expect((await fleet.hostStatus(s.host.host))!).toMatchObject({ status: "draining", current: false });
     const [kill] = await nextCommands(old, isKillOf(s.agent));
     expect(kill).toMatchObject({ epoch: 1 });
@@ -1959,7 +1965,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const back = await Ws.connect("/v1/fleet", a.host_token);
     back.send(hostHello(a.host, cell, { role: "brain" }));
     await back.next("hello_ack");
-    await sleep(100);
+    await inboundSettled(cell, a.host);
     expect((await fleet.hostStatus(a.host))!.status).toBe("dead");
   });
 
@@ -1967,7 +1973,8 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
     s.host.ws.close();
-    await sleep(50);
+    const fleet = env.FLEET.get(env.FLEET.idFromName(s.cell));
+    await eventually("FleetDO to see the drop", async () => !(await fleet.hostStatus(s.host.host))!.connected);
     expect(await agentStub(s.agent).start()).toMatchObject({ kind: "none" });
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", s.host.host);
@@ -2156,7 +2163,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const old = await Ws.connect("/v1/fleet", s.host.host_token);
     old.send(hostHello(s.host.host, s.cell, { brain_epochs: false, agents: [{ agent: s.agent, state: "idle" }] }));
     await old.next("hello_ack");
-    await sleep(100);
+    await inboundSettled(s.cell, s.host.host);
     expect(order).toEqual(["drain", "reconcile"]);
     expect(await old.none("commands", 200, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_suspend"))).toBe(true);
   });
@@ -2209,12 +2216,12 @@ describe("FleetDO and SandboxDO at the seam", () => {
     const ws = await Ws.connect("/v1/fleet", a.host_token);
     ws.send(hostHello(a.host, cell, { role: "brain", brain_epochs: false }));
     await ws.next("hello_ack");
-    for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "draining"; n++) await sleep(25);
+    await eventually("the host draining", async () => (await fleet.hostStatus(a.host))!.status === "draining");
     await runInDurableObject(fleet, async (inst: FleetDO, st) => {
       st.storage.sql.exec("UPDATE hosts SET status = 'stonith_pending' WHERE host = ?", a.host);
       (inst as any).stonithDoneIfClear(a.host);
     });
-    for (let n = 0; n < 40 && (await fleet.hostStatus(a.host))!.status !== "draining"; n++) await sleep(25);
+    await eventually("the host draining again", async () => (await fleet.hostStatus(a.host))!.status === "draining");
     expect((await fleet.hostStatus(a.host))!.status).toBe("draining");
   });
 
@@ -2247,20 +2254,22 @@ describe("FleetDO and SandboxDO at the seam", () => {
   it("SandboxDO tells agents of a move from its alarm, never inside the call that moved it", async () => {
     const s = await setup();
     await okResult(s.host.ws, s.start.cmd);
+    // The notice is held until released: a move that waited for it inside the call would never return.
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
       inst.testHooks["sandboxMoved:enter"] = async () => {
-        await new Promise((r) => setTimeout(r, 600));
+        while (!(inst as any).go) await new Promise((r) => setTimeout(r, 10));
       };
     });
     await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
       st.storage.sql.exec("DELETE FROM leases WHERE sandbox = ?", s.sandbox);
     });
-    const t0 = Date.now();
-    await sandboxStub(s.sandbox).evicted(s.sbxHost.host, 1);
-    expect(Date.now() - t0).toBeLessThan(400);
+    const moved = await Promise.race([sandboxStub(s.sandbox).evicted(s.sbxHost.host, 1).then(() => "returned"), sleep(5_000).then(() => "held")]);
+    expect(moved).toBe("returned");
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as any).go = true;
+    });
     await runDurableObjectAlarm(sandboxStub(s.sandbox));
-    for (let n = 0; n < 40 && (await agentStub(s.agent).info()).hands_moved_ms === undefined; n++) await sleep(50);
-    expect((await agentStub(s.agent).info()).hands_moved_ms).toBeDefined();
+    await eventually("the agent told of the move", async () => (await agentStub(s.agent).info()).hands_moved_ms !== undefined);
   });
 });
 

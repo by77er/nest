@@ -7,7 +7,8 @@ import { Deadlines } from "../src/lib/reliable";
 import { issueHostToken } from "../src/lib/tokens";
 import { bytesToB64 } from "../src/lib/util";
 import {
-  admin, adminJson, BASE, connectHost, csrPem, hostHello, manifest, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws,
+  admin, adminJson, BASE, connectHost, csrPem, eventually, hostHello, inboundPending, manifest, nextCommands, okResult, received, sendEvents, sleep,
+  uniqueCell, Ws,
 } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -158,9 +159,8 @@ describe("a turn recovered while pump awaits", () => {
       };
     });
     const queued = adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
-    for (let n = 0; n < 100 && (await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => inst.testHooks["pump:beforeSend"] !== undefined)); n++) {
-      await sleep(20);
-    }
+    await eventually("the pump to reach its send", async () =>
+      runInDurableObject(agentStub(s.agent), (inst: AgentDO) => inst.testHooks["pump:beforeSend"] === undefined));
     // A new runner process says hello meanwhile: the claimed turn is recovered.
     const r2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_two");
     const rec = await r2.ws.next("run_turn");
@@ -407,8 +407,7 @@ describe("#13 a nestd restart doesn't fail live sandboxes", () => {
     // The unreported one is gone with the old process: placed again under a new epoch.
     const [again] = await nextCommands(restarted, (c) => c.type === "sandbox_create");
     expect(again).toMatchObject({ sandbox: s2.sandbox, epoch: 2 });
-    await sleep(50);
-    expect((await sandboxStub(s1.sandbox).info()).state).toBe("running");
+    await eventually("the reported sandbox running", async () => (await sandboxStub(s1.sandbox).info()).state === "running");
     expect((await sandboxStub(s2.sandbox).info()).state).not.toBe("failed");
   });
 });
@@ -652,7 +651,7 @@ describe("#22 a detached agent with waiting work gets a brain", () => {
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "work" } }, 201);
     await r.ws.next("run_turn");
     r.ws.send(seg(0, "l1\nl2\n"));
-    for (let i = 0; i < 100 && (await agentStub(s.agent).info()).received_bytes < 6; i++) await sleep(10);
+    await received(s.agent, 6);
     expect(await agentStub(s.agent).info()).toMatchObject({ received_bytes: 6, durable_bytes: 0 });
     r.ws.close();
     const seq = exited(s, s.agent, "crashed");
@@ -720,7 +719,7 @@ describe("docs #8 hello.agents reconciliation", () => {
     const again = await Ws.connect("/v1/fleet", s.host.host_token);
     again.send(hostHello(s.host.host, s.cell, { agents: [] }));
     await again.next("hello_ack");
-    await sleep(50);
+    await eventually("the brain marked detached", async () => (await agentStub(s.agent).info()).state === "detached");
     // Gone, at its start's epoch: the agent no longer has a host there.
     expect(await agentStub(s.agent).info()).toMatchObject({ state: "detached", host: null });
 
@@ -733,8 +732,7 @@ describe("docs #8 hello.agents reconciliation", () => {
     const third = await Ws.connect("/v1/fleet", s.host.host_token);
     third.send(hostHello(s.host.host, s.cell, { agents: [{ agent: s.agent, state: "idle" }] }));
     await third.next("hello_ack");
-    await sleep(50);
-    expect((await agentStub(s.agent).info()).state).toBe("idle");
+    await eventually("the reported brain kept", async () => (await agentStub(s.agent).info()).state === "idle");
   });
 });
 
@@ -753,7 +751,9 @@ describe("#24 a platform tool re-run after an eviction repeats no side effect", 
       expect((await ws.next("tool_result", (m) => m.call === call)).outcome.status).toBe("ok");
     }
     ws.send(toolCall(++seq, "cal_i-4", "ask", { question: "which way?", to: "user" }));
-    await sleep(50);
+    // The ask has applied once (it posts its question) before the eviction is staged.
+    const wsStub = env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream));
+    await eventually("the ask's question", async () => (await wsStub.userNotifications()).some((n) => n.text.includes("which way?")));
     // An eviction mid-dispatch leaves each call without an outcome; the runner redelivers them.
     await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
       st.storage.sql.exec("UPDATE tool_calls SET status = 'dispatching', outcome = NULL");
@@ -768,7 +768,6 @@ describe("#24 a platform tool re-run after an eviction repeats no side effect", 
     const inbox = await runInDurableObject(agentStub(s.captain!), (_i: AgentDO, st) =>
       st.storage.sql.exec<{ input: string }>("SELECT input FROM turns").toArray().filter((r) => r.input.includes("hello once")).length);
     expect(inbox).toBe(1);
-    const wsStub = env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream));
     expect((await wsStub.events()).filter((e) => e.type === "progress").length).toBe(1);
     const notes = await wsStub.userNotifications();
     expect(notes.filter((n) => n.text === "user once").length).toBe(1);
@@ -926,18 +925,6 @@ async function untilAsync(what: string, pred: () => Promise<boolean>, ms = 3000)
     await sleep(5);
   }
 }
-
-/** Wait until AgentDO has received `bytes` of the current stream (at `base`, when given): a sent segment lands when workerd delivers it. */
-async function received(agent: string, bytes: number, base?: number) {
-  await untilAsync(`${bytes} bytes received`, async () => {
-    const i = await agentStub(agent).info();
-    return i.received_bytes >= bytes && (base === undefined || i.recv_base === base);
-  }, 10_000);
-}
-
-/** Inbound items (hellos, event batches) submitted for `host` and not finished, the running one included. */
-const inboundPending = (cell: string, host: string) => runInDurableObject(fleetStub(cell), (inst: FleetDO) =>
-  (inst as unknown as { inbound: Map<string, { pending: number }> }).inbound.get(host)?.pending ?? 0);
 
 const fleetRows = <T,>(cell: string, q: string, ...args: SqlStorageValue[]) =>
   runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => st.storage.sql.exec(q, ...args).toArray() as T[]);
@@ -1222,7 +1209,7 @@ describe("#29 command batches go on the wire in seq order", () => {
     // AgentDO's escalation issues kills by RPC: it gets the id back while the chain is held.
     const kill = await Promise.race([
       fleetStub(cell).issueKill(h.host, "agt_01killwhilechainheld00000", 1, "t"),
-      sleep(1000).then(() => "held"),
+      sleep(5_000).then(() => "held"),
     ]);
     expect(kill).toMatch(/^cmd_/);
     refs.released = true;
