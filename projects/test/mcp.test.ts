@@ -179,10 +179,3 @@ describe("a retried write", () => {
     expect(b.id).not.toBe(a.id);
   });
 });
-
-describe("a reviewer", () => {
-  it("gets stubs until the review pipeline lands", async () => {
-    const t = await nest.sign(agentClaims("review", "agt_r1", { project: "prj_x", role: "reviewer", pr: "1", sha: "abc" }));
-    expect(toolError(await callTool("review", t, "get_review"))).toMatch(/built yet/);
-  });
-});

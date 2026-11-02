@@ -4,7 +4,7 @@
 // `tools/list`, `tools/call`. Every request must carry a valid Nest-Identity (src/identity.ts), or it
 // gets 401/403 and no data.
 
-import { directory, type Env, project } from "./env";
+import { directory, type Env, project, review } from "./env";
 import { type Caller, verifyIdentity } from "./identity";
 import { clientIdOf } from "./nest";
 import { SERVERS, type Server, TOOLS } from "./tools";
@@ -80,13 +80,11 @@ async function call(env: Env, server: Server, caller: Caller, msg: Rpc): Promise
   const meta = msg.params?._meta as Record<string, unknown> | undefined;
   const callKey = typeof meta?.["nest/call"] === "string" ? (meta["nest/call"] as string) : null;
 
-  if (server === "review") {
-    // The review pipeline (a later release) fills these in.
-    return toolError(msg.id, "reviews aren't built yet");
-  }
   const id = caller.labels.project!;
   if (!(await directory(env).getProject(id))) return toolError(msg.id, "unknown project");
-  const r = await project(env, id).mcpCall(server, caller, name, args as Record<string, unknown>, callKey);
+  const r = server === "review"
+    ? await review(env, id).mcpCall(caller, name, args as Record<string, unknown>, callKey)
+    : await project(env, id).mcpCall(server, caller, name, args as Record<string, unknown>, callKey);
   if (r.error !== null || r.result === null) return toolError(msg.id, r.error ?? "no result");
   return answer(msg.id, { content: [{ type: "text", text: r.result }], structuredContent: JSON.parse(r.result) });
 }

@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { syncCatalog } from "./catalog";
 import { REPO } from "./do/directory";
-import { directory, type Env, project } from "./env";
+import { directory, type Env, project, review } from "./env";
 import { nestFrom } from "./nest";
 import type { Result } from "./sql";
 
@@ -13,14 +13,24 @@ const json = (body: unknown, status = 200) =>
 const err = (status: number, error: string) => json({ error }, status);
 const done = <T>(r: Result<T>, status = 200) => (r.ok ? json(r.value, status) : err(r.status, r.error));
 
+/** A project's settings with ReviewDO's one, `max_concurrent_reviews`. */
+async function withReviews<T extends object>(env: Env, id: string, r: Result<T>): Promise<Result<T & { max_concurrent_reviews: number | null }>> {
+  return r.ok ? { ok: true, value: { ...r.value, max_concurrent_reviews: await review(env, id).maxConcurrent() } } : r;
+}
+
 const Text = (max: number) => z.string().max(max);
 const CreateProject = z.strictObject({
   name: z.string().min(1).max(100),
   repo: z.string().regex(REPO, "repo is owner/name"),
   auto_assign: z.boolean().optional(),
   max_workers: z.number().int().min(0).max(20).optional(),
+  max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
 });
-const Settings = z.strictObject({ auto_assign: z.boolean().optional(), max_workers: z.number().int().min(0).max(20).optional() });
+const Settings = z.strictObject({
+  auto_assign: z.boolean().optional(), max_workers: z.number().int().min(0).max(20).optional(),
+  // ReviewDO's: null (the default) for no cap.
+  max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
+});
 const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
 const Spec = z.strictObject({
@@ -77,10 +87,12 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     const p = created.value;
     // The templates may push only to attached repos: written again with this one before its manager starts.
     const synced = await sync(env);
+    await review(env, p.id).init({ project: p.id, repo: p.repo }, { max_concurrent_reviews: b.value.max_concurrent_reviews });
     const stub = project(env, p.id);
     await stub.init({ id: p.id, name: p.name, repo: p.repo, auto_assign: b.value.auto_assign, max_workers: b.value.max_workers });
+    // Attaches the repo, then starts the manager (README.md#flows).
     await stub.drain();
-    const settings = await stub.getSettings();
+    const settings = await withReviews(env, p.id, await stub.getSettings());
     return json({ ...p, settings: settings.ok ? settings.value : null, catalog_synced: synced.ok }, 201);
   }
 
@@ -96,16 +108,23 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
 
   switch (route) {
     case "GET ": {
-      const s = await p.getSettings();
+      const s = await withReviews(env, pid, await p.getSettings());
       if (!s.ok) return done(s);
       return json({ ...row, settings: s.value });
     }
     case "GET settings":
-      return done(await p.getSettings());
+      return done(await withReviews(env, pid, await p.getSettings()));
     case "PATCH settings": {
       const b = await body(req, Settings);
-      return b.ok ? done(await p.updateSettings(b.value)) : b.res;
+      if (!b.ok) return b.res;
+      const { max_concurrent_reviews, ...rest } = b.value;
+      if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
+      return done(await withReviews(env, pid, await p.updateSettings(rest)));
     }
+    case "POST attach":
+      return done(await withReviews(env, pid, await p.retryAttach()));
+    case "GET reviews":
+      return json(await review(env, pid).jobs());
     case "GET tasks":
       return done(await p.listTasks());
     case "POST tasks": {

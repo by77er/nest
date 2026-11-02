@@ -136,6 +136,7 @@ export async function verifyIdentity(token: string | null, config: IdentityConfi
   if (l.role !== role) return refuse(403, `not a ${role}`);
   if (typeof l.project !== "string") return refuse(403, "no project");
   if (role === "worker" && typeof l.task !== "string") return refuse(403, "no task");
+  if (role === "reviewer" && (typeof l.pr !== "string" || typeof l.sha !== "string")) return refuse(403, "no pr and sha");
   const strings = Object.fromEntries(Object.entries(l).filter((e): e is [string, string] => typeof e[1] === "string"));
   return { ok: true, caller: { kind: "agent", agent: claims.sub, role, labels: strings, tainted: claims.tainted === true } };
 }

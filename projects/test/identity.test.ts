@@ -75,12 +75,14 @@ describe("Nest-Identity on the MCP servers", () => {
     }
   });
 
-  it("refuses a manager on the worker's and the reviewer's servers, and a worker without a task", async () => {
+  it("refuses a manager on the worker's and the reviewer's servers, a worker without a task, and a reviewer without a pr and sha", async () => {
     expect((await list("task", await nest.sign({ ...good(), aud: `${APP}/mcp/task` }))).status).toBe(403);
     expect((await list("review", await nest.sign({ ...good(), aud: `${APP}/mcp/review` }))).status).toBe(403);
     expect((await list("task", await nest.sign(agentClaims("task", "agt_w", { project: "prj_none", role: "worker" })))).status).toBe(403);
     expect((await list("task", await nest.sign(agentClaims("task", "agt_w", { project: "prj_none", role: "worker", task: "tsk_a" })))).status).toBe(200);
-    expect((await list("review", await nest.sign(agentClaims("review", "agt_r", { project: "prj_none", role: "reviewer" })))).status).toBe(200);
+    expect((await list("review", await nest.sign(agentClaims("review", "agt_r", { project: "prj_none", role: "reviewer" })))).status).toBe(403);
+    expect((await list("review", await nest.sign(agentClaims("review", "agt_r", { project: "prj_none", role: "reviewer", pr: "1" })))).status).toBe(403);
+    expect((await list("review", await nest.sign(agentClaims("review", "agt_r", { project: "prj_none", role: "reviewer", pr: "1", sha: "a".repeat(40) })))).status).toBe(200);
   });
 
   it("lets nest's connector initialize and list, never call", async () => {

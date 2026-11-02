@@ -122,6 +122,16 @@ export class Nest {
     return this.call("POST", "/v1/agents", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
+  /**
+   * A new agent with a sandbox of its own, both labelled, the agent's push scope narrowed to `repo`.
+   * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
+   * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back.
+   */
+  async startAgent(template: string, labels: Labels, repo: string, key: string): Promise<string> {
+    const sandbox = (await this.createSandbox({ labels }, `${key}/sandbox`)).sandbox;
+    return (await this.createAgent({ template, sandbox, labels, overrides: { repos: [repo] }, start: true }, `${key}/agent`)).agent;
+  }
+
   getAgent(agent: string): Promise<AgentView> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}`);
   }
@@ -171,6 +181,9 @@ export class Nest {
     return this.call("POST", "/v1/clients/self/github-token", { repo, permissions });
   }
 }
+
+/** Retry waits for work owed to nest or GitHub: from 5 s, doubling, to 5 min. */
+export const backoff = (attempts: number) => Math.min(5_000 * 2 ** Math.max(0, attempts - 1), 300_000);
 
 const labelFilters = (labels: Labels) => Object.entries(labels).map(([k, v]) => `${k}=${v}`);
 

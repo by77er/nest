@@ -55,6 +55,7 @@ describe("the Access check", () => {
   it("isn't asked of /hooks/* and /mcp/*, which have their own proof", async () => {
     // No Access token: each answers its own refusal, not Access's 403 page.
     expect((await SELF.fetch(`${APP}/hooks/nest`, { method: "POST", body: "{}" })).status).toBe(401);
+    expect((await SELF.fetch(`${APP}/hooks/github`, { method: "POST", body: "{}" })).status).toBe(401);
     expect((await SELF.fetch(`${APP}/mcp/board`, { method: "POST", body: "{}" })).status).toBe(401);
   });
 });

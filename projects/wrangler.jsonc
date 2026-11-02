@@ -42,5 +42,5 @@
   // Secrets (wrangler secret put / .dev.vars), never in this file:
   // - NEST_CLIENT_TOKEN: the `projects` API client's token (`POST /v1/admin/clients`, shown once).
   // - NEST_WEBHOOK_SECRET: the secret `PUT /v1/clients/self/webhook` showed (signs /hooks/nest).
-  // - GITHUB_WEBHOOK_SECRET: the GitHub App webhook's secret (signs /hooks/github; the review PR).
+  // - GITHUB_WEBHOOK_SECRET: the GitHub App webhook's secret (signs /hooks/github).
 }

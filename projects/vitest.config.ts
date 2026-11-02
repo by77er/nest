@@ -18,6 +18,7 @@ export default defineConfig({
           // A client token's shape (nest_cli_<id>_<64 hex>), low in entropy (dev/review-lessons.md 9).
           NEST_CLIENT_TOKEN: `nest_cli_app_${"0".repeat(64)}`,
           NEST_WEBHOOK_SECRET: `whsec_${"1".repeat(64)}`,
+          GITHUB_WEBHOOK_SECRET: `ghsec_${"2".repeat(40)}`,
         },
       },
     }),

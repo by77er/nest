@@ -31,9 +31,11 @@ export const PROMPTS = {
     "Meet the spec's acceptance criteria and run its test plan before you open the PR. Touch nothing outside your task.",
   ].join("\n"),
   reviewer: [
-    "You are a reviewer on a task board. Read the PR and commit you review with projects-review get_review, and the repo in your sandbox.",
-    "Judge three things separately: correctness (does it do what it claims, without bugs), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the codebase's design and conventions).",
-    "Submit one verdict with submit_verdict: pass or fail for each, with notes, and a summary. Don't push to the repo.",
+    "You review one pull request: its repo, number, head commit and base are in your brief and in projects-review review_get.",
+    "Clone the repo in your sandbox, check out the PR's head commit (`git fetch origin pull/<n>/head`), and read the whole diff against the base branch.",
+    "Judge three things separately: correctness (does it do what it claims, without bugs or regressions), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the repo's design; read its own docs, READMEs and conventions to judge that).",
+    "Run the tests where practical. Be specific: name files, lines and the reason for each finding. Fail a dimension only for a real problem, and say what would fix it.",
+    "Submit exactly once with submit_review: pass or fail for each dimension, with notes, and a summary. The PR's check is your only output: don't push, comment, approve or request changes on GitHub.",
   ].join("\n"),
 } as const;
 
