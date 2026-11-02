@@ -75,8 +75,14 @@ describe("projects", () => {
     expect(m.overrides).toEqual({ repos: [p.repo.toLowerCase()] });
     expect(p.body.settings.manager).toBe(m.agent);
     expect(fake.inbox.find((x) => x.agent === m.agent)?.text).toContain(p.repo.toLowerCase());
-    // Every call named the cell, which production's nest requires.
-    expect(fake.calls.every((c) => c.query.get("cell") === CELL)).toBe(true);
+    // The cell goes where nest takes it: in each create's body, which carries an Idempotency-Key.
+    const creates = fake.calls.filter((c) => c.method === "POST" && (c.path === "/v1/agents" || c.path === "/v1/sandboxes"));
+    expect(creates.length).toBeGreaterThanOrEqual(2);
+    for (const c of creates) {
+      expect(c.body.cell).toBe(CELL);
+      expect(c.idempotencyKey).toMatch(new RegExp(`^${p.id}/manager/1/(sandbox|agent)$`));
+    }
+    expect(fake.calls.filter((c) => c.query.has("cell") && c.method !== "GET")).toEqual([]);
 
     const list = await api(token, "GET", "/api/projects");
     expect(list.body.projects.map((x: { id: string }) => x.id)).toContain(p.id);
@@ -107,9 +113,21 @@ describe("projects", () => {
     const s = await api(token, "GET", `/api/projects/${p.id}/settings`);
     expect(s.body.manager).toMatch(/^agt_/);
     expect(s.body.manager_error).toBeNull();
-    // Each attempt reused the sandbox the first one made (found by its labels): one sandbox, one manager.
+    // Each attempt sent the same keys, so the sandbox the first one made came back: one sandbox, one manager.
     expect([...fake.sandboxes.values()].filter((x) => x.labels.project === p.id)).toHaveLength(1);
     expect([...fake.agents.values()].filter((a) => a.labels.project === p.id)).toHaveLength(1);
+  });
+
+  it("a create whose answer was lost is sent again with its key, and nest answers the one it made", async () => {
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    const p = await newProject();
+    expect(p.body.settings.manager).toBeNull();
+    const stub = env.PROJECT.get(env.PROJECT.idFromName(p.id));
+    await runInDurableObject(stub, (_o, st) => { st.storage.sql.exec("UPDATE settings SET manager_next_ms = 0"); });
+    await stub.drain();
+    const managers = [...fake.agents.values()].filter((a) => a.labels.project === p.id);
+    expect(managers).toHaveLength(1);
+    expect((await api(token, "GET", `/api/projects/${p.id}/settings`)).body.manager).toBe(managers[0]!.agent);
   });
 
   it("retries a 503 nest marks retryable, within the call", async () => {
@@ -178,6 +196,25 @@ describe("tasks", () => {
     const again = await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
     expect(again.body.state).toBe("in_progress");
     expect(workersOf(p.id).map((w) => w.labels.start)).toEqual(["2"]);
+  });
+
+  it("a create nest is still handling (409, retryable) is retried within the call", async () => {
+    const p = await newProject();
+    const t = await readyTask(p.id);
+    fake.inProgress.push({ match: new RegExp(`^${p.id}/${t.id}/1/agent$`), times: 2 });
+    const r = await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
+    expect(r.body.state).toBe("in_progress");
+    expect(workersOf(p.id)).toHaveLength(1);
+  });
+
+  it("a key nest says was used for another request (409, not retryable) stalls the task", async () => {
+    const p = await newProject();
+    const t = await readyTask(p.id);
+    fake.keys.set(`${p.id}/${t.id}/1/agent`, { digest: "another request", status: 201, body: "{}" });
+    const r = await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
+    expect(r.body.state).toBe("stalled");
+    expect(r.body.start_error).toMatch(/409/);
+    expect(workersOf(p.id)).toHaveLength(0);
   });
 
   it("a worker whose start fails for now is retried, twice, without a second worker", async () => {

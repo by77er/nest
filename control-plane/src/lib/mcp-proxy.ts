@@ -125,7 +125,8 @@ interface ServerRow {
  * again with a replacement, once (`renewed`): a server that refuses the fresh one too is refused.
  */
 interface Bearer {
-  value: string;
+  /** Null: the grant names no credential, so no `Authorization` is sent and there is nothing to renew. */
+  value: string | null;
   renewed: boolean;
 }
 
@@ -153,10 +154,11 @@ const platformError = (code: string, message: string, retryable = false): McpCal
   ({ outcome: { status: "error", error: errorBody(code, message, retryable) }, from_server: false });
 
 /** An HTTP refusal (nothing was processed) as a platform error. */
-function refusal(cap: string, a: Extract<RpcAnswer, { kind: "refused" }>, oauth = false): McpCallOutcome {
+function refusal(cap: string, a: Extract<RpcAnswer, { kind: "refused" }>, oauth = false, bearerless = false): McpCallOutcome {
   const what = `the MCP server of ${cap} answered HTTP ${a.status}`;
   const again = `POST /v1/admin/capabilities/${cap}/oauth`;
   if (a.status === 401) {
+    if (bearerless) return platformError(ErrorCodes.UNAUTHORIZED, `${what}: it refused nest's caller identity (the capability names no bearer, so Nest-Identity is the only credential sent)`);
     return platformError(ErrorCodes.UNAUTHORIZED, `${what}: it refused nest's credential${oauth ? ` (a fresh OAuth token too); the operator may need to authorize it again (${again})` : ""}`);
   }
   if (a.status === 403) {
@@ -179,7 +181,7 @@ export function setupError(g: McpGrant, what: string, a: RpcAnswer): NestError {
   const m = `the MCP server of ${g.capability} failed ${what}`;
   switch (a.kind) {
     case "refused": {
-      const r = refusal(g.capability, a, !!g.oauth).outcome as Extract<ToolOutcome, { status: "error" }>;
+      const r = refusal(g.capability, a, !!g.oauth, g.auth === undefined).outcome as Extract<ToolOutcome, { status: "error" }>;
       return new NestError(r.error.code, r.error.message, 502, r.error.retryable);
     }
     case "rpc_error":
@@ -237,8 +239,9 @@ export class McpProxy {
     return g.url;
   }
 
-  /** The one place the proxy gets a server's bearer (lib/mcp-auth.ts decides what it is). */
+  /** The one place the proxy gets a server's bearer (lib/mcp-auth.ts decides what it is); none for a grant naming no credential. */
   private async bearerOf(g: McpGrant): Promise<Bearer> {
+    if (g.auth === undefined) return { value: null, renewed: true };
     const t = await this.d.bearer(g);
     if (!t) throw new NestError(ErrorCodes.FORBIDDEN, `capability ${g.capability}: no credential stored as ${g.auth}`, 409);
     return { value: t, renewed: false };
@@ -246,7 +249,7 @@ export class McpProxy {
 
   /** After a 401: a replacement bearer, once per request sequence; false when there is none (the 401 stands). */
   private async renew(g: McpGrant, b: Bearer): Promise<boolean> {
-    if (b.renewed) return false;
+    if (b.renewed || b.value === null) return false;
     b.renewed = true;
     const t = await this.d.bearer(g, b.value);
     if (!t) return false;
@@ -255,7 +258,7 @@ export class McpProxy {
   }
 
   /** An initialized session (`initialize` once, then `notifications/initialized`), reused until it ends. */
-  private async session(g: McpGrant, token: string, timeoutMs: number, ctx: CallContext): Promise<ServerRow> {
+  private async session(g: McpGrant, token: string | null, timeoutMs: number, ctx: CallContext): Promise<ServerRow> {
     const s = this.server(g);
     if (s.version) return s;
     const running = this.initializing.get(g.capability);
@@ -265,7 +268,7 @@ export class McpProxy {
     return p;
   }
 
-  private async initialize(g: McpGrant, token: string, timeoutMs: number, ctx: CallContext): Promise<ServerRow> {
+  private async initialize(g: McpGrant, token: string | null, timeoutMs: number, ctx: CallContext): Promise<ServerRow> {
     const o = await openSession(this.url(g), token, timeoutMs, "nest", () => this.identityFor(g, ctx));
     if (o.kind === "failed" && o.answer.kind === "refused" && o.answer.status === 401) throw new BearerRefused(setupError(g, "initialize", o.answer));
     if (o.kind === "failed") throw setupError(g, "initialize", o.answer);
@@ -498,7 +501,7 @@ export class McpProxy {
               continue;
             }
           }
-          return this.settle(ctx.key, refusal(g.capability, a, !!g.oauth));
+          return this.settle(ctx.key, refusal(g.capability, a, !!g.oauth, g.auth === undefined));
         }
         case "too_large":
           return this.settle(ctx.key, platformError(ErrorCodes.INVALID_MESSAGE, `the call ran, but its answer is over 1 MiB, which nest doesn't relay`));
