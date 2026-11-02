@@ -526,8 +526,8 @@ describe("#21 a deadline re-armed while it runs isn't dropped", () => {
     });
   });
 
-  // A bare object with a deadlines table (ChannelDO: a stub that stores nothing of its own).
-  const bare = () => env.CHANNEL.get(env.CHANNEL.idFromName(`~deadlines-${crypto.randomUUID()}`));
+  // A bare object to hold a deadlines table: an MCP connector nothing else addresses (it arms nothing of its own).
+  const bare = () => env.MCP_CONNECTOR.get(env.MCP_CONNECTOR.idFromName(`~deadlines-${crypto.randomUUID()}`));
 
   it("the arm-if-absent idiom inside the key's own handler re-arms it (a running key isn't armed)", async () => {
     await runInDurableObject(bare(), async (_i, st) => {

@@ -9,9 +9,6 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [agent/](agent/) | Turn queue and inbox, scheduled wakes, brain placement and the agent epoch, hands setup through SandboxDO, session stream, state, spec, grants, taint and budget, tool relay |
 | [broker/](broker/) | Claude setup tokens, injected secrets, capability credentials, GitHub App token minting |
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
-| WorkstreamDO (stub) | Nothing: workstreams left the platform. Like ChannelDO, it serves only the health probe, leaves the previous release's rows untouched, and re-arms that release's alarm daily while decision events wait for a wake, until stage 4 |
-| TaskLedgerDO (stub) | Nothing: the task ledger left the platform. The class stays declared, serving only the health probe and leaving the previous release's rows untouched, until stage 4 deletes it in a deploy of its own |
-| ChannelDO (stub) | Nothing: channels left the platform. Like TaskLedgerDO, it serves only the health probe, leaves its rows and its R2 bodies untouched, and re-arms a previous release's alarm daily while its deadlines remain, until stage 4 |
 | [mcp-connector/](mcp-connector/) | One remote MCP server and credential: the shared tool list, its change notices to agents, and call admission |
 
 ## Conventions

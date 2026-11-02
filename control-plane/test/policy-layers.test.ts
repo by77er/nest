@@ -1,6 +1,5 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { WORKSTREAM_ALARM_MS, type WorkstreamDO } from "../src/do/workstream";
 import { admin, adminJson, connectHost, nextCommands, runDue, sleep, uniqueCell } from "./helpers";
 
 describe("egress policy layers", () => {
@@ -45,45 +44,6 @@ describe("egress policy layers", () => {
     const secrets = cmds.find((c) => c.type === "secrets_update");
     expect(secrets.secrets).toEqual([{ binding: "github", value: "ghs_realtoken" }]);
     expect(JSON.stringify(cmds.find((c) => c.type === "policy_update")?.policy ?? {})).not.toContain("ghs_realtoken");
-  });
-});
-
-describe("the WorkstreamDO stub (workstreams left the platform)", () => {
-  it("wakes nobody, leaves the previous release's rows alone and keeps an alarm while decision events wait, so a rollback's wake still comes", async () => {
-    const workstream = (id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
-    // A workstream as the previous release left it: an unwoken decision event for its subscriber, alarm armed.
-    const old = workstream(`ws_old${crypto.randomUUID().slice(0, 8)}`);
-    await runInDurableObject(old, async (_i: WorkstreamDO, st) => {
-      st.storage.sql.exec("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      st.storage.sql.exec(`CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, type TEXT NOT NULL,
-        decision INTEGER NOT NULL, body TEXT NOT NULL, woke INTEGER NOT NULL DEFAULT 0)`);
-      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('info', ?)", JSON.stringify({ workstream: "ws_old", goal: "g", subscriber: "agt_nobody", created_ms: 1 }));
-      st.storage.sql.exec("INSERT INTO events (ts_ms, type, decision, body) VALUES (1, 'blocked', 1, '{}')");
-      await st.storage.setAlarm(Date.now() + 60_000);
-    });
-    const before = Date.now();
-    expect(await runDurableObjectAlarm(old)).toBe(true);
-    await runInDurableObject(old, async (_i: WorkstreamDO, st) => {
-      expect(await st.storage.getAlarm()).toBeGreaterThanOrEqual(before + WORKSTREAM_ALARM_MS);
-      expect(st.storage.sql.exec("SELECT type, woke FROM events").toArray()).toEqual([{ type: "blocked", woke: 0 }]);
-    });
-    // Woken already, or progress only, or nothing stored at all: no alarm.
-    for (const rows of ["woken", "progress", null] as const) {
-      const w = workstream(`ws_x${crypto.randomUUID().slice(0, 8)}`);
-      await runInDurableObject(w, async (_i: WorkstreamDO, st) => {
-        if (rows) {
-          st.storage.sql.exec(`CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, type TEXT NOT NULL,
-            decision INTEGER NOT NULL, body TEXT NOT NULL, woke INTEGER NOT NULL DEFAULT 0)`);
-          st.storage.sql.exec("INSERT INTO events (ts_ms, type, decision, body, woke) VALUES (1, ?, ?, '{}', ?)",
-            rows === "woken" ? "blocked" : "progress", rows === "woken" ? 1 : 0, rows === "woken" ? 1 : 0);
-        }
-        await st.storage.setAlarm(Date.now() + 60_000);
-      });
-      expect(await runDurableObjectAlarm(w)).toBe(true);
-      expect(await runInDurableObject(w, (_i: WorkstreamDO, st) => st.storage.getAlarm()), String(rows)).toBeNull();
-    }
-    // The routes went with it.
-    expect((await adminJson("/v1/workstreams", { body: { goal: "g" } }, 404)).error.code).toBe("invalid_message");
   });
 });
 

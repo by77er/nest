@@ -1,24 +1,16 @@
 import type { AgentDO } from "./do/agent";
 import type { BrokerDO } from "./do/broker";
 import type { CatalogDO } from "./do/catalog";
-import type { ChannelDO } from "./do/channel";
 import type { FleetDO } from "./do/fleet";
 import type { McpConnectorDO } from "./do/mcp-connector";
 import type { SandboxDO } from "./do/sandbox";
-import type { TaskLedgerDO } from "./do/tasks";
-import type { WorkstreamDO } from "./do/workstream";
 
 export interface Env {
   FLEET: DurableObjectNamespace<FleetDO>;
   SANDBOX: DurableObjectNamespace<SandboxDO>;
   AGENT: DurableObjectNamespace<AgentDO>;
-  WORKSTREAM: DurableObjectNamespace<WorkstreamDO>;
   BROKER: DurableObjectNamespace<BrokerDO>;
   CATALOG: DurableObjectNamespace<CatalogDO>;
-  /** Channels' class, kept declared until stage 4 of their removal deletes it (do/channel.ts): serves only health. */
-  CHANNEL: DurableObjectNamespace<ChannelDO>;
-  /** The task ledger's class, kept declared until stage 4 of its removal deletes it (do/tasks.ts): serves only health. */
-  TASKS: DurableObjectNamespace<TaskLedgerDO>;
   /** One per remote MCP server and credential (`connectorName`): the shared tool list and admission. */
   MCP_CONNECTOR: DurableObjectNamespace<McpConnectorDO>;
   BUCKET: R2Bucket;
