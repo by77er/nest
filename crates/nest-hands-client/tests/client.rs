@@ -418,7 +418,12 @@ fn one_classification_for_every_refusal_and_guest_error() {
         Next::Resolve,
         "a host that never completes the upgrade"
     );
-    assert_eq!(OpenError::Timeout(Phase::Bind).next(), Next::Final);
+    // The gateway took the bind and nothing reached the guest: a guest frozen past both timers
+    // (a VM paused for a checkpoint, behind a gateway that can't tell) is waited out like `busy`.
+    assert_eq!(
+        OpenError::Timeout(Phase::Bind).next(),
+        Next::RetrySame { after: BUSY_RETRY }
+    );
     assert_eq!(
         OpenError::Transport(TransportError::Http(404)).next(),
         Next::Final

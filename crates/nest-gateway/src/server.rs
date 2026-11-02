@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use nest_protocol::gateway::{ClientMessage, GatewayMessage, ROUTE_HANDS, ROUTE_INGRESS_PREFIX, ROUTE_PTY, close_code, error_code};
+use nest_protocol::gateway::{
+    ClientMessage, GUEST_CONNECT_TIMEOUT_MS, GatewayMessage, ROUTE_HANDS, ROUTE_INGRESS_PREFIX, ROUTE_PTY, close_code, error_code,
+};
 use nest_protocol::guest::frame::{self, Kind, MAX_WS_MESSAGE};
 use nest_protocol::guest::framed::FramedReader;
 use nest_protocol::guest::{PORT_HANDS, handshake};
@@ -25,8 +27,9 @@ use crate::verify::{Refusal, first_frame_mismatch, verify_token};
 
 /// How long a client has, from the TCP accept, to finish the upgrade and send `bind`.
 pub const BIND_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the vsock `CONNECT` handshake may take.
-const VSOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the vsock `CONNECT` handshake may take before the bind is refused `busy`. Clients
+/// wait longer (`nest_protocol::gateway::CLIENT_BIND_TIMEOUT_MS`), so that `busy` reaches them.
+const VSOCK_TIMEOUT: Duration = Duration::from_millis(GUEST_CONNECT_TIMEOUT_MS);
 /// Bound on every write toward a client (a close, a refusal, a guest frame): a client that
 /// stops reading cannot pin a task, its registration and the guest connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);

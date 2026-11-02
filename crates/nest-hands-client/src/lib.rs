@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::gateway::{
-    BindingClaims, ClientMessage, GatewayMessage, GuestInfo, HandsTarget,
+    BindingClaims, CLIENT_BIND_TIMEOUT_MS, ClientMessage, GatewayMessage, GuestInfo, HandsTarget,
     MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code,
     parse_binding,
 };
@@ -40,7 +40,9 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct OpenOptions {
     /// TCP connect (and TLS) plus the WebSocket upgrade.
     pub connect_timeout: Duration,
-    /// From sending `bind` to the gateway's `bound` or `error`.
+    /// From sending `bind` to the gateway's `bound` or `error`. The default,
+    /// [`CLIENT_BIND_TIMEOUT_MS`], outlasts the gateway's own guest-connect timer with margin, so
+    /// a slow or frozen guest comes back as the gateway's retryable `busy`.
     pub bind_timeout: Duration,
 }
 
@@ -48,7 +50,7 @@ impl Default for OpenOptions {
     fn default() -> Self {
         OpenOptions {
             connect_timeout: Duration::from_secs(5),
-            bind_timeout: Duration::from_secs(5),
+            bind_timeout: Duration::from_millis(CLIENT_BIND_TIMEOUT_MS),
         }
     }
 }
@@ -295,15 +297,18 @@ impl std::error::Error for OpenError {}
 impl OpenError {
     /// [`Refusal::next`] for a refusal; [`Next::Resolve`] when nothing usable answered where
     /// the target points ([`TransportError::is_unreachable`], or a connect that timed out: a
-    /// host that accepts TCP and never completes the upgrade); otherwise [`Next::Final`].
+    /// host that accepts TCP and never completes the upgrade); [`Next::RetrySame`] after
+    /// [`BUSY_RETRY`] for a bind that timed out (the gateway upgraded and took the `bind`, so
+    /// the target is live and nothing reached the guest: a guest slow or frozen past both
+    /// timers, or a gateway of an older release whose timer was not shorter than ours);
+    /// otherwise [`Next::Final`].
     pub fn next(&self) -> Next {
         match self {
             OpenError::Refused(r) => r.next(),
             OpenError::Transport(t) if t.is_unreachable() => Next::Resolve,
             OpenError::Timeout(Phase::Connect) => Next::Resolve,
-            OpenError::Transport(_) | OpenError::Timeout(Phase::Bind) | OpenError::Protocol(_) => {
-                Next::Final
-            }
+            OpenError::Timeout(Phase::Bind) => Next::RetrySame { after: BUSY_RETRY },
+            OpenError::Transport(_) | OpenError::Protocol(_) => Next::Final,
         }
     }
 }
