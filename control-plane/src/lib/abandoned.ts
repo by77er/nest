@@ -85,12 +85,24 @@ export function classifySandbox(s: SandboxFacts, agentKind: (agent: string) => A
   return { kind: "unknown", ttl, destroy_at: null };
 }
 
-/** The registry's page cursor: after this row (`registered_ms`, then `sandbox`). */
-export const cursorOf = (r: { registered_ms: number; sandbox: string }) => `${r.registered_ms}.${r.sandbox}`;
+/**
+ * The view's page cursor: the sandbox registry's pages first (after this row: `registered_ms`, then
+ * `sandbox`), then the agent registry's (`a`: its start; `a.<ms>.<agent>`: after that row).
+ */
+export type LifetimesCursor =
+  | { phase: "sandboxes"; registered_ms: number; sandbox: string }
+  | { phase: "agents"; registered_ms: number; agent: string };
 
-export function parseCursor(c: string): { registered_ms: number; sandbox: string } | null {
-  const m = /^(\d{1,16})\.(sbx_[A-Za-z0-9]+)$/.exec(c);
-  return m ? { registered_ms: Number(m[1]), sandbox: m[2]! } : null;
+export const cursorOf = (r: { registered_ms: number; sandbox: string }) => `${r.registered_ms}.${r.sandbox}`;
+export const AGENTS_CURSOR = "a";
+export const agentCursorOf = (r: { registered_ms: number; agent: string }) => `a.${r.registered_ms}.${r.agent}`;
+
+export function parseCursor(c: string): LifetimesCursor | null {
+  if (c === AGENTS_CURSOR) return { phase: "agents", registered_ms: -1, agent: "" };
+  const s = /^(\d{1,16})\.(sbx_[A-Za-z0-9]+)$/.exec(c);
+  if (s) return { phase: "sandboxes", registered_ms: Number(s[1]), sandbox: s[2]! };
+  const a = /^a\.(\d{1,16})\.(agt_[A-Za-z0-9]+)$/.exec(c);
+  return a ? { phase: "agents", registered_ms: Number(a[1]), agent: a[2]! } : null;
 }
 
 /** `fn` over `items`, at most `limit` at once, results in order. */

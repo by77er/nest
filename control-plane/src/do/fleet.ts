@@ -41,7 +41,7 @@ import {
   type AwsView, AGENT_LIFETIME_KINDS, type AgentLifetimeKind, type LifetimeAgentView, type LifetimeSandboxView, type LifetimesView,
   SANDBOX_LIFETIME_KINDS, type SandboxLifetimeKind,
 } from "../../../protocol/admin/view";
-import { type AgentRead, classifyAgent, classifySandbox, cursorOf, DEFAULT_QUIET_MS, mapBounded, parseCursor } from "../lib/abandoned";
+import { AGENTS_CURSOR, agentCursorOf, type AgentRead, classifyAgent, classifySandbox, cursorOf, DEFAULT_QUIET_MS, mapBounded, parseCursor } from "../lib/abandoned";
 import { cellIdleTtlMs } from "../lib/lifetimes";
 
 // Closed unions for every status/kind column (docs/data/#enums): written through these types, read
@@ -372,6 +372,11 @@ export class FleetDO extends DurableObject<Env> {
       destroyed_ms INTEGER)`);
     // When its SandboxDO confirmed its lifetime check is armed (null: not yet; `armLifetimes` backfills it).
     addColumn(this.sql, "sandboxes", "lifetime_ms", "INTEGER");
+    // The cell's agents (the lifetimes view's agent pages): each AgentDO registers itself (`registry`
+    // deadline, re-checked at its alarms, so agents from before this table backfill within the hour)
+    // and its end once done; its reap removes it.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS agent_registry (agent TEXT PRIMARY KEY, registered_ms INTEGER NOT NULL, ended_ms INTEGER)");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS agent_registry_page ON agent_registry (registered_ms, agent)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS gc_runs (run TEXT PRIMARY KEY, host TEXT NOT NULL, marked_ms INTEGER NOT NULL,
       dry_run INTEGER NOT NULL, mark_version INTEGER NOT NULL, roots INTEGER NOT NULL, finished_ms INTEGER, report TEXT)`);
     // Agents whose last start found no brain host with room: poked when room appears, and the tick
@@ -2344,13 +2349,27 @@ export class FleetDO extends DurableObject<Env> {
     }));
   }
 
+  /** An agent of this cell exists (and since when its end is done, if it is): AgentDO keeps this current. */
+  async registerAgent(agent: string, ended_ms: number | null): Promise<void> {
+    this.sql.exec(`INSERT INTO agent_registry (agent, registered_ms, ended_ms) VALUES (?, ?, ?)
+      ON CONFLICT(agent) DO UPDATE SET ended_ms = excluded.ended_ms`, agent, Date.now(), ended_ms);
+  }
+
+  /** Its records are pruned: no longer an agent of this cell. */
+  async unregisterAgent(agent: string): Promise<void> {
+    this.sql.exec("DELETE FROM agent_registry WHERE agent = ?", agent);
+  }
+
   /**
-   * Operator view (docs/control-plane/dashboard/#abandoned): a page of the registry's live sandboxes
-   * (after `cursor`, in registration order), each read from SandboxDO with its generation counts,
-   * and the agents they lead to (attached, or made for), followed through owners and live children,
-   * read from AgentDO; classified by lib/abandoned.ts, the in-use and the recent counted, the rest
-   * listed. Reads are bounded: `limit` sandboxes, `LIFETIMES_MAX_AGENTS` agents a page,
-   * `LIFETIMES_CONCURRENCY` at a time; one that can't be read is a row with its error.
+   * Operator view (docs/control-plane/dashboard/#abandoned), paged: first the sandbox registry's live
+   * sandboxes (after `cursor`, in registration order), each read from SandboxDO with its generation
+   * counts and classified by the agents attached to it; then the agent registry's agents whose end
+   * isn't done, each read from AgentDO, so every agent is read and counted once, whatever it holds
+   * (ended ones are counted from the registry). A sandbox page lists an attached agent only once its
+   * records are gone (the registry no longer has it). Classified by lib/abandoned.ts, the in-use and
+   * the recent counted, the rest listed. Reads are bounded: `limit` rows a page, `LIFETIMES_MAX_AGENTS`
+   * attached agents a sandbox page, `LIFETIMES_CONCURRENCY` at a time; one that can't be read is a row
+   * with its error.
    */
   async lifetimes(q: { cursor?: string; limit?: number; quiet_ms?: number } = {}): Promise<LifetimesView> {
     const now = Date.now();
@@ -2359,6 +2378,54 @@ export class FleetDO extends DurableObject<Env> {
     const limit = Math.max(1, Math.min(LIFETIMES_MAX_PAGE, q.limit ?? LIFETIMES_PAGE));
     const after = q.cursor ? parseCursor(q.cursor) : null;
     if (q.cursor && !after) throw new NestError(ErrorCodes.INVALID_MESSAGE, `bad cursor ${q.cursor}`, 400);
+    const counts = {
+      sandboxes: Object.fromEntries(SANDBOX_LIFETIME_KINDS.map((k) => [k, 0])) as Record<SandboxLifetimeKind, number>,
+      agents: Object.fromEntries(AGENT_LIFETIME_KINDS.map((k) => [k, 0])) as Record<AgentLifetimeKind, number>,
+    };
+    const base = { cell, now_ms: now, quiet_ms: quietMs, cell_idle_ttl_ms: cellIdleTtlMs(this.env, cell), counts };
+    const readAgent = async (agent: string): Promise<AgentRead> => {
+      try {
+        return { facts: await this.agentStub(agent).lifetimeFacts() };
+      } catch (e) {
+        if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return { gone: true };
+        console.error(`FleetDO: reading ${agent} for the lifetimes view failed`, e);
+        return { error: String(e) };
+      }
+    };
+    const agentView = (agent: string, r: AgentRead, kind: AgentLifetimeKind, found_via: LifetimeAgentView["found_via"]): LifetimeAgentView => {
+      const f = "facts" in r ? r.facts : null;
+      return {
+        agent, kind, template: f?.template ?? null, owner: f?.owner ?? null, sandbox: f?.sandbox ?? null, last_turn_ms: f?.last_turn_ms ?? null,
+        stopped_by_operator: f?.stopped_by_operator ?? false, live_children: f?.live_children ?? [], subscriptions: f?.subscriptions ?? 0,
+        ended_ms: f?.ended?.ms ?? null, ended_reason: f?.ended?.reason ?? null, found_via, error: "error" in r ? r.error : null,
+      };
+    };
+
+    if (after?.phase === "agents") {
+      const rows = this.sql.exec<{ agent: string; registered_ms: number }>(
+        `SELECT agent, registered_ms FROM agent_registry WHERE ended_ms IS NULL AND (registered_ms > ? OR (registered_ms = ? AND agent > ?))
+          ORDER BY registered_ms, agent LIMIT ?`, after.registered_ms, after.registered_ms, after.agent, limit + 1).toArray();
+      const page = rows.slice(0, limit);
+      // Ended agents (their end done) hold nothing and go at their prune: counted, never read.
+      if (after.registered_ms < 0) {
+        counts.agents.ended += this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM agent_registry WHERE ended_ms IS NOT NULL").one().n;
+      }
+      const read = await mapBounded(page, LIFETIMES_CONCURRENCY, (r) => readAgent(r.agent));
+      const agents: LifetimeAgentView[] = [];
+      page.forEach((row, i) => {
+        const r = read[i]!;
+        const kind = classifyAgent(r, now, quietMs);
+        counts.agents[kind]++;
+        // Pruned, yet still registered (its reap's unregister failed): the row goes now.
+        if (kind === "gone") this.sql.exec("DELETE FROM agent_registry WHERE agent = ?", row.agent);
+        if (kind === "quiet" || kind === "ending" || kind === "unreadable") agents.push(agentView(row.agent, r, kind, "registry"));
+      });
+      return {
+        ...base, sandboxes: [], agents, agents_omitted: 0,
+        next_cursor: rows.length > limit ? agentCursorOf(page[page.length - 1]!) : null,
+      };
+    }
+
     const rows = this.sql.exec<{ sandbox: string; registered_ms: number }>(
       `SELECT sandbox, registered_ms FROM sandboxes WHERE destroyed_ms IS NULL AND (registered_ms > ? OR (registered_ms = ? AND sandbox > ?))
         ORDER BY registered_ms, sandbox LIMIT ?`, after?.registered_ms ?? -1, after?.registered_ms ?? -1, after?.sandbox ?? "", limit + 1).toArray();
@@ -2374,60 +2441,17 @@ export class FleetDO extends DurableObject<Env> {
       }
     });
 
-    // The agents they lead to, then their owners and live children, breadth first up to the cap.
-    const found = new Map<string, LifetimeAgentView["found_via"]>();
-    const attached = new Set<string>();
-    const find = (agent: string | null | undefined, via: LifetimeAgentView["found_via"]) => {
-      if (agent && !found.has(agent)) found.set(agent, via);
-    };
-    for (const r of read) {
-      if (!("info" in r)) continue;
-      for (const a of r.info.attached) {
-        attached.add(a);
-        find(a, "sandbox");
-      }
-      find(r.info.owner, "sandbox");
-    }
-    const agents = new Map<string, AgentRead>();
-    for (let frontier = [...found.keys()]; frontier.length && agents.size < LIFETIMES_MAX_AGENTS;) {
-      const batch = frontier.slice(0, LIFETIMES_MAX_AGENTS - agents.size);
-      const got = await mapBounded(batch, LIFETIMES_CONCURRENCY, async (agent): Promise<AgentRead> => {
-        try {
-          return { facts: await this.agentStub(agent).lifetimeFacts() };
-        } catch (e) {
-          if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return { gone: true };
-          console.error(`FleetDO: reading ${agent} for the lifetimes view failed`, e);
-          return { error: String(e) };
-        }
-      });
-      batch.forEach((agent, i) => {
-        const r = got[i]!;
-        agents.set(agent, r);
-        if (!("facts" in r)) return;
-        find(r.facts.owner, "owner");
-        for (const c of r.facts.live_children) find(c, "child");
-      });
-      frontier = [...found.keys()].filter((a) => !agents.has(a));
-    }
-
-    const counts = {
-      sandboxes: Object.fromEntries(SANDBOX_LIFETIME_KINDS.map((k) => [k, 0])) as Record<SandboxLifetimeKind, number>,
-      agents: Object.fromEntries(AGENT_LIFETIME_KINDS.map((k) => [k, 0])) as Record<AgentLifetimeKind, number>,
-    };
-    const kindOf = new Map([...agents].map(([a, r]) => [a, classifyAgent(r, now, quietMs)]));
+    // The agents attached to them, read to classify each sandbox (and listed only once gone: the agent pages have the rest).
+    const attached = [...new Set(read.flatMap((r) => ("info" in r ? r.info.attached : [])))];
+    const batch = attached.slice(0, LIFETIMES_MAX_AGENTS);
+    const got = await mapBounded(batch, LIFETIMES_CONCURRENCY, readAgent);
+    const kindOf = new Map(batch.map((a, i) => [a, classifyAgent(got[i]!, now, quietMs)]));
     const agentViews: LifetimeAgentView[] = [];
-    for (const [agent, r] of agents) {
-      const kind = kindOf.get(agent)!;
-      counts.agents[kind]++;
-      // Listed: what nobody will use. A pruned agent is noise unless a sandbox still has it attached.
-      if (!(kind === "quiet" || kind === "ending" || kind === "unreadable" || (kind === "gone" && attached.has(agent)))) continue;
-      const f = "facts" in r ? r.facts : null;
-      agentViews.push({
-        agent, kind, template: f?.template ?? null, owner: f?.owner ?? null, sandbox: f?.sandbox ?? null, last_turn_ms: f?.last_turn_ms ?? null,
-        stopped_by_operator: f?.stopped_by_operator ?? false, live_children: f?.live_children ?? [], subscriptions: f?.subscriptions ?? 0,
-        ended_ms: f?.ended?.ms ?? null, ended_reason: f?.ended?.reason ?? null, found_via: found.get(agent)!, error: "error" in r ? r.error : null,
-      });
-    }
+    batch.forEach((agent, i) => {
+      if (kindOf.get(agent) !== "gone") return;
+      counts.agents.gone++;
+      agentViews.push(agentView(agent, got[i]!, "gone", "sandbox"));
+    });
     const sandboxes: LifetimeSandboxView[] = [];
     for (const r of read) {
       if (!("info" in r)) {
@@ -2449,9 +2473,10 @@ export class FleetDO extends DurableObject<Env> {
         expiry_notice_ms: i.expiry_notice_ms ?? null, destroy_at_ms: c.destroy_at, generations: r.gens, memory_generations: r.mem, error: null,
       });
     }
+    const agentsLeft = this.sql.exec("SELECT 1 FROM agent_registry LIMIT 1").toArray().length > 0;
     return {
-      cell, now_ms: now, quiet_ms: quietMs, cell_idle_ttl_ms: cellIdleTtlMs(this.env, cell), sandboxes, agents: agentViews, counts,
-      next_cursor: rows.length > limit ? cursorOf(page[page.length - 1]!) : null, agents_omitted: found.size - agents.size,
+      ...base, sandboxes, agents: agentViews, agents_omitted: attached.length - batch.length,
+      next_cursor: rows.length > limit ? cursorOf(page[page.length - 1]!) : agentsLeft ? AGENTS_CURSOR : null,
     };
   }
 

@@ -3,8 +3,8 @@
 // only shows (docs/control-plane/dashboard/#abandoned). Typed by the admin view contract.
 import type { AgentLifetimeKind, LifetimeAgentView, LifetimeSandboxView, LifetimesView, SandboxLifetimeKind } from "../../protocol/admin/view";
 
-/** Pages of the registry the Worker reads per request (the control plane's are 50 sandboxes). */
-export const MAX_LIFETIME_PAGES = 10;
+/** Pages the Worker reads per request (the control plane's are 50 sandboxes, then 50 agents). */
+export const MAX_LIFETIME_PAGES = 20;
 
 /** What `GET /api/lifetimes` answers: the pages merged, how many were read, and whether more were left. */
 export interface LifetimesResponse extends Omit<LifetimesView, "next_cursor"> {
@@ -33,7 +33,8 @@ export function mergePages(pages: readonly LifetimesView[], truncated: boolean):
   };
 }
 
-const CURSOR = /^\d{1,16}\.sbx_[A-Za-z0-9]+$/;
+/** The control plane's cursors: a sandbox page's, then the agent pages' (`a`, `a.<ms>.<agent>`). */
+const CURSOR = /^(\d{1,16}\.sbx_[A-Za-z0-9]+|a|a\.\d{1,16}\.agt_[A-Za-z0-9]+)$/;
 
 /**
  * Every page through `read` (the upstream GET for a cursor, null the first), up to the cap; more

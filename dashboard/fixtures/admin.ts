@@ -249,7 +249,7 @@ export const lifetimes = {
       "subscriptions": 0,
       "ended_ms": null,
       "ended_reason": null,
-      "found_via": "sandbox",
+      "found_via": "registry",
       "error": null
     },
     {
@@ -266,7 +266,7 @@ export const lifetimes = {
       "subscriptions": 0,
       "ended_ms": null,
       "ended_reason": null,
-      "found_via": "owner",
+      "found_via": "registry",
       "error": null
     }
   ],

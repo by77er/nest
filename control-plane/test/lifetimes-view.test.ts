@@ -11,7 +11,7 @@ import type { SandboxDO } from "../src/do/sandbox";
 import { type AgentFacts, type AgentRead, classifyAgent, classifySandbox, DEFAULT_QUIET_MS, ENDING_STUCK_MS, type SandboxFacts } from "../src/lib/abandoned";
 import { DEFAULT_SANDBOX_IDLE_TTL_MS, destroyAtMs, EXPIRY_GAP_MS, EXPIRY_NOTICE_MS, expiryStep } from "../src/lib/lifetimes";
 import type { LifetimesView } from "../../protocol/admin/view";
-import { admin, adminJson, connectHost, nextCommands, runDue, sendEvents, sleep, uniqueCell } from "./helpers";
+import { admin, adminJson, connectHost, eventually, nextCommands, runDue, sendEvents, sleep, uniqueCell } from "./helpers";
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -135,7 +135,36 @@ describe("destroyAtMs", () => {
 
 // --- The route, over real DOs ----------------------------------------------------------------------
 
-const view = (cell: string, q = "") => adminJson<LifetimesView>(`/v1/admin/lifetimes?cell=${cell}${q}`);
+const page = (cell: string, q = "") => adminJson<LifetimesView>(`/v1/admin/lifetimes?cell=${cell}${q}`);
+
+/** Every page merged, as the dashboard does: sandboxes appended, an agent listed once, counts summed. */
+function merge(pages: LifetimesView[]): LifetimesView {
+  const v = structuredClone(pages[0]!);
+  const listed = new Set(v.agents.map((a) => a.agent));
+  for (const p of pages.slice(1)) {
+    v.sandboxes.push(...p.sandboxes);
+    for (const a of p.agents) if (!listed.has(a.agent)) (listed.add(a.agent), v.agents.push(a));
+    for (const [k, n] of Object.entries(p.counts.sandboxes)) v.counts.sandboxes[k as keyof typeof v.counts.sandboxes] += n;
+    for (const [k, n] of Object.entries(p.counts.agents)) v.counts.agents[k as keyof typeof v.counts.agents] += n;
+    v.agents_omitted += p.agents_omitted;
+  }
+  v.next_cursor = null;
+  return v;
+}
+
+async function view(cell: string, q = ""): Promise<LifetimesView> {
+  const pages: LifetimesView[] = [];
+  for (let cursor: string | null = ""; cursor !== null;) {
+    const p = await page(cell, `${q}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+    pages.push(p);
+    cursor = p.next_cursor;
+  }
+  return merge(pages);
+}
+
+/** Once the agent's cell has it in its agent registry (AgentDO registers from its `registry` deadline). */
+const registered = (cell: string, agent: string) => eventually(`${agent} registered`, () =>
+  runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => st.storage.sql.exec("SELECT 1 FROM agent_registry WHERE agent = ?", agent).toArray().length > 0));
 
 /** A cell with a sandbox host, a workstream and a credential for `worker`s. */
 async function cellWithHost() {
@@ -168,9 +197,12 @@ async function sandboxIn(c: Cell, opts: { suspended?: boolean; idle_ttl_ms?: num
   return sandbox;
 }
 
-/** A `worker` bound to `sandbox`, never started (no brain host): no brain, no turn. */
-const workerOn = async (sandbox: string, owner?: string) =>
-  (await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", sandbox, start: false, ...(owner ? { owner } : {}) } }, 201)).agent;
+/** A `worker` bound to `sandbox`, never started (no brain host): no brain, no turn. Registered in its cell before it returns. */
+async function workerOn(sandbox: string, owner?: string): Promise<string> {
+  const { agent } = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", sandbox, start: false, ...(owner ? { owner } : {}) } }, 201);
+  await registered((await sandboxStub(sandbox).info()).cell, agent);
+  return agent;
+}
 
 const editAgent = (agent: string, fn: (sql: SqlStorage, info: any) => void) =>
   runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
@@ -224,7 +256,7 @@ describe("GET /v1/admin/lifetimes", () => {
     v = await view(c.cell, `&quiet_ms=${HOUR / 2}`);
     expect(v.sandboxes).toEqual([expect.objectContaining({ sandbox, kind: "held", attached: [agent], destroy_at_ms: null, dormant_since_ms: null })]);
     expect(v.agents).toEqual([expect.objectContaining({
-      agent, kind: "quiet", template: "worker", sandbox, last_turn_ms: expect.any(Number), live_children: [], subscriptions: 0, found_via: "sandbox", error: null,
+      agent, kind: "quiet", template: "worker", sandbox, last_turn_ms: expect.any(Number), live_children: [], subscriptions: 0, found_via: "registry", error: null,
     })]);
     expect(Date.now() - v.agents[0]!.last_turn_ms!).toBeGreaterThanOrEqual(HOUR);
     // The operator's stop says so.
@@ -238,7 +270,7 @@ describe("GET /v1/admin/lifetimes", () => {
     expect(v.counts.agents).toMatchObject({ active: 1 });
   });
 
-  it("follows owners and live children: a quiet agent with no sandbox is listed through the one it owns", async () => {
+  it("an agent with no sandbox, owner or live child is still listed: every agent of the cell is read once, from its registry", async () => {
     const c = await cellWithHost();
     const sandbox = await sandboxIn(c, { suspended: true });
     const tpl = `lead-${crypto.randomUUID().slice(0, 8)}`;
@@ -246,13 +278,14 @@ describe("GET /v1/admin/lifetimes", () => {
       capabilities: ["nest"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token", escalate_to: "user",
     } });
     const captain = (await adminJson<{ agent: string }>("/v1/agents", { body: { template: tpl, workstream: c.workstream, cell: c.cell, start: false } }, 201)).agent;
-    const child = await workerOn(sandbox, captain);
-    await runInDurableObject(agentStub(captain), (_i: AgentDO, st) => {
-      st.storage.sql.exec("INSERT INTO children (agent, created_ms) VALUES (?, ?)", child, Date.now());
-    });
+    await registered(c.cell, captain);
+    const worker = await workerOn(sandbox);
     const v = await view(c.cell);
-    expect(v.agents.find((a) => a.agent === captain)).toMatchObject({ kind: "quiet", found_via: "owner", sandbox: null, live_children: [child] });
-    expect(v.agents.find((a) => a.agent === child)).toMatchObject({ kind: "quiet", found_via: "sandbox", owner: captain });
+    expect(v.agents.find((a) => a.agent === captain)).toMatchObject({ kind: "quiet", found_via: "registry", sandbox: null, owner: null, live_children: [] });
+    expect(v.agents.find((a) => a.agent === worker)).toMatchObject({ kind: "quiet", found_via: "registry", sandbox });
+    // Each read once: the worker classifies its sandbox on the sandbox page, and is counted on the agent page only.
+    expect(v.counts.agents.quiet).toBe(2);
+    expect(v.agents).toHaveLength(2);
   });
 
   it("an ended agent is counted, not listed; its end detaches it, so its sandbox goes dormant; an unfinished end over an hour old is listed", async () => {
@@ -274,7 +307,8 @@ describe("GET /v1/admin/lifetimes", () => {
     await editAgent(done, (_sql, i) => { i.ended = { ms: Date.now() - 3 * DAY, by: "user", reason: "stopped", kill: true, destroy_sandbox: false, done_ms: Date.now() - 3 * DAY }; });
     await editAgent(stuck, (_sql, i) => { i.ended = { ms: Date.now() - 2 * HOUR, by: "user", reason: "stopped", kill: true, destroy_sandbox: false }; });
     v = await view(c.cell);
-    expect(v.counts.agents).toMatchObject({ ended: 1, ending: 1 });
+    // The first agent (its end done, from the registry) and `done` (read: its record says so) are counted.
+    expect(v.counts.agents).toMatchObject({ ended: 2, ending: 1 });
     expect(v.agents).toEqual([expect.objectContaining({ agent: stuck, kind: "ending", ended_reason: "stopped", ended_ms: expect.any(Number) })]);
     expect(v.sandboxes.find((s) => s.sandbox === s2)).toMatchObject({ kind: "held", attached: expect.arrayContaining([done, stuck]) });
   });
@@ -295,14 +329,44 @@ describe("GET /v1/admin/lifetimes", () => {
     expect(v.sandboxes).toEqual([expect.objectContaining({ sandbox, kind: "held" })]);
   });
 
-  it("a pruned agent only named as an owner is counted, not listed (its records are simply gone)", async () => {
+  it("a registered agent whose records are gone (its reap could not leave the registry) is counted once and its row dropped", async () => {
+    const c = await cellWithHost();
+    await fleetStub(c.cell).registerAgent("agt_prunedlongago", null);
+    let v = await view(c.cell);
+    expect(v.counts.agents.gone).toBe(1);
+    expect(v.agents).toEqual([]);
+    v = await view(c.cell);
+    expect(v.counts.agents.gone).toBe(0);
+  });
+
+  it("an agent registers itself (agents from before the registry at their next alarm), its finished end is counted from the registry, and its reap leaves it", async () => {
     const c = await cellWithHost();
     const sandbox = await sandboxIn(c, { suspended: true });
     const agent = await workerOn(sandbox);
-    await editAgent(agent, (_sql, i) => { i.owner = "agt_prunedlongago"; });
+    const row = () => runInDurableObject(fleetStub(c.cell), (_i: FleetDO, st) =>
+      st.storage.sql.exec<{ ended_ms: number | null }>("SELECT ended_ms FROM agent_registry WHERE agent = ?", agent).toArray()[0] ?? null);
+    // As a release before the registry left it: unregistered, and its own mark gone.
+    await runInDurableObject(fleetStub(c.cell), (_i: FleetDO, st) => { st.storage.sql.exec("DELETE FROM agent_registry WHERE agent = ?", agent); });
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("DELETE FROM kv WHERE key = 'registry'");
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'registry'");
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+    });
+    await runDue(agentStub(agent));
+    await eventually("re-registered", async () => (await row()) !== null);
+    expect(await row()).toEqual({ ended_ms: null });
+    // Its end, once done, is recorded; the view counts it without reading it.
+    await adminJson(`/v1/agents/${agent}/stop`, { body: { end: true } });
+    await eventually("its end recorded", async () => (await row())?.ended_ms != null);
     const v = await view(c.cell);
-    expect(v.counts.agents).toMatchObject({ gone: 1, quiet: 1 });
-    expect(v.agents.map((a) => a.agent)).toEqual([agent]);
+    expect(v.counts.agents).toMatchObject({ ended: 1, quiet: 0 });
+    // Reaped: out of the registry.
+    await editAgent(agent, (sql, i) => {
+      i.ended.ms = Date.now() - 31 * DAY;
+      sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('reap', 0)");
+    });
+    await runDue(agentStub(agent));
+    expect(await row()).toBeNull();
   });
 
   it("a sandbox SandboxDO can't answer for is a row with its error; an agent that can't be read makes its sandbox unknown", async () => {
@@ -319,12 +383,15 @@ describe("GET /v1/admin/lifetimes", () => {
       const real = (inst as any).agentStub.bind(inst);
       (inst as any).agentStub = (id: string) => (id === agent ? { lifetimeFacts: async () => { throw new Error("boom"); } } : real(id));
       try {
-        return await inst.lifetimes();
+        const pages = [await inst.lifetimes()];
+        while (pages.at(-1)!.next_cursor) pages.push(await inst.lifetimes({ cursor: pages.at(-1)!.next_cursor! }));
+        return merge(pages);
       } finally {
         (inst as any).agentStub = real;
       }
     });
-    expect(v.agents).toEqual([expect.objectContaining({ agent, kind: "unreadable", error: expect.stringContaining("boom") })]);
+    expect(v.agents).toEqual([expect.objectContaining({ agent, kind: "unreadable", found_via: "registry", error: expect.stringContaining("boom") })]);
+    expect(v.counts.agents.unreadable).toBe(1);
     expect(v.sandboxes.find((s) => s.sandbox === sandbox)).toMatchObject({ kind: "unknown" });
   });
 
@@ -336,7 +403,7 @@ describe("GET /v1/admin/lifetimes", () => {
     let cursor: string | null = "";
     let pages = 0;
     while (cursor !== null) {
-      const v: LifetimesView = await view(c.cell, `&limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      const v: LifetimesView = await page(c.cell, `&limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
       expect(v.sandboxes.length).toBeLessThanOrEqual(2);
       seen.push(...v.sandboxes.map((s) => s.sandbox));
       cursor = v.next_cursor;
@@ -345,41 +412,51 @@ describe("GET /v1/admin/lifetimes", () => {
     expect(pages).toBe(2);
     expect(seen).toEqual(made);
     expect((await admin(`/v1/admin/lifetimes?cell=${c.cell}&cursor=nope`)).status).toBe(400);
+    expect((await admin(`/v1/admin/lifetimes?cell=${c.cell}&cursor=a.12.sbx_x`)).status).toBe(400);
+    // The agent pages, after the sandboxes: none here.
+    expect(await page(c.cell, "&cursor=a")).toMatchObject({ sandboxes: [], agents: [], next_cursor: null });
     expect((await admin(`/v1/admin/lifetimes?cell=${c.cell}&limit=0`)).status).toBe(400);
     expect((await admin(`/v1/admin/lifetimes?cell=${c.cell}&quiet_ms=-1`)).status).toBe(400);
     // Over the most a page holds: capped, not refused.
-    expect((await view(c.cell, "&limit=100000")).next_cursor).toBeNull();
+    expect((await page(c.cell, "&limit=100000")).next_cursor).toBeNull();
   });
 
-  it("reads at most 200 agents a page, 8 at a time, and says how many it left out", async () => {
+  it("reads at most 200 attached agents a sandbox page, 8 at a time, and says how many it left out", async () => {
     const c = await cellWithHost();
     const sandbox = await sandboxIn(c, { suspended: true });
-    const root = await workerOn(sandbox);
-    const kids = Array.from({ length: 300 }, (_, i) => `agt_kid${i}`);
+    const many = Array.from({ length: 301 }, (_, i) => `agt_kid${i}`);
     const r = await runInDurableObject(fleetStub(c.cell), async (inst: FleetDO) => {
-      const real = (inst as any).agentStub.bind(inst);
+      const realAgent = (inst as any).agentStub.bind(inst);
+      const realSandbox = (inst as any).sandbox.bind(inst);
       let inFlight = 0;
       let most = 0;
       let calls = 0;
+      (inst as any).sandbox = (id: string) => {
+        const s = realSandbox(id);
+        return id === sandbox ? { info: async () => ({ ...(await s.info()), attached: many }), generations: () => s.generations() } : s;
+      };
       (inst as any).agentStub = (id: string) => ({
         lifetimeFacts: async () => {
           calls++;
           most = Math.max(most, ++inFlight);
           await sleep(1);
           inFlight--;
-          return { ...(facts({ agent: id }) as { facts: AgentFacts }).facts, live_children: id === root ? kids : [] };
+          return (facts({ agent: id }) as { facts: AgentFacts }).facts;
         },
       });
       try {
         return { v: await inst.lifetimes(), most, calls };
       } finally {
-        (inst as any).agentStub = real;
+        (inst as any).agentStub = realAgent;
+        (inst as any).sandbox = realSandbox;
       }
     });
     expect(r.calls).toBe(200);
     expect(r.most).toBeLessThanOrEqual(8);
     expect(r.most).toBeGreaterThan(1);
-    expect(r.v.agents_omitted).toBe(301 - 200);
-    expect(r.v.counts.agents.quiet).toBe(200);
+    expect(r.v.agents_omitted).toBe(101);
+    // Read to classify the sandbox (an agent left unread makes it unknown); counted on the agent pages, not here.
+    expect(r.v.sandboxes).toEqual([expect.objectContaining({ sandbox, kind: "unknown" })]);
+    expect(r.v.counts.agents.quiet).toBe(0);
   });
 });

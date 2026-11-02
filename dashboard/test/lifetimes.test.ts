@@ -82,6 +82,21 @@ describe("GET /api/lifetimes", () => {
     expect(body).toMatchObject({ pages: MAX_LIFETIME_PAGES, truncated: true });
   });
 
+  it("follows the sandbox pages into the agent pages", async () => {
+    const agentPage = (agent: string, next: string | null): LifetimesView => ({ ...lifetimes, sandboxes: [], agents: [{ ...quiet!, agent }], next_cursor: next });
+    respond = (p) => {
+      const cursor = new URL(`https://x${p}`).searchParams.get("cursor");
+      if (cursor === null) return Response.json({ ...page(0, 1), next_cursor: "a" });
+      if (cursor === "a") return Response.json(agentPage("agt_one", "a.1000.agt_one"));
+      if (cursor === "a.1000.agt_one") return Response.json(agentPage("agt_two", null));
+      return undefined;
+    };
+    const body = (await (await get("/api/lifetimes?cell=use1")).json()) as LifetimesResponse;
+    expect(upstream).toHaveLength(3);
+    expect(body.agents.map((a) => a.agent)).toEqual(expect.arrayContaining(["agt_one", "agt_two"]));
+    expect(body).toMatchObject({ pages: 3, truncated: false });
+  });
+
   it("never sends on a cursor that isn't the control plane's shape", async () => {
     respond = (p) => (p === "/v1/admin/lifetimes?cell=use1" ? Response.json({ ...page(0, 1), next_cursor: "../secrets/x" }) : undefined);
     const body = (await (await get("/api/lifetimes?cell=use1")).json()) as LifetimesResponse;
@@ -145,7 +160,7 @@ describe("the page's reading of it", () => {
     expect(dormant).toMatchObject({ kind: "dormant", attached: [] });
     expect(held).toMatchObject({ kind: "held", attached: [quiet!.agent] });
     expect(quiet).toMatchObject({ kind: "quiet", stopped_by_operator: true, sandbox: held!.sandbox, owner: lead!.agent });
-    expect(lead).toMatchObject({ kind: "quiet", found_via: "owner", live_children: [quiet!.agent] });
+    expect(lead).toMatchObject({ kind: "quiet", found_via: "registry", live_children: [quiet!.agent] });
   });
 });
 
