@@ -25,6 +25,8 @@
 
 **The dashboard deploys apart** (`deploy-dashboard.yml`): on a push to `main` that touches `dashboard/` (or by `workflow_dispatch`), `npm ci`, typecheck, tests, `vite build` and `wrangler deploy` of the `nest-dashboard` Worker to `dash-nest.bitcru.sh`, then `wrangler secret put NEST_ADMIN_TOKEN` from the `production` environment's secret when it is set. It needs no AWS role; it shares nothing with the platform deploy but the Cloudflare token.
 
+**The projects app deploys apart too** (`deploy-projects.yml`): on a push to `main` that touches `projects/` outside `projects/deploy/` (or by `workflow_dispatch`), `npm ci`, typecheck, tests, `vite build` and `wrangler deploy` of the `nest-projects` Worker to `projects-nest.bitcru.sh`, then `wrangler secret put` of `NEST_CLIENT_TOKEN`, `NEST_WEBHOOK_SECRET` and `GITHUB_WEBHOOK_SECRET` from the `production` environment's `PROJECTS_NEST_CLIENT_TOKEN`, `PROJECTS_NEST_WEBHOOK_SECRET` and `PROJECTS_GITHUB_WEBHOOK_SECRET`, each when it is set. Without them the Worker serves and fails closed (503 on its nest calls, 401 on the hooks). Its Access stack is `deploy-projects-infra.yml`'s.
+
 **Not built yet:** the pause, deploy classification, the metrics health window, `rollback.yml`, desired host versions with canaries, and guest image rebuilds (the sections below are the design). Rebuild the guest image by hand (`images/guest/build-on-ec2.sh`) when `nest-guest` changes.
 
 **Credentials:**

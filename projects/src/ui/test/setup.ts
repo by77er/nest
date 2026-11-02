@@ -1,7 +1,11 @@
 // Component tests run in jsdom, which lacks a few browser APIs Mantine and dnd-kit use.
 import "@testing-library/jest-dom/vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
+
+// The pages load lazily (one chunk each), and a CI runner renders jsdom far slower than a laptop: the
+// default 1 s for `findBy…`/`waitFor` ran out there (PR #108's first run) while the page was still loading.
+configure({ asyncUtilTimeout: 5_000 });
 
 afterEach(() => {
   cleanup();

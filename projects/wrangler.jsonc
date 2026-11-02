@@ -35,11 +35,12 @@
     // Every path but /hooks/* and /mcp/* needs a Cloudflare Access token (Cf-Access-Jwt-Assertion)
     // issued by this team for the app's Access application (src/access.ts).
     "ACCESS_TEAM_DOMAIN": "https://bitcrush.cloudflareaccess.com",
-    // A placeholder until the app's own stack (deploy/, `inframe output --stack projects`, output
-    // `projects_aud`) has created the application: until then every Access check fails closed.
-    "PROJECTS_AUD": "unset-until-the-projects-stack-creates-the-application"
+    // The app's Access application's audience tag: the app's own stack's output `projects_aud`
+    // (deploy/, `inframe output --stack projects`; applied 2026-11-02). Not a secret.
+    "PROJECTS_AUD": "08e750a01b448aeea2f1d52dd521b01822359dd08ef898e610b53b46575ed580"
   }
-  // Secrets (wrangler secret put / .dev.vars), never in this file:
+  // Secrets (wrangler secret put / .dev.vars), never in this file. deploy-projects.yml puts each from
+  // the `production` environment's `PROJECTS_<name>` secret when it is set:
   // - NEST_CLIENT_TOKEN: the `projects` API client's token (`POST /v1/admin/clients`, shown once).
   // - NEST_WEBHOOK_SECRET: the secret `PUT /v1/clients/self/webhook` showed (signs /hooks/nest).
   // - GITHUB_WEBHOOK_SECRET: the GitHub App webhook's secret (signs /hooks/github).
