@@ -74,6 +74,10 @@ export function summarize(h: HistoryRow): string {
       return str(o.reason) ? `Blocked: ${clip(str(o.reason)!)}` : "Blocked";
     case "unblocked":
       return str(o.note) ? `Unblocked: ${clip(str(o.note)!)}` : o.why ? "Unblocked (the task ended)" : "Unblocked";
+    case "worker_notified":
+      return Array.isArray(o.fields) && o.fields.length ? `Its worker was told of the change (${o.fields.join(", ")})` : "Its worker was told of the change";
+    case "worker_not_notified":
+      return "Its worker couldn't be told of the change";
     case "block_answered":
       return str(o.answer) ? `You answered: ${clip(str(o.answer)!)}` : "You answered";
     default:

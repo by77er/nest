@@ -6,7 +6,8 @@ export type TaskState = (typeof TASK_STATES)[number];
 
 /**
  * What can happen to a task:
- * - `spec`: the manager wrote its spec (a draft becomes ready; a ready one is re-specced);
+ * - `spec`: the manager wrote its spec (a draft becomes ready; a ready one, or one with a live worker,
+ *   is re-specced, and that worker is told);
  * - `assign`: by the owner, the manager or auto-assign; a worker is to be started for it;
  * - `started`: its worker exists and has its first input;
  * - `start_failed`: nest refused the worker for good (a stalled task is reassigned by hand);
@@ -25,7 +26,8 @@ export const TERMINAL: ReadonlySet<TaskState> = new Set(["done", "cancelled"]);
 
 /** The states each event moves from, and where to. Anything not listed is refused. */
 const MOVES: Record<TaskEvent, Partial<Record<TaskState, TaskState>>> = {
-  spec: { draft: "ready", ready: "ready" },
+  // A task with a live worker may be re-specced too: its worker is told (README.md#task-changes).
+  spec: { draft: "ready", ready: "ready", assigned: "assigned", in_progress: "in_progress", in_review: "in_review" },
   assign: { ready: "assigned", stalled: "assigned" },
   started: { assigned: "in_progress" },
   start_failed: { assigned: "stalled" },

@@ -15,7 +15,7 @@ import type { AgentCaller } from "../identity";
 import { backoff, NestError, nestFrom, type Nest } from "../nest";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
-import { canBlock, canUnblock, pickForAssignment, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition } from "../tasks";
+import { canBlock, canUnblock, pickForAssignment, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition, WORKER_STATES } from "../tasks";
 import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
 import { randomId } from "./directory";
@@ -179,6 +179,16 @@ const MIGRATIONS = [
     `CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, to_agent TEXT NOT NULL, text TEXT NOT NULL, relayed INTEGER NOT NULL,
       at_ms INTEGER NOT NULL, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   ],
+  [
+    // Task changes owed to its live worker (README.md#task-changes): each change, coalesced into one
+    // message per window; `notify_upto` freezes a set once its first post is tried, so a retry is the same post.
+    `CREATE TABLE task_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, agent TEXT NOT NULL, field TEXT NOT NULL,
+      before TEXT, after TEXT, actor TEXT NOT NULL, tainted INTEGER NOT NULL, at_ms INTEGER NOT NULL)`,
+    "CREATE INDEX task_changes_task ON task_changes (task, seq)",
+    "ALTER TABLE tasks ADD COLUMN notify_next_ms INTEGER",
+    "ALTER TABLE tasks ADD COLUMN notify_upto INTEGER",
+    "ALTER TABLE tasks ADD COLUMN notify_attempts INTEGER NOT NULL DEFAULT 0",
+  ],
 ] as const;
 
 type Row = Record<string, SqlStorageValue>;
@@ -306,15 +316,16 @@ export class ProjectDO extends DurableObject<Env> {
     const r = this.taskRow(id);
     if (!r) return fail(404, "unknown task");
     if (TERMINAL.has(r.state as TaskState) && (u.title !== undefined || u.body !== undefined)) return fail(409, `a ${r.state} task can't change`);
+    // Its live worker is told of a new title or body; a reorder isn't its concern (README.md#task-changes).
+    if (u.title !== undefined && u.title !== r.title) this.noteChange(id, "title", r.title as string, u.title, actor);
+    if (u.body !== undefined && u.body !== r.body) this.noteChange(id, "body", r.body as string, u.body, actor);
     if (u.title !== undefined) this.sql.exec("UPDATE tasks SET title = ? WHERE id = ?", u.title, id);
     if (u.body !== undefined) this.sql.exec("UPDATE tasks SET body = ? WHERE id = ?", u.body, id);
     if (u.ord !== undefined) this.sql.exec("UPDATE tasks SET ord = ? WHERE id = ?", u.ord, id);
     this.sql.exec("UPDATE tasks SET updated_ms = ? WHERE id = ?", Date.now(), id);
     this.record(id, actor, "updated", u);
-    if (u.ord !== undefined) {
-      this.autoAssign();
-      await this.arm();
-    }
+    if (u.ord !== undefined) this.autoAssign();
+    await this.arm();
     return ok(this.toTask(this.taskRow(id)!));
   }
 
@@ -348,9 +359,11 @@ export class ProjectDO extends DurableObject<Env> {
 
   async writeSpec(id: string, spec: Spec, actor: Actor = { kind: "owner" }): Promise<Result<Task>> {
     if (!this.settings()) return fail(404, "unknown project");
+    const before = this.taskRow(id)?.spec as string | null | undefined;
     const m = this.move(id, "spec", actor, spec);
     if (!m.ok) return m;
     this.sql.exec("UPDATE tasks SET spec = ? WHERE id = ?", JSON.stringify(spec), id);
+    if (before !== JSON.stringify(spec)) this.noteChange(id, "spec", before ?? null, JSON.stringify(spec), actor);
     this.autoAssign();
     await this.arm();
     return ok(this.toTask(this.taskRow(id)!));
@@ -530,6 +543,66 @@ export class ProjectDO extends DurableObject<Env> {
     await this.arm();
   }
 
+  // --- telling a task's worker what changed ---------------------------------------------------------
+
+  /**
+   * Note a change to a task for its live worker (`assigned`, `in_progress`, or `in_review` while it
+   * lives): told within NOTIFY_WINDOW_MS, coalesced with the changes after it. A task without one has
+   * nobody to tell; a worker started later gets the current task in its brief.
+   */
+  private noteChange(id: string, field: "title" | "body" | "spec" | "blocked", before: string | null, after: string | null, actor: Actor): void {
+    const r = this.taskRow(id);
+    if (!r || !r.assignee || r.worker_live !== 1 || !WORKER_STATES.has(r.state as TaskState)) return;
+    const who = actor.kind === "owner" ? "owner" : actor.kind === "app" ? `app:${actor.what}` : actor.agent;
+    if (actor.kind === "agent" && actor.agent === r.assignee) return; // its own change
+    this.sql.exec(
+      "INSERT INTO task_changes (task, agent, field, before, after, actor, tainted, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      id, r.assignee, field, before, after, who, actor.kind === "agent" && actor.tainted ? 1 : 0, Date.now(),
+    );
+    this.sql.exec("UPDATE tasks SET notify_next_ms = COALESCE(notify_next_ms, ?) WHERE id = ?", Date.now() + NOTIFY_WINDOW_MS, id);
+  }
+
+  /** Tell a task's worker its changes, one message per set, posted once (its request id names the set). */
+  private async notifyWorker(nest: Nest, id: string): Promise<void> {
+    const r = this.taskRow(id);
+    if (!r) return;
+    // Freeze the set on its first try, so a retry posts exactly what the first did.
+    let upto = r.notify_upto as number | null;
+    if (upto === null) {
+      upto = this.sql.exec<{ m: number | null }>("SELECT MAX(seq) AS m FROM task_changes WHERE task = ?", id).one().m;
+      if (upto === null) {
+        this.sql.exec("UPDATE tasks SET notify_next_ms = NULL WHERE id = ?", id);
+        return;
+      }
+      this.sql.exec("UPDATE tasks SET notify_upto = ? WHERE id = ?", upto, id);
+    }
+    const changes = this.sql.exec("SELECT * FROM task_changes WHERE task = ? AND seq <= ? ORDER BY seq", id, upto).toArray();
+    const agent = changes.at(-1)!.agent as string;
+    const done = (detail: Record<string, unknown>, action: string) => {
+      this.sql.exec("DELETE FROM task_changes WHERE task = ? AND seq <= ?", id, upto);
+      const more = this.sql.exec("SELECT MIN(at_ms) AS t FROM task_changes WHERE task = ?", id).one().t as number | null;
+      this.sql.exec("UPDATE tasks SET notify_upto = NULL, notify_attempts = 0, notify_next_ms = ? WHERE id = ?", more === null ? null : more + NOTIFY_WINDOW_MS, id);
+      this.record(id, { kind: "app", what: "board" }, action, detail);
+    };
+    // The worker ended, or the task moved on to another: nobody to tell.
+    if (agent !== r.assignee || r.worker_live !== 1 || !WORKER_STATES.has(r.state as TaskState)) {
+      done({ agent, dropped: changes.length }, "worker_not_notified");
+      return;
+    }
+    const tainted = changes.some((c) => c.tainted === 1);
+    try {
+      await nest.postInbox(agent, changeMessage(this.toTask(r), changes), { requestId: `${id}/changes/${upto}`, ...(tainted ? { from: "projects/board" } : {}) });
+      done({ agent, fields: [...new Set(changes.map((c) => c.field as string))], changes: changes.length }, "worker_notified");
+    } catch (e) {
+      const attempts = (r.notify_attempts as number) + 1;
+      if (e instanceof NestError && e.permanent) {
+        done({ agent, error: message(e) }, "worker_not_notified");
+        return;
+      }
+      this.sql.exec("UPDATE tasks SET notify_attempts = ?, notify_next_ms = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), id);
+    }
+  }
+
   // --- blocked --------------------------------------------------------------------------------------
 
   private clearBlock(id: string): void {
@@ -576,6 +649,9 @@ export class ProjectDO extends DurableObject<Env> {
     if (!may.ok) return fail(409, may.error);
     this.clearBlock(id);
     this.record(id, { kind: "agent", agent: caller.agent, tainted: caller.tainted }, "unblocked", note ? { note } : undefined);
+    // Its worker hears of a block it didn't clear itself (noteChange skips the worker's own).
+    this.noteChange(id, "blocked", r.blocked_reason as string, null, { kind: "agent", agent: caller.agent, tainted: caller.tainted });
+    await this.arm();
     return ok(this.toTask(this.taskRow(id)!));
   }
 
@@ -598,6 +674,8 @@ export class ProjectDO extends DurableObject<Env> {
     }
     this.clearBlock(id);
     this.record(id, { kind: "owner" }, "block_answered", { answer, to: by });
+    // The worker that blocked it has the answer already; another live worker on it hears it's clear.
+    if (by !== r.assignee) this.noteChange(id, "blocked", r.blocked_reason as string, null, { kind: "owner" });
     await this.arm();
     await this.drain();
     return ok(this.toTask(this.taskRow(id)!));
@@ -825,6 +903,7 @@ export class ProjectDO extends DurableObject<Env> {
         SELECT am_write_next_ms AS t FROM settings WHERE am_write_next_ms IS NOT NULL
         UNION ALL SELECT am_read_next_ms FROM settings WHERE am_read_next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM messages WHERE next_ms IS NOT NULL
+        UNION ALL SELECT notify_next_ms FROM tasks WHERE notify_next_ms IS NOT NULL
         UNION ALL SELECT t.am_next_ms FROM tasks t, settings s WHERE t.am_next_ms IS NOT NULL
           AND (t.am_owed = 'disable' OR (s.am_write_next_ms IS NULL AND s.am_write_error IS NULL)))`),
     ].filter((t): t is number => t !== null);
@@ -882,6 +961,7 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT seq FROM messages WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverMessage(nest, r.seq as number);
+    for (const r of this.sql.exec("SELECT id FROM tasks WHERE notify_next_ms IS NOT NULL AND notify_next_ms <= ?", now).toArray()) await this.notifyWorker(nest, r.id as string);
     await this.arm();
   }
 
@@ -1094,6 +1174,33 @@ export class ProjectDO extends DurableObject<Env> {
 }
 
 const clampWorkers = (n: number) => Math.max(0, Math.min(MAX_WORKERS_LIMIT, Math.floor(n)));
+/** How long a task's changes gather before its worker is told of them, in one message. */
+export const NOTIFY_WINDOW_MS = 10_000;
+/** How much of a title or body before and after goes in that message. */
+const CHANGE_CLIP = 600;
+
+const clipText = (s: string | null) => (s === null ? "(none)" : s.length > CHANGE_CLIP ? `${s.slice(0, CHANGE_CLIP)}… (${s.length} characters)` : s);
+
+/**
+ * The message telling a worker its task changed: which fields, and for each the first before and the
+ * last after of the set (bounded), the whole new spec, and to re-read the task.
+ */
+export function changeMessage(t: Task, changes: Record<string, SqlStorageValue>[]): string {
+  const by = [...new Set(changes.map((c) => (c.actor === "owner" ? "the owner" : String(c.actor).startsWith("app:") ? "the app" : "the manager")))].join(" and ");
+  const fields = [...new Set(changes.map((c) => c.field as string))];
+  const first = (f: string) => changes.find((c) => c.field === f)!;
+  const last = (f: string) => changes.filter((c) => c.field === f).at(-1)!;
+  const lines = [`Your task ${t.id} was changed by ${by}: ${fields.join(", ")}. Re-read it with projects-task get_task and adjust your work.`];
+  if (fields.includes("title")) lines.push("", `Title, before: ${clipText(first("title").before as string)}`, `Title, now: ${clipText(last("title").after as string)}`);
+  if (fields.includes("body")) lines.push("", "Body, before:", clipText(first("body").before as string), "", "Body, now:", clipText(last("body").after as string));
+  if (fields.includes("spec") && t.spec) {
+    lines.push("", "The spec, now:", `Goal: ${t.spec.goal}`, "Acceptance criteria:", ...t.spec.acceptance_criteria.map((c) => `- ${c}`),
+      `Files likely touched: ${t.spec.files.join(", ") || "(not given)"}`, `Test plan: ${t.spec.test_plan}`);
+  }
+  if (fields.includes("blocked")) lines.push("", "Its block was cleared: carry on.");
+  return lines.join("\n");
+}
+
 /** How often looking at a project reads its repo's auto-merge setting again, at most. */
 const REPO_READ_EVERY_MS = 60_000;
 

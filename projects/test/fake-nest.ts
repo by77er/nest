@@ -63,6 +63,8 @@ export class FakeNest {
   failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
   lost: { match: RegExp; times: number }[] = [];
+  /** Inbox posts that land but whose answer is lost (a 500), per agent. */
+  lostInbox: { agent: string; times: number }[] = [];
   /** Creates answered "still being handled" (409, retryable) before they run. */
   inProgress: { match: RegExp; times: number }[] = [];
   /** Idempotency keys: the request each binds, and its first answer once made. */
@@ -161,6 +163,12 @@ export class FakeNest {
       if (req.method === "POST" && sub === "/inbox") {
         const dup = call.body.request_id && this.inbox.some((x) => x.agent === a.agent && x.request_id === call.body.request_id);
         if (!dup) this.inbox.push({ agent: a.agent, text: call.body.text, from: call.body.from, request_id: call.body.request_id });
+        // Posted, but the answer lost (as after a timeout): a retry with the same request id lands once.
+        const lose = this.lostInbox.find((x) => x.times > 0 && x.agent === a.agent);
+        if (lose) {
+          lose.times--;
+          return nestErr(500, "internal", "the answer was lost", true);
+        }
         return json(201, { message: { seq: this.inbox.length } });
       }
       if (req.method === "POST" && sub === "/stop") {

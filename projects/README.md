@@ -111,7 +111,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
   - **Retries:** ProjectDO owes nest its manager, workers, stops and chat messages, each retried from its alarm (5 s doubling to 5 min); a retryable 503 or 409 is also retried within the call. A worker nest refuses for good (a 4xx) stalls its task with the reason; the manager is retried until it starts.
 - **The board:**
-  - **States** (`src/tasks.ts`): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no PR and no live worker (`draft`, `ready`, `stalled`; a stalled task never has a PR, since one with a PR is `in_review`); a draft may be deleted, anything later is cancelled.
+  - **States** (`src/tasks.ts`; a task with a live worker may be re-specced, [below](#task-changes)): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no PR and no live worker (`draft`, `ready`, `stalled`; a stalled task never has a PR, since one with a PR is `in_review`); a draft may be deleted, anything later is cancelled.
   - **A spec** is a goal, acceptance criteria, the files it likely touches and a test plan.
   - **`max_workers`** caps auto-assign and the manager's `assign_task`; the owner's assign by hand isn't capped (nest's `max_agents` still is). A worker counts from its assignment until it exits or the app has stopped it.
   - **History:** every change records who (the owner, the app, or an agent), what, when, and whether the session was tainted.
@@ -186,6 +186,23 @@ The owner's request (2026-11-02): "Agents might mark their tasks as blocked, whi
 - **Delivery:** messages to agents' inboxes are owed in ProjectDO's `messages` table, posted once each (a request id) from the alarm, retried from 5 s doubling to 5 min, and kept with the reason when nest refuses for good.
 - **"Needs you"** is one area at the top of the board: open asks and blocked tasks together, oldest first (`GET /api/projects/:id/attention`). Each shows who, why, how long ago, and its answer (approve or deny, or words). It replaces the asks banner, and is calm: the surface with a warning rule down its left edge and a warning icon by its title, not a tinted fill.
 - **The count:** `GET /api/projects` gives each project `needs_you`, its open asks plus blocked tasks, which the projects list badges (and a sidebar can).
+
+## Task changes
+
+The owner's request (2026-11-02): "Workers should be notified when their assigned task is modified."
+
+- **What's told:** a new title, body or spec, and its block cleared by the owner (answering it) or the manager. It doesn't matter whether the owner made the change (the API), the manager (`/mcp/board`) or the app.
+  - The worker's own changes aren't told back, nor is a block it raised and the owner answered: that answer reached it already.
+  - Cancelling stops the worker, as before.
+  - A task with a live worker (`assigned`, `in_progress`, or `in_review` while its worker lives) may now be re-specced, so the spec can change under a worker (`spec` loops on those states in `src/tasks.ts`).
+- **A reorder isn't told:** board order is priority among tasks not yet started, and a worker already on its task has nothing to do with that.
+- **To whom:** only a live worker (the task's assignee, still live). A task without one tells nobody, since a worker started later gets the task as it is in its brief.
+- **How:**
+  - Each change is noted in ProjectDO (`task_changes`) and told within 10 s (`NOTIFY_WINDOW_MS`) from the alarm. Changes in that window go out as one message.
+  - The message names the fields, gives each field's first before and last after (title and body clipped to 600 characters), the whole new spec, and asks the worker to re-read the task with `get_task`.
+  - A set is frozen on its first try and posted with the request id `<task>/changes/<last change>`, so a retry after a lost answer posts once. A change after that try is the next message.
+  - A set with any change from a tainted session is posted as relayed text (`from: "projects/board"`), as the brief is.
+  - Each set is recorded in the task's history (`worker_notified`, or `worker_not_notified` when the worker had gone or nest refused).
 
 ## The UI
 
