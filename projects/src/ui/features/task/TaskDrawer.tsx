@@ -12,6 +12,7 @@ import { HistoryList } from "./HistoryList";
 import { SpecView } from "./SpecView";
 import { TaskActions } from "./TaskActions";
 import { TaskEditForm } from "./TaskEditForm";
+import { TaskTraces } from "../trace/AgentTraces";
 
 export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: string; repo: string; taskId: string | undefined; onClose: () => void }) {
   const task = useTask(projectId, taskId);
@@ -70,6 +71,8 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
           <Section title="History" count={t.history.length} region={false}>
             <HistoryList history={t.history} />
           </Section>
+
+          <TaskTraces task={t} />
         </Stack>
       ) : null}
     </Sheet>

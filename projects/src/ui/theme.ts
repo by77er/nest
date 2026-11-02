@@ -107,6 +107,9 @@ export const layout = {
   sidebar: "16.5rem",
   /** A comfortable reading line for a conversation (the Manager page): about 70 characters. */
   readingMeasure: "42rem",
+  /** A scrolling log's height (a trace): fixed below `lg`, the viewport's rest from `lg` on. */
+  logMax: "22.5rem",
+  logMaxBeside: "calc(100vh - 24rem)",
   /** A narrow side element's width (a tooltip's): under a third of a desktop page. */
   sidePanel: "20rem",
   /** A board column's least width: from `md` on (all six beside the chat at 1280 px), and below. */
@@ -147,6 +150,8 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
       "--nest-header-height": layout.headerHeight,
       "--nest-sidebar": layout.sidebar,
       "--nest-reading-measure": layout.readingMeasure,
+      "--nest-log-max": layout.logMax,
+      "--nest-log-max-beside": layout.logMaxBeside,
       "--nest-side-panel": layout.sidePanel,
       "--nest-column-min": layout.column.min,
       "--nest-column-min-narrow": layout.column.minNarrow,

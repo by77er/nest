@@ -1,5 +1,5 @@
 // A project's manager: the conversation with it, full width at a reading measure, the composer pinned
-// to the bottom; its status in the header; and beside "Chat", the "Trace" tab's slot (`?view=trace`).
+// to the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
 
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
@@ -8,7 +8,7 @@ import { icon, Stack } from "../../layout";
 import { ChatView } from "../chat/ChatView";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ManagerProblem, ManagerStatusLine } from "./ManagerStatus";
-import { TraceSlot } from "./TraceSlot";
+import { ManagerTrace } from "../trace/AgentTraces";
 
 export function ManagerPage() {
   const { projectId } = useParams({ from: "/projects/$projectId/manager" });
@@ -33,7 +33,7 @@ export function ManagerPage() {
               <ChatView projectId={projectId} />
             </Tabs.Panel>
             <Tabs.Panel value="trace" pt="xl">
-              <TraceSlot projectId={projectId} agent={p.settings.manager} />
+              <ManagerTrace settings={p.settings} />
             </Tabs.Panel>
           </Tabs>
         </Stack>

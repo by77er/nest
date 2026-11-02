@@ -1,7 +1,8 @@
 // The Manager page: its status in the header, as nest's record says (src/manager.ts), with a retry when
 // the repo couldn't be attached; and the Trace tab beside Chat, kept in the URL for the trace viewer.
 import { screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { RecordingSocket } from "../../test/sockets";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
@@ -37,12 +38,17 @@ describe("the Manager page", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("has a Trace tab beside Chat, kept in the URL", async () => {
+  it("has the manager's live trace in a tab beside Chat, kept in the URL", async () => {
+    RecordingSocket.opened = [];
+    vi.stubGlobal("WebSocket", RecordingSocket);
     const { user, router } = renderApp("/projects/prj_one/manager");
     await screen.findByRole("tabpanel", { name: "Chat" });
     await user.click(screen.getByRole("tab", { name: "Trace" }));
     await waitFor(() => expect(router.state.location.search).toEqual({ view: "trace" }));
-    expect(await screen.findByRole("tabpanel", { name: "Trace" })).toBeInTheDocument();
+    const panel = await screen.findByRole("tabpanel", { name: "Trace" });
+    expect(within(panel).getByRole("heading", { name: "Manager's trace" })).toBeInTheDocument();
     expect(screen.queryByLabelText("Message to the manager")).toBeNull();
+    // The trace viewer connects for the manager the project names (fakeApi: agt_manager), only once shown.
+    await waitFor(() => expect(RecordingSocket.opened.map((u) => new URL(u).pathname)).toEqual(["/api/agents/agt_manager/trace"]));
   });
 });
