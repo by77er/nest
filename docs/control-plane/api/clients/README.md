@@ -2,7 +2,15 @@
 
 **Decided (2026-11-02, the owner's):** external systems (an app with its own Worker and Durable Objects, such as a task board) use nest only through this interface. An app never gets the admin token, and nest gets nothing specific to any app. **An app that seems to need a special case in nest means this interface is wrong:** fix the interface, generically ([principle 9](../../../README.md#principles)).
 
-Being built; this is the design the code follows.
+**Built (2026-11-02):** clients and grants, ownership and visibility, labels, and the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`). **Not built:** caller identity, events to the owner, GitHub tokens (the grant's `github` is stored, unused).
+
+**How the built parts read the grant** (each a choice the design left open):
+- **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own.
+- **Brokered actions:** only GitHub actions scoped to repos in `repos` are within a grant. An http profile (a URL and a credential no field covers), a fork (it widens the push allowlist) and an unscoped GitHub action are refused.
+- **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's (403).
+- **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
+- **An mcp capability's tools are named `<client>-<entry>_<tool>`** (tool names hold no `/`). A spec where two capabilities would give the same names is refused.
+- **Deleting a client is refused while anything in its subtree lives.** Then its token stops, and its namespace, name and record go.
 
 ## Clients and grants
 

@@ -12,6 +12,17 @@ import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
+/**
+ * A reference to an entry: the operator's `<entry>`, or a client's `<client-name>/<entry>`
+ * (docs/control-plane/api/clients/#the-clients-catalog).
+ */
+export const EntryName = z.string().regex(/^(?:[a-z][a-z0-9-]{1,30}\/)?[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-', optionally <client>/<name>");
+
+/**
+ * The prefix of an mcp capability's tools (`<prefix>_<tool>`): its name, with a client's `/` as `-`
+ * (tool names hold no `/`). Two capabilities of one spec with the same prefix are refused at expansion.
+ */
+export const mcpPrefix = (capability: string): string => capability.replace("/", "-");
 
 export const HandsRule = z.enum(["required", "forbidden", "optional"]);
 
@@ -27,12 +38,12 @@ export const Capability = z.object({
   /** Brokered actions it grants, each scoped (docs/agents/capabilities/#brokered-actions): GitHub actions to repos, http profiles. */
   brokered: BrokeredSource.optional(),
   /** The templates its `agent_spawn` may spawn from (the spawn grant; docs/agents/#spawning). */
-  spawn: z.array(CatalogName).optional(),
+  spawn: z.array(EntryName).optional(),
 });
 export type Capability = z.output<typeof Capability>;
 
 export const Template = z.object({
-  capabilities: z.array(CatalogName),
+  capabilities: z.array(EntryName),
   /** Model, effort, built-in tools and the base system prompt; capability prompts are appended to its text. */
   launch: LaunchConfig,
   /** Whether a spawn from it takes a sandbox. */
@@ -469,7 +480,11 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     if (!Object.hasOwn(catalog.capabilities, c)) return err(`template ${name}: unknown capability ${c}`);
     const cap = catalog.capabilities[c]!;
     caps.push(cap);
-    if (cap.mcp) mcp.push(grantOf(c, cap.mcp));
+    if (cap.mcp) {
+      const g = grantOf(mcpPrefix(c), cap.mcp);
+      if (mcp.some((x) => x.capability === g.capability)) return err(`template ${name}: two mcp capabilities make tools named ${g.capability}_*`);
+      mcp.push(g);
+    }
     for (const t of cap.spawn ?? []) if (!spawn.includes(t)) spawn.push(t);
     for (const e of cap.brokered ?? []) {
       const g = grantOfEntry(c, e);

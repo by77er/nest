@@ -20,6 +20,8 @@ import {
 import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
 import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
 import { Repo } from "../lib/repos";
+import { isAgentId, Labels } from "../lib/clients";
+import type { MemberFacts } from "./client";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
 import {
@@ -90,8 +92,18 @@ export interface AgentInfo extends AgentSpec, BrainFields {
    */
   workstream?: string;
   cell: string;
-  /** The agent that owns this one (it spawned it, or the operator named it); fixed at spawn. */
+  /**
+   * Who owns this one, a principal fixed at spawn: the agent that spawned it (or the one the operator
+   * or a client named), a client (`cli_…`) for one a client created, or null for the operator (`user`).
+   */
   owner: string | null;
+  /**
+   * The API client whose subtree it is in (docs/control-plane/api/clients/): the client that created
+   * it or its root ancestor; every spawn inherits it. Absent: the operator's.
+   */
+  client?: string;
+  /** Set by its creator and fixed after; not inherited. Absent: none. */
+  labels?: Labels;
   /** The bound sandbox, by id only: its epoch is SandboxDO's, never copied here. */
   hands: { sandbox: string } | null;
   /** Session of the committed base (what `--resume` restores). */
@@ -133,7 +145,7 @@ const offered = (info: Pick<AgentSpec, "tools">): string[] => (info.tools.includ
 /** The sender of the platform's own notes about an agent's work (not input: see `stop_quiet`). */
 const SYSTEM_SENDER = "system";
 /** What `info()` answers: the record plus the derived brain host and `state`. */
-export type AgentView = AgentInfo & { host: string | null; state: AgentState };
+export type AgentView = Omit<AgentInfo, "client" | "labels"> & { host: string | null; state: AgentState; client: string | null; labels: Labels };
 
 /** Fields of records stored by the previous release, which `load()` migrates. */
 interface PreviousReleaseFields {
@@ -180,6 +192,9 @@ export interface CreateAgent {
   depth?: number;
   /** It starts with its spawner's taint (docs/agents/tools/#taint-and-sinks). */
   tainted?: boolean;
+  /** The client whose subtree it joins (it was admitted there first). */
+  client?: string | null;
+  labels?: Labels;
 }
 
 /** How an agent is ended (`Ended` without the steps it records later). */
@@ -397,9 +412,9 @@ export class AgentDO extends DurableObject<Env> {
 
   async create(req: CreateAgent): Promise<AgentInfo> {
     if (this.exists()) return this.load();
-    // The owner must be an agent (`info()` refuses one never created).
+    // An agent owner must exist (`info()` refuses one never created); a client owner was checked by its caller.
     const owner = req.owner ?? null;
-    if (owner !== null && !req.owner_is_caller) await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info();
+    if (isAgentId(owner) && !req.owner_is_caller) await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info();
     let hands: AgentInfo["hands"] = null;
     if (req.sandbox) {
       // An agent's cell is its sandbox's (its FleetDO).
@@ -436,6 +451,8 @@ export class AgentDO extends DurableObject<Env> {
       runner_instance: null,
       start_attempts: 0,
       ...(req.depth ? { depth: req.depth } : {}),
+      ...(req.client ? { client: req.client } : {}),
+      ...(req.labels && Object.keys(req.labels).length ? { labels: req.labels } : {}),
     };
     this.save(info);
     if (req.tainted) this.kvPut("read_tainted", true);
@@ -447,7 +464,22 @@ export class AgentDO extends DurableObject<Env> {
   /** The record as the API shows it (without the compat `workstream`), plus its brain host and state. */
   async info(): Promise<AgentView> {
     const { workstream: _, ...info } = this.load();
-    return { ...info, host: info.brain?.host ?? null, state: agentState(info) };
+    return { ...info, client: info.client ?? null, labels: info.labels ?? {}, host: info.brain?.host ?? null, state: agentState(info) };
+  }
+
+  /** Whose subtree it is in, and whether it has ended (a client's routes answer 404 outside its own). */
+  async subtree(): Promise<{ client: string | null; ended: boolean }> {
+    const info = this.load();
+    return { client: info.client ?? null, ended: !!info.ended };
+  }
+
+  /** What its client's registry records of it (`ClientDO.report`). */
+  private memberFacts(info: AgentInfo): MemberFacts {
+    return { kind: "agent", id: info.agent, cell: info.cell, owner: info.owner, labels: info.labels ?? {} };
+  }
+
+  private clientStub(client: string) {
+    return this.env.CLIENT.get(this.env.CLIENT.idFromName(client));
   }
 
   private sandboxStub(id: string) {
@@ -994,7 +1026,8 @@ export class AgentDO extends DurableObject<Env> {
         if (i.ended) i.ended.sandbox = r.destroyed ? "destroyed" : "detached";
       });
     }
-    if (info.owner && !info.ended!.owner_told) {
+    // Only an agent owner hears of it (a client hears through its registry, the operator through the API).
+    if (isAgentId(info.owner) && !info.ended!.owner_told) {
       try {
         await this.agentStub(info.owner).childEnded(info.agent);
       } catch (err) {
@@ -1064,19 +1097,28 @@ export class AgentDO extends DurableObject<Env> {
     };
   }
 
-  /** What FleetDO's agent registry should hold for it: its cell, and when it ended once its end is done. */
+  /**
+   * What its registries should hold for it: its cell, and when it ended once its end is done; with a
+   * client or labels, those too (its client's registry is told as well).
+   */
   private registryWanted(): string {
     const info = this.load();
-    return JSON.stringify({ cell: info.cell, ended_ms: info.ended?.done_ms ? info.ended.ms : null });
+    const meta = info.client || info.labels ? { client: info.client ?? null, labels: info.labels ?? {} } : {};
+    return JSON.stringify({ cell: info.cell, ended_ms: info.ended?.done_ms ? info.ended.ms : null, ...meta });
   }
 
-  /** The `registry` deadline: tell its cell's FleetDO it exists (and its end, once done), if it hasn't. */
+  /**
+   * The `registry` deadline: tell its cell's FleetDO, and its client's ClientDO (what `max_agents`
+   * counts), that it exists (and its end, once done), if they haven't been told. Retried until both answer.
+   */
   private async register(): Promise<void> {
     if (!this.exists()) return;
     const want = this.registryWanted();
     if (this.kvGet<string>("registry") === want) return;
     const info = this.load();
-    await this.fleet(info.cell).registerAgent(info.agent, info.ended?.done_ms ? info.ended.ms : null);
+    const ended = info.ended?.done_ms ? info.ended.ms : null;
+    await this.fleet(info.cell).registerAgent(info.agent, ended, { client: info.client ?? null, labels: info.labels ?? null });
+    if (info.client) await this.clientStub(info.client).report({ ...this.memberFacts(info), ended_ms: ended });
     this.kvPut("registry", want);
   }
 
@@ -1127,7 +1169,8 @@ export class AgentDO extends DurableObject<Env> {
         break;
       }
       chain.push(owner);
-      if (!owner || owner === me) break;
+      // A client or the operator owns the root: the chain ends there.
+      if (!isAgentId(owner) || owner === me) break;
       cur = owner;
     }
     return chain;
@@ -1168,10 +1211,17 @@ export class AgentDO extends DurableObject<Env> {
       ...(a.ephemeral === true ? { ephemeral: true as const } : {}),
       ...(typeof a.sandbox_idle_ttl_s === "number" ? { sandbox_idle_ttl_ms: a.sandbox_idle_ttl_s * 1000 } : {}),
     };
+    // Labels are the spawner's to give (not inherited): to the child, and to a sandbox created for it.
+    const parsedLabels = Labels.safeParse(a.labels ?? {});
+    if (!parsedLabels.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `labels: ${parsedLabels.error.issues.map((i) => i.message).join("; ")}`);
+    const labels = parsedLabels.data;
+    // In a client's subtree, the client's grant bounds the child whatever the template gives
+    // (docs/control-plane/api/clients/): only what the client sees expands, and within its grant.
+    const scope = info.client ? await this.clientStub(info.client).scope() : undefined;
     const catalog = this.env.CATALOG.get(this.env.CATALOG.idFromName("catalog"));
     const spec = await catalog.expand({
       template, hands: mode !== null, by: "spawner", share: mode === "share", overrides, cell_idle_ttl_ms: cellIdleTtlMs(this.env, info.cell),
-    });
+    }, scope);
     const tainted = this.tainted(info);
     const sandbox = mode === "new" ? await keyedId("sbx_", key) : mode === "share" ? info.hands!.sandbox : null;
     await live();
@@ -1184,9 +1234,27 @@ export class AgentDO extends DurableObject<Env> {
     }
     this.sql.exec("INSERT OR IGNORE INTO children (agent, created_ms) VALUES (?, ?)", child, Date.now());
     try {
-      return await this.spawnChild(info, child, sandbox, mode === "new", template, spec, String(a.task), key, tainted, live);
+      // Its client's places, taken before anything is made (its grant's max_agents and max_sandboxes, counted across the subtree).
+      if (info.client) {
+        const client = this.clientStub(info.client);
+        await client.admit({ kind: "agent", id: child, cell: info.cell, owner: info.agent, labels });
+        if (sandbox && mode === "new") await client.admit({ kind: "sandbox", id: sandbox, cell: info.cell, owner: child, labels });
+        await live();
+      }
+      return await this.spawnChild(info, child, sandbox, mode === "new", template, spec, String(a.task), key, tainted, live, labels);
     } catch (e) {
-      if (!asNestError(e)?.retryable && !(await this.agentExists(child))) this.sql.exec("DELETE FROM children WHERE agent = ? AND ended = 0", child);
+      if (!asNestError(e)?.retryable && !(await this.agentExists(child))) {
+        this.sql.exec("DELETE FROM children WHERE agent = ? AND ended = 0", child);
+        if (info.client) {
+          // Places reserved for what was never made go back (the reservation check would find them too).
+          const client = this.clientStub(info.client);
+          await client.release(child).catch(() => undefined);
+          if (sandbox && mode === "new") {
+            const made = await this.sandboxStub(sandbox).info().then(() => true, () => false);
+            if (!made) await client.release(sandbox).catch(() => undefined);
+          }
+        }
+      }
       throw e;
     }
   }
@@ -1204,11 +1272,13 @@ export class AgentDO extends DurableObject<Env> {
   /** `agent_spawn`'s writes, each behind the epoch fence: the sandbox (owned by the child), the child, its task. */
   private async spawnChild(
     info: AgentInfo, child: string, sandbox: string | null, fresh: boolean, template: string, spec: AgentSpec, task: string, key: string, tainted: boolean,
-    live: () => Promise<void>,
+    live: () => Promise<void>, labels: Labels,
   ): Promise<ToolOutcome> {
+    // Its client's subtree, whatever it spawns: the child and a sandbox created for it.
+    const client = info.client ? { client: info.client } : {};
     if (sandbox && fresh) {
       await this.sandboxStub(sandbox).create({
-        sandbox, cell: info.cell, owner: child,
+        sandbox, cell: info.cell, owner: child, ...client, labels,
         ...(spec.sandbox_idle_ttl_ms !== undefined ? { idle_ttl_ms: spec.sandbox_idle_ttl_ms } : {}),
       });
       await live();
@@ -1216,7 +1286,7 @@ export class AgentDO extends DurableObject<Env> {
     const stub = this.agentStub(child);
     await stub.create({
       agent: child, cell: info.cell, spec, owner: info.agent, sandbox, owner_is_caller: true,
-      depth: (info.depth ?? 0) + 1, tainted,
+      depth: (info.depth ?? 0) + 1, tainted, ...client, labels,
     });
     // Ended meanwhile (its owner's end may have looked for this child before it existed): the child ends too.
     if (this.load().ended) {

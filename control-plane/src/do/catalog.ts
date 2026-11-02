@@ -8,8 +8,9 @@ import type { Env } from "../env";
 import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
   type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
-  rewritePrompt, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template, templatesUsing,
+  expandTemplate, mcpPrefix, rewritePrompt, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template, templatesUsing,
 } from "../lib/spec";
+import { capabilityOutsideGrant, entryVisible, type Grant, grantRefusal, specOutsideGrant } from "../lib/clients";
 import { NestError } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
 
@@ -20,6 +21,31 @@ import { ErrorCodes } from "../protocol/model";
  */
 const PREVIOUS_RELEASE_TEMPLATE_FIELDS = { escalate_to: "user", subscribe: [] } as const;
 const templateRow = (t: Template): string => JSON.stringify({ ...PREVIOUS_RELEASE_TEMPLATE_FIELDS, ...t });
+
+/**
+ * A client acting on the catalog (docs/control-plane/api/clients/#the-clients-catalog): it sees the
+ * operator's entries and its own namespace, and everything it writes or spawns is held to its grant.
+ */
+export interface ClientScope {
+  /** Its id, `cli_…` (named in refusals). */
+  client: string;
+  /** Its name: its namespace. */
+  name: string;
+  grant: Grant;
+}
+
+/** The entries `scope` sees (all of them for the operator, `undefined`). */
+function visibleTo(cat: Catalog, scope: ClientScope | undefined): Catalog {
+  if (!scope) return cat;
+  const pick = <T>(r: Readonly<Record<string, T>>) => Object.fromEntries(Object.entries(r).filter(([n]) => entryVisible(n, scope.name)));
+  return { capabilities: pick(cat.capabilities), templates: pick(cat.templates) };
+}
+
+/** A client's write may only name entries it sees: the operator's and its own. */
+function refuseHidden(names: readonly string[], scope: ClientScope | undefined, what: string): void {
+  const hidden = scope ? names.filter((n) => !entryVisible(n, scope.name)) : [];
+  if (hidden.length) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${what}: unknown ${hidden.join(", ")}`);
+}
 
 export class CatalogDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -128,16 +154,33 @@ export class CatalogDO extends DurableObject<Env> {
     return { capabilities: rows("capabilities", Capability), templates: rows("templates", Template) };
   }
 
-  async catalog(): Promise<Catalog> {
-    return this.load();
+  /** The catalog, or what a client sees of it: the operator's entries and its own. */
+  async catalog(scope?: ClientScope): Promise<Catalog> {
+    return visibleTo(this.load(), scope);
   }
 
-  /** Create or replace a capability. Its tools must be platform tools, and its mcp source a server nest will call. */
-  async putCapability(name: string, cap: Capability): Promise<Capability> {
+  /** One entry (404 when absent). */
+  async entry(kind: "templates" | "capabilities", name: string): Promise<Template | Capability> {
+    const cat = this.load();
+    const e = kind === "templates" ? cat.templates[name] : cat.capabilities[name];
+    if (!Object.hasOwn(cat[kind], name) || !e) throw new NestError(ErrorCodes.NOT_FOUND, `unknown ${kind === "templates" ? "template" : "capability"} ${name}`, 404);
+    return e;
+  }
+
+  /**
+   * Create or replace a capability. Its tools must be platform tools, and its mcp source a server nest
+   * will call. A client's (`scope`) names only entries it sees and stays within its grant.
+   */
+  async putCapability(name: string, cap: Capability, scope?: ClientScope): Promise<Capability> {
     const r = checkCapability(cap, PLATFORM_TOOL_NAMES, {
-      name, allowLoopback: this.env.ALLOW_LOOPBACK_MCP === "1", allowLoopbackBrokered: this.env.ALLOW_LOOPBACK_BROKERED === "1",
+      name: mcpPrefix(name), allowLoopback: this.env.ALLOW_LOOPBACK_MCP === "1", allowLoopbackBrokered: this.env.ALLOW_LOOPBACK_BROKERED === "1",
     });
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `capability ${name}: ${r.error}`);
+    if (scope) {
+      refuseHidden(cap.spawn ?? [], scope, `capability ${name}: spawn`);
+      const refusal = grantRefusal(scope.client, capabilityOutsideGrant(name, cap, scope.grant));
+      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `capability ${name}: ${refusal}`, 403);
+    }
     // Every template listing it must still hold together (e.g. a parameter default it no longer takes).
     const cat = this.load();
     const next = { ...cat.capabilities, [name]: cap };
@@ -157,10 +200,22 @@ export class CatalogDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM capabilities WHERE name = ?", name);
   }
 
-  /** Create or replace a template. Its capabilities must exist. */
-  async putTemplate(name: string, tpl: Template): Promise<Template> {
-    const r = checkTemplate(tpl, this.load().capabilities);
+  /**
+   * Create or replace a template. Its capabilities must exist. A client's (`scope`) lists only
+   * capabilities it sees, and expands within its grant.
+   */
+  async putTemplate(name: string, tpl: Template, scope?: ClientScope): Promise<Template> {
+    refuseHidden(tpl.capabilities, scope, `template ${name}`);
+    const cat = this.load();
+    const r = checkTemplate(tpl, cat.capabilities);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${r.error}`);
+    // Expanded as written (no overrides): what it gives must hold together, and a client's stay in its grant.
+    const spec = expandTemplate({ capabilities: cat.capabilities, templates: { [name]: tpl } }, PLATFORM_TOOL_NAMES, name);
+    if (!spec.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, spec.error);
+    if (scope) {
+      const refusal = grantRefusal(scope.client, specOutsideGrant(spec.value, scope.grant));
+      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `template ${name}: ${refusal}`, 403);
+    }
     this.sql.exec("INSERT INTO templates (name, body) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET body = excluded.body",
       name, templateRow(tpl));
     return tpl;
@@ -170,10 +225,26 @@ export class CatalogDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM templates WHERE name = ?", name);
   }
 
-  /** Expand a spawn spec against the current catalog (400 when it doesn't expand). */
-  async expand(spec: SpawnSpec): Promise<AgentSpec> {
-    const r = expandSpec(this.load(), PLATFORM_TOOL_NAMES, spec);
+  /** A deleted client's namespace: every `<ns>/…` entry, templates first. */
+  async deleteNamespace(ns: string): Promise<number> {
+    const prefix = `${ns}/`;
+    let n = this.sql.exec("DELETE FROM templates WHERE substr(name, 1, ?) = ?", prefix.length, prefix).rowsWritten;
+    n += this.sql.exec("DELETE FROM capabilities WHERE substr(name, 1, ?) = ?", prefix.length, prefix).rowsWritten;
+    return n;
+  }
+
+  /**
+   * Expand a spawn spec against the current catalog (400 when it doesn't expand). In a client's
+   * subtree (`scope`), only what it sees expands, and the result must lie within its grant (403):
+   * neither a template nor an override widens it.
+   */
+  async expand(spec: SpawnSpec, scope?: ClientScope): Promise<AgentSpec> {
+    const r = expandSpec(visibleTo(this.load(), scope), PLATFORM_TOOL_NAMES, spec);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, r.error);
+    if (scope) {
+      const refusal = grantRefusal(scope.client, specOutsideGrant(r.value, scope.grant));
+      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `template ${spec.template}: ${refusal}`, 403);
+    }
     return r.value;
   }
 }

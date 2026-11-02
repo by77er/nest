@@ -13,7 +13,8 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/mcp-connector.ts` | **McpConnectorDO**: one per remote MCP server and credential: the shared tool list, change notices to agents, call admission (docs/control-plane/durable-objects/mcp-connector/) |
 | `src/do/workstream.ts` | **WorkstreamDO** (stub): workstreams left the platform; the class stays declared, serving only health (its alarm re-arms daily while the previous release's decision events wait), until stage 4 deletes it |
 | `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), MCP OAuth tokens (`OAuthStore`, `src/lib/mcp-auth.ts`), http profile credentials (`http:<name>`), the argument secret scan, the GitHub App minter (`github_app`; `src/lib/github.ts`), and the issuance audit in R2 |
-| `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries; the task ledger's and the channel capabilities removed); expansion is `src/lib/spec.ts` (pure) |
+| `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries; the task ledger's and the channel capabilities removed), and API clients' namespaces (`<client>/<entry>`); expansion is `src/lib/spec.ts` (pure), held to a client's grant in its subtree |
+| `src/do/client.ts` | **ClientDO** (one per API client, plus the `directory` of names): the record, grant and token hash, and the registry of its subtree that its maximums count and it lists; grants, tokens and labels are `src/lib/clients.ts` (pure) (docs/control-plane/durable-objects/client/) |
 | `src/do/channel.ts` | **ChannelDO** (stub): channels left the platform; the class stays declared, serving only health and re-arming a previous release's alarm, until stage 4 deletes it |
 | `src/do/tasks.ts` | **TaskLedgerDO** (stub): the task ledger left the platform; the class stays declared, serving only health, until stage 4 deletes it |
 | `src/lib/` | Reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry, repo allowlists (`repos.ts`) and the egress rule constructors (`rules/`: GitHub's push allowlist to request guards; docs/sandbox/networking/egress/policy/#request-guards) |
@@ -67,6 +68,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
      once that brain's exit or its host's loss releases it
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt`
+   - `GET /v1/agents?cell=&label=k=v&state=live|ended|all&limit=&cursor=` and the same for `GET /v1/sandboxes`: the cell's
+     registry (FleetDO), or `?client=cli_…` a client's subtree (ClientDO); `label` repeats, each must hold. `POST /v1/agents`
+     and `POST /v1/sandboxes` take `labels` (up to 16, fixed once set), and `owner` may be `user`
    - `GET /v1/agents/<id>/asks`: its calls held for the operator (sink approvals, tool rules in `ask` mode), oldest
      first, `{ask, question, created_ms, approval?: {name, tool}}`; `POST /v1/agents/<id>/asks/<ask>/answer {answer}`
      decides one, and the decision reaches the agent as an `ask_answer` turn
@@ -100,6 +104,17 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - Brokered actions (`docs/agents/capabilities/brokered/`): the GitHub App with `PUT /v1/admin/secrets/github_app {"value": "{\"app_id\": \"…\", \"private_key\": \"-----BEGIN RSA PRIVATE KEY-----…\"}"}`,
      a profile's credential with `PUT /v1/admin/secrets/http:<name>`, then a capability `{"brokered": [{"action": "github.create_pr", "repos": ["owner/name"]}, …]}`
      added to a template. `GET /v1/agents/<id>/brokered?limit=&before=` is the agent's journal, newest first
+
+## API clients
+
+External systems (docs/control-plane/api/clients/): `POST /v1/admin/clients {name, grant}` (answers the token once:
+`nest_cli_<id>_<secret>`) · `GET /v1/admin/clients` · `GET|PATCH /v1/admin/clients/<cli> {grant}` ·
+`POST /v1/admin/clients/<cli>/rotate` · `DELETE /v1/admin/clients/<cli>` (409 while its subtree lives). A grant is
+`{cells, credentials, repos, mcp_urls, github?, max_agents, max_sandboxes}`. With its token a client calls the owner routes
+(`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript,
+brokered journal, asks and answers; sandbox create, list, read, destroy, lifetime and effective policy) on its own subtree only
+(anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
+`GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`.
 
 ## Secrets and vars
 

@@ -18,18 +18,33 @@ const NOT_ADMIN = {
   "GET /v1/oauth/callback": "none",
   // nest's client ID metadata document, fetched by authorization servers: public by design.
   "GET /v1/oauth/client.json": "none",
+  // An API client's token is accepted too, on its own subtree (docs/control-plane/api/clients/; test/clients.test.ts).
+  ...Object.fromEntries([
+    "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript",
+    "POST /v1/agents/:agent/turns", "POST /v1/agents/:agent/inbox", "POST /v1/agents/:agent/interrupt", "POST /v1/agents/:agent/start",
+    "POST /v1/agents/:agent/stop", "GET /v1/agents/:agent/children", "GET /v1/agents/:agent/brokered", "GET /v1/agents/:agent/asks",
+    "POST /v1/agents/:agent/asks/:ask/answer",
+    "POST /v1/sandboxes", "GET /v1/sandboxes", "GET /v1/sandboxes/:sandbox", "DELETE /v1/sandboxes/:sandbox", "PUT /v1/sandboxes/:sandbox/lifetime",
+    "GET /v1/sandboxes/:sandbox/policy",
+    "GET /v1/catalog",
+    ...["GET", "PUT", "DELETE"].flatMap((m) => ["templates", "capabilities"].map((k) => `${m} /v1/catalog/${k}/:ns/:entry`)),
+  ].map((r) => [r, "owner"])),
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */
 const concrete = (path: string) => path.replace(/[:*]([a-z]+)/g, (_m, k: string) =>
-  ({ agent: "agt_x", sandbox: "sbx_x", host: "hst_x", ws: "ws_x", ask: "ask_x", sub: "sub_x", port: "80", secret: "s" } as Record<string, string>)[k] ?? "x");
+  ({ agent: "agt_x", sandbox: "sbx_x", host: "hst_x", ws: "ws_x", ask: "ask_x", sub: "sub_x", port: "80", secret: "s", client: "cli_x", ns: "ns", entry: "e" } as Record<string, string>)[k] ?? "x");
 
 describe("route authentication", () => {
   it("every route that isn't on the allowlist needs the admin token, and the allowlist is exact", async () => {
     const open = Object.fromEntries(ROUTES.filter((r) => r.auth !== "admin").map((r) => [`${r.method} ${r.path}`, r.auth]));
     expect(open).toEqual(NOT_ADMIN);
-    for (const r of ROUTES.filter((x) => x.auth === "admin")) {
-      const res = await SELF.fetch(`${BASE}${concrete(r.path)}`, { method: r.method, headers: { "content-type": "application/json" }, ...(r.method === "GET" ? {} : { body: "{}" }) });
-      expect(res.status, `${r.method} ${r.path}`).toBe(401);
+    // Neither an admin route nor an owner route answers without a token, or with a client token that isn't one.
+    const forged = `nest_cli_x_${"0".repeat(64)}`;
+    for (const r of ROUTES.filter((x) => x.auth === "admin" || x.auth === "owner")) {
+      for (const auth of [{}, { authorization: `Bearer ${forged}` }] as Record<string, string>[]) {
+        const res = await SELF.fetch(`${BASE}${concrete(r.path)}`, { method: r.method, headers: { "content-type": "application/json", ...auth }, ...(r.method === "GET" ? {} : { body: "{}" }) });
+        expect(res.status, `${r.method} ${r.path}`).toBe(401);
+      }
     }
   });
 
