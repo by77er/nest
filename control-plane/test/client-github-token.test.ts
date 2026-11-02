@@ -267,6 +267,25 @@ describe("the GitHub App's identity", () => {
     expect(Object.keys(await self(none.token))).not.toContain("github_app");
   });
 
+  it("when GitHub doesn't answer after it did: what it said before, slug included", async () => {
+    await forget();
+    // GitHub's id for the App the credentials name ("77" in both test files).
+    gh.app = { id: 77, slug: "nest-test-app" };
+    const c = await newClient({ repos: [repo()], permissions: { checks: "read" } });
+    expect((await self(c.token)).github_app).toEqual({ app_id: 77, app_slug: "nest-test-app" });
+    await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), async (_i, st) => {
+      st.storage.sql.exec("UPDATE github_app_identity SET expires_ms = 0");
+    });
+    gh.app = null;
+    const reads = gh.appReads;
+    expect((await self(c.token)).github_app).toEqual({ app_id: 77, app_slug: "nest-test-app" });
+    // Kept again for a while: the next answers don't wait on GitHub.
+    expect((await self(c.token)).github_app).toEqual({ app_id: 77, app_slug: "nest-test-app" });
+    expect(gh.appReads - reads).toBe(1);
+    gh.app = { id: 424242, slug: "nest-test-app" };
+    await forget();
+  });
+
   it("when GitHub doesn't answer: the id the App's credentials name, without the slug, and the token still goes out", async () => {
     await forget();
     gh.app = null;

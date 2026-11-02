@@ -513,7 +513,9 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   // before it went): ignored, not a failed spawn. Writes still refuse one (`checkCapability`).
   const given = new Set(caps.flatMap((c) => c.tools).filter((t) => registry.includes(t)));
   const prompt = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter((t) => t.length > 0).join("\n\n");
-  const readOnly = readOnlyRepos(tpl.repos ?? [], tpl.read_repos ?? []);
+  // Kept whole here (a repo also in `repos` included), so an override that drops it from the
+  // allowlist leaves it readable; `withRepos` subtracts the final allowlist.
+  const readOnly = canonicalRepos(tpl.read_repos ?? []);
   return ok({
     template: name,
     tools: registry.filter((t) => given.has(t)),
@@ -533,13 +535,18 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
 
 /**
  * The spec with this push allowlist and these read-only repos: recorded (a repo on both is pushable),
- * and its unscoped GitHub grants narrowed to the allowlist (`scopeToRepos`; read-only repos scope no action).
+ * and its unscoped GitHub grants narrowed to the allowlist (`scopeToRepos`; read-only repos scope no
+ * action). `narrowed`: the allowlist narrows the template's, so an unscoped grant narrowed to none
+ * reaches nothing and goes, rather than reaching every repo as an unscoped grant does.
  */
-function withRepos(spec: AgentSpec, repos: readonly string[], readRepos: readonly string[]): AgentSpec {
+function withRepos(spec: AgentSpec, repos: readonly string[], readRepos: readonly string[], narrowed = false): AgentSpec {
   const { repos: _, read_repos: _read, brokered, ...rest } = spec;
   const r = canonicalRepos(repos);
   const read = readOnlyRepos(r, readRepos);
-  const scoped = brokered ? scopeToRepos(brokered, r) : undefined;
+  const kept = narrowed && !r.length && spec.repos?.length
+    ? brokered?.filter((g) => g.action === "http.request" || g.action === "github.fork" || g.repos !== null)
+    : brokered;
+  const scoped = kept ? scopeToRepos(kept, r) : undefined;
   return { ...rest, ...(scoped?.length ? { brokered: scoped } : {}), ...(r.length ? { repos: r } : {}), ...(read.length ? { read_repos: read } : {}) };
 }
 
@@ -616,7 +623,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     const tplTtl = base.value.sandbox_idle_ttl_ms;
     const ttl = asked !== undefined ? narrowTtl(tplTtl ?? spec.cell_idle_ttl_ms ?? Infinity, asked) : tplTtl;
     const lifetimes = { ...(ephemeral ? { ephemeral: true as const } : {}), ...(ttl !== undefined ? { sandbox_idle_ttl_ms: ttl } : {}) };
-    return ok(withRepos({ ...rest, ...tools.value, ...lifetimes, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value, readRepos.value));
+    return ok(withRepos({ ...rest, ...tools.value, ...lifetimes, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value, readRepos.value, true));
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);

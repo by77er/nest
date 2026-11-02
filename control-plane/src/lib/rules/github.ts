@@ -27,6 +27,13 @@ export const GITHUB_READ_BINDING = "github_read";
  * placeholder anywhere in a request (a substring) before it substitutes an exact match.
  */
 export const GITHUB_READ_PLACEHOLDER = "nest-ph-read-github";
+/**
+ * The read-only token under the guest's default placeholder, for a sandbox with read-only repos and no
+ * push allowlist, so `git` and `gh` read them unconfigured. Not named `github`: a push token the proxy
+ * still holds under `github` while a policy without the allowlist is installed has no binding then, so
+ * it can't be substituted (nor its GraphQL exception used) before the read-only token replaces it.
+ */
+export const GITHUB_READ_DEFAULT_BINDING = "github_read_default";
 
 const READS = ["GET", "HEAD"];
 const RECEIVE_DISCOVERY: RequestMatch = { path: "/**/info/refs", query: [{ name: "service", values: ["git-receive-pack"] }] };
@@ -51,16 +58,17 @@ const apiRepo = (repos: readonly string[]): RequestMatch[] => repos.map((r) => (
  * - `gist-write`: no writes to gists (each is a git repo);
  * - `githubusercontent-write`: no writes to `*.githubusercontent.com` (signed upload URLs).
  */
-export function githubGuards(allowlist: readonly string[], readOnly: readonly string[] = []): RequestGuard[] {
+export function githubGuards(allowlist: readonly string[], readOnly: readonly string[] = [], operator: readonly InjectionBinding[] = []): RequestGuard[] {
   const repos = canonicalRepos(allowlist);
   const read = readOnlyRepos(repos, readOnly);
   const named = repos.length ? ` (${repos.join(", ")})` : "";
   const readNamed = read.length ? `; ${read.join(", ")} ${read.length > 1 ? "are" : "is"} read-only` : "";
   const pushReason = `git pushes reach only the repos on this sandbox's push allowlist${named || " (none)"}${readNamed}`;
   const writeReason = `writes to GitHub reach only the repos on this sandbox's push allowlist${named || " (none)"}${readNamed}`;
-  // The sandbox's own tokens: `github` (its push token, or its read-only one when it may push nowhere)
-  // and `github_read` (its read-only token).
-  const tokens = [...(repos.length || read.length ? [GITHUB_BINDING] : []), ...(read.length ? [GITHUB_READ_BINDING] : [])];
+  // GraphQL goes with the sandbox's own tokens: `github` with an allowlist (as before read-only repos,
+  // the operator's own `github` binding included), and the read-only bindings only when nest mints
+  // their token (an operator's binding of that name carries whatever the operator gave it).
+  const tokens = [...(repos.length ? [GITHUB_BINDING] : []), ...readBindings(repos, read, operator).filter((b) => !operator.some((o) => o.name === b))];
   const guards: RequestGuard[] = [
     {
       name: "github-push", hosts: ["github.com"], scope: [{ path: "/**/git-receive-pack" }, RECEIVE_DISCOVERY], allow: webRepo(repos),
@@ -101,16 +109,32 @@ export function githubReadBinding(): InjectionBinding {
 }
 
 /**
- * What a push allowlist and read-only repos add to a sandbox's policy: the guards always (an empty
- * allowlist refuses every push), and with any repo the API host (for `gh`) and the binding its token is
- * injected under; with read-only repos, the read-only binding too.
+ * The bindings a sandbox's read-only token goes out under: `github_read`, and with no allowlist
+ * `github_read_default` (the guest's default placeholder) unless an operator binding already takes
+ * that name or placeholder (`operator`: the operator's layer's bindings).
  */
-export function githubEgress(allowlist: readonly string[], readOnly: readonly string[] = []): PolicyFragment {
+export function readBindings(allowlist: readonly string[], readOnly: readonly string[], operator: readonly InjectionBinding[] = []): string[] {
+  const read = readOnlyRepos(allowlist, readOnly);
+  if (!read.length) return [];
+  const taken = operator.some((o) => o.name === GITHUB_BINDING || o.name === GITHUB_READ_DEFAULT_BINDING || o.placeholder === GITHUB_PLACEHOLDER);
+  return [GITHUB_READ_BINDING, ...(canonicalRepos(allowlist).length || taken ? [] : [GITHUB_READ_DEFAULT_BINDING])];
+}
+
+/**
+ * What a push allowlist and read-only repos add to a sandbox's policy: the guards always (an empty
+ * allowlist refuses every push), and with any repo the API host (for `gh`) and the bindings its tokens
+ * are injected under (`operator`: the operator's layer's bindings, which win over these by name).
+ */
+export function githubEgress(allowlist: readonly string[], readOnly: readonly string[] = [], operator: readonly InjectionBinding[] = []): PolicyFragment {
   const repos = canonicalRepos(allowlist);
   const read = readOnlyRepos(repos, readOnly);
+  const readOnes = readBindings(repos, read, operator);
   return {
     allow: repos.length || read.length ? [{ host: "api.github.com" }] : [],
-    inject: [...(repos.length || read.length ? [githubBinding()] : []), ...(read.length ? [githubReadBinding()] : [])],
-    guards: githubGuards(repos, read),
+    inject: [
+      ...(repos.length ? [githubBinding()] : []),
+      ...readOnes.map((name) => (name === GITHUB_READ_BINDING ? githubReadBinding() : { ...githubBinding(), name })),
+    ],
+    guards: githubGuards(repos, read, operator),
   };
 }

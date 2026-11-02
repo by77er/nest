@@ -25,7 +25,7 @@ import {
 import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
 import { ClientOutbox } from "../lib/client-events";
-import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress } from "../lib/rules/github";
+import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, readBindings } from "../lib/rules/github";
 import type { MintedInjection } from "./broker";
 import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
@@ -77,6 +77,8 @@ const OPERATOR_LAYER = "workstream" as const;
 const LAYER_KEY = "ws_layer";
 /** Each attached agent's read-only repos, by agent (`agent_repos` holds their push allowlists). */
 const AGENT_READ_REPOS = "agent_read_repos";
+/** Set once a read-only token was asked for, so a sandbox without any never asks BrokerDO to forget one. */
+const READ_MINTED = "read_token";
 /** A push allowlist and read-only repos, compared as one. */
 const accessKey = (a: { push: string[]; read: string[] }): string => `${a.push.join()}|${a.read.join()}`;
 
@@ -230,6 +232,10 @@ export class SandboxDO extends DurableObject<Env> {
   private get<T>(key: string): T | undefined {
     const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray()[0];
     return row ? (JSON.parse(row.value) as T) : undefined;
+  }
+
+  private del(key: string): void {
+    this.sql.exec("DELETE FROM kv WHERE key = ?", key);
   }
 
   private put(key: string, value: unknown): void {
@@ -829,7 +835,7 @@ export class SandboxDO extends DurableObject<Env> {
     const info = this.info_();
     const ws = this.operatorLayer();
     const access = this.repoAccess();
-    const gh = githubEgress(access.push, access.read);
+    const gh = githubEgress(access.push, access.read, ws.inject);
     const inject = [...ws.inject, ...gh.inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
     const allow: AllowRule[] = [
       ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
@@ -994,14 +1000,33 @@ export class SandboxDO extends DurableObject<Env> {
         later(Date.now() + INJECT_RETRY_MS);
       }
     };
+    /** A token no longer wanted is deleted (an empty source forgets it); a failure leaves it unpushed, retried with the next push. */
+    const forget = async (call: () => Promise<unknown>) => {
+      try {
+        await call();
+      } catch (e) {
+        console.warn(`sandbox ${before.sandbox}: forgetting a GitHub token it no longer needs failed`, e);
+        later(Date.now() + INJECT_RETRY_MS);
+      }
+    };
+    const none = { kind: "github_app" as const, repos: [] };
     if (!mint && !mintRead && force) await broker.forgetInjections(before.sandbox);
-    // No allowlist but read-only repos: a push token held from before goes (an empty source forgets it).
-    else if (!mint && force && !own(GITHUB_BINDING)) await broker.injectionSecret(target, { kind: "github_app", binding: GITHUB_BINDING, repos: [] }, "SandboxDO");
+    else if (force) {
+      if (!mint && !own(GITHUB_BINDING)) await forget(() => broker.injectionSecret(target, { ...none, binding: GITHUB_BINDING }, "SandboxDO"));
+      // Only a sandbox that had read-only repos asks (a BrokerDO of the previous release lacks the method).
+      if (!mintRead && !own(GITHUB_READ_BINDING) && this.get(READ_MINTED)) {
+        await forget(async () => {
+          await broker.readInjectionSecret(target, { ...none, binding: GITHUB_READ_BINDING }, "SandboxDO");
+          this.del(READ_MINTED);
+        });
+      }
+    }
     if (mint) {
       await minted("GitHub token", () => broker.injectionSecret(target, { kind: "github_app", binding: GITHUB_BINDING, repos: access.push }, "SandboxDO"), [GITHUB_BINDING]);
     }
     if (mintRead) {
-      const bindings = [GITHUB_READ_BINDING, ...(access.push.length || own(GITHUB_BINDING) ? [] : [GITHUB_BINDING])];
+      this.put(READ_MINTED, true);
+      const bindings = readBindings(access.push, access.read, ws.inject).filter((b) => !own(b));
       await minted("read-only GitHub token", () => broker.readInjectionSecret(target, { kind: "github_app", binding: GITHUB_READ_BINDING, repos: access.read }, "SandboxDO"), bindings);
     }
     const after = this.info_();

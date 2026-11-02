@@ -74,6 +74,9 @@ export class BrokerDO extends DurableObject<Env> {
    */
   private readonly injectionRequests = new Map<string, number>();
   private injectionSeq = 0;
+  /** `githubApp`'s lookup in flight, and when an App nothing could tell may be asked about again, per configured `app_id` (memory only). */
+  private readonly appLookups = new Map<string, Promise<{ app_id: number; app_slug?: string } | null>>();
+  private readonly appUnknownUntil = new Map<string, number>();
   /** Imported caller-identity signing keys by kid (memory only; rebuilt from the stored JWK after an eviction). */
   private readonly identitySigners = new Map<string, Promise<CryptoKey>>();
   /** MCP servers' OAuth tokens (lib/mcp-auth.ts); its tables are read by nothing else. */
@@ -505,19 +508,31 @@ export class BrokerDO extends DurableObject<Env> {
   /**
    * The GitHub App's identity, for API clients (docs/control-plane/api/clients/#github-tokens): its
    * numeric id (what a required status check pins to an App) and its slug. Not secret. Read with
-   * `GET /app` and the App's JWT, kept a day per configured App; when GitHub doesn't answer, the id
-   * its credentials name if that is the numeric one (GitHub also takes the client id as the JWT's
-   * issuer), kept 10 minutes. Null when no App is configured or nothing can tell; never throws for
-   * GitHub's sake.
+   * `GET /app` and the App's JWT, kept a day per configured App, one lookup at a time. When GitHub
+   * doesn't answer: what was read before, else the id its credentials name if that is the numeric one
+   * (GitHub also takes the client id as the JWT's issuer), each kept 10 minutes; else null, and nobody
+   * asks again for 10 minutes. Null too when no App is configured. Never throws for GitHub's sake.
    */
   async githubApp(): Promise<{ app_id: number; app_slug?: string } | null> {
     const app = this.secret("github_app");
     const creds = app ? parseAppSecret(app.value) : null;
     if (!creds) return null;
-    const now = Date.now();
     const known = this.sql.exec<{ app_id: number; slug: string | null; expires_ms: number }>(
       "SELECT app_id, slug, expires_ms FROM github_app_identity WHERE configured = ?", creds.app_id).toArray()[0];
-    if (known && known.expires_ms > now) return { app_id: known.app_id, ...(known.slug ? { app_slug: known.slug } : {}) };
+    const answer = (k: { app_id: number; slug: string | null }) => ({ app_id: k.app_id, ...(k.slug ? { app_slug: k.slug } : {}) });
+    if (known && known.expires_ms > Date.now()) return answer(known);
+    if ((this.appUnknownUntil.get(creds.app_id) ?? 0) > Date.now()) return null;
+    // One lookup at a time per configured App: concurrent callers share it.
+    let lookup = this.appLookups.get(creds.app_id);
+    if (!lookup) {
+      lookup = this.lookupApp(creds).finally(() => this.appLookups.delete(creds.app_id));
+      this.appLookups.set(creds.app_id, lookup);
+    }
+    return await lookup;
+  }
+
+  /** {@link githubApp}'s `GET /app`, and what it keeps; never throws. */
+  private async lookupApp(creds: { app_id: string; private_key: string }): Promise<{ app_id: number; app_slug?: string } | null> {
     const keep = (app_id: number, slug: string | null, ttl: number) => {
       this.sql.exec(`INSERT INTO github_app_identity (configured, app_id, slug, expires_ms) VALUES (?, ?, ?, ?)
         ON CONFLICT(configured) DO UPDATE SET app_id = excluded.app_id, slug = excluded.slug, expires_ms = excluded.expires_ms`,
@@ -530,8 +545,19 @@ export class BrokerDO extends DurableObject<Env> {
       return { app_id: a.id, app_slug: a.slug };
     } catch (e) {
       console.warn("BrokerDO: reading the GitHub App's identity (GET /app) failed", e instanceof Error ? e.message : e);
-      const id = /^[1-9][0-9]{0,15}$/.test(creds.app_id) ? Number(creds.app_id) : null;
-      if (id === null || !Number.isSafeInteger(id)) return null;
+      // What it was is still what it is (an App's id never changes): served, and asked again later.
+      const stale = this.sql.exec<{ app_id: number; slug: string | null }>(
+        "SELECT app_id, slug FROM github_app_identity WHERE configured = ?", creds.app_id).toArray()[0];
+      const id = /^[1-9][0-9]{0,15}$/.test(creds.app_id) && Number.isSafeInteger(Number(creds.app_id)) ? Number(creds.app_id) : null;
+      if (stale && (id === null || stale.app_id === id)) {
+        keep(stale.app_id, stale.slug, APP_IDENTITY_RETRY_MS);
+        return { app_id: stale.app_id, ...(stale.slug ? { app_slug: stale.slug } : {}) };
+      }
+      if (id === null) {
+        // Nothing to tell (a client id configured): callers don't each wait out GitHub meanwhile.
+        this.appUnknownUntil.set(creds.app_id, Date.now() + APP_IDENTITY_RETRY_MS);
+        return null;
+      }
       keep(id, null, APP_IDENTITY_RETRY_MS);
       return { app_id: id };
     }
