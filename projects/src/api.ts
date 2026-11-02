@@ -4,7 +4,8 @@
 import type { z } from "zod";
 import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
-import { nestFrom } from "./nest";
+import { type AgentRecord, type Lookup, managerStatus } from "./manager";
+import { NestError, nestFrom } from "./nest";
 import { Answer, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 
@@ -101,6 +102,24 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST attach":
       return done(await withReviews(env, pid, await p.retryAttach()));
+    case "GET manager": {
+      // The manager's status for its page: the project's record, then nest's agent record once it has one.
+      const s = await p.getSettings();
+      if (!s.ok) return done(s);
+      let lookup: Lookup | null = null;
+      if (s.value.attached && s.value.manager) {
+        const nest = nestFrom(env);
+        if (!nest) lookup = { failed: "NEST_CLIENT_TOKEN is not set" };
+        else {
+          try {
+            lookup = { record: (await nest.getAgent(s.value.manager)) as AgentRecord };
+          } catch (e) {
+            lookup = e instanceof NestError && e.status === 404 ? { gone: true } : { failed: e instanceof Error ? e.message : String(e) };
+          }
+        }
+      }
+      return json(managerStatus(s.value, lookup));
+    }
     case "GET reviews":
       return json(await review(env, pid).jobs());
     case "GET tasks":

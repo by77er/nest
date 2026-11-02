@@ -31,7 +31,8 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
 
   return (
     <Section
-      title="Board"
+      title="Tasks"
+      count={tasks.data?.length}
       actions={
         <Toolbar>
           <Switch label="Show cancelled" checked={showCancelled} onChange={(e) => setShowCancelled(e.currentTarget.checked)} />

@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { Ask, ChatMessage, HistoryRow, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { Ask, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
 
 export interface Write {
   method: string;
@@ -43,6 +43,8 @@ export class FakeApi {
   chat: ChatMessage[] = [];
   asks: Ask[] = [];
   sync: SyncState | null = null;
+  reviews: Job[] = [];
+  manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
   /** Answers to give instead, by `METHOD path` pattern, once each. */
   readonly failures: { match: RegExp; status: number; error: string }[] = [];
@@ -101,6 +103,13 @@ export class FakeApi {
         this.tasks.push(n);
         return json(n, 201);
       }
+      case "GET manager":
+        return json(this.manager);
+      case "POST attach":
+        this.manager = { ...this.manager, phase: "starting", error: null };
+        return json(p.settings);
+      case "GET reviews":
+        return json(this.reviews);
       case "GET chat":
         return json(this.chat);
       case "POST chat": {

@@ -24,3 +24,20 @@ export function Bubble({ side, children, ...data }: { side: "start" | "end" | "n
     </Box>
   );
 }
+
+/**
+ * What stays at the viewport's bottom while the page scrolls above it (a conversation's composer): on
+ * the page's ground, with a hairline above, the page's width.
+ */
+export function PinnedFooter({ children }: { children: ReactNode }) {
+  return (
+    <Box
+      pt="md"
+      pb="lg"
+      data-ds="pinned-footer"
+      style={{ position: "sticky", bottom: 0, zIndex: 1, background: "var(--nest-page-bg)", borderTop: "var(--nest-border)" }}
+    >
+      {children}
+    </Box>
+  );
+}

@@ -7,6 +7,9 @@ export type { Ask, ChatMessage, HistoryRow, Settings, Task } from "../../do/proj
 export type { ProjectRow, SyncState } from "../../do/directory";
 export type { AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";
 export type { Spec, TaskState } from "../../tasks";
+export type { ManagerPhase, ManagerStatus } from "../../manager";
+export type { Job, JobState } from "../../do/review";
+export type { Dimension, Verdict } from "../../github";
 
 /** `GET /api/projects/<id>`. */
 export type Project = ProjectRow & { settings: Settings };

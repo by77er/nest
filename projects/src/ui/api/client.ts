@@ -3,7 +3,7 @@
 
 import type {
   AnswerBody, Ask, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
-  Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
+  Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
 } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
@@ -63,6 +63,10 @@ export const api = {
   postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean }>("POST", `${prj(id)}/chat`, b),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),
+
+  manager: (id: string) => call<ManagerStatus>("GET", `${prj(id)}/manager`),
+  retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
+  reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
 
   syncState: () => call<SyncState | null>("GET", "/admin/sync-state"),
   sync: () => call<SyncResult>("POST", "/admin/sync"),

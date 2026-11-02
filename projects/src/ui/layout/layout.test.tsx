@@ -7,7 +7,7 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { cssVariablesResolver, motion, theme } from "../theme";
-import { ErrorState, FieldGroup, LoadingState, PageHeader, Panel, Section, Toolbar } from ".";
+import { AppFrame, ErrorState, FieldGroup, LoadingState, Page, PageHeader, Panel, PinnedFooter, Section, Toolbar } from ".";
 
 const wrap = (ui: ReactNode) => render(<MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">{ui}</MantineProvider>);
 /** Whether `a` comes before `b` in the document. */
@@ -121,5 +121,51 @@ describe("Panel", () => {
     );
     expect(style(screen.getByTestId("plain"))).toContain("var(--nest-surface)");
     expect(style(screen.getByTestId("banner"))).toContain("var(--mantine-color-warning-light)");
+  });
+});
+
+describe("AppFrame", () => {
+  it("puts the brand, then the places, then the footer, in the sidebar; the page beside it", () => {
+    wrap(
+      <AppFrame brand={<a href="/">nest</a>} nav={() => <a href="/projects">Projects</a>} navFooter={() => <a href="/admin">Admin</a>}>
+        <p>the page</p>
+      </AppFrame>,
+    );
+    const bar = screen.getByRole("navigation", { name: "Sidebar" });
+    const [brand, places, footer] = ["nest", "Projects", "Admin"].map((n) => within(bar).getByRole("link", { name: n }));
+    expect(before(brand!, places!) && before(places!, footer!)).toBe(true);
+    expect(within(screen.getByRole("main")).getByText("the page")).toBeInTheDocument();
+    expect(bar).toHaveAttribute("id", "sidebar");
+  });
+
+  it("the burger toggles the drawer and closes it when a place is picked", async () => {
+    wrap(
+      <AppFrame brand={<span>nest</span>} nav={(close) => <button onClick={close}>Board</button>}>
+        <p />
+      </AppFrame>,
+    );
+    const user = userEvent.setup();
+    const bar = screen.getByRole("navigation", { name: "Sidebar" });
+    expect(bar).not.toHaveAttribute("data-opened");
+    await user.click(screen.getByRole("button", { name: "Open the menu" }));
+    expect(bar).toHaveAttribute("data-opened");
+    await user.click(within(bar).getByRole("button", { name: "Board" }));
+    expect(bar).not.toHaveAttribute("data-opened");
+  });
+});
+
+describe("Page and PinnedFooter", () => {
+  it("a reading page keeps its content to the reading measure; a pinned footer sticks to the bottom", () => {
+    wrap(
+      <Page measure="reading">
+        <PinnedFooter>
+          <button>Send</button>
+        </PinnedFooter>
+      </Page>,
+    );
+    const footer = screen.getByRole("button", { name: "Send" }).closest("[data-ds=pinned-footer]")!;
+    expect(style(footer)).toMatch(/position:\s*sticky/);
+    expect(style(footer)).toMatch(/bottom:\s*0/);
+    expect(style(footer.parentElement!)).toContain("var(--nest-reading-measure)");
   });
 });

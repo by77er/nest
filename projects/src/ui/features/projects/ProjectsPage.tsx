@@ -45,7 +45,7 @@ export function ProjectsPage() {
           {projects.data.map((p) => (
             <Panel key={p.id} component="article" aria-label={p.name}>
               <Stack gap="sm">
-                <AnchorLink to="/projects/$projectId" params={{ projectId: p.id }} search={{}} c="bright" fw="bold" fz="lg">
+                <AnchorLink to="/projects/$projectId/board" params={{ projectId: p.id }} search={{}} c="bright" fw="bold" fz="lg">
                   {p.name}
                 </AnchorLink>
                 <MetaRow>
@@ -72,7 +72,7 @@ export function ProjectsPage() {
             if (!p.catalog_synced) {
               notifications.show({ color: "warning", title: "The catalog wasn't synced", message: "Its agents may not push to the repo yet: run the sync from Admin." });
             }
-            void navigate({ to: "/projects/$projectId", params: { projectId: p.id }, search: {} });
+            void navigate({ to: "/projects/$projectId/board", params: { projectId: p.id }, search: {} });
           }}
         />
       </Modal>

@@ -103,6 +103,10 @@ export const layout = {
   /** A readable measure, for a page of forms or prose (admin). */
   measure: "45rem",
   headerHeight: "3.5rem",
+  /** The persistent sidebar (projects and their pages), from `md` on; a drawer below. */
+  sidebar: "16.5rem",
+  /** A comfortable reading line for a conversation (the Manager page): about 70 characters. */
+  readingMeasure: "42rem",
   /** The chat beside the board, from `lg` on: under a third of the width. */
   sidePanel: "20rem",
   /** A board column's least width: from `md` on (all six beside the chat at 1280 px), and below. */
@@ -144,6 +148,8 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
       "--nest-page-max": layout.pageMax,
       "--nest-measure": layout.measure,
       "--nest-header-height": layout.headerHeight,
+      "--nest-sidebar": layout.sidebar,
+      "--nest-reading-measure": layout.readingMeasure,
       "--nest-side-panel": layout.sidePanel,
       "--nest-column-min": layout.column.min,
       "--nest-column-min-narrow": layout.column.minNarrow,

@@ -1,22 +1,56 @@
-// The frame around every page: a header (the product's name left, its places right) on the surface,
-// over the content on the page's ground.
+// The frame around every page: a persistent sidebar on the surface (the product's name, the places, and
+// a footer pinned to its bottom) beside the content on the page's ground. Below `md` the sidebar is a
+// drawer behind a burger in a slim header; it collapses in 180 ms (motion `base`), honouring reduced
+// motion, and closes when the owner picks a place.
 
-import { AppShell, Group } from "@mantine/core";
+import { AppShell, Burger, Group, ScrollArea } from "@mantine/core";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import type { ReactNode } from "react";
+import { layout, motion } from "../theme";
 
-export function AppFrame({ brand, nav, children }: { brand: ReactNode; nav?: ReactNode; children: ReactNode }) {
+export interface AppFrameProps {
+  /** The product's name, a link home. */
+  brand: ReactNode;
+  /** The sidebar's places; `close` closes the drawer (call it when a place is picked). */
+  nav: (close: () => void) => ReactNode;
+  /** What stays at the sidebar's bottom (Admin). */
+  navFooter?: (close: () => void) => ReactNode;
+  children: ReactNode;
+}
+
+export function AppFrame({ brand, nav, navFooter, children }: AppFrameProps) {
+  const [opened, { toggle, close }] = useDisclosure(false);
+  // `md` and up: the sidebar is always there, and the header isn't needed.
+  const narrow = useMediaQuery("(max-width: 61.99em)") ?? false;
   return (
-    <AppShell header={{ height: "var(--nest-header-height)" }} padding={0}>
-      <AppShell.Header px={{ base: "lg", sm: "xl", md: "2xl" }} style={{ background: "var(--nest-surface)", borderBottom: "var(--nest-border)" }}>
-        <Group h="100%" justify="space-between" wrap="nowrap" gap="lg">
+    <AppShell
+      header={{ height: "var(--nest-header-height)", collapsed: !narrow }}
+      navbar={{ width: layout.sidebar, breakpoint: "md", collapsed: { mobile: !opened } }}
+      padding={0}
+      transitionDuration={motion.base}
+      transitionTimingFunction={motion.enter}
+    >
+      <AppShell.Header px="lg" style={{ background: "var(--nest-surface)", borderBottom: "var(--nest-border)" }}>
+        <Group h="100%" gap="md" wrap="nowrap">
+          <Burger opened={opened} onClick={toggle} size="sm" aria-label={opened ? "Close the menu" : "Open the menu"} aria-expanded={opened} aria-controls="sidebar" />
           {brand}
-          {nav && (
-            <Group gap="lg" component="nav" aria-label="Main" wrap="nowrap">
-              {nav}
-            </Group>
-          )}
         </Group>
       </AppShell.Header>
+      <AppShell.Navbar id="sidebar" aria-label="Sidebar" style={{ background: "var(--nest-surface)", borderRight: "var(--nest-border)" }} data-ds="sidebar" data-opened={opened || undefined}>
+        {!narrow && (
+          <AppShell.Section px="lg" style={{ height: "var(--nest-header-height)", display: "flex", alignItems: "center" }}>
+            {brand}
+          </AppShell.Section>
+        )}
+        <AppShell.Section grow component={ScrollArea} px="sm" py="sm">
+          <nav aria-label="Main">{nav(close)}</nav>
+        </AppShell.Section>
+        {navFooter && (
+          <AppShell.Section px="sm" py="sm" style={{ borderTop: "var(--nest-border)" }}>
+            {navFooter(close)}
+          </AppShell.Section>
+        )}
+      </AppShell.Navbar>
       <AppShell.Main style={{ background: "var(--nest-page-bg)" }}>{children}</AppShell.Main>
     </AppShell>
   );

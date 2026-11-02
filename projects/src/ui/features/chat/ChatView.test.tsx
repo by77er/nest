@@ -1,11 +1,11 @@
-// The chat with the manager: the log as the Worker keeps it, undelivered messages flagged with why, and
-// the composer posting the owner's words.
+// The chat with the manager, on its own page (/projects/:id/manager): the log as the Worker keeps it,
+// undelivered messages flagged with why, and the composer posting the owner's words.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
-const chat = () => screen.findByRole("region", { name: "Manager" });
+const chat = () => screen.findByRole("tabpanel", { name: "Chat" });
 
 describe("the chat", () => {
   it("shows the manager's replies and flags only the owner's undelivered messages, with the reason", async () => {
@@ -16,7 +16,7 @@ describe("the chat", () => {
       { seq: 3, at_ms: 3, sender: "owner", text: "And a fourth", delivered: false, error: "the manager isn't started yet" },
       { seq: 4, at_ms: 4, sender: "app", text: "The manager ended (exited).", delivered: true, error: null },
     ];
-    renderApp("/projects/prj_one", api);
+    renderApp("/projects/prj_one/manager", api);
     const c = await chat();
 
     await within(c).findByText("Three tasks, coming up");
@@ -30,7 +30,7 @@ describe("the chat", () => {
 
   it("sends what the owner wrote, trimmed, and clears the composer", async () => {
     const api = new FakeApi();
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
 
     const box = within(c).getByLabelText("Message to the manager");
@@ -46,7 +46,7 @@ describe("the chat", () => {
   it("gives the text back to the composer when the message isn't taken", async () => {
     const api = new FakeApi();
     api.fail(/^POST .*\/chat$/, 503, "ProjectDO is unavailable");
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
 
     const box = within(c).getByLabelText("Message to the manager");
@@ -54,22 +54,5 @@ describe("the chat", () => {
     expect(await screen.findByText("ProjectDO is unavailable")).toBeInTheDocument();
     await waitFor(() => expect(box).toHaveValue("Hello"));
     expect(within(c).queryByText("Hello", { selector: "p" })).toBeNull();
-  });
-
-  it("collapses, giving the board the width, and stays as the owner left it", async () => {
-    window.localStorage.clear();
-    const first = renderApp("/projects/prj_one");
-    await chat();
-    await first.user.click(screen.getByRole("button", { name: "Hide chat" }));
-    expect(screen.queryByRole("region", { name: "Manager" })).toBeNull();
-    expect(screen.getByRole("heading", { name: "Board" })).toBeInTheDocument();
-    first.unmount();
-
-    const again = renderApp("/projects/prj_one");
-    await screen.findByRole("heading", { name: "Board" });
-    expect(screen.queryByRole("region", { name: "Manager" })).toBeNull();
-    await again.user.click(screen.getByRole("button", { name: "Show chat" }));
-    expect(await chat()).toBeInTheDocument();
-    window.localStorage.clear();
   });
 });
