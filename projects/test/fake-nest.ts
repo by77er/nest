@@ -1,10 +1,11 @@
-// A fake of nest's client interface, as docs/control-plane/api/clients/ and docs/interfaces/remote-mcp/
+// A fake of nest's client interface and of the GitHub API the app calls with the tokens nest mints it: as docs/control-plane/api/clients/ and docs/interfaces/remote-mcp/
 // describe it: the routes the app calls (answering as nest does: a create's cell in its body, refused
 // outside the grant's; a create's Idempotency-Key replayed, conflicting or in progress), the JWKS behind Nest-Identity, and helpers that sign identity tokens, Access tokens and
 // webhooks the way nest and Cloudflare do. It replaces the global fetch, which the Worker and its Durable
 // Objects share with the tests in the pool, and records every call.
 
 import { env, SELF } from "cloudflare:test";
+import { GITHUB_API, signGithub } from "../src/github";
 import { sign as signWebhook } from "../src/webhook";
 
 export const NEST = "https://nest.test";
@@ -47,6 +48,7 @@ let seq = 0;
 const id = (prefix: string) => `${prefix}${(++seq).toString(36)}${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
 
 export class FakeNest {
+  readonly github = new FakeGitHub();
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
   readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean }>();
@@ -175,7 +177,14 @@ export class FakeNest {
       return json(200, { ok: true });
     }
     if (r === "POST /v1/clients/self/github-token") {
-      return json(200, { token: "ghs_fake", expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: call.body.repo.toLowerCase(), permissions: call.body.permissions });
+      // Within the grant (README.md#how-it-uses-nest), as nest checks it: the repo and each permission.
+      const { repo, permissions } = call.body as { repo: string; permissions: Record<string, string> };
+      if (!Object.keys(permissions ?? {}).length) return nestErr(400, "invalid", "name at least one permission");
+      for (const [k, v] of Object.entries(permissions)) {
+        if (!levelWithin(v, GRANT_PERMISSIONS[k])) return nestErr(403, "forbidden", `${k}: ${v} is outside the grant`);
+      }
+      const token = this.github.mint(repo, permissions);
+      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions });
     }
     return nestErr(404, "not_found", `no route for ${r}`);
   }
@@ -199,6 +208,7 @@ export function installFetch(fake: FakeNest, access?: () => unknown): () => void
     const req = new Request(input as RequestInfo, init);
     const u = new URL(req.url);
     if (u.origin === NEST) return fake.handle(req);
+    if (u.origin === GITHUB_API) return fake.github.handle(req);
     if (access && req.url === `${TEAM}/cdn-cgi/access/certs`) return Response.json(access());
     throw new Error(`unexpected fetch ${req.url}`);
   }) as typeof fetch;
@@ -314,3 +324,235 @@ export async function eventually<T>(f: () => T | Promise<T>, what: string): Prom
     await new Promise((r) => setTimeout(r, 25));
   }
 }
+
+// --- GitHub --------------------------------------------------------------------------------------------
+
+/** The GitHub App's id, as GitHub answers it in a check run's `app.id`. */
+export const GH_APP_ID = 4242;
+
+/** The app's grant's `github.permissions` (README.md#how-it-uses-nest). */
+export const GRANT_PERMISSIONS: Record<string, string> = { checks: "write", administration: "write", metadata: "read" };
+const RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
+const levelWithin = (want: string, have: string | undefined) => !!have && !!RANK[want] && RANK[want]! <= RANK[have]!;
+
+export interface FakeCheckRun {
+  id: number;
+  repo: string;
+  name: string;
+  head_sha: string;
+  external_id: string | null;
+  details_url: string | null;
+  status: string;
+  conclusion: string | null;
+  output: { title?: string; summary?: string; text?: string } | null;
+  app: { id: number };
+  updates: any[];
+}
+
+/**
+ * GitHub's REST API as https://docs.github.com/en/rest/checks/runs and
+ * https://docs.github.com/en/rest/branches/branch-protection describe it, for the routes the app calls:
+ * each token is a repo's, with its permissions (403 outside them, as GitHub answers an installation
+ * token); branch protection is kept in GET's shape and written by PUT and PATCH.
+ */
+export class FakeGitHub {
+  readonly calls: { method: string; path: string; body: any; token: string | null }[] = [];
+  readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
+  readonly repos = new Map<string, { default_branch: string; protection: Record<string, any> | null }>();
+  readonly checkRuns = new Map<number, FakeCheckRun>();
+  failures: { match: RegExp; status: number; times: number; message?: string }[] = [];
+  /** Check-run creates that are made but whose answer is lost (a 502), as after a timeout. */
+  lost: { match: RegExp; times: number }[] = [];
+  private nextId = 1000;
+
+  mint(repo: string, permissions: Record<string, string>): string {
+    // Low in entropy and made at run time (dev/review-lessons.md 9).
+    const token = `ghs_fake${(++this.nextId).toString().padStart(8, "0")}`;
+    this.tokens.set(token, { repo: repo.toLowerCase(), permissions });
+    return token;
+  }
+
+  fail(match: RegExp, status: number, o: { times?: number; message?: string } = {}): void {
+    this.failures.push({ match, status, times: o.times ?? 1, message: o.message });
+  }
+
+  repo(name: string) {
+    const k = name.toLowerCase();
+    if (!this.repos.has(k)) this.repos.set(k, { default_branch: "main", protection: null });
+    return this.repos.get(k)!;
+  }
+
+  runsOf(repo: string, sha?: string): FakeCheckRun[] {
+    return [...this.checkRuns.values()].filter((c) => c.repo === repo.toLowerCase() && (sha === undefined || c.head_sha === sha));
+  }
+
+  callsTo(method: string, path: RegExp) {
+    return this.calls.filter((c) => c.method === method && path.test(c.path));
+  }
+
+  async handle(req: Request): Promise<Response> {
+    const u = new URL(req.url);
+    const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    const text = await req.text();
+    const token = req.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
+    const call = { method: req.method, path: u.pathname, body: text ? JSON.parse(text) : undefined, token };
+    this.calls.push(call);
+    const route = `${req.method} ${u.pathname}`;
+    const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
+    if (!m) return json(404, { message: "Not Found" });
+    const repoName = m[1]!.toLowerCase();
+    const sub = m[2] ?? "";
+    const t = token ? this.tokens.get(token) : undefined;
+    if (!t) return json(401, { message: "Bad credentials" });
+    if (t.repo !== repoName) return json(404, { message: "Not Found" });
+    const need = (perm: string, level: string) => levelWithin(level, t.permissions[perm]);
+    const denied = () => json(403, { message: "Resource not accessible by integration" });
+    const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
+    if (f) {
+      f.times--;
+      return json(f.status, { message: f.message ?? "injected" });
+    }
+    const repo = this.repo(repoName);
+    let s: RegExpMatchArray | null;
+
+    if (req.method === "GET" && sub === "") {
+      // Metadata, which GitHub grants every installation token; the fake asks for it named.
+      if (!need("metadata", "read")) return denied();
+      return json(200, { full_name: repoName, default_branch: repo.default_branch });
+    }
+    if ((s = sub.match(/^\/branches\/([^/]+)\/protection(\/required_status_checks)?$/))) {
+      if (decodeURIComponent(s[1]!) !== repo.default_branch) return json(404, { message: "Branch not found" });
+      if (!need("administration", req.method === "GET" ? "read" : "write")) return denied();
+      const p = repo.protection;
+      if (!s[2]) {
+        if (req.method === "GET") return p ? json(200, p) : json(404, { message: "Branch not protected" });
+        if (req.method === "PUT") {
+          for (const k of ["required_status_checks", "enforce_admins", "required_pull_request_reviews", "restrictions"]) {
+            if (!(k in call.body)) return json(422, { message: `${k} is required` });
+          }
+          repo.protection = protectionFromPut(call.body, p, this.appOf(repoName));
+          return json(200, repo.protection);
+        }
+      } else {
+        const rsc = p?.required_status_checks;
+        if (!rsc) return json(404, { message: "Required status checks not enabled" });
+        if (req.method === "GET") return json(200, rsc);
+        if (req.method === "PATCH") {
+          p.required_status_checks = statusChecksFrom({ ...call.body, strict: call.body.strict ?? rsc.strict }, this.appOf(repoName), rsc);
+          return json(200, p.required_status_checks);
+        }
+      }
+    }
+    if (sub === "/check-runs" && req.method === "POST") {
+      if (!need("checks", "write")) return denied();
+      const b = call.body;
+      if (typeof b.name !== "string" || !/^[0-9a-f]{40}$/.test(b.head_sha ?? "")) return json(422, { message: "Invalid request" });
+      const run: FakeCheckRun = {
+        id: ++this.nextId, repo: repoName, name: b.name, head_sha: b.head_sha, external_id: b.external_id ?? null, details_url: b.details_url ?? null,
+        status: b.status ?? "queued", conclusion: b.conclusion ?? null, output: b.output ?? null, app: { id: GH_APP_ID }, updates: [],
+      };
+      this.checkRuns.set(run.id, run);
+      const lose = this.lost.find((x) => x.times > 0 && x.match.test(route));
+      if (lose) {
+        lose.times--;
+        return json(502, { message: "Server Error" });
+      }
+      return json(201, run);
+    }
+    if ((s = sub.match(/^\/check-runs\/(\d+)$/)) && req.method === "PATCH") {
+      if (!need("checks", "write")) return denied();
+      const run = this.checkRuns.get(Number(s[1]));
+      if (!run || run.repo !== repoName) return json(404, { message: "Not Found" });
+      const b = call.body;
+      if (b.status === "completed" && !b.conclusion) return json(422, { message: "conclusion is required when status is completed" });
+      run.updates.push(b);
+      if (b.conclusion) {
+        run.status = "completed";
+        run.conclusion = b.conclusion;
+      } else if (b.status) run.status = b.status;
+      if (b.output) run.output = b.output;
+      return json(200, run);
+    }
+    if ((s = sub.match(/^\/commits\/([0-9a-f]{40})\/check-runs$/)) && req.method === "GET") {
+      if (!need("checks", "read")) return denied();
+      const name = u.searchParams.get("check_name");
+      const runs = this.runsOf(repoName, s[1]).filter((r) => !name || r.name === name);
+      return json(200, { total_count: runs.length, check_runs: runs });
+    }
+    return json(404, { message: `no route for ${route}` });
+  }
+
+  /** The app that "recently provided" each check on the repo, as GitHub picks one for an omitted app_id. */
+  private appOf(repo: string): (context: string) => number | null {
+    return (context) => (this.runsOf(repo).some((r) => r.name === context) ? GH_APP_ID : null);
+  }
+}
+
+/** `required_status_checks` in GET's shape from a PUT's or PATCH's (`app_id` -1: any; omitted: GitHub's pick). */
+function statusChecksFrom(b: any, appOf: (c: string) => number | null, before?: any): any {
+  let checks: { context: string; app_id: number | null }[];
+  if (Array.isArray(b.checks)) checks = b.checks.map((c: any) => ({ context: c.context, app_id: c.app_id === undefined ? appOf(c.context) : c.app_id === -1 ? null : c.app_id }));
+  else if (Array.isArray(b.contexts)) checks = b.contexts.map((context: string) => ({ context, app_id: null }));
+  else checks = before?.checks ?? [];
+  return { url: "u", strict: !!b.strict, contexts: checks.map((c) => c.context), checks, contexts_url: "u" };
+}
+
+/** A protection in GET's shape from a PUT body, keeping what PUT doesn't name (required signatures). */
+function protectionFromPut(b: any, before: Record<string, any> | null, appOf: (c: string) => number | null): Record<string, any> {
+  const flag = (v: unknown) => ({ enabled: v === true });
+  const people = (o: any) => ({ users: (o?.users ?? []).map((login: string) => ({ login })), teams: (o?.teams ?? []).map((slug: string) => ({ slug })), apps: (o?.apps ?? []).map((slug: string) => ({ slug })) });
+  const r = b.required_pull_request_reviews;
+  return {
+    url: "u",
+    required_status_checks: b.required_status_checks ? statusChecksFrom(b.required_status_checks, appOf) : undefined,
+    enforce_admins: { url: "u", enabled: b.enforce_admins === true },
+    ...(r ? {
+      required_pull_request_reviews: {
+        url: "u", dismiss_stale_reviews: !!r.dismiss_stale_reviews, require_code_owner_reviews: !!r.require_code_owner_reviews,
+        required_approving_review_count: r.required_approving_review_count ?? 0, require_last_push_approval: !!r.require_last_push_approval,
+        ...(r.dismissal_restrictions ? { dismissal_restrictions: people(r.dismissal_restrictions) } : {}),
+        ...(r.bypass_pull_request_allowances ? { bypass_pull_request_allowances: people(r.bypass_pull_request_allowances) } : {}),
+      },
+    } : {}),
+    ...(b.restrictions ? { restrictions: people(b.restrictions) } : {}),
+    required_linear_history: flag(b.required_linear_history), allow_force_pushes: flag(b.allow_force_pushes), allow_deletions: flag(b.allow_deletions),
+    block_creations: flag(b.block_creations), required_conversation_resolution: flag(b.required_conversation_resolution),
+    lock_branch: flag(b.lock_branch), allow_fork_syncing: flag(b.allow_fork_syncing),
+    required_signatures: before?.required_signatures ?? { url: "u", enabled: false },
+  };
+}
+
+/** POST one event to /hooks/github, signed as GitHub signs it (or with what `o` changes). */
+export async function deliverGithub(event: string, payload: unknown, o: { secret?: string; signature?: string | null; delivery?: string | null; raw?: string } = {}): Promise<Response> {
+  const body = o.raw ?? JSON.stringify(payload);
+  const signature = o.signature === undefined ? await signGithub(o.secret ?? env.GITHUB_WEBHOOK_SECRET!, new TextEncoder().encode(body)) : o.signature;
+  const delivery = o.delivery === undefined ? crypto.randomUUID() : o.delivery;
+  return SELF.fetch(`${APP}/hooks/github`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json", "x-github-event": event,
+      ...(signature === null ? {} : { "x-hub-signature-256": signature }), ...(delivery === null ? {} : { "x-github-delivery": delivery }),
+    },
+    body,
+  });
+}
+
+/** A `pull_request` event's payload, in the fields GitHub sends that the app reads. */
+export function prEvent(o: {
+  repo: string; number: number; sha: string; action: string; ref?: string; base?: string; title?: string; merged?: boolean; updated_at?: string; headRepo?: string;
+}) {
+  return {
+    action: o.action, number: o.number,
+    pull_request: {
+      number: o.number, title: o.title ?? `PR ${o.number}`, state: o.action === "closed" ? "closed" : "open", merged: o.merged ?? false,
+      updated_at: o.updated_at ?? new Date().toISOString(),
+      head: { sha: o.sha, ref: o.ref ?? `feature-${o.number}`, repo: { full_name: o.headRepo ?? o.repo } },
+      base: { ref: o.base ?? "main", repo: { full_name: o.repo } },
+    },
+    repository: { full_name: o.repo },
+    installation: { id: 1 },
+  };
+}
+
+/** A 40-hex commit id. */
+export const shaOf = (seed: string) => [...seed].map((c) => c.charCodeAt(0).toString(16)).join("").padEnd(40, "0").slice(0, 40);

@@ -9,8 +9,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { TEMPLATE } from "../catalog";
 import { directory, type Env } from "../env";
+import { type AttachChange, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { NestError, nestFrom, type Labels, type Nest } from "../nest";
+import { backoff, NestError, nestFrom, type Nest } from "../nest";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { pickForAssignment, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition } from "../tasks";
@@ -26,7 +27,21 @@ export interface Settings {
   max_workers: number;
   manager: string | null;
   manager_error: string | null;
+  /** Whether the repo is attached: the review check required on its default branch (README.md#flows). */
+  attached: boolean;
+  /** Why the last attach failed; `POST /api/projects/:id/attach` tries again. */
+  attach_error: string | null;
+  /** What the last attach that succeeded did. */
+  attach: AttachDetail | null;
   created_ms: number;
+}
+
+export interface AttachDetail {
+  branch: string;
+  change: AttachChange;
+  /** The GitHub App the check is required from; null: from any source, until the App's id is known. */
+  app_id: number | null;
+  at_ms: number;
 }
 
 export interface Task {
@@ -80,8 +95,6 @@ export interface Ask {
 export type Actor = { kind: "owner" } | { kind: "app"; what: string } | { kind: "agent"; agent: string; tainted: boolean };
 
 const MAX_WORKERS_LIMIT = 20;
-/** Retry waits for work owed to nest: from 5 s, doubling, to 5 min. */
-const backoff = (attempts: number) => Math.min(5_000 * 2 ** Math.max(0, attempts - 1), 300_000);
 /** How long a deduplicated MCP call's answer is kept (nest retries a lost answer within minutes). */
 const CALLS_KEEP_MS = 24 * 3600 * 1000;
 
@@ -102,6 +115,16 @@ const MIGRATIONS = [
     "CREATE TABLE errors (seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE, at_ms INTEGER NOT NULL, agent TEXT NOT NULL, role TEXT, task TEXT, code TEXT, message TEXT)",
     "CREATE TABLE stops (agent TEXT PRIMARY KEY, task TEXT, reason TEXT NOT NULL, next_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT)",
     "CREATE TABLE mcp_calls (key TEXT PRIMARY KEY, result TEXT NOT NULL, at_ms INTEGER NOT NULL)",
+  ],
+  [
+    // Attaching the repo on GitHub (README.md#flows), which the manager's start waits for.
+    "ALTER TABLE settings ADD COLUMN attached_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN attach_next_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN attach_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN attach_error TEXT",
+    "ALTER TABLE settings ADD COLUMN attach_detail TEXT",
+    // A project made before attaching existed attaches at its next alarm.
+    "UPDATE settings SET attach_next_ms = 0",
   ],
 ] as const;
 
@@ -129,8 +152,8 @@ export class ProjectDO extends DurableObject<Env> {
   async init(p: { id: string; name: string; repo: string; auto_assign?: boolean; max_workers?: number }): Promise<Settings> {
     if (!this.settingsRow()) {
       this.sql.exec(
-        "INSERT INTO settings (id, name, repo, auto_assign, max_workers, manager_next_ms, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        p.id, p.name, p.repo, p.auto_assign ? 1 : 0, clampWorkers(p.max_workers ?? 2), Date.now(), Date.now(),
+        "INSERT INTO settings (id, name, repo, auto_assign, max_workers, attach_next_ms, manager_next_ms, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        p.id, p.name, p.repo, p.auto_assign ? 1 : 0, clampWorkers(p.max_workers ?? 2), Date.now(), Date.now(), Date.now(),
       );
       await this.arm();
     }
@@ -146,7 +169,9 @@ export class ProjectDO extends DurableObject<Env> {
     if (!r) return null;
     return {
       id: r.id as string, name: r.name as string, repo: r.repo as string, auto_assign: r.auto_assign === 1, max_workers: r.max_workers as number,
-      manager: (r.manager as string | null) ?? null, manager_error: (r.manager_error as string | null) ?? null, created_ms: r.created_ms as number,
+      manager: (r.manager as string | null) ?? null, manager_error: (r.manager_error as string | null) ?? null,
+      attached: r.attached_ms !== null, attach_error: (r.attach_error as string | null) ?? null,
+      attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null, created_ms: r.created_ms as number,
     };
   }
 
@@ -334,6 +359,61 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.toTask(this.taskRow(id)!));
   }
 
+  // --- the repo on GitHub ----------------------------------------------------------------------------
+
+  /** Attach the repo again now (the board's retry after a failure; harmless when attached). */
+  async retryAttach(): Promise<Result<Settings>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    this.sql.exec("UPDATE settings SET attach_next_ms = ?, attach_attempts = 0", Date.now());
+    await this.arm();
+    await this.drain();
+    return ok(this.settings()!);
+  }
+
+  /** The App's id is known (from a check run it made): attach again to require the check from it. */
+  async appIdLearned(appId: number): Promise<void> {
+    const s = this.settings();
+    if (!s?.attached || s.attach?.app_id === appId) return;
+    this.sql.exec("UPDATE settings SET attach_next_ms = ?, attach_attempts = 0", Date.now());
+    await this.arm();
+  }
+
+  /**
+   * A PR on the repo opened or closed (GitHub's `pull_request`, routed here by the Worker). `task` is the
+   * task its branch names (`task/<id>`, from the repo itself, not a fork), when it does:
+   * - opened: the PR is linked to its task (`pr_opened`), if the worker hadn't reported it;
+   * - merged: its task is done, and its worker ended;
+   * - closed without merging: noted in the task's history; the task stays as it is.
+   */
+  async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean }): Promise<void> {
+    if (!this.settings()) return;
+    const byBranch = e.task ? this.taskRow(e.task) : undefined;
+    const r = byBranch ?? this.sql.exec("SELECT id FROM tasks WHERE pr = ?", e.pr).toArray()[0];
+    if (!r) return;
+    const id = r.id as string;
+    const github: Actor = { kind: "app", what: "github" };
+    const link = () => {
+      const t = this.taskRow(id)!;
+      if (t.pr === e.pr && t.state === "in_review") return;
+      if (this.move(id, "pr_opened", github, { pr: e.pr }).ok) this.sql.exec("UPDATE tasks SET pr = ? WHERE id = ?", e.pr, id);
+      else this.record(id, github, "pr_seen", { pr: e.pr, state: t.state });
+    };
+    if (e.action === "opened") {
+      link();
+    } else if (e.merged) {
+      if (this.taskRow(id)!.state === "in_progress") link();
+      if (this.move(id, "merged", github, { pr: e.pr }).ok) {
+        this.stopWorkerOf(id, "merged");
+        this.autoAssign();
+      } else {
+        this.record(id, github, "pr_merged", { pr: e.pr, state: this.taskRow(id)!.state });
+      }
+    } else {
+      this.record(id, github, "pr_closed", { pr: e.pr });
+    }
+    await this.arm();
+  }
+
   // --- chat and approvals ----------------------------------------------------------------------------
 
   async chat(limit = 200): Promise<Result<ChatMessage[]>> {
@@ -516,7 +596,8 @@ export class ProjectDO extends DurableObject<Env> {
   private async arm(): Promise<void> {
     const next = this.sql.exec<{ t: number | null }>(
       `SELECT MIN(t) AS t FROM (
-        SELECT manager_next_ms AS t FROM settings WHERE manager_next_ms IS NOT NULL
+        SELECT manager_next_ms AS t FROM settings WHERE manager_next_ms IS NOT NULL AND attached_ms IS NOT NULL
+        UNION ALL SELECT attach_next_ms FROM settings WHERE attach_next_ms IS NOT NULL
         UNION ALL SELECT start_next_ms FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM stops
         UNION ALL SELECT next_ms FROM chat WHERE next_ms IS NOT NULL)`,
@@ -556,7 +637,10 @@ export class ProjectDO extends DurableObject<Env> {
     const nest = nestFrom(this.env);
     if (!nest) return;
     const now = Date.now();
-    if (s.manager_next_ms !== null && (s.manager_next_ms as number) <= now) await this.startManager(nest);
+    if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
+    // The manager starts once the repo is attached (README.md#flows).
+    const a = this.settingsRow()!;
+    if (a.attached_ms !== null && a.manager_next_ms !== null && (a.manager_next_ms as number) <= now) await this.startManager(nest);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL AND start_next_ms <= ? ORDER BY ord", now).toArray()) {
       await this.startWorker(nest, r.id as string);
     }
@@ -566,12 +650,26 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * A new agent with a sandbox of its own, both labelled. `key` names this start attempt: a retry after a
-   * lost answer sends the same Idempotency-Keys and gets the same sandbox and agent back.
+   * Require the review check on the repo's default branch, keeping the rest of its protection
+   * (src/github.ts `requireReviewCheck`). A refusal that will repeat (the App not installed, the repo
+   * outside the grant, no admin) waits for the owner's retry; anything else is retried from the alarm.
    */
-  private async agentFor(nest: Nest, template: string, labels: Labels, repo: string, key: string): Promise<string> {
-    const sandbox = (await nest.createSandbox({ labels }, `${key}/sandbox`)).sandbox;
-    return (await nest.createAgent({ template, sandbox, labels, overrides: { repos: [repo] }, start: true }, `${key}/agent`)).agent;
+  private async attachRepo(nest: Nest): Promise<void> {
+    const s = this.settings()!;
+    try {
+      const appId = await directory(this.env).githubAppId();
+      const gh = await githubFor(nest, s.repo, PERMISSIONS.attach);
+      const r = await requireReviewCheck(gh, s.repo, appId);
+      const detail: AttachDetail = { ...r, at_ms: Date.now() };
+      this.sql.exec(
+        "UPDATE settings SET attached_ms = COALESCE(attached_ms, ?), attach_next_ms = NULL, attach_attempts = 0, attach_error = NULL, attach_detail = ?",
+        Date.now(), JSON.stringify(detail),
+      );
+    } catch (e) {
+      const attempts = (this.settingsRow()!.attach_attempts as number) + 1;
+      const permanent = (e instanceof NestError || e instanceof GitHubError) && e.permanent;
+      this.sql.exec("UPDATE settings SET attach_attempts = ?, attach_next_ms = ?, attach_error = ?", attempts, permanent ? null : Date.now() + backoff(attempts), message(e));
+    }
   }
 
   private async startManager(nest: Nest): Promise<void> {
@@ -579,7 +677,7 @@ export class ProjectDO extends DurableObject<Env> {
     const n = (this.settingsRow()!.manager_starts as number) + 1;
     const labels = { project: s.id, role: "manager", start: String(n) };
     try {
-      const agent = s.manager ?? (await this.agentFor(nest, TEMPLATE.manager, labels, s.repo, `${s.id}/manager/${n}`));
+      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, s.repo, `${s.id}/manager/${n}`));
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       this.sql.exec("UPDATE settings SET manager = ?", agent);
       await nest.postInbox(agent, managerBrief(s), { requestId: `${s.id}/manager/${n}/brief` });
@@ -604,7 +702,7 @@ export class ProjectDO extends DurableObject<Env> {
     try {
       let agent = before.assignee as string | null;
       if (!agent) {
-        agent = await this.agentFor(nest, TEMPLATE.worker, labels, s.repo, `${s.id}/${id}/${n}`);
+        agent = await nest.startAgent(TEMPLATE.worker, labels, s.repo, `${s.id}/${id}/${n}`);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         if (!current()) {
           // Cancelled (or reassigned) while it was being made: it goes.

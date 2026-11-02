@@ -25,6 +25,10 @@ const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
 const str = (description: string, maxLength = 4000) => ({ type: "string", description, maxLength });
 const strs = (description: string) => ({ type: "array", items: { type: "string", maxLength: 1000 }, maxItems: 50, description });
 const taskId = str("The task's id (tsk_…).", 64);
+const dimension = (question: string) => ({
+  ...obj({ verdict: { type: "string", enum: ["pass", "fail"], description: question }, notes: str("Why: specific files, lines and reasons.", 20000) }, ["verdict", "notes"]),
+  description: question,
+});
 
 export const TOOLS: Record<Server, readonly ToolDef[]> = {
   board: [
@@ -54,15 +58,15 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     { name: "report_pr", description: "Tell the board you opened your task's PR (from its task branch).", inputSchema: obj({ number: { type: "integer", minimum: 1, description: "The PR's number." } }, ["number"]), idempotent: true },
   ],
   review: [
-    { name: "get_review", description: "The PR and head commit you review.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    { name: "review_get", description: "The PR you review, as the app knows it: its repo, number, head commit (sha), base branch and title.", inputSchema: obj({}), readOnly: true, idempotent: true },
     {
-      name: "submit_verdict",
-      description: "Your verdict: pass or fail for each of correctness, quality and architectural cohesiveness, with a summary.",
+      name: "submit_review",
+      description: "Your review, once: pass or fail for each of correctness, quality and architectural cohesiveness, each with specific notes, and a summary. The PR's check passes only if all three pass.",
       inputSchema: obj({
-        correctness: obj({ pass: { type: "boolean" }, notes: str("Why.") }, ["pass", "notes"]),
-        quality: obj({ pass: { type: "boolean" }, notes: str("Why.") }, ["pass", "notes"]),
-        architecture: obj({ pass: { type: "boolean" }, notes: str("Why.") }, ["pass", "notes"]),
-        summary: str("The review's summary, shown as the check's output.", 20000),
+        correctness: dimension("Does it do what it claims, without bugs?"),
+        quality: dimension("Is it clear, tested, and free of needless code?"),
+        architecture: dimension("Does it fit the repo's design, docs and conventions?"),
+        summary: str("The review's summary, shown as the check's summary.", 20000),
       }, ["correctness", "quality", "architecture", "summary"]),
     },
   ],

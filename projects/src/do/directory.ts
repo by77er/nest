@@ -1,5 +1,6 @@
 // DirectoryDO, one instance (README.md#pieces): the projects, repo → project, agent → {project, role,
-// task, pr}, the nest events already handled (deduplicated by id), and the catalog sync's state.
+// task, pr}, the nest events and GitHub deliveries already handled (deduplicated by id), the catalog
+// sync's state, and the GitHub App's id once a check run has told it.
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
@@ -70,6 +71,22 @@ export class DirectoryDO extends DurableObject<Env> {
 
   async getProject(id: string): Promise<ProjectRow | null> {
     return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>("SELECT id, name, repo, created_ms FROM projects WHERE id = ?", id).toArray()[0] ?? null;
+  }
+
+  /** The project attached to `repo` (compared without case), if any. */
+  async projectByRepo(repo: string): Promise<ProjectRow | null> {
+    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>("SELECT id, name, repo, created_ms FROM projects WHERE repo = ?", repo.toLowerCase()).toArray()[0] ?? null;
+  }
+
+  /** nest's GitHub App's id, once a check run it made has told it (`app.id`); null until then. */
+  async githubAppId(): Promise<number | null> {
+    const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_id'").toArray()[0];
+    return row ? Number(row.v) : null;
+  }
+
+  async recordGithubAppId(id: number): Promise<void> {
+    if (!Number.isSafeInteger(id) || id <= 0) return;
+    this.sql.exec("INSERT INTO sync (k, v) VALUES ('github_app_id', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", String(id));
   }
 
   /** Every project's repo: what the role templates may push to. */

@@ -22,7 +22,7 @@ export interface Env {
   NEST_CLIENT_TOKEN?: string;
   /** Secret: signs nest's webhooks to /hooks/nest. */
   NEST_WEBHOOK_SECRET?: string;
-  /** Secret: signs GitHub's webhooks to /hooks/github (the review PR). */
+  /** Secret: signs the GitHub App's webhooks to /hooks/github. */
   GITHUB_WEBHOOK_SECRET?: string;
 }
 

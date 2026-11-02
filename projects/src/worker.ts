@@ -1,11 +1,13 @@
 // The projects app's Worker (README.md): the page and its JSON API behind Cloudflare Access, the MCP
-// servers agents call (authenticated by Nest-Identity), and nest's webhook (authenticated by its
-// signature). It reaches nest only through the client interface (src/nest.ts) and imports nothing
-// from the control plane (test/deps.test.ts).
+// servers agents call (authenticated by Nest-Identity), and the webhooks of nest and of the GitHub App
+// (each authenticated by its signature). It reaches nest only through the client interface (src/nest.ts),
+// and GitHub with the tokens nest mints it (src/github.ts); it imports nothing from the control plane
+// (test/deps.test.ts).
 
 import { verifyAccessJwt } from "./access";
 import { handleApi } from "./api";
-import { directory, type Env, project } from "./env";
+import { directory, type Env, project, review } from "./env";
+import { githubHook } from "./github-hook";
 import { handleMcp, isServer } from "./mcp";
 import { clientIdOf, NestError, nestFrom } from "./nest";
 import { routable, verifySignature } from "./webhook";
@@ -73,7 +75,11 @@ async function nestHook(request: Request, env: Env): Promise<Response> {
     }
     await dir.recordAgent(route);
   }
-  if (route.project) await project(env, route.project).onEvent(event, { role: route.role, task: route.task });
+  if (route.project) {
+    await project(env, route.project).onEvent(event, { role: route.role, task: route.task });
+    // A reviewer's end is its review's: retried, or the check completed without a verdict.
+    if (route.role === "reviewer" && event.type === "agent.exited") await review(env, route.project).onAgentExited(event.agent, event.reason);
+  }
   await dir.markSeen(event.id);
   return json({ ok: true });
 }
@@ -88,6 +94,7 @@ export default {
       return isServer(server) ? handleMcp(request, env, server) : new Response(null, { status: 404 });
     }
     if (path === "/hooks/nest") return nestHook(request, env);
+    if (path === "/hooks/github") return githubHook(request, env);
     if (path.startsWith("/hooks/")) return new Response(null, { status: 404 });
 
     if (!(await admitted(request, env))) return json({ error: "a Cloudflare Access login for this app is required" }, 403);

@@ -16,7 +16,8 @@ const now = Date.UTC(2026, 10, 2, 9, 0, 0);
 export function project(over: Partial<ProjectRow> = {}): Project {
   const row: ProjectRow = { id: "prj_one", name: "Widgets", repo: "owner/widgets", created_ms: now - 86_400_000, ...over };
   const settings: Settings = {
-    id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null, created_ms: row.created_ms,
+    id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null,
+    attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms }, created_ms: row.created_ms,
   };
   return { ...row, settings };
 }

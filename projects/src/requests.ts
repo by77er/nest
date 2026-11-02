@@ -13,8 +13,14 @@ export const CreateProject = z.strictObject({
   repo: z.string().regex(REPO, "repo is owner/name").refine((r) => !/\.git$/i.test(r), "repo is owner/name, without .git"),
   auto_assign: z.boolean().optional(),
   max_workers: z.number().int().min(0).max(20).optional(),
+  max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
 });
-export const Settings = z.strictObject({ auto_assign: z.boolean().optional(), max_workers: z.number().int().min(0).max(20).optional() });
+export const Settings = z.strictObject({
+  auto_assign: z.boolean().optional(),
+  max_workers: z.number().int().min(0).max(20).optional(),
+  // ReviewDO's: null (the default) for no cap on running reviews.
+  max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
+});
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
 export const Spec = z.strictObject({
