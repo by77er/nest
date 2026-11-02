@@ -2,7 +2,7 @@
 
 **Decided (2026-11-02, the owner's):** external systems (an app with its own Worker and Durable Objects, such as a task board) use nest only through this interface. An app never gets the admin token, and nest gets nothing specific to any app. **An app that seems to need a special case in nest means this interface is wrong:** fix the interface, generically ([principle 9](../../../README.md#principles)).
 
-**Built (2026-11-02), all of it:** clients and grants, ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`.
+**Built (2026-11-02), all of it:** clients and grants (with [read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos)), ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`.
 
 **How the built parts read the grant** (each a choice the design left open):
 - **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
@@ -19,6 +19,7 @@
   - `cells`: where its agents and sandboxes may run.
   - `credentials`: the model credentials its agents may run on (e.g. `claude_oauth_token`).
   - `repos`: the repos its agents' sandboxes may push to (`owner/name`, exact).
+  - `read_repos`: the repos they may only read ([read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos), 2026-11-02). A spec may read any repo in `repos` or `read_repos`, and push only to `repos`. A grant stored before it reads as none.
   - `mcp_urls`: the MCP server URLs its capabilities may name (exact, or a prefix ending in `/`).
   - `github`: the repos and the GitHub App permissions it may [mint tokens](#github-tokens) for.
   - `max_agents`, `max_sandboxes`: live (not ended or destroyed) at once, across everything it owns.
@@ -40,7 +41,7 @@
 ## The client's catalog
 
 - **A client writes templates and capabilities in its own namespace,** `<client-name>/<entry>` (`PUT /v1/catalog/templates/<client-name>/<entry>`, and the same for capabilities). It reads its own entries and the operator's; it never writes outside its namespace.
-- **Expansion applies the grant:** an mcp capability whose URL isn't in `mcp_urls`, a repo outside `repos`, or a credential outside `credentials` is refused when written and again at spawn.
+- **Expansion applies the grant:** an mcp capability whose URL isn't in `mcp_urls`, a repo to push to outside `repos`, a repo to read outside `repos` and `read_repos`, or a credential outside `credentials` is refused when written and again at spawn. A client's `overrides.read_repos` narrows a template's read-only repos as `overrides.repos` narrows its allowlist, and may move a repo from the allowlist to the read list (less access), never back.
 
 ## Caller identity for MCP servers
 
@@ -93,10 +94,11 @@
 - **What a client can ask for:** `POST /v1/clients/self/github-token {repo, permissions}` returns a short-lived installation token of nest's GitHub App, for a repo in the grant's `github.repos`, with permissions within the grant's `github.permissions` (e.g. `checks: write`, `administration: write`, `pull_requests: read`).
 - **How it's minted:** by BrokerDO, as for brokered actions. It's audited, and the App's private key never leaves nest.
 - **Built (2026-11-02)** (`githubTokenOutsideGrant` in `control-plane/src/lib/clients.ts`, [BrokerDO](../../durable-objects/broker/) `clientGithubToken`), with these choices:
-  - **The answer** is `{token, expires_at, repo, permissions}`: the repo lowercased, the permissions as asked.
+  - **The answer** is `{token, expires_at, repo, permissions, app_id, app_slug}`: the repo lowercased, the permissions as asked, and the App the token is from (below).
   - **Permissions are repository permissions only,** each at a level GitHub offers for it (`GITHUB_REPO_PERMISSIONS` in `src/lib/github.ts`, from GitHub's [REST description](https://github.com/github/rest-api-description)'s `app-permissions`). Organization and account permissions are never minted: a token for one repo would still carry them. A request names at least one, since GitHub gives a token naming none every permission the installation has ([GitHub](https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app)). The same rule validates the grant's `github.permissions` at `POST` and `PATCH /v1/admin/clients`.
   - **Within the grant:** the repo is in `github.repos` (exact, compared without case: GitHub's names are case-insensitive), and each permission is in `github.permissions` at the same or a lower level (`read` < `write` < `admin`). The token gets exactly the permissions asked for, not the grant's.
   - **Answers:** outside the grant, `403`; a name not in the list, another case or a look-alike character, a level GitHub doesn't offer, or no permission, `400`. Neither mints. GitHub's own refusal (the App isn't installed on the repo, or lacks a permission) is passed on and audited.
   - **Who:** only a client token has a `self`: the operator's token is `403`, and a deleted client's or a rotated-out token `401`.
   - **Reuse:** a token is cached per client, repo and permissions, and handed out again while it has 10 minutes left; it is never shared with another client or an agent's action. Narrowing the grant applies to the next request; a token already handed out lasts until it expires (an hour at most). nest doesn't [revoke](https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token) it.
+- **The App's identity (2026-11-02):** `app_id` (GitHub's numeric App id) and `app_slug`, in each token's answer and as `github_app: {app_id, app_slug}` in `GET /v1/clients/self` when the grant has `github`. A client pins a required status check to the App with it (branch protection's `checks[].app_id`, [GitHub](https://docs.github.com/en/rest/branches/branch-protection#update-branch-protection)), so no other app or commit status satisfies the check, without first creating a check run to learn it. Not a secret: it is on the App's public page. BrokerDO reads it from `GET /app` and keeps it a day ([BrokerDO](../../durable-objects/broker/)). `app_slug` is absent when GitHub didn't answer, and both when nest can't tell (no App configured, or GitHub silent and only the App's client id configured); a token's answer goes out either way.
 - **The webhook:** the App's single webhook goes to whichever app the operator points it at (nest itself consumes none).

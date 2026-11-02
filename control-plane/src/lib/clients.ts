@@ -39,6 +39,11 @@ export const Grant = z.strictObject({
   credentials: z.array(z.string().min(1).max(160)).max(64).default([]),
   /** The repos its agents' sandboxes may push to and its GitHub brokered actions may reach (`owner/name`, exact). */
   repos: z.array(Repo).max(256).default([]),
+  /**
+   * The repos its agents' sandboxes may only read (`owner/name`, exact): a spec may read any repo here or
+   * in `repos`, and push only to `repos`. A grant stored before this field reads as none.
+   */
+  read_repos: z.array(Repo).max(256).default([]),
   /** The MCP server URLs its capabilities may name. */
   mcp_urls: z.array(McpUrlEntry).max(64).default([]),
   /**
@@ -84,9 +89,9 @@ function brokeredOutside(action: string, repos: readonly string[] | null, capabi
 
 /**
  * Everything an expanded spec reaches outside the grant: its credential, each mcp server and the
- * secrets it authenticates with, its push allowlist and its brokered actions. Empty: within it.
+ * secrets it authenticates with, its push allowlist, its read-only repos and its brokered actions. Empty: within it.
  */
-export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "brokered" | "repos">, grant: Grant): string[] {
+export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "brokered" | "repos" | "read_repos">, grant: Grant): string[] {
   const out: string[] = [];
   const creds = new Set(grant.credentials);
   if (!creds.has(spec.credential)) out.push(`credential ${spec.credential}`);
@@ -99,6 +104,10 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
   const allowed = repoSet(grant.repos);
   const wider = canonicalRepos(spec.repos ?? []).filter((r) => !allowed.has(r));
   if (wider.length) out.push(`repos ${wider.join(", ")}`);
+  // Reading is within either list; a grant stored before `read_repos` has none.
+  const readable = repoSet([...grant.repos, ...(grant.read_repos ?? [])]);
+  const unreadable = canonicalRepos(spec.read_repos ?? []).filter((r) => !readable.has(r));
+  if (unreadable.length) out.push(`read_repos ${unreadable.join(", ")}`);
   for (const b of spec.brokered ?? []) {
     const o = brokeredOutside(b.action, "repos" in b ? b.repos : null, b.capability, grant);
     if (o) out.push(o);

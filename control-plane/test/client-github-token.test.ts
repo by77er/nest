@@ -14,11 +14,18 @@ class FakeGitHub {
   readonly installs = new Map<string, number>();
   readonly mints: { installation: number; repositories: string[]; permissions: Record<string, string>; token: string; expires_at: string }[] = [];
   private n = 0;
+  /** `GET /app`'s answer (null: GitHub doesn't answer), and how many times it was asked. */
+  app: { id: number; slug: string } | null = { id: 424242, slug: "nest-test-app" };
+  appReads = 0;
 
   async handle(req: Request): Promise<Response> {
     const u = new URL(req.url);
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     let m: RegExpMatchArray | null;
+    if (u.pathname === "/app" && req.method === "GET") {
+      this.appReads++;
+      return this.app ? json(200, { ...this.app, client_id: "Iv1.test", name: "nest test" }) : json(503, { message: "unavailable" });
+    }
     if ((m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/))) {
       const id = this.installs.get(m[1]!.toLowerCase());
       return id ? json(200, { id }) : json(404, { message: "Not Found" });
@@ -102,7 +109,10 @@ describe("POST /v1/clients/self/github-token", () => {
     expect(gh.mints.length).toBe(before + 1);
     expect(mint).toMatchObject({ installation: gh.installs.get(r), repositories: [r.split("/")[1]], permissions: { checks: "read", repository_projects: "write" } });
     expect(Object.keys(mint.permissions).sort()).toEqual(["checks", "repository_projects"]);
-    expect(t).toEqual({ token: mint.token, expires_at: mint.expires_at, repo: r, permissions: { checks: "read", repository_projects: "write" } });
+    // Beside the token, the App it is from (its own test below).
+    const { app_id, app_slug: _slug, ...answer } = t;
+    expect(answer).toEqual({ token: mint.token, expires_at: mint.expires_at, repo: r, permissions: { checks: "read", repository_projects: "write" } });
+    expect(typeof app_id).toBe("number");
 
     // The same request again: the cached token (no mint). Other permissions: a token of their own.
     expect((await askJson(c.token, { repo: r, permissions: { repository_projects: "write", checks: "read" } }, 200)).token).toBe(mint.token);
@@ -229,6 +239,65 @@ describe("POST /v1/clients/self/github-token", () => {
       proto.clientGithubToken = method;
     }
     expect((await askJson(c.token, { repo: r, permissions: { checks: "read" } }, 200)).token).toMatch(/^ghs_cli/);
+  });
+});
+
+describe("the GitHub App's identity", () => {
+  const forget = () => runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), async (_i, st) => {
+    st.storage.sql.exec("DELETE FROM github_app_identity");
+  });
+  const self = async (token: string) => {
+    const res = await SELF.fetch(`${BASE}/v1/clients/self`, { headers: { authorization: `Bearer ${token}` } });
+    expect(res.status).toBe(200);
+    return await res.json() as any;
+  };
+
+  it("is in a token's answer and in the record of a client whose grant has github, read once from GET /app and kept", async () => {
+    await forget();
+    gh.app = { id: 424242, slug: "nest-test-app" };
+    const reads = gh.appReads;
+    const r = repo();
+    const c = await newClient({ repos: [r], permissions: { checks: "write" } });
+    const t = await askJson(c.token, { repo: r, permissions: { checks: "write" } }, 200);
+    expect(t).toMatchObject({ app_id: 424242, app_slug: "nest-test-app", repo: r, permissions: { checks: "write" } });
+    expect((await self(c.token)).github_app).toEqual({ app_id: 424242, app_slug: "nest-test-app" });
+    expect(gh.appReads - reads).toBe(1);
+    // A client without github hears nothing of the App.
+    const none = await newClient();
+    expect(Object.keys(await self(none.token))).not.toContain("github_app");
+  });
+
+  it("when GitHub doesn't answer after it did: what it said before, slug included", async () => {
+    await forget();
+    // GitHub's id for the App the credentials name ("77" in both test files).
+    gh.app = { id: 77, slug: "nest-test-app" };
+    const c = await newClient({ repos: [repo()], permissions: { checks: "read" } });
+    expect((await self(c.token)).github_app).toEqual({ app_id: 77, app_slug: "nest-test-app" });
+    await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), async (_i, st) => {
+      st.storage.sql.exec("UPDATE github_app_identity SET expires_ms = 0");
+    });
+    gh.app = null;
+    const reads = gh.appReads;
+    expect((await self(c.token)).github_app).toEqual({ app_id: 77, app_slug: "nest-test-app" });
+    // Kept again for a while: the next answers don't wait on GitHub.
+    expect((await self(c.token)).github_app).toEqual({ app_id: 77, app_slug: "nest-test-app" });
+    expect(gh.appReads - reads).toBe(1);
+    gh.app = { id: 424242, slug: "nest-test-app" };
+    await forget();
+  });
+
+  it("when GitHub doesn't answer: the id the App's credentials name, without the slug, and the token still goes out", async () => {
+    await forget();
+    gh.app = null;
+    const r = repo();
+    const c = await newClient({ repos: [r], permissions: { checks: "read" } });
+    // `app_id` as the credentials stored it ("77", here and in repos.test.ts).
+    const t = await askJson(c.token, { repo: r, permissions: { checks: "read" } }, 200);
+    expect(t.token).toMatch(/^ghs_cli/);
+    expect([t.app_id, "app_slug" in t]).toEqual([77, false]);
+    expect((await self(c.token)).github_app).toEqual({ app_id: 77 });
+    gh.app = { id: 424242, slug: "nest-test-app" };
+    await forget();
   });
 });
 

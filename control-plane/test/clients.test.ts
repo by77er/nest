@@ -99,6 +99,19 @@ describe("grants, tokens and labels (pure)", () => {
       .toEqual(["credential cap:z"]);
   });
 
+  it("read_repos: a spec may read a repo in repos or read_repos, push only to repos; a grant stored before read_repos reads none", () => {
+    const g2 = Grant.parse({ credentials: ["c"], repos: ["acme/app"], read_repos: ["Acme/Lib"] });
+    const spec = (repos: string[], read_repos: string[]) => ({ credential: "c", repos, read_repos });
+    expect(specOutsideGrant(spec(["acme/app"], ["acme/lib"]), g2)).toEqual([]);
+    expect(specOutsideGrant(spec([], ["ACME/APP", "acme/lib"]), g2)).toEqual([]);
+    // Reading is no licence to push.
+    expect(specOutsideGrant(spec(["acme/lib"], []), g2)).toEqual(["repos acme/lib"]);
+    expect(specOutsideGrant(spec([], ["acme/lib", "acme/secret"]), g2)).toEqual(["read_repos acme/secret"]);
+    const { read_repos: _, ...old } = g2;
+    expect(specOutsideGrant(spec([], ["acme/lib"]), old as never)).toEqual(["read_repos acme/lib"]);
+    expect(specOutsideGrant(spec([], ["acme/app"]), old as never)).toEqual([]);
+  });
+
   it("a client token names its client; anything else is no client token", async () => {
     const t = newClientToken("cli_abc123");
     expect(parseClientToken(t)).toMatchObject({ client: "cli_abc123" });
@@ -280,6 +293,25 @@ describe("the grant bounds everything in the subtree", () => {
     // An entry the operator wrote into the namespace is held to the same grant at spawn.
     await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], max_agents: 10 } } });
     expect((await createAgent(c, { template: `${c.name}/pusher` }, 403)).error.message).toContain("repos acme/app");
+  });
+
+  it("read_repos: within the grant when written and again at spawn, and a client's overrides only narrow them", async () => {
+    const c = await newClient({ repos: ["acme/app"], read_repos: ["acme/lib", "acme/docs"] });
+    // Outside both lists, refused when written; a read-only repo can't be made pushable.
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/peek`, { method: "PUT", body: basic({ read_repos: ["acme/lib", "acme/secret"] }) }, 403)).error.message)
+      .toContain("read_repos acme/secret");
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/sneak`, { method: "PUT", body: basic({ repos: ["acme/lib"] }) }, 403)).error.message)
+      .toContain("repos acme/lib");
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/reader`, { method: "PUT", body: basic({ repos: ["acme/app"], read_repos: ["Acme/Lib", "acme/docs"] }) });
+    const a = await createAgent(c, { template: `${c.name}/reader` });
+    expect([a.repos, a.read_repos]).toEqual([["acme/app"], ["acme/docs", "acme/lib"]]);
+    // A client's overrides narrow, never widen: to a subset, or down from push to read.
+    const n = await createAgent(c, { template: `${c.name}/reader`, overrides: { repos: [], read_repos: ["acme/app"] } });
+    expect([n.repos, n.read_repos]).toEqual([undefined, ["acme/app"]]);
+    expect((await createAgent(c, { template: `${c.name}/reader`, overrides: { read_repos: ["acme/other"] } }, 400)).error.message).toContain("can't widen the repos it may read with acme/other");
+    // The operator narrowing the grant refuses the same template at spawn.
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], repos: ["acme/app"], read_repos: ["acme/docs"], max_agents: 10 } } });
+    expect((await createAgent(c, { template: `${c.name}/reader` }, 403)).error.message).toContain("read_repos acme/lib");
   });
 
   it("mcp capabilities: the URL in mcp_urls and its auth in credentials, when written and again at spawn", async () => {

@@ -126,6 +126,20 @@ function operatorOnly(c: { caller: Caller }, what: string): void {
   if (c.caller.kind !== "operator") throw new NestError(ErrorCodes.FORBIDDEN, `${what} is the operator's`, 403);
 }
 
+/**
+ * The GitHub App a client's tokens come from (docs/control-plane/api/clients/#github-tokens): `app_id`
+ * and, when known, `app_slug`. Not secret. Null when BrokerDO can't tell, including for minutes after a
+ * deploy while it runs the previous code: the answer goes out without it rather than failing.
+ */
+async function githubAppOf(env: Env): Promise<{ app_id: number; app_slug?: string } | null> {
+  try {
+    return await broker(env).githubApp();
+  } catch (e) {
+    console.warn("the GitHub App's identity is unavailable", e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
 /** A `/v1/clients/self/…` route's client: only a client token has a self (the operator is refused, 403). */
 function selfClient(c: { caller: Caller }): ClientScope {
   if (c.caller.kind !== "client") throw new NestError(ErrorCodes.FORBIDDEN, "only an API client's token has a self", 403);
@@ -790,10 +804,16 @@ export const ROUTES: Route[] = [
     await clientDO(env, p.client).purge();
     return { deleted: p.client, name, catalog_entries: entries };
   } }),
-  // A client's own record (its grant, live counts and events: what it missed shows as `events.dropped`) and
-  // webhook (docs/control-plane/api/clients/#events-to-the-owner): https only, its signing secret in this
-  // answer and nowhere else. The operator has no `self` (403).
-  route({ method: "GET", path: "/v1/clients/self", auth: "owner", run: (c) => clientDO(c.env, selfClient(c).client).info() }),
+  // A client's own record (its grant, live counts and events: what it missed shows as `events.dropped`;
+  // with a `github` grant, the App its tokens come from, `github_app`) and webhook
+  // (docs/control-plane/api/clients/#events-to-the-owner): https only, its signing secret in this answer
+  // and nowhere else. The operator has no `self` (403).
+  route({ method: "GET", path: "/v1/clients/self", auth: "owner", run: async (c) => {
+    const self = selfClient(c);
+    const view = await clientDO(c.env, self.client).info();
+    const app = self.grant.github ? await githubAppOf(c.env) : null;
+    return { ...view, ...(app ? { github_app: app } : {}) };
+  } }),
   route({
     method: "PUT", path: "/v1/clients/self/webhook", auth: "owner", body: z.strictObject({ url: z.string().min(1).max(2048) }),
     run: (c) => newMethod("ClientDO.setWebhook", () => clientDO(c.env, selfClient(c).client).setWebhook(c.body.url)),
@@ -808,7 +828,8 @@ export const ROUTES: Route[] = [
       const refusal = grantRefusal(self.client, githubTokenOutsideGrant(c.body, self.grant));
       if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
       const t = await newMethod("BrokerDO.clientGithubToken", () => broker(c.env).clientGithubToken(self.client, c.body.repo, c.body.permissions));
-      return { token: t.token, expires_at: new Date(t.expires_ms).toISOString(), repo: c.body.repo.toLowerCase(), permissions: c.body.permissions };
+      const app = await githubAppOf(c.env);
+      return { token: t.token, expires_at: new Date(t.expires_ms).toISOString(), repo: c.body.repo.toLowerCase(), permissions: c.body.permissions, ...(app ?? {}) };
     },
   }),
 

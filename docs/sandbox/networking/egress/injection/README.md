@@ -8,6 +8,13 @@ github:
   placeholder: nest-ph-github               # unique per binding
   where: [authorization.bearer, authorization.basic.password]
   source: github-app{repos: <the push allowlist>, permissions: {contents: write, pull_requests: write}}   # BrokerDO mints a 1-hour token
+github_read:                                # only with read-only repos
+  hosts: [github.com, api.github.com]
+  placeholder: nest-ph-read-github
+  where: [authorization.bearer, authorization.basic.password]
+  source: github-app{repos: <the read-only repos>, permissions: {contents: read, metadata: read}}
+github_read_default:                        # the same token, with read-only repos and no allowlist
+  placeholder: nest-ph-github               # the guest's default
 stripe-read:
   hosts: [api.stripe.com]
   placeholder: nest-ph-stripe-91c2
@@ -48,6 +55,7 @@ stripe-read:
 ## GitHub
 
 - **GitHub uses a GitHub App (built).** A sandbox with a [push allowlist](../policy/#repo-allowlists) gets the binding `github` from the GitHub rule constructor; BrokerDO mints its installation token narrowed to exactly the allowed repos with `contents: write` (which includes the `contents: read` pull requests need) and `pull_requests: write`, valid for one hour, and SandboxDO pushes it again 15 minutes before it expires ([BrokerDO](../../../../control-plane/durable-objects/broker/#injection-minting)). An operator binding named `github` in the sandbox layer replaces the constructed one (and its static secret is used instead).
+- **Read-only repos get a token of their own** under the binding `github_read`, which can only read, and under `github_read_default` (the default placeholder) when the sandbox has no allowlist ([read-only repos](../policy/#read-only-repos)). An operator binding named `github_read` replaces that one the same way.
 - **The token doesn't decide where a push may go:** the [request guards](../policy/#github) do, whatever credential a request carries.
 - **Defaults in the image (built, `images/guest/`):**
   - a git credential helper (`git-credential-nest`, set for `https://github.com`) that returns `x-access-token` / the placeholder

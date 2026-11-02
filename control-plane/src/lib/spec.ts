@@ -7,7 +7,7 @@ import { z } from "zod";
 import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
 import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry, scopeToRepos } from "./brokered";
-import { canonicalRepos, narrowRepos, Repos } from "./repos";
+import { canonicalRepos, narrowRepos, readOnlyRepos, Repos } from "./repos";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
@@ -54,6 +54,11 @@ export const Template = z.object({
    * its sandbox's allowlist while attached, and the scope of its unscoped GitHub brokered actions.
    */
   repos: Repos.optional(),
+  /**
+   * The repos its agents may only read (docs/sandbox/networking/egress/policy/#read-only-repos): joined to
+   * its sandbox's read-only repos while attached, never pushed to. A repo also in `repos` may be pushed to.
+   */
+  read_repos: Repos.optional(),
   /** Its agents stop themselves once their work is done (docs/agents/#lifetimes); a spawn may set it, never clear it. */
   ephemeral: z.boolean().optional(),
   /** The idle TTL of a sandbox `agent_spawn` creates for its agents (a spawn may only shorten it); absent: the cell default. */
@@ -74,6 +79,8 @@ export const OperatorOverrides = z.object({
   credential: Credential.optional(),
   /** The push allowlist, replacing the template's. */
   repos: Repos.optional(),
+  /** The read-only repos, replacing the template's. */
+  read_repos: Repos.optional(),
   /** Replaces the template's. */
   ephemeral: z.boolean().optional(),
 });
@@ -95,6 +102,11 @@ export const SpawnerOverrides = z.strictObject({
    * it gives, as for tools (a captain holds no repos, yet spawns workers that push).
    */
   repos: Repos.optional(),
+  /**
+   * A subset of the repos the template lets its agents read: its read-only repos, or its push allowlist
+   * (read access to a repo it may push to is less). Narrowed against the template, as `repos` is.
+   */
+  read_repos: Repos.optional(),
   ephemeral: z.literal(true).optional(),
   sandbox_idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
 });
@@ -115,6 +127,8 @@ export interface AgentSpec {
   brokered?: BrokeredGrant[];
   /** Its push allowlist, canonical; absent when empty (as is every stored spec before it). */
   repos?: string[];
+  /** Its read-only repos, canonical and none of them in `repos`; absent when empty (as is every stored spec before them). */
+  read_repos?: string[];
   /** The templates it may spawn from: the union of its capabilities' `spawn`; absent when none. */
   spawn?: string[];
   /** It stops itself once its work is done (docs/agents/#lifetimes); absent: it doesn't. */
@@ -499,6 +513,9 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   // before it went): ignored, not a failed spawn. Writes still refuse one (`checkCapability`).
   const given = new Set(caps.flatMap((c) => c.tools).filter((t) => registry.includes(t)));
   const prompt = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter((t) => t.length > 0).join("\n\n");
+  // Kept whole here (a repo also in `repos` included), so an override that drops it from the
+  // allowlist leaves it readable; `withRepos` subtracts the final allowlist.
+  const readOnly = canonicalRepos(tpl.read_repos ?? []);
   return ok({
     template: name,
     tools: registry.filter((t) => given.has(t)),
@@ -509,18 +526,28 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     ...(mcp.length ? { mcp } : {}),
     ...(brokered.length ? { brokered } : {}),
     ...(tpl.repos?.length ? { repos: canonicalRepos(tpl.repos) } : {}),
+    ...(readOnly.length ? { read_repos: readOnly } : {}),
     ...(spawn.length ? { spawn } : {}),
     ...(tpl.ephemeral ? { ephemeral: true as const } : {}),
     ...(tpl.sandbox_idle_ttl_ms !== undefined ? { sandbox_idle_ttl_ms: tpl.sandbox_idle_ttl_ms } : {}),
   });
 }
 
-/** The spec with this push allowlist: recorded, and its unscoped GitHub grants narrowed to it (`scopeToRepos`). */
-function withRepos(spec: AgentSpec, repos: readonly string[]): AgentSpec {
-  const { repos: _, brokered, ...rest } = spec;
+/**
+ * The spec with this push allowlist and these read-only repos: recorded (a repo on both is pushable),
+ * and its unscoped GitHub grants narrowed to the allowlist (`scopeToRepos`; read-only repos scope no
+ * action). `narrowed`: the allowlist narrows the template's, so an unscoped grant narrowed to none
+ * reaches nothing and goes, rather than reaching every repo as an unscoped grant does.
+ */
+function withRepos(spec: AgentSpec, repos: readonly string[], readRepos: readonly string[], narrowed = false): AgentSpec {
+  const { repos: _, read_repos: _read, brokered, ...rest } = spec;
   const r = canonicalRepos(repos);
-  const scoped = brokered ? scopeToRepos(brokered, r) : undefined;
-  return { ...rest, ...(scoped?.length ? { brokered: scoped } : {}), ...(r.length ? { repos: r } : {}) };
+  const read = readOnlyRepos(r, readRepos);
+  const kept = narrowed && !r.length && spec.repos?.length
+    ? brokered?.filter((g) => g.action === "http.request" || g.action === "github.fork" || g.repos !== null)
+    : brokered;
+  const scoped = kept ? scopeToRepos(kept, r) : undefined;
+  return { ...rest, ...(scoped?.length ? { brokered: scoped } : {}), ...(r.length ? { repos: r } : {}), ...(read.length ? { read_repos: read } : {}) };
 }
 
 /**
@@ -585,6 +612,9 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     if (!tools.ok) return tools;
     const repos = narrowRepos(base.value.repos ?? [], o.data.repos ?? base.value.repos ?? []);
     if (!repos.ok) return err(`template ${spec.template}: ${repos.error}`);
+    const readable = [...(base.value.repos ?? []), ...(base.value.read_repos ?? [])];
+    const readRepos = narrowRepos(readable, o.data.read_repos ?? base.value.read_repos ?? [], "the repos it may read");
+    if (!readRepos.ok) return err(`template ${spec.template}: ${readRepos.error}`);
     const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, ...rest } = base.value;
     // Lifetimes only shorten: ephemeral once set stays, and the shorter TTL wins.
     const ephemeral = base.value.ephemeral || o.data.ephemeral;
@@ -593,7 +623,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     const tplTtl = base.value.sandbox_idle_ttl_ms;
     const ttl = asked !== undefined ? narrowTtl(tplTtl ?? spec.cell_idle_ttl_ms ?? Infinity, asked) : tplTtl;
     const lifetimes = { ...(ephemeral ? { ephemeral: true as const } : {}), ...(ttl !== undefined ? { sandbox_idle_ttl_ms: ttl } : {}) };
-    return ok(withRepos({ ...rest, ...tools.value, ...lifetimes, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value));
+    return ok(withRepos({ ...rest, ...tools.value, ...lifetimes, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value, readRepos.value, true));
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);
@@ -607,7 +637,7 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,
     credential: o.credential ?? base.value.credential,
-  }, o.repos ?? base.value.repos ?? []));
+  }, o.repos ?? base.value.repos ?? [], o.read_repos ?? base.value.read_repos ?? []));
 }
 
 // --- Records stored with a role (the previous release) ----------------------------------------------

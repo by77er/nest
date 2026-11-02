@@ -1,7 +1,7 @@
 // Repo allowlists (docs/sandbox/networking/egress/policy/#repo-allowlists): the repos a sandbox may push to
-// and an agent's brokered actions may reach, as exact `owner/name` names. Generic: a set of names that
-// only narrows. What a name means on a forge (the guards, the tokens) is that forge's constructor's
-// (lib/rules/github.ts). Pure.
+// and an agent's brokered actions may reach, and those it may only read, as exact `owner/name` names.
+// Generic: a set of names that only narrows. What a name means on a forge (the guards, the tokens) is
+// that forge's constructor's (lib/rules/github.ts). Pure.
 import { z } from "zod";
 
 /**
@@ -25,11 +25,20 @@ export function unionRepos(...lists: readonly (readonly string[] | undefined)[])
 
 /**
  * Attenuation: `child` must name only repos `parent` has (an agent spawning another, a fork's
- * allowlist). Answers the child's canonical list, or the repos it would add.
+ * allowlist). Answers the child's canonical list, or the repos it would add (`what`: the list, for the error).
  */
-export function narrowRepos(parent: readonly string[], child: readonly string[]): { ok: true; value: string[] } | { ok: false; error: string } {
+export function narrowRepos(parent: readonly string[], child: readonly string[], what = "the repo allowlist"): { ok: true; value: string[] } | { ok: false; error: string } {
   const have = new Set(canonicalRepos(parent));
   const want = canonicalRepos(child);
   const wider = want.filter((r) => !have.has(r));
-  return wider.length ? { ok: false, error: `can't widen the repo allowlist with ${wider.join(", ")}` } : { ok: true, value: want };
+  return wider.length ? { ok: false, error: `can't widen ${what} with ${wider.join(", ")}` } : { ok: true, value: want };
+}
+
+/**
+ * The read-only repos of a push allowlist and a read list (docs/sandbox/networking/egress/policy/#read-only-repos):
+ * the read list's repos that aren't on the allowlist (a repo on both may be pushed to), canonical.
+ */
+export function readOnlyRepos(push: readonly string[], read: readonly string[]): string[] {
+  const p = new Set(canonicalRepos(push));
+  return canonicalRepos(read).filter((r) => !p.has(r));
 }

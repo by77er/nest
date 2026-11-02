@@ -68,7 +68,7 @@ CARGO_TARGET_DIR=target/nest-proxy cargo test -p nest-proxy
     - stale policy pushes ignored
     - WebSocket through inspection
     - h2 multiplexing
-- **Request guards:** the evaluator with made-up rules (`guard.rs` unit tests; `tests/guards.rs` through the real proxy: refusal before the upstream, a judged body replayed whole, the injected-credential exception, guarded hosts never spliced or TCP exceptions), and the seam with the control plane's GitHub constructor (`tests/github_rules.rs` evaluates its output, the fixture `egress_policy.github.json`, against GitHub's request shapes).
+- **Request guards:** the evaluator with made-up rules (`guard.rs` unit tests; `tests/guards.rs` through the real proxy: refusal before the upstream, a judged body replayed whole, the injected-credential exception, guarded hosts never spliced or TCP exceptions), and the seam with the control plane's GitHub constructor (`tests/github_rules.rs` evaluates its output, the fixtures `egress_policy.github.json` and, with a read-only repo, `egress_policy.github_read.json`, against GitHub's request shapes).
 - **Security regression tests (`tests/review_regressions.rs`):** absolute-form/Host fronting with injection, duplicate Host, upstream Host rewrite, explicit-proxy fronting, plaintext CONNECT tunnels (incl. passthrough hosts), denied CONNECT answered in-tunnel, a 70 KB Host not breaking the nestd link, pushes after `sandbox_drop`, DNS-flood aggregation, TRACE with a credential, `te: trailers` over h2.
 
 ## Gaps

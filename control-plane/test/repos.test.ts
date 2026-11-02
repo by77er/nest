@@ -5,11 +5,13 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github.json";
+import readFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github_read.json";
 import { grantOfEntry } from "../src/lib/brokered";
-import { SANDBOX_TOKEN_PERMISSIONS } from "../src/lib/github";
+import { SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS } from "../src/lib/github";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { canonicalRepos, narrowRepos, Repo } from "../src/lib/repos";
-import { GITHUB_PLACEHOLDER, githubEgress, githubGuards } from "../src/lib/rules/github";
+import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER, githubBinding, githubEgress, githubGuards } from "../src/lib/rules/github";
+import { BrokerDO } from "../src/do/broker";
 import { type Catalog, expandSpec, SEED_CATALOG } from "../src/lib/spec";
 import { bytesToB64 } from "../src/lib/util";
 import { adminJson, connectHost, nextCommands, runDue, type Ws, uniqueCell } from "./helpers";
@@ -43,6 +45,46 @@ describe("the GitHub rule constructor", () => {
     expect(helper).toContain(`password=${GITHUB_PLACEHOLDER}\n`);
     expect(build).toContain(`GITHUB_TOKEN=${GITHUB_PLACEHOLDER}"`);
     expect(githubEgress(["a/b"]).inject[0]!.placeholder).toBe(GITHUB_PLACEHOLDER);
+  });
+
+  it("with read-only repos, builds exactly the guards and bindings in the fixture nest-proxy's seam test evaluates", () => {
+    // by77er/nest is on both lists: pushable, so not read-only.
+    const f = githubEgress(["by77er/nest"], ["By77er/Private-Lib", "by77er/nest"]);
+    expect(f.guards).toEqual(readFixture.guards);
+    expect(f.inject).toEqual(readFixture.inject);
+    expect(f.allow).toEqual([{ host: "api.github.com" }]);
+  });
+
+  it("read-only repos alone: no push or REST write exception for them, no `github` binding, GraphQL only with the read-only bindings", () => {
+    const f = githubEgress([], ["a/b"]);
+    expect(f.guards.find((g) => g.name === "github-push")!.allow).toBeUndefined();
+    expect(f.guards.find((g) => g.name === "github-write")!.allow!.map((a) => a.path)).toEqual(["/**/git-upload-pack", "/**/info/lfs/objects/batch"]);
+    // Never `github`: a push token the proxy still holds under it has no binding and no exception.
+    expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toEqual([
+      { methods: ["POST"], path: "/graphql", injected: "github_read" }, { methods: ["POST"], path: "/graphql", injected: "github_read_default" },
+    ]);
+    expect(f.inject.map((b) => [b.name, b.placeholder])).toEqual([["github_read", GITHUB_READ_PLACEHOLDER], ["github_read_default", GITHUB_PLACEHOLDER]]);
+    expect(f.allow).toEqual([{ host: "api.github.com" }]);
+    // nest-proxy looks for a placeholder as a substring before it substitutes an exact one: neither may contain the other.
+    expect(GITHUB_READ_PLACEHOLDER.includes(GITHUB_PLACEHOLDER) || GITHUB_PLACEHOLDER.includes(GITHUB_READ_PLACEHOLDER)).toBe(false);
+    // No read-only repos: exactly the push allowlist's rules, as before them.
+    expect(githubEgress(["a/b"], [])).toEqual(githubEgress(["a/b"]));
+    expect(githubEgress(["a/b"], ["A/B"])).toEqual(githubEgress(["a/b"]));
+  });
+
+  it("an operator's own binding gets no GraphQL exception from read-only repos, and keeps the default placeholder", () => {
+    const pat = { ...githubBinding(), name: "github" };
+    // The operator's `github` (a credential nest didn't mint) and no allowlist: GraphQL stays refused for it.
+    const f = githubEgress([], ["a/b"], [pat]);
+    expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toEqual([{ methods: ["POST"], path: "/graphql", injected: "github_read" }]);
+    expect(f.inject.map((b) => b.name)).toEqual(["github_read"]);
+    // Nor for an operator's binding named `github_read`, or one taking the default placeholder under another name.
+    const theirs = githubEgress([], ["a/b"], [{ ...pat, name: "github_read", placeholder: "x" }]);
+    expect(theirs.guards.find((g) => g.name === "github-api-write")!.allow).toBeUndefined();
+    expect(theirs.inject.map((b) => b.name)).toEqual(["github_read"]);
+    expect(githubEgress([], ["a/b"], [{ ...pat, name: "mine" }]).inject.map((b) => b.name)).toEqual(["github_read"]);
+    // With an allowlist, as before read-only repos: the exception names `github`, whoever's it is.
+    expect(githubEgress(["a/c"], [], [pat])).toEqual(githubEgress(["a/c"]));
   });
 
   it("names repos exactly: no wildcard, no .git, case folded", () => {
@@ -85,6 +127,61 @@ describe("push allowlists in specs", () => {
     const r = expandSpec({ ...catalog, templates: { coder: tpl } }, PLATFORM_TOOL_NAMES, { template: "coder", hands: true, by: "operator" });
     expect(r.ok && r.value.repos).toBeUndefined();
     expect(r.ok && r.value.brokered![0]).toEqual(grantOfEntry("gh", { action: "github.create_pr" }));
+  });
+});
+
+describe("read-only repos in specs", () => {
+  const catalog: Catalog = {
+    capabilities: { ...SEED_CATALOG.capabilities, gh: { tools: [], rules: [], prompt: "", brokered: [{ action: "github.comment" }] } },
+    templates: { reviewer: { ...SEED_CATALOG.templates.worker!, capabilities: ["nest", "hands", "gh"], repos: ["me/app"], read_repos: ["Me/Lib", "me/docs", "ME/APP"] } },
+  };
+  const expand = (by: "operator" | "spawner", overrides: Record<string, unknown> = {}) =>
+    expandSpec(catalog, PLATFORM_TOOL_NAMES, { template: "reviewer", hands: true, by, overrides } as never);
+
+  it("come from the template, less its push allowlist, and scope no brokered action", () => {
+    const r = expand("operator");
+    expect(r.ok && r.value.repos).toEqual(["me/app"]);
+    expect(r.ok && r.value.read_repos).toEqual(["me/docs", "me/lib"]);
+    expect(r.ok && r.value.brokered!.map((g) => (g.action === "http.request" ? null : g.repos))).toEqual([["me/app"]]);
+  });
+
+  it("the operator replaces them; a spawner (or a client) may only narrow them, to the template's read-only repos or its push allowlist", () => {
+    expect((expand("operator", { read_repos: ["x/y"] }) as any).value.read_repos).toEqual(["x/y"]);
+    expect((expand("spawner", { read_repos: ["ME/LIB"] }) as any).value.read_repos).toEqual(["me/lib"]);
+    // Reading a repo it could push to is narrower: dropped from the allowlist, it stays readable.
+    const down = expand("spawner", { repos: [], read_repos: ["me/app"] }) as any;
+    expect([down.value.repos, down.value.read_repos]).toEqual([undefined, ["me/app"]]);
+    expect(expand("spawner", { read_repos: ["me/lib", "attacker/x"] })).toEqual({ ok: false, error: "template reviewer: can't widen the repos it may read with attacker/x" });
+    // A read-only repo never becomes pushable.
+    expect(expand("spawner", { repos: ["me/lib"] })).toEqual({ ok: false, error: "template reviewer: can't widen the repo allowlist with me/lib" });
+    const none = expand("spawner", { read_repos: [] }) as any;
+    expect("read_repos" in none.value).toBe(false);
+  });
+
+  it("an allowlist override keeps a template's read-only repo that was also on its allowlist readable", () => {
+    const tpl = { ...catalog.templates.reviewer!, repos: ["me/app"], read_repos: ["me/app", "me/lib"] };
+    const cat = { ...catalog, templates: { reviewer: tpl } };
+    for (const by of ["operator", "spawner"] as const) {
+      const r = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "reviewer", hands: true, by, overrides: { repos: [] } } as never) as any;
+      expect([by, r.value.repos, r.value.read_repos]).toEqual([by, undefined, ["me/app", "me/lib"]]);
+    }
+  });
+
+  it("a spawner narrowing the allowlist to none drops the unscoped GitHub grants it scoped, rather than leaving them on any repo", () => {
+    const r = expand("spawner", { repos: [], read_repos: ["me/app"] }) as any;
+    expect(r.value.brokered).toBeUndefined();
+    // Scoped grants keep the repos the catalog named; the operator (the root) may still leave them unscoped.
+    const cat: Catalog = { ...catalog, capabilities: { ...catalog.capabilities, gh: { ...catalog.capabilities.gh!, brokered: [{ action: "github.comment" }, { action: "github.create_pr", repos: ["me/app"] }] } } };
+    const s = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "reviewer", hands: true, by: "spawner", overrides: { repos: [] } }) as any;
+    expect(s.value.brokered.map((g: any) => [g.action, g.repos])).toEqual([["github.create_pr", ["me/app"]]]);
+    const o = expand("operator", { repos: [] }) as any;
+    expect(o.value.brokered.map((g: any) => g.repos)).toEqual([null]);
+  });
+
+  it("a template without them expands to a spec without them, as before", () => {
+    const { read_repos: _, ...tpl } = catalog.templates.reviewer!;
+    const r = expandSpec({ ...catalog, templates: { reviewer: tpl } }, PLATFORM_TOOL_NAMES, { template: "reviewer", hands: true, by: "operator" });
+    expect(r.ok && Object.keys(r.value)).not.toContain("read_repos");
   });
 });
 
@@ -289,5 +386,183 @@ describe("a sandbox's push allowlist", () => {
     await broker.putSecret(`inject:${b}:sbx_mine`, "sandbox-value");
     expect(await ref({ sandbox: "sbx_mine", workstream: "ws_old" })).toBe(`$nest-secret:inject:${b}:sbx_mine`);
     expect(await ref({ sandbox: "sbx_other" })).toBe(`$nest-secret:inject:${b}`);
+  });
+});
+
+const readSecret = (cmds: any[]) => cmds.find((c) => c.type === "secrets_update")?.secrets.find((s: any) => s.binding === "github_read");
+/** The next secrets_update and the policy_update after it: the secrets must come first, in the same batch or an earlier one. */
+async function secretsThenPolicy(ws: Ws): Promise<{ secrets: any[]; policy: any }> {
+  const first = await nextCommands(ws, (c) => c.type === "policy_update" || c.type === "secrets_update");
+  const si = first.findIndex((c) => c.type === "secrets_update");
+  const pi = first.findIndex((c) => c.type === "policy_update");
+  expect(si, "a secrets_update before the policy_update").toBeGreaterThanOrEqual(0);
+  expect(pi === -1 || si < pi, "secrets_update before policy_update").toBe(true);
+  const policy = pi >= 0 ? first[pi] : (await nextCommands(ws, (c) => c.type === "policy_update")).find((c) => c.type === "policy_update");
+  return { secrets: first, policy };
+}
+
+describe("a sandbox's read-only repos", () => {
+  it("alone: a token that can only read, for exactly those repos, under both read-only bindings; pushes to them stay refused", async () => {
+    const r = repo();
+    const before = gh.mints.length;
+    const { sandbox, ws } = await placed({ read_repos: [r.toUpperCase()] });
+    const cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
+    const mint = gh.mints.slice(before);
+    expect(mint.map((m) => ({ repositories: m.repositories, permissions: m.permissions }))).toEqual([{ repositories: [r.split("/")[1]], permissions: SANDBOX_READ_TOKEN_PERMISSIONS }]);
+    expect(Object.values(mint[0]!.permissions)).toEqual(["read", "read"]);
+    // The guest's default placeholder (`github_read_default`) and the read-only one both carry it; nothing is under `github`.
+    expect(ghSecret(cmds)).toBeUndefined();
+    expect(cmds.find((c) => c.type === "secrets_update").secrets.find((x: any) => x.binding === "github_read_default")).toMatchObject({ value: mint[0]!.token });
+    expect(readSecret(cmds)).toMatchObject({ binding: "github_read", value: mint[0]!.token });
+    const policy = await sandboxStub(sandbox).policy() as any;
+    expect(policy.guards.find((g: any) => g.name === "github-push").allow).toBeUndefined();
+    expect(policy.guards.find((g: any) => g.name === "github-api-write").allow.filter((a: any) => a.path !== "/graphql")).toEqual([]);
+    expect(policy.inject.map((b: any) => [b.name, b.placeholder])).toEqual([["github_read", GITHUB_READ_PLACEHOLDER], ["github_read_default", GITHUB_PLACEHOLDER]]);
+    const listed = await env.BUCKET.list({ prefix: "audit/broker/" });
+    const records = await Promise.all(listed.objects.map(async (o) => JSON.parse(await (await env.BUCKET.get(o.key))!.text())));
+    expect(records.find((x) => x.target?.sandbox === sandbox && x.expires_ms)).toMatchObject({ repos: [r], permissions: SANDBOX_READ_TOKEN_PERMISSIONS, binding: "github_read" });
+  });
+
+  it("with a push allowlist: the push token covers only the allowlist, the read-only token only the read-only repos", async () => {
+    const pushable = repo(6161);
+    const readable = repo(6161);
+    const before = gh.mints.length;
+    // On both lists, `pushable` stays pushable; `readable` gains no write anywhere.
+    const { sandbox, ws } = await placed({ repos: [pushable], read_repos: [readable, pushable] });
+    // The push that carries both tokens (pushes before it may carry fewer).
+    let last: any;
+    while (!last) {
+      const update = (await nextCommands(ws, (c) => c.type === "secrets_update")).find((c) => c.type === "secrets_update");
+      if (["github", "github_read"].every((b) => update.secrets.some((x: any) => x.binding === b))) last = update;
+    }
+    const mints = gh.mints.slice(before);
+    expect(mints.map((m) => [m.repositories, m.permissions]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))).toEqual([
+      [[pushable.split("/")[1]], SANDBOX_TOKEN_PERMISSIONS], [[readable.split("/")[1]], SANDBOX_READ_TOKEN_PERMISSIONS],
+    ].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+    for (const m of mints) if (m.repositories.includes(readable.split("/")[1]!)) expect(Object.values(m.permissions).every((l) => l === "read"), JSON.stringify(m)).toBe(true);
+    const write = mints.find((m) => m.permissions.contents === "write")!;
+    const read = mints.find((m) => m.permissions.contents === "read")!;
+    expect(last.secrets.find((x: any) => x.binding === "github").value).toBe(write.token);
+    expect(last.secrets.find((x: any) => x.binding === "github_read").value).toBe(read.token);
+    const policy = await sandboxStub(sandbox).policy() as any;
+    expect(policy.guards.find((g: any) => g.name === "github-push").allow).toEqual([{ path: `/${pushable}/**` }, { path: `/${pushable}.git/**` }]);
+  });
+
+  it("an attached agent's join while attached and go at detach; a sandbox with none keeps its push token alone", async () => {
+    const mine = repo(7171);
+    const theirs = repo(7171);
+    const { sandbox, ws } = await placed({ repos: [mine] });
+    const first = await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(readSecret(first)).toBeUndefined();
+    const stub = sandboxStub(sandbox);
+    const agent = `agt_${rand()}${rand()}${rand()}`;
+    const before = gh.mints.length;
+    await stub.attach(agent, undefined, [], [theirs]);
+    let cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
+    const read = gh.mints.slice(before).find((m) => m.permissions.contents === "read")!;
+    expect(read.repositories).toEqual([theirs.split("/")[1]]);
+    expect(readSecret(cmds).value).toBe(read.token);
+    // The allowlist didn't change: its token is reused, not minted wider.
+    expect(gh.mints.slice(before).filter((m) => m.permissions.contents === "write")).toEqual([]);
+    expect(await stub.repoAccess()).toEqual({ push: [mine], read: [theirs] });
+    await stub.detach(agent);
+    cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(readSecret(cmds)).toBeUndefined();
+    expect(ghSecret(cmds)).toBeDefined();
+    expect((await stub.policy()).inject.map((b) => b.name)).toEqual(["github"]);
+  });
+
+  it("an allowlist moved to the read list: the push token leaves the proxy before the policy changes, the new policy has no `github` binding, and BrokerDO forgets the push token", async () => {
+    const r = repo();
+    const { sandbox, ws } = await placed({ repos: [r] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    const stub = sandboxStub(sandbox);
+    const before = gh.mints.length;
+    await stub.setPolicy({ read_repos: [r] });
+    // The secrets go first (the proxy drops the push token), then a policy with no binding it could go out under.
+    const { secrets: cmds, policy: update } = await secretsThenPolicy(ws);
+    expect(update.policy.inject.map((b: any) => b.name)).toEqual(["github_read", "github_read_default"]);
+    expect(update.policy.guards.find((g: any) => g.name === "github-api-write").allow.map((a: any) => a.injected)).toEqual(["github_read", "github_read_default"]);
+    expect(ghSecret(cmds)).toBeUndefined();
+    expect(gh.mints.slice(before).map((m) => m.permissions)).toEqual([SANDBOX_READ_TOKEN_PERMISSIONS]);
+    const held = await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), async (_i, st) =>
+      st.storage.sql.exec("SELECT name FROM secrets WHERE name LIKE ?", `inject:%:${sandbox}`).toArray().map((x) => x.name));
+    expect(held).toEqual([`inject:github_read:${sandbox}`]);
+    // Emptied too: the read-only token goes.
+    await stub.setPolicy({ repos: [r] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    const after = await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), async (_i, st) =>
+      st.storage.sql.exec("SELECT name FROM secrets WHERE name LIKE ?", `inject:%:${sandbox}`).toArray().map((x) => x.name));
+    expect(after).toEqual([`inject:github:${sandbox}`]);
+  });
+
+  it("part of an allowlist moved to the read list: the narrowed push token reaches the proxy before the policy that makes the repo read-only", async () => {
+    const moved = repo(8181);
+    const kept = repo(8181);
+    const { sandbox, ws } = await placed({ repos: [moved, kept] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    await sandboxStub(sandbox).setPolicy({ repos: [kept], read_repos: [moved] });
+    const { secrets, policy } = await secretsThenPolicy(ws);
+    const push = secrets.find((c) => c.type === "secrets_update").secrets.find((x: any) => x.binding === "github");
+    const mint = gh.mints.find((m) => m.token === push.value)!;
+    expect([mint.repositories, mint.permissions]).toEqual([[kept.split("/")[1]], SANDBOX_TOKEN_PERMISSIONS]);
+    expect(policy.policy.guards.find((g: any) => g.name === "github-push").allow).toEqual([{ path: `/${kept}/**` }, { path: `/${kept}.git/**` }]);
+  });
+
+  it("an operator's own `github` binding never resolves to a push token nest minted before, once the repo is read-only", async () => {
+    const x = repo(9191);
+    const { sandbox, ws } = await placed({ repos: [x] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    const minted = await runInDurableObject(broker, async (_i, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM secrets WHERE name = ?", `inject:github:${sandbox}`).one().n);
+    expect(minted).toBe(1);
+    await broker.putSecret("inject:github", "operator-static-value");
+    await sandboxStub(sandbox).setPolicy({ inject: [githubBinding()], repos: [repo(9191)], read_repos: [x] });
+    const { secrets } = await secretsThenPolicy(ws);
+    expect(secrets.find((c) => c.type === "secrets_update").secrets.find((s: any) => s.binding === "github").value).toBe("operator-static-value");
+    const left = await runInDurableObject(broker, async (_i, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM secrets WHERE name = ?", `inject:github:${sandbox}`).one().n);
+    expect(left).toBe(0);
+    await runInDurableObject(broker, async (_i, st) => { st.storage.sql.exec("DELETE FROM secrets WHERE name = 'inject:github'"); });
+  });
+
+  it("with a BrokerDO of the previous release (no readInjectionSecret): no token for the read-only repos, never a push token, retried in 2 minutes", async () => {
+    const r = repo();
+    const proto = BrokerDO.prototype as unknown as Record<string, unknown>;
+    const method = proto.readInjectionSecret;
+    delete proto.readInjectionSecret;
+    const before = gh.mints.length;
+    let sandbox: string;
+    try {
+      const p = await placed({ read_repos: [r] });
+      sandbox = p.sandbox;
+      const cmds = await nextCommands(p.ws, (c) => c.type === "secrets_update");
+      expect(cmds.find((c) => c.type === "secrets_update").secrets).toEqual([]);
+    } finally {
+      proto.readInjectionSecret = method;
+    }
+    expect(gh.mints.slice(before).filter((m) => m.repositories.includes(r.split("/")[1]!))).toEqual([]);
+    const at = await runInDurableObject(sandboxStub(sandbox), async (_i, st) => st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'inject_refresh'").one().at);
+    expect(at).toBeGreaterThan(Date.now() + 60_000);
+    expect(at).toBeLessThan(Date.now() + 3 * 60_000);
+  });
+
+  it("a sandbox stored before them (no read_repos in its layer, no agent_read_repos) reads as having none", async () => {
+    const r = repo();
+    const { sandbox, ws } = await placed({ repos: [r] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    const stub = sandboxStub(sandbox);
+    const want = await stub.policy();
+    await runInDurableObject(stub, async (_i, st) => {
+      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'ws_layer'").one();
+      const { read_repos: _, ...old } = JSON.parse(row.value);
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'ws_layer'", JSON.stringify(old));
+      st.storage.sql.exec("DELETE FROM kv WHERE key = 'agent_read_repos'");
+    });
+    expect(await stub.repoAccess()).toEqual({ push: [r], read: [] });
+    expect(await stub.policy()).toEqual(want);
+    // Attaching an agent with none (as the previous AgentDO does) writes no read-only list.
+    await stub.attach(`agt_${rand()}${rand()}${rand()}`, undefined, [r]);
+    const stored = await runInDurableObject(stub, async (_i, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM kv WHERE key = 'agent_read_repos'").one().n);
+    expect(stored).toBe(0);
   });
 });
