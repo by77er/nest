@@ -1,7 +1,9 @@
 // A thin typed client of nest's public client interface (docs/control-plane/api/clients/): the routes
-// this app uses, and nothing of nest's code. Every call carries the client's token and `?cell=` (nest's
-// owner routes read the cell from the query on every route, defaulting to one production refuses).
-// A 503 nest marks `retryable` (a Durable Object still on the previous release after a deploy) is retried
+// this app uses, and nothing of nest's code. Every call carries the client's token; the cell goes only
+// where nest takes one (a create's body, a listing's optional filter). Creates carry an `Idempotency-Key`,
+// so a create whose answer was lost is sent again without making a second agent or sandbox.
+// A 503 or 409 nest marks `retryable` (a Durable Object still on the previous release after a deploy, a
+// create with the same key still running) is retried
 // a few times; anything else is the caller's to handle. The token is never logged or put in an error.
 
 /** nest's error body: `{error: {code, message, retryable}}`. */
@@ -16,7 +18,7 @@ export class NestError extends Error {
   }
   /** A refusal that will repeat: retrying the same call can't succeed. */
   get permanent(): boolean {
-    return this.status >= 400 && this.status < 500 && this.status !== 408 && this.status !== 409 && this.status !== 429;
+    return this.status >= 400 && this.status < 500 && !this.retryable && this.status !== 408 && this.status !== 429;
   }
 }
 
@@ -72,18 +74,20 @@ export function clientIdOf(token: string | undefined): string | null {
   return m ? `cli_${m[1]}` : null;
 }
 
-/** How many times a retryable 503 is tried, and the first wait (doubling). */
+/** How many times a retryable 503 or 409 is tried, and the first wait (doubling). */
 const ATTEMPTS = 3;
 const FIRST_WAIT_MS = 200;
 
 export class Nest {
   constructor(private readonly config: NestConfig) {}
 
-  /** One call. A JSON answer is returned; an error status throws NestError (a retryable 503 is retried first). */
-  async call<T>(method: string, path: string, body?: unknown, query: Record<string, string | string[]> = {}): Promise<T> {
+  /**
+   * One call. A JSON answer is returned; an error status throws NestError (a retryable 503 or 409 is
+   * retried first, with the same idempotency key).
+   */
+  async call<T>(method: string, path: string, body?: unknown, o: { query?: Record<string, string | string[]>; idempotencyKey?: string } = {}): Promise<T> {
     const url = new URL(path, this.config.base);
-    url.searchParams.set("cell", this.config.cell);
-    for (const [k, v] of Object.entries(query)) for (const one of Array.isArray(v) ? v : [v]) url.searchParams.append(k, one);
+    for (const [k, v] of Object.entries(o.query ?? {})) for (const one of Array.isArray(v) ? v : [v]) url.searchParams.append(k, one);
     for (let attempt = 1; ; attempt++) {
       // The global fetch, looked up per call (dev/review-lessons.md 8).
       const res = await fetch(url.toString(), {
@@ -93,13 +97,14 @@ export class Nest {
           accept: "application/json",
           "user-agent": "nest-projects/1",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...(o.idempotencyKey ? { "idempotency-key": o.idempotencyKey } : {}),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       const text = await res.text();
       if (res.ok) return (text ? JSON.parse(text) : {}) as T;
       const err = parseError(res.status, text);
-      if (err.status === 503 && err.retryable && attempt < ATTEMPTS) {
+      if ((err.status === 503 || err.status === 409) && err.retryable && attempt < ATTEMPTS) {
         await new Promise((r) => setTimeout(r, FIRST_WAIT_MS * 2 ** (attempt - 1)));
         continue;
       }
@@ -107,25 +112,27 @@ export class Nest {
     }
   }
 
-  createSandbox(r: { labels: Labels; idle_ttl_ms?: number }): Promise<{ sandbox: string }> {
-    return this.call("POST", "/v1/sandboxes", { ...r, cell: this.config.cell });
+  /** Create a sandbox in the app's cell. The same `idempotencyKey` with the same request answers the same sandbox. */
+  createSandbox(r: { labels: Labels; idle_ttl_ms?: number }, idempotencyKey: string): Promise<{ sandbox: string }> {
+    return this.call("POST", "/v1/sandboxes", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
-  createAgent(r: { template: string; sandbox?: string; labels: Labels; overrides?: SpawnOverrides; start?: boolean }): Promise<AgentView> {
-    return this.call("POST", "/v1/agents", { ...r, cell: this.config.cell });
+  /** Create an agent in the app's cell. The same `idempotencyKey` with the same request answers the same agent. */
+  createAgent(r: { template: string; sandbox?: string; labels: Labels; overrides?: SpawnOverrides; start?: boolean }, idempotencyKey: string): Promise<AgentView> {
+    return this.call("POST", "/v1/agents", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
   getAgent(agent: string): Promise<AgentView> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}`);
   }
 
-  /** The first page of agents carrying every label in `labels` (`state`: live by default). */
+  /** The first page of the app's agents carrying every label in `labels` (`state`: live by default), in the app's cell. */
   listAgents(labels: Labels, state: "live" | "ended" | "all" = "live"): Promise<{ agents: Listed[]; next_cursor: string | null }> {
-    return this.call("GET", "/v1/agents", undefined, { label: labelFilters(labels), state });
+    return this.call("GET", "/v1/agents", undefined, { query: { label: labelFilters(labels), state, cell: this.config.cell } });
   }
 
   listSandboxes(labels: Labels, state: "live" | "ended" | "all" = "live"): Promise<{ sandboxes: Listed[]; next_cursor: string | null }> {
-    return this.call("GET", "/v1/sandboxes", undefined, { label: labelFilters(labels), state });
+    return this.call("GET", "/v1/sandboxes", undefined, { query: { label: labelFilters(labels), state, cell: this.config.cell } });
   }
 
   /**

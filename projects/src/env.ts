@@ -10,7 +10,7 @@ export interface Env {
   REVIEW: DurableObjectNamespace<ReviewDO>;
   /** nest's base URL: its client API, and the `iss` of Nest-Identity tokens. */
   NEST_CONTROL_PLANE: string;
-  /** The cell the app's agents and sandboxes run in, sent as `?cell=` on every call. */
+  /** The cell the app's agents and sandboxes run in: a create's `cell`, and a listing's filter. */
   NEST_CELL: string;
   /** This Worker's base URL; the MCP servers are `${PUBLIC_BASE_URL}/mcp/<server>`. */
   PUBLIC_BASE_URL: string;
