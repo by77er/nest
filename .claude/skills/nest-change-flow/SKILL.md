@@ -5,7 +5,7 @@ description: Use at the start of any nest code or docs change, and again before 
 
 # From task to merged change
 
-Subsystem skills: `nest-control-plane`, `nest-host`, `nest-wire`, `nest-infra`, `nest-verification`. Cross-cutting: `nest-tests`, `nest-validation`, `nest-review`. Repo rules: `CLAUDE.md` and [dev/](../../../dev/README.md).
+Subsystem skills: `nest-control-plane`, `nest-host`, `nest-wire`, `nest-infra`, `nest-verification`. Cross-cutting: `nest-tests`, `nest-validation`, `nest-review`, `nest-ui-design` (any web UI). Repo rules: `CLAUDE.md` and [dev/](../../../dev/README.md).
 
 ## 1. Start clean
 
