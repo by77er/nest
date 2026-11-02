@@ -70,7 +70,9 @@ export type ChannelKind =
  * A valid channel name and what it is. Names are hierarchical for tidiness only: lowercase segments
  * of `[a-z0-9_.-]` joined by `/`, at most 128 characters. `agt_…/inbox`, `agt_…/events`,
  * `sbx_…/events` and `user` are the built-in channels; any other name with an `agt_`, `sbx_`, `hk_`
- * or `ws_` first segment, `user/…` or `platform…` is reserved.
+ * or `ws_` first segment, `user/…`, `platform…` or `ledger` / `ledger/…` is reserved (`ledger` was the
+ * task ledger's, which left the platform; kept, because the previous release refuses those names and
+ * a channel made under one would be unreachable after a rollback).
  */
 export function parseChannel(name: string): Result<ChannelKind> {
   if (typeof name !== "string" || name.length === 0 || name.length > MAX_NAME_LENGTH) {
@@ -83,7 +85,7 @@ export function parseChannel(name: string): Result<ChannelKind> {
   if (segs.length === 2 && AGENT_ID.test(first!) && second === "inbox") return ok({ kind: "inbox", agent: first! });
   if (segs.length === 2 && AGENT_ID.test(first!) && second === "events") return ok({ kind: "events", agent: first! });
   if (segs.length === 2 && SANDBOX_ID.test(first!) && second === "events") return ok({ kind: "sandbox_events", sandbox: first! });
-  if (/^(agt|sbx|hk|ws)_/.test(first!) || first === "user" || first!.startsWith("platform")) {
+  if (/^(agt|sbx|hk|ws)_/.test(first!) || first === "user" || first!.startsWith("platform") || first === "ledger") {
     return err(`${name} is a reserved channel name`);
   }
   return ok({ kind: "free" });

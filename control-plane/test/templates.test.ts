@@ -1,10 +1,11 @@
 // Templates and capabilities as data (CatalogDO, the admin routes) and agents spawned from them: what
 // an agent is offered, may call, is started with and escalates to comes from its expanded spec, and
 // nothing decides on a role or a template's name.
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
+import { LEDGER_ALARM_MS, type TaskLedgerDO } from "../src/do/tasks";
 import { SEED_CATALOG } from "../src/lib/spec";
 import { adminJson, connectHost, nextCommands, uniqueCell, Ws } from "./helpers";
 
@@ -395,5 +396,36 @@ describe("the task ledger's removal", () => {
     expect(outcome).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
     // Its record still reads (the stored `params` is ignored).
     expect((await adminJson(`/v1/agents/${a.agent}`)).agent).toBe(a.agent);
+  });
+
+  it("an operator spawn naming a capability parameter is refused, not silently given an agent without it", async () => {
+    const s = await cellWithSandbox();
+    const r = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false, overrides: { params: { ledger: "proj-a" } } } }, 400);
+    expect(r.error.message).toContain("overrides.params is no longer accepted");
+  });
+
+  it("the stub ledger leaves the previous release's rows alone and keeps an alarm while it has deadlines, so a rollback's alarm still comes", async () => {
+    const ledger = (name: string) => env.TASKS.get(env.TASKS.idFromName(name));
+    // A ledger as the previous release left it: an undelivered notice and its due deadline, alarm armed.
+    const old = ledger(`ledger/${uniqueName("old")}`);
+    await runInDurableObject(old, async (_i: TaskLedgerDO, st) => {
+      st.storage.sql.exec("CREATE TABLE deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
+      st.storage.sql.exec("CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL)");
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('notices', 1)");
+      st.storage.sql.exec("INSERT INTO outbox (channel, body) VALUES ('agt_x/inbox', '{}')");
+      await st.storage.setAlarm(Date.now() + 60_000);
+    });
+    const before = Date.now();
+    expect(await runDurableObjectAlarm(old)).toBe(true);
+    await runInDurableObject(old, async (_i: TaskLedgerDO, st) => {
+      expect(await st.storage.getAlarm()).toBeGreaterThanOrEqual(before + LEDGER_ALARM_MS);
+      expect(st.storage.sql.exec("SELECT key, at FROM deadlines").toArray()).toEqual([{ key: "notices", at: 1 }]);
+      expect(st.storage.sql.exec("SELECT channel FROM outbox").toArray()).toEqual([{ channel: "agt_x/inbox" }]);
+    });
+    // One with no deadlines (or none stored at all) is left with no alarm.
+    const empty = ledger(`ledger/${uniqueName("empty")}`);
+    await runInDurableObject(empty, (_i: TaskLedgerDO, st) => st.storage.setAlarm(Date.now() + 60_000));
+    expect(await runDurableObjectAlarm(empty)).toBe(true);
+    expect(await runInDurableObject(empty, (_i: TaskLedgerDO, st) => st.storage.getAlarm())).toBeNull();
   });
 });

@@ -517,7 +517,10 @@ export const ROUTES: Route[] = [
       sandbox: z.string().startsWith("sbx_").optional(),
       owner: z.string().startsWith("agt_").optional(),
       captain: z.string().startsWith("agt_").optional(),
-      overrides: OperatorOverrides.optional(),
+      // `params` is gone (the task ledger's `ledger` was the only one): refused, not silently dropped, for one release.
+      overrides: OperatorOverrides.extend({
+        params: z.never({ error: "overrides.params is no longer accepted: the task ledger left the platform" }).optional(),
+      }).optional(),
       launch: LaunchConfig.optional(),
       rules: z.array(ToolRule).optional(),
       // Gone: a client still sending it must not silently get the template's wider tool set.
