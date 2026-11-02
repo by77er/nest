@@ -67,6 +67,19 @@ export class FakeNest {
   inProgress: { match: RegExp; times: number }[] = [];
   /** Idempotency keys: the request each binds, and its first answer once made. */
   readonly keys = new Map<string, { digest: string; status: number; body: string }>();
+  /** Each agent's trace events, as nest's ring holds them (docs/control-plane/api/, "Live trace"). */
+  readonly traces = new Map<string, Record<string, unknown>[]>();
+  /** What a trace upgrade answers instead of a socket, once each (a deploy's 503, say). */
+  traceRefusals: { status: number; code: string; retryable: boolean }[] = [];
+
+  /** Record a trace event for `agent` (its next seq), as nest's ring does. */
+  pushTrace(agent: string, ev: Record<string, unknown>): Record<string, unknown> {
+    const ring = this.traces.get(agent) ?? [];
+    const full = { seq: ring.length + 1, ts_ms: Date.now(), ...ev };
+    ring.push(full);
+    this.traces.set(agent, ring);
+    return full;
+  }
 
   fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number } = {}): void {
     this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1 });
@@ -158,6 +171,26 @@ export class FakeNest {
       if (!a || a.client !== CLIENT) return nestErr(404, "unknown_agent", "unknown agent");
       const sub = m[2] ?? "";
       if (req.method === "GET" && sub === "") return json(200, this.view(a));
+      if (req.method === "GET" && sub === "/trace") {
+        if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return nestErr(426, "invalid_message", "expected a WebSocket upgrade");
+        const refusal = this.traceRefusals.shift();
+        if (refusal) return nestErr(refusal.status, refusal.code, "refused", refusal.retryable);
+        // As nest answers it: the backlog after `after`, `live`, then what `pushTrace` sends.
+        const after = Number(u.searchParams.get("after") ?? 0);
+        const pair = new WebSocketPair();
+        const server = pair[1];
+        server.accept();
+        for (const ev of (this.traces.get(a.agent) ?? []).filter((e) => (e.seq as number) > after)) server.send(JSON.stringify(ev));
+        server.send(JSON.stringify({ type: "live" }));
+        // A socket can only be used from the request that made it (workerd's rule), so a test drives this one
+        // through itself: `{fake: "push", event}` records an event and sends it here; `{fake: "drop"}` closes it.
+        server.addEventListener("message", (e) => {
+          const m = JSON.parse(e.data as string) as { fake?: string; event?: Record<string, unknown> };
+          if (m.fake === "push") server.send(JSON.stringify(this.pushTrace(a.agent, m.event ?? {})));
+          if (m.fake === "drop") server.close(1011, "dropped");
+        });
+        return new Response(null, { status: 101, webSocket: pair[0] });
+      }
       if (req.method === "POST" && sub === "/inbox") {
         const dup = call.body.request_id && this.inbox.some((x) => x.agent === a.agent && x.request_id === call.body.request_id);
         if (!dup) this.inbox.push({ agent: a.agent, text: call.body.text, from: call.body.from, request_id: call.body.request_id });
