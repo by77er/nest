@@ -31,6 +31,8 @@ const NOT_ADMIN = {
     "GET /v1/catalog",
     ...["GET", "PUT", "DELETE"].flatMap((m) => ["templates", "capabilities"].map((k) => `${m} /v1/catalog/${k}/:ns/:entry`)),
   ].map((r) => [r, "owner"])),
+  // A client's own: only a client token has a self, the operator's is refused (test/client-github-token.test.ts).
+  "POST /v1/clients/self/github-token": "owner",
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */
 const concrete = (path: string) => path.replace(/[:*]([a-z]+)/g, (_m, k: string) =>

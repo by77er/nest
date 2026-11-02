@@ -6,8 +6,9 @@ import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
 import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
-import { appJwt, type GitHubApi, githubApiOf, importAppKey, parseAppSecret, SANDBOX_TOKEN_PERMISSIONS } from "../lib/github";
-import { canonicalRepos } from "../lib/repos";
+import { appJwt, type GitHubApi, githubApiOf, GithubRepoPermissions, importAppKey, parseAppSecret, SANDBOX_TOKEN_PERMISSIONS } from "../lib/github";
+import { isClientId } from "../lib/clients";
+import { canonicalRepos, Repo } from "../lib/repos";
 import type { GithubPermissions } from "../lib/brokered";
 import { canonicalJson } from "../lib/sinks";
 import { Credential } from "../protocol/control";
@@ -450,7 +451,35 @@ export class BrokerDO extends DurableObject<Env> {
    */
   async githubToken(repo: string, permissions: GithubPermissions, caller: CredentialCaller): Promise<{ token: string; expires_ms: number }> {
     const r = repo.toLowerCase();
-    const key = `${r}|${canonicalJson(permissions)}`;
+    return await this.mintGithub(`${r}|${canonicalJson(permissions)}`, r, permissions, caller);
+  }
+
+  /**
+   * An installation token an API client asked for (`POST /v1/clients/self/github-token`,
+   * docs/control-plane/api/clients/#github-tokens): one repo, exactly these repository permissions.
+   * The caller (the Worker) has held the request to the client's grant; this checks the shape again,
+   * so no caller gets a token for every permission (none named) or for anything outside
+   * `GITHUB_REPO_PERMISSIONS`. Cached per client, repo and permissions (never shared with another
+   * client or an agent's action), reused while it has 10 minutes left; expired client tokens are
+   * deleted here. Audited as every mint is, with `caller: {client}`.
+   */
+  async clientGithubToken(client: string, repo: string, permissions: GithubPermissions): Promise<{ token: string; expires_ms: number }> {
+    const r = Repo.safeParse(repo);
+    const p = GithubRepoPermissions.safeParse(permissions);
+    if (!isClientId(client) || !r.success || !p.success || !Object.keys(p.data).length) {
+      throw new NestError(ErrorCodes.INVALID_MESSAGE, "a client's GitHub token is for a cli_ client, one owner/name repo and at least one repository permission", 400);
+    }
+    this.sql.exec("DELETE FROM github_tokens WHERE key LIKE 'client:%' AND expires_ms <= ?", Date.now());
+    const name = r.data.toLowerCase();
+    return await this.mintGithub(`client:${client}|${name}|${canonicalJson(p.data)}`, name, p.data, { client });
+  }
+
+  /**
+   * The mint behind {@link githubToken} and {@link clientGithubToken}: the token cached under `key`
+   * while it has 10 minutes left, else a new one for repo `r` (lowercase) with exactly `permissions`,
+   * audited (with `caller`) before anyone holds it.
+   */
+  private async mintGithub(key: string, r: string, permissions: GithubPermissions, caller: unknown): Promise<{ token: string; expires_ms: number }> {
     const cached = this.sql.exec<{ token: string; expires_ms: number }>("SELECT token, expires_ms FROM github_tokens WHERE key = ?", key).toArray()[0];
     if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS) return cached;
     const audit = { event: "github_installation_token", repos: [r], permissions, caller };

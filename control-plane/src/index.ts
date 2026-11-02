@@ -10,7 +10,10 @@ import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, EntryName, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
 import { cellIdleTtlMs, MIN_IDLE_TTL_MS } from "./lib/lifetimes";
-import { CLIENT_ID, ClientName, Grant, isAgentId, Labels, newClientToken, parseClientToken, parseLabelFilters, tokenHash } from "./lib/clients";
+import {
+  CLIENT_ID, ClientName, GithubTokenRequest, githubTokenOutsideGrant, Grant, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
+  parseLabelFilters, tokenHash,
+} from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
 import { CLIENT_DIRECTORY } from "./do/client";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
@@ -120,6 +123,27 @@ async function ownSandbox(c: { env: Env; caller: Caller }, id: string) {
 /** A client refused something only the operator does. */
 function operatorOnly(c: { caller: Caller }, what: string): void {
   if (c.caller.kind !== "operator") throw new NestError(ErrorCodes.FORBIDDEN, `${what} is the operator's`, 403);
+}
+
+/** A `/v1/clients/self/…` route's client: only a client token has a self (the operator is refused, 403). */
+function selfClient(c: { caller: Caller }): ClientScope {
+  if (c.caller.kind !== "client") throw new NestError(ErrorCodes.FORBIDDEN, "only an API client's token has a self", 403);
+  return c.caller;
+}
+
+/**
+ * A call to a Durable Object method this release added. For minutes after a deploy the object may
+ * still run the previous code, which lacks it (dev/deploy.md): that answers a retryable 503, not a 500.
+ */
+async function newMethod<T>(what: string, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (e) {
+    if (!asNestError(e) && /RPC receiver does not implement/.test(e instanceof Error ? e.message : String(e))) {
+      throw new NestError(ErrorCodes.INTERNAL, `${what} isn't running yet after a deploy: try again in a few minutes`, 503, true);
+    }
+    throw e;
+  }
 }
 
 const isUpgrade = (req: Request) => req.headers.get("upgrade")?.toLowerCase() === "websocket";
@@ -720,6 +744,19 @@ export const ROUTES: Route[] = [
     await clientDO(env, p.client).purge();
     return { deleted: p.client, name, catalog_entries: entries };
   } }),
+
+  // A client's own GitHub App token (docs/control-plane/api/clients/#github-tokens): one repo and the
+  // permissions it names, each within its grant's `github` (403 otherwise, and nothing is minted).
+  route({
+    method: "POST", path: "/v1/clients/self/github-token", auth: "owner", body: GithubTokenRequest,
+    run: async (c) => {
+      const self = selfClient(c);
+      const refusal = grantRefusal(self.client, githubTokenOutsideGrant(c.body, self.grant));
+      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
+      const t = await newMethod("BrokerDO.clientGithubToken", () => broker(c.env).clientGithubToken(self.client, c.body.repo, c.body.permissions));
+      return { token: t.token, expires_at: new Date(t.expires_ms).toISOString(), repo: c.body.repo.toLowerCase(), permissions: c.body.permissions };
+    },
+  }),
 
   // The catalog as an owner sees it: the operator all of it, a client the operator's entries and its own
   // namespace, `<client-name>/<entry>`, which it alone (and the operator) writes.

@@ -12,8 +12,11 @@ import { sha256, hex } from "./util";
 
 // --- The registry ------------------------------------------------------------------------------------
 
-/** GitHub repository permissions an action's installation token is narrowed to (docs.github.com, "Permissions required for GitHub Apps"). */
-export type GithubPermissions = Readonly<Record<string, "read" | "write">>;
+/**
+ * GitHub repository permissions an installation token is narrowed to (docs.github.com, "Permissions
+ * required for GitHub Apps"); the names and levels a client may ask for are `GITHUB_REPO_PERMISSIONS` (lib/github.ts).
+ */
+export type GithubPermissions = Readonly<Record<string, "read" | "write" | "admin">>;
 
 const REPO = { type: "string", description: "owner/name" };
 const BODY = (what: string) => ({ type: "string", description: `${what} (Markdown).`, maxLength: 65_536 });

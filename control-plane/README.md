@@ -114,7 +114,8 @@ External systems (docs/control-plane/api/clients/): `POST /v1/admin/clients {nam
 (`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript,
 brokered journal, asks and answers; sandbox create, list, read, destroy, lifetime and effective policy) on its own subtree only
 (anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
-`GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`.
+`GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`. Its own, with a
+client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a GitHub App token within `github`; BrokerDO mints it).
 
 ## Secrets and vars
 
