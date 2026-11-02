@@ -335,7 +335,7 @@ export async function eventually<T>(f: () => T | Promise<T>, what: string): Prom
 export const GH_APP_ID = 4242;
 
 /** The app's grant's `github.permissions` (README.md#how-it-uses-nest). */
-export const GRANT_PERMISSIONS: Record<string, string> = { checks: "write", administration: "write", metadata: "read" };
+export const GRANT_PERMISSIONS: Record<string, string> = { checks: "write", administration: "write", metadata: "read", pull_requests: "write", contents: "write" };
 const RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
 const levelWithin = (want: string, have: string | undefined) => !!have && !!RANK[want] && RANK[want]! <= RANK[have]!;
 
@@ -362,7 +362,11 @@ export interface FakeCheckRun {
 export class FakeGitHub {
   readonly calls: { method: string; path: string; body: any; token: string | null }[] = [];
   readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
-  readonly repos = new Map<string, { default_branch: string; protection: Record<string, any> | null }>();
+  readonly repos = new Map<string, { default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean }>();
+  /** Each PR's auto-merge, by node id, as GraphQL's mutations leave it. */
+  readonly autoMerge = new Map<string, { method: string } | null>();
+  /** GraphQL errors to answer (a 200 with `errors`), for mutations whose name matches. */
+  gqlErrors: { match: RegExp; message: string; times: number }[] = [];
   readonly checkRuns = new Map<number, FakeCheckRun>();
   failures: { match: RegExp; status: number; times: number; message?: string }[] = [];
   /** Check-run creates that are made but whose answer is lost (a 502), as after a timeout. */
@@ -382,7 +386,7 @@ export class FakeGitHub {
 
   repo(name: string) {
     const k = name.toLowerCase();
-    if (!this.repos.has(k)) this.repos.set(k, { default_branch: "main", protection: null });
+    if (!this.repos.has(k)) this.repos.set(k, { default_branch: "main", protection: null, allow_auto_merge: false });
     return this.repos.get(k)!;
   }
 
@@ -402,6 +406,14 @@ export class FakeGitHub {
     const call = { method: req.method, path: u.pathname, body: text ? JSON.parse(text) : undefined, token };
     this.calls.push(call);
     const route = `${req.method} ${u.pathname}`;
+    if (route === "POST /graphql") {
+      const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
+      if (f) {
+        f.times--;
+        return json(f.status, { message: f.message ?? "injected" });
+      }
+      return this.graphql(call.body, token, json);
+    }
     const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
     if (!m) return json(404, { message: "Not Found" });
     const repoName = m[1]!.toLowerCase();
@@ -419,10 +431,19 @@ export class FakeGitHub {
     const repo = this.repo(repoName);
     let s: RegExpMatchArray | null;
 
+    // Merge settings are shown only to contents: read and write
+    // (https://docs.github.com/en/rest/repos/repos#get-a-repository).
+    const repoView = () => ({ full_name: repoName, default_branch: repo.default_branch, ...(need("contents", "write") ? { allow_auto_merge: repo.allow_auto_merge } : {}) });
     if (req.method === "GET" && sub === "") {
       // Metadata, which GitHub grants every installation token; the fake asks for it named.
       if (!need("metadata", "read")) return denied();
-      return json(200, { full_name: repoName, default_branch: repo.default_branch });
+      return json(200, repoView());
+    }
+    if (req.method === "PATCH" && sub === "") {
+      // Administration: write (https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps).
+      if (!need("administration", "write")) return denied();
+      if (typeof call.body?.allow_auto_merge === "boolean") repo.allow_auto_merge = call.body.allow_auto_merge;
+      return json(200, repoView());
     }
     if ((s = sub.match(/^\/branches\/([^/]+)\/protection(\/required_status_checks)?$/))) {
       if (decodeURIComponent(s[1]!) !== repo.default_branch) return json(404, { message: "Branch not found" });
@@ -484,6 +505,35 @@ export class FakeGitHub {
       return json(200, { total_count: runs.length, check_runs: runs });
     }
     return json(404, { message: `no route for ${route}` });
+  }
+
+  /** GraphQL's auto-merge mutations, on a PR named by its node id (`prNode`), for a token of its repo. */
+  private graphql(body: any, token: string | null, json: (status: number, body: unknown) => Response): Response {
+    const t = token ? this.tokens.get(token) : undefined;
+    if (!t) return json(401, { message: "Bad credentials" });
+    const query = String(body?.query ?? "");
+    const name = /enablePullRequestAutoMerge|disablePullRequestAutoMerge/.exec(query)?.[0];
+    const id = String(body?.variables?.id ?? "");
+    const target = nodeTarget(id);
+    if (!name || !target) return json(200, { errors: [{ type: "NOT_FOUND", message: `Could not resolve to a node with the global id of '${id}'` }] });
+    if (target.repo !== t.repo) return json(200, { errors: [{ type: "NOT_FOUND", message: `Could not resolve to a node with the global id of '${id}'` }] });
+    if (!levelWithin("write", t.permissions.pull_requests) || !levelWithin("write", t.permissions.contents)) {
+      return json(200, { errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] });
+    }
+    const injected = this.gqlErrors.find((e) => e.times > 0 && e.match.test(name));
+    if (injected) {
+      injected.times--;
+      return json(200, { errors: [{ message: injected.message }] });
+    }
+    if (name === "enablePullRequestAutoMerge") {
+      if (!this.repo(target.repo).allow_auto_merge) return json(200, { errors: [{ type: "UNPROCESSABLE", message: "Pull request Auto merge is not allowed for this repository" }] });
+      const method = body.variables.method;
+      if (!["SQUASH", "MERGE", "REBASE"].includes(method)) return json(200, { errors: [{ message: `Variable $method of type PullRequestMergeMethod! was provided invalid value` }] });
+      this.autoMerge.set(id, { method });
+    } else {
+      this.autoMerge.set(id, null);
+    }
+    return json(200, { data: { [name]: { pullRequest: { id } } } });
   }
 
   /** The app that "recently provided" each check on the repo, as GitHub picks one for an omitted app_id. */
@@ -548,7 +598,7 @@ export function prEvent(o: {
   return {
     action: o.action, number: o.number,
     pull_request: {
-      number: o.number, title: o.title ?? `PR ${o.number}`, state: o.action === "closed" ? "closed" : "open", merged: o.merged ?? false,
+      number: o.number, node_id: prNode(o.repo, o.number), title: o.title ?? `PR ${o.number}`, state: o.action === "closed" ? "closed" : "open", merged: o.merged ?? false,
       updated_at: o.updated_at ?? new Date().toISOString(),
       head: { sha: o.sha, ref: o.ref ?? `feature-${o.number}`, repo: { full_name: o.headRepo ?? o.repo } },
       base: { ref: o.base ?? "main", repo: { full_name: o.repo } },
@@ -560,3 +610,18 @@ export function prEvent(o: {
 
 /** A 40-hex commit id. */
 export const shaOf = (seed: string) => [...seed].map((c) => c.charCodeAt(0).toString(16)).join("").padEnd(40, "0").slice(0, 40);
+
+/** A PR's GraphQL node id in the fake: its repo and number, readable back by the fake. */
+export const prNode = (repo: string, number: number) => `PR_${btoa(`${repo.toLowerCase()}#${number}`).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_")}`;
+
+function nodeTarget(id: string): { repo: string; number: number } | null {
+  const m = /^PR_([A-Za-z0-9_-]+)$/.exec(id);
+  if (!m) return null;
+  try {
+    const raw = atob(m[1]!.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (m[1]!.length % 4)) % 4));
+    const [repo, n] = raw.split("#");
+    return repo && n ? { repo, number: Number(n) } : null;
+  } catch {
+    return null;
+  }
+}

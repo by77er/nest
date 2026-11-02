@@ -13,6 +13,31 @@ import { HistoryList } from "./HistoryList";
 import { SpecView } from "./SpecView";
 import { TaskActions } from "./TaskActions";
 import { TaskEditForm } from "./TaskEditForm";
+import type { Task } from "../../api/types";
+
+/** GitHub's auto-merge on the task's PR, while the project's auto-merge is on. */
+function AutoMerge({ task }: { task: Task }) {
+  const a = task.auto_merge;
+  if (!a) return null;
+  if (a.state === "failed") {
+    return (
+      <Alert color="warning" variant="light" icon={<IconAlertTriangle size={18} />} title="Auto-merge wasn't changed on its PR">
+        {a.error}
+      </Alert>
+    );
+  }
+  const label = a.state === "enabled" ? `Auto-merge on${a.method ? ` (${a.method})` : ""}` : a.state === "pending" ? "Auto-merge pending" : "Auto-merge off";
+  return (
+    <Group gap="xs">
+      <Badge color={a.state === "enabled" ? "success" : "gray"} variant="light">
+        {label}
+      </Badge>
+      <Text size="xs" c="dimmed" title={exact(a.at_ms)}>
+        {a.state === "enabled" ? "Merges once its review passes" : a.error ? `Retrying: ${a.error}` : ago(a.at_ms)}
+      </Text>
+    </Group>
+  );
+}
 
 export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: string; repo: string; taskId: string | undefined; onClose: () => void }) {
   const task = useTask(projectId, taskId);
@@ -56,6 +81,8 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
               )}
             </Group>
           </Stack>
+
+          <AutoMerge task={t} />
 
           {t.start_error && (
             <Alert color="warning" variant="light" icon={<IconAlertTriangle size={18} />} title={t.state === "stalled" ? "Its worker didn't start" : "Its worker is being retried"}>
