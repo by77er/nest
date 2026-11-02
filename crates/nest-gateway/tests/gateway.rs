@@ -16,7 +16,7 @@ use nest_protocol::gateway::{
 };
 use nest_protocol::guest::frame::{self, Decoder, Kind, MAX_FRAME_LEN};
 use nest_protocol::guest::{PORT_HANDS, handshake};
-use nest_protocol::host::gateway_link::{GatewayCommand, GatewayEvent};
+use nest_protocol::host::gateway_link::{GatewayCommand, GatewayEvent, SandboxPause};
 use nest_protocol::model::{Epoch, SandboxId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -607,6 +607,7 @@ fn upsert(guest: &FakeGuest, with_guest: bool) -> GatewayCommand {
         vsock_uds_path: guest.path.to_string_lossy().into_owned(),
         clients: vec![AGENT.into()],
         guest: with_guest.then(guest_v1),
+        paused: None,
     }
 }
 
@@ -637,7 +638,7 @@ async fn the_link_resyncs_on_hello_drops_what_nestd_did_not_resend_and_answers_p
     write_cmd(&mut s, &GatewayCommand::KeyUpdate { keys: vec![key_of(&signer)] }).await;
     write_cmd(&mut s, &upsert(&guest, true)).await;
     // A second sandbox that the next resync will not re-send.
-    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: SandboxId("sbx_second".into()), epoch: Epoch(1), vsock_uds_path: "/x".into(), clients: vec![], guest: None }).await;
+    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: SandboxId("sbx_second".into()), epoch: Epoch(1), vsock_uds_path: "/x".into(), clients: vec![], guest: None, paused: None }).await;
     write_cmd(&mut s, &GatewayCommand::ResyncDone).await;
     wait_until("resync done", || !state.resyncing() && state.sandbox_count() == 2).await;
     assert_eq!(state.key(&signer.kid()), Some(signer.public_key()));
@@ -693,7 +694,7 @@ async fn the_link_resyncs_on_hello_drops_what_nestd_did_not_resend_and_answers_p
     assert_eq!(state.sandbox_count(), 1, "the sandbox nestd did not re-send is gone");
     let mut ws = bound_ws(&addr, &signer).await;
     // An epoch bump from nestd cuts the open connection and refuses the old binding as stale.
-    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: sbx(), epoch: Epoch(5), vsock_uds_path: guest.path.to_string_lossy().into_owned(), clients: vec![AGENT.into()], guest: Some(guest_v1()) }).await;
+    write_cmd(&mut s, &GatewayCommand::SandboxUpsert { sandbox: sbx(), epoch: Epoch(5), vsock_uds_path: guest.path.to_string_lossy().into_owned(), clients: vec![AGENT.into()], guest: Some(guest_v1()), paused: None }).await;
     assert_eq!(close_code(&mut ws).await, Some(close_code::MOVED));
     let mut ws = connect(&addr, "/hands").await;
     assert_eq!(refusal(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await.0, error_code::STALE_EPOCH);
@@ -702,4 +703,59 @@ async fn the_link_resyncs_on_hello_drops_what_nestd_did_not_resend_and_answers_p
     wait_until("removed", || state.sandbox_count() == 0).await;
     let mut ws = connect(&addr, "/hands").await;
     assert_eq!(refusal(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await.0, error_code::MOVED);
+}
+
+/// The incident of 2026-11-02: while nestd had the VM paused for a checkpoint's commit, a bind
+/// waited out the whole vsock timeout. Now nestd's `sandbox_upsert` carries the pause and the
+/// gateway refuses at once with `busy` and the pause hint, naming the reason; a call bound before
+/// the pause is not cut; once nestd sends the upsert without it, binds are admitted again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_sandbox_is_busy_at_once_with_the_pause_hint_and_bound_calls_survive_it() {
+    let signer = Signer::generate();
+    let guest = FakeGuest::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("gateway.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let state = State::new();
+    tokio::spawn(nest_gateway::link(sock.clone(), "127.0.0.1:0".into(), state.clone()));
+    let (mut s, _) = listener.accept().await.unwrap();
+    let GatewayEvent::Hello { .. } = read_event(&mut s).await else { panic!("expected hello") };
+    write_cmd(&mut s, &GatewayCommand::HelloAck { protocol_version: nest_protocol::host::PROTOCOL_VERSION, host_id: nest_protocol::model::HostId("hst_1".into()) }).await;
+    write_cmd(&mut s, &GatewayCommand::KeyUpdate { keys: vec![key_of(&signer)] }).await;
+    write_cmd(&mut s, &upsert(&guest, true)).await;
+    write_cmd(&mut s, &GatewayCommand::ResyncDone).await;
+    wait_until("resync done", || !state.resyncing() && state.sandbox_count() == 1).await;
+    let addr = start_server(state.clone()).await;
+    let mut bound = bound_ws(&addr, &signer).await;
+
+    // The VM is frozen: its vsock would answer `CONNECT` only after the gateway's own timeout.
+    guest.ok_delay_ms.store(30_000, Ordering::SeqCst);
+    let paused = |p: bool| {
+        let GatewayCommand::SandboxUpsert { sandbox, epoch, vsock_uds_path, clients, guest, .. } = upsert(&guest, true) else { unreachable!() };
+        let paused = p.then(|| SandboxPause { reason: "checkpoint (turn_end)".into() });
+        GatewayCommand::SandboxUpsert { sandbox, epoch, vsock_uds_path, clients, guest, paused }
+    };
+    write_cmd(&mut s, &paused(true)).await;
+    wait_until("pause applied", || state.sandbox(&sbx()).is_some_and(|e| e.paused.is_some())).await;
+    let started = std::time::Instant::now();
+    let mut ws = connect(&addr, "/hands").await;
+    let GatewayMessage::Error { error, executed, retry_after_ms } = bind(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await else {
+        panic!("bound a paused sandbox")
+    };
+    // Well under the gateway's 5 s vsock timeout: no connect was tried.
+    assert!(started.elapsed() < Duration::from_secs(2), "refused after {:?}", started.elapsed());
+    assert_eq!((error.code.as_str(), error.retryable, executed), (error_code::BUSY, true, false));
+    assert_eq!(retry_after_ms, Some(nest_protocol::gateway::PAUSED_RETRY_AFTER_MS));
+    assert!(error.message.contains("checkpoint (turn_end)"), "{}", error.message);
+
+    // The call bound before the pause is still open and still pipes frames.
+    bound.send(Message::binary(hands_request(AGENT, 4, 1))).await.unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), bound.next()).await.expect("a frame in time").unwrap().unwrap();
+    assert!(matches!(m, Message::Binary(_)), "{m:?}");
+
+    // Running again: the next bind is admitted.
+    guest.ok_delay_ms.store(0, Ordering::SeqCst);
+    write_cmd(&mut s, &paused(false)).await;
+    wait_until("pause lifted", || state.sandbox(&sbx()).is_some_and(|e| e.paused.is_none())).await;
+    let _ws = bound_ws(&addr, &signer).await;
 }

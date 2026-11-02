@@ -563,6 +563,14 @@ pub mod gateway_link {
             clients: Vec<String>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             guest: Option<GuestInfo>,
+            /// Present while nestd has the VM paused with the sandbox still placed here (a
+            /// checkpoint's, suspend's or archive's commit): binds get `busy` at once, with
+            /// `gateway::PAUSED_RETRY_AFTER_MS`, instead of a vsock connect that would hang.
+            /// Connections already bound stay open and stall until the VM runs again. Optional
+            /// since this release: a gateway of the previous release ignores it, and an absent
+            /// one means running.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            paused: Option<SandboxPause>,
         },
         /// The sandbox left this host (destroyed, evicted, fenced): open connections close with
         /// `close_code::MOVED` and bindings get `moved`.
@@ -571,6 +579,14 @@ pub mod gateway_link {
         /// dropped, and unknown sandboxes answer `moved` instead of `busy` from here on.
         ResyncDone,
         Ping,
+    }
+
+    /// Why a sandbox's VM is paused (`SandboxUpsert.paused`).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SandboxPause {
+        /// What the pause is for, e.g. `checkpoint (turn_end)` or `suspend`: free text for the
+        /// gateway's log and the client's `busy` message, never parsed.
+        pub reason: String,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]

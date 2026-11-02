@@ -54,7 +54,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 | Lease watchdog | `nestd_core::lease::check` | the deadline (in host.rs) | what remains of it on each clock | `Expired` (self-fence) or `Valid { recheck_ms }` | none | 1, done (decision only) |
 | Incarnations | `nestd_core::incarnation` (decisions now; the machine in phase 2) | per `(sandbox, epoch)`: phase, `meta` (head, clean, unanswered), tombstone, salvage retry | commands, driver and store outcomes, commit answers, a scan at start | write meta, boot, pause or stop the VM, send `commit_request`, rename to `.del`, proxy and gateway ops, report | `meta.json`, the directory | 2 |
 | Proxy link | phase 2 | mirror, `seq`, listener ownership, resync | proxy frames, connection, timers | send op, resync, pass fds | none | 2 |
-| Gateway link | phase 2 | binding keys, per-sandbox entries, tombstones | gateway frames, sandbox upserts/forgets/removes | send op, replay | none | 2 |
+| Gateway link | phase 2 | binding keys, per-sandbox entries, pause marks (per sandbox and epoch), tombstones | gateway frames, sandbox upserts/forgets/removes | send op, replay | none | 2 |
 | Runner link (brain table) | phase 2 | brains by agent: binding, state, connection | runner frames, `agent_start`/`agent_stop`, connection | send, report `agent_exited` | none | 2 |
 
 ## Fleet link (phase 1)
