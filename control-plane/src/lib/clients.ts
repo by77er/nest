@@ -2,6 +2,7 @@
 // beyond hashing, nothing awaited but WebCrypto. Nothing here knows any one client: a grant is a
 // ceiling, checked the same way for every client.
 import { z } from "zod";
+import { GithubRepoPermissions, levelWithin } from "./github";
 import { canonicalRepos, Repo } from "./repos";
 import type { AgentSpec, Capability } from "./spec";
 import { hex, sha256 } from "./util";
@@ -29,7 +30,6 @@ const McpUrlEntry = z.string().min(1).max(2048).refine((u) => {
     return false;
   }
 }, "an mcp_urls entry is an http(s) URL in canonical form (as new URL(u).href writes it), with no credentials, query or fragment");
-const GithubPermission = z.enum(["read", "write"]);
 
 /** What a client may do: its ceiling. Anything it doesn't name is refused. */
 export const Grant = z.strictObject({
@@ -41,10 +41,14 @@ export const Grant = z.strictObject({
   repos: z.array(Repo).max(256).default([]),
   /** The MCP server URLs its capabilities may name. */
   mcp_urls: z.array(McpUrlEntry).max(64).default([]),
-  /** GitHub App tokens it may mint (a later release builds the route; stored now). */
+  /**
+   * The GitHub App tokens it may mint (`POST /v1/clients/self/github-token`): for these repos, with at
+   * most these repository permissions. A grant stored by the release before this one may name other
+   * permissions; no request can name them, so they mint nothing.
+   */
   github: z.strictObject({
     repos: z.array(Repo).max(256).default([]),
-    permissions: z.record(z.string().regex(/^[a-z_]{1,64}$/), GithubPermission).default({}),
+    permissions: GithubRepoPermissions.default({}),
   }).optional(),
   /** Live (not ended, not destroyed) at once, across its whole subtree. */
   max_agents: z.number().int().min(0).max(100_000).default(0),
@@ -115,6 +119,31 @@ export function capabilityOutsideGrant(name: string, cap: Capability, grant: Gra
   for (const e of cap.brokered ?? []) {
     const o = brokeredOutside(e.action, "repos" in e ? e.repos ?? null : null, name, grant);
     if (o) out.push(o);
+  }
+  return out;
+}
+
+/** `POST /v1/clients/self/github-token`'s body: one repo, and at least one permission. */
+export const GithubTokenRequest = z.strictObject({
+  repo: Repo,
+  // None named would be a token with every permission the installation has (GitHub's default).
+  permissions: GithubRepoPermissions.refine((p) => Object.keys(p).length > 0, "name at least one permission"),
+});
+export type GithubTokenRequest = z.output<typeof GithubTokenRequest>;
+
+/**
+ * What a GitHub token request asks for that the grant's `github` doesn't name: the repo (exact, without
+ * case: GitHub's names are case-insensitive), each permission, and each level above the granted one
+ * (`read` < `write` < `admin`). Empty: within it.
+ */
+export function githubTokenOutsideGrant(req: GithubTokenRequest, grant: Pick<Grant, "github">): string[] {
+  const g = grant.github;
+  const out: string[] = [];
+  if (!g || !repoSet(g.repos).has(req.repo.toLowerCase())) out.push(`github repo ${req.repo}`);
+  for (const [name, level] of Object.entries(req.permissions)) {
+    const have = g && Object.hasOwn(g.permissions, name) ? g.permissions[name] : undefined;
+    if (have === undefined) out.push(`github permission ${name}`);
+    else if (!levelWithin(level, have)) out.push(`github permission ${name}: ${level} (the grant has ${have})`);
   }
   return out;
 }
