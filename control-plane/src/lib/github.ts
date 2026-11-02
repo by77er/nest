@@ -4,6 +4,7 @@
 //   JWT:          /en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
 //   installation: /en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
 //   token:        /en/rest/apps/apps#create-an-installation-access-token-for-an-app
+//   the App:      /en/rest/apps/apps#get-the-authenticated-app
 //   comments:     /en/rest/issues/comments#create-an-issue-comment, #list-issue-comments
 //   issues:       /en/rest/issues/issues#create-an-issue, #list-repository-issues
 //   pulls:        /en/rest/pulls/pulls#create-a-pull-request, #list-pull-requests
@@ -21,6 +22,13 @@ export const GITHUB_API = "https://api.github.com";
  * open pull requests (`gh pr create`).
  */
 export const SANDBOX_TOKEN_PERMISSIONS: GithubPermissions = { contents: "write", pull_requests: "write" };
+/**
+ * What a sandbox's read-only token may do in its read-only repos: read their code (`contents: read`:
+ * clone, fetch, the contents API) and the repo itself (`metadata: read`, which every App has: named so
+ * the token carries it whether or not GitHub adds it; docs.github.com/en/rest/authentication/permissions-required-for-github-apps).
+ * No write of any kind, so GraphQL with it can't change anything.
+ */
+export const SANDBOX_READ_TOKEN_PERMISSIONS: GithubPermissions = { contents: "read", metadata: "read" };
 /**
  * Every repository permission an installation token may be asked for, with the levels GitHub offers
  * for each: the `app-permissions` schema of GitHub's REST description
@@ -193,6 +201,14 @@ export class GitHubApi {
     const id = r.kind === "ok" ? (r.json as { id?: unknown } | null)?.id : undefined;
     if (typeof id === "number") return id;
     throw ghError(r, `looking up the App's installation on ${repo}`);
+  }
+
+  /** The App itself (`GET /app` with its JWT): its numeric id and its slug. */
+  async app(jwt: string): Promise<{ id: number; slug: string }> {
+    const r = await this.request(jwt, "GET", "/app");
+    const j = r.kind === "ok" ? (r.json as { id?: unknown; slug?: unknown } | null) : null;
+    if (j && Number.isSafeInteger(j.id) && (j.id as number) > 0 && typeof j.slug === "string" && j.slug) return { id: j.id as number, slug: j.slug };
+    throw ghError(r, "reading the App (GET /app)");
   }
 
   /**

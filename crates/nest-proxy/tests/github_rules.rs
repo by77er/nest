@@ -1,14 +1,19 @@
 //! The seam between the control plane's GitHub rule constructor (`control-plane/src/lib/rules/github.ts`)
 //! and the proxy's generic evaluator: the constructor's output for `by77er/nest` and `by77er/nest-fork`
 //! is the fixture `protocol/fixtures/control/egress_policy/egress_policy.github.json` (a vitest asserts
-//! the constructor still produces it); here the proxy evaluates real GitHub request shapes against it.
+//! the constructor still produces it), and with read-only repos `egress_policy.github_read.json`; here
+//! the proxy evaluates real GitHub request shapes against them.
 
 use nest_protocol::model::EgressPolicy;
 use nest_proxy::guard::{BodyView, Req, refusing};
 
-fn policy() -> EgressPolicy {
-    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../protocol/fixtures/control/egress_policy/egress_policy.github.json");
+fn fixture(name: &str) -> EgressPolicy {
+    let p = format!("{}/../../protocol/fixtures/control/egress_policy/{name}", env!("CARGO_MANIFEST_DIR"));
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+}
+
+fn policy() -> EgressPolicy {
+    fixture("egress_policy.github.json")
 }
 
 /// `(host, method, path?query, body, injected, refused)`.
@@ -67,6 +72,46 @@ fn pushes_and_writes_reach_only_allowed_repos() {
         // not GitHub's
         ("example.com", "POST", "/attacker/repo.git/git-receive-pack", None, None, false),
     ];
+    check(&p, cases);
+    assert!(p.guarded("github.com") && p.guarded("api.github.com") && p.guarded("raw.githubusercontent.com"));
+}
+
+/// The constructor's output for push allowlist `by77er/nest` and read-only repos `by77er/private-lib`
+/// and `by77er/nest` (a repo on both is pushable): `egress_policy.github_read.json`, which a vitest
+/// asserts the constructor still produces. A read-only repo is fetched and never written.
+#[test]
+fn read_only_repos_are_fetched_never_written() {
+    let p = fixture("egress_policy.github_read.json");
+    let cases: &[Case] = &[
+        // pushes into the read-only repo, in each shape
+        ("github.com", "POST", "/by77er/private-lib.git/git-receive-pack", None, None, true),
+        ("github.com", "POST", "/by77er/private-lib/git-receive-pack", None, None, true),
+        ("github.com", "POST", "/By77er/Private-Lib.git/git-receive-pack", None, None, true),
+        ("github.com", "GET", "/by77er/private-lib.git/info/refs?service=git-receive-pack", None, None, true),
+        ("github.com", "POST", "/by77er/private-lib.git/git-receive-pack", None, Some("github_read"), true),
+        ("github.com", "POST", "/by77er/private-lib.git/info/lfs/objects/batch", Some(r#"{"operation":"upload"}"#), None, true),
+        // fetches of it
+        ("github.com", "GET", "/by77er/private-lib.git/info/refs?service=git-upload-pack", None, Some("github_read"), false),
+        ("github.com", "POST", "/by77er/private-lib.git/git-upload-pack", None, Some("github_read"), false),
+        ("github.com", "POST", "/by77er/private-lib.git/info/lfs/objects/batch", Some(r#"{"operation":"download"}"#), None, false),
+        // its REST API: reads only
+        ("api.github.com", "GET", "/repos/by77er/private-lib/contents/README.md", None, Some("github_read"), false),
+        ("api.github.com", "PUT", "/repos/by77er/private-lib/contents/a.txt", None, Some("github_read"), true),
+        ("api.github.com", "POST", "/repos/by77er/private-lib/pulls", None, Some("github"), true),
+        ("api.github.com", "DELETE", "/repos/by77er/private-lib/git/refs/heads%2Fmain", None, None, true),
+        // the allowlist's repo is still pushable
+        ("github.com", "POST", "/by77er/nest.git/git-receive-pack", None, Some("github"), false),
+        ("api.github.com", "POST", "/repos/by77er/nest/pulls", None, Some("github"), false),
+        // GraphQL with either of the sandbox's own tokens (the read-only one can't write), never without
+        ("api.github.com", "POST", "/graphql", Some(r#"{"query":"{viewer{login}}"}"#), Some("github_read"), false),
+        ("api.github.com", "POST", "/graphql", Some(r#"{"query":"mutation{}"}"#), Some("github"), false),
+        ("api.github.com", "POST", "/graphql", Some(r#"{"query":"mutation{}"}"#), None, true),
+        ("api.github.com", "POST", "/graphql", Some(r#"{"query":"mutation{}"}"#), Some("other"), true),
+    ];
+    check(&p, cases);
+}
+
+fn check(p: &EgressPolicy, cases: &[Case]) {
     for &(host, method, target, body, injected, want) in cases {
         let (path, query) = target.split_once('?').map_or((target, None), |(p, q)| (p, Some(q)));
         let json = body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
@@ -79,5 +124,4 @@ fn pushes_and_writes_reach_only_allowed_repos() {
         let got = refusing(&p.guards, &req, &view).map(|g| g.name.clone());
         assert_eq!(got.is_some(), want, "{method} {host}{target}: {got:?}");
     }
-    assert!(p.guarded("github.com") && p.guarded("api.github.com") && p.guarded("raw.githubusercontent.com"));
 }

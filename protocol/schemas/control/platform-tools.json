@@ -44,6 +44,13 @@
           },
           "description": "Narrow its push allowlist to these owner/repo names (a subset of the template's)."
         },
+        "read_repos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Narrow the repos it may only read to these owner/repo names (a subset of the template's read-only repos and push allowlist)."
+        },
         "labels": {
           "type": "object",
           "additionalProperties": {

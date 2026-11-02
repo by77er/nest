@@ -6,7 +6,9 @@ import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
 import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
-import { appJwt, type GitHubApi, githubApiOf, GithubRepoPermissions, importAppKey, parseAppSecret, SANDBOX_TOKEN_PERMISSIONS } from "../lib/github";
+import {
+  appJwt, type GitHubApi, githubApiOf, GithubRepoPermissions, importAppKey, parseAppSecret, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
+} from "../lib/github";
 import { isClientId } from "../lib/clients";
 import { canonicalRepos, Repo } from "../lib/repos";
 import type { GithubPermissions } from "../lib/brokered";
@@ -28,6 +30,11 @@ const INSTALLATION_TTL_MS = 24 * 3_600_000;
  * before expiry, so a refresh always mints.
  */
 const SANDBOX_TOKEN_REUSE_MS = 20 * 60_000;
+/** The App's identity (`GET /app`) is kept this long; the configured id alone, when GitHub didn't answer, this long. */
+const APP_IDENTITY_TTL_MS = 24 * 3_600_000;
+const APP_IDENTITY_RETRY_MS = 10 * 60_000;
+/** `GET /app` gives up after this long: it delays a client's answer, which doesn't need it. */
+const APP_LOOKUP_TIMEOUT_MS = 5_000;
 /** Values shorter than this aren't scanned for (they'd match ordinary text). */
 const SCAN_MIN_LENGTH = 8;
 
@@ -88,6 +95,10 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_tokens (key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_ms INTEGER NOT NULL,
       installation INTEGER NOT NULL, minted_ms INTEGER NOT NULL)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_installations (repo TEXT PRIMARY KEY, installation INTEGER NOT NULL, fetched_ms INTEGER NOT NULL)`);
+    // The App's identity (`GET /app`), by the `app_id` its credentials name (a new App is a new row): its
+    // numeric id and slug, kept until `expires_ms`.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS github_app_identity (configured TEXT PRIMARY KEY, app_id INTEGER NOT NULL, slug TEXT,
+      expires_ms INTEGER NOT NULL)`);
     // Minted injection secrets, one per (sandbox, binding): what it was minted from and for, so a push
     // with the same source reuses it. The value is the secret `inject:<binding>:<sandbox>`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS injections (sandbox TEXT NOT NULL, binding TEXT NOT NULL, source TEXT NOT NULL,
@@ -194,7 +205,7 @@ export class BrokerDO extends DurableObject<Env> {
   /**
    * A minted injection secret for one sandbox (docs/control-plane/durable-objects/broker/#injection-minting):
    * for `github_app`, an installation token narrowed to the source's repos with
-   * {@link SANDBOX_TOKEN_PERMISSIONS}, stored as `inject:<binding>:<sandbox>` and reused while it has 20
+   * {@link SANDBOX_TOKEN_PERMISSIONS} (its push allowlist), stored as `inject:<binding>:<sandbox>` and reused while it has 20
    * minutes left. `null` when nothing can be minted (no App, or it's installed on none of the repos): any
    * earlier token for the sandbox is dropped then, so a narrowed allowlist never keeps a wider token.
    * Repos in several installations get the installation holding most of them; the others are refused
@@ -203,13 +214,30 @@ export class BrokerDO extends DurableObject<Env> {
    * (its caller's push is stale too).
    */
   async injectionSecret(target: InjectionTarget, source: InjectionSource, caller: string): Promise<MintedInjection | null> {
+    return await this.mintInjection(target, source, "write", caller);
+  }
+
+  /**
+   * As {@link injectionSecret}, for a sandbox's read-only repos: the token has
+   * {@link SANDBOX_READ_TOKEN_PERMISSIONS}, nothing that writes. A method of its own, not a field of the
+   * source: a BrokerDO of the previous release, which would ignore such a field and mint a push token,
+   * refuses a method it lacks instead.
+   */
+  async readInjectionSecret(target: InjectionTarget, source: InjectionSource, caller: string): Promise<MintedInjection | null> {
+    return await this.mintInjection(target, source, "read", caller);
+  }
+
+  private async mintInjection(target: InjectionTarget, source: InjectionSource, access: "write" | "read", caller: string): Promise<MintedInjection | null> {
+    const permissions = access === "read" ? SANDBOX_READ_TOKEN_PERMISSIONS : SANDBOX_TOKEN_PERMISSIONS;
     const repos = canonicalRepos(source.repos);
     const name = `inject:${source.binding}:${target.sandbox}`;
     const slot = `${target.sandbox}|${source.binding}`;
     const seq = ++this.injectionSeq;
     this.injectionRequests.set(slot, seq);
     const overtaken = () => this.injectionRequests.get(slot) !== seq;
-    const key = JSON.stringify({ kind: source.kind, repos });
+    // A push token's key is the previous release's, so its tokens are reused across the deploy; a read
+    // token's names its access, so neither is ever reused for the other.
+    const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access } : { kind: source.kind, repos });
     const now = Date.now();
     this.sql.exec("DELETE FROM secrets WHERE name LIKE 'inject:%:sbx\\_%' ESCAPE '\\' AND expires_ms IS NOT NULL AND expires_ms <= ?", now);
     const held = this.sql.exec<{ source: string; covers: string; expires_ms: number }>(
@@ -222,7 +250,7 @@ export class BrokerDO extends DurableObject<Env> {
       this.sql.exec("DELETE FROM secrets WHERE name = ?", name);
       this.sql.exec("DELETE FROM injections WHERE sandbox = ? AND binding = ?", target.sandbox, source.binding);
     };
-    const audit = { event: "github_installation_token", permissions: SANDBOX_TOKEN_PERMISSIONS, target, binding: source.binding, caller };
+    const audit = { event: "github_installation_token", permissions, target, binding: source.binding, caller };
     const app = this.secret("github_app");
     const creds = app ? parseAppSecret(app.value) : null;
     if (!creds || !repos.length) {
@@ -261,7 +289,7 @@ export class BrokerDO extends DurableObject<Env> {
     }
     let t: { token: string; expires_ms: number };
     try {
-      t = await api.mint(jwt, installation, covers.map((r) => r.split("/")[1]!), SANDBOX_TOKEN_PERMISSIONS);
+      t = await api.mint(jwt, installation, covers.map((r) => r.split("/")[1]!), permissions);
     } catch (e) {
       if (e instanceof NestError && !e.retryable) {
         forget();
@@ -472,6 +500,41 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM github_tokens WHERE key LIKE 'client:%' AND expires_ms <= ?", Date.now());
     const name = r.data.toLowerCase();
     return await this.mintGithub(`client:${client}|${name}|${canonicalJson(p.data)}`, name, p.data, { client });
+  }
+
+  /**
+   * The GitHub App's identity, for API clients (docs/control-plane/api/clients/#github-tokens): its
+   * numeric id (what a required status check pins to an App) and its slug. Not secret. Read with
+   * `GET /app` and the App's JWT, kept a day per configured App; when GitHub doesn't answer, the id
+   * its credentials name if that is the numeric one (GitHub also takes the client id as the JWT's
+   * issuer), kept 10 minutes. Null when no App is configured or nothing can tell; never throws for
+   * GitHub's sake.
+   */
+  async githubApp(): Promise<{ app_id: number; app_slug?: string } | null> {
+    const app = this.secret("github_app");
+    const creds = app ? parseAppSecret(app.value) : null;
+    if (!creds) return null;
+    const now = Date.now();
+    const known = this.sql.exec<{ app_id: number; slug: string | null; expires_ms: number }>(
+      "SELECT app_id, slug, expires_ms FROM github_app_identity WHERE configured = ?", creds.app_id).toArray()[0];
+    if (known && known.expires_ms > now) return { app_id: known.app_id, ...(known.slug ? { app_slug: known.slug } : {}) };
+    const keep = (app_id: number, slug: string | null, ttl: number) => {
+      this.sql.exec(`INSERT INTO github_app_identity (configured, app_id, slug, expires_ms) VALUES (?, ?, ?, ?)
+        ON CONFLICT(configured) DO UPDATE SET app_id = excluded.app_id, slug = excluded.slug, expires_ms = excluded.expires_ms`,
+      creds.app_id, app_id, slug, Date.now() + ttl);
+    };
+    try {
+      const jwt = await appJwt(creds.app_id, await importAppKey(creds.private_key));
+      const a = await githubApiOf(this.env, APP_LOOKUP_TIMEOUT_MS).app(jwt);
+      keep(a.id, a.slug, APP_IDENTITY_TTL_MS);
+      return { app_id: a.id, app_slug: a.slug };
+    } catch (e) {
+      console.warn("BrokerDO: reading the GitHub App's identity (GET /app) failed", e instanceof Error ? e.message : e);
+      const id = /^[1-9][0-9]{0,15}$/.test(creds.app_id) ? Number(creds.app_id) : null;
+      if (id === null || !Number.isSafeInteger(id)) return null;
+      keep(id, null, APP_IDENTITY_RETRY_MS);
+      return { app_id: id };
+    }
   }
 
   /**

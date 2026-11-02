@@ -53,7 +53,7 @@ Each action's installation token is minted for its one repo and only: `github.co
 
 ## Repo allowlists
 
-**Built.** An agent's spec may carry a push allowlist (`repos`: the template's, replaced by the operator's `overrides.repos`, narrowed by a spawner; [policy](../../../sandbox/networking/egress/policy/#repo-allowlists)). Then an **unscoped** GitHub grant ("any repo the App is installed on") reaches only those repos, and the tool's `repo` enum lists them; a **scoped** grant keeps the repos the catalog named, so existing catalogs work unchanged; `github.fork`'s repos are upstreams and keep their own scope. No allowlist: nothing changes. **Why not intersect scoped grants too:** every catalog written before allowlists would lose its actions, and a scoped grant is already the operator's explicit choice.
+**Built.** An agent's spec may carry a push allowlist (`repos`: the template's, replaced by the operator's `overrides.repos`, narrowed by a spawner; [policy](../../../sandbox/networking/egress/policy/#repo-allowlists)). Then an **unscoped** GitHub grant ("any repo the App is installed on") reaches only those repos, and the tool's `repo` enum lists them; a **scoped** grant keeps the repos the catalog named, so existing catalogs work unchanged; `github.fork`'s repos are upstreams and keep their own scope. No allowlist: nothing changes. [Read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos) scope no action: every action writes. **Why not intersect scoped grants too:** every catalog written before allowlists would lose its actions, and a scoped grant is already the operator's explicit choice.
 
 ## Forks
 

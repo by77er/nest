@@ -477,7 +477,7 @@ export class AgentDO extends DurableObject<Env> {
       if (cur.cell !== req.cell) {
         throw new NestError(ErrorCodes.INVALID_MESSAGE, `${req.sandbox} is in cell ${cur.cell}; the agent must be too`, 409);
       }
-      await stub.attach(req.agent, undefined, req.spec.repos ?? []);
+      await stub.attach(req.agent, undefined, req.spec.repos ?? [], req.spec.read_repos ?? []);
       hands = { sandbox: req.sandbox };
     }
     if (this.exists()) return this.load();
@@ -1267,6 +1267,7 @@ export class AgentDO extends DurableObject<Env> {
     const overrides: SpawnerOverrides = {
       ...(Array.isArray(a.tools) ? { tools: a.tools.map(String) } : {}),
       ...(Array.isArray(a.repos) ? { repos: a.repos.map(String) } : {}),
+      ...(Array.isArray(a.read_repos) ? { read_repos: a.read_repos.map(String) } : {}),
       ...(a.ephemeral === true ? { ephemeral: true as const } : {}),
       ...(typeof a.sandbox_idle_ttl_s === "number" ? { sandbox_idle_ttl_ms: a.sandbox_idle_ttl_s * 1000 } : {}),
     };
