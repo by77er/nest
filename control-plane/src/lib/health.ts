@@ -38,6 +38,7 @@ export function healthProbes(env: Env): Record<string, () => Promise<unknown>> {
     BrokerDO: at(env.BROKER),
     CatalogDO: at(env.CATALOG),
     McpConnectorDO: at(env.MCP_CONNECTOR),
+    ClientDO: at(env.CLIENT),
   };
 }
 
