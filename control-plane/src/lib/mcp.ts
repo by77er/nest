@@ -40,7 +40,8 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
 
 /**
  * The `mcp` source of a capability (docs/agents/capabilities/#sources). `auth` names the BrokerDO secret
- * holding the bearer token (`cap:<name>`), or is the oauth form (`{oauth, client?, scopes?}`, lib/mcp-auth.ts); `tools` is the allowlist (absent: every tool the server lists); `idempotent`
+ * holding the bearer token (`cap:<name>`), or is the oauth form (`{oauth, client?, scopes?}`, lib/mcp-auth.ts),
+ * or is absent: no bearer, and `Nest-Identity` is the only credential; `tools` is the allowlist (absent: every tool the server lists); `idempotent`
  * overrides the server's annotations (a list of tools that are, or a map of tool → whether it is);
  * `read_only` likewise marks the tools that aren't sinks; `trusted` (default false) means its list and
  * results don't taint the session (and its annotations count); `when_tainted` is what a sink call from a
@@ -49,7 +50,7 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
  */
 export const McpSource = z.object({
   url: z.string().min(1).max(2048),
-  auth: z.union([CapRef, OAuthAuth]),
+  auth: z.union([CapRef, OAuthAuth]).optional(),
   tools: z.array(McpToolName).max(MAX_TOOLS_PER_CAPABILITY).optional(),
   idempotent: ToolFlags.optional(),
   read_only: ToolFlags.optional(),
@@ -64,8 +65,11 @@ export type McpSource = z.output<typeof McpSource>;
 export interface McpGrant {
   capability: string;
   url: string;
-  /** The BrokerDO record of its credential: the bearer secret, or (with `oauth`) where its OAuth tokens are kept. */
-  auth: string;
+  /**
+   * The BrokerDO record of its credential: the bearer secret, or (with `oauth`) where its OAuth tokens are
+   * kept. Absent: the server takes no bearer (nest sends no `Authorization`; `Nest-Identity` is the credential).
+   */
+  auth?: string;
   /** Present when the credential is OAuth (absent in specs written before it, and for a static bearer). */
   oauth?: OAuthGrant;
   /** The allowlist; null: whatever the server lists. */
@@ -80,17 +84,34 @@ export interface McpGrant {
   /** The connector's admission caps; absent: the defaults. */
   max_concurrent?: number;
   per_minute?: number;
+  /**
+   * The client whose catalog namespace the capability is in (`cli_…`), set at expansion; absent for the
+   * operator's capabilities (and in specs written before it). Its connector is that namespace's own, and
+   * names the client in its caller identity.
+   */
+  client?: string;
 }
 
-/** The connector a grant's server is shared through: one per server and credential (docs/agents/capabilities/mcp/#the-connector). */
-export const connectorName = (g: Pick<McpGrant, "url" | "auth">): string => JSON.stringify(["mcp", g.url, g.auth]);
+/**
+ * The connector a grant's server is shared through (docs/agents/capabilities/mcp/#the-connector): one per
+ * server and credential (`null`: none), and per client namespace for a client's capability. A grant with a
+ * credential and no client (every grant stored before either could be absent) keeps the name it had.
+ */
+export const connectorName = (g: Pick<McpGrant, "url" | "auth" | "client">): string =>
+  JSON.stringify(["mcp", g.url, g.auth ?? null, ...(g.client ? [g.client] : [])]);
 
-export function grantOf(capability: string, src: McpSource): McpGrant {
+/** Whether two grants share a connector. */
+export const sameConnector = (a: Pick<McpGrant, "url" | "auth" | "client">, b: Pick<McpGrant, "url" | "auth" | "client">): boolean =>
+  connectorName(a) === connectorName(b);
+
+/** What a spec keeps of capability `capability`'s source; `client`: whose namespace it is in (absent: the operator's). */
+export function grantOf(capability: string, src: McpSource, client?: string): McpGrant {
+  const auth = src.auth;
   return {
     capability,
     url: src.url,
-    auth: typeof src.auth === "string" ? src.auth : src.auth.oauth,
-    ...(typeof src.auth === "string" ? {} : { oauth: { client: src.auth.client ?? null, scopes: src.auth.scopes ? [...src.auth.scopes] : null } }),
+    ...(auth === undefined ? {} : { auth: typeof auth === "string" ? auth : auth.oauth }),
+    ...(auth === undefined || typeof auth === "string" ? {} : { oauth: { client: auth.client ?? null, scopes: auth.scopes ? [...auth.scopes] : null } }),
     tools: src.tools ? [...src.tools] : null,
     idempotent: flags(src.idempotent),
     read_only: flags(src.read_only),
@@ -98,6 +119,7 @@ export function grantOf(capability: string, src: McpSource): McpGrant {
     when_tainted: src.when_tainted ?? "approve",
     ...(src.max_concurrent !== undefined ? { max_concurrent: src.max_concurrent } : {}),
     ...(src.per_minute !== undefined ? { per_minute: src.per_minute } : {}),
+    ...(client ? { client } : {}),
   };
 }
 
@@ -271,7 +293,8 @@ export type RpcAnswer =
   | { kind: "lost"; why: string };
 
 export interface RpcOptions {
-  token: string;
+  /** The bearer; null: no `Authorization` header (a server that takes `Nest-Identity` alone). */
+  token: string | null;
   session: string | null;
   /** The negotiated version (sent as `MCP-Protocol-Version` after initialize). */
   version: string | null;
@@ -339,7 +362,7 @@ export async function rpc(url: string, message: { method: string; params?: unkno
   const headers: Record<string, string> = {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
-    authorization: `Bearer ${o.token}`,
+    ...(o.token === null ? {} : { authorization: `Bearer ${o.token}` }),
     [IDENTITY_HEADER]: o.identity,
   };
   if (o.session) headers["mcp-session-id"] = o.session;
@@ -405,7 +428,7 @@ export type Opened =
   | { kind: "unsupported"; version: unknown };
 
 /** `initialize`, then `notifications/initialized` (lifecycle); the session id, if the server gave one. */
-export async function openSession(url: string, token: string, timeoutMs: number, client: string, identity: IdentityFor): Promise<Opened> {
+export async function openSession(url: string, token: string | null, timeoutMs: number, client: string, identity: IdentityFor): Promise<Opened> {
   const id = await identity();
   const a = await rpc(url, {
     id: 1, method: "initialize",
@@ -424,7 +447,7 @@ export async function openSession(url: string, token: string, timeoutMs: number,
 const MAX_LIST_PAGES = 10;
 
 /** Every `tools/list` page over one session, within `deadline` (epoch ms). */
-export async function listAll(url: string, token: string, s: { session: string | null; version: string }, deadline: number, identity: IdentityFor):
+export async function listAll(url: string, token: string | null, s: { session: string | null; version: string }, deadline: number, identity: IdentityFor):
   Promise<{ kind: "listed"; tools: ListedTool[]; list_changed: boolean } | { kind: "session_gone" } | { kind: "failed"; answer: RpcAnswer }> {
   const tools: ListedTool[] = [];
   let cursor: string | null = null;

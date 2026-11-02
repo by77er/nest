@@ -1,6 +1,6 @@
 # ClientDO
 
-One instance per [API client](../../api/clients/), named by its id (`cli_…`), and one more, `directory`, for the names.
+One instance per [API client](../../api/clients/), named by its id (`cli_…`), one more, `directory`, for the names, and one more, `operator`, for the operator's idempotency keys.
 
 - **The record:** name, grant, the token's SHA-256 (the token itself is shown once, at create and rotate), created and rotated times. The Worker hashes a bearer token and ClientDO compares the hash in constant time. A deleted or unknown client answers 401.
 - **The directory:** name → id, unique (`claimName` refuses a taken name, 409), and the list of clients. A create writes the record first and claims the name second, so a create that dies between them leaves an orphan record whose token was never handed out.
@@ -19,4 +19,5 @@ One instance per [API client](../../api/clients/), named by its id (`cli_…`), 
   - `outbox` is the backlog, in arrival order, with the event's `id` unique: `enqueue` (an agent's or sandbox's hand-off) inserts in one synchronous step and never waits on a delivery, so a hand-off retried after a lost answer is stored once. Past 10,000 rows the oldest go, counted in `dropped`. Without a webhook nothing is kept.
   - The `deliver` deadline sends the oldest event, one request at a time, deleting it on a 2xx, up to 100 a run. The first failure (another status, a network error, or no answer within 10 s, `AbortSignal`) stops the run and arms the next one `1 s · 2^(failures-1)` later, at most 5 min; an `enqueue` doesn't advance a deadline that is waiting out its backoff.
   - The hourly prune arms `deliver` again for a backlog with no deadline (a rolled-back release has no handler for it).
+- **Idempotency keys** ([decisions](../../api/#idempotency-keys), `control-plane/src/lib/idempotency.ts`): `idempotency_keys`, one row per key of this principal (a client in its own instance, the operator in `operator`, which holds nothing else and has no alarm): the request's digest, the id it was given, `pending` or `done`, the answer's status, and the claim holding it with when. `claimKey`, `finishKey` and `abandonKey` are each one synchronous step, so two requests with one key can't both claim it fresh. Rows go 24 h after their first use, at the next claim (100 at a time) and in a client's hourly prune.
 - **Deploying it was one-way:** a new class ([deploy](../../../../dev/deploy.md)).

@@ -68,6 +68,10 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
      once that brain's exit or its host's loss releases it
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt`
+   - `POST /v1/agents` and `POST /v1/sandboxes` take an `Idempotency-Key` header (`src/lib/idempotency.ts`): the same key and
+     body within 24 h answer the first object (`Idempotent-Replayed: true`), another body 409 ([idempotency keys](../docs/control-plane/api/#idempotency-keys)).
+     Only a cell's own routes read `?cell=` (the fleet, hosts, images, lifetimes, tunnels, GC, root CA, the operator's
+     listings); the rest need none ([which routes take a cell](../docs/control-plane/api/#which-routes-take-a-cell))
    - `GET /v1/agents?cell=&label=k=v&state=live|ended|all&limit=&cursor=` and the same for `GET /v1/sandboxes`: the cell's
      registry (FleetDO), or `?client=cli_…` a client's subtree (ClientDO); `label` repeats, each must hold. `POST /v1/agents`
      and `POST /v1/sandboxes` take `labels` (up to 16, fixed once set), and `owner` may be `user`
@@ -96,7 +100,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<sandbox>`; `inject:<binding>:<ws_…>` is still read for older secrets)
    - A remote MCP server: its bearer token with `PUT /v1/admin/secrets/cap:<name>`, then
      `PUT /v1/admin/capabilities/<name> {"mcp": {"url": "https://…/mcp", "auth": "cap:<name>", "tools": [...]}}` and the capability
-     added to a template (`docs/agents/capabilities/mcp/`)
+     added to a template (`docs/agents/capabilities/mcp/`); without `auth`, no bearer is sent and the server verifies `Nest-Identity`
    - Over OAuth: `"auth": {"oauth": "cap:<name>", "client"?: "cap:<name>-client", "scopes"?: [...]}`, then
      `POST /v1/admin/capabilities/<name>/oauth {scopes?}` (answers `authorize_url`: open it and approve), which lands on the public
      `GET /v1/oauth/callback`; `GET /v1/admin/capabilities/<name>/oauth` shows the state, never a token. nest's client ID metadata

@@ -1,9 +1,9 @@
 // The Worker's route table (src/index.ts): authentication is a required field of every route, so a
 // route added anywhere is checked by what it says, never by where it sits.
-import { SELF } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { ROUTES } from "../src/index";
-import { BASE } from "./helpers";
+import worker, { ROUTES } from "../src/index";
+import { ADMIN, BASE, uniqueCell } from "./helpers";
 
 /** The only routes reachable without the admin token, and what proves the caller instead. */
 const NOT_ADMIN = {
@@ -62,5 +62,60 @@ describe("route authentication", () => {
   it("no two routes share a method and path", () => {
     const keys = ROUTES.map((r) => `${r.method} ${r.path}`);
     expect(keys.length).toBe(new Set(keys).size);
+  });
+});
+
+// --- ?cell= only where a route is about one cell ------------------------------------------------------------
+
+describe("?cell= (a multi-cell config: CELLS names two cells, neither of them the default `local`)", () => {
+  const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+
+  it("routes that reach an agent, a sandbox, the catalog, a client or a secret need no ?cell= (and still accept one); a cell's own routes do", async () => {
+    const cellA = uniqueCell();
+    const cellB = uniqueCell();
+    const multi = { ...env, CELLS: `${cellA},${cellB}` } as typeof env;
+    const call = async (token: string, method: string, path: string, body?: unknown) => {
+      const res = await worker.fetch(new Request(`${BASE}${path}`, {
+        method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }), multi);
+      const text = await res.text();
+      return { status: res.status, text };
+    };
+    const ok = async (token: string, method: string, path: string, body?: unknown) => {
+      const r = await call(token, method, path, body);
+      expect(r.status, `${method} ${path}: ${r.text}`).toBeLessThan(300);
+      return JSON.parse(r.text);
+    };
+    const name = `cells-${rand()}`;
+    const c = await ok(ADMIN, "POST", "/v1/admin/clients", { name, grant: { cells: [cellA], credentials: ["claude_oauth_token"], max_agents: 2 } });
+    // The client's own: its catalog, an agent and everything reached by the agent's id, its listing, its self.
+    await ok(c.token, "PUT", `/v1/catalog/templates/${name}/t`, {
+      capabilities: ["nest"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
+    });
+    await ok(c.token, "GET", `/v1/catalog/templates/${name}/t`);
+    const a = await ok(c.token, "POST", "/v1/agents", { template: `${name}/t`, cell: cellA, start: false });
+    expect(a.cell).toBe(cellA);
+    await ok(c.token, "GET", `/v1/agents/${a.agent}`);
+    await ok(c.token, "POST", `/v1/agents/${a.agent}/inbox`, { text: "hello" });
+    await ok(c.token, "GET", `/v1/agents/${a.agent}/asks`);
+    await ok(c.token, "GET", "/v1/agents");
+    await ok(c.token, "GET", "/v1/clients/self");
+    // Refused by its grant, not by a cell: the route reached its own check.
+    const gh = await call(c.token, "POST", "/v1/clients/self/github-token", { repo: "o/r", permissions: { contents: "read" } });
+    expect(gh.status).toBe(403);
+    expect(gh.text).toContain("outside");
+    // The operator's routes that aren't about a cell.
+    await ok(ADMIN, "PUT", `/v1/admin/secrets/x-${rand()}`, { value: "v" });
+    await ok(ADMIN, "GET", "/v1/admin/catalog");
+    await ok(ADMIN, "GET", `/v1/admin/clients/${c.client}`);
+    // ?cell= is still accepted where it was sent before.
+    await ok(c.token, "POST", `/v1/agents/${a.agent}/inbox?cell=${cellA}`, { text: "again" });
+    await ok(c.token, "POST", `/v1/agents/${a.agent}/stop?cell=${cellA}`, { end: true });
+    // A cell's own routes still take ?cell= (default `local`, outside CELLS here).
+    expect((await call(ADMIN, "GET", "/v1/admin/fleet")).text).toContain("unknown cell local");
+    await ok(ADMIN, "GET", `/v1/admin/fleet?cell=${cellB}`);
+    expect((await call(ADMIN, "GET", "/v1/agents")).status).toBe(403);
+    await ok(ADMIN, "GET", `/v1/agents?cell=${cellA}`);
+    expect((await call(ADMIN, "GET", `/v1/admin/gc?cell=nowhere`)).status).toBe(403);
   });
 });
