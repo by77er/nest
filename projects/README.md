@@ -43,6 +43,7 @@ Only the client interface. One client, `projects`, has this grant:
 | Check runs and branch protection | `POST /v1/clients/self/github-token {repo, permissions}`, then GitHub's API with that token |
 | GitHub's events | The GitHub App's webhook, pointed at `/hooks/github` by the operator (nest consumes none of it) |
 | Telling which agent calls the MCP server | The `Nest-Identity` JWT on every request, checked against nest's JWKS |
+| Watching an agent work | `GET /v1/agents/<id>/trace?after=<seq>`, nest's live trace (a WebSocket), proxied for the page by `GET /api/agents/<id>/trace` ([below](#the-live-trace)) |
 
 ## The MCP server: agents see only their own work
 
@@ -189,16 +190,30 @@ The owner's request (2026-11-02): "Agents might mark their tasks as blocked, whi
 
 ## The UI
 
-**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
+**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`, `trace`), each component next to its test. `src/main.tsx` mounts it.
 
 - **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and one theme (`src/ui/theme.ts`); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons, Inter and JetBrains Mono self-hosted from npm.
 - **One API client** (`src/ui/api/client.ts`), same origin, so Access's cookie is the only credential: nothing secret is in the bundle. Its types are the Worker's own, imported by type only; the request bodies' zod schemas live in `src/requests.ts`, which both the Worker and the forms validate with.
-- **Live views poll while the tab is visible:** the chat every 3 s, the board and "Needs you" every 5 s, the project every 10 s. The board stops polling while a card is dragged. Nothing animates on a poll.
+- **Live views poll while the tab is visible** (the trace is a WebSocket instead): the chat every 3 s, the board and "Needs you" every 5 s, the project every 10 s. The board stops polling while a card is dragged. Nothing animates on a poll.
 - **Optimistic where safe:** reordering (one `ord` written, between the new neighbours'; put back if refused) and a chat message (shown as sending; its text back in the composer if refused). An answer to an ask isn't: the ask stays until nest has taken it.
 - **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling, deleting and marking done are confirmed, with the safe choice focused; "Mark done" shows only for a task with no PR and no live worker. A failed write is a notification (bottom right) with the Worker's reason.
 - **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit; Mantine, React and the other libraries are chunks of their own too (vite.config.ts), cached across releases.
 - **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
 - **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, a "Blocked" badge (warning) while the task is blocked, and a "needs input" marker from the project's open asks.
+
+### The live trace
+
+**Built (2026-11-02):** an agent's turns as they happen, from nest's live trace ([API](../docs/control-plane/api/), "Live trace"). Code: `src/trace.ts` (the route) and `src/ui/features/trace/` (the viewer, self-contained). Tests: `test/trace.test.ts` (the route, against a WebSocket in the fake nest) and `src/ui/features/trace/trace.test.tsx`.
+- **The route:** `GET /api/agents/<id>/trace?after=<seq>`, behind Access like the rest of `/api/`. Only an agent DirectoryDO recorded for one of the app's projects (its manager, a worker, a reviewer); any other id is `404` before nest is asked. Then it opens the upgrade to nest with the client token (`fetch` with `Upgrade: websocket` and `Authorization`, nothing of the browser's forwarded) and returns nest's socket as its own `101`. Workers proxy a WebSocket that way ([Response](https://developers.cloudflare.com/workers/runtime-apis/response/): "This establishes a WebSocket connection proxied through a Worker"), so the app holds no state for it and the token never reaches the browser. nest's retryable `503` (minutes after its deploy) stays a `503`; its `404` is a `404`; any other refusal is a `502` with nest's message.
+- **The viewer** (`TraceView`, and one mount per place: `ManagerTrace`, `TaskTraces` for a task's worker in its drawer, `ReviewTrace` for a review job's reviewer):
+  - Turns are groups: the input's kind and when, then the assistant's text, each tool call with its result's status (Running, Done, Error) and its input and result a click away, asks and errors as notices, state changes as captions; the turn's badge says Working or Completed, with its tokens.
+  - The header shows the connection (Live, Connecting, Reconnecting, Ended) and the agent's last state.
+  - It follows the newest event only while scrolled to the bottom; above it, "Jump to live (n new)".
+  - **Reconnects** after a drop from the last seq received (`after`), 1 s doubling to 30 s, starting over once a connect's backlog is done; never after `ended`. A repeated seq is dropped. A `ping` every 25 s keeps the socket open without waking the agent's object.
+  - **Motion:** an event that arrives after nest's `live` marker fades in (`base`, 180 ms, the `FadeIn` primitive); the backlog and everything replayed on a reconnect don't. Reduced motion makes it instant.
+  - **The gap notice** names the events nest no longer holds. The app has no transcript view, so it links to none.
+  - At most 2,000 events are kept per view; older ones are dropped from it, and it says so.
+- **Where it's mounted:** the task drawer (the worker's). `ManagerTrace` is for the Manager page's "Trace" tab beside "Chat", and `ReviewTrace` for each job on the Reviews page; those pages come with the sidebar.
 
 ### Design system
 
@@ -218,7 +233,7 @@ The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-de
 | Motion | 120 / 180 / 240 ms, `cubic-bezier(0.2, 0, 0, 1)` in, `cubic-bezier(0.4, 0, 1, 1)` out; opacity and transform only; reduced motion honoured; a spinner only after 300 ms |
 | Layout | page max 1440 px; gutters `lg` / `xl` / `2xl` (phone / tablet / desktop); side panel 320 px from 75em; board columns at least 8.5rem from 62em (16rem below) |
 
-**Primitives** (`src/ui/layout/`): `AppFrame` (header and content), `Page` (the max width, gutters, `2xl` between blocks; `measure` for a page of forms), `PageHeader` (breadcrumbs, the one h1 with its actions right on its row, wrapping when narrow, and a meta line), `Section` (a heading row of one height: title, count, actions right; `dense` for a board column), `Panel` (the bordered surface, `lg` padding, `md` when dense; never nested) and `Well` (the borderless subtle region that holds Panels), `Toolbar` (actions `sm` apart, wrapping; destructive ones last after a divider), `Stack` and `Row` (gaps from the scale), `FieldGroup` (fields `lg` apart, actions bottom right), `EmptyState`, `LoadingState`, `ErrorState` and `Notice`, `MetaRow`/`MetaItem` (caption lines), `CardGrid`, `ColumnGrid` and `SplitView` (the board and the chat beside it), `SortablePanel` (a draggable card), `Sheet` (the task drawer), `ScrollLog` and `Bubble` (the chat), `Prose`.
+**Primitives** (`src/ui/layout/`): `AppFrame` (header and content), `Page` (the max width, gutters, `2xl` between blocks; `measure` for a page of forms), `PageHeader` (breadcrumbs, the one h1 with its actions right on its row, wrapping when narrow, and a meta line), `Section` (a heading row of one height: title, count, actions right; `dense` for a board column), `Panel` (the bordered surface, `lg` padding, `md` when dense; never nested) and `Well` (the borderless subtle region that holds Panels), `Toolbar` (actions `sm` apart, wrapping; destructive ones last after a divider), `Stack` and `Row` (gaps from the scale), `FieldGroup` (fields `lg` apart, actions bottom right), `EmptyState`, `LoadingState`, `ErrorState` and `Notice`, `MetaRow`/`MetaItem` (caption lines), `CardGrid`, `ColumnGrid` and `SplitView` (the board and the chat beside it), `SortablePanel` (a draggable card), `Sheet` (the task drawer), `ScrollLog` and `Bubble` (the chat), `FadeIn` (something that just arrived, once), `Prose`.
 
 **Rules:**
 - **Placement:** a section's primary action at its top right, secondary ones to its left; destructive ones last, set apart, and confirmed. In forms and dialogs the actions are bottom right, the primary rightmost. A status badge right after the thing it's about; who and when on a caption line below.
