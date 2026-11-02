@@ -1803,8 +1803,8 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * `GET /v1/agents/<id>/trace?after=<seq>`, its caller already checked by the Worker: a hibernatable
-   * socket that gets the gap (if events after `after` are gone), the backlog after `after`, then live
-   * events, and `ended` and a close once the agent's end is done. Every answer carries `TRACE_HEADER`,
+   * socket that gets the gap (if events after `after` are gone), the backlog after `after`, `live`, then
+   * live events, and `ended` and a close once the agent's end is done. Every answer carries `TRACE_HEADER`,
    * which tells the Worker this object runs a release that has the trace.
    */
   private traceSocket(request: Request, url: URL): Response {
@@ -1838,6 +1838,9 @@ export class AgentDO extends DurableObject<Env> {
       // A client that had read past its `ended` hears it again, without a seq.
       if (!events.some((e) => e.type === "ended")) control({ type: "ended", reason: info.ended.reason });
       this.closeTraceSocket(ws, 1000, "agent ended");
+    } else if (ok) {
+      // The backlog is done: what follows happens as the client watches.
+      control({ type: "live" });
     }
     return new Response(null, { status: 101, webSocket: pair[0], headers: { [TRACE_HEADER]: "1" } });
   }

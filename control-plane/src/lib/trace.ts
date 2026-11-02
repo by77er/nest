@@ -35,8 +35,11 @@ export type TraceBody =
   | { type: "ended"; reason: string };
 export type TraceUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number };
 export type TraceEvent = { seq: number; ts_ms: number; turn?: string } & TraceBody;
-/** Messages that aren't events (no `seq`): older events are gone from the ring, or (once, on a late connect) the end. */
-export type TraceControl = { type: "gap"; from: number; to: number } | { type: "ended"; reason: string };
+/**
+ * Messages that aren't events (no `seq`): older events are gone from the ring (`gap`, before the
+ * backlog), the backlog is done and what follows is live (`live`), or (on a connect after it) the end.
+ */
+export type TraceControl = { type: "gap"; from: number; to: number } | { type: "live" } | { type: "ended"; reason: string };
 
 // --- Redaction ---------------------------------------------------------------------------------------
 

@@ -254,7 +254,12 @@ describe("what streams", () => {
     await s.events([{ type: "escalation", turn, call: "cal_esc1", tool: "Bash", input: { command: "rm -rf /" } }]);
     await s.events([{ type: "turn_completed", turn, stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 20 } }]);
     const got = await readUntil(t, (m) => m.type === "state" && m.state === "idle");
-    const seqs = got.map((m) => m.seq);
+    // The backlog (its start, before this socket) ended with `live`, before the turn.
+    const live = got.findIndex((m) => m.type === "live");
+    expect(live).toBeGreaterThanOrEqual(0);
+    expect(got[live]).toEqual({ type: "live" });
+    expect(got.slice(live + 1).some((m) => m.type === "turn_started")).toBe(true);
+    const seqs = got.filter((m) => m.type !== "live").map((m) => m.seq);
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
     expect(new Set(seqs).size).toBe(seqs.length);
     const ask = (await asJson(w.c.token, `/v1/agents/${s.agent}/asks`))[0].ask;
@@ -270,7 +275,7 @@ describe("what streams", () => {
       { type: "turn_completed", turn, stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
       { type: "state", state: "idle" },
     ]);
-    for (const m of got) expect(typeof m.ts_ms).toBe("number");
+    for (const m of got.filter((x) => x.type !== "live")) expect(typeof m.ts_ms).toBe("number");
     await asJson(w.c.token, `/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "no" } });
     expect((await t.next("ask_answered")).ask).toBe(ask);
     // A trace client's frames are ignored; the session socket is unaffected (the answer reaches the runner as its next turn).
@@ -348,6 +353,9 @@ describe("resume", () => {
     const t2 = await trace(s.agent, w.c.token, last);
     const missed = await readUntil(t2, (m) => m.text === "three");
     expect(missed.map((m) => [m.seq, m.text])).toEqual([[last + 1, "two"], [last + 2, "three"]]);
+    // Then `live`, next: nothing else was owed.
+    await eventually("live", () => t2.received.length > 0);
+    expect(t2.received[0]).toEqual({ type: "live" });
     await s.events([{ type: "assistant_text", turn, text: "four" }]);
     expect(await t2.next("assistant_text")).toMatchObject({ seq: last + 3, text: "four" });
     t2.close();
@@ -359,6 +367,7 @@ describe("resume", () => {
     const back = await readUntil(t3, (m) => m.text === "four");
     expect(back[0]).toEqual({ type: "gap", from: 2, to: last + 1 });
     expect(back.slice(1).map((m) => m.seq)).toEqual([last + 2, last + 3]);
+    expect(await t3.next("live")).toEqual({ type: "live" });
     t3.close();
     s.ws.close();
   });
@@ -448,6 +457,7 @@ describe("the end", () => {
     const backlog = await readUntil(again, (m) => m.type === "ended");
     expect(backlog.at(-1)).toEqual(ended);
     expect((await again.whenClosed())?.code).toBe(1000);
+    expect(again.received.filter((m) => m.type === "live")).toEqual([]);
     // Past it: `ended` again without a seq.
     const past = await trace(a, w.c.token, ended.seq);
     expect(await past.next("ended")).toEqual({ type: "ended", reason: "stopped" });
