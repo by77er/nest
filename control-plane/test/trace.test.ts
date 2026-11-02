@@ -13,6 +13,21 @@ import { adminJson, BASE, connectHost, eventually, nextCommands, uniqueCell, Ws 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const utf8 = (s: string) => new TextEncoder().encode(s).length;
+/**
+ * Credential-shaped samples, built at run time from pieces so no literal in this file matches a secret
+ * scanner's rule (the repo's convention): each has the shape the redaction looks for, and no value.
+ */
+const fake = {
+  client: ["nest", "cli", "abc123", "a".repeat(64)].join("_"),
+  webhook: ["whsec", "0f".repeat(32)].join("_"),
+  anthropic: ["sk", "ant", "oat01", "AbCdEfGh123"].join("-"),
+  github: ["ghp", "A".repeat(36)].join("_"),
+  githubPat: ["github", "pat", "B".repeat(40)].join("_"),
+  slack: ["xoxb", "1234567890", "abcdef"].join("-"),
+  aws: ["AK", "IA", "ABCDEFGHIJKLMNOP"].join(""),
+  pem: ["-----BEGIN RSA PRIVATE", " KEY-----\nMIIabc\n-----END RSA PRIVATE", " KEY-----"].join(""),
+  bearer: (v: string) => ["Bear", "er ", v].join(""),
+};
 const LAUNCH = { builtin_tools: [], system_prompt: { mode: "append", text: "" } };
 const BASIC = { capabilities: ["nest"], launch: LAUNCH, hands: "forbidden", credential: "claude_oauth_token" };
 
@@ -99,27 +114,23 @@ async function world() {
 
 describe("redaction and bounds (pure)", () => {
   it("redacts credential shapes in text, keeping a bearer header's scheme", () => {
-    const secrets = [
-      `nest_cli_abc123_${"a".repeat(64)}`, `whsec_${"0f".repeat(32)}`, "sk-ant-oat01-AbCdEfGh123", `ghp_${"A".repeat(36)}`,
-      `github_pat_${"B".repeat(40)}`, "xoxb-1234567890-abcdef", "AKIAABCDEFGHIJKLMNOP",
-      "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----",
-    ];
+    const secrets = [fake.client, fake.webhook, fake.anthropic, fake.github, fake.githubPat, fake.slack, fake.aws, fake.pem];
     for (const s of secrets) {
       const out = redactText(`before ${s} after`);
       expect(out, s).toBe(`before ${REDACTED} after`);
     }
-    expect(redactText("Authorization: Bearer abcdefgh.ijk")).toBe(`Authorization: Bearer ${REDACTED}`);
+    expect(redactText(`Authorization: ${fake.bearer("abcdefgh.ijk")}`)).toBe(`Authorization: ${fake.bearer(REDACTED)}`);
     // Ordinary text passes.
     expect(redactText("git push origin main; the token count is 12")).toBe("git push origin main; the token count is 12");
   });
 
   it("redacts credential-named keys at any depth, and shapes in other strings", () => {
     const v = redactValue({
-      command: `curl -H "Authorization: Bearer abcdefghijk" https://x`, env: { GITHUB_TOKEN: "anything", PATH: "/bin" },
+      command: `curl -H "Authorization: ${fake.bearer("abcdefghijk")}" https://x`, env: { GITHUB_TOKEN: "anything", PATH: "/bin" },
       headers: [{ name: "x", password: "hunter22" }], api_key: "k", empty_token: "", n: 3,
     });
     expect(v).toEqual({
-      command: `curl -H "Authorization: Bearer ${REDACTED}" https://x`, env: { GITHUB_TOKEN: REDACTED, PATH: "/bin" },
+      command: `curl -H "Authorization: ${fake.bearer(REDACTED)}" https://x`, env: { GITHUB_TOKEN: REDACTED, PATH: "/bin" },
       headers: [{ name: "x", password: REDACTED }], api_key: REDACTED, empty_token: "", n: 3,
     });
   });
@@ -138,7 +149,7 @@ describe("redaction and bounds (pure)", () => {
     expect(utf8(t.text)).toBeGreaterThan(TRACE_FIELD_MAX);
     // A secret is redacted before the cut, so a cut can't leave it half-matched.
     // Placed so a cut first would keep "ghp_" and 19 of its characters, one short of the shape.
-    const cut = traceOf({ ...base, type: "error", error: { code: "x", message: `${"z".repeat(TRACE_FIELD_MAX - 3 - 24)} ghp_${"Q".repeat(36)}`, retryable: false } }) as { message: string };
+    const cut = traceOf({ ...base, type: "error", error: { code: "x", message: `${"z".repeat(TRACE_FIELD_MAX - 3 - 24)} ${["ghp", "Q".repeat(36)].join("_")}`, retryable: false } }) as { message: string };
     expect(cut.message).not.toMatch(/ghp_|QQQ/);
   });
 
@@ -325,9 +336,9 @@ describe("what streams", () => {
     const s = await w.session();
     const t = await trace(s.agent, w.c.token);
     const turn = await s.turn(w.c.token, "work");
-    const pat = `ghp_${"x".repeat(36)}`;
+    const pat = ["ghp", "x".repeat(36)].join("_");
     await s.events([
-      { type: "tool_call", turn, call_id: "toolu_2", name: "WebFetch", input: { url: "https://x", headers: { Authorization: "Bearer abcdefghijkl" }, body: "y".repeat(20_000) } },
+      { type: "tool_call", turn, call_id: "toolu_2", name: "WebFetch", input: { url: "https://x", headers: { Authorization: fake.bearer("abcdefghijkl") }, body: "y".repeat(20_000) } },
       { type: "tool_result", turn, call_id: "toolu_2", is_error: false, summary: `got ${pat}` },
     ]);
     const call = await t.next("tool_call");
