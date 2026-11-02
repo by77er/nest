@@ -78,6 +78,21 @@ describe("the manager", () => {
     ]);
   });
 
+  it("the board marks a task tainted once any tainted session wrote to it, and only that task", async () => {
+    const p = await newProject();
+    const clean = await managerToken(p);
+    const dirty = await managerToken(p, { tainted: true });
+    const a = ok(await callTool("board", clean, "create_task", { title: "clean" }));
+    const b = ok(await callTool("board", clean, "create_task", { title: "touched" }));
+    const c = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "the owner's" })).body;
+    ok(await callTool("board", dirty, "update_task", { task: b.id, body: "from a tainted session" }));
+    // A later clean write doesn't clear it: the taint is in the history.
+    ok(await callTool("board", clean, "write_spec", { task: b.id, ...spec }));
+    const tasks = (await api(token, "GET", `/api/projects/${p.id}/tasks`)).body as { id: string; tainted: boolean }[];
+    expect(Object.fromEntries(tasks.map((t) => [t.id, t.tainted]))).toEqual({ [a.id]: false, [b.id]: true, [c.id]: false });
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${b.id}`)).body.tainted).toBe(true);
+  });
+
   it("can't reach another project's tasks", async () => {
     const a = await newProject();
     const b = await newProject();

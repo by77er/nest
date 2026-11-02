@@ -2,7 +2,7 @@
 
 A task board for GitHub repos, run by agents on nest: an app with its own Worker and Durable Objects, built only on nest's [API clients](../docs/control-plane/api/clients/) interface. nest knows nothing of projects, tasks or reviews. A feature here that seems to need one of nest's internals means that interface is wrong: fix it there, generically, and build this on the result.
 
-**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)). **Not built:** the UI (a placeholder page), attaching a repo on GitHub (branch protection), the review pipeline (`/hooks/github`, ReviewDO's queue, the reviewer's tools) setting the webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
+**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), and the UI ([below](#the-ui)). **Not built:** attaching a repo on GitHub (branch protection), the review pipeline (`/hooks/github`, ReviewDO's queue, the reviewer's tools) setting the webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
 
 ## What it does
 
@@ -88,7 +88,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 ## Built: the core
 
-**Code:** `src/worker.ts` (routes, the Access check of `src/access.ts`, a copy of the dashboard's, and `/hooks/nest`), `src/api.ts` (the JSON API), `src/mcp.ts` and `src/identity.ts` (the MCP servers and Nest-Identity), `src/tools.ts` (each server's tools), `src/catalog.ts` (templates, capabilities, prompts), `src/nest.ts` (the client of nest), `src/tasks.ts` (the state machine, pure), `src/webhook.ts` (`Nest-Signature`), `src/do/` (DirectoryDO, ProjectDO, ReviewDO's schema), `src/sql.ts` (versioned migrations). Nothing imports the control plane (`test/deps.test.ts`).
+**Code:** `src/worker.ts` (routes, the Access check of `src/access.ts`, a copy of the dashboard's, and `/hooks/nest`), `src/api.ts` (the JSON API; its request bodies in `src/requests.ts`), `src/mcp.ts` and `src/identity.ts` (the MCP servers and Nest-Identity), `src/tools.ts` (each server's tools), `src/catalog.ts` (templates, capabilities, prompts), `src/nest.ts` (the client of nest), `src/tasks.ts` (the state machine, pure), `src/webhook.ts` (`Nest-Signature`), `src/do/` (DirectoryDO, ProjectDO, ReviewDO's schema), `src/sql.ts` (versioned migrations). Nothing imports the control plane (`test/deps.test.ts`).
 
 ```bash
 npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, against a fake nest (test/fake-nest.ts)
@@ -114,6 +114,34 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 - **Events:** deduplicated by id (DirectoryDO, 7 days) and idempotent besides. An event for an agent the app hasn't recorded is routed by that agent's labels (`GET /v1/agents/<id>`), only if the app is its client and owner; any other agent is remembered as not the app's and acknowledged. A failure answers 5xx, so nest delivers again.
 
 **Asked of nest** (generic interface changes this build worked around; see the [open questions](../docs/README.md#open-questions-and-watch-items)): an mcp capability with no bearer (`auth` optional) for servers that admit by Nest-Identity; owner routes that aren't about a cell not checking `?cell=`; an idempotency key on `POST /v1/agents` and `POST /v1/sandboxes`.
+
+## The UI
+
+**Code:** `src/ui/`, one folder per feature (`projects`, `project`, `board`, `task`, `chat`, `asks`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
+
+- **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and a custom theme (`src/ui/theme.ts`), no CSS of its own; TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons.
+- **One API client** (`src/ui/api/client.ts`), same origin, so Access's cookie is the only credential: nothing secret is in the bundle. Its types are the Worker's own, imported by type only; the request bodies' zod schemas live in `src/requests.ts`, which both the Worker and the forms validate with.
+- **Live views poll while the tab is visible:** the chat every 3 s, the board and the asks every 5 s, the project every 10 s. The board stops polling while a card is dragged.
+- **Optimistic where safe:** reordering (one `ord` written, between the new neighbours'; put back if refused) and a chat message (shown as sending; its text back in the composer if refused). An answer to an ask isn't: the ask stays until nest has taken it.
+- **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling and marking done are confirmed; a failed write is a red notification with the Worker's reason.
+- **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one).
+- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list now returns, and a "needs input" marker from the project's open asks.
+
+**The theme:** light only, near-white page (`#fafafa`) with white surfaces, near-black text (`#212529`) and Mantine's grays. Color is only for actions and status, in four roles, each a 10-shade tuple ([`src/ui/theme.ts`](src/ui/theme.ts)), Bootstrap's hues a step muted. Shade 6 is the filled one; filled text is white, or dark on yellow (Mantine's `autoContrast`):
+
+| Role | Shade 6 | Text on it | For |
+|---|---|---|---|
+| `primary` (blue) | `#3b6fc0` | white, 4.98:1 | primary actions (create, assign, save, send); work in progress (assigned, in progress, in review) |
+| `danger` (red) | `#c2414c` | white, 5.05:1 | close, cancel, delete, deny; cancelled |
+| `warning` (yellow) | `#dca71c` | dark, 7.21:1 | stalled, needs input (asks), undelivered messages, start errors |
+| `success` (green) | `#2c8152` | white, 4.81:1 | mark done, approve; done |
+
+Drafts and ready tasks are gray: no work has started. `src/ui/theme.test.ts` checks every filled label and light badge against WCAG AA (4.5:1), and that components name only these roles and the grays.
+
+```bash
+npm run dev    # the page and the API in workerd; without NEST_CLIENT_TOKEN the API answers, but nothing reaches nest
+npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testing Library)
+```
 
 ## Setup (the operator's)
 
