@@ -31,7 +31,7 @@ const NOT_ADMIN = {
     "GET /v1/catalog",
     ...["GET", "PUT", "DELETE"].flatMap((m) => ["templates", "capabilities"].map((k) => `${m} /v1/catalog/${k}/:ns/:entry`)),
     // A client's own (test/client-events.test.ts): the operator has no `self`.
-    "PUT /v1/clients/self/webhook",
+    "GET /v1/clients/self", "PUT /v1/clients/self/webhook",
   ].map((r) => [r, "owner"])),
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */

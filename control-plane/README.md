@@ -117,7 +117,7 @@ brokered journal, asks and answers; sandbox create, list, read, destroy, lifetim
 `GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
 its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
-retries; `GET /v1/admin/clients/<cli>` shows `events {webhook, backlog, dropped, failures, last_error}`.
+retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.
 
 ## Secrets and vars
 

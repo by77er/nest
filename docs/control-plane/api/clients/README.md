@@ -84,7 +84,7 @@
 - **The signing key** is the secret's UTF-8 bytes (`whsec_<64 hex>`). Setting the webhook again replaces the secret and sends what waits to the new URL at once.
 - **No webhook set:** events are dropped on arrival (nobody would hear them), not queued for later.
 - **Redirects aren't followed** (a 3xx is a failure). The retry wait runs from the failure, so an attempt cut off at 10 s is retried 1 s after that.
-- **The record** (the operator's `GET /v1/admin/clients/<id>`) shows `events: {webhook, backlog, dropped, failures, last_error}`, never the secret. A client can't read it yet: there is no `GET /v1/clients/self`.
+- **The record** shows `events: {webhook, backlog, dropped, failures, last_error}`, never the secret: the client reads its own with `GET /v1/clients/self` (its grant and live counts too), so it sees when `dropped` rises; the operator with `GET /v1/admin/clients/<id>`.
 
 ## GitHub tokens
 

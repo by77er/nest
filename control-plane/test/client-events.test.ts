@@ -163,7 +163,8 @@ async function verifies(secret: string, hit: Hit): Promise<boolean> {
   return crypto.subtle.verify("HMAC", key, mac, enc.encode(`${m[1]}.${hit.body}`));
 }
 
-const view = async (c: Client) => (await adminJson(`/v1/admin/clients/${c.id}`)).events;
+/** Its events' state, as the client reads it. */
+const view = async (c: Client) => (await asJson(c.token, "/v1/clients/self")).events;
 const outboxRows = (agent: string) => runInDurableObject(agentStub(agent), (_i: unknown, st: DurableObjectState) =>
   st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM client_events").one().n);
 const ev = (id: string): StampedEvent => ({ id, type: "sandbox.destroyed", sandbox: `sbx_${id}` });
@@ -188,8 +189,11 @@ describe("the webhook", () => {
     await adminJson("/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/x" } }, 400);
     const set = await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/x" } });
     expect(set.secret).toMatch(/^whsec_[0-9a-f]{64}$/);
-    const shown = JSON.stringify(await adminJson(`/v1/admin/clients/${c.id}`));
-    expect(shown).not.toContain(set.secret);
+    // Neither the client's own record nor the operator's view shows it.
+    for (const shown of [await asJson(c.token, "/v1/clients/self"), await adminJson(`/v1/admin/clients/${c.id}`)]) {
+      expect(shown).toMatchObject({ client: c.id, events: { webhook: "https://hook.test/x" } });
+      expect(JSON.stringify(shown)).not.toContain(set.secret);
+    }
     expect(await view(c)).toEqual({ webhook: "https://hook.test/x", backlog: 0, dropped: 0, failures: 0, last_error: null });
     // Set again: a new secret.
     expect((await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/x" } })).secret).not.toBe(set.secret);

@@ -117,6 +117,12 @@ async function ownSandbox(c: { env: Env; caller: Caller }, id: string) {
   return stub;
 }
 
+/** The calling client, for `/v1/clients/self` routes (the operator has no `self`). */
+function selfClient(caller: Caller): string {
+  if (caller.kind !== "client") throw new NestError(ErrorCodes.INVALID_MESSAGE, "/v1/clients/self is an API client's own; the operator has none", 400);
+  return caller.client;
+}
+
 /** A client refused something only the operator does. */
 function operatorOnly(c: { caller: Caller }, what: string): void {
   if (c.caller.kind !== "operator") throw new NestError(ErrorCodes.FORBIDDEN, `${what} is the operator's`, 403);
@@ -720,14 +726,13 @@ export const ROUTES: Route[] = [
     await clientDO(env, p.client).purge();
     return { deleted: p.client, name, catalog_entries: entries };
   } }),
-  // A client's own webhook (docs/control-plane/api/clients/#events-to-the-owner): https only; its signing
-  // secret is in this answer and nowhere else. The operator has no `self`.
+  // A client's own record (its grant, live counts and events: what it missed shows as `events.dropped`) and
+  // webhook (docs/control-plane/api/clients/#events-to-the-owner): https only, its signing secret in this
+  // answer and nowhere else. The operator has no `self`.
+  route({ method: "GET", path: "/v1/clients/self", auth: "owner", run: ({ env, caller }) => clientDO(env, selfClient(caller)).info() }),
   route({
     method: "PUT", path: "/v1/clients/self/webhook", auth: "owner", body: z.strictObject({ url: z.string().min(1).max(2048) }),
-    run: ({ env, caller, body: r }) => {
-      if (caller.kind !== "client") throw new NestError(ErrorCodes.INVALID_MESSAGE, "/v1/clients/self is an API client's own; the operator has none", 400);
-      return clientDO(env, caller.client).setWebhook(r.url);
-    },
+    run: ({ env, caller, body: r }) => clientDO(env, selfClient(caller)).setWebhook(r.url),
   }),
 
   // The catalog as an owner sees it: the operator all of it, a client the operator's entries and its own
