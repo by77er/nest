@@ -463,7 +463,9 @@ describe("one brain per agent: the brain record", () => {
     });
     await runDeadline(t.agent, "condemned");
     expect(await wedgedMs(t.cell, t.host.host)).toBeNull();
-    expect((await agentStub(t.agent).info()).brain).toBeNull();
+    // Released: the start intent is due at once, so the real alarm may already have placed epoch 2.
+    const brain = (await agentStub(t.agent).info()).brain;
+    if (brain !== null) expect(brain).toMatchObject({ epoch: 2, host: c.host });
     await runDeadline(t.agent, "intent");
     expect((await nextCommands(c.ws, isStartOf(t.agent))).find(isStartOf(t.agent))).toMatchObject({ epoch: 2 });
   });
