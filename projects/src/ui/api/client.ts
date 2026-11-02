@@ -49,6 +49,7 @@ export const api = {
   createProject: (b: CreateProjectBody) => call<CreatedProject>("POST", "/projects", b),
   project: (id: string) => call<Project>("GET", prj(id)),
   updateSettings: (id: string, b: SettingsBody) => call<Settings>("PATCH", `${prj(id)}/settings`, b),
+  retryRepoAutoMerge: (id: string) => call<Settings>("POST", `${prj(id)}/auto-merge/retry`),
 
   tasks: (id: string) => call<Task[]>("GET", `${prj(id)}/tasks`),
   task: (id: string, task: string) => call<TaskDetail>("GET", tsk(id, task)),

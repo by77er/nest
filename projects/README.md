@@ -2,7 +2,7 @@
 
 A task board for GitHub repos, run by agents on nest: an app with its own Worker and Durable Objects, built only on nest's [API clients](../docs/control-plane/api/clients/) interface. nest knows nothing of projects, tasks or reviews. A feature here that seems to need one of nest's internals means that interface is wrong: fix it there, generically, and build this on the result.
 
-**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), and attaching a repo and the review pipeline ([below](#built-the-review-pipeline)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
+**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), and auto-merge ([below](#auto-merge)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
 
 ## What it does
 
@@ -28,7 +28,7 @@ All state is the app's. nest holds the agents, their sandboxes and their transcr
 Only the client interface. One client, `projects`, has this grant:
 - `cells`, and `credentials: [claude_oauth_token]`;
 - `repos` and `github.repos`: the attachable repos. Workers push to them; the manager and reviewers only read them, which `repos` covers (no `read_repos` needed);
-- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch). The app reads nothing else on GitHub: a PR's number, head, base and title come in its webhook, and the reviewer reads the code in its sandbox;
+- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
 - `max_agents` and `max_sandboxes`.
 
@@ -83,7 +83,7 @@ Only the client interface. One client, `projects`, has this grant:
   3. Each job creates a check run (`in_progress`) and starts a reviewer.
   4. The reviewer's verdict completes the check: `success` only if all three dimensions pass, else `failure`, with the summary as the check's output.
   5. A reviewer that exits without a verdict is started again, twice, then the check completes as `action_required`. Not `neutral`: a required check accepts `success`, `skipped` and `neutral` ([GitHub](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)), so `neutral` would let the PR merge unreviewed. A `check_run` `rerequested` queues the job again.
-- **Merging** is GitHub's, gated by the required check. A `pull_request` `closed` event with `merged: true` marks the PR's task `done` and ends its worker; closed without merging, it's noted in the task's history and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
+- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR's task `done` and ends its worker; closed without merging, it's noted in the task's history and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
 
 ## Not decided here
 
@@ -146,6 +146,31 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **The App's id:** the check is required from the App (`checks: [{context, app_id}]`) from the first attach, so no other app or commit status can pass it. The id is the `app_id` of nest's token answer ([GitHub tokens](../docs/control-plane/api/clients/#github-tokens)). If an answer has none (nest can't tell), the check is required from any source (`contexts`, or `checks` without `app_id` where other entries are pinned, which keeps their pins), and the first check run's `app.id` then pins it: the project attaches again. Another entry's `app_id: null` (any source) is sent back as `-1`, GitHub's "any app".
   - Rulesets aren't read or changed: a repo protected by rulesets alone gets branch protection besides.
 - **Tasks and PRs:** a `pull_request` from the repo's own branch `task/<id>` (not a fork's) links the PR to its task (`pr_opened`) if the worker hadn't reported it. Merged, the task is `done` (through `pr_opened` first if it was still `in_progress`) and its worker ended.
+
+## Auto-merge
+
+The owner's request (2026-11-02): "Auto-merge should be an option in the project, which writes back to the repo settings."
+
+- **The settings:** `auto_merge` (default off) and `merge_method` (`squash`, the default, `merge` or `rebase`), set at create or with `PATCH /api/projects/:id/settings`.
+- **The repo's "Allow auto-merge":**
+  - Turning `auto_merge` on writes `allow_auto_merge: true` to the repo; turning it off writes `false`. The write is `PATCH /repos/{o}/{r}`, from ProjectDO's alarm, retried from 5 s doubling to 5 min.
+  - A refusal that will repeat is shown (`repo_auto_merge.state: error`), with the setting kept as asked. `POST /api/projects/:id/auto-merge/retry` writes it again.
+  - Looking at the project (`GET /api/projects/:id`) reads the repo's value again, at most once a minute, from the alarm. A value that differs from the setting is shown as `drifted` (changed by hand on GitHub), and the same retry writes it back. A repo whose setting the app never wrote isn't watched.
+- **Per PR:**
+  - While `auto_merge` is on, a task's PR gets GitHub's auto-merge when it opens or reopens, with the project's merge method. The app uses GraphQL `enablePullRequestAutoMerge` with the PR's `node_id` from the webhook.
+  - Only a task's own PR counts: one from the repo's own branch `task/<id>`. Other PRs, and forks' branches with that name, are left alone.
+  - Turning `auto_merge` on enables it on the task PRs already open, and turning it off disables it on them (`disablePullRequestAutoMerge`).
+  - A PR's auto-merge waits until the repo allows it.
+  - The task records each change (`auto_merge_enabled`, `auto_merge_disabled`, `auto_merge_failed` with GitHub's reason) and shows it in its drawer. GitHub's GraphQL `errors` are refusals for good, except its rate limit.
+  - Changing `merge_method` applies to PRs opened after the change.
+- **Merging stays GitHub's,** gated by the required `nest-projects/review` check and the branch's other rules. GitHub's auto-merge merges "after all required reviews and status checks pass" ([GitHub](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request)). A PR that could merge at once has no auto-merge to enable; GitHub refuses it, and that's recorded.
+- **Each call's token:**
+
+| Call | Permissions | Source |
+|---|---|---|
+| `PATCH /repos/{o}/{r}` (`allow_auto_merge`) | `administration: write` | [Permissions required for GitHub Apps](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps) ("Administration": `PATCH /repos/{owner}/{repo}`, write) |
+| `GET /repos/{o}/{r}` (reading `allow_auto_merge`) | `metadata: read`, `contents: write` | the same page ("Metadata": `GET /repos/{owner}/{repo}`, read), and [Get a repository](https://docs.github.com/en/rest/repos/repos#get-a-repository): "To view merge-related settings, you must have the contents:read and contents:write permissions" |
+| GraphQL `enablePullRequestAutoMerge`, `disablePullRequestAutoMerge` | `pull_requests: write`, `contents: write` | GitHub's [GraphQL reference](https://docs.github.com/en/graphql/reference/pulls) names none (unverified). [Auto-merge](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request) needs "write permissions to a repository". The merge it arms is Contents: write (`PUT …/pulls/{n}/merge`, same permissions page), and it changes the PR |
 
 ## The UI
 
@@ -211,4 +236,5 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 2. Cloudflare Access comes from the app's own inframe stack, [`deploy/`](deploy/) (not nest's `edge` stack): the owner's login on `projects-nest.bitcru.sh`, with `/hooks` and `/mcp` bypassed, since they are authenticated by signature and by identity instead. `.github/workflows/deploy-projects-infra.yml` applies it on a push to `main` that touches `deploy/`, with `CLOUDFLARE_ACCESS_API_TOKEN` (Access: Apps and Policies: Edit); or by hand, `inframe plan --stack projects` then `apply` ([deploy/README.md](deploy/README.md#use)). Set `PROJECTS_AUD` in `wrangler.jsonc` to its output `projects_aud`.
 3. The Worker deploys by `.github/workflows/deploy-projects.yml` on a push to `main` that touches `projects/` (outside `deploy/`), to `projects-nest.bitcru.sh`. It puts its secrets from the `production` environment's `PROJECTS_NEST_CLIENT_TOKEN`, `PROJECTS_NEST_WEBHOOK_SECRET` and `PROJECTS_GITHUB_WEBHOOK_SECRET` when they're set. Then `POST /api/admin/sync` writes the catalog.
 4. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
-5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events. The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo.
+5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events. The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo. For auto-merge, the App also needs Contents: read and write, and Pull requests: read and write.
+6. **Auto-merge's permissions (2026-11-02):** add `pull_requests: write` and `contents: write` to the live client's `github.permissions`. Use `PATCH /v1/admin/clients/<id>`, which takes the grant ([clients doc](../docs/control-plane/api/clients/)). Until then, turning auto-merge on writes the repo setting, but each PR's auto-merge fails with nest's 403, recorded on its task.

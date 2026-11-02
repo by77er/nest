@@ -2,6 +2,7 @@
 // page (src/ui/) validates its forms with the very schemas the Worker checks, and types its calls by them.
 
 import { z } from "zod";
+import { MERGE_METHODS } from "./automerge";
 
 /** A GitHub repo, `owner/name`. */
 export const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
@@ -14,12 +15,17 @@ export const CreateProject = z.strictObject({
   auto_assign: z.boolean().optional(),
   max_workers: z.number().int().min(0).max(20).optional(),
   max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
+  auto_merge: z.boolean().optional(),
+  merge_method: z.enum(MERGE_METHODS).optional(),
 });
 export const Settings = z.strictObject({
   auto_assign: z.boolean().optional(),
   max_workers: z.number().int().min(0).max(20).optional(),
   // ReviewDO's: null (the default) for no cap on running reviews.
   max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
+  // GitHub's auto-merge on task PRs, and the repo's "Allow auto-merge" written back (README.md#auto-merge).
+  auto_merge: z.boolean().optional(),
+  merge_method: z.enum(MERGE_METHODS).optional(),
 });
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
