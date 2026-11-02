@@ -172,7 +172,7 @@ The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-de
 | Spacing | `2xs` 2, `xs` 4, `sm` 8, `md` 12, `lg` 16, `xl` 24, `2xl` 32, `3xl` 48, `4xl` 64 (px) |
 | Radii | `sm` 4 (badges, inputs), `md` 8 (panels, buttons) |
 | Borders, shadows | a 1 px hairline in `border`; `raised` (a dragged card) and `overlay` (drawers, modals) |
-| Neutrals (light / dark) | page `#fafafa` / `#121314`, surface `#ffffff` / `#1a1b1e`, subtle `#f1f3f5` / `#222327`, border `#e9ecef` / `#2c2e33`, text `#212529` / `#e9ecef`, muted `#656d75` / `#9aa0a6` |
+| Neutrals (light / dark) | page `#fafafa` / `#121314`, surface `#ffffff` / `#1a1b1e`, subtle `#f1f3f5` / `#222327`, border `#e9ecef` / `#2c2e33`, text `#212529` / `#e9ecef`, muted `#666e76` / `#9aa0a6` |
 | Roles (filled, light / dark) | primary `#3b6fc0` / `#5a8ad6`, danger `#c2414c` / `#d9606a`, warning `#dca71c` / `#e3b341`, success `#2c8152` / `#3f9e6a`; label white (dark on warning) in light, `#121314` in dark |
 | Motion | 120 / 180 / 240 ms, `cubic-bezier(0.2, 0, 0, 1)` in, `cubic-bezier(0.4, 0, 1, 1)` out; opacity and transform only; reduced motion honoured; a spinner only after 300 ms |
 | Layout | page max 1440 px; gutters `lg` / `xl` / `2xl` (phone / tablet / desktop); side panel 320 px from 75em; board columns at least 8.5rem from 62em (16rem below) |

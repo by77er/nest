@@ -26,6 +26,8 @@ RULES = [
     ("docs/", set()),
     ("dev/", set()),
     (".claude/", set()),
+    # The UI design skill: both apps' theme tests read its token tables.
+    (".claude/skills/nest-ui-design/", {"dashboard", "projects"}),
     ("README.md", set()),
     ("CLAUDE.md", set()),
     ("images/", set()),

@@ -1,0 +1,196 @@
+/* The layout primitives' values (the skill's "Layout primitives"): only these, the theme and
+   ../global.css define sizes; feature code composes the primitives. Breakpoints are the theme's
+   (sm 48em: tablet, md 62em: desktop). */
+
+/* AppFrame */
+.header {
+  background-color: var(--nest-surface);
+  border-bottom: 1px solid var(--nest-border);
+}
+
+.headerInner {
+  min-height: 3.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mantine-spacing-lg);
+}
+
+/* Page: max width 1440 px, centred; gutters 2xl desktop, xl tablet, lg phone. */
+.page {
+  width: 100%;
+  max-width: 90rem;
+  margin-inline: auto;
+  padding-inline: var(--mantine-spacing-lg);
+}
+
+@media (min-width: 48em) {
+  .page {
+    padding-inline: var(--mantine-spacing-xl);
+  }
+}
+
+@media (min-width: 62em) {
+  .page {
+    padding-inline: var(--mantine-spacing-2xl);
+  }
+}
+
+.content {
+  padding-block: var(--mantine-spacing-xl) var(--mantine-spacing-3xl);
+}
+
+/* PageHeader: actions on the title's baseline, wrapping below it on narrow screens. */
+.pageHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--mantine-spacing-sm) var(--mantine-spacing-lg);
+}
+
+/* Section: a heading row, lg above the content. */
+.sectionHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--mantine-spacing-sm) var(--mantine-spacing-lg);
+  margin-bottom: var(--mantine-spacing-lg);
+}
+
+.section {
+  scroll-margin-top: var(--mantine-spacing-xl);
+  min-width: 0;
+}
+
+/* DataTable: the table scrolls in its own frame, never the page; long ones keep their header in view. */
+.scroller {
+  overflow: auto;
+  max-height: min(70vh, 40rem);
+  border-radius: var(--mantine-radius-md);
+}
+
+.scroller table {
+  width: max-content;
+  min-width: 100%;
+}
+
+.scroller th,
+.scroller td {
+  white-space: nowrap;
+}
+
+.scroller th {
+  font-size: var(--mantine-font-size-xs);
+  line-height: var(--mantine-line-height-xs);
+  font-weight: 500;
+  color: var(--nest-muted);
+}
+
+.scroller tr {
+  scroll-margin-top: var(--mantine-spacing-3xl);
+}
+
+/* ItemList: rows divided by hairlines, no list markers. */
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.list > li + li {
+  border-top: 1px solid var(--nest-border);
+}
+
+/* Panel, filling its grid cell (cards in a row line up). */
+.fill {
+  height: 100%;
+}
+
+/* Command: wraps at any character, within a measure that keeps its column narrow. The table's
+   cells don't wrap; this one does. */
+.command {
+  display: block;
+  max-width: 44ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.scroller td .command {
+  white-space: normal;
+}
+
+/* The copy button: 32 px on desktop (Mantine's lg is 34), 44 px on touch. */
+@media (pointer: coarse) {
+  .copy {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+}
+
+/* Prose: a readable measure. */
+.prose {
+  max-width: 80ch;
+}
+
+/* StatTile: a label, a value in the h1 size, and a caption line. */
+.statValue {
+  font-size: var(--mantine-h1-font-size);
+  line-height: var(--mantine-h1-line-height);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* State primitives: centred in their container. */
+.state {
+  padding-block: var(--mantine-spacing-xl);
+  text-align: center;
+}
+
+/* Hit targets: 32 px on desktop, 44 px on touch. */
+.target {
+  min-height: 2rem;
+  display: inline-flex;
+  align-items: center;
+}
+
+@media (pointer: coarse) {
+  .target {
+    min-height: 2.75rem;
+  }
+}
+
+/* Flash: a value that changed on a poll flashes its tint once (base), by opacity only, and never
+   under reduced motion. A remount (a new key) restarts it. */
+.flash {
+  position: relative;
+  isolation: isolate;
+}
+
+.flash[data-flash]::after {
+  content: "";
+  position: absolute;
+  inset: calc(var(--mantine-spacing-2xs) * -1) calc(var(--mantine-spacing-xs) * -1);
+  border-radius: var(--mantine-radius-sm);
+  background-color: var(--mantine-color-primary-light);
+  z-index: -1;
+  opacity: 0;
+  pointer-events: none;
+  animation: flash var(--nest-duration-base) var(--nest-ease-leave) 1;
+}
+
+@keyframes flash {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash[data-flash]::after {
+    animation: none;
+  }
+}

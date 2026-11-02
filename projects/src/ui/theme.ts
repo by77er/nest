@@ -35,7 +35,7 @@ export const ROLES = ["primary", "danger", "warning", "success"] as const;
 
 /** The neutral roles, per scheme (the skill's color table). */
 export const neutrals = {
-  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#656d75" },
+  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#666e76" },
   dark: { page: "#121314", surface: "#1a1b1e", subtle: "#222327", border: "#2c2e33", text: "#e9ecef", muted: "#9aa0a6" },
 } as const;
 
