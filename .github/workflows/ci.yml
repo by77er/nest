@@ -305,7 +305,8 @@ jobs:
 
   # The cell stack's proofs and graph policies (deploy/lean/Cell/Test.lean), with no AWS
   # credentials: a pull request can't change IAM in a way that breaks a theorem. Plans run only
-  # in deploy.yml, which holds the credentials.
+  # in deploy.yml, which holds the credentials. Also the projects app's own stack (projects/deploy/),
+  # applied by deploy-projects-infra.yml.
   infra:
     needs: plan
     if: needs.plan.outputs.infra == 'true'
@@ -325,7 +326,9 @@ jobs:
             ~/.cargo/bin/.inframe-rev
             deploy/lean/.lake
             deploy/lean/.generated
-          key: infra-v2-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json', 'deploy/cloudflare-schema.json') }}
+            projects/deploy/lean/.lake
+            projects/deploy/lean/.generated
+          key: infra-v2-${{ runner.os }}-${{ hashFiles('scripts/infra-tools.sh', 'deploy/lean/lean-toolchain', 'deploy/lean/lake-manifest.json', 'deploy/aws-schema.json', 'deploy/cloudflare-schema.json', 'projects/deploy/lean/lean-toolchain', 'projects/deploy/lean/lake-manifest.json', 'projects/deploy/cloudflare-schema.json') }}
           restore-keys: infra-v2-${{ runner.os }}-
       - run: scripts/infra-tools.sh
       - name: Proofs and policies
@@ -337,6 +340,11 @@ jobs:
           # a cached .lake rebuilds the stack when they change.
           inframe test --stack use1
           inframe test --stack edge
+      - name: Projects app's proofs and policies
+        working-directory: projects/deploy
+        run: |
+          inframe provider generate cloudflare --frontend lean --schema-json cloudflare-schema.json
+          inframe test --stack projects
 
   # nestd's cores checked as the code that ships (docs/verification/nestd/): the Stateright checks
   # at CI bounds and mutation testing of nestd-core. Both crates are standalone (own lockfiles).

@@ -88,7 +88,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 ## Built: the core
 
-**Code:** `src/worker.ts` (routes, the Access check of `src/access.ts`, a copy of the dashboard's, and `/hooks/nest`), `src/api.ts` (the JSON API; its request bodies in `src/requests.ts`), `src/mcp.ts` and `src/identity.ts` (the MCP servers and Nest-Identity), `src/tools.ts` (each server's tools), `src/catalog.ts` (templates, capabilities, prompts), `src/nest.ts` (the client of nest), `src/tasks.ts` (the state machine, pure), `src/webhook.ts` (`Nest-Signature`), `src/do/` (DirectoryDO, ProjectDO, ReviewDO's schema), `src/sql.ts` (versioned migrations). Nothing imports the control plane (`test/deps.test.ts`).
+**Code:** `src/worker.ts` (routes, the Access check of `src/access.ts`, a copy of the dashboard's, and `/hooks/nest`), `src/api.ts` (the JSON API; its request bodies in `src/requests.ts`), `src/mcp.ts` and `src/identity.ts` (the MCP servers and Nest-Identity), `src/tools.ts` (each server's tools), `src/catalog.ts` (templates, capabilities, prompts), `src/nest.ts` (the client of nest), `src/tasks.ts` (the state machine, pure), `src/webhook.ts` (`Nest-Signature`), `src/do/` (DirectoryDO, ProjectDO, ReviewDO's schema), `src/sql.ts` (versioned migrations), `deploy/` (Cloudflare Access in front of it: the app's own inframe stack). Nothing imports the control plane (`test/deps.test.ts`).
 
 ```bash
 npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, against a fake nest (test/fake-nest.ts)
@@ -147,6 +147,7 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 ## Setup (the operator's)
 
 1. Create the client: `POST /v1/admin/clients {name: "projects", grant}`, and store its token as the Worker's secret `NEST_CLIENT_TOKEN`.
-2. Deploy the Worker to `projects-nest.bitcru.sh`, then `POST /api/admin/sync` to write the catalog. Put Cloudflare Access in front of it for the owner's login (the `edge` inframe stack), with `/hooks/*` and `/mcp/*` bypassed: they are authenticated by signature and by identity instead.
-3. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
-4. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github`, with a new secret, stored as `GITHUB_WEBHOOK_SECRET`. Subscribe the App to `pull_request` and `check_run` events.
+2. Cloudflare Access comes from the app's own inframe stack, [`deploy/`](deploy/) (not nest's `edge` stack): the owner's login on `projects-nest.bitcru.sh`, with `/hooks` and `/mcp` bypassed, since they are authenticated by signature and by identity instead. `.github/workflows/deploy-projects-infra.yml` applies it on a push to `main` that touches `deploy/`, with `CLOUDFLARE_ACCESS_API_TOKEN` (Access: Apps and Policies: Edit); or by hand, `inframe plan --stack projects` then `apply` ([deploy/README.md](deploy/README.md#use)). Set `PROJECTS_AUD` in `wrangler.jsonc` to its output `projects_aud`.
+3. Deploy the Worker to `projects-nest.bitcru.sh`, then `POST /api/admin/sync` to write the catalog.
+4. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
+5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github`, with a new secret, stored as `GITHUB_WEBHOOK_SECRET`. Subscribe the App to `pull_request` and `check_run` events.

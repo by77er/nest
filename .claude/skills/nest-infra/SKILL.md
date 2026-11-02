@@ -62,6 +62,7 @@ All of `deploy/`, `.github/`, `dev/` and `scripts/` are `CODEOWNERS` paths.
 - **Not in the pipeline:**
   - the guest image is rebuilt by hand (`images/guest/build-on-ec2.sh`) when `nest-guest` changes;
   - the dashboard deploys from `deploy-dashboard.yml`;
+  - the projects app's Access stack (`projects/deploy/`) applies from `deploy-projects-infra.yml`, only on its own changes;
   - the health window, the deploy pause and `rollback.yml` aren't built.
 - **A release with ordering constraints gets a rollout rule** in `dev/deploy.md`. It says what must already be true before the Worker deploys, what runs in each gap (apply → Worker → release), and what an automatic `wrangler rollback` does with what this release wrote. A DO class change or a raised gateway `min_supported` is one-way and ships alone.
 - **Rollback:**

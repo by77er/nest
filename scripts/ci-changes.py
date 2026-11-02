@@ -62,10 +62,12 @@ RULES = [
     ("dashboard/", {"dashboard"}),
     # The projects app: a separate Worker that imports nothing outside projects/.
     ("projects/", {"projects"}),
+    # Its own inframe stack, which the infra job tests; the app's npm checks don't read it.
+    ("projects/deploy/", {"infra"}),
     # The MCP test server is a separate Worker with no CI job of its own; e2e runs it.
     ("mcp-test/", {"e2e"}),
     ("e2e/", {"e2e"}),
-    # The cell stack.
+    # nest's stacks.
     ("deploy/", {"infra"}),
     ("scripts/infra-tools.sh", {"infra"}),
 ]
