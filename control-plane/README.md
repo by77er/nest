@@ -14,7 +14,7 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/workstream.ts` | **WorkstreamDO** (stub): workstreams left the platform; the class stays declared, serving only health (its alarm re-arms daily while the previous release's decision events wait), until stage 4 deletes it |
 | `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), MCP OAuth tokens (`OAuthStore`, `src/lib/mcp-auth.ts`), http profile credentials (`http:<name>`), the argument secret scan, the GitHub App minter (`github_app`; `src/lib/github.ts`), the caller identity keys and signer (`src/lib/identity.ts`, served at `/.well-known/jwks.json`), and the issuance audit in R2 |
 | `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries; the task ledger's and the channel capabilities removed), and API clients' namespaces (`<client>/<entry>`); expansion is `src/lib/spec.ts` (pure), held to a client's grant in its subtree |
-| `src/do/client.ts` | **ClientDO** (one per API client, plus the `directory` of names): the record, grant and token hash, and the registry of its subtree that its maximums count and it lists; grants, tokens and labels are `src/lib/clients.ts` (pure) (docs/control-plane/durable-objects/client/) |
+| `src/do/client.ts` | **ClientDO** (one per API client, plus the `directory` of names): the record, grant and token hash, the registry of its subtree that its maximums count and it lists, and its webhook with the backlog of events it delivers (`src/lib/client-events.ts`); grants, tokens and labels are `src/lib/clients.ts` (pure) (docs/control-plane/durable-objects/client/) |
 | `src/do/channel.ts` | **ChannelDO** (stub): channels left the platform; the class stays declared, serving only health and re-arming a previous release's alarm, until stage 4 deletes it |
 | `src/do/tasks.ts` | **TaskLedgerDO** (stub): the task ledger left the platform; the class stays declared, serving only health, until stage 4 deletes it |
 | `src/lib/` | Reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry, repo allowlists (`repos.ts`) and the egress rule constructors (`rules/`: GitHub's push allowlist to request guards; docs/sandbox/networking/egress/policy/#request-guards) |
@@ -116,6 +116,9 @@ brokered journal, asks and answers; sandbox create, list, read, destroy, lifetim
 (anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
 `GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`. Its own, with a
 client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a GitHub App token within `github`; BrokerDO mints it).
+Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
+its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
+retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.
 
 ## Secrets and vars
 

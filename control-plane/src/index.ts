@@ -744,6 +744,14 @@ export const ROUTES: Route[] = [
     await clientDO(env, p.client).purge();
     return { deleted: p.client, name, catalog_entries: entries };
   } }),
+  // A client's own record (its grant, live counts and events: what it missed shows as `events.dropped`) and
+  // webhook (docs/control-plane/api/clients/#events-to-the-owner): https only, its signing secret in this
+  // answer and nowhere else. The operator has no `self` (403).
+  route({ method: "GET", path: "/v1/clients/self", auth: "owner", run: (c) => clientDO(c.env, selfClient(c).client).info() }),
+  route({
+    method: "PUT", path: "/v1/clients/self/webhook", auth: "owner", body: z.strictObject({ url: z.string().min(1).max(2048) }),
+    run: (c) => newMethod("ClientDO.setWebhook", () => clientDO(c.env, selfClient(c).client).setWebhook(c.body.url)),
+  }),
 
   // A client's own GitHub App token (docs/control-plane/api/clients/#github-tokens): one repo and the
   // permissions it names, each within its grant's `github` (403 otherwise, and nothing is minted).

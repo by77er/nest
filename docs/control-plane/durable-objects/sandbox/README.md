@@ -88,6 +88,8 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 
 ## Lifetime
 
+**Its client hears it destroyed:** a sandbox in a client's subtree writes `sandbox.destroyed` to its `client_events` outbox in the step that decides the destroy (every path goes through `decide`), with its `client` deadline, which hands the event to ClientDO before reporting the destroy to the client's registry ([events to the owner](../../api/clients/#events-to-the-owner)).
+
 **A sandbox nobody uses is destroyed, through `destroy`** (so FleetDO's registry marks it and its generations stop being GC roots, [commit-gc](../../../verification/commit-gc/)). Built (`checkExpiry`, `release`; rules in `lib/lifetimes.ts`):
 - **Dormant:** no agent attached, no placement in flight, and no VM up (`creating`, `restoring`, `running` or `suspending` on a host): suspended, unplaced or failed. `decide`, the step every mutation goes through, keeps `dormant_since_ms`: set at the first dormant change, cleared at once by one that isn't (a wake, a placement, an attach), so a sandbox used again starts its clock over.
 - **Idle TTL:** its own (`idle_ttl_ms` at create, from the operator's `POST /v1/sandboxes` or `agent_spawn`; `PUT /v1/sandboxes/<id>/lifetime` sets or clears it), else the cell default: the cell's `sandbox_idle_ttl_ms` in `AWS_CELLS`, else `SANDBOX_IDLE_TTL_MS`, else **1 day**, so the sandboxes of many short-lived agents don't pile up (owner's choice, 2026-11-01); a sandbox to keep gets a long TTL of its own. At least a minute.

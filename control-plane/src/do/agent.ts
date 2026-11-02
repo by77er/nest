@@ -23,6 +23,7 @@ import { type IdentitySubject, IdentityTokens } from "../lib/identity";
 import { Repo } from "../lib/repos";
 import { isAgentId, Labels } from "../lib/clients";
 import type { MemberFacts } from "./client";
+import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-events";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
 import {
@@ -162,7 +163,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry";
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events";
 /**
  * A `sync` ask's window, `ask:<ask id>`: armed only by the previous release's `ask` tool, which left the
  * platform. One it armed still ends its waiting call here (`askWindowLapsed`); dropped next release.
@@ -326,6 +327,7 @@ export class AgentDO extends DurableObject<Env> {
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
     });
     this.journal = new BrokeredJournal(this.sql);
+    this.outbox = new ClientOutbox(this.sql);
   }
 
   private readonly queue!: TurnQueue;
@@ -352,6 +354,8 @@ export class AgentDO extends DurableObject<Env> {
   }
   /** Every brokered action it ran or was refused (docs/agents/tools/#taint-and-sinks). */
   private readonly journal!: BrokeredJournal;
+  /** Events for its client, until ClientDO has them (docs/control-plane/api/clients/#events-to-the-owner). */
+  private readonly outbox!: ClientOutbox;
 
   // ---------------------------------------------------------------------------------------------
   // State
@@ -424,9 +428,36 @@ export class AgentDO extends DurableObject<Env> {
   /** Load, mutate and save synchronously (never across an await). */
   private update(fn: (info: AgentInfo) => void): AgentInfo {
     const info = this.load();
+    const was = info.lifecycle;
     fn(info);
     this.save(info);
+    // Every way into `errored` goes through here: its client hears of it in the same step.
+    if (was !== "errored" && info.lifecycle === "errored") {
+      this.emit(info, `${info.agent}/errored/${newId("evt_")}`, {
+        type: "agent.error", agent: info.agent, code: "errored",
+        message: "its brain could not be started, or kept exiting without completing a turn; it waits for new input",
+      });
+    }
     return info;
+  }
+
+  /**
+   * Record an event for its client (none without one) in the caller's synchronous step, with the
+   * `client_events` deadline that hands it to ClientDO: nothing on the agent's own path waits on
+   * ClientDO or the webhook. `id` is the event's for good: derived from what it reports where that
+   * can repeat (a resent event batch), so a repeat is the same event.
+   */
+  private emit(info: AgentInfo, id: string, ev: ClientEvent): void {
+    if (!info.client) return;
+    this.outbox.add(info.client, id, ev);
+    // The row and the alarm are written now (`set`'s synchronous part); only its promise is left.
+    this.deadlines.set("client_events", Date.now(), true).catch((e) => console.error(`agent ${info.agent}: arming client_events failed`, e));
+  }
+
+  /** The last assistant text of turn `turn`, if the runner reported one. */
+  private turnText(turn: string | null): string {
+    const t = this.kvGet<{ turn: string; text: string }>("turn_text");
+    return t && (turn === null || t.turn === turn) ? t.text : "";
   }
 
   private exists(): boolean {
@@ -1064,6 +1095,10 @@ export class AgentDO extends DurableObject<Env> {
     }
     const done = this.update((i) => {
       if (i.ended) i.ended.done_ms = Date.now();
+    });
+    // Its client hears once its end is done (as its registry does): the note it gave, or its last words.
+    this.emit(done, `${done.agent}/exited`, {
+      type: "agent.exited", agent: done.agent, reason: done.ended!.reason, text: done.ended!.note ?? this.turnText(null),
     });
     await this.deadlines.set("reap", done.ended!.ms + AGENT_RECORD_RETENTION_MS);
     await this.deadlines.set("registry", Date.now(), true);
@@ -1992,6 +2027,16 @@ export class AgentDO extends DurableObject<Env> {
           break;
       }
     });
+    // Its client's events, in this step (`emit`); each id repeats with a resent batch.
+    if (ev.type === "assistant_text" && !stale && before.current_turn) {
+      this.kvPut("turn_text", { turn: before.current_turn, text: clip(ev.text, EVENT_TEXT_MAX) });
+    } else if (completed) {
+      this.emit(info, `${info.agent}/turn/${ev.turn!}`, { type: "agent.turn_completed", agent: info.agent, turn: ev.turn!, text: this.turnText(ev.turn!) });
+    } else if (ev.type === "error") {
+      this.emit(info, `${info.agent}/error/${ev.epoch}.${ev.seq}.${ev.ts_ms}`, {
+        type: "agent.error", agent: info.agent, code: ev.error.code, message: clip(ev.error.message, 2048),
+      });
+    }
     // The emptied mirror goes before any later `run_turn` (one may start while this awaits): a requeued
     // message must not be shown again from the runner's old cache.
     if (completed) this.pushCache();
@@ -2704,6 +2749,9 @@ export class AgentDO extends DurableObject<Env> {
     const ask = newId("ask_");
     this.calls.recordAsk({ ask, call, epoch, question, status: "async", deadline: 0 });
     if (approval) this.calls.requestApproval(ask, approval.name, approval.digest, approval.tool);
+    this.emit(info, `${info.agent}/ask/${ask}`, {
+      type: "agent.ask", agent: info.agent, ask, question, ...(approval ? { approval: { name: approval.name, tool: approval.tool } } : {}),
+    });
     console.log(`agent ${info.agent}: ${ask} waits for the operator: ${clip(question, 300)}`);
     return ask;
   }
@@ -2827,6 +2875,9 @@ export class AgentDO extends DurableObject<Env> {
       end: () => this.finishEnd(),
       reap: () => this.reap(),
       registry: () => this.register(),
+      client_events: async () => {
+        if (await this.outbox.handOff(this.env)) await this.deadlines.set("client_events", Date.now());
+      },
     };
     // An end's deadlines a rolled-back release dropped (it has no handler for them) come back here: the
     // hourly `prune` keeps the alarm running.
@@ -2836,6 +2887,8 @@ export class AgentDO extends DurableObject<Env> {
       if (e?.done_ms && !this.deadlines.has("reap")) await this.deadlines.set("reap", e.ms + AGENT_RECORD_RETENTION_MS);
       // An agent from before the registry (or whose registration failed) registers at its next alarm.
       if (this.kvGet<string>("registry") !== this.registryWanted() && !this.deadlines.has("registry")) await this.deadlines.set("registry", Date.now());
+      // Events whose hand-off a rolled-back release dropped (no handler for `client_events`).
+      if (this.outbox.waiting() && !this.deadlines.has("client_events")) await this.deadlines.set("client_events", Date.now());
     }
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key.startsWith(ASK_DEADLINE)) return this.askWindowLapsed(key.slice(ASK_DEADLINE.length));

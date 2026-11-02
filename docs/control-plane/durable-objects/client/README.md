@@ -14,5 +14,9 @@ One instance per [API client](../../api/clients/), named by its id (`cli_…`), 
 - **Recheck:** the hourly prune reads up to 100 live rows against their objects, least recently checked first, so an end or destroy whose report never came (a rollback ran meanwhile) frees its place.
 - **Retention:** ended rows 7 days (hourly prune). The record lives until the client is deleted.
 - **Delete:** `markDeleted` is refused (409) while any row is reserved or live. Otherwise no token works and nothing more is admitted. The Worker then deletes the catalog namespace and the name, and `purge` empties the object.
-- **Not built:** the webhook and the event outbox ([events](../../api/clients/#events-to-the-owner)) go here.
+- **Events** ([events to the owner](../../api/clients/#events-to-the-owner)):
+  - `kv` holds the webhook (`{url, secret, set_ms}`) and delivery's state (`{failures, dropped, last_error, failed_ms}`), so the retry schedule survives a restart.
+  - `outbox` is the backlog, in arrival order, with the event's `id` unique: `enqueue` (an agent's or sandbox's hand-off) inserts in one synchronous step and never waits on a delivery, so a hand-off retried after a lost answer is stored once. Past 10,000 rows the oldest go, counted in `dropped`. Without a webhook nothing is kept.
+  - The `deliver` deadline sends the oldest event, one request at a time, deleting it on a 2xx, up to 100 a run. The first failure (another status, a network error, or no answer within 10 s, `AbortSignal`) stops the run and arms the next one `1 s · 2^(failures-1)` later, at most 5 min; an `enqueue` doesn't advance a deadline that is waiting out its backoff.
+  - The hourly prune arms `deliver` again for a backlog with no deadline (a rolled-back release has no handler for it).
 - **Deploying it was one-way:** a new class ([deploy](../../../../dev/deploy.md)).
