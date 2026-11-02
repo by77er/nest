@@ -155,7 +155,7 @@ describe("AppFrame", () => {
 });
 
 describe("Page and PinnedFooter", () => {
-  it("a reading page keeps its content to the reading measure; a pinned footer sticks to the bottom", () => {
+  it("a reading page keeps its content to the reading measure, centred; a pinned footer sticks to the bottom", () => {
     wrap(
       <Page measure="reading">
         <PinnedFooter>
@@ -167,5 +167,7 @@ describe("Page and PinnedFooter", () => {
     expect(style(footer)).toMatch(/position:\s*sticky/);
     expect(style(footer)).toMatch(/bottom:\s*0/);
     expect(style(footer.parentElement!)).toContain("var(--nest-reading-measure)");
+    // Centred in the content area, and the header inside the same column.
+    expect(style(footer.parentElement!)).toMatch(/margin-inline:\s*auto|margin-left:\s*auto/);
   });
 });
