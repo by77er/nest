@@ -1,11 +1,11 @@
 // The JSON API the board's UI reads (behind Cloudflare Access, src/worker.ts). The state is the app's
 // own Durable Objects'; the only calls out are to nest's client interface (src/nest.ts).
 
-import { z } from "zod";
+import type { z } from "zod";
 import { syncCatalog } from "./catalog";
-import { REPO } from "./do/directory";
 import { directory, type Env, project, review } from "./env";
 import { nestFrom } from "./nest";
+import { Answer, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 
 const json = (body: unknown, status = 200) =>
@@ -17,28 +17,6 @@ const done = <T>(r: Result<T>, status = 200) => (r.ok ? json(r.value, status) : 
 async function withReviews<T extends object>(env: Env, id: string, r: Result<T>): Promise<Result<T & { max_concurrent_reviews: number | null }>> {
   return r.ok ? { ok: true, value: { ...r.value, max_concurrent_reviews: await review(env, id).maxConcurrent() } } : r;
 }
-
-const Text = (max: number) => z.string().max(max);
-const CreateProject = z.strictObject({
-  name: z.string().min(1).max(100),
-  repo: z.string().regex(REPO, "repo is owner/name"),
-  auto_assign: z.boolean().optional(),
-  max_workers: z.number().int().min(0).max(20).optional(),
-  max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
-});
-const Settings = z.strictObject({
-  auto_assign: z.boolean().optional(), max_workers: z.number().int().min(0).max(20).optional(),
-  // ReviewDO's: null (the default) for no cap.
-  max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
-});
-const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
-const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
-const Spec = z.strictObject({
-  goal: Text(4000), acceptance_criteria: z.array(Text(1000)).max(50), files: z.array(Text(1000)).max(50), test_plan: Text(4000),
-});
-const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
-const Answer = z.strictObject({ answer: z.string().max(20000) });
-const Cancel = z.strictObject({ reason: Text(1000).optional() });
 
 async function body<S extends z.ZodType>(req: Request, schema: S): Promise<{ ok: true; value: z.output<S> } | { ok: false; res: Response }> {
   let raw: unknown;

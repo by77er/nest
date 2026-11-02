@@ -247,13 +247,20 @@ describe("tasks", () => {
     expect((await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/cancel`, {})).status).toBe(409);
   });
 
-  it("marking a task done ends its worker", async () => {
+  it("marks done by hand only a task with no PR and no live worker; a running one is refused and keeps its worker", async () => {
     const p = await newProject();
     const t = await readyTask(p.id);
     await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
-    const r = await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/done`);
+    const refused = await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/done`);
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toMatch(/worker is running/);
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body.state).toBe("in_progress");
+    expect(liveWorkersOf(p.id)).toHaveLength(1);
+
+    const noPr = await readyTask(p.id, "research, no PR");
+    const r = await api(token, "POST", `/api/projects/${p.id}/tasks/${noPr.id}/done`);
+    expect(r.status).toBe(200);
     expect(r.body.state).toBe("done");
-    expect(liveWorkersOf(p.id)).toHaveLength(0);
   });
 });
 
