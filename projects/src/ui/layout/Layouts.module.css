@@ -1,0 +1,68 @@
+/* The board's columns share the row equally while each keeps its least width (layout.column in theme.ts); past
+   that the row scrolls sideways. From 62em (md) on, six fit beside the side panel at 1280 px. */
+.columns {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(var(--nest-column-min-narrow), 1fr);
+  gap: var(--mantine-spacing-sm);
+  align-items: start;
+  overflow-x: auto;
+  padding-bottom: var(--mantine-spacing-xs);
+  scroll-snap-type: x proximity;
+}
+
+.columns > * {
+  min-width: 0;
+  scroll-snap-align: start;
+}
+
+@media (min-width: 62em) {
+  .columns {
+    grid-auto-columns: minmax(var(--nest-column-min), 1fr);
+  }
+}
+
+.split {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-xl);
+}
+
+.splitMain {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+@media (min-width: 75em) {
+  .split {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .splitAside {
+    flex: 0 0 var(--nest-side-panel);
+    width: var(--nest-side-panel);
+  }
+}
+
+/* A drag grip: a 32 px target with a pointer, 44 px on touch. */
+.grip {
+  min-width: var(--nest-hit);
+  min-height: var(--nest-hit);
+  flex-shrink: 0;
+  cursor: grab;
+  touch-action: none;
+  margin-block: calc(var(--mantine-spacing-xs) * -1);
+  margin-inline-end: calc(var(--mantine-spacing-xs) * -1);
+}
+
+.grip[data-dragging] {
+  cursor: grabbing;
+}
+
+@media (pointer: coarse) {
+  .grip {
+    min-width: var(--nest-hit-touch);
+    min-height: var(--nest-hit-touch);
+  }
+}
