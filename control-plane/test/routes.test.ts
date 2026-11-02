@@ -18,6 +18,8 @@ const NOT_ADMIN = {
   "GET /v1/oauth/callback": "none",
   // nest's client ID metadata document, fetched by authorization servers: public by design.
   "GET /v1/oauth/client.json": "none",
+  // The caller identity's public keys, fetched by MCP servers that verify Nest-Identity: public by design.
+  "GET /.well-known/jwks.json": "none",
   // An API client's token is accepted too, on its own subtree (docs/control-plane/api/clients/; test/clients.test.ts).
   ...Object.fromEntries([
     "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript",

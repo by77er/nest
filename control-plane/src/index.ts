@@ -14,6 +14,7 @@ import { CLIENT_ID, ClientName, Grant, isAgentId, Labels, newClientToken, parseC
 import type { ClientScope } from "./do/catalog";
 import { CLIENT_DIRECTORY } from "./do/client";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
+import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
 import { parseAppSecret } from "./lib/github";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Resources } from "./protocol/model";
@@ -450,6 +451,10 @@ export const ROUTES: Route[] = [
       status: r.ok ? 200 : 400, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer" },
     });
   } }),
+  // The caller identity's public keys (docs/control-plane/api/clients/#caller-identity-for-mcp-servers):
+  // what an MCP server verifies `Nest-Identity` against. A next key is listed a day before it signs.
+  route({ method: "GET", path: "/.well-known/jwks.json", auth: "none", run: async ({ env }) =>
+    json(await broker(env).identityJwks(), 200, { "cache-control": `public, max-age=${JWKS_MAX_AGE_S}` }) }),
   // nest's client ID metadata document: its URL is the client id an authorization server fetches.
   route({ method: "GET", path: "/v1/oauth/client.json", auth: "none", run: async ({ env }) =>
     json(clientMetadataDocument(env.PUBLIC_BASE_URL), 200, { "cache-control": "public, max-age=300" }) }),

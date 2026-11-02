@@ -2,12 +2,13 @@
 // pool: the admin API configures an mcp capability, a runner session calls `<capability>_<tool>`, and a
 // stub MCP server (a fetch handler for https://mcp.test/<id>/mcp, installed over the global fetch the
 // proxy calls) records every request. Each guarantee has a test that fails without it.
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { McpConnectorDO } from "../src/do/mcp-connector";
 import { approves, argsDigest, checkMcpUrl, connectorName } from "../src/lib/mcp";
-import { adminJson, connectHost, eventually, nextCommands, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
+import { fetchJwks, verifyIdentity } from "./jwt";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -47,6 +48,10 @@ class StubMcp {
   private n = 0;
   /** Per tool: the next calls' behaviour, consumed in order. */
   readonly next: Record<string, Behaviour[]> = {};
+  /** A verifying server: every request's `Nest-Identity` must verify for this audience (else 401). */
+  verifyAud: string | null = null;
+  /** What the verifier said of each request it refused. */
+  readonly refusedIdentity: string[] = [];
 
   /** Sessions opened by `client`. */
   opened(client: string): number {
@@ -67,6 +72,13 @@ class StubMcp {
     const json = (status: number, body: unknown, extra: Record<string, string> = {}) =>
       new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...extra } });
     if (headers.authorization !== `Bearer ${this.token}`) return json(401, { error: "unauthorized" });
+    if (this.verifyAud) {
+      const v = await verifyIdentity(headers["nest-identity"], { aud: this.verifyAud, keys: (await fetchJwks()).keys });
+      if (!v.ok) {
+        this.refusedIdentity.push(v.why);
+        return json(401, { error: "identity" });
+      }
+    }
     if (!(headers.accept ?? "").includes("application/json") || !(headers.accept ?? "").includes("text/event-stream")) return json(406, {});
     if (msg.method === "initialize") {
       const sid = `sess-${++this.n}`;
@@ -193,7 +205,7 @@ async function setup(opts: McpOpts = {}) {
     return { agent: b.agent as string, ws: await runner(b.agent, host.host, host.host_token, 1, `rin_${rand()}`, toolsChanged) };
   };
   return {
-    id, cap, stub, agent: ag.agent as string, host, ws, t: (tool: string) => `${cap}_${tool}`, another,
+    id, cap, cell, stub, agent: ag.agent as string, host, ws, t: (tool: string) => `${cap}_${tool}`, another,
     connector: () => connectorStub(url, `cap:${cap}`),
   };
 }
@@ -636,6 +648,134 @@ describe("taint", () => {
     const s = await setup();
     await listTools(s.ws);
     expect(await tainted(s.agent)).toBe(true);
+  });
+});
+
+// --- Caller identity ---------------------------------------------------------------------------------------------
+
+describe("caller identity (Nest-Identity, docs/control-plane/api/clients/#caller-identity-for-mcp-servers)", () => {
+  const urlOf = (s: { id: string }) => `https://mcp.test/${s.id}/mcp`;
+  /** Each request's identity as a verifying server sees it (test/jwt.ts), in the order they arrived. */
+  async function identities(s: { id: string; stub: StubMcp }, method?: string) {
+    const keys = (await fetchJwks()).keys;
+    return Promise.all(s.stub.requests.filter((r) => !method || r.method === method).map(async (r) => {
+      const v = await verifyIdentity(r.headers["nest-identity"], { aud: urlOf(s), keys });
+      expect(v.ok, `${r.method}: ${JSON.stringify(v)}`).toBe(true);
+      return { method: r.method, token: r.headers["nest-identity"]!, claims: (v as { claims: Record<string, any> }).claims };
+    }));
+  }
+
+  it("every request carries one that verifies for that server: the agent's on its session's requests, nest:connector's on the listing session's", async () => {
+    const s = await setup({ trusted: true });
+    await listTools(s.ws);
+    call(s.ws, "cal_i1", s.t("echo"), { text: "hi" });
+    await result(s.ws, "cal_i1");
+    const all = await identities(s);
+    const agent = all.filter((x) => x.claims.sub === s.agent);
+    const connector = all.filter((x) => x.claims.sub === "nest:connector");
+    expect(agent.length + connector.length).toBe(all.length);
+    expect(new Set(agent.map((x) => x.method))).toEqual(new Set(["initialize", "notifications/initialized", "tools/call"]));
+    expect(new Set(connector.map((x) => x.method))).toEqual(new Set(["initialize", "notifications/initialized", "tools/list"]));
+    const c = agent.find((x) => x.method === "tools/call")!.claims;
+    // No client or labels: this agent's record has neither.
+    expect(c).toEqual({ aud: urlOf(s), sub: s.agent, owner: "user", epoch: 1, tainted: false, iss: "https://nest.test", iat: c.iat, exp: c.iat + 300 });
+    const k = connector[0]!.claims;
+    expect(k).toEqual({ aud: urlOf(s), sub: "nest:connector", iss: "https://nest.test", iat: k.iat, exp: k.iat + 300 });
+  });
+
+  it("a verifying server accepts nest's requests, and refuses the token nest made for another server", async () => {
+    const s = await setup({ trusted: true });
+    const t = await setup({ trusted: true });
+    s.stub.verifyAud = urlOf(s);
+    t.stub.verifyAud = urlOf(t);
+    call(s.ws, "cal_i2", s.t("echo"), { text: "a" });
+    expect((await result(s.ws, "cal_i2")).status).toBe("ok");
+    call(t.ws, "cal_i3", t.t("echo"), { text: "b" });
+    expect((await result(t.ws, "cal_i3")).status).toBe("ok");
+    expect([...s.stub.refusedIdentity, ...t.stub.refusedIdentity]).toEqual([]);
+    const stolen = s.stub.requests.find((r) => r.method === "tools/call")!.headers["nest-identity"];
+    expect(await verifyIdentity(stolen, { aud: urlOf(t), keys: (await fetchJwks()).keys })).toEqual({ ok: false, why: `aud ${urlOf(s)}` });
+  });
+
+  it("names the taint and epoch the request's _meta does; a cached token is reused only while both are unchanged", async () => {
+    const s = await setup({ whenTainted: "allow" });
+    for (const id of ["cal_i4", "cal_i5", "cal_i6"]) {
+      call(s.ws, id, s.t("echo"), { text: id });
+      await result(s.ws, id);
+    }
+    // The untrusted server's first answer tainted the session.
+    let calls = await identities(s, "tools/call");
+    expect(calls.map((c) => c.claims.tainted)).toEqual([false, true, true]);
+    expect(calls.map((c) => c.claims.tainted)).toEqual(s.stub.calls.map((c) => c._meta["nest/taint"]));
+    expect(calls[1]!.token).not.toBe(calls[0]!.token);
+    expect(calls[2]!.token).toBe(calls[1]!.token);
+    // A newer brain's call names its epoch, in a token of its own.
+    await bumpEpoch(s.agent);
+    const ws2 = await runner(s.agent, s.host.host, s.host.host_token, 2, "rin_two");
+    call(ws2, "cal_i7", s.t("echo"), { text: "later" });
+    await result(ws2, "cal_i7");
+    calls = await identities(s, "tools/call");
+    expect(calls[3]!.claims).toMatchObject({ epoch: 2, tainted: true });
+    expect(s.stub.calls[3]!._meta).toMatchObject({ "nest/epoch": 2, "nest/taint": true });
+    expect(calls[3]!.token).not.toBe(calls[2]!.token);
+  });
+
+  it("a taint that lands while the identity is made is in the identity, read as the request leaves", async () => {
+    const s = await setup({ whenTainted: "allow" });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["dispatch:beforeWrite"] = async () => {
+        delete inst.testHooks["dispatch:beforeWrite"];
+        (inst as any).kvPut("read_tainted", true);
+      };
+    });
+    call(s.ws, "cal_i8", s.t("echo"), { text: "x" });
+    expect((await result(s.ws, "cal_i8")).status).toBe("ok");
+    const [c] = await identities(s, "tools/call");
+    expect(s.stub.calls[0]!._meta["nest/taint"]).toBe(true);
+    expect(c!.claims.tainted).toBe(true);
+  });
+
+  it("carries the agent's client and labels when its record has them", async () => {
+    const s = await setup({ trusted: true });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as any).update((i: any) => {
+        i.client = "cli_board";
+        i.labels = { task: "t-17", project: "board" };
+      });
+    });
+    call(s.ws, "cal_i9", s.t("echo"), { text: "x" });
+    await result(s.ws, "cal_i9");
+    const [c] = await identities(s, "tools/call");
+    expect(c!.claims).toMatchObject({ sub: s.agent, client: "cli_board", labels: { task: "t-17", project: "board" } });
+  });
+
+  it("an API client's agent, created with its token and labels, is named as its own: owner and client the client's id, labels as set", async () => {
+    const s = await setup({ trusted: true });
+    const name = `idc-${rand()}`;
+    const c = await adminJson("/v1/admin/clients", {
+      body: { name, grant: { cells: [s.cell], credentials: ["claude_oauth_token", `cap:${s.cap}`], mcp_urls: [`https://mcp.test/${s.id}/`], max_agents: 1 } },
+    }, 201);
+    const asClient = async (method: string, path: string, body: unknown) => {
+      const res = await SELF.fetch(`${BASE}${path}`, {
+        method, headers: { authorization: `Bearer ${c.token}`, "content-type": "application/json" }, body: JSON.stringify(body),
+      });
+      const text = await res.text();
+      expect(res.status, text).toBeLessThan(300);
+      return JSON.parse(text);
+    };
+    // Its own template, listing the operator's capability (within its grant: the URL and the credential).
+    await asClient("PUT", `/v1/catalog/templates/${name}/t`, {
+      capabilities: ["nest", s.cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
+    });
+    const a = await asClient("POST", "/v1/agents", { template: `${name}/t`, cell: s.cell, labels: { task: "t-17" } });
+    await nextCommands(s.host.ws, (x) => x.type === "agent_start" && x.agent === a.agent);
+    const ws = await runner(a.agent, s.host.host, s.host.host_token, 1, `rin_${rand()}`);
+    call(ws, "cal_ic1", s.t("echo"), { text: "x" });
+    expect((await result(ws, "cal_ic1")).status).toBe("ok");
+    const mine = (await identities(s, "tools/call")).filter((x) => x.claims.sub === a.agent);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.claims).toMatchObject({ sub: a.agent, owner: c.client, client: c.client, labels: { task: "t-17" } });
+    ws.close();
   });
 });
 
