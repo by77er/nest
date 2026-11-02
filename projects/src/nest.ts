@@ -62,6 +62,7 @@ export interface Ask {
 export interface SpawnOverrides {
   tools?: string[];
   repos?: string[];
+  read_repos?: string[];
   ephemeral?: true;
   sandbox_idle_ttl_ms?: number;
 }
@@ -123,13 +124,15 @@ export class Nest {
   }
 
   /**
-   * A new agent with a sandbox of its own, both labelled, the agent's push scope narrowed to `repo`.
+   * A new agent with a sandbox of its own, both labelled, its repos narrowed to `repo`: to push to
+   * (`overrides.repos`), or only to read (`overrides.read_repos`), as its template has them.
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
    * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back.
    */
-  async startAgent(template: string, labels: Labels, repo: string, key: string): Promise<string> {
+  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string): Promise<string> {
     const sandbox = (await this.createSandbox({ labels }, `${key}/sandbox`)).sandbox;
-    return (await this.createAgent({ template, sandbox, labels, overrides: { repos: [repo] }, start: true }, `${key}/agent`)).agent;
+    const overrides: SpawnOverrides = "push" in repo ? { repos: [repo.push] } : { read_repos: [repo.read] };
+    return (await this.createAgent({ template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
   }
 
   getAgent(agent: string): Promise<AgentView> {
@@ -176,8 +179,11 @@ export class Nest {
     return this.call("PUT", `/v1/catalog/${kind}/${encodeURIComponent(ns!)}/${encodeURIComponent(entry!)}`, body);
   }
 
-  /** A short-lived GitHub App token for one repo of the grant, with exactly these permissions. */
-  githubToken(repo: string, permissions: Record<string, string>): Promise<{ token: string; expires_at: string; repo: string; permissions: Record<string, string> }> {
+  /**
+   * A short-lived GitHub App token for one repo of the grant, with exactly these permissions, and the
+   * App it's from (`app_id`, `app_slug`: absent when nest can't tell).
+   */
+  githubToken(repo: string, permissions: Record<string, string>): Promise<{ token: string; expires_at: string; repo: string; permissions: Record<string, string>; app_id?: number; app_slug?: string }> {
     return this.call("POST", "/v1/clients/self/github-token", { repo, permissions });
   }
 }

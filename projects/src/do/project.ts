@@ -657,8 +657,10 @@ export class ProjectDO extends DurableObject<Env> {
   private async attachRepo(nest: Nest): Promise<void> {
     const s = this.settings()!;
     try {
-      const appId = await directory(this.env).githubAppId();
       const gh = await githubFor(nest, s.repo, PERMISSIONS.attach);
+      // The App's id from nest's token answer; else one a check run told, if any has yet.
+      const appId = gh.appId ?? (await directory(this.env).githubAppId());
+      if (gh.appId !== null) await directory(this.env).recordGithubAppId(gh.appId);
       const r = await requireReviewCheck(gh, s.repo, appId);
       const detail: AttachDetail = { ...r, at_ms: Date.now() };
       this.sql.exec(
@@ -677,7 +679,7 @@ export class ProjectDO extends DurableObject<Env> {
     const n = (this.settingsRow()!.manager_starts as number) + 1;
     const labels = { project: s.id, role: "manager", start: String(n) };
     try {
-      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, s.repo, `${s.id}/manager/${n}`));
+      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, `${s.id}/manager/${n}`));
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       this.sql.exec("UPDATE settings SET manager = ?", agent);
       await nest.postInbox(agent, managerBrief(s), { requestId: `${s.id}/manager/${n}/brief` });
@@ -702,7 +704,7 @@ export class ProjectDO extends DurableObject<Env> {
     try {
       let agent = before.assignee as string | null;
       if (!agent) {
-        agent = await nest.startAgent(TEMPLATE.worker, labels, s.repo, `${s.id}/${id}/${n}`);
+        agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, `${s.id}/${id}/${n}`);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         if (!current()) {
           // Cancelled (or reassigned) while it was being made: it goes.

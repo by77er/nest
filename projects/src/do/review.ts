@@ -418,7 +418,7 @@ export class ReviewDO extends DurableObject<Env> {
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
-          // The App's id is known now: the project pins its required check to it.
+          // The App's id, if nest's token answer didn't name it: the project pins its required check to it.
           await directory(this.env).recordGithubAppId(appId);
           await projectStub(this.env, project).appIdLearned(appId);
           this.setSetting("github_app_id", String(appId));
@@ -436,7 +436,7 @@ export class ReviewDO extends DurableObject<Env> {
       let agent = (j0.agent as string | null) ?? null;
       if (!agent) {
         const labels = { project, role: "reviewer", pr: String(pr), sha, start: String(runs) };
-        agent = await nest.startAgent(TEMPLATE.reviewer, labels, repo, `${project}/review/${pr}/${sha}/${runs}`);
+        agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, `${project}/review/${pr}/${sha}/${runs}`);
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
         if (!current()) {
           this.oweStop(agent, "superseded");

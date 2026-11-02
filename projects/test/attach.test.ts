@@ -30,6 +30,8 @@ async function create(repo: string) {
   expect(r.status, JSON.stringify(r.body)).toBe(201);
   return r.body as { id: string; settings: any };
 }
+/** Forget the App id a check run told the directory, as before any check run. */
+const forgetAppId = () => runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => { st.storage.sql.exec("DELETE FROM sync WHERE k = 'github_app_id'"); });
 const managersOf = (id: string) => [...fake.agents.values()].filter((a) => a.labels.project === id && a.labels.role === "manager");
 const writes = (repo: string) => gh.calls.filter((c) => c.method !== "GET" && c.path.startsWith(`/repos/${repo}/branches/`));
 
@@ -51,9 +53,9 @@ describe("attaching a repo", () => {
     const repo = `o-${rand()}/r-${rand()}`;
     gh.repo(repo).default_branch = "trunk";
     const p = await create(repo);
-    expect(p.settings).toMatchObject({ attached: true, attach_error: null, attach: { branch: "trunk", change: "created", app_id: null } });
+    expect(p.settings).toMatchObject({ attached: true, attach_error: null, attach: { branch: "trunk", change: "created", app_id: GH_APP_ID } });
     const prot = gh.repo(repo).protection!;
-    expect(prot.required_status_checks).toMatchObject({ strict: false, checks: [{ context: CHECK_NAME, app_id: null }] });
+    expect(prot.required_status_checks).toMatchObject({ strict: false, checks: [{ context: CHECK_NAME, app_id: GH_APP_ID }] });
     expect(prot.enforce_admins.enabled).toBe(false);
     expect(prot.required_pull_request_reviews).toBeUndefined();
     expect(prot.restrictions).toBeUndefined();
@@ -70,7 +72,7 @@ describe("attaching a repo", () => {
     expect(p.settings.attach).toMatchObject({ branch: "main", change: "added" });
     const want = protectedBranch();
     const have = gh.repo(repo).protection!;
-    expect(have.required_status_checks.checks).toEqual([...want.required_status_checks.checks, { context: CHECK_NAME, app_id: null }]);
+    expect(have.required_status_checks.checks).toEqual([...want.required_status_checks.checks, { context: CHECK_NAME, app_id: GH_APP_ID }]);
     expect(have.required_status_checks.strict).toBe(true);
     expect({ ...have, required_status_checks: undefined }).toEqual({ ...want, required_status_checks: undefined });
     expect(writes(repo.toLowerCase()).map((c) => `${c.method} ${c.path.split("/protection")[1]}`)).toEqual(["PATCH /required_status_checks"]);
@@ -88,27 +90,41 @@ describe("attaching a repo", () => {
     const p = await create(repo);
     expect(p.settings.attach.change).toBe("added");
     const have = gh.repo(repo).protection!;
-    expect(have.required_status_checks).toMatchObject({ strict: false, checks: [{ context: CHECK_NAME, app_id: null }] });
+    expect(have.required_status_checks).toMatchObject({ strict: false, checks: [{ context: CHECK_NAME, app_id: GH_APP_ID }] });
     expect({ ...have, required_status_checks: undefined }).toEqual(before);
   });
 
-  it("pins the check to the App once its first check run tells its id", async () => {
+  it("pins the check to the App from the first attach, by the id nest's token answer names", async () => {
+    // No check run has told the id (none of the app's has run).
+    await forgetAppId();
     const repo = `o-${rand()}/r-${rand()}`;
     gh.repo(repo).protection = protectedBranch();
     const p = await create(repo);
-    expect(p.settings.attach.app_id).toBeNull();
-    await deliverGithub("pull_request", prEvent({ repo, number: 1, sha: sha(), action: "opened" }));
-    await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
-    await env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
-    const s = (await api(token, "GET", `/api/projects/${p.id}/settings`)).body;
-    expect(s.attach).toMatchObject({ change: "pinned", app_id: GH_APP_ID });
-    const checks = gh.repo(repo).protection!.required_status_checks.checks;
-    expect(checks).toEqual([{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: null }, { context: CHECK_NAME, app_id: GH_APP_ID }]);
-    // A project attached after that requires it from the App from the start.
-    const repo2 = `o-${rand()}/r-${rand()}`;
-    const p2 = await create(repo2);
-    expect(p2.settings.attach).toMatchObject({ change: "created", app_id: GH_APP_ID });
-    expect(gh.repo(repo2).protection!.required_status_checks.checks).toEqual([{ context: CHECK_NAME, app_id: GH_APP_ID }]);
+    expect(p.settings.attach).toMatchObject({ change: "added", app_id: GH_APP_ID });
+    // In one write: the check required from the App, never from any source first.
+    const patches = writes(repo.toLowerCase());
+    expect(patches.map((c) => c.body)).toEqual([{ checks: [{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: -1 }, { context: CHECK_NAME, app_id: GH_APP_ID }] }]);
+  });
+
+  it("without the App's id in nest's answer, requires the check from any source, then pins it once a check run tells the id", async () => {
+    fake.githubApp = null;
+    try {
+      await forgetAppId();
+      const repo = `o-${rand()}/r-${rand()}`;
+      gh.repo(repo).protection = protectedBranch();
+      const p = await create(repo);
+      expect(p.settings.attach.app_id).toBeNull();
+      expect(gh.repo(repo).protection!.required_status_checks.checks.at(-1)).toEqual({ context: CHECK_NAME, app_id: null });
+      await deliverGithub("pull_request", prEvent({ repo, number: 1, sha: sha(), action: "opened" }));
+      await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+      await env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
+      const s = (await api(token, "GET", `/api/projects/${p.id}/settings`)).body;
+      expect(s.attach).toMatchObject({ change: "pinned", app_id: GH_APP_ID });
+      const checks = gh.repo(repo).protection!.required_status_checks.checks;
+      expect(checks).toEqual([{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: null }, { context: CHECK_NAME, app_id: GH_APP_ID }]);
+    } finally {
+      fake.githubApp = { app_id: GH_APP_ID, app_slug: "nest-test" };
+    }
   });
 
   it("a refusal is shown, the manager waits, and the owner's retry attaches and starts it", async () => {

@@ -49,6 +49,8 @@ const id = (prefix: string) => `${prefix}${(++seq).toString(36)}${crypto.randomU
 
 export class FakeNest {
   readonly github = new FakeGitHub();
+  /** The App nest's token answers name; null: nest can't tell, and the answers leave it out. */
+  githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: "nest-test" };
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
   readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean }>();
@@ -184,7 +186,9 @@ export class FakeNest {
         if (!levelWithin(v, GRANT_PERMISSIONS[k])) return nestErr(403, "forbidden", `${k}: ${v} is outside the grant`);
       }
       const token = this.github.mint(repo, permissions);
-      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions });
+      // The App it's from (docs/control-plane/api/clients/#github-tokens), unless nest can't tell.
+      const app = this.githubApp ? { app_id: this.githubApp.app_id, app_slug: this.githubApp.app_slug } : {};
+      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions, ...app });
     }
     return nestErr(404, "not_found", `no route for ${r}`);
   }

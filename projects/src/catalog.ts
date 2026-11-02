@@ -18,11 +18,11 @@ const BUILTIN_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSe
 
 export const PROMPTS = {
   manager: [
-    "You are the manager of one project on a task board: a GitHub repo, checked out read-only in your sandbox.",
+    "You are the manager of one project on a task board: a GitHub repo, which your sandbox can read but not push to.",
     "The owner talks to you through your inbox; your replies reach them as chat.",
     "You keep the board with the projects-board tools. Spec every new task as soon as it exists, with write_spec: its goal, acceptance criteria, the files it likely touches and its test plan. Read the code before you spec.",
     "A specced task is ready. Assign it with assign_task when the owner asks you to, or when it is the next thing to do and the project doesn't assign automatically. Each assigned task gets a worker of its own, which sees only that task.",
-    "Never push to the repo or open PRs yourself; workers do. Keep tasks small enough for one PR each.",
+    "You can't push to the repo or open PRs (nest refuses your sandbox's writes); workers do. Keep tasks small enough for one PR each.",
   ].join("\n"),
   worker: [
     "You are a worker on a task board. You have one task: read it with projects-task get_task.",
@@ -35,7 +35,7 @@ export const PROMPTS = {
     "Clone the repo in your sandbox, check out the PR's head commit (`git fetch origin pull/<n>/head`), and read the whole diff against the base branch.",
     "Judge three things separately: correctness (does it do what it claims, without bugs or regressions), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the repo's design; read its own docs, READMEs and conventions to judge that).",
     "Run the tests where practical. Be specific: name files, lines and the reason for each finding. Fail a dimension only for a real problem, and say what would fix it.",
-    "Submit exactly once with submit_review: pass or fail for each dimension, with notes, and a summary. The PR's check is your only output: don't push, comment, approve or request changes on GitHub.",
+    "Submit exactly once with submit_review: pass or fail for each dimension, with notes, and a summary. The PR's check is your only output: your sandbox can read the repo but not write to it (nest refuses pushes, comments and reviews), so don't try.",
   ].join("\n"),
 } as const;
 
@@ -57,15 +57,19 @@ function mcpCapability(base: string, server: Server, prompt: string) {
   };
 }
 
-const template = (capability: Server, prompt: string, repos: readonly string[]) => ({
+/**
+ * A role's template. `access` is what its sandbox may do with every attached project's repo: `push`
+ * (`repos`, the worker's) or only `read` (`read_repos`: the manager and the reviewer, which nest refuses
+ * to push). Each spawn narrows it to its own project's (`overrides.repos` or `overrides.read_repos`).
+ */
+const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read") => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
   // capabilities, which a client's templates may name.
   capabilities: ["nest", "hands", `${NAMESPACE}/${capability}`],
   launch: { builtin_tools: BUILTIN_TOOLS, system_prompt: { mode: "append", text: prompt } },
   hands: "required",
   credential: CREDENTIAL,
-  // Every attached project's repo; each spawn narrows it to its own project's (`overrides.repos`).
-  ...(repos.length ? { repos: [...repos] } : {}),
+  ...(repos.length ? { [access === "push" ? "repos" : "read_repos"]: [...repos] } : {}),
 });
 
 export interface CatalogEntries {
@@ -73,7 +77,7 @@ export interface CatalogEntries {
   templates: Record<string, unknown>;
 }
 
-/** The catalog for this deployment: MCP URLs under `base`, templates allowed to push to `repos`. */
+/** The catalog for this deployment: MCP URLs under `base`, templates reaching `repos` (the worker's to push). */
 export function catalogFor(base: string, repos: readonly string[]): CatalogEntries {
   const sorted = [...new Set(repos.map((r) => r.toLowerCase()))].sort();
   return {
@@ -83,9 +87,9 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       [`${NAMESPACE}/review`]: mcpCapability(base, "review", "The projects-review tools read the PR you review and take your verdict."),
     },
     templates: {
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted),
-      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted),
-      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted),
+      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read"),
+      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push"),
+      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read"),
     },
   };
 }
