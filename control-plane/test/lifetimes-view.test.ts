@@ -23,7 +23,7 @@ const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const facts = (f: Partial<AgentFacts> = {}): AgentRead => ({
   facts: {
     agent: "agt_a", template: "worker", owner: null, sandbox: null, brain: false, starting: false, current_turn: false, queued: 0,
-    last_turn_ms: null, stopped_by_operator: false, live_children: [], subscriptions: 0, ended: null, ...f,
+    last_turn_ms: null, stopped_by_operator: false, live_children: [], ended: null, ...f,
   },
 });
 
@@ -256,7 +256,7 @@ describe("GET /v1/admin/lifetimes", () => {
     v = await view(c.cell, `&quiet_ms=${HOUR / 2}`);
     expect(v.sandboxes).toEqual([expect.objectContaining({ sandbox, kind: "held", attached: [agent], destroy_at_ms: null, dormant_since_ms: null })]);
     expect(v.agents).toEqual([expect.objectContaining({
-      agent, kind: "quiet", template: "worker", sandbox, last_turn_ms: expect.any(Number), live_children: [], subscriptions: 0, found_via: "registry", error: null,
+      agent, kind: "quiet", template: "worker", sandbox, last_turn_ms: expect.any(Number), live_children: [], found_via: "registry", error: null,
     })]);
     expect(Date.now() - v.agents[0]!.last_turn_ms!).toBeGreaterThanOrEqual(HOUR);
     // The operator's stop says so.

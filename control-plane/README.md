@@ -13,10 +13,10 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/mcp-connector.ts` | **McpConnectorDO**: one per remote MCP server and credential: the shared tool list, change notices to agents, call admission (docs/control-plane/durable-objects/mcp-connector/) |
 | `src/do/workstream.ts` | **WorkstreamDO**: the interim workstream channel: event log, batched wakes of its one subscriber, user-notification queue |
 | `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), MCP OAuth tokens (`OAuthStore`, `src/lib/mcp-auth.ts`), http profile credentials (`http:<name>`), the argument secret scan, the GitHub App minter (`github_app`; `src/lib/github.ts`), and the issuance audit in R2 |
-| `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries, and the task ledger's capabilities removed); expansion is `src/lib/spec.ts` (pure) |
-| `src/do/channel.ts` | **ChannelDO** (one per channel, plus `~directory`): the log, keyed view, grant list, subscriptions and their cursors, fan-out from the alarm, retention and tiering. Every decision is `src/lib/channels.ts` (pure) |
+| `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries; the task ledger's and the channel capabilities removed); expansion is `src/lib/spec.ts` (pure) |
+| `src/do/channel.ts` | **ChannelDO** (stub): channels left the platform; the class stays declared, serving only health and re-arming a previous release's alarm, until stage 4 deletes it |
 | `src/do/tasks.ts` | **TaskLedgerDO** (stub): the task ledger left the platform; the class stays declared, serving only health, until stage 4 deletes it |
-| `src/lib/` | Channels core (`channels.ts`: names, validation, permissions, post guards, filters, batching, envelopes) and the channel outbox (`outbox.ts`), reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry, repo allowlists (`repos.ts`) and the egress rule constructors (`rules/`: GitHub's push allowlist to request guards; docs/sandbox/networking/egress/policy/#request-guards) |
+| `src/lib/` | Reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry, repo allowlists (`repos.ts`) and the egress rule constructors (`rules/`: GitHub's push allowlist to request guards; docs/sandbox/networking/egress/policy/#request-guards) |
 | `test/regressions.test.ts` | One regression test per finding of the control-plane review |
 
 ## Commands
@@ -68,19 +68,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      again once released); `kind: waiting, waiting_for: <host>` when the brain runs on another host: it is condemned
      and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
      once that brain's exit or its host's loss releases it
-   - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}` ·
-     `GET /v1/agents/<id>/subscriptions` (its channel subscriptions, with each one's delivered high-water seq)
-   - Channels ([docs/channels/](../docs/channels/)); the operator is `user`, the root, and a channel's name is one
-     URL-encoded path segment (`agt_…%2Finbox`):
-     - `POST /v1/admin/channels {name, retention_days?}` (a free channel, owned by `user`) ·
-       `GET /v1/admin/channels?prefix=&after=&limit=` (the directory) · `GET /v1/admin/channels/<name>` (head, grant list, subscriptions)
-     - `GET /v1/admin/channels/<name>/messages?since=&limit=` (the log) or `?latest_by_key=true&prefix=&keys_only=&after_key=`
-       (the keyed view) · `POST /v1/admin/channels/<name>/messages {text, kind?, data?, reply_to?, key?, if_seq?, mentions?, idem_key?}`
-       (201 posted; 200 `existing` or `repeat`; 409 `conflict` with the key's `current_seq`). `GET /v1/admin/channels/user/messages`
-       is the notification queue's successor (the Discord bot isn't built). To reach an agent now, use `POST /v1/agents/<id>/inbox` (its text arrives inline, for any agent); a post to `<agt>/inbox` reaches an agent whose template has `read` (`channels`) fully, and one without it only with the operator's own text, inline (every message whole, across turns if need be; one over 32 KiB as a note that it needs `read`). Another agent's `message` to one without `read` is refused
-     - `GET|POST /v1/admin/channels/<name>/subscriptions {agent, filter?, delivery?, batch_ms?, once?}` (on an agent's behalf) ·
-       `DELETE /v1/admin/channels/<name>/subscriptions/<sub>`
-     - `PUT /v1/admin/channels/<name>/acl [{principal, action: post|read}]` (the channel's own grant list, replaced)
+   - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
      `{lines, next_seq, more}`)
@@ -176,20 +164,17 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   agents; an end's cascade, turn drop, sandbox release (`SandboxDO.release`) and record pruning; sandboxes' idle TTL. An
   operator's plain stop is unchanged (its next input lifts it) and keeps the agent's slot; `POST /v1/agents/<id>/stop
   {end: true, destroy_sandbox?}` ends it for good. `GET /v1/agents/<id>/children` lists what it spawned. Not built:
-  adoption and parking, budgets (fixed depth and live-children caps stand in), ending an agent's channels with it.
-- **Channels** (`docs/channels/`) are built as the design's subset listed in
-  `docs/control-plane/durable-objects/channel/`: ChannelDO, subscriptions delivered through AgentDO's turn queue
-  and inbox, the built-in channels, channel grants on capabilities (`channels`, `messaging-tree`), and the tools.
-  Not yet: `await_reply_s`, `read` with a wait, `interrupt`, the guest `nest post`, hooks, budgets in the wake
-  envelope, and moving the workstream channel, `notify`, `ask` and the user-notification queue onto channels
-  (stage 2 of removing workstreams).
-- **Behind the design** (`docs/agents/`): webhooks (HookDO), grants with attenuation beyond channel grants,
+  adoption and parking, budgets (fixed depth and live-children caps stand in), agent events delivered to owners.
+- **Removed** (microkernel, `docs/README.md` principle 9): the task ledger (stage 1) and channels (stage 2: ChannelDO's
+  logic, the channel tools and capabilities, subscriptions and wakes, agent and sandbox events, `/v1/admin/channels`).
+  Their classes stay declared as stubs until stage 4. WorkstreamDO and `notify`/`ask`/`emit` go in stage 3.
+- **Behind the design** (`docs/agents/`): grants with attenuation,
   capability sources (`api`) and parameters, and labels aren't built.
   Templates and capabilities are data (CatalogDO), an agent stores its expanded spec and `owner`, and nothing
   decides on a role; `agent_start.role` and `ToolDef.roles` are still sent for one release. WorkstreamDO is the
   interim workstream channel (`WorkstreamEvent`, one subscriber woken with batches), and there is a `workstream`
-  egress policy layer. Taint is a conservative stand-in (an agent with hands or a web built-in, or one that read a
-  tainted message, is tainted). The sink gate covers remote MCP tools, brokered actions and `egress_policy`; budgets and the hands journal aren't built.
+  egress policy layer. Taint is a conservative stand-in (an agent with hands or a web built-in, or one another agent's
+  possibly tainted text reached, is tainted). The sink gate covers remote MCP tools, brokered actions and `egress_policy`; budgets and the hands journal aren't built.
   Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
   commit and flushes at turn boundaries. The contract changes are listed in `docs/interfaces/README.md`.
 - **Built: placement** packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox

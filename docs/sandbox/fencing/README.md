@@ -24,7 +24,7 @@ SandboxDO issues a new epoch with every [placement claim](../../control-plane/du
 
 Before granting a new epoch, FleetDO terminates the old instance through the cloud provider's API and waits for confirmation. **If termination can't be confirmed, the sandbox is not run twice:** we wait or ask me. An unreachable host means defer, never destroy: nothing of its sandboxes' state or generations is deleted because it went quiet.
 
-Every STONITH records each sandbox's loss explicitly ("work since generation G at T lost"), as a rollback notice on its `events` channel ([losses](../../control-plane/durable-objects/sandbox/#losses)). The loss is bounded by the [commit cadence](../state/#writeback-cadence); salvage may still recover it (below).
+Every STONITH records each sandbox's loss explicitly ("work since generation G at T lost") ([losses](../../control-plane/durable-objects/sandbox/#losses)), which reaches its attached agents with the move notice. The loss is bounded by the [commit cadence](../state/#writeback-cadence); salvage may still recover it (below).
 
 ## 4. External side effects
 
@@ -35,7 +35,7 @@ Every STONITH records each sandbox's loss explicitly ("work since generation G a
 
 ## 5. Salvage
 
-If a host that was fenced off comes back with uncommitted work, it commits that work as a **sibling branch** off its last parent. An `orphaned_work` message is posted to the sandbox's `events` channel. No agent work is silently lost.
+If a host that was fenced off comes back with uncommitted work, it commits that work as a **sibling branch** off its last parent. An `orphaned_work` event goes to the workstream's subscriber (until stage 3; then to the agents attached). No agent work is silently lost.
 
 The same happens when a newer epoch of a sandbox is created on a host that still has an older, dirty incarnation: the old work is salvaged in the background from its own directory (incarnations never share a disk), and the new one doesn't wait. A salvage that fails transiently is retried with backoff until it lands or the incarnation is destroyed; one refused for good is dropped and logged. A commit rejected for a stale epoch fences the sandbox and offers its work as salvage too. Salvage holds the sandbox lock only while chunking, never while waiting for the control plane. Salvage can't flush the guest (a fenced VM never runs again), so its cut is crash-consistent ([disk](../state/disk/#flush-before-commit)).
 

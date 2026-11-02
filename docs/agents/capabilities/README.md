@@ -1,26 +1,26 @@
 # Capabilities
 
-A capability is a **named, pluggable bundle**: the tools an agent gets, the grants those tools need, and a short prompt section on using them. Its tools come from the platform, from an **MCP server**, or from an **API** with read-only or read-write access, and they all reach the agent the same way: as tools. Spawn specs and templates list capabilities, and the platform expands them into the agent's tool list, its grants (attenuated against the spawner's) and its system prompt. Messaging, channels, spawning and memory are all capabilities, so a template is a composition, not code.
+A capability is a **named, pluggable bundle**: the tools an agent gets, the grants those tools need, and a short prompt section on using them. Its tools come from the platform, from an **MCP server**, or from an **API** with read-only or read-write access, and they all reach the agent the same way: as tools. Spawn specs and templates list capabilities, and the platform expands them into the agent's tool list, its grants (attenuated against the spawner's) and its system prompt. Spawning, MCP servers and brokered actions are all capabilities, so a template is a composition, not code.
 
-**Why:** grants say what's allowed, not what an agent is equipped and told to do. A bundle keeps the three together, so turning messaging on is one line, and the same unit plugs into any template. It's the shape of Claude Code's plugins and skills: tools plus instructions.
+**Why:** grants say what's allowed, not what an agent is equipped and told to do. A bundle keeps the three together, so turning spawning on is one line, and the same unit plugs into any template. It's the shape of Claude Code's plugins and skills: tools plus instructions.
 
 ## Definition
 
 ```yaml
-capability: messaging
-params:  {peers: label:<key> | tree | any}
-tools:   [message]                          # from the platform tool registry, or Claude Code built-ins
-grants:  [post on agent{<peers>}/inbox]     # expanded from params
+capability: spawning
+params:  {budget: {depth, concurrent}}
+tools:   [agent_spawn, agent_stop]          # from the platform tool registry, or Claude Code built-ins
+spawn:   [worker]                           # the templates it may spawn from
 prompt:  |                                  # added to the system prompt
-  To reach a peer, use `message`. …
+  Spawn an agent with `agent_spawn`. …
 ```
 
 - **Data, not code:** capabilities are stored in the control plane ([CatalogDO](../../control-plane/durable-objects/catalog/)) and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
 - **Parameters (designed, not built):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. The only one built, the task ledger's `ledger`, left with it ([principle 9](../../README.md#principles)).
-- **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
+- **Always present, not capabilities:** an agent's own input queue and inbox, and `exit`.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
-- **Built so far:** `builtin` tools, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `egress` and `spawning`; no parameter is built (`peers: label:<key>`, `any`), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
+- **Built so far:** `builtin` tools ([CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. Beyond the first seed it has `egress` and `spawning`; no parameter is built.
 
 ## Sources
 
@@ -54,14 +54,11 @@ prompt: The issue tracker: read freely; comment only when asked.
 | Capability | Tools | Grants it expands to |
 |---|---|---|
 | `hands{sandbox}` | `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TaskOutput`, `TaskStop` | `attach` on that sandbox |
-| `messaging{peers}` | `message` | `post` on the peers' inboxes |
-| `channels` | `channel_create`, `post`, `read`, `subscribe`, `unsubscribe` | its own channels; others by extra grants |
-| `memory` | `post` and `read` on its private keyed channel | that channel; the key index (at most 200 keys) is injected at session start, and a weekly wake asks for consolidation. **Only for long-lived agents** (see [continuity](../#continuity)) |
+| `memory` | a keyed store's tools, over MCP ([principle 9](../../README.md#principles)) | its own keys; the key index (at most 200 keys) is injected at session start, and a weekly wake asks for consolidation. **Only for long-lived agents** (see [continuity](../#continuity)) |
 | `spawning{budget}` | `agent_spawn`, `agent_stop`, `attach`, `adopt`, `list` | spawning within the budget. Built as the seeded `spawning` (`agent_spawn`, `agent_stop`); the templates it spawns from are its `spawn` list (`worker`), and fixed depth and live-children caps stand in for the budget ([spawning](../#spawning)) |
 | `sandboxes` | `sandbox_create`, `sandbox_fork`, `sandbox_destroy`, `checkpoint`, `expose_port`, `egress_policy` | its own sandboxes; built: `egress_policy` on the bound sandbox, seeded alone as `egress` (no seed template lists it) |
 | `authority` | `grant`, `revoke` | granting what it holds; sink grants are `approve` when tainted |
 | `transcripts` | `read_transcript` | agents it owns |
-| `hooks` | `hook_create(channel, verify, filter?, map?)` → URL, `hook_delete`, `list` | hooks posting to channels it can post to; it never sees their secrets (see [sources](../../channels/sources/)) |
 | `schedules` | `wake_at(at \| every, note)` → id, `wake_cancel(id)` | waking itself, within its turn budget |
 | `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding; built as the `brokered` source ([brokered/](brokered/)) |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
@@ -70,25 +67,21 @@ prompt: The issue tracker: read freely; comment only when asked.
 **Templates compose them,** with any `mcp` or `api` capability alongside. For example:
 
 ```yaml
-worker:    [hands, messaging{peers: label:workstream}, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
-captain:   [channels, messaging{peers: tree}, spawning{budget}, sandboxes, authority, transcripts, memory, schedules, hooks]
-monitor:   [channels, messaging{peers: tree}, memory, schedules, hooks, web]   # long-lived: watches hooks, channels or the web; add `metrics` to watch nest itself
-assistant: [channels, messaging{peers: tree}, spawning{budget}, memory, schedules, web]  # long-lived: talks to me through `user`
+worker:    [hands, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
+captain:   [spawning{budget}, sandboxes, authority, transcripts, memory, schedules]
+monitor:   [memory, schedules, web]   # long-lived: watches the web; add `metrics` to watch nest itself
+assistant: [spawning{budget}, memory, schedules, web]  # long-lived
 ```
 
 ## Messaging
 
-`message(agent, text, await_reply_s?, interrupt?)` posts to the agent's inbox. It's `post` addressed by agent id, so replies (`reply_to`), `await_reply_s`, taint, wake envelopes and loop guards all work as for any [channel](../../channels/).
-
-- **Default reach is the label group.** With `peers: label:<key>`, an agent can message its owner and every agent with the same value of `<key>` (e.g. everyone with `workstream=auth`). The template picks the key. `tree` (owner and children) and `any` (every agent it knows the id of) are the alternatives.
-- **Labels set reach,** so the spawner sets them at spawn time, and changing an agent's labels needs a grant on it.
-- **Injection spread is a group, not a tree:** a tainted agent can reach its whole group. Every message carries the sender's taint, wake envelopes carry no bodies, and loop guards and rate limits bound the traffic.
+Messaging between agents is an external integration ([principle 9](../../README.md#principles)): an MCP server the agents share, which delivers to an agent through its inbox (`POST /v1/agents/<id>/inbox`, carrying the sender's taint). Reach, threading, loop guards and rate limits are the integration's. Until stage 3, the interim `notify` (in the seeded `messaging` capability) posts to an agent of the same workstream directly.
 
 ## Schedules
 
 `wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
 
 - **Durable:** wakes are AgentDO alarms, so they survive restarts and moves, and cost nothing while waiting.
-- **A due wake is a wake envelope** carrying the note, and it starts a brain like any other wake (see [continuity](../#continuity)).
+- **A due wake is a turn** carrying the note, and it starts a brain like any other input (see [continuity](../#continuity)).
 - **Taint travels:** a wake carries the taint of the session that set it, so an injected note can't launder itself into a clean fresh session.
-- **Bounded:** scheduled wakes count against the agent's turn budget and the per-agent wake cap.
+- **Bounded:** scheduled wakes count against the agent's turn budget.

@@ -144,7 +144,7 @@ export function AbandonedView({ view, error, now }: { view: LifetimesResponse | 
         {agentRows.length === 0 ? <p className="muted">None quiet, stuck ending or gone among the agents these sandboxes lead to.</p> : (
           <div className="tbl"><table>
             <thead><tr>
-              <th>agent</th><th>kind</th><th>template</th><th>last turn</th><th>sandbox</th><th>live children</th><th>subscriptions</th><th>found via</th><th>operator</th>
+              <th>agent</th><th>kind</th><th>template</th><th>last turn</th><th>sandbox</th><th>live children</th><th>found via</th><th>operator</th>
             </tr></thead>
             <tbody>
               {agentRows.map((a) => (
@@ -158,7 +158,6 @@ export function AbandonedView({ view, error, now }: { view: LifetimesResponse | 
                   <td>{a.last_turn_ms === null ? <span className="muted">never</span> : `${span(now - a.last_turn_ms)} ago`}</td>
                   <td className="mono" title={a.sandbox ?? ""}>{a.sandbox ? short(a.sandbox) : <span className="muted">—</span>}</td>
                   <td>{a.live_children.length || <span className="muted">0</span>}</td>
-                  <td>{a.subscriptions || <span className="muted">0</span>}</td>
                   <td className="muted">{a.found_via}</td>
                   <td className="mono small muted">{agentCall(a)}</td>
                 </tr>

@@ -29,6 +29,28 @@ def api(method, path, body=None):
                                        headers={"authorization": f"Bearer {ADMIN}", "content-type": "application/json", "user-agent": "nest-cloud-check/1"}))
 
 
+def assistant_texts(agent):
+    """The text blocks of the agent's assistant messages, in order, from its session transcript (None: no answer)."""
+    texts, since, base = [], 0, None
+    for _ in range(50):
+        s, v = api("GET", f"/v1/agents/{agent}/transcript?since={since}&limit=500" + (f"&base={base}" if base is not None else ""))
+        if s != 200 or not isinstance(v, dict):
+            return None
+        for line in v.get("lines", []):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("type") == "assistant":
+                for b in (e.get("message") or {}).get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                        texts.append(b["text"])
+        if not v.get("more"):
+            return texts
+        since, base = v.get("next_seq", since), v.get("base")
+    return texts
+
+
 def log(m):
     print(time.strftime("%H:%M:%S"), m, flush=True)
 
@@ -117,11 +139,8 @@ try:
         log(f"child {c1} on {s1}")
         ended = until(lambda: info(c1).get("ended"), 1200, "the ephemeral child ending")
         check("the ephemeral child ended itself when its turn finished (done)", ended and ended.get("reason") == "done" and ended.get("by") == c1, ended)
-        s, ev = api("GET", f"/v1/admin/channels/{c1}%2Fevents/messages?since=0&limit=200")
-        msgs = (ev or {}).get("messages", []) if s == 200 else []
-        final = [m.get("text", "") for m in msgs if m.get("kind") == "turn_completed"]
-        check("the child ran its task in its sandbox", any("lifetimes-check-ok" in t for t in final), final[-1:] if final else msgs[-3:])
-        check("its events say it exited", any(m.get("kind") == "exited" for m in msgs), [m.get("kind") for m in msgs][-6:])
+        final = assistant_texts(c1) or []
+        check("the child ran its task in its sandbox", any("lifetimes-check-ok" in t for t in final), final[-1:])
         check("its sandbox was destroyed", until(lambda: sbx_state(s1) == "destroyed", 300, "child sandbox destroyed"), sbx_state(s1))
         check("the GC registry dropped it", until(lambda: live_sandboxes() == before, 120, "registry back"), live_sandboxes())
         check("the parent's index has it ended", any(k["agent"] == c1 and k["ended"] for k in children(parent)), children(parent))

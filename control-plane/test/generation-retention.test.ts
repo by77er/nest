@@ -70,14 +70,8 @@ async function age(sandbox: string, id: string, ageMs: number): Promise<void> {
 const states = async (sandbox: string) =>
   Object.fromEntries((await sandboxStub(sandbox).generations()).map((g) => [g.record.id, g.state]));
 
-/** Fire one deadline through the real alarm handler (after the sandbox's event posts drained). */
+/** Fire one deadline through the real alarm handler. */
 async function runSandboxAlarm(sandbox: string, key: string): Promise<void> {
-  const end = Date.now() + 10_000;
-  while (await runInDurableObject(sandboxStub(sandbox), (_inst: SandboxDO, st) =>
-    st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'chan_out' UNION ALL SELECT 1 FROM chan_out").toArray().length > 0)) {
-    if (Date.now() > end) throw new Error("the sandbox's channel outbox didn't drain");
-    await new Promise((r) => setTimeout(r, 50));
-  }
   await runInDurableObject(sandboxStub(sandbox), async (_inst: SandboxDO, st) => {
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES (?, 0)", key);
     await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime

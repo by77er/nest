@@ -181,11 +181,9 @@ export class Deadlines<K extends string = string> {
    * (and only if nobody re-armed it meanwhile, even for the same time); a failing handler is retried
    * after `retryMs`.
    */
-  async runDue(now: number, handler: (key: string) => Promise<void>, retryMs = 5_000, last: readonly string[] = []): Promise<void> {
-    // In time order, except `last` (background work, e.g. a channel outbox): after every other key,
-    // so it never holds up the object's own transitions.
-    const due = this.sql.exec<{ key: string }>("SELECT key FROM deadlines WHERE at <= ? ORDER BY at", now).toArray()
-      .sort((a, b) => Number(last.includes(a.key)) - Number(last.includes(b.key)));
+  async runDue(now: number, handler: (key: string) => Promise<void>, retryMs = 5_000): Promise<void> {
+    // In time order.
+    const due = this.sql.exec<{ key: string }>("SELECT key FROM deadlines WHERE at <= ? ORDER BY at", now).toArray();
     for (const { key } of due) {
       // Read again: an earlier key's handler (or a call while it awaited) may have cleared or moved it.
       const at = this.at(key);

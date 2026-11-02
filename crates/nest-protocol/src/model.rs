@@ -149,7 +149,7 @@ pub mod error_codes {
     /// The caller gave up waiting (e.g. a platform tool call that timed out in the runner): the
     /// operation may or may not have taken effect. Not retryable under the same call id.
     pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
-    /// A compare-and-set lost: the state it was conditioned on changed (e.g. a channel key's `if_seq`).
+    /// A compare-and-set lost: the state it was conditioned on changed.
     /// The caller reads the current state and decides again. HTTP 409.
     pub const CONFLICT: &str = "conflict";
     /// The named object doesn't exist. Passed through as an ordinary tool error.

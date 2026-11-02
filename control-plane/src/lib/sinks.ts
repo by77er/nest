@@ -42,3 +42,19 @@ export function canonicalJson(v: unknown): string {
 export function approves(answer: string): boolean {
   return /^(approve[ds]?|allow(ed)?|yes|y|ok(ay)?)\b/i.test(answer.trim());
 }
+
+/** Claude Code built-ins whose results are untrusted (web). */
+const TAINTING_BUILTINS = ["WebFetch", "WebSearch"];
+
+/**
+ * An agent session's taint, as far as the platform tracks it today: per-call taint isn't built, so
+ * an agent that can see untrusted content is assumed to have (it has hands, or a web built-in), and
+ * `read_tainted` is AgentDO's sticky bit, set when another agent's text reaches the session and
+ * that agent is (or may be) tainted (a `notify` or inbox post, a workstream batch, another agent's
+ * transcript) or an untrusted MCP server's text does. What it guarantees: no text from an agent that
+ * may be tainted, and nothing from a sandbox or the web, reaches a session that then calls a sink
+ * ungated. The operator's text (`user`) never taints. It over-taints freely (any hands agent, for life).
+ */
+export function sessionTaint(a: { hands: boolean; builtin_tools: readonly string[]; read_tainted: boolean }): boolean {
+  return a.hands || a.read_tainted || a.builtin_tools.some((t) => TAINTING_BUILTINS.includes(t));
+}

@@ -10,7 +10,6 @@ The authority for one sandbox.
 - Resources: vCPUs, memory, disk I/O limits ([I/O limits](../../../sandbox/state/disk/#io-limits))
 - Policy layers: base (image), sandbox (allow, passthrough, injection bindings, TCP exceptions, the push allowlist `repos`, request guards; set by whoever holds `egress_policy` on it, and inherited by forks), temporary grants. The effective policy adds what the rule constructors build from the push allowlist ([repo allowlists](../../../sandbox/networking/egress/policy/#repo-allowlists)): the layer's `repos` plus each attached agent's (kv `agent_repos`, by agent). Built: the middle layer is still the `workstream` layer, set by the operator API ([pending contract changes](../../../interfaces/README.md#pending-contract-changes)).
 - Exposed ports
-- The channels programs inside it may post to (`sandbox_create{channels}`; by default its own `events`)
 - Its `owner` (the agent an `agent_spawn` made it for; none for the operator's), its idle TTL, and its dormancy ([lifetime](#lifetime))
 
 ## Placement
@@ -47,7 +46,7 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 
 ## Losses
 
-**Every abandon and every STONITH writes a loss record** and posts it to the sandbox's `events` as a rollback notice: "work since generation G (at T) lost", and "process state lost" when a memory head comes back disk-only. No loss is implicit. The recovery point is the [commit cadence](../../../sandbox/state/#writeback-cadence).
+**Every abandon and every STONITH writes a loss record** (designed: "work since generation G (at T) lost", and "process state lost" when a memory head comes back disk-only), which reaches attached agents with the move notice and their next tool result. No loss is implicit. The recovery point is the [commit cadence](../../../sandbox/state/#writeback-cadence).
 
 ## Lease loss
 
@@ -55,7 +54,7 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 - Idempotent: FleetDO retries it until it succeeds.
 - Keyed on the lease (host, epoch), never on a state a host reported: a sandbox whose last report was `fenced` or `failed` is placed again like any other. A lease this DO never adopted (its placement was cut off) counts as its own.
 - It records the loss, then claims again under a new epoch, restoring from head.
-- Bound clients keep running wherever they are: their open calls were cancelled by the hangup, their bindings for the old epoch are dead, and their next `resolve` returns the new host and epoch. The loss record reaches each agent through the sandbox's `events` and its recovery turn.
+- Bound clients keep running wherever they are: their open calls were cancelled by the hangup, their bindings for the old epoch are dead, and their next `resolve` returns the new host and epoch. The loss reaches each agent through the move notice and its next tool result.
 
 ## Commits and generations
 
@@ -91,7 +90,7 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 **A sandbox nobody uses is destroyed, through `destroy`** (so FleetDO's registry marks it and its generations stop being GC roots, [commit-gc](../../../verification/commit-gc/)). Built (`checkExpiry`, `release`; rules in `lib/lifetimes.ts`):
 - **Dormant:** no agent attached, no placement in flight, and no VM up (`creating`, `restoring`, `running` or `suspending` on a host): suspended, unplaced or failed. `decide`, the step every mutation goes through, keeps `dormant_since_ms`: set at the first dormant change, cleared at once by one that isn't (a wake, a placement, an attach), so a sandbox used again starts its clock over.
 - **Idle TTL:** its own (`idle_ttl_ms` at create, from the operator's `POST /v1/sandboxes` or `agent_spawn`; `PUT /v1/sandboxes/<id>/lifetime` sets or clears it), else the cell default: the cell's `sandbox_idle_ttl_ms` in `AWS_CELLS`, else `SANDBOX_IDLE_TTL_MS`, else **1 day**, so the sandboxes of many short-lived agents don't pile up (owner's choice, 2026-11-01); a sandbox to keep gets a long TTL of its own. At least a minute.
-- **The `expiry` deadline** checks it (armed at create and on every check, at most an hour apart, sooner for a short TTL): dormant for its TTL → destroyed. A TTL over a day posts a `sandbox_expiring` notice on `user` a day before (saying how to keep it), and destruction never comes less than a day after that notice: a late check posts it and waits. A TTL of a day or less (the default, an ephemeral worker's) gets no notice: whoever set it chose it. Each check records when it ran (`expiry_checked_ms`); after a gap of over 6 hours (missed checks: a rolled-back release, which keeps but never updates the clock, ran meanwhile) the clock and any notice start again, so a missed wake can't shorten a TTL.
+- **The `expiry` deadline** checks it (armed at create and on every check, at most an hour apart, sooner for a short TTL): dormant for its TTL → destroyed. A TTL over a day records a `sandbox_expiring` notice a day before (`expiry_notice_ms`; logged, saying how to keep it, and shown as `destroy_at` in the [lifetimes view](../../dashboard/#abandoned)), and destruction never comes less than a day after that notice: a late check records it and waits. SandboxDO posts nothing else: its events on `<sbx>/events` went with channels ([principle 9](../../../README.md#principles)); a `chan_out` row the previous release left is never posted. A TTL of a day or less (the default, an ephemeral worker's) gets no notice: whoever set it chose it. Each check records when it ran (`expiry_checked_ms`); after a gap of over 6 hours (missed checks: a rolled-back release, which keeps but never updates the clock, ran meanwhile) the clock and any notice start again, so a missed wake can't shorten a TTL.
 - **Owner release:** an ending agent's `release(agent, destroy)` detaches it and, with `destroy`, destroys the sandbox in the same step if the agent owns it and no other agent is attached. A sandbox attached to an agent that hasn't ended (even one stopped by the operator) is never dormant, so never destroyed by its TTL.
 - **Older sandboxes:** FleetDO's daily `prune` asks each live registered sandbox to arm its check if it isn't (`ensureLifetime`): first those never asked (`sandboxes.lifetime_ms` null), then each again weekly, 200 a day. So a sandbox from before this release, suspended and called by nobody, gets its TTL too, counted from the first check, and one whose check a rolled-back release dropped gets it back.
 - A destroyed sandbox refuses `attach`.

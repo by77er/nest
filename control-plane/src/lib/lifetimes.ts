@@ -54,7 +54,7 @@ export const MIN_IDLE_TTL_MS = 60_000;
  * sandboxes of many short-lived agents don't pile up; one to keep gets its own TTL.
  */
 export const DEFAULT_SANDBOX_IDLE_TTL_MS = 86_400_000;
-/** A sandbox destroyed by an idle TTL longer than this gets a notice on `user` this long first. */
+/** A sandbox destroyed by an idle TTL longer than this is noticed (logged; the lifetimes view shows when) this long first. */
 export const EXPIRY_NOTICE_MS = 86_400_000;
 /** How often a live sandbox re-checks whether it is dormant, at most. */
 export const EXPIRY_CHECK_MAX_MS = 3_600_000;
@@ -119,7 +119,7 @@ export interface ExpiryFacts {
   dormant: boolean;
   /** Since when it has been dormant (absent: not, as far as recorded). */
   since?: number;
-  /** When the notice was posted (absent: not yet). */
+  /** When the notice was given (absent: not yet). */
   noticed?: number;
   ttl: number;
   now: number;

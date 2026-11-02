@@ -1,10 +1,9 @@
 // An agent's turn queue and inbox (docs/control-plane/durable-objects/agent/; the model's Q1-Q4,
-// docs/verification/agent-brain/). `TurnQueue` is the only code that touches the `turns`, `inbox`
-// and `chan_wakes` tables; the decisions that need no storage are pure functions below it.
+// docs/verification/agent-brain/). `TurnQueue` is the only code that touches the `turns` and `inbox`
+// tables; the decisions that need no storage are pure functions below it.
 
 import { z } from "zod";
 import type { InboxMessage, TurnInput } from "../protocol/control";
-import { MAX_WAITING_DELIVERIES, WAKE_CAP_PER_HOUR } from "./channels";
 import { addColumn, storedEnum } from "./stored";
 import { newId } from "./util";
 
@@ -17,16 +16,8 @@ const InboxStatusEnum = z.enum(["delivered", "consumed"]);
 const TURN = TurnStatusEnum.enum;
 const INBOX = InboxStatusEnum.enum;
 
-const DEFER_RETRY_MS = 30_000;
-export const MERGED_TURN_BYTES = 64 * 1024;
-const HOUR_MS = 3_600_000;
 /** Separates a recovery turn's notes from the original turn's text. */
 export const RECOVERY_MARK = "\nThe turn was:\n";
-
-/** The request id prefix of a channel delivery's turn or inbox row. */
-const CHANNEL_REQUEST = "chan/";
-export const channelRequestId = (channel: string, subscription: string, upTo: number) =>
-  `${CHANNEL_REQUEST}${channel}/${subscription}/${upTo}`;
 
 export interface QueuedTurn {
   turn: string;
@@ -39,13 +30,6 @@ export interface QueuedTurn {
 export interface TurnStart {
   started_ms: number;
   hands_epoch: number | null;
-}
-
-/** Channel-started turns and merges this hour (and the oldest's time), and channel turns waiting. */
-export interface ChannelLoad {
-  hour: number;
-  oldest: number | null;
-  waiting: number;
 }
 
 export class TurnQueue {
@@ -62,8 +46,6 @@ export class TurnQueue {
     addColumn(sql, "inbox", "request_id", "TEXT");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS turns_request ON turns (request_id) WHERE request_id IS NOT NULL");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS inbox_request ON inbox (request_id) WHERE request_id IS NOT NULL");
-    // Merged notices' wakes, counted toward the hourly cap like channel-started turns.
-    sql.exec("CREATE TABLE IF NOT EXISTS chan_wakes (ts_ms INTEGER NOT NULL)");
   }
 
   // --- turns (Q1-Q4) ------------------------------------------------------------------------------
@@ -152,30 +134,6 @@ export class TurnQueue {
     return this.sql.exec<{ t: number | null }>("SELECT MAX(COALESCE(started_ms, created_ms)) AS t FROM turns").one().t;
   }
 
-  // --- channel deliveries ---------------------------------------------------------------------------
-
-  load(now = Date.now()): ChannelLoad {
-    this.sql.exec("DELETE FROM chan_wakes WHERE ts_ms <= ?", now - HOUR_MS);
-    const hour = this.sql.exec<{ n: number; oldest: number | null }>(
-      `SELECT COUNT(*) AS n, MIN(t) AS oldest FROM (SELECT created_ms AS t FROM turns WHERE request_id LIKE '${CHANNEL_REQUEST}%' AND created_ms > ?
-        UNION ALL SELECT ts_ms AS t FROM chan_wakes)`, now - HOUR_MS).one();
-    const waiting = this.sql.exec<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM turns WHERE request_id LIKE '${CHANNEL_REQUEST}%' AND status = '${TURN.queued}'`).one().n;
-    return { hour: hour.n, oldest: hour.oldest, waiting };
-  }
-
-  /** The newest channel turn still waiting to start, which another notice may join. */
-  waitingChannelTurn(): { turn: string; input: TurnInput } | undefined {
-    const r = this.sql.exec<{ turn: string; input: string }>(
-      `SELECT turn, input FROM turns WHERE status = '${TURN.queued}' AND request_id LIKE '${CHANNEL_REQUEST}%' ORDER BY ord DESC LIMIT 1`).toArray()[0];
-    return r && { turn: r.turn, input: JSON.parse(r.input) as TurnInput };
-  }
-
-  merge(turn: string, input: TurnInput, now = Date.now()): void {
-    this.sql.exec("UPDATE turns SET input = ? WHERE turn = ?", JSON.stringify(input), turn);
-    this.sql.exec("INSERT INTO chan_wakes (ts_ms) VALUES (?)", now);
-  }
-
   // --- inbox ----------------------------------------------------------------------------------------
 
   messageFor(requestId: string): string | undefined {
@@ -239,12 +197,11 @@ export class TurnQueue {
 /** An inbox message as a turn of its own shows it (a message that arrived between turns). */
 export const inboxTurnText = (m: Pick<InboxMessage, "from" | "text">) => `Message from ${m.from}: ${m.text}`;
 
-/** Unconfirmed messages as one turn (all channel notices: an `event_batch`), keyed by the first so it is queued once. */
+/** Unconfirmed messages as one turn, keyed by the first so it is queued once. */
 export function requeuedTurn(unseen: { message: InboxMessage; request_id: string | null }[]): { input: TurnInput; requestId: string } {
-  const channel = (r: { request_id: string | null }) => r.request_id?.startsWith(CHANNEL_REQUEST) ?? false;
-  const text = unseen.map((r) => (channel(r) ? r.message.text : inboxTurnText(r.message))).join("\n\n");
+  const text = unseen.map((r) => inboxTurnText(r.message)).join("\n\n");
   const first = unseen[0]!;
-  return { input: { kind: unseen.every(channel) ? "event_batch" : "inbox", text }, requestId: `${first.request_id ?? first.message.id}/requeued` };
+  return { input: { kind: "inbox", text }, requestId: `${first.request_id ?? first.message.id}/requeued` };
 }
 
 /** `notes`, then the original turn's text (once, however often the recovery is itself interrupted). */
@@ -265,32 +222,4 @@ export function moveNoteDue(f: { epoch: number | null; told: number | undefined;
   return f.epoch !== null && f.continued.hands_epoch !== null
     ? f.continued.hands_epoch !== f.epoch
     : (f.movedMs ?? 0) >= f.continued.started_ms;
-}
-
-/** A channel notice joins the running turn's inbox, merges into a waiting channel turn, queues, or defers (the channel retries). */
-export type Admission =
-  | { kind: "join" }
-  | { kind: "merge"; turn: string; input: TurnInput }
-  | { kind: "queue" }
-  | { kind: "defer"; retry_after_ms: number };
-
-/**
- * Mid-turn, only a notice from the agent's own inbox joins the running turn: anything else injected
- * into a busy turn can be passed over, spending a `once` subscription (3-12% of mention wakes in the
- * 2026-10-31 stress test, dev/cloud-checks/). The loop guards defer.
- */
-export function admitDelivery(f: {
-  midTurnInbox: boolean;
-  load: ChannelLoad;
-  waiting: { turn: string; input: TurnInput } | undefined;
-  text: string;
-  now: number;
-}): Admission {
-  if (f.midTurnInbox) return { kind: "join" };
-  if (f.load.hour >= WAKE_CAP_PER_HOUR) return { kind: "defer", retry_after_ms: Math.max(1_000, (f.load.oldest ?? f.now) + HOUR_MS - f.now) };
-  if (f.load.waiting >= MAX_WAITING_DELIVERIES) return { kind: "defer", retry_after_ms: DEFER_RETRY_MS };
-  if (!f.waiting) return { kind: "queue" };
-  const text = `${f.waiting.input.text}\n\n${f.text}`;
-  if (new TextEncoder().encode(text).length > MERGED_TURN_BYTES) return { kind: "defer", retry_after_ms: DEFER_RETRY_MS };
-  return { kind: "merge", turn: f.waiting.turn, input: { ...f.waiting.input, text } };
 }

@@ -18,8 +18,7 @@ nest's MCP proxy, and the platform's guarantees are checked against the server's
                 was seen with, `nest/call` starting `<agent>/<that epoch>/`, and `nest/taint` true;
                 epochs never go back; no call key reaches the server twice (only note_put, the one
                 idempotent tool, may be retried once under its key); the counter is exactly 2;
-                note_get returned what note_put stored; the session is tainted (the turn's
-                `turn_completed` event on `<agent>/events` carries the session's taint); no more sink
+                note_get returned what note_put stored; no more sink
                 calls reach the server than were approved, and the denied one never does.
   4. sleep    - until every brain has idle-exited (MCP_IDLE_S).
   5. cleanup  - stop every agent (on every exit path; SIGINT or SIGTERM), check no brain of the run is
@@ -136,6 +135,28 @@ def short(v, n=200):
     return json.dumps(v)[:n]
 
 
+def assistant_texts(agent):
+    """The text blocks of the agent's assistant messages, in order, from its session transcript (None: no answer)."""
+    texts, since, base = [], 0, None
+    for _ in range(50):
+        s, v = api("GET", f"/v1/agents/{agent}/transcript?since={since}&limit=500" + (f"&base={base}" if base is not None else ""))
+        if s != 200 or not isinstance(v, dict):
+            return None
+        for line in v.get("lines", []):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("type") == "assistant":
+                for b in (e.get("message") or {}).get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                        texts.append(b["text"])
+        if not v.get("more"):
+            return texts
+        since, base = v.get("next_seq", since), v.get("base")
+    return texts
+
+
 def log(m):
     print(time.strftime("%H:%M:%S"), m, flush=True)
 
@@ -178,12 +199,6 @@ def turn_statuses(agent):
     """The status of each of the agent's turns ([None]: no answer)."""
     s, t = api("GET", f"/v1/agents/{agent}/turns")
     return [x.get("status") for x in t] if s == 200 and isinstance(t, list) else [None]
-
-
-def events(agent):
-    """The agent's `<agent>/events` channel (None: no answer)."""
-    s, v = api("GET", f"/v1/admin/channels/{urllib.parse.quote(agent + '/events', safe='')}/messages?since=0&limit=200")
-    return v.get("messages", []) if s == 200 and isinstance(v, dict) else None
 
 
 def brains_on_hosts(agents):
@@ -398,12 +413,7 @@ def main():
         for a in agents:
             mine = [c for c in calls if (c.get("_meta") or {}).get("nest/agent") == a]
             results = verify(a, plan[a]["value"], plan[a]["epochs"], mine, decisions)
-            # Taint as the platform records it: the turn_completed event carries the session's taint.
-            evs = events(a)
-            done = [m for m in (evs or []) if m.get("kind") == "turn_completed"]
-            results.append(("the session is tainted (its turn_completed event says so)", bool(done) and all(m.get("taint") is True for m in done),
-                            short([m.get("taint") for m in done]) if evs is not None else "events unavailable"))
-            reply = done[-1].get("text", "") if done else ""
+            reply = (assistant_texts(a) or [""])[-1]
             record("agent", agent=a, value=plan[a]["value"], epochs=sorted(plan[a]["epochs"]), calls=len(mine), reply=reply,
                    checks=[{"check": n, "ok": g, "detail": d} for n, g, d in results])
             log(f"{a}: {len(mine)} calls ({', '.join(c.get('tool', '?') for c in mine)}); reply: {reply[:160]!r}")

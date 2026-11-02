@@ -9,7 +9,6 @@ import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
-import { ChannelOutbox, OUTBOX_DEADLINE } from "../lib/outbox";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { signShare } from "../lib/tokens";
@@ -158,8 +157,6 @@ export class SandboxDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   // `!`: set in the constructor, except on the health instance, which serves only `health()`.
   private readonly deadlines!: Deadlines;
-  /** Posts to `<sbx>/events` (docs/channels/#built-in-channels), queued with the change they report. */
-  private readonly outbox!: ChannelOutbox;
 
   /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
   async health(): Promise<true> {
@@ -192,7 +189,6 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
       expires_ms INTEGER NOT NULL)`);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
-    this.outbox = new ChannelOutbox(this.sql, this.deadlines, env, (p) => ctx.waitUntil(p), () => this.info_().sandbox);
   }
 
   // --- state helpers ------------------------------------------------------------------------------
@@ -265,12 +261,6 @@ export class SandboxDO extends DurableObject<Env> {
 
   private fleet(cell: string) {
     return this.env.FLEET.get(this.env.FLEET.idFromName(cell));
-  }
-
-  /** Queue a platform post on `<sbx>/events` (synchronous; posted from the alarm). Never a decision. */
-  private report(kind: string, text: string, data: Record<string, unknown>, idem?: string): void {
-    const sandbox = this.info_().sandbox;
-    this.outbox.push(`${sandbox}/events`, { kind, text, data, ...(idem ? { idem_key: idem } : {}) }, { tainted: false });
   }
 
   // --- lifecycle ----------------------------------------------------------------------------------
@@ -441,7 +431,6 @@ export class SandboxDO extends DurableObject<Env> {
     if (state === "failed" && detail) console.warn(`sandbox ${info.sandbox}: failed on ${host}: ${detail}`);
     const [r] = this.decide((i) => lease.reported(i, host, epoch, state, guest));
     if (!r.applied) return;
-    if (r.changed) this.report("state_changed", `state: ${state}`, { state, epoch, host });
     // A guest that just came up (boot, resume) takes the slots its sandbox was suspended without.
     if (r.becameRunning) await this.reissuePendingAttaches(true);
     await this.armIdle();
@@ -516,9 +505,6 @@ export class SandboxDO extends DurableObject<Env> {
    * agent's own call (its start wakes the sandbox) would deadlock calling back into it.
    */
   private async notifyAgentsMoved(): Promise<void> {
-    const info = this.info_();
-    this.report("moved", info.host ? `placed on ${info.host} at epoch ${info.epoch}` : "no host: restored from its head when next woken",
-      { epoch: info.epoch, host: info.host }, `${info.sandbox}/moved/${info.epoch}/${info.host ?? "none"}`);
     await this.deadlines.set("notify_moved", Date.now(), true);
   }
 
@@ -557,7 +543,7 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** What follows the decision that it is destroyed (`before`: the record just before it). A retry repeats it. */
   private async afterDestroyed(before: SandboxInfo, reason: string): Promise<void> {
-    this.report("destroyed", `destroyed (${reason})`, { epoch: before.epoch, reason }, `${before.sandbox}/destroyed`);
+    console.log(`sandbox ${before.sandbox}: destroyed (${reason})`);
     const fleet = this.fleet(before.cell);
     await fleet.sandboxDestroyed(before.sandbox);
     if (before.host) await fleet.issueCommands(before.host, [{ type: "sandbox_destroy", sandbox: before.sandbox, epoch: before.epoch }]);
@@ -897,10 +883,8 @@ export class SandboxDO extends DurableObject<Env> {
         await this.sendMoveNotices();
       } else if (key === "expiry") {
         await this.checkExpiry();
-      } else if (key === OUTBOX_DEADLINE) {
-        await this.outbox.flush();
       }
-    }, 5_000, [OUTBOX_DEADLINE]);
+    });
   }
 
   private async policyChanged(injectionChanged: boolean): Promise<EgressPolicy> {
@@ -1016,7 +1000,8 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * The `expiry` deadline: a sandbox dormant for its idle TTL is destroyed (`expiryStep`); one with a
-   * TTL over a day gets a notice on `user` a day first. Re-armed on every check while it lives.
+   * TTL over a day is noticed a day first (recorded, so the destroy waits out the notice; logged).
+   * Re-armed on every check while it lives.
    */
   private async checkExpiry(): Promise<void> {
     const now = Date.now();
@@ -1045,15 +1030,9 @@ export class SandboxDO extends DurableObject<Env> {
       this.update((i) => {
         i.expiry_notice_ms = now;
       });
-      const at = new Date(step.destroy_at).toISOString();
-      this.outbox.push("user", {
-        kind: "sandbox_expiring",
-        text: `Sandbox ${s.sandbox} (cell ${s.cell}) has had no agent attached and no VM up since ${new Date(step.since).toISOString()}; it will be ` +
-          `destroyed at ${at} (idle TTL ${days(ttl)}). To keep it, wake it (POST /v1/sandboxes/${s.sandbox}/place), attach an agent, or give it ` +
-          `a longer TTL (PUT /v1/sandboxes/${s.sandbox}/lifetime).`,
-        data: { sandbox: s.sandbox, cell: s.cell, dormant_since_ms: step.since, destroy_at_ms: step.destroy_at, idle_ttl_ms: ttl },
-        idem_key: `${s.sandbox}/expiry/${step.since}`,
-      }, { tainted: false });
+      // Logged only: the operator's lifetimes view shows the destroy time (docs/control-plane/dashboard/#abandoned).
+      console.log(`sandbox ${s.sandbox}: dormant since ${new Date(step.since).toISOString()}; destroyed at ${new Date(step.destroy_at).toISOString()} ` +
+        `(idle TTL ${days(ttl)}) unless woken, attached or given a longer TTL`);
     }
     // Sandboxes from before retention (and any whose deadline a rolled-back release dropped) get it here.
     if (!this.deadlines.has("retention")) await this.deadlines.set("retention", now);
@@ -1227,7 +1206,6 @@ export class SandboxDO extends DurableObject<Env> {
     this.update((i) => {
       i.ports = [...i.ports.filter((p) => p.port !== port), { port, url }];
     });
-    this.report("port_exposed", `port ${port} exposed at ${url}`, { port, url });
     let shareUrl: string | undefined;
     if (share) {
       // Signed and expiring, for one {sandbox, port}. Minted only: no Worker route serves it yet.
@@ -1242,6 +1220,5 @@ export class SandboxDO extends DurableObject<Env> {
     this.update((i) => {
       i.ports = i.ports.filter((p) => p.port !== port);
     });
-    this.report("port_unexposed", `port ${port} no longer exposed`, { port });
   }
 }

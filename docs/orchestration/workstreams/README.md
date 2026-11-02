@@ -5,10 +5,8 @@
 A workstream is a **convention**, not a platform object: a goal plus the resources an agent sets up for it. The platform never sees a workstream, only labels.
 
 A captain running workstream `auth` typically creates:
-- a channel `ws/auth` holding the goal and the spec, plus progress;
-- a task board in an external tracker, reached over MCP;
+- a shared log and a task board in external integrations, reached over MCP, holding the goal, the spec and progress;
 - sandboxes and workers labeled `workstream=auth`, owned by the captain;
-- subscriptions from itself to those workers' and sandboxes' `events`, filtered to the kinds it acts on and batched;
 - an egress policy on those sandboxes;
 - a budget, carved from its own into each worker's spawn spec (`budget`).
 
@@ -22,9 +20,9 @@ Any other grouping works the same way, since labels are free-form.
 
 ## The interim workstream channel
 
-**Decision (2026-10-26): WorkstreamDO is the interim implementation of the workstream channel `ws/<label>`, not a platform object.** ChannelDO is built (2026-10-30), but today's agents, sandboxes and egress policy still group by a `ws_` id, so it stays until its duties move onto channels; nothing new is built on it.
+**Decision (2026-10-26): WorkstreamDO is the interim implementation of the workstream channel `ws/<label>`, not a platform object.** Today's agents, sandboxes and egress policy still group by a `ws_` id, so it stays until stage 3 of the microkernel removal takes it out; nothing new is built on it.
 
-- **What it is:** a channel keyed by the workstream label, with a log of events (`progress`, `blocked`, `pr_opened`, `needs_input`, …, from agents' `emit`, asks and sandboxes' host events), one **subscriber** woken with a batch of decision events (the design's subscription with a batch window), and the user-notification queue (the `user` channel's stand-in).
+- **What it is:** a channel keyed by the workstream label, with a log of events (`progress`, `blocked`, `pr_opened`, `needs_input`, …, from agents' `emit`, asks and sandboxes' host events), one **subscriber** woken with a batch of decision events (a batch window), and the user-notification queue.
 - **No roles in it:** the subscriber is whichever agent subscribed: one spawned from a template with `subscribe: [workstream]` (the seeded `captain`), or one I set (`PUT /v1/workstreams/<id>/subscriber`, which must name an agent). The previous release's `captain` field and route are read as the subscriber for one release.
-- **Evidence for keeping it:** until the move, `emit`, `ask` and `notify` still write to it; the `workstream` egress policy layer, sandbox events and BrokerDO's per-workstream injection secrets all key on the `ws_` id, so removing it now would leave events and asks with nowhere to go.
-- **Path to channels:** when ChannelDO lands, `ws/<label>` becomes an ordinary channel; the subscriber becomes a subscription; `emit` and `needs_input` become posts with a `kind`; the notification queue becomes `user`; `escalate_to: workstream` names the channel; `ws_` ids become `workstream=<label>` labels ([pending contract changes](../../interfaces/#pending-contract-changes)), and WorkstreamDO goes. The catalog's values that name it (`escalate_to: workstream`, `subscribe: [workstream]`) and agents' stored specs then need a data migration to the channel's name.
+- **Evidence for keeping it:** until stage 3, `emit`, `ask` and `notify` still write to it; the `workstream` egress policy layer, sandbox events and BrokerDO's per-workstream injection secrets all key on the `ws_` id, so removing it now would leave events and asks with nowhere to go.
+- **Stage 3:** `emit`, `ask` and `notify` go with it; the catalog's values that name it (`escalate_to: workstream`, `subscribe: [workstream]`) and agents' stored specs then need a data migration, and `ws_` ids become `workstream=<label>` labels ([pending contract changes](../../interfaces/#pending-contract-changes)).

@@ -8,11 +8,9 @@ import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } f
 import { checkHealth, healthProbes } from "./lib/health";
 import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
-import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, SubscribeInput } from "./lib/channels";
 import { Capability, CatalogName, OperatorOverrides, Template } from "./lib/spec";
 import { MIN_IDLE_TTL_MS } from "./lib/lifetimes";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
-import { DIRECTORY } from "./do/channel";
 import { Port, WorkstreamPolicyLayer } from "./do/sandbox";
 import { parseAppSecret } from "./lib/github";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Resources } from "./protocol/model";
@@ -59,10 +57,6 @@ const agent = (env: Env, id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const workstream = (env: Env, id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
 const broker = (env: Env) => env.BROKER.get(env.BROKER.idFromName("broker"));
 const catalog = (env: Env) => env.CATALOG.get(env.CATALOG.idFromName("catalog"));
-const channel = (env: Env, name: string) => env.CHANNEL.get(env.CHANNEL.idFromName(name));
-/** The operator, as a channel caller: `user`, the root. */
-const USER: Caller = { principal: "user" };
-
 /** An agent id that names an agent (404 otherwise): the subscriber or owner a route records. */
 async function existingAgent(env: Env, id: string): Promise<{ workstream: string }> {
   return await agent(env, id).info();
@@ -213,20 +207,6 @@ function forwardSocket(c: Ctx<string, unknown>): Request {
   return new Request(c.req.url, { headers, method: "GET" });
 }
 
-/** A channel route's name (one URL-encoded segment, `agt_…%2Finbox`); an agent's built-in channel needs its agent. */
-async function channelOf(env: Env, encoded: string): Promise<string> {
-  let name: string;
-  try {
-    name = decodeURIComponent(encoded);
-  } catch {
-    throw new NestError(ErrorCodes.INVALID_MESSAGE, "bad channel name encoding");
-  }
-  const kind = parseChannel(name);
-  if (!kind.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, kind.error);
-  if (kind.value.kind === "inbox" || kind.value.kind === "events") await existingAgent(env, kind.value.agent);
-  return name;
-}
-
 /** An mcp capability whose `auth` is the oauth form (404 for an unknown one, 409 for any other). */
 async function oauthCapability(env: Env, raw: string) {
   const name = catalogName(raw);
@@ -371,62 +351,6 @@ export const ROUTES: Route[] = [
     json(clientMetadataDocument(env.PUBLIC_BASE_URL), 200, { "cache-control": "public, max-age=300" }) }),
   route({ method: "DELETE", path: "/v1/admin/templates/:name", auth: "admin", run: ({ env, p }) => catalog(env).deleteTemplate(catalogName(p.name)) }),
 
-  // Channels (docs/channels/): the operator is `user`, the root.
-  route({
-    method: "POST", path: "/v1/admin/channels", auth: "admin", status: 201,
-    body: z.object({ name: ChannelName, retention_days: z.number().int().min(1).max(MAX_RETENTION_DAYS).optional() }),
-    run: ({ env, body: r }) => channel(env, r.name).create(r.name, USER, r.retention_days),
-  }),
-  route({ method: "GET", path: "/v1/admin/channels", auth: "admin", run: ({ env, url }) =>
-    channel(env, DIRECTORY).dirList(url.searchParams.get("prefix") ?? "", url.searchParams.get("after") ?? "", num(url.searchParams.get("limit") ?? undefined, 200)) }),
-  route({ method: "GET", path: "/v1/admin/channels/:channel", auth: "admin", run: async ({ env, p }) => {
-    const name = await channelOf(env, p.channel);
-    return channel(env, name).info(name);
-  } }),
-  route({ method: "GET", path: "/v1/admin/channels/:channel/messages", auth: "admin", run: async ({ env, url, p }) => {
-    const name = await channelOf(env, p.channel);
-    const q = url.searchParams;
-    const flag = (k: string) => q.get(k) === "true" || q.get(k) === "1";
-    const int = (k: string) => (q.has(k) ? num(q.get(k) ?? undefined, 0) : undefined);
-    const since = int("since");
-    const limit = int("limit");
-    return channel(env, name).read(name, USER, {
-      ...(since !== undefined ? { since } : {}), ...(limit !== undefined ? { limit } : {}),
-      ...(flag("latest_by_key") ? { latest_by_key: true } : {}), ...(q.has("prefix") ? { prefix: q.get("prefix")! } : {}),
-      ...(flag("keys_only") ? { keys_only: true } : {}), ...(q.has("after_key") ? { after_key: q.get("after_key")! } : {}),
-    });
-  } }),
-  route({ method: "POST", path: "/v1/admin/channels/:channel/messages", auth: "admin", body: z.unknown(), run: async ({ env, p, body }) => {
-    const name = await channelOf(env, p.channel);
-    const r = await channel(env, name).post(name, USER, body);
-    return json(r, r.status === "conflict" ? 409 : r.status === "posted" ? 201 : 200);
-  } }),
-  route({ method: "GET", path: "/v1/admin/channels/:channel/subscriptions", auth: "admin", run: async ({ env, p }) => {
-    const name = await channelOf(env, p.channel);
-    return channel(env, name).subscriptions(name);
-  } }),
-  route({
-    // On an agent's behalf (a spawner subscribing its child is the operator here until agent_spawn exists).
-    method: "POST", path: "/v1/admin/channels/:channel/subscriptions", auth: "admin", status: 201,
-    body: z.object({ agent: z.string().regex(PARAM.agent!) }).passthrough(),
-    run: async ({ env, p, body: r }) => {
-      const name = await channelOf(env, p.channel);
-      await existingAgent(env, r.agent);
-      const { agent: who, ...rest } = r;
-      const input = SubscribeInput.safeParse(rest);
-      if (!input.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, input.error.message);
-      return channel(env, name).subscribe(name, USER, who, input.data);
-    },
-  }),
-  route({ method: "DELETE", path: "/v1/admin/channels/:channel/subscriptions/:sub", auth: "admin", run: async ({ env, p }) => {
-    const name = await channelOf(env, p.channel);
-    return channel(env, name).unsubscribe(name, USER, p.sub);
-  } }),
-  route({ method: "PUT", path: "/v1/admin/channels/:channel/acl", auth: "admin", body: z.array(AclEntry), run: async ({ env, p, body }) => {
-    const name = await channelOf(env, p.channel);
-    return channel(env, name).setAcl(name, body);
-  } }),
-
   // Workstreams: the interim workstream channel (docs/orchestration/workstreams/).
   route({
     method: "POST", path: "/v1/workstreams", auth: "admin", status: 201,
@@ -570,7 +494,6 @@ export const ROUTES: Route[] = [
   }),
   route({ method: "GET", path: "/v1/agents/:agent", auth: "admin", run: ({ env, p }) => agent(env, p.agent).info() }),
   route({ method: "GET", path: "/v1/agents/:agent/turns", auth: "admin", run: ({ env, p }) => agent(env, p.agent).turns() }),
-  route({ method: "GET", path: "/v1/agents/:agent/subscriptions", auth: "admin", run: ({ env, p }) => agent(env, p.agent).channelSubscriptions() }),
   route({ method: "GET", path: "/v1/agents/:agent/transcript", auth: "admin", run: async ({ env, url, p }) => {
     const a = agent(env, p.agent);
     const q = url.searchParams;

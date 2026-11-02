@@ -2,26 +2,26 @@
 
 nest is two systems with one seam between them:
 - **The sandbox system runs machines.** Sandbox hosts (spot, KVM) run Firecracker VMs, and each host's **gateway** is the one network door into its sandboxes. SandboxDO and FleetDO hold its state.
-- **The agent system runs loops.** Brain hosts (cheap, no KVM) run unmodified Claude Code processes; AgentDO and the channels hold its state. A brain never shares a machine with a sandbox.
+- **The agent system runs loops.** Brain hosts (cheap, no KVM) run unmodified Claude Code processes; AgentDO holds its state. A brain never shares a machine with a sandbox.
 - **A control plane on Cloudflare** holds every piece of authoritative state for both and makes every decision.
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
-> **Microkernel (decided 2026-11-02):** coordination leaves the platform. Channels, the task ledger, WorkstreamDO and the `notify`/`ask`/`emit` tools become external integrations that agents reach over MCP and the public API ([principle 9](../README.md#principles)). The task ledger is gone; channels (ChannelDO, HookDO, wake envelopes, events on channels) are described below as built until stage 2 removes them.
+> **Microkernel (decided 2026-11-02):** coordination leaves the platform. Channels, the task ledger, WorkstreamDO and the `notify`/`ask`/`emit` tools become external integrations that agents reach over MCP and the public API ([principle 9](../README.md#principles)). The task ledger and channels are gone; WorkstreamDO and `notify`/`ask`/`emit` go in stage 3.
 
-> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23, with Access in front on 2026-10-24: spike item 13); brain hosts, so every brain starts on a brain host, never on a sandbox host, and reaches the guest only through its gateway (on AWS since 2026-10-29); templates and capabilities as data in CatalogDO, with nothing deciding on an agent role. Channels are built (ChannelDO, subscriptions, the built-in channels, channel grants). **Not built:** the rest of the coordination layer (HookDO, grants beyond channels, taint beyond a conservative stand-in, `wake_at`; WorkstreamDO stands in for the workstream channel until its duties move onto channels), the Discord bot, memory snapshots, the hands journal's `call_status`, the 60 s dirty-disk commit and desired host versions. `control-plane/README.md` lists the gaps.
+> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23, with Access in front on 2026-10-24: spike item 13); brain hosts, so every brain starts on a brain host, never on a sandbox host, and reaches the guest only through its gateway (on AWS since 2026-10-29); templates and capabilities as data in CatalogDO, with nothing deciding on an agent role. **Not built:** grants, taint beyond a conservative stand-in, `wake_at`, agent events delivered to owners, the Discord bot, memory snapshots, the hands journal's `call_status`, the 60 s dirty-disk commit and desired host versions. `control-plane/README.md` lists the gaps.
 
 ## At a glance
 
 ```
-         me: Discord · API · nest CLI              external senders: GitHub, email, …
+         me: Discord · API · nest CLI              external integrations: MCP, API
                      │                                          │
                      ▼                                          ▼
 ┌────────────────────── Cloudflare control plane (authoritative) ──────────────────────┐
-│ Worker: API · webhook route · Discord interactions · signed blob URLs (stateless)     │
+│ Worker: API · Discord interactions · signed blob URLs (stateless)                     │
 │ Durable Objects, one writer per entity:                                               │
-│  FleetDO (per cell) · SandboxDO · AgentDO · ChannelDO · HookDO · BrokerDO · CatalogDO │
-│ R2: session transcripts · large and older channel messages · audit                   │
+│  FleetDO (per cell) · SandboxDO · AgentDO · BrokerDO · CatalogDO · McpConnectorDO     │
+│ R2: session transcripts · audit                                                      │
 └────────────▲──────────────────────────────────────────────────▲──────────────────────┘
              │ WebSockets that hosts dial out:                  │
              │ fleet channel per host · session per brain       │ fleet channel per host
@@ -32,7 +32,7 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 │   the subscription token lives only here   │    │  nest-proxy: every byte of sandbox egress        │
 │  Discord gateway client (one brain host)   │    │  (hands, PTY and ingress: one door, a binding)   │
 └────────────────────────────────────────────┘    └──────────────────────────┬───────────────────────┘
-      the seam: SandboxDO control API · hands over the tunnel · events on channels
+      the seam: SandboxDO control API · hands over the tunnel
                                                                              ▼
                                                               S3 (per cell): disk and memory chunks
 ```
@@ -41,13 +41,11 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 
 | Component | Runs on | Does | Doc |
 |---|---|---|---|
-| **Worker** | Cloudflare | HTTP API, webhook route, Discord interactions, signed blob URLs, tunnel and DNS records per sandbox host. Stateless; routes to DOs. | [control-plane/api/](../control-plane/api/) |
+| **Worker** | Cloudflare | HTTP API, Discord interactions, signed blob URLs, tunnel and DNS records per sandbox host. Stateless; routes to DOs. | [control-plane/api/](../control-plane/api/) |
 | **FleetDO** | Cloudflare, one per cell | Hosts of both kinds, enrollment, leases, placement and autoscaling, STONITH, ordered command delivery, the binding public keys pushed to gateways; three desired versions per cell (designed) | [fleet/](../control-plane/durable-objects/fleet/) |
 | **SandboxDO** | Cloudflare, one per sandbox | Epoch, generation head (compare-and-set commits), egress policy, attached clients; issues bindings and answers `resolve` | [sandbox/](../control-plane/durable-objects/sandbox/) |
 | **AgentDO** | Cloudflare, one per agent | Spawn spec (capabilities, grants, budget), turn queue, session stream, taint, scheduled wakes, tool relay, the agent epoch, brain placement | [agent/](../control-plane/durable-objects/agent/) |
-| **ChannelDO** | Cloudflare, one per channel | Message log, keyed view, subscriptions, fan-out | [channel/](../control-plane/durable-objects/channel/) |
-| **HookDO** | Cloudflare, one per webhook | Verification (through BrokerDO), mapping, dedup, posting | [hook/](../control-plane/durable-objects/hook/) |
-| **BrokerDO** | Cloudflare, one | The only DO that stores secret values: setup tokens, injection secrets, hook and capability credentials, the Access service token. Platform keys (AWS, the host-token secret, operator-token hashes, the revocation counter, the Cloudflare Tunnel API token) are Worker secrets; the proxy root CA key is in AWS KMS | [broker/](../control-plane/durable-objects/broker/) |
+| **BrokerDO** | Cloudflare, one | The only DO that stores secret values: setup tokens, injection secrets, capability credentials, the Access service token. Platform keys (AWS, the host-token secret, operator-token hashes, the revocation counter, the Cloudflare Tunnel API token) are Worker secrets; the proxy root CA key is in AWS KMS | [broker/](../control-plane/durable-objects/broker/) |
 | **CatalogDO** | Cloudflare, one | Templates and capabilities, as data I edit; expands spawn specs | [catalog/](../control-plane/durable-objects/catalog/) |
 | **nestd** | Every host | Enrollment, the lease, command delivery, self-fencing. On sandbox hosts: runs sandboxes, builds their network namespaces, launches cloudflared and the gateway, commits sandbox state to S3. On brain hosts: supervises the runner | [compute/nestd/](../compute/nestd/) |
 | **nest-proxy** | Sandbox hosts | All sandbox egress: allowlist, TLS inspection, credential injection by placeholder, audit | [egress/](../sandbox/networking/egress/) |
@@ -61,22 +59,21 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 
 ## The seam
 
-Three things cross between the systems, and nothing else:
-1. **The SandboxDO control API:** `create`, `fork`, `pause`, `suspend`, `resume`, `archive`, `destroy`, `attach`, `detach`, `resolve`, `expose_port`, `egress_policy`, `checkpoint`. `attach` issues a **binding** (a signed token naming the sandbox, its epoch, the client, a scope and an expiry); `resolve` returns the host's tunnel hostname, a renewed binding, and the guest's protocol version and capabilities.
+Two things cross between the systems, and nothing else:
+1. **The SandboxDO control API:** `create`, `fork`, `pause`, `suspend`, `resume`, `archive`, `destroy`, `attach`, `detach`, `resolve`, `expose_port`, `egress_policy`, `checkpoint`. `attach` issues a **binding** (a signed token naming the sandbox, its epoch, the client, a scope and an expiry); `resolve` returns the host's tunnel hostname, a renewed binding, and the guest's protocol version and capabilities. SandboxDO tells each attached agent when the sandbox moves (a new host or epoch, and what was lost).
 2. **The hands data plane on the gateway:** one WebSocket per call to the host's tunnel hostname, the binding first, then the host-guest hands frames verbatim. Cancel is a close. Terminals (`/pty`) and ingress (`/ingress/<port>`) are the same kind of connection. A person's `nest` CLI is a client like any brain.
-3. **The sandbox's events** on `<sbx>/events`: ports, task exits, egress denials, loss records.
 
 The contract is in [interfaces/gateway/](../interfaces/gateway/). Any runner can drive any sandbox: a brain host in the cell, one in another cell, or (later) the `api-loop` inside AgentDO.
 
 ## A turn, end to end
 
-1. **Something happens.** A webhook arrives (HookDO verifies it and posts to a channel), another agent or I post, or a scheduled `wake_at` comes due. ChannelDO delivers it to the agent's AgentDO.
+1. **Something happens.** I send a turn or an inbox message, an owner or an integration posts to the agent's inbox over the API, or a scheduled `wake_at` comes due. It enters the agent's AgentDO queue.
 2. **Placing the brain.** AgentDO queues the turn and, if no brain is running, picks a runner by backend and capacity: for `claude-code`, a brain host with room, preferring the one that ran the agent last. FleetDO sends `agent_start`, and the runner rebuilds the session from R2 and starts Claude Code, resumed or fresh (see [continuity](../agents/#continuity)).
 3. **Reaching the hands.** If the agent has hands, AgentDO makes sure the sandbox is running (a suspended one is resumed, an archived one placed and restored by the [activator](../control-plane/activator/)), attaches the agent through SandboxDO, and gives the runner the sandbox host's hostname, the binding and the guest's version. The runner renews or re-resolves through AgentDO when a binding ages or a connection is refused.
-4. **The turn.** AgentDO sends a [wake envelope](../channels/#the-wake-envelope): a notice of what arrived, not the bodies. Claude Code reads the bodies with `read`; messages from me arrive inline.
-5. **Hands.** `mcp__nest__Bash` goes Claude Code → `nest mcp` → runner → hands client → one WebSocket to the gateway (binding first) → vsock → guest agent, which runs it as the sandbox user and keeps a call record. Results come back the same way. Platform tools (`post`, `agent_spawn`, `wake_at`, brokered actions, MCP or API capability tools) go runner → AgentDO, which checks the grant and the session's [taint](../agents/tools/#taint-and-sinks).
+4. **The turn.** AgentDO sends the turn's input to the runner; messages that arrive mid-turn join it through the inbox mirror.
+5. **Hands.** `mcp__nest__Bash` goes Claude Code → `nest mcp` → runner → hands client → one WebSocket to the gateway (binding first) → vsock → guest agent, which runs it as the sandbox user and keeps a call record. Results come back the same way. Platform tools (`agent_spawn`, `wake_at`, brokered actions, MCP or API capability tools) go runner → AgentDO, which checks the grant and the session's [taint](../agents/tools/#taint-and-sinks).
 6. **Egress and durability.** Processes in the VM reach the network only through nest-proxy, which allows listed hosts and injects credentials by placeholder. The session streams from the brain host to AgentDO and R2 (acked once in SQLite; flushed at 1 MiB, at turn end, after 30 s idle and before any start). nestd commits the sandbox disk to S3 from the sandbox host at turn ends (at most every 10 s), every 60 s while dirty, and on pause and suspend, each after the guest's `syncfs`; the head moves by compare-and-set in SandboxDO. The two never touch.
-7. **After.** `turn_completed` is posted to the agent's `events`, which its spawner subscribes to. An idle brain exits after 120 s. A sandbox with no agent mid-turn, no live ingress and no hold pauses after 1 minute and suspends after 10 more. An idle brain host and an idle sandbox host drain and terminate independently.
+7. **After.** The turn is recorded done, and the next queued one starts. An idle brain exits after 120 s. A sandbox with no agent mid-turn, no live ingress and no hold pauses after 1 minute and suspends after 10 more. An idle brain host and an idle sandbox host drain and terminate independently.
 
 ## When things fail
 
@@ -99,9 +96,9 @@ Details: [sandbox/fencing/](../sandbox/fencing/), [sandbox/gateway/](../sandbox/
 
 | State | Store | Written by |
 |---|---|---|
-| Entity metadata: leases, epochs, agent epochs, generation heads, spawn specs, grants, taint, turns, subscriptions, channel indexes and recent messages, tunnel ids per sandbox host, the three desired versions per cell | DO SQLite | The entity's own DO |
+| Entity metadata: leases, epochs, agent epochs, generation heads, spawn specs, grants, taint, turns, tunnel ids per sandbox host, the three desired versions per cell | DO SQLite | The entity's own DO |
 | Session transcripts | DO SQLite until flushed, then R2 | AgentDO |
-| Large and older channel bodies, audit logs | R2 | ChannelDO, FleetDO |
+| Audit logs | R2 | FleetDO |
 | Sandbox disk and memory chunks, manifests | S3, per cell | nestd; the head moves only through SandboxDO |
 | Secrets | BrokerDO (platform keys: Worker secrets) | Me, or minted by BrokerDO |
 | The binding key | BrokerDO (private, per cell; it signs); FleetDO pushes the public keys to each sandbox host's gateway over the fleet channel | BrokerDO |
@@ -119,6 +116,6 @@ Bindings themselves are verified, never stored. Hosts hold only caches: page cac
 | Brain | The subscription token, in its process environment | No local exec or file tools; repo config never loads. It acts only through `nest` tools and the web built-ins (host-allowlisted, tainting) |
 | Brain host | Brains, session file caches | Trusted but fenced by its lease and the agent epoch. No KVM, no sandbox state; in S3 it may read the release (`releases/*`) only |
 | Control plane | All authority | Every platform tool call is checked against grants and taint here; hands calls are gated by the runner's local policy cache, pushed from AgentDO, and by the binding |
-| External input | Webhooks, web pages, other agents' posts | Tainted; its content reaches models only as tool results |
+| External input | Web pages, integrations' results, other agents' messages | Tainted; its content reaches models only as tool results |
 
 See [security/](../security/).

@@ -143,7 +143,6 @@ export const agent = {
   ],
   "credential": "claude_oauth_token:worker",
   "escalate_to": "workstream",
-  "channel_grants": [],
   "agent": "agt_01jbx8k2m9qv3t7w5y4n6p0r1s",
   "workstream": "ws_01m5pv1581hvrmhfbravczqzf3",
   "cell": "use1",
@@ -239,7 +238,6 @@ export const lifetimes = {
       "last_turn_ms": 1793279692222,
       "stopped_by_operator": true,
       "live_children": [],
-      "subscriptions": 0,
       "ended_ms": null,
       "ended_reason": null,
       "found_via": "registry",
@@ -256,7 +254,6 @@ export const lifetimes = {
       "live_children": [
         "agt_01m6bkz8dcfjdhvb67rwrty02t"
       ],
-      "subscriptions": 0,
       "ended_ms": null,
       "ended_reason": null,
       "found_via": "registry",

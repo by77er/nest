@@ -1275,9 +1275,6 @@ def run_lifecycle(ids):
     check("lifetimes: the child ended (exited, by itself), no brain left", (info.get("ended") or {}).get("reason") == "exited"
           and info["ended"].get("by") == c1 and info.get("brain") is None, json.dumps(info.get("ended"))[:300])
     check("lifetimes: the GC registry dropped its sandbox", live_sandboxes() == before, f"{before} -> {live_sandboxes()}")
-    st, evs = api("GET", f"/v1/admin/channels/{c1}%2Fevents/messages")
-    check("lifetimes: its events say it exited", st == 200 and any(m.get("kind") == "exited" and (m.get("data") or {}).get("ended") == "exited"
-          for m in (evs or {}).get("messages", [])), json.dumps(evs)[:300])
     st, r = api("POST", f"/v1/agents/{c1}/turns", {"text": "more"})
     check("lifetimes: an ended agent takes no turn", st == 404, json.dumps(r)[:200])
 

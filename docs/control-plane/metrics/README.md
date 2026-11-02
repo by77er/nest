@@ -25,8 +25,6 @@ One dataset, `nest_metrics`, bound to the Worker (and so to every DO). Each even
 | FleetDO | Host connects by kind, reconnect time after a deploy, lease renewals (late, missed), expiries, STONITH, placement attempts and failures, the host version mix during a rollout |
 | SandboxDO | Commits (latency, bytes), restores (time, from cache or S3), forks, fences |
 | AgentDO | Turns (queued → started latency, duration, outcome, tokens and cost from the stream's `result`), brain starts (resume or fresh), crash restarts, rate limits, wake latency, tool calls by group and outcome, approvals |
-| ChannelDO | Posts, deliveries, loop-guard drops, backlog depth |
-| HookDO | Deliveries, verification failures, dedup hits |
 | Sandbox hosts (via FleetDO) | CPU, memory, free hugepages, VM count, proxy allows and denies, gateway connections by route and outcome (refused bindings, stale epochs), hands-call latency p50 and p99 at the gateway, guest agents' WARN and ERROR counts by log site ([diagnostics](../../sandbox/guest-agent/#diagnostics)) |
 | Brain hosts (via FleetDO) | CPU, memory, brains running, hands-call round trip p50 and p99 as the runner sees it, session tail lag |
 
@@ -34,4 +32,4 @@ One dataset, `nest_metrics`, bound to the Worker (and so to every DO). Each even
 
 - **The `metrics` [capability](../../agents/capabilities/)** gives `metrics_query(sql)`. The control plane runs the query against the SQL API (`POST …/accounts/<id>/analytics_engine/sql`) with a token that has only Account Analytics Read, stored in BrokerDO as `cap:metrics`. It's a builtin rather than an `api` capability because the SQL API takes `POST`, which `mode: ro` refuses. Results don't taint (see above).
 - **Deploy checks** can run the same queries with their own read token.
-- **No dashboards or platform alerting.** Noticing a trend is a judgment, so a [monitor agent](../../orchestration/#example-structures) with the `metrics` capability polls with `wake_at` and reports what matters, the same rule as [polling](../../channels/sources/#other-sources).
+- **No dashboards or platform alerting.** Noticing a trend is a judgment, so a [monitor agent](../../orchestration/#example-structures) with the `metrics` capability polls with `wake_at` and reports what matters, since what is worth noticing is a judgment, and judgments belong to agents.

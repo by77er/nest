@@ -1,6 +1,6 @@
 # Security
 
-**Threat model:** the adversary is **one of my own agents after a prompt injection**, not me. Injected instructions act through hands, which run inside a sandbox, and through platform tools, which are bounded by the agent's grants. Channels carry untrusted content between agents, and injections spread from agent to agent. External events (webhooks, email) are attacker-reachable: anyone who can open a PR or send an email shapes their content, so they're always tainted. A compromised agent can post only where it holds grants, its posts carry its taint, and readers get message bodies only as tool results. Model robustness lowers the odds but isn't a boundary; grants, taint and sinks are.
+**Threat model:** the adversary is **one of my own agents after a prompt injection**, not me. Injected instructions act through hands, which run inside a sandbox, and through platform tools, which are bounded by the agent's grants. Messages carry untrusted content between agents (inbox posts, transcripts, integrations), and injections spread from agent to agent. External events (webhooks, email) are attacker-reachable: anyone who can open a PR or send an email shapes their content, so they're always tainted. A compromised agent acts only where it holds grants, and what it sends another agent carries its taint. Model robustness lowers the odds but isn't a boundary; grants, taint and sinks are.
 
 ## Trust boundaries
 
