@@ -178,7 +178,7 @@ describe("gcRootsOf and memoryToUnroot", () => {
 });
 
 describe("the switch", () => {
-  it.each([[undefined, "report"], ["", "report"], ["on", "on"], ["off", "off"], ["report", "report"], ["yes", "report"]] as const)(
+  it.each([[undefined, "on"], ["", "on"], ["on", "on"], ["off", "off"], ["report", "on"], ["yes", "on"]] as const)(
     "SANDBOX_RETENTION=%s is %s", (v, want) => {
       expect(retentionMode({ SANDBOX_RETENTION: v })).toBe(want);
     });
