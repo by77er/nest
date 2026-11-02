@@ -222,26 +222,25 @@ async function setup(brokered: unknown[], opts: { tools?: string[]; hands?: bool
     method: "PUT",
     body: {
       capabilities: ["nest", cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
-      hands: opts.hands ? "required" : "forbidden", credential: "claude_oauth_token", escalate_to: "user",
+      hands: opts.hands ? "required" : "forbidden", credential: "claude_oauth_token",
     },
   });
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "brokered" } }, 201);
   let sandbox: string | undefined;
   let sbxHost: Awaited<ReturnType<typeof connectHost>> | undefined;
   if (opts.hands) {
     sbxHost = await connectHost(cell);
-    sandbox = (await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201)).sandbox;
+    sandbox = (await adminJson("/v1/sandboxes", { body: { cell } }, 201)).sandbox;
     await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   }
   const host = await connectHost(cell, "brain");
-  const ag = await adminJson("/v1/agents", { body: { template: tpl, workstream, cell, ...(sandbox ? { sandbox } : {}) } }, 201);
+  const ag = await adminJson("/v1/agents", { body: { template: tpl, cell, ...(sandbox ? { sandbox } : {}) } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === ag.agent);
   const ws = await Ws.connect(`/v1/agents/${ag.agent}/session`, host.host_token);
   ws.send({ type: "hello", protocol_version: 1, agent: ag.agent, host: host.host, instance_id: "rin_one", epoch: 1, session: SESSION });
   await ws.next("hello_ack");
-  return { id, agent: ag.agent as string, workstream: workstream as string, ws, sandbox, sbxHost };
+  return { id, agent: ag.agent as string, ws, sandbox, sbxHost };
 }
 
 /** A fresh repo the App is installed on (each test its own: tokens are cached per repo). */
@@ -513,8 +512,7 @@ describe("the secret scan", () => {
       expect(JSON.stringify(o)).not.toContain(stored);
       expect(JSON.stringify(o)).not.toContain(pat);
     }
-    const notes = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications();
-    expect(notes).toEqual([]); // the operator was never asked to approve a leak
+    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]); // the operator was never asked to approve a leak
     expect(gh.writes.some((w) => w.path.includes(r))).toBe(false);
     const j = await journal(s.agent);
     expect(j.map((e: any) => e.status)).toEqual(["refused", "refused", "refused"]);
@@ -537,9 +535,10 @@ describe("the sink gate for brokered actions", () => {
     expect(p1).toMatchObject({ status: "pending", ask: expect.stringMatching(/^ask_/), message: expect.stringContaining("mcp__nest__github_create_issue") });
     // Asked again before a decision (keys in another order, through `brokered`): the same ask.
     expect((await run(s.ws, "brokered", { action: "github.create_issue", args: { body: "details", title: "Bug", repo: other } })).ask).toBe(p1.ask);
-    const notes = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications();
-    expect(notes.filter((n) => n.text.includes(p1.ask))).toHaveLength(1);
-    expect(notes.at(-1)!.text).toContain(`github.create_issue on ${other}`);
+    // Held for the operator: listed once, with the tool to call again.
+    const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
+    expect(asks).toEqual([{ ask: p1.ask, question: expect.stringContaining(`github.create_issue on ${other}`), created_ms: expect.any(Number),
+      approval: { name: "github.create_issue", tool: "mcp__nest__github_create_issue" } }]);
     expect(gh.issues.get(other) ?? []).toEqual([]);
 
     await answer(s.agent, p1.ask, "approve");

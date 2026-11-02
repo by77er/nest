@@ -11,7 +11,7 @@ import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, OperatorOverrides, Template } from "./lib/spec";
 import { MIN_IDLE_TTL_MS } from "./lib/lifetimes";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
-import { Port, WorkstreamPolicyLayer } from "./do/sandbox";
+import { Port, SandboxPolicyLayer } from "./do/sandbox";
 import { parseAppSecret } from "./lib/github";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
@@ -54,13 +54,8 @@ function checkCell(env: Env, cell: string): string {
 const fleet = (env: Env, cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandbox = (env: Env, id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const agent = (env: Env, id: string) => env.AGENT.get(env.AGENT.idFromName(id));
-const workstream = (env: Env, id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
 const broker = (env: Env) => env.BROKER.get(env.BROKER.idFromName("broker"));
 const catalog = (env: Env) => env.CATALOG.get(env.CATALOG.idFromName("catalog"));
-/** An agent id that names an agent (404 otherwise): the subscriber or owner a route records. */
-async function existingAgent(env: Env, id: string): Promise<{ workstream: string }> {
-  return await agent(env, id).info();
-}
 
 /** Parse the JSON body against `schema`; an `optional` body may be empty (parsed as `{}`). */
 async function body<T extends z.ZodType>(req: Request, schema: T, optional = false): Promise<z.output<T>> {
@@ -160,7 +155,6 @@ const PARAM: Record<string, RegExp> = {
   agent: /^agt_[A-Za-z0-9]+$/,
   sandbox: /^sbx_[A-Za-z0-9]+$/,
   host: /^hst_[A-Za-z0-9]+$/,
-  ws: /^ws_[A-Za-z0-9]+$/,
   ask: /^ask_[A-Za-z0-9]+$/,
   sub: /^sub_[a-z0-9_]+$/,
   port: /^\d+$/,
@@ -351,41 +345,13 @@ export const ROUTES: Route[] = [
     json(clientMetadataDocument(env.PUBLIC_BASE_URL), 200, { "cache-control": "public, max-age=300" }) }),
   route({ method: "DELETE", path: "/v1/admin/templates/:name", auth: "admin", run: ({ env, p }) => catalog(env).deleteTemplate(catalogName(p.name)) }),
 
-  // Workstreams: the interim workstream channel (docs/orchestration/workstreams/).
-  route({
-    method: "POST", path: "/v1/workstreams", auth: "admin", status: 201,
-    body: z.object({ goal: z.string(), subscriber: z.string().startsWith("agt_").nullable().optional() }),
-    run: ({ env, body: r }) => {
-      // A subscriber must be an agent of the workstream, and a new one has none yet.
-      if (r.subscriber) {
-        throw new NestError(ErrorCodes.INVALID_MESSAGE, "a new workstream has no agents yet: set its subscriber once one is spawned in it");
-      }
-      const id = newId("ws_");
-      return workstream(env, id).init(id, r.goal, null);
-    },
-  }),
-  route({ method: "GET", path: "/v1/workstreams/:ws", auth: "admin", run: ({ env, p }) => workstream(env, p.ws).info() }),
-  route({ method: "GET", path: "/v1/workstreams/:ws/events", auth: "admin", run: ({ env, url, p }) =>
-    workstream(env, p.ws).events(num(url.searchParams.get("limit") ?? undefined, 100)) }),
-  route({ method: "GET", path: "/v1/workstreams/:ws/notifications", auth: "admin", run: ({ env, p }) => workstream(env, p.ws).userNotifications() }),
-  route({
-    method: "PUT", path: "/v1/workstreams/:ws/subscriber", auth: "admin", body: z.object({ subscriber: z.string().startsWith("agt_").nullable().optional() }),
-    run: async ({ env, p, body: { subscriber } }) => {
-      if (subscriber === undefined) throw new NestError(ErrorCodes.INVALID_MESSAGE, "subscriber is required (an agent id, or null)");
-      if (subscriber) {
-        // Only an agent of this workstream reads its channel (its events come from that workstream's agents).
-        const other = (await existingAgent(env, subscriber)).workstream;
-        if (other !== p.ws) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${subscriber} is in workstream ${other}, not ${p.ws}`, 409);
-      }
-      await workstream(env, p.ws).setSubscriber(subscriber);
-    },
-  }),
-
   // Sandboxes.
   route({
     method: "POST", path: "/v1/sandboxes", auth: "admin",
     body: z.object({
-      workstream: z.string().startsWith("ws_"), image: z.string().optional(), resources: Resources.optional(), policy: WorkstreamPolicyLayer.optional(),
+      // Workstreams left the platform: for one release a `workstream` is accepted and ignored (old clients send it).
+      workstream: z.string().optional(),
+      image: z.string().optional(), resources: Resources.optional(), policy: SandboxPolicyLayer.optional(),
       cell: z.string().default(DEFAULT_CELL),
       // Destroyed after being dormant this long (absent: the cell default; docs/control-plane/durable-objects/sandbox/#lifetime).
       idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
@@ -393,9 +359,9 @@ export const ROUTES: Route[] = [
     run: async ({ env, body: r }) => {
       const id = newId("sbx_");
       const info = await sandbox(env, id).create({
-        sandbox: id, workstream: r.workstream, cell: checkCell(env, r.cell),
+        sandbox: id, cell: checkCell(env, r.cell),
         ...(r.image ? { image: r.image } : {}), ...(r.resources ? { resources: r.resources } : {}),
-        ...(r.policy ? { workstreamPolicy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
+        ...(r.policy ? { policy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
       });
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
@@ -417,7 +383,7 @@ export const ROUTES: Route[] = [
   route({ method: "POST", path: "/v1/sandboxes/:sandbox/resolve", auth: "admin", body: z.object({ client: z.string().min(1) }),
     run: ({ env, p, body: r }) => sandbox(env, p.sandbox).resolve(r.client) }),
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).policy() }),
-  route({ method: "PUT", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", body: WorkstreamPolicyLayer, run: ({ env, p, body }) => sandbox(env, p.sandbox).setWorkstreamPolicy(body) }),
+  route({ method: "PUT", path: "/v1/sandboxes/:sandbox/policy", auth: "admin", body: SandboxPolicyLayer, run: ({ env, p, body }) => sandbox(env, p.sandbox).setPolicy(body) }),
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/generations", auth: "admin", run: ({ env, p }) => sandbox(env, p.sandbox).generations() }),
   route({ method: "POST", path: "/v1/sandboxes/:sandbox/place", auth: "admin", run: async ({ env, p }) => ({ host: await sandbox(env, p.sandbox).retryPlacement() }) }),
   route({
@@ -436,8 +402,8 @@ export const ROUTES: Route[] = [
     body: z.object({
       template: CatalogName.optional(),
       role: AgentRole.optional(),
-      // An agent's workstream and cell are its sandbox's: optional, and refused when they differ.
-      workstream: z.string().startsWith("ws_").optional(),
+      // Workstreams left the platform: for one release a `workstream` is accepted and ignored (old clients send it).
+      workstream: z.string().optional(),
       sandbox: z.string().startsWith("sbx_").optional(),
       owner: z.string().startsWith("agt_").optional(),
       captain: z.string().startsWith("agt_").optional(),
@@ -458,24 +424,20 @@ export const ROUTES: Route[] = [
       if (!template) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template is required");
       if (r.owner && r.captain && r.owner !== r.captain) throw new NestError(ErrorCodes.INVALID_MESSAGE, "owner and captain differ");
       const overrides: OperatorOverrides = { ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...r.overrides };
-      let wsId = r.workstream;
+      // An agent's cell is its sandbox's: optional, and refused when it differs.
       let cellName = r.cell ?? DEFAULT_CELL;
       if (r.sandbox) {
         const sbx = await sandbox(env, r.sandbox).info();
-        if ((r.workstream && r.workstream !== sbx.workstream) || (r.cell && r.cell !== sbx.cell)) {
-          throw new NestError(ErrorCodes.INVALID_MESSAGE,
-            `${r.sandbox} is in cell ${sbx.cell}, workstream ${sbx.workstream}; a worker takes its sandbox's`, 409);
+        if (r.cell && r.cell !== sbx.cell) {
+          throw new NestError(ErrorCodes.INVALID_MESSAGE, `${r.sandbox} is in cell ${sbx.cell}; an agent takes its sandbox's`, 409);
         }
-        wsId = sbx.workstream;
         cellName = sbx.cell;
       }
-      if (!wsId) throw new NestError(ErrorCodes.INVALID_MESSAGE, "an agent without a sandbox needs a workstream");
       checkCell(env, cellName);
       const spec = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides });
       const id = newId("agt_");
       const a = agent(env, id);
-      await a.create({ agent: id, workstream: wsId, cell: cellName, spec, owner: r.owner ?? r.captain ?? null, sandbox: r.sandbox ?? null });
-      if (spec.subscribe.includes("workstream")) await workstream(env, wsId).setSubscriber(id);
+      await a.create({ agent: id, cell: cellName, spec, owner: r.owner ?? r.captain ?? null, sandbox: r.sandbox ?? null });
       // The agent exists now: a start that can't run yet (no brain host, a cold cell) keeps its intent and
       // runs when room appears, so the create still answers 201 with the agent and why its start waits.
       let started: Awaited<ReturnType<typeof a.start>> | null = null;
@@ -539,6 +501,9 @@ export const ROUTES: Route[] = [
   // The agent's brokered-action journal, newest first; `before` pages by an earlier page's last created_ms.
   route({ method: "GET", path: "/v1/agents/:agent/brokered", auth: "admin", run: ({ env, url, p }) =>
     agent(env, p.agent).brokeredJournal(num(url.searchParams.get("limit") ?? undefined, 100), url.searchParams.has("before") ? num(url.searchParams.get("before")!, Date.now()) : undefined) }),
+  // Its approvals (and questions) waiting for the operator, oldest first; each is answered below and the
+  // decision reaches the agent as its next turn (docs/agents/tools/#taint-and-sinks).
+  route({ method: "GET", path: "/v1/agents/:agent/asks", auth: "admin", run: ({ env, p }) => agent(env, p.agent).openAsks() }),
   route({ method: "POST", path: "/v1/agents/:agent/asks/:ask/answer", auth: "admin", body: z.object({ answer: z.string() }),
     run: async ({ env, p, body: r }) => ({ delivered: await agent(env, p.agent).answerAsk(p.ask, r.answer) }) }),
 ];

@@ -11,7 +11,7 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/sandbox.ts` | **SandboxDO**: epoch, commit compare-and-set, generations, layered policy and expiring grants, idle refcount, ports |
 | `src/do/agent.ts` | **AgentDO**: session channel, segments to R2 (acked after the put), turns, inbox, interrupts, hook caches, tool relay, the sink gate (`src/lib/sinks.ts`), the MCP client of its mcp capabilities (`src/lib/mcp-proxy.ts` over `src/lib/mcp.ts`; docs/agents/capabilities/mcp/), brokered actions and their journal (`src/lib/brokered.ts`; docs/agents/capabilities/brokered/) and `egress_policy` |
 | `src/do/mcp-connector.ts` | **McpConnectorDO**: one per remote MCP server and credential: the shared tool list, change notices to agents, call admission (docs/control-plane/durable-objects/mcp-connector/) |
-| `src/do/workstream.ts` | **WorkstreamDO**: the interim workstream channel: event log, batched wakes of its one subscriber, user-notification queue |
+| `src/do/workstream.ts` | **WorkstreamDO** (stub): workstreams left the platform; the class stays declared, serving only health (its alarm re-arms daily while the previous release's decision events wait), until stage 4 deletes it |
 | `src/do/broker.ts` | **BrokerDO**: Claude setup tokens, injection secrets, capability credentials (`cap:<name>`, read by AgentDO only), MCP OAuth tokens (`OAuthStore`, `src/lib/mcp-auth.ts`), http profile credentials (`http:<name>`), the argument secret scan, the GitHub App minter (`github_app`; `src/lib/github.ts`), and the issuance audit in R2 |
 | `src/do/catalog.ts` | **CatalogDO** (one): templates and capabilities, seeded with `worker` and `captain` and migrated once per later seed version (new entries; the task ledger's and the channel capabilities removed); expansion is `src/lib/spec.ts` (pure) |
 | `src/do/channel.ts` | **ChannelDO** (stub): channels left the platform; the class stays declared, serving only health and re-arming a previous release's alarm, until stage 4 deletes it |
@@ -43,22 +43,20 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    falls back to `claude_oauth_token` while it isn't set.
 5. Create work (all admin endpoints use `Authorization: Bearer $ADMIN_TOKEN`):
    - `GET /v1/admin/catalog` · `PUT|DELETE /v1/admin/capabilities/<name> {tools, rules, prompt}` ·
-     `PUT|DELETE /v1/admin/templates/<name> {capabilities, launch, hands, credential, escalate_to, subscribe}`
-   - `POST /v1/workstreams {goal}` · `PUT /v1/workstreams/<id>/subscriber {subscriber}` (an agent of that
-     workstream, or null; `captain` is accepted for one release). `GET /v1/workstreams/<id>` answers `subscriber`
-   - `POST /v1/sandboxes {workstream, cell, policy?, idle_ttl_ms?}`: placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
-     workstream layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`. `idle_ttl_ms`: destroyed once dormant this long
+     `PUT|DELETE /v1/admin/templates/<name> {capabilities, launch, hands, credential}`
+   - `POST /v1/sandboxes {cell, policy?, idle_ttl_ms?}` (a `workstream` is accepted and ignored for one release): placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
+     operator's layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`. `idle_ttl_ms`: destroyed once dormant this long
      (no agent attached, no VM up; default the cell's, 1 day); `PUT /v1/sandboxes/<id>/lifetime {idle_ttl_ms | null}` changes it ([lifetime](../docs/control-plane/durable-objects/sandbox/#lifetime))
    - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
      (409 if it's placed)
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
      the only way to mint a public share link (agents can't)
-   - `POST /v1/agents {template, workstream?, sandbox?, owner?, overrides?, cell?, start?}`: expands the template
-     (operator overrides: `launch`, `rules`, `tools` (narrows only), `escalate_to`, `credential`, `ephemeral`; an agent's own
+   - `POST /v1/agents {template, sandbox?, owner?, overrides?, cell?, start?}`: expands the template
+     (operator overrides: `launch`, `rules`, `tools` (narrows only), `credential`, `ephemeral`; an agent's own
      spawn, `agent_spawn`, takes only `SpawnerOverrides`, which narrow) and sends `agent_start` to
-     the host; an agent with a sandbox takes its workstream and cell (a mismatch is refused with 409), and an
-     `owner` must be an agent of the same workstream. For one release `role` is read as the same-named template,
+     the host; an agent with a sandbox takes its cell (a mismatch is refused with 409), and an `owner` must name an
+     agent. For one release `workstream` is accepted and ignored, `role` is read as the same-named template,
      `captain` as `owner`, top-level `launch` and `rules` as overrides, and `grants` intersects the tools silently.
      Answers 201 with the agent and `started`; a start that can't run yet (no brain host, a cold cell) keeps its
      intent and runs when room appears, and the answer says why in `start_waiting` (an error body) with `started: null`
@@ -68,7 +66,10 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      again once released); `kind: waiting, waiting_for: <host>` when the brain runs on another host: it is condemned
      and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
      once that brain's exit or its host's loss releases it
-   - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt` · `/asks/<ask>/answer {answer}`
+   - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt`
+   - `GET /v1/agents/<id>/asks`: its calls held for the operator (sink approvals, tool rules in `ask` mode), oldest
+     first, `{ask, question, created_ms, approval?: {name, tool}}`; `POST /v1/agents/<id>/asks/<ask>/answer {answer}`
+     decides one, and the decision reaches the agent as an `ask_answer` turn
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
      `{lines, next_seq, more}`)
@@ -88,7 +89,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      ([what counts](../docs/control-plane/dashboard/#abandoned); the dashboard reads it)
    - `POST /v1/admin/launched {instance_id, role, account_id?, region?, cell}`: record an instance we
      launched so it may enroll with its AWS identity document (as that role, from that account and region)
-   - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<workstream>`)
+   - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<sandbox>`; `inject:<binding>:<ws_…>` is still read for older secrets)
    - A remote MCP server: its bearer token with `PUT /v1/admin/secrets/cap:<name>`, then
      `PUT /v1/admin/capabilities/<name> {"mcp": {"url": "https://…/mcp", "auth": "cap:<name>", "tools": [...]}}` and the capability
      added to a template (`docs/agents/capabilities/mcp/`)
@@ -109,8 +110,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 | `ROOT_CA_CERT_PEM`, `ROOT_CA_KEY_PEM` | Development proxy root CA (PKCS#8 ECDSA P-256 key), for a cell with no KMS key. Without them, `ALLOW_DEV_CA=1` mints a dev root. A cell with a KMS key derives its certificate instead and ignores them (`docs/sandbox/networking/egress/tls/`) |
 | `AWS_IDENTITY_CERT_PEM` | AWS public certificate for the `rsa2048` identity signature (enables AWS enrollment) |
 | `AWS_CELL_CREDENTIALS` | Secret: JSON object of cell → `{access_key_id, secret_access_key}` of `nest-<cell>-control-plane` (STONITH, the autoscaler, KMS). Without an entry the cell has no AWS access (no global fallback): STONITH waits for the host to fence, or for an operator |
-| `PUBLIC_BASE_URL`, `ASK_SYNC_WINDOW_MS`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
-| `WAKE_BATCH_MS` | Batching window of the workstream channel's subscriber wakes; defaults to 2000 in code (not in `wrangler.jsonc`) |
+| `PUBLIC_BASE_URL`, `HOST_TOKEN_TTL_MS`, `PROXY_CA_TTL_MS` | See `wrangler.jsonc` |
 | `CELLS` | Optional comma-separated list of valid cells; when set, requests for other cells are refused |
 | `SANDBOX_RETENTION` | Generation retention (`src/lib/retention.ts`; docs/sandbox/state/#retention): `on` (the default: marks generations `deleting` and non-source memory unrooted; GC's first run after it turns on is dry) or `off` (an emergency stop) |
 | `ALLOW_LOOPBACK_MCP` | `1` lets an mcp capability name a loopback URL (`http://127.0.0.1:…`): tests and local dev (the e2e harness) only; never set in a deploy |
@@ -165,15 +165,15 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   operator's plain stop is unchanged (its next input lifts it) and keeps the agent's slot; `POST /v1/agents/<id>/stop
   {end: true, destroy_sandbox?}` ends it for good. `GET /v1/agents/<id>/children` lists what it spawned. Not built:
   adoption and parking, budgets (fixed depth and live-children caps stand in), agent events delivered to owners.
-- **Removed** (microkernel, `docs/README.md` principle 9): the task ledger (stage 1) and channels (stage 2: ChannelDO's
-  logic, the channel tools and capabilities, subscriptions and wakes, agent and sandbox events, `/v1/admin/channels`).
-  Their classes stay declared as stubs until stage 4. WorkstreamDO and `notify`/`ask`/`emit` go in stage 3.
+- **Removed** (microkernel, `docs/README.md` principle 9): the task ledger (stage 1), channels (stage 2: ChannelDO's
+  logic, the channel tools and capabilities, subscriptions and wakes, agent and sandbox events, `/v1/admin/channels`)
+  and workstreams (stage 3: WorkstreamDO's logic and routes, `notify`/`ask`/`emit`, `escalate_to`, `subscribe`).
+  Their classes stay declared as stubs until stage 4. For one release the control plane still writes and sends a
+  `ws_` value (records, `sandbox_create`, `agent_start`) for the previous release's hosts, runners and rollback.
 - **Behind the design** (`docs/agents/`): grants with attenuation,
   capability sources (`api`) and parameters, and labels aren't built.
   Templates and capabilities are data (CatalogDO), an agent stores its expanded spec and `owner`, and nothing
-  decides on a role; `agent_start.role` and `ToolDef.roles` are still sent for one release. WorkstreamDO is the
-  interim workstream channel (`WorkstreamEvent`, one subscriber woken with batches), and there is a `workstream`
-  egress policy layer. Taint is a conservative stand-in (an agent with hands or a web built-in, or one another agent's
+  decides on a role; `agent_start.role` and `ToolDef.roles` are still sent for one release. Taint is a conservative stand-in (an agent with hands or a web built-in, or one another agent's
   possibly tainted text reached, is tainted). The sink gate covers remote MCP tools, brokered actions and `egress_policy`; budgets and the hands journal aren't built.
   Session bytes are acked after the R2 put and flushed every 5 s, where the design acks on the SQLite
   commit and flushes at turn boundaries. The contract changes are listed in `docs/interfaces/README.md`.
@@ -197,5 +197,4 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
   host's send chain.
 - **Delivery semantics to know:** platform tool calls are at least once across an AgentDO eviction
   (a call cut off mid-dispatch runs again when redelivered); a turn cut off by a brain restart comes
-  back as a `recovery` turn; a guest `nest ask` waiting in memory falls back to an async answer on
-  eviction.
+  back as a `recovery` turn.

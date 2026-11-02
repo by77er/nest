@@ -1,6 +1,6 @@
 # Fleet channel (host ↔ FleetDO)
 
-> **Implemented contract.** Workstream fields, `role` and `WorkstreamEvent` go; see [pending contract changes](../../README.md#pending-contract-changes).
+> **Implemented contract.** The workstream compat fields (below) and `role` go; see [pending contract changes](../../README.md#pending-contract-changes).
 
 
 One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycle, leases, commands and host-level events. Per-agent traffic goes over the [session channel](../session/).
@@ -47,19 +47,19 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 
 | `type` | Fields | Host behavior |
 |---|---|---|
-| `sandbox_create` | sandbox, workstream, **epoch**, image, resources, policy, `from?` | **Grants the lease.** Builds the netns, proxy listeners and policy, then boots: fresh from `image`, or restored lazily from `from`. Memory restore happens only if `from.kind = checkpoint`. |
+| `sandbox_create` | sandbox, `workstream?` (compat: a `ws_` value previous hosts require; nothing reads it), **epoch**, image, resources, policy, `from?` | **Grants the lease.** Builds the netns, proxy listeners and policy, then boots: fresh from `image`, or restored lazily from `from`. Memory restore happens only if `from.kind = checkpoint`. |
 | `sandbox_suspend` | sandbox, epoch, mode (`memory`/`disk_only`) | Commit (`suspend`), then stop the VM. Keeps the netns and local state. A suspend that fails (a pause, snapshot or commit error, a commit timeout included) resumes the VM and reports `running` again, with the error as `detail`, unless SandboxDO's rejection (`stale_epoch`, `parent_mismatch`) fenced it. |
 | `sandbox_resume` | sandbox, epoch | Resume a sandbox suspended on this host |
 | `sandbox_archive` | sandbox, epoch | Commit, then evict all local state |
 | `sandbox_checkpoint` | sandbox, epoch, reason | Commit now |
-| `sandbox_fork` | parent, parent_epoch, child, child_epoch, child_workstream, mode, policy | Same-host fork: commit the parent (`fork`), then create the child from that generation. For a cross-host fork, FleetDO sends `sandbox_checkpoint` to this host and `sandbox_create{from}` to the other. |
+| `sandbox_fork` | parent, parent_epoch, child, child_epoch, `child_workstream?` (compat, as `sandbox_create`), mode, policy | Same-host fork: commit the parent (`fork`), then create the child from that generation. For a cross-host fork, FleetDO sends `sandbox_checkpoint` to this host and `sandbox_create{from}` to the other. |
 | `sandbox_destroy` | sandbox, epoch | Stop and delete local state. Chunks are left for GC. |
 | `policy_update` | sandbox, epoch, policy | Applied live by nest-proxy. Ignored if `policy.version` isn't newer. |
 | `secrets_update` | sandbox, epoch, secrets | Injection secret values, held in proxy memory only |
 | `port_expose` / `port_unexpose` | sandbox, epoch, port, `host_header{mode}` | The gateway's preview mapping |
 | `commit_result` | request, sandbox, outcome | Answer to `commit_request` (see the CAS sequence below) |
 | `guest_cli_result` | request, result (`guest::CliResult`) | Answer to a `guest_cli` event; nestd relays it to the guest's pending `cli` request. Like `commit_result`, hosts resolve it **on arrival**, not in command order |
-| `agent_start` | agent, `role?` (deprecated: no longer sent; nothing reads it), workstream, `epoch`, `resume?`, `hands?{sandbox}`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. `epoch` is the agent epoch of this start. `hands` names the sandbox only; the runner fetches the gateway target over its session channel. Sent only to a brain host |
+| `agent_start` | agent, `role?` (deprecated: no longer sent; nothing reads it), `workstream?` (compat: previous runners require it; nothing reads it), `epoch`, `resume?`, `hands?{sandbox}`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. `epoch` is the agent epoch of this start. `hands` names the sandbox only; the runner fetches the gateway target over its session channel. Sent only to a brain host |
 | `agent_attach` | sandbox, epoch, agent, `cwd?` | Configure the agent's slot in the guest (cwd, proxy port, cgroup) on the sandbox's host; idempotent (an existing slot is replaced), `cwd` defaults to `/workspace`. SandboxDO waits for its `ok` before it hands out a binding. Stale epoch → `stale_epoch` |
 | `agent_detach` | sandbox, epoch, agent, `kill_processes` | Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's cgroup first. The gateway then refuses the agent's bindings |
 | `agent_stop` | agent, reason, `mode?`, `epoch?` | `graceful` (absent: the previous release's nestd always does this) ends the turn cleanly if possible, then stops the process, in order; `kill` ends it at once, applied on arrival like `fence`, for a start elsewhere. `epoch`: the newest agent epoch the stop ends; nestd remembers the highest killed one per agent and refuses a later `agent_start` at or below it (a kill overtaking a queued start; the refused start's `agent_exited{fenced}` is reported). A kill for a brain nestd isn't running is answered with its `agent_exited` at once. The `ok` doesn't mean the brain is gone: its `agent_exited` does |
@@ -74,13 +74,13 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `sandbox_state` | Every transition (`model::SandboxState`), with `suspend_mode?`, `detail?` and, for `running`, `guest{protocol_version, capabilities}` (nestd caches the guest's hello, so a resume reports it too; a repeated `running` with a new `guest` is an update). |
 | `incarnation_retired` | `sandbox`, `epoch`: a fenced or superseded incarnation is gone from the host (salvaged, nothing to salvage, or refused for good by SandboxDO), its disk deleted. FleetDO marks the stale incarnation clean, so it is destroyed without waiting out the salvage window. A Worker that predates it quarantines the event (logged, skipped, acked with its batch) and only loses that shortcut |
 | `commit_request` | Chunks and manifest are already uploaded. Asks for a CAS with `request`, epoch, parent, kind, manifests, reason (`salvage` marks the commit as orphaned work) |
-| `workstream` | A host-originated `WorkstreamEvent` (`port_opened`, `port_exposed`, `egress_denied`, `egress_alert`) |
+| `workstream` | A `SandboxEvent` about a sandbox the host holds (`port_opened`, `egress_denied`, `egress_alert`); the tag is historical. FleetDO drops one from a host that isn't the lease holder and logs the rest |
 | `egress_audit` | Batches of `EgressAuditRecord` (no secret values, no query strings), written to R2. `via?` names the nest-proxy entry point: `dns http_transparent https_transparent explicit tcp_exception`; `reason` values are listed in [nestd-proxy](../../host-internal/nestd-proxy/). `count?` marks an aggregated record (how many requests it stands for), used for nest-proxy's per-window suppression summaries |
 | `capacity` | Free vCPU, memory (`MemAvailable`) and hugepages, the hugepage pool's size (`hugepages_mib_total`; 0 or absent means regular pages), counts, warm generations |
 | `tunnel_state` | `state`: the host's tunnel changed to `none`, `connecting` or `connected` (from cloudflared's `/ready`); FleetDO advertises the tunnel hostname only while `connected` |
 | `spot_notice` | IMDS interruption notice; the host is draining |
 | `agent_exited` | Brain process exit (lifecycle only): `exit_code?`, `signal?`, `reason` (`AgentExitReason`: `idle stopped fenced auth_failed crashed`, the runner's reasons; `host_lost`, the control plane's own for a brain a reconnecting host no longer reports; `unknown`, what any other string parses as, including an older nestd's free text). `epoch?`: the agent epoch the brain ran under; AgentDO and the brain index ignore an exit of an older start. AgentDO restarts the brain at once when work is waiting after `idle`, `crashed`, `fenced` or `host_lost` |
-| `guest_cli` | `request, sandbox, epoch, agent?, command` (`guest::CliCommand`): a `nest notify/emit/ask/expose` run by a program in the sandbox, attributed by `NEST_AGENT_ID`. FleetDO runs it on the agent's AgentDO as the platform tool of the same name (`expose` → `expose_port`) **without holding the event batch** (an `ask` waits ≤ 120 s, then returns `pending`), and answers with a `guest_cli_result` command. nestd gives up after `wait_s` + 15 s (`ask`) or 30 s (others) |
+| `guest_cli` | `request, sandbox, epoch, agent?, command` (`guest::CliCommand`): a `nest expose` run by a program in the sandbox, attributed by `NEST_AGENT_ID`. FleetDO runs it on the agent's AgentDO as `expose_port` **without holding the event batch**, and answers with a `guest_cli_result` command; `notify`, `emit` and `ask` from a previous release's guest answer `unknown_tool`. nestd gives up after 30 s |
 | `task_exited` | `sandbox, epoch, agent, task` (`guest::TaskInfo`): a background hands task exited. FleetDO forwards it to the agent's AgentDO (mid-turn it becomes an inbox note) |
 
 ## Lease and fence
@@ -114,7 +114,7 @@ host                                    FleetDO → SandboxDO
  │                                      │   epoch stale → rejected{reason: stale_epoch, head}
  │◄ commands[commit_result{rejected stale_epoch}] → host fences sbx, then may send
  │ events[commit_request{epoch=3, parent=gen_A, reason: salvage}] ─►│ orphaned{generation} (sibling; head unchanged)
- │                                      │ + WorkstreamEvent orphaned_work → the workstream's subscriber
+ │                                      │ + logged (SandboxDO)
 ```
 
 - **`parent_mismatch`** (same epoch, head moved) doesn't happen with a single writer. If it does, it's a bug: the host re-reads the head from the next `commit_result` and fences.

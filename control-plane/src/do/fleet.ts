@@ -169,6 +169,7 @@ function parseOrphans(value: string): Orphans {
 
 export interface PlaceRequest {
   sandbox: string;
+  /** Compat: the `ws_` value `sandbox_create` carries to hosts of the previous release (SandboxDO's). */
   workstream: string;
   epoch: number;
   image: string;
@@ -1305,12 +1306,15 @@ export class FleetDO extends DurableObject<Env> {
       case "commit_request":
         return this.onCommitRequest(host, ev);
       case "workstream": {
-        // Host-originated workstream events must be about a sandbox this host holds.
-        if (!this.holds(host, ev.event.sandbox, ev.event.epoch)) {
-          console.warn(`FleetDO: dropping ${ev.event.type} from ${host}: not the lease holder of ${ev.event.sandbox ?? "(no sandbox)"}`);
+        // A sandbox event (the tag is historical): about a sandbox this host holds, and logged. Owners
+        // hear of them once agent events reach them as webhooks (docs/README.md#principles).
+        const e = ev.event;
+        if (!this.holds(host, e.sandbox, e.epoch)) {
+          console.warn(`FleetDO: dropping ${e.type} from ${host}: not the lease holder of ${e.sandbox ?? "(no sandbox)"}`);
           return;
         }
-        await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(ev.event.workstream)).ingest(ev.event);
+        const what = e.type === "port_opened" ? `port ${e.port}` : e.type === "egress_denied" ? `${e.host}:${e.port}` : `${e.host} (${e.reason}${e.binding ? `, ${e.binding}` : ""})`;
+        (e.type === "egress_alert" ? console.warn : console.log)(`FleetDO: ${e.sandbox}@${e.epoch} ${e.type} ${what}${e.agent ? ` by ${e.agent}` : ""}`);
         return;
       }
       case "egress_audit": {
@@ -2341,10 +2345,10 @@ export class FleetDO extends DurableObject<Env> {
       };
       try {
         const info = await this.sandbox(r.sandbox).info();
-        return { ...base, epoch: r.epoch ?? info.epoch, sandbox_state: info.state, image: info.image, workstream: info.workstream, info_error: false };
+        return { ...base, epoch: r.epoch ?? info.epoch, sandbox_state: info.state, image: info.image, info_error: false };
       } catch (e) {
         console.error(`FleetDO: reading ${r.sandbox} for the fleet view failed`, e);
-        return { ...base, sandbox_state: null, image: null, workstream: null, info_error: true };
+        return { ...base, sandbox_state: null, image: null, info_error: true };
       }
     }));
   }

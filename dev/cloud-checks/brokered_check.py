@@ -14,8 +14,8 @@ capability taints from its start:
                 narrowed to REPO with contents, issues and pull_requests write): one commit adding
                 `dev/cloud-checks/.scratch/<run>.md` on top of main's head, pushed as `nest-check/brokered-<run>`
                 through the Git Data API (blob, tree, commit, ref).
-  3. turn     - one workstream and one agent, one turn: create the issue (held: the session is tainted and the
-                grant says approve; the check approves it from the workstream's needs_input), comment on it,
+  3. turn     - one agent, one turn: create the issue (held: the session is tainted and the grant says
+                approve; the check approves it from the agent's open asks), comment on it,
                 open a draft pull request from the branch to main, then comment a random fake credential shaped
                 like a GitHub token (`ghp_` + 36), which nest must refuse.
   4. verify   - through GitHub (the script's own token): the issue exists, was made by the App's bot and carries
@@ -23,7 +23,7 @@ capability taints from its start:
                 bot, a draft; no comment on the issue holds the fake token. The agent's journal
                 (`GET /v1/agents/<id>/brokered`): done rows for the three actions, a refused row for the scan
                 with its arguments withheld, no row holding the fake token, the issue's row tainted and written
-                after the needs_input event that asked for it (server clocks), and no approval asked for
+                after the approval that held it was asked for (server clocks), and no approval asked for
                 anything but the issue.
   5. sleep    - until the brain has idle-exited (BROKERED_IDLE_S).
   6. cleanup  - on every exit path (SIGINT, SIGTERM): every open issue and pull request on REPO by the App's bot
@@ -98,7 +98,7 @@ SYSTEM = ("You are an agent in an automated check of nest's brokered GitHub acti
 TEMPLATE = {
     "capabilities": ["nest", MCP_CAP, CAP],
     "launch": {"model": MODEL, "builtin_tools": [], "system_prompt": {"mode": "append", "text": SYSTEM}},
-    "hands": "forbidden", "credential": "claude_oauth_token:worker", "escalate_to": "workstream", "subscribe": [], "params": {},
+    "hands": "forbidden", "credential": "claude_oauth_token:worker",
 }
 MARKER = "<!-- nest:"
 
@@ -213,8 +213,8 @@ def approval_checks(asks, rows):
     out.append(("no approval was asked for the comment or the pull request (scoped grants: allow)", not others,
                 short([e.get("question", "")[:120] for e in others])))
     issue = [r for r in rows if r.get("action") == "github.create_issue" and r.get("status") == "done"]
-    first_ask = min((e.get("ts_ms") or 0 for e in issue_asks), default=None)
-    out.append(("the issue went out after it was asked for (journal created_ms > needs_input ts_ms)",
+    first_ask = min((e.get("created_ms") or 0 for e in issue_asks), default=None)
+    out.append(("the issue went out after it was asked for (journal created_ms > the ask's created_ms)",
                 bool(issue) and first_ask is not None and issue[0].get("created_ms", 0) > first_ask,
                 short({"asked_ms": first_ask, "sent_ms": issue[0].get("created_ms") if issue else None})))
     return out
@@ -267,9 +267,10 @@ def mint(key):
     return tok["token"], f"{app['slug']}[bot]"
 
 
-def needs_input(ws):
-    s, v = api("GET", f"/v1/workstreams/{ws}/events?limit=500")
-    return [e for e in reversed(v) if e.get("type") == "needs_input"] if s == 200 and isinstance(v, list) else None
+def open_asks(agent):
+    """The agent's approvals waiting for the operator, oldest first; None: no answer."""
+    s, v = api("GET", f"/v1/agents/{agent}/asks")
+    return v if s == 200 and isinstance(v, list) else None
 
 
 def turn_statuses(agent):
@@ -289,7 +290,7 @@ def main():
         sys.exit(f"not set: {', '.join(missing)}")
     if not shutil.which("openssl"):
         sys.exit("openssl is needed to sign the App's JWT")
-    made = {"run": RUN, "repo": REPO, "branch": None, "workstream": None, "agent": None, "issue": None, "pull": None}
+    made = {"run": RUN, "repo": REPO, "branch": None, "agent": None, "issue": None, "pull": None}
     ok = True
     keydir = tempfile.mkdtemp(prefix="nest-brokered-check-")
     state = {"token": None, "bot": None, "key": None}
@@ -337,22 +338,19 @@ def main():
 
         # 3. One agent, one turn; the check approves the issue's call when it's asked for.
         fake = fake_token()
-        s, v = api("POST", "/v1/workstreams", {"goal": f"brokered actions check {RUN}"})
-        expect(s == 201, "create workstream", v)
-        ws = made["workstream"] = v["workstream"]
-        s, v = api("POST", "/v1/agents", {"template": TEMPLATE_NAME, "workstream": ws, "cell": CELL, "start": False})
+        s, v = api("POST", "/v1/agents", {"template": TEMPLATE_NAME, "cell": CELL, "start": False})
         expect(s == 201, "create agent", v)
         agent = made["agent"] = v["agent"]
         s, v = api("POST", f"/v1/agents/{agent}/turns", {"text": turn_text(fake), "request_id": f"{RUN}/{agent}/turn"})
         expect(s == 201 and isinstance(v, dict) and v.get("turn"), "enqueue the turn", v)
-        mark("turn sent", workstream=ws, agent=agent)
+        mark("turn sent", agent=agent)
         answered = {}
         t0 = time.time()
         ever_live = False
         while True:
             info = agent_info(agent)
             ever_live |= bool(info and info.get("brain"))
-            for e in needs_input(ws) or []:
+            for e in open_asks(agent) or []:
                 ask = e.get("ask")
                 if ask in answered:
                     continue
@@ -360,12 +358,12 @@ def main():
                 verdict = "approve" if "github.create_issue" in q else "deny: this check approves only the issue"
                 s, _ = api("POST", f"/v1/agents/{agent}/asks/{ask}/answer", {"answer": verdict})
                 if s == 200:
-                    answered[ask] = verdict
+                    answered[ask] = {"verdict": verdict, "question": q, "created_ms": e.get("created_ms")}
                     record("decision", ask=ask, verdict=verdict.split(":")[0], question=q[:300], local_ms=int(time.time() * 1000))
                     log(f"  {ask}: {verdict.split(':')[0]} ({q[:100]!r})")
             st = turn_statuses(agent)
             log(f"turns {st}; asks answered {len(answered)}")
-            if st and all(x == "done" for x in st) and answered and all(a in answered for a in [e.get("ask") for e in needs_input(ws) or []]):
+            if st and all(x == "done" for x in st) and answered and open_asks(agent) == []:
                 break
             if "interrupted" in st:
                 raise SystemExit("FAIL: a turn was interrupted")
@@ -379,7 +377,7 @@ def main():
         expect(s == 200 and isinstance(rows, list), "read the agent's journal", rows)
         for r in rows:
             record("journal", **r)
-        results = journal_checks(rows, fake) + approval_checks(needs_input(ws) or [], rows)
+        results = journal_checks(rows, fake) + approval_checks(list(answered.values()), rows)
         issue_row = next((r for r in rows if r.get("action") == "github.create_issue" and r.get("status") == "done"), None)
         pr_row = next((r for r in rows if r.get("action") == "github.create_pr" and r.get("status") == "done"), None)
         number = made_of(issue_row or {}).get("number")

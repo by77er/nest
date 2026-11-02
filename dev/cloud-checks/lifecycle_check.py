@@ -106,20 +106,16 @@ def check(name, good, detail=""):
 try:
     for path, body in (
         (f"capabilities/{CAP}", {"tools": ["agent_spawn", "agent_stop"], "spawn": [CHILD], "prompt": "You may spawn lc-child agents and stop them."}),
-        (f"templates/{CHILD}", {"capabilities": ["nest", "hands"], "hands": "required", "credential": "claude_oauth_token:worker", "escalate_to": "workstream",
-                                "subscribe": [], "params": {}, "launch": {"model": "haiku", "builtin_tools": [], "system_prompt": {"mode": "append",
+        (f"templates/{CHILD}", {"capabilities": ["nest", "hands"], "hands": "required", "credential": "claude_oauth_token:worker", "launch": {"model": "haiku", "builtin_tools": [], "system_prompt": {"mode": "append",
                                 "text": "You are in an automated check. Do exactly the task, then reply with one line."}}}),
-        (f"templates/{PARENT}", {"capabilities": ["nest", CAP], "hands": "forbidden", "credential": "claude_oauth_token:worker", "escalate_to": "workstream",
-                                 "subscribe": [], "params": {}, "launch": {"model": "haiku", "builtin_tools": [], "system_prompt": {"mode": "append",
+        (f"templates/{PARENT}", {"capabilities": ["nest", CAP], "hands": "forbidden", "credential": "claude_oauth_token:worker", "launch": {"model": "haiku", "builtin_tools": [], "system_prompt": {"mode": "append",
                                  "text": "You are in an automated check. Make exactly the tool calls given, each once, then reply with the tool's answer verbatim."}}}),
     ):
         s, v = api("PUT", f"/v1/admin/{path}", body)
         assert s == 200, (path, s, v)
-    s, v = api("POST", "/v1/workstreams", {"goal": "lifetimes cloud check"})
-    ws = v["workstream"]
     before = live_sandboxes()
     log(f"live sandboxes before: {before}")
-    s, v = api("POST", "/v1/agents", {"template": PARENT, "workstream": ws, "cell": CELL, "start": False})
+    s, v = api("POST", "/v1/agents", {"template": PARENT, "cell": CELL, "start": False})
     assert s == 201, v
     parent = v["agent"]
     log(f"parent {parent}")

@@ -1,5 +1,5 @@
 // Templates and capabilities as data (CatalogDO, the admin routes) and agents spawned from them: what
-// an agent is offered, may call, is started with and escalates to comes from its expanded spec, and
+// an agent is offered, may call and is started with comes from its expanded spec, and
 // nothing decides on a role or a template's name.
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -7,12 +7,11 @@ import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
 import { CHANNEL_ALARM_MS, type ChannelDO } from "../src/do/channel";
 import { LEDGER_ALARM_MS, type TaskLedgerDO } from "../src/do/tasks";
-import { SEED_CATALOG, SEED_VERSION, SPAWNING_PROMPT_V5 } from "../src/lib/spec";
+import { MESSAGING_TOOLS_REMOVED, RETIRED_TOOLS, SEED_CATALOG, SEED_CATALOG_V1, SEED_VERSION, SPAWNING_PROMPT_V5 } from "../src/lib/spec";
 import { adminJson, connectHost, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
-const wsStub = (id: string) => env.WORKSTREAM.get(env.WORKSTREAM.idFromName(id));
 const isStartOf = (agent: string) => (c: any) => c.type === "agent_start" && c.agent === agent;
 const uniqueName = (p: string) => `${p}-${crypto.randomUUID().slice(0, 8)}`;
 
@@ -34,10 +33,9 @@ async function cellWithSandbox() {
   const sandboxHost = await connectHost(cell);
   // Every brain, with hands or without, runs on a brain host.
   const brain = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "templates" } }, 201);
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(sandboxHost.ws, (c) => c.type === "sandbox_create");
-  return { cell, brain, workstream: workstream as string, sandbox: sbx.sandbox as string };
+  return { cell, brain, sandbox: sbx.sandbox as string };
 }
 
 /** Edit AgentInfo in place (a record as an earlier release, or a bad edit, left it). */
@@ -53,13 +51,16 @@ describe("the catalog is data the operator edits", () => {
   it("is seeded with worker and captain, and refuses entries that don't hold together", async () => {
     const cat = await adminJson("/v1/admin/catalog");
     expect(Object.keys(cat.templates)).toEqual(expect.arrayContaining(["worker", "captain"]));
-    expect(cat.templates.captain).toMatchObject({ hands: "forbidden", credential: "claude_oauth_token:captain", escalate_to: "user" });
+    expect(cat.templates.captain).toMatchObject({ hands: "forbidden", credential: "claude_oauth_token:captain" });
 
     const name = uniqueName("cap");
     expect((await adminJson(`/v1/admin/capabilities/${name}`, { method: "PUT", body: { tools: ["no_such_tool"] } }, 400)).error.message)
       .toContain("unknown platform tool no_such_tool");
-    await adminJson(`/v1/admin/capabilities/${name}`, { method: "PUT", body: { tools: ["notify"] } });
-    const tpl = { capabilities: [name], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "optional", escalate_to: "user" };
+    // `notify` left the registry with workstreams: refused like any unknown tool.
+    expect((await adminJson(`/v1/admin/capabilities/${name}`, { method: "PUT", body: { tools: ["notify"] } }, 400)).error.message)
+      .toContain("unknown platform tool notify");
+    await adminJson(`/v1/admin/capabilities/${name}`, { method: "PUT", body: { tools: ["read_transcript"] } });
+    const tpl = { capabilities: [name], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "optional" };
     // A credential is a Claude setup token's name and nothing else (it is sent to a brain host).
     expect((await adminJson(`/v1/admin/templates/${name}`, { method: "PUT", body: { ...tpl, credential: "binding_key:use1" } }, 400)).error.code)
       .toBe("invalid_message");
@@ -78,19 +79,19 @@ describe("an agent is its expanded spec", () => {
     const s = await cellWithSandbox();
     const name = uniqueName("rv");
     await adminJson(`/v1/admin/capabilities/${name}`, {
-      method: "PUT", body: { tools: ["read_transcript", "notify"], rules: [{ pattern: "Bash", decision: "ask" }], prompt: "Review carefully." },
+      method: "PUT", body: { tools: ["checkpoint", "read_transcript"], rules: [{ pattern: "Bash", decision: "ask" }], prompt: "Review carefully." },
     });
     await adminJson(`/v1/admin/templates/${name}`, {
       method: "PUT",
       body: {
         capabilities: ["nest", name], launch: { builtin_tools: ["TodoWrite"], system_prompt: { mode: "append", text: "You review." } },
-        hands: "optional", credential: `claude_oauth_token:${name}`, escalate_to: "user",
+        hands: "optional", credential: `claude_oauth_token:${name}`,
       },
     });
     await adminJson(`/v1/admin/secrets/claude_oauth_token:${name}`, { method: "PUT", body: { value: "sk-reviewer" } });
     const a = await adminJson("/v1/agents", { body: { template: name, sandbox: s.sandbox } }, 201);
-    expect(a).toMatchObject({ template: name, tools: ["notify", "read_transcript"], credential: `claude_oauth_token:${name}`, escalate_to: "user", owner: null });
-    expect(a).not.toHaveProperty("role");
+    expect(a).toMatchObject({ template: name, tools: ["read_transcript", "checkpoint"], credential: `claude_oauth_token:${name}`, owner: null });
+    for (const gone of ["role", "escalate_to", "subscribe", "workstream"]) expect(a).not.toHaveProperty(gone);
 
     // An agent with hands starts where its sandbox is, whatever its template is called.
     const [start] = await nextCommands(s.brain.ws, isStartOf(a.agent));
@@ -104,10 +105,10 @@ describe("an agent is its expanded spec", () => {
     const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     const tools = await toolNames(ws);
     // Its capabilities' tools, and `exit`, which every agent has (docs/agents/#lifetimes).
-    expect(tools.map((t) => t.name)).toEqual(["notify", "exit", "read_transcript"]);
+    expect(tools.map((t) => t.name)).toEqual(["exit", "read_transcript", "checkpoint"]);
     // `roles: []` on every definition, for runners of the previous release (they require the field).
     expect(tools.every((t) => Array.isArray(t.roles) && (t.roles as unknown[]).length === 0)).toBe(true);
-    ws.send({ type: "tool_call", seq: 1, call: "cal_tpl-1", turn: "trn_x", name: "emit", arguments: { event: "progress", summary: "x" } });
+    ws.send({ type: "tool_call", seq: 1, call: "cal_tpl-1", turn: "trn_x", name: "fork_sandbox", arguments: { sandbox: s.sandbox } });
     expect((await ws.next("tool_result", (m) => m.call === "cal_tpl-1")).outcome.error.code).toBe("forbidden");
     expect((await adminJson(`/v1/agents/${a.agent}`)).rules).toEqual([{ pattern: "mcp__nest__*", decision: "allow" }, { pattern: "Bash", decision: "ask" }]);
   });
@@ -117,16 +118,13 @@ describe("an agent is its expanded spec", () => {
     const name = uniqueName("solo");
     await adminJson(`/v1/admin/templates/${name}`, {
       method: "PUT",
-      body: { capabilities: ["nest", "messaging"], launch: { builtin_tools: [], system_prompt: { mode: "replace", text: "Solo." } },
-        hands: "optional", credential: "claude_oauth_token", escalate_to: "user" },
+      body: { capabilities: ["nest", "transcripts"], launch: { builtin_tools: [], system_prompt: { mode: "replace", text: "Solo." } },
+        hands: "optional", credential: "claude_oauth_token" },
     });
-    const a = await adminJson("/v1/agents", { body: { template: name, workstream: s.workstream, cell: s.cell } }, 201);
+    const a = await adminJson("/v1/agents", { body: { template: name, cell: s.cell } }, 201);
     const [start] = await nextCommands(s.brain.ws, isStartOf(a.agent));
     expect(start).toMatchObject({ oauth_token: "sk-default" });
     expect(start).not.toHaveProperty("hands");
-    expect(start).not.toHaveProperty("hands");
-    // Nothing subscribed it to the workstream: only a template that says so does (the captain's).
-    expect((await wsStub(s.workstream).info()).subscriber).toBeNull();
   });
 
   it("a stored credential naming any other secret is refused at start, never resolved", async () => {
@@ -142,86 +140,40 @@ describe("an agent is its expanded spec", () => {
     await expect(Promise.resolve().then(() => broker.credentialRef("access:gateway"))).rejects.toThrow(/not a Claude setup token/);
   });
 
-  it("overrides narrow the tools and may send questions to the user; a role is the same-named template", async () => {
+  it("overrides narrow the tools; a role is the same-named template; a `workstream` is accepted and ignored for one release", async () => {
     const s = await cellWithSandbox();
     const a = await adminJson("/v1/agents", {
-      body: { role: "worker", sandbox: s.sandbox, overrides: { tools: ["ask", "notify"], escalate_to: "user" } },
+      body: { role: "worker", sandbox: s.sandbox, overrides: { tools: ["checkpoint", "read_transcript"] }, start: false },
     }, 201);
-    expect(a).toMatchObject({ template: "worker", tools: ["notify", "ask"], escalate_to: "user" });
+    expect(a).toMatchObject({ template: "worker", tools: ["read_transcript", "checkpoint"] });
     expect((await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, overrides: { tools: ["merge"] } } }, 400)).error.message)
       .toContain("doesn't give merge");
     expect((await adminJson("/v1/agents", { body: { template: "captain", role: "worker", sandbox: s.sandbox } }, 400)).error.message)
       .toContain("template and role differ");
-    expect((await adminJson("/v1/agents", { body: { template: "worker", workstream: s.workstream, cell: s.cell } }, 400)).error.message)
+    expect((await adminJson("/v1/agents", { body: { template: "worker", cell: s.cell } }, 400)).error.message)
       .toContain("needs a sandbox");
-
-    await nextCommands(s.brain.ws, isStartOf(a.agent));
-    const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
-    ws.send({ type: "tool_call", seq: 1, call: "cal_esc-1", turn: "trn_x", name: "ask", arguments: { question: "Which colour?" } });
-    for (let i = 0; i < 50 && !(await wsStub(s.workstream).userNotifications()).some((n) => n.text.includes("Which colour?")); i++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    expect((await wsStub(s.workstream).userNotifications()).some((n) => n.text.includes("Which colour?"))).toBe(true);
-    expect((await wsStub(s.workstream).events()).some((e) => e.type === "needs_input")).toBe(false);
-  });
-});
-
-describe("escalation and the workstream channel's subscriber", () => {
-  it("a captain escalates to the user, not to the workstream channel it reads", async () => {
-    const s = await cellWithSandbox();
-    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell } }, 201);
-    expect((await wsStub(s.workstream).info()).subscriber).toBe(c.agent);
-    await nextCommands(s.brain.ws, isStartOf(c.agent));
-    const ws = await runner(c.agent, s.brain.host, s.brain.host_token);
-    ws.send({ type: "tool_call", seq: 1, call: "cal_cq-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "to whom?" } });
-    expect((await ws.next("tool_result", (m) => m.call === "cal_cq-1")).outcome.status).toBe("ok");
-    expect((await wsStub(s.workstream).userNotifications()).map((n) => n.text)).toContain("to whom?");
-    // Not its own inbox (the previous release delivered a captain's `captain` notify to itself).
-    expect(await agentStub(c.agent).turns()).toEqual([]);
-  });
-
-  it("a worker without an owner reaches the subscriber; subscribers must be agents; a stored `captain` is the subscriber", async () => {
-    const s = await cellWithSandbox();
-    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell, start: false } }, 201);
-    const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
-    expect(w.owner).toBeNull();
-    await nextCommands(s.brain.ws, isStartOf(w.agent));
-    const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
-    ws.send({ type: "tool_call", seq: 1, call: "cal_ws-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "done" } });
-    expect((await ws.next("tool_result", (m) => m.call === "cal_ws-1")).outcome.status).toBe("ok");
-    const turns = await agentStub(c.agent).turns();
-    expect(turns.map((t) => t.input.text).join("\n")).toContain("done");
-
-    expect((await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: "agt_nobody00000000000000000000" } }, 404))
-      .error.code).toBe("unknown_agent");
-    await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: null } });
-    expect((await wsStub(s.workstream).info()).subscriber).toBeNull();
-
-    await runInDurableObject(wsStub(s.workstream), (_i, st) => {
-      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
-      delete info.subscriber;
-      info.captain = c.agent;
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
-    });
-    expect(await wsStub(s.workstream).info()).toMatchObject({ subscriber: c.agent });
-    expect(await wsStub(s.workstream).info()).not.toHaveProperty("captain");
+    // Old clients (the nest CLI, scripts) still send a workstream: neither route requires or keeps one.
+    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: "ws_legacy", cell: s.cell } });
+    expect(await adminJson(`/v1/sandboxes/${sbx.sandbox}`)).not.toHaveProperty("workstream");
+    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: "ws_legacy", cell: s.cell, start: false } }, 201);
+    expect(c).not.toHaveProperty("workstream");
   });
 });
 
 describe("records stored with a role (the previous release)", () => {
   it("load as the role's expanded spec: grants narrow the tools, the captain is the owner, and the role is gone", async () => {
     const s = await cellWithSandbox();
-    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell, start: false } }, 201);
+    const c = await adminJson("/v1/agents", { body: { template: "captain", cell: s.cell, start: false } }, 201);
     const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
     await editAgent(w.agent, (i) => {
-      for (const k of ["template", "tools", "credential", "escalate_to", "owner"]) delete i[k];
-      Object.assign(i, { role: "worker", grants: ["notify", "emit", "merge"], captain: c.agent });
+      for (const k of ["template", "tools", "credential", "owner"]) delete i[k];
+      Object.assign(i, { role: "worker", grants: ["checkpoint", "notify", "read_transcript", "merge"], captain: c.agent, escalate_to: "workstream" });
     });
     const info = await agentStub(w.agent).info();
-    expect(info).toMatchObject({ template: "worker", tools: ["notify", "emit"], credential: "claude_oauth_token:worker", escalate_to: "workstream", owner: c.agent });
+    expect(info).toMatchObject({ template: "worker", tools: ["read_transcript", "checkpoint"], credential: "claude_oauth_token:worker", owner: c.agent });
     const stored = await runInDurableObject(agentStub(w.agent), (_i: AgentDO, st) =>
       JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
-    expect(stored).toMatchObject({ tools: ["notify", "emit"], owner: c.agent });
+    expect(stored).toMatchObject({ tools: ["read_transcript", "checkpoint"], owner: c.agent });
     // Migrated: neither the record read nor the one stored has the previous release's fields.
     for (const k of ["role", "grants", "captain"]) {
       expect(info).not.toHaveProperty(k);
@@ -230,78 +182,17 @@ describe("records stored with a role (the previous release)", () => {
 
     await nextCommands(s.brain.ws, isStartOf(w.agent));
     const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
-    expect((await toolNames(ws)).map((t) => t.name)).toEqual(["notify", "emit", "exit"]);
+    expect((await toolNames(ws)).map((t) => t.name)).toEqual(["exit", "read_transcript", "checkpoint"]);
   });
 });
 
 describe("one release of compatibility, and the review's edge cases", () => {
-  const raw = async (stub: any) => runInDurableObject(stub, (_i: unknown, st: DurableObjectState) =>
-    JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value));
-
-  it("a workstream writes the previous release's `captain` beside its subscriber, and reads one the previous release changed", async () => {
-    const s = await cellWithSandbox();
-    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: s.workstream, cell: s.cell, start: false } }, 201);
-    expect(await raw(wsStub(s.workstream))).toMatchObject({ subscriber: c.agent, captain: c.agent });
-    // A forward revert's release changes only `captain`: once back, that is the subscriber.
-    await runInDurableObject(wsStub(s.workstream), (_i, st) => {
-      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
-      info.captain = null;
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
-    });
-    expect((await wsStub(s.workstream).info()).subscriber).toBeNull();
-  });
-
-  it("a subscriber is an agent of the workstream; a new workstream takes none", async () => {
-    const s = await cellWithSandbox();
-    const other = await cellWithSandbox();
-    const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: other.sandbox, start: false } }, 201);
-    expect((await adminJson(`/v1/workstreams/${s.workstream}/subscriber`, { method: "PUT", body: { subscriber: w.agent } }, 409)).error.message)
-      .toContain("is in workstream");
-    expect((await adminJson("/v1/workstreams", { body: { goal: "g", subscriber: w.agent } }, 400)).error.code).toBe("invalid_message");
-  });
-
   it("the previous release's grants field is refused, never ignored (that would widen the tools)", async () => {
     const s = await cellWithSandbox();
     const r = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, grants: ["notify"], start: false } }, 400);
     expect(r.error.message).toContain("overrides.tools");
   });
 
-  it("a stored owner in another workstream (an older record) still can't be notified", async () => {
-    const other = await cellWithSandbox();
-    const c = await adminJson("/v1/agents", { body: { template: "captain", workstream: other.workstream, cell: other.cell, start: false } }, 201);
-    const s = await cellWithSandbox();
-    const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
-    await editAgent(w.agent, (i) => {
-      i.owner = c.agent;
-    });
-    await nextCommands(s.brain.ws, isStartOf(w.agent));
-    const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
-    ws.send({ type: "tool_call", seq: 1, call: "cal_own-1", turn: "trn_x", name: "notify", arguments: { to: "captain", message: "hi" } });
-    expect((await ws.next("tool_result", (m) => m.call === "cal_own-1")).outcome.error.code).toBe("forbidden");
-    expect(await agentStub(c.agent).turns()).toEqual([]);
-  });
-
-  it("an ask re-run after its escalation changed is applied once, where it first went", async () => {
-    const s = await cellWithSandbox();
-    const w = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox } }, 201);
-    await nextCommands(s.brain.ws, isStartOf(w.agent));
-    const ws = await runner(w.agent, s.brain.host, s.brain.host_token);
-    const ask = { type: "tool_call", call: "cal_rr-1", turn: "trn_x", name: "ask", arguments: { question: "Rerouted?" } };
-    ws.send({ ...ask, seq: 1 });
-    await ws.next("ack", (m) => m.up_to >= 1);
-    expect((await wsStub(s.workstream).events()).filter((e) => e.type === "needs_input").length).toBe(1);
-    // An eviction mid-call, across a deploy that sends this agent's questions to the user.
-    await editAgent(w.agent, (i) => {
-      i.escalate_to = "user";
-    });
-    await runInDurableObject(agentStub(w.agent), (_i: AgentDO, st) => {
-      st.storage.sql.exec("UPDATE tool_calls SET status = 'dispatching', outcome = NULL");
-    });
-    ws.send({ ...ask, seq: 2 });
-    await ws.next("ack", (m) => m.up_to >= 2);
-    expect((await wsStub(s.workstream).events()).filter((e) => e.type === "needs_input").length).toBe(1);
-    expect((await wsStub(s.workstream).userNotifications()).some((n) => n.text.includes("Rerouted?"))).toBe(false);
-  });
 });
 
 describe("CatalogDO storage", () => {
@@ -390,7 +281,7 @@ describe("the task ledger's removal", () => {
     await nextCommands(s.brain.ws, isStartOf(a.agent));
     const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     const names = (await toolNames(ws)).map((t) => t.name);
-    expect(names).toEqual(expect.arrayContaining(["notify", "checkpoint"]));
+    expect(names).toEqual(expect.arrayContaining(["read_transcript", "checkpoint"]));
     expect(names.filter((n) => n.startsWith("task_"))).toEqual([]);
     ws.send({ type: "tool_call", seq: 1, call: "cal_task", turn: "trn_x", name: "task_list", arguments: {} });
     const outcome = (await ws.next("tool_result", (m) => m.call === "cal_task")).outcome;
@@ -446,7 +337,7 @@ describe("the channels' removal", () => {
     const worker = SEED_CATALOG.templates.worker!;
     const captain = SEED_CATALOG.templates.captain!;
     const untouched = JSON.stringify({ ...worker, capabilities: ["nest", "hands"], later_field: 1 });
-    const mineAfter = { tools: ["notify"], rules: [{ pattern: "mcp__nest__*", decision: "allow" }], prompt: "Mine.", later_field: 2 };
+    const mineAfter = { tools: ["checkpoint"], rules: [{ pattern: "mcp__nest__*", decision: "allow" }], prompt: "Mine.", later_field: 2 };
     const rows = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
       const sql = st.storage.sql;
       // As the previous release left the live catalog: the seed with spawning's old prompt, the channel
@@ -459,7 +350,7 @@ describe("the channels' removal", () => {
         ...Object.fromEntries(Object.entries(SEED_CATALOG.capabilities).map(([n, c]) => [n, { ...c, grants: [] }])),
         spawning: { ...SEED_CATALOG.capabilities.spawning!, prompt: SPAWNING_PROMPT_V5, grants: [] },
         ...OLD_CHANNELS,
-        mine: { ...mineAfter, tools: ["post", "notify", "read"], grants: [{ action: "read", channel: "team/*" }] },
+        mine: { ...mineAfter, tools: ["post", "checkpoint", "read"], grants: [{ action: "read", channel: "team/*" }] },
       };
       for (const [n, c] of Object.entries(caps)) sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", n, JSON.stringify(c));
       sql.exec("INSERT INTO capabilities (name, body) VALUES ('garbled', 'not json')");
@@ -475,7 +366,7 @@ describe("the channels' removal", () => {
       expect({ templates: read("templates"), capabilities: read("capabilities") }).toEqual(once);
       return { ...once, version: sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value };
     });
-    expect(rows.version).toBe("7");
+    expect(rows.version).toBe(String(SEED_VERSION));
     expect(Object.keys(rows.capabilities).sort()).toEqual([...Object.keys(SEED_CATALOG.capabilities), "garbled", "mine"].sort());
     // Raw rows: the channel tools and grants gone from each, every other field kept.
     expect(JSON.parse(rows.capabilities.mine!)).toEqual(mineAfter);
@@ -518,7 +409,7 @@ describe("the channels' removal", () => {
     await nextCommands(s.brain.ws, isStartOf(a.agent));
     const ws = await runner(a.agent, s.brain.host, s.brain.host_token);
     const names = (await toolNames(ws)).map((t) => t.name);
-    expect(names).toEqual(expect.arrayContaining(["notify", "checkpoint"]));
+    expect(names).toEqual(expect.arrayContaining(["read_transcript", "checkpoint"]));
     expect(names.filter((n) => ["post", "read", "message"].includes(n))).toEqual([]);
     ws.send({ type: "tool_call", seq: 1, call: "cal_post", turn: "trn_x", name: "post", arguments: { channel: "user", text: "hi" } });
     const outcome = (await ws.next("tool_result", (m) => m.call === "cal_post")).outcome;
@@ -580,5 +471,81 @@ describe("the channels' removal", () => {
       expect(await runDurableObjectAlarm(empty)).toBe(true);
       expect(await runInDurableObject(empty, (_i: ChannelDO, st) => st.storage.getAlarm()), `deadlines table: ${table}`).toBeNull();
     }
+  });
+});
+
+// Workstreams and the messaging tools left the platform (docs/README.md#principles): seed version 8
+// takes `messaging` and `events` and the tools that left out of stored catalogs.
+describe("the messaging tools' removal", () => {
+  const catalogStub = (name: string) => env.CATALOG.get(env.CATALOG.idFromName(name));
+  const rawRows = (stub: DurableObjectStub<CatalogDO>, table: "templates" | "capabilities") => runInDurableObject(stub, (_i: CatalogDO, st) =>
+    Object.fromEntries(st.storage.sql.exec<{ name: string; body: string }>(`SELECT name, body FROM ${table}`).toArray().map((r) => [r.name, JSON.parse(r.body)])));
+
+  it("a catalog at version 7 loses messaging and events, and the tools that left everywhere; everything else stays", async () => {
+    const stub = catalogStub(uniqueName("catalog-v7"));
+    const v1 = SEED_CATALOG_V1;
+    const mineAfter = { tools: ["read_transcript"], rules: [{ pattern: "mcp__nest__*", decision: "allow" }], prompt: "Mine.", later_field: 3 };
+    const rows = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
+      const sql = st.storage.sql;
+      // As the previous release left the live catalog: the seed with `messaging`, `events` and the
+      // workstream tools of `management`, templates listing them with `escalate_to` and `subscribe`, an
+      // operator's capability naming `notify` among others, and an operator's template.
+      sql.exec("DELETE FROM capabilities");
+      sql.exec("DELETE FROM templates");
+      sql.exec("UPDATE kv SET value = '7' WHERE key = 'seed_version'");
+      const caps: Record<string, unknown> = {
+        ...SEED_CATALOG.capabilities,
+        messaging: v1.capabilities.messaging, events: v1.capabilities.events,
+        management: { ...v1.capabilities.management!, tools: v1.capabilities.management!.tools.filter((t) => !RETIRED_TOOLS.includes(t)) },
+        mine: { ...mineAfter, tools: ["notify", "read_transcript", "emit"] },
+      };
+      for (const [n, c] of Object.entries(caps)) sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", n, JSON.stringify(c));
+      const tpl = (name: string, body: unknown) => sql.exec("INSERT INTO templates (name, body) VALUES (?, ?)", name, JSON.stringify(body));
+      const worker = SEED_CATALOG.templates.worker!;
+      const captain = SEED_CATALOG.templates.captain!;
+      tpl("worker", { ...worker, capabilities: v1.templates.worker!.capabilities.filter((c) => c !== "subagents"), escalate_to: "workstream", subscribe: [] });
+      tpl("captain", { ...captain, capabilities: [...v1.templates.captain!.capabilities, "spawning"], escalate_to: "user", subscribe: ["workstream"] });
+      tpl("solo", { ...captain, capabilities: ["nest", "messaging", "mine"], escalate_to: "user", subscribe: [] });
+      new CatalogDO(st, env as never);
+      return sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value;
+    });
+    expect(rows).toBe("8");
+    const caps = await rawRows(stub, "capabilities");
+    expect(Object.keys(caps).sort()).toEqual([...Object.keys(SEED_CATALOG.capabilities), "mine"].sort());
+    // Raw rows: the tools that left gone from each, every other field kept.
+    expect(caps.mine).toEqual(mineAfter);
+    expect(caps.management.tools).toEqual(SEED_CATALOG.capabilities.management!.tools);
+    for (const [n, c] of Object.entries(caps)) expect((c.tools as string[]).filter((t) => MESSAGING_TOOLS_REMOVED.includes(t)), n).toEqual([]);
+    const tpls = await rawRows(stub, "templates");
+    expect(tpls.worker.capabilities).toEqual(SEED_CATALOG.templates.worker!.capabilities);
+    expect(tpls.captain.capabilities).toEqual(SEED_CATALOG.templates.captain!.capabilities);
+    expect(tpls.solo.capabilities).toEqual(["nest", "mine"]);
+    // The previous release's fields stay in the rows (it requires `escalate_to`, for a rollback).
+    expect(tpls.worker).toMatchObject({ escalate_to: "workstream", subscribe: [] });
+    for (const [name, hands] of [["worker", true], ["captain", false], ["solo", false]] as const) {
+      const spec = await stub.expand({ template: name, hands, by: "operator" });
+      expect(spec.tools.filter((t) => MESSAGING_TOOLS_REMOVED.includes(t)), name).toEqual([]);
+      expect(spec, name).not.toHaveProperty("escalate_to");
+      expect(spec, name).not.toHaveProperty("subscribe");
+    }
+  });
+
+  it("template rows written now carry the previous release's escalate_to and subscribe; the catalog shows neither", async () => {
+    // A fresh seed.
+    const fresh = await rawRows(catalogStub(uniqueName("catalog-fresh")), "templates");
+    for (const n of ["worker", "captain"]) expect(fresh[n], n).toMatchObject({ escalate_to: "user", subscribe: [] });
+    // An operator's write.
+    const name = uniqueName("tpl");
+    await adminJson(`/v1/admin/templates/${name}`, {
+      method: "PUT", body: { capabilities: ["nest"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "optional", credential: "claude_oauth_token" },
+    });
+    const live = await rawRows(catalogStub("catalog"), "templates");
+    expect(live[name]).toMatchObject({ escalate_to: "user", subscribe: [], capabilities: ["nest"] });
+    const cat = await adminJson("/v1/admin/catalog");
+    for (const n of [name, "worker", "captain"]) {
+      expect(cat.templates[n], n).not.toHaveProperty("escalate_to");
+      expect(cat.templates[n], n).not.toHaveProperty("subscribe");
+    }
+    await adminJson(`/v1/admin/templates/${name}`, { method: "DELETE" });
   });
 });

@@ -286,7 +286,7 @@ pub mod proxy {
         /// `HostEventBody::EgressAudit`.
         Audit { records: Vec<EgressAuditRecord> },
         /// High-priority security signal, sent immediately (the request is also audited with
-        /// verdict `alert`). nestd turns it into an egress-alert workstream event.
+        /// verdict `alert`). nestd turns it into an egress-alert sandbox event.
         Alert {
             ts_ms: TimestampMs,
             sandbox: SandboxId,

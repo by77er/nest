@@ -5,7 +5,7 @@ import {
   AgentEvent, AgentId, AgentRole, AgentState, AskId, CallId, CliCommand, CliResult, CommandId, CommitReason, Epoch, ErrorBody,
   EgressPolicy, ForkMode, GenerationId, GenerationKind, GenerationRecord, HostId, HostRole, InjectionSecret,
   ManifestHash, MessageId, openEnum, RequestId, Resources, SandboxId, SandboxState, Seq, SessionId, SuspendMode,
-  TaskInfo, TimestampMs, TurnId, TurnInputKind, WorkstreamEvent, WorkstreamId,
+  TaskInfo, TimestampMs, TurnId, TurnInputKind, SandboxEvent, WorkstreamId,
 } from "./model";
 import { BindingKey, GuestInfo, HandsTarget } from "./gateway";
 export { GuestInfo, HandsTarget };
@@ -216,7 +216,8 @@ const AgentStartFields = {
    * agent's tools, hands and prompt come from its spec, never from a role.
    */
   role: AgentRole.optional(),
-  workstream: WorkstreamId,
+  /** Compat: runners of the previous release require it (and ignore it); workstreams left the platform. */
+  workstream: WorkstreamId.optional(),
   /** The agent epoch AgentDO issued for this brain start; absent only from the previous release. */
   epoch: Epoch.optional(),
   resume: SessionResume.optional(),
@@ -228,7 +229,9 @@ const AgentStartFields = {
 
 export const CommandBodyVariants = [
   z.object({
-    type: z.literal("sandbox_create"), sandbox: SandboxId, workstream: WorkstreamId, epoch: Epoch, image: z.string(),
+    type: z.literal("sandbox_create"), sandbox: SandboxId,
+    /** Compat: hosts of the previous release require it (and ignore it); workstreams left the platform. */
+    workstream: WorkstreamId.optional(), epoch: Epoch, image: z.string(),
     resources: Resources, policy: EgressPolicy, from: GenerationRecord.optional(),
   }),
   z.object({ type: z.literal("sandbox_suspend"), sandbox: SandboxId, epoch: Epoch, mode: SuspendMode }),
@@ -237,7 +240,8 @@ export const CommandBodyVariants = [
   z.object({ type: z.literal("sandbox_checkpoint"), sandbox: SandboxId, epoch: Epoch, reason: CommitReason }),
   z.object({
     type: z.literal("sandbox_fork"), parent: SandboxId, parent_epoch: Epoch, child: SandboxId, child_epoch: Epoch,
-    child_workstream: WorkstreamId, mode: ForkMode, policy: EgressPolicy,
+    /** Compat, as `sandbox_create.workstream`. */
+    child_workstream: WorkstreamId.optional(), mode: ForkMode, policy: EgressPolicy,
   }),
   z.object({ type: z.literal("sandbox_destroy"), sandbox: SandboxId, epoch: Epoch }),
   z.object({ type: z.literal("policy_update"), sandbox: SandboxId, epoch: Epoch, policy: EgressPolicy }),
@@ -323,7 +327,8 @@ export const HostEventVariants = [
     parent: GenerationId.optional(), kind: GenerationKind, disk_manifest: ManifestHash,
     mem_manifest: ManifestHash.optional(), reason: CommitReason,
   }),
-  z.object({ ...hostEventBase, type: z.literal("workstream"), event: WorkstreamEvent }),
+  /** What a host saw about a sandbox it holds; the tag `workstream` is historical (a rename is two releases). */
+  z.object({ ...hostEventBase, type: z.literal("workstream"), event: SandboxEvent }),
   z.object({ ...hostEventBase, type: z.literal("egress_audit"), records: z.array(EgressAuditRecord) }),
   z.object({ ...hostEventBase, type: z.literal("capacity"), capacity: Capacity }),
   /** Sent on every change of the host's tunnel state. */

@@ -9,6 +9,7 @@ const prefixed = (prefix: string) => z.string().startsWith(prefix);
 export const HostId = prefixed("hst_");
 export const SandboxId = prefixed("sbx_");
 export const AgentId = prefixed("agt_");
+/** Compat, one release back: the `ws_` value hosts and runners of the previous release require (docs/interfaces/#pending-contract-changes). */
 export const WorkstreamId = prefixed("ws_");
 export const GenerationId = prefixed("gen_");
 export const SessionId = prefixed("ses_");
@@ -121,6 +122,7 @@ export type AgentLifecycle = z.output<typeof AgentLifecycle>;
 // --- Egress policy -------------------------------------------------------------------------------
 
 export const HostPattern = z.string();
+/** `workstream` is the operator layer's historical wire name (hosts parse a closed enum): see SandboxDO's `OPERATOR_LAYER`. */
 export const PolicyLayer = z.enum(["base", "workstream", "sandbox"]);
 export type PolicyLayer = z.output<typeof PolicyLayer>;
 
@@ -225,6 +227,7 @@ export function decideEgress(policy: EgressPolicy, host: string, port: number, n
 
 // --- Canonical agent events ------------------------------------------------------------------------
 
+/** `event_batch` is no longer sent (workstream event batches left the platform); a turn the previous release queued still parses. */
 export const TurnInputKind = z.enum(["user", "event_batch", "inbox", "ask_answer", "recovery"]);
 export type TurnInputKind = z.output<typeof TurnInputKind>;
 
@@ -252,7 +255,10 @@ export const TaskInfo = z.object({
 export type TaskInfo = z.output<typeof TaskInfo>;
 
 export const Urgency = z.enum(["low", "normal", "high"]);
-/** A `nest` CLI command run by a program inside a sandbox (guest `CliCommand`). */
+/**
+ * A `nest` CLI command run by a program inside a sandbox (guest `CliCommand`). `notify`, `emit` and `ask`
+ * left with their tools: kept so a guest of the previous release parses, and answered `unknown_tool`.
+ */
 export const CliCommand = z.discriminatedUnion("command", [
   z.object({ command: z.literal("notify"), to: z.string(), message: z.string(), urgency: Urgency.default("normal") }),
   z.object({ command: z.literal("emit"), event: z.string(), payload: z.unknown().default(null) }),
@@ -305,10 +311,14 @@ export const AgentEventVariants = [
 export const AgentEvent = z.discriminatedUnion("type", AgentEventVariants);
 export type AgentEvent = z.output<typeof AgentEvent>;
 
-// --- Workstream events -----------------------------------------------------------------------------
+// --- Sandbox events --------------------------------------------------------------------------------
 
-const wsEventBase = {
-  workstream: WorkstreamId,
+/**
+ * What a host saw about a sandbox it holds (host_event `workstream`, a historical tag). `workstream`
+ * is compat: the `ws_` value the control plane sent, echoed back; nothing reads it.
+ */
+const sandboxEventBase = {
+  workstream: WorkstreamId.optional(),
   ts_ms: TimestampMs,
   agent: AgentId.optional(),
   sandbox: SandboxId.optional(),
@@ -320,32 +330,13 @@ export const EGRESS_ALERT_REASONS = ["placeholder_wrong_host", "domain_fronting"
 export const EgressAlertReason = openEnum(EGRESS_ALERT_REASONS, "unknown");
 export type EgressAlertReason = z.output<typeof EgressAlertReason>;
 
-export const WorkstreamEventVariants = [
-  z.object({ ...wsEventBase, type: z.literal("started"), goal: z.string() }),
-  z.object({ ...wsEventBase, type: z.literal("progress"), summary: z.string() }),
-  z.object({ ...wsEventBase, type: z.literal("needs_input"), ask: AskId, question: z.string() }),
-  z.object({ ...wsEventBase, type: z.literal("blocked"), reason: z.string() }),
-  z.object({ ...wsEventBase, type: z.literal("pr_opened"), url: z.string(), title: z.string() }),
-  z.object({ ...wsEventBase, type: z.literal("completed"), summary: z.string() }),
-  z.object({ ...wsEventBase, type: z.literal("failed"), error: ErrorBody }),
-  z.object({ ...wsEventBase, type: z.literal("budget_exceeded"), detail: z.string() }),
-  z.object({ ...wsEventBase, type: z.literal("quota_parked"), retry_after_ms: U64.optional() }),
-  z.object({ ...wsEventBase, type: z.literal("orphaned_work"), generation: GenerationId, stale_epoch: Epoch }),
-  z.object({ ...wsEventBase, type: z.literal("egress_denied"), host: z.string(), port: U16 }),
-  z.object({ ...wsEventBase, type: z.literal("egress_alert"), host: z.string(), binding: z.string().optional(), reason: EgressAlertReason }),
-  z.object({ ...wsEventBase, type: z.literal("port_opened"), port: U16 }),
-  z.object({ ...wsEventBase, type: z.literal("port_exposed"), port: U16, url: z.string() }),
+export const SandboxEventVariants = [
+  z.object({ ...sandboxEventBase, type: z.literal("egress_denied"), host: z.string(), port: U16 }),
+  z.object({ ...sandboxEventBase, type: z.literal("egress_alert"), host: z.string(), binding: z.string().optional(), reason: EgressAlertReason }),
+  z.object({ ...sandboxEventBase, type: z.literal("port_opened"), port: U16 }),
 ] as const;
-export const WorkstreamEvent = z.discriminatedUnion("type", WorkstreamEventVariants);
-export type WorkstreamEvent = z.output<typeof WorkstreamEvent>;
-
-const DECISION_EVENTS = new Set([
-  "needs_input", "blocked", "completed", "failed", "pr_opened", "budget_exceeded", "orphaned_work", "egress_alert",
-]);
-/** Only these wake a captain. */
-export function isDecisionEvent(e: Pick<WorkstreamEvent, "type">): boolean {
-  return DECISION_EVENTS.has(e.type);
-}
+export const SandboxEvent = z.discriminatedUnion("type", SandboxEventVariants);
+export type SandboxEvent = z.output<typeof SandboxEvent>;
 
 // --- Generations -------------------------------------------------------------------------------------
 

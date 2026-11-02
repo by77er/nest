@@ -157,8 +157,7 @@ function repo(installation = 1000 + Math.floor(Math.random() * 1e6)): string {
 async function placed(policy: Record<string, unknown> = {}): Promise<{ sandbox: string; ws: Ws }> {
   const cell = uniqueCell();
   const h = await connectHost(cell);
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "x" } }, 201);
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell, policy } }, 201);
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell, policy } }, 201);
   return { sandbox: sbx.sandbox, ws: h.ws };
 }
 const ghSecret = (cmds: any[]) => cmds.find((c) => c.type === "secrets_update")?.secrets.find((s: any) => s.binding === "github");
@@ -203,7 +202,7 @@ describe("a sandbox's push allowlist", () => {
     expect(gh.mints.at(-1)!.repositories).toEqual([mine.split("/")[1]]);
     expect(ghSecret(cmds).value).toBe(gh.mints.at(-1)!.token);
     // Emptied: the proxy's set is replaced without it, the policy has no binding, and BrokerDO forgot it.
-    const policy = await stub.setWorkstreamPolicy({ repos: [] });
+    const policy = await stub.setPolicy({ repos: [] });
     expect(policy.inject).toEqual([]);
     expect(policy.guards!.find((g) => g.name === "github-push")!.allow).toBeUndefined();
     cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
@@ -238,10 +237,10 @@ describe("a sandbox's push allowlist", () => {
     let release!: () => void;
     gh.hold = new Promise<void>((r) => { release = r; });
     const before = gh.mints.length;
-    const slow = stub.setWorkstreamPolicy({ repos: [a] });
+    const slow = stub.setPolicy({ repos: [a] });
     // Let the first mint reach the fake and wait there.
     await new Promise((r) => setTimeout(r, 200));
-    await stub.setWorkstreamPolicy({ repos: [b] });
+    await stub.setPolicy({ repos: [b] });
     release();
     await slow;
     const minted = gh.mints.slice(before);
@@ -273,7 +272,7 @@ describe("a sandbox's push allowlist", () => {
   it("guards the operator writes by hand are layered with the constructed ones, in the same policy push", async () => {
     const { sandbox, ws } = await placed({});
     const mine = { name: "registry-publish", hosts: ["registry.npmjs.org"], scope: [{ methods: ["PUT"] }], reason: "no publishing" };
-    const policy = await sandboxStub(sandbox).setWorkstreamPolicy({ guards: [mine] });
+    const policy = await sandboxStub(sandbox).setPolicy({ guards: [mine] });
     expect(policy.guards!.map((g) => g.name)).toEqual([...githubGuards([]).map((g) => g.name), "registry-publish"]);
     const [update] = (await nextCommands(ws, (c) => c.type === "policy_update")).filter((c) => c.type === "policy_update");
     expect(update.policy.guards.at(-1)).toEqual(mine);

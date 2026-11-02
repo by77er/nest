@@ -1,6 +1,6 @@
 // Regression tests for the control-plane review findings (one block per finding).
 import { env, runInDurableObject, SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import type { FleetDO } from "../src/do/fleet";
 import { Deadlines } from "../src/lib/reliable";
@@ -14,26 +14,22 @@ const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 
-async function workstream() {
-  return (await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "x" } }, 201)).workstream;
-}
 
 async function setup(opts: { start?: boolean; captain?: boolean } = {}) {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-regress" } });
   const sbxHost = await connectHost(cell);
   const host = await connectHost(cell, "brain");
-  const ws = await workstream();
   let captain: string | undefined;
   if (opts.captain) {
-    captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: ws, cell } }, 201)).agent;
+    captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent;
   }
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
   const start = opts.start ?? true;
-  const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream: ws, sandbox: sbx.sandbox, cell, start, ...(captain ? { captain } : {}) } }, 201);
+  const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell, start, ...(captain ? { captain } : {}) } }, 201);
   if (start) await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { cell, host, sbxHost, workstream: ws, sandbox: sbx.sandbox as string, agent: worker.agent as string, captain };
+  return { cell, host, sbxHost, sandbox: sbx.sandbox as string, agent: worker.agent as string, captain };
 }
 
 async function runner(agent: string, hostId: string, token: string, instance = "rin_one", epoch = 1, extra: Record<string, unknown> = {}) {
@@ -52,8 +48,7 @@ describe("#1 one lease, one host", () => {
   it("refuses to re-place a placed sandbox, and FleetDO never overwrites a lease", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
-    const ws = await workstream();
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     const [create] = await nextCommands(a.ws, (c) => c.type === "sandbox_create");
     expect(create.epoch).toBe(1);
     await connectHost(cell);
@@ -61,7 +56,7 @@ describe("#1 one lease, one host", () => {
     expect(res.status).toBe(409);
     expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 1 });
     await expect(Promise.resolve().then(() => fleetStub(cell).place({
-      sandbox: sbx.sandbox, workstream: ws, epoch: 9, image: "x", resources: { vcpus: 1, memory_mib: 1, disk_gib: 1 },
+      sandbox: sbx.sandbox, workstream: "ws_test", epoch: 9, image: "x", resources: { vcpus: 1, memory_mib: 1, disk_gib: 1 },
       policy: { version: 1, allow: [], passthrough: [], inject: [], tcp: [], limits: { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 } },
     }))).rejects.toThrow(/already holds a lease/);
   });
@@ -69,8 +64,7 @@ describe("#1 one lease, one host", () => {
   it("re-places a failed sandbox under a new epoch after fencing its old host", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
-    const ws = await workstream();
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     const [create] = await nextCommands(a.ws, (c) => c.type === "sandbox_create");
     const seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "command_result", cmd: create.cmd, outcome: { status: "error", error: { code: "internal", message: "boom", retryable: false } } }]);
     await a.ws.next("ack", (m) => m.up_to >= seq);
@@ -90,7 +84,7 @@ describe("#2 a restarted runner is a new lineage", () => {
     const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "one" } }, 201)).turn;
     await r1.ws.next("run_turn", (m) => m.turn === t1);
     for (let i = 1; i <= 3; i++) {
-      r1.ws.send(toolCall(i, `cal_a-${i}`, "emit", { event: "progress", summary: `p${i}` }));
+      r1.ws.send(toolCall(i, `cal_a-${i}`, "read_transcript", { agent: s.agent }));
       await r1.ws.next("tool_result", (m) => m.call === `cal_a-${i}`);
     }
     r1.ws.send({ type: "events", seq: 4, events: [{ agent: s.agent, epoch: 1, seq: 1, ts_ms: 1, turn: t1, type: "turn_started", input_kind: "user" }] });
@@ -103,7 +97,7 @@ describe("#2 a restarted runner is a new lineage", () => {
     const recovery = await r2.ws.next("run_turn");
     expect(recovery.input.kind).toBe("recovery");
     expect(recovery.input.text).toContain("one");
-    r2.ws.send(toolCall(1, "cal_b-1", "emit", { event: "progress", summary: "new" }));
+    r2.ws.send(toolCall(1, "cal_b-1", "read_transcript", { agent: s.agent }));
     expect((await r2.ws.next("tool_result", (m) => m.call === "cal_b-1")).outcome.status).toBe("ok");
     r2.ws.send({ type: "events", seq: 2, events: [
       { agent: s.agent, epoch: 1, seq: 1, ts_ms: 2, turn: recovery.turn, type: "turn_started", input_kind: "recovery" },
@@ -188,9 +182,8 @@ describe("#4 reassignment can't strand leases", () => {
   it("one agent failing to follow doesn't stop the other sandboxes from moving", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
-    const ws = await workstream();
-    const s1 = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
-    const s2 = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    const s1 = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
+    const s2 = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     for (const s of [s1, s2]) await sandboxStub(s.sandbox).reportState(a.host, 1, "running", null, null);
     await sandboxStub(s1.sandbox).attach("agt_doesnotexist0000000000000");
     const b = await connectHost(cell);
@@ -202,8 +195,7 @@ describe("#4 reassignment can't strand leases", () => {
   it("without capacity, the sandbox waits and is placed by its own retry alarm", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
-    const ws = await workstream();
-    const s1 = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    const s1 = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await sandboxStub(s1.sandbox).reportState(a.host, 1, "running", null, null);
     a.ws.close();
     await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
@@ -250,8 +242,7 @@ describe("#6 STONITH by fence can't stall", () => {
     const cell = uniqueCell();
     const fleet = fleetStub(cell);
     const a = await connectHost(cell);
-    const ws = await workstream();
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(a.ws, (c) => c.type === "sandbox_create");
     await runInDurableObject(fleet, (inst: FleetDO, st) => {
       inst.ec2Override = null;
@@ -296,10 +287,10 @@ describe("#8 tool calls cut off by an eviction", () => {
     const s = await setup({ captain: true });
     // Simulate an eviction mid-dispatch: the row exists, the seq was never marked processed.
     await runInDurableObject(agentStub(s.agent), (_i, st) => {
-      st.storage.sql.exec("INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (1, 'cal_e-1', 'notify', 'dispatching', NULL, 0)");
+      st.storage.sql.exec("INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (1, 'cal_e-1', 'read_transcript', 'dispatching', NULL, 0)");
     });
     const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
-    ws.send(toolCall(1, "cal_e-1", "notify", { to: "captain", message: "hello" }));
+    ws.send(toolCall(1, "cal_e-1", "read_transcript", { agent: s.agent }));
     expect((await ws.next("tool_result", (m) => m.call === "cal_e-1")).outcome.status).toBe("ok");
   });
 });
@@ -319,10 +310,9 @@ describe("#9 no secrets at rest outside BrokerDO", () => {
   it("injection secrets travel by reference too (policy set through the admin API)", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const ws = await workstream();
     await adminJson("/v1/admin/secrets/inject:github", { method: "PUT", body: { value: "ghs_REALVALUE" } });
     const sbx = await adminJson("/v1/sandboxes", {
-      body: { workstream: ws, cell, policy: { allow: [{ host: "api.example.com" }], inject: [{ name: "github", hosts: ["api.github.com"], placeholder: "nest-ph-github-1", locations: [{ type: "authorization_bearer" }] }] } },
+      body: { cell, policy: { allow: [{ host: "api.example.com" }], inject: [{ name: "github", hosts: ["api.github.com"], placeholder: "nest-ph-github-1", locations: [{ type: "authorization_bearer" }] }] } },
     }, 201);
     const [secrets] = await nextCommands(h.ws, (c) => c.type === "secrets_update");
     expect(secrets.secrets[0]).toMatchObject({ binding: "github", value: "ghs_REALVALUE" });
@@ -364,13 +354,23 @@ describe("#12 host events are scoped to the reporting host", () => {
     expect((await agentStub(s.agent).info()).state).toBe("starting");
   });
 
-  it("a workstream event about a sandbox the host doesn't hold is dropped", async () => {
+  it("a sandbox event about a sandbox the host doesn't hold is dropped; the holder's is logged", async () => {
     const s = await setup();
     const other = await connectHost(s.cell);
-    const seq = sendEvents(other.ws, [{ ts_ms: Date.now(), type: "workstream", event: { workstream: s.workstream, ts_ms: Date.now(), sandbox: s.sandbox, epoch: 1, type: "egress_alert", host: "evil.example", reason: "domain_fronting" } }]);
-    await other.ws.next("ack", (m) => m.up_to >= seq);
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
-    expect(events.some((e) => e.type === "egress_alert")).toBe(false);
+    const warn = vi.spyOn(console, "warn");
+    try {
+      const alert = { ts_ms: Date.now(), sandbox: s.sandbox, epoch: 1, type: "egress_alert", host: "evil.example", reason: "domain_fronting" };
+      const seq = sendEvents(other.ws, [{ ts_ms: Date.now(), type: "workstream", event: alert }]);
+      await other.ws.next("ack", (m) => m.up_to >= seq);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`dropping egress_alert from ${other.host}`));
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("egress_alert evil.example"));
+      // The holder's, with the compat `workstream` an older host echoes.
+      const seq2 = sendEvents(s.sbxHost.ws, [{ ts_ms: Date.now(), type: "workstream", event: { ...alert, workstream: `ws_${s.sandbox.slice(4)}` } }]);
+      await s.sbxHost.ws.next("ack", (m) => m.up_to >= seq2);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`${s.sandbox}@1 egress_alert evil.example (domain_fronting)`));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("a salvage commit is accepted only from the host that held that epoch", async () => {
@@ -389,9 +389,8 @@ describe("#13 a nestd restart doesn't fail live sandboxes", () => {
   it("a pending create reported by the new process completes; an unreported one is re-issued", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const ws = await workstream();
-    const s1 = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
-    const s2 = await adminJson("/v1/sandboxes", { body: { workstream: ws, cell } }, 201);
+    const s1 = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
+    const s2 = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(h.ws, (c) => c.type === "sandbox_create" && c.sandbox === s2.sandbox);
     const restarted = await Ws.connect("/v1/fleet", h.host_token);
     restarted.send(hostHello(h.host, cell, { instance_id: "nestd-restarted", sandboxes: [{ sandbox: s1.sandbox, epoch: 1, state: "running", dirty: false }] }));
@@ -447,11 +446,11 @@ describe("#15 AWS enrollment binds the role; a bad CSR doesn't burn a token", ()
 });
 
 describe("#16 prompt-injection blast radius", () => {
-  it("notify can't reach an agent in another workstream", async () => {
+  it("read_transcript can't read an agent it doesn't own", async () => {
     const a = await setup({ captain: true });
     const b = await setup();
     const { ws } = await runner(a.agent, a.host.host, a.host.host_token);
-    ws.send(toolCall(1, "cal_n-1", "notify", { to: b.agent, message: "hi" }));
+    ws.send(toolCall(1, "cal_n-1", "read_transcript", { agent: b.agent }));
     expect((await ws.next("tool_result", (m) => m.call === "cal_n-1")).outcome.error.code).toBe("forbidden");
   });
 });
@@ -578,7 +577,7 @@ describe("#21 a deadline re-armed while it runs isn't dropped", () => {
   it("an unplaced sandbox keeps retrying while there is no capacity", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
-    const s1 = await adminJson("/v1/sandboxes", { body: { workstream: await workstream(), cell } }, 201);
+    const s1 = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await sandboxStub(s1.sandbox).reportState(a.host, 1, "running", null, null);
     a.ws.close();
     await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
@@ -669,7 +668,7 @@ describe("#23 captains move off a silent brain host", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-regress" } });
     const a = await connectHost(cell, "brain");
-    const captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream: await workstream(), cell } }, 201)).agent as string;
+    const captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
     await nextCommands(a.ws, (c) => c.type === "agent_start" && c.agent === captain);
     const r = await runner(captain, a.host, a.host_token, "rin_cap", 1);
     await adminJson(`/v1/agents/${captain}/turns`, { body: { text: "plan" } }, 201);
@@ -687,15 +686,11 @@ describe("#23 captains move off a silent brain host", () => {
 });
 
 describe("docs #13 guest CLI mapping", () => {
-  it("maps urgency low, validates emit events, defaults the summary, and unexposes", async () => {
+  it("unexposes; notify and emit (a previous release's guest) answer unknown_tool", async () => {
     const s = await setup({ captain: true });
     const stub = agentStub(s.agent);
-    expect((await stub.guestCli(s.sandbox, 1, { command: "notify", to: "captain", message: "m", urgency: "low" })).status).toBe("ok");
-    const bad = await stub.guestCli(s.sandbox, 1, { command: "emit", event: "nonsense", payload: null });
-    expect(bad).toMatchObject({ status: "error", error: { code: "invalid_message" } });
-    expect((await stub.guestCli(s.sandbox, 1, { command: "emit", event: "progress", payload: null })).status).toBe("ok");
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
-    expect(events.at(-1)).toMatchObject({ type: "progress", summary: "progress" });
+    expect(await stub.guestCli(s.sandbox, 1, { command: "notify", to: "captain", message: "m", urgency: "low" })).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
+    expect(await stub.guestCli(s.sandbox, 1, { command: "emit", event: "progress", payload: null })).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
     expect((await stub.guestCli(s.sandbox, 1, { command: "expose", port: 3000, exposed: false })).status).toBe("ok");
     const [un] = await nextCommands(s.sbxHost.ws, (c) => c.type === "port_unexpose");
     expect(un).toMatchObject({ sandbox: s.sandbox, port: 3000 });
@@ -729,43 +724,28 @@ describe("docs #8 hello.agents reconciliation", () => {
 });
 
 describe("#24 a platform tool re-run after an eviction repeats no side effect", () => {
-  it("notify, emit and ask each apply once when a call is dispatched again", async () => {
-    const s = await setup({ captain: true });
+  it("agent_spawn applies once when a call is dispatched again: one child, its task posted once", async () => {
+    const s = await setup();
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.tools = [...info.tools, "agent_spawn"];
+      info.spawn = ["captain"];
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
     const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
-    const calls: [string, string, unknown][] = [
-      ["cal_i-1", "notify", { to: "captain", message: "hello once" }],
-      ["cal_i-2", "notify", { to: "user", message: "user once" }],
-      ["cal_i-3", "emit", { event: "progress", summary: "progress once" }],
-    ];
-    let seq = 0;
-    for (const [call, name, args] of calls) {
-      ws.send(toolCall(++seq, call, name, args));
-      expect((await ws.next("tool_result", (m) => m.call === call)).outcome.status).toBe("ok");
-    }
-    ws.send(toolCall(++seq, "cal_i-4", "ask", { question: "which way?", to: "user" }));
-    // The ask has applied once (it posts its question) before the eviction is staged.
-    const wsStub = env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream));
-    await eventually("the ask's question", async () => (await wsStub.userNotifications()).some((n) => n.text.includes("which way?")));
-    // An eviction mid-dispatch leaves each call without an outcome; the runner redelivers them.
+    const args = { template: "captain", task: "hello once" };
+    ws.send(toolCall(1, "cal_i-1", "agent_spawn", args));
+    const child = (await ws.next("tool_result", (m) => m.call === "cal_i-1")).outcome.content[1].value.agent as string;
+    // An eviction mid-dispatch leaves the call without an outcome; the runner redelivers it.
     await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
       st.storage.sql.exec("UPDATE tool_calls SET status = 'dispatching', outcome = NULL");
     });
-    for (const [call, name, args] of calls) {
-      ws.send(toolCall(++seq, call, name, args));
-      expect((await ws.next("tool_result", (m) => m.call === call)).outcome.status).toBe("ok");
-    }
-    ws.send(toolCall(++seq, "cal_i-4", "ask", { question: "which way?", to: "user" }));
-    await ws.next("ack", (m) => m.up_to === seq);
-
-    const inbox = await runInDurableObject(agentStub(s.captain!), (_i: AgentDO, st) =>
+    ws.send(toolCall(2, "cal_i-1", "agent_spawn", args));
+    expect((await ws.next("tool_result", (m) => m.call === "cal_i-1")).outcome.content[1].value.agent).toBe(child);
+    expect((await agentStub(s.agent).children()).map((c) => c.agent)).toEqual([child]);
+    const posted = await runInDurableObject(agentStub(child), (_i: AgentDO, st) =>
       st.storage.sql.exec<{ input: string }>("SELECT input FROM turns").toArray().filter((r) => r.input.includes("hello once")).length);
-    expect(inbox).toBe(1);
-    expect((await wsStub.events()).filter((e) => e.type === "progress").length).toBe(1);
-    const notes = await wsStub.userNotifications();
-    expect(notes.filter((n) => n.text === "user once").length).toBe(1);
-    expect(notes.filter((n) => n.text.includes("which way?")).length).toBe(1);
-    const asks = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM asks").toArray().length);
-    expect(asks).toBe(1);
+    expect(posted).toBe(1);
   });
 });
 
@@ -1149,7 +1129,7 @@ describe("#29 command batches go on the wire in seq order", () => {
 
   it("two agent_starts go out in seq order, once each, when their secrets resolve in reverse", async () => {
     const s = await setup({ start: false });
-    const second = await adminJson("/v1/agents", { body: { role: "worker", workstream: s.workstream, sandbox: s.sandbox, cell: s.cell, start: false } }, 201);
+    const second = await adminJson("/v1/agents", { body: { role: "worker", sandbox: s.sandbox, cell: s.cell, start: false } }, 201);
     const first = gate();
     let calls = 0;
     await hookBroker(s.cell, { resolveRefs: async () => {
@@ -1302,7 +1282,7 @@ describe("#30 a nestd restart's capture outlives a FleetDO restart, not its host
   it("leases the old process held and the new one doesn't report are dropped by the next hello", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream: await workstream(), cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     const [create] = await nextCommands(h.ws, (c) => c.type === "sandbox_create");
     await okResult(h.ws, create.cmd);
     await restartMidHello(cell, h.host, h.host_token, "nestdtest0000002");

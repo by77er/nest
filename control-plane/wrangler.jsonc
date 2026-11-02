@@ -35,7 +35,6 @@
   "routes": [{ "pattern": "nest.bitcru.sh", "custom_domain": true }],
   "vars": {
     "PUBLIC_BASE_URL": "http://127.0.0.1:8787",
-    "ASK_SYNC_WINDOW_MS": "120000",
     "HOST_TOKEN_TTL_MS": "3600000",
     "PROXY_CA_TTL_MS": "604800000"
   }

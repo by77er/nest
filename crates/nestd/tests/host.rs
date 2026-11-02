@@ -660,7 +660,7 @@ async fn host_lifecycle_commit_and_self_fence() {
             "cmd_create",
             CommandBody::SandboxCreate {
                 sandbox: sbx.clone(),
-                workstream: WorkstreamId("ws_1".into()),
+                workstream: None,
                 epoch: Epoch(1),
                 image: "base".into(),
                 resources: Resources { vcpus: 1, memory_mib: 512, disk_gib: 1 },
@@ -678,7 +678,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     wait_until("ack of batch 1", || fleet.log.lock().unwrap().acks.contains(&1)).await;
     assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::Configure { epoch: Epoch(1), .. })));
     wait_until("proxy upsert", || proxy.lock().unwrap().iter().any(|c| matches!(c, ProxyCommand::SandboxUpsert { .. }))).await;
-    fleet.wait_event("port opened", |b| matches!(b, HostEventBody::Workstream { event } if matches!(event.kind, WorkstreamEventKind::PortOpened { port: 5173 }))).await;
+    fleet.wait_event("port opened", |b| matches!(b, HostEventBody::SandboxEvent { event } if matches!(event.kind, SandboxEventKind::PortOpened { port: 5173 }))).await;
     // The gateway learned the sandbox: its epoch, the vsock socket, no clients yet, the guest.
     let upserts = |g: &Vec<GatewayCommand>| g.iter().filter(|c| matches!(c, GatewayCommand::SandboxUpsert { sandbox, .. } if sandbox.0 == "sbx_1")).cloned().collect::<Vec<_>>();
     wait_until("gateway upsert", || !upserts(&gateway.lock().unwrap()).is_empty()).await;
@@ -696,7 +696,7 @@ async fn host_lifecycle_commit_and_self_fence() {
     let start = AgentStart {
         agent: AgentId("agt_w".into()),
         role: None,
-        workstream: WorkstreamId("ws_1".into()),
+        workstream: None,
         epoch: Some(Epoch(1)),
         resume: None,
         hands: Some(HandsBinding { sandbox: sbx.clone(), epoch: None }),
@@ -887,7 +887,7 @@ fn netns_listeners_handed_to_proxy() {
                 "cmd_create",
                 CommandBody::SandboxCreate {
                     sandbox: SandboxId("sbx_n".into()),
-                    workstream: WorkstreamId("ws_1".into()),
+                    workstream: None,
                     epoch: Epoch(1),
                     image: "base".into(),
                     resources: Resources { vcpus: 1, memory_mib: 256, disk_gib: 1 },
@@ -1155,7 +1155,7 @@ fn create(id: &str, sandbox: &str) -> Command {
         id,
         CommandBody::SandboxCreate {
             sandbox: SandboxId(sandbox.into()),
-            workstream: WorkstreamId("ws_1".into()),
+            workstream: None,
             epoch: Epoch(1),
             image: "base".into(),
             resources: Resources { vcpus: 1, memory_mib: 512, disk_gib: 1 },
@@ -1501,7 +1501,7 @@ async fn a_lost_runner_reports_its_brains_exited_and_nothing_is_replayed() {
     let start = AgentStart {
         agent: AgentId("agt_c".into()),
         role: None,
-        workstream: WorkstreamId("ws_1".into()),
+        workstream: None,
         epoch: Some(Epoch(1)),
         resume: None,
         hands: None,
@@ -2283,7 +2283,7 @@ fn bound_start(agent: &str, sandbox: &str) -> AgentStart {
     AgentStart {
         agent: AgentId(agent.into()),
         role: None,
-        workstream: WorkstreamId("ws_1".into()),
+        workstream: None,
         epoch: Some(Epoch(1)),
         resume: None,
         hands: Some(HandsBinding { sandbox: SandboxId(sandbox.into()), epoch: None }),

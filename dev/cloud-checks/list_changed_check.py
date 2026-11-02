@@ -70,15 +70,12 @@ try:
                                                         "prompt": "The mcp-test server (trusted), no allowlist."})
     assert s == 200, v
     s, v = api("PUT", f"/v1/admin/templates/{TPL}", {
-        "capabilities": ["nest", CAP], "hands": "forbidden", "credential": "claude_oauth_token:worker", "escalate_to": "workstream",
-        "subscribe": [], "params": {},
+        "capabilities": ["nest", CAP], "hands": "forbidden", "credential": "claude_oauth_token:worker",
         "launch": {"model": "haiku", "builtin_tools": [], "system_prompt": {"mode": "append", "text":
                    "You are in an automated check. Do exactly the steps given, each tool call once, then reply with one line."}}})
     assert s == 200, v
-    s, v = api("POST", "/v1/workstreams", {"goal": "list_changed cloud check"})
-    ws = v["workstream"]
     for _ in range(2):
-        s, v = api("POST", "/v1/agents", {"template": TPL, "workstream": ws, "cell": CELL, "start": False})
+        s, v = api("POST", "/v1/agents", {"template": TPL, "cell": CELL, "start": False})
         agents.append(v["agent"])
     t1 = {}
     for a in agents:

@@ -19,7 +19,6 @@ use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerCommand, RunnerE
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
     AgentEventBody, AgentId, Epoch, HostId, HostRole, MessageId, SandboxId, Seq, SessionId, TurnId, TurnInputKind,
-    WorkstreamId,
 };
 use nest_runner::test_support::FakeGuest;
 use nest_runner::test_support::gateway::TestGateway;
@@ -169,7 +168,7 @@ impl MockDo {
                             }
                             RunnerToAgent::ToolCall(c) => {
                                 let outcome = match c.name.as_str() {
-                                    "notify" => ToolOutcome::Ok { content: vec![ToolContent::Text { text: "Notified captain.".into() }] },
+                                    "checkpoint" => ToolOutcome::Ok { content: vec![ToolContent::Text { text: "Checkpointed.".into() }] },
                                     _ => ToolOutcome::Pending { ask: nest_protocol::model::AskId("ask_1".into()), message: "Question posted.".into() },
                                 };
                                 let _ = tx.send(AgentToRunner::Ack { up_to: c.seq });
@@ -177,7 +176,7 @@ impl MockDo {
                                 l.tool_calls.push(c);
                             }
                             RunnerToAgent::ToolsListRequest { request } => {
-                                let _ = tx.send(AgentToRunner::ToolsList { request, tools: vec![notify_tool()] });
+                                let _ = tx.send(AgentToRunner::ToolsList { request, tools: vec![checkpoint_tool()] });
                             }
                             RunnerToAgent::HandsResolve { request } => {
                                 l.resolves += 1;
@@ -250,11 +249,11 @@ impl MockDo {
     }
 }
 
-fn notify_tool() -> ToolDef {
+fn checkpoint_tool() -> ToolDef {
     ToolDef {
-        name: "notify".into(),
-        description: "Send a message.".into(),
-        input_schema: json!({"type": "object", "properties": {"to": {"type": "string"}, "message": {"type": "string"}}, "required": ["to", "message"], "additionalProperties": false}),
+        name: "checkpoint".into(),
+        description: "Commit the sandbox's disk now.".into(),
+        input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         roles: None,
         requires_approval: false,
     }
@@ -330,7 +329,7 @@ impl Harness {
         let start = control::AgentStart {
             agent: AgentId(AGENT.into()),
             role: None,
-            workstream: WorkstreamId("ws_e2e".into()),
+            workstream: None,
             // The agent epoch (3) is unrelated to the sandbox's (7, inside the binding).
             epoch: Some(Epoch(3)),
             resume,
@@ -432,7 +431,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
                 _ => None,
             })
             .collect();
-        // Step 1: Bash (its PostToolUse hands the model the inbox) + notify + text → step 2, on the
+        // Step 1: Bash (its PostToolUse hands the model the inbox) + checkpoint + text → step 2, on the
         // message: Bash + text. Nothing is left for Stop.
         assert_eq!(
             kinds,
@@ -443,7 +442,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
         assert!(l.events.iter().all(|e| e.epoch == Epoch(3) && e.agent.0 == AGENT));
         // The platform tool went through the relay with a cal_<turn>-<n> id.
         let call = &l.tool_calls[0];
-        assert_eq!(call.name, "notify");
+        assert_eq!(call.name, "checkpoint");
         assert!(call.call.0.starts_with("cal_trnone-"), "{}", call.call);
     }
 
@@ -506,9 +505,9 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
     let tools = events.iter().find(|e| e["kind"] == "tool").map(|_| ()).is_some();
     assert!(tools);
     let names: Vec<&str> = events.iter().find(|e| e["kind"] == "tools").unwrap()["names"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-    assert_eq!(names, ["Bash", "TaskOutput", "TaskStop", "Read", "Write", "Edit", "Glob", "Grep", "notify"]);
-    let notify = events.iter().find(|e| e["kind"] == "tool" && e["name"] == "notify").unwrap();
-    assert_eq!(notify["text"], "Notified captain.");
+    assert_eq!(names, ["Bash", "TaskOutput", "TaskStop", "Read", "Write", "Edit", "Glob", "Grep", "checkpoint"]);
+    let platform = events.iter().find(|e| e["kind"] == "tool" && e["name"] == "checkpoint").unwrap();
+    assert_eq!(platform["text"], "Checkpointed.");
     // The inbox reached the model once, at the first tool boundary; nothing was left for Stop.
     let contexts: Vec<&str> = events.iter().filter_map(|e| e["context"].as_str()).collect();
     assert!(matches!(contexts[..], [c] if c.contains("please also run the tests")), "{contexts:?}");

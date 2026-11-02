@@ -29,17 +29,16 @@ template:      worker              # optional; the fields below override it
 launch:        {system_prompt, builtin_tools, model, effort}   # becomes Claude Code flags
 backend:       claude-code         # or api-loop (deferred)
 hands:         {sandbox, cwd?}     # or null
-capabilities:  [messaging{peers: label:workstream}, web, ...]   # see capabilities/
+capabilities:  [coordination, web, ...]   # see capabilities/
 grants:        [...]               # extra grants; everything must be a subset of the spawner's
 budget:        {depth, concurrent, spawns, turns_per_day}   # at most what the spawner has left
 report_schema: {...}               # optional: a final report that matches it reaches the spawner untainted
-escalate_to:   user                # or workstream (until stage 3)
 priority:      normal              # or high; see quota scheduling
-labels:        {workstream: auth}
+labels:        {project: auth}
 credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:captain
 ```
 
-- **Built so far:** the admin API's spawn is `{template, sandbox?, workstream?, owner?, overrides?}`, expanded by [CatalogDO](../control-plane/durable-objects/catalog/) (the fields above that aren't built: backend, grants, budget, report schema, priority, labels). An agent's own spawn is the `agent_spawn` tool: `{template, task, sandbox?: new | share, ephemeral?, sandbox_idle_ttl_s?, tools?, repos?}`, from a template one of its capabilities names in `spawn` (the spawn grant; the seeded `spawning` capability names `worker`), its overrides only narrowing; `task` is the child's first input. The child gets its spawner's workstream and cell, its taint (sticky, and on the task), and depth plus one. Its ids (and a new sandbox's) come from the call's key, so a re-run makes nothing twice.
+- **Built so far:** the admin API's spawn is `{template, sandbox?, owner?, overrides?}` (a `workstream` an old client sends is ignored for one release), expanded by [CatalogDO](../control-plane/durable-objects/catalog/) (the fields above that aren't built: backend, grants, budget, report schema, priority, labels). An agent's own spawn is the `agent_spawn` tool: `{template, task, sandbox?: new | share, ephemeral?, sandbox_idle_ttl_s?, tools?, repos?}`, from a template one of its capabilities names in `spawn` (the spawn grant; the seeded `spawning` capability names `worker`), its overrides only narrowing; `task` is the child's first input. The child gets its spawner's workstream and cell, its taint (sticky, and on the task), and depth plus one. Its ids (and a new sandbox's) come from the call's key, so a re-run makes nothing twice.
 - **Interim limits, until budgets** (confirmed by the owner, 2026-11-02): spawn depth at most 3 (the operator's agents are 0) and at most 8 children that haven't ended, per spawner (`lib/lifetimes.ts`). The design's budgets replace them.
 - **Templates** are named specs stored in the control plane and edited by me, mostly a list of [capabilities](capabilities/). `captain` and `worker` are just the two I start with. See [../orchestration/](../orchestration/).
 - **Brain placement is by backend and capacity, never by sandbox:** a `claude-code` brain starts on any [brain host](../compute/brain-hosts/) with capacity, preferring the host that ran the agent last (a warm session file), a preference and not a rule; an `api-loop` brain needs no host. Hands are a binding to one sandbox, reached through its [gateway](../sandbox/gateway/) from wherever the brain runs.

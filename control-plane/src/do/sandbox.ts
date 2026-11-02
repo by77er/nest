@@ -12,7 +12,7 @@ import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { signShare } from "../lib/tokens";
-import { asNestError, hex, NestError, newId, sha256 } from "../lib/util";
+import { asNestError, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -39,16 +39,19 @@ export const BASE_ALLOW = [
   "github.com", "*.githubusercontent.com", "deb.debian.org",
 ];
 
+/** The compat `ws_` value hosts of the previous release require in `sandbox_create` (`SandboxInfo.workstream`). */
+const wireWorkstream = (info: { sandbox: string; workstream?: string }): string => info.workstream ?? compatWorkstream(info.sandbox);
+
 /** The ports an allow rule (or a grant) covers when it names none. */
 const WEB_PORTS = [80, 443];
 export const Port = z.number().int().min(1).max(65535);
 /**
  * The operator's egress policy layer for one sandbox (docs/sandbox/networking/egress/policy/), as the API
- * takes it (named for the workstreams it was once set per; it is per sandbox). `repos`: the push
+ * takes it. `repos`: the push
  * allowlist (#repo-allowlists), which the GitHub rule constructor turns into guards; `guards`: request
  * guards written by hand, layered with the constructed ones.
  */
-export const WorkstreamPolicyLayer = z.object({
+export const SandboxPolicyLayer = z.object({
   allow: z.array(z.object({ host: z.string().min(1), ports: z.array(Port).optional() })).default([]),
   passthrough: z.array(z.string().min(1)).default([]),
   inject: z.array(InjectionBinding).default([]),
@@ -56,15 +59,27 @@ export const WorkstreamPolicyLayer = z.object({
   repos: Repos.default([]),
   guards: z.array(RequestGuard).max(64).default([]),
 });
-export type WorkstreamPolicyLayer = z.output<typeof WorkstreamPolicyLayer>;
+export type SandboxPolicyLayer = z.output<typeof SandboxPolicyLayer>;
 /** What a caller may pass: the fields with defaults may be left out. */
-export type WorkstreamPolicyInput = z.input<typeof WorkstreamPolicyLayer>;
-const EMPTY_LAYER: WorkstreamPolicyLayer = WorkstreamPolicyLayer.parse({});
+export type SandboxPolicyInput = z.input<typeof SandboxPolicyLayer>;
+const EMPTY_LAYER: SandboxPolicyLayer = SandboxPolicyLayer.parse({});
+/**
+ * The operator layer's rules on the wire: `workstream` is the layer's historical name, which hosts
+ * parse as a closed enum (`PolicyLayer`), so it stays (docs/interfaces/#pending-contract-changes).
+ */
+const OPERATOR_LAYER = "workstream" as const;
+/** Where the operator's layer is stored (its key predates the rename; the previous release reads it). */
+const LAYER_KEY = "ws_layer";
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
 export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
-  workstream: string;
+  /**
+   * Compat, for one release (dev/deploy.md): the `ws_` value `sandbox_create` carries to hosts of the
+   * previous release, which the previous release also reads here. A real workstream id for a sandbox
+   * created before workstreams left, `compatWorkstream(sandbox)` for one created since. Not shown.
+   */
+  workstream?: string;
   cell: string;
   image: string;
   resources: Resources;
@@ -88,11 +103,11 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
 
 export interface CreateSandbox {
   sandbox: string;
-  workstream: string;
   cell: string;
   image?: string;
   resources?: Resources;
-  workstreamPolicy?: WorkstreamPolicyInput;
+  /** The operator's policy layer. */
+  policy?: SandboxPolicyInput;
   /** The agent it is created for (it owns it). */
   owner?: string;
   idle_ttl_ms?: number;
@@ -272,11 +287,11 @@ export class SandboxDO extends DurableObject<Env> {
     // again once destroyed (its registry row may already be pruned).
     const existing = this.get<SandboxInfo>("info");
     if (existing?.state !== "destroyed") await this.fleet(req.cell).registerSandbox(req.sandbox);
-    if (existing) return this.info_();
+    if (existing) return this.view();
     const info: SandboxInfo = {
       ...newFields(),
       sandbox: req.sandbox,
-      workstream: req.workstream,
+      workstream: compatWorkstream(req.sandbox),
       cell: req.cell,
       image: req.image ?? DEFAULT_IMAGE,
       resources: req.resources ?? DEFAULT_RESOURCES,
@@ -293,8 +308,8 @@ export class SandboxDO extends DurableObject<Env> {
     };
     this.put("info", info);
     await this.deadlines.set("expiry", Date.now() + 60_000, true);
-    const layer = WorkstreamPolicyLayer.parse(req.workstreamPolicy ?? {});
-    this.put("ws_layer", { ...layer, repos: canonicalRepos(layer.repos) });
+    const layer = SandboxPolicyLayer.parse(req.policy ?? {});
+    this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos) });
     try {
       await this.placeCurrentEpoch();
     } catch (e) {
@@ -303,11 +318,17 @@ export class SandboxDO extends DurableObject<Env> {
       if (this.info_().placing === null) throw e;
       console.warn(`sandbox ${req.sandbox}: placement answer unknown; the place deadline reconciles it`, e);
     }
-    return this.info_();
+    return this.view();
   }
 
   async info(): Promise<SandboxInfo> {
-    return this.info_();
+    return this.view();
+  }
+
+  /** The record as the API shows it: without the compat `workstream`. */
+  private view(): SandboxInfo {
+    const { workstream: _, ...info } = this.info_();
+    return info;
   }
 
   /** A placement that never finished leaves `placing` set: once stale, FleetDO's lease decides. */
@@ -355,7 +376,7 @@ export class SandboxDO extends DurableObject<Env> {
     try {
       const host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
-        workstream: before.workstream,
+        workstream: wireWorkstream(before),
         epoch,
         image: before.image,
         resources: before.resources,
@@ -560,7 +581,7 @@ export class SandboxDO extends DurableObject<Env> {
   private createBody(info: SandboxInfo): CommandBody {
     const from = this.restoreSource(info, Date.now());
     return {
-      type: "sandbox_create", sandbox: info.sandbox, workstream: info.workstream, epoch: info.epoch, image: info.image,
+      type: "sandbox_create", sandbox: info.sandbox, workstream: wireWorkstream(info), epoch: info.epoch, image: info.image,
       resources: info.resources, policy: this.effectivePolicy(), ...(from ? { from } : {}),
     };
   }
@@ -697,7 +718,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (stored) {
       const outcome = JSON.parse(stored.outcome) as CommitOutcome;
       // The first answer's notice may not have been posted (it failed after the record was stored).
-      if (outcome.status === "orphaned") await this.noticeOrphan(ev, outcome.generation);
+      if (outcome.status === "orphaned") this.noticeOrphan(ev, outcome.generation);
       return outcome;
     }
     const info = this.info_();
@@ -731,22 +752,17 @@ export class SandboxDO extends DurableObject<Env> {
       ev.request, JSON.stringify(outcome), Date.now(), outcome.status === "rejected" ? null : outcome.generation.id);
     await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
     if (outcome.status !== "rejected") await this.deadlines.set("retention", Date.now() + RETENTION_AFTER_COMMIT_MS, true);
-    if (outcome.status === "orphaned") await this.noticeOrphan(ev, outcome.generation);
+    if (outcome.status === "orphaned") this.noticeOrphan(ev, outcome.generation);
     return outcome;
   }
 
-  /** `orphaned_work` to the workstream, at least once per request (WorkstreamDO drops a repeated key). */
-  private async noticeOrphan(ev: CommitRequestEvent, orphan: GenerationRecord): Promise<void> {
+  /**
+   * An orphaned generation is logged (its record lists it among the generations); owners hear of it
+   * once agent events reach them as webhooks (docs/README.md#principles).
+   */
+  private noticeOrphan(ev: CommitRequestEvent, orphan: GenerationRecord): void {
     const info = this.info_();
-    await this.env.WORKSTREAM.get(this.env.WORKSTREAM.idFromName(info.workstream)).ingest({
-      workstream: info.workstream,
-      ts_ms: Date.now(),
-      sandbox: info.sandbox,
-      epoch: info.epoch,
-      type: "orphaned_work",
-      generation: orphan.id,
-      stale_epoch: ev.epoch,
-    }, `orphan/${ev.request}`);
+    console.warn(`sandbox ${info.sandbox}: orphaned work ${orphan.id} from stale epoch ${ev.epoch} (current ${info.epoch}, request ${ev.request})`);
   }
 
   /**
@@ -769,18 +785,18 @@ export class SandboxDO extends DurableObject<Env> {
   // --- egress policy --------------------------------------------------------------------------------
 
   /**
-   * Effective policy merged from the base, workstream and sandbox (temporary grant) layers, plus what the
+   * Effective policy merged from the base, operator and sandbox (temporary grant) layers, plus what the
    * rule constructors build from the push allowlist (lib/rules/github.ts): its guards always, layered
    * with the operator's own. An operator binding named `github` wins over the constructed one.
    */
   private effectivePolicy(now = Date.now()): EgressPolicy {
     const info = this.info_();
-    const ws = this.wsLayer();
+    const ws = this.operatorLayer();
     const gh = githubEgress(this.pushRepos());
     const inject = [...ws.inject, ...gh.inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
     const allow: AllowRule[] = [
       ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
-      ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: "workstream" as const })),
+      ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER })),
       ...this.sql
         .exec<{ host: string; ports: string; expires_ms: number }>("SELECT host, ports, expires_ms FROM grants WHERE expires_ms > ? ORDER BY expires_ms", now)
         .toArray()
@@ -798,8 +814,8 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** The operator's layer; one stored before `repos` and `guards` reads as having none. */
-  private wsLayer(): WorkstreamPolicyLayer {
-    const l = this.get<Partial<WorkstreamPolicyLayer>>("ws_layer");
+  private operatorLayer(): SandboxPolicyLayer {
+    const l = this.get<Partial<SandboxPolicyLayer>>(LAYER_KEY);
     return { ...EMPTY_LAYER, ...l, repos: l?.repos ?? [], guards: l?.guards ?? [] };
   }
 
@@ -807,10 +823,10 @@ export class SandboxDO extends DurableObject<Env> {
     return this.effectivePolicy();
   }
 
-  async setWorkstreamPolicy(input: WorkstreamPolicyInput): Promise<EgressPolicy> {
+  async setPolicy(input: SandboxPolicyInput): Promise<EgressPolicy> {
     this.info_();
-    const layer = WorkstreamPolicyLayer.parse(input);
-    this.put("ws_layer", { ...layer, repos: canonicalRepos(layer.repos) });
+    const layer = SandboxPolicyLayer.parse(input);
+    this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos) });
     return this.policyChanged(true);
   }
 
@@ -910,13 +926,13 @@ export class SandboxDO extends DurableObject<Env> {
    */
   private async pushSecrets(force = false): Promise<void> {
     const before = this.info_();
-    const ws = this.wsLayer();
+    const ws = this.operatorLayer();
     const repos = this.pushRepos();
     const mint = repos.length > 0 && !ws.inject.some((b) => b.name === GITHUB_BINDING);
     if (!before.host || (!ws.inject.length && !mint && !force)) return;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const secrets: InjectionSecret[] = ws.inject.length
-      ? await broker.injectionSecretRefs(ws.inject.map((b) => b.name), { sandbox: before.sandbox, workstream: before.workstream })
+      ? await broker.injectionSecretRefs(ws.inject.map((b) => b.name), { sandbox: before.sandbox, ...(before.workstream ? { workstream: before.workstream } : {}) })
       : [];
     let next: number | null = null;
     if (!mint && force) await broker.forgetInjections(before.sandbox);
@@ -1056,7 +1072,7 @@ export class SandboxDO extends DurableObject<Env> {
       delete i.expiry_notice_ms;
     });
     if (!lease.gone(info.state)) await this.deadlines.set("expiry", Date.now());
-    return info;
+    return this.view();
   }
 
   /**
@@ -1082,7 +1098,7 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** The push allowlist: the operator's layer and every attached agent's spec (docs/sandbox/networking/egress/policy/#repo-allowlists). */
   pushRepos(): string[] {
-    return unionRepos(this.wsLayer().repos, ...Object.values(this.get<Record<string, string[]>>("agent_repos") ?? {}));
+    return unionRepos(this.operatorLayer().repos, ...Object.values(this.get<Record<string, string[]>>("agent_repos") ?? {}));
   }
 
   /** Send `agent_attach` for these agents, each as the agent's one in flight. */

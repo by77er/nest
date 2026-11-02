@@ -13,6 +13,14 @@ import {
 import { NestError } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
 
+/**
+ * Fields the previous release requires in every template row (its schema has no default for
+ * `escalate_to`): written beside each template for one release, so a rollback still spawns from a
+ * template written now. This release's schema strips them on read; they mean nothing here.
+ */
+const PREVIOUS_RELEASE_TEMPLATE_FIELDS = { escalate_to: "user", subscribe: [] } as const;
+const templateRow = (t: Template): string => JSON.stringify({ ...PREVIOUS_RELEASE_TEMPLATE_FIELDS, ...t });
+
 export class CatalogDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
 
@@ -58,7 +66,7 @@ export class CatalogDO extends DurableObject<Env> {
       this.sql.exec("INSERT OR IGNORE INTO capabilities (name, body) VALUES (?, ?)", name, JSON.stringify(cap));
     }
     for (const [name, t] of Object.entries(c.templates)) {
-      this.sql.exec("INSERT OR IGNORE INTO templates (name, body) VALUES (?, ?)", name, JSON.stringify(t));
+      this.sql.exec("INSERT OR IGNORE INTO templates (name, body) VALUES (?, ?)", name, templateRow(t));
     }
   }
 
@@ -154,7 +162,7 @@ export class CatalogDO extends DurableObject<Env> {
     const r = checkTemplate(tpl, this.load().capabilities);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${r.error}`);
     this.sql.exec("INSERT INTO templates (name, body) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET body = excluded.body",
-      name, JSON.stringify(tpl));
+      name, templateRow(tpl));
     return tpl;
   }
 

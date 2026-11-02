@@ -65,17 +65,16 @@ async function world() {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
   const sbxHost = await connectHost(cell);
   const brain = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "lifecycle" } }, 201);
   const kid = `kid-${id}`;
   const cap = `sp-${id}`;
   await adminJson(`/v1/admin/capabilities/${cap}`, { method: "PUT", body: { tools: ["agent_spawn", "agent_stop"], spawn: [kid] } });
   const tpl = (hands: string, extra: Record<string, unknown> = {}) => ({
     capabilities: ["nest", cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
-    hands, credential: "claude_oauth_token", escalate_to: "user", ...extra,
+    hands, credential: "claude_oauth_token", ...extra,
   });
   await adminJson(`/v1/admin/templates/${kid}`, { method: "PUT", body: tpl("optional", { share_sandbox: true }) });
   await adminJson(`/v1/admin/templates/par-${id}`, { method: "PUT", body: tpl("forbidden") });
-  return { id, cell, sbxHost, brain, workstream: workstream as string, kid, par: `par-${id}` };
+  return { id, cell, sbxHost, brain, kid, par: `par-${id}` };
 }
 type World = Awaited<ReturnType<typeof world>>;
 
@@ -90,7 +89,7 @@ async function session(w: World, agent: string): Promise<Session> {
 
 /** An operator's agent from `template`, with its session. */
 async function operatorAgent(w: World, template: string, sandbox?: string): Promise<Session> {
-  const a = await adminJson("/v1/agents", { body: { template, workstream: w.workstream, cell: w.cell, ...(sandbox ? { sandbox } : {}) } }, 201);
+  const a = await adminJson("/v1/agents", { body: { template, cell: w.cell, ...(sandbox ? { sandbox } : {}) } }, 201);
   return session(w, a.agent);
 }
 
@@ -217,7 +216,7 @@ describe("agent_spawn", () => {
     const v = out.content.find((c: any) => c.type === "json").value;
     expect(v).toMatchObject({ template: w.kid, ephemeral: true });
     const child = await agentStub(v.agent).info();
-    expect(child).toMatchObject({ owner: p.agent, depth: 1, ephemeral: true, hands: { sandbox: v.sandbox }, workstream: w.workstream, cell: w.cell });
+    expect(child).toMatchObject({ owner: p.agent, depth: 1, ephemeral: true, hands: { sandbox: v.sandbox }, cell: w.cell });
     expect(await runInDurableObject(agentStub(v.agent), (inst: AgentDO) => (inst as any).tainted((inst as any).load()))).toBe(true);
     const sbx = await sandboxStub(v.sandbox).info();
     expect(sbx).toMatchObject({ owner: v.agent, attached: [v.agent], cell: w.cell });
@@ -415,7 +414,7 @@ describe("agent_stop", () => {
     expect((await live())).toBe(before);
     expect(await sandboxStub(c2.sandbox!).gcRoots()).toEqual([]);
     // A sandbox it didn't make (the operator's) is never destroyed by its end.
-    const shared = await adminJson("/v1/sandboxes", { body: { workstream: w.workstream, cell: w.cell } }, 201);
+    const shared = await adminJson("/v1/sandboxes", { body: { cell: w.cell } }, 201);
     const o = await operatorAgent(w, w.kid, shared.sandbox);
     await adminJson(`/v1/agents/${o.agent}/stop`, { body: { end: true, destroy_sandbox: true } });
     await exited(w, o);
@@ -524,14 +523,13 @@ describe("a dormant sandbox's idle TTL", () => {
   async function suspended(idleTtlMs?: number) {
     const cell = uniqueCell();
     const host = await connectHost(cell);
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "ttl" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell, ...(idleTtlMs ? { idle_ttl_ms: idleTtlMs } : {}) } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell, ...(idleTtlMs ? { idle_ttl_ms: idleTtlMs } : {}) } }, 201);
     await nextCommands(host.ws, (c) => c.type === "sandbox_create");
     expect((await sandboxStub(sbx.sandbox).info()).dormant_since_ms).toBeUndefined();
     const seq = sendEvents(host.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state: "suspended" }]);
     await host.ws.next("ack", (m) => m.up_to >= seq);
     await until(async () => (await sandboxStub(sbx.sandbox).info()).dormant_since_ms, "dormancy recorded");
-    return { cell, host, workstream: workstream as string, sandbox: sbx.sandbox as string };
+    return { cell, host, sandbox: sbx.sandbox as string };
   }
   /** Move the sandbox's dormancy (and notice) back in time, then run its expiry check now. */
   async function age(sandbox: string, edit: (i: any) => void) {

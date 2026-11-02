@@ -36,8 +36,8 @@ use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, ExitReason, Ru
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
     error_codes, AgentId, CommitReason, EgressPolicy, Epoch, ErrorBody, ForkMode, GenerationId, GenerationKind,
-    GenerationRecord, HostId, HostRole, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, WorkstreamEvent,
-    WorkstreamEventKind, WorkstreamId,
+    GenerationRecord, HostId, HostRole, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, SandboxEvent,
+    SandboxEventKind, WorkstreamId,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -82,7 +82,8 @@ const MAX_DENIED_SEEN: usize = 10_000;
 
 #[derive(Clone, Debug)]
 struct Summary {
-    workstream: WorkstreamId,
+    /// Compat: the `ws_` value the control plane sent, echoed in sandbox events (see `SandboxEvent`).
+    workstream: Option<WorkstreamId>,
     epoch: Epoch,
     state: SandboxState,
     head: Option<GenerationId>,
@@ -94,7 +95,7 @@ struct Summary {
 
 struct Sbx {
     id: SandboxId,
-    workstream: WorkstreamId,
+    workstream: Option<WorkstreamId>,
     epoch: Epoch,
     image: String,
     resources: Resources,
@@ -135,7 +136,7 @@ impl Sbx {
     #[allow(clippy::too_many_arguments)]
     fn new(
         id: SandboxId,
-        workstream: WorkstreamId,
+        workstream: Option<WorkstreamId>,
         epoch: Epoch,
         image: String,
         resources: Resources,
@@ -840,14 +841,14 @@ impl Inner {
         self.sandboxes.lock().expect("sandboxes").get(id).cloned()
     }
 
-    fn workstream_of(&self, id: &SandboxId) -> Option<(WorkstreamId, Epoch)> {
+    fn summary_of(&self, id: &SandboxId) -> Option<(Option<WorkstreamId>, Epoch)> {
         self.summary.lock().expect("summary").get(id).map(|s| (s.workstream.clone(), s.epoch))
     }
 
-    fn workstream_event(&self, sbx: &SandboxId, agent: Option<AgentId>, kind: WorkstreamEventKind) {
-        let Some((workstream, epoch)) = self.workstream_of(sbx) else { return };
-        self.emit(HostEventBody::Workstream {
-            event: WorkstreamEvent { workstream, ts_ms: now_ms(), agent, sandbox: Some(sbx.clone()), epoch: Some(epoch), kind },
+    fn sandbox_event(&self, sbx: &SandboxId, agent: Option<AgentId>, kind: SandboxEventKind) {
+        let Some((workstream, epoch)) = self.summary_of(sbx) else { return };
+        self.emit(HostEventBody::SandboxEvent {
+            event: SandboxEvent { workstream, ts_ms: now_ms(), agent, sandbox: Some(sbx.clone()), epoch: Some(epoch), kind },
         });
     }
 
@@ -966,7 +967,7 @@ impl Inner {
                 for r in records.iter().filter(|r| is_request_denial(r)) {
                     let fresh = self.denied_seen.fresh((r.sandbox.clone(), r.host.clone(), r.port));
                     if fresh && self.limiter.allow(&r.sandbox, "denied", limits::DENIED) {
-                        self.workstream_event(&r.sandbox, r.agent.clone(), WorkstreamEventKind::EgressDenied { host: r.host.clone(), port: r.port });
+                        self.sandbox_event(&r.sandbox, r.agent.clone(), SandboxEventKind::EgressDenied { host: r.host.clone(), port: r.port });
                     }
                 }
                 // Per-sandbox budget for audit records (each batch becomes an R2 write).
@@ -980,7 +981,7 @@ impl Inner {
                 let host: String = host.chars().take(253).collect();
                 let fresh = self.alerts_seen.fresh((sandbox.clone(), format!("{reason:?}"), host.clone()));
                 if fresh && self.limiter.allow(&sandbox, "alert", limits::ALERTS) {
-                    self.workstream_event(&sandbox, agent, WorkstreamEventKind::EgressAlert { host, binding, reason });
+                    self.sandbox_event(&sandbox, agent, SandboxEventKind::EgressAlert { host, binding, reason });
                 }
             }
             ProxyNotice::Event(ProxyEvent::ListenerFailed { sandbox, listener_id, error }) => {
@@ -1042,7 +1043,7 @@ impl Inner {
                     drop(s);
                     for port in new {
                         if this.limiter.allow(&sbx, "ports", limits::PORTS) {
-                            this.workstream_event(&sbx, None, WorkstreamEventKind::PortOpened { port });
+                            this.sandbox_event(&sbx, None, SandboxEventKind::PortOpened { port });
                         }
                     }
                 });
@@ -1052,7 +1053,7 @@ impl Inner {
                 if !self.limiter.allow(&sbx, "tasks", limits::TASKS) {
                     return;
                 }
-                let Some((_, epoch)) = self.workstream_of(&sbx) else { return };
+                let Some((_, epoch)) = self.summary_of(&sbx) else { return };
                 self.emit(HostEventBody::TaskExited { sandbox: sbx, epoch, agent: agent_id, task });
             }
             GuestEvent::Ready { resumed, guest } => {
@@ -1097,7 +1098,7 @@ impl Inner {
             let _ = reply.send(refusal);
             return;
         }
-        let Some((_, epoch)) = self.workstream_of(&sbx) else {
+        let Some((_, epoch)) = self.summary_of(&sbx) else {
             let _ = reply.send(CliResult::Error { error: error(error_codes::UNKNOWN_SANDBOX, format!("{sbx} is not on this host"), false) });
             return;
         };
@@ -1500,7 +1501,7 @@ impl Inner {
     async fn create_sandbox(
         self: &Arc<Self>,
         sandbox: SandboxId,
-        workstream: WorkstreamId,
+        workstream: Option<WorkstreamId>,
         epoch: Epoch,
         image: String,
         resources: Resources,
@@ -1711,7 +1712,7 @@ impl Inner {
             sbx.netns = Some(ns);
         }
         // The proxy link refuses all of these for an epoch already dropped by a fence.
-        if !self.proxy.apply(ProxyOp::Upsert { sandbox: sbx.id.clone(), epoch: sbx.epoch, workstream: Some(sbx.workstream.clone()), policy }) {
+        if !self.proxy.apply(ProxyOp::Upsert { sandbox: sbx.id.clone(), epoch: sbx.epoch, workstream: sbx.workstream.clone(), policy }) {
             anyhow::bail!("{} was fenced: proxy refused the sandbox", sbx.id);
         }
         self.proxy.apply(ProxyOp::Secrets { sandbox: sbx.id.clone(), epoch: sbx.epoch, secrets: vec![] });
@@ -1952,7 +1953,7 @@ impl Inner {
         parent_epoch: Epoch,
         child: SandboxId,
         child_epoch: Epoch,
-        child_workstream: WorkstreamId,
+        child_workstream: Option<WorkstreamId>,
         mode: ForkMode,
         policy: EgressPolicy,
     ) -> CmdResult {
@@ -1981,7 +1982,7 @@ impl Inner {
             return Ok(Some(serde_json::json!({ "note": "stale policy version ignored" })));
         }
         s.policy = Some(policy.clone());
-        self.proxy.apply(ProxyOp::Upsert { sandbox: id.clone(), epoch, workstream: Some(s.workstream.clone()), policy: policy.clone() });
+        self.proxy.apply(ProxyOp::Upsert { sandbox: id.clone(), epoch, workstream: s.workstream.clone(), policy: policy.clone() });
         // Reconcile TCP-exception listeners.
         if let Some(ns) = s.netns.clone() {
             let wanted: Vec<String> = policy.tcp.iter().map(|t| format!("{}:{}", t.host, t.port)).collect();

@@ -47,6 +47,8 @@ macro_rules! id_type {
 id_type!(HostId, "hst_");
 id_type!(SandboxId, "sbx_");
 id_type!(AgentId, "agt_");
+// Compat, one release back: hosts and runners of the previous release require a `ws_` value in
+// `sandbox_create`, `sandbox_fork` and `agent_start`. Workstreams left the platform; nothing reads it.
 id_type!(WorkstreamId, "ws_");
 id_type!(GenerationId, "gen_");
 id_type!(SessionId, "ses_");
@@ -288,9 +290,11 @@ impl HostPattern {
 pub enum PolicyLayer {
     /// Image defaults (package registries, GitHub, distro mirrors).
     Base,
-    /// Set by a captain or me for the whole workstream.
+    /// The operator's own layer for the sandbox (allow rules, passthrough, injection, repos). Its
+    /// wire name is `workstream` (historical: the layer was once set per workstream); a rename is
+    /// two releases of expand/contract, not worth it for a label.
     Workstream,
-    /// Per-sandbox, typically temporary grants approved through `ask`.
+    /// Temporary per-sandbox grants (the operator's, or `egress_policy` widening).
     Sandbox,
 }
 
@@ -508,11 +512,13 @@ impl EgressPolicy {
 pub enum TurnInputKind {
     /// Me (Discord, UI, CLI).
     User,
-    /// Batched workstream events waking a captain.
+    /// No longer sent (it carried workstream event batches, which left the platform); kept so a
+    /// turn a control plane of the previous release queued still parses.
     EventBatch,
     /// Messages queued in the agent's inbox.
     Inbox,
-    /// Answer to an earlier `ask` that returned `pending`.
+    /// The operator's decision on an approval (or an answer to a question asked before the `ask`
+    /// tool left) that returned `pending`.
     AskAnswer,
     /// Continuation after a crash/move ("you were interrupted, here's what happened since").
     Recovery,
@@ -590,12 +596,17 @@ pub enum AgentEventBody {
     InboxDelivered { message: MessageId },
 }
 
-// --- Workstream events --------------------------------------------------------------------------
+// --- Sandbox events ----------------------------------------------------------------------------
 
-/// Normalized workstream event (docs/orchestration/workstreams/). Decision events wake captains.
+/// Something a host saw about a sandbox it holds (a port opened, egress denied, an egress alert),
+/// sent as `HostEventBody::SandboxEvent`. The control plane logs it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WorkstreamEvent {
-    pub workstream: WorkstreamId,
+pub struct SandboxEvent {
+    /// Compat, one release back: the `ws_` value the control plane sent in `sandbox_create`, echoed
+    /// because a control plane of the previous release requires it. Workstreams left the platform;
+    /// nothing reads it. Absent once the control plane stops sending one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstream: Option<WorkstreamId>,
     pub ts_ms: TimestampMs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentId>,
@@ -604,25 +615,12 @@ pub struct WorkstreamEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<Epoch>,
     #[serde(flatten)]
-    pub kind: WorkstreamEventKind,
+    pub kind: SandboxEventKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum WorkstreamEventKind {
-    Started { goal: String },
-    Progress { summary: String },
-    NeedsInput { ask: AskId, question: String },
-    Blocked { reason: String },
-    PrOpened { url: String, title: String },
-    Completed { summary: String },
-    Failed { error: ErrorBody },
-    BudgetExceeded { detail: String },
-    QuotaParked {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retry_after_ms: Option<u64>,
-    },
-    OrphanedWork { generation: GenerationId, stale_epoch: Epoch },
+pub enum SandboxEventKind {
     EgressDenied { host: String, port: u16 },
     /// A binding's placeholder was sent to a host outside the binding: likely exfiltration.
     EgressAlert {
@@ -633,10 +631,9 @@ pub enum WorkstreamEventKind {
         reason: EgressAlertReason,
     },
     PortOpened { port: u16 },
-    PortExposed { port: u16, url: String },
 }
 
-/// Why nest-proxy raised an egress alert (`WorkstreamEventKind::EgressAlert.reason`): nest-proxy's
+/// Why nest-proxy raised an egress alert (`SandboxEventKind::EgressAlert.reason`): nest-proxy's
 /// `host::proxy::AlertKind`, plus a catch-all. Open: a member this build doesn't know (a newer
 /// sender, or free text from an older one) parses as `unknown` instead of failing the event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]

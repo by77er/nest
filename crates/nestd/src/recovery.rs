@@ -32,7 +32,10 @@ pub const META_VERSION: u32 = 1;
 pub struct SandboxMeta {
     pub version: u32,
     pub sandbox: SandboxId,
-    pub workstream: WorkstreamId,
+    /// Compat: the `ws_` value the control plane sent (absent from a control plane that no longer
+    /// sends one). Written while present, so a nestd of the previous release reads this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstream: Option<WorkstreamId>,
     pub epoch: Epoch,
     pub image: String,
     pub resources: Resources,
@@ -236,7 +239,7 @@ mod tests {
         SandboxMeta {
             version: META_VERSION,
             sandbox: SandboxId(id.into()),
-            workstream: WorkstreamId("ws_1".into()),
+            workstream: Some(WorkstreamId("ws_1".into())),
             epoch: Epoch(epoch),
             image: "base".into(),
             resources: Resources { vcpus: 1, memory_mib: 256, disk_gib: 1 },

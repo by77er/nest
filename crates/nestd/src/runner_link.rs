@@ -492,7 +492,7 @@ mod tests {
         CpAgentStart {
             agent: AgentId(agent.into()),
             role: None,
-            workstream: WorkstreamId("ws_1".into()),
+            workstream: Some(WorkstreamId("ws_1".into())),
             epoch: Some(Epoch(1)),
             resume: None,
             hands: None,

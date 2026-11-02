@@ -176,25 +176,24 @@ async function setup(opts: McpOpts = {}) {
     body: {
       capabilities: opts.withCapability === false ? ["nest"] : ["nest", cap],
       launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } },
-      hands: "forbidden", credential: "claude_oauth_token", escalate_to: "user",
+      hands: "forbidden", credential: "claude_oauth_token",
     },
   });
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
   const host = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "mcp" } }, 201);
-  const ag = await adminJson("/v1/agents", { body: { template: tpl, workstream, cell } }, 201);
+  const ag = await adminJson("/v1/agents", { body: { template: tpl, cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === ag.agent);
   const ws = await runner(ag.agent, host.host, host.host_token, 1, "rin_one", opts.toolsChanged);
   const url = `https://mcp.test/${id}/mcp`;
   /** Another agent of the same template (so the same server and credential), with its runner. */
   const another = async (toolsChanged = opts.toolsChanged) => {
-    const b = await adminJson("/v1/agents", { body: { template: tpl, workstream, cell } }, 201);
+    const b = await adminJson("/v1/agents", { body: { template: tpl, cell } }, 201);
     await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === b.agent);
     return { agent: b.agent as string, ws: await runner(b.agent, host.host, host.host_token, 1, `rin_${rand()}`, toolsChanged) };
   };
   return {
-    id, cap, stub, agent: ag.agent as string, workstream: workstream as string, host, ws, t: (tool: string) => `${cap}_${tool}`, another,
+    id, cap, stub, agent: ag.agent as string, host, ws, t: (tool: string) => `${cap}_${tool}`, another,
     connector: () => connectorStub(url, `cap:${cap}`),
   };
 }
@@ -247,7 +246,7 @@ describe("the mcp capability source", () => {
     expect(checkMcpUrl("http://example.com/mcp", true).ok).toBe(false);
     // A capability without a source is stored as it was.
     const plain = `p-${rand()}`;
-    await adminJson(`/v1/admin/capabilities/${plain}`, { method: "PUT", body: { tools: ["notify"] } });
+    await adminJson(`/v1/admin/capabilities/${plain}`, { method: "PUT", body: { tools: ["read_transcript"] } });
     expect((await adminJson("/v1/admin/catalog")).capabilities[plain]).not.toHaveProperty("mcp");
   });
 });
@@ -282,12 +281,11 @@ describe("tool listing and authority", () => {
     await adminJson(`/v1/admin/capabilities/${other}`, { method: "PUT", body: { mcp: { url: `https://mcp.test/${s.id}/mcp`, auth: `cap:${other}`, trusted: true } } });
     await adminJson(`/v1/admin/templates/t2-${s.id}`, {
       method: "PUT",
-      body: { capabilities: ["nest", other], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token", escalate_to: "user" },
+      body: { capabilities: ["nest", other], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token" },
     });
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "mcp2" } }, 201);
     const cell = uniqueCell();
     const host = await connectHost(cell, "brain");
-    const ag = await adminJson("/v1/agents", { body: { template: `t2-${s.id}`, workstream, cell } }, 201);
+    const ag = await adminJson("/v1/agents", { body: { template: `t2-${s.id}`, cell } }, 201);
     await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === ag.agent);
     const ws = await runner(ag.agent, host.host, host.host_token, 1, "rin_cred");
     expect((await listTools(ws)).map((t) => t.name)).toContain(`${other}_echo`);
@@ -658,12 +656,13 @@ describe("sinks (docs/agents/tools/#taint-and-sinks)", () => {
     // Asked again before a decision (keys in another order): the same ask, not posted twice.
     call(s.ws, "cal_k2", s.t("note_put"), { value: "secret", key: "k" });
     expect((await result(s.ws, "cal_k2")).ask).toBe(p1.ask);
-    const notes = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications();
-    expect(notes.filter((n) => n.text.includes(p1.ask))).toHaveLength(1);
-    expect(notes.at(-1)!.text).toContain('"value":"secret"');
+    const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
+    expect(asks.map((a: { ask: string }) => a.ask)).toEqual([p1.ask]);
+    expect(asks[0].question).toContain('"value":"secret"');
     expect(s.stub.calls).toEqual([]);
 
     expect((await answer(s.agent, p1.ask, "approve")).delivered).toBe("async");
+    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]);
     expect(await lastTurn(s.agent)).toMatchObject({ kind: "ask_answer", text: expect.stringContaining(`Approved (${p1.ask})`) });
     // Other arguments aren't approved by it.
     call(s.ws, "cal_k3", s.t("note_put"), { key: "k", value: "other" });

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use nest_protocol::control::{self, LaunchConfig, SystemPrompt, TurnInput};
 use nest_protocol::host::runner::{AgentStart, ExitReason, RunnerCommand, RunnerEvent};
-use nest_protocol::model::{AgentId, TurnId, TurnInputKind, WorkstreamId};
+use nest_protocol::model::{AgentId, TurnId, TurnInputKind};
 use nest_runner::runtime::AgentCmd;
 use nest_runner::{Config, Runtime};
 
@@ -45,7 +45,7 @@ fn start_cmd(dir: &Path, agent: &str, tools: &[&str]) -> RunnerCommand {
     let s = control::AgentStart {
         agent: AgentId(agent.into()),
         role: None,
-        workstream: WorkstreamId("ws_t".into()),
+        workstream: None,
         epoch: Some(nest_protocol::model::Epoch(1)),
         resume: None,
         hands: None,

@@ -209,8 +209,7 @@ async function tickAt(cell: string, ec2: MockEc2 | null, shiftMs = 0) {
 
 async function captain(cell: string, start = true) {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-brains" } });
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "brains" } }, 201);
-  const res = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", workstream, cell, start: false } }, 201);
+  const res = await adminJson<{ agent: string }>("/v1/agents", { body: { role: "captain", cell, start: false } }, 201);
   if (start) await agentStub(res.agent).start().catch(() => undefined);
   return res.agent;
 }
@@ -219,13 +218,12 @@ describe("FleetDO: host kinds", () => {
   it("a sandbox is never placed on a brain host, and an agent_start never goes to a sandbox host", async () => {
     const cell = uniqueCell();
     const brain = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "kinds" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 202);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 202);
     expect(sbx.host ?? null).toBeNull();
     expect(await brain.ws.none("commands", 150, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_create"))).toBe(true);
     const sandboxHost = await connectHost(cell);
     const refused = await fleetStub(cell).issueCommands(sandboxHost.host, [{
-      type: "agent_start", agent: "agt_x", role: "captain", workstream, epoch: 1, launch: { builtin_tools: [], system_prompt: { mode: "append" } },
+      type: "agent_start", agent: "agt_x", role: "captain", epoch: 1, launch: { builtin_tools: [], system_prompt: { mode: "append" } },
       oauth_token: "ref", session_ws_url: "ws://x",
     } as never]).then(() => "sent", (e: Error) => e.message);
     expect(refused).toMatch(/brains run only on brain hosts/);
@@ -794,10 +792,9 @@ describe("AgentDO: where a brain starts", () => {
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-brains" } });
     const sandboxHost = await connectHost(cell);
     const a = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "where" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(sandboxHost.ws, (c) => c.type === "sandbox_create");
-    const worker = (await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell } }, 201)).agent;
+    const worker = (await adminJson<{ agent: string }>("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell } }, 201)).agent;
     const [start] = await nextCommands(a.ws, isStartOf(worker));
     await okResult(a.ws, start.cmd);
     expect(await sandboxHost.ws.none("commands", 100, (m) => (m.commands as any[]).some(isStartOf(worker)))).toBe(true);
@@ -816,9 +813,8 @@ describe("creating an agent on a cell with no brain host", () => {
   it("answers 201 with the agent and why its start waits, and keeps the start's intent", async () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-cold" } });
-    const { workstream } = await adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "cold cell" } }, 201);
     const created = await adminJson<{ agent: string; started: unknown; start_waiting?: { code: string; retryable: boolean } }>(
-      "/v1/agents", { body: { template: "captain", workstream, cell, start: true } }, 201);
+      "/v1/agents", { body: { template: "captain", cell, start: true } }, 201);
     expect(created.agent).toMatch(/^agt_/);
     expect(created.started).toBeNull();
     expect(created.start_waiting).toMatchObject({ code: "capacity_exhausted", retryable: true });

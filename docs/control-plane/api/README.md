@@ -2,7 +2,7 @@
 
 - **Worker HTTP API,** authenticated by [operator tokens](#operator-tokens). The read-only [dashboard](../dashboard/) is a Worker of its own behind Cloudflare Access.
 - **External events** (webhooks, email) are external integrations, not platform routes ([principle 9](../../README.md#principles)): one delivers to an agent through its inbox. Agents schedule their own wakes with `wake_at`.
-- **Approvals and escalations** go through the **[Discord bot](discord/)**.
+- **Approvals:** a call the sink gate or a tool rule in `ask` mode holds is listed by `GET /v1/agents/<id>/asks` (`{ask, question, created_ms, approval?: {name, tool}}`, oldest first) and answered by `POST /v1/agents/<id>/asks/<ask>/answer {answer}`; the decision reaches the agent as an `ask_answer` turn. The **[Discord bot](discord/)** is designed on top of these; agent events delivered to owners (webhooks) are kernel but not built.
 - **`nest` CLI on my machine:** `login` (the Access service token, and a binding per sandbox from SandboxDO's `resolve`), `attach` (a terminal: a WebSocket to the sandbox host's [gateway](../../sandbox/gateway/), then vsock), `logs -f`, `port-forward` (TCP over the same path), `diff <a> <b>`. The CLI reaches a sandbox the way a brain does, by hostname and binding. Not built: these commands (the CLI has only `hook`, `mcp` and the in-sandbox commands).
 - **Host authentication:**
   - A signed instance identity document (or a one-time enrollment token) is exchanged for a rotating host token. See [../../compute/provisioning/](../../compute/provisioning/).
@@ -11,7 +11,8 @@
 - **Operator API:** endpoints are listed in `control-plane/README.md`.
   - **Includes:** egress policy layers (`PUT /v1/sandboxes/<id>/policy`), ports and public share links (operator-only), paged transcripts, a sandbox's hands target for a person or a harness (`POST /v1/sandboxes/<id>/resolve`), starting a brain on a named host (`POST /v1/agents/<id>/start {host}`), and the Access service token for the gateways (`PUT /v1/admin/secrets/access:gateway`).
   - **Cells:** must be well-formed names, and must be in `CELLS` when that's set.
-  - **Agents:** `POST /v1/agents` takes an agent's workstream and cell from its sandbox when it has one; both are optional, and a value that differs from the sandbox's is refused (409).
+  - **Agents:** `POST /v1/agents` takes an agent's cell from its sandbox when it has one; a cell that differs from the sandbox's is refused (409).
+  - **Compat (one release):** `POST /v1/sandboxes` and `POST /v1/agents` accept a `workstream` field and ignore it (old clients and scripts send it).
 
 ## Operator tokens
 

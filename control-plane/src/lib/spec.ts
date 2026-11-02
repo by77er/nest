@@ -1,6 +1,6 @@
 // Templates, capabilities and spawn specs (docs/agents/capabilities/, docs/orchestration/): data, not
 // code. A capability names platform tools, the permission rules they need and a prompt section; a
-// template lists capabilities plus launch, hands, credential and escalation. Expanding a spawn spec
+// template lists capabilities plus launch, hands and credential. Expanding a spawn spec
 // against them gives the agent's stored spec. Everything here is pure and synchronous: the catalog
 // is passed in, nothing is awaited, and errors are returned, not thrown.
 import { z } from "zod";
@@ -13,14 +13,7 @@ import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
 
-/**
- * Where an agent's questions go (`ask`, approvals): the user's notification queue, or its workstream
- * (WorkstreamDO: a `needs_input` event that wakes its subscriber).
- */
-export const EscalateTo = z.enum(["user", "workstream"]);
-export type EscalateTo = z.output<typeof EscalateTo>;
 export const HandsRule = z.enum(["required", "forbidden", "optional"]);
-export const Subscription = z.enum(["workstream"]);
 
 export const Capability = z.object({
   /** Platform tools (from `platform-tools.json`). */
@@ -45,9 +38,6 @@ export const Template = z.object({
   /** Whether a spawn from it takes a sandbox. */
   hands: HandsRule,
   credential: Credential,
-  escalate_to: EscalateTo,
-  /** `workstream`: the new agent becomes its workstream's subscriber at spawn (WorkstreamDO). */
-  subscribe: z.array(Subscription).default([]),
   /**
    * The repos its agents may push to (docs/sandbox/networking/egress/policy/#repo-allowlists): joined to
    * its sandbox's allowlist while attached, and the scope of its unscoped GitHub brokered actions.
@@ -64,13 +54,12 @@ export type Template = z.output<typeof Template>;
 
 /**
  * What the operator may change at spawn (the admin API only; it holds the root): replace the launch
- * or the rules, narrow the tools, and pick the escalation and the setup token.
+ * or the rules, narrow the tools, and pick the setup token.
  */
 export const OperatorOverrides = z.object({
   launch: LaunchConfig.optional(),
   rules: z.array(ToolRule).optional(),
   tools: z.array(z.string()).optional(),
-  escalate_to: EscalateTo.optional(),
   credential: Credential.optional(),
   /** The push allowlist, replacing the template's. */
   repos: Repos.optional(),
@@ -82,7 +71,7 @@ export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 /**
  * What an agent spawning another may change: it can only narrow. `tools` is a subset of the
  * template's, and `rules` only `deny` or `ask`, placed before the template's (first match wins), so
- * they can only take permissions away. No launch, built-in tools, credential or escalation: those
+ * they can only take permissions away. No launch, built-in tools or credential: those
  * stay the template's. Lifetimes only shorten: `ephemeral` can be set, never cleared, and the sandbox's
  * idle TTL only lowered. Anything else is refused (`strict`).
  */
@@ -109,8 +98,6 @@ export interface AgentSpec {
   launch: LaunchConfig;
   rules: ToolRule[];
   credential: string;
-  escalate_to: EscalateTo;
-  subscribe: "workstream"[];
   /** Its mcp capabilities' servers, in capability order; absent when it has none (as is every stored spec before them). */
   mcp?: McpGrant[];
   /** Its brokered action grants, in capability order; absent when it has none (as is every stored spec before them). */
@@ -162,8 +149,6 @@ export const SEED_CATALOG_V1: Catalog = {
       launch: { builtin_tools: ["TodoWrite", "Task", "WebSearch"], system_prompt: { mode: "append", text: "" } },
       hands: "required",
       credential: setupTokenSecret("worker"),
-      escalate_to: "workstream",
-      subscribe: [],
     },
     captain: {
       capabilities: ["nest", "messaging", "transcripts", "sandboxes", "brokered", "management", "memory"],
@@ -173,8 +158,6 @@ export const SEED_CATALOG_V1: Catalog = {
       },
       hands: "forbidden",
       credential: setupTokenSecret("captain"),
-      escalate_to: "user",
-      subscribe: ["workstream"],
     },
   },
 };
@@ -229,25 +212,41 @@ export const WORKER_BUILTIN_TOOLS: readonly string[] = ["TaskCreate", "TaskGet",
 export const RETIRED_TOOLS: readonly string[] = ["delegate", "spawn_agent", "kill"];
 
 /**
+ * Version 8: workstreams and the messaging tools left the platform (docs/README.md#principles): the
+ * `messaging` (`notify`, `ask`) and `events` (`emit`) capabilities, and the workstream tools of
+ * `management`, which no handler ever served.
+ */
+export const MESSAGING_CAPABILITIES_REMOVED: readonly string[] = ["messaging", "events"];
+export const MESSAGING_TOOLS_REMOVED: readonly string[] = [
+  "notify", "emit", "ask", "spawn_workstream", "send", "list_workstreams", "get_status", "wait_events", "merge", "notify_user",
+];
+
+/**
  * The seed of an empty catalog (the current version). Beyond version 1 it adds the later steps'
- * capabilities and, for new catalogs only (a seed step never edits an entry a catalog already holds):
- * `management` without the {@link RETIRED_TOOLS}, `captain` with `spawning`, and `worker` without
- * `subagents` and with {@link WORKER_BUILTIN_TOOLS}.
+ * capabilities, leaves out what they removed, and, for new catalogs only (a seed step never edits an
+ * entry a catalog already holds): `management` without the {@link RETIRED_TOOLS}, `captain` with
+ * `spawning`, and `worker` without `subagents` and with {@link WORKER_BUILTIN_TOOLS}.
  */
 export const SEED_CATALOG: Catalog = {
   capabilities: {
-    ...SEED_CATALOG_V1.capabilities,
-    management: { ...SEED_CATALOG_V1.capabilities.management!, tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => !RETIRED_TOOLS.includes(t)) },
+    ...Object.fromEntries(Object.entries(SEED_CATALOG_V1.capabilities).filter(([n]) => !MESSAGING_CAPABILITIES_REMOVED.includes(n))),
+    management: {
+      ...SEED_CATALOG_V1.capabilities.management!,
+      tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => !RETIRED_TOOLS.includes(t) && !MESSAGING_TOOLS_REMOVED.includes(t)),
+    },
     ...EGRESS_CAPABILITIES,
     ...SPAWNING_CAPABILITIES,
   },
   templates: {
     worker: {
       ...SEED_CATALOG_V1.templates.worker!,
-      capabilities: SEED_CATALOG_V1.templates.worker!.capabilities.filter((c) => c !== "subagents"),
+      capabilities: SEED_CATALOG_V1.templates.worker!.capabilities.filter((c) => c !== "subagents" && !MESSAGING_CAPABILITIES_REMOVED.includes(c)),
       launch: { ...SEED_CATALOG_V1.templates.worker!.launch, builtin_tools: [...WORKER_BUILTIN_TOOLS] },
     },
-    captain: { ...SEED_CATALOG_V1.templates.captain!, capabilities: [...SEED_CATALOG_V1.templates.captain!.capabilities, "spawning"] },
+    captain: {
+      ...SEED_CATALOG_V1.templates.captain!,
+      capabilities: [...SEED_CATALOG_V1.templates.captain!.capabilities.filter((c) => !MESSAGING_CAPABILITIES_REMOVED.includes(c)), "spawning"],
+    },
   },
 };
 
@@ -316,6 +315,7 @@ export const SEED_STEPS: readonly SeedStep[] = [
     removes: { capabilities: CHANNEL_CAPABILITIES_REMOVED, params: [], tools: CHANNEL_TOOLS_REMOVED, fields: CHANNEL_FIELDS_REMOVED },
     prompts: [{ capability: "spawning", was: SPAWNING_PROMPT_V5, now: SPAWNING_CAPABILITIES.spawning!.prompt }],
   },
+  { version: 8, capabilities: {}, templates: {}, removes: { capabilities: MESSAGING_CAPABILITIES_REMOVED, params: [], tools: MESSAGING_TOOLS_REMOVED } },
 ];
 export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
 
@@ -487,8 +487,6 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     // In capability order, each once (first occurrence kept).
     rules: dedupeRules(caps.flatMap((c) => c.rules)),
     credential: tpl.credential,
-    escalate_to: tpl.escalate_to,
-    subscribe: [...tpl.subscribe],
     ...(mcp.length ? { mcp } : {}),
     ...(brokered.length ? { brokered } : {}),
     ...(tpl.repos?.length ? { repos: canonicalRepos(tpl.repos) } : {}),
@@ -590,7 +588,6 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,
     credential: o.credential ?? base.value.credential,
-    escalate_to: o.escalate_to ?? base.value.escalate_to,
   }, o.repos ?? base.value.repos ?? []));
 }
 
@@ -600,22 +597,19 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
  * What each role meant when records were stored with one, frozen here so editing the seed (or the
  * catalog) never changes how an old record is read. (A test checks the first seed still expands to it.)
  */
-export const ROLE_SPECS: Readonly<Record<"worker" | "captain", Omit<AgentSpec, "launch" | "rules" | "subscribe">>> = {
+export const ROLE_SPECS: Readonly<Record<"worker" | "captain", Omit<AgentSpec, "launch" | "rules">>> = {
+  // Without the tools the registry no longer has: the retired ones (`delegate`, `spawn_agent`, `kill`)
+  // and those that left with workstreams ({@link MESSAGING_TOOLS_REMOVED}). A stored record naming
+  // one lists a tool its runner is never offered.
   worker: {
     template: "worker",
-    tools: ["notify", "emit", "ask", "fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"],
+    tools: ["fork_sandbox", "read_transcript", "checkpoint", "expose_port", "brokered"],
     credential: setupTokenSecret("worker"),
-    escalate_to: "workstream",
   },
   captain: {
     template: "captain",
-    // Without the retired tools (`delegate`, `spawn_agent`, `kill`), which no handler ever served and
-    // the registry no longer has (a stored record naming one lists a tool its runner is never offered).
-    tools: ["notify", "ask", "fork_sandbox", "attach", "read_transcript", "brokered", "spawn_workstream", "send",
-      "list_workstreams", "get_status", "wait_events", "approve", "deny", "merge", "memory_read", "memory_write",
-      "notify_user"],
+    tools: ["fork_sandbox", "attach", "read_transcript", "brokered", "approve", "deny", "memory_read", "memory_write"],
     credential: setupTokenSecret("captain"),
-    escalate_to: "user",
   },
 };
 
@@ -632,7 +626,7 @@ export interface RoleRecord {
  * (they were already that role's defaults or the operator's overrides) and its grant list narrowing
  * the tools (names the role didn't offer are ignored, as they were).
  */
-export function specFromRole(rec: RoleRecord): Omit<AgentSpec, "subscribe"> {
+export function specFromRole(rec: RoleRecord): AgentSpec {
   const r = ROLE_SPECS[rec.role];
   const grants = rec.grants;
   return {

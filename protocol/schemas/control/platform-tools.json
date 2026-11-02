@@ -1,107 +1,5 @@
 [
   {
-    "name": "notify",
-    "description": "Send a short message to `captain` (your owner, or else whoever reads your escalation channel), to the user (via Discord), or to another agent's inbox. Does not wait for a reply.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "to": {
-          "type": "string",
-          "description": "Recipient: 'captain' (your owner, or your escalation channel's reader), 'user', or an agent id (agt_...)."
-        },
-        "message": {
-          "type": "string",
-          "description": "Message text."
-        },
-        "urgency": {
-          "type": "string",
-          "description": "normal or high (high may @-mention the user).",
-          "enum": [
-            "normal",
-            "high"
-          ]
-        }
-      },
-      "required": [
-        "to",
-        "message"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
-    "name": "emit",
-    "description": "Emit a structured workstream event (progress, blocked, pr_opened, completed, failed). Decision events wake the workstream channel's subscriber.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "event": {
-          "type": "string",
-          "description": "Event type.",
-          "enum": [
-            "progress",
-            "blocked",
-            "pr_opened",
-            "completed",
-            "failed"
-          ]
-        },
-        "summary": {
-          "type": "string",
-          "description": "Human-readable summary."
-        },
-        "url": {
-          "type": "string",
-          "description": "Related URL, e.g. the PR."
-        },
-        "title": {
-          "type": "string",
-          "description": "PR title (pr_opened)."
-        }
-      },
-      "required": [
-        "event",
-        "summary"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
-    "name": "ask",
-    "description": "Ask whoever reads your escalation channel (`captain`, the default) or the user a question. Answers within ~2 minutes are returned directly; otherwise the call returns 'pending', you should end your turn, and the answer arrives as your next input.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "question": {
-          "type": "string",
-          "description": "The question."
-        },
-        "options": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Suggested answers."
-        },
-        "to": {
-          "type": "string",
-          "description": "captain (your escalation channel; the default) or user.",
-          "enum": [
-            "captain",
-            "user"
-          ]
-        }
-      },
-      "required": [
-        "question"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
     "name": "agent_spawn",
     "description": "Spawn an agent from a template your capabilities allow. You own it: its events (its final text, its exit) reach you, and you can stop it (agent_stop). It gets the task as its first input.",
     "input_schema": {
@@ -232,7 +130,7 @@
   },
   {
     "name": "attach",
-    "description": "Bind (or with sandbox omitted, unbind) a worker agent's hands to a sandbox in the same workstream.",
+    "description": "Bind (or with sandbox omitted, unbind) a worker agent's hands to a sandbox.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -387,145 +285,8 @@
     "requires_approval": false
   },
   {
-    "name": "spawn_workstream",
-    "description": "Create a workstream with a goal/spec and budget, and start its first worker.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "goal": {
-          "type": "string",
-          "description": "One-line goal."
-        },
-        "spec": {
-          "type": "string",
-          "description": "Full spec for the first worker."
-        },
-        "repo": {
-          "type": "string",
-          "description": "Repository URL, if any."
-        },
-        "budget_turns": {
-          "type": "integer",
-          "description": "Turn budget."
-        },
-        "image": {
-          "type": "string",
-          "description": "Sandbox image (default nest-base)."
-        }
-      },
-      "required": [
-        "goal",
-        "spec"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
-    "name": "send",
-    "description": "Send a message to a workstream's agents (or one agent). interrupt=true interrupts the current turn.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "workstream": {
-          "type": "string",
-          "description": "Workstream id."
-        },
-        "agent": {
-          "type": "string",
-          "description": "Specific agent (optional)."
-        },
-        "message": {
-          "type": "string",
-          "description": "Message."
-        },
-        "interrupt": {
-          "type": "boolean",
-          "description": "Interrupt the current turn first."
-        }
-      },
-      "required": [
-        "workstream",
-        "message"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
-    "name": "list_workstreams",
-    "description": "List workstreams in your scope with their state.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "state": {
-          "type": "string",
-          "description": "Filter.",
-          "enum": [
-            "active",
-            "parked",
-            "done",
-            "all"
-          ]
-        }
-      },
-      "required": [],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
-    "name": "get_status",
-    "description": "Detailed status of a workstream: agents, sandboxes, recent events, open asks, budget.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "workstream": {
-          "type": "string",
-          "description": "Workstream id."
-        }
-      },
-      "required": [
-        "workstream"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
-    "name": "wait_events",
-    "description": "Wait up to timeout_ms (max 120000) for workstream events matching the filter. Prefer ending your turn: you are woken on decision events.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "workstreams": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Workstream ids (default: all in scope)."
-        },
-        "types": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Event types."
-        },
-        "timeout_ms": {
-          "type": "integer",
-          "description": "Max wait.",
-          "maximum": 120000
-        }
-      },
-      "required": [],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
     "name": "approve",
-    "description": "Approve a pending request (ask or approval-gated action).",
+    "description": "Approve a pending approval-gated call.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -568,30 +329,8 @@
     "requires_approval": false
   },
   {
-    "name": "merge",
-    "description": "Mark a workstream's result as accepted (e.g. merge its PR via brokered action) and wind it down.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "workstream": {
-          "type": "string",
-          "description": "Workstream id."
-        },
-        "note": {
-          "type": "string",
-          "description": "Note."
-        }
-      },
-      "required": [
-        "workstream"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": true
-  },
-  {
     "name": "memory_read",
-    "description": "Read a key from your durable memory (notes per workstream).",
+    "description": "Read a key from your durable memory.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -625,32 +364,6 @@
       "required": [
         "key",
         "value"
-      ],
-      "additionalProperties": false
-    },
-    "requires_approval": false
-  },
-  {
-    "name": "notify_user",
-    "description": "Message the user on Discord. urgency high @-mentions them.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "message": {
-          "type": "string",
-          "description": "Message."
-        },
-        "urgency": {
-          "type": "string",
-          "description": "normal or high.",
-          "enum": [
-            "normal",
-            "high"
-          ]
-        }
-      },
-      "required": [
-        "message"
       ],
       "additionalProperties": false
     },

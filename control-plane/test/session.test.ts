@@ -2,6 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { bytesToB64 } from "../src/lib/util";
 import type { AgentDO } from "../src/do/agent";
+import { CallLedger } from "../src/lib/calls";
 import { admin, adminJson, connectHost, eventually, nextCommands, received, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -12,16 +13,15 @@ async function setup(opts: { captain?: boolean } = {}) {
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
   const sbxHost = await connectHost(cell);
   const host = await connectHost(cell, "brain");
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "ship it" } }, 201);
   let captain: string | undefined;
   if (opts.captain) {
-    captain = (await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201)).agent;
+    captain = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent;
   }
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(sbxHost.ws, (c) => c.type === "sandbox_create");
-  const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, ...(captain ? { captain } : {}) } }, 201);
+  const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell, ...(captain ? { captain } : {}) } }, 201);
   const [start] = await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === worker.agent);
-  return { cell, host, sbxHost, workstream, sandbox: sbx.sandbox, agent: worker.agent as string, start, captain };
+  return { cell, host, sbxHost, sandbox: sbx.sandbox, agent: worker.agent as string, start, captain };
 }
 
 async function connectRunner(agent: string, hostId: string, token: string, epoch = 1, extra: Record<string, unknown> = {}) {
@@ -38,36 +38,19 @@ const seg = (offset: number, text: string, base = false) => ({
 let runnerSeq = 0;
 const toolCall = (call: string, name: string, args: unknown, seq = ++runnerSeq) => ({ type: "tool_call", seq, call, turn: "trn_x", name, arguments: args });
 
-/** The ask a sent `ask` call posted, once its `needs_input` event is in (a call lands when workerd delivers it). */
-async function askPosted(workstream: string): Promise<string> {
-  for (let i = 0; i < 250; i++) {
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(workstream)).events();
-    const needs = events.find((e) => e.type === "needs_input") as { ask: string } | undefined;
-    if (needs) return needs.ask;
-    await sleep(20);
-  }
-  throw new Error("timed out waiting for the ask's needs_input event");
-}
-
-/** Lapse the sync window of the agent's open ask: wait for its deadline, make it due, run the alarm. */
-async function lapseAskWindow(agent: string): Promise<void> {
-  const due = () => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
-    st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key LIKE 'ask:%'").rowsWritten);
-  for (let i = 0; i < 250 && (await due()) === 0; i++) await sleep(20);
-  await runDue(agentStub(agent));
-}
-
 describe("agent start", () => {
   it("sends agent_start to a brain host (never the sandbox's) with the setup token, hands and session URL", async () => {
     const s = await setup();
     expect(s.start).toMatchObject({
-      agent: s.agent, workstream: s.workstream, epoch: 1, hands: { sandbox: s.sandbox },
+      agent: s.agent, epoch: 1, hands: { sandbox: s.sandbox },
       oauth_token: "sk-ant-oat01-test", launch: { system_prompt: { mode: "append" } },
     });
     expect(s.start.session_ws_url).toMatch(new RegExp(`/v1/agents/${s.agent}/session$`));
     // Nothing for the previous release's runners: no role, and the epoch only once.
     expect(s.start).not.toHaveProperty("role");
     expect(s.start.hands).toEqual({ sandbox: s.sandbox });
+    // Compat for one release: runners of the previous release require a `ws_` value.
+    expect(s.start.workstream).toBe(`ws_${s.agent.slice("agt_".length)}`);
   });
 });
 
@@ -198,83 +181,80 @@ describe("session channel", () => {
 });
 
 describe("platform tool relay", () => {
-  it("notify reaches the captain's inbox once, even when the call is redelivered", async () => {
-    const s = await setup({ captain: true });
-    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
-    ws.send(toolCall("cal_t1-1", "notify", { to: "captain", message: "PR is up" }));
-    const r = await ws.next("tool_result");
-    expect(r).toMatchObject({ call: "cal_t1-1", outcome: { status: "ok" } });
-    ws.send(toolCall("cal_t1-1", "notify", { to: "captain", message: "PR is up" })); // redelivery, new seq
-    expect((await ws.next("tool_result")).call).toBe("cal_t1-1");
-    const captainTurns = await agentStub(s.captain!).turns();
-    expect(captainTurns.length).toBe(1);
-    expect(captainTurns[0]!.input).toMatchObject({ kind: "inbox" });
-    expect(captainTurns[0]!.input.text).toContain("PR is up");
-  });
-
-  it("ask answers within the window synchronously, otherwise returns pending and answers as a turn", async () => {
-    const s = await setup({ captain: true });
-    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
-    ws.send(toolCall("cal_t2-1", "ask", { question: "Allow api.openai.com?", options: ["allow 2h", "deny"] }));
-    const ask = await askPosted(s.workstream);
-    expect(await ws.none("tool_result", 50)).toBe(true);
-    expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "allow 2h" } })).delivered).toBe("sync");
-    const r = await ws.next("tool_result");
-    expect(r.outcome).toEqual({ status: "ok", content: [{ type: "text", text: "allow 2h" }] });
-
-    ws.send(toolCall("cal_t2-2", "ask", { question: "Merge?", to: "user" }));
-    // The window lapses (its deadline made due, rather than waiting out ASK_SYNC_WINDOW_MS).
-    await lapseAskWindow(s.agent);
-    const pending = await ws.next("tool_result", (m) => m.call === "cal_t2-2");
-    expect(pending.outcome.status).toBe("pending");
-    const notes = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications();
-    expect(notes.at(-1)!.text).toContain("Merge?");
-    expect((await adminJson(`/v1/agents/${s.agent}/asks/${pending.outcome.ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
-    const turns = await agentStub(s.agent).turns();
-    expect(turns.at(-1)!.input).toMatchObject({ kind: "ask_answer" });
-  });
-
-  it("an ask answered inside its window after its brain was restarted arrives as a turn (the call's result has no brain to reach)", async () => {
-    const s = await setup({ captain: true });
-    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
-    ws.send(toolCall("cal_t3-1", "ask", { question: "Merge?" }));
-    const ask = await askPosted(s.workstream);
-    await agentStub(s.agent).start(undefined, undefined, true); // an operator's restart condemns brain 1
-    expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
-    expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("yes") });
-  });
-
-  it("an ask answered while it is still being routed ends its call `done`, never `waiting` (which is never pruned)", async () => {
-    const s = await setup({ captain: true });
-    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
-    await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {
-      inst.testHooks["ask:beforeRoute"] = async () => {
-        delete inst.testHooks["ask:beforeRoute"];
-        await inst.answerAsk(st.storage.sql.exec<{ ask: string }>("SELECT ask FROM asks").one().ask, "yes");
-      };
+  it("a spec stored with notify, ask and emit still starts: they aren't offered, and a call answers unknown_tool", async () => {
+    const s = await setup();
+    // As the previous release stored a worker's spec (its seed gave `messaging` and `events`).
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.tools = ["notify", "emit", "ask", ...info.tools];
+      info.escalate_to = "workstream";
+      info.subscribe = [];
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
     });
-    ws.send(toolCall("cal_t4-1", "ask", { question: "Merge?" }));
-    expect((await ws.next("tool_result", (m) => m.call === "cal_t4-1")).outcome).toEqual({ status: "ok", content: [{ type: "text", text: "yes" }] });
-    await ws.next("ack");
-    const status = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
-      st.storage.sql.exec<{ status: string }>("SELECT status FROM tool_calls WHERE call = 'cal_t4-1'").one().status);
-    expect(status).toBe("done");
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    ws.send({ type: "tools_list_request", request: "req_tl" });
+    const names = ((await ws.next("tools_list")).tools as { name: string }[]).map((t) => t.name);
+    expect(names).toContain("read_transcript");
+    for (const gone of ["notify", "emit", "ask"]) expect(names).not.toContain(gone);
+    for (const [call, name, args] of [
+      ["cal_g1", "notify", { to: "captain", message: "PR is up" }], ["cal_g2", "ask", { question: "Merge?" }], ["cal_g3", "emit", { event: "progress", summary: "x" }],
+    ] as const) {
+      ws.send(toolCall(call, name, args));
+      expect((await ws.next("tool_result", (m) => m.call === call)).outcome.error.code, name).toBe("unknown_tool");
+    }
+    // The view shows neither the stored spec fields nor the compat workstream.
+    const info = await adminJson(`/v1/agents/${s.agent}`);
+    for (const k of ["escalate_to", "subscribe", "workstream"]) expect(info, k).not.toHaveProperty(k);
   });
 
-  it("an escalation event becomes an async ask whose answer arrives as a turn", async () => {
-    const s = await setup({ captain: true });
+  it("a sync ask the previous release left: its lapsed window ends the call pending; an answer inside it is the call's result", async () => {
+    const s = await setup();
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    // Rows as the previous release's `ask` tool left them: the call waiting, the ask in its window.
+    const plant = (call: string, ask: string) => runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const l = new CallLedger(st.storage.sql);
+      l.begin(1, call, "ask");
+      l.wait(1, call);
+      l.recordAsk({ ask, call, epoch: 1, question: "Merge?", status: "sync", deadline: Date.now() + 60_000 });
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES (?, 0)", `ask:${ask}`);
+    });
+    await plant("cal_o1", "ask_old1");
+    await runDue(agentStub(s.agent));
+    expect((await ws.next("tool_result", (m) => m.call === "cal_o1")).outcome).toMatchObject({ status: "pending", ask: "ask_old1" });
+    expect((await adminJson(`/v1/agents/${s.agent}/asks`)).map((a: { ask: string }) => a.ask)).toEqual(["ask_old1"]);
+    expect((await adminJson(`/v1/agents/${s.agent}/asks/ask_old1/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
+    expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("yes") });
+
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => st.storage.sql.exec("DELETE FROM deadlines WHERE key LIKE 'ask:%'"));
+    await plant("cal_o2", "ask_old2");
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => st.storage.sql.exec("UPDATE deadlines SET at = ? WHERE key = 'ask:ask_old2'", Date.now() + 60_000));
+    expect((await adminJson(`/v1/agents/${s.agent}/asks/ask_old2/answer`, { body: { answer: "merge" } })).delivered).toBe("sync");
+    expect((await ws.next("tool_result", (m) => m.call === "cal_o2")).outcome).toEqual({ status: "ok", content: [{ type: "text", text: "merge" }] });
+    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]);
+  });
+
+  it("a call a tool rule holds (an escalation) waits for the operator: listed, answered, and the decision arrives as a turn", async () => {
+    const s = await setup();
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     ws.send({ type: "events", seq: 1, events: [
       { agent: s.agent, epoch: 1, seq: 1, ts_ms: Date.now(), type: "capabilities", capabilities: ["interrupt_receipt_v1"] },
       { agent: s.agent, epoch: 1, seq: 2, ts_ms: Date.now(), type: "escalation", call: "cal_t9-1", tool: "WebFetch", input: { url: "https://x.test" } },
     ] });
     expect((await ws.next("ack")).up_to).toBe(1);
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
-    const needs = events.find((e) => e.type === "needs_input") as { ask: string; question: string } | undefined;
-    expect(needs?.question).toContain("WebFetch");
-    expect(needs?.question).toContain("cal_t9-1");
-    expect((await adminJson(`/v1/agents/${s.agent}/asks/${needs!.ask}/answer`, { body: { answer: "allow" } })).delivered).toBe("async");
-    expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer" });
+    const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
+    expect(asks).toEqual([{ ask: expect.stringMatching(/^ask_/), question: expect.stringContaining("WebFetch"), created_ms: expect.any(Number) }]);
+    expect(asks[0].question).toContain("cal_t9-1");
+    // Reported again (a redelivered event): still one ask.
+    ws.send({ type: "events", seq: 2, events: [
+      { agent: s.agent, epoch: 1, seq: 2, ts_ms: Date.now(), type: "escalation", call: "cal_t9-1", tool: "WebFetch", input: { url: "https://x.test" } },
+    ] });
+    expect((await ws.next("ack")).up_to).toBe(2);
+    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toHaveLength(1);
+    expect((await adminJson(`/v1/agents/${s.agent}/asks/${asks[0].ask}/answer`, { body: { answer: "allow" } })).delivered).toBe("async");
+    expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("allow") });
+    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]);
+    expect((await adminJson(`/v1/agents/${s.agent}/asks/${asks[0].ask}/answer`, { body: { answer: "allow" } })).delivered).toBe("already_answered");
+    await adminJson("/v1/agents/agt_nobody00000000000000000000/asks", {}, 404);
   });
 
   it("enforces roles, validates arguments, and reports unimplemented tools", async () => {
@@ -283,12 +263,12 @@ describe("platform tool relay", () => {
     ws.send({ type: "tools_list_request", request: "req_tl" });
     const list = await ws.next("tools_list");
     const names = (list.tools as { name: string }[]).map((t) => t.name);
-    expect(names).toContain("notify");
-    expect(names).not.toContain("spawn_workstream");
+    expect(names).toContain("read_transcript");
+    expect(names).not.toContain("attach");
 
-    ws.send(toolCall("cal_t3-1", "spawn_workstream", { goal: "x", spec: "y" }));
+    ws.send(toolCall("cal_t3-1", "attach", { agent: s.agent }));
     expect((await ws.next("tool_result", (m) => m.call === "cal_t3-1")).outcome.error.code).toBe("forbidden");
-    ws.send(toolCall("cal_t3-2", "notify", { to: "captain" }));
+    ws.send(toolCall("cal_t3-2", "read_transcript", {}));
     expect((await ws.next("tool_result", (m) => m.call === "cal_t3-2")).outcome.error.code).toBe("invalid_message");
     ws.send(toolCall("cal_t3-3", "fork_sandbox", { sandbox: s.sandbox }));
     expect((await ws.next("tool_result", (m) => m.call === "cal_t3-3")).outcome.error.code).toBe("not_implemented");
@@ -296,7 +276,7 @@ describe("platform tool relay", () => {
     expect((await ws.next("tool_result", (m) => m.call === "cal_t3-4")).outcome.error.code).toBe("unknown_tool");
   });
 
-  it("emit, read_transcript and expose_port", async () => {
+  it("read_transcript (its own, or an agent it owns) and expose_port", async () => {
     const s = await setup({ captain: true });
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     ws.send(seg(0, "line one\nline two\n"));
@@ -304,17 +284,19 @@ describe("platform tool relay", () => {
     await received(s.agent, 18);
     await agentStub(s.agent).flush();
 
-    ws.send(toolCall("cal_t4-1", "emit", { event: "pr_opened", summary: "dark mode", url: "https://github.com/x/y/pull/1" }));
-    expect((await ws.next("tool_result", (m) => m.call === "cal_t4-1")).outcome.status).toBe("ok");
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
-    expect(events.at(-1)).toMatchObject({ type: "pr_opened", url: "https://github.com/x/y/pull/1", agent: s.agent, sandbox: s.sandbox });
-
     ws.send(toolCall("cal_t4-2", "read_transcript", { agent: s.agent, since_seq: 1 }));
     const tr = await ws.next("tool_result", (m) => m.call === "cal_t4-2");
     expect(tr.outcome.content[0].text).toBe("line two");
     // Only an agent id names an agent: never another DO instance (`~health`, lib/health.ts).
     ws.send(toolCall("cal_t4-2b", "read_transcript", { agent: "~health" }));
     expect((await ws.next("tool_result", (m) => m.call === "cal_t4-2b")).outcome.error.code).toBe("invalid_message");
+    // Another agent's only if it owns it: not its owner's (the captain).
+    ws.send(toolCall("cal_t4-2c", "read_transcript", { agent: s.captain! }));
+    expect((await ws.next("tool_result", (m) => m.call === "cal_t4-2c")).outcome.error.code).toBe("forbidden");
+    // Its owner reads it.
+    const owner = await connectRunner(s.captain!, s.host.host, s.host.host_token);
+    owner.ws.send(toolCall("cal_t4-2d", "read_transcript", { agent: s.agent, since_seq: 1 }, 1));
+    expect((await owner.ws.next("tool_result", (m) => m.call === "cal_t4-2d")).outcome.content[0].text).toBe("line two");
 
     ws.send(toolCall("cal_t4-3", "expose_port", { port: 3000 }));
     const ex = await ws.next("tool_result", (m) => m.call === "cal_t4-3");

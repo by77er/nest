@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cloud check for brain hosts, against the live Worker (README.md in this directory).
 
-Creates a workstream, CHECK_AGENTS sandboxes and one worker agent per sandbox, starts each brain and
+Creates CHECK_AGENTS sandboxes and one worker agent per sandbox, starts each brain and
 gives it one turn: run a command in its own sandbox through hands (mcp__nest__Bash). Passes when every
 turn is done, every transcript shows the command's output, every brain was only ever seen on a brain
 host and every sandbox only on a sandbox host. Both host kinds autoscale from zero, so a cold cell
@@ -81,21 +81,18 @@ def main():
     try:
         log(f"{BASE} cell {CELL}: live hosts before: "
             f"{[(h['host'][-6:], kind(h.get('role')), h['status']) for h in fleet()['hosts'] if h['status'] in ('active', 'draining')]}")
-        s, v = api("POST", "/v1/workstreams", {"goal": f"brain-host cloud check: {N} workers"})
-        expect(s == 201, "create workstream", v)
-        ws = v["workstream"]
         for _ in range(N):
-            s, v = api("POST", "/v1/sandboxes", {"workstream": ws, "cell": CELL})
+            s, v = api("POST", "/v1/sandboxes", {"cell": CELL})
             expect(s in (201, 202), "create sandbox", v)
             sbxs.append(v["sandbox"])
         for sbx in sbxs:
-            s, v = api("POST", "/v1/agents", {"template": "worker", "workstream": ws, "sandbox": sbx, "cell": CELL, "start": False})
+            s, v = api("POST", "/v1/agents", {"template": "worker", "sandbox": sbx, "cell": CELL, "start": False})
             expect(s == 201, "create agent", v)
             agents.append(v["agent"])
             s, r = api("POST", f"/v1/agents/{v['agent']}/start")
             log(f"start {v['agent'][-6:]}: {s} {short(r, 140)}")
             expect(s == 200 or (s == 503 and isinstance(r, dict) and r.get("error", {}).get("retryable")), "start agent", r)
-        log(f"workstream {ws}; sandboxes {[x[-6:] for x in sbxs]}; agents {[a[-6:] for a in agents]}")
+        log(f"sandboxes {[x[-6:] for x in sbxs]}; agents {[a[-6:] for a in agents]}")
         for a in agents:
             s, v = api("POST", f"/v1/agents/{a}/turns", {"text": PROMPT})
             expect(s in (200, 201, 202), "queue turn", v)

@@ -44,17 +44,16 @@ async function setup(opts: { guest?: unknown } = {}) {
   const cell = uniqueCell();
   await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-hands" } });
   const host = await connectHost(cell);
-  const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "hands" } }, 201);
-  const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+  const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
   await nextCommands(host.ws, (c) => c.type === "sandbox_create");
-  const worker = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, start: false } }, 201);
+  const worker = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell, start: false } }, 201);
   const [attach] = await nextCommands(host.ws, (c) => c.type === "agent_attach" && c.agent === worker.agent);
   // nestd reports `running` once the guest is up, before any attach result; resolve needs it.
   await running(host.ws, sbx.sandbox, 1, "running", "guest" in opts ? opts.guest : GUEST);
   const pub = b64urlToBytes(host.keys[0]!.public_key);
   // Where the worker's brain runs: a brain host, never the sandbox's.
   const brain = await connectHost(cell, "brain");
-  return { cell, host, brain, workstream, sandbox: sbx.sandbox as string, agent: worker.agent as string, attach, pub };
+  return { cell, host, brain, sandbox: sbx.sandbox as string, agent: worker.agent as string, attach, pub };
 }
 
 async function verified(pub: Uint8Array, target: HandsTarget) {
@@ -105,9 +104,8 @@ describe("attach and resolve", () => {
     await okResult(s.host.ws, s.attach.cmd);
     await expect(Promise.resolve().then(() => sandboxStub(s.sandbox).resolve("agt_nobody000000000000000000"))).rejects.toThrow(/not_bound/);
     const empty = uniqueCell();
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "no hosts" } }, 201);
-    const unplaced = await adminJson("/v1/sandboxes", { body: { workstream, cell: empty } }, 202);
-    const w = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: unplaced.sandbox, cell: empty, start: false } }, 201);
+    const unplaced = await adminJson("/v1/sandboxes", { body: { cell: empty } }, 202);
+    const w = await adminJson("/v1/agents", { body: { role: "worker", sandbox: unplaced.sandbox, cell: empty, start: false } }, 201);
     await expect(Promise.resolve().then(() => sandboxStub(unplaced.sandbox).resolve(w.agent))).rejects.toThrow(/sandbox_not_ready/);
   });
 
@@ -157,7 +155,7 @@ describe("attach and resolve", () => {
     const s = await setup();
     await okResult(s.host.ws, s.attach.cmd);
     await running(s.host.ws, s.sandbox, 1, "suspended");
-    const other = await adminJson("/v1/agents", { body: { role: "worker", workstream: s.workstream, sandbox: s.sandbox, cell: s.cell, start: false } }, 201);
+    const other = await adminJson("/v1/agents", { body: { role: "worker", sandbox: s.sandbox, cell: s.cell, start: false } }, 201);
     const [first] = await nextCommands(s.host.ws, (c) => c.type === "agent_attach" && c.agent === other.agent);
     await failResult(s.host.ws, first.cmd);
     await running(s.host.ws, s.sandbox, 1, "running");
@@ -224,10 +222,9 @@ describe("attach and resolve", () => {
     const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
     ws.send(hostHello(enrolled.host, cell, { gateway_url: undefined }));
     await ws.next("hello_ack");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "no gateway" } }, 201);
-    const sbx = await adminJson("/v1/sandboxes", { body: { workstream, cell } }, 201);
+    const sbx = await adminJson("/v1/sandboxes", { body: { cell } }, 201);
     await nextCommands(ws, (c) => c.type === "sandbox_create");
-    const w = await adminJson("/v1/agents", { body: { role: "worker", workstream, sandbox: sbx.sandbox, cell, start: false } }, 201);
+    const w = await adminJson("/v1/agents", { body: { role: "worker", sandbox: sbx.sandbox, cell, start: false } }, 201);
     const [attach] = await nextCommands(ws, (c) => c.type === "agent_attach");
     await okResult(ws, attach.cmd);
     await rejects(sandboxStub(sbx.sandbox).resolve(w.agent)).toThrow(/sandbox_not_ready/);
@@ -381,8 +378,7 @@ describe("hands_resolve on the session channel", () => {
     const cell = uniqueCell();
     await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-hands" } });
     const ctl = await connectHost(cell, "brain");
-    const { workstream } = await adminJson("/v1/workstreams", { body: { goal: "captain" } }, 201);
-    const captain = await adminJson("/v1/agents", { body: { role: "captain", workstream, cell } }, 201);
+    const captain = await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201);
     const [start] = await nextCommands(ctl.ws, (c) => c.type === "agent_start" && c.agent === captain.agent);
     // A captain gets an agent epoch like any agent; no hands, so no `hands` field.
     expect(start).toMatchObject({ epoch: 1 });

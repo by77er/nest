@@ -33,7 +33,7 @@ const dirs: Record<string, Entry> = {
   runner_to_agent: { schema: C.RunnerToAgent, variants: byType(C.RunnerToAgentVariants), tag: typeTag },
   agent_to_runner: { schema: C.AgentToRunner, variants: byType(C.AgentToRunnerVariants), tag: typeTag },
   agent_event: { schema: M.AgentEvent, variants: byType(M.AgentEventVariants), tag: typeTag },
-  workstream_event: { schema: M.WorkstreamEvent, variants: byType(M.WorkstreamEventVariants), tag: typeTag },
+  sandbox_event: { schema: M.SandboxEvent, variants: byType(M.SandboxEventVariants), tag: typeTag },
   enroll_request: {
     schema: C.EnrollRequest,
     variants: ["aws_identity_document", "enrollment_token"],

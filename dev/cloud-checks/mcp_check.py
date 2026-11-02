@@ -8,7 +8,7 @@ nest's MCP proxy, and the platform's guarantees are checked against the server's
                 capability `mcp-check` (untrusted, all five tools allowed, only note_put idempotent,
                 echo, note_get and slow marked read-only, so note_put and counter_add are sinks)
                 and the template `mcp-check` (nest + mcp-check, no hands, MCP_MODEL, Haiku by default).
-  2. turns    - one workstream (an agent without a sandbox still needs one) and MCP_AGENTS agents, each
+  2. turns    - MCP_AGENTS agents (no sandbox), each
                 given one turn: echo a phrase holding its id, note_put `<agent>/k` = a random value,
                 note_get it back, counter_add `<agent>` by 1 twice, then by 100, then reply. Each sink
                 call is held for approval (the session is tainted): the check approves every one but
@@ -81,7 +81,7 @@ TEMPLATE = {
     # approval would end the turn.
     "capabilities": ["nest", CAP],
     "launch": {"model": MODEL, "builtin_tools": [], "system_prompt": {"mode": "append", "text": SYSTEM}},
-    "hands": "forbidden", "credential": "claude_oauth_token:worker", "escalate_to": "workstream", "subscribe": [], "params": {},
+    "hands": "forbidden", "credential": "claude_oauth_token:worker",
 }
 
 
@@ -216,15 +216,20 @@ def live_hosts():
     return [(h["host"][-6:], h.get("role"), h["status"]) for h in f.get("hosts", []) if h["status"] in ("active", "draining")]
 
 
-def needs_input(ws):
-    """The workstream's `needs_input` events (approvals and asks), oldest first; None: no answer."""
-    s, v = api("GET", f"/v1/workstreams/{ws}/events?limit=500")
-    return [e for e in reversed(v) if e.get("type") == "needs_input"] if s == 200 and isinstance(v, list) else None
+def open_asks(agents):
+    """Every agent's approvals waiting for the operator (`GET /v1/agents/<id>/asks`), oldest first per agent; None: no answer."""
+    out = []
+    for a in agents:
+        s, v = api("GET", f"/v1/agents/{a}/asks")
+        if s != 200 or not isinstance(v, list):
+            return None
+        out += [{**e, "agent": a} for e in v]
+    return out
 
 
-def decide(ws, answered):
+def decide(agents, answered):
     """Answer every new approval: deny the call with n DENIED_N, approve the rest. Returns how many are unanswered."""
-    evs = needs_input(ws)
+    evs = open_asks(agents)
     if evs is None:
         return 1
     left = 0
@@ -320,7 +325,7 @@ def main():
         sys.exit("NEST_ADMIN_TOKEN is not set")
     if not MCP_URL or not MCP_TOKEN:
         sys.exit("MCP_TEST_URL and MCP_TEST_TOKEN must both be set")
-    made = {"run": RUN, "capability": CAP, "template": TEMPLATE_NAME, "workstream": None, "agents": []}
+    made = {"run": RUN, "capability": CAP, "template": TEMPLATE_NAME, "agents": []}
     plan = {}  # agent -> {value, turn, epochs}
     ok = True
 
@@ -345,12 +350,9 @@ def main():
         mark("configured", capability=CAP, template=TEMPLATE_NAME, idempotent=[t for t, i in IDEMPOTENT.items() if i],
              read_only=CAPABILITY["mcp"]["read_only"])
 
-        # 2. A workstream, the agents (not started: the turn wakes each), one turn each.
-        s, v = api("POST", "/v1/workstreams", {"goal": f"remote MCP check {RUN}: {AGENTS} agents"})
-        expect(s == 201, "create workstream", v)
-        ws = made["workstream"] = v["workstream"]
+        # 2. The agents (not started: the turn wakes each), one turn each.
         for _ in range(AGENTS):
-            s, v = api("POST", "/v1/agents", {"template": TEMPLATE_NAME, "workstream": ws, "cell": CELL, "start": False})
+            s, v = api("POST", "/v1/agents", {"template": TEMPLATE_NAME, "cell": CELL, "start": False})
             expect(s == 201, "create agent", v)
             made["agents"].append(v["agent"])
         agents = made["agents"]
@@ -359,7 +361,7 @@ def main():
             s, v = api("POST", f"/v1/agents/{a}/turns", {"text": turn_text(a, value), "request_id": f"{RUN}/{a}/turn"})
             expect(s == 201 and isinstance(v, dict) and v.get("turn"), f"enqueue {a}'s turn", v)
             plan[a] = {"value": value, "turn": v["turn"], "epochs": set()}
-        mark("turns sent", workstream=ws, agents=agents)
+        mark("turns sent", agents=agents)
 
         # 3. Wait for every turn, answering approvals and noting each brain's epoch while it runs. Done
         # means every turn done and no approval unanswered (each answer is a new turn).
@@ -375,10 +377,10 @@ def main():
                     plan[a]["epochs"].add(info["brain"]["epoch"])
         while True:
             note_epochs()
-            decide(ws, decisions)
+            decide(agents, decisions)
             st = {a: turn_statuses(a) for a in agents}
             log(f"turns {({a[-6:]: v for a, v in st.items()})}; brains seen {len(ever_live)}/{len(agents)}; decisions {len(decisions)}")
-            if all(v and all(x == "done" for x in v) for v in st.values()) and decide(ws, decisions) == 0 \
+            if all(v and all(x == "done" for x in v) for v in st.values()) and decide(agents, decisions) == 0 \
                     and all(x == "done" for a in agents for x in turn_statuses(a)):
                 break
             if any("interrupted" in v for v in st.values()):

@@ -14,7 +14,6 @@ The Worker answers an interaction within Discord's 3-second window by deferring,
 ## Mapping
 
 - **Bridges:** a Discord thread can be bridged to an agent (`/bridge <agent>`). What I type there goes to its inbox as a message from `user` and wakes it. What it says comes back through agent events delivered to its owner (kernel, not built: [principle 9](../../../README.md#principles)); the control plane posts through the REST API and batches to stay under rate limits.
-- **Notifications** (`notify` to `user`, until stage 3) appear in one thread that is always bridged.
-- **Questions** (asks and approvals) become messages with buttons. Each button's `custom_id` carries the ask's reference; my click or modal answer is the ask's answer.
-- **Mentions:** a question or a high-urgency notification @-mentions me; anything else posts silently.
+- **Approvals** (an agent's open asks, `GET /v1/agents/<id>/asks`) become messages with buttons. Each button's `custom_id` carries the ask's reference; my click or modal answer is the ask's answer.
+- **Mentions:** an approval @-mentions me; anything else posts silently.
 - **What gets bridged is up to me** (`/bridge`); an agent can ask me to bridge it, e.g. a captain.

@@ -15,7 +15,7 @@ use crate::model::{
     AgentEvent, AgentId, AgentRole, AgentState, AskId, CallId, CommandId, CommitReason, Epoch,
     ErrorBody, EgressPolicy, ForkMode, GenerationId, GenerationKind, GenerationRecord, HostId,
     HostRole, InjectionSecret, ManifestHash, MessageId, RequestId, Resources, SandboxId,
-    SandboxState, Seq, SessionId, SuspendMode, TimestampMs, TurnId, TurnInputKind, WorkstreamEvent,
+    SandboxState, Seq, SessionId, SuspendMode, TimestampMs, TurnId, TurnInputKind, SandboxEvent,
     WorkstreamId,
 };
 
@@ -309,7 +309,10 @@ pub enum CommandBody {
     /// `checkpoint`, cold boot otherwise.
     SandboxCreate {
         sandbox: SandboxId,
-        workstream: WorkstreamId,
+        /// Compat: required by hosts of the previous release, ignored here. Workstreams left the
+        /// platform; the control plane drops it once every host runs this release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workstream: Option<WorkstreamId>,
         epoch: Epoch,
         image: String,
         resources: Resources,
@@ -333,7 +336,9 @@ pub enum CommandBody {
         parent_epoch: Epoch,
         child: SandboxId,
         child_epoch: Epoch,
-        child_workstream: WorkstreamId,
+        /// Compat, as `SandboxCreate::workstream`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_workstream: Option<WorkstreamId>,
         mode: ForkMode,
         policy: EgressPolicy,
     },
@@ -437,7 +442,10 @@ pub struct AgentStart {
     /// its spec (`hands` here, `tools_list`, `launch`), never from a role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<AgentRole>,
-    pub workstream: WorkstreamId,
+    /// Compat: required by runners of the previous release, ignored here. Workstreams left the
+    /// platform; the control plane drops it once every brain host runs this release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstream: Option<WorkstreamId>,
     /// The agent epoch AgentDO issued for this brain start (one per start, never reused). The
     /// brain presents it in its session `hello`; AgentDO keys platform tool calls and filters
     /// events by it. Unrelated to the sandbox's epoch: a sandbox move doesn't change it. Absent
@@ -558,9 +566,11 @@ pub enum HostEventBody {
         mem_manifest: Option<ManifestHash>,
         reason: CommitReason,
     },
-    /// Host-originated workstream events (port opened/exposed, egress denied/alert).
-    Workstream { event: WorkstreamEvent },
-    /// A `nest` CLI command run by a program inside the sandbox (`notify`/`emit`/`ask`/`expose`),
+    /// What a host saw about a sandbox it holds (port opened, egress denied, egress alert). Its wire
+    /// tag stays `workstream` (historical) so a control plane of the previous release parses it.
+    #[serde(rename = "workstream")]
+    SandboxEvent { event: SandboxEvent },
+    /// A `nest` CLI command run by a program inside the sandbox (`expose`, `unexpose`),
     /// relayed guest → nestd → FleetDO → AgentDO. Answered by `CommandBody::GuestCliResult`.
     /// `agent` comes from `NEST_AGENT_ID` (attribution only).
     GuestCli {
@@ -1035,7 +1045,7 @@ mod tests {
             HostEventBody::CommandResult { .. } => "command_result",
             HostEventBody::SandboxState { .. } => "sandbox_state",
             HostEventBody::CommitRequest { .. } => "commit_request",
-            HostEventBody::Workstream { .. } => "workstream",
+            HostEventBody::SandboxEvent { .. } => "workstream",
             HostEventBody::EgressAudit { .. } => "egress_audit",
             HostEventBody::Capacity { .. } => "capacity",
             HostEventBody::TunnelState { .. } => "tunnel_state",
@@ -1111,30 +1121,15 @@ mod tests {
         "error", "usage", "state_changed", "escalation", "capabilities", "task_exited", "inbox_delivered",
     ];
 
-    fn workstream_event(e: &crate::model::WorkstreamEvent) -> &'static str {
-        use crate::model::WorkstreamEventKind::*;
+    fn sandbox_event(e: &crate::model::SandboxEvent) -> &'static str {
+        use crate::model::SandboxEventKind::*;
         match &e.kind {
-            Started { .. } => "started",
-            Progress { .. } => "progress",
-            NeedsInput { .. } => "needs_input",
-            Blocked { .. } => "blocked",
-            PrOpened { .. } => "pr_opened",
-            Completed { .. } => "completed",
-            Failed { .. } => "failed",
-            BudgetExceeded { .. } => "budget_exceeded",
-            QuotaParked { .. } => "quota_parked",
-            OrphanedWork { .. } => "orphaned_work",
             EgressDenied { .. } => "egress_denied",
             EgressAlert { .. } => "egress_alert",
             PortOpened { .. } => "port_opened",
-            PortExposed { .. } => "port_exposed",
         }
     }
-    const WORKSTREAM_EVENTS: &[&str] = &[
-        "started", "progress", "needs_input", "blocked", "pr_opened", "completed", "failed",
-        "budget_exceeded", "quota_parked", "orphaned_work", "egress_denied", "egress_alert",
-        "port_opened", "port_exposed",
-    ];
+    const SANDBOX_EVENTS: &[&str] = &["egress_denied", "egress_alert", "port_opened"];
 
     fn proof(p: &EnrollRequest) -> &'static str {
         match p.proof {
@@ -1160,7 +1155,7 @@ mod tests {
     #[test]
     fn model_fixtures() {
         roundtrip::<crate::model::AgentEvent>("agent_event", AGENT_EVENTS, agent_event);
-        roundtrip::<crate::model::WorkstreamEvent>("workstream_event", WORKSTREAM_EVENTS, workstream_event);
+        roundtrip::<crate::model::SandboxEvent>("sandbox_event", SANDBOX_EVENTS, sandbox_event);
         roundtrip::<EnrollRequest>("enroll_request", &["aws_identity_document", "enrollment_token"], proof);
         roundtrip::<EnrollResponse>("enroll_response", &["enroll_response"], |_| "enroll_response");
         roundtrip::<crate::model::EgressPolicy>("egress_policy", &["egress_policy"], |_| "egress_policy");
@@ -1180,15 +1175,19 @@ mod tests {
             assert!(t.roles.is_none(), "{}: the catalog has no roles (an agent's spec picks its tools)", t.name);
         }
         for required in [
-            "notify", "emit", "ask", "agent_spawn", "agent_stop", "exit", "fork_sandbox", "attach", "read_transcript", "checkpoint",
-            "expose_port", "brokered", "spawn_workstream", "send", "list_workstreams", "get_status", "wait_events",
-            "approve", "deny", "merge", "memory_read", "memory_write", "notify_user",
+            "agent_spawn", "agent_stop", "exit", "fork_sandbox", "attach", "read_transcript", "checkpoint", "expose_port", "brokered",
+            "approve", "deny", "memory_read", "memory_write",
         ] {
             assert!(names.contains(required), "missing platform tool {required}");
         }
         // Inspecting without hands is a pattern, not a tool (docs/orchestration/captains/); the stubs
-        // `spawn_agent` and `kill` were replaced by `agent_spawn` and `agent_stop`.
-        for retired in ["delegate", "spawn_agent", "kill"] {
+        // `spawn_agent` and `kill` were replaced by `agent_spawn` and `agent_stop`. Messaging,
+        // questions and workstream events (`notify`, `ask`, `emit` and the workstream tools) left the
+        // platform (docs/README.md#principles).
+        for retired in [
+            "delegate", "spawn_agent", "kill", "notify", "emit", "ask", "spawn_workstream", "send", "list_workstreams", "get_status",
+            "wait_events", "merge", "notify_user",
+        ] {
             assert!(!names.contains(retired), "the registry has no `{retired}` tool");
         }
     }

@@ -10,7 +10,7 @@ which events run `nest hook`, synchronously (`--sync`) or not, within each hook'
 
 Turn behavior (by user text):
 - contains SLOW     → mcp__nest__Bash `sleep 30`; honors stream-json interrupts
-- contains PLATFORM → also calls the `notify` platform tool
+- contains PLATFORM → also calls the `checkpoint` platform tool
 - `E2E <scenario.json>` (alone, or as an agent's message: `Message from <sender>: E2E …`) → the scripted tool calls in that file ({"results": path, "steps":
   [{"tool", "args", "label"}]}), each result appended to `results` at once (JSONL, flushed); a step
   {"await_tool": name, "absent"?: bool, "timeout_s"?: n, "label"} instead waits until the tool list
@@ -295,7 +295,7 @@ def turn(text):
                   "total_cost_usd": 0.0, "usage": {"input_tokens": 1, "output_tokens": 1}, "stop_reason": "interrupted", "result": "interrupted"})
             return
         if "PLATFORM" in text:
-            more = tool("notify", {"to": "captain", "message": "hello from fake claude"})[1]
+            more = tool("checkpoint", {})[1]
             context = "\n".join(c for c in (context, more) if c)
         say("done: " + text[:40])
         if not context:

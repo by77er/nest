@@ -30,10 +30,10 @@ unshare --user --map-root-user --mount  (inner.sh)    ← host network shared
    - a direct connection with no proxy fails (no route)
    - from inside the sandbox netns: no route out, and the proxy listener on `172.16.0.1:443` is reachable
 4. **The seam:** the gateway's log shows at least as many bound connections as the scripted hands calls (the SessionStart CLAUDE.md read adds one), counted before the probes below run; the gateway was listening and had synced with nestd before the scenario, as its own uid with no capabilities (`/proc/<pid>/status`), so every call reached the guest through the sockets nestd gave its group; `POST /v1/sandboxes/<sbx>/resolve` returns a target whose URL is the advertised `gateway_url` and whose binding the gateway admits (`bound`, probed by `gateway_probe.mjs` with Node's WebSocket client); the same binding with one character of its signature flipped is refused `unauthorized` with `executed: false`; after the self-fence the still-valid binding is refused `moved`, and the log shows nestd removed the sandbox rather than the gateway losing its nestd link.
-5. **Platform tool:** `notify` reaches the workstream's user-notification queue.
+5. **Platform tool:** `egress_policy` (no arguments) answers the effective policy.
 6. **Control plane state:**
    - the session transcript is in R2 (read through `GET /v1/agents/<id>/transcript`)
-   - the turn is `done`; workstream events are visible
+   - the turn is `done`; the agent's open asks are listable (`GET /v1/agents/<id>/asks`)
    - the egress audit (allowed and denied records) is in R2 under `audit/…`
 7. **Remote MCP** (fake mode; needs the MCP test server, `mcp-test/`, run with `wrangler dev --local` on its own port): an mcp capability names the local server (a loopback URL, which only `ALLOW_LOOPBACK_MCP=1` admits) with its token in BrokerDO; an agent of a template listing it calls `echo`, `note_put`/`note_get` (and a missing note, a tool error) and `counter_add` as `mcp__nest__notes_<tool>`. The server's `GET /calls` shows each call once with nest's `_meta` (`nest/agent`, `nest/epoch`, a unique `nest/call`, and `nest/taint` true: the untrusted server's tool list tainted the session). Then the control plane is restarted while a `slow` call (made non-idempotent by the capability's `idempotent` override) is out at the server: the runner redelivers it to the new AgentDO incarnation, which answers `outcome_unknown`, and the server saw it once. Then `list_changed`: a second capability on the same server and credential (one connector) with no allowlist; the server gains a tool (`POST /tools?name=extra_live`), the brain's next call carries the server's `list_changed`, and without a restart the fake brain's tool list gets `live_extra_live` (it lists again on `nest mcp`'s `list_changed`, as Claude Code 2.1.316 does under `-p`: `claude-verify` item 13) and calls it; removing the tool takes it off the list.
    - **Over OAuth** (the server runs in its OAuth mode, `MCP_TEST_OAUTH=1`): a capability with `auth: {oauth: cap:onotes}`; the operator's `POST /v1/admin/capabilities/onotes/oauth` discovers the server's metadata and picks nest's client ID metadata document; the harness plays the browser (it follows the authorize URL with the server's static token as the user's login) and lands on nest's callback, whose state then works only once. A call carries the access token; after the server expires every token the next call is refused, refreshed once and runs once; after it revokes them the call is a platform error naming re-authorization, and the next one doesn't ask the authorization server again; a second authorization recovers. The broker's audit records are in R2.
@@ -106,7 +106,7 @@ The runner starts the real `claude`; the token becomes the control plane's `clau
 - the transcript has `mcp__nest__` tool uses and no host-side built-ins
 - the OAuth token is in neither the guest's nor the gateway's environment or command line
 
-Startup, netns, control-plane state and fencing checks run as in fake mode; the scripted hands, egress, `notify` and audit checks are skipped. Quota: one turn with about six tool calls.
+Startup, netns, control-plane state and fencing checks run as in fake mode; the scripted hands, egress, platform tool and audit checks are skipped. Quota: one turn with about six tool calls.
 
 ### Safety
 

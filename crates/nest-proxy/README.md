@@ -33,7 +33,7 @@ NEST_LOG=debug   # tracing filter
 - **Upstreams** are always re-resolved by the proxy from SNI / Host / CONNECT authority, **never** from the IP the guest dialed.
 - **Non-public upstream addresses are refused:** loopback, private ranges, link-local/IMDS, CGNAT, ULA. `Config::allow_private_upstreams` turns this off for tests only.
 - **Decisions:**
-  - **Deny:** after TLS termination, a JSON 403 with a hint to use `ask`.
+  - **Deny:** after TLS termination, a JSON 403 with a hint to use `egress_policy`.
   - **Passthrough:** spliced, never decrypted.
   - **Inspect:** the upstream TLS connection comes first (its ALPN is mirrored to the client). The request target's authority and the single `Host` header must both equal the routed host; the h1 upstream always gets a `Host` set by the proxy.
 - **CONNECT:** tunnels must carry TLS with SNI equal to the authority; plaintext tunnels are denied (`non_tls_tunnel`). A denied CONNECT is accepted and answered inside the tunnel with the readable 403 (over our TLS, or plaintext).

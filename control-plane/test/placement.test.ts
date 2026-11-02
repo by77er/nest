@@ -15,12 +15,8 @@ type HostView = { host: string; leases: number; capacity: Record<string, unknown
 type FleetView = { hosts: HostView[]; launches: Record<string, unknown>[]; sandboxes: { sandbox: string; host: string | null; epoch: number | null }[] };
 const view = async (cell: string) => (await fleetStub(cell).fleetView()) as unknown as FleetView;
 
-async function workstream() {
-  return adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal: "placement" } }, 201);
-}
-
-async function place(cell: string, ws: string, status = 201) {
-  return adminJson<{ sandbox: string; host: string | null }>("/v1/sandboxes", { body: { workstream: ws, cell } }, status);
+async function place(cell: string, status = 201) {
+  return adminJson<{ sandbox: string; host: string | null }>("/v1/sandboxes", { body: { cell } }, status);
 }
 
 /** A connected sandbox host whose hello reports the given capacity. */
@@ -38,14 +34,13 @@ describe("placement packs", () => {
     // 8192 MiB of hugepages each: room for two default sandboxes (4096 MiB) per host.
     const a = await connectHost(cell);
     const b = await connectHost(cell);
-    const { workstream: ws } = await workstream();
-    const s1 = await place(cell, ws);
-    const s2 = await place(cell, ws);
-    const s3 = await place(cell, ws);
-    const s4 = await place(cell, ws);
+    const s1 = await place(cell);
+    const s2 = await place(cell);
+    const s3 = await place(cell);
+    const s4 = await place(cell);
     expect([s1.host, s2.host], "the first host fills first").toEqual([a.host, a.host]);
     expect([s3.host, s4.host], "then the second").toEqual([b.host, b.host]);
-    const s5 = await place(cell, ws, 202);
+    const s5 = await place(cell, 202);
     expect(s5.host, "nothing fits: unplaced, not squeezed on").toBeNull();
     const v = await view(cell);
     expect(v.hosts.map((h) => h.leases)).toEqual([2, 2]);
@@ -55,11 +50,10 @@ describe("placement packs", () => {
   it("a capacity report after the leases' first states ends their reservation; the host's report then rules", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
-    const { workstream: ws } = await workstream();
-    const s1 = await place(cell, ws);
-    const s2 = await place(cell, ws);
+    const s1 = await place(cell);
+    const s2 = await place(cell);
     expect([s1.host, s2.host]).toEqual([a.host, a.host]);
-    expect((await place(cell, ws, 202)).host).toBeNull();
+    expect((await place(cell, 202)).host).toBeNull();
     // The host counts both sandboxes and still reports room for one more.
     const seq = sendEvents(a.ws, [
       { ts_ms: Date.now(), type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "running" },
@@ -67,18 +61,17 @@ describe("placement packs", () => {
       { ts_ms: Date.now(), type: "capacity", capacity: { vcpus_free: 4, memory_mib_free: 8192, hugepages_mib_free: 4096, hugepages_mib_total: 8192, sandboxes: 2, agents: 0, warm: [] } },
     ]);
     await a.ws.next("ack", (m) => m.up_to >= seq);
-    expect((await place(cell, ws)).host, "the report's free hugepages admit a third").toBe(a.host);
-    expect((await place(cell, ws, 202)).host, "and no more").toBeNull();
+    expect((await place(cell)).host, "the report's free hugepages admit a third").toBe(a.host);
+    expect((await place(cell, 202)).host, "and no more").toBeNull();
   });
 
   it("an empty host takes a sandbox larger than its pool; a second one does not join it", async () => {
     const cell = uniqueCell();
     const small = await hostWithCapacity(cell, { hugepages_mib_free: 1952, vcpus_free: 2 });
-    const { workstream: ws } = await workstream();
-    expect((await place(cell, ws)).host, "placed alone, overcommitted as before packing").toBe(small.host);
-    expect((await place(cell, ws, 202)).host, "the host is spoken for").toBeNull();
+    expect((await place(cell)).host, "placed alone, overcommitted as before packing").toBe(small.host);
+    expect((await place(cell, 202)).host, "the host is spoken for").toBeNull();
     const big = await hostWithCapacity(cell, { hugepages_mib_free: 8192, vcpus_free: 8 });
-    expect((await place(cell, ws)).host).toBe(big.host);
+    expect((await place(cell)).host).toBe(big.host);
   });
 });
 
@@ -88,19 +81,17 @@ describe("placement on regular pages", () => {
   it("packs by free memory: a 2.5 GiB host takes three default sandboxes, not a fourth", async () => {
     const cell = uniqueCell();
     const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 2560, vcpus_free: 2 });
-    const { workstream: ws } = await workstream();
-    const placed = [await place(cell, ws), await place(cell, ws), await place(cell, ws)];
+    const placed = [await place(cell), await place(cell), await place(cell)];
     expect(placed.map((p) => p.host), "three fit: 2560 - 2*768 = 1024 >= 768").toEqual([a.host, a.host, a.host]);
-    expect((await place(cell, ws, 202)).host, "the fourth would leave less than a reserve").toBeNull();
+    expect((await place(cell, 202)).host, "the fourth would leave less than a reserve").toBeNull();
   });
 
   it("a burst of placements keeps its reservations until a capacity report made after the sandboxes reported", async () => {
     const cell = uniqueCell();
     // Room for two reserves (2000 - 768 = 1232 >= 768), not three (2000 - 2*768 = 464).
     const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 2000, vcpus_free: 2 });
-    const { workstream: ws } = await workstream();
-    const s1 = await place(cell, ws);
-    const s2 = await place(cell, ws);
+    const s1 = await place(cell);
+    const s2 = await place(cell);
     expect([s1.host, s2.host]).toEqual([a.host, a.host]);
     // nestd reports state at once, capacity at most every 30 s: the stale report counts neither.
     let seq = sendEvents(a.ws, [
@@ -108,48 +99,44 @@ describe("placement on regular pages", () => {
       { ts_ms: Date.now(), type: "sandbox_state", sandbox: s2.sandbox, epoch: 1, state: "running" },
     ]);
     await a.ws.next("ack", (m) => m.up_to >= seq);
-    expect((await place(cell, ws, 202)).host, "still reserved: the last report predates both").toBeNull();
+    expect((await place(cell, 202)).host, "still reserved: the last report predates both").toBeNull();
     // A report made since counts them; its free memory rules.
     seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "capacity", capacity: { vcpus_free: 2, memory_mib_free: 2000, hugepages_mib_free: 0, hugepages_mib_total: 0, sandboxes: 2, agents: 0, warm: [] } }]);
     await a.ws.next("ack", (m) => m.up_to >= seq);
-    expect((await place(cell, ws)).host).toBe(a.host);
+    expect((await place(cell)).host).toBe(a.host);
   });
 
   it("declared vCPUs are a shape, not a reservation: a 2 vCPU host takes several 2 vCPU sandboxes", async () => {
     const cell = uniqueCell();
     const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 8192, vcpus_free: 2 });
-    const { workstream: ws } = await workstream();
-    for (let i = 0; i < 5; i++) expect((await place(cell, ws)).host).toBe(a.host);
+    for (let i = 0; i < 5; i++) expect((await place(cell)).host).toBe(a.host);
   });
 
   it("the host's report rules once it counts a sandbox: a report with less room stops placement", async () => {
     const cell = uniqueCell();
     const a = await hostWithCapacity(cell, { hugepages_mib_free: 0, hugepages_mib_total: 0, memory_mib_free: 4096, vcpus_free: 2 });
-    const { workstream: ws } = await workstream();
-    const s1 = await place(cell, ws);
+    const s1 = await place(cell);
     expect(s1.host).toBe(a.host);
     const seq = sendEvents(a.ws, [
       { ts_ms: Date.now(), type: "sandbox_state", sandbox: s1.sandbox, epoch: 1, state: "running" },
       { ts_ms: Date.now(), type: "capacity", capacity: { vcpus_free: 0, memory_mib_free: 500, hugepages_mib_free: 0, hugepages_mib_total: 0, sandboxes: 1, agents: 0, warm: [] } },
     ]);
     await a.ws.next("ack", (m) => m.up_to >= seq);
-    expect((await place(cell, ws, 202)).host, "500 MiB free is under a reserve").toBeNull();
+    expect((await place(cell, 202)).host, "500 MiB free is under a reserve").toBeNull();
   });
 
   it("a hugepage host keeps the pool rule: the declared size counts against the pool", async () => {
     const cell = uniqueCell();
     const a = await hostWithCapacity(cell, { hugepages_mib_free: 8192, hugepages_mib_total: 8192, memory_mib_free: 16384, vcpus_free: 8 });
-    const { workstream: ws } = await workstream();
-    expect([(await place(cell, ws)).host, (await place(cell, ws)).host]).toEqual([a.host, a.host]);
-    expect((await place(cell, ws, 202)).host, "two 4096 MiB sandboxes fill an 8192 MiB pool").toBeNull();
+    expect([(await place(cell)).host, (await place(cell)).host]).toEqual([a.host, a.host]);
+    expect((await place(cell, 202)).host, "two 4096 MiB sandboxes fill an 8192 MiB pool").toBeNull();
   });
 });
 
 describe("operator views", () => {
   it("a sandbox without a lease shows its own state, not 'unplaced'", async () => {
     const cell = uniqueCell();
-    const { workstream: ws } = await workstream();
-    const s1 = await place(cell, ws, 202); // no host at all
+    const s1 = await place(cell, 202); // no host at all
     const v = await view(cell);
     expect(v.sandboxes).toEqual([expect.objectContaining({ sandbox: s1.sandbox, host: null })]);
     const row = v.sandboxes[0] as unknown as { state: string | null; image: string };
@@ -160,8 +147,7 @@ describe("operator views", () => {
   it("the fleet view lists each host's residents, brains and capacity, and every live sandbox", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
-    const { workstream: ws } = await workstream();
-    const s1 = await place(cell, ws);
+    const s1 = await place(cell);
     const v = await view(cell);
     const h = v.hosts.find((x) => x.host === a.host)!;
     expect(h.capacity).toMatchObject({ hugepages_mib_free: 8192, vcpus_free: 8 });
