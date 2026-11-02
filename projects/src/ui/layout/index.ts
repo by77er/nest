@@ -3,6 +3,7 @@
 // (src/ui/design.test.ts).
 export { AppFrame } from "./AppFrame";
 export { Bubble, ScrollLog } from "./Chat";
+export { FadeIn } from "./FadeIn";
 export { FieldGroup } from "./FieldGroup";
 export { CardGrid, ColumnGrid, SplitView } from "./Layouts";
 export { MetaItem, MetaRow } from "./Meta";

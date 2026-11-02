@@ -7,6 +7,7 @@ import { directory, type Env, project, review } from "./env";
 import { nestFrom } from "./nest";
 import { Answer, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
+import { proxyTrace } from "./trace";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -54,6 +55,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   if (parts.join("/") === "admin/sync") return m === "POST" ? sync(env) : err(405, "POST only");
   if (parts.join("/") === "admin/sync-state" && m === "GET") return json(await directory(env).lastSync());
 
+  // An agent's live trace, a WebSocket proxied to nest (src/trace.ts).
+  if (parts[0] === "agents" && parts.length === 3 && parts[2] === "trace") return proxyTrace(req, env, parts[1]!, url);
   if (parts[0] !== "projects") return err(404, "unknown route");
   if (parts.length === 1) {
     // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).

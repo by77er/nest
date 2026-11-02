@@ -12,6 +12,7 @@ import { HistoryList } from "./HistoryList";
 import { SpecView } from "./SpecView";
 import { TaskActions } from "./TaskActions";
 import { TaskEditForm } from "./TaskEditForm";
+import { TaskTraces } from "../trace/AgentTraces";
 import type { Task } from "../../api/types";
 
 /** GitHub's auto-merge on the task's PR, while the project's auto-merge is on. */
@@ -102,6 +103,8 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
           <Section title="History" count={t.history.length} region={false}>
             <HistoryList history={t.history} />
           </Section>
+
+          <TaskTraces task={t} />
         </Stack>
       ) : null}
     </Sheet>
