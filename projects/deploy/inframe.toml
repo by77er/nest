@@ -1,0 +1,35 @@
+# The projects app's own infrastructure as an inframe project (https://github.com/by77er/inframe):
+# Lean stacks rendered to OpenTofu. The app is separate from nest (../README.md), so is this: it
+# imports nothing from nest's deploy/ and has its own state. See README.md.
+
+[lean]
+directory = "lean"
+main = "projects"
+core = { git = "https://github.com/by77er/inframe", rev = "a68f89ce683be8fd0f548da4fb74442142a55fac", subdir = "lean" }
+
+# Cloudflare Access in front of the app's hostname. The schema (`inframe provider inspect`) is
+# trimmed to the one resource type the stack uses, Access applications, so bindings build in seconds.
+[providers.cloudflare]
+source = "cloudflare/cloudflare"
+version = "5.27.0"
+module_root = "Cloudflare"
+
+[workspace]
+directory = ".inframe"
+graph_directory = ".inframe/graphs"
+
+[stacks.projects]
+frontend = "lean"
+main = "projects"
+test = "projects-test"
+
+# nest's state bucket, shared only as storage under the app's own key; it could move.
+[stacks.projects.backend]
+type = "s3"
+
+[stacks.projects.backend.config]
+bucket = "nest-tfstate-589531222691"
+key = "projects/projects.tfstate"
+region = "us-east-1"
+use_lockfile = true
+encrypt = true

@@ -9,7 +9,7 @@
 | `control-plane` | `npm ci`, `npm run typecheck`, `npm test` (vitest in workerd) | Node 22 |
 | `dashboard`, `projects` | Each app's `npm ci`, `npm run typecheck`, `npm test` and `npm run build` (the projects app's tests run in workerd, against a fake nest) | Node 22 |
 | `e2e` | The `claude-verify` harness tests (with a stub, never the real binary), then `e2e/run.sh` with the fake brain | The above, plus outbound access to `registry.npmjs.org` and `httpbin.org`; logs are uploaded on failure |
-| `infra` | `inframe test --stack use1`: the cell stack's IAM theorems and graph policies, with no AWS credentials (plans run only in [deploy.yml](deploy.md)) | elan and the inframe CLI (`scripts/infra-tools.sh`, pinned) |
+| `infra` | `inframe test` for nest's stacks (`use1`: the cell stack's IAM theorems and graph policies; `edge`) and for the projects app's own (`projects/deploy/`, `--stack projects`: Access only for the owner, bypass only on `/hooks` and `/mcp`), with no cloud credentials (plans run only in [deploy.yml](deploy.md) and `deploy-projects-infra.yml`) | elan and the inframe CLI (`scripts/infra-tools.sh`, pinned) |
 | `verify-nestd` | The Stateright checks of nestd's real cores at CI bounds (`verification/nestd/check`, `cargo test --release`), then `cargo mutants -p nestd-core --in-place` (0 missed expected) | cargo-mutants, pinned and cached ([verification](#verification)) |
 | `kani-nestd` | `cargo kani -p nestd-core`: the proofs of nestd-core's decision functions | kani-verifier, pinned and cached |
 | `fuzz-nestd` | The fuzz seeds still decode, and every target in `verification/nestd/fuzz` replays the seeds and the cached corpus once (no timed fuzzing: `fuzz.yml` does that weekly) | the pinned nightly in that directory, cargo-fuzz |
