@@ -10,7 +10,7 @@ NEST_E2E_CLAUDE=fake (default): brains are crates/nest-cli/tests/fake_claude.py 
 `claude` binary is never invoked. NEST_E2E_CLAUDE=real: brains are the real `claude` with the token
 from NEST_CLAUDE_OAUTH_TOKEN, given a short natural-language turn that uses the hands tools.
 """
-import json, os, pwd, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
+import glob, json, os, pwd, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 E2E = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(E2E)
@@ -1190,6 +1190,70 @@ def run_repos(ids):
         check("repos: the refusal is in the egress audit (reason guard: github-push)", False, str(e)[:200])
 
 
+# ---------------------------------------------------------------------------------- checkpoints
+# docs/sandbox/state/disk/ (M1): a checkpoint pauses the VM only while it reads the disk, and a disk
+# nothing wrote since the last commit isn't read again (its mtime still holds nestd's sentinel).
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def commit_reads(sbx, since=0):
+    """nestd's `commit: disk read` lines for `sbx` after byte `since` of its log: (end offset, fields)."""
+    text = ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log")))
+    out = []
+    for m in re.finditer(r"commit: disk read(.*)", text):
+        if m.start() < since:
+            continue
+        fields = dict(re.findall(r"(\w+)=(\S+)", m.group(1)))
+        if fields.get("sandbox") == sbx:
+            out.append((m.end(), fields))
+    return out
+
+
+def log_size():
+    return len(ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log"))))
+
+
+def run_checkpoints(ids):
+    if REAL:
+        skip("checkpoints", "fake mode only: the calls are scripted")
+        return
+    agid, sbx = ids["agent"], ids["sandbox"]
+    disks = glob.glob(os.path.join(WORK, "state", "sandboxes", sbx, "*", "disk.img"))
+    if not check("checkpoints: the sandbox's disk image is found", len(disks) == 1, str(disks)):
+        return
+    # The process driver's guest never writes the image: write 32 MiB into it as a guest would.
+    with open(disks[0], "r+b") as f:
+        f.seek(1 << 30)
+        f.write(os.urandom(32 << 20))
+    since = log_size()
+    text, err = sink_turn(agid, "ckpt-written", [("a", "Bash", {"command": "echo a"})])
+    check("checkpoints: a turn after a disk write runs", text("a").strip() == "a" and not err("a"), text("a")[:200])
+    try:
+        end, f = wait_for(lambda: next(((e, f) for e, f in commit_reads(sbx, since) if int(f.get("bytes_read", 0)) >= 32 << 20), None),
+                          60, 0.5, "a turn-end commit that reads the write")
+        check("checkpoints: the commit after a write reads it", f.get("reused") == "false", json.dumps(f)[:300])
+    except TimeoutError as e:
+        check("checkpoints: the commit after a write reads it", False, str(e)[:200])
+        return
+    # A turn that writes nothing: its turn-end commit reuses the manifest, reading nothing, and
+    # the VM is paused for about no time. A turn right behind it has working hands.
+    text, err = sink_turn(agid, "ckpt-unchanged", [("b", "Bash", {"command": "echo b"})])
+    check("checkpoints: a turn that writes nothing runs", text("b").strip() == "b" and not err("b"), text("b")[:200])
+    try:
+        _, f = wait_for(lambda: next(((e, f) for e, f in commit_reads(sbx, end) if f.get("reused") == "true"), None),
+                        60, 0.5, "a turn-end commit of the unchanged disk")
+        check("checkpoints: an unchanged disk is committed without reading it",
+              f.get("bytes_read") == "0" and int(f.get("scan_ms", 99999)) < 1000, json.dumps(f)[:300])
+    except TimeoutError as e:
+        check("checkpoints: an unchanged disk is committed without reading it", False, str(e)[:200])
+    text, err = sink_turn(agid, "ckpt-after", [(f"c{i}", "Bash", {"command": f"echo c{i}"}) for i in range(3)])
+    check("checkpoints: hands work right after a turn-end checkpoint",
+          all(text(f"c{i}").strip() == f"c{i}" and not err(f"c{i}") for i in range(3)), " | ".join(text(f"c{i}")[:40] for i in range(3)))
+    pauses = [int(m.group(1)) for m in re.finditer(r"checkpoint: VM resumed.*?paused_ms=(\d+)", ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log")))[end:])]
+    check("checkpoints: each checkpoint since paused its VM under a second", pauses and max(pauses) < 1000, str(pauses))
+
+
 # ---------------------------------------------------------------------------------- agent lifetimes
 # docs/agents/#lifetimes: a parent agent spawns children that own new sandboxes; one exits itself, the
 # parent stops the other; each sandbox is destroyed through SandboxDO's destroy, so FleetDO's GC
@@ -1405,6 +1469,7 @@ def main():
         run_mcp_oauth(ids)
         run_brokered(ids)
         run_repos(ids)
+        run_checkpoints(ids)
         run_lifecycle(ids)
         run_retention(ids)
         # After the turns: the token has been handed to the brains by now.

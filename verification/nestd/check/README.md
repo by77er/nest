@@ -17,6 +17,7 @@ It's a standalone crate (its own `[workspace]` and lockfile), so `cargo test --w
   - `variant` is `fixed`, `main` (FleetDO as on `edf6829`), or `fixed` with one fix removed: `no-baseline`, `late-capture`, `volatile-capture`, `broker-quiet`, `stale-hello` or `stale-events`.
   - The defaults are 3 commands and one of each fault.
 - **Lease:** `lease[,unit=MS][,horizon=STEPS][,drops=N][,suspends=N][,suspend=STEPS][,inflight=N]`.
+- **Unchanged disk:** `sentinel[,async][,trust-running][,writes=N][,commits=N][,restarts=N]`; `async` and `trust-running` are the two broken shells, each expected to fail.
 
 **Environment variables:**
 

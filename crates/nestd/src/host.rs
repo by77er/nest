@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use nestd_core::checkpoint::{DiskStamp, SENTINEL, ScanMemo};
 use nestd_core::incarnation;
 use nestd_core::results::ResultCache;
 use nest_protocol::control::{
@@ -36,7 +37,7 @@ use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, ExitReason, Ru
 use nest_protocol::host::Secret;
 use nest_protocol::model::{
     error_codes, AgentId, CommitReason, EgressPolicy, Epoch, ErrorBody, ForkMode, GenerationId, GenerationKind,
-    GenerationRecord, HostId, HostRole, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, SandboxEvent,
+    GenerationRecord, HostId, HostRole, Manifest, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, SandboxEvent,
     SandboxEventKind, WorkstreamId,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -130,6 +131,9 @@ struct Sbx {
     /// next commit asks again under the same request id first: SandboxDO answers a repeated id with
     /// its stored outcome.
     unanswered: Option<SentCommit>,
+    /// The last pass over the disk a later commit may reuse unread (`nestd_core::checkpoint`). In
+    /// memory only: a restarted nestd reads every disk it salvages.
+    scan_memo: ScanMemo<Manifest>,
 }
 
 impl Sbx {
@@ -169,6 +173,7 @@ impl Sbx {
             state_dir,
             guest_info: None,
             unanswered: None,
+            scan_memo: ScanMemo::new(),
         }
     }
 
@@ -1266,7 +1271,8 @@ impl Inner {
         let mut backoff = incarnation::RETIRE_RETRY_FIRST;
         let salvage = s.may_hold_work();
         while salvage && s.state_dir.exists() {
-            let (s2, r) = self.commit(s, CommitReason::Salvage, None, self.cfg.commit_timeout()).await;
+            let stable = s.vm.is_none() || s.paused;
+            let (s2, r) = self.commit(s, CommitReason::Salvage, None, stable, self.cfg.commit_timeout()).await;
             s = s2;
             match r {
                 Ok(Some(g)) => {
@@ -1814,7 +1820,8 @@ impl Inner {
                 }
             }
         }
-        let (s, r) = self.commit(s, CommitReason::Suspend, mem, commit_timeout).await;
+        // Paused: nothing writes the disk.
+        let (s, r) = self.commit(s, CommitReason::Suspend, mem, true, commit_timeout).await;
         (s, r.map(|_| ()))
     }
 
@@ -1878,28 +1885,52 @@ impl Inner {
         Ok(None)
     }
 
+    /// Commit a running (or suspended) sandbox's disk. The VM is paused only while its disk is read:
+    /// a lost answer is asked about again first, while it runs, and the held-back uploads and the
+    /// control plane's answer come after it resumes. A checkpoint never marks the disk clean (a
+    /// resumed VM writes it again), so resuming before the answer changes nothing a restart reads.
     async fn checkpoint(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: CommitReason) -> CmdResult {
-        let mut s = self.lock_live(id, epoch).await?;
+        let s = self.lock_live(id, epoch).await?;
+        let timeout = self.cfg.commit_timeout();
+        let (mut s, answered) = match self.reask(s, reason, timeout).await {
+            (s, Ok(a)) => (s, a),
+            (_, Err(e)) => return Err(e),
+        };
         let running = s.vm.is_some() && !s.paused;
-        // TODO(ublk): epoch-flip CoW cut instead of pausing for the whole chunking pass.
+        // TODO(reflink): cut the disk with a reflink instead of pausing while it is read (M2,
+        // docs/sandbox/state/disk/).
         if let Some(g) = &s.guest {
             let _ = g.prepare_snapshot(false).await;
         }
+        let paused_at = Instant::now();
         if running {
             s.vm.as_mut().expect("checked").pause().await.map_err(internal)?;
         }
-        let (mut s, r) = self.commit(s, reason, None, self.cfg.commit_timeout()).await;
-        // Never resume a VM fenced during the commit, or whose rejection fences it.
-        if running && !self.fenced(id, epoch) && !r.as_ref().is_err_and(|e| rejection_fences(&e.code)) {
+        // Paused, or no VM runs: nothing writes the disk while it is read.
+        let r = self.scan(&mut s, reason, None, true).await;
+        // Never resume a VM fenced meanwhile. A rejection that fences comes after this, and fences
+        // the running VM through its pause handle, as a fence of any running VM does.
+        if running && !self.fenced(id, epoch) {
             if let Some(vm) = s.vm.as_mut() {
                 let _ = vm.resume().await;
+                // A fence marks the row before its lock-free pause: one that landed between the
+                // check above and this resume is undone by it, so freeze the VM again.
+                if self.fenced(id, epoch) {
+                    let _ = vm.pause().await;
+                }
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
             }
             self.with_row(id, epoch, |x| x.dirty = true);
         }
-        let g = r?;
+        if running {
+            tracing::info!(sandbox = %id, epoch = epoch.0, reason = ?reason, paused_ms = paused_at.elapsed().as_millis() as u64, "checkpoint: VM resumed");
+        }
+        let g = match r? {
+            Some(p) => self.publish_and_send(s, p, answered, timeout).await.1?,
+            None => answered.and_then(|(_, g)| g),
+        };
         Ok(g.map(|g| serde_json::json!({ "generation": g.id })))
     }
 
@@ -1908,10 +1939,12 @@ impl Inner {
             let mut s = self.lock_live(id, epoch).await?;
             self.transition(id, epoch, SandboxState::Archiving, None, None)?;
             if s.may_hold_work() || s.head.is_none() {
-                if let Some(vm) = s.vm.as_mut() {
-                    let _ = vm.pause().await;
-                }
-                let (s2, r) = self.commit(s, CommitReason::Archive, None, self.cfg.commit_timeout()).await;
+                // Stable only if the pause landed (a failed one is ignored, as before).
+                let stable = match s.vm.as_mut() {
+                    Some(vm) => vm.pause().await.is_ok() || s.paused,
+                    None => true,
+                };
+                let (s2, r) = self.commit(s, CommitReason::Archive, None, stable, self.cfg.commit_timeout()).await;
                 s = s2;
                 r?;
             }
@@ -2145,33 +2178,119 @@ impl Inner {
 
     /// Chunk disk (+ memory) into the store and compare-and-set the head through the control
     /// plane. `Ok(None)`: nothing to commit. A `stale_epoch` rejection fences the sandbox.
+    /// `stable`: no VM can write the disk until this returns (it is paused or stopped).
     ///
     /// The sandbox lock (`s`) is held while chunking (the disk must be stable) but **released
     /// while waiting for `commit_result`**, then re-taken and returned with the result: a slow or
     /// partitioned control plane never blocks fencing, guest events or other commands on this
-    /// sandbox.
-    async fn commit(self: &Arc<Self>, mut s: SbxGuard, reason: CommitReason, mem: Option<PathBuf>, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
-        // An earlier commit's answer was lost (timed out), but SandboxDO may have moved its head:
-        // ask again under the same request id (idempotent per id) and adopt the outcome, rather
-        // than send a new request with a stale parent that is rejected and fences the sandbox.
-        let mut answered = None;
-        if let Some(prev) = s.unanswered.clone() {
-            let (s2, r) = self.send_commit(s, prev.clone(), timeout).await;
-            s = s2;
-            match r {
-                Ok(g) => answered = Some((prev, g)),
-                Err(e) if incarnation::reask_failure_ends_commit(reason == CommitReason::Salvage, prev.reason == CommitReason::Salvage, !e.retryable) => {
-                    return (s, Err(e));
-                }
-                // Another kind of request was refused: this incarnation's salvage still runs.
-                Err(_) => {}
-            }
-        }
-        let c = match self.prepare_commit(&mut s, reason, mem).await {
-            Ok(Some(c)) => c,
-            Ok(None) => return (s, Ok(answered.and_then(|(_, g)| g))),
-            Err(e) => return (s, Err(e)),
+    /// sandbox. A checkpoint runs the same steps with the VM resumed after the read.
+    async fn commit(self: &Arc<Self>, s: SbxGuard, reason: CommitReason, mem: Option<PathBuf>, stable: bool, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
+        let (mut s, answered) = match self.reask(s, reason, timeout).await {
+            (s, Ok(a)) => (s, a),
+            (s, Err(e)) => return (s, Err(e)),
         };
+        match self.scan(&mut s, reason, mem, stable).await {
+            Ok(Some(p)) => self.publish_and_send(s, p, answered, timeout).await,
+            Ok(None) => (s, Ok(answered.and_then(|(_, g)| g))),
+            Err(e) => (s, Err(e)),
+        }
+    }
+
+    /// An earlier commit's answer was lost (timed out), but SandboxDO may have moved its head: ask
+    /// again under the same request id (idempotent per id) and adopt the outcome, rather than send
+    /// a new request with a stale parent that is rejected and fences the sandbox. `Ok(Some)`: the
+    /// request asked again and its outcome; `Ok(None)`: nothing to ask, or a refusal that leaves
+    /// this commit to go on (a salvage after another kind of request).
+    async fn reask(self: &Arc<Self>, s: SbxGuard, reason: CommitReason, timeout: Duration) -> (SbxGuard, Result<Option<(SentCommit, Option<GenerationRecord>)>, ErrorBody>) {
+        let Some(prev) = s.unanswered.clone() else { return (s, Ok(None)) };
+        let (s, r) = self.send_commit(s, prev.clone(), timeout).await;
+        match r {
+            Ok(g) => (s, Ok(Some((prev, g)))),
+            Err(e) if incarnation::reask_failure_ends_commit(reason == CommitReason::Salvage, prev.reason == CommitReason::Salvage, !e.retryable) => (s, Err(e)),
+            // Another kind of request was refused: this incarnation's salvage still runs.
+            Err(_) => (s, Ok(None)),
+        }
+    }
+
+    /// Read the disk (+ memory) into manifests while nothing writes it, holding back up to
+    /// [`HOLD_BACK_BYTES`] of chunks the store isn't known to have for [`Inner::publish_and_send`]
+    /// (after a checkpoint's VM resumes). A disk known unchanged since the last stable pass
+    /// (`nestd_core::checkpoint`) isn't read but for the chunks the 12 h rule needs. `Ok(None)`: no
+    /// disk, or a salvage of a disk that equals its head.
+    async fn scan(self: &Arc<Self>, s: &mut Sbx, reason: CommitReason, mem: Option<PathBuf>, stable: bool) -> Result<Option<Prepared>, ErrorBody> {
+        let disk = s.disk_path();
+        if !disk.exists() {
+            return Ok(None);
+        }
+        // The memo is trusted only where a pause or stop really stops every write to the file.
+        let stable = stable && self.driver.pause_quiesces_disk();
+        let reuse = if stable { disk_stamp(&disk).ok().and_then(|st| s.scan_memo.unchanged(true, Some(&st)).cloned()) } else { None };
+        let store = self.store.clone();
+        let started = Instant::now();
+        let (disk_scan, mem_scan, stamp) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+            let reused = match &reuse {
+                Some(prev) => storage::rescan_unchanged(store.as_ref(), &disk, prev, HOLD_BACK_BYTES)?,
+                None => None,
+            };
+            let d = match reused {
+                Some(d) => d,
+                None => storage::scan_file(store.as_ref(), &disk, ManifestKind::Disk, HOLD_BACK_BYTES)?,
+            };
+            // Still stable: a write from here on moves the mtime off the sentinel.
+            let stamp = if stable { set_sentinel(&disk).ok() } else { None };
+            // A memory snapshot is taken only with the VM paused for a suspend: uploaded now.
+            let m = match mem {
+                Some(p) => Some(storage::scan_file(store.as_ref(), &p, ManifestKind::Memory, 0)?),
+                None => None,
+            };
+            Ok((d, m, stamp))
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+        s.scan_memo.scanned(stable, stamp, disk_scan.manifest.clone());
+        let st = disk_scan.stats;
+        tracing::info!(
+            sandbox = %s.id, epoch = s.epoch.0, reason = ?reason, scan_ms = started.elapsed().as_millis() as u64, reused = st.reused,
+            chunks_read = st.chunks_read, bytes_read = st.bytes_read, chunks_put = st.chunks_put, chunks_held = st.chunks_deferred,
+            "commit: disk read"
+        );
+        // The disk is exactly its head's (nothing written since; a head's memory doesn't matter to
+        // a salvage, which has none): there is no work to salvage.
+        if incarnation::nothing_to_salvage(reason == CommitReason::Salvage, s.head.as_ref().map(|h| &h.disk_manifest), &disk_scan.hash) {
+            return Ok(None);
+        }
+        Ok(Some(Prepared { disk: disk_scan, mem: mem_scan, reason }))
+    }
+
+    /// Upload what [`Inner::scan`] held back and the manifests, then send the `commit_request`
+    /// (a new request id) unless the commit just asked again already covers these manifests.
+    async fn publish_and_send(
+        self: &Arc<Self>,
+        s: SbxGuard,
+        p: Prepared,
+        answered: Option<(SentCommit, Option<GenerationRecord>)>,
+        timeout: Duration,
+    ) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
+        let store = self.store.clone();
+        let started = Instant::now();
+        let Prepared { disk, mem, reason } = p;
+        let published = tokio::task::spawn_blocking(move || -> std::io::Result<(ManifestHash, Option<ManifestHash>)> {
+            storage::publish(store.as_ref(), &disk)?;
+            if let Some(m) = &mem {
+                storage::publish(store.as_ref(), m)?;
+            }
+            Ok((disk.hash, mem.map(|m| m.hash)))
+        })
+        .await;
+        let (disk_manifest, mem_manifest) = match published {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => return (s, Err(internal(e))),
+            Err(e) => return (s, Err(internal(e))),
+        };
+        tracing::debug!(sandbox = %s.id, epoch = s.epoch.0, publish_ms = started.elapsed().as_millis() as u64, "commit: uploaded");
+        let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
+        let c = SentCommit { request: RequestId(new_id("req_")), parent: s.head.as_ref().map(|h| h.id.clone()), kind, disk_manifest, mem_manifest, reason };
         // Nothing changed since the commit just answered: its generation is this one.
         if let Some((prev, g)) = answered
             && (&prev.disk_manifest, &prev.mem_manifest) == (&c.disk_manifest, &c.mem_manifest)
@@ -2227,42 +2346,19 @@ impl Inner {
         (s, r)
     }
 
-    /// Chunk disk (+ memory) into the store and build the `commit_request` (a new request id).
-    async fn prepare_commit(self: &Arc<Self>, s: &mut Sbx, reason: CommitReason, mem: Option<PathBuf>) -> Result<Option<SentCommit>, ErrorBody> {
-        let disk = s.disk_path();
-        if !disk.exists() {
-            return Ok(None);
-        }
-        let store = self.store.clone();
-        let (disk_manifest, mem_manifest) = tokio::task::spawn_blocking(move || -> std::io::Result<(ManifestHash, Option<ManifestHash>)> {
-            let (_, d) = storage::commit_file(store.as_ref(), &disk, ManifestKind::Disk)?;
-            let m = match mem {
-                Some(p) => Some(storage::commit_file(store.as_ref(), &p, ManifestKind::Memory)?.1),
-                None => None,
-            };
-            Ok((d, m))
-        })
-        .await
-        .map_err(internal)?
-        .map_err(internal)?;
-        // The disk is exactly its head's (nothing written since; a head's memory doesn't matter to
-        // a salvage, which has none): there is no work to salvage.
-        if incarnation::nothing_to_salvage(reason == CommitReason::Salvage, s.head.as_ref().map(|h| &h.disk_manifest), &disk_manifest) {
-            return Ok(None);
-        }
-        let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
-        Ok(Some(SentCommit { request: RequestId(new_id("req_")), parent: s.head.as_ref().map(|h| h.id.clone()), kind, disk_manifest, mem_manifest, reason }))
-    }
-
     fn apply_commit(self: &Arc<Self>, s: &mut Sbx, id: &SandboxId, outcome: CommitOutcome) -> Result<Option<GenerationRecord>, ErrorBody> {
         match outcome {
             CommitOutcome::Committed { generation } => {
                 s.head = Some(generation.clone());
-                // Clean only while no VM runs on the disk (a suspend); `send_commit` persists it.
-                s.disk_clean = s.vm.is_none() || s.paused;
+                // Clean only while no VM runs on the disk (a suspend); `send_commit` persists it. A
+                // checkpoint's VM resumed before the answer: its disk stays dirty.
+                let still = s.vm.is_none() || s.paused;
+                s.disk_clean = still;
                 self.with_row(id, s.epoch, |x| {
                     x.head = Some(generation.id.clone());
-                    x.dirty = false;
+                    if still {
+                        x.dirty = false;
+                    }
                 });
                 Ok(Some(generation))
             }
@@ -2285,6 +2381,33 @@ impl Inner {
 /// task (`apply_commit`), so a caller that would resume the VM checks this, not only `fenced`.
 fn rejection_fences(code: &str) -> bool {
     code == error_codes::STALE_EPOCH || code == error_codes::PARENT_MISMATCH
+}
+
+/// What [`Inner::scan`] read, for [`Inner::publish_and_send`].
+struct Prepared {
+    disk: storage::Scanned,
+    mem: Option<storage::Scanned>,
+    reason: CommitReason,
+}
+
+/// Chunks a commit holds back in memory for upload after a checkpoint's VM resumes; past this it
+/// uploads them while the VM is paused, as before. A turn changes tens of MB, usually
+/// (`docs/sandbox/state/`), and nestd's own memory is what guests are packed around.
+const HOLD_BACK_BYTES: usize = 64 << 20;
+
+/// `path` as `stat` reads it, for the unchanged-disk check.
+fn disk_stamp(path: &std::path::Path) -> std::io::Result<DiskStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    Ok(DiskStamp { dev: m.dev(), ino: m.ino(), size: m.len(), mtime_sec: m.mtime(), mtime_nsec: m.mtime_nsec() as u32 })
+}
+
+/// Set `path`'s modification time to [`SENTINEL`] and read it back. Only nestd sets it, only while
+/// nothing writes the file; any write after moves it to the current time.
+fn set_sentinel(path: &std::path::Path) -> std::io::Result<DiskStamp> {
+    let at = std::time::UNIX_EPOCH + Duration::new(SENTINEL.0 as u64, SENTINEL.1);
+    std::fs::File::open(path)?.set_modified(at)?;
+    disk_stamp(path)
 }
 
 fn bind_listener(ns: &Netns, next: &mut u32, transport: Transport, port: u16, purpose: ListenerPurpose) -> anyhow::Result<HeldListener> {

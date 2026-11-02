@@ -2,7 +2,9 @@
 //!
 //! Backends: [`LocalFsStore`] (a directory per cell) and `s3::S3Store`.
 //! Disk images are chunked hole-aware (`SEEK_DATA`), so sparse images commit quickly and all-zero
-//! chunks become `null` entries that are never stored.
+//! chunks become `null` entries that are never stored. A commit's pass over the file
+//! ([`scan_file`], or [`rescan_unchanged`] for a disk nestd knows is unchanged) runs while the file
+//! is stable; what it holds back is uploaded by [`publish`] after the VM resumes.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -26,6 +28,12 @@ pub trait ObjectStore: Send + Sync {
         1
     }
     fn has_chunk(&self, hex: &str) -> io::Result<bool>;
+    /// Whether this process already knows the store holds `hex` under the 12 h rule (`has_chunk`
+    /// would say yes), without asking the store: a chunk it isn't sure of is held back for
+    /// [`publish`] rather than asked about while the VM is paused.
+    fn known_recent(&self, _hex: &str) -> bool {
+        false
+    }
     fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()>;
     fn get_chunk(&self, hex: &str) -> io::Result<Vec<u8>>;
     fn put_manifest(&self, hex: &str, data: &[u8]) -> io::Result<()>;
@@ -62,6 +70,9 @@ impl LocalFsStore {
 impl ObjectStore for LocalFsStore {
     fn has_chunk(&self, hex: &str) -> io::Result<bool> {
         Ok(self.root.join("chunks").join(hex).exists())
+    }
+    fn known_recent(&self, hex: &str) -> bool {
+        self.has_chunk(hex).unwrap_or(false)
     }
     fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()> {
         Self::write_atomic(&self.root.join("chunks").join(hex), data)
@@ -111,10 +122,84 @@ fn next_data(file: &File, pos: u64) -> io::Result<Option<u64>> {
     Ok(Some(r as u64))
 }
 
-/// Chunk `path` into `store` and write its manifest. Returns the manifest and its hash.
-/// Unchanged chunks already present in the store are not rewritten (content addressing). The file
-/// is read sequentially; hashing and uploads run on `store.parallelism()` threads.
-pub fn commit_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind) -> io::Result<(Manifest, ManifestHash)> {
+/// A commit's pass over a file while it was stable: its manifest, and the chunks it found that
+/// may need uploading but held back (in memory, within the pass's budget) so the upload can run
+/// after the VM resumes. [`publish`] uploads those and the manifest.
+pub struct Scanned {
+    pub manifest: Manifest,
+    pub hash: ManifestHash,
+    /// The manifest's bytes (what `hash` names).
+    bytes: Vec<u8>,
+    /// Chunks not yet known to be in the store (by hex): `publish` stores each that isn't.
+    deferred: Vec<(String, Vec<u8>)>,
+    pub stats: ScanStats,
+}
+
+/// What a pass read and did, for the commit's log line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    /// Chunks read from the file (all-zero ones included).
+    pub chunks_read: u64,
+    pub bytes_read: u64,
+    /// Chunks the pass uploaded itself (its hold-back budget was spent).
+    pub chunks_put: u64,
+    /// Chunks held back for `publish`.
+    pub chunks_deferred: u64,
+    /// The previous pass's manifest was reused ([`rescan_unchanged`]).
+    pub reused: bool,
+}
+
+/// A byte budget shared by a pass's workers.
+struct Budget(Mutex<usize>);
+
+impl Budget {
+    fn take(&self, n: usize) -> bool {
+        let mut left = self.0.lock().expect("budget");
+        if *left < n {
+            return false;
+        }
+        *left -= n;
+        true
+    }
+}
+
+/// Whether `buf` is all zeros (compared a block at a time, which the compiler turns into `memcmp`).
+pub fn is_zero(buf: &[u8]) -> bool {
+    const BLOCK: usize = 64 << 10;
+    static ZEROS: [u8; BLOCK] = [0; BLOCK];
+    buf.chunks(BLOCK).all(|b| b == &ZEROS[..b.len()])
+}
+
+/// One non-zero chunk a pass read: it is in the store already (as far as this process knows), held
+/// back within `budget`, or else stored now (the pre-hold-back behaviour, while the file is still
+/// stable).
+fn place(store: &dyn ObjectStore, hex: String, bytes: Vec<u8>, budget: &Budget, deferred: &Mutex<Vec<(String, Vec<u8>)>>, stats: &Mutex<ScanStats>) -> io::Result<String> {
+    if store.known_recent(&hex) {
+        return Ok(hex);
+    }
+    if budget.take(bytes.len()) {
+        stats.lock().expect("stats").chunks_deferred += 1;
+        deferred.lock().expect("deferred").push((hex.clone(), bytes));
+        return Ok(hex);
+    }
+    if !store.has_chunk(&hex)? {
+        store.put_chunk(&hex, &bytes)?;
+        stats.lock().expect("stats").chunks_put += 1;
+    }
+    Ok(hex)
+}
+
+fn finish(manifest: Manifest, deferred: Vec<(String, Vec<u8>)>, stats: ScanStats) -> io::Result<Scanned> {
+    let bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
+    let hash = ManifestHash(format!("blake3:{}", blake3::hash(&bytes).to_hex()));
+    Ok(Scanned { manifest, hash, bytes, deferred, stats })
+}
+
+/// Read `path` (which must not change meanwhile) into a manifest: hole-aware (`SEEK_DATA`), each
+/// chunk read once, sequentially; zero checks, hashing and any uploads run on
+/// `store.parallelism()` workers. Non-zero chunks the store isn't known to hold are held back up to
+/// `hold_back` bytes, for [`publish`]; past that they are stored now.
+pub fn scan_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind, hold_back: usize) -> io::Result<Scanned> {
     let chunk_size = match kind {
         ManifestKind::Disk => DISK_CHUNK,
         ManifestKind::Memory => MEMORY_CHUNK,
@@ -122,39 +207,122 @@ pub fn commit_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind) -> 
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
     let chunks: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; size.div_ceil(chunk_size) as usize]);
-    // The file is read sequentially (the reader runs under par_try_for_each's lock); all-zero
-    // chunks are skipped.
+    let stats = Mutex::new(ScanStats::default());
+    let deferred = Mutex::new(Vec::new());
+    let budget = Budget(Mutex::new(hold_back));
+    // The file is read sequentially (the reader runs under par_try_for_each's lock); the workers
+    // check for zeros, so the reader only reads.
     let mut pos = 0u64;
     let mut read_next = || -> io::Result<Option<(usize, Vec<u8>)>> {
-        while pos < size {
-            let Some(data) = next_data(&file, pos)? else { break };
-            let idx = data / chunk_size;
-            let start = idx * chunk_size;
-            let mut buf = vec![0u8; chunk_size.min(size - start) as usize];
-            file.seek(SeekFrom::Start(start))?;
-            file.read_exact(&mut buf)?;
-            pos = start + chunk_size;
-            if buf.iter().any(|&b| b != 0) {
-                return Ok(Some((idx as usize, buf)));
-            }
+        if pos >= size {
+            return Ok(None);
         }
-        Ok(None)
+        let Some(data) = next_data(&file, pos)? else {
+            pos = size;
+            return Ok(None);
+        };
+        if data >= size {
+            pos = size;
+            return Ok(None);
+        }
+        let idx = data / chunk_size;
+        let start = idx * chunk_size;
+        let mut buf = vec![0u8; chunk_size.min(size - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        pos = start + chunk_size;
+        Ok(Some((idx as usize, buf)))
     };
     let items = std::iter::from_fn(|| read_next().transpose());
     par_try_for_each(items, store.parallelism(), |(idx, bytes)| {
-        let hex = blake3::hash(&bytes).to_hex().to_string();
-        if !store.has_chunk(&hex)? {
-            store.put_chunk(&hex, &bytes)?;
+        {
+            let mut s = stats.lock().expect("stats");
+            s.chunks_read += 1;
+            s.bytes_read += bytes.len() as u64;
         }
+        if is_zero(&bytes) {
+            return Ok(());
+        }
+        let hex = blake3::hash(&bytes).to_hex().to_string();
+        let hex = place(store, hex, bytes, &budget, &deferred, &stats)?;
         chunks.lock().expect("chunks")[idx] = Some(format!("blake3:{hex}"));
         Ok(())
     })?;
     let chunks = chunks.into_inner().expect("chunks");
     let manifest = Manifest { format: 1, kind, chunk_size: chunk_size as u32, size_bytes: size, chunks, prefetch: vec![] };
-    let bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
-    let hex = blake3::hash(&bytes).to_hex().to_string();
-    store.put_manifest(&hex, &bytes)?;
-    Ok((manifest, ManifestHash(format!("blake3:{hex}"))))
+    finish(manifest, deferred.into_inner().expect("deferred"), stats.into_inner().expect("stats"))
+}
+
+/// `prev` again for a file known to be unchanged since the pass that made it (nestd's mtime
+/// sentinel; `nestd_core::checkpoint`). Nothing is read but the non-zero chunks the store isn't
+/// known to hold (the 12 h rule: every chunk of a new generation is verified, never assumed), and
+/// each of those must still hash to its entry. `Ok(None)`: the file doesn't match `prev` (its size,
+/// or a chunk read back), so the caller reads it whole.
+pub fn rescan_unchanged(store: &dyn ObjectStore, path: &Path, prev: &Manifest, hold_back: usize) -> io::Result<Option<Scanned>> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let chunk_size = prev.chunk_size as u64;
+    if size != prev.size_bytes || chunk_size == 0 || prev.chunks.len() as u64 != size.div_ceil(chunk_size) {
+        return Ok(None);
+    }
+    let todo: Vec<(usize, &str)> = prev
+        .chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.as_deref().map(|c| hex_of(c).map(|h| (i, h))))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, h)| !store.known_recent(h))
+        .collect();
+    let stats = Mutex::new(ScanStats { reused: true, ..ScanStats::default() });
+    let deferred = Mutex::new(Vec::new());
+    let budget = Budget(Mutex::new(hold_back));
+    let mismatch = Mutex::new(false);
+    par_try_for_each(todo.into_iter().map(Ok::<_, io::Error>), store.parallelism(), |(i, hex)| {
+        let start = i as u64 * chunk_size;
+        let mut buf = vec![0u8; chunk_size.min(size - start) as usize];
+        file.read_exact_at(&mut buf, start)?;
+        {
+            let mut s = stats.lock().expect("stats");
+            s.chunks_read += 1;
+            s.bytes_read += buf.len() as u64;
+        }
+        if blake3::hash(&buf).to_hex().as_str() != hex {
+            *mismatch.lock().expect("mismatch") = true;
+            return Err(io::Error::other("changed"));
+        }
+        place(store, hex.to_string(), buf, &budget, &deferred, &stats).map(|_| ())
+    })
+    .or_else(|e| if *mismatch.lock().expect("mismatch") { Ok(()) } else { Err(e) })?;
+    if mismatch.into_inner().expect("mismatch") {
+        return Ok(None);
+    }
+    finish(prev.clone(), deferred.into_inner().expect("deferred"), stats.into_inner().expect("stats")).map(Some)
+}
+
+/// Store what a pass held back (each chunk the store doesn't hold under the 12 h rule), then the
+/// manifest. Runs after the VM resumes: nothing here reads the file.
+pub fn publish(store: &dyn ObjectStore, scanned: &Scanned) -> io::Result<()> {
+    // Equal chunks held back twice are stored once.
+    let mut seen = std::collections::BTreeSet::new();
+    let todo: Vec<&(String, Vec<u8>)> = scanned.deferred.iter().filter(|(hex, _)| seen.insert(hex.as_str())).collect();
+    par_try_for_each(todo.into_iter().map(Ok::<_, io::Error>), store.parallelism(), |(hex, bytes)| {
+        if !store.has_chunk(hex)? {
+            store.put_chunk(hex, bytes)?;
+        }
+        Ok(())
+    })?;
+    let hex = scanned.hash.0.strip_prefix("blake3:").expect("made by finish");
+    store.put_manifest(hex, &scanned.bytes)
+}
+
+/// Chunk `path` into `store` and write its manifest. Returns the manifest and its hash.
+/// Unchanged chunks already present in the store are not rewritten (content addressing). The file
+/// is read sequentially; hashing and uploads run on `store.parallelism()` threads.
+pub fn commit_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind) -> io::Result<(Manifest, ManifestHash)> {
+    let scanned = scan_file(store, path, kind, 0)?;
+    publish(store, &scanned)?;
+    Ok((scanned.manifest, scanned.hash))
 }
 
 /// Materialize a manifest into a (sparse) file at `dest`.
@@ -229,6 +397,136 @@ mod tests {
         let a = fs::read(&img).unwrap();
         let b = fs::read(&out).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// A local store that never vouches for a chunk without asking (as an S3 store that hasn't
+    /// seen it this process), and counts what is stored.
+    struct Asking {
+        inner: LocalFsStore,
+        puts: Mutex<Vec<String>>,
+    }
+    impl ObjectStore for Asking {
+        fn parallelism(&self) -> usize {
+            4
+        }
+        fn has_chunk(&self, hex: &str) -> io::Result<bool> {
+            self.inner.has_chunk(hex)
+        }
+        fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()> {
+            self.puts.lock().unwrap().push(hex.to_string());
+            self.inner.put_chunk(hex, data)
+        }
+        fn get_chunk(&self, hex: &str) -> io::Result<Vec<u8>> {
+            self.inner.get_chunk(hex)
+        }
+        fn put_manifest(&self, hex: &str, data: &[u8]) -> io::Result<()> {
+            self.inner.put_manifest(hex, data)
+        }
+        fn get_manifest(&self, hex: &str) -> io::Result<Vec<u8>> {
+            self.inner.get_manifest(hex)
+        }
+    }
+
+    fn asking(dir: &Path) -> Asking {
+        Asking { inner: LocalFsStore::new(dir.join("store")).unwrap(), puts: Mutex::new(vec![]) }
+    }
+
+    /// A 64 MiB sparse image with distinct data in chunks 1, 3 and 5, and chunk 7 written as zeros.
+    fn image(dir: &Path) -> PathBuf {
+        let img = dir.join("disk.img");
+        create_sparse(&img, 16 * DISK_CHUNK as u64).unwrap();
+        let f = OpenOptions::new().write(true).open(&img).unwrap();
+        for i in [1u64, 3, 5] {
+            f.write_all_at(&vec![i as u8; 4096], i * DISK_CHUNK as u64 + 100).unwrap();
+        }
+        f.write_all_at(&vec![0u8; DISK_CHUNK as usize], 7 * DISK_CHUNK as u64).unwrap();
+        img
+    }
+
+    /// A pass holds back what it would upload, within its budget, until `publish`; the result is
+    /// what `commit_file` makes. Zeros written as data are read (by the workers) and stay `null`.
+    #[test]
+    fn a_pass_holds_back_its_uploads_until_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = image(dir.path());
+        let store = asking(dir.path());
+        let s = scan_file(&store, &img, ManifestKind::Disk, 64 << 20).unwrap();
+        assert!(store.puts.lock().unwrap().is_empty(), "nothing stored before publish");
+        assert_eq!(s.stats, ScanStats { chunks_read: 4, bytes_read: 4 * DISK_CHUNK as u64, chunks_put: 0, chunks_deferred: 3, reused: false });
+        assert_eq!(s.manifest.chunks.iter().filter(|c| c.is_some()).count(), 3);
+        assert!(s.manifest.chunks[7].is_none(), "a chunk of zeros is null");
+        publish(&store, &s).unwrap();
+        assert_eq!(store.puts.lock().unwrap().len(), 3);
+        let local = LocalFsStore::new(dir.path().join("plain")).unwrap();
+        let (m, h) = commit_file(&local, &img, ManifestKind::Disk).unwrap();
+        assert_eq!((m, h), (s.manifest.clone(), s.hash.clone()));
+        let out = dir.path().join("restored.img");
+        restore_file(&store, &s.hash, &out).unwrap();
+        assert_eq!(fs::read(&img).unwrap(), fs::read(&out).unwrap());
+    }
+
+    /// Past its budget a pass stores chunks itself, while the file is still stable.
+    #[test]
+    fn past_its_budget_a_pass_uploads_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = image(dir.path());
+        let store = asking(dir.path());
+        let s = scan_file(&store, &img, ManifestKind::Disk, DISK_CHUNK as usize).unwrap();
+        assert_eq!((s.stats.chunks_deferred, s.stats.chunks_put), (1, 2));
+        assert_eq!(store.puts.lock().unwrap().len(), 2);
+        publish(&store, &s).unwrap();
+        assert_eq!(store.puts.lock().unwrap().len(), 3);
+        // A chunk the store holds isn't stored again by either.
+        let again = scan_file(&store, &img, ManifestKind::Disk, 0).unwrap();
+        assert_eq!(again.stats.chunks_put, 0);
+        publish(&store, &again).unwrap();
+        assert_eq!(store.puts.lock().unwrap().len(), 3);
+    }
+
+    /// The unchanged path reads only the chunks the store isn't known to hold, checks each against
+    /// its entry, and gives up (for a full pass) on any difference.
+    #[test]
+    fn an_unchanged_file_is_read_only_where_the_store_is_in_doubt() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = image(dir.path());
+        let local = LocalFsStore::new(dir.path().join("store")).unwrap();
+        let (prev, h) = commit_file(&local, &img, ManifestKind::Disk).unwrap();
+
+        // Everything known: nothing read, the same manifest.
+        let s = rescan_unchanged(&local, &img, &prev, 64 << 20).unwrap().expect("reused");
+        assert_eq!((s.hash.clone(), s.stats.bytes_read, s.stats.reused), (h.clone(), 0, true));
+
+        // A chunk gone from the store: read back, checked, stored again at publish.
+        let hex = prev.chunks[3].as_deref().unwrap().strip_prefix("blake3:").unwrap().to_string();
+        fs::remove_file(dir.path().join("store/chunks").join(&hex)).unwrap();
+        let s = rescan_unchanged(&local, &img, &prev, 64 << 20).unwrap().expect("reused");
+        assert_eq!((s.stats.chunks_read, s.stats.chunks_deferred), (1, 1));
+        assert!(!local.has_chunk(&hex).unwrap());
+        publish(&local, &s).unwrap();
+        assert!(local.has_chunk(&hex).unwrap());
+
+        // A doubted chunk that no longer matches: not reused.
+        fs::remove_file(dir.path().join("store/chunks").join(&hex)).unwrap();
+        OpenOptions::new().write(true).open(&img).unwrap().write_all_at(b"changed", 3 * DISK_CHUNK as u64).unwrap();
+        assert!(rescan_unchanged(&local, &img, &prev, 64 << 20).unwrap().is_none());
+
+        // Another size: not reused, nothing read.
+        OpenOptions::new().write(true).open(&img).unwrap().set_len(17 * DISK_CHUNK as u64).unwrap();
+        assert!(rescan_unchanged(&local, &img, &prev, 64 << 20).unwrap().is_none());
+    }
+
+    #[test]
+    fn is_zero_checks_every_byte() {
+        assert!(is_zero(&[]));
+        for len in [1usize, 4095, 64 << 10, (64 << 10) + 1, 3 << 20] {
+            let mut v = vec![0u8; len];
+            assert!(is_zero(&v), "{len}");
+            for at in [0, len / 2, len - 1] {
+                v[at] = 1;
+                assert!(!is_zero(&v), "{len} {at}");
+                v[at] = 0;
+            }
+        }
     }
 
     /// A store whose every upload fails, slowly enough that the reader is ahead of the uploads.

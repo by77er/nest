@@ -2,10 +2,11 @@
 //! every violated property. A spec is a FleetDO variant with optional bounds:
 //! `fixed`, `main`, `no-baseline`, `late-capture`, `volatile-capture`, `broker-quiet`, then any of
 //! `,cmds=N`, `,drops=N`, `,restarts=N`, `,resets=N`, `,broker=N`, `,secrets=0`.
-//! Example: `fixed,cmds=2,drops=1`.
+//! Example: `fixed,cmds=2,drops=1`. `lease[,...]` and `sentinel[,async][,trust-running][,writes=N]
+//! [,commits=N][,restarts=N]` check the lease and the unchanged-disk short-circuit.
 
 use nestd_check::fleet::{Config, FleetModel, describe};
-use nestd_check::lease;
+use nestd_check::{lease, sentinel};
 use nestd_check::{check, counterexample};
 
 fn parse(spec: &str) -> Result<Config, String> {
@@ -44,6 +45,27 @@ fn parse(spec: &str) -> Result<Config, String> {
 fn main() {
     let specs: Vec<String> = std::env::args().skip(1).collect();
     for spec in &specs {
+        if let Some(rest) = spec.strip_prefix("sentinel") {
+            let mut cfg = sentinel::Config::fixed();
+            for p in rest.split(',').filter(|p| !p.is_empty()) {
+                match p.split_once('=') {
+                    None if p == "async" => cfg.async_engine = true,
+                    None if p == "trust-running" => cfg.trust_running = true,
+                    Some(("writes", v)) => cfg.max_writes = v.parse().expect("a number"),
+                    Some(("commits", v)) => cfg.max_commits = v.parse().expect("a number"),
+                    Some(("restarts", v)) => cfg.max_restarts = v.parse().expect("a number"),
+                    _ => panic!("unknown sentinel option {p}"),
+                }
+            }
+            let o = check(sentinel::SentinelModel { cfg });
+            println!("{spec}: {} states in {:.1?}; violated {:?}; examples {:?}", o.unique_states, o.elapsed, o.violations, o.examples);
+            for v in &o.violations {
+                if let Some(path) = counterexample(&|| sentinel::SentinelModel { cfg }, v) {
+                    println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| a.clone()).collect::<Vec<_>>());
+                }
+            }
+            continue;
+        }
         if let Some(rest) = spec.strip_prefix("lease") {
             let mut cfg = lease::Config { unit_ms: 5_000, horizon: 14, max_drops: 1, max_suspends: 1, suspend_steps: 4, max_in_flight: 1 };
             for p in rest.split(',').filter(|p| !p.is_empty()) {

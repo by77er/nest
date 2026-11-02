@@ -30,6 +30,7 @@ use nestd::config::Config;
 use nestd::driver::{Driver, Vm, VmSpec};
 use nestd::enroll::Enrolled;
 use nestd::host::Host;
+use nestd::storage::{LocalFsStore, ObjectStore};
 use nestd::vsock::Emulator;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -78,6 +79,10 @@ struct FakeDriver {
 
 #[async_trait]
 impl Driver for FakeDriver {
+    /// The fake VM writes its disk only from `start` (and tests from outside, as a guest would).
+    fn pause_quiesces_disk(&self) -> bool {
+        true
+    }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         std::fs::create_dir_all(&spec.vm_dir)?;
         // Never gets to a VM (the test kills the process meanwhile).
@@ -1667,26 +1672,113 @@ async fn a_failed_suspend_rolls_back_to_running() {
     assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Suspended));
 }
 
-/// A suspend or checkpoint whose commit is rejected (`parent_mismatch`: another incarnation moved
-/// the head) never resumes its VM: the rejection fences this incarnation. Both used to resume it
-/// before the fence the rejection spawns had run, so the VM of a stale epoch ran on.
+/// A suspend whose commit is rejected (`parent_mismatch`: another incarnation moved the head) never
+/// resumes its VM: the rejection fences this incarnation. It used to resume it before the fence the
+/// rejection spawns had run, so the VM of a stale epoch ran on. A checkpoint resumes its VM once the
+/// disk is read, before any answer (as a running VM runs between commits), and its rejection
+/// freezes that VM through the pause handle; nothing resumes it after.
 // One thread: that fence runs only once the command yields, the order that lost the race.
 #[tokio::test(flavor = "current_thread")]
 async fn a_rejected_commit_never_resumes_its_vm() {
     let h = start_host().await;
-    let checkpoint = |id: &str, sbx: &str| cmd(id, CommandBody::SandboxCheckpoint { sandbox: SandboxId(sbx.into()), epoch: Epoch(1), reason: CommitReason::TurnEnd });
-    for (sbx, command) in [("sbx_1", suspend_cmd("cmd_1", "sbx_1", SuspendMode::DiskOnly)), ("sbx_2", checkpoint("cmd_2", "sbx_2"))] {
-        let what = format!("{sbx} {:?}", command.body);
-        h.fleet.commands.send(vec![create(&format!("cmd_create_{sbx}"), sbx)]).unwrap();
-        assert!(is_ok(&h.fleet.result(&format!("cmd_create_{sbx}")).await));
-        *h.fleet.reject_next.lock().unwrap() = Some("parent_mismatch".into());
-        // A resume would hold the command (and its answer) until released.
-        h.vm.resume_latch.held.store(true, Ordering::SeqCst);
-        let id = command.cmd.0.clone();
-        h.fleet.commands.send(vec![command]).unwrap();
-        assert!(!is_ok(&h.fleet.result(&id).await), "{what}");
-        assert!(!h.vm.resume_latch.reached.load(Ordering::SeqCst), "{what} resumed its VM");
-        h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, .. } if sandbox.0 == sbx)).await;
+    h.fleet.commands.send(vec![create("cmd_create_sbx_1", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create_sbx_1").await));
+    *h.fleet.reject_next.lock().unwrap() = Some("parent_mismatch".into());
+    // A resume would hold the command (and its answer) until released.
+    h.vm.resume_latch.held.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![suspend_cmd("cmd_1", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_1").await));
+    assert!(!h.vm.resume_latch.reached.load(Ordering::SeqCst), "a rejected suspend resumed its VM");
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, .. } if sandbox.0 == "sbx_1")).await;
+    h.vm.resume_latch.held.store(false, Ordering::SeqCst);
+
+    h.fleet.commands.send(vec![create("cmd_create_sbx_2", "sbx_2")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create_sbx_2").await));
+    *h.fleet.reject_next.lock().unwrap() = Some("parent_mismatch".into());
+    h.fleet.commands.send(vec![cmd("cmd_2", CommandBody::SandboxCheckpoint { sandbox: SandboxId("sbx_2".into()), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_2").await));
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, .. } if sandbox.0 == "sbx_2")).await;
+    wait_until("the rejected checkpoint's VM is frozen", || h.vm.paused.lock().unwrap().contains(&("sbx_2".to_string(), 1))).await;
+    wait_until("and stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_2")).await;
+}
+
+/// Every `commit_request`'s disk manifest for `sandbox`, in order.
+fn disk_manifests(fleet: &MockFleet, sandbox: &str) -> Vec<ManifestHash> {
+    fleet
+        .log
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|e| match &e.body {
+            HostEventBody::CommitRequest { sandbox: s, disk_manifest, .. } if s.0 == sandbox => Some(disk_manifest.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn disk_path(dir: &Path, sandbox: &str, epoch: u64) -> PathBuf {
+    dir.join("state/sandboxes").join(sandbox).join(epoch.to_string()).join("disk.img")
+}
+
+/// Change the disk's bytes behind nestd's back, leaving its modification time as nestd set it.
+fn rewrite_keeping_mtime(path: &Path, at: u64, what: &[u8]) {
+    let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&f, what, at).unwrap();
+    f.set_modified(mtime).unwrap();
+}
+
+/// M1, the unchanged-disk short-circuit: a checkpoint of a disk nothing wrote since the last one
+/// reuses that manifest without reading the disk; any write moves the disk's modification time off
+/// the sentinel, and the next checkpoint reads it again. (Bytes changed with the time put back, as
+/// nothing but nestd does, show which happened.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_disk_is_committed_without_reading_it() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    checkpoint(&h.fleet, "cmd_ck1", "sbx_1", 1).await;
+    let mtime = std::fs::metadata(&disk).unwrap().modified().unwrap();
+    let sentinel = std::time::UNIX_EPOCH + Duration::new(nestd_core::checkpoint::SENTINEL.0 as u64, nestd_core::checkpoint::SENTINEL.1);
+    assert_eq!(mtime, sentinel, "the checkpoint leaves the sentinel on the disk");
+
+    rewrite_keeping_mtime(&disk, 0, b"unseen");
+    checkpoint(&h.fleet, "cmd_ck2", "sbx_1", 1).await;
+    append_to_disk(h.dir.path(), "sbx_1", 1, b"a guest write");
+    checkpoint(&h.fleet, "cmd_ck3", "sbx_1", 1).await;
+    let m = disk_manifests(&h.fleet, "sbx_1");
+    assert_eq!(m.len(), 3, "{m:?}");
+    assert_eq!(m[1], m[0], "an unchanged disk is not read again");
+    assert_ne!(m[2], m[1], "a write is always read");
+    // The third read the whole disk again, so it also saw the bytes changed behind nestd's back.
+    let store = LocalFsStore::new(h.dir.path().join("state/store/test-cell")).unwrap();
+    let manifest: Manifest = serde_json::from_slice(&store.get_manifest(m[2].0.strip_prefix("blake3:").unwrap()).unwrap()).unwrap();
+    let first = manifest.chunks[0].as_deref().unwrap().strip_prefix("blake3:").unwrap().to_string();
+    assert!(store.get_chunk(&first).unwrap().starts_with(b"unseen"));
+}
+
+/// The short-circuit never relies on the store still holding what it reuses: a chunk the store no
+/// longer has (or this process can't vouch for under the 12 h rule) is read back from the disk,
+/// checked against its entry and stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_manifest_still_stores_every_chunk_it_names() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    checkpoint(&h.fleet, "cmd_ck1", "sbx_1", 1).await;
+    let chunks = h.dir.path().join("state/store/test-cell/chunks");
+    let named: Vec<_> = std::fs::read_dir(&chunks).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(!named.is_empty());
+    for n in &named {
+        std::fs::remove_file(chunks.join(n)).unwrap();
+    }
+    checkpoint(&h.fleet, "cmd_ck2", "sbx_1", 1).await;
+    let m = disk_manifests(&h.fleet, "sbx_1");
+    assert_eq!(m[1], m[0], "still reused");
+    for n in &named {
+        assert!(chunks.join(n).exists(), "{n:?} stored again");
     }
 }
 

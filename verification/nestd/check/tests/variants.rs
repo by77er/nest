@@ -130,3 +130,18 @@ fn the_lease_never_outlives_fleetdos_view() {
         assert!(o.examples.contains(&e), "no example of {e}: the property would be vacuous");
     }
 }
+
+/// The unchanged-disk short-circuit holds as `host.rs` drives the memo, and the reuse is reached
+/// (not vacuous); a write that lands after a pause (an `Async` io_engine), or a shell that trusts
+/// a running VM, breaks it.
+#[test]
+fn the_sentinel_holds_with_a_sync_engine_and_fails_without_its_assumptions() {
+    use nestd_check::sentinel::{Config, REUSED, SAFETY, SentinelModel};
+    let o = check(SentinelModel { cfg: Config::fixed() });
+    assert!(o.violations.is_empty(), "violated {:?} ({} states)", o.violations, o.unique_states);
+    assert!(o.examples.contains(&REUSED), "the reuse is never reached");
+    for cfg in [Config { async_engine: true, ..Config::fixed() }, Config { trust_running: true, ..Config::fixed() }] {
+        let o = check(SentinelModel { cfg });
+        assert!(o.violated(SAFETY), "{cfg:?}: expected {SAFETY} to fail");
+    }
+}

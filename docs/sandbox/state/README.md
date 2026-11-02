@@ -11,7 +11,7 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 
 - **Chunks are immutable.** Any host can upload them at any time without harm.
 - **Manifests are content-addressed in S3.** SandboxDO stores only `head = manifest hash`.
-- **Commit:** flush the guest ([disk](disk/#flush-before-commit)), upload the chunks, verify them, upload the manifest, then `commit(epoch, parent, hash)` as a compare-and-set in the DO.
+- **Commit:** flush the guest ([disk](disk/#flush-before-commit)), read the disk while nothing writes it (today the VM is paused for the read only; designed, a reflink cut while it runs), upload the chunks, verify them, upload the manifest, then `commit(epoch, parent, hash)` as a compare-and-set in the DO. The upload and the answer come after the VM resumes, and a disk nothing wrote since the last commit isn't read again ([disk](disk/#m1-pause-only-to-read-and-never-read-an-unchanged-disk)). Designed: only changed chunks are read, and the request carries `cut_ms` ([disk](disk/)).
 - **Verified before commit:** every chunk a generation adds over its parent must have been uploaded less than 12 h before the commit, by this commit's PUT or as a HEAD shows, with the manifest's length; anything older is uploaded again ([GC](object-store/#garbage-collection)). The rule is applied to every non-zero chunk of the file, not only to those that differ from the parent (`storage.rs` `commit_file`, `s3.rs` `recent`), so a commit never relies on its parent still being a GC root: retention may have dropped it (a salvage's parent may even be pruned). A committed generation is therefore `ready`: every chunk is present.
 - **`reason`:** `turn_end`, `periodic`, `pressure`, `pause`, `suspend`, `drain`, `spot`, `fork` or `salvage`. Retention and rollback notices read it.
 - **`deleting` is one-way.** A generation is marked `deleting` before any of its bytes can go, and never returns to `ready`, because a previous pass may already have removed some of them.
@@ -23,7 +23,7 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 |---|---|---|
 | Disk | At each agent's `Stop` (rate-limited to about one per 10 s); every 60 s if dirty; immediately if dirty data exceeds 256 MB; on pause, suspend, drain or spot notice | ≤60 s, usually at a turn boundary |
 
-**Built:** turn-end commits (SandboxDO asks for a `turn_end` checkpoint when an agent's turn completes; one sooner than 10 s after the last is deferred, not dropped), and suspend, drain and spot notice. **Not built:** the 60 s timer and the 256 MB threshold, so for now the recovery point is the last turn end. A sandbox's first commit uploads its base image's chunks (about 700 MB for `nest-base`, roughly 30 s), until base generations exist.
+**Built:** turn-end commits (SandboxDO asks for a `turn_end` checkpoint when an agent's turn completes; one sooner than 10 s after the last is deferred, not dropped), and suspend, drain and spot notice. A commit pauses the VM only while it reads the disk, and a turn that wrote nothing reads nothing ([disk](disk/)); a disk that changed is still read whole until M3. **Not built:** the 60 s timer and the 256 MB threshold, so for now the recovery point is the last turn end. A sandbox's first commit uploads its base image's chunks (about 700 MB for `nest-base`, roughly 30 s), until base generations exist.
 | Memory | **Only** on suspend, drain or spot notice. Never on a timer (a hugepage snapshot is always full and pauses the VM). | Last suspend |
 
 The cadence is the RPO: a lost host loses at most the work since its last commit, and the loss is recorded ([SandboxDO](../../control-plane/durable-objects/sandbox/#losses)).
@@ -91,7 +91,7 @@ SandboxDO runs retention from its alarm, in the same single writer that admits f
 
 **Built:** the notice suspends every running sandbox, in no order ([autoscaling](../../compute/autoscaling/)). **Designed, not built:** the order below.
 
-1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then flip every disk epoch (milliseconds each) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
+1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk ([disk](disk/#m2-cut-with-a-reflink-while-the-vm-runs-designed-not-built)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
 2. Then, in order of recent activity: pause, write a full memory snapshot to NVMe (`sync_snapshot_files=false`), upload with zstd compression, commit.
 3. Anything that doesn't finish falls back to its disk-only generation, and the loss is recorded.
 
@@ -105,5 +105,5 @@ A **rebalance recommendation** can arrive with the notice rather than before it,
 ## Components
 
 - [memory/](memory/): hugepages, UFFD, prefetch, tiers, restore ABI, base generations
-- [disk/](disk/): ublk lazy disk, copy-on-write epoch flips, flush before commit, I/O limits
+- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts and extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
 - [object-store/](object-store/): S3 per cell, costs, garbage collection

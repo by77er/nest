@@ -53,6 +53,13 @@ impl Driver for FirecrackerDriver {
     fn supports_memory_snapshots(&self) -> bool {
         true
     }
+    /// The drive uses Firecracker's default `Sync` io_engine: each guest write is a `pwrite` that
+    /// returns before the guest sees it complete, and a paused VM polls no device
+    /// ([snapshot-support.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md)).
+    /// The `Async` engine completes writes after a pause: switching to it must revisit this.
+    fn pause_quiesces_disk(&self) -> bool {
+        true
+    }
     async fn create(&self, spec: VmSpec) -> io::Result<Box<dyn Vm>> {
         super::access::create_searchable(&self.run_dir, &spec.vm_dir)?;
         let jail = match (&self.cfg.jailer_bin, &self.cfg.jailer) {
