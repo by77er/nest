@@ -14,7 +14,7 @@ Usage: git diff --name-only --no-renames A B | ci-changes.py
 
 import sys
 
-JOBS = ("rust", "control-plane", "dashboard", "e2e", "infra", "verify-nestd", "fuzz-nestd")
+JOBS = ("rust", "control-plane", "dashboard", "projects", "e2e", "infra", "verify-nestd", "fuzz-nestd")
 ALL = frozenset(JOBS)
 
 # (path prefix, jobs). The longest matching prefix wins; a prefix ending in "/" is a directory.
@@ -60,6 +60,8 @@ RULES = [
     # nestd's test that its GC grace stays below FleetDO's (crates/nestd/src/s3.rs).
     ("control-plane/src/do/fleet.ts", {"control-plane", "e2e", "rust"}),
     ("dashboard/", {"dashboard"}),
+    # The projects app: a separate Worker that imports nothing outside projects/.
+    ("projects/", {"projects"}),
     # The MCP test server is a separate Worker with no CI job of its own; e2e runs it.
     ("mcp-test/", {"e2e"}),
     ("e2e/", {"e2e"}),

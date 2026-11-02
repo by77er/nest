@@ -19,6 +19,8 @@
 /crates/*/Cargo.toml                        @by77er
 /control-plane/package.json                 @by77er
 /control-plane/package-lock.json            @by77er
+/projects/package.json                      @by77er
+/projects/package-lock.json                 @by77er
 
 # Control plane: deploy config (bindings, DO migrations), API auth, secrets,
 # host identity, the root CA, EC2 access, and the authority checks (grants,

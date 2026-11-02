@@ -1,0 +1,71 @@
+// The MCP servers' tools (README.md#the-mcp-server-agents-see-only-their-own-work): one server per
+// role, so a role's tool list is its URL's. The catalog (src/catalog.ts) names the same tools, and their
+// read-only and idempotent marks, so nest's connector and retries agree with what the server does.
+
+export const SERVERS = ["board", "task", "review"] as const;
+export type Server = (typeof SERVERS)[number];
+export type Role = "manager" | "worker" | "reviewer";
+
+/** The role whose agents a server serves. */
+export const ROLE_OF: Record<Server, Role> = { board: "manager", task: "worker", review: "reviewer" };
+
+export interface ToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  /** Reads only: nest may retry it, and it is not a sink. */
+  readOnly?: boolean;
+  /** Safe to run twice with the same arguments (a set, not an append). */
+  idempotent?: boolean;
+}
+
+const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
+  type: "object", properties, required, additionalProperties: false,
+});
+const str = (description: string, maxLength = 4000) => ({ type: "string", description, maxLength });
+const strs = (description: string) => ({ type: "array", items: { type: "string", maxLength: 1000 }, maxItems: 50, description });
+const taskId = str("The task's id (tsk_…).", 64);
+
+export const TOOLS: Record<Server, readonly ToolDef[]> = {
+  board: [
+    { name: "list_tasks", description: "The project's board: every task in board order with its state, assignee and PR, and the project's settings.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    { name: "get_task", description: "One task in full: its body, spec and history.", inputSchema: obj({ task: taskId }, ["task"]), readOnly: true, idempotent: true },
+    { name: "create_task", description: "Add a task to the board as a draft. Spec it next with write_spec.", inputSchema: obj({ title: str("A short title.", 200), body: str("What is wanted and why.", 20000) }, ["title"]) },
+    {
+      name: "write_spec",
+      description: "Write a draft or ready task's spec, which makes it ready to assign: its goal, acceptance criteria, the files it likely touches and its test plan.",
+      inputSchema: obj({
+        task: taskId,
+        goal: str("What the change achieves, in a sentence or two."),
+        acceptance_criteria: strs("Checkable statements that hold once it's done."),
+        files: strs("Files or directories it likely touches."),
+        test_plan: str("How the worker proves it works."),
+      }, ["task", "goal", "acceptance_criteria", "files", "test_plan"]),
+      idempotent: true,
+    },
+    { name: "update_task", description: "Change a task's title or body.", inputSchema: obj({ task: taskId, title: str("A short title.", 200), body: str("What is wanted and why.", 20000) }, ["task"]), idempotent: true },
+    { name: "assign_task", description: "Assign a ready (or stalled) task: the app starts a worker for it.", inputSchema: obj({ task: taskId }, ["task"]), idempotent: true },
+    { name: "cancel_task", description: "Cancel a task that isn't done; its worker, if any, is stopped.", inputSchema: obj({ task: taskId, reason: str("Why.", 1000) }, ["task"]), idempotent: true },
+  ],
+  task: [
+    { name: "get_task", description: "Your task: its title, body, spec, repo and the branch to push.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    { name: "report_progress", description: "Tell the board how your task is going.", inputSchema: obj({ text: str("What you did or found.") }, ["text"]) },
+    { name: "report_blocker", description: "Tell the board you are blocked, and on what.", inputSchema: obj({ text: str("What blocks you and what would unblock you.") }, ["text"]) },
+    { name: "report_pr", description: "Tell the board you opened your task's PR (from its task branch).", inputSchema: obj({ number: { type: "integer", minimum: 1, description: "The PR's number." } }, ["number"]), idempotent: true },
+  ],
+  review: [
+    { name: "get_review", description: "The PR and head commit you review.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    {
+      name: "submit_verdict",
+      description: "Your verdict: pass or fail for each of correctness, quality and architectural cohesiveness, with a summary.",
+      inputSchema: obj({
+        correctness: obj({ pass: { type: "boolean" }, notes: str("Why.") }, ["pass", "notes"]),
+        quality: obj({ pass: { type: "boolean" }, notes: str("Why.") }, ["pass", "notes"]),
+        architecture: obj({ pass: { type: "boolean" }, notes: str("Why.") }, ["pass", "notes"]),
+        summary: str("The review's summary, shown as the check's output.", 20000),
+      }, ["correctness", "quality", "architecture", "summary"]),
+    },
+  ],
+};
+
+export const toolOf = (server: Server, name: string): ToolDef | undefined => TOOLS[server].find((t) => t.name === name);
