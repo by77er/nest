@@ -29,6 +29,8 @@ export const MCP_MAX_ATTEMPTS = 2;
 const FENCE_POLL_MS = 50;
 /** How often a call refused admission (no slot free) asks again, at most. */
 const ADMIT_POLL_MS = 250;
+/** How many times a request's identity is signed again because the session's taint changed meanwhile, before the call is refused. */
+const IDENTITY_TRIES = 3;
 
 /**
  * The bearer to send to a grant's server (`mcpBearer`: its static secret or its OAuth access token);
@@ -74,6 +76,15 @@ export interface ProxyDeps {
   bearer(g: McpGrant, refused?: string): Promise<string | null>;
   /** The connector of a grant's server. */
   connector(g: McpGrant): McpConnector;
+  /**
+   * The caller identity (`Nest-Identity`, lib/identity.ts) for a request to `aud` from the brain of
+   * `epoch` with the session's taint `tainted`: `ensure` signs one if none is cached (a BrokerDO round
+   * trip), `current` is the cached one or null, read synchronously as the request leaves.
+   */
+  identity: {
+    ensure(aud: string, epoch: number, tainted: boolean): Promise<void>;
+    current(aud: string, epoch: number, tainted: boolean): string | null;
+  };
   /** Work that outlives the call (a release, a change report). */
   background(p: Promise<unknown>): void;
   callTimeoutMs: number;
@@ -180,6 +191,9 @@ export function setupError(g: McpGrant, what: string, a: RpcAnswer): NestError {
   }
 }
 
+const identityUnsettled = (g: McpGrant) => new NestError(ErrorCodes.INTERNAL,
+  `the call to the MCP server of ${g.capability} wasn't sent: the session's taint kept changing while its identity was signed`, 503, true);
+
 export class McpProxy {
   /** Initializations in flight, by capability (one per server at a time). */
   private readonly initializing = new Map<string, Promise<ServerRow>>();
@@ -241,18 +255,18 @@ export class McpProxy {
   }
 
   /** An initialized session (`initialize` once, then `notifications/initialized`), reused until it ends. */
-  private async session(g: McpGrant, token: string, timeoutMs: number): Promise<ServerRow> {
+  private async session(g: McpGrant, token: string, timeoutMs: number, ctx: CallContext): Promise<ServerRow> {
     const s = this.server(g);
     if (s.version) return s;
     const running = this.initializing.get(g.capability);
     if (running) return running;
-    const p = this.initialize(g, token, timeoutMs).finally(() => this.initializing.delete(g.capability));
+    const p = this.initialize(g, token, timeoutMs, ctx).finally(() => this.initializing.delete(g.capability));
     this.initializing.set(g.capability, p);
     return p;
   }
 
-  private async initialize(g: McpGrant, token: string, timeoutMs: number): Promise<ServerRow> {
-    const o = await openSession(this.url(g), token, timeoutMs, "nest");
+  private async initialize(g: McpGrant, token: string, timeoutMs: number, ctx: CallContext): Promise<ServerRow> {
+    const o = await openSession(this.url(g), token, timeoutMs, "nest", () => this.identityFor(g, ctx));
     if (o.kind === "failed" && o.answer.kind === "refused" && o.answer.status === 401) throw new BearerRefused(setupError(g, "initialize", o.answer));
     if (o.kind === "failed") throw setupError(g, "initialize", o.answer);
     if (o.kind === "unsupported") {
@@ -286,6 +300,22 @@ export class McpProxy {
   async listed(g: McpGrant, tool: string): Promise<ListedTool | undefined> {
     const tools = this.server(g).tools ?? (await this.list(g));
     return tools?.find((t) => t.name === tool);
+  }
+
+  // --- Caller identity ------------------------------------------------------------------------------------
+
+  /**
+   * A caller identity for a request to the grant's server from `ctx`'s brain, for the session's taint
+   * as this returns (the caller sends it without another await). Signed again when the taint changed
+   * while it was being signed; refused (nothing sent) if it keeps changing.
+   */
+  private async identityFor(g: McpGrant, ctx: CallContext): Promise<string> {
+    for (let i = 0; i < IDENTITY_TRIES; i++) {
+      await this.d.identity.ensure(g.url, ctx.epoch, ctx.tainted());
+      const t = this.d.identity.current(g.url, ctx.epoch, ctx.tainted());
+      if (t) return t;
+    }
+    throw identityUnsettled(g);
   }
 
   // --- Forwards -------------------------------------------------------------------------------------------
@@ -405,28 +435,38 @@ export class McpProxy {
   private async forwardAdmitted(g: McpGrant, tool: string, args: Record<string, unknown>, ctx: CallContext, bearer: Bearer, attempts: number,
     idempotent: boolean): Promise<McpCallOutcome> {
     let reinitialized = false;
+    let identityTries = 0;
     for (;;) {
       let s: ServerRow;
+      let identity: string | null;
+      let tainted: boolean;
       try {
         try {
-          s = await this.session(g, bearer.value, this.d.callTimeoutMs);
+          s = await this.session(g, bearer.value, this.d.callTimeoutMs, ctx);
         } catch (e) {
           if (!(e instanceof BearerRefused)) throw e;
           if (await this.renew(g, bearer)) continue;
           throw e.error;
         }
+        await this.identityFor(g, ctx);
         await ctx.live();
+        // The identity names the taint as the request leaves: one that changed across `live` signs again.
+        tainted = ctx.tainted();
+        identity = this.d.identity.current(g.url, ctx.epoch, tainted);
+        if (!identity && ++identityTries >= IDENTITY_TRIES) throw identityUnsettled(g);
       } catch (e) {
         // An earlier attempt (lost answer) is still unsettled: it settles as unknown.
         if (attempts > 0) this.settle(ctx.key, unknown("an earlier attempt's answer was lost, and it couldn't be sent again"));
         throw e;
       }
-      // From here to the request leaving there is no await: the epoch was current when it left.
+      if (!identity) continue;
+      // From here to the request leaving there is no await: the epoch was current when it left, and the
+      // identity and `_meta` name the same epoch and taint.
       attempts++;
       this.recordForward(ctx, g, tool, attempts);
-      const meta = { "nest/agent": ctx.agent, "nest/epoch": ctx.epoch, "nest/call": ctx.key, "nest/taint": ctx.tainted() };
+      const meta = { "nest/agent": ctx.agent, "nest/epoch": ctx.epoch, "nest/call": ctx.key, "nest/taint": tainted };
       const a = await rpc(this.url(g), { id: 100 + attempts, method: "tools/call", params: { name: tool, arguments: args, _meta: meta } },
-        { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs });
+        { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs, identity });
       if ((a.kind === "result" || a.kind === "rpc_error") && a.list_changed) {
         this.d.background(this.d.connector(g).changed(g).catch((e) => console.warn(`mcp ${g.capability}: reporting a changed tool list failed`, e)));
       }

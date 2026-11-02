@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { ToolContent, ToolDef } from "../protocol/control";
 import { CapRef, OAuthAuth, type OAuthGrant } from "./mcp-auth";
 import { argsDigest, gated } from "./sinks";
+import { IDENTITY_HEADER } from "./identity";
 
 export { approves, argsDigest } from "./sinks";
 
@@ -275,7 +276,12 @@ export interface RpcOptions {
   /** The negotiated version (sent as `MCP-Protocol-Version` after initialize). */
   version: string | null;
   timeoutMs: number;
+  /** The caller identity (`Nest-Identity`, lib/identity.ts), derived by the caller as the request leaves. */
+  identity: string;
 }
+
+/** The caller identity for the next request, made ready as it leaves (each request asks again: the state it names may change between them). */
+export type IdentityFor = () => Promise<string>;
 
 const decoder = new TextDecoder();
 
@@ -334,6 +340,7 @@ export async function rpc(url: string, message: { method: string; params?: unkno
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
     authorization: `Bearer ${o.token}`,
+    [IDENTITY_HEADER]: o.identity,
   };
   if (o.session) headers["mcp-session-id"] = o.session;
   if (o.version) headers["mcp-protocol-version"] = o.version;
@@ -398,15 +405,17 @@ export type Opened =
   | { kind: "unsupported"; version: unknown };
 
 /** `initialize`, then `notifications/initialized` (lifecycle); the session id, if the server gave one. */
-export async function openSession(url: string, token: string, timeoutMs: number, client: string): Promise<Opened> {
+export async function openSession(url: string, token: string, timeoutMs: number, client: string, identity: IdentityFor): Promise<Opened> {
+  const id = await identity();
   const a = await rpc(url, {
     id: 1, method: "initialize",
     params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: client, version: "1" } },
-  }, { token, session: null, version: null, timeoutMs });
+  }, { token, session: null, version: null, timeoutMs, identity: id });
   if (a.kind !== "result") return { kind: "failed", answer: a };
   const version = (a.result as { protocolVersion?: unknown } | null)?.protocolVersion;
   if (typeof version !== "string" || !MCP_SUPPORTED_VERSIONS.includes(version)) return { kind: "unsupported", version };
-  const n = await rpc(url, { method: "notifications/initialized" }, { token, session: a.session, version, timeoutMs });
+  const id2 = await identity();
+  const n = await rpc(url, { method: "notifications/initialized" }, { token, session: a.session, version, timeoutMs, identity: id2 });
   if (n.kind !== "result") console.warn(`mcp ${new URL(url).host}: notifications/initialized: ${n.kind}`);
   return { kind: "open", session: a.session, version };
 }
@@ -415,14 +424,15 @@ export async function openSession(url: string, token: string, timeoutMs: number,
 const MAX_LIST_PAGES = 10;
 
 /** Every `tools/list` page over one session, within `deadline` (epoch ms). */
-export async function listAll(url: string, token: string, s: { session: string | null; version: string }, deadline: number):
+export async function listAll(url: string, token: string, s: { session: string | null; version: string }, deadline: number, identity: IdentityFor):
   Promise<{ kind: "listed"; tools: ListedTool[]; list_changed: boolean } | { kind: "session_gone" } | { kind: "failed"; answer: RpcAnswer }> {
   const tools: ListedTool[] = [];
   let cursor: string | null = null;
   let changed = false;
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    const id = await identity();
     const a = await rpc(url, { id: 2 + page, method: "tools/list", ...(cursor ? { params: { cursor } } : {}) },
-      { token, session: s.session, version: s.version, timeoutMs: Math.max(1, deadline - Date.now()) });
+      { token, session: s.session, version: s.version, timeoutMs: Math.max(1, deadline - Date.now()), identity: id });
     if (a.kind === "session_gone") return a;
     if (a.kind !== "result") return { kind: "failed", answer: a };
     changed ||= a.list_changed === true;

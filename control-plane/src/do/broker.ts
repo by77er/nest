@@ -13,6 +13,10 @@ import { canonicalJson } from "../lib/sinks";
 import { Credential } from "../protocol/control";
 import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
 import { ErrorCodes, type InjectionSecret } from "../protocol/model";
+import {
+  generateIdentityKey, IDENTITY_TTL_MS, type IdentityJwk, type IdentityKeyPair, IdentitySubject, importIdentitySigner, keyPlan, type KeyPlan,
+  type SignedIdentity, signJwt,
+} from "../lib/identity";
 
 /** An installation token is reused while it has this long left (tokens last an hour: reused for 50 minutes). */
 const GITHUB_TOKEN_REUSE_MS = 10 * 60_000;
@@ -62,6 +66,8 @@ export class BrokerDO extends DurableObject<Env> {
    */
   private readonly injectionRequests = new Map<string, number>();
   private injectionSeq = 0;
+  /** Imported caller-identity signing keys by kid (memory only; rebuilt from the stored JWK after an eviction). */
+  private readonly identitySigners = new Map<string, Promise<CryptoKey>>();
   /** MCP servers' OAuth tokens (lib/mcp-auth.ts); its tables are read by nothing else. */
   private readonly oauth!: OAuthStore;
 
@@ -85,6 +91,9 @@ export class BrokerDO extends DurableObject<Env> {
     // with the same source reuses it. The value is the secret `inject:<binding>:<sandbox>`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS injections (sandbox TEXT NOT NULL, binding TEXT NOT NULL, source TEXT NOT NULL,
       covers TEXT NOT NULL, expires_ms INTEGER NOT NULL, minted_ms INTEGER NOT NULL, PRIMARY KEY (sandbox, binding))`);
+    // Caller-identity signing keys (lib/identity.ts): the private JWK rests here and nowhere else.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS identity_keys (kid TEXT PRIMARY KEY, private_jwk TEXT NOT NULL, public_jwk TEXT NOT NULL,
+      signs_from_ms INTEGER NOT NULL, created_ms INTEGER NOT NULL)`);
     this.oauth = new OAuthStore({
       sql: this.sql,
       secret: (name) => this.secret(name)?.value ?? null,
@@ -306,6 +315,72 @@ export class BrokerDO extends DurableObject<Env> {
     const stored: StoredBindingKey = { kid: pair.kid, public_key: b64url(pair.publicKey), private_jwk: pair.privateJwk };
     await this.putSecret(name, JSON.stringify(stored));
     return stored;
+  }
+
+  // --- caller identity for MCP servers (docs/control-plane/api/clients/#caller-identity-for-mcp-servers) ---
+
+  /** The stored keys' schedule at `now` (lib/identity.ts `keyPlan`). */
+  private identityPlan(now: number): KeyPlan {
+    return keyPlan(this.sql.exec<{ kid: string; signs_from_ms: number }>("SELECT kid, signs_from_ms FROM identity_keys").toArray(), now);
+  }
+
+  /**
+   * The keys as the schedule wants them now: a due next key generated (the first one signs at once,
+   * every later one is published a day before it signs) and keys retired over a day ago deleted. Run
+   * by every sign and every JWKS read, so no alarm is needed: a key that would have been due while
+   * nothing ran is made later, and the current key signs on until it has been published a day.
+   */
+  private async identityKeysNow(): Promise<KeyPlan> {
+    let plan = this.identityPlan(Date.now());
+    if (plan.next_signs_from_ms !== null) {
+      const k: IdentityKeyPair = await generateIdentityKey();
+      // Another caller may have added the key across the await: re-plan, and insert only if one is still due.
+      plan = this.identityPlan(Date.now());
+      if (plan.next_signs_from_ms !== null) {
+        this.sql.exec("INSERT INTO identity_keys (kid, private_jwk, public_jwk, signs_from_ms, created_ms) VALUES (?, ?, ?, ?, ?)",
+          k.kid, JSON.stringify(k.private_jwk), JSON.stringify(k.public_jwk), plan.next_signs_from_ms, Date.now());
+        plan = this.identityPlan(Date.now());
+      }
+    }
+    for (const kid of plan.drop) {
+      this.sql.exec("DELETE FROM identity_keys WHERE kid = ?", kid);
+      this.identitySigners.delete(kid);
+    }
+    return plan;
+  }
+
+  /** The JWKS (`GET /.well-known/jwks.json`): the signing key, the next one, and recently retired ones. */
+  async identityJwks(): Promise<{ keys: IdentityJwk[] }> {
+    const plan = await this.identityKeysNow();
+    const rows = new Map(this.sql.exec<{ kid: string; public_jwk: string }>("SELECT kid, public_jwk FROM identity_keys").toArray()
+      .map((r) => [r.kid, JSON.parse(r.public_jwk) as IdentityJwk]));
+    return { keys: plan.published.flatMap((kid) => rows.get(kid) ?? []) };
+  }
+
+  /**
+   * Sign a caller identity (AgentDO's MCP proxy, the connector): `subject` is every claim but `iss`
+   * (the Worker's public base URL), `iat` and `exp` (5 minutes on), which are set here.
+   */
+  async signIdentity(subject: IdentitySubject): Promise<SignedIdentity> {
+    const s = IdentitySubject.safeParse(subject);
+    if (!s.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `caller identity: ${s.error.message}`);
+    const plan = await this.identityKeysNow();
+    const kid = plan.signer;
+    const row = kid && this.sql.exec<{ private_jwk: string }>("SELECT private_jwk FROM identity_keys WHERE kid = ?", kid).toArray()[0];
+    if (!kid || !row) throw new NestError(ErrorCodes.INTERNAL, "no caller-identity signing key", 500, true);
+    let signer = this.identitySigners.get(kid);
+    if (!signer) {
+      // A rejected import must not stick: the next call imports again.
+      signer = importIdentitySigner(JSON.parse(row.private_jwk) as JsonWebKey).catch((e: unknown) => {
+        this.identitySigners.delete(kid);
+        throw e;
+      });
+      this.identitySigners.set(kid, signer);
+    }
+    const iat = Math.floor(Date.now() / 1000);
+    const exp = iat + IDENTITY_TTL_MS / 1000;
+    const token = await signJwt(await signer, kid, { ...s.data, iss: this.env.PUBLIC_BASE_URL, iat, exp });
+    return { token, exp_ms: exp * 1000 };
   }
 
   /**

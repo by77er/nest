@@ -18,6 +18,8 @@ const NOT_ADMIN = {
   "GET /v1/oauth/callback": "none",
   // nest's client ID metadata document, fetched by authorization servers: public by design.
   "GET /v1/oauth/client.json": "none",
+  // The caller identity's public keys, fetched by MCP servers that verify Nest-Identity: public by design.
+  "GET /.well-known/jwks.json": "none",
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */
 const concrete = (path: string) => path.replace(/[:*]([a-z]+)/g, (_m, k: string) =>

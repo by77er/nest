@@ -1,6 +1,6 @@
 # MCP capabilities
 
-A capability with an `mcp` source gives an agent a remote MCP server's tools. The control plane is the MCP client: AgentDO hands the server's tools to the brain as `mcp__nest__<capability>_<tool>` and forwards each call through its **MCP proxy** (`control-plane/src/lib/mcp-proxy.ts`, over `lib/mcp.ts`); a **connector** per server (`src/do/mcp-connector.ts`) keeps the shared tool list and admits calls. The server stays plain MCP; what nest adds rides in `_meta`, which a server may ignore ([contract](../../../interfaces/remote-mcp/)).
+A capability with an `mcp` source gives an agent a remote MCP server's tools. The control plane is the MCP client: AgentDO hands the server's tools to the brain as `mcp__nest__<capability>_<tool>` and forwards each call through its **MCP proxy** (`control-plane/src/lib/mcp-proxy.ts`, over `lib/mcp.ts`); a **connector** per server (`src/do/mcp-connector.ts`) keeps the shared tool list and admits calls. The server stays plain MCP; what nest adds rides in `_meta`, which a server may ignore, and in the signed `Nest-Identity` header, which a server may verify to scope each agent ([contract](../../../interfaces/remote-mcp/)).
 
 ## Catalog
 
