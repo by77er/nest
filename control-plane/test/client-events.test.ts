@@ -186,7 +186,7 @@ describe("the webhook", () => {
     const c = await newClient(null);
     await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "http://hook.test/x" } }, 400);
     await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "https://u:p@hook.test/x" } }, 400);
-    await adminJson("/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/x" } }, 400);
+    await adminJson("/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/x" } }, 403);
     const set = await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: "https://hook.test/x" } });
     expect(set.secret).toMatch(/^whsec_[0-9a-f]{64}$/);
     // Neither the client's own record nor the operator's view shows it.

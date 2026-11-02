@@ -11,6 +11,7 @@
 //   permissions:  /en/rest/authentication/permissions-required-for-github-apps
 import { b64url, concatBytes, NestError, pemToDer } from "./util";
 import { ErrorCodes } from "../protocol/model";
+import { z } from "zod";
 import { checkBaseUrl, type GithubAction, type GithubPermissions, marker } from "./brokered";
 
 export const GITHUB_API = "https://api.github.com";
@@ -20,6 +21,59 @@ export const GITHUB_API = "https://api.github.com";
  * open pull requests (`gh pr create`).
  */
 export const SANDBOX_TOKEN_PERMISSIONS: GithubPermissions = { contents: "write", pull_requests: "write" };
+/**
+ * Every repository permission an installation token may be asked for, with the levels GitHub offers
+ * for each: the `app-permissions` schema of GitHub's REST description
+ * (github.com/github/rest-api-description, `descriptions/api.github.com`, read 2026-11-02), its
+ * repository block. Organization and account permissions are left out on purpose: a token minted for
+ * one repo would still carry them, reaching past that repo.
+ */
+export const GITHUB_REPO_PERMISSIONS = {
+  actions: ["read", "write"],
+  administration: ["read", "write"],
+  artifact_metadata: ["read", "write"],
+  attestations: ["read", "write"],
+  checks: ["read", "write"],
+  code_quality: ["read", "write"],
+  codespaces: ["read", "write"],
+  contents: ["read", "write"],
+  dependabot_secrets: ["read", "write"],
+  deployments: ["read", "write"],
+  discussions: ["read", "write"],
+  environments: ["read", "write"],
+  issues: ["read", "write"],
+  merge_queues: ["read", "write"],
+  metadata: ["read", "write"],
+  packages: ["read", "write"],
+  pages: ["read", "write"],
+  pull_requests: ["read", "write"],
+  repository_custom_properties: ["read", "write"],
+  repository_hooks: ["read", "write"],
+  repository_projects: ["read", "write", "admin"],
+  secret_scanning_alerts: ["read", "write"],
+  secrets: ["read", "write"],
+  security_events: ["read", "write"],
+  single_file: ["read", "write"],
+  statuses: ["read", "write"],
+  vulnerability_alerts: ["read", "write"],
+  workflows: ["write"],
+} as const satisfies Record<string, readonly ["read" | "write", ...("read" | "write" | "admin")[]]>;
+export type GithubPermissionLevel = "read" | "write" | "admin";
+
+const LEVEL_RANK: Readonly<Record<string, number>> = { read: 1, write: 2, admin: 3 };
+/** Whether `want` is at most `have` (`read` < `write` < `admin`); a level outside the three is never within. */
+export const levelWithin = (want: string, have: string): boolean =>
+  Object.hasOwn(LEVEL_RANK, want) && Object.hasOwn(LEVEL_RANK, have) && LEVEL_RANK[want]! <= LEVEL_RANK[have]!;
+
+/**
+ * Repository permissions, as a grant or a token request names them: only names in
+ * {@link GITHUB_REPO_PERMISSIONS}, exactly (no other case, no look-alike characters), each at a level
+ * GitHub offers for it.
+ */
+export const GithubRepoPermissions = z.strictObject(Object.fromEntries(Object.entries(GITHUB_REPO_PERMISSIONS)
+  .map(([name, levels]) => [name, z.enum(levels as unknown as [GithubPermissionLevel, ...GithubPermissionLevel[]]).optional()])))
+  .transform((p) => p as Readonly<Record<string, GithubPermissionLevel>>);
+
 /** GitHub's REST version header (docs.github.com/en/rest/about-the-rest-api/api-versions). */
 const API_VERSION = "2022-11-28";
 /** An answer's body is read up to this many bytes. */

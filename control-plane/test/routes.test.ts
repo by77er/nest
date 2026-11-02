@@ -33,6 +33,8 @@ const NOT_ADMIN = {
     // A client's own (test/client-events.test.ts): the operator has no `self`.
     "GET /v1/clients/self", "PUT /v1/clients/self/webhook",
   ].map((r) => [r, "owner"])),
+  // A client's own: only a client token has a self, the operator's is refused (test/client-github-token.test.ts).
+  "POST /v1/clients/self/github-token": "owner",
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */
 const concrete = (path: string) => path.replace(/[:*]([a-z]+)/g, (_m, k: string) =>
