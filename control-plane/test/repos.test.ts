@@ -79,8 +79,9 @@ describe("the GitHub rule constructor", () => {
     expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toEqual([{ methods: ["POST"], path: "/graphql", injected: "github_read" }]);
     expect(f.inject.map((b) => b.name)).toEqual(["github_read"]);
     // Nor for an operator's binding named `github_read`, or one taking the default placeholder under another name.
-    expect(githubEgress([], ["a/b"], [{ ...pat, name: "github_read", placeholder: "x" }]).guards.find((g) => g.name === "github-api-write")!.allow)
-      .toEqual([{ methods: ["POST"], path: "/graphql", injected: "github_read_default" }]);
+    const theirs = githubEgress([], ["a/b"], [{ ...pat, name: "github_read", placeholder: "x" }]);
+    expect(theirs.guards.find((g) => g.name === "github-api-write")!.allow).toBeUndefined();
+    expect(theirs.inject.map((b) => b.name)).toEqual(["github_read"]);
     expect(githubEgress([], ["a/b"], [{ ...pat, name: "mine" }]).inject.map((b) => b.name)).toEqual(["github_read"]);
     // With an allowlist, as before read-only repos: the exception names `github`, whoever's it is.
     expect(githubEgress(["a/c"], [], [pat])).toEqual(githubEgress(["a/c"]));
@@ -389,14 +390,15 @@ describe("a sandbox's push allowlist", () => {
 });
 
 const readSecret = (cmds: any[]) => cmds.find((c) => c.type === "secrets_update")?.secrets.find((s: any) => s.binding === "github_read");
-/** Every secrets_update the host gets within `ms` of quiet. */
-async function drainSecrets(ws: Ws, ms = 500): Promise<any[]> {
-  const out: any[] = [];
-  for (;;) {
-    const cmds = await Promise.race([nextCommands(ws, (c) => c.type === "secrets_update"), new Promise<null>((r) => setTimeout(() => r(null), ms))]);
-    if (!cmds) return out;
-    out.push(...cmds.filter((c) => c.type === "secrets_update"));
-  }
+/** The next secrets_update and the policy_update after it: the secrets must come first, in the same batch or an earlier one. */
+async function secretsThenPolicy(ws: Ws): Promise<{ secrets: any[]; policy: any }> {
+  const first = await nextCommands(ws, (c) => c.type === "policy_update" || c.type === "secrets_update");
+  const si = first.findIndex((c) => c.type === "secrets_update");
+  const pi = first.findIndex((c) => c.type === "policy_update");
+  expect(si, "a secrets_update before the policy_update").toBeGreaterThanOrEqual(0);
+  expect(pi === -1 || si < pi, "secrets_update before policy_update").toBe(true);
+  const policy = pi >= 0 ? first[pi] : (await nextCommands(ws, (c) => c.type === "policy_update")).find((c) => c.type === "policy_update");
+  return { secrets: first, policy };
 }
 
 describe("a sandbox's read-only repos", () => {
@@ -427,13 +429,17 @@ describe("a sandbox's read-only repos", () => {
     const before = gh.mints.length;
     // On both lists, `pushable` stays pushable; `readable` gains no write anywhere.
     const { sandbox, ws } = await placed({ repos: [pushable], read_repos: [readable, pushable] });
-    const pushed = await drainSecrets(ws);
+    // The push that carries both tokens (pushes before it may carry fewer).
+    let last: any;
+    while (!last) {
+      const update = (await nextCommands(ws, (c) => c.type === "secrets_update")).find((c) => c.type === "secrets_update");
+      if (["github", "github_read"].every((b) => update.secrets.some((x: any) => x.binding === b))) last = update;
+    }
     const mints = gh.mints.slice(before);
     expect(mints.map((m) => [m.repositories, m.permissions]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))).toEqual([
       [[pushable.split("/")[1]], SANDBOX_TOKEN_PERMISSIONS], [[readable.split("/")[1]], SANDBOX_READ_TOKEN_PERMISSIONS],
     ].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
     for (const m of mints) if (m.repositories.includes(readable.split("/")[1]!)) expect(Object.values(m.permissions).every((l) => l === "read"), JSON.stringify(m)).toBe(true);
-    const last = pushed.at(-1)!;
     const write = mints.find((m) => m.permissions.contents === "write")!;
     const read = mints.find((m) => m.permissions.contents === "read")!;
     expect(last.secrets.find((x: any) => x.binding === "github").value).toBe(write.token);
@@ -466,18 +472,15 @@ describe("a sandbox's read-only repos", () => {
     expect((await stub.policy()).inject.map((b) => b.name)).toEqual(["github"]);
   });
 
-  it("an allowlist moved to the read list: the policy drops `github` (and its GraphQL exception) before any token changes, and the push token is forgotten", async () => {
+  it("an allowlist moved to the read list: the push token leaves the proxy before the policy changes, the new policy has no `github` binding, and BrokerDO forgets the push token", async () => {
     const r = repo();
     const { sandbox, ws } = await placed({ repos: [r] });
     await nextCommands(ws, (c) => c.type === "secrets_update");
     const stub = sandboxStub(sandbox);
     const before = gh.mints.length;
     await stub.setPolicy({ read_repos: [r] });
-    // The policy, installed first, has no binding the proxy's old push token could go out under.
-    const first = await nextCommands(ws, (c) => c.type === "policy_update" || c.type === "secrets_update");
-    const update = first.find((c) => c.type === "policy_update");
-    expect(update, "policy_update comes before secrets_update").toBeDefined();
-    const cmds = first.some((c) => c.type === "secrets_update") ? first : await nextCommands(ws, (c) => c.type === "secrets_update");
+    // The secrets go first (the proxy drops the push token), then a policy with no binding it could go out under.
+    const { secrets: cmds, policy: update } = await secretsThenPolicy(ws);
     expect(update.policy.inject.map((b: any) => b.name)).toEqual(["github_read", "github_read_default"]);
     expect(update.policy.guards.find((g: any) => g.name === "github-api-write").allow.map((a: any) => a.injected)).toEqual(["github_read", "github_read_default"]);
     expect(ghSecret(cmds)).toBeUndefined();
@@ -491,6 +494,35 @@ describe("a sandbox's read-only repos", () => {
     const after = await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), async (_i, st) =>
       st.storage.sql.exec("SELECT name FROM secrets WHERE name LIKE ?", `inject:%:${sandbox}`).toArray().map((x) => x.name));
     expect(after).toEqual([`inject:github:${sandbox}`]);
+  });
+
+  it("part of an allowlist moved to the read list: the narrowed push token reaches the proxy before the policy that makes the repo read-only", async () => {
+    const moved = repo(8181);
+    const kept = repo(8181);
+    const { sandbox, ws } = await placed({ repos: [moved, kept] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    await sandboxStub(sandbox).setPolicy({ repos: [kept], read_repos: [moved] });
+    const { secrets, policy } = await secretsThenPolicy(ws);
+    const push = secrets.find((c) => c.type === "secrets_update").secrets.find((x: any) => x.binding === "github");
+    const mint = gh.mints.find((m) => m.token === push.value)!;
+    expect([mint.repositories, mint.permissions]).toEqual([[kept.split("/")[1]], SANDBOX_TOKEN_PERMISSIONS]);
+    expect(policy.policy.guards.find((g: any) => g.name === "github-push").allow).toEqual([{ path: `/${kept}/**` }, { path: `/${kept}.git/**` }]);
+  });
+
+  it("an operator's own `github` binding never resolves to a push token nest minted before, once the repo is read-only", async () => {
+    const x = repo(9191);
+    const { sandbox, ws } = await placed({ repos: [x] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    const minted = await runInDurableObject(broker, async (_i, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM secrets WHERE name = ?", `inject:github:${sandbox}`).one().n);
+    expect(minted).toBe(1);
+    await broker.putSecret("inject:github", "operator-static-value");
+    await sandboxStub(sandbox).setPolicy({ inject: [githubBinding()], repos: [repo(9191)], read_repos: [x] });
+    const { secrets } = await secretsThenPolicy(ws);
+    expect(secrets.find((c) => c.type === "secrets_update").secrets.find((s: any) => s.binding === "github").value).toBe("operator-static-value");
+    const left = await runInDurableObject(broker, async (_i, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM secrets WHERE name = ?", `inject:github:${sandbox}`).one().n);
+    expect(left).toBe(0);
+    await runInDurableObject(broker, async (_i, st) => { st.storage.sql.exec("DELETE FROM secrets WHERE name = 'inject:github'"); });
   });
 
   it("with a BrokerDO of the previous release (no readInjectionSecret): no token for the read-only repos, never a push token, retried in 2 minutes", async () => {

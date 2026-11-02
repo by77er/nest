@@ -116,7 +116,8 @@ export function githubReadBinding(): InjectionBinding {
 export function readBindings(allowlist: readonly string[], readOnly: readonly string[], operator: readonly InjectionBinding[] = []): string[] {
   const read = readOnlyRepos(allowlist, readOnly);
   if (!read.length) return [];
-  const taken = operator.some((o) => o.name === GITHUB_BINDING || o.name === GITHUB_READ_DEFAULT_BINDING || o.placeholder === GITHUB_PLACEHOLDER);
+  // An operator's `github_read` carries the operator's credential, not a token nest mints: nothing to repeat under the default placeholder.
+  const taken = operator.some((o) => [GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING].includes(o.name) || o.placeholder === GITHUB_PLACEHOLDER);
   return [GITHUB_READ_BINDING, ...(canonicalRepos(allowlist).length || taken ? [] : [GITHUB_READ_DEFAULT_BINDING])];
 }
 

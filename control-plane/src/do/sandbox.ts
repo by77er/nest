@@ -948,14 +948,34 @@ export class SandboxDO extends DurableObject<Env> {
     });
   }
 
+  /**
+   * A new policy version, sent to the host. When the injection secrets change too, they go first: a
+   * token for the new repos under the old policy is held to the old guards and to GitHub's own scope,
+   * whereas the new policy beside a token the proxy still held (an allowlist repo moved to read-only,
+   * say) would let that token write through the new policy's GraphQL exception. If the secrets can't be
+   * read, the proxy's set is emptied instead (fail closed) and the refresh tries again. A newer version
+   * sent meanwhile is left as the host's.
+   */
   private async policyChanged(injectionChanged: boolean): Promise<EgressPolicy> {
     const info = this.update((i) => {
       i.policy_version += 1;
     });
     const policy = this.effectivePolicy();
     if (info.host && ACTIVE_STATES.includes(info.state)) {
+      if (injectionChanged) {
+        try {
+          await this.pushSecrets(true);
+        } catch (e) {
+          console.warn(`sandbox ${info.sandbox}: its secrets couldn't be pushed; emptying the proxy's set until they can`, e);
+          await this.command({ type: "secrets_update", secrets: [] });
+          await this.deadlines.set("inject_refresh", Date.now() + INJECT_RETRY_MS);
+        }
+        const now = this.info_();
+        if (now.policy_version !== info.policy_version || now.epoch !== info.epoch || now.host !== info.host) return this.effectivePolicy();
+        await this.command({ type: "policy_update", policy: this.effectivePolicy() });
+        return this.effectivePolicy();
+      }
       await this.command({ type: "policy_update", policy });
-      if (injectionChanged) await this.pushSecrets(true);
     }
     return policy;
   }
@@ -964,8 +984,8 @@ export class SandboxDO extends DurableObject<Env> {
    * Injection secrets for the policy's bindings, as BrokerDO references (FleetDO resolves them when it
    * sends): the operator's static ones (`inject:<binding>[:<sandbox>]`), for a push allowlist a GitHub
    * installation token BrokerDO mints for exactly those repos (`github`), and for read-only repos a
-   * read-only token for exactly those (`github_read`, and `github` too when there is no allowlist, so the
-   * guest's default placeholder reads them). `secrets_update` replaces the proxy's set, so `force` sends
+   * read-only token for exactly those (`github_read`, and `github_read_default` too when there is no
+   * allowlist, so the guest's default placeholder reads them). `secrets_update` replaces the proxy's set, so `force` sends
    * it even when empty (an allowlist emptied takes the token away).
    *
    * Checked twice: whatever arrives while BrokerDO minted (a fence, a move, an allowlist change) makes
@@ -980,10 +1000,26 @@ export class SandboxDO extends DurableObject<Env> {
     const mintRead = access.read.length > 0 && !own(GITHUB_READ_BINDING);
     if (!before.host || (!ws.inject.length && !mint && !mintRead && !force)) return;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    const target = { sandbox: before.sandbox, epoch: before.epoch };
+    // No push token minted (none wanted, or the operator's own `github`): every minted token goes, as
+    // before read-only repos (a read-only one is minted again below), so an operator's binding never
+    // resolves to a push token minted earlier: `inject:github:<sandbox>` is the most specific name it
+    // looks up. Before the static refs are read, so they resolve past it.
+    if (!mint && force) await broker.forgetInjections(before.sandbox);
+    else if (force && !mintRead && !own(GITHUB_READ_BINDING) && this.get(READ_MINTED) !== undefined) {
+      // Only a sandbox that asked for a read-only token asks to forget it (a previous BrokerDO lacks the
+      // method); the flag goes only if no mint asked again meanwhile.
+      const asked = this.get<number>(READ_MINTED);
+      try {
+        await broker.readInjectionSecret(target, { kind: "github_app", binding: GITHUB_READ_BINDING, repos: [] }, "SandboxDO");
+        if (this.get<number>(READ_MINTED) === asked) this.del(READ_MINTED);
+      } catch (e) {
+        console.warn(`sandbox ${before.sandbox}: forgetting its read-only GitHub token failed; it is left unpushed`, e);
+      }
+    }
     const secrets: InjectionSecret[] = ws.inject.length
       ? await broker.injectionSecretRefs(ws.inject.map((b) => b.name), { sandbox: before.sandbox, ...(before.workstream ? { workstream: before.workstream } : {}) })
       : [];
-    const target = { sandbox: before.sandbox, epoch: before.epoch };
     let next: number | null = null;
     const later = (at: number) => {
       next = next === null ? at : Math.min(next, at);
@@ -1000,32 +1036,11 @@ export class SandboxDO extends DurableObject<Env> {
         later(Date.now() + INJECT_RETRY_MS);
       }
     };
-    /** A token no longer wanted is deleted (an empty source forgets it); a failure leaves it unpushed, retried with the next push. */
-    const forget = async (call: () => Promise<unknown>) => {
-      try {
-        await call();
-      } catch (e) {
-        console.warn(`sandbox ${before.sandbox}: forgetting a GitHub token it no longer needs failed`, e);
-        later(Date.now() + INJECT_RETRY_MS);
-      }
-    };
-    const none = { kind: "github_app" as const, repos: [] };
-    if (!mint && !mintRead && force) await broker.forgetInjections(before.sandbox);
-    else if (force) {
-      if (!mint && !own(GITHUB_BINDING)) await forget(() => broker.injectionSecret(target, { ...none, binding: GITHUB_BINDING }, "SandboxDO"));
-      // Only a sandbox that had read-only repos asks (a BrokerDO of the previous release lacks the method).
-      if (!mintRead && !own(GITHUB_READ_BINDING) && this.get(READ_MINTED)) {
-        await forget(async () => {
-          await broker.readInjectionSecret(target, { ...none, binding: GITHUB_READ_BINDING }, "SandboxDO");
-          this.del(READ_MINTED);
-        });
-      }
-    }
     if (mint) {
       await minted("GitHub token", () => broker.injectionSecret(target, { kind: "github_app", binding: GITHUB_BINDING, repos: access.push }, "SandboxDO"), [GITHUB_BINDING]);
     }
     if (mintRead) {
-      this.put(READ_MINTED, true);
+      this.put(READ_MINTED, (this.get<number>(READ_MINTED) ?? 0) + 1);
       const bindings = readBindings(access.push, access.read, ws.inject).filter((b) => !own(b));
       await minted("read-only GitHub token", () => broker.readInjectionSecret(target, { kind: "github_app", binding: GITHUB_READ_BINDING, repos: access.read }, "SandboxDO"), bindings);
     }
