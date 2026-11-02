@@ -13,7 +13,9 @@ export type TaskState = (typeof TASK_STATES)[number];
  * - `pr_opened`: its worker reported its PR;
  * - `worker_exited`: its worker ended (nest's `agent.exited`);
  * - `merged`: its PR was merged (GitHub's event; the review PR);
- * - `done`: the owner marked it done (a task with no PR, or one whose PR merged);
+ * - `done`: the owner marked it done: only a task with no PR and no live worker (a draft, a ready task,
+ *   a stalled one). A task with an open PR is done when it merges (`merged`); one with a worker is
+ *   cancelled instead;
  * - `cancel`: the owner or the manager cancelled it; its worker is stopped.
  */
 export const TASK_EVENTS = ["spec", "assign", "started", "start_failed", "pr_opened", "worker_exited", "merged", "done", "cancel"] as const;
@@ -30,16 +32,25 @@ const MOVES: Record<TaskEvent, Partial<Record<TaskState, TaskState>>> = {
   pr_opened: { in_progress: "in_review", in_review: "in_review" },
   worker_exited: { assigned: "stalled", in_progress: "stalled" },
   merged: { in_review: "done" },
-  done: { draft: "done", ready: "done", assigned: "done", in_progress: "done", in_review: "done", stalled: "done" },
+  done: { draft: "done", ready: "done", stalled: "done" },
   cancel: { draft: "cancelled", ready: "cancelled", assigned: "cancelled", in_progress: "cancelled", in_review: "cancelled", stalled: "cancelled" },
 };
 
 export type Transition = { ok: true; to: TaskState } | { ok: false; error: string };
 
+/** Why the owner can't mark a task done where the reason isn't obvious from its state's name. */
+const NOT_DONE: Partial<Record<TaskState, string>> = {
+  in_review: "its PR is open: the task is done when the PR merges",
+  assigned: "its worker is running: cancel the task instead",
+  in_progress: "its worker is running: cancel the task instead",
+};
+
 /** Where `event` takes a task in `from`, or why it can't. */
 export function transition(from: TaskState, event: TaskEvent): Transition {
   const to = MOVES[event][from];
-  return to ? { ok: true, to } : { ok: false, error: `a ${from.replace("_", " ")} task can't take ${event.replace("_", " ")}` };
+  if (to) return { ok: true, to };
+  const why = event === "done" ? NOT_DONE[from] : undefined;
+  return { ok: false, error: `a ${from.replace("_", " ")} task can't take ${event.replace("_", " ")}${why ? `: ${why}` : ""}` };
 }
 
 /** States in which a task's worker, if it has one, is expected to be running. */

@@ -16,8 +16,8 @@ const FLOW: [TaskState, TaskEvent, TaskState][] = [
   ["assigned", "worker_exited", "stalled"], // a worker that exits before opening a PR
   ["in_progress", "worker_exited", "stalled"],
   ["in_review", "merged", "done"], // 6. the PR is merged
-  // The owner marks it done (a task with no PR, or whose PR merged).
-  ...(["draft", "ready", "assigned", "in_progress", "in_review", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "done", "done"]),
+  // The owner marks it done: only a task with no PR and no live worker.
+  ...(["draft", "ready", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "done", "done"]),
   // Cancelling: anything not over.
   ...(["draft", "ready", "assigned", "in_progress", "in_review", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "cancel", "cancelled"]),
 ];
@@ -37,6 +37,11 @@ describe("the task state machine", () => {
     expect(transition("in_review", "worker_exited").ok).toBe(false);
     expect(transition("done", "cancel").ok).toBe(false);
     expect(transition("cancelled", "assign").ok).toBe(false);
+  });
+
+  it("refuses marking done by hand past the merge gate: an open PR waits for its merge, a running worker is cancelled", () => {
+    expect(transition("in_review", "done")).toEqual({ ok: false, error: expect.stringMatching(/PR is open.*merges/) });
+    for (const s of ["assigned", "in_progress"] as const) expect(transition(s, "done")).toEqual({ ok: false, error: expect.stringMatching(/worker is running.*cancel/) });
   });
 });
 

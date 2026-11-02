@@ -1,0 +1,19 @@
+/* The board's columns share the row equally while each keeps its minimum width; past that the row
+   scrolls sideways. On a phone a column is nearly the screen's width; from 62em (md) on, all six fit
+   beside the chat panel at 1280px. */
+.columns {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(16rem, 1fr);
+  gap: var(--mantine-spacing-xs);
+  align-items: start;
+  overflow-x: auto;
+  padding-bottom: var(--mantine-spacing-xs);
+  scroll-snap-type: x proximity;
+}
+
+@media (min-width: 62em) {
+  .columns {
+    grid-auto-columns: minmax(8.5rem, 1fr);
+  }
+}

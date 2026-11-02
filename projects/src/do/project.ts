@@ -39,6 +39,8 @@ export interface Task {
   assignee: string | null;
   pr: number | null;
   start_error: string | null;
+  /** Whether any write to it came from a tainted session (README.md#the-mcp-server-agents-see-only-their-own-work). */
+  tainted: boolean;
   created_ms: number;
   updated_ms: number;
 }
@@ -49,6 +51,29 @@ export interface HistoryRow {
   action: string;
   detail: string | null;
   tainted: boolean;
+}
+
+export interface ChatMessage {
+  seq: number;
+  at_ms: number;
+  /** `owner`, `manager` or `app`. */
+  sender: string;
+  text: string;
+  delivered: boolean;
+  error: string | null;
+}
+
+/** An agent's ask (nest's `agent.ask`), open until `answered_ms`. */
+export interface Ask {
+  ask: string;
+  agent: string;
+  role: string | null;
+  task: string | null;
+  question: string | null;
+  /** nest's `{name, tool}` for a held sink call; null for a plain question. */
+  approval: unknown;
+  at_ms: number;
+  answered_ms: number | null;
 }
 
 /** Who did something: the owner (from the board), the app itself, or an agent over MCP (with its taint). */
@@ -81,6 +106,9 @@ const MIGRATIONS = [
 ] as const;
 
 type Row = Record<string, SqlStorageValue>;
+
+/** A task's row with `tainted`: whether any write in its history came from a tainted session. */
+const TASK_SELECT = "SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = t.id AND h.tainted = 1) AS tainted FROM tasks t";
 
 export class ProjectDO extends DurableObject<Env> {
   private draining: Promise<void> | null = null;
@@ -140,20 +168,20 @@ export class ProjectDO extends DurableObject<Env> {
   // --- the board -------------------------------------------------------------------------------------
 
   private taskRow(id: string): Row | undefined {
-    return this.sql.exec("SELECT * FROM tasks WHERE id = ?", id).toArray()[0];
+    return this.sql.exec(`${TASK_SELECT} WHERE t.id = ?`, id).toArray()[0];
   }
 
   private toTask(r: Row): Task {
     return {
       id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null,
       state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null, pr: (r.pr as number | null) ?? null,
-      start_error: (r.start_error as string | null) ?? null, created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
   }
 
   async listTasks(): Promise<Result<Task[]>> {
     if (!this.settings()) return fail(404, "unknown project");
-    return ok(this.sql.exec("SELECT * FROM tasks ORDER BY ord, created_ms").toArray().map((r) => this.toTask(r)));
+    return ok(this.sql.exec(`${TASK_SELECT} ORDER BY t.ord, t.created_ms`).toArray().map((r) => this.toTask(r)));
   }
 
   async getTask(id: string): Promise<Result<Task & { history: HistoryRow[] }>> {
@@ -291,7 +319,10 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.toTask(this.taskRow(id)!));
   }
 
-  /** The owner marks a task done (one with no PR, or whose PR merged); its worker is ended. */
+  /**
+   * The owner marks a task done: one with no PR and no live worker (src/tasks.ts). A stalled task's
+   * stopped worker is ended for good, if it isn't already.
+   */
   async markDone(id: string): Promise<Result<Task>> {
     if (!this.settings()) return fail(404, "unknown project");
     const m = this.move(id, "done", { kind: "owner" });
@@ -305,7 +336,7 @@ export class ProjectDO extends DurableObject<Env> {
 
   // --- chat and approvals ----------------------------------------------------------------------------
 
-  async chat(limit = 200): Promise<Result<{ seq: number; at_ms: number; sender: string; text: string; delivered: boolean; error: string | null }[]>> {
+  async chat(limit = 200): Promise<Result<ChatMessage[]>> {
     if (!this.settings()) return fail(404, "unknown project");
     const rows = this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat ORDER BY seq DESC LIMIT ?", limit).toArray().reverse();
     return ok(rows.map((r) => ({
@@ -325,7 +356,7 @@ export class ProjectDO extends DurableObject<Env> {
     return ok({ seq, delivered: r.next_ms === null && r.error === null });
   }
 
-  async asks(): Promise<Result<{ ask: string; agent: string; role: string | null; task: string | null; question: string | null; approval: unknown; at_ms: number; answered_ms: number | null }[]>> {
+  async asks(): Promise<Result<Ask[]>> {
     if (!this.settings()) return fail(404, "unknown project");
     return ok(this.sql.exec("SELECT * FROM asks ORDER BY at_ms").toArray().map((r) => ({
       ask: r.ask as string, agent: r.agent as string, role: (r.role as string | null) ?? null, task: (r.task as string | null) ?? null,
@@ -584,9 +615,8 @@ export class ProjectDO extends DurableObject<Env> {
         this.record(id, { kind: "app", what: "assign" }, "worker", { agent });
       }
       const t = this.toTask(this.taskRow(id)!);
-      const tainted = this.sql.exec("SELECT 1 FROM history WHERE task = ? AND tainted = 1 LIMIT 1", id).toArray().length > 0;
       // A spec a tainted session wrote reaches the worker as relayed text, so its session is tainted too.
-      await nest.postInbox(agent, workerBrief(s, t), { requestId: `${id}/${n}/brief`, ...(tainted ? { from: "projects/board" } : {}) });
+      await nest.postInbox(agent, workerBrief(s, t), { requestId: `${id}/${n}/brief`, ...(t.tainted ? { from: "projects/board" } : {}) });
       if (!current()) return;
       this.move(id, "started", { kind: "app", what: "assign" }, { agent });
       this.sql.exec("UPDATE tasks SET start_next_ms = NULL, start_error = NULL WHERE id = ?", id);

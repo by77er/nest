@@ -2,7 +2,7 @@
 
 A task board for GitHub repos, run by agents on nest: an app with its own Worker and Durable Objects, built only on nest's [API clients](../docs/control-plane/api/clients/) interface. nest knows nothing of projects, tasks or reviews. A feature here that seems to need one of nest's internals means that interface is wrong: fix it there, generically, and build this on the result.
 
-**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)). **Not built:** the UI (a placeholder page), attaching a repo on GitHub (branch protection), the review pipeline (`/hooks/github`, ReviewDO's queue, the reviewer's tools) setting the webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
+**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), and the UI ([below](#the-ui)). **Not built:** attaching a repo on GitHub (branch protection), the review pipeline (`/hooks/github`, ReviewDO's queue, the reviewer's tools) setting the webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
 
 ## What it does
 
@@ -10,7 +10,7 @@ A task board for GitHub repos, run by agents on nest: an app with its own Worker
 - **The manager.** One agent per project, the one the owner talks to. It keeps the board, specs each task as it's created, and assigns tasks when the project is set to assign automatically.
 - **Tasks.** The owner or the manager creates them, and the manager specs them. They're assigned by hand from the board, or automatically. An assigned task gets a worker of its own: one agent, which sees only that task and opens one PR for it.
 - **Review.** Every PR on the repo gets a review by a reviewer agent, asynchronously. The review judges correctness, quality and architectural cohesiveness, and sets a required check. Branch protection, which the app sets up, makes merging wait for that check.
-- **Done.** A task is done when its PR is merged. Merging needs the review check to pass.
+- **Done.** A task is done when its work is finished: for a task with a PR, when the PR is merged, which needs the review check to pass. Only a task with no PR and no live worker is marked done by hand.
 
 ## Pieces
 
@@ -79,16 +79,16 @@ Only the client interface. One client, `projects`, has this grant:
   3. Each job creates a check run (`in_progress`) and starts a reviewer.
   4. The reviewer's verdict completes the check: `success` only if all three dimensions pass, with the summary as the check's output.
   5. A reviewer that exits without a verdict fails the job after retries, and the check completes as `neutral`, which branch protection doesn't accept as passing. A `check_run` `rerequested` queues the job again.
-- **Merging** is GitHub's, gated by the required check. A `pull_request` `closed` event with `merged: true` marks the PR's task `done`. The owner may also mark a task done by hand once its PR is merged.
+- **Merging** is GitHub's, gated by the required check. A `pull_request` `closed` event with `merged: true` marks the PR's task `done`. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
 
 ## Not decided here
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
-- Tasks without a PR (research, specs) end by the owner marking them done.
+- Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
 
 ## Built: the core
 
-**Code:** `src/worker.ts` (routes, the Access check of `src/access.ts`, a copy of the dashboard's, and `/hooks/nest`), `src/api.ts` (the JSON API), `src/mcp.ts` and `src/identity.ts` (the MCP servers and Nest-Identity), `src/tools.ts` (each server's tools), `src/catalog.ts` (templates, capabilities, prompts), `src/nest.ts` (the client of nest), `src/tasks.ts` (the state machine, pure), `src/webhook.ts` (`Nest-Signature`), `src/do/` (DirectoryDO, ProjectDO, ReviewDO's schema), `src/sql.ts` (versioned migrations), `deploy/` (Cloudflare Access in front of it: the app's own inframe stack). Nothing imports the control plane (`test/deps.test.ts`).
+**Code:** `src/worker.ts` (routes, the Access check of `src/access.ts`, a copy of the dashboard's, and `/hooks/nest`), `src/api.ts` (the JSON API; its request bodies in `src/requests.ts`), `src/mcp.ts` and `src/identity.ts` (the MCP servers and Nest-Identity), `src/tools.ts` (each server's tools), `src/catalog.ts` (templates, capabilities, prompts), `src/nest.ts` (the client of nest), `src/tasks.ts` (the state machine, pure), `src/webhook.ts` (`Nest-Signature`), `src/do/` (DirectoryDO, ProjectDO, ReviewDO's schema), `src/sql.ts` (versioned migrations), `deploy/` (Cloudflare Access in front of it: the app's own inframe stack). Nothing imports the control plane (`test/deps.test.ts`).
 
 ```bash
 npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, against a fake nest (test/fake-nest.ts)
@@ -107,12 +107,42 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
   - **Retries:** ProjectDO owes nest its manager, workers, stops and chat messages, each retried from its alarm (5 s doubling to 5 min); a retryable 503 or 409 is also retried within the call. A worker nest refuses for good (a 4xx) stalls its task with the reason; the manager is retried until it starts.
 - **The board:**
-  - **States** (`src/tasks.ts`): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark any task done (one with no PR); a draft may be deleted, anything later is cancelled.
+  - **States** (`src/tasks.ts`): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no PR and no live worker (`draft`, `ready`, `stalled`; a stalled task never has a PR, since one with a PR is `in_review`); a draft may be deleted, anything later is cancelled.
   - **A spec** is a goal, acceptance criteria, the files it likely touches and a test plan.
   - **`max_workers`** caps auto-assign and the manager's `assign_task`; the owner's assign by hand isn't capped (nest's `max_agents` still is). A worker counts from its assignment until it exits or the app has stopped it.
   - **History:** every change records who (the owner, the app, or an agent), what, when, and whether the session was tainted.
 - **The MCP servers:** no sessions (no `Mcp-Session-Id`), JSON answers only. A worker's tools take no task id: its labels name its task. Every write is answered once per call key (`_meta["nest/call"]`) that begins with the caller's own id, kept 24 h. The reviewer's tools answer "not built" until the review pipeline.
 - **Events:** deduplicated by id (DirectoryDO, 7 days) and idempotent besides. An event for an agent the app hasn't recorded is routed by that agent's labels (`GET /v1/agents/<id>`), only if the app is its client and owner; any other agent is remembered as not the app's and acknowledged. A failure answers 5xx, so nest delivers again.
+
+## The UI
+
+**Code:** `src/ui/`, one folder per feature (`projects`, `project`, `board`, `task`, `chat`, `asks`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
+
+- **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and a custom theme (`src/ui/theme.ts`), with one CSS module of its own (the board's grid); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons.
+- **One API client** (`src/ui/api/client.ts`), same origin, so Access's cookie is the only credential: nothing secret is in the bundle. Its types are the Worker's own, imported by type only; the request bodies' zod schemas live in `src/requests.ts`, which both the Worker and the forms validate with.
+- **Live views poll while the tab is visible:** the chat every 3 s, the board and the asks every 5 s, the project every 10 s. The board stops polling while a card is dragged.
+- **Optimistic where safe:** reordering (one `ord` written, between the new neighbours'; put back if refused) and a chat message (shown as sending; its text back in the composer if refused). An answer to an ask isn't: the ask stays until nest has taken it.
+- **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling and marking done are confirmed, and "Mark done" shows only for a task with no PR and no live worker; a failed write is a red notification with the Worker's reason.
+- **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit.
+- **Layout:** the board's columns share its width, each at least 8.5rem from 62em on (all six fit beside the chat at 1280 px) and 16rem below; past that the row scrolls sideways. A card's badges and details wrap, never clip. The chat is a 320 px side panel from 75em, below the board on narrower screens, and can be hidden (remembered per browser).
+- **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
+- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list now returns, and a "needs input" marker from the project's open asks.
+
+**The theme:** light only, near-white page (`#fafafa`) with white surfaces, near-black text (`#212529`) and Mantine's grays. Color is only for actions and status, in four roles, each a 10-shade tuple ([`src/ui/theme.ts`](src/ui/theme.ts)), Bootstrap's hues a step muted. Shade 6 is the filled one; filled text is white, or dark on yellow (Mantine's `autoContrast`):
+
+| Role | Shade 6 | Text on it | For |
+|---|---|---|---|
+| `primary` (blue) | `#3b6fc0` | white, 4.98:1 | primary actions (create, assign, save, send); work in progress (assigned, in progress, in review) |
+| `danger` (red) | `#c2414c` | white, 5.05:1 | close, cancel, delete, deny; cancelled |
+| `warning` (yellow) | `#dca71c` | dark, 7.21:1 | stalled, needs input (asks), undelivered messages, start errors |
+| `success` (green) | `#2c8152` | white, 4.81:1 | mark done, approve; done |
+
+Drafts and ready tasks are gray: no work has started. `src/ui/theme.test.ts` checks every filled label and light badge against WCAG AA (4.5:1), and that components name only these roles and the grays.
+
+```bash
+npm run dev    # the page and the API in workerd; without NEST_CLIENT_TOKEN the API answers, but nothing reaches nest
+npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testing Library)
+```
 
 ## Setup (the operator's)
 

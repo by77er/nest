@@ -3,6 +3,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { REPO } from "../requests";
 import { fail, migrate, ok, type Result } from "../sql";
 import type { Role } from "../tools";
 
@@ -11,6 +12,13 @@ export interface ProjectRow {
   name: string;
   repo: string;
   created_ms: number;
+}
+
+/** The last catalog sync that succeeded: what it wrote, for which repos, and when. */
+export interface SyncState {
+  written: string[];
+  repos: string[];
+  at_ms: number;
 }
 
 /** Where an agent's events go. `project` null: an agent nest told us about that isn't the app's. */
@@ -34,8 +42,6 @@ const MIGRATIONS = [
     "CREATE TABLE sync (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
   ],
 ] as const;
-
-export const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 
 export class DirectoryDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -99,7 +105,7 @@ export class DirectoryDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO sync (k, v) VALUES ('last', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", JSON.stringify({ ...v, at_ms: Date.now() }));
   }
 
-  async lastSync(): Promise<unknown> {
+  async lastSync(): Promise<SyncState | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'last'").toArray()[0];
     return row ? JSON.parse(row.v) : null;
   }
