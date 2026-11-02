@@ -19,6 +19,7 @@ import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSI
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
 export { CatalogDO } from "./do/catalog";
+export { ClientDO } from "./do/client";
 export { FleetDO } from "./do/fleet";
 export { McpConnectorDO } from "./do/mcp-connector";
 export { SandboxDO } from "./do/sandbox";

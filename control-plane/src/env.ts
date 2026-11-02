@@ -1,6 +1,7 @@
 import type { AgentDO } from "./do/agent";
 import type { BrokerDO } from "./do/broker";
 import type { CatalogDO } from "./do/catalog";
+import type { ClientDO } from "./do/client";
 import type { FleetDO } from "./do/fleet";
 import type { McpConnectorDO } from "./do/mcp-connector";
 import type { SandboxDO } from "./do/sandbox";
@@ -13,6 +14,8 @@ export interface Env {
   CATALOG: DurableObjectNamespace<CatalogDO>;
   /** One per remote MCP server and credential (`connectorName`): the shared tool list and admission. */
   MCP_CONNECTOR: DurableObjectNamespace<McpConnectorDO>;
+  /** One per API client (`cli_…`), and the `directory` of their names (docs/control-plane/api/clients/). */
+  CLIENT: DurableObjectNamespace<ClientDO>;
   BUCKET: R2Bucket;
 
   /** Bearer token for the admin API (Cloudflare Access replaces this later). */

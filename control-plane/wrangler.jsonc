@@ -14,7 +14,8 @@
       { "name": "AGENT", "class_name": "AgentDO" },
       { "name": "BROKER", "class_name": "BrokerDO" },
       { "name": "CATALOG", "class_name": "CatalogDO" },
-      { "name": "MCP_CONNECTOR", "class_name": "McpConnectorDO" }
+      { "name": "MCP_CONNECTOR", "class_name": "McpConnectorDO" },
+      { "name": "CLIENT", "class_name": "ClientDO" }
     ]
   },
   "migrations": [
@@ -26,7 +27,9 @@
     { "tag": "mcp-connectors", "new_sqlite_classes": ["McpConnectorDO"] },
     // One-way, and alone in its release: deletes the three classes and every instance's storage
     // (nest is a microkernel, docs/README.md principle 9; dev/deploy.md, microkernel stage 4).
-    { "tag": "microkernel", "deleted_classes": ["WorkstreamDO", "ChannelDO", "TaskLedgerDO"] }
+    { "tag": "microkernel", "deleted_classes": ["WorkstreamDO", "ChannelDO", "TaskLedgerDO"] },
+    // One-way, and alone in its release: a new class, API clients (docs/control-plane/api/clients/, dev/deploy.md).
+    { "tag": "clients", "new_sqlite_classes": ["ClientDO"] }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "nest-control" }],
   // Production hostname (a Workers Custom Domain on the bitcru.sh zone; Cloudflare issues its certificate).
