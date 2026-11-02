@@ -11,6 +11,7 @@ One instance per [API client](../../api/clients/), named by its id (`cli_…`), 
   - The object then reports itself from its own alarm, retried until ClientDO answers: AgentDO from its `registry` deadline (live, then ended once its end is done), and SandboxDO from its `client` deadline (live, then destroyed, armed in the destroy decision's step). Ended is final.
   - A report for a row that isn't there (the reconcile dropped it) inserts the row, so the count never misses an object that exists.
 - **Reconcile:** a row still `reserved` `RESERVE_CHECK_MS` (10 min) after `admit` is checked against its object. One that was never created goes; one that exists is counted as it stands. A failure to ask counts as live.
+- **Recheck:** the hourly prune reads up to 100 live rows against their objects, least recently checked first, so an end or destroy whose report never came (a rollback ran meanwhile) frees its place.
 - **Retention:** ended rows 7 days (hourly prune). The record lives until the client is deleted.
 - **Delete:** `markDeleted` is refused (409) while any row is reserved or live. Otherwise no token works and nothing more is admitted. The Worker then deletes the catalog namespace and the name, and `purge` empties the object.
 - **Not built:** the webhook and the event outbox ([events](../../api/clients/#events-to-the-owner)) go here.

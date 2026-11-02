@@ -45,6 +45,11 @@ describe("GET /v1/health", () => {
     }
   });
 
+  it("ClientDO is probed", async () => {
+    const res = await SELF.fetch(`${BASE}/v1/health`);
+    expect((await res.json<{ durable_objects: Record<string, string> }>()).durable_objects.ClientDO).toBe("ok");
+  });
+
   it("no name a user can give reaches the health instance", () => {
     expect(CatalogName.safeParse(HEALTH_INSTANCE).success).toBe(false);
   });

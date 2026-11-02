@@ -31,6 +31,8 @@ export const RESERVE_CHECK_MS = 10 * 60_000;
 /** An ended agent or destroyed sandbox stays listed this long (an agent's records are kept as long). */
 export const ENDED_RETENTION_MS = 7 * 86_400_000;
 const PRUNE_EVERY_MS = 3_600_000;
+/** Live rows read against their objects per hourly prune. */
+const RECHECK_PER_RUN = 100;
 
 export type MemberKind = "agent" | "sandbox";
 const MemberState = z.enum(["reserved", "live", "ended"]);
@@ -121,7 +123,7 @@ export class ClientDO extends DurableObject<Env> {
   private schema(): void {
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS members (id TEXT PRIMARY KEY, kind TEXT NOT NULL, cell TEXT NOT NULL, owner TEXT,
-      labels TEXT NOT NULL, created_ms INTEGER NOT NULL, state TEXT NOT NULL, ended_ms INTEGER)`);
+      labels TEXT NOT NULL, created_ms INTEGER NOT NULL, state TEXT NOT NULL, ended_ms INTEGER, checked_ms INTEGER)`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS members_page ON members (kind, created_ms, id)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
   }
@@ -359,6 +361,7 @@ export class ClientDO extends DurableObject<Env> {
       if (key === "reconcile") await this.reconcile();
       else if (key === "prune") {
         this.sql.exec("DELETE FROM members WHERE state = 'ended' AND ended_ms < ?", Date.now() - ENDED_RETENTION_MS);
+        await this.recheckLive();
         if (this.record()) await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
       }
     });
@@ -377,6 +380,21 @@ export class ClientDO extends DurableObject<Env> {
     }
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(created_ms) AS at FROM members WHERE state = 'reserved'").one().at;
     if (next !== null) await this.deadlines.set("reconcile", next + RESERVE_CHECK_MS);
+  }
+
+  /**
+   * Live rows, oldest checked first (`RECHECK_PER_RUN` an hour), read against their objects: an end or
+   * destroy whose report never came (a rollback ran meanwhile) frees its place within hours.
+   */
+  private async recheckLive(): Promise<void> {
+    const rows = this.sql.exec<{ id: string; kind: string }>(
+      "SELECT id, kind FROM members WHERE state = 'live' ORDER BY COALESCE(checked_ms, 0), created_ms LIMIT ?", RECHECK_PER_RUN).toArray();
+    for (const r of rows) {
+      const now = await this.exists(r.kind as MemberKind, r.id);
+      // Re-read in this step: a report may have landed during the await (ended stays ended).
+      if (now === "live") this.sql.exec("UPDATE members SET checked_ms = ? WHERE id = ?", Date.now(), r.id);
+      else this.sql.exec("UPDATE members SET state = 'ended', ended_ms = ?, checked_ms = ? WHERE id = ? AND state = 'live'", Date.now(), Date.now(), r.id);
+    }
   }
 
   /** Whether the object exists; a failure to ask counts as live, so nothing is forgotten. */

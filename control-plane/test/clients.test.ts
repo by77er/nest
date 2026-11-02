@@ -337,6 +337,24 @@ describe("the grant bounds everything in the subtree", () => {
     expect((await stub.list("agent", { state: "all" })).items.map((m) => [m.id, m.state])).toEqual([[real.agent, "live"]]);
     await createAgent(c);
   });
+
+  it("the hourly recheck frees the place of a destroyed sandbox whose report never came, and keeps a live one", async () => {
+    const c = await newClient({ max_sandboxes: 2 });
+    const gone = await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+    const kept = await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+    await asJson(c.token, `/v1/sandboxes/${gone.sandbox}`, { method: "DELETE" });
+    const stub = clientStub(c.id);
+    await eventually("the destroy reported", async () => (await stub.info()).live.sandboxes === 1);
+    // As if the report had been lost (a rollback ran when it was due): the row says live again.
+    await runInDurableObject(stub, (_i: ClientDO, st) => {
+      st.storage.sql.exec("UPDATE members SET state = 'live', ended_ms = NULL");
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+    });
+    expect((await stub.info()).live.sandboxes).toBe(2);
+    await runDue(stub);
+    expect((await stub.list("sandbox", { state: "all" })).items.map((m) => [m.id, m.state]))
+      .toEqual([[gone.sandbox, "ended"], [kept.sandbox, "live"]]);
+  });
 });
 
 // --- Labels and listings -----------------------------------------------------------------------------------

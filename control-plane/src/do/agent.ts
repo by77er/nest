@@ -490,10 +490,11 @@ export class AgentDO extends DurableObject<Env> {
     return { ...info, client: info.client ?? null, labels: info.labels ?? {}, host: info.brain?.host ?? null, state: agentState(info) };
   }
 
-  /** Whose subtree it is in, and whether it has ended (a client's routes answer 404 outside its own). */
+  /** Whose subtree it is in, and whether its end is done (a client's routes answer 404 outside its own). */
   async subtree(): Promise<{ client: string | null; ended: boolean }> {
     const info = this.load();
-    return { client: info.client ?? null, ended: !!info.ended };
+    // Ended once its end is done, as its client's registry counts it.
+    return { client: info.client ?? null, ended: !!info.ended?.done_ms };
   }
 
   /** What its client's registry records of it (`ClientDO.report`). */
