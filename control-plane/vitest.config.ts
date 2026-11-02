@@ -27,6 +27,8 @@ export default defineConfig({
           BROKERED_TIMEOUT_MS: "1500",
           // How long a call waits for a call slot on its server (test/mcp.test.ts "admission").
           MCP_ADMIT_WAIT_MS: "2000",
+          // One webhook delivery's budget, short so a hanging webhook is quick to cut off (test/client-events.test.ts).
+          CLIENT_WEBHOOK_TIMEOUT_MS: "2000",
         },
       },
     }),

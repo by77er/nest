@@ -720,6 +720,15 @@ export const ROUTES: Route[] = [
     await clientDO(env, p.client).purge();
     return { deleted: p.client, name, catalog_entries: entries };
   } }),
+  // A client's own webhook (docs/control-plane/api/clients/#events-to-the-owner): https only; its signing
+  // secret is in this answer and nowhere else. The operator has no `self`.
+  route({
+    method: "PUT", path: "/v1/clients/self/webhook", auth: "owner", body: z.strictObject({ url: z.string().min(1).max(2048) }),
+    run: ({ env, caller, body: r }) => {
+      if (caller.kind !== "client") throw new NestError(ErrorCodes.INVALID_MESSAGE, "/v1/clients/self is an API client's own; the operator has none", 400);
+      return clientDO(env, caller.client).setWebhook(r.url);
+    },
+  }),
 
   // The catalog as an owner sees it: the operator all of it, a client the operator's entries and its own
   // namespace, `<client-name>/<entry>`, which it alone (and the operator) writes.

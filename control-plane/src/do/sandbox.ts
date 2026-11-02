@@ -24,6 +24,7 @@ import {
 } from "../protocol/model";
 import { canonicalRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
+import { ClientOutbox } from "../lib/client-events";
 import { GITHUB_BINDING, githubEgress } from "../lib/rules/github";
 import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
@@ -180,6 +181,8 @@ export class SandboxDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   // `!`: set in the constructor, except on the health instance, which serves only `health()`.
   private readonly deadlines!: Deadlines;
+  /** Its `sandbox.destroyed` for its client, until ClientDO has it (docs/control-plane/api/clients/#events-to-the-owner). */
+  private readonly outbox!: ClientOutbox;
 
   /** `GET /v1/health`'s read-only round trip (lib/health.ts). */
   async health(): Promise<true> {
@@ -212,6 +215,7 @@ export class SandboxDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, host TEXT NOT NULL, ports TEXT NOT NULL,
       expires_ms INTEGER NOT NULL)`);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
+    this.outbox = new ClientOutbox(this.sql);
   }
 
   // --- state helpers ------------------------------------------------------------------------------
@@ -268,6 +272,7 @@ export class SandboxDO extends DurableObject<Env> {
   /** `update`, returning what `fn` decided (a core's answer) with the saved info. */
   private decide<T>(fn: (info: SandboxInfo) => T): [T, SandboxInfo] {
     const info = this.info_();
+    const was = info.state;
     const r = fn(info);
     // Dormancy is kept in the step of every change: it starts at the first and ends at once (a wake, an attach).
     if (!dormant(info)) {
@@ -279,6 +284,12 @@ export class SandboxDO extends DurableObject<Env> {
     info.history = this.recentEpochs();
     const { history: _derived, ...stored } = info;
     this.put("info", stored);
+    // Every way to destroyed goes through here: its client's event is written in the same step, with
+    // the `client` deadline that hands it over (and reports the destroy to the client's registry).
+    if (info.client && was !== "destroyed" && info.state === "destroyed") {
+      this.outbox.add(info.client, `${info.sandbox}/destroyed`, { type: "sandbox.destroyed", sandbox: info.sandbox });
+      this.deadlines.set("client", Date.now(), true).catch((e) => console.error(`sandbox ${info.sandbox}: arming client failed`, e));
+    }
     return [r, info];
   }
 
@@ -1033,11 +1044,13 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * The `client` deadline: tell its client's ClientDO it lives, or was destroyed (what `max_sandboxes`
-   * counts), unless it was told that already. A failure is retried by the deadline.
+   * counts), unless it was told that already, and hand over its waiting event. A failure is retried by
+   * the deadline.
    */
   private async reportToClient(): Promise<void> {
     const info = this.tryInfo();
     if (!info?.client) return;
+    while (await this.outbox.handOff(this.env));
     const ended = info.state === "destroyed";
     const want = ended ? "ended" : "live";
     if (this.get<string>("client_reported") === want) return;

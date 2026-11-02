@@ -69,6 +69,8 @@ export interface Env {
   MCP_ADMIT_WAIT_MS?: string;
   /** While brains use an MCP server's list, its connector lists it again this often (default 60 s). */
   MCP_RELIST_MS?: string;
+  /** How long one delivery to a client's webhook may take before it counts as failed (default 10 s; tests shorten it). */
+  CLIENT_WEBHOOK_TIMEOUT_MS?: string;
 }
 
 export const num = (v: string | undefined, fallback: number): number => {

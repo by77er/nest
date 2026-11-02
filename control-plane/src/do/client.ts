@@ -1,8 +1,8 @@
 // ClientDO (docs/control-plane/api/clients/): one per API client, named by its id (`cli_…`), holding
 // its record (name, grant, token hash), and the registry of its subtree: every agent and sandbox it
 // owns, directly or through the agents it created, with their labels. The registry is what the grant's
-// `max_agents` and `max_sandboxes` count and what the client lists. A later release adds the webhook
-// and the event outbox here.
+// `max_agents` and `max_sandboxes` count and what the client lists. And its webhook, with the backlog
+// of events its subtree's agents and sandboxes handed it, delivered one at a time from its alarm.
 //
 // One more instance, named `directory`, holds the names: unique, each mapped to its client's id, and
 // the list of clients. Nothing else addresses it.
@@ -16,10 +16,12 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { type Grant, labelWhere, type Labels } from "../lib/clients";
+import { BACKLOG_MAX, checkWebhookUrl, retryDelayMs, signature, type StampedEvent, WEBHOOK_TIMEOUT_MS } from "../lib/client-events";
+import { num } from "../env";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { Deadlines } from "../lib/reliable";
 import { storedEnum } from "../lib/stored";
-import { asNestError, NestError, timingSafeEqual } from "../lib/util";
+import { asNestError, clip, hex, NestError, timingSafeEqual } from "../lib/util";
 import { z } from "zod";
 import { ErrorCodes } from "../protocol/model";
 import type { ClientScope } from "./catalog";
@@ -33,6 +35,8 @@ export const ENDED_RETENTION_MS = 7 * 86_400_000;
 const PRUNE_EVERY_MS = 3_600_000;
 /** Live rows read against their objects per hourly prune. */
 const RECHECK_PER_RUN = 100;
+/** Deliveries per alarm run (each is awaited, one at a time); more go on in the next run, at once. */
+const DELIVER_PER_RUN = 100;
 
 export type MemberKind = "agent" | "sandbox";
 const MemberState = z.enum(["reserved", "live", "ended"]);
@@ -59,6 +63,36 @@ export interface ClientView {
   rotated_ms: number | null;
   /** Live (or reserved) agents and sandboxes across its subtree: what `max_agents` and `max_sandboxes` count. */
   live: { agents: number; sandboxes: number };
+  /** Its webhook (never its secret) and the delivery of its events. */
+  events: EventsView;
+}
+
+/** Where a client's events stand. */
+export interface EventsView {
+  webhook: string | null;
+  /** Events waiting to be delivered. */
+  backlog: number;
+  /** Events dropped because the backlog was full (oldest first), ever. */
+  dropped: number;
+  /** Consecutive failed attempts (0 once one succeeds), and the last failure's reason. */
+  failures: number;
+  last_error: string | null;
+}
+
+/** The webhook, as stored. The secret is shown once, when it is set. */
+interface Webhook {
+  url: string;
+  secret: string;
+  set_ms: number;
+}
+
+/** Delivery's state: its retry schedule survives a restart. */
+interface Delivery {
+  failures: number;
+  dropped: number;
+  last_error?: string;
+  /** When the last attempt failed (the next one is `retryDelayMs(failures)` later). */
+  failed_ms?: number;
 }
 
 /** One agent or sandbox of a client's subtree, as listed. */
@@ -92,7 +126,7 @@ export interface ListQuery {
   cursor?: string;
 }
 
-type Key = "reconcile" | "prune";
+type Key = "reconcile" | "prune" | "deliver";
 
 const notFound = () => new NestError(ErrorCodes.NOT_FOUND, "unknown client", 404);
 
@@ -126,6 +160,8 @@ export class ClientDO extends DurableObject<Env> {
       labels TEXT NOT NULL, created_ms INTEGER NOT NULL, state TEXT NOT NULL, ended_ms INTEGER, checked_ms INTEGER)`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS members_page ON members (kind, created_ms, id)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
+    // Events waiting for its webhook, in the order they were handed over; `id` is the event's (dedup).
+    this.sql.exec("CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, body TEXT NOT NULL)");
   }
 
   // --- the directory -------------------------------------------------------------------------------
@@ -190,6 +226,7 @@ export class ClientDO extends DurableObject<Env> {
     return {
       client: r.client, name: r.name, grant: r.grant, created_ms: r.created_ms, rotated_ms: r.rotated_ms ?? null,
       live: { agents: this.count("agent"), sandboxes: this.count("sandbox") },
+      events: this.eventsView(),
     };
   }
 
@@ -353,14 +390,123 @@ export class ClientDO extends DurableObject<Env> {
     };
   }
 
+  // --- events to the client (docs/control-plane/api/clients/#events-to-the-owner) -------------------
+
+  private kv<T>(key: string): T | undefined {
+    const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray()[0];
+    return row ? JSON.parse(row.value) as T : undefined;
+  }
+
+  private kvPut(key: string, value: unknown): void {
+    this.sql.exec("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, JSON.stringify(value));
+  }
+
+  private delivery(): Delivery {
+    return this.kv<Delivery>("delivery") ?? { failures: 0, dropped: 0 };
+  }
+
+  private backlog(): number {
+    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM outbox").one().n;
+  }
+
+  private eventsView(): EventsView {
+    const d = this.delivery();
+    return { webhook: this.kv<Webhook>("webhook")?.url ?? null, backlog: this.backlog(), dropped: d.dropped, failures: d.failures, last_error: d.last_error ?? null };
+  }
+
+  /**
+   * Set (or replace) its webhook: `https` only. A new signing secret every time, answered here only.
+   * What waits goes to the new URL at once, its retry schedule started over.
+   */
+  async setWebhook(url: string): Promise<{ url: string; secret: string }> {
+    this.live();
+    const bad = checkWebhookUrl(url);
+    if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, bad);
+    const secret = `whsec_${hex(crypto.getRandomValues(new Uint8Array(32)))}`;
+    this.kvPut("webhook", { url, secret, set_ms: Date.now() } satisfies Webhook);
+    const d = this.delivery();
+    this.kvPut("delivery", { failures: 0, dropped: d.dropped } satisfies Delivery);
+    if (this.backlog()) await this.deadlines.set("deliver", Date.now());
+    return { url, secret };
+  }
+
+  /**
+   * Events from an agent or sandbox of its subtree (its outbox's hand-off, retried until this answers).
+   * Taken in one synchronous step, never waiting on a delivery: an id already here is kept once; with
+   * no webhook (or no client any more) they go, as nobody would hear them; past `BACKLOG_MAX` the
+   * oldest go and are counted.
+   */
+  async enqueue(events: StampedEvent[]): Promise<void> {
+    this.requireClient();
+    const r = this.record();
+    if (!r || r.deleted_ms || !this.kv<Webhook>("webhook") || !events.length) return;
+    for (const ev of events) this.sql.exec("INSERT OR IGNORE INTO outbox (id, body) VALUES (?, ?)", ev.id, JSON.stringify(ev));
+    const over = this.backlog() - BACKLOG_MAX;
+    if (over > 0) {
+      this.sql.exec("DELETE FROM outbox WHERE seq IN (SELECT seq FROM outbox ORDER BY seq LIMIT ?)", over);
+      const d = this.delivery();
+      this.kvPut("delivery", { ...d, dropped: d.dropped + over } satisfies Delivery);
+      console.warn(`client ${r.client}: its event backlog is full; dropped the ${over} oldest`);
+    }
+    // A delivery waiting out its backoff keeps its time; otherwise the next one goes now.
+    if (!this.deadlines.has("deliver")) await this.deadlines.set("deliver", Date.now());
+  }
+
+  /**
+   * The `deliver` deadline: the oldest events, one request at a time, each deleted once its webhook
+   * answered 2xx. The first failure (any other status, a network error, or no answer within the
+   * timeout) stops the run, and the next one comes `retryDelayMs(failures)` later.
+   */
+  private async deliver(): Promise<void> {
+    const timeoutMs = num(this.env.CLIENT_WEBHOOK_TIMEOUT_MS, WEBHOOK_TIMEOUT_MS);
+    for (let i = 0; i < DELIVER_PER_RUN; i++) {
+      const hook = this.kv<Webhook>("webhook");
+      const row = this.sql.exec<{ seq: number; body: string }>("SELECT seq, body FROM outbox ORDER BY seq LIMIT 1").toArray()[0];
+      if (!hook || !row) return;
+      const t = Date.now();
+      let error: string | null = null;
+      try {
+        const res = await fetch(hook.url, {
+          method: "POST",
+          headers: { "content-type": "application/json", "nest-signature": await signature(hook.secret, t, row.body) },
+          body: row.body,
+          redirect: "manual",
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        await res.body?.cancel();
+        if (res.status < 200 || res.status > 299) error = `HTTP ${res.status}`;
+      } catch (e) {
+        error = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError") ? `no answer within ${timeoutMs} ms` : clip(String(e), 300);
+      }
+      // Re-read in this step: a new webhook set during the attempt starts its own schedule.
+      const d = this.delivery();
+      if (this.kv<Webhook>("webhook")?.set_ms !== hook.set_ms) continue;
+      if (error === null) {
+        this.sql.exec("DELETE FROM outbox WHERE seq = ?", row.seq);
+        if (d.failures) this.kvPut("delivery", { failures: 0, dropped: d.dropped } satisfies Delivery);
+        continue;
+      }
+      // The wait runs from the failure: an attempt cut off at the timeout is retried 1 s after that.
+      const failures = d.failures + 1;
+      const now = Date.now();
+      this.kvPut("delivery", { failures, dropped: d.dropped, last_error: error, failed_ms: now } satisfies Delivery);
+      await this.deadlines.set("deliver", now + retryDelayMs(failures));
+      return;
+    }
+    if (this.backlog()) await this.deadlines.set("deliver", Date.now());
+  }
+
   // --- alarms --------------------------------------------------------------------------------------
 
   override async alarm(): Promise<void> {
     if (this.directory) return;
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === "reconcile") await this.reconcile();
+      else if (key === "deliver") await this.deliver();
       else if (key === "prune") {
         this.sql.exec("DELETE FROM members WHERE state = 'ended' AND ended_ms < ?", Date.now() - ENDED_RETENTION_MS);
+        // A delivery a rolled-back release dropped (it has no handler for `deliver`) is armed again.
+        if (this.backlog() && !this.deadlines.has("deliver")) await this.deadlines.set("deliver", Date.now());
         await this.recheckLive();
         if (this.record()) await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
       }

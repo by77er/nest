@@ -2,7 +2,7 @@
 
 **Decided (2026-11-02, the owner's):** external systems (an app with its own Worker and Durable Objects, such as a task board) use nest only through this interface. An app never gets the admin token, and nest gets nothing specific to any app. **An app that seems to need a special case in nest means this interface is wrong:** fix the interface, generically ([principle 9](../../../README.md#principles)).
 
-**Built (2026-11-02):** clients and grants, ownership and visibility, labels, and the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`). **Not built:** caller identity, events to the owner, GitHub tokens (the grant's `github` is stored, unused).
+**Built (2026-11-02):** clients and grants, ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), and [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`). **Not built:** caller identity, GitHub tokens (the grant's `github` is stored, unused).
 
 **How the built parts read the grant** (each a choice the design left open):
 - **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own.
@@ -71,6 +71,20 @@
     - any non-2xx response is a failure.
   - The backlog is bounded at 10,000 events, and past that the oldest go. The number dropped is counted and shown in the client's record.
   - A client that missed events re-reads the agents' state.
+
+**How the build settled what the design left open (2026-11-02):**
+- **Where each event comes from** (AgentDO and SandboxDO write it in the step of the change):
+  - `turn_completed`: a turn the runner completed. `text` is the turn's last `assistant_text` event (Claude Code's last text block), else empty.
+  - `exited`: once the agent's end is done (as its registry hears it). `reason` is the end's (`exited`, `done`, `stopped`, `owner_ended`); `text` the note it was given (`exit`'s or `agent_stop`'s `reason`), else its last assistant text.
+  - `ask`: every ask held for the owner (a sink approval, or a tool rule in `ask` mode); `approval` is `{name, tool}`, as `GET …/asks` lists it.
+  - `error`: a runner `error` event (a Claude Code result that failed: `code` is its subtype), or the agent becoming `errored` (its brain couldn't start or kept exiting; `code: "errored"`).
+  - `sandbox.destroyed`: once, at the destroy decision.
+  - `text` is clipped to 16 KiB and `message` to 2 KiB (UTF-8).
+- **The body** is the event as JSON: `{id, type, …fields}`. The `id` is opaque and fixed when the event is written, so every hand-off and every attempt carries the same one. Delivery is at least once: a client dedups by `id`. Order is the order ClientDO received them, which is each agent's own order.
+- **The signing key** is the secret's UTF-8 bytes (`whsec_<64 hex>`). Setting the webhook again replaces the secret and sends what waits to the new URL at once.
+- **No webhook set:** events are dropped on arrival (nobody would hear them), not queued for later.
+- **Redirects aren't followed** (a 3xx is a failure). The retry wait runs from the failure, so an attempt cut off at 10 s is retried 1 s after that.
+- **The record** (the operator's `GET /v1/admin/clients/<id>`) shows `events: {webhook, backlog, dropped, failures, last_error}`, never the secret. A client can't read it yet: there is no `GET /v1/clients/self`.
 
 ## GitHub tokens
 
