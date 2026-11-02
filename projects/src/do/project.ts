@@ -9,6 +9,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { TEMPLATE } from "../catalog";
 import { directory, type Env } from "../env";
+import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
 import type { AgentCaller } from "../identity";
 import { backoff, NestError, nestFrom, type Nest } from "../nest";
@@ -33,6 +34,11 @@ export interface Settings {
   attach_error: string | null;
   /** What the last attach that succeeded did. */
   attach: AttachDetail | null;
+  /** Whether task PRs get GitHub's auto-merge, which the repo is set to allow (README.md#auto-merge). */
+  auto_merge: boolean;
+  merge_method: MergeMethod;
+  /** The repo's "Allow auto-merge", as the app writes it back from `auto_merge`. */
+  repo_auto_merge: RepoAutoMerge;
   created_ms: number;
 }
 
@@ -56,6 +62,8 @@ export interface Task {
   start_error: string | null;
   /** Whether any write to it came from a tainted session (README.md#the-mcp-server-agents-see-only-their-own-work). */
   tainted: boolean;
+  /** GitHub's auto-merge on its PR, while the project's `auto_merge` is on; null when never asked. */
+  auto_merge: TaskAutoMerge | null;
   created_ms: number;
   updated_ms: number;
 }
@@ -126,6 +134,24 @@ const MIGRATIONS = [
     // A project made before attaching existed attaches at its next alarm.
     "UPDATE settings SET attach_next_ms = 0",
   ],
+  [
+    // Auto-merge (README.md#auto-merge): the setting, the repo's "Allow auto-merge" written back from it
+    // (`am_write_*`) and read again (`am_read_*`, `am_observed`), and each task PR's auto-merge (`am_*`).
+    "ALTER TABLE settings ADD COLUMN auto_merge INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN merge_method TEXT NOT NULL DEFAULT 'squash'",
+    "ALTER TABLE settings ADD COLUMN am_write_next_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN am_write_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN am_write_error TEXT",
+    "ALTER TABLE settings ADD COLUMN am_applied TEXT",
+    "ALTER TABLE settings ADD COLUMN am_observed TEXT",
+    "ALTER TABLE settings ADD COLUMN am_read_next_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN am_read_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN pr_node TEXT",
+    "ALTER TABLE tasks ADD COLUMN am_owed TEXT",
+    "ALTER TABLE tasks ADD COLUMN am_next_ms INTEGER",
+    "ALTER TABLE tasks ADD COLUMN am_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN am_status TEXT",
+  ],
 ] as const;
 
 type Row = Record<string, SqlStorageValue>;
@@ -149,11 +175,13 @@ export class ProjectDO extends DurableObject<Env> {
   // --- settings --------------------------------------------------------------------------------------
 
   /** Set the project up (once; a repeat with the same id is a no-op) and owe nest its manager. */
-  async init(p: { id: string; name: string; repo: string; auto_assign?: boolean; max_workers?: number }): Promise<Settings> {
+  async init(p: { id: string; name: string; repo: string; auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod }): Promise<Settings> {
     if (!this.settingsRow()) {
       this.sql.exec(
-        "INSERT INTO settings (id, name, repo, auto_assign, max_workers, attach_next_ms, manager_next_ms, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        p.id, p.name, p.repo, p.auto_assign ? 1 : 0, clampWorkers(p.max_workers ?? 2), Date.now(), Date.now(), Date.now(),
+        `INSERT INTO settings (id, name, repo, auto_assign, max_workers, attach_next_ms, manager_next_ms, auto_merge, merge_method, am_write_next_ms, created_ms)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        p.id, p.name, p.repo, p.auto_assign ? 1 : 0, clampWorkers(p.max_workers ?? 2), Date.now(), Date.now(),
+        p.auto_merge ? 1 : 0, p.merge_method ?? "squash", p.auto_merge ? Date.now() : null, Date.now(),
       );
       await this.arm();
     }
@@ -171,7 +199,13 @@ export class ProjectDO extends DurableObject<Env> {
       id: r.id as string, name: r.name as string, repo: r.repo as string, auto_assign: r.auto_assign === 1, max_workers: r.max_workers as number,
       manager: (r.manager as string | null) ?? null, manager_error: (r.manager_error as string | null) ?? null,
       attached: r.attached_ms !== null, attach_error: (r.attach_error as string | null) ?? null,
-      attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null, created_ms: r.created_ms as number,
+      attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
+      auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod,
+      repo_auto_merge: repoAutoMerge({
+        want: r.auto_merge === 1, owed: r.am_write_next_ms !== null, error: (r.am_write_error as string | null) ?? null,
+        applied: r.am_applied ? (JSON.parse(r.am_applied as string) as Seen) : null, observed: r.am_observed ? (JSON.parse(r.am_observed as string) as Seen) : null,
+      }),
+      created_ms: r.created_ms as number,
     };
   }
 
@@ -180,10 +214,13 @@ export class ProjectDO extends DurableObject<Env> {
     return s ? ok(s) : fail(404, "unknown project");
   }
 
-  async updateSettings(u: { auto_assign?: boolean; max_workers?: number }): Promise<Result<Settings>> {
-    if (!this.settings()) return fail(404, "unknown project");
+  async updateSettings(u: { auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod }): Promise<Result<Settings>> {
+    const before = this.settings();
+    if (!before) return fail(404, "unknown project");
     if (u.auto_assign !== undefined) this.sql.exec("UPDATE settings SET auto_assign = ?", u.auto_assign ? 1 : 0);
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
+    if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
+    if (u.auto_merge !== undefined && u.auto_merge !== before.auto_merge) this.setAutoMerge(u.auto_merge);
     this.autoAssign();
     await this.arm();
     await this.drain();
@@ -200,7 +237,8 @@ export class ProjectDO extends DurableObject<Env> {
     return {
       id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null,
       state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null, pr: (r.pr as number | null) ?? null,
-      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, auto_merge: taskAutoMerge(r),
+      created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
   }
 
@@ -385,7 +423,7 @@ export class ProjectDO extends DurableObject<Env> {
    * - merged: its task is done, and its worker ended;
    * - closed without merging: noted in the task's history; the task stays as it is.
    */
-  async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean }): Promise<void> {
+  async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean; node?: string | null }): Promise<void> {
     if (!this.settings()) return;
     const byBranch = e.task ? this.taskRow(e.task) : undefined;
     const r = byBranch ?? this.sql.exec("SELECT id FROM tasks WHERE pr = ?", e.pr).toArray()[0];
@@ -400,6 +438,12 @@ export class ProjectDO extends DurableObject<Env> {
     };
     if (e.action === "opened") {
       link();
+      // A task's own PR (its branch, from the repo itself) gets auto-merge while the setting is on.
+      const t = this.taskRow(id)!;
+      if (e.task === id && t.pr === e.pr && t.state === "in_review" && e.node) {
+        this.sql.exec("UPDATE tasks SET pr_node = ? WHERE id = ?", e.node, id);
+        if (this.settings()!.auto_merge) this.oweTaskAutoMerge(id, "enable");
+      }
     } else if (e.merged) {
       if (this.taskRow(id)!.state === "in_progress") link();
       if (this.move(id, "merged", github, { pr: e.pr }).ok) {
@@ -411,6 +455,46 @@ export class ProjectDO extends DurableObject<Env> {
     } else {
       this.record(id, github, "pr_closed", { pr: e.pr });
     }
+    // A closed PR's auto-merge is GitHub's to drop: nothing more is owed for it.
+    if (e.action === "closed") this.sql.exec("UPDATE tasks SET am_owed = NULL, am_next_ms = NULL WHERE id = ? AND pr = ?", id, e.pr);
+    await this.arm();
+  }
+
+  // --- auto-merge ------------------------------------------------------------------------------------
+
+  /** Turn auto-merge on or off: the repo's setting is owed its write, and each open task PR its change. */
+  private setAutoMerge(on: boolean): void {
+    this.sql.exec("UPDATE settings SET auto_merge = ?, am_write_next_ms = ?, am_write_attempts = 0, am_write_error = NULL", on ? 1 : 0, Date.now());
+    for (const t of this.sql.exec("SELECT id, am_status, am_owed FROM tasks WHERE state = 'in_review' AND pr_node IS NOT NULL").toArray()) {
+      const status = t.am_status ? (JSON.parse(t.am_status as string) as TaskAutoMerge) : null;
+      if (on) this.oweTaskAutoMerge(t.id as string, "enable");
+      else if (status?.state === "enabled" || t.am_owed === "enable") this.oweTaskAutoMerge(t.id as string, "disable");
+    }
+  }
+
+  private oweTaskAutoMerge(id: string, what: "enable" | "disable"): void {
+    this.sql.exec("UPDATE tasks SET am_owed = ?, am_next_ms = ?, am_attempts = 0 WHERE id = ?", what, Date.now(), id);
+  }
+
+  /** Write the repo's setting again now: after a refusal, or to undo a drift. */
+  async retryRepoAutoMerge(): Promise<Result<Settings>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    this.sql.exec("UPDATE settings SET am_write_next_ms = ?, am_write_attempts = 0, am_write_error = NULL", Date.now());
+    await this.arm();
+    await this.drain();
+    return ok(this.settings()!);
+  }
+
+  /**
+   * The project is being looked at: read the repo's setting again, at most once a minute, if the app
+   * has written it, so a change by hand shows as drifted. The read is the alarm's; this answers at once.
+   */
+  async refreshRepoAutoMerge(): Promise<void> {
+    const r = this.settingsRow();
+    if (!r?.am_applied || r.am_write_next_ms !== null || r.am_read_next_ms !== null) return;
+    const seen = [r.am_applied, r.am_observed].filter(Boolean).map((x) => (JSON.parse(x as string) as Seen).at_ms);
+    if (Date.now() - Math.max(...seen) < REPO_READ_EVERY_MS) return;
+    this.sql.exec("UPDATE settings SET am_read_next_ms = ?, am_read_attempts = 0", Date.now());
     await this.arm();
   }
 
@@ -594,14 +678,24 @@ export class ProjectDO extends DurableObject<Env> {
 
   /** Arm the alarm for the earliest work owed (in the step that owed it). */
   private async arm(): Promise<void> {
-    const next = this.sql.exec<{ t: number | null }>(
-      `SELECT MIN(t) AS t FROM (
+    // Separate queries: the platform's SQLite caps the terms of one compound SELECT.
+    const min = (q: string) => this.sql.exec<{ t: number | null }>(q).one().t;
+    const times = [
+      min(`SELECT MIN(t) AS t FROM (
         SELECT manager_next_ms AS t FROM settings WHERE manager_next_ms IS NOT NULL AND attached_ms IS NOT NULL
         UNION ALL SELECT attach_next_ms FROM settings WHERE attach_next_ms IS NOT NULL
         UNION ALL SELECT start_next_ms FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM stops
-        UNION ALL SELECT next_ms FROM chat WHERE next_ms IS NOT NULL)`,
-    ).one().t;
+        UNION ALL SELECT next_ms FROM chat WHERE next_ms IS NOT NULL)`),
+      // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
+      // the repo allows it).
+      min(`SELECT MIN(t) AS t FROM (
+        SELECT am_write_next_ms AS t FROM settings WHERE am_write_next_ms IS NOT NULL
+        UNION ALL SELECT am_read_next_ms FROM settings WHERE am_read_next_ms IS NOT NULL
+        UNION ALL SELECT t.am_next_ms FROM tasks t, settings s WHERE t.am_next_ms IS NOT NULL
+          AND (t.am_owed = 'disable' OR (s.am_write_next_ms IS NULL AND s.am_write_error IS NULL)))`),
+    ].filter((t): t is number => t !== null);
+    const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
     const cur = await this.ctx.storage.getAlarm();
     if (cur === null || next < cur) await this.ctx.storage.setAlarm(Math.max(next, Date.now()));
@@ -638,6 +732,14 @@ export class ProjectDO extends DurableObject<Env> {
     if (!nest) return;
     const now = Date.now();
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
+    if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge(nest);
+    if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge(nest);
+    // A PR's auto-merge is enabled only once the repo allows it; disabling needn't wait.
+    const w = this.settingsRow()!;
+    const repoReady = w.am_write_next_ms === null && w.am_write_error === null;
+    for (const r of this.sql.exec("SELECT id, am_owed FROM tasks WHERE am_next_ms IS NOT NULL AND am_next_ms <= ?", now).toArray()) {
+      if (r.am_owed === "disable" || repoReady) await this.taskAutoMerge(nest, r.id as string);
+    }
     // The manager starts once the repo is attached (README.md#flows).
     const a = this.settingsRow()!;
     if (a.attached_ms !== null && a.manager_next_ms !== null && (a.manager_next_ms as number) <= now) await this.startManager(nest);
@@ -647,6 +749,76 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     await this.arm();
+  }
+
+  /** Write the repo's "Allow auto-merge" to the setting's value (`PATCH /repos/{o}/{r}`). */
+  private async writeRepoAutoMerge(nest: Nest): Promise<void> {
+    const s = this.settings()!;
+    const want = s.auto_merge;
+    try {
+      const gh = await githubFor(nest, s.repo, PERMISSIONS.repoSettings);
+      const after = await gh.setAllowAutoMerge(s.repo, want);
+      const now = Date.now();
+      const seen = JSON.stringify({ value: want, at_ms: now } satisfies Seen);
+      const observed = typeof after === "boolean" ? JSON.stringify({ value: after, at_ms: now } satisfies Seen) : null;
+      // Done, unless the setting changed meanwhile: then the write owed for the new value stays.
+      this.sql.exec(
+        `UPDATE settings SET am_applied = ?, am_observed = COALESCE(?, am_observed), am_write_attempts = 0, am_write_error = NULL,
+          am_write_next_ms = CASE WHEN auto_merge = ? THEN NULL ELSE am_write_next_ms END`,
+        seen, observed, want ? 1 : 0,
+      );
+    } catch (e) {
+      const attempts = (this.settingsRow()!.am_write_attempts as number) + 1;
+      const permanent = (e instanceof NestError || e instanceof GitHubError) && e.permanent;
+      // Refused for good: the setting stays as asked, the error shown, until the owner retries.
+      this.sql.exec("UPDATE settings SET am_write_attempts = ?, am_write_next_ms = ?, am_write_error = ?", attempts, permanent ? null : Date.now() + backoff(attempts), message(e));
+    }
+  }
+
+  /** Read the repo's "Allow auto-merge" (`GET /repos/{o}/{r}`), to show a change made by hand. */
+  private async readRepoAutoMerge(nest: Nest): Promise<void> {
+    const s = this.settings()!;
+    try {
+      const gh = await githubFor(nest, s.repo, PERMISSIONS.repoRead);
+      const value = await gh.allowAutoMerge(s.repo);
+      this.sql.exec("UPDATE settings SET am_observed = ?, am_read_next_ms = NULL, am_read_attempts = 0", JSON.stringify({ value, at_ms: Date.now() } satisfies Seen));
+    } catch (e) {
+      const attempts = (this.settingsRow()!.am_read_attempts as number) + 1;
+      const permanent = (e instanceof NestError || e instanceof GitHubError) && e.permanent;
+      this.sql.exec("UPDATE settings SET am_read_attempts = ?, am_read_next_ms = ?", attempts, permanent || attempts >= 5 ? null : Date.now() + backoff(attempts));
+    }
+  }
+
+  /** Enable or disable GitHub's auto-merge on a task's PR, as owed, recording the result on the task. */
+  private async taskAutoMerge(nest: Nest, id: string): Promise<void> {
+    const before = this.taskRow(id);
+    if (!before?.am_owed || !before.pr_node) return;
+    const what = before.am_owed as "enable" | "disable";
+    const s = this.settings()!;
+    const method = s.merge_method;
+    const github: Actor = { kind: "app", what: "github" };
+    const still = () => this.taskRow(id)?.am_owed === what;
+    try {
+      const gh = await githubFor(nest, s.repo, PERMISSIONS.autoMerge);
+      if (what === "enable") await gh.enableAutoMerge(before.pr_node as string, GRAPHQL_METHOD[method]);
+      else await gh.disableAutoMerge(before.pr_node as string);
+      const status: TaskAutoMerge = { state: what === "enable" ? "enabled" : "disabled", method: what === "enable" ? method : null, error: null, at_ms: Date.now() };
+      this.sql.exec("UPDATE tasks SET am_status = ? WHERE id = ?", JSON.stringify(status), id);
+      this.record(id, github, what === "enable" ? "auto_merge_enabled" : "auto_merge_disabled", { pr: before.pr, ...(what === "enable" ? { method } : {}) });
+      if (still()) this.sql.exec("UPDATE tasks SET am_owed = NULL, am_next_ms = NULL, am_attempts = 0 WHERE id = ?", id);
+    } catch (e) {
+      if (!still()) return;
+      const attempts = (before.am_attempts as number) + 1;
+      if ((e instanceof NestError || e instanceof GitHubError) && e.permanent) {
+        const status: TaskAutoMerge = { state: "failed", method: what === "enable" ? method : null, error: message(e), at_ms: Date.now() };
+        this.sql.exec("UPDATE tasks SET am_status = ?, am_owed = NULL, am_next_ms = NULL, am_attempts = ? WHERE id = ?", JSON.stringify(status), attempts, id);
+        this.record(id, github, "auto_merge_failed", { pr: before.pr, action: what, error: message(e) });
+        return;
+      }
+      const prior = before.am_status ? (JSON.parse(before.am_status as string) as TaskAutoMerge) : null;
+      const status: TaskAutoMerge = { state: "pending", method: prior?.method ?? null, error: message(e), at_ms: Date.now() };
+      this.sql.exec("UPDATE tasks SET am_status = ?, am_attempts = ?, am_next_ms = ? WHERE id = ?", JSON.stringify(status), attempts, Date.now() + backoff(attempts), id);
+    }
   }
 
   /**
@@ -774,6 +946,16 @@ export class ProjectDO extends DurableObject<Env> {
 }
 
 const clampWorkers = (n: number) => Math.max(0, Math.min(MAX_WORKERS_LIMIT, Math.floor(n)));
+/** How often looking at a project reads its repo's auto-merge setting again, at most. */
+const REPO_READ_EVERY_MS = 60_000;
+
+/** A task's auto-merge for the board: pending while owed, else the last result. */
+function taskAutoMerge(r: Row): TaskAutoMerge | null {
+  const status = r.am_status ? (JSON.parse(r.am_status as string) as TaskAutoMerge) : null;
+  if (r.am_owed) return { state: "pending", method: status?.method ?? null, error: status?.error ?? null, at_ms: status?.at_ms ?? (r.updated_ms as number) };
+  return status;
+}
+
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
 
 function managerBrief(s: Settings): string {

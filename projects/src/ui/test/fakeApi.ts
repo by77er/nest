@@ -17,7 +17,8 @@ export function project(over: Partial<ProjectRow> = {}): Project {
   const row: ProjectRow = { id: "prj_one", name: "Widgets", repo: "owner/widgets", created_ms: now - 86_400_000, ...over };
   const settings: Settings = {
     id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null,
-    attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms }, created_ms: row.created_ms,
+    attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms },
+    auto_merge: false, merge_method: "squash", repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, created_ms: row.created_ms,
   };
   return { ...row, settings };
 }
@@ -26,7 +27,7 @@ let seq = 0;
 export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
-    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false,
+    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, auto_merge: null,
     created_ms: now - 3_600_000, updated_ms: now - 60_000, ...over,
   };
 }
@@ -95,6 +96,9 @@ export class FakeApi {
         return json(p);
       case "PATCH settings":
         Object.assign(p.settings, body);
+        return json(p.settings);
+      case "POST auto-merge/retry":
+        p.settings.repo_auto_merge = { state: "applied", want: p.settings.auto_merge, repo: p.settings.auto_merge, error: null, at_ms: now };
         return json(p.settings);
       case "GET tasks":
         return json([...this.tasks].sort((a, b) => a.ord - b.ord));

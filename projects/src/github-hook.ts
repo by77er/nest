@@ -19,6 +19,7 @@ const json = (body: unknown, status = 200) =>
 const SHA = /^[0-9a-f]{40}$/;
 const TASK_BRANCH = /^task\/(tsk_[a-z0-9]+)$/;
 const DELIVERY = /^[A-Za-z0-9-]{1,100}$/;
+const NODE = /^[A-Za-z0-9_=-]{1,200}$/;
 
 type Obj = Record<string, unknown>;
 const obj = (v: unknown): Obj => (typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Obj) : {});
@@ -68,7 +69,11 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
       await review(env, p.id).onHead(of, {
         pr: number, sha, base: (str(obj(pr.base).ref) ?? "").slice(0, 255), title: (str(pr.title) ?? "").slice(0, 1000), updated_at,
       });
-      if (action !== "synchronize") await project(env, p.id).onPullRequest({ pr: number, task, action: "opened", merged: false });
+      // Its node id, for GraphQL's auto-merge on a task's PR.
+      const node = str(pr.node_id);
+      if (action !== "synchronize") {
+        await project(env, p.id).onPullRequest({ pr: number, task, action: "opened", merged: false, node: node && NODE.test(node) ? node : null });
+      }
     } else if (action === "closed") {
       await review(env, p.id).onClosed(of, { pr: number, updated_at });
       await project(env, p.id).onPullRequest({ pr: number, task, action: "closed", merged: pr.merged === true });

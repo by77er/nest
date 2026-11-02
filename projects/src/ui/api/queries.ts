@@ -84,6 +84,16 @@ export function useUpdateSettings(id: string) {
   });
 }
 
+/** Write the repo's "Allow auto-merge" again: after GitHub refused it, or to undo a change by hand. */
+export function useRetryRepoAutoMerge(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.retryRepoAutoMerge(id),
+    meta: { failure: "The repo's auto-merge setting wasn't written" },
+    onSuccess: () => qc.invalidateQueries({ queryKey: keys.project(id), exact: true }),
+  });
+}
+
 /** After a task changes: its row on the board at once, then the board and its detail fetched again. */
 function useTaskWrite<V extends { task: string }>(id: string, fn: (v: V) => Promise<Task>, failure: string) {
   const qc = useQueryClient();

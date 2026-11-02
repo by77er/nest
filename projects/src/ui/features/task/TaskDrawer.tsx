@@ -13,6 +13,29 @@ import { SpecView } from "./SpecView";
 import { TaskActions } from "./TaskActions";
 import { TaskEditForm } from "./TaskEditForm";
 import { TaskTraces } from "../trace/AgentTraces";
+import type { Task } from "../../api/types";
+
+/** GitHub's auto-merge on the task's PR, while the project's auto-merge is on. */
+function AutoMerge({ task }: { task: Task }) {
+  const a = task.auto_merge;
+  if (!a) return null;
+  if (a.state === "failed") {
+    return (
+      <Notice tone="warning" title="Auto-merge wasn't changed on its PR">
+        {a.error}
+      </Notice>
+    );
+  }
+  const label = a.state === "enabled" ? `Auto-merge on${a.method ? ` (${a.method})` : ""}` : a.state === "pending" ? "Auto-merge pending" : "Auto-merge off";
+  return (
+    <Row gap="sm">
+      <Badge color={a.state === "enabled" ? "success" : "gray"} variant="light">
+        {label}
+      </Badge>
+      <MetaItem title={exact(a.at_ms)}>{a.state === "enabled" ? "Merges once its review passes" : a.error ? `Retrying: ${a.error}` : ago(a.at_ms)}</MetaItem>
+    </Row>
+  );
+}
 
 export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: string; repo: string; taskId: string | undefined; onClose: () => void }) {
   const task = useTask(projectId, taskId);
@@ -52,6 +75,7 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
                 <MetaItem title={exact(t.updated_ms)}>Updated {ago(t.updated_ms)}</MetaItem>
               </MetaRow>
             </Stack>
+            <AutoMerge task={t} />
             {t.start_error && (
               <Notice tone="warning" title={t.state === "stalled" ? "Its worker didn't start" : "Its worker is being retried"}>
                 {t.start_error}

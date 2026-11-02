@@ -11,7 +11,7 @@ export function SettingsPage() {
     <ProjectFrame projectId={projectId} title="Settings" measure="form">
       {(p) => (
         <Panel>
-          <SettingsForm key={`${p.settings.auto_assign}/${p.settings.max_workers}`} projectId={projectId} settings={p.settings} />
+          <SettingsForm key={[p.settings.auto_assign, p.settings.max_workers, p.settings.auto_merge, p.settings.merge_method].join("/")} projectId={projectId} settings={p.settings} />
         </Panel>
       )}
     </ProjectFrame>
