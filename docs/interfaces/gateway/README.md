@@ -74,10 +74,26 @@ Before `bound`, the gateway sends a text frame `error{error{code, message, retry
 | 6 | `stale_epoch` | The binding names an epoch older than the sandbox's current one | No: resolve again |
 | 6 | `busy` | The binding names an epoch newer than the gateway's table (a placement nestd has not pushed yet) | Yes |
 | 7 | `unauthorized` | A client not attached to the sandbox (checked once the sandbox and epoch are known, since the attached set is that sandbox's); the same message as row 4 | No: resolve again once (a revoked binding) |
-| 8 | `busy` | The guest has not been configured, or its vsock port did not answer the `CONNECT` | Yes |
+| 8 | `busy` | The guest has not been configured, or its vsock port did not answer the `CONNECT` within 5 s ([timers](#timers)) | Yes |
 | 9 | `unsupported_version` | `bind.protocol_version` is not the guest's | No: resolve again once (the target was minted before SandboxDO heard of a guest upgrade) |
+| 10 | `busy` | nestd has the VM paused with the sandbox still placed here (a checkpoint's, suspend's or archive's commit; `sandbox_upsert.paused` on [nestd-gateway](../host-internal/nestd-gateway/)). Answered at once, with `retry_after_ms: 2000` and a message naming the pause, e.g. `the sandbox is paused: checkpoint (turn_end)`; no vsock connect is tried | Yes, after `retry_after_ms` |
 
-The signature is verified before any state-dependent answer, so an unsigned probe learns nothing about which sandboxes a host runs. Rows 5 to 9 are checked under the lock that registers the connection, so a removal, epoch bump, detach or guest change that lands before the registration is the answer. One after it: a removal, epoch bump or lost nestd link cuts the connection (`4409`); a detach is the guest's to enforce (its slot check and cgroup kill). One rule for every client (`nest_hands_client::Next`): only `busy` is retried with the same binding, per `retry_after_ms` within a 30 s budget, and a guest's own `busy` error after `bound` (refused before anything ran) shares that budget; `stale_epoch`, `moved`, `unknown_key`, `unauthorized` and `unsupported_version` mean "resolve again once", since a fresh target may carry a new epoch, key, binding or guest version; `bad_request` is final.
+The signature is verified before any state-dependent answer, so an unsigned probe learns nothing about which sandboxes a host runs. Rows 5 to 10 are checked under the lock that registers the connection, so a removal, epoch bump, detach or guest change that lands before the registration is the answer. One after it: a removal, epoch bump or lost nestd link cuts the connection (`4409`); a detach is the guest's to enforce (its slot check and cgroup kill). One rule for every client (`nest_hands_client::Next`): only `busy` is retried with the same binding, per `retry_after_ms` within a 120 s budget (long enough for a checkpoint's pause), and so are a guest's own `busy` error after `bound` (refused before anything ran) and a bind that timed out (the gateway took the bind and nothing reached the guest), in the same budget; `stale_epoch`, `moved`, `unknown_key`, `unauthorized` and `unsupported_version` mean "resolve again once", since a fresh target may carry a new epoch, key, binding or guest version; `bad_request` is final.
+
+### Timers
+
+Set together (`nest_protocol::gateway`), so a slow or frozen guest reaches the client as the gateway's retryable `busy` rather than as a timeout of the client's own:
+
+| Timer | Value | Counted from | When it fires |
+|---|---|---|---|
+| Gateway: upgrade and `bind` | 5 s | the TCP accept | dropped (row 1's `bad_request` if the upgrade finished) |
+| Gateway: guest vsock `CONNECT` (`GUEST_CONNECT_TIMEOUT_MS`) | 5 s | the admitted bind | `busy` (row 8) |
+| Client: bind (`CLIENT_BIND_TIMEOUT_MS`) | 10 s | sending `bind` | `Timeout(Bind)`, retried like `busy` |
+| Client: `busy` budget (the runner's `Budgets::busy`) | 120 s | the first `busy` or bind timeout of a call | the call's error, naming the last refusal's message |
+
+The client's bind timer must exceed the gateway's guest timer by at least 5 s (`BIND_TIMEOUT_MARGIN_MS`: the edge, the tunnel and the token check), asserted at compile time. Before 2026-11-02 both were 5 s, the client's always fired first, and its timeout was final: a hands call during a checkpoint's 35 s pause failed at once with `bind timed out` (cell use1, 2026-11-02).
+
+**A pause cuts nothing.** Connections bound before nestd pauses the VM stay open: their guest streams stall with the vCPUs and continue when it runs again. Only new binds get row 10's `busy`.
 
 ## Sequence
 

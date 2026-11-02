@@ -34,7 +34,9 @@ pub struct Budgets {
     pub resolve_timeout: Duration,
     /// Total wait while AgentDO answers `sandbox_not_ready` (placing, waking, a slot pending).
     pub not_ready: Duration,
-    /// Total wait while the gateway answers `busy` (guest not configured, a resync, vsock down).
+    /// Total wait while the gateway answers `busy` (guest not configured, a resync, vsock down,
+    /// the VM paused for a commit) or a bind times out. Covers a checkpoint's pause: on
+    /// 2026-11-02 one 32 GiB disk's held its VM paused 33-39 s.
     pub busy: Duration,
     /// The longest single sleep, whatever a `retry_after_ms` hint says.
     pub max_sleep: Duration,
@@ -49,7 +51,7 @@ impl Default for Budgets {
         Budgets {
             resolve_timeout: Duration::from_secs(10),
             not_ready: Duration::from_secs(60),
-            busy: Duration::from_secs(30),
+            busy: Duration::from_secs(120),
             max_sleep: Duration::from_secs(10),
             edge_pause: Duration::from_secs(2),
             open: OpenOptions::default(),
@@ -147,8 +149,9 @@ async fn busy_wait(
 ) -> Result<(), ToolCallResult> {
     let since = *retries.busy_since.get_or_insert_with(Instant::now);
     let Some(wait) = capped(after, since, budgets.busy, budgets.max_sleep) else {
+        // The last refusal's message says why, e.g. "the sandbox is paused: checkpoint (turn_end)".
         return Err(ToolCallResult::error(format!(
-            "hands unavailable: the sandbox stayed busy for {}s ({message})",
+            "hands unavailable: the sandbox stayed busy for {}s (last: {message})",
             budgets.busy.as_secs()
         )));
     };
@@ -168,7 +171,13 @@ async fn connect(
 ) -> Result<(HandsConn, Epoch, u64), ToolCallResult> {
     loop {
         let (target, generation) = ensure_target(agent, cancel, budgets).await?;
-        let e = match nest_hands_client::open(&target, &budgets.open).await {
+        // A bind may take the whole bind timeout (a frozen guest behind a gateway that can't
+        // tell); an interrupt doesn't wait for it.
+        let opened = tokio::select! {
+            r = nest_hands_client::open(&target, &budgets.open) => r,
+            _ = cancel.cancelled() => return Err(ToolCallResult::error("interrupted")),
+        };
+        let e = match opened {
             // The epoch every request carries is the binding's, the one the gateway checks.
             Ok(c) => match c.epoch() {
                 Some(epoch) => return Ok((c, epoch, generation)),
@@ -183,6 +192,10 @@ async fn connect(
             Next::RetrySame { after } => {
                 let msg = match &e {
                     OpenError::Refused(r) => r.message.clone(),
+                    OpenError::Timeout(_) => format!(
+                        "the gateway took the bind but answered nothing within {}s: the guest is paused or slow",
+                        budgets.open.bind_timeout.as_secs()
+                    ),
                     other => other.to_string(),
                 };
                 busy_wait(retries, after, budgets, cancel, &msg).await?;
@@ -694,6 +707,106 @@ mod tests {
         assert!(r.is_error);
         assert!(text_of(&r).contains("stayed busy"), "{r:?}");
         assert!(started.elapsed() < quick().busy + Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    /// The default busy budget outlasts a checkpoint's pause as the incident of 2026-11-02 saw it
+    /// (39 s, 32 GiB), with a full bind timeout and a pause hint on top: a call that starts just
+    /// as the pause does still finds the VM running before the budget ends. Every sleep stays
+    /// capped, so an interrupt or the budget still ends a wait promptly.
+    #[test]
+    fn the_default_busy_budget_covers_a_checkpoints_pause() {
+        use nest_protocol::gateway::{CLIENT_BIND_TIMEOUT_MS, PAUSED_RETRY_AFTER_MS};
+        let b = Budgets::default();
+        let incident_pause = Duration::from_secs(40);
+        let slack = Duration::from_millis(CLIENT_BIND_TIMEOUT_MS) + Duration::from_millis(PAUSED_RETRY_AFTER_MS);
+        assert!(b.busy >= incident_pause + slack, "busy {:?}", b.busy);
+        assert_eq!(b.open.bind_timeout, Duration::from_millis(CLIENT_BIND_TIMEOUT_MS));
+        assert!(b.max_sleep <= Duration::from_secs(10), "a pause hint never parks a call for long");
+    }
+
+    /// A call that meets a paused VM (nestd's pause on the gateway) waits it out within the busy
+    /// budget and runs once the VM runs again: the incident's call, scaled down (a 1.2 s pause
+    /// inside a 4 s budget for the 40 s pause inside 120 s).
+    #[tokio::test]
+    async fn a_call_waits_out_a_checkpoints_pause_then_runs() {
+        let (gw, guest) = gateway_with_guest().await;
+        guest.freeze(true).await;
+        gw.set_paused(SBX, 4, &guest.path, &[AGENT], Some("checkpoint (turn_end)"));
+        let (agent, resolves) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
+        let (state, path) = (gw.state.clone(), guest.path.clone());
+        let pause = Duration::from_millis(1200);
+        let g2 = guest.log_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            g2.lock().await.frozen = false;
+            TestGateway::configure(&state, SBX, 4, &path, &[AGENT]);
+        });
+        let budgets = Budgets { busy: Duration::from_secs(4), ..quick() };
+        let started = Instant::now();
+        let r = call_with(&agent, "c1".into(), bash("echo hi"), &CancellationToken::new(), &budgets).await;
+        assert!(!r.is_error, "{r:?}");
+        assert!(started.elapsed() >= pause, "it ran only after the pause: {:?}", started.elapsed());
+        assert_eq!(guest.requests().await.len(), 1, "once, after the pause");
+        assert_eq!(*resolves.lock().unwrap(), 1, "busy keeps the target");
+    }
+
+    /// A pause longer than the budget ends the call with a message that says the sandbox was
+    /// checkpointing, not "bind timed out"; nothing reached the guest.
+    #[tokio::test]
+    async fn a_pause_past_the_budget_gives_up_saying_the_sandbox_was_checkpointing() {
+        let (gw, guest) = gateway_with_guest().await;
+        guest.freeze(true).await;
+        gw.set_paused(SBX, 4, &guest.path, &[AGENT], Some("checkpoint (turn_end)"));
+        let (agent, _) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
+        let started = Instant::now();
+        let r = call_with(&agent, "c1".into(), bash("echo hi"), &CancellationToken::new(), &quick()).await;
+        assert!(r.is_error);
+        let text = text_of(&r);
+        assert!(text.contains("stayed busy") && text.contains("paused: checkpoint (turn_end)"), "{r:?}");
+        assert!(started.elapsed() < quick().busy + Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert!(guest.requests().await.is_empty());
+    }
+
+    /// A gateway that can't tell the VM is paused (nestd of the previous release): the guest's
+    /// vsock stays silent, the gateway answers `busy` after its own timer (the client's is longer),
+    /// and the call retries and runs once the guest thaws. Real timers: about 5 s.
+    #[tokio::test]
+    async fn a_silent_guest_is_the_gateways_busy_and_the_call_retries() {
+        let (gw, guest) = gateway_with_guest().await;
+        guest.freeze(true).await;
+        let (agent, resolves) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
+        let g2 = guest.log_handle();
+        tokio::spawn(async move {
+            // Past the gateway's guest-connect timer, so the first bind is refused.
+            tokio::time::sleep(Duration::from_millis(nest_protocol::gateway::GUEST_CONNECT_TIMEOUT_MS + 500)).await;
+            g2.lock().await.frozen = false;
+        });
+        let budgets = Budgets { busy: Duration::from_secs(30), open: OpenOptions::default(), ..quick() };
+        let started = Instant::now();
+        let r = call_with(&agent, "c1".into(), bash("echo hi"), &CancellationToken::new(), &budgets).await;
+        assert!(!r.is_error, "{r:?}");
+        assert!(started.elapsed() >= Duration::from_millis(nest_protocol::gateway::GUEST_CONNECT_TIMEOUT_MS), "{:?}", started.elapsed());
+        assert_eq!(guest.requests().await.len(), 1);
+        assert_eq!(*resolves.lock().unwrap(), 1);
+    }
+
+    /// An interrupt during a bind that would take the whole bind timeout ends the call at once.
+    #[tokio::test]
+    async fn an_interrupt_during_a_slow_bind_ends_the_call_at_once() {
+        let (gw, guest) = gateway_with_guest().await;
+        guest.freeze(true).await;
+        let (agent, _) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
+        let tx = CancellationToken::new();
+        let rx = tx.clone();
+        let a2 = agent.clone();
+        let budgets = Budgets { open: OpenOptions::default(), ..quick() };
+        let h = tokio::spawn(async move { call_with(&a2, "c1".into(), bash("echo hi"), &rx, &budgets).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let at = Instant::now();
+        tx.cancel();
+        let r = h.await.unwrap();
+        assert!(text_of(&r).contains("interrupted"), "{r:?}");
+        assert!(at.elapsed() < Duration::from_secs(2), "took {:?} (the gateway's timer is 5 s)", at.elapsed());
     }
 
     #[tokio::test]

@@ -31,11 +31,13 @@ pub fn install_executable(path: &Path, contents: impl AsRef<[u8]>) {
 }
 
 #[derive(Default)]
-struct GuestLog {
+pub struct GuestLog {
     requests: Vec<HandsRequest>,
     cancelled: Vec<String>,
     /// The next this many requests are refused `busy` before anything runs (a guest not configured yet).
     busy_left: usize,
+    /// A paused VM: `CONNECT` is read and answered only once this is cleared.
+    pub frozen: bool,
 }
 
 /// A fake guest agent behind a hybrid-vsock-style unix socket (`CONNECT 1025\n` → `OK n\n`).
@@ -78,6 +80,17 @@ impl FakeGuest {
     pub async fn refuse_busy(&self, n: usize) {
         self.log.lock().await.busy_left = n;
     }
+
+    /// The guest's shared state, for a task that thaws it later (`frozen`).
+    pub fn log_handle(&self) -> Arc<Mutex<GuestLog>> {
+        self.log.clone()
+    }
+
+    /// Freeze or thaw the guest as a paused VM is: while frozen, a `CONNECT` gets no answer
+    /// until the thaw (by which time the gateway has given up on it).
+    pub async fn freeze(&self, frozen: bool) {
+        self.log.lock().await.frozen = frozen;
+    }
 }
 
 async fn serve(mut s: tokio::net::UnixStream, log: Arc<Mutex<GuestLog>>) {
@@ -95,6 +108,9 @@ async fn serve(mut s: tokio::net::UnixStream, log: Arc<Mutex<GuestLog>>) {
     let port = guest::handshake::parse_connect_line(&String::from_utf8_lossy(&line));
     if port != Some(guest::PORT_HANDS) {
         return;
+    }
+    while log.lock().await.frozen {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let _ = s.write_all(guest::handshake::ok_line(1_073_741_824).as_bytes()).await;
     let Ok(frame) = framing::read_guest(&mut s).await else { return };
@@ -213,6 +229,19 @@ pub mod gateway {
                 PathBuf::from(vsock_uds_path),
                 clients.iter().map(|c| c.to_string()).collect::<BTreeSet<_>>(),
                 None,
+            );
+        }
+
+        /// What nestd's `sandbox_upsert` says around a commit's pause: `Some(reason)` while the VM
+        /// is paused (binds get `busy` at once), `None` once it runs again.
+        pub fn set_paused(&self, sandbox: &str, epoch: u64, vsock_uds_path: &str, clients: &[&str], reason: Option<&str>) {
+            self.state.upsert_sandbox_paused(
+                SandboxId(sandbox.into()),
+                Epoch(epoch),
+                PathBuf::from(vsock_uds_path),
+                clients.iter().map(|c| c.to_string()).collect::<BTreeSet<_>>(),
+                Some(GuestInfo { protocol_version: nest_protocol::guest::PROTOCOL_VERSION, capabilities: vec![] }),
+                reason.map(|r| nest_protocol::host::gateway_link::SandboxPause { reason: r.into() }),
             );
         }
 

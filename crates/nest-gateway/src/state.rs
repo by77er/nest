@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use nest_protocol::gateway::{BindingClaims, GuestInfo, close_code};
+use nest_protocol::host::gateway_link::SandboxPause;
 use nest_protocol::model::{Epoch, SandboxId};
 use tokio::sync::watch;
 
@@ -19,6 +20,9 @@ pub struct SandboxEntry {
     pub clients: BTreeSet<String>,
     /// `None` until the guest's hello arrived: bindings get `busy`.
     pub guest: Option<GuestInfo>,
+    /// `Some` while nestd has the VM paused (a commit): bindings get `busy` with a short hint
+    /// instead of a vsock connect that would hang until the VM runs again.
+    pub paused: Option<SandboxPause>,
     /// Resync generation this entry was last (re)sent in; entries older than the current one
     /// are dropped at `resync_done`.
     generation: u64,
@@ -126,6 +130,21 @@ impl State {
         clients: impl IntoIterator<Item = impl Into<String>>,
         guest: Option<GuestInfo>,
     ) {
+        self.upsert_sandbox_paused(sandbox, epoch, vsock_uds_path, clients, guest, None);
+    }
+
+    /// [`State::upsert_sandbox`] with the VM's pause, as nestd's `sandbox_upsert` carries it: one
+    /// entry replaced under one lock, so no bind sees the new entry with the old pause. A pause
+    /// cuts no open connection; their guest streams stall and resume with the VM.
+    pub fn upsert_sandbox_paused(
+        &self,
+        sandbox: SandboxId,
+        epoch: Epoch,
+        vsock_uds_path: PathBuf,
+        clients: impl IntoIterator<Item = impl Into<String>>,
+        guest: Option<GuestInfo>,
+        paused: Option<SandboxPause>,
+    ) {
         let clients: BTreeSet<String> = clients.into_iter().map(Into::into).collect();
         let mut g = self.write();
         let generation = g.generation;
@@ -136,7 +155,14 @@ impl State {
             tracing::error!(sandbox = %sandbox.0, held = old.0, sent = epoch.0, "refusing an epoch older than the one held");
             return;
         }
-        g.sandboxes.insert(sandbox.clone(), SandboxEntry { epoch, vsock_uds_path, clients, guest, generation });
+        let was_paused = g.sandboxes.get(&sandbox).is_some_and(|e| e.epoch == epoch && e.paused.is_some());
+        if was_paused != paused.is_some() {
+            match &paused {
+                Some(p) => tracing::info!(sandbox = %sandbox.0, epoch = epoch.0, reason = %p.reason, "sandbox paused: binds get busy"),
+                None => tracing::info!(sandbox = %sandbox.0, epoch = epoch.0, "sandbox running again"),
+            }
+        }
+        g.sandboxes.insert(sandbox.clone(), SandboxEntry { epoch, vsock_uds_path, clients, guest, paused, generation });
         if let Some(old) = old_epoch
             && old != epoch
         {

@@ -1182,6 +1182,7 @@ name = "nest-hands-client"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "nest-gateway",
  "nest-protocol",
  "rustls",
  "serde",

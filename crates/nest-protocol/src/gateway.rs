@@ -33,6 +33,21 @@ pub const ROUTE_HANDS: &str = "/hands";
 pub const ROUTE_PTY: &str = "/pty";
 pub const ROUTE_INGRESS_PREFIX: &str = "/ingress/";
 
+/// The bind timers, set together (`docs/interfaces/gateway/#timers`). The gateway waits at most
+/// [`GUEST_CONNECT_TIMEOUT_MS`] for the guest's vsock `CONNECT` answer and then refuses the bind
+/// as a retryable `busy`; a client waits [`CLIENT_BIND_TIMEOUT_MS`] from sending `bind`, which
+/// exceeds the gateway's timer by at least [`BIND_TIMEOUT_MARGIN_MS`] (the edge, the tunnel and
+/// the token check), so a slow or frozen guest reaches the client as that `busy`, not as a
+/// timeout of the client's own.
+pub const GUEST_CONNECT_TIMEOUT_MS: u64 = 5_000;
+pub const CLIENT_BIND_TIMEOUT_MS: u64 = 10_000;
+pub const BIND_TIMEOUT_MARGIN_MS: u64 = 5_000;
+const _: () = assert!(CLIENT_BIND_TIMEOUT_MS >= GUEST_CONNECT_TIMEOUT_MS + BIND_TIMEOUT_MARGIN_MS);
+
+/// The `retry_after_ms` of the `busy` a gateway answers while nestd has the sandbox's VM paused
+/// (a checkpoint's or suspend's commit): short, since a pause ends with its commit.
+pub const PAUSED_RETRY_AFTER_MS: u64 = 2_000;
+
 /// Everything a client needs to reach one sandbox's hands. Issued by SandboxDO (`resolve`) and
 /// carried to the runner only over the session channel (`hands_resolved`), never through
 /// FleetDO, nestd or any command at rest: a bearer token travels AgentDO → runner, nowhere else.

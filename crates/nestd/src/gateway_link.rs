@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::gateway::{BindingKey, GuestInfo};
 use nest_protocol::host::PROTOCOL_VERSION;
-use nest_protocol::host::gateway_link::{GatewayCommand, GatewayEvent};
+use nest_protocol::host::gateway_link::{GatewayCommand, GatewayEvent, SandboxPause};
 use nest_protocol::model::{Epoch, HostId, SandboxId};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -66,6 +66,11 @@ pub struct Entry {
 struct State {
     keys: Vec<BindingKey>,
     sandboxes: BTreeMap<SandboxId, Entry>,
+    /// Sandboxes whose VM the host core has paused (`set_paused`), at the epoch of the entry the
+    /// mark was set on, sent with their upserts so binds get `busy` at once. Kept apart from
+    /// [`Entry`]: a lifecycle upsert (an attach, a guest hello) never clears a pause, only the
+    /// core's own unpause, a `forget`, or an upsert of another epoch does.
+    paused: BTreeMap<SandboxId, (Epoch, SandboxPause)>,
     /// The host's fenced epochs (shared with the proxy link; the host core writes them): an upsert
     /// at or below one is refused, so a late `gateway_sync` after a fence can't re-add the sandbox.
     tombstones: crate::tombstones::Tombstones,
@@ -159,9 +164,53 @@ impl GatewayLink {
             if st.sandboxes.get(&sandbox) == Some(&entry) {
                 return;
             }
+            // A mark belongs to one incarnation: another epoch's entry starts running.
+            if st.paused.get(&sandbox).is_some_and(|(e, _)| *e != entry.epoch) {
+                st.paused.remove(&sandbox);
+            }
             st.sandboxes.insert(sandbox.clone(), entry.clone());
         }
-        self.send(GatewayCommand::SandboxUpsert { sandbox, epoch: entry.epoch, vsock_uds_path: entry.vsock_uds_path, clients: entry.clients, guest: entry.guest });
+        self.send_upsert(&sandbox);
+    }
+
+    /// Mark `sandbox@epoch`'s VM paused (`Some`: binds get `busy` with a hint) or running
+    /// (`None`), and tell the gateway. A mark is kept only on the entry the gateway has at that
+    /// epoch: none for a sandbox it doesn't have (booting, suspended, or forgotten by a fence that
+    /// raced the pause), so no mark outlives its incarnation. A repeated mark sends nothing.
+    pub fn set_paused(&self, sandbox: &SandboxId, epoch: Epoch, pause: Option<SandboxPause>) {
+        {
+            let mut st = self.state.lock().expect("gateway state");
+            let changed = match pause {
+                Some(p) => {
+                    if st.sandboxes.get(sandbox).is_none_or(|e| e.epoch != epoch) {
+                        return;
+                    }
+                    st.paused.insert(sandbox.clone(), (epoch, p.clone())).as_ref() != Some(&(epoch, p))
+                }
+                // Only this epoch's own mark: an older incarnation never lifts a newer one's.
+                None if st.paused.get(sandbox).is_some_and(|(e, _)| *e == epoch) => st.paused.remove(sandbox).is_some(),
+                None => false,
+            };
+            if !changed || !st.sandboxes.contains_key(sandbox) {
+                return;
+            }
+        }
+        self.send_upsert(sandbox);
+    }
+
+    /// The sandbox's pause mark, if any (tests and logs).
+    pub fn paused(&self, sandbox: &SandboxId) -> Option<SandboxPause> {
+        self.state.lock().expect("gateway state").paused.get(sandbox).map(|(_, p)| p.clone())
+    }
+
+    /// Send the mirror's entry for `sandbox`, with its pause, under the lock that reads them.
+    fn send_upsert(&self, sandbox: &SandboxId) {
+        let st = self.state.lock().expect("gateway state");
+        let Some(e) = st.sandboxes.get(sandbox) else { return };
+        let cmd = upsert_command(sandbox, e, st.paused.get(sandbox).map(|(_, p)| p));
+        if let Some(c) = &st.conn {
+            let _ = c.send(cmd);
+        }
     }
 
     /// Drop the sandbox from the gateway (its open calls close). On its own this leaves no
@@ -169,14 +218,29 @@ impl GatewayLink {
     /// at the same epoch. A fence records the epoch in the host's tombstones first, which keeps
     /// every later upsert at or below it out.
     pub fn forget(&self, sandbox: &SandboxId) {
-        if self.state.lock().expect("gateway state").sandboxes.remove(sandbox).is_none() {
-            return;
+        {
+            let mut st = self.state.lock().expect("gateway state");
+            st.paused.remove(sandbox);
+            if st.sandboxes.remove(sandbox).is_none() {
+                return;
+            }
         }
         self.send(GatewayCommand::SandboxRemove { sandbox: sandbox.clone() });
     }
 
     pub fn entry(&self, sandbox: &SandboxId) -> Option<Entry> {
         self.state.lock().expect("gateway state").sandboxes.get(sandbox).cloned()
+    }
+}
+
+fn upsert_command(sandbox: &SandboxId, e: &Entry, paused: Option<&SandboxPause>) -> GatewayCommand {
+    GatewayCommand::SandboxUpsert {
+        sandbox: sandbox.clone(),
+        epoch: e.epoch,
+        vsock_uds_path: e.vsock_uds_path.clone(),
+        clients: e.clients.clone(),
+        guest: e.guest.clone(),
+        paused: paused.cloned(),
     }
 }
 
@@ -204,13 +268,7 @@ async fn serve(mut framed: Framed<tokio::net::UnixStream, LengthDelimitedCodec>,
         let _ = tx.send(GatewayCommand::HelloAck { protocol_version: PROTOCOL_VERSION, host_id });
         let _ = tx.send(GatewayCommand::KeyUpdate { keys: st.keys.clone() });
         for (sandbox, e) in &st.sandboxes {
-            let _ = tx.send(GatewayCommand::SandboxUpsert {
-                sandbox: sandbox.clone(),
-                epoch: e.epoch,
-                vsock_uds_path: e.vsock_uds_path.clone(),
-                clients: e.clients.clone(),
-                guest: e.guest.clone(),
-            });
+            let _ = tx.send(upsert_command(sandbox, e, st.paused.get(sandbox).map(|(_, p)| p)));
         }
         let _ = tx.send(GatewayCommand::ResyncDone);
         st.conn = Some(tx.clone());
@@ -342,6 +400,72 @@ mod tests {
         assert!(matches!(read(&mut f).await, GatewayCommand::HelloAck { .. }));
         assert!(matches!(read(&mut f).await, GatewayCommand::KeyUpdate { keys } if keys.is_empty()));
         assert!(matches!(read(&mut f).await, GatewayCommand::ResyncDone));
+    }
+
+    /// The host core's pause mark rides on the sandbox's upserts: set and lifted once each (a
+    /// repeated mark sends nothing), kept across a lifecycle upsert (an attach while paused stays
+    /// paused) and replayed on reconnect; `forget` drops it, so a sandbox that comes back runs.
+    #[tokio::test]
+    async fn a_pause_rides_on_the_upserts_until_lifted_or_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.sock");
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let link = GatewayLink::start(&path, HostId("hst_1".into()), crate::proxy_link::Access::default(), Default::default(), ntx).unwrap();
+        let sbx = SandboxId("sbx_1".into());
+        let guest = GuestInfo { protocol_version: 1, capabilities: vec![] };
+        let mut f = connect(&path).await;
+        for _ in 0..3 {
+            let _ = read(&mut f).await; // hello_ack, key_update, resync_done
+        }
+        link.upsert(sbx.clone(), entry(1, &[], Some(guest.clone())));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { paused: None, .. }));
+        let pause = SandboxPause { reason: "checkpoint (turn_end)".into() };
+        link.set_paused(&sbx, Epoch(1), Some(pause.clone()));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { paused: Some(p), .. } if p == pause));
+        link.set_paused(&sbx, Epoch(1), Some(pause.clone())); // the same mark: nothing sent
+        link.upsert(sbx.clone(), entry(1, &["agt_a"], Some(guest.clone())));
+        assert!(
+            matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { clients, paused: Some(_), .. } if clients == vec!["agt_a".to_string()]),
+            "an attach while paused keeps the pause"
+        );
+
+        // A reconnecting gateway hears the pause in the replay.
+        drop(f);
+        assert!(matches!(nrx.recv().await, Some(GatewayNotice::Connected { .. })));
+        assert!(matches!(nrx.recv().await, Some(GatewayNotice::Disconnected)));
+        let mut f = connect(&path).await;
+        assert!(matches!(read(&mut f).await, GatewayCommand::HelloAck { .. }));
+        assert!(matches!(read(&mut f).await, GatewayCommand::KeyUpdate { .. }));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { paused: Some(_), .. }), "replayed paused");
+        assert!(matches!(read(&mut f).await, GatewayCommand::ResyncDone));
+
+        link.set_paused(&sbx, Epoch(1), None);
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { paused: None, .. }));
+        link.set_paused(&sbx, Epoch(1), None); // already running: nothing sent
+
+        // Forgotten while paused (a suspend's commit landed): back later, it runs.
+        link.set_paused(&sbx, Epoch(1), Some(pause.clone()));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { paused: Some(_), .. }));
+        link.forget(&sbx);
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxRemove { .. }));
+        assert_eq!(link.paused(&sbx), None);
+        link.upsert(sbx.clone(), entry(1, &["agt_a"], Some(guest.clone())));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { paused: None, .. }));
+
+        // A mark is never kept without its entry (a fence forgot the sandbox while a checkpoint
+        // was about to pause it), nor carried to another epoch.
+        link.forget(&sbx);
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxRemove { .. }));
+        link.set_paused(&sbx, Epoch(1), Some(pause.clone()));
+        assert_eq!(link.paused(&sbx), None, "no entry, no mark");
+        link.upsert(sbx.clone(), entry(2, &["agt_a"], Some(guest.clone())));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { epoch: Epoch(2), paused: None, .. }));
+        link.set_paused(&sbx, Epoch(1), Some(pause.clone()));
+        assert_eq!(link.paused(&sbx), None, "a mark for an older epoch is not kept");
+        link.set_paused(&sbx, Epoch(2), Some(pause.clone()));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { epoch: Epoch(2), paused: Some(_), .. }));
+        link.upsert(sbx.clone(), entry(3, &["agt_a"], Some(guest)));
+        assert!(matches!(read(&mut f).await, GatewayCommand::SandboxUpsert { epoch: Epoch(3), paused: None, .. }), "a newer epoch runs");
     }
 
     /// A fence tombstones the epoch in the host's one map, which this link and the proxy link

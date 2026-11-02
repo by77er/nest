@@ -2520,3 +2520,58 @@ fn install_executable(path: &Path, contents: impl AsRef<[u8]>) {
     std::fs::remove_file(&staging).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// The pause marks of 2026-11-02's fix: while a commit holds the VM paused with the sandbox still
+/// placed here, the gateway hears it (binds get `busy` at once instead of hanging on the frozen
+/// guest's vsock). A checkpoint's mark is up while the VM is paused (held here at its resume) and
+/// lifted only once it runs again; a suspend's stays up until the sandbox is removed; a failed
+/// suspend lifts it when its VM runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commits_pause_is_marked_at_the_gateway_until_the_vm_runs_or_leaves() {
+    let h = start_host_opts(None, 400).await;
+    let sbx = SandboxId("sbx_1".into());
+    let paused = |g: &FakeGateway| match last_gateway_word(g, "sbx_1") {
+        Some(GatewayCommand::SandboxUpsert { paused, .. }) => Some(paused.map(|p| p.reason)),
+        _ => None,
+    };
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    wait_until("the gateway has the running sandbox", || paused(&h.gateway) == Some(None)).await;
+
+    // A checkpoint: marked while paused, lifted only after the resume.
+    h.vm.resume_latch.held.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    wait_until("the checkpoint resumes its VM", || h.vm.resume_latch.reached.load(Ordering::SeqCst)).await;
+    assert_eq!(paused(&h.gateway), Some(Some("checkpoint (turn_end)".into())), "the paused VM is marked");
+    h.vm.resume_latch.held.store(false, Ordering::SeqCst);
+    h.vm.resume_latch.release.notify_waiters();
+    assert!(is_ok(&h.fleet.result("cmd_ck").await));
+    wait_until("the mark is lifted once the VM runs", || paused(&h.gateway) == Some(None)).await;
+
+    // A suspend whose commit fails (its answer is lost): marked, then lifted by the rollback.
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    let mark = h.gateway.got.lock().unwrap().len();
+    h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_1", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_suspend_1").await));
+    wait_until("running again", || last_state(&h.fleet, "sbx_1") == Some(SandboxState::Running)).await;
+    let since: Vec<Option<String>> = h.gateway.got.lock().unwrap()[mark..]
+        .iter()
+        .filter_map(|c| match c {
+            GatewayCommand::SandboxUpsert { sandbox, paused, .. } if sandbox == &sbx => Some(paused.clone().map(|p| p.reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(since, vec![Some("suspend".to_string()), None], "marked for the suspend, lifted by its rollback");
+
+    // A suspend that lands: marked until the sandbox leaves the gateway.
+    h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_2", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_suspend_2").await));
+    let got = h.gateway.got.lock().unwrap().clone();
+    let words: Vec<&GatewayCommand> = got
+        .iter()
+        .filter(|c| matches!(c, GatewayCommand::SandboxUpsert { sandbox: s, .. } | GatewayCommand::SandboxRemove { sandbox: s } if s == &sbx))
+        .collect();
+    let n = words.len();
+    assert!(matches!(words[n - 1], GatewayCommand::SandboxRemove { .. }), "{words:?}");
+    assert!(matches!(words[n - 2], GatewayCommand::SandboxUpsert { paused: Some(p), .. } if p.reason == "suspend"), "{words:?}");
+}
