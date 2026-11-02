@@ -15,7 +15,7 @@ import type { AgentCaller } from "../identity";
 import { backoff, NestError, nestFrom, type Nest } from "../nest";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
-import { pickForAssignment, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition } from "../tasks";
+import { canBlock, canUnblock, pickForAssignment, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition } from "../tasks";
 import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
 import { randomId } from "./directory";
@@ -64,9 +64,24 @@ export interface Task {
   tainted: boolean;
   /** GitHub's auto-merge on its PR, while the project's `auto_merge` is on; null when never asked. */
   auto_merge: TaskAutoMerge | null;
+  /** Set while an agent has the task waiting on the owner (README.md#blocked). */
+  blocked: Blocked | null;
   created_ms: number;
   updated_ms: number;
 }
+
+/** Who blocked a task, when, why, and what they ask the owner. */
+export interface Blocked {
+  at_ms: number;
+  by: string;
+  role: "manager" | "worker";
+  reason: string;
+  question: string | null;
+  tainted: boolean;
+}
+
+/** One thing waiting on the owner: an agent's ask (nest's), or a blocked task. Oldest first. */
+export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked);
 
 export interface HistoryRow {
   at_ms: number;
@@ -151,6 +166,18 @@ const MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN am_next_ms INTEGER",
     "ALTER TABLE tasks ADD COLUMN am_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN am_status TEXT",
+  ],
+  [
+    // Blocked (README.md#blocked): a flag on a task, with who set it, why and what they ask the owner;
+    // and the messages owed to agents' inboxes besides the manager's chat.
+    "ALTER TABLE tasks ADD COLUMN blocked_ms INTEGER",
+    "ALTER TABLE tasks ADD COLUMN blocked_by TEXT",
+    "ALTER TABLE tasks ADD COLUMN blocked_role TEXT",
+    "ALTER TABLE tasks ADD COLUMN blocked_reason TEXT",
+    "ALTER TABLE tasks ADD COLUMN blocked_question TEXT",
+    "ALTER TABLE tasks ADD COLUMN blocked_tainted INTEGER",
+    `CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, to_agent TEXT NOT NULL, text TEXT NOT NULL, relayed INTEGER NOT NULL,
+      at_ms INTEGER NOT NULL, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   ],
 ] as const;
 
@@ -237,7 +264,7 @@ export class ProjectDO extends DurableObject<Env> {
     return {
       id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null,
       state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null, pr: (r.pr as number | null) ?? null,
-      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, auto_merge: taskAutoMerge(r),
+      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, auto_merge: taskAutoMerge(r), blocked: blockedOf(r),
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
   }
@@ -311,6 +338,11 @@ export class ProjectDO extends DurableObject<Env> {
     if (!t.ok) return fail(409, t.error);
     this.sql.exec("UPDATE tasks SET state = ?, updated_ms = ? WHERE id = ?", t.to, Date.now(), id);
     this.record(id, actor, event, detail);
+    // A task that ends has nothing left to wait on the owner for.
+    if (TERMINAL.has(t.to) && r.blocked_ms !== null) {
+      this.clearBlock(id);
+      this.record(id, { kind: "app", what: "board" }, "unblocked", { why: t.to });
+    }
     return ok({ from, to: t.to });
   }
 
@@ -358,8 +390,8 @@ export class ProjectDO extends DurableObject<Env> {
   private autoAssign(): void {
     const s = this.settings();
     if (!s?.auto_assign) return;
-    const tasks = this.sql.exec("SELECT id, state, ord FROM tasks WHERE state = 'ready'").toArray()
-      .map((r) => ({ id: r.id as string, state: r.state as TaskState, ord: r.ord as number }));
+    const tasks = this.sql.exec("SELECT id, state, ord, blocked_ms FROM tasks WHERE state = 'ready'").toArray()
+      .map((r) => ({ id: r.id as string, state: r.state as TaskState, ord: r.ord as number, blocked: r.blocked_ms !== null }));
     for (const id of pickForAssignment(tasks, this.liveWorkers(), s.max_workers)) this.assignNow(id, { kind: "app", what: "auto-assign" });
   }
 
@@ -496,6 +528,98 @@ export class ProjectDO extends DurableObject<Env> {
     if (Date.now() - Math.max(...seen) < REPO_READ_EVERY_MS) return;
     this.sql.exec("UPDATE settings SET am_read_next_ms = ?, am_read_attempts = 0", Date.now());
     await this.arm();
+  }
+
+  // --- blocked --------------------------------------------------------------------------------------
+
+  private clearBlock(id: string): void {
+    this.sql.exec("UPDATE tasks SET blocked_ms = NULL, blocked_by = NULL, blocked_role = NULL, blocked_reason = NULL, blocked_question = NULL, blocked_tainted = NULL WHERE id = ?", id);
+  }
+
+  /** Owe an agent's inbox a message; `relayed` when its text came from a tainted session (nest's rule). */
+  private oweMessage(agent: string, text: string, relayed: boolean): void {
+    this.sql.exec("INSERT INTO messages (to_agent, text, relayed, at_ms, next_ms) VALUES (?, ?, ?, ?, ?)", agent, text, relayed ? 1 : 0, Date.now(), Date.now());
+  }
+
+  /**
+   * An agent marks a task blocked (README.md#blocked): the manager any task, a worker its own (the
+   * caller passes its labels' task). A worker's block is told to the manager.
+   */
+  private async block(id: string, caller: AgentCaller, by: "manager" | "worker", reason: string, question: string | null): Promise<Result<Task>> {
+    const r = this.taskRow(id);
+    if (!r) return fail(404, "unknown task");
+    if (by === "worker" && r.assignee !== caller.agent) return fail(403, "only the task's own worker may block it");
+    const may = canBlock(r.state as TaskState, r.blocked_ms !== null, by);
+    if (!may.ok) return fail(409, may.error);
+    this.sql.exec(
+      "UPDATE tasks SET blocked_ms = ?, blocked_by = ?, blocked_role = ?, blocked_reason = ?, blocked_question = ?, blocked_tainted = ?, updated_ms = ? WHERE id = ?",
+      Date.now(), caller.agent, by, reason, question, caller.tainted ? 1 : 0, Date.now(), id,
+    );
+    this.record(id, { kind: "agent", agent: caller.agent, tainted: caller.tainted }, "blocked", { reason, ...(question ? { question } : {}) });
+    const manager = this.settings()!.manager;
+    if (by === "worker" && manager) {
+      this.oweMessage(manager, [
+        `Worker ${caller.agent} blocked task ${id} ("${r.title as string}"). The owner sees it on the board.`,
+        `Reason: ${reason}`, ...(question ? [`Question for the owner: ${question}`] : []),
+      ].join("\n"), caller.tainted);
+    }
+    await this.arm();
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  /** The manager, or the task's own worker, clears its block. */
+  private async unblock(id: string, caller: AgentCaller, note: string | null): Promise<Result<Task>> {
+    const r = this.taskRow(id);
+    if (!r) return fail(404, "unknown task");
+    if (caller.role === "worker" && r.assignee !== caller.agent) return fail(403, "only the task's own worker may clear its block");
+    const may = canUnblock(r.blocked_ms !== null);
+    if (!may.ok) return fail(409, may.error);
+    this.clearBlock(id);
+    this.record(id, { kind: "agent", agent: caller.agent, tainted: caller.tainted }, "unblocked", note ? { note } : undefined);
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  /**
+   * The owner answers a blocked task: the block clears, and the answer goes to the agent that blocked
+   * it, and to the manager too when a worker did.
+   */
+  async answerBlocked(id: string, answer: string): Promise<Result<Task>> {
+    const s = this.settings();
+    if (!s) return fail(404, "unknown project");
+    const r = this.taskRow(id);
+    if (!r) return fail(404, "unknown task");
+    const may = canUnblock(r.blocked_ms !== null);
+    if (!may.ok) return fail(409, may.error);
+    const by = r.blocked_by as string;
+    // The owner's words and the task's id only: nothing an agent wrote, so nothing relayed.
+    this.oweMessage(by, `The owner answered your block on task ${id}:\n${answer}`, false);
+    if (r.blocked_role === "worker" && s.manager && s.manager !== by) {
+      this.oweMessage(s.manager, `The owner answered the block worker ${by} raised on task ${id}:\n${answer}`, false);
+    }
+    this.clearBlock(id);
+    this.record(id, { kind: "owner" }, "block_answered", { answer, to: by });
+    await this.arm();
+    await this.drain();
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  /** What's waiting on the owner: open asks and blocked tasks, together, oldest first. */
+  async attention(): Promise<Result<Attention[]>> {
+    const asks = await this.asks();
+    if (!asks.ok) return asks;
+    const blocked = this.sql.exec(`${TASK_SELECT} WHERE t.blocked_ms IS NOT NULL`).toArray().map((r): Attention => ({
+      kind: "blocked", task: r.id as string, title: r.title as string, state: r.state as TaskState, ...blockedOf(r)!,
+    }));
+    const open = asks.value.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
+    return ok([...open, ...blocked].sort((a, b) => a.at_ms - b.at_ms));
+  }
+
+  /** How many things wait on the owner (the projects list's count). */
+  async attentionCount(): Promise<number> {
+    if (!this.settings()) return 0;
+    return this.sql.exec<{ n: number }>(
+      "SELECT (SELECT COUNT(*) FROM asks WHERE answered_ms IS NULL) + (SELECT COUNT(*) FROM tasks WHERE blocked_ms IS NOT NULL) AS n",
+    ).one().n;
   }
 
   // --- chat and approvals ----------------------------------------------------------------------------
@@ -646,6 +770,10 @@ export class ProjectDO extends DurableObject<Env> {
           return this.assign(a.task as string, actor, { wait: false });
         case "cancel_task":
           return this.cancel(a.task as string, actor, a.reason as string | undefined);
+        case "block_task":
+          return this.block(a.task as string, caller, "manager", a.reason as string, (a.question as string | undefined) ?? null);
+        case "unblock_task":
+          return this.unblock(a.task as string, caller, (a.note as string | undefined) ?? null);
       }
     }
     if (server === "task") {
@@ -659,10 +787,14 @@ export class ProjectDO extends DurableObject<Env> {
           return ok({ id: t.id, title: t.title, body: t.body, spec: t.spec, state: t.state, pr: t.pr, repo: this.settings()!.repo, branch: taskBranch(t.id) });
         }
         case "report_progress":
-        case "report_blocker":
           if (TERMINAL.has(r.state as TaskState)) return fail(409, `the task is ${r.state}`);
-          this.record(id, actor, tool === "report_progress" ? "progress" : "blocker", a.text as string);
+          this.record(id, actor, "progress", a.text as string);
           return ok({ recorded: true });
+        // Only its own task: the id is its labels', never an argument.
+        case "report_blocked":
+          return this.block(id, caller, "worker", a.reason as string, (a.question as string | undefined) ?? null);
+        case "clear_blocked":
+          return this.unblock(id, caller, (a.note as string | undefined) ?? null);
         case "report_pr": {
           const m = this.move(id, "pr_opened", actor, { pr: a.number });
           if (!m.ok) return m;
@@ -692,6 +824,7 @@ export class ProjectDO extends DurableObject<Env> {
       min(`SELECT MIN(t) AS t FROM (
         SELECT am_write_next_ms AS t FROM settings WHERE am_write_next_ms IS NOT NULL
         UNION ALL SELECT am_read_next_ms FROM settings WHERE am_read_next_ms IS NOT NULL
+        UNION ALL SELECT next_ms FROM messages WHERE next_ms IS NOT NULL
         UNION ALL SELECT t.am_next_ms FROM tasks t, settings s WHERE t.am_next_ms IS NOT NULL
           AND (t.am_owed = 'disable' OR (s.am_write_next_ms IS NULL AND s.am_write_error IS NULL)))`),
     ].filter((t): t is number => t !== null);
@@ -748,6 +881,7 @@ export class ProjectDO extends DurableObject<Env> {
     }
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
+    for (const r of this.sql.exec("SELECT seq FROM messages WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverMessage(nest, r.seq as number);
     await this.arm();
   }
 
@@ -925,6 +1059,20 @@ export class ProjectDO extends DurableObject<Env> {
     this.autoAssign();
   }
 
+  /** One message owed to an agent's inbox, posted once (its request id), retried until nest refuses it for good. */
+  private async deliverMessage(nest: Nest, seq: number): Promise<void> {
+    const row = this.sql.exec("SELECT to_agent, text, relayed, attempts FROM messages WHERE seq = ? AND next_ms IS NOT NULL", seq).toArray()[0];
+    if (!row) return;
+    try {
+      await nest.postInbox(row.to_agent as string, row.text as string, { requestId: `${this.settings()!.id}/message/${seq}`, ...(row.relayed === 1 ? { from: "projects/board" } : {}) });
+      this.sql.exec("UPDATE messages SET next_ms = NULL, error = NULL WHERE seq = ?", seq);
+    } catch (e) {
+      const attempts = (row.attempts as number) + 1;
+      const next = e instanceof NestError && e.permanent ? null : Date.now() + backoff(attempts);
+      this.sql.exec("UPDATE messages SET attempts = ?, next_ms = ?, error = ? WHERE seq = ?", attempts, next, message(e), seq);
+    }
+  }
+
   private async deliverChat(nest: Nest, seq: number): Promise<void> {
     const s = this.settings()!;
     const row = this.sql.exec("SELECT text, attempts FROM chat WHERE seq = ? AND next_ms IS NOT NULL", seq).toArray()[0];
@@ -948,6 +1096,15 @@ export class ProjectDO extends DurableObject<Env> {
 const clampWorkers = (n: number) => Math.max(0, Math.min(MAX_WORKERS_LIMIT, Math.floor(n)));
 /** How often looking at a project reads its repo's auto-merge setting again, at most. */
 const REPO_READ_EVERY_MS = 60_000;
+
+/** A task's block, from its row. */
+function blockedOf(r: Row): Blocked | null {
+  if (r.blocked_ms === null || r.blocked_ms === undefined) return null;
+  return {
+    at_ms: r.blocked_ms as number, by: r.blocked_by as string, role: r.blocked_role as "manager" | "worker", reason: r.blocked_reason as string,
+    question: (r.blocked_question as string | null) ?? null, tainted: r.blocked_tainted === 1,
+  };
+}
 
 /** A task's auto-merge for the board: pending while owed, else the last result. */
 function taskAutoMerge(r: Row): TaskAutoMerge | null {

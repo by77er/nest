@@ -70,6 +70,12 @@ export function summarize(h: HistoryRow): string {
       return text ? `Progress: ${clip(text)}` : "Progress reported";
     case "blocker":
       return text ? `Blocked: ${clip(text)}` : "Reported a blocker";
+    case "blocked":
+      return str(o.reason) ? `Blocked: ${clip(str(o.reason)!)}` : "Blocked";
+    case "unblocked":
+      return str(o.note) ? `Unblocked: ${clip(str(o.note)!)}` : o.why ? "Unblocked (the task ended)" : "Unblocked";
+    case "block_answered":
+      return str(o.answer) ? `You answered: ${clip(str(o.answer)!)}` : "You answered";
     default:
       return h.action.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
   }

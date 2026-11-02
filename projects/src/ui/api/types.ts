@@ -10,6 +10,9 @@ export type { Spec, TaskState } from "../../tasks";
 
 /** `GET /api/projects/<id>`. */
 export type Project = ProjectRow & { settings: Settings };
+/** A row of the projects list: with `needs_you`, how many asks and blocked tasks wait on the owner. */
+export type ListedProject = ProjectRow & { needs_you: number };
+export type { Attention, Blocked } from "../../do/project";
 /** `POST /api/projects`. */
 export type CreatedProject = ProjectRow & { settings: Settings | null; catalog_synced: boolean };
 /** `GET /api/projects/<id>/tasks/<task>`. */

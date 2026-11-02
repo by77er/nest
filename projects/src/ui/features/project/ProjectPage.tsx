@@ -8,7 +8,7 @@ import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useProject } from "../../api/queries";
 import { AnchorLink } from "../../common/links";
 import { ErrorState, icon, LoadingState, MetaItem, MetaRow, Page, PageHeader, SplitView } from "../../layout";
-import { AsksPanel } from "../asks/AsksPanel";
+import { NeedsYou } from "../attention/NeedsYou";
 import { Board } from "../board/Board";
 import { ChatPanel } from "../chat/ChatPanel";
 import { SettingsForm } from "../settings/SettingsForm";
@@ -77,7 +77,7 @@ export function ProjectPage() {
         }
       />
 
-      <AsksPanel projectId={projectId} />
+      <NeedsYou projectId={projectId} />
 
       {/* The board is the focal element; the chat is a side panel from lg on, below the board before. */}
       <SplitView aside={chatOpen ? <ChatPanel projectId={projectId} settings={p.settings} /> : undefined}>

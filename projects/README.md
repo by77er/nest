@@ -37,7 +37,7 @@ Only the client interface. One client, `projects`, has this grant:
 | Templates for the three roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer}` and capabilities `projects/{board,task,review}` (the MCP URLs), synced from this directory at deploy |
 | Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides}`, each with an `Idempotency-Key`. `overrides` is `{repos: [<repo>]}` for a worker, whose sandbox pushes only to that repo, and `{read_repos: [<repo>]}` for the manager and a reviewer, whose sandboxes only read it ([read-only repos](../docs/sandbox/networking/egress/policy/#read-only-repos)). The agent clones it |
 | Talking to the manager | `POST /v1/agents/<id>/inbox`. Replies arrive as `agent.turn_completed` events |
-| Approvals | `agent.ask` events, shown on the board, answered by `POST /v1/agents/<id>/asks/…` |
+| Approvals | `agent.ask` events, shown in "Needs you" with blocked tasks ([below](#blocked)), answered by `POST /v1/agents/<id>/asks/…` |
 | Ending a worker or reviewer | `POST /v1/agents/<id>/stop {end: true, destroy_sandbox: true}` |
 | Knowing what agents did | Signed webhooks to `/hooks/nest`, deduplicated by event `id`. After a gap (the dropped count rises), it re-reads `GET /v1/agents?label=project=<id>` |
 | Check runs and branch protection | `POST /v1/clients/self/github-token {repo, permissions}`, then GitHub's API with that token |
@@ -55,7 +55,7 @@ Only the client interface. One client, `projects`, has this grant:
   - There is no bearer secret: the capabilities name no `auth`, so nest sends no `Authorization`, and the identity is the credential.
 - **Scope comes from the labels:**
   - The manager reads and writes the board of its `project`.
-  - A worker reads its `task`, posts progress on it, and says when its PR is open. It sees no other task.
+  - A worker reads its `task`, posts progress on it, marks it blocked or clears that, and says when its PR is open. It sees no other task.
   - A reviewer reads its `pr` at its `sha`, and submits one verdict per dimension (correctness, quality, architectural cohesiveness) with a summary.
 - **`tainted`** is recorded with each write and shown on the board. It gates nothing: a worker and a reviewer read repo content by design.
 
@@ -171,18 +171,34 @@ The owner's request (2026-11-02): "Auto-merge should be an option in the project
 | `GET /repos/{o}/{r}` (reading `allow_auto_merge`) | `metadata: read`, `contents: write` | the same page ("Metadata": `GET /repos/{owner}/{repo}`, read), and [Get a repository](https://docs.github.com/en/rest/repos/repos#get-a-repository): "To view merge-related settings, you must have the contents:read and contents:write permissions" |
 | GraphQL `enablePullRequestAutoMerge`, `disablePullRequestAutoMerge` | `pull_requests: write`, `contents: write` | GitHub's [GraphQL reference](https://docs.github.com/en/graphql/reference/pulls) names none (unverified). [Auto-merge](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request) needs "write permissions to a repository". The merge it arms is Contents: write (`PUT …/pulls/{n}/merge`, same permissions page), and it changes the PR |
 
+## Blocked
+
+The owner's request (2026-11-02): "Agents might mark their tasks as blocked, which should bubble up to me."
+
+- **A flag, not a state.** A blocked task keeps its state, its worker and its PR, and goes on from there once unblocked. A state would need a way back to wherever it was, and an `in_review` task blocked on a question still has its PR open and under review. The rules are pure, in `src/tasks.ts` (`canBlock`, `canUnblock`):
+  - the manager may block any task that isn't over (`block_task` on `/mcp/board`); a worker only its own, while its worker is live (`report_blocked` on `/mcp/task`, which takes no task id, and the task's assignee must be the caller);
+  - a blocked task isn't blocked again (clear it first). A task that ends (`done`, `cancelled`) drops its block, and auto-assign skips a blocked `ready` task.
+- **What it carries:** who blocked it, their role, when, the reason, an optional question for the owner, and whether the session was tainted.
+- **Unblocking:**
+  - **The owner answers** (`POST /api/projects/:id/tasks/:task/answer {answer}`). The answer goes to the blocking agent's inbox, and to the manager's too when a worker blocked it. Those messages carry the owner's words and the task's id only, nothing an agent wrote, so they're never relayed.
+  - **The manager** (`unblock_task`) **or the task's worker** (`clear_blocked`) clears it when it's resolved another way.
+- **The manager is told** when a worker blocks, with the reason and the question. That text is relayed (`from: "projects/board"`) when the worker's session was tainted, as a brief from a tainted spec is.
+- **Delivery:** messages to agents' inboxes are owed in ProjectDO's `messages` table, posted once each (a request id) from the alarm, retried from 5 s doubling to 5 min, and kept with the reason when nest refuses for good.
+- **"Needs you"** is one area at the top of the board: open asks and blocked tasks together, oldest first (`GET /api/projects/:id/attention`). Each shows who, why, how long ago, and its answer (approve or deny, or words). It replaces the asks banner, and is calm: the surface with a warning rule down its left edge and a warning icon by its title, not a tinted fill.
+- **The count:** `GET /api/projects` gives each project `needs_you`, its open asks plus blocked tasks, which the projects list badges (and a sidebar can).
+
 ## The UI
 
-**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `asks`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
+**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
 
 - **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and one theme (`src/ui/theme.ts`); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons, Inter and JetBrains Mono self-hosted from npm.
 - **One API client** (`src/ui/api/client.ts`), same origin, so Access's cookie is the only credential: nothing secret is in the bundle. Its types are the Worker's own, imported by type only; the request bodies' zod schemas live in `src/requests.ts`, which both the Worker and the forms validate with.
-- **Live views poll while the tab is visible:** the chat every 3 s, the board and the asks every 5 s, the project every 10 s. The board stops polling while a card is dragged. Nothing animates on a poll.
+- **Live views poll while the tab is visible:** the chat every 3 s, the board and "Needs you" every 5 s, the project every 10 s. The board stops polling while a card is dragged. Nothing animates on a poll.
 - **Optimistic where safe:** reordering (one `ord` written, between the new neighbours'; put back if refused) and a chat message (shown as sending; its text back in the composer if refused). An answer to an ask isn't: the ask stays until nest has taken it.
 - **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling, deleting and marking done are confirmed, with the safe choice focused; "Mark done" shows only for a task with no PR and no live worker. A failed write is a notification (bottom right) with the Worker's reason.
 - **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit; Mantine, React and the other libraries are chunks of their own too (vite.config.ts), cached across releases.
 - **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
-- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, and a "needs input" marker from the project's open asks.
+- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, a "Blocked" badge (warning) while the task is blocked, and a "needs input" marker from the project's open asks.
 
 ### Design system
 
