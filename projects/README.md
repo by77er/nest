@@ -26,7 +26,7 @@ All state is the app's. nest holds the agents, their sandboxes and their transcr
 ## How it uses nest
 
 Only the client interface. One client, `projects`, has this grant:
-- `cells`, and `credentials: [claude_oauth_token, cap:projects-mcp]`: nest requires every mcp capability to name a bearer secret ([settled](#built-the-core));
+- `cells`, and `credentials: [claude_oauth_token]`;
 - `repos` and `github.repos`: the attachable repos;
 - `github.permissions`: `checks: write`, `administration: write`, `pull_requests: read`, `contents: read`;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
@@ -35,7 +35,7 @@ Only the client interface. One client, `projects`, has this grant:
 | Need | Interface |
 |---|---|
 | Templates for the three roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer}` and capabilities `projects/{board,task,review}` (the MCP URLs), synced from this directory at deploy |
-| Starting an agent | `POST /v1/sandboxes {labels}`, then `POST /v1/agents {template: "projects/<role>", sandbox, labels, overrides: {repos: [<repo>]}}`. Its sandbox pushes only to that repo; the agent clones it |
+| Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides: {repos: [<repo>]}}`, each with an `Idempotency-Key`. Its sandbox pushes only to that repo; the agent clones it |
 | Talking to the manager | `POST /v1/agents/<id>/inbox`. Replies arrive as `agent.turn_completed` events |
 | Approvals | `agent.ask` events, shown on the board, answered by `POST /v1/agents/<id>/asks/…` |
 | Ending a worker or reviewer | `POST /v1/agents/<id>/stop {end: true, destroy_sandbox: true}` |
@@ -51,7 +51,7 @@ Only the client interface. One client, `projects`, has this grant:
   - `aud` is that URL, and `iss` is nest;
   - `client` is the app's own client id;
   - **`owner` is also the app's client id.** Only agents the app created itself are trusted. A spawned agent's labels are whatever its spawner chose, so they mean nothing here.
-  - The bearer nest sends (its capability must name one) is ignored: the identity is the credential.
+  - There is no bearer secret: the capabilities name no `auth`, so nest sends no `Authorization`, and the identity is the credential.
 - **Scope comes from the labels:**
   - The manager reads and writes the board of its `project`.
   - A worker reads its `task`, posts progress on it, and says when its PR is open. It sees no other task.
@@ -95,16 +95,17 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 ```
 
 **What the build settled** (2026-11-02):
-- **nest's side, as it is:**
-  - **Every call sends `?cell=<NEST_CELL>`.** nest's owner routes check `?cell=` on every route and default it to `local`, which a deployment with `CELLS` set refuses (403).
-  - **The MCP capabilities name `cap:projects-mcp` as their bearer**, since nest requires `auth` on every mcp capability. The operator stores any value under that name and adds it to the grant's `credentials`; the servers ignore the bearer and admit by Nest-Identity alone.
+- **Using nest's interface:**
+  - **The cell goes where nest takes one:** in a create's body (`NEST_CELL`), and as a listing's filter. Nothing else sends it.
+  - **The MCP capabilities name no `auth`:** nest sends no bearer, the grant covers no secret for them, and Nest-Identity is the only credential.
   - **The app's client id is its token's** (`nest_cli_<id>_…` → `cli_<id>`), the way nest itself reads it.
 - **Agents:**
   - **Every agent gets a sandbox of its own,** made first (`POST /v1/sandboxes`) with the agent's labels, and ended with it (`stop {end: true, destroy_sandbox: true}`). The manager has one too, to read the code it specs. The agent clones the repo itself.
   - **Push scope:** each role template's `repos` is every attached project's repo, and each spawn narrows it to its project's (`overrides.repos`). Creating a project syncs the catalog again first.
-  - **Labels:** `project`, `role`, `task` for a worker, and `start`, the task's (or the manager's) start count. A start whose answer was lost is retried, and adopts the live agent or sandbox carrying exactly its labels (and the app as owner) instead of making a second: nest's creates take no idempotency key.
+  - **Labels:** `project`, `role`, `task` for a worker, and `start`, the task's (or the manager's) start count. They find the app's agents again after a gap (`GET /v1/agents?label=…`).
+  - **Creates are idempotent:** each start attempt sends `Idempotency-Key: <project>/<task or manager>/<start>/{sandbox,agent}` with its creates, so a retry after a lost answer gets the same sandbox and agent back. A key nest is still handling (a retryable 409) is retried like a 503; a key bound to another request (a 409 that isn't) is a refusal for good.
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
-  - **Retries:** ProjectDO owes nest its manager, workers, stops and chat messages, each retried from its alarm (5 s doubling to 5 min); a retryable 503 is also retried within the call. A worker nest refuses for good (a 4xx) stalls its task with the reason; the manager is retried until it starts.
+  - **Retries:** ProjectDO owes nest its manager, workers, stops and chat messages, each retried from its alarm (5 s doubling to 5 min); a retryable 503 or 409 is also retried within the call. A worker nest refuses for good (a 4xx) stalls its task with the reason; the manager is retried until it starts.
 - **The board:**
   - **States** (`src/tasks.ts`): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark any task done (one with no PR); a draft may be deleted, anything later is cancelled.
   - **A spec** is a goal, acceptance criteria, the files it likely touches and a test plan.
@@ -112,8 +113,6 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **History:** every change records who (the owner, the app, or an agent), what, when, and whether the session was tainted.
 - **The MCP servers:** no sessions (no `Mcp-Session-Id`), JSON answers only. A worker's tools take no task id: its labels name its task. Every write is answered once per call key (`_meta["nest/call"]`) that begins with the caller's own id, kept 24 h. The reviewer's tools answer "not built" until the review pipeline.
 - **Events:** deduplicated by id (DirectoryDO, 7 days) and idempotent besides. An event for an agent the app hasn't recorded is routed by that agent's labels (`GET /v1/agents/<id>`), only if the app is its client and owner; any other agent is remembered as not the app's and acknowledged. A failure answers 5xx, so nest delivers again.
-
-**Asked of nest** (generic interface changes this build worked around; see the [open questions](../docs/README.md#open-questions-and-watch-items)): an mcp capability with no bearer (`auth` optional) for servers that admit by Nest-Identity; owner routes that aren't about a cell not checking `?cell=`; an idempotency key on `POST /v1/agents` and `POST /v1/sandboxes`.
 
 ## The UI
 
@@ -145,7 +144,7 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 
 ## Setup (the operator's)
 
-1. Create the client: `POST /v1/admin/clients {name: "projects", grant}`, and store its token as the Worker's secret `NEST_CLIENT_TOKEN`. Store any value as nest's secret `cap:projects-mcp` (`PUT /v1/admin/secrets/cap:projects-mcp`).
+1. Create the client: `POST /v1/admin/clients {name: "projects", grant}`, and store its token as the Worker's secret `NEST_CLIENT_TOKEN`.
 2. Deploy the Worker to `projects-nest.bitcru.sh`, then `POST /api/admin/sync` to write the catalog. Put Cloudflare Access in front of it for the owner's login (the `edge` inframe stack), with `/hooks/*` and `/mcp/*` bypassed: they are authenticated by signature and by identity instead.
 3. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
 4. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github`, with a new secret, stored as `GITHUB_WEBHOOK_SECRET`. Subscribe the App to `pull_request` and `check_run` events.

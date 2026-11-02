@@ -10,14 +10,6 @@ import { SERVERS, type Server, TOOLS } from "./tools";
 /** The client's name, which is its catalog namespace (README.md#setup-the-operators). */
 export const NAMESPACE = "projects";
 
-/**
- * The BrokerDO secret each MCP capability names as its bearer. nest requires one on every mcp
- * capability (`McpSource.auth`); this server ignores it, since the Nest-Identity token is the proof
- * (README.md#the-mcp-server-agents-see-only-their-own-work). The operator stores any value under
- * this name and adds it to the client's grant `credentials`.
- */
-export const MCP_AUTH_SECRET = "cap:projects-mcp";
-
 /** The model credential every role runs on (in the grant's `credentials`). */
 const CREDENTIAL = "claude_oauth_token";
 
@@ -51,8 +43,8 @@ function mcpCapability(base: string, server: Server, prompt: string) {
   return {
     prompt,
     mcp: {
+      // No `auth`: nest sends no bearer, and the Nest-Identity token is the only credential.
       url: `${base}/mcp/${server}`,
-      auth: MCP_AUTH_SECRET,
       tools: tools.map((t) => t.name),
       read_only: tools.filter((t) => t.readOnly).map((t) => t.name),
       idempotent: tools.filter((t) => t.idempotent).map((t) => t.name),

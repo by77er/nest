@@ -11,7 +11,7 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
-import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX } from "../lib/mcp";
+import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
 import { approves, argsDigest, gated, sessionTaint, type SinkCall } from "../lib/sinks";
 import {
   actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
@@ -2224,10 +2224,10 @@ export class AgentDO extends DurableObject<Env> {
    * (the connector awaits this from its alarm): it records the change and tells the runner, which has
    * Claude Code list again; it never calls the connector back.
    */
-  async mcpToolsChanged(server: Pick<McpGrant, "url" | "auth">, changed: boolean): Promise<boolean> {
+  async mcpToolsChanged(server: Pick<McpGrant, "url" | "auth" | "client">, changed: boolean): Promise<boolean> {
     if (!this.exists()) return false;
     const info = this.load();
-    if (!info.brain || !(info.mcp ?? []).some((g) => g.url === server.url && g.auth === server.auth)) return false;
+    if (!info.brain || !(info.mcp ?? []).some((g) => sameConnector(g, server))) return false;
     if (changed) {
       this.kvPut("mcp_changed_ms", Date.now());
       const ws = this.socket();

@@ -742,9 +742,11 @@ export interface BearerSource {
  * The bearer to send to `g`'s server: its static `cap:` secret, or its OAuth access token (refreshed as
  * needed). With `refused`, the bearer that server just answered 401 to: a replacement, or null when there
  * is none (a static bearer never has one). Null without `refused`: no static bearer is stored. A missing
- * or spent OAuth authorization throws the platform error the operator acts on.
+ * or spent OAuth authorization throws the platform error the operator acts on. A grant with no `auth`
+ * has no bearer (null): callers check `g.auth` first and send none.
  */
 export async function mcpBearer(broker: BearerSource, g: McpGrant, refused?: string): Promise<string | null> {
+  if (g.auth === undefined) return null;
   if (g.oauth) return await broker.mcpOAuthToken(g.auth, g.url, refused);
   return refused === undefined ? await broker.capabilityToken(g.auth) : null;
 }

@@ -10,7 +10,7 @@ import { DurableObject } from "cloudflare:workers";
 import { TEMPLATE } from "../catalog";
 import { directory, type Env } from "../env";
 import type { AgentCaller } from "../identity";
-import { NestError, nestFrom, clientIdOf, type Labels, type Nest } from "../nest";
+import { NestError, nestFrom, type Labels, type Nest } from "../nest";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { pickForAssignment, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition } from "../tasks";
@@ -551,34 +551,32 @@ export class ProjectDO extends DurableObject<Env> {
     const s = this.settingsRow();
     if (!s) return;
     const nest = nestFrom(this.env);
-    const client = clientIdOf(this.env.NEST_CLIENT_TOKEN);
-    if (!nest || !client) return;
+    if (!nest) return;
     const now = Date.now();
-    if (s.manager_next_ms !== null && (s.manager_next_ms as number) <= now) await this.startManager(nest, client);
+    if (s.manager_next_ms !== null && (s.manager_next_ms as number) <= now) await this.startManager(nest);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL AND start_next_ms <= ? ORDER BY ord", now).toArray()) {
-      await this.startWorker(nest, client, r.id as string);
+      await this.startWorker(nest, r.id as string);
     }
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     await this.arm();
   }
 
-  /** The live agent of the app's carrying exactly these labels, or a new one (with a sandbox of its own). */
-  private async agentFor(nest: Nest, client: string, template: string, labels: Labels, repo: string): Promise<string> {
-    const mine = (owner: string | null | undefined) => owner === client;
-    const found = (await nest.listAgents(labels)).agents.find((a) => mine(a.owner) && a.agent);
-    if (found) return found.agent!;
-    let sandbox = (await nest.listSandboxes(labels)).sandboxes.find((x) => mine(x.owner) && x.sandbox)?.sandbox;
-    if (!sandbox) sandbox = (await nest.createSandbox({ labels })).sandbox;
-    return (await nest.createAgent({ template, sandbox, labels, overrides: { repos: [repo] }, start: true })).agent;
+  /**
+   * A new agent with a sandbox of its own, both labelled. `key` names this start attempt: a retry after a
+   * lost answer sends the same Idempotency-Keys and gets the same sandbox and agent back.
+   */
+  private async agentFor(nest: Nest, template: string, labels: Labels, repo: string, key: string): Promise<string> {
+    const sandbox = (await nest.createSandbox({ labels }, `${key}/sandbox`)).sandbox;
+    return (await nest.createAgent({ template, sandbox, labels, overrides: { repos: [repo] }, start: true }, `${key}/agent`)).agent;
   }
 
-  private async startManager(nest: Nest, client: string): Promise<void> {
+  private async startManager(nest: Nest): Promise<void> {
     const s = this.settings()!;
     const n = (this.settingsRow()!.manager_starts as number) + 1;
     const labels = { project: s.id, role: "manager", start: String(n) };
     try {
-      const agent = s.manager ?? (await this.agentFor(nest, client, TEMPLATE.manager, labels, s.repo));
+      const agent = s.manager ?? (await this.agentFor(nest, TEMPLATE.manager, labels, s.repo, `${s.id}/manager/${n}`));
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       this.sql.exec("UPDATE settings SET manager = ?", agent);
       await nest.postInbox(agent, managerBrief(s), { requestId: `${s.id}/manager/${n}/brief` });
@@ -590,7 +588,7 @@ export class ProjectDO extends DurableObject<Env> {
     }
   }
 
-  private async startWorker(nest: Nest, client: string, id: string): Promise<void> {
+  private async startWorker(nest: Nest, id: string): Promise<void> {
     const before = this.taskRow(id);
     if (!before || before.state !== "assigned") return;
     const n = before.assignments as number;
@@ -603,7 +601,7 @@ export class ProjectDO extends DurableObject<Env> {
     try {
       let agent = before.assignee as string | null;
       if (!agent) {
-        agent = await this.agentFor(nest, client, TEMPLATE.worker, labels, s.repo);
+        agent = await this.agentFor(nest, TEMPLATE.worker, labels, s.repo, `${s.id}/${id}/${n}`);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         if (!current()) {
           // Cancelled (or reassigned) while it was being made: it goes.

@@ -1,6 +1,6 @@
 // A fake of nest's client interface, as docs/control-plane/api/clients/ and docs/interfaces/remote-mcp/
-// describe it: the routes the app calls (answering as nest does, with `?cell=` required as production's
-// CELLS makes it), the JWKS behind Nest-Identity, and helpers that sign identity tokens, Access tokens and
+// describe it: the routes the app calls (answering as nest does: a create's cell in its body, refused
+// outside the grant's; a create's Idempotency-Key replayed, conflicting or in progress), the JWKS behind Nest-Identity, and helpers that sign identity tokens, Access tokens and
 // webhooks the way nest and Cloudflare do. It replaces the global fetch, which the Worker and its Durable
 // Objects share with the tests in the pool, and records every call.
 
@@ -34,7 +34,14 @@ export interface Call {
   query: URLSearchParams;
   body: any;
   auth: string | null;
+  idempotencyKey: string | null;
 }
+
+/** JSON with sorted keys: a request's identity for its idempotency key, as nest binds one. */
+const canonical = (v: unknown): string =>
+  Array.isArray(v) ? `[${v.map(canonical).join(",")}]`
+  : v && typeof v === "object" ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`).join(",")}}`
+  : JSON.stringify(v);
 
 let seq = 0;
 const id = (prefix: string) => `${prefix}${(++seq).toString(36)}${crypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
@@ -50,6 +57,12 @@ export class FakeNest {
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
   failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
+  /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
+  lost: { match: RegExp; times: number }[] = [];
+  /** Creates answered "still being handled" (409, retryable) before they run. */
+  inProgress: { match: RegExp; times: number }[] = [];
+  /** Idempotency keys: the request each binds, and its first answer once made. */
+  readonly keys = new Map<string, { digest: string; status: number; body: string }>();
 
   fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number } = {}): void {
     this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1 });
@@ -68,16 +81,47 @@ export class FakeNest {
       return json(200, this.jwks);
     }
     const text = await req.text();
-    const call: Call = { method: req.method, path: u.pathname, query: u.searchParams, body: text ? JSON.parse(text) : undefined, auth: req.headers.get("authorization") };
+    const call: Call = {
+      method: req.method, path: u.pathname, query: u.searchParams, body: text ? JSON.parse(text) : undefined,
+      auth: req.headers.get("authorization"), idempotencyKey: req.headers.get("idempotency-key"),
+    };
     this.calls.push(call);
     if (call.auth !== `Bearer ${env.NEST_CLIENT_TOKEN}`) return nestErr(401, "unauthorized", "admin or client token required");
-    // nest's owner routes check `?cell=` and default to "local", which production's CELLS refuses.
-    if (u.searchParams.get("cell") !== CELL) return nestErr(403, "forbidden", `unknown cell ${u.searchParams.get("cell") ?? "local"}`);
-    const f = this.failures.find((x) => x.times > 0 && x.match.test(`${req.method} ${u.pathname}`));
+    const route = `${req.method} ${u.pathname}`;
+    const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
       f.times--;
       return nestErr(f.status, f.status === 503 ? "internal" : "refused", "injected", f.retryable ?? false);
     }
+    if (route !== "POST /v1/sandboxes" && route !== "POST /v1/agents") return this.route(req, u, call);
+    // A create: its cell in the body (nest's default, `local`, is outside the grant), and its key.
+    if (call.body?.cell !== CELL) return nestErr(403, "forbidden", `cell ${call.body?.cell ?? "local"} is outside the grant`);
+    const key = call.idempotencyKey;
+    if (key === null) return this.route(req, u, call);
+    const digest = `${route} ${canonical(call.body)}`;
+    const had = this.keys.get(key);
+    if (had && had.digest !== digest) return nestErr(409, "conflict", "this Idempotency-Key was used for a different request", false);
+    const busy = this.inProgress.find((x) => x.times > 0 && x.match.test(key));
+    if (busy) {
+      busy.times--;
+      return nestErr(409, "conflict", "a request with this Idempotency-Key is still being handled", true);
+    }
+    if (had) {
+      return new Response(had.body, { status: had.status, headers: { "content-type": "application/json", "idempotent-replayed": "true" } });
+    }
+    const res = await this.route(req, u, call);
+    if (res.ok) this.keys.set(key, { digest, status: res.status, body: await res.clone().text() });
+    const lose = this.lost.find((x) => x.times > 0 && x.match.test(route));
+    if (lose) {
+      lose.times--;
+      return nestErr(500, "internal", "the answer was lost", true);
+    }
+    return res;
+  }
+
+  private async route(req: Request, u: URL, call: Call): Promise<Response> {
+    const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    const nestErr = (status: number, code: string, message: string, retryable = false) => json(status, { error: { code, message, retryable } });
     const labelsMatch = (have: Record<string, string>) => u.searchParams.getAll("label").every((l) => {
       const i = l.indexOf("=");
       return have[l.slice(0, i)] === l.slice(i + 1);
