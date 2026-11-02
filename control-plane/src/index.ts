@@ -18,12 +18,9 @@ import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSI
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
 export { CatalogDO } from "./do/catalog";
-export { ChannelDO } from "./do/channel";
 export { FleetDO } from "./do/fleet";
 export { McpConnectorDO } from "./do/mcp-connector";
 export { SandboxDO } from "./do/sandbox";
-export { TaskLedgerDO } from "./do/tasks";
-export { WorkstreamDO } from "./do/workstream";
 
 const DEFAULT_CELL = "local";
 

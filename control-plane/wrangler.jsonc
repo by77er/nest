@@ -12,11 +12,8 @@
       { "name": "FLEET", "class_name": "FleetDO" },
       { "name": "SANDBOX", "class_name": "SandboxDO" },
       { "name": "AGENT", "class_name": "AgentDO" },
-      { "name": "WORKSTREAM", "class_name": "WorkstreamDO" },
       { "name": "BROKER", "class_name": "BrokerDO" },
       { "name": "CATALOG", "class_name": "CatalogDO" },
-      { "name": "CHANNEL", "class_name": "ChannelDO" },
-      { "name": "TASKS", "class_name": "TaskLedgerDO" },
       { "name": "MCP_CONNECTOR", "class_name": "McpConnectorDO" }
     ]
   },
@@ -26,7 +23,10 @@
     { "tag": "channels", "new_sqlite_classes": ["ChannelDO"] },
     { "tag": "tasks", "new_sqlite_classes": ["TaskLedgerDO"] },
     // One-way: a new class (docs/agents/capabilities/mcp/#the-connector, dev/deploy.md).
-    { "tag": "mcp-connectors", "new_sqlite_classes": ["McpConnectorDO"] }
+    { "tag": "mcp-connectors", "new_sqlite_classes": ["McpConnectorDO"] },
+    // One-way, and alone in its release: deletes the three classes and every instance's storage
+    // (nest is a microkernel, docs/README.md principle 9; dev/deploy.md, microkernel stage 4).
+    { "tag": "microkernel", "deleted_classes": ["WorkstreamDO", "ChannelDO", "TaskLedgerDO"] }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "nest-control" }],
   // Production hostname (a Workers Custom Domain on the bitcru.sh zone; Cloudflare issues its certificate).

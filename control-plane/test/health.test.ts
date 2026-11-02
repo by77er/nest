@@ -20,7 +20,7 @@ const CLASSES: Record<string, DurableObjectNamespace> = Object.fromEntries(
 describe("GET /v1/health", () => {
   it("answers 200 only after every DO class answered, naming each class and nothing else", async () => {
     expect(Object.keys(CLASSES).length).toBe([...wrangler.matchAll(/"class_name"/g)].length);
-    expect(Object.keys(CLASSES).length).toBeGreaterThanOrEqual(8);
+    expect(Object.keys(CLASSES).length).toBeGreaterThanOrEqual(6);
     for (const ns of Object.values(CLASSES)) expect(ns).toBeDefined();
     const res = await SELF.fetch(`${BASE}/v1/health`);
     const body = await res.json<Record<string, unknown>>();
