@@ -19,12 +19,8 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
   const confirmDone = () =>
     modals.openConfirmModal({
       title: "Mark this task done?",
-      children: (
-        <Text size="sm">
-          {task.pr !== null ? `Do this once PR #${task.pr} is merged. ` : ""}
-          {task.assignee ? "Its worker is ended." : ""}
-        </Text>
-      ),
+      // Only a task with no PR and no live worker gets here (src/tasks.ts): one with a PR is done when it merges.
+      children: <Text size="sm">For work that needs no PR, such as research or a spec. A done task can't be reopened.</Text>,
       labels: { confirm: "Mark done", cancel: "Not yet" },
       confirmProps: { color: "success" },
       cancelProps: { variant: "default" },

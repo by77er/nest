@@ -37,8 +37,8 @@ export function BoardColumn({ column, tasks, projectId, repo, pendingAsks, onMov
   };
 
   return (
-    <Paper component="section" aria-labelledby={headingId} bg="gray.0" withBorder p="xs" w={280} miw={260} style={{ flexShrink: 0, scrollSnapAlign: "start" }}>
-      <Group justify="space-between" mb="xs" px={4}>
+    <Paper component="section" aria-labelledby={headingId} bg="gray.0" withBorder p={6} miw={0} style={{ scrollSnapAlign: "start" }}>
+      <Group justify="space-between" mb="xs" px={4} gap={4} wrap="nowrap">
         <Title order={3} size="sm" id={headingId}>
           {column.title}
         </Title>

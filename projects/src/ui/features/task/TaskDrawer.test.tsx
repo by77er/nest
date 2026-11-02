@@ -91,9 +91,24 @@ describe("the task drawer", () => {
     expect(within(d).getByLabelText(/Title/)).toHaveAttribute("readonly");
   });
 
-  it("marks done in green once confirmed", async () => {
+  it("offers no Mark done for a task with an open PR or a running worker: those wait for the merge, or are cancelled", async () => {
     const api = new FakeApi();
-    const t = task({ title: "Reviewed", state: "in_review", pr: 7 });
+    const review = task({ title: "Reviewed", state: "in_review", pr: 7 });
+    const running = task({ title: "Running", state: "in_progress", assignee: "agt_w1" });
+    api.tasks = [review, running];
+    const { user } = renderApp(`/projects/prj_one?task=${review.id}`, api);
+    const d = await waitFor(drawer);
+    expect(await within(d).findByRole("button", { name: "Cancel task" })).toBeInTheDocument();
+    expect(within(d).queryByRole("button", { name: "Mark done" })).toBeNull();
+
+    await user.click(screen.getByRole("link", { name: "Running" }));
+    await waitFor(() => expect(within(drawer()).getByText("agt_w1")).toBeInTheDocument());
+    expect(within(drawer()).queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("marks a task with no PR done, in green, once confirmed", async () => {
+    const api = new FakeApi();
+    const t = task({ title: "Research", state: "ready" });
     api.tasks = [t];
     const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
     const d = await waitFor(drawer);
@@ -102,7 +117,6 @@ describe("the task drawer", () => {
     expect(done.getAttribute("style")).toContain("--mantine-color-success-");
     await user.click(done);
     const confirm = await screen.findByRole("dialog", { name: "Mark this task done?" });
-    expect(confirm).toHaveTextContent("PR #7");
     await user.click(within(confirm).getByRole("button", { name: "Mark done" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/tasks/${t.id}/done`, body: undefined }]));
     await waitFor(() => expect(within(d).getByText("Done")).toBeInTheDocument());

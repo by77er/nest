@@ -4,7 +4,7 @@
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { ActionIcon, Anchor, Badge, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
-import { IconAlertTriangle, IconGitPullRequest, IconGripVertical, IconRobot } from "@tabler/icons-react";
+import { IconGitPullRequest, IconGripVertical, IconRobot } from "@tabler/icons-react";
 import type { Task } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { StateBadge } from "./StateBadge";
@@ -24,7 +24,7 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
   const style = { transform: CSS.Translate.toString(transform), transition, zIndex: isDragging ? 2 : undefined };
 
   return (
-    <Paper ref={setNodeRef} style={style} withBorder p="sm" shadow={isDragging ? "md" : undefined} data-task={task.id} aria-label={task.title} component="article">
+    <Paper ref={setNodeRef} style={style} withBorder p="xs" miw={0} shadow={isDragging ? "md" : undefined} data-task={task.id} aria-label={task.title} component="article">
       <Stack gap={6}>
         <Group gap={4} wrap="nowrap" align="flex-start">
           {sortable && (
@@ -45,10 +45,10 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
             {task.title}
           </AnchorLink>
         </Group>
-        <Group gap={6}>
+        <Group gap={4} wrap="wrap">
           <StateBadge state={task.state} size="sm" />
           {pendingAsks > 0 && (
-            <Badge size="sm" color="warning" variant="filled" leftSection={<IconAlertTriangle size={12} />} data-marker="ask">
+            <Badge size="sm" color="warning" variant="filled" data-marker="ask">
               Needs input
             </Badge>
           )}
@@ -61,11 +61,11 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
           )}
         </Group>
         {(task.assignee || task.pr !== null) && (
-          <Group gap="sm" wrap="nowrap">
+          <Group gap={6} wrap="wrap" miw={0}>
             {task.assignee && (
-              <Group gap={4} wrap="nowrap" miw={0}>
-                <IconRobot size={14} aria-hidden color="var(--mantine-color-dimmed)" />
-                <Text size="xs" c="dimmed" truncate title={task.assignee}>
+              <Group gap={4} wrap="nowrap" miw={0} align="flex-start">
+                <IconRobot size={14} aria-hidden color="var(--mantine-color-dimmed)" style={{ flexShrink: 0 }} />
+                <Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
                   {task.assignee}
                 </Text>
               </Group>
@@ -80,7 +80,7 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
           </Group>
         )}
         {task.start_error && (
-          <Text size="xs" c="warning.8" lineClamp={2} title={task.start_error}>
+          <Text size="xs" c="warning.8" style={{ overflowWrap: "anywhere" }}>
             {task.start_error}
           </Text>
         )}

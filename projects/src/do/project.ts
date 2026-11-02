@@ -319,7 +319,10 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.toTask(this.taskRow(id)!));
   }
 
-  /** The owner marks a task done (one with no PR, or whose PR merged); its worker is ended. */
+  /**
+   * The owner marks a task done: one with no PR and no live worker (src/tasks.ts). A stalled task's
+   * stopped worker is ended for good, if it isn't already.
+   */
   async markDone(id: string): Promise<Result<Task>> {
     if (!this.settings()) return fail(404, "unknown project");
     const m = this.move(id, "done", { kind: "owner" });

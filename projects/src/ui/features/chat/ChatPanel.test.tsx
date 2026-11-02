@@ -55,4 +55,21 @@ describe("the chat", () => {
     await waitFor(() => expect(box).toHaveValue("Hello"));
     expect(within(c).queryByText("Hello", { selector: "p" })).toBeNull();
   });
+
+  it("collapses, giving the board the width, and stays as the owner left it", async () => {
+    window.localStorage.clear();
+    const first = renderApp("/projects/prj_one");
+    await chat();
+    await first.user.click(screen.getByRole("button", { name: "Hide chat" }));
+    expect(screen.queryByRole("region", { name: "Manager" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Board" })).toBeInTheDocument();
+    first.unmount();
+
+    const again = renderApp("/projects/prj_one");
+    await screen.findByRole("heading", { name: "Board" });
+    expect(screen.queryByRole("region", { name: "Manager" })).toBeNull();
+    await again.user.click(screen.getByRole("button", { name: "Show chat" }));
+    expect(await chat()).toBeInTheDocument();
+    window.localStorage.clear();
+  });
 });

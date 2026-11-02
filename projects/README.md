@@ -10,7 +10,7 @@ A task board for GitHub repos, run by agents on nest: an app with its own Worker
 - **The manager.** One agent per project, the one the owner talks to. It keeps the board, specs each task as it's created, and assigns tasks when the project is set to assign automatically.
 - **Tasks.** The owner or the manager creates them, and the manager specs them. They're assigned by hand from the board, or automatically. An assigned task gets a worker of its own: one agent, which sees only that task and opens one PR for it.
 - **Review.** Every PR on the repo gets a review by a reviewer agent, asynchronously. The review judges correctness, quality and architectural cohesiveness, and sets a required check. Branch protection, which the app sets up, makes merging wait for that check.
-- **Done.** A task is done when its PR is merged. Merging needs the review check to pass.
+- **Done.** A task is done when its work is finished: for a task with a PR, when the PR is merged, which needs the review check to pass. Only a task with no PR and no live worker is marked done by hand.
 
 ## Pieces
 
@@ -79,12 +79,12 @@ Only the client interface. One client, `projects`, has this grant:
   3. Each job creates a check run (`in_progress`) and starts a reviewer.
   4. The reviewer's verdict completes the check: `success` only if all three dimensions pass, with the summary as the check's output.
   5. A reviewer that exits without a verdict fails the job after retries, and the check completes as `neutral`, which branch protection doesn't accept as passing. A `check_run` `rerequested` queues the job again.
-- **Merging** is GitHub's, gated by the required check. A `pull_request` `closed` event with `merged: true` marks the PR's task `done`. The owner may also mark a task done by hand once its PR is merged.
+- **Merging** is GitHub's, gated by the required check. A `pull_request` `closed` event with `merged: true` marks the PR's task `done`. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
 
 ## Not decided here
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
-- Tasks without a PR (research, specs) end by the owner marking them done.
+- Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
 
 ## Built: the core
 
@@ -107,7 +107,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
   - **Retries:** ProjectDO owes nest its manager, workers, stops and chat messages, each retried from its alarm (5 s doubling to 5 min); a retryable 503 or 409 is also retried within the call. A worker nest refuses for good (a 4xx) stalls its task with the reason; the manager is retried until it starts.
 - **The board:**
-  - **States** (`src/tasks.ts`): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark any task done (one with no PR); a draft may be deleted, anything later is cancelled.
+  - **States** (`src/tasks.ts`): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no PR and no live worker (`draft`, `ready`, `stalled`; a stalled task never has a PR, since one with a PR is `in_review`); a draft may be deleted, anything later is cancelled.
   - **A spec** is a goal, acceptance criteria, the files it likely touches and a test plan.
   - **`max_workers`** caps auto-assign and the manager's `assign_task`; the owner's assign by hand isn't capped (nest's `max_agents` still is). A worker counts from its assignment until it exits or the app has stopped it.
   - **History:** every change records who (the owner, the app, or an agent), what, when, and whether the session was tainted.
@@ -118,12 +118,14 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 
 **Code:** `src/ui/`, one folder per feature (`projects`, `project`, `board`, `task`, `chat`, `asks`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
 
-- **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and a custom theme (`src/ui/theme.ts`), no CSS of its own; TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons.
+- **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and a custom theme (`src/ui/theme.ts`), with one CSS module of its own (the board's grid); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons.
 - **One API client** (`src/ui/api/client.ts`), same origin, so Access's cookie is the only credential: nothing secret is in the bundle. Its types are the Worker's own, imported by type only; the request bodies' zod schemas live in `src/requests.ts`, which both the Worker and the forms validate with.
 - **Live views poll while the tab is visible:** the chat every 3 s, the board and the asks every 5 s, the project every 10 s. The board stops polling while a card is dragged.
 - **Optimistic where safe:** reordering (one `ord` written, between the new neighbours'; put back if refused) and a chat message (shown as sending; its text back in the composer if refused). An answer to an ask isn't: the ask stays until nest has taken it.
-- **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling and marking done are confirmed; a failed write is a red notification with the Worker's reason.
-- **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one).
+- **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling and marking done are confirmed, and "Mark done" shows only for a task with no PR and no live worker; a failed write is a red notification with the Worker's reason.
+- **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit.
+- **Layout:** the board's columns share its width, each at least 8.5rem from 62em on (all six fit beside the chat at 1280 px) and 16rem below; past that the row scrolls sideways. A card's badges and details wrap, never clip. The chat is a 320 px side panel from 75em, below the board on narrower screens, and can be hidden (remembered per browser).
+- **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
 - **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list now returns, and a "needs input" marker from the project's open asks.
 
 **The theme:** light only, near-white page (`#fafafa`) with white surfaces, near-black text (`#212529`) and Mantine's grays. Color is only for actions and status, in four roles, each a 10-shade tuple ([`src/ui/theme.ts`](src/ui/theme.ts)), Bootstrap's hues a step muted. Shade 6 is the filled one; filled text is white, or dark on yellow (Mantine's `autoContrast`):

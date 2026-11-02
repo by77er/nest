@@ -1,9 +1,9 @@
 // A project: what its agents are waiting on, its board, the chat with its manager, its settings, and the
 // drawer of the task named in the URL.
 
-import { Anchor, Badge, Breadcrumbs, Button, Grid, Group, Modal, Stack, Text, Title } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
-import { IconBrandGithub, IconSettings } from "@tabler/icons-react";
+import { Anchor, Badge, Box, Breadcrumbs, Button, Flex, Group, Modal, Stack, Text, Title } from "@mantine/core";
+import { useDisclosure, useLocalStorage } from "@mantine/hooks";
+import { IconBrandGithub, IconMessage, IconSettings } from "@tabler/icons-react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useProject } from "../../api/queries";
 import { AnchorLink } from "../../common/links";
@@ -20,6 +20,8 @@ export function ProjectPage() {
   const navigate = useNavigate({ from: "/projects/$projectId" });
   const project = useProject(projectId);
   const [settingsOpen, settings] = useDisclosure(false);
+  // Whether the chat panel shows, remembered in this browser; hiding it gives the board the width.
+  const [chatOpen, setChatOpen] = useLocalStorage({ key: "nest-projects:chat-open", defaultValue: true, getInitialValueInEffect: false });
 
   if (project.isPending) return <Loading label="Loading the project" />;
   if (project.isError) {
@@ -61,22 +63,30 @@ export function ProjectPage() {
               </Badge>
             </Group>
           </Stack>
-          <Button variant="default" leftSection={<IconSettings size={16} />} onClick={settings.open}>
-            Settings
-          </Button>
+          <Group gap="xs">
+            <Button variant="default" leftSection={<IconMessage size={16} />} aria-pressed={chatOpen} onClick={() => setChatOpen((o) => !o)}>
+              {chatOpen ? "Hide chat" : "Show chat"}
+            </Button>
+            <Button variant="default" leftSection={<IconSettings size={16} />} onClick={settings.open}>
+              Settings
+            </Button>
+          </Group>
         </Group>
       </Stack>
 
       <AsksPanel projectId={projectId} />
 
-      <Grid gap="md">
-        <Grid.Col span={{ base: 12, lg: 8, xl: 9 }}>
+      {/* The chat is a side panel from lg on, of a fixed width, and below the board on narrower screens. */}
+      <Flex direction={{ base: "column", lg: "row" }} gap="md" align={{ base: "stretch", lg: "flex-start" }}>
+        <Box flex={1} miw={0}>
           <Board projectId={projectId} repo={p.repo} />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, lg: 4, xl: 3 }}>
-          <ChatPanel projectId={projectId} settings={p.settings} />
-        </Grid.Col>
-      </Grid>
+        </Box>
+        {chatOpen && (
+          <Box w={{ base: "100%", lg: 320 }} style={{ flexShrink: 0 }}>
+            <ChatPanel projectId={projectId} settings={p.settings} />
+          </Box>
+        )}
+      </Flex>
 
       <TaskDrawer projectId={projectId} repo={p.repo} taskId={task} onClose={() => void navigate({ search: {} })} />
 

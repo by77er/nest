@@ -1,11 +1,13 @@
 // The page's routes, typed (TanStack Router, code-based). The Worker serves index.html for any path
 // (wrangler.jsonc's single-page-application handling), after the Access check.
 
-import { createRootRoute, createRoute, createRouter, type RouterHistory } from "@tanstack/react-router";
-import { AdminPage } from "./features/admin/AdminPage";
-import { ProjectPage } from "./features/project/ProjectPage";
-import { ProjectsPage } from "./features/projects/ProjectsPage";
+import { createRootRoute, createRoute, createRouter, lazyRouteComponent, type RouterHistory } from "@tanstack/react-router";
 import { NotFound, RouteError, Shell } from "./layout/Shell";
+
+// Each page is its own chunk, loaded when its route is first visited (or hovered: preload on intent).
+const ProjectsPage = lazyRouteComponent(() => import("./features/projects/ProjectsPage"), "ProjectsPage");
+const ProjectPage = lazyRouteComponent(() => import("./features/project/ProjectPage"), "ProjectPage");
+const AdminPage = lazyRouteComponent(() => import("./features/admin/AdminPage"), "AdminPage");
 
 const TASK_ID = /^tsk_[a-z0-9]+$/;
 

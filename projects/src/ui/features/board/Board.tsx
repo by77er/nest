@@ -1,7 +1,7 @@
 // The board: a column per stage of a task's life, cancelled ones behind a switch. It polls while the
 // tab is visible, except while a card is being dragged.
 
-import { Button, Card, EmptyState, Group, Modal, ScrollArea, Stack, Switch, Title } from "@mantine/core";
+import { Button, Card, EmptyState, Group, Modal, Stack, Switch, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconLayoutKanban, IconPlus } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
@@ -9,6 +9,7 @@ import { useAsks, useReorderTask, useTasks } from "../../api/queries";
 import type { Task } from "../../api/types";
 import { Loading, LoadError } from "../../common/QueryStates";
 import { CANCELLED_COLUMN, COLUMNS } from "../../status";
+import classes from "./Board.module.css";
 import { BoardColumn } from "./BoardColumn";
 import { CreateTaskForm } from "./CreateTaskForm";
 
@@ -56,22 +57,20 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
           </EmptyState>
         </Card>
       ) : (
-        <ScrollArea type="auto" offsetScrollbars scrollbarSize={8}>
-          <Group align="flex-start" wrap="nowrap" gap="sm" pb="xs" style={{ scrollSnapType: "x proximity" }}>
-            {columns.map((c) => (
-              <BoardColumn
-                key={c.id}
-                column={c}
-                tasks={byColumn(c.states, tasks.data)}
-                projectId={projectId}
-                repo={repo}
-                pendingAsks={pendingAsks}
-                onMove={(task, ord) => reorder.mutate({ task, ord })}
-                onDragging={setDragging}
-              />
-            ))}
-          </Group>
-        </ScrollArea>
+        <div className={classes.columns} data-columns={columns.length}>
+          {columns.map((c) => (
+            <BoardColumn
+              key={c.id}
+              column={c}
+              tasks={byColumn(c.states, tasks.data)}
+              projectId={projectId}
+              repo={repo}
+              pendingAsks={pendingAsks}
+              onMove={(task, ord) => reorder.mutate({ task, ord })}
+              onDragging={setDragging}
+            />
+          ))}
+        </div>
       )}
 
       <Modal opened={creating} onClose={close} title="New task" size="lg">
