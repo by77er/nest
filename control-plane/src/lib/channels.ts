@@ -70,8 +70,9 @@ export type ChannelKind =
  * A valid channel name and what it is. Names are hierarchical for tidiness only: lowercase segments
  * of `[a-z0-9_.-]` joined by `/`, at most 128 characters. `agt_…/inbox`, `agt_…/events`,
  * `sbx_…/events` and `user` are the built-in channels; any other name with an `agt_`, `sbx_`, `hk_`
- * or `ws_` first segment, `user/…`, `platform…` or `ledger` / `ledger/…` (a task ledger's channel,
- * when ledgers post to channels: docs/control-plane/durable-objects/tasks/) is reserved.
+ * or `ws_` first segment, `user/…`, `platform…` or `ledger` / `ledger/…` is reserved (`ledger` was the
+ * task ledger's, which left the platform; kept, because the previous release refuses those names and
+ * a channel made under one would be unreachable after a rollback).
  */
 export function parseChannel(name: string): Result<ChannelKind> {
   if (typeof name !== "string" || name.length === 0 || name.length > MAX_NAME_LENGTH) {

@@ -12,8 +12,6 @@ import { AclEntry, type Caller, ChannelName, MAX_RETENTION_DAYS, parseChannel, S
 import { Capability, CatalogName, OperatorOverrides, Template } from "./lib/spec";
 import { MIN_IDLE_TTL_MS } from "./lib/lifetimes";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
-import { type Actor, LedgerName, type SpecGrant, type TaskOp, TaskPriority, TaskStatus } from "./lib/tasks";
-import { LIST_DEFAULT_LIMIT, ledgerStub } from "./do/tasks";
 import { DIRECTORY } from "./do/channel";
 import { Port, WorkstreamPolicyLayer } from "./do/sandbox";
 import { parseAppSecret } from "./lib/github";
@@ -117,15 +115,6 @@ async function enroll(req: Request, env: Env): Promise<Response> {
 /** A client's id for a submission (body `request_id` or `Idempotency-Key`): a retry with it is applied once. */
 const RequestIdField = z.string().min(1).max(128).optional();
 
-/** Task fields the operator may set (the core checks their bounds); `parent: null` clears it. */
-const TaskEditsBody = z.strictObject({
-  title: z.string().optional(),
-  description: z.string().optional(),
-  status: TaskStatus.optional(),
-  priority: TaskPriority.optional(),
-  labels: z.array(z.string()).optional(),
-  parent: z.string().nullable().optional(),
-});
 function requestId(req: Request, fromBody: string | undefined): string | undefined {
   const header = req.headers.get("idempotency-key") ?? undefined;
   const id = fromBody ?? header;
@@ -254,20 +243,6 @@ function catalogName(raw: string): string {
   const name = CatalogName.safeParse(raw);
   if (!name.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, name.error.message);
   return name.data;
-}
-
-function ledgerOf(env: Env, raw: string) {
-  const parsed = LedgerName.safeParse(raw);
-  if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, parsed.error.issues[0]!.message);
-  return { name: parsed.data, l: ledgerStub(env, parsed.data) };
-}
-const OPERATOR: Actor = { kind: "operator" };
-const AgentOrNull = z.string().startsWith("agt_").nullable();
-/** An agent's grant as its spec states it (null: unassign / no watcher). */
-async function grantOf(env: Env, id: string | null): Promise<SpecGrant | null> {
-  if (id === null) return null;
-  const a = await agent(env, id).info();
-  return { agent: id, ledger: a.params?.ledger ?? null, tools: a.tools };
 }
 
 export const ROUTES: Route[] = [
@@ -482,70 +457,6 @@ export const ROUTES: Route[] = [
     },
   }),
 
-  // Task ledgers (docs/control-plane/durable-objects/tasks/): named, with the operator as the root.
-  route({ method: "GET", path: "/v1/ledgers/:ledger", auth: "admin", run: ({ env, p }) => {
-    const { name, l } = ledgerOf(env, p.ledger);
-    return l.info(name, OPERATOR);
-  } }),
-  route({
-    method: "PUT", path: "/v1/ledgers/:ledger/watcher", auth: "admin", body: z.object({ watcher: AgentOrNull, request_id: RequestIdField }),
-    run: async ({ env, req, p, body: r }) => {
-      const { name, l } = ledgerOf(env, p.ledger);
-      return l.apply(name, OPERATOR, { kind: "set_watcher", watcher: await grantOf(env, r.watcher) }, requestId(req, r.request_id));
-    },
-  }),
-  route({ method: "GET", path: "/v1/ledgers/:ledger/tasks", auth: "admin", run: ({ env, url, p }) => {
-    const { name, l } = ledgerOf(env, p.ledger);
-    const q = (k: string) => url.searchParams.get(k) ?? undefined;
-    const status = q("status");
-    // A query string has no null: `assignee=none` is the unassigned filter here.
-    const assignee = q("assignee");
-    if (status !== undefined && !TaskStatus.safeParse(status).success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown status ${status}`);
-    return l.list(name, OPERATOR, {
-      status: status as TaskStatus | undefined, assignee: assignee === "none" ? null : assignee, label: q("label"), text: q("text"), parent: q("parent"),
-    }, num(q("cursor"), 0), num(q("limit"), LIST_DEFAULT_LIMIT));
-  } }),
-  route({
-    method: "POST", path: "/v1/ledgers/:ledger/tasks", auth: "admin", status: 201,
-    body: TaskEditsBody.extend({ title: z.string(), assignee: AgentOrNull.optional(), request_id: RequestIdField }),
-    run: async ({ env, req, p, body: r }) => {
-      const { name, l } = ledgerOf(env, p.ledger);
-      const { assignee, request_id, ...edits } = r;
-      const grant = await grantOf(env, assignee ?? null);
-      const op: TaskOp = { kind: "create", ...edits, parent: edits.parent ?? undefined, ...(grant ? { assignee: grant } : {}) };
-      return (await l.apply(name, OPERATOR, op, requestId(req, request_id))).task;
-    },
-  }),
-  route({ method: "GET", path: "/v1/ledgers/:ledger/tasks/:task", auth: "admin", run: ({ env, p }) => {
-    const { name, l } = ledgerOf(env, p.ledger);
-    return l.get(name, OPERATOR, p.task);
-  } }),
-  route({
-    method: "PATCH", path: "/v1/ledgers/:ledger/tasks/:task", auth: "admin",
-    body: TaskEditsBody.extend({ expected_version: z.number().int().optional(), request_id: RequestIdField }),
-    run: async ({ env, req, p, body: r }) => {
-      const { name, l } = ledgerOf(env, p.ledger);
-      const { request_id, ...edits } = r;
-      return (await l.apply(name, OPERATOR, { kind: "update_any", task: p.task, ...edits }, requestId(req, request_id))).task;
-    },
-  }),
-  route({
-    method: "POST", path: "/v1/ledgers/:ledger/tasks/:task/assign", auth: "admin",
-    body: z.object({ assignee: AgentOrNull, expected_version: z.number().int().optional(), request_id: RequestIdField }),
-    run: async ({ env, req, p, body: r }) => {
-      const { name, l } = ledgerOf(env, p.ledger);
-      const op: TaskOp = { kind: "assign", task: p.task, expected_version: r.expected_version, assignee: await grantOf(env, r.assignee) };
-      return (await l.apply(name, OPERATOR, op, requestId(req, r.request_id))).task;
-    },
-  }),
-  route({
-    method: "POST", path: "/v1/ledgers/:ledger/tasks/:task/comments", auth: "admin", status: 201, body: z.object({ body: z.string(), request_id: RequestIdField }),
-    run: async ({ env, req, p, body: r }) => {
-      const { name, l } = ledgerOf(env, p.ledger);
-      return (await l.apply(name, OPERATOR, { kind: "comment", task: p.task, body: r.body }, requestId(req, r.request_id))).comment;
-    },
-  }),
-
   // Sandboxes.
   route({
     method: "POST", path: "/v1/sandboxes", auth: "admin",
@@ -606,7 +517,10 @@ export const ROUTES: Route[] = [
       sandbox: z.string().startsWith("sbx_").optional(),
       owner: z.string().startsWith("agt_").optional(),
       captain: z.string().startsWith("agt_").optional(),
-      overrides: OperatorOverrides.optional(),
+      // `params` is gone (the task ledger's `ledger` was the only one): refused, not silently dropped, for one release.
+      overrides: OperatorOverrides.extend({
+        params: z.never({ error: "overrides.params is no longer accepted: the task ledger left the platform" }).optional(),
+      }).optional(),
       launch: LaunchConfig.optional(),
       rules: z.array(ToolRule).optional(),
       // Gone: a client still sending it must not silently get the template's wider tool set.

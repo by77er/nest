@@ -39,7 +39,7 @@ describe("channel names", () => {
     expect(parseChannel("user")).toEqual({ ok: true, value: { kind: "user" } });
     expect(parseChannel("team/review")).toEqual({ ok: true, value: { kind: "free" } });
     expect(parseChannel("ws/auth/ci")).toEqual({ ok: true, value: { kind: "free" } });
-    // Only the `ledger` segment is reserved (a task ledger's future channel), not names that start with it.
+    // Only the `ledger` segment is reserved (the previous release refuses it), not names that start with it.
     expect(parseChannel("ledgers/x")).toEqual({ ok: true, value: { kind: "free" } });
     for (const bad of ["", "Team", "a//b", "/a", "a/", "a b", `${A}/memory`, `${A}`, "sbx_1/inbox", "user/x", "platform", "ws_1/x", "hk_1", "ledger", "ledger/proj-a", "ledger/proj-a/x", "x".repeat(129)]) {
       expect(parseChannel(bad).ok, bad).toBe(false);

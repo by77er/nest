@@ -17,10 +17,10 @@ prompt:  |                                  # added to the system prompt
 
 - **Data, not code:** capabilities are stored in the control plane ([CatalogDO](../../control-plane/durable-objects/catalog/)) and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
-- **Parameters (built for `ledger` only):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. Until attenuation is built a spawner can't set one and its children get none (not even the template's defaults). A parameter naming several values (`tasks{ledgers}`) is the extension point.
+- **Parameters (designed, not built):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. The only one built, the task ledger's `ledger`, left with it ([principle 9](../../README.md#principles)).
 - **Always present, not capabilities:** an agent's own inbox and `events`, and posting questions to its escalation channel.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
-- **Built so far:** `builtin` tools, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `tasks`, `tasks-admin` and `egress`; of the parameters only `ledger` is built (`peers: label:<key>`, `any` aren't), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
+- **Built so far:** `builtin` tools, with channel grants on the capability (`grants`, [CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. The seed has `channels`, `messaging-tree` (`messaging{peers: tree}`), `egress` and `spawning`; no parameter is built (`peers: label:<key>`, `any`), so a wider reach is a capability with a wider pattern (`post` on `agt_*/inbox`).
 
 ## Sources
 
@@ -66,8 +66,6 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding; built as the `brokered` source ([brokered/](brokered/)) |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
 | `metrics` | `metrics_query(sql)` over nest's own [runtime metrics](../../control-plane/metrics/) | reading them; results hold only numbers, enums and ids, so they don't taint |
-| `tasks{ledger}` | `task_list`, `task_get`, `task_create`, `task_update`, `task_claim`, `task_comment` | reading the [task ledger](../../control-plane/durable-objects/tasks/) `ledger`, creating in it, claiming unassigned tasks, updating its own tasks, commenting |
-| `tasks-admin{ledger}` | `task_assign`, `task_update_any`, `task_cancel`, `task_set_watcher` | administering that ledger. Only templates and the operator give it; a spawner can't add it |
 
 **Templates compose them,** with any `mcp` or `api` capability alongside. For example:
 

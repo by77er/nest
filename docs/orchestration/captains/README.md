@@ -27,7 +27,7 @@ priority: high
 credential: claude_oauth_token:captain   # revocable separately from workers
 ```
 
-**Built so far:** the seeded `captain` template ([CatalogDO](../../control-plane/durable-objects/catalog/)): the interim `messaging`, `transcripts`, `sandboxes`, `brokered`, `management` and `memory` capabilities (most of their tools answer `not_implemented`; see [tools](../../agents/tools/)), a replaced prompt with no built-ins, `hands: forbidden`, `escalate_to: user`, `subscribe: [workstream]` and `credential: claude_oauth_token:captain`; a new catalog's also lists `tasks`, `tasks-admin` and `spawning` (`agent_spawn` from `worker`, `agent_stop` on what it spawned: [lifetimes](../../agents/#lifetimes)), and a worker it spawns `ephemeral` ends itself when its task's turn is done. The other capabilities above aren't built.
+**Built so far:** the seeded `captain` template ([CatalogDO](../../control-plane/durable-objects/catalog/)): the interim `messaging`, `transcripts`, `sandboxes`, `brokered`, `management` and `memory` capabilities (most of their tools answer `not_implemented`; see [tools](../../agents/tools/)), a replaced prompt with no built-ins, `hands: forbidden`, `escalate_to: user`, `subscribe: [workstream]` and `credential: claude_oauth_token:captain`; a new catalog's also lists `spawning` (`agent_spawn` from `worker`, `agent_stop` on what it spawned: [lifetimes](../../agents/#lifetimes)), and a worker it spawns `ephemeral` ends itself when its task's turn is done. The other capabilities above aren't built.
 
 ## Conventions in its prompt
 

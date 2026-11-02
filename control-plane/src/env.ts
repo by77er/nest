@@ -16,7 +16,7 @@ export interface Env {
   BROKER: DurableObjectNamespace<BrokerDO>;
   CATALOG: DurableObjectNamespace<CatalogDO>;
   CHANNEL: DurableObjectNamespace<ChannelDO>;
-  /** Task ledgers, one per name (`ledger/<name>`). */
+  /** The task ledger's class, kept declared until stage 4 of its removal deletes it (do/tasks.ts): serves only health. */
   TASKS: DurableObjectNamespace<TaskLedgerDO>;
   /** One per remote MCP server and credential (`connectorName`): the shared tool list and admission. */
   MCP_CONNECTOR: DurableObjectNamespace<McpConnectorDO>;
