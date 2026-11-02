@@ -2,7 +2,7 @@
 // (pure, against the shared fixture nest-proxy evaluates), attenuation in specs, and SandboxDO turning an
 // allowlist into guards, a binding and a token BrokerDO mints for exactly those repos, refreshed before
 // it expires and never pushed once stale. A fake GitHub stands in for api.github.com.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github.json";
 import { grantOfEntry } from "../src/lib/brokered";
@@ -12,7 +12,7 @@ import { canonicalRepos, narrowRepos, Repo } from "../src/lib/repos";
 import { GITHUB_PLACEHOLDER, githubEgress, githubGuards } from "../src/lib/rules/github";
 import { type Catalog, expandSpec, SEED_CATALOG } from "../src/lib/spec";
 import { bytesToB64 } from "../src/lib/util";
-import { adminJson, connectHost, nextCommands, uniqueCell, type Ws } from "./helpers";
+import { adminJson, connectHost, nextCommands, runDue, type Ws, uniqueCell } from "./helpers";
 
 // --- the constructor (pure) ----------------------------------------------------------------------------
 
@@ -224,7 +224,7 @@ describe("a sandbox's push allowlist", () => {
     expect(at).toBeGreaterThan(Date.now());
     expect(at).toBeLessThan(Date.now() + 2 * 60_000);
     await runInDurableObject(stub, async (_i, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'inject_refresh'"));
-    await runDurableObjectAlarm(stub);
+    await runDue(stub);
     const second = ghSecret(await nextCommands(ws, (c) => c.type === "secrets_update")).value;
     expect(second).not.toBe(first);
     expect(second).toBe(gh.mints.at(-1)!.token);

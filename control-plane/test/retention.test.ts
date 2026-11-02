@@ -3,7 +3,7 @@
 // commit records go after their retention, and nothing something still depends on; the GC registry
 // is written by SandboxDO's create; salvage is authorized against every epoch; values read back
 // outside their union are logged.
-import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FleetDO } from "../src/do/fleet";
 import { SandboxDO } from "../src/do/sandbox";
@@ -12,7 +12,7 @@ import type { CommitRequestEvent } from "../src/protocol/control";
 import { storedEnum } from "../src/lib/stored";
 import { SandboxState } from "../src/protocol/model";
 import type { AgentDO } from "../src/do/agent";
-import { adminJson, BASE, connectHost, csrPem, hostHello, manifest, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, BASE, connectHost, csrPem, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
@@ -35,7 +35,7 @@ async function prune(cell: string): Promise<void> {
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
   });
-  expect(await runDurableObjectAlarm(fleetStub(cell)), "the alarm ran").toBe(true);
+  await runDue(fleetStub(cell));
 }
 
 async function workerOnHost(cell: string) {
@@ -346,7 +346,7 @@ async function runSandboxAlarm(sandbox: string, key: string): Promise<void> {
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES (?, 0)", key);
     await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
   });
-  expect(await runDurableObjectAlarm(sandboxStub(sandbox)), "the alarm ran").toBe(true);
+  await runDue(sandboxStub(sandbox));
 }
 
 async function sandboxDeadline(sandbox: string, key: string): Promise<number | undefined> {
@@ -482,7 +482,7 @@ describe("a kill FleetDO answered itself", () => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('condemned', 0)");
       await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
     });
-    await runDurableObjectAlarm(agentStub(agent));
+    await runDue(agentStub(agent));
   };
 
   it("never releases a brain on a retired host whose death isn't proof; its loss does", async () => {
@@ -576,16 +576,16 @@ describe("confirming a host dead", () => {
     await adminJson(`/v1/admin/hosts/${h.host}/confirm-dead?cell=${cell}`, { body: {} });
     expect(await fleetSql(cell, (sql) => rows(sql, "SELECT reason, ended_ms FROM launched WHERE instance_id = 'i-0confirm'")[0])).toEqual({ reason: "dead", ended_ms: null });
     await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
     expect(terminated).toEqual(["i-0confirm"]);
     // Shutting down is not yet ended, nor terminated again.
     await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
     expect(await fleetSql(cell, (sql) => rows(sql, "SELECT ended_ms FROM launched WHERE instance_id = 'i-0confirm'")[0]?.ended_ms)).toBeNull();
     expect(terminated).toEqual(["i-0confirm"]);
     state = "terminated";
     await fleetSql(cell, (sql) => sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
     expect(await fleetSql(cell, (sql) => rows(sql, "SELECT ended_ms FROM launched WHERE instance_id = 'i-0confirm'")[0]?.ended_ms)).toEqual(expect.any(Number));
   });
 });
@@ -606,7 +606,7 @@ describe("the pruning pass", () => {
       st.storage.sql.exec("UPDATE hosts SET dead_ms = ? WHERE host = ?", Date.now() - 8 * DAY, h.host);
       await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
     });
-    expect(await runDurableObjectAlarm(fleetStub(cell))).toBe(true);
+    await runDue(fleetStub(cell));
     expect(await fleetSql(cell, (sql) => rows(sql, "SELECT 1 FROM hosts WHERE host = ?", h.host).length)).toBe(0);
     expect(await fleetSql(cell, (sql) => rows(sql, "SELECT at FROM deadlines WHERE key = 'prune'")[0]?.at as number)).toBeGreaterThan(Date.now() + 23 * 3_600_000);
     // A fresh start re-arms a missing one.

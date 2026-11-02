@@ -1,7 +1,7 @@
 // cancel_call (runner abandoned a platform call) and inbox_delivered (prune the inbox mirror).
-import { env, runDurableObjectAlarm } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -30,10 +30,12 @@ describe("cancel_call", () => {
     expect((await s.ws.next("ack")).up_to).toBe(1);
     s.ws.send({ type: "cancel_call", seq: 2, call: "cal_c1-1", reason: "timed out" });
     expect((await s.ws.next("ack")).up_to).toBe(2);
-    await sleep(250);
-    await runDurableObjectAlarm(agentStub(s.agent));
+    // The sync window lapsing (made due, if it is still armed) sends nothing: the wait was cancelled.
+    await runInDurableObject(agentStub(s.agent), (_i, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key LIKE 'ask:%'"));
+    await runDue(agentStub(s.agent));
     expect(await s.ws.none("tool_result", 100)).toBe(true);
-    const note = (await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications()).at(-1)!;
+    const note = await eventually("the ask's notification", async () =>
+      (await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications()).at(-1));
     const ask = /\[(ask_[A-Za-z0-9]+)\]/.exec(note.text)![1];
     expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
     expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer" });

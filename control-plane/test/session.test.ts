@@ -1,8 +1,8 @@
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { bytesToB64 } from "../src/lib/util";
 import type { AgentDO } from "../src/do/agent";
-import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+import { admin, adminJson, connectHost, eventually, nextCommands, received, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -54,7 +54,7 @@ async function lapseAskWindow(agent: string): Promise<void> {
   const due = () => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
     st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key LIKE 'ask:%'").rowsWritten);
   for (let i = 0; i < 250 && (await due()) === 0; i++) await sleep(20);
-  await runDurableObjectAlarm(agentStub(agent));
+  await runDue(agentStub(agent));
 }
 
 describe("agent start", () => {
@@ -127,8 +127,9 @@ describe("session channel", () => {
     expect(r2.ack.durable_bytes).toBe(a.length + b.length);
 
     const c = '{"type":"summary"}\n';
+    const oldBase = (await agentStub(s.agent).info()).recv_base;
     r2.ws.send(seg(0, c, true)); // file rewritten (compaction): new base
-    await sleep(50);
+    await received(s.agent, c.length, oldBase + 1);
     // Until the new base is durable, the old one stays what resume and transcripts read.
     expect(await (await admin(`/v1/agents/${s.agent}/transcript`)).text()).toBe(a + b);
     await agentStub(s.agent).flush();
@@ -142,7 +143,7 @@ describe("session channel", () => {
 
     // Restarting the brain (once it's gone) rebuilds the session file from signed segment URLs.
     again.ws.close();
-    await sleep(50);
+    await sessionGone(s.agent);
     await agentStub(s.agent).onExited(s.host.host, "idle", 1); // gone: its exit released it
     const { cmd } = await agentStub(s.agent).start();
     const [restart] = await nextCommands(s.host.ws, (x) => x.cmd === cmd);
@@ -160,7 +161,7 @@ describe("session channel", () => {
     const a = '{"type":"user"}\n';
     const big = `${"x".repeat(1024 * 1024)}\n`;
     ws.send(seg(0, a));
-    await sleep(50);
+    await received(s.agent, a.length);
     // The first flush is held just before its R2 put.
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
       inst.testHooks["flush:beforePut"] = async () => {
@@ -170,9 +171,9 @@ describe("session channel", () => {
       };
     });
     const first = agentStub(s.agent).flush();
-    while (!(await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).testHeld))) await sleep(5);
+    await eventually("the first flush to be held", () => runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).testHeld));
     ws.send(seg(a.length, big)); // past 1 MiB: flushes at once
-    while ((await agentStub(s.agent).info()).received_bytes < a.length + big.length) await sleep(10);
+    await received(s.agent, a.length + big.length);
     await sleep(100); // room for the threshold flush to reach R2, were it not waiting for the first
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
       (inst as any).testGo = true;
@@ -300,7 +301,7 @@ describe("platform tool relay", () => {
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     ws.send(seg(0, "line one\nline two\n"));
     // The segment is processed in order on the socket; flush only once it has arrived.
-    for (let i = 0; i < 100 && (await agentStub(s.agent).info()).received_bytes < 18; i++) await sleep(10);
+    await received(s.agent, 18);
     await agentStub(s.agent).flush();
 
     ws.send(toolCall("cal_t4-1", "emit", { event: "pr_opened", summary: "dark mode", url: "https://github.com/x/y/pull/1" }));

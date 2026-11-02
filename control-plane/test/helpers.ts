@@ -1,7 +1,8 @@
 import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
-import { SELF } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { expect } from "vitest";
+import type { FleetDO } from "../src/do/fleet";
 import type { Kms } from "../src/lib/kms";
 import type { EnrollResponse, FleetToHost } from "../src/protocol/control";
 
@@ -189,6 +190,63 @@ export async function okResult(ws: Ws, cmd: string) {
 
 export const manifest = (c: string) => `blake3:${c.repeat(64)}`;
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * `fn`'s first truthy value, polled for up to `ms`. For what another DO, an alarm or workerd's socket
+ * delivery settles on its own time: wait for it rather than sleeping and hoping.
+ */
+export async function eventually<T>(what: string, fn: () => Promise<T> | T, ms = 10_000): Promise<NonNullable<T>> {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v as NonNullable<T>;
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(10);
+  }
+}
+
+/**
+ * Run a DO's alarm and wait until every deadline due now has run (a test makes one due with `at = 0`).
+ * `runDurableObjectAlarm` alone runs only an alarm that is scheduled and not already running: with a real
+ * alarm in flight it does nothing, and a row a test wrote never armed one (`Deadlines.set` does that).
+ * After the one direct run, the rest is left to the pool's real alarms, which never overlap (a second
+ * direct run alongside one in flight would run a handler twice at once, which production never does).
+ */
+export async function runDue(stub: DurableObjectStub): Promise<void> {
+  const t0 = Date.now();
+  await runDurableObjectAlarm(stub);
+  await eventually("the due deadlines to run", () => runInDurableObject(stub, async (_i: unknown, st: DurableObjectState) => {
+    if (!st.storage.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deadlines'").toArray().length) return true;
+    const due = st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM deadlines WHERE at <= ?", t0).one().n;
+    if (due && (await st.storage.getAlarm()) === null) await st.storage.setAlarm(Date.now());
+    return due === 0;
+  }));
+}
+
+const agentDO = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
+
+/** Wait until AgentDO has received `bytes` of the current stream (at `base`, when given): a sent segment lands when workerd delivers it. */
+export async function received(agent: string, bytes: number, base?: number): Promise<void> {
+  await eventually(`${bytes} bytes received`, async () => {
+    const i = await agentDO(agent).info();
+    return i.received_bytes >= bytes && (base === undefined || i.recv_base === base);
+  });
+}
+
+/** Wait until AgentDO holds no runner session socket (a client's close lands when workerd delivers it). */
+export async function sessionGone(agent: string): Promise<void> {
+  await eventually("the session socket to close", async () =>
+    (await runInDurableObject(agentDO(agent), (_i: unknown, st: DurableObjectState) => st.getWebSockets("session").length)) === 0);
+}
+
+/** Inbound items (hellos, event batches) submitted for `host` at FleetDO and not finished, the running one included. */
+export const inboundPending = (cell: string, host: string) => runInDurableObject(env.FLEET.get(env.FLEET.idFromName(cell)), (inst: FleetDO) =>
+  (inst as unknown as { inbound: Map<string, { pending: number }> }).inbound.get(host)?.pending ?? 0);
+
+/** Wait until FleetDO has finished everything it took from `host`: a hello's work goes on after its `hello_ack`. */
+export async function inboundSettled(cell: string, host: string): Promise<void> {
+  await eventually(`FleetDO to finish ${host}'s inbound`, async () => (await inboundPending(cell, host)) === 0);
+}
 export type { FleetToHost };
 
 const EC = { name: "ECDSA", namedCurve: "P-256" } as const;

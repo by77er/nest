@@ -3,14 +3,14 @@
 // AgentDO's turn queue and inbox (batched, once per window under retries and a crash mid-delivery,
 // `none` and `once`), the built-in channels, permission refusals, the channel tools through the
 // real dispatch path, and the catalog's seed migration.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
 import type { ChannelDO } from "../src/do/channel";
 import type { Caller } from "../src/lib/channels";
 import { SEED_CATALOG_V1, SEED_VERSION } from "../src/lib/spec";
-import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+import { admin, adminJson, connectHost, nextCommands, runDue, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -87,7 +87,7 @@ async function fanoutNow(name: string): Promise<void> {
     }
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('fanout', 0)");
   });
-  await runDurableObjectAlarm(chStub(name));
+  await runDue(chStub(name));
 }
 
 describe("ChannelDO: the log", () => {
@@ -895,7 +895,7 @@ describe("review fixes", () => {
         st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('chan_out', 0)");
         await st.storage.setAlarm(Date.now() + 60_000); // run below, not by the runtime
       });
-      await runDurableObjectAlarm(agentStub(agent));
+      await runDue(agentStub(agent));
     }
     const left = await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM chan_out").toArray().length);
     expect(left).toBe(0);
@@ -923,7 +923,7 @@ describe("review fixes", () => {
     const b = await idleAgent();
     await adminJson(`/v1/workstreams/${b.workstream}/subscriber`, { method: "PUT", body: { subscriber: b.agent } });
     await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(b.workstream)).ingest({ workstream: b.workstream, ts_ms: Date.now(), agent: a.agent, type: "blocked", reason: "x" });
-    await runDurableObjectAlarm(env.WORKSTREAM.get(env.WORKSTREAM.idFromName(b.workstream)));
+    await runDue(env.WORKSTREAM.get(env.WORKSTREAM.idFromName(b.workstream)));
     await until(() => kvTainted(b.agent), (t) => t, 10_000, "the subscriber tainted by the batch");
   });
 });
@@ -1095,7 +1095,7 @@ describe("review round 2", () => {
     while (failures < 4) {
       if (Date.now() > end) throw new Error("the post wasn't tried");
       await force();
-      await runDurableObjectAlarm(agentStub(agent));
+      await runDue(agentStub(agent));
     }
     // Past MAX_REFUSALS tries, still queued and never counted as a refusal.
     expect(await runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
@@ -1103,7 +1103,7 @@ describe("review round 2", () => {
     while (!((await readAs(events)).messages as any[]).some((m) => m.text === "kept through failures")) {
       if (Date.now() > end) throw new Error("the post never went through");
       await force();
-      await runDurableObjectAlarm(agentStub(agent));
+      await runDue(agentStub(agent));
     }
   }, 30_000);
 });

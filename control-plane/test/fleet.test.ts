@@ -1,9 +1,9 @@
-import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import { CapacityError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
-import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
 async function workstream(goal = "test") {
   return adminJson<{ workstream: string }>("/v1/workstreams", { body: { goal } }, 201);
@@ -25,7 +25,7 @@ async function expireNow(cell: string, host: string) {
     state.storage.sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, host);
     state.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
   });
-  await runDurableObjectAlarm(fleetStub(cell));
+  await runDue(fleetStub(cell));
 }
 
 describe("fleet channel", () => {
@@ -283,7 +283,7 @@ describe("lease expiry and STONITH", () => {
       inst.ec2Override = ec2;
       state.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     expect((await fleet.hostStatus(a.host))!.status).toBe("dead");
     const info = await sandboxStub(sbx.sandbox).info();
     expect(info).toMatchObject({ epoch: 2, host: b.host, state: "restoring" });
@@ -372,7 +372,7 @@ describe("lease expiry and STONITH", () => {
       state.storage.sql.exec("UPDATE hosts SET token_exp = ? WHERE host = ?", Date.now() + 60_000, h.host);
       state.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
     const rotated = await h.ws.next("host_token");
     expect(rotated.token).toMatch(/^nht_/);
     expect(rotated.expires_ms).toBeGreaterThan(Date.now() + 30 * 60_000);
@@ -394,7 +394,7 @@ describe("autoscaling", () => {
       state.storage.sql.exec("UPDATE launched SET launched_ms = launched_ms - ?", shiftMs);
       state.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
   }
 
   async function autoscaled(cell: string, ec2: MockEc2) {
@@ -572,7 +572,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await runInDurableObject(stub, (_i, st) => {
       st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = ?", key);
     });
-    await runDurableObjectAlarm(stub);
+    await runDue(stub);
   }
 
   it("suspends a running sandbox once nobody has worked on it for the idle period", async () => {
@@ -648,7 +648,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
         st.storage.sql.exec("UPDATE hosts SET idle_since = idle_since - ? WHERE idle_since IS NOT NULL", shift);
         st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
       });
-      await runDurableObjectAlarm(fleet);
+      await runDue(fleet);
     };
     await tick(0);
     await tick(61_000);
@@ -662,7 +662,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('place', 0)");
     });
-    await runDurableObjectAlarm(sandboxStub(sbx.sandbox));
+    await runDue(sandboxStub(sbx.sandbox));
     expect((await sandboxStub(sbx.sandbox).info()).host).toBeNull();
 
     // Lazy start: waking places it from head on the connected host, under the next epoch.

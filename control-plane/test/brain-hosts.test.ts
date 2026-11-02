@@ -1,7 +1,7 @@
 // Brain hosts (docs/compute/brain-hosts/): the pure placement and scaling decisions (lib/placement.ts),
 // unit- and property-tested, then FleetDO and AgentDO applying them: brains only on brain hosts,
 // sandboxes never there, the warm-host preference, capacity in brains, scale-up and idle retirement.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import type { AwsCellConfig } from "../src/lib/cells";
@@ -11,7 +11,7 @@ import { BRAINS_PER_VCPU, brainHostNeeded, idleStep, maxBrains, pickBrainHost, s
 import { capacityRetryMs, type AgentDO } from "../src/do/agent";
 import { NestError } from "../src/lib/util";
 import { ErrorCodes } from "../src/protocol/model";
-import { adminJson, connectHost, csrPem, enrollHost, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, csrPem, enrollHost, hostHello, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -204,7 +204,7 @@ async function tickAt(cell: string, ec2: MockEc2 | null, shiftMs = 0) {
     st.storage.sql.exec("UPDATE hosts SET idle_since = idle_since - ? WHERE idle_since IS NOT NULL", shiftMs);
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
   });
-  await runDurableObjectAlarm(fleetStub(cell));
+  await runDue(fleetStub(cell));
 }
 
 async function captain(cell: string, start = true) {
@@ -442,7 +442,7 @@ describe("brain hosts scale with brains", () => {
       await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => {
         s.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'intent'");
       });
-      await runDurableObjectAlarm(agentStub(agent));
+      await runDue(agentStub(agent));
     }
     const st = await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => ({
       info: JSON.parse(s.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value),
@@ -641,7 +641,7 @@ describe("a brain the operator stopped restarts nothing, however it ends (stop_e
     await runInDurableObject(agentStub(agent), (_i: AgentDO, s) => {
       s.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES (?, 0)", key);
     });
-    await runDurableObjectAlarm(agentStub(agent));
+    await runDue(agentStub(agent));
   };
   /** Two brain hosts and a captain started on the first, with a turn waiting. */
   const started = async () => {
