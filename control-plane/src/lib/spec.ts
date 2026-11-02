@@ -429,7 +429,7 @@ export function checkCapability(
     const idem = cap.mcp.idempotent;
     if (Array.isArray(idem) && new Set(idem).size !== idem.length) return err("mcp.idempotent lists a tool twice");
     const auth = cap.mcp.auth;
-    if (typeof auth !== "string" && auth.client === auth.oauth) return err("mcp.auth: the client secret and the token record must be different names");
+    if (auth !== undefined && typeof auth !== "string" && auth.client === auth.oauth) return err("mcp.auth: the client secret and the token record must be different names");
   }
   if (cap.brokered) {
     const b = checkBrokered(cap.brokered, mcp?.allowLoopbackBrokered ?? false);
@@ -468,8 +468,11 @@ function dedupeBy<T>(items: readonly T[], key: (t: T) => string): T[] {
 }
 const dedupeRules = (rules: readonly ToolRule[]) => dedupeBy(rules, (r) => JSON.stringify([r.pattern, r.decision, r.reason ?? null]));
 
-/** Template `name` expanded as it stands: no overrides, no hands check. */
-export function expandTemplate(catalog: Catalog, registry: readonly string[], name: string): Result<AgentSpec> {
+/**
+ * Template `name` expanded as it stands: no overrides, no hands check. `clients` maps a catalog namespace
+ * to its client's id: an mcp capability in a mapped namespace is that client's (`McpGrant.client`).
+ */
+export function expandTemplate(catalog: Catalog, registry: readonly string[], name: string, clients: Readonly<Record<string, string>> = {}): Result<AgentSpec> {
   if (!Object.hasOwn(catalog.templates, name)) return err(`unknown template ${name}`);
   const tpl = catalog.templates[name]!;
   const caps: Capability[] = [];
@@ -481,7 +484,8 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     const cap = catalog.capabilities[c]!;
     caps.push(cap);
     if (cap.mcp) {
-      const g = grantOf(mcpPrefix(c), cap.mcp);
+      const ns = c.includes("/") ? c.slice(0, c.indexOf("/")) : null;
+      const g = grantOf(mcpPrefix(c), cap.mcp, ns !== null && Object.hasOwn(clients, ns) ? clients[ns] : undefined);
       if (mcp.some((x) => x.capability === g.capability)) return err(`template ${name}: two mcp capabilities make tools named ${g.capability}_*`);
       mcp.push(g);
     }
@@ -564,13 +568,13 @@ export type SpawnSpec =
    */
   | { template: string; hands: boolean; by: "spawner"; share?: boolean; cell_idle_ttl_ms?: number; overrides?: SpawnerOverrides };
 
-/** Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make. */
-export function expandSpec(catalog: Catalog, registry: readonly string[], spec: SpawnSpec): Result<AgentSpec> {
+/** Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make (`clients`: as for `expandTemplate`). */
+export function expandSpec(catalog: Catalog, registry: readonly string[], spec: SpawnSpec, clients: Readonly<Record<string, string>> = {}): Result<AgentSpec> {
   const tpl = Object.hasOwn(catalog.templates, spec.template) ? catalog.templates[spec.template]! : undefined;
   if (!tpl) return err(`unknown template ${spec.template}`);
   if (tpl.hands === "required" && !spec.hands) return err(`template ${spec.template} needs a sandbox`);
   if (tpl.hands === "forbidden" && spec.hands) return err(`template ${spec.template} has no hands`);
-  const base = expandTemplate(catalog, registry, spec.template);
+  const base = expandTemplate(catalog, registry, spec.template, clients);
   if (!base.ok) return base;
   if (spec.by === "spawner") {
     if (spec.share && !tpl.share_sandbox) return err(`template ${spec.template} doesn't share its spawner's sandbox`);

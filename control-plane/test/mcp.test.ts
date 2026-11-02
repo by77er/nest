@@ -58,7 +58,8 @@ class StubMcp {
     return [...this.clients.values()].filter((c) => c === client).length;
   }
 
-  constructor(readonly token: string) {}
+  /** `token`: the bearer it requires; null, a server that takes no bearer and refuses one (it admits by `Nest-Identity`). */
+  constructor(readonly token: string | null) {}
 
   expireSessions(): void {
     this.sessions.clear();
@@ -71,7 +72,7 @@ class StubMcp {
     this.requests.push({ method: msg.method, headers });
     const json = (status: number, body: unknown, extra: Record<string, string> = {}) =>
       new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...extra } });
-    if (headers.authorization !== `Bearer ${this.token}`) return json(401, { error: "unauthorized" });
+    if (this.token === null ? headers.authorization !== undefined : headers.authorization !== `Bearer ${this.token}`) return json(401, { error: "unauthorized" });
     if (this.verifyAud) {
       const v = await verifyIdentity(headers["nest-identity"], { aud: this.verifyAud, keys: (await fetchJwks()).keys });
       if (!v.ok) {
@@ -283,6 +284,13 @@ describe("tool listing and authority", () => {
     await runInDurableObject(s.connector(), (_: McpConnectorDO, st) => st.storage.sql.exec("UPDATE kv SET value = '0' WHERE key = 'listed_ms'"));
     await listTools(s.ws);
     expect(s.stub.methods.filter((m) => m === "tools/list")).toHaveLength(2);
+  });
+
+  it("a connector's name is per server, credential and client namespace, and unchanged for a grant with a credential and no client (connectors from before keep their lists and subscribers)", () => {
+    const url = "https://mcp.example.com/mcp";
+    expect(connectorName({ url, auth: "cap:a" })).toBe(JSON.stringify(["mcp", url, "cap:a"]));
+    const names = [{ url, auth: "cap:a" }, { url }, { url, client: "cli_a" }, { url, client: "cli_b" }, { url, auth: "cap:a", client: "cli_a" }].map(connectorName);
+    expect(new Set(names).size).toBe(names.length);
   });
 
   it("a different credential for the same server is another connector, with its own list", async () => {
@@ -779,6 +787,52 @@ describe("caller identity (Nest-Identity, docs/control-plane/api/clients/#caller
     const mine = (await identities(s, "tools/call")).filter((x) => x.claims.sub === a.agent);
     expect(mine).toHaveLength(1);
     expect(mine[0]!.claims).toMatchObject({ sub: a.agent, owner: c.client, client: c.client, labels: { task: "t-17" } });
+    ws.close();
+  });
+
+  it("a capability with no auth sends no Authorization: Nest-Identity alone, the connector's naming the client whose namespace it is in, and the grant needs no credential for it", async () => {
+    const id = rand();
+    const stub = new StubMcp(null);
+    servers.set(id, stub);
+    const url = `https://mcp.test/${id}/mcp`;
+    stub.verifyAud = url;
+    const cell = uniqueCell();
+    const host = await connectHost(cell, "brain");
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
+    const name = `na-${rand()}`;
+    // Only the model credential: nothing covers a bearer, and none is needed.
+    const c = await adminJson("/v1/admin/clients", {
+      body: { name, grant: { cells: [cell], credentials: ["claude_oauth_token"], mcp_urls: [`https://mcp.test/${id}/`], max_agents: 1 } },
+    }, 201);
+    const asClient = async (method: string, path: string, body: unknown) => {
+      const res = await SELF.fetch(`${BASE}${path}`, { method, headers: { authorization: `Bearer ${c.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      const text = await res.text();
+      expect(res.status, `${path}: ${text}`).toBeLessThan(300);
+      return JSON.parse(text);
+    };
+    await asClient("PUT", `/v1/catalog/capabilities/${name}/srv`, { mcp: { url, trusted: true, tools: ["echo"] } });
+    await asClient("PUT", `/v1/catalog/templates/${name}/t`, {
+      capabilities: ["nest", `${name}/srv`], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
+    });
+    const a = await asClient("POST", "/v1/agents", { template: `${name}/t`, cell });
+    expect(a.mcp).toEqual([expect.objectContaining({ capability: `${name}-srv`, url, client: c.client })]);
+    expect(a.mcp[0]).not.toHaveProperty("auth");
+    await nextCommands(host.ws, (x) => x.type === "agent_start" && x.agent === a.agent);
+    const ws = await runner(a.agent, host.host, host.host_token, 1, `rin_${rand()}`);
+    expect((await listTools(ws)).map((t) => t.name)).toContain(`${name}-srv_echo`);
+    call(ws, "cal_na1", `${name}-srv_echo`, { text: "hi" });
+    expect(await result(ws, "cal_na1")).toEqual({ status: "ok", content: [{ type: "text", text: "hi" }] });
+    // The server refused nothing: no request carried a bearer, and every one's identity verified.
+    expect(stub.refusedIdentity).toEqual([]);
+    expect(stub.requests.filter((r) => "authorization" in r.headers)).toEqual([]);
+    const all = await identities({ id, stub });
+    expect(new Set(all.map((x) => x.method))).toEqual(new Set(["initialize", "notifications/initialized", "tools/list", "tools/call"]));
+    const call_ = all.find((x) => x.method === "tools/call")!.claims;
+    expect(call_).toMatchObject({ sub: a.agent, owner: c.client, client: c.client });
+    // The listing session is this namespace's own connector, and says whose.
+    const listing = all.filter((x) => x.claims.sub === "nest:connector");
+    expect(listing.length).toBeGreaterThan(0);
+    for (const l of listing) expect(l.claims).toMatchObject({ sub: "nest:connector", client: c.client });
     ws.close();
   });
 });

@@ -35,7 +35,7 @@ const McpUrlEntry = z.string().min(1).max(2048).refine((u) => {
 export const Grant = z.strictObject({
   /** Where its agents and sandboxes may run. */
   cells: z.array(CellName).max(64).default([]),
-  /** The BrokerDO secrets its agents' specs may name: the model credential, and an mcp capability's `auth`. Exact. */
+  /** The BrokerDO secrets its agents' specs may name: the model credential, and an mcp capability's `auth` (one with none needs none). Exact. */
   credentials: z.array(z.string().min(1).max(160)).max(64).default([]),
   /** The repos its agents' sandboxes may push to and its GitHub brokered actions may reach (`owner/name`, exact). */
   repos: z.array(Repo).max(256).default([]),
@@ -92,7 +92,8 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
   if (!creds.has(spec.credential)) out.push(`credential ${spec.credential}`);
   for (const m of spec.mcp ?? []) {
     if (!mcpUrlAllowed(grant, m.url)) out.push(`mcp url ${m.url} (${m.capability})`);
-    if (!creds.has(m.auth)) out.push(`credential ${m.auth} (${m.capability})`);
+    // A server that takes no bearer (no `auth`) has no secret to cover: its caller identity is the credential.
+    if (m.auth !== undefined && !creds.has(m.auth)) out.push(`credential ${m.auth} (${m.capability})`);
     if (m.oauth?.client && !creds.has(m.oauth.client)) out.push(`credential ${m.oauth.client} (${m.capability})`);
   }
   const allowed = repoSet(grant.repos);
@@ -112,7 +113,7 @@ export function capabilityOutsideGrant(name: string, cap: Capability, grant: Gra
   if (cap.mcp) {
     if (!mcpUrlAllowed(grant, cap.mcp.url)) out.push(`mcp url ${cap.mcp.url}`);
     const auth = cap.mcp.auth;
-    for (const s of typeof auth === "string" ? [auth] : [auth.oauth, ...(auth.client ? [auth.client] : [])]) {
+    for (const s of auth === undefined ? [] : typeof auth === "string" ? [auth] : [auth.oauth, ...(auth.client ? [auth.client] : [])]) {
       if (!creds.has(s)) out.push(`credential ${s}`);
     }
   }

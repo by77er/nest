@@ -10,7 +10,8 @@ import {
   type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
   expandTemplate, mcpPrefix, rewritePrompt, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template, templatesUsing,
 } from "../lib/spec";
-import { capabilityOutsideGrant, entryVisible, type Grant, grantRefusal, specOutsideGrant } from "../lib/clients";
+import { capabilityOutsideGrant, entryVisible, type Grant, grantRefusal, namespaceOf, specOutsideGrant } from "../lib/clients";
+import { CLIENT_DIRECTORY } from "./client";
 import { NestError } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
 
@@ -225,6 +226,23 @@ export class CatalogDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM templates WHERE name = ?", name);
   }
 
+  /**
+   * The client of each namespace template `name`'s capabilities are in (`expandSpec`'s `clients`): a
+   * client's own from its scope, any other's from the client directory. Only the catalog is read before
+   * the await; nothing here is written.
+   */
+  private async namespaceClients(cat: Catalog, name: string, scope?: ClientScope): Promise<Record<string, string>> {
+    const tpl = Object.hasOwn(cat.templates, name) ? cat.templates[name] : undefined;
+    const out: Record<string, string> = scope ? { [scope.name]: scope.client } : {};
+    const wanted = new Set((tpl?.capabilities ?? []).filter((c) => cat.capabilities[c]?.mcp).map(namespaceOf).filter((ns): ns is string => ns !== null));
+    for (const ns of wanted) {
+      if (Object.hasOwn(out, ns)) continue;
+      const id = await this.env.CLIENT.get(this.env.CLIENT.idFromName(CLIENT_DIRECTORY)).lookup(ns);
+      if (id) out[ns] = id;
+    }
+    return out;
+  }
+
   /** A deleted client's namespace: every `<ns>/…` entry, templates first. */
   async deleteNamespace(ns: string): Promise<number> {
     const prefix = `${ns}/`;
@@ -239,7 +257,8 @@ export class CatalogDO extends DurableObject<Env> {
    * neither a template nor an override widens it.
    */
   async expand(spec: SpawnSpec, scope?: ClientScope): Promise<AgentSpec> {
-    const r = expandSpec(visibleTo(this.load(), scope), PLATFORM_TOOL_NAMES, spec);
+    const cat = visibleTo(this.load(), scope);
+    const r = expandSpec(cat, PLATFORM_TOOL_NAMES, spec, await this.namespaceClients(cat, spec.template, scope));
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, r.error);
     if (scope) {
       const refusal = grantRefusal(scope.client, specOutsideGrant(r.value, scope.grant));
