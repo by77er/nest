@@ -2,12 +2,12 @@
 // pool: the admin API configures an mcp capability, a runner session calls `<capability>_<tool>`, and a
 // stub MCP server (a fetch handler for https://mcp.test/<id>/mcp, installed over the global fetch the
 // proxy calls) records every request. Each guarantee has a test that fails without it.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { McpConnectorDO } from "../src/do/mcp-connector";
 import { approves, argsDigest, checkMcpUrl, connectorName } from "../src/lib/mcp";
-import { adminJson, connectHost, eventually, nextCommands, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, nextCommands, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -550,7 +550,7 @@ describe("a server's changed tool list reaches live brains", () => {
   /** Fire the connector's re-list now (its interval is a minute). */
   const relistNow = async (s: Awaited<ReturnType<typeof setup>>) => {
     await runInDurableObject(s.connector(), (_: McpConnectorDO, st) => st.storage.sql.exec("UPDATE deadlines SET at = 1 WHERE key = 'relist'"));
-    await runDurableObjectAlarm(s.connector());
+    await runDue(s.connector());
   };
 
   it("list_changed on a call's stream: the connector lists again and each live brain is told tools_changed, an older runner isn't, and re-listing shows the tool", async () => {

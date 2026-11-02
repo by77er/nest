@@ -1,15 +1,12 @@
 // Regression tests for the control-plane review findings (one block per finding).
-import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import type { FleetDO } from "../src/do/fleet";
 import { Deadlines } from "../src/lib/reliable";
 import { issueHostToken } from "../src/lib/tokens";
 import { bytesToB64 } from "../src/lib/util";
-import {
-  admin, adminJson, BASE, connectHost, csrPem, eventually, hostHello, inboundPending, manifest, nextCommands, okResult, received, sendEvents, sleep,
-  uniqueCell, Ws,
-} from "./helpers";
+import { admin, adminJson, BASE, connectHost, csrPem, eventually, hostHello, inboundPending, manifest, nextCommands, okResult, received, runDue, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const SESSION2 = "ses_0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d";
@@ -221,7 +218,7 @@ describe("#4 reassignment can't strand leases", () => {
     await runInDurableObject(sandboxStub(s1.sandbox), (_i, st) => {
       st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'");
     });
-    await runDurableObjectAlarm(sandboxStub(s1.sandbox));
+    await runDue(sandboxStub(s1.sandbox));
     expect(await sandboxStub(s1.sandbox).info()).toMatchObject({ host: b.host, epoch: 2 });
   });
 });
@@ -267,7 +264,7 @@ describe("#6 STONITH by fence can't stall", () => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
     a.ws.close();
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     const back = await Ws.connect("/v1/fleet", a.host_token);
     back.send(hostHello(a.host, cell, { instance_id: "nestdtest0000001" }));
     await back.next("hello_ack");
@@ -594,7 +591,7 @@ describe("#21 a deadline re-armed while it runs isn't dropped", () => {
       await runInDurableObject(sandboxStub(s1.sandbox), (_i, st) => {
         st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'");
       });
-      await runDurableObjectAlarm(sandboxStub(s1.sandbox));
+      await runDue(sandboxStub(s1.sandbox));
     };
     await retryNow(); // still no capacity
     expect(await sandboxStub(s1.sandbox).info()).toMatchObject({ host: null });
@@ -687,7 +684,7 @@ describe("#23 captains move off a silent brain host", () => {
       st.storage.sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, a.host);
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
     await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === captain);
     expect((await agentStub(captain).info()).host).toBe(b.host);
     expect((await r.ws.whenClosed())?.code).toBe(4409);
@@ -1244,7 +1241,7 @@ describe("#29 command batches go on the wire in seq order", () => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
       await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
     });
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
     expect((await h.ws.next("commands", (m) => m.seq === seq)).commands[0].cmd).toBe("cmd_01tickcarried000000000000");
   });
 

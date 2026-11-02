@@ -3,7 +3,7 @@
 // gateway URL; resolve then targets that hostname and carries the Access service token; a dead host's
 // assets are deleted and a daily sweep removes leaks, touching only what this cell created. The
 // Cloudflare API is a fake behind the `CloudflareApi` interface; the HTTP client has its own test.
-import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import { CloudflareError, type CloudflareApi, type Listing } from "../src/lib/cloudflare";
@@ -12,7 +12,7 @@ import type { AwsCellConfig } from "../src/lib/cells";
 import { NestError } from "../src/lib/util";
 import { ErrorCodes } from "../src/protocol/model";
 import type { HandsTarget } from "../src/protocol/gateway";
-import { ADMIN, adminJson, BASE, connectHost, csrPem, enrollHost, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { ADMIN, adminJson, BASE, connectHost, csrPem, enrollHost, hostHello, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const DOMAIN = "nest.example.dev";
 const ZONE_ID = "zone-example-dev";
@@ -150,7 +150,7 @@ async function runAlarm(cell: string, key: string) {
   await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES (?, 0)", key);
   });
-  await runDurableObjectAlarm(fleetStub(cell));
+  await runDue(fleetStub(cell));
 }
 
 async function deadline(cell: string, key: string): Promise<number | undefined> {
@@ -456,7 +456,7 @@ describe("retirement releases the tunnel", () => {
       st.storage.sql.exec("UPDATE hosts SET idle_since = idle_since - ? WHERE idle_since IS NOT NULL", shiftMs);
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleetStub(cell));
+    await runDue(fleetStub(cell));
   }
   /** A launched instance, enrolled (with a tunnel) and connected. */
   async function launchedHost(cell: string, instanceId: string) {

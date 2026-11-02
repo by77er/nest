@@ -3,13 +3,13 @@
 // generation it restores before anything else can run; a head that isn't a restore source is never
 // restored; `report` and `off` change nothing; a destroyed sandbox is left alone; rows stored before
 // the `state` column read as ready; FleetDO's first GC run after retention is switched on is dry.
-import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import { SandboxDO } from "../src/do/sandbox";
 import type { CommitRequestEvent } from "../src/protocol/control";
 import type { GenerationRecord } from "../src/protocol/model";
-import { adminJson, connectHost, nextCommands, uniqueCell } from "./helpers";
+import { adminJson, connectHost, nextCommands, runDue, uniqueCell } from "./helpers";
 
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
@@ -82,7 +82,7 @@ async function runSandboxAlarm(sandbox: string, key: string): Promise<void> {
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES (?, 0)", key);
     await st.storage.setAlarm(Date.now() + 3_600_000); // run below, not by the runtime
   });
-  expect(await runDurableObjectAlarm(sandboxStub(sandbox)), "the alarm ran").toBe(true);
+  await runDue(sandboxStub(sandbox));
 }
 
 const deadline = (sandbox: string, key: string) => runInDurableObject(sandboxStub(sandbox), (_i: SandboxDO, st) =>

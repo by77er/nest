@@ -3,13 +3,13 @@
 // bindings only once a slot is confirmed, resolve answers not-ready or not-bound otherwise, and the
 // runner gets its target over the session channel. The oracle for every token is verifyBinding with
 // the key the host received, never the code that minted it.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { kidOf, verifyBinding } from "../src/lib/binding";
 import { b64urlToBytes } from "../src/lib/util";
 import type { SandboxDO } from "../src/do/sandbox";
 import type { HandsTarget } from "../src/protocol/gateway";
-import { adminJson, connectHost, enrollHost, GATEWAY_URL, hostHello, nextCommands, okResult, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, enrollHost, GATEWAY_URL, hostHello, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -21,7 +21,7 @@ async function runAlarm(stub: DurableObjectStub, key: string) {
   await runInDurableObject(stub, (_i, st) => {
     st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = ?", key);
   });
-  await runDurableObjectAlarm(stub);
+  await runDue(stub);
 }
 
 /** An attach command's result: an error nestd would give while the guest is unreachable (retryable). */

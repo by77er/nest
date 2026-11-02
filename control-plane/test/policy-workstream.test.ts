@@ -1,6 +1,6 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { admin, adminJson, connectHost, nextCommands, sleep, uniqueCell } from "./helpers";
+import { admin, adminJson, connectHost, nextCommands, runDue, sleep, uniqueCell } from "./helpers";
 
 describe("egress policy layers", () => {
   it("a temporary grant pushes a newer policy and is withdrawn when it expires", async () => {
@@ -22,7 +22,7 @@ describe("egress policy layers", () => {
     expect(update).toMatchObject({ sandbox: sbx.sandbox, epoch: 1, policy: { version: 2 } });
 
     await sleep(150);
-    await runDurableObjectAlarm(env.SANDBOX.get(env.SANDBOX.idFromName(sbx.sandbox)));
+    await runDue(env.SANDBOX.get(env.SANDBOX.idFromName(sbx.sandbox)));
     const [expired] = await nextCommands(h.ws, (c) => c.type === "policy_update" && c.policy.version === 3);
     expect(expired.policy.allow.some((r: any) => r.host === "api.openai.com")).toBe(false);
   });

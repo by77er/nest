@@ -1,6 +1,6 @@
 // AgentDO and BrokerDO at their seams: side effects that must not be lost, an agent epoch that a sandbox
 // move doesn't touch, secret references that must stay in their slot, and states that must not strand an agent.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import type { FleetDO } from "../src/do/fleet";
@@ -10,7 +10,7 @@ import { verifyBinding } from "../src/lib/binding";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { expandTemplate, SEED_CATALOG } from "../src/lib/spec";
 import { b64urlToBytes } from "../src/lib/util";
-import { adminJson, connectHost, eventually, hostHello, inboundSettled, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, hostHello, inboundSettled, nextCommands, okResult, runDue, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -75,7 +75,7 @@ async function runDeadline(agent: string, key: string) {
   await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
     st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = ?", key);
   });
-  await runDurableObjectAlarm(agentStub(agent));
+  await runDue(agentStub(agent));
 }
 
 describe("an event's side effects survive a failure", () => {
@@ -940,7 +940,7 @@ describe("one brain per agent: the brain record", () => {
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     expect(await fleetRows(cell, captain)).toEqual([]);
     await runDeadline(captain, "intent");
     expect((await nextCommands(b.ws, isStartOf(captain))).find(isStartOf(captain))).toMatchObject({ epoch: 2 });
@@ -1005,7 +1005,7 @@ describe("one brain per agent: the brain record", () => {
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     expect((await agentStub(captain).info()).agent_epoch).toBeGreaterThanOrEqual(1);
   });
 
@@ -1074,7 +1074,7 @@ describe("one brain per agent: the brain record", () => {
       await nextCommands(s.host.ws, isKillOf(s.agent));
       await exited(s.host.ws, s.agent, 1, "fenced");
       expect(await stub.info()).toMatchObject({ brain: null, intent: null, state: "errored", agent_epoch: 1 });
-      await runDurableObjectAlarm(stub);
+      await runDue(stub);
       expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(s.agent)))).toBe(true);
       await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "try again" } }, 201);
       expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
@@ -1172,7 +1172,7 @@ describe("one brain per agent: the brain record", () => {
     await runInDurableObject(fleet, (_i, st) => {
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     expect(await fleetRows(s.cell, s.agent)).toEqual([]);
     expect((await agentStub(s.agent).info()).brain).toBeNull();
   });
@@ -1279,7 +1279,7 @@ describe("one brain per agent: the brain record", () => {
       st.storage.sql.exec("INSERT INTO turns (turn, ord, input, status, created_ms) VALUES ('trn_r', 1, ?, 'queued', ?)", JSON.stringify({ kind: "user", text: "go" }), Date.now());
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('restart', 0)");
     });
-    await runDurableObjectAlarm(agentStub(s.agent));
+    await runDue(agentStub(s.agent));
     expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(s.agent)))).toBe(true);
     expect(await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
       st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'restart'").toArray().length)).toBe(0);
@@ -1361,7 +1361,7 @@ describe("a draining host's brains", () => {
       inst.ec2Override = null;
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     return fleet;
   };
 
@@ -1483,7 +1483,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
         inst.ec2Override = null;
         st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
       });
-      await runDurableObjectAlarm(fleet);
+      await runDue(fleet);
     };
     // The sandbox host: no running sandbox, but a brain indexed there (the previous release ran
     // workers' brains on their sandbox's host; the upgrade leaves them until they exit).
@@ -1752,7 +1752,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     let state = "shutting-down";
     const tick = async () => {
       await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)"));
-      await runDurableObjectAlarm(fleet);
+      await runDue(fleet);
     };
     await tick();
     expect((await fleet.hostStatus(a.host))!.lost).toBe(false);
@@ -1863,7 +1863,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
       inst.ec2Override = null;
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     expect((await fleet.hostStatus(a.host))!.status).toBe("dead");
   });
 
@@ -2202,7 +2202,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
       inst.ec2Override = null;
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
     });
-    await runDurableObjectAlarm(fleet);
+    await runDue(fleet);
     expect((await fleet.hostStatus(a.host))!.status).toBe("draining");
     expect((await fleet.hostStatus(b.host))!.status).toBe("draining");
   });
@@ -2246,7 +2246,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
         inst.ec2Override = null;
         st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
       });
-      await runDurableObjectAlarm(fleet);
+      await runDue(fleet);
     }
     expect((await fleet.hostStatus(s.host.host))!.status).toBe("dead");
   });
@@ -2268,7 +2268,7 @@ describe("FleetDO and SandboxDO at the seam", () => {
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
       (inst as any).go = true;
     });
-    await runDurableObjectAlarm(sandboxStub(s.sandbox));
+    await runDue(sandboxStub(s.sandbox));
     await eventually("the agent told of the move", async () => (await agentStub(s.agent).info()).hands_moved_ms !== undefined);
   });
 });
@@ -2303,7 +2303,7 @@ async function silent(cell: string, host: string) {
     st.storage.sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, host);
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
   });
-  await runDurableObjectAlarm(fleet);
+  await runDue(fleet);
 }
 
 async function wedgedMs(cell: string, host: string) {

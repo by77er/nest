@@ -1,8 +1,8 @@
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { bytesToB64 } from "../src/lib/util";
 import type { AgentDO } from "../src/do/agent";
-import { admin, adminJson, connectHost, eventually, nextCommands, received, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
+import { admin, adminJson, connectHost, eventually, nextCommands, received, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -54,7 +54,7 @@ async function lapseAskWindow(agent: string): Promise<void> {
   const due = () => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
     st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key LIKE 'ask:%'").rowsWritten);
   for (let i = 0; i < 250 && (await due()) === 0; i++) await sleep(20);
-  await runDurableObjectAlarm(agentStub(agent));
+  await runDue(agentStub(agent));
 }
 
 describe("agent start", () => {

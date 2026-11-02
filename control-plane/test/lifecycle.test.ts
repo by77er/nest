@@ -4,12 +4,12 @@
 // stale incarnations are destroyed on their old host after salvage, and preview and share names
 // follow the hostname rule. Event orders are the ones nestd produces (crates/nestd/src/host.rs:
 // `fence_sandbox` emits `sandbox_state{fenced}` before the fence command's result).
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FleetDO } from "../src/do/fleet";
 import { portHostname, type SandboxDO } from "../src/do/sandbox";
 import type { Ec2, InstanceState } from "../src/lib/ec2";
-import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, enrollHost, hostHello, nextCommands, okResult, runDue, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const fleetStub = (cell: string) => env.FLEET.get(env.FLEET.idFromName(cell));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
@@ -32,7 +32,7 @@ async function expireNow(cell: string, host: string, ec2: Ec2 | null) {
     st.storage.sql.exec("UPDATE hosts SET last_rx = ? WHERE host = ?", Date.now() - 31_000, host);
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
   });
-  await runDurableObjectAlarm(fleetStub(cell));
+  await runDue(fleetStub(cell));
 }
 
 async function tick(cell: string, ec2: Ec2 | null) {
@@ -40,7 +40,7 @@ async function tick(cell: string, ec2: Ec2 | null) {
     inst.ec2Override = ec2;
     st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
   });
-  await runDurableObjectAlarm(fleetStub(cell));
+  await runDue(fleetStub(cell));
 }
 
 /** A sandbox host whose hello reports this much hugepage room (placement prefers the fullest host). */
@@ -141,7 +141,7 @@ describe("an unfinished placement is reconciled against the lease", () => {
     await events(a.ws, [{ type: "sandbox_state", sandbox: unplaced.sandbox, epoch: 1, state: "running", guest: GUEST }]);
     expect((await sandboxStub(unplaced.sandbox).info()).host).toBeNull();
 
-    await runDurableObjectAlarm(sandboxStub(unplaced.sandbox));
+    await runDue(sandboxStub(unplaced.sandbox));
     const info = await sandboxStub(unplaced.sandbox).info();
     expect(info).toMatchObject({ host: a.host, epoch: 1, state: "running", placing: null, guest: GUEST });
     // Running and placed: the idle countdown is armed, so it suspends (and stops billing) when idle.
@@ -176,11 +176,11 @@ describe("an unfinished placement is reconciled against the lease", () => {
     expect(await stub.info()).toMatchObject({ placing: 1, host: null });
     // Not stale yet: the alarm only re-arms itself.
     await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'"));
-    await runDurableObjectAlarm(stub);
+    await runDue(stub);
     expect(await stub.info()).toMatchObject({ placing: 1, host: null });
     // Stale, and FleetDO never leased it: cleared, then placed.
     await cutOff(unplaced.sandbox, 1);
-    await runDurableObjectAlarm(stub);
+    await runDue(stub);
     expect(await stub.info()).toMatchObject({ placing: null, host: a.host, epoch: 2 });
   });
 });
@@ -486,7 +486,7 @@ describe("the lease's guards (docs/verification/sandbox-lease)", () => {
     expect(await stub.info()).toMatchObject({ state: "fenced", host: null });
     const b = await hostWithRoom(cell, 8192);
     await runInDurableObject(stub, (_i, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'"));
-    await runDurableObjectAlarm(stub);
+    await runDue(stub);
     expect((await stub.info()).host).toBe(b.host);
   });
 

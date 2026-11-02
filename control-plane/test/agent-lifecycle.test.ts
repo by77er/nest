@@ -4,7 +4,7 @@
 // ephemeral agent ends itself; an end cascades, drops queued turns, refuses input and may destroy the
 // sandbox made for the agent; a dormant sandbox is destroyed after its idle TTL, with a day's notice;
 // an ended agent's records go after the retention. The pure rules are checked directly first.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import type { SandboxDO } from "../src/do/sandbox";
@@ -14,7 +14,7 @@ import {
 } from "../src/lib/lifetimes";
 import { expandSpec, SEED_CATALOG, type Catalog } from "../src/lib/spec";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
-import { adminJson, connectHost, nextCommands, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, nextCommands, runDue, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_0b7e7a52-3c1d-4e8f-9a6b-1d2c3e4f5a6b";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -471,7 +471,7 @@ describe("ends that wait for what they own", () => {
       st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'end'");
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('prune', 0)");
     });
-    await runDurableObjectAlarm(agentStub(p.agent));
+    await runDue(agentStub(p.agent));
     // Armed again, before anything else (here, its brain's exit) would.
     expect(await runInDurableObject(agentStub(p.agent), (_i: AgentDO, st) =>
       st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'end'").toArray().length)).toBe(1);
@@ -543,7 +543,7 @@ describe("a dormant sandbox's idle TTL", () => {
       st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('expiry', 0)");
     });
-    await runDurableObjectAlarm(sandboxStub(sandbox));
+    await runDue(sandboxStub(sandbox));
   }
   /** The `user` channel's expiry notices for `sandbox` (the channel is every test's: paged from the start). */
   const userNotices = async (sandbox: string) => {
@@ -633,16 +633,16 @@ describe("a dormant sandbox's idle TTL", () => {
       st.storage.sql.exec("UPDATE sandboxes SET lifetime_ms = NULL");
       st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('prune', 0)");
     });
-    await runDurableObjectAlarm(fleetStub(s.cell));
+    await runDue(fleetStub(s.cell));
     expect(await armed()).toBe(true);
     const row = await runInDurableObject(fleetStub(s.cell), (_i: FleetDO, st) =>
       st.storage.sql.exec<{ lifetime_ms: number | null }>("SELECT lifetime_ms FROM sandboxes WHERE sandbox = ?", s.sandbox).one());
     expect(row.lifetime_ms).toBeGreaterThan(0);
     // Its first check starts its clock, durably (a later check counts from it, not from itself).
-    await runDurableObjectAlarm(sandboxStub(s.sandbox));
+    await runDue(sandboxStub(s.sandbox));
     const since = await until(async () => (await sandboxStub(s.sandbox).info()).dormant_since_ms, "its clock started");
     await runInDurableObject(sandboxStub(s.sandbox), (_i: SandboxDO, st) => { st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'expiry'"); });
-    await runDurableObjectAlarm(sandboxStub(s.sandbox));
+    await runDue(sandboxStub(s.sandbox));
     expect((await sandboxStub(s.sandbox).info()).dormant_since_ms).toBe(since);
   });
 });
@@ -661,13 +661,13 @@ describe("an ended agent's records", () => {
     await until(async () => (await ended(c.agent))?.done_ms, "the end done");
     // Not before the retention.
     await runInDurableObject(agentStub(c.agent), (_i: AgentDO, st) => { st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'reap'"); });
-    await runDurableObjectAlarm(agentStub(c.agent));
+    await runDue(agentStub(c.agent));
     expect(await env.BUCKET.get(`sessions/${c.agent}/b0/0`)).not.toBeNull();
     await runInDurableObject(agentStub(c.agent), (inst: AgentDO, st) => {
       (inst as any).update((i: any) => { i.ended.ms = Date.now() - AGENT_RECORD_RETENTION_MS - 1; });
       st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'reap'");
     });
-    await runDurableObjectAlarm(agentStub(c.agent));
+    await runDue(agentStub(c.agent));
     expect(await env.BUCKET.get(`sessions/${c.agent}/b0/0`)).toBeNull();
     await expect(Promise.resolve().then(() => agentStub(c.agent).info())).rejects.toThrow("unknown agent");
     // Its owner's stop now finds nobody (and its index row says it ended).

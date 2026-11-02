@@ -1,6 +1,6 @@
 import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
-import { env, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { expect } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
 import type { Kms } from "../src/lib/kms";
@@ -203,6 +203,24 @@ export async function eventually<T>(what: string, fn: () => Promise<T> | T, ms =
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
     await sleep(10);
   }
+}
+
+/**
+ * Run a DO's alarm and wait until every deadline due now has run (a test makes one due with `at = 0`).
+ * `runDurableObjectAlarm` alone runs only an alarm that is scheduled and not already running: with a real
+ * alarm in flight it does nothing, and a row a test wrote never armed one (`Deadlines.set` does that).
+ * After the one direct run, the rest is left to the pool's real alarms, which never overlap (a second
+ * direct run alongside one in flight would run a handler twice at once, which production never does).
+ */
+export async function runDue(stub: DurableObjectStub): Promise<void> {
+  const t0 = Date.now();
+  await runDurableObjectAlarm(stub);
+  await eventually("the due deadlines to run", () => runInDurableObject(stub, async (_i: unknown, st: DurableObjectState) => {
+    if (!st.storage.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deadlines'").toArray().length) return true;
+    const due = st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM deadlines WHERE at <= ?", t0).one().n;
+    if (due && (await st.storage.getAlarm()) === null) await st.storage.setAlarm(Date.now());
+    return due === 0;
+  }));
 }
 
 const agentDO = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));

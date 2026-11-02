@@ -3,7 +3,7 @@
 // against the lifetime check it predicts), then the route over real DOs: a dormant sandbox with its
 // destroy time, a sandbox held by an agent nobody uses (never dormant, so no TTL takes it), what an
 // end leaves, a pruned agent still attached, an unreadable sandbox or agent, pages and caps.
-import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import type { FleetDO } from "../src/do/fleet";
@@ -11,7 +11,7 @@ import type { SandboxDO } from "../src/do/sandbox";
 import { type AgentFacts, type AgentRead, classifyAgent, classifySandbox, DEFAULT_QUIET_MS, ENDING_STUCK_MS, type SandboxFacts } from "../src/lib/abandoned";
 import { DEFAULT_SANDBOX_IDLE_TTL_MS, destroyAtMs, EXPIRY_GAP_MS, EXPIRY_NOTICE_MS, expiryStep } from "../src/lib/lifetimes";
 import type { LifetimesView } from "../../protocol/admin/view";
-import { admin, adminJson, connectHost, nextCommands, sendEvents, sleep, uniqueCell } from "./helpers";
+import { admin, adminJson, connectHost, nextCommands, runDue, sendEvents, sleep, uniqueCell } from "./helpers";
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -288,7 +288,7 @@ describe("GET /v1/admin/lifetimes", () => {
       i.ended = { ms: Date.now() - 31 * DAY, by: "user", reason: "stopped", kill: true, destroy_sandbox: false, done_ms: Date.now() - 31 * DAY };
       sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('reap', 0)");
     });
-    await runDurableObjectAlarm(agentStub(agent));
+    await runDue(agentStub(agent));
     await expect(Promise.resolve().then(async () => { await agentStub(agent).info(); })).rejects.toThrow("unknown agent");
     const v = await view(c.cell);
     expect(v.agents).toEqual([expect.objectContaining({ agent, kind: "gone", template: null, error: null })]);
