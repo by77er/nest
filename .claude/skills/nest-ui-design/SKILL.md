@@ -62,7 +62,7 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 | subtle | `#f1f3f5` | `#222327` | hover, column wells, code |
 | border | `#e9ecef` | `#2c2e33` | hairlines |
 | text | `#212529` | `#e9ecef` | body |
-| muted | `#6c757d` | `#9aa0a6` | meta, captions |
+| muted | `#666e76` | `#9aa0a6` | meta, captions |
 | primary | `#3b6fc0` | `#5a8ad6` | primary actions; assigned, in progress, in review |
 | danger | `#c2414c` | `#d9606a` | close, cancel, delete, deny; cancelled, failed |
 | warning | `#dca71c` (dark text) | `#e3b341` (dark text) | stalled, needs input, undelivered, expiring |
@@ -71,7 +71,8 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 - Each semantic role is a 10-shade Mantine tuple, with the filled shade as above. Dark mode uses Mantine's `primaryShade: {light: 6, dark: 5}` or equivalent.
 - Light (tinted) variants for badges and banners come from the same tuple.
 - Never use pure RGB, and never invent a color outside this table.
-- **Contrast:** text on every filled color, and every light badge, meets WCAG AA (4.5:1) in both schemes, checked by a test. If a dark value above fails, adjust it here and in the theme together.
+- **Text on a filled role:** white in light (dark text on warning); the dark `page` color in dark, since white on the dark fills is about 3.5:1.
+- **Contrast:** text on every filled color, and every light badge, meets WCAG AA (4.5:1) in both schemes, checked by a test. If a dark value above fails, adjust it here and in the theme together. (Light `muted` was `#6c757d`, 4.49:1 on `page` and 4.22:1 on `subtle`: darkened to `#666e76`, 4.96:1 and 4.65:1.)
 
 ## Layout primitives
 
