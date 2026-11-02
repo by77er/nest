@@ -108,6 +108,27 @@
   height: 100%;
 }
 
+/* Command: wraps at any character, within a measure that keeps its column narrow. The table's
+   cells don't wrap; this one does. */
+.command {
+  display: block;
+  max-width: 44ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.scroller td .command {
+  white-space: normal;
+}
+
+/* The copy button: 32 px on desktop (Mantine's lg is 34), 44 px on touch. */
+@media (pointer: coarse) {
+  .copy {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+}
+
 /* Prose: a readable measure. */
 .prose {
   max-width: 80ch;

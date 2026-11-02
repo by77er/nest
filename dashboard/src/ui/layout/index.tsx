@@ -1,9 +1,9 @@
 // The layout primitives (the skill's "Layout primitives"): every screen is composed from these and
 // Mantine's components. They hold the layout's values (layout.module.css); feature code arranges them.
 
-import { Alert, Badge, Button, Group, Loader, Paper, Stack, Table, Text, Title } from "@mantine/core";
+import { ActionIcon, Alert, Badge, Button, CopyButton, Group, Loader, Paper, Stack, Table, Text, Title } from "@mantine/core";
 import { useTimeout } from "@mantine/hooks";
-import { IconAlertTriangle, IconCircleCheck, IconCircleX } from "@tabler/icons-react";
+import { IconAlertTriangle, IconCheck, IconCircleCheck, IconCircleX, IconCopy } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useId, useRef, useState } from "react";
 import type { Role } from "../theme";
 import classes from "./layout.module.css";
@@ -205,4 +205,23 @@ export function ItemList({ label, children }: { label: string; children: ReactNo
 /** A paragraph of secondary text, kept to a readable measure. */
 export function Prose({ children }: { children: ReactNode }) {
   return <Text size="sm" c="dimmed" className={classes.prose}>{children}</Text>;
+}
+
+/**
+ * A command the reader may run themselves (the page runs nothing): mono, caption size, wrapping at any
+ * character within a bounded measure so a table column stays readable, with a button that copies it.
+ */
+export function Command({ text }: { text: string }) {
+  return (
+    <Group gap="xs" wrap="nowrap" align="flex-start">
+      <Text span size="xs" c="dimmed" ff="monospace" className={classes.command}>{text}</Text>
+      <CopyButton value={text} timeout={1500}>
+        {({ copied, copy }) => (
+          <ActionIcon variant="subtle" color={copied ? "success" : "gray"} size="lg" className={classes.copy} onClick={copy} aria-label={copied ? "Copied" : `Copy command: ${text}`}>
+            {copied ? <IconCheck size={14} stroke={2} aria-hidden /> : <IconCopy size={14} stroke={2} aria-hidden />}
+          </ActionIcon>
+        )}
+      </CopyButton>
+    </Group>
+  );
 }

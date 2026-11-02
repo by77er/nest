@@ -59,7 +59,23 @@ describe("the recorded fleet", () => {
     expect(rows[0]).toHaveTextContent("never (not dormant)");
     const agents = within(life).getByRole("table", { name: "Agents left lying around" });
     expect(within(agents).getAllByRole("row").slice(1).map((r) => within(r).getAllByTitle(/^agt_/)[0]!.title)).toEqual([lead!.agent, quiet!.agent]);
-    expect(life.querySelector("button, form, input, select, textarea")).toBeNull();
+    // Nothing that acts: no form or field, and the only buttons copy an operator's command.
+    expect(life.querySelector("form, input, select, textarea")).toBeNull();
+    const buttons = within(life).getAllByRole("button");
+    expect(buttons.map((b) => b.getAttribute("aria-label")!.replace(/: .*/, ""))).toEqual(Array(4).fill("Copy command"));
+  });
+
+  it("copies an operator's command as the page shows it", async () => {
+    const writeText = vi.fn(async () => {});
+    const { user } = renderPage();
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const sandboxes = await screen.findByRole("table", { name: "Sandboxes left lying around" });
+    const row = within(sandboxes).getByTitle(dormant!.sandbox).closest("tr")!;
+    const command = `PUT /v1/sandboxes/${dormant!.sandbox}/lifetime (keep) · DELETE /v1/sandboxes/${dormant!.sandbox} (now)`;
+    expect(row).toHaveTextContent(command);
+    await user.click(within(row).getByRole("button", { name: `Copy command: ${command}` }));
+    expect(writeText).toHaveBeenCalledWith(command);
+    expect(await within(row).findByRole("button", { name: "Copied" })).toBeInTheDocument();
   });
 });
 

@@ -7,7 +7,7 @@ import { useMemo } from "react";
 import type { LifetimesResponse } from "../../api";
 import { iso, span } from "../format";
 import { rowId } from "../fleet";
-import { DataTable, EmptyState, ErrorState, LoadingState, Panel, Prose, Section } from "../layout";
+import { Command, DataTable, EmptyState, ErrorState, LoadingState, Panel, Prose, Section } from "../layout";
 import { agentCall, byAge, destroyIn, idleSince, operatorCall, SANDBOX_WHY, total } from "../lifetimes";
 import { AGENT_LIFETIME_ROLE, SANDBOX_LIFETIME_ROLE } from "../status";
 import { Id, Mono, None, Status } from "./common";
@@ -66,7 +66,7 @@ export function Lifetimes({ view, now }: { view: LifetimesResponse; now: number 
                 <Table.Td ta="right">{s.generations === null ? <None /> : `${s.generations}${s.memory_generations ? ` (${s.memory_generations} with memory)` : ""}`}</Table.Td>
                 <Table.Td>{s.attached.length ? <Group gap="xs" wrap="nowrap">{s.attached.map((a) => <Id key={a} id={a} />)}</Group> : <None />}</Table.Td>
                 <Table.Td>{s.owner ? <Id id={s.owner} /> : <None>operator</None>}</Table.Td>
-                <Table.Td><Text span size="xs" c="dimmed" ff="monospace">{operatorCall(s)}</Text></Table.Td>
+                <Table.Td><Command text={operatorCall(s)} /></Table.Td>
               </Table.Tr>
             ))}
           </DataTable>
@@ -97,7 +97,7 @@ export function Lifetimes({ view, now }: { view: LifetimesResponse; now: number 
                 <Table.Td><Id id={a.sandbox} /></Table.Td>
                 <Table.Td ta="right">{a.live_children.length}</Table.Td>
                 <Table.Td><Text span size="sm" c="dimmed">{a.found_via}</Text></Table.Td>
-                <Table.Td><Text span size="xs" c="dimmed" ff="monospace">{agentCall(a)}</Text></Table.Td>
+                <Table.Td><Command text={agentCall(a)} /></Table.Td>
               </Table.Tr>
             ))}
           </DataTable>
