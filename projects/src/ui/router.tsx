@@ -2,7 +2,7 @@
 // (wrangler.jsonc's single-page-application handling), after the Access check.
 
 import { createRootRoute, createRoute, createRouter, lazyRouteComponent, type RouterHistory } from "@tanstack/react-router";
-import { NotFound, RouteError, Shell } from "./layout/Shell";
+import { NotFound, RouteError, Shell } from "./features/shell/Shell";
 
 // Each page is its own chunk, loaded when its route is first visited (or hovered: preload on intent).
 const ProjectsPage = lazyRouteComponent(() => import("./features/projects/ProjectsPage"), "ProjectsPage");

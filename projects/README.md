@@ -148,28 +148,42 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 
 ## The UI
 
-**Code:** `src/ui/`, one folder per feature (`projects`, `project`, `board`, `task`, `chat`, `asks`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
+**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `asks`, `settings`, `admin`), each component next to its test. `src/main.tsx` mounts it.
 
-- **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and a custom theme (`src/ui/theme.ts`), with one CSS module of its own (the board's grid); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons.
+- **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and one theme (`src/ui/theme.ts`); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons, Inter and JetBrains Mono self-hosted from npm.
 - **One API client** (`src/ui/api/client.ts`), same origin, so Access's cookie is the only credential: nothing secret is in the bundle. Its types are the Worker's own, imported by type only; the request bodies' zod schemas live in `src/requests.ts`, which both the Worker and the forms validate with.
-- **Live views poll while the tab is visible:** the chat every 3 s, the board and the asks every 5 s, the project every 10 s. The board stops polling while a card is dragged.
+- **Live views poll while the tab is visible:** the chat every 3 s, the board and the asks every 5 s, the project every 10 s. The board stops polling while a card is dragged. Nothing animates on a poll.
 - **Optimistic where safe:** reordering (one `ord` written, between the new neighbours'; put back if refused) and a chat message (shown as sending; its text back in the composer if refused). An answer to an ask isn't: the ask stays until nest has taken it.
-- **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling and marking done are confirmed, and "Mark done" shows only for a task with no PR and no live worker; a failed write is a red notification with the Worker's reason.
-- **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit.
-- **Layout:** the board's columns share its width, each at least 8.5rem from 62em on (all six fit beside the chat at 1280 px) and 16rem below; past that the row scrolls sideways. A card's badges and details wrap, never clip. The chat is a 320 px side panel from 75em, below the board on narrower screens, and can be hidden (remembered per browser).
+- **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling, deleting and marking done are confirmed, with the safe choice focused; "Mark done" shows only for a task with no PR and no live worker. A failed write is a notification (bottom right) with the Worker's reason.
+- **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit; Mantine, React and the other libraries are chunks of their own too (vite.config.ts), cached across releases.
 - **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
-- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list now returns, and a "needs input" marker from the project's open asks.
+- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, and a "needs input" marker from the project's open asks.
 
-**The theme:** light only, near-white page (`#fafafa`) with white surfaces, near-black text (`#212529`) and Mantine's grays. Color is only for actions and status, in four roles, each a 10-shade tuple ([`src/ui/theme.ts`](src/ui/theme.ts)), Bootstrap's hues a step muted. Shade 6 is the filled one; filled text is white, or dark on yellow (Mantine's `autoContrast`):
+### Design system
 
-| Role | Shade 6 | Text on it | For |
-|---|---|---|---|
-| `primary` (blue) | `#3b6fc0` | white, 4.98:1 | primary actions (create, assign, save, send); work in progress (assigned, in progress, in review) |
-| `danger` (red) | `#c2414c` | white, 5.05:1 | close, cancel, delete, deny; cancelled |
-| `warning` (yellow) | `#dca71c` | dark, 7.21:1 | stalled, needs input (asks), undelivered messages, start errors |
-| `success` (green) | `#2c8152` | white, 4.81:1 | mark done, approve; done |
+The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-design/SKILL.md)'s; this app implements them.
 
-Drafts and ready tasks are gray: no work has started. `src/ui/theme.test.ts` checks every filled label and light badge against WCAG AA (4.5:1), and that components name only these roles and the grays.
+**Tokens**, defined once in `src/ui/theme.ts` as Mantine theme values and `--nest-*` CSS variables, light and dark (the scheme follows the system):
+
+| Token | Values |
+|---|---|
+| Fonts | Inter Variable (UI), JetBrains Mono Variable (ids, code), from `@fontsource-variable/*`; no external request |
+| Type | caption 12/16 (`xs`), small 13/20 (`sm`), body 14/20 (`md`), body-lg 16/24 (`lg`); h4 14/20, h3 16/24, h2 20/28, h1 24/32, all 600; weights `regular` 400, `medium` 500, `bold` 600 |
+| Spacing | `2xs` 2, `xs` 4, `sm` 8, `md` 12, `lg` 16, `xl` 24, `2xl` 32, `3xl` 48, `4xl` 64 (px) |
+| Radii | `sm` 4 (badges, inputs), `md` 8 (panels, buttons) |
+| Borders, shadows | a 1 px hairline in `border`; `raised` (a dragged card) and `overlay` (drawers, modals) |
+| Neutrals (light / dark) | page `#fafafa` / `#121314`, surface `#ffffff` / `#1a1b1e`, subtle `#f1f3f5` / `#222327`, border `#e9ecef` / `#2c2e33`, text `#212529` / `#e9ecef`, muted `#656d75` / `#9aa0a6` |
+| Roles (filled, light / dark) | primary `#3b6fc0` / `#5a8ad6`, danger `#c2414c` / `#d9606a`, warning `#dca71c` / `#e3b341`, success `#2c8152` / `#3f9e6a`; label white (dark on warning) in light, `#121314` in dark |
+| Motion | 120 / 180 / 240 ms, `cubic-bezier(0.2, 0, 0, 1)` in, `cubic-bezier(0.4, 0, 1, 1)` out; opacity and transform only; reduced motion honoured; a spinner only after 300 ms |
+| Layout | page max 1440 px; gutters `lg` / `xl` / `2xl` (phone / tablet / desktop); side panel 320 px from 75em; board columns at least 8.5rem from 62em (16rem below) |
+
+**Primitives** (`src/ui/layout/`): `AppFrame` (header and content), `Page` (the max width, gutters, `2xl` between blocks; `measure` for a page of forms), `PageHeader` (breadcrumbs, the one h1 with its actions right on its row, wrapping when narrow, and a meta line), `Section` (a heading row of one height: title, count, actions right; `dense` for a board column), `Panel` (the bordered surface, `lg` padding, `md` when dense; never nested) and `Well` (the borderless subtle region that holds Panels), `Toolbar` (actions `sm` apart, wrapping; destructive ones last after a divider), `Stack` and `Row` (gaps from the scale), `FieldGroup` (fields `lg` apart, actions bottom right), `EmptyState`, `LoadingState`, `ErrorState` and `Notice`, `MetaRow`/`MetaItem` (caption lines), `CardGrid`, `ColumnGrid` and `SplitView` (the board and the chat beside it), `SortablePanel` (a draggable card), `Sheet` (the task drawer), `ScrollLog` and `Bubble` (the chat), `Prose`.
+
+**Rules:**
+- **Placement:** a section's primary action at its top right, secondary ones to its left; destructive ones last, set apart, and confirmed. In forms and dialogs the actions are bottom right, the primary rightmost. A status badge right after the thing it's about; who and when on a caption line below.
+- **Proximity:** `sm` between a card's lines, `md` between cards, `2xl` between a page's blocks.
+- **Similarity:** one card (a Panel), one badge per status, one button hierarchy (filled primary, default secondary, subtle tertiary; red for close and cancel).
+- **Enforced** by `src/ui/design.test.ts`: outside `theme.ts` and `layout/`, no inline `style`, `className` or CSS; no raw lengths or literal colors; colors only by role, gray, `dimmed` or `bright`; spacing only by the scale's names; weights by name; and no Mantine layout container (Group, Stack, Paper, Box, …). `src/ui/theme.test.ts` reads the skill's tables and checks every token against them, AA contrast in both schemes, and each status's role. `src/ui/layout/layout.test.tsx` checks the primitives' placement.
 
 ```bash
 npm run dev    # the page and the API in workerd; without NEST_CLIENT_TOKEN the API answers, but nothing reaches nest

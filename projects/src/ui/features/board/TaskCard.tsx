@@ -1,12 +1,12 @@
-// One task on the board: its title (a link that opens its drawer), its state, who works on it, its PR,
-// and the markers that need the owner's eye. The grip drags it, by pointer or keyboard (space, arrows).
+// One task on the board: its title (a link that opens its drawer), then its status badges with the
+// grip at the right, then a caption line of who and which PR. The grip drags it, by pointer or keyboard
+// (space, arrows).
 
-import { useSortable } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
-import { ActionIcon, Anchor, Badge, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
-import { IconGitPullRequest, IconGripVertical, IconRobot } from "@tabler/icons-react";
+import { Anchor, Badge, Text, Tooltip } from "@mantine/core";
+import { IconGitPullRequest, IconRobot } from "@tabler/icons-react";
 import type { Task } from "../../api/types";
 import { AnchorLink } from "../../common/links";
+import { MetaItem, MetaRow, Row, SortablePanel, Stack } from "../../layout";
 import { StateBadge } from "./StateBadge";
 
 export interface TaskCardProps {
@@ -20,71 +20,54 @@ export interface TaskCardProps {
 }
 
 export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskCardProps) {
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: task.id, disabled: !sortable });
-  const style = { transform: CSS.Translate.toString(transform), transition, zIndex: isDragging ? 2 : undefined };
-
   return (
-    <Paper ref={setNodeRef} style={style} withBorder p="xs" miw={0} shadow={isDragging ? "md" : undefined} data-task={task.id} aria-label={task.title} component="article">
-      <Stack gap={6}>
-        <Group gap={4} wrap="nowrap" align="flex-start">
-          {sortable && (
-            <ActionIcon
-              ref={setActivatorNodeRef}
-              variant="subtle"
-              color="gray"
-              size="sm"
-              aria-label={`Move ${task.title}`}
-              style={{ cursor: isDragging ? "grabbing" : "grab", touchAction: "none" }}
-              {...attributes}
-              {...listeners}
-            >
-              <IconGripVertical size={14} />
-            </ActionIcon>
-          )}
-          <AnchorLink to="/projects/$projectId" params={{ projectId }} search={{ task: task.id }} c="dark" fw={500} size="sm" style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>
+    <SortablePanel id={task.id} disabled={!sortable} gripLabel={`Move ${task.title}`} dense component="article" aria-label={task.title} data-task={task.id}>
+      {(grip) => (
+        <Stack gap="sm">
+          <AnchorLink to="/projects/$projectId" params={{ projectId }} search={{ task: task.id }} c="bright" fw="medium" fz="sm">
             {task.title}
           </AnchorLink>
-        </Group>
-        <Group gap={4} wrap="wrap">
-          <StateBadge state={task.state} size="sm" />
-          {pendingAsks > 0 && (
-            <Badge size="sm" color="warning" variant="filled" data-marker="ask">
-              Needs input
-            </Badge>
-          )}
-          {task.tainted && (
-            <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline w={220}>
-              <Badge size="sm" color="gray" variant="outline" data-marker="tainted" tabIndex={0}>
-                Tainted
-              </Badge>
-            </Tooltip>
-          )}
-        </Group>
-        {(task.assignee || task.pr !== null) && (
-          <Group gap={6} wrap="wrap" miw={0}>
-            {task.assignee && (
-              <Group gap={4} wrap="nowrap" miw={0} align="flex-start">
-                <IconRobot size={14} aria-hidden color="var(--mantine-color-dimmed)" style={{ flexShrink: 0 }} />
-                <Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+          <Row gap="xs" justify="space-between" align="flex-start">
+            <Row gap="xs">
+              <StateBadge state={task.state} size="sm" />
+              {pendingAsks > 0 && (
+                <Badge size="sm" color="warning" variant="filled" data-marker="ask">
+                  Needs input
+                </Badge>
+              )}
+              {task.tainted && (
+                <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
+                  <Badge size="sm" color="gray" variant="outline" data-marker="tainted" tabIndex={0}>
+                    Tainted
+                  </Badge>
+                </Tooltip>
+              )}
+            </Row>
+            {grip}
+          </Row>
+          {(task.assignee || task.pr !== null) && (
+            <MetaRow>
+              {task.assignee && (
+                <MetaItem icon={IconRobot} mono>
                   {task.assignee}
-                </Text>
-              </Group>
-            )}
-            {task.pr !== null && (
-              <Anchor href={`https://github.com/${repo}/pull/${task.pr}`} target="_blank" rel="noreferrer" size="xs">
-                <Group gap={2} wrap="nowrap">
-                  <IconGitPullRequest size={14} aria-hidden />#{task.pr}
-                </Group>
-              </Anchor>
-            )}
-          </Group>
-        )}
-        {task.start_error && (
-          <Text size="xs" c="warning.8" style={{ overflowWrap: "anywhere" }}>
-            {task.start_error}
-          </Text>
-        )}
-      </Stack>
-    </Paper>
+                </MetaItem>
+              )}
+              {task.pr !== null && (
+                <MetaItem icon={IconGitPullRequest}>
+                  <Anchor href={`https://github.com/${repo}/pull/${task.pr}`} target="_blank" rel="noreferrer" inherit>
+                    #{task.pr}
+                  </Anchor>
+                </MetaItem>
+              )}
+            </MetaRow>
+          )}
+          {task.start_error && (
+            <Text size="xs" c="warning">
+              {task.start_error}
+            </Text>
+          )}
+        </Stack>
+      )}
+    </SortablePanel>
   );
 }
