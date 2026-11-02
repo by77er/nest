@@ -1,17 +1,8 @@
-// A conversation's pieces: a scrolling log of a fixed height (the viewport's rest beside the board), and
-// a message on the owner's side (end, on the subtle ground), the other's (start), or a note across the
-// middle. Borderless: the log sits in one Panel already.
+// A conversation's pieces: a message on the owner's side (end, on the subtle ground), the other's
+// (start, a hairline around it), or a note across the middle; and the composer pinned below them.
 
-import { Box, ScrollArea } from "@mantine/core";
-import type { ReactNode, RefObject } from "react";
-
-export function ScrollLog({ children, viewportRef }: { children: ReactNode; viewportRef?: RefObject<HTMLDivElement | null> }) {
-  return (
-    <ScrollArea.Autosize mah={{ base: "var(--nest-log-max)", lg: "var(--nest-log-max-beside)" }} viewportRef={viewportRef} type="auto" aria-live="polite" offsetScrollbars>
-      {children}
-    </ScrollArea.Autosize>
-  );
-}
+import { Box } from "@mantine/core";
+import type { ReactNode } from "react";
 
 export function Bubble({ side, children, ...data }: { side: "start" | "end" | "note"; children: ReactNode; [k: `data-${string}`]: string | undefined }) {
   const style =

@@ -2,9 +2,9 @@
 // these and Mantine's controls; only these files and the theme may use inline styles, raw sizes or CSS
 // (src/ui/design.test.ts).
 export { AppFrame } from "./AppFrame";
-export { Bubble, PinnedFooter, ScrollLog } from "./Chat";
+export { Bubble, PinnedFooter } from "./Chat";
 export { FieldGroup } from "./FieldGroup";
-export { CardGrid, ColumnGrid, SplitView } from "./Layouts";
+export { CardGrid, ColumnGrid } from "./Layouts";
 export { MetaItem, MetaRow } from "./Meta";
 export { Notice, type NoticeTone } from "./Notice";
 export { Page, PageHeader } from "./Page";

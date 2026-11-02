@@ -22,29 +22,6 @@
   }
 }
 
-.split {
-  display: flex;
-  flex-direction: column;
-  gap: var(--mantine-spacing-xl);
-}
-
-.splitMain {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-@media (min-width: 75em) {
-  .split {
-    flex-direction: row;
-    align-items: flex-start;
-  }
-
-  .splitAside {
-    flex: 0 0 var(--nest-side-panel);
-    width: var(--nest-side-panel);
-  }
-}
-
 /* A drag grip: a 32 px target with a pointer, 44 px on touch. */
 .grip {
   min-width: var(--nest-hit);

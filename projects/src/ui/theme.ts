@@ -107,16 +107,13 @@ export const layout = {
   sidebar: "16.5rem",
   /** A comfortable reading line for a conversation (the Manager page): about 70 characters. */
   readingMeasure: "42rem",
-  /** The chat beside the board, from `lg` on: under a third of the width. */
+  /** A narrow side element's width (a tooltip's): under a third of a desktop page. */
   sidePanel: "20rem",
   /** A board column's least width: from `md` on (all six beside the chat at 1280 px), and below. */
   column: { min: "8.5rem", minNarrow: "16rem" },
   /** A section heading row's height (a small button's), so heading rows line up; a column's. */
   sectionHead: "2.25rem",
   denseHead: "1.75rem",
-  /** The chat's scrolling log: a fixed height below `lg`, the viewport's rest beside the board. */
-  logMax: "22.5rem",
-  logMaxBeside: "calc(100vh - 24rem)",
   /** Hit targets: 32 px with a pointer, 44 px on touch. */
   hit: "2rem",
   hitTouch: "2.75rem",
@@ -155,8 +152,6 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
       "--nest-column-min-narrow": layout.column.minNarrow,
       "--nest-section-head": layout.sectionHead,
       "--nest-dense-head": layout.denseHead,
-      "--nest-log-max": layout.logMax,
-      "--nest-log-max-beside": layout.logMaxBeside,
       "--nest-hit": layout.hit,
       "--nest-hit-touch": layout.hitTouch,
       "--nest-motion-fast": `${motion.fast}ms`,
