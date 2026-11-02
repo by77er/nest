@@ -45,6 +45,9 @@ Changes to any of these need a conformance check against [the model](../../../ve
 - **Isolation:** tests share the DO namespaces, so each test makes its own cell (`uniqueCell()`) and ids and never reads another test's objects.
 - **Real alarms run in the pool.** Assert eventual outcomes, and tolerate an alarm that fires early. To fire one now, use `runDurableObjectAlarm`; to read or plant rows, use `runInDurableObject`.
 - **A test that passes alone and fails under load** usually asserts an intermediate state or waits too briefly. Find the root cause; don't just raise the timeout.
+  - A fixed `sleep` before asserting what a socket or another DO delivers (a segment received, a close code, a deadline `webSocketClose` arms) is the usual culprit: wait for the thing itself (`Ws.whenClosed`, poll the record).
+  - When two DOs write in turn (SandboxDO destroys, then AgentDO records it), wait on the later write.
+  - The pool's per-test timeout is 15 s (`vitest.config.ts`): CI's first ~30 s overlap the other workers' module imports. A test whose deliberate waits (batch windows, call timeouts) approach it sets its own, naming the timer.
 - **A fake collaborator hides binding errors** ([review lesson 8](../../../dev/review-lessons.md)): one test per injected global runs the real default.
 - **Mutation-check fixes:** revert the guard, run its file, watch the named test fail, restore.
 - A change to an admin view (`protocol/admin/view.ts`) also needs the dashboard: `cd dashboard && npm ci && npm run typecheck && npm test && npm run build`.

@@ -179,16 +179,16 @@ describe("#3 no lost updates across awaits", () => {
     const s = await setup();
     const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
     ws.send(seg(0, "a\n"));
-    await sleep(50);
+    await received(s.agent, 2);
     await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {
       await Promise.all([inst.flush(), inst.enqueueTurn({ kind: "user", text: "one" })]);
     });
     const info = await agentStub(s.agent).info();
     expect(info.current_turn).not.toBeNull();
     expect(info.durable_bytes).toBe(2);
+    expect((await ws.next("run_turn")).input.text).toBe("one");
     await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "two" } }, 201);
-    await sleep(50);
-    expect(ws.drain().filter((m) => m.type === "run_turn").map((m) => m.input.text)).toEqual(["one"]);
+    expect(await ws.none("run_turn", 200)).toBe(true);
   });
 });
 
@@ -236,16 +236,14 @@ describe("#5 at-least-once, in order", () => {
     await h.ws.next("ack", (m) => m.up_to === 1);
     sendEvents(h.ws, [bad], 2);
     expect((await h.ws.next("error")).error.retryable).toBe(true);
-    await sleep(50);
-    expect(h.ws.closed?.code).toBe(4500);
+    expect((await h.ws.whenClosed())?.code).toBe(4500);
 
     const ws2 = await Ws.connect("/v1/fleet", h.host_token);
     ws2.send(hostHello(h.host, cell));
     expect((await ws2.next("hello_ack")).last_event_seq).toBe(1);
     sendEvents(ws2, [capacity], 3); // skipping 2 is a gap
     expect((await ws2.next("error")).error.message).toMatch(/out of order/);
-    await sleep(50);
-    expect(ws2.closed?.code).toBe(4409);
+    expect((await ws2.whenClosed())?.code).toBe(4409);
 
     const ws3 = await Ws.connect("/v1/fleet", h.host_token);
     ws3.send(hostHello(h.host, cell));
@@ -351,13 +349,13 @@ describe("#11 a new session file starts a new receive stream", () => {
     const s = await setup();
     const r1 = await runner(s.agent, s.host.host, s.host.host_token);
     r1.ws.send(seg(0, "old\n"));
-    await sleep(30);
+    await received(s.agent, 4);
     await agentStub(s.agent).flush();
     r1.ws.close();
     const r2 = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1, { session: SESSION2, local_bytes: 9 });
     expect(r2.ack.durable_bytes).toBe(0);
     r2.ws.send(seg(0, "new one\n", false, SESSION2));
-    await sleep(30);
+    await received(s.agent, 8);
     expect(await (await admin(`/v1/agents/${s.agent}/transcript`)).text()).toBe("old\n");
     await agentStub(s.agent).flush();
     expect(await (await admin(`/v1/agents/${s.agent}/transcript`)).text()).toBe("new one\n");
@@ -472,7 +470,7 @@ describe("#17/#14 read_transcript pages by entry", () => {
     const s = await setup({ captain: true });
     const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
     ws.send(seg(0, "l1\nl2\nl3\nl4\n"));
-    await sleep(30);
+    await received(s.agent, 12);
     await agentStub(s.agent).flush();
     ws.send(toolCall(1, "cal_r-1", "read_transcript", { agent: s.agent, since_seq: 1, limit: 2 }));
     const r = await ws.next("tool_result", (m) => m.call === "cal_r-1");
@@ -483,8 +481,9 @@ describe("#17/#14 read_transcript pages by entry", () => {
 
     // The file is rewritten (e.g. trimmed after compaction): an old cursor would skip entries, so a
     // reader holding one starts the new base from the top, told so.
+    const base = (await agentStub(s.agent).info()).recv_base;
     ws.send(seg(0, "n1\nn2\n", true));
-    await sleep(30);
+    await received(s.agent, 6, base + 1);
     await agentStub(s.agent).flush();
     const after = await adminJson(`/v1/agents/${s.agent}/transcript?since=4&base=0`);
     expect(after).toEqual({ lines: ["n1", "n2"], next_seq: 2, more: false, base: 1, reset: true });
@@ -692,8 +691,7 @@ describe("#23 captains move off a silent brain host", () => {
     await runDurableObjectAlarm(fleetStub(cell));
     await nextCommands(b.ws, (c) => c.type === "agent_start" && c.agent === captain);
     expect((await agentStub(captain).info()).host).toBe(b.host);
-    await sleep(50);
-    expect(r.ws.closed?.code).toBe(4409);
+    expect((await r.ws.whenClosed())?.code).toBe(4409);
   });
 });
 
@@ -809,7 +807,7 @@ describe("#26 a recovery turn says what the transcript can't", () => {
     const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "refactor the parser" } }, 201)).turn;
     await r1.ws.next("run_turn", (m) => m.turn === t1);
     r1.ws.send(seg(0, '{"type":"user"}\n'));
-    await sleep(30);
+    await received(s.agent, 16);
     await agentStub(s.agent).flush();
     const durable = (await agentStub(s.agent).info()).durable_ms!;
     // The sandbox commits a generation, then moves (restored from that head) while the turn runs.
@@ -927,6 +925,14 @@ async function untilAsync(what: string, pred: () => Promise<boolean>, ms = 3000)
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
     await sleep(5);
   }
+}
+
+/** Wait until AgentDO has received `bytes` of the current stream (at `base`, when given): a sent segment lands when workerd delivers it. */
+async function received(agent: string, bytes: number, base?: number) {
+  await untilAsync(`${bytes} bytes received`, async () => {
+    const i = await agentStub(agent).info();
+    return i.received_bytes >= bytes && (base === undefined || i.recv_base === base);
+  }, 10_000);
 }
 
 /** Inbound items (hellos, event batches) submitted for `host` and not finished, the running one included. */

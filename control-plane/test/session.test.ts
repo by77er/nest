@@ -38,6 +38,25 @@ const seg = (offset: number, text: string, base = false) => ({
 let runnerSeq = 0;
 const toolCall = (call: string, name: string, args: unknown, seq = ++runnerSeq) => ({ type: "tool_call", seq, call, turn: "trn_x", name, arguments: args });
 
+/** The ask a sent `ask` call posted, once its `needs_input` event is in (a call lands when workerd delivers it). */
+async function askPosted(workstream: string): Promise<string> {
+  for (let i = 0; i < 250; i++) {
+    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(workstream)).events();
+    const needs = events.find((e) => e.type === "needs_input") as { ask: string } | undefined;
+    if (needs) return needs.ask;
+    await sleep(20);
+  }
+  throw new Error("timed out waiting for the ask's needs_input event");
+}
+
+/** Lapse the sync window of the agent's open ask: wait for its deadline, make it due, run the alarm. */
+async function lapseAskWindow(agent: string): Promise<void> {
+  const due = () => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+    st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key LIKE 'ask:%'").rowsWritten);
+  for (let i = 0; i < 250 && (await due()) === 0; i++) await sleep(20);
+  await runDurableObjectAlarm(agentStub(agent));
+}
+
 describe("agent start", () => {
   it("sends agent_start to a brain host (never the sandbox's) with the setup token, hands and session URL", async () => {
     const s = await setup();
@@ -103,8 +122,7 @@ describe("session channel", () => {
     expect((await ws.next("segment_ack")).durable_bytes).toBe(a.length + b.length);
     ws.send(seg(a.length + b.length + 10, "x\n")); // gap: rejected, and the runner must reconnect
     expect((await ws.next("error")).error.code).toBe("invalid_message");
-    await sleep(50);
-    expect(ws.closed?.code).toBe(4500);
+    expect((await ws.whenClosed())?.code).toBe(4500);
     const r2 = await connectRunner(s.agent, s.host.host, s.host.host_token);
     expect(r2.ack.durable_bytes).toBe(a.length + b.length);
 
@@ -197,19 +215,15 @@ describe("platform tool relay", () => {
     const s = await setup({ captain: true });
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     ws.send(toolCall("cal_t2-1", "ask", { question: "Allow api.openai.com?", options: ["allow 2h", "deny"] }));
-    await sleep(50);
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
-    const needs = events.find((e) => e.type === "needs_input")!;
-    expect(needs).toBeDefined();
-    const ask = (needs as { ask: string }).ask;
+    const ask = await askPosted(s.workstream);
     expect(await ws.none("tool_result", 50)).toBe(true);
     expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "allow 2h" } })).delivered).toBe("sync");
     const r = await ws.next("tool_result");
     expect(r.outcome).toEqual({ status: "ok", content: [{ type: "text", text: "allow 2h" }] });
 
     ws.send(toolCall("cal_t2-2", "ask", { question: "Merge?", to: "user" }));
-    await sleep(250); // ASK_SYNC_WINDOW_MS = 200 in tests
-    await runDurableObjectAlarm(agentStub(s.agent));
+    // The window lapses (its deadline made due, rather than waiting out ASK_SYNC_WINDOW_MS).
+    await lapseAskWindow(s.agent);
     const pending = await ws.next("tool_result", (m) => m.call === "cal_t2-2");
     expect(pending.outcome.status).toBe("pending");
     const notes = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).userNotifications();
@@ -223,9 +237,7 @@ describe("platform tool relay", () => {
     const s = await setup({ captain: true });
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     ws.send(toolCall("cal_t3-1", "ask", { question: "Merge?" }));
-    await sleep(50);
-    const events = await env.WORKSTREAM.get(env.WORKSTREAM.idFromName(s.workstream)).events();
-    const ask = (events.find((e) => e.type === "needs_input") as { ask: string }).ask;
+    const ask = await askPosted(s.workstream);
     await agentStub(s.agent).start(undefined, undefined, true); // an operator's restart condemns brain 1
     expect((await adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: "yes" } })).delivered).toBe("async");
     expect((await agentStub(s.agent).turns()).at(-1)!.input).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("yes") });

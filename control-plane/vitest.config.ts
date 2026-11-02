@@ -2,6 +2,12 @@ import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  test: {
+    // Not vitest's 5 s: on a 4-vCPU CI runner the suite's first ~30 s overlap the other workers' module imports, and
+    // tests that take ~0.3 s alone took 1.6-5.8 s there (agent-seams D1, D7, D9, rule 1). Above the helpers' own waits
+    // (`Ws.next` 3 s, `until` 10 s), so a message that never comes fails naming what was awaited.
+    testTimeout: 15_000,
+  },
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
@@ -9,7 +15,9 @@ export default defineConfig({
         bindings: {
           ADMIN_TOKEN: "test-admin-token",
           HOST_TOKEN_SECRET: "test-host-token-secret-0123456789abcdef",
-          ASK_SYNC_WINDOW_MS: "200",
+          // Wide enough that an answer "within the window" never races a loaded runner; a test that needs it to
+          // lapse fires its deadline (test/session.test.ts).
+          ASK_SYNC_WINDOW_MS: "5000",
           ALLOW_DEV_CA: "1",
           // The MCP proxy's timeouts, short so lost answers are quick to provoke (test/mcp.test.ts).
           MCP_CALL_TIMEOUT_MS: "1500",

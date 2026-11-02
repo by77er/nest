@@ -255,11 +255,15 @@ describe("random histories", () => {
   }
 
   const seeds = Array.from({ length: 60 }, (_, i) => i + 1);
+  // A walk is a pure function of its seed: the summary below reuses the walks the seeds ran rather than
+  // repeating them (repeated, the summary alone took most of the 5 s test budget on a loaded CI runner).
+  const walked = new Map<number, ReturnType<typeof walk>>();
+  const walkOnce = (seed: number) => walked.get(seed) ?? walked.set(seed, walk(seed)).get(seed)!;
   it.each(seeds)("seed %i: never drops or unroots a restore source, is stable, and a former restore source never returns", (seed) => {
-    expect(walk(seed).marked).toBeGreaterThan(0);
+    expect(walkOnce(seed).marked).toBeGreaterThan(0);
   });
   it("the walks are not vacuous: drops while a former head was pinned, memory unrooted, rows pruned", () => {
-    const total = seeds.map(walk).reduce((a, b) => ({
+    const total = seeds.map(walkOnce).reduce((a, b) => ({
       marked: a.marked + b.marked, pinnedNonHead: a.pinnedNonHead + b.pinnedNonHead, unrooted: a.unrooted + b.unrooted, pruned: a.pruned + b.pruned,
     }));
     expect(total.pinnedNonHead).toBeGreaterThan(10);
