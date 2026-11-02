@@ -24,6 +24,7 @@ import { Repo } from "../lib/repos";
 import { isAgentId, Labels } from "../lib/clients";
 import type { MemberFacts } from "./client";
 import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-events";
+import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
 import {
@@ -224,6 +225,16 @@ interface Attachment {
   tools_changed?: boolean;
 }
 
+/** A trace socket's attachment: the order it was opened in (`n`), and whether it was closed from this side. */
+interface TraceAttachment {
+  n: number;
+  closed?: boolean;
+}
+/** The tag of a trace socket (the runner's is `session`). */
+const TRACE_TAG = "trace";
+/** On every answer to a trace request: the object runs a release that has it (the Worker answers 503 when it's missing). */
+export const TRACE_HEADER = "x-nest-trace";
+
 type DispatchResult = ToolOutcome | "wait";
 /** When the brain of `epoch` last asked for its tool list (`kv.tools_listed`); a change at or after `ms` isn't in it. */
 interface ToolsListed { epoch: number; ms: number }
@@ -328,6 +339,9 @@ export class AgentDO extends DurableObject<Env> {
     });
     this.journal = new BrokeredJournal(this.sql);
     this.outbox = new ClientOutbox(this.sql);
+    this.traceRing = new TraceRing(this.sql);
+    // A trace client's keepalive, answered by the runtime without waking this object. The runner sends only JSON objects, never this.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(TRACE_PING, TRACE_PONG));
   }
 
   private readonly queue!: TurnQueue;
@@ -356,6 +370,8 @@ export class AgentDO extends DurableObject<Env> {
   private readonly journal!: BrokeredJournal;
   /** Events for its client, until ClientDO has them (docs/control-plane/api/clients/#events-to-the-owner). */
   private readonly outbox!: ClientOutbox;
+  /** Its live trace's recent events (docs/control-plane/api/#live-trace). */
+  private readonly traceRing!: TraceRing;
 
   // ---------------------------------------------------------------------------------------------
   // State
@@ -429,8 +445,12 @@ export class AgentDO extends DurableObject<Env> {
   private update(fn: (info: AgentInfo) => void): AgentInfo {
     const info = this.load();
     const was = info.lifecycle;
+    const wasState = agentState(info);
     fn(info);
     this.save(info);
+    // Every change of its state is in its trace, in the same step.
+    const state = agentState(info);
+    if (state !== wasState) this.traceEmit({ type: "state", state }, Date.now(), info.current_turn);
     // Every way into `errored` goes through here: its client hears of it in the same step.
     if (was !== "errored" && info.lifecycle === "errored") {
       this.emit(info, `${info.agent}/errored/${newId("evt_")}`, {
@@ -1096,6 +1116,9 @@ export class AgentDO extends DurableObject<Env> {
     const done = this.update((i) => {
       if (i.ended) i.ended.done_ms = Date.now();
     });
+    // Nothing more will happen to it: its trace says so, and its trace sockets close.
+    this.traceEmit({ type: "ended", reason: done.ended!.reason });
+    this.closeTraceSockets(1000, "agent ended");
     // Its client hears once its end is done (as its registry does): the note it gave, or its last words.
     this.emit(done, `${done.agent}/exited`, {
       type: "agent.exited", agent: done.agent, reason: done.ended!.reason, text: done.ended!.note ?? this.turnText(null),
@@ -1595,6 +1618,8 @@ export class AgentDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------------
 
   override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/trace")) return this.traceSocket(request, url);
     const host = request.headers.get("x-nest-host");
     const cell = request.headers.get("x-nest-cell");
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket" || !host) {
@@ -1617,6 +1642,8 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
+    // A trace client has nothing to say (its keepalive is answered without waking this object).
+    if (this.isTraceSocket(ws)) return;
     let msg: RunnerToAgent;
     try {
       const r = RunnerToAgent.safeParse(JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw)));
@@ -1694,6 +1721,14 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+    if (this.isTraceSocket(ws)) {
+      try {
+        ws.close(code === 1005 ? 1000 : code, "closing");
+      } catch {
+        // already closed
+      }
+      return;
+    }
     const att = ws.deserializeAttachment() as Attachment | null;
     try {
       ws.close(code === 1005 ? 1000 : code, "closing");
@@ -1704,6 +1739,110 @@ export class AgentDO extends DurableObject<Env> {
     if (att && this.exists() && att.helloed && this.current(att) && this.load().brain?.phase === "live") {
       await this.deadlines.set("no_session", Date.now() + NO_SESSION_MS, true);
     }
+  }
+
+  // --- Live trace (docs/control-plane/api/#live-trace) ------------------------------------
+  //
+  // Trace sockets are tagged `trace` and never in `getWebSockets("session")`: nothing about the
+  // runner's session reads them, and nothing on the runner's path awaits them. A send is a
+  // synchronous `ws.send` after the row is written; the output gate holds it until the write is
+  // durable, so a client never sees an event the ring could lose.
+
+  /** Test seam: replaces `ws.send` for trace sockets; whatever it returns is never awaited. */
+  testTraceSend: ((ws: WebSocket, data: string) => unknown) | null = null;
+
+  private isTraceSocket(ws: WebSocket): boolean {
+    return this.ctx.getTags(ws).includes(TRACE_TAG);
+  }
+
+  /** Its open trace sockets, oldest first. */
+  private traceSockets(): WebSocket[] {
+    return this.ctx.getWebSockets(TRACE_TAG)
+      .map((ws) => ({ ws, a: ws.deserializeAttachment() as TraceAttachment | null }))
+      .filter((x) => !x.a?.closed)
+      .sort((x, y) => (x.a?.n ?? 0) - (y.a?.n ?? 0))
+      .map((x) => x.ws);
+  }
+
+  /** Record a trace event and hand it to every trace socket, fire-and-forget. `src` dedups a resent runner event. */
+  private traceEmit(body: TraceBody, tsMs = Date.now(), turn?: string | null, src?: string): void {
+    const ev = this.traceRing.append(body, tsMs, turn, Date.now(), src);
+    if (!ev) return;
+    const data = JSON.stringify(ev);
+    for (const ws of this.traceSockets()) this.traceSendTo(ws, data);
+  }
+
+  /** Send on one trace socket; one that throws is closed (its client reconnects with `after`). */
+  private traceSendTo(ws: WebSocket, data: string): boolean {
+    try {
+      if (this.testTraceSend) void this.testTraceSend(ws, data);
+      else ws.send(data);
+      return true;
+    } catch {
+      this.closeTraceSocket(ws, 1011, "trace send failed");
+      return false;
+    }
+  }
+
+  private closeTraceSocket(ws: WebSocket, code: number, reason: string): void {
+    try {
+      ws.serializeAttachment({ ...(ws.deserializeAttachment() as TraceAttachment), closed: true } satisfies TraceAttachment);
+    } catch {
+      // gone already
+    }
+    try {
+      ws.close(code, reason);
+    } catch {
+      // already closed
+    }
+  }
+
+  private closeTraceSockets(code: number, reason: string): void {
+    for (const ws of this.traceSockets()) this.closeTraceSocket(ws, code, reason);
+  }
+
+  /**
+   * `GET /v1/agents/<id>/trace?after=<seq>`, its caller already checked by the Worker: a hibernatable
+   * socket that gets the gap (if events after `after` are gone), the backlog after `after`, `live`, then
+   * live events, and `ended` and a close once the agent's end is done. Every answer carries `TRACE_HEADER`,
+   * which tells the Worker this object runs a release that has the trace.
+   */
+  private traceSocket(request: Request, url: URL): Response {
+    const headers = { [TRACE_HEADER]: "1", "content-type": "application/json" };
+    const refuse = (status: number, code: string, message: string) =>
+      new Response(JSON.stringify({ error: errorBody(code, message) }), { status, headers });
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return refuse(426, ErrorCodes.INVALID_MESSAGE, "expected a WebSocket upgrade");
+    if (!this.exists()) return refuse(404, ErrorCodes.UNKNOWN_AGENT, "unknown agent");
+    const raw = url.searchParams.get("after");
+    if (raw !== null && !/^\d{1,15}$/.test(raw)) return refuse(400, ErrorCodes.INVALID_MESSAGE, "after must be a non-negative integer");
+    const after = raw === null ? 0 : Number(raw);
+    const info = this.load();
+    // All in one synchronous step: no event can land between the backlog and the first live send.
+    const n = (this.kvGet<number>("trace_sockets") ?? 0) + 1;
+    this.kvPut("trace_sockets", n);
+    const pair = new WebSocketPair();
+    const ws = pair[1];
+    this.ctx.acceptWebSocket(ws, [TRACE_TAG]);
+    ws.serializeAttachment({ n } satisfies TraceAttachment);
+    // Past the cap, the oldest go (each reconnects with `after` if its client still wants it).
+    const open = this.traceSockets();
+    for (const old of open.slice(0, Math.max(0, open.length - TRACE_SOCKETS_MAX))) this.closeTraceSocket(old, 4008, "too many trace sockets");
+    const { gap, events } = this.traceRing.after(after, Date.now());
+    const control = (m: TraceControl) => this.traceSendTo(ws, JSON.stringify(m));
+    let ok = gap ? control({ type: "gap", ...gap }) : true;
+    for (const ev of events) {
+      if (!ok) break;
+      ok = this.traceSendTo(ws, JSON.stringify(ev));
+    }
+    if (ok && info.ended?.done_ms) {
+      // A client that had read past its `ended` hears it again, without a seq.
+      if (!events.some((e) => e.type === "ended")) control({ type: "ended", reason: info.ended.reason });
+      this.closeTraceSocket(ws, 1000, "agent ended");
+    } else if (ok) {
+      // The backlog is done: what follows happens as the client watches.
+      control({ type: "live" });
+    }
+    return new Response(null, { status: 101, webSocket: pair[0], headers: { [TRACE_HEADER]: "1" } });
   }
 
   private send(ws: WebSocket, msg: AgentToRunner): void {
@@ -2001,6 +2140,10 @@ export class AgentDO extends DurableObject<Env> {
     if (ev.agent !== before.agent || ev.epoch !== sessionEpoch) return;
     // Recorded as seen only after its side effects, each safe to repeat, succeeded: a throw leaves the batch unacked.
     if (this.sql.exec("SELECT 1 FROM events WHERE seq = ?", ev.seq).toArray().length) return;
+    // Its trace row first, in this step, before the state it changes: a batch resent after a throw
+    // below applies the event again, and `src` (the runner's own stamp) records it once.
+    const traced = traceOf(ev);
+    if (traced) this.traceEmit(traced, ev.ts_ms, ev.turn, `${ev.epoch}.${ev.seq}.${ev.ts_ms}.${ev.type}`);
     const completed = ev.type === "turn_completed" && !!ev.turn && ev.turn === before.current_turn;
     // A turn's trailing `idle` may arrive while the next turn runs: an event stamped with another turn changes no state.
     const stale = !!ev.turn && ev.turn !== before.current_turn;
@@ -2750,6 +2893,7 @@ export class AgentDO extends DurableObject<Env> {
     const ask = newId("ask_");
     this.calls.recordAsk({ ask, call, epoch, question, status: "async", deadline: 0 });
     if (approval) this.calls.requestApproval(ask, approval.name, approval.digest, approval.tool);
+    this.traceEmit({ type: "ask", ask, question: field(question) }, Date.now(), info.current_turn);
     this.emit(info, `${info.agent}/ask/${ask}`, {
       type: "agent.ask", agent: info.agent, ask, question, ...(approval ? { approval: { name: approval.name, tool: approval.tool } } : {}),
     });
@@ -2823,6 +2967,7 @@ export class AgentDO extends DurableObject<Env> {
     const route = askRoute(row.status, this.isCurrent(this.load(), row.epoch));
     if (route === "already_answered") return route;
     this.calls.answer(ask, answer);
+    this.traceEmit({ type: "ask_answered", ask }, Date.now(), this.load().current_turn);
     const approval = this.calls.approvalOf(ask);
     if (approval) {
       const ok = approves(answer);

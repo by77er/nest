@@ -81,6 +81,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
      `{lines, next_seq, more}`)
+   - `GET /v1/agents/<id>/trace?after=<seq>`: a WebSocket of the agent's live trace (turns, assistant text, tool calls
+     and results, state, asks, `ended`), resumed after a seq, with a `gap` first when the ring no longer reaches back
+     (`src/lib/trace.ts`; docs/control-plane/api/#live-trace)
    - `POST /v1/admin/hosts/<id>/confirm-dead`: manual STONITH (also releases the host's tunnel and record; a host
      still running cloudflared keeps its tunnel undeletable until the instance is gone, and the sweep finishes it)
    - `POST /v1/admin/tunnels/sweep?cell=<cell>`: run the daily tunnel sweep now; returns what it deleted, retried,
@@ -115,7 +118,7 @@ External systems (docs/control-plane/api/clients/): `POST /v1/admin/clients {nam
 `nest_cli_<id>_<secret>`) · `GET /v1/admin/clients` · `GET|PATCH /v1/admin/clients/<cli> {grant}` ·
 `POST /v1/admin/clients/<cli>/rotate` · `DELETE /v1/admin/clients/<cli>` (409 while its subtree lives). A grant is
 `{cells, credentials, repos, mcp_urls, github?, max_agents, max_sandboxes}`. With its token a client calls the owner routes
-(`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript,
+(`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript, live trace,
 brokered journal, asks and answers; sandbox create, list, read, destroy, lifetime and effective policy) on its own subtree only
 (anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
 `GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`. Its own, with a
