@@ -12,7 +12,7 @@ A read-only page of what is live in one cell: agents with a brain (template, `st
 
 ## Abandoned
 
-**What is left lying around, so nothing accumulates unseen** (owner's goal, 2026-11-01). The control plane decides what each thing is (`GET /v1/admin/lifetimes?cell=&cursor=&limit=&quiet_ms=`, admin token; FleetDO's `lifetimes`, rules in `control-plane/src/lib/abandoned.ts`); the page lists, sorts oldest first, and shows the API call an operator would make as text. Unconfirmed by the owner: the classes and both thresholds below.
+**What is left lying around, so nothing accumulates unseen** (owner's goal, 2026-11-01). The control plane decides what each thing is (`GET /v1/admin/lifetimes?cell=&cursor=&limit=&quiet_ms=`, admin token; FleetDO's `lifetimes`, rules in `control-plane/src/lib/abandoned.ts`); the page lists, sorts oldest first, and shows the API call an operator would make as text. The classes and both thresholds below are the owner's (confirmed 2026-11-02).
 - **Sandboxes** (every live one in FleetDO's registry, each read from SandboxDO):
   - **Dormant:** SandboxDO's own rule (no agent attached, no placement in flight, no VM up; [lifetime](../durable-objects/sandbox/#lifetime)), with `dormant_since`, the TTL that applies (its own or the cell's) and when the lifetime check will destroy it (`destroyAtMs`, which mirrors `expiryStep` and is tested against it: the notice day for a TTL over a day, a missed-check gap restarting the clock; null before the clock starts). Already handled by the TTL; listed so it is seen.
   - **Held:** attached only to agents that will never use it (quiet, stuck ending, ended, or gone). Never dormant, so no TTL takes it: **the real leak**. Listed with its attached agents.
