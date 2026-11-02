@@ -27,7 +27,7 @@ All state is the app's. nest holds the agents, their sandboxes and their transcr
 
 Only the client interface. One client, `projects`, has this grant:
 - `cells`, and `credentials: [claude_oauth_token]`;
-- `repos` and `github.repos`: the attachable repos;
+- `repos` and `github.repos`: the attachable repos. Workers push to them; the manager and reviewers only read them, which `repos` covers (no `read_repos` needed);
 - `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch). The app reads nothing else on GitHub: a PR's number, head, base and title come in its webhook, and the reviewer reads the code in its sandbox;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
 - `max_agents` and `max_sandboxes`.
@@ -35,7 +35,7 @@ Only the client interface. One client, `projects`, has this grant:
 | Need | Interface |
 |---|---|
 | Templates for the three roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer}` and capabilities `projects/{board,task,review}` (the MCP URLs), synced from this directory at deploy |
-| Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides: {repos: [<repo>]}}`, each with an `Idempotency-Key`. Its sandbox pushes only to that repo; the agent clones it |
+| Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides}`, each with an `Idempotency-Key`. `overrides` is `{repos: [<repo>]}` for a worker, whose sandbox pushes only to that repo, and `{read_repos: [<repo>]}` for the manager and a reviewer, whose sandboxes only read it ([read-only repos](../docs/sandbox/networking/egress/policy/#read-only-repos)). The agent clones it |
 | Talking to the manager | `POST /v1/agents/<id>/inbox`. Replies arrive as `agent.turn_completed` events |
 | Approvals | `agent.ask` events, shown on the board, answered by `POST /v1/agents/<id>/asks/…` |
 | Ending a worker or reviewer | `POST /v1/agents/<id>/stop {end: true, destroy_sandbox: true}` |
@@ -105,7 +105,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **The app's client id is its token's** (`nest_cli_<id>_…` → `cli_<id>`), the way nest itself reads it.
 - **Agents:**
   - **Every agent gets a sandbox of its own,** made first (`POST /v1/sandboxes`) with the agent's labels, and ended with it (`stop {end: true, destroy_sandbox: true}`). The manager has one too, to read the code it specs. The agent clones the repo itself.
-  - **Push scope:** each role template's `repos` is every attached project's repo, and each spawn narrows it to its project's (`overrides.repos`). Creating a project syncs the catalog again first.
+  - **Repo access:** the worker's template pushes to every attached project's repo (`repos`); the manager's and the reviewer's only read them (`read_repos`), so nest refuses their sandboxes' pushes and REST writes (comments, reviews) and mints them only `contents: read`. Each spawn narrows the list to its project's repo (`overrides.repos` or `overrides.read_repos`). Creating a project syncs the catalog again first.
   - **Labels:** `project`, `role`, `task` for a worker, and `start`, the task's (or the manager's) start count. They find the app's agents again after a gap (`GET /v1/agents?label=…`).
   - **Creates are idempotent:** each start attempt sends `Idempotency-Key: <project>/<task or manager>/<start>/{sandbox,agent}` with its creates, so a retry after a lost answer gets the same sandbox and agent back. A key nest is still handling (a retryable 409) is retried like a 503; a key bound to another request (a 409 that isn't) is a refusal for good.
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
@@ -132,7 +132,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - One job per PR head. An event with an older `updated_at` than the PR's last is ignored, since deliveries aren't ordered. A head moving back to a reviewed commit, or a reopened PR, queues that commit again.
   - **`max_concurrent_reviews`**: per project, unset (no cap) by default, set with `PATCH /api/projects/:id/settings`. Jobs start from ReviewDO's alarm, oldest first, while running ones are fewer.
   - **Retries:** every call to GitHub or nest is retried from the alarm (5 s doubling to 5 min). A refusal that will repeat fails the job with the reason, its check `action_required`. A check-run create whose answer was lost is found again by its `external_id`, not made twice.
-  - **Reviewers:** made as workers are (`Nest.startAgent`, `Idempotency-Key: <project>/review/<pr>/<sha>/<start>/{sandbox,agent}`), labelled `project`, `role=reviewer`, `pr`, `sha`, `start`, and ended with their sandboxes (`stop {end, destroy_sandbox}`) on a verdict, a newer head, a closed PR, or an exit. Two more starts after an exit without a verdict.
+  - **Reviewers:** made as workers are (`Nest.startAgent`, `Idempotency-Key: <project>/review/<pr>/<sha>/<start>/{sandbox,agent}`), labelled `project`, `role=reviewer`, `pr`, `sha`, `start`, reading the repo but unable to push or write to it (`read_repos`, above), and ended with their sandboxes (`stop {end, destroy_sandbox}`) on a verdict, a newer head, a closed PR, or an exit. Two more starts after an exit without a verdict.
   - **The brief** has only what the app knows from GitHub's routing (repo, number, head, base), none of the PR's own text. `review_get` gives the title.
 - **The check:** `nest-projects/review`, created `in_progress` at the head with `details_url` the project's board. On completion:
   - a verdict: `success` only if all three pass, else `failure`. The title names the failed dimensions, the summary is the reviewer's, the text holds each dimension's notes, the reviewer and whether its session was tainted. Clipped to GitHub's 65535 characters (the title to 255; GitHub documents no limit for it);
@@ -142,7 +142,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 - **Attaching:**
   - **Required checks that exist** change only their lists (`PATCH …/required_status_checks`), and only when the check is missing or not yet pinned to the App; `strict` and everything else stay. A second attach writes nothing.
   - **A branch protected without required checks** gets its protection written back whole with them (`PUT`, from what `GET` answers). Required signatures aren't in that body (unverified that `PUT` leaves them).
-  - **The App's id:** with it known, the check is required from the App (`checks: [{context, app_id}]`), so no other app or commit status can pass it. nest's token answer doesn't name the App, so the app learns its id from its first check run's `app.id`. Until then, the check is required from any source (`contexts`, or `checks` without `app_id` where other entries are pinned, which keeps their pins). The project then attaches again to pin it. Another entry's `app_id: null` (any source) is sent back as `-1`, GitHub's "any app".
+  - **The App's id:** the check is required from the App (`checks: [{context, app_id}]`) from the first attach, so no other app or commit status can pass it. The id is the `app_id` of nest's token answer ([GitHub tokens](../docs/control-plane/api/clients/#github-tokens)). If an answer has none (nest can't tell), the check is required from any source (`contexts`, or `checks` without `app_id` where other entries are pinned, which keeps their pins), and the first check run's `app.id` then pins it: the project attaches again. Another entry's `app_id: null` (any source) is sent back as `-1`, GitHub's "any app".
   - Rulesets aren't read or changed: a repo protected by rulesets alone gets branch protection besides.
 - **Tasks and PRs:** a `pull_request` from the repo's own branch `task/<id>` (not a fork's) links the PR to its task (`pr_opened`) if the worker hadn't reported it. Merged, the task is `done` (through `pr_opened` first if it was still `in_progress`) and its worker ended.
 

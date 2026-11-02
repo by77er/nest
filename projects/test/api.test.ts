@@ -65,15 +65,23 @@ describe("projects", () => {
     const p = await newProject();
     expect(p.body.repo).toBe(p.repo.toLowerCase());
     expect(p.body.catalog_synced).toBe(true);
-    const tmpl = fake.catalog.get("templates/projects/manager") as { repos?: string[] };
-    expect(tmpl.repos).toContain(p.repo.toLowerCase());
+    // The manager and the reviewer only read the repos; the worker pushes to them.
+    for (const role of ["manager", "reviewer"]) {
+      const tmpl = fake.catalog.get(`templates/projects/${role}`) as { repos?: string[]; read_repos?: string[] };
+      expect(tmpl.read_repos, role).toContain(p.repo.toLowerCase());
+      expect(tmpl.repos, role).toBeUndefined();
+    }
+    const worker = fake.catalog.get("templates/projects/worker") as { repos?: string[]; read_repos?: string[] };
+    expect(worker.repos).toContain(p.repo.toLowerCase());
+    expect(worker.read_repos).toBeUndefined();
     const managers = [...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "manager");
     expect(managers).toHaveLength(1);
     const m = managers[0]!;
     expect(m.template).toBe("projects/manager");
     expect(m.sandbox).toMatch(/^sbx_/);
     expect(fake.sandboxes.get(m.sandbox!)!.labels).toEqual(m.labels);
-    expect(m.overrides).toEqual({ repos: [p.repo.toLowerCase()] });
+    // It reads its project's repo and pushes to none.
+    expect(m.overrides).toEqual({ read_repos: [p.repo.toLowerCase()] });
     expect(p.body.settings.manager).toBe(m.agent);
     expect(fake.inbox.find((x) => x.agent === m.agent)?.text).toContain(p.repo.toLowerCase());
     // The cell goes where nest takes it: in each create's body, which carries an Idempotency-Key.

@@ -1,6 +1,6 @@
 // DirectoryDO, one instance (README.md#pieces): the projects, repo → project, agent → {project, role,
 // task, pr}, the nest events and GitHub deliveries already handled (deduplicated by id), the catalog
-// sync's state, and the GitHub App's id once a check run has told it.
+// sync's state, and the GitHub App's id once nest's token answer or a check run has told it.
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
@@ -78,7 +78,7 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>("SELECT id, name, repo, created_ms FROM projects WHERE repo = ?", repo.toLowerCase()).toArray()[0] ?? null;
   }
 
-  /** nest's GitHub App's id, once a check run it made has told it (`app.id`); null until then. */
+  /** nest's GitHub App's id, as nest's token answer (`app_id`) or a check run it made (`app.id`) last told it; null until one has. */
   async githubAppId(): Promise<number | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_id'").toArray()[0];
     return row ? Number(row.v) : null;

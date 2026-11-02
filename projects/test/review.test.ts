@@ -133,7 +133,8 @@ describe("a PR's review", () => {
     expect(a.template).toBe("projects/reviewer");
     expect(a.labels).toMatchObject({ project: p.id, role: "reviewer", pr: "3", sha: s });
     expect(a.sandbox).toMatch(/^sbx_/);
-    expect(a.overrides).toEqual({ repos: [p.repo.toLowerCase()] });
+    // It reads the repo and pushes to none.
+    expect(a.overrides).toEqual({ read_repos: [p.repo.toLowerCase()] });
     const brief = fake.inbox.find((x) => x.agent === reviewer)!.text;
     for (const part of [p.repo.toLowerCase(), "#3", s, "develop", "submit_review"]) expect(brief).toContain(part);
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);

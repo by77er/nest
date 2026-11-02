@@ -92,7 +92,11 @@ export interface StatusChecks {
 }
 
 export class GitHub {
-  constructor(private readonly token: string) {}
+  constructor(
+    private readonly token: string,
+    /** The GitHub App the token is from, as nest's answer names it; null when it doesn't. */
+    readonly appId: number | null = null,
+  ) {}
 
   /** One call: the JSON answer, or GitHubError. A 404 is answered as null where `nullOn404`. */
   async call<T>(method: string, path: string, body?: unknown, o: { nullOn404?: boolean } = {}): Promise<T | null> {
@@ -167,9 +171,10 @@ export class GitHub {
   }
 }
 
-/** A client with a token for `repo` with exactly `permissions`. */
+/** A client with a token for `repo` with exactly `permissions`, knowing the App it's from when nest says. */
 export async function githubFor(nest: Nest, repo: string, permissions: Record<string, string>): Promise<GitHub> {
-  return new GitHub((await nest.githubToken(repo, permissions)).token);
+  const t = await nest.githubToken(repo, permissions);
+  return new GitHub(t.token, typeof t.app_id === "number" && Number.isSafeInteger(t.app_id) && t.app_id > 0 ? t.app_id : null);
 }
 
 // --- branch protection, kept ---------------------------------------------------------------------------
@@ -180,10 +185,10 @@ export async function githubFor(nest: Nest, repo: string, permissions: Record<st
  * - With the App's id known, the check is required from the App (`checks: [{context, app_id}]`): no
  *   other app, nor a commit status anyone with write access may post, can pass it. An entry already
  *   there from any source, or another app, is pinned to the App.
- * - Without it, from any source: `contexts` when no entry is pinned to an app, so nothing changes form;
- *   `checks` with the review check's `app_id` left out (GitHub then takes the app that recently set
- *   it) when some entry is pinned, so that pin survives. The App's first check run tells its id, and
- *   the project then attaches again to pin it (README.md#flows).
+ * - Without it (nest's token answer didn't name the App), from any source: `contexts` when no entry
+ *   is pinned to an app, so nothing changes form; `checks` with the review check's `app_id` left out
+ *   (GitHub then takes the app that recently set it) when some entry is pinned, so that pin survives.
+ *   The App's first check run then tells its id, and the project attaches again to pin it.
  * - Every other entry is kept as it was: an `app_id` of null (any source) is sent back as -1, GitHub's
  *   "any app".
  */
