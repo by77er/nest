@@ -135,8 +135,22 @@ const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "susp
 const PLACE_RETRY_MS = 30_000;
 /** Idle this long → suspend. The design pauses at 1 min and suspends 10 min later; pausing isn't built. */
 const DEFAULT_SUSPEND_IDLE_MS = 11 * 60_000;
-/** At most one turn-end commit this often (docs/sandbox/state/#writeback-cadence). */
+/** At most one turn-end commit this often (docs/sandbox/state/#writeback-cadence), counted from the last one's landing. */
 const TURN_CHECKPOINT_MIN_MS = 10_000;
+/**
+ * A turn-end checkpoint counts as in flight this long at most without landing (its commit decided, or
+ * its command failed): its pause plus nestd's 60 s commit timeout, with room for a large disk's
+ * chunking pass. Past it, a turn end asks for a new one.
+ */
+const TURN_CHECKPOINT_INFLIGHT_MAX_MS = 5 * 60_000;
+
+/** The turn-end checkpoint SandboxDO asked for and hasn't seen land (kv `turn_checkpoint_inflight`). */
+interface InflightCheckpoint {
+  epoch: number;
+  sent_ms: number;
+  /** Turn ends that arrived while it was in flight: they get one follow-up checkpoint once it lands. */
+  waiting: number;
+}
 /** How many epochs `info().history` shows; the `epochs` table keeps them all. */
 const HISTORY_MAX = 50;
 /** `commits` records: one rejected, or whose generation left the chain, goes this long after it was made. */
@@ -538,8 +552,12 @@ export class SandboxDO extends DurableObject<Env> {
     }
   }
 
-  /** A command failed on the lease holder: only `sandbox_create` failures matter here. */
+  /** A command failed on the lease holder: `sandbox_create` and `sandbox_checkpoint` failures matter here. */
   async commandFailed(host: string, type: string, epoch: number, error: ErrorBody): Promise<void> {
+    if (type === "sandbox_checkpoint" && this.tryInfo()) {
+      await this.turnCheckpointLanded(epoch);
+      return;
+    }
     if (type !== "sandbox_create" || !this.tryInfo()) return;
     const [r, info] = this.decide((i) => lease.createFailed(i, host, epoch, error.retryable));
     if (r === "reissue") {
@@ -758,6 +776,9 @@ export class SandboxDO extends DurableObject<Env> {
     const stored = this.sql.exec<{ outcome: string }>("SELECT outcome FROM commits WHERE request = ?", ev.request).toArray()[0];
     if (stored) {
       const outcome = JSON.parse(stored.outcome) as CommitOutcome;
+      // nestd asks again for a commit whose answer it lost, and may then find nothing new to send: the
+      // checkpoint in flight may end with this replay, so it lands here (at worst, early).
+      if (ev.reason === "turn_end") await this.turnCheckpointLanded(ev.epoch);
       // The first answer's notice may not have been posted (it failed after the record was stored).
       if (outcome.status === "orphaned") this.noticeOrphan(ev, outcome.generation);
       return outcome;
@@ -794,6 +815,7 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.set("commit_prune", Date.now() + COMMIT_PRUNE_INTERVAL_MS, true);
     if (outcome.status !== "rejected") await this.deadlines.set("retention", Date.now() + RETENTION_AFTER_COMMIT_MS, true);
     if (outcome.status === "orphaned") this.noticeOrphan(ev, outcome.generation);
+    if (ev.reason === "turn_end") await this.turnCheckpointLanded(ev.epoch);
     return outcome;
   }
 
@@ -1330,20 +1352,64 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * An agent finished a turn: commit the disk (`turn_end`), at most once per TURN_CHECKPOINT_MIN_MS; a
-   * turn ending sooner gets its commit when the interval is up, so the last turn's is never skipped.
+   * An agent finished a turn: commit the disk (`turn_end`), one checkpoint at a time and at most once per
+   * TURN_CHECKPOINT_MIN_MS after the last one landed; a turn ending sooner gets its commit when the
+   * interval is up, so the last turn's is never skipped.
+   *
+   * Turns that end while one is in flight queue no second one behind it: they share one follow-up,
+   * TURN_CHECKPOINT_MIN_MS after it lands (`turnCheckpointLanded`), so the VM runs between two pauses.
+   * The follow-up isn't skipped: the in-flight checkpoint's cut is the guest's `sync`, not the pause (the
+   * guest freezes nothing), so a call answered between the two may have left writes it lacks
+   * (docs/sandbox/state/#one-turn-end-checkpoint-at-a-time).
    */
   private async turnEndCheckpoint(): Promise<void> {
+    const now = Date.now();
+    const info = this.info_();
+    const inflight = this.inflightCheckpoint(info.epoch, now);
+    if (inflight) {
+      this.put("turn_checkpoint_inflight", { ...inflight, waiting: inflight.waiting + 1 });
+      // If it never lands (its command and commit both lost), they get one when its window ends.
+      await this.deadlines.set("turn_checkpoint", inflight.sent_ms + TURN_CHECKPOINT_INFLIGHT_MAX_MS, true);
+      return;
+    }
     const last = this.get<number>("turn_checkpoint_ms") ?? 0;
     const due = last + TURN_CHECKPOINT_MIN_MS;
-    if (Date.now() < due) {
+    if (now < due) {
       await this.deadlines.set("turn_checkpoint", due);
       return;
     }
-    const info = this.info_();
     if (!info.host || info.state !== "running") return;
-    this.put("turn_checkpoint_ms", Date.now());
-    await this.command({ type: "sandbox_checkpoint", reason: "turn_end" });
+    this.put("turn_checkpoint_ms", now);
+    // Recorded before the await: a turn that ends while the command is being queued waits for it too.
+    this.put("turn_checkpoint_inflight", { epoch: info.epoch, sent_ms: now, waiting: 0 } satisfies InflightCheckpoint);
+    try {
+      await this.command({ type: "sandbox_checkpoint", reason: "turn_end" });
+    } catch (e) {
+      // Never queued: nothing is in flight, and a turn that ended meanwhile gets the follow-up.
+      await this.turnCheckpointLanded(info.epoch);
+      throw e;
+    }
+  }
+
+  /** The turn-end checkpoint in flight for `epoch`, unless it has been out longer than it can be. */
+  private inflightCheckpoint(epoch: number, now: number): InflightCheckpoint | undefined {
+    const f = this.get<InflightCheckpoint>("turn_checkpoint_inflight");
+    return f && f.epoch === epoch && now - f.sent_ms < TURN_CHECKPOINT_INFLIGHT_MAX_MS ? f : undefined;
+  }
+
+  /**
+   * The in-flight turn-end checkpoint of `epoch` landed: its commit was decided (any outcome) or its
+   * command failed. The interval to the next one counts from here, so the VM runs between two pauses,
+   * and the turns that ended while it was in flight get their one follow-up when the interval is up
+   * (replacing the deadline for its never landing, the only one armed meanwhile).
+   */
+  private async turnCheckpointLanded(epoch: number): Promise<void> {
+    const f = this.get<InflightCheckpoint>("turn_checkpoint_inflight");
+    if (!f || f.epoch !== epoch) return;
+    const now = Date.now();
+    this.del("turn_checkpoint_inflight");
+    this.put("turn_checkpoint_ms", now);
+    if (f.waiting > 0) await this.deadlines.set("turn_checkpoint", now + TURN_CHECKPOINT_MIN_MS);
   }
 
   // --- ports ----------------------------------------------------------------------------------------

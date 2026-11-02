@@ -65,6 +65,7 @@ A client reaches the sandbox only with a binding this DO issued, whoever and whe
 - **Pins:** a claim pins the generation it restores, and a fork pins its source, by id, until completion or abandon (for a fork, until the child has recorded it as its head). Built for placement: `restore_pin {generation, epoch}`, set in the claim's step, live while that epoch is placing, creating or restoring (`livePins`).
 - **`isRestoreSource`** lives here and is the only answer to "may this be loaded or deleted" for resume selection, the drain gate and GC ([restore sources](../../../sandbox/state/#restore-sources)).
 - **Retention** runs from the alarm: it thins generations and marks them `deleting`, which is one-way ([retention](../../../sandbox/state/#retention)). Built and on by default (`SANDBOX_RETENTION=off` stops it); the decisions are a pure core (`control-plane/src/lib/retention.ts`).
+- **Turn-end checkpoints:** one at a time, at most one per 10 s after the last landed, and turns that end while one is in flight share one follow-up after it ([writeback cadence](../../../sandbox/state/#one-turn-end-checkpoint-at-a-time)). A `turn_end` commit's decision (a stored one's replay included), or a failed `sandbox_checkpoint`, lands it.
 - **The single writer serializes** fork admission, sandbox destruction and retention: a fork can't pin a `deleting` generation, retention can't delete a pinned one, and a destroy keeps pinned generations until their forks finish.
 
 ## Activity and idle

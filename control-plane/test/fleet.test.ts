@@ -585,7 +585,8 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(suspend).toMatchObject({ sandbox: sbx.sandbox, epoch: 1, mode: "disk_only" });
   });
 
-  it("commits the disk when a turn ends, and a turn ending within 10 s gets its commit when the interval is up", async () => {
+  /** A running sandbox with one attached agent, on a connected host. */
+  async function turnSandbox(agent: string) {
     const cell = uniqueCell();
     const a = await connectHost(cell);
     const sbx = await createSandbox(cell);
@@ -593,23 +594,119 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     state(a.ws, sbx.sandbox, 1, "running");
     await a.ws.next("ack");
     const stub = sandboxStub(sbx.sandbox);
-    const agent = "agt_turnend000000000000000000";
     await stub.attach(agent);
     await nextCommands(a.ws, (c) => c.type === "agent_attach"); // the slot, not a commit
-    await stub.agentActivity(agent, true);
-    await stub.agentActivity(agent, false);
-    const [first] = await nextCommands(a.ws, (c) => c.type === "sandbox_checkpoint");
-    expect(first).toMatchObject({ sandbox: sbx.sandbox, epoch: 1, reason: "turn_end" });
-    // A second turn right away: no commit yet (rate limit), but one is due, not dropped.
-    await stub.agentActivity(agent, true);
-    await stub.agentActivity(agent, false);
-    expect(await a.ws.none("commands", 300)).toBe(true);
-    await runInDurableObject(stub, (_i, st) => {
+    const turn = async () => {
+      await stub.agentActivity(agent, true);
+      await stub.agentActivity(agent, false);
+    };
+    // nestd's commit for the checkpoint: decided, with its result back to the host.
+    let n = 0;
+    const land = async (parent?: string, request = `req_turn${n++}`) => {
+      sendEvents(a.ws, [{
+        ts_ms: Date.now(), type: "commit_request", request, sandbox: sbx.sandbox, epoch: 1,
+        ...(parent ? { parent } : {}), kind: "disk_only", disk_manifest: manifest("c"), reason: "turn_end",
+      }]);
+      const [r] = await nextCommands(a.ws, (c) => c.type === "commit_result" && c.request === request);
+      return r.outcome;
+    };
+    const fail = async (cmd: string) => {
+      const seq = sendEvents(a.ws, [{
+        ts_ms: Date.now(), type: "command_result", cmd,
+        outcome: { status: "error", error: { code: "internal", message: "commit timed out", retryable: true } },
+      }]);
+      await a.ws.next("ack", (m) => m.up_to >= seq);
+    };
+    // The interval since the last checkpoint landed has passed.
+    const intervalUp = () => runInDurableObject(stub, (_i, st) => {
       st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'turn_checkpoint_ms'", JSON.stringify(Date.now() - 11_000));
     });
-    await runAlarm(stub, "turn_checkpoint");
-    const [second] = await nextCommands(a.ws, (c) => c.type === "sandbox_checkpoint");
+    const armed = () => runInDurableObject(stub, (_i, st) =>
+      st.storage.sql.exec("SELECT key FROM deadlines WHERE key = 'turn_checkpoint'").toArray().length > 0);
+    // Armed for the interval after a landing just now (not the 5 min window of one that never lands).
+    const dueSoon = () => runInDurableObject(stub, (_i, st) => {
+      const at = st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'turn_checkpoint'").toArray()[0]?.at;
+      return at !== undefined && at > Date.now() && at <= Date.now() + 10_000;
+    });
+    const checkpoints = (ms = 300) => a.ws.none("commands", ms, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_checkpoint"));
+    return { a, sbx, stub, turn, land, fail, intervalUp, armed, dueSoon, checkpoints };
+  }
+
+  it("commits the disk when a turn ends, and a turn ending within 10 s of the last landing gets its commit when the interval is up", async () => {
+    const t = await turnSandbox("agt_turnend000000000000000000");
+    await t.turn();
+    const [first] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(first).toMatchObject({ sandbox: t.sbx.sandbox, epoch: 1, reason: "turn_end" });
+    const landed = await t.land();
+    expect(landed.status).toBe("committed");
+    // A second turn right away: no commit yet (rate limit), but one is due, not dropped.
+    await t.turn();
+    expect(await t.checkpoints()).toBe(true);
+    expect(await t.armed()).toBe(true);
+    await t.intervalUp();
+    await runAlarm(t.stub, "turn_checkpoint");
+    const [second] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
     expect(second).toMatchObject({ reason: "turn_end", epoch: 1 });
+  });
+
+  // 2026-11-02, cell use1: a turn that ended while a 35 s checkpoint held the VM paused queued a second
+  // checkpoint, which paused the VM again 14 ms after it resumed. Turns that end while one is in flight
+  // now share one follow-up, 10 s after it lands (not skipped: the cut is the guest's sync, not the pause).
+  it("one turn-end checkpoint at a time: turns ending while one is in flight share one follow-up after it lands", async () => {
+    const t = await turnSandbox("agt_coalesce0000000000000000");
+    await t.turn();
+    await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
+    // Two turns end while it is in flight, one past the interval: no second checkpoint queues behind it.
+    await t.turn();
+    await t.intervalUp();
+    await t.turn();
+    expect(await t.checkpoints()).toBe(true);
+    // It lands: still none at once, but one is due when the interval from the landing is up.
+    expect((await t.land()).status).toBe("committed");
+    expect(await t.checkpoints()).toBe(true);
+    expect(await t.dueSoon()).toBe(true);
+    await runAlarm(t.stub, "turn_checkpoint"); // too early: the interval counts from the landing
+    expect(await t.checkpoints()).toBe(true);
+    await t.intervalUp();
+    await runAlarm(t.stub, "turn_checkpoint");
+    const [followUp] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(followUp).toMatchObject({ reason: "turn_end", epoch: 1 });
+    expect(await t.checkpoints()).toBe(true); // one for both turns
+
+    // A turn ends while the follow-up is in flight, and the follow-up fails (the commit timed out): that
+    // turn gets its own once the interval from the failure is up.
+    await t.turn();
+    await t.fail(followUp.cmd);
+    expect(await t.checkpoints()).toBe(true);
+    expect(await t.dueSoon()).toBe(true);
+    await t.intervalUp();
+    await runAlarm(t.stub, "turn_checkpoint");
+    const [third] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(third).toMatchObject({ reason: "turn_end", epoch: 1 });
+
+    // One that never lands (its command and commit lost) stops counting after its window, and the turns
+    // that ended meanwhile still get a checkpoint: its window's deadline asks for one.
+    await t.turn();
+    expect(await t.checkpoints()).toBe(true);
+    await runInDurableObject(t.stub, (_i, st) => {
+      const f = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'turn_checkpoint_inflight'").one().value);
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'turn_checkpoint_inflight'", JSON.stringify({ ...f, sent_ms: Date.now() - 6 * 60_000 }));
+    });
+    await t.intervalUp();
+    await runAlarm(t.stub, "turn_checkpoint");
+    const [fourth] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(fourth).toMatchObject({ reason: "turn_end" });
+
+    // nestd asking again for a commit whose answer it lost gets the stored outcome, and may then send
+    // nothing new: the replay lands the one in flight, and the turn that ended meanwhile is followed up.
+    await t.turn();
+    const replayed = await t.land(undefined, "req_turn0");
+    expect(replayed.status).toBe("committed");
+    expect(await t.dueSoon()).toBe(true);
+    await t.intervalUp();
+    await runAlarm(t.stub, "turn_checkpoint");
+    const [fifth] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(fifth).toMatchObject({ reason: "turn_end" });
   });
 
   it("a host retired with only suspended sandboxes evicts them; waking places them from head elsewhere", async () => {
