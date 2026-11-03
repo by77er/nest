@@ -312,6 +312,8 @@ struct FleetLog {
     acks: Vec<u64>,
     claims: Vec<Vec<LeaseClaim>>,
     ca_renews: Vec<String>,
+    /// Command batches resent after a hello (their seq): the host hadn't reported them done.
+    redelivered: Vec<u64>,
 }
 
 struct MockFleet {
@@ -421,6 +423,7 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                 let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease, host_token_expires_ms: 0, next_command_seq: None };
                                 if ws.send(send(FleetToHost::HelloAck(ack))).await.is_err() { break; }
                                 for (s, cmds) in &unacked {
+                                    log2.lock().unwrap().redelivered.push(*s);
                                     let _ = ws.send(send(FleetToHost::Commands { seq: Seq(*s), commands: cmds.clone() })).await;
                                 }
                             }
@@ -1436,8 +1439,11 @@ async fn retryable_fleet_error_resends_the_failed_batch() {
         let (sent, logged) = (failed.iter().filter(|f| *f == e).count(), log.events.iter().filter(|f| *f == e).count());
         assert_eq!(logged, sent, "resent exactly once: {e:#?}");
     }
-    let n = log.events.iter().filter(|e| matches!(&e.body, HostEventBody::CommandResult { cmd, .. } if cmd.0 == "cmd_a")).count();
-    assert_eq!(n, 1);
+    // One result, plus one per redelivery of cmd_a's batch: a reconnect before the host reported it
+    // done (on a loaded machine) resends it, and the host answers it again from its result cache.
+    let results: Vec<&CommandOutcome> = log.events.iter().filter_map(|e| match &e.body { HostEventBody::CommandResult { cmd, outcome } if cmd.0 == "cmd_a" => Some(outcome), _ => None }).collect();
+    assert_eq!(results.len(), 1 + log.redelivered.len(), "redelivered: {:?}", log.redelivered);
+    assert!(results.windows(2).all(|w| w[0] == w[1]), "a redelivered command is answered with its first outcome: {results:?}");
 }
 
 /// Review #10: the proxy intermediate CA is renewed (new key + CSR) before it expires, and the
@@ -1765,6 +1771,8 @@ async fn a_rejected_commit_never_resumes_its_vm() {
     assert!(!is_ok(&h.fleet.result("cmd_1").await));
     assert!(!h.vm.resume_latch.reached.load(Ordering::SeqCst), "a rejected suspend resumed its VM");
     h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, .. } if sandbox.0 == "sbx_1")).await;
+    // Its salvage is a new request too: once it is done, the next rejection can only be sbx_2's.
+    h.fleet.wait_event("sbx_1 retired", |b| matches!(b, HostEventBody::IncarnationRetired { sandbox, .. } if sandbox.0 == "sbx_1")).await;
     h.vm.resume_latch.held.store(false, Ordering::SeqCst);
 
     h.fleet.commands.send(vec![create("cmd_create_sbx_2", "sbx_2")]).unwrap();
@@ -2756,6 +2764,8 @@ async fn a_commits_pause_is_marked_at_the_gateway_until_the_vm_runs_or_leaves() 
     // A suspend that lands: marked until the sandbox leaves the gateway.
     h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_2", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_suspend_2").await));
+    // The gateway hears the removal over its own link, after the command's result.
+    wait_until("the sandbox removed at the gateway", || matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxRemove { .. }))).await;
     let got = h.gateway.got.lock().unwrap().clone();
     let words: Vec<&GatewayCommand> = got
         .iter()
