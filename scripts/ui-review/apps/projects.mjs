@@ -488,6 +488,15 @@ const app = {
     // A task's description (README.md#descriptions): edited in the rich editor, a table kept as written;
     // typed into, with the toolbar showing what's on; the new task's editor focused.
     { name: "drawer-edit", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: enterEdit, check: editorCheck, checkName: "editor" },
+    // Escape in the description's text, with a change: the form's own Escape, so it asks before
+    // discarding (the editor's keymap would take it; jsdom can't tell, a browser can).
+    { name: "drawer-edit-escape", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, checkName: "editor", after: async (p) => {
+      await p.getByRole("button", { name: "Edit the title and description" }).click();
+      await p.getByRole("textbox", { name: "Details" }).getByText(/^Owners filter/).click();
+      await p.keyboard.type("x");
+      await p.keyboard.press("Escape");
+      await p.getByRole("dialog", { name: "Discard changes?" }).waitFor({ timeout: 3000 }).catch(() => {});
+    }, check: async (p) => ((await p.getByRole("dialog", { name: "Discard changes?" }).count()) === 1 ? [] : ["Escape in the description's text with a change doesn't ask to discard it"]) },
     { name: "drawer-edit-typing", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: editorCheck, checkName: "editor", after: async (p) => {
       await p.getByRole("button", { name: "Edit the title and description" }).click();
       // The caret at the end of the scope's last item, as a click past its text puts it.

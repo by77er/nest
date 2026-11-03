@@ -9,9 +9,13 @@ import { editorExtensions, fromMarkdown, toMarkdown } from "../../rich/editor-ma
 // Its own module, not the layout index: the editor (Tiptap) loads only with the forms that use it.
 import { RichEditor, richEditorAttributes, useRichEditorLabel } from "../../layout/RichEditor";
 
-export function DescriptionField({ value, onChange, label = "Details", description, error, autoFocus = false, readOnly = false }: {
+export function DescriptionField({ value, onChange, label = "Details", description, error, autoFocus = false, readOnly = false, onEscape }: {
   value: string; onChange: (md: string) => void; label?: string; description?: ReactNode; error?: ReactNode; autoFocus?: boolean; readOnly?: boolean;
+  /** Escape in the text: the form's own (leave it, or ask first). ProseMirror's (selecting the parent block) otherwise. */
+  onEscape?: () => void;
 }) {
+  const escape = useRef(onEscape);
+  escape.current = onEscape;
   const labelId = useRichEditorLabel();
   // What the editor last said, so its own edits coming back as `value` aren't loaded again (which would
   // move the cursor).
@@ -23,7 +27,16 @@ export function DescriptionField({ value, onChange, label = "Details", descripti
     autofocus: autoFocus ? "end" : false,
     immediatelyRender: true,
     shouldRerenderOnTransaction: true,
-    editorProps: { attributes: richEditorAttributes(labelId) },
+    editorProps: {
+      attributes: richEditorAttributes(labelId),
+      // Ahead of the editor's keymap, which takes Escape: the same as anywhere else in the form. (The
+      // link editor is a popover outside the text: its Escape only closes it.)
+      handleKeyDown: (_view, event) => {
+        if (event.key !== "Escape" || event.isComposing || !escape.current) return false;
+        escape.current();
+        return true;
+      },
+    },
     onUpdate: ({ editor: e }) => {
       const md = toMarkdown(e.getJSON());
       said.current = md;

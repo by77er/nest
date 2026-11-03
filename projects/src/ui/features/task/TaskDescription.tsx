@@ -83,7 +83,8 @@ export function TaskDescription({ projectId, task, readOnly, editing, onEditing,
       actions={
         readOnly ? null : edit ? (
           <>
-            <Button variant="subtle" color="danger" size="xs" onClick={cancel}>
+            {/* Neutral: the drawer's red Cancel task may sit right above it. */}
+            <Button variant="subtle" color="gray" size="xs" onClick={cancel}>
               Cancel
             </Button>
             <Button type="submit" form={formId} size="xs" disabled={!state.dirty} loading={state.pending}>

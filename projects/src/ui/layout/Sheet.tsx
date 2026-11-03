@@ -42,6 +42,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
         onClose={onClose}
         closeOnEscape={closeOnEscape}
         position="right"
+        closeButtonProps={{ "aria-label": "Close" }}
         size={size}
         title={title}
         styles={{
@@ -65,6 +66,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
         onClose={onClose}
         closeOnEscape={closeOnEscape}
         position="right"
+        closeButtonProps={{ "aria-label": "Close" }}
         size={size}
         title={title}
         styles={{ content: { display: "flex", flexDirection: "column" }, body: { ...FULL } }}
@@ -93,7 +95,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
     );
   }
   return (
-    <Drawer opened={opened} onClose={onClose} closeOnEscape={closeOnEscape} position="right" size={size} title={title}>
+    <Drawer opened={opened} onClose={onClose} closeOnEscape={closeOnEscape} position="right" closeButtonProps={{ "aria-label": "Close" }} size={size} title={title}>
       {split && wide ? <Box maw="var(--nest-measure)">{children}</Box> : children}
     </Drawer>
   );

@@ -65,7 +65,7 @@ export function TaskEditForm({ projectId, task, formId, onDone, onCancel, onStat
       <FieldGroup>
         {/* Focus goes to the first field as the form opens (its Edit button is gone). */}
         <TextInput label="Title" withAsterisk maxLength={200} autoFocus {...form.getInputProps("title")} />
-        <DescriptionField value={form.values.body} onChange={(md) => form.setFieldValue("body", md)} error={form.errors.body} />
+        <DescriptionField value={form.values.body} onChange={(md) => form.setFieldValue("body", md)} error={form.errors.body} onEscape={onCancel} />
       </FieldGroup>
     </form>
   );

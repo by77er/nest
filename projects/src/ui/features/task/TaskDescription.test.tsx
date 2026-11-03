@@ -155,6 +155,12 @@ describe("a task's description", () => {
     await user.keyboard("{Escape}");
     expect(within(d).queryByRole("textbox", { name: "Details" })).toBeNull();
     expect(drawer()).toBeInTheDocument();
+    // And from the description's text, when clean.
+    await user.click(within(d).getByRole("button", { name: "Edit the title and description" }));
+    await user.click(await within(d).findByRole("textbox", { name: "Details" }));
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(within(d).queryByRole("textbox", { name: "Details" })).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Discard changes?" })).toBeNull();
 
     await user.click(within(d).getByRole("button", { name: "Edit the title and description" }));
     await user.type(await within(d).findByLabelText(/Title/), " now");
@@ -166,8 +172,15 @@ describe("a task's description", () => {
     expect(within(d).getByLabelText(/Title/)).toHaveValue("Migrate auth now");
     void title;
 
+    // Escape in the description's text does the same as in the title (the editor would take it).
+    await user.click(within(d).getByRole("textbox", { name: "Details" }));
+    await user.keyboard("{Escape}");
+    const fromBody = await screen.findByRole("dialog", { name: "Discard changes?" });
+    await user.click(within(fromBody).getByRole("button", { name: "Keep editing" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Discard changes?" })).toBeNull());
+
     // Closing the drawer with changes asks too; Discard drops them and closes it.
-    await user.click(within(d).getAllByRole("button").find((b) => b.classList.contains("mantine-Drawer-close"))!);
+    await user.click(within(d).getByRole("button", { name: "Close" }));
     const again = await screen.findByRole("dialog", { name: "Discard changes?" });
     await user.click(within(again).getByRole("button", { name: "Discard" }));
     await waitFor(() => expect(screen.queryByRole("dialog", SHEET)).toBeNull());
