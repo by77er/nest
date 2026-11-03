@@ -218,13 +218,23 @@ export function measure(sel) {
       }
       return box;
     };
-    /** Whether (x, y) is outside a box that clips `el` (an ancestor scrolling or hiding its overflow). */
+    /**
+     * Whether (x, y) is outside a box that clips `el`: an ancestor scrolling or hiding its overflow, on
+     * the axis it clips (overflow-x: clip leaves what sticks out below painted and tappable), its box
+     * widened by overflow-clip-margin where that applies.
+     */
+    const clips = (v) => /(auto|scroll|hidden|clip)/.test(v);
     const clippedAt = (el, x, y) => {
       for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
         const cs = getComputedStyle(p);
-        if (!/(auto|scroll|hidden|clip)/.test(`${cs.overflowX} ${cs.overflowY}`)) continue;
+        const [cx, cy] = [clips(cs.overflowX), clips(cs.overflowY)];
+        if (!cx && !cy) continue;
         const r = p.getBoundingClientRect();
-        if (x < r.left || x > r.right || y < r.top || y > r.bottom) return true;
+        // overflow-clip-margin widens a clip box (it applies to `clip`, not to scrollers).
+        const m = (v) => (v === "clip" ? parseFloat(cs.overflowClipMargin) || 0 : 0);
+        const [mx, my] = [m(cs.overflowX), m(cs.overflowY)];
+        if (cx && (x < r.left - mx || x > r.right + mx)) return true;
+        if (cy && (y < r.top - my || y > r.bottom + my)) return true;
       }
       return false;
     };

@@ -184,6 +184,21 @@ for (const remount of [false, true]) {
   };
   assert.deepEqual(await overlap(true), [], "a control clipped out of its scroller isn't a neighbour");
   assert.equal((await overlap(false)).length, 1, "the same control, unclipped, is");
+  // A parent that clips only sideways (overflow-x: clip, overflow-y: visible) leaves a control sticking
+  // out below it painted and tappable: still a neighbour (the reviewer's plantclip2).
+  const xOnly = (style) => `<!doctype html><html><head><style>
+    body { margin: 0; font: 16px/20px sans-serif; }
+    .t::after { content: ""; position: absolute; inset: -30px 0; }
+  </style></head><body><div style="margin-top: 200px"><div style="${style}; height: 1px"><a href="/b" style="display: block; position: relative; width: 200px; height: 20px">B</a></div><div style="position: relative; margin-top: 24px"><a class="t" href="/a" style="position: relative; display: inline-block; width: 200px">A</a></div></div></body></html>`;
+  const overlapOf = async (style) => {
+    await page.setContent(xOnly(style));
+    return (await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"];
+  };
+  assert.equal((await overlapOf("overflow-x: clip; overflow-y: visible")).length, 1, "a control sticking out of a parent that clips only sideways is a neighbour");
+  assert.equal((await overlapOf("")).length, 1, "and so it is with no overflow at all");
+  // Inside a clip margin a control is still painted: a neighbour.
+  assert.equal((await overlapOf("overflow: clip; overflow-clip-margin: 40px")).length, 1, "a control within overflow-clip-margin is a neighbour");
+  assert.deepEqual(await overlapOf("overflow: clip"), [], "clipped on both axes, it isn't");
 }
 
 // The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the
