@@ -12,7 +12,8 @@ import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { backoff, NestError, nestFrom, type Nest } from "../nest";
+import { backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras } from "../nest";
+import { bindingOf, MAX_BINDINGS, SECRET_NAME, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { canBlock, canUnblock, dependencyError, pickForAssignment, type PrState, prsDone, waitingOn, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition, WORKER_STATES } from "../tasks";
@@ -41,6 +42,8 @@ export interface Settings {
   merge_method: MergeMethod;
   /** The repo's "Allow auto-merge", as the app writes it back from `auto_merge`. */
   repo_auto_merge: RepoAutoMerge;
+  /** Whether workers' push tokens may change `.github/workflows/` (README.md#secrets); off by default. */
+  workers_edit_workflows: boolean;
   created_ms: number;
 }
 
@@ -108,7 +111,24 @@ export interface Blocked {
 }
 
 /** One thing waiting on the owner: an agent's ask (nest's), or a blocked task. Oldest first. */
-export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked);
+export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked) | ({ kind: "secret" } & SecretRequest);
+
+/** An agent asking the owner for a secret (README.md#secrets): one to inject, or one CI needs. */
+export interface SecretRequest {
+  id: string;
+  type: "injected" | "ci";
+  name: string;
+  purpose: string;
+  hosts: string[] | null;
+  agent: string;
+  role: string;
+  task: string | null;
+  tainted: boolean;
+  at_ms: number;
+}
+
+/** A secret as the board lists it: its metadata, and the live agents that have it. */
+export type SecretView = SecretMeta & { holders: { agent: string; role: string }[] };
 
 export interface HistoryRow {
   at_ms: number;
@@ -243,6 +263,18 @@ export const MIGRATIONS = [
       next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, at_ms INTEGER)`,
     "CREATE TABLE frozen_egress (key TEXT PRIMARY KEY, rev INTEGER NOT NULL, egress TEXT NOT NULL)",
   ],
+  [
+    // Secrets (README.md#secrets): what the app keeps of each (never a value), agents' requests for
+    // them, which live agent got which (so a delete names them), each start attempt's sandbox spec
+    // (frozen, so a retry sends the request its idempotency key was bound to), and the workflows setting.
+    `CREATE TABLE secrets (name TEXT PRIMARY KEY, description TEXT NOT NULL, hosts TEXT NOT NULL, locations TEXT NOT NULL, roles TEXT NOT NULL,
+      env TEXT NOT NULL DEFAULT '', size INTEGER, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)`,
+    `CREATE TABLE secret_requests (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, purpose TEXT NOT NULL, hosts TEXT,
+      agent TEXT NOT NULL, role TEXT NOT NULL, task TEXT, tainted INTEGER NOT NULL, at_ms INTEGER NOT NULL, done_ms INTEGER)`,
+    "CREATE TABLE agent_secrets (agent TEXT PRIMARY KEY, role TEXT NOT NULL, names TEXT NOT NULL, at_ms INTEGER NOT NULL)",
+    "CREATE TABLE start_specs (key TEXT PRIMARY KEY, spec TEXT NOT NULL, at_ms INTEGER NOT NULL)",
+    "ALTER TABLE settings ADD COLUMN workers_edit_workflows INTEGER NOT NULL DEFAULT 0",
+  ],
 ] as const;
 
 type Row = Record<string, SqlStorageValue>;
@@ -291,7 +323,7 @@ export class ProjectDO extends DurableObject<Env> {
       manager: (r.manager as string | null) ?? null, manager_error: (r.manager_error as string | null) ?? null,
       attached: r.attached_ms !== null, attach_error: (r.attach_error as string | null) ?? null,
       attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
-      auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod,
+      auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod, workers_edit_workflows: r.workers_edit_workflows === 1,
       repo_auto_merge: repoAutoMerge({
         want: r.auto_merge === 1, owed: r.am_write_next_ms !== null, error: (r.am_write_error as string | null) ?? null,
         applied: r.am_applied ? (JSON.parse(r.am_applied as string) as Seen) : null, observed: r.am_observed ? (JSON.parse(r.am_observed as string) as Seen) : null,
@@ -305,12 +337,13 @@ export class ProjectDO extends DurableObject<Env> {
     return s ? ok(s) : fail(404, "unknown project");
   }
 
-  async updateSettings(u: { auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod }): Promise<Result<Settings>> {
+  async updateSettings(u: { auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean }): Promise<Result<Settings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
     if (u.auto_assign !== undefined) this.sql.exec("UPDATE settings SET auto_assign = ?", u.auto_assign ? 1 : 0);
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
     if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
+    if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
     if (u.auto_merge !== undefined && u.auto_merge !== before.auto_merge) this.setAutoMerge(u.auto_merge);
     this.autoAssign();
     await this.arm();
@@ -849,6 +882,137 @@ export class ProjectDO extends DurableObject<Env> {
     }
   }
 
+  // --- secrets (README.md#secrets) ---------------------------------------------------------------------
+
+  private secretRows(): SecretMeta[] {
+    return this.sql.exec("SELECT * FROM secrets ORDER BY name").toArray().map((r) => ({
+      name: r.name as string, description: r.description as string, hosts: JSON.parse(r.hosts as string) as string[],
+      locations: JSON.parse(r.locations as string) as SecretLocation[], roles: JSON.parse(r.roles as string) as SecretRole[],
+      size: (r.size as number | null) ?? null, created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+    }));
+  }
+
+  /** The live agents holding a secret: those started with it, until they exit or are stopped. */
+  private holdersOf(name: string): { agent: string; role: string }[] {
+    return this.sql.exec("SELECT agent, role, names FROM agent_secrets ORDER BY at_ms").toArray()
+      .filter((r) => (JSON.parse(r.names as string) as string[]).includes(name)).map((r) => ({ agent: r.agent as string, role: r.role as string }));
+  }
+
+  async secrets(): Promise<Result<SecretView[]>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    return ok(this.secretRows().map((m) => ({ ...m, holders: this.holdersOf(m.name) })));
+  }
+
+  /**
+   * Record a secret's metadata, after the Worker stored its value in nest (when it set one): the value
+   * never reaches this object. Open requests to inject one by that name are done, and their agents told.
+   */
+  async saveSecretMeta(m: Pick<SecretMeta, "name" | "description" | "hosts" | "locations" | "roles">, size: number | null): Promise<Result<SecretView>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const had = this.sql.exec("SELECT created_ms FROM secrets WHERE name = ?", m.name).toArray()[0];
+    if (!had && size === null) return fail(400, "a new secret needs a value");
+    const now = Date.now();
+    this.sql.exec(
+      `INSERT INTO secrets (name, description, hosts, locations, roles, size, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (name) DO UPDATE SET description = excluded.description, hosts = excluded.hosts, locations = excluded.locations, roles = excluded.roles,
+          size = COALESCE(excluded.size, size), updated_ms = excluded.updated_ms`,
+      m.name, m.description, JSON.stringify(m.hosts), JSON.stringify(m.locations), JSON.stringify(m.roles), size, now, now,
+    );
+    for (const r of this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL AND kind = 'injected' AND name = ?", m.name).toArray()) {
+      this.finishRequest(r);
+    }
+    await this.arm();
+    return ok({ ...this.secretRows().find((x) => x.name === m.name)!, holders: this.holdersOf(m.name) });
+  }
+
+  /** Forget a secret's metadata (the Worker deleted its value in nest first); answers who had it. */
+  async deleteSecretMeta(name: string): Promise<Result<{ deleted: string; holders: { agent: string; role: string }[] }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const holders = this.holdersOf(name);
+    const gone = this.sql.exec("DELETE FROM secrets WHERE name = ? RETURNING name", name).toArray().length;
+    if (!gone) return fail(404, `no secret ${name}`);
+    return ok({ deleted: name, holders });
+  }
+
+  /**
+   * A start attempt's sandbox spec: its role's bindings, and `workflows: write` for a worker when the
+   * setting is on. Frozen per attempt (`key`), so a retry after a lost answer sends the same request its
+   * Idempotency-Key is bound to, however the secrets changed since. The brief names the placeholders.
+   */
+  private sandboxSpec(role: SecretRole, key: string): { extras: SandboxExtras; names: string[]; brief: string } {
+    const s = this.settings()!;
+    const had = this.sql.exec<{ spec: string }>("SELECT spec FROM start_specs WHERE key = ?", key).toArray()[0];
+    let frozen: { extras: SandboxExtras; names: string[]; brief: string };
+    if (had) frozen = JSON.parse(had.spec);
+    else {
+      const mine = this.secretRows().filter((m) => m.roles.includes(role)).slice(0, MAX_BINDINGS);
+      const extras: SandboxExtras = {
+        ...(mine.length ? { inject: mine.map((m) => bindingOf(s.id, m)) } : {}),
+        ...(role === "worker" && s.workers_edit_workflows ? { github_push: { workflows: true } } : {}),
+      };
+      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(clientIdOf(this.env.NEST_CLIENT_TOKEN) ?? "cli_unknown", mine) };
+      this.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(frozen), Date.now());
+      this.sql.exec("DELETE FROM start_specs WHERE at_ms < ?", Date.now() - 7 * 24 * 3600 * 1000);
+    }
+    return frozen;
+  }
+
+  /** A reviewer's sandbox spec (ReviewDO starts reviewers): as a worker's, without workflows. */
+  async reviewerSpec(key: string): Promise<{ extras: SandboxExtras; names: string[]; brief: string }> {
+    if (!this.settings()) return { extras: {}, names: [], brief: "" };
+    return this.sandboxSpec("reviewer", key);
+  }
+
+  /** Which secrets an agent got at its start (so deleting one names it). */
+  async recordHolder(agent: string, role: string, names: string[]): Promise<void> {
+    if (names.length) this.sql.exec("INSERT OR REPLACE INTO agent_secrets (agent, role, names, at_ms) VALUES (?, ?, ?, ?)", agent, role, JSON.stringify(names), Date.now());
+  }
+
+  /**
+   * An agent asks the owner for a secret (`request_secret`): `injected`, one its sandbox should get
+   * injected, or `ci`, one GitHub Actions needs. It's a "Needs you" item; never a value.
+   */
+  private requestSecret(caller: AgentCaller, a: Record<string, unknown>, task: string | null): Result<SecretRequest> {
+    const kind = a.kind as "injected" | "ci";
+    const name = (a.name as string).trim();
+    if (kind === "injected" && !SECRET_NAME.test(name)) return fail(400, "an injected secret's name is lowercase letters, digits and _, starting with a letter, at most 31");
+    if (kind === "ci" && (!/^[A-Za-z_][A-Za-z0-9_]{0,99}$/.test(name) || /^GITHUB_/i.test(name))) return fail(400, "an Actions secret's name is letters, digits and _, not starting with a digit or GITHUB_");
+    const open = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL AND kind = ? AND name = ?", kind, name).toArray()[0];
+    if (open) return ok(requestOf(open));
+    if (kind === "injected" && this.sql.exec("SELECT 1 FROM secrets WHERE name = ?", name).toArray().length) {
+      return fail(409, `${name} exists already: it's injected into sandboxes started since it was added`);
+    }
+    const id = `srq_${randomId()}`;
+    const hosts = Array.isArray(a.hosts) ? (a.hosts as string[]) : null;
+    this.sql.exec(
+      "INSERT INTO secret_requests (id, kind, name, purpose, hosts, agent, role, task, tainted, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, kind, name, a.purpose as string, hosts ? JSON.stringify(hosts) : null, caller.agent, caller.role, task, caller.tainted ? 1 : 0, Date.now(),
+    );
+    if (task) this.record(task, { kind: "agent", agent: caller.agent, tainted: caller.tainted }, "secret_requested", { kind, name });
+    return ok(requestOf(this.sql.exec("SELECT * FROM secret_requests WHERE id = ?", id).one()));
+  }
+
+  /** The owner marks a request done (a CI secret added on GitHub, or an injected one set up). */
+  async secretRequestDone(id: string): Promise<Result<{ done: string }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.sql.exec("SELECT * FROM secret_requests WHERE id = ?", id).toArray()[0];
+    if (!r) return fail(404, "unknown request");
+    if (r.done_ms !== null) return fail(409, "already done");
+    this.finishRequest(r);
+    await this.arm();
+    await this.drain();
+    return ok({ done: id });
+  }
+
+  private finishRequest(r: Row): void {
+    this.sql.exec("UPDATE secret_requests SET done_ms = ? WHERE id = ?", Date.now(), r.id);
+    // Names only, the owner's act: nothing an agent wrote, so nothing relayed.
+    const text = r.kind === "ci"
+      ? `The owner added the GitHub Actions secret ${r.name as string} you asked for.`
+      : `The owner set up the secret ${r.name as string} you asked for. It's injected into sandboxes started from now on, not into yours if it was started before: say so if you need it now.`;
+    this.oweMessage(r.agent as string, text, false);
+  }
+
   // --- blocked --------------------------------------------------------------------------------------
 
   private clearBlock(id: string): void {
@@ -936,14 +1100,15 @@ export class ProjectDO extends DurableObject<Env> {
       kind: "blocked", task: r.id as string, title: r.title as string, state: r.state as TaskState, ...blockedOf(r)!,
     }));
     const open = asks.value.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
-    return ok([...open, ...blocked].sort((a, b) => a.at_ms - b.at_ms));
+    const secrets = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL").toArray().map((r): Attention => ({ kind: "secret", ...requestOf(r) }));
+    return ok([...open, ...blocked, ...secrets].sort((a, b) => a.at_ms - b.at_ms));
   }
 
   /** How many things wait on the owner (the projects list's count). */
   async attentionCount(): Promise<number> {
     if (!this.settings()) return 0;
     return this.sql.exec<{ n: number }>(
-      "SELECT (SELECT COUNT(*) FROM asks WHERE answered_ms IS NULL) + (SELECT COUNT(*) FROM tasks WHERE blocked_ms IS NOT NULL) AS n",
+      "SELECT (SELECT COUNT(*) FROM asks WHERE answered_ms IS NULL) + (SELECT COUNT(*) FROM tasks WHERE blocked_ms IS NOT NULL) + (SELECT COUNT(*) FROM secret_requests WHERE done_ms IS NULL) AS n",
     ).one().n;
   }
 
@@ -1014,6 +1179,7 @@ export class ProjectDO extends DurableObject<Env> {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'app', ?, ?)", Date.now(), `The manager ended (${e.reason ?? "exited"}).`, e.id);
         }
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
+        this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", e.agent);
         break;
       case "agent.ask":
         this.sql.exec(
@@ -1330,6 +1496,8 @@ export class ProjectDO extends DurableObject<Env> {
           return this.addDependency(a.task as string, a.blocked_by as string, actor);
         case "remove_dependency":
           return this.removeDependency(a.task as string, a.blocked_by as string, actor);
+        case "request_secret":
+          return this.requestSecret(caller, a, null);
         case "block_task":
           return this.block(a.task as string, caller, "manager", a.reason as string, (a.question as string | undefined) ?? null);
         case "unblock_task":
@@ -1371,6 +1539,8 @@ export class ProjectDO extends DurableObject<Env> {
           this.record(id, actor, "progress", a.text as string);
           return ok({ recorded: true });
         // Only its own task: the id is its labels', never an argument.
+        case "request_secret":
+          return this.requestSecret(caller, a, id);
         case "report_blocked":
           return this.block(id, caller, "worker", a.reason as string, (a.question as string | undefined) ?? null);
         case "clear_blocked":
@@ -1581,11 +1751,14 @@ export class ProjectDO extends DurableObject<Env> {
     try {
       const key = `${s.id}/manager/${n}`;
       const frozen = this.frozenEgress(key, "manager");
-      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, egressExtras(frozen.egress)));
+      // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
+      const spec = this.sandboxSpec("manager", key);
+      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       this.sql.exec("UPDATE settings SET manager = ?", agent);
       this.trackLayer(agent, "manager", frozen.rev);
-      await nest.postInbox(agent, managerBrief(s), { requestId: `${s.id}/manager/${n}/brief` });
+      this.recordHolder(agent, "manager", spec.names);
+      await nest.postInbox(agent, managerBrief(s) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
       this.sql.exec("UPDATE settings SET manager_next_ms = NULL, manager_attempts = 0, manager_error = NULL, manager_starts = ?", n);
     } catch (e) {
       // The manager is the project's only way in: always retried, the error shown meanwhile.
@@ -1609,9 +1782,11 @@ export class ProjectDO extends DurableObject<Env> {
       if (!agent) {
         const key = `${s.id}/${id}/${n}`;
         const frozen = this.frozenEgress(key, "worker");
-        agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, key, egressExtras(frozen.egress));
+        const spec = this.sandboxSpec("worker", key);
+        agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         this.trackLayer(agent, "worker", frozen.rev);
+        this.recordHolder(agent, "worker", spec.names);
         if (!current()) {
           // Cancelled (or reassigned) while it was being made: it goes.
           this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, 'cancelled', ?)", agent, id, Date.now());
@@ -1622,7 +1797,7 @@ export class ProjectDO extends DurableObject<Env> {
       }
       const t = this.toTask(this.taskRow(id)!);
       // A spec a tainted session wrote reaches the worker as relayed text, so its session is tainted too.
-      await nest.postInbox(agent, workerBrief(s, t), { requestId: `${id}/${n}/brief`, ...(t.tainted ? { from: "projects/board" } : {}) });
+      await nest.postInbox(agent, workerBrief(s, t) + this.sandboxSpec("worker", `${s.id}/${id}/${n}`).brief, { requestId: `${id}/${n}/brief`, ...(t.tainted ? { from: "projects/board" } : {}) });
       if (!current()) return;
       this.move(id, "started", { kind: "app", what: "assign" }, { agent });
       this.sql.exec("UPDATE tasks SET start_next_ms = NULL, start_error = NULL WHERE id = ?", id);
@@ -1730,6 +1905,14 @@ export function changeMessage(t: Task, changes: Record<string, SqlStorageValue>[
 
 /** How often looking at a project reads its repo's auto-merge setting again, at most. */
 const REPO_READ_EVERY_MS = 60_000;
+
+function requestOf(r: Row): SecretRequest {
+  return {
+    id: r.id as string, type: r.kind as "injected" | "ci", name: r.name as string, purpose: r.purpose as string,
+    hosts: r.hosts ? (JSON.parse(r.hosts as string) as string[]) : null, agent: r.agent as string, role: r.role as string,
+    task: (r.task as string | null) ?? null, tainted: r.tainted === 1, at_ms: r.at_ms as number,
+  };
+}
 
 /** A task's block, from its row. */
 function blockedOf(r: Row): Blocked | null {

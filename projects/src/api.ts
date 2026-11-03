@@ -5,10 +5,11 @@ import type { z } from "zod";
 import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
-import { NestError, nestFrom } from "./nest";
+import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
-import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, Settings, Spec, UpdateTask } from "./requests";
+import { nestSecretName, type SecretGrant, secretProblems, valueProblem } from "./secrets";
+import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -94,7 +95,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   if (!row) return err(404, "unknown project");
   const p = project(env, pid);
   const rest = parts.slice(2);
-  const route = `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
+  const route = rest[0] === "secrets" && rest.length === 2 ? `${m} secrets/:name`
+    : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
+    : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
   const task = rest[1] ?? "";
   const ask = rest[1] ?? "";
 
@@ -112,9 +115,75 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const b = await body(req, Settings);
       if (!b.ok) return b.res;
       const { max_concurrent_reviews, ...rest } = b.value;
+      // Workers editing CI workflows needs the grant to allow it: refused here rather than at every spawn.
+      if (rest.workers_edit_workflows === true) {
+        const g = await grantOf(env);
+        if (!g.ok) return err(g.status, g.error);
+        if (!g.value.workflows) return err(409, "the app's grant doesn't allow workflows on push tokens: the operator must set github_push.workflows in its grant");
+      }
       if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
       return done(await withReviews(env, pid, await p.updateSettings(rest)));
     }
+    case "GET secrets": {
+      // Metadata only: the app's, with nest's last injection and size; never a value.
+      const [mine, g] = await Promise.all([p.secrets(), grantOf(env)]);
+      if (!mine.ok) return done(mine);
+      const nest = nestFrom(env);
+      let theirs: Map<string, { size: number; last_injected_ms: number | null }> = new Map();
+      if (nest) {
+        try {
+          theirs = new Map((await nest.listSecrets()).map((x) => [x.name, x]));
+        } catch {
+          // shown without nest's facts
+        }
+      }
+      return json({
+        secrets: mine.value.map((x) => {
+          const n = theirs.get(nestSecretName(pid, x.name));
+          return { ...x, size: n?.size ?? x.size, last_injected_ms: n?.last_injected_ms ?? null, in_nest: theirs.size ? n !== undefined : null };
+        }),
+        grant: g.ok ? { ...g.value, used: theirs.size } : null,
+        client: clientIdOf(env.NEST_CLIENT_TOKEN),
+      });
+    }
+    case "PUT secrets/:name": {
+      const name = rest[1]!;
+      const b = await body(req, PutSecret);
+      if (!b.ok) return b.res;
+      const { value, ...meta } = b.value;
+      const g = await grantOf(env);
+      const problems = secretProblems({ name, ...meta }, g.ok ? g.value : null);
+      if (value !== undefined) {
+        const v = valueProblem(value, g.ok ? g.value : null);
+        if (v) problems.value = v;
+      }
+      if (Object.keys(problems).length) return json({ error: Object.values(problems).join("; "), problems }, 400);
+      const nest = nestFrom(env);
+      if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
+      let size: number | null = null;
+      if (value !== undefined) {
+        // Straight to nest, write-only: the value never reaches the app's objects, logs or answers.
+        try {
+          size = (await nest.putSecret(nestSecretName(pid, name), value, meta.description)).size;
+        } catch (e) {
+          return err(e instanceof NestError ? e.status : 502, e instanceof NestError && e.status === 403 ? `nest refused it: ${e.message} (the grant's secrets.max_count or max_bytes)` : String(e));
+        }
+      }
+      return done(await p.saveSecretMeta({ name, ...meta }, size));
+    }
+    case "DELETE secrets/:name": {
+      const name = rest[1]!;
+      const nest = nestFrom(env);
+      if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
+      try {
+        await nest.deleteSecret(nestSecretName(pid, name));
+      } catch (e) {
+        if (!(e instanceof NestError && e.status === 404)) return err(502, String(e));
+      }
+      return done(await p.deleteSecretMeta(name));
+    }
+    case "POST secret-requests/:id/done":
+      return done(await p.secretRequestDone(rest[1]!));
     case "POST auto-merge/retry":
       return done(await withReviews(env, pid, await p.retryRepoAutoMerge()));
     case "POST attach":
@@ -257,4 +326,19 @@ async function networkView(env: Env, p: ReturnType<typeof project>, have?: Await
     }
   }
   return json({ ...mine.value, egress_hosts: grant.ok ? grant.value : null, base });
+}
+
+/** The parts of the app's grant secrets need, from `GET /v1/clients/self` (docs/control-plane/api/clients/#clients-and-grants). */
+async function grantOf(env: Env): Promise<Result<SecretGrant>> {
+  const nest = nestFrom(env);
+  if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
+  try {
+    const g = (await nest.self()).grant ?? {};
+    return { ok: true, value: {
+      inject_hosts: Array.isArray(g.inject_hosts) ? g.inject_hosts : [],
+      max_count: g.secrets?.max_count ?? 0, max_bytes: g.secrets?.max_bytes ?? 4096, workflows: g.github_push?.workflows === true,
+    } };
+  } catch (e) {
+    return { ok: false, status: 502, error: e instanceof Error ? e.message : String(e) };
+  }
 }

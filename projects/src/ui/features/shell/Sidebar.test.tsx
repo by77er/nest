@@ -84,8 +84,8 @@ describe("the views", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Widgets" })).toBeInTheDocument();
     const views = within(sidebar()).getByRole("group", { name: "Views" });
     const rows = within(views).getAllByRole("link");
-    expect(rows.map((r) => r.textContent)).toEqual(["Board", "Manager", "Reviews", "Network", "Settings"]);
-    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["board", "manager", "reviews", "network", "settings"].map((v) => `/projects/prj_one/${v}`));
+    expect(rows.map((r) => r.textContent)).toEqual(["Board", "Manager", "Reviews", "Secrets", "Network", "Settings"]);
+    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["board", "manager", "reviews", "secrets", "network", "settings"].map((v) => `/projects/prj_one/${v}`));
     expect(rows.filter((r) => r.getAttribute("aria-current") === "page").map((r) => r.textContent)).toEqual(["Reviews"]);
     for (const r of rows) expect(r).toHaveAttribute("data-ds", "nav-row");
     expect(document.querySelector(".mantine-Breadcrumbs-root")).toBeNull();
