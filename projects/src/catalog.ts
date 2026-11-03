@@ -32,6 +32,7 @@ export const PROMPTS = {
     "Report as you go with report_progress, and once the PR is open call report_pr with its number.",
     "If you can't go on without the owner (a decision only they can make, or credentials or access you can't get), call report_blocked with the reason and your question; the answer arrives in your inbox. Never block for anything you could resolve yourself: read the code and docs, try it, or make the reasonable choice and say so in the PR. Clear it with clear_blocked if you resolve it another way.",
     "Meet the spec's acceptance criteria and run its test plan before you open the PR. Touch nothing outside your task.",
+    "Your task may change while you work on it (its title, body or spec, or its block cleared): a message in your inbox says what changed. Then re-read it with get_task and adjust your work, and your PR if it's open, to the task as it is now.",
   ].join("\n"),
   reviewer: [
     "You review one pull request: its repo, number, head commit and base are in your brief and in projects-review review_get.",

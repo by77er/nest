@@ -7,6 +7,10 @@ import { canBlock, canUnblock, pickForAssignment, TASK_EVENTS, TASK_STATES, type
 const FLOW: [TaskState, TaskEvent, TaskState][] = [
   ["draft", "spec", "ready"], // 2. the manager specs it
   ["ready", "spec", "ready"], // a ready task is re-specced
+  // A task with a live worker is re-specced in place; its worker is told (README.md#task-changes).
+  ["assigned", "spec", "assigned"],
+  ["in_progress", "spec", "in_progress"],
+  ["in_review", "spec", "in_review"],
   ["ready", "assign", "assigned"], // 3. it's assigned
   ["stalled", "assign", "assigned"], // a stalled task is reassigned
   ["assigned", "started", "in_progress"], // 4. the app starts a worker
