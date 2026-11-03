@@ -196,10 +196,12 @@ An agent with the [`timers`](../../../agents/capabilities/timers/) capability se
   - `overrides.egress` on `POST /v1/agents`, which only narrows: the template's hosts, and a subset of their ports.
   - `egress` in `POST /v1/sandboxes`.
   - The live sandbox's [client layer](#the-client-layer).
-- **Checked** against `egress_hosts` at the template's write, the spawn, the sandbox's create and the client layer's write (403). A sandbox applies its rules within its client's `egress_hosts` as it last read them (at its create, an attach, a client-layer write, and any `PATCH` of the grant, which tells every live sandbox of the client at once). So narrowing the grant takes a rule away in the next policy push.
+- **Checked** against `egress_hosts` at the template's write, the spawn, the sandbox's create and the client layer's write (403). A sandbox applies its rules within its client's `egress_hosts` as it last read them: at its create, an attach, a client-layer write, any `PATCH` of the grant (which tells every live sandbox of the client at once), and every 15 minutes while it has client rules, so a sandbox the fan-out missed converges. Each read carries the grant's revision (`grant_rev`, bumped by every `PATCH`), and a read never replaces a newer one, so a write whose read was overtaken by a narrowing can't put a revoked host back. Narrowing the grant takes a rule away in the next policy push.
+- **No port ceiling:** a granted host may be opened on any port a rule names (1-16 ports; default 80 and 443). The grant bounds hosts, not ports.
 - **The operator's policy stays authoritative.**
   - A client's rules compile into the policy nest-proxy already gets, as allow rules of the sandbox's layer (`layer: workstream` on the wire, the layer's historical name). Allow rules only add.
   - Every request guard (the GitHub rules, the operator's own) still applies to what they open, as does the [hard deny](../../../sandbox/networking/egress/policy/#hard-deny) of non-public addresses, whatever rule allowed a host. So a client rule never allows what the operator's policy refuses.
+  - **Except passthrough:** a host the operator marks passthrough is spliced uninspected, so no guard could apply there. A client's rule for such a host (equal to a passthrough entry, under one, or covering one) is left out of the policy: a client never opens a host the proxy wouldn't inspect.
   - No host change.
 - **A binding opens no host:** an injection binding still needs a rule (the operator's, or one here) to reach its host.
 
@@ -212,10 +214,10 @@ An agent with the [`timers`](../../../agents/capabilities/timers/) capability se
   {"CLOUDFLARE_API_TOKEN": "nest-ph.<client id>.cloudflare.", "APP_ENV": "staging"}
   ```
 
-- **Names:** at most 64 variables. A name is `[A-Z_][A-Z0-9_]{0,63}` and not one nest or the guest sets: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PWD`, `OLDPWD`, `TERM`, `HOSTNAME`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, the proxy variables, `GITHUB_TOKEN` (the image's GitHub placeholder), and `NEST_*`.
-- **Values:** each at most 4 KiB with no NUL, and only a literal or a placeholder.
-  - A value holding a placeholder (`nest-ph.…`) must be exactly the placeholder of a binding declared beside it: in the same template or spec, the same sandbox spec or client layer, or already in that sandbox's policy.
-  - A value that holds any stored secret's value is refused (BrokerDO's `scanSecrets`; nothing is answered of which).
+- **Names:** at most 64 variables. A name is `[A-Z_][A-Z0-9_]{0,63}` and not one nest or the guest sets: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PWD`, `OLDPWD`, `TERM`, `HOSTNAME`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, the proxy variables, `GITHUB_TOKEN` (the image's GitHub placeholder), `NEST_*`, and the CA-trust variables (`NODE_EXTRA_CA_CERTS`, which the image sets, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`: set otherwise they could only break TLS through the proxy).
+- **Values:** each at most 4 KiB with no NUL, and only a literal or a placeholder. **Env is for values that aren't secret:** a credential goes in a secret and a binding, and its placeholder here.
+  - A value holding a placeholder (`nest-ph.…`) must be exactly the placeholder of a binding declared beside it: in the same template or spec, or the same sandbox spec. In a client-layer write, one of that layer's own bindings, or an operator binding already in the sandbox's policy; never the layer it replaces, nor one only an attached agent's spec brings.
+  - A value holding a stored secret's value is refused (BrokerDO's `scanSecretValues`; nothing is answered of which). It is a best-effort check against accidents, not a guarantee. A client's values are compared with its own secrets only: comparing with every secret would answer whether another tenant's or the operator's secret has a guessed value. The operator's values are compared with every secret.
   - All 400.
 - **Where:**
   - `env` in a template.

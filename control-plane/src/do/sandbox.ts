@@ -20,7 +20,7 @@ import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
-  InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
+  hostPatternMatches, InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
 } from "../protocol/model";
 import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
@@ -177,6 +177,13 @@ const OWN_ENV = "client_env";
 const AGENT_ENV = "agent_env";
 /** Its client's grant's `egress_hosts`, as last read: the ceiling its rules are applied within (absent: none). */
 const EGRESS_CEILING = "client_egress_hosts";
+/** A sandbox with client egress rules reads its client's `egress_hosts` again this often, so a missed grant change converges. */
+const EGRESS_CEILING_REFRESH_MS = 15 * 60_000;
+/** The ceiling as stored: the hosts and the grant revision they were read at (a list stored without one: revision -1). */
+interface Ceiling {
+  hosts: string[];
+  rev: number;
+}
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
 const PLACE_RETRY_MS = 30_000;
@@ -928,7 +935,9 @@ export class SandboxDO extends DurableObject<Env> {
       ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER })),
       // Its own and its agents' egress rules (docs/control-plane/api/clients/#egress): allow rules only, so the
       // guards and the hard deny still apply to what they open.
-      ...compileEgress(this.clientEgress()),
+      // A host the operator lets through uninspected (passthrough) is never opened by a client's rule: no
+      // guard could apply to it there.
+      ...compileEgress(this.clientEgress().filter((r) => !ws.passthrough.some((p) => p === r.host || hostPatternMatches(p, r.host) || hostPatternMatches(r.host, p)))),
       ...this.sql
         .exec<{ host: string; ports: string; expires_ms: number }>("SELECT host, ports, expires_ms FROM grants WHERE expires_ms > ? ORDER BY expires_ms", now)
         .toArray()
@@ -1033,6 +1042,13 @@ export class SandboxDO extends DurableObject<Env> {
         await this.checkExpiry();
       } else if (key === "client") {
         await this.reportToClient();
+      } else if (key === "egress_ceiling") {
+        // The periodic re-read: a grant change whose fan-out missed this sandbox reaches it here.
+        const info = this.tryInfo();
+        if (info?.client && !lease.gone(info.state) && this.hasClientEgress()) {
+          await this.clientGrantChanged();
+          await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
+        }
       }
     });
   }
@@ -1175,10 +1191,16 @@ export class SandboxDO extends DurableObject<Env> {
     const cur = this.info_();
     if (lease.gone(cur.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${cur.state}`, 409);
     // Its client's grant's `egress_hosts`, read before the agent's rules count.
-    if (extra.egress?.length && cur.client) await this.readEgressCeiling();
+    if (extra.egress?.length && cur.client) {
+      await this.readEgressCeiling();
+      // Destroyed while the ceiling was read: nothing more is attached.
+      const now = this.info_();
+      if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
+    }
     // What its client bindings, push opt-ins and egress rules count is the attached agents': compared across the attach itself.
     const extrasBefore = this.extrasKey();
     this.setAgentExtras(agent, extra);
+    if (cur.client && extra.egress?.length && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
     const repoChanged = this.setAgentRepos(agent, repos ?? [], readRepos ?? []);
     const [send, info] = this.decide((i) => slots.attach(i, agent, cwd ?? null, i.host !== null));
     const widened = repoChanged || this.extrasKey() !== extrasBefore;
@@ -1419,22 +1441,39 @@ export class SandboxDO extends DurableObject<Env> {
     const all = [...(this.get<EgressRule[]>(OWN_EGRESS) ?? []), ...Object.keys(agents).filter((a) => attached.has(a)).sort().flatMap((a) => agents[a]!)];
     const seen = new Set<string>();
     const once = all.filter((r) => !seen.has(r.host) && seen.add(r.host));
-    return info.client ? egressWithin(once, this.get<string[]>(EGRESS_CEILING) ?? []) : once;
+    return info.client ? egressWithin(once, this.ceiling().hosts) : once;
   }
 
   /** Read its client's `egress_hosts` (a deleted client's: none). */
   private async readEgressCeiling(): Promise<void> {
     const client = this.info_().client;
     if (!client) return;
-    let hosts: string[];
+    let read: Ceiling;
     try {
-      hosts = (await this.env.CLIENT.get(this.env.CLIENT.idFromName(client)).scope()).grant.egress_hosts ?? [];
+      const scope = await this.env.CLIENT.get(this.env.CLIENT.idFromName(client)).scope();
+      read = { hosts: scope.grant.egress_hosts ?? [], rev: scope.grant_rev ?? 0 };
     } catch (e) {
-      // A deleted client (403) has nothing; anything else leaves the ceiling as it was.
+      // A deleted client (403) has nothing, for good; anything else leaves the ceiling as it was.
       if (asNestError(e)?.code !== ErrorCodes.FORBIDDEN) throw e;
-      hosts = [];
+      read = { hosts: [], rev: Number.MAX_SAFE_INTEGER };
     }
-    this.put(EGRESS_CEILING, hosts);
+    // Compared in the step it is written: a read that left before a newer grant was read (and written)
+    // never puts the older ceiling back, however the awaits interleave.
+    if (read.rev >= this.ceiling().rev) this.put(EGRESS_CEILING, read);
+    if (this.hasClientEgress() && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
+  }
+
+  /** The ceiling as last read (a bare list, stored before revisions, reads as revision -1). */
+  private ceiling(): Ceiling {
+    const c = this.get<Ceiling | string[]>(EGRESS_CEILING);
+    if (Array.isArray(c)) return { hosts: c, rev: -1 };
+    return c ?? { hosts: [], rev: -1 };
+  }
+
+  /** Whether any client egress rule is stored (its own, or an attached agent's), whatever the ceiling lets through. */
+  private hasClientEgress(): boolean {
+    const agents = this.get<Record<string, EgressRule[]>>(AGENT_EGRESS) ?? {};
+    return (this.get<EgressRule[]>(OWN_EGRESS)?.length ?? 0) > 0 || Object.values(agents).some((r) => r.length > 0);
   }
 
   /**
@@ -1448,12 +1487,14 @@ export class SandboxDO extends DurableObject<Env> {
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
     if (info.client) await this.readEgressCeiling();
     const now = this.info_();
+    if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
     const put = (key: string, v: unknown, has: boolean) => (has ? this.put(key, v) : this.del(key));
     const envBefore = JSON.stringify(this.get(OWN_ENV) ?? {});
     put(OWN_EGRESS, layer.egress, layer.egress.length > 0);
     const inject = layer.inject.filter((b) => b.client === now.client);
     put(OWN_INJECT, inject, inject.length > 0);
     put(OWN_ENV, layer.env, Object.keys(layer.env).length > 0);
+    if (this.hasClientEgress() && now.client && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
     const policy = await this.policyChanged(true);
     if (JSON.stringify(layer.env) !== envBefore && now.attached.length) await this.issueAttachCommands(now.attached);
     return policy;

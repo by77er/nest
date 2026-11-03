@@ -56,6 +56,8 @@ interface ClientRecord {
   token_hash: string;
   created_ms: number;
   rotated_ms?: number;
+  /** Bumped by every `setGrant` (absent: 0): what a copy of the grant elsewhere is compared by. */
+  grant_rev?: number;
   /** Deleted: no token works, nothing new is admitted; the operator's delete finishes the cleanup and purges it. */
   deleted_ms?: number;
 }
@@ -295,20 +297,21 @@ export class ClientDO extends DurableObject<Env> {
     if (!r || r.deleted_ms || !timingSafeEqual(enc.encode(tokenHashHex), enc.encode(r.token_hash))) {
       throw new NestError(ErrorCodes.UNAUTHORIZED, "admin or client token required", 401);
     }
-    return { client: r.client, name: r.name, grant: r.grant };
+    return { client: r.client, name: r.name, grant: r.grant, grant_rev: r.grant_rev ?? 0 };
   }
 
   /** Its name and grant, for a spawn in its subtree (403 once deleted: nothing more is created for it). */
   async scope(): Promise<ClientScope> {
     const r = this.record();
     if (!r || r.deleted_ms) throw new NestError(ErrorCodes.FORBIDDEN, "the client this agent belongs to was deleted", 403);
-    return { client: r.client, name: r.name, grant: r.grant };
+    return { client: r.client, name: r.name, grant: r.grant, grant_rev: r.grant_rev ?? 0 };
   }
 
   /** Replace the grant. What runs keeps running; every later create, spawn and expansion is held to the new one. */
   async setGrant(grant: Grant): Promise<ClientView> {
     const r = this.live();
     r.grant = grant;
+    r.grant_rev = (r.grant_rev ?? 0) + 1;
     this.save(r);
     return this.view(r);
   }

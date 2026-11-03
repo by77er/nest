@@ -345,6 +345,8 @@ export class AgentDO extends DurableObject<Env> {
     });
     this.journal = new BrokeredJournal(this.sql);
     this.timerStore = new TimerStore(this.sql);
+    // Timers a rolled-back release left without their deadline are armed again at once (the alarm does too).
+    if (this.timerStore.names().length) void ctx.blockConcurrencyWhile(() => this.rearmTimers());
     this.outbox = new ClientOutbox(this.sql);
     this.traceRing = new TraceRing(this.sql);
     // A trace client's keepalive, answered by the runtime without waking this object. The runner sends only JSON objects, never this.
@@ -2356,6 +2358,14 @@ export class AgentDO extends DurableObject<Env> {
     if (!(await this.cancelTimer(name, by))) throw new NestError(ErrorCodes.NOT_FOUND, `no timer ${name}`, 404);
   }
 
+  /** Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. */
+  private async rearmTimers(): Promise<void> {
+    for (const t of this.timerStore.list()) {
+      const key = `${TIMER_DEADLINE}${t.name}` as const;
+      if (!this.deadlines.has(key)) await this.deadlines.set(key, t.at_ms);
+    }
+  }
+
   /** An end drops every timer: nobody would hear it. */
   private async dropTimers(): Promise<void> {
     for (const name of this.timerStore.names()) {
@@ -3181,6 +3191,8 @@ export class AgentDO extends DurableObject<Env> {
       if (e?.done_ms && !this.deadlines.has("reap")) await this.deadlines.set("reap", e.ms + AGENT_RECORD_RETENTION_MS);
       // An agent from before the registry (or whose registration failed) registers at its next alarm.
       if (this.kvGet<string>("registry") !== this.registryWanted() && !this.deadlines.has("registry")) await this.deadlines.set("registry", Date.now());
+      // Timers whose deadline a rolled-back release dropped (no handler for `timer:`): armed again.
+      await this.rearmTimers();
       // Events whose hand-off a rolled-back release dropped (no handler for `client_events`).
       if (this.outbox.waiting() && !this.deadlines.has("client_events")) await this.deadlines.set("client_events", Date.now());
     }

@@ -27,6 +27,7 @@
 ## Durability
 
 - **Storage:** AgentDO's SQLite holds them (`timers`: `name`, `id`, `at_ms`, `note`, `set_ms`), and each has one deadline of AgentDO's existing alarm (`Deadlines`, key `timer:<name>`). A row and its deadline are written in one synchronous step.
+- **A timer left without its deadline** (a rolled-back release dropped it, having no handler) is armed again when the agent's object starts and at every alarm run: late, never lost.
 - **No second scheduler.** A timer survives a brain restart, the brain host's loss, a deploy and the Durable Object's eviction, because nothing about it is in memory.
 
 ## Waiting is a pattern, not a tool

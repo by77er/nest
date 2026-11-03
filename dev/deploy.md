@@ -91,13 +91,14 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **The gap after the deploy:** a Durable Object still on the previous code for minutes lacks the new methods. These answer `503` (`internal`, retryable), never 500:
   - `GET` and `DELETE /v1/agents/<id>/timers…` (AgentDO);
   - `GET` and `PUT /v1/sandboxes/<id>/client-policy` (SandboxDO);
-  - a grant's `PATCH` while one of the client's sandboxes can't take it (`PATCH` again).
+  - a grant's `PATCH` while one of the client's sandboxes can't take it (`PATCH` again);
+  - a request whose `env` is checked for secret values (`BrokerDO.scanSecretValues`).
 
-  A timer set meanwhile is armed by the new code. A previous AgentDO meeting a `timer:` deadline logs "no handler" and drops it (the row stays: the next `timer_set` or a list shows it, and it never fires; set it again).
+  A timer set meanwhile is armed by the new code. A previous AgentDO meeting a `timer:` deadline logs "no handler" and drops it; the row stays, and this release arms it again when the agent's object starts or its next alarm runs (the hourly `prune`), so it fires late, never not at all.
 - **Hosts of the previous release:** their slots get no `env` until they are replaced. Everything else (egress rules, bindings) is in the policy and secrets they already apply.
-- **Stored data (expand-only):** AgentDO `timers`; grants may carry `egress_hosts` (absent: none); templates may carry `egress` and `env`, specs `egress` and `env`; SandboxDO kv `client_egress`, `client_env`, `client_egress_hosts`, `agent_egress`, `agent_env`. Catalogs gain `timers` at seed version 9 (only where the name is free); adding it to templates is the operator's (or a client's) step.
+- **Stored data (expand-only):** ClientDO's record gains `grant_rev` (absent: 0); AgentDO `timers`; grants may carry `egress_hosts` (absent: none); templates may carry `egress` and `env`, specs `egress` and `env`; SandboxDO kv `client_egress`, `client_env`, `client_egress_hosts` (the hosts and the grant revision they were read at), `agent_egress`, `agent_env`, and the `egress_ceiling` deadline (a 15-minute re-read while it has client rules). Catalogs gain `timers` at seed version 9 (only where the name is free); adding it to templates is the operator's (or a client's) step.
 - **What a rollback does:**
-  - The previous code has no handler for `timer:` deadlines: a timer due during the rollback is dropped (logged), and its row stays until set again or the agent ends. Its schemas strip `timer_*` from the registry (a stored spec naming them lists tools its registry lacks: ignored) and `egress`/`env` from templates and specs.
+  - The previous code has no handler for `timer:` deadlines: a timer due during the rollback isn't fired then (logged) and its row stays; after the roll forward it is armed again and fires late. Its schemas strip `timer_*` from the registry (a stored spec naming them lists tools its registry lacks: ignored) and `egress`/`env` from templates and specs.
   - Its SandboxDO never reads the new kv keys, so a client's rules leave the next policy, and slots configured again get no env.
   - The `/timers` and `/client-policy` routes answer 401 (an unknown route to a non-operator).
   - After the roll forward, everything stored is read again, and the next policy push restores the rules.

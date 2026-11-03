@@ -3,12 +3,13 @@
 // (joined while its agent is attached) or `PUT /v1/sandboxes/<id>/client-policy` on a live sandbox. Each
 // reaches the host through the usual paths: the policy (`policy_update`), the secrets (`secrets_update`)
 // and the agents' slots (`agent_attach.env`). The pure checks first.
-import { env, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { compileEgress, egressOutsideGrant, narrowEgress } from "../src/lib/client-egress";
 import { EnvName, unboundPlaceholders } from "../src/lib/sandbox-env";
 import { hostPatternMatches } from "../src/protocol/model";
-import { adminJson, BASE, connectHost, nextCommands, uniqueCell, type Ws } from "./helpers";
+import { ClientDO } from "../src/do/client";
+import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell, type Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const LAUNCH = { builtin_tools: [], system_prompt: { mode: "append", text: "" } };
@@ -26,7 +27,8 @@ describe("client egress rules and env (pure)", () => {
 
   it("env names are uppercase and never nest's or the guest's own; a placeholder must be one bound beside it", () => {
     for (const ok of ["API_TOKEN", "_X", "A1"]) expect(EnvName.safeParse(ok).success, ok).toBe(true);
-    for (const bad of ["PATH", "HOME", "NEST_AGENT_ID", "NEST_ANYTHING", "HTTPS_PROXY", "GITHUB_TOKEN", "LD_PRELOAD", "lower", "1A", "A-B", ""]) {
+    for (const bad of ["PATH", "HOME", "NEST_AGENT_ID", "NEST_ANYTHING", "HTTPS_PROXY", "GITHUB_TOKEN", "LD_PRELOAD", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+      "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "lower", "1A", "A-B", ""]) {
       expect(EnvName.safeParse(bad).success, bad).toBe(false);
     }
     expect(unboundPlaceholders({ A: "nest-ph.cli_x.api.", B: "literal" }, ["nest-ph.cli_x.api."])).toEqual([]);
@@ -128,6 +130,73 @@ describe("client egress", () => {
   });
 });
 
+describe("the ceiling a sandbox applies", () => {
+  it("a client-layer write whose grant read is overtaken by a narrowing PATCH never puts the revoked host back", async () => {
+    const c = await newClient();
+    const s = await placed(c);
+    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { egress: { allow: [{ host: "x.npmjs.com" }] } } });
+    expect(allowed(await nextPolicy(s.ws))).toContain("x.npmjs.com");
+    // Hold the sandbox's own grant read (the second scope() of the next PUT; the route's is the first), after it read the old grant.
+    const real = ClientDO.prototype.scope;
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let reached = false;
+    ClientDO.prototype.scope = async function (this: ClientDO) {
+      const r = await real.call(this);
+      if (++calls === 2) {
+        reached = true;
+        await gate;
+      }
+      return r;
+    };
+    try {
+      const put = as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { egress: { allow: [{ host: "x.npmjs.com" }, { host: "nodejs.org" }] } } });
+      await eventually("the sandbox's grant read is held", () => reached);
+      await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { ...c.grant, egress_hosts: ["nodejs.org"] } } });
+      release();
+      expect((await put).status).toBe(200);
+    } finally {
+      ClientDO.prototype.scope = real;
+    }
+    const after = allowed(await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`));
+    expect(after).toContain("nodejs.org");
+    expect(after).not.toContain("x.npmjs.com");
+  });
+
+  it("a grant change the fan-out missed reaches the sandbox at its periodic re-read", async () => {
+    const c = await newClient();
+    const s = await placed(c, { egress: { allow: [{ host: "x.npmjs.com" }] } });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    const armed = await runInDurableObject(stub, (_i, st) => st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'egress_ceiling'").toArray()[0]?.at ?? 0);
+    expect(armed - Date.now()).toBeGreaterThan(14 * 60_000);
+    // Narrowed straight in ClientDO: no PATCH, so no fan-out.
+    await env.CLIENT.get(env.CLIENT.idFromName(c.id)).setGrant({ ...c.grant, egress_hosts: [] } as never);
+    expect(allowed(await stub.policy())).toContain("x.npmjs.com");
+    await runInDurableObject(stub, (_i, st) => { st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'egress_ceiling'"); });
+    const next = nextPolicy(s.ws);
+    await runDue(stub);
+    expect(allowed(await next)).not.toContain("x.npmjs.com");
+  });
+
+  it("a client's rule never opens a host the operator lets through uninspected", async () => {
+    const c = await newClient();
+    const s = await placed(c, { egress: { allow: [{ host: "nodejs.org" }, { host: "x.npmjs.com" }] } });
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { passthrough: ["nodejs.org"] } });
+    const policy = await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
+    expect(allowed(policy)).not.toContain("nodejs.org");
+    expect(allowed(policy)).toContain("x.npmjs.com");
+  });
+
+  it("only its owner reads a sandbox's client layer", async () => {
+    const c = await newClient();
+    const s = await placed(c, { egress: { allow: [{ host: "nodejs.org" }] } });
+    const other = await newClient();
+    expect((await as(other.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).status).toBe(404);
+    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).egress.allow).toEqual([{ host: "nodejs.org" }]);
+  });
+});
+
 describe("the live client layer: bindings and environment", () => {
   const stripe = { name: "stripe", secret: "stripe-key", hosts: ["api.stripe.com"], locations: BEARER };
 
@@ -169,6 +238,18 @@ describe("the live client layer: bindings and environment", () => {
     await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { inject: [stripe], env: { STRIPE_KEY: ph, REGION: "eu" } } });
     const again = (await nextCommands(s.ws, (x) => x.type === "agent_attach" && x.agent === a.agent)).find((x) => x.type === "agent_attach")!;
     expect(again.env).toEqual({ STRIPE_KEY: ph, REGION: "eu", APP_ENV: "test", ROLE: "reviewer" });
+    // A spawn's override is scanned too.
+    expect((await as(c.token, "/v1/agents", { body: { template: `${c.name}/w`, sandbox: s.sandbox, start: false, overrides: { env: { K: value } } } })).body.error.message)
+      .toContain("stored secret");
+    // Another client's secret value is just a literal to this one: no oracle on other tenants' secrets.
+    const other = await newClient();
+    const s2 = await placed(other, { env: { K: value } });
+    expect((await ok(other.token, `/v1/sandboxes/${s2.sandbox}/client-policy`)).env).toEqual({ K: value });
+    // The operator's values are checked against every secret.
+    expect((await adminJson("/v1/sandboxes", { body: { cell: c.cell, env: { K: value } } }, 400)).error.message).toContain("stored secret");
+    // A layer's placeholder must be its own bindings' (or the operator's): not the one of the layer it replaces.
+    expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { STRIPE_KEY: ph } } })).body.error.message)
+      .toContain("no binding here has");
     // The operator's sandbox has no client: its client layer takes no bindings.
     const op = await adminJson("/v1/sandboxes", { body: { cell: c.cell } });
     expect((await adminJson(`/v1/sandboxes/${op.sandbox}/client-policy`, { method: "PUT", body: { inject: [stripe] } }, 400)).error.message).toContain("operator's");

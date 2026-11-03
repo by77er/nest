@@ -18,7 +18,7 @@ import type { ClientScope } from "./do/catalog";
 import { CLIENT_DIRECTORY, CLIENT_OPERATOR } from "./do/client";
 import { idempotencyKey, type KeyClaim, requestDigest } from "./lib/idempotency";
 import {
-  CLIENT_SECRET_PREFIX, ClientInjections, ClientSecretName, ClientSecretPut, holdInjections, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT,
+  CLIENT_BINDING_PREFIX, CLIENT_SECRET_PREFIX, ClientInjections, ClientSecretName, ClientSecretPut, holdInjections, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT,
 } from "./lib/client-secrets";
 import { GithubPush } from "./lib/rules/github";
 import { ClientEgress, egressOutsideGrant } from "./lib/client-egress";
@@ -319,19 +319,25 @@ const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt
 const ClientLayer = z.strictObject({ egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional() });
 
 /**
- * An environment's values: no placeholder that none of `bound` is, and no value of any stored secret
- * (BrokerDO's `scanSecrets`, names only, never answered): env carries literals and placeholders only.
+ * An environment's values: no placeholder that none of `bound` is, and no value of a secret the caller
+ * may see (`refuseSecretValues`): env carries literals and placeholders only.
  */
-async function checkEnv(env: Env, vars: Readonly<Record<string, string>>, bound: readonly string[]): Promise<void> {
+async function checkEnv(env: Env, caller: Caller, vars: Readonly<Record<string, string>>, bound: readonly string[]): Promise<void> {
   const unbound = unboundPlaceholders(vars, bound);
   if (unbound.length) throw new NestError(ErrorCodes.INVALID_MESSAGE, unbound.join("; "));
-  await refuseSecretValues(env, vars);
+  await refuseSecretValues(env, caller, vars);
 }
 
-/** No env value holds a stored secret's value (a template's, a spawn's: their placeholders are checked at expansion). */
-async function refuseSecretValues(env: Env, vars: Readonly<Record<string, string>> | undefined): Promise<void> {
+/**
+ * No env value holds a stored secret's value (a template's, a spawn's: their placeholders are checked at
+ * expansion). A best-effort check against accidents, never a guarantee: a client's values are compared
+ * with its own secrets only (anything wider would answer whether another tenant's or the operator's
+ * secret has a guessed value), the operator's with every stored secret.
+ */
+async function refuseSecretValues(env: Env, caller: Caller, vars: Readonly<Record<string, string>> | undefined): Promise<void> {
   const values = Object.values(vars ?? {});
-  if (values.length && (await broker(env).scanSecrets(values)).length) {
+  const client = caller.kind === "client" ? caller.client : null;
+  if (values.length && (await newMethod("BrokerDO.scanSecretValues", () => broker(env).scanSecretValues(values, client))).length) {
     throw new NestError(ErrorCodes.INVALID_MESSAGE, "an env value holds a stored secret's value: store it as a secret, bind it, and put the binding's placeholder in env");
   }
 }
@@ -559,7 +565,7 @@ export const ROUTES: Route[] = [
   route({ method: "GET", path: "/v1/admin/catalog", auth: "admin", run: ({ env }) => catalog(env).catalog() }),
   route({ method: "PUT", path: "/v1/admin/capabilities/:name", auth: "admin", body: Capability, run: ({ env, p, body }) => catalog(env).putCapability(catalogName(p.name), body) }),
   route({ method: "PUT", path: "/v1/admin/templates/:name", auth: "admin", body: Template, run: async ({ env, p, body }) => {
-    await refuseSecretValues(env, body.env);
+    await refuseSecretValues(env, { kind: "operator" }, body.env);
     return catalog(env).putTemplate(catalogName(p.name), body);
   } }),
   route({ method: "DELETE", path: "/v1/admin/capabilities/:name", auth: "admin", run: ({ env, p }) => catalog(env).deleteCapability(catalogName(p.name)) }),
@@ -633,7 +639,7 @@ export const ROUTES: Route[] = [
         const refusal = grantRefusal(caller.client, outside);
         if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
       }
-      await checkEnv(env, r.env ?? {}, inject.map((b) => b.placeholder));
+      await checkEnv(env, caller, r.env ?? {}, inject.map((b) => b.placeholder));
       // A client's place first (its grant's cells and max_sandboxes, counted across its subtree).
       if (client) await clientDO(env, client).admit({ kind: "sandbox", id, cell, owner: client, labels });
       begin();
@@ -668,9 +674,11 @@ export const ROUTES: Route[] = [
           ...egressOutsideGrant(r.egress?.allow ?? [], scope.grant.egress_hosts ?? [])]);
         if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
       }
-      // A placeholder of this layer's bindings, or of one its agents' specs already bound.
-      const bound = [...inject.map((b) => b.placeholder), ...(await stub.policy()).inject.map((b) => b.placeholder)];
-      await checkEnv(c.env, r.env ?? {}, bound);
+      // A placeholder of this layer's own bindings, or of a binding that isn't a client's (the operator's):
+      // never one of the layer this replaces, nor one only an attached agent's spec brings.
+      const bound = [...inject.map((b) => b.placeholder),
+        ...(await stub.policy()).inject.filter((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX)).map((b) => b.placeholder)];
+      await checkEnv(c.env, c.caller, r.env ?? {}, bound);
       return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({ egress: r.egress?.allow ?? [], inject, env: r.env ?? {} }));
     },
   }),
@@ -731,7 +739,7 @@ export const ROUTES: Route[] = [
       if (r.template && r.role && r.template !== r.role) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template and role differ");
       // An override's env carries literals and placeholders only (its placeholders are checked at expansion).
       const overEnv = (r.overrides as { env?: unknown } | undefined)?.env;
-      if (overEnv && typeof overEnv === "object") await refuseSecretValues(env, overEnv as Record<string, string>);
+      if (overEnv && typeof overEnv === "object") await refuseSecretValues(env, caller, overEnv as Record<string, string>);
       const template = r.template ?? r.role;
       if (!template) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template is required");
       if (r.owner && r.captain && r.owner !== r.captain) throw new NestError(ErrorCodes.INVALID_MESSAGE, "owner and captain differ");
@@ -1007,7 +1015,7 @@ export const ROUTES: Route[] = [
       run: async (c) => {
         const scope = await namespaceScope(c, c.p.ns);
         const name = `${c.p.ns}/${c.p.entry}`;
-        if (kind === "templates") await refuseSecretValues(c.env, (c.body as Template).env);
+        if (kind === "templates") await refuseSecretValues(c.env, c.caller, (c.body as Template).env);
         return kind === "templates" ? catalog(c.env).putTemplate(name, c.body as Template, scope) : catalog(c.env).putCapability(name, c.body as Capability, scope);
       },
     }),
