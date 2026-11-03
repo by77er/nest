@@ -219,7 +219,7 @@ async function egressHostsOf(env: Env): Promise<Result<string[]>> {
 
 /**
  * The Network page's view: the rules and each live agent's layer (ProjectDO's), the grant's ceiling,
- * and the operator's rules (nest's defaults and the operator's layer, `operatorRules`) as the manager's
+ * and the operator's rules (nest's defaults, the operator's layer and the repo allowlists', `operatorRules`) as the manager's
  * sandbox's effective policy shows them (a client may read its own sandboxes' policy; null until the
  * manager runs, or when nest can't be read).
  */
@@ -231,8 +231,10 @@ async function networkView(env: Env, p: ReturnType<typeof project>, have?: Await
   const nest = nestFrom(env);
   if (nest && sandbox) {
     try {
-      const [policy, own] = await Promise.all([nest.sandboxPolicy(sandbox), nest.getClientPolicy(sandbox)]);
-      base = operatorRules(policy.allow ?? [], own.egress?.allow ?? []);
+      const allow = (await nest.sandboxPolicy(sandbox)).allow ?? [];
+      // The client's own layer is needed only by the fallback for a control plane without `source`.
+      const own = allow.some((r) => r.source !== undefined) ? [] : ((await nest.getClientPolicy(sandbox)).egress?.allow ?? []);
+      base = operatorRules(allow, own);
     } catch {
       base = null;
     }

@@ -252,8 +252,11 @@ export function NetworkPage() {
                       <Text fz="sm" c="dimmed">
                         Always allowed, for every role.
                       </Text>
-                      <PolicyLine label="nest's defaults" slot="base" rules={net.data.base.filter((r) => r.layer === "base")} />
-                      <PolicyLine label="The operator's rules" slot="operator" rules={net.data.base.filter((r) => r.layer === "operator")} />
+                      <PolicyLine label="nest's defaults" slot="base" rules={net.data.base.filter((r) => r.source === "base")} />
+                      <PolicyLine label="The operator's rules" slot="operator" rules={net.data.base.filter((r) => r.source === "operator")} />
+                      {net.data.base.some((r) => r.source === "repos") && (
+                        <PolicyLine label="The operator's rules, from its repo allowlists" slot="repos" rules={net.data.base.filter((r) => r.source === "repos")} />
+                      )}
                     </Stack>
                   </Panel>
                 )}

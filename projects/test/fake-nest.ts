@@ -63,6 +63,10 @@ export class FakeNest {
   baseRules: { host: string; ports: number[] }[] = [{ host: "github.com", ports: [443] }];
   /** The operator's own layer, which the effective policy labels `workstream`, as it does the client's own rules. */
   operatorRules: { host: string; ports?: number[] }[] = [{ host: "mirror.internal.example", ports: [8443] }];
+  /** The rules nest builds from the repo allowlists (source `repos`, layer `workstream`). */
+  reposRules: { host: string; ports?: number[] }[] = [{ host: "api.github.com", ports: [443] }];
+  /** Answer the policy as a control plane before nest's `source` did: `layer` only. */
+  legacyPolicy = false;
   /** Temporary grants (layer `sandbox`), in every sandbox's effective policy. */
   grantRules: { host: string; ports: number[]; expires_ms: number }[] = [{ host: "approved.example.com", ports: [443], expires_ms: Date.now() + 3_600_000 }];
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
@@ -174,16 +178,19 @@ export class FakeNest {
       if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
       if (sb.ended) return nestErr(409, "forbidden", "sandbox is destroyed");
       if (m[2] === "policy" && req.method === "GET") {
-        // As nest's effectivePolicy: its defaults `base`; the operator's layer and the client's own rules
-        // (no ports: 80 and 443) both `workstream`; grants `sandbox`.
-        const web = (r: { host: string; ports?: number[] }) => ({ host: r.host, ports: r.ports ?? [80, 443] });
+        // As nest's policy view (docs/sandbox/networking/egress/policy/#sources): each rule's `source`, and
+        // its `layer` (`base`; `workstream` for the operator's, the repo allowlists' and the client's own,
+        // no ports being 80 and 443; `sandbox` for grants). An older control plane answers `layer` only.
+        const rule = (r: { host: string; ports?: number[]; expires_ms?: number }, layer: string, source: string) =>
+          ({ ...r, host: r.host, ports: r.ports ?? [80, 443], layer, ...(this.legacyPolicy ? {} : { source }) });
         return json(200, {
           version: 1,
           allow: [
-            ...this.baseRules.map((b) => ({ ...web(b), layer: "base" })),
-            ...this.operatorRules.map((b) => ({ ...web(b), layer: "workstream" })),
-            ...(sb.layer.egress.allow as { host: string; ports?: number[] }[]).map((x) => ({ ...web(x), layer: "workstream" })),
-            ...this.grantRules.map((g) => ({ ...g, layer: "sandbox" })),
+            ...this.baseRules.map((b) => rule(b, "base", "base")),
+            ...this.operatorRules.map((b) => rule(b, "workstream", "operator")),
+            ...this.reposRules.map((b) => rule(b, "workstream", "repos")),
+            ...(sb.layer.egress.allow as { host: string; ports?: number[] }[]).map((x) => rule(x, "workstream", "client")),
+            ...this.grantRules.map((g) => rule(g, "sandbox", "grant")),
           ],
           passthrough: [],
         });

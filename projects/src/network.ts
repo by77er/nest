@@ -138,29 +138,44 @@ export function clientLayerFor(rules: RoleRules, role: NetworkRole, feeds: Layer
   };
 }
 
-/** One allow rule of a sandbox's effective policy (`GET /v1/sandboxes/<id>/policy`), with the layer it came from. */
+/** One allow rule of a sandbox's effective policy (`GET /v1/sandboxes/<id>/policy`): its layer, and where it came from. */
 export interface PolicyAllow {
   host: string;
   ports?: number[];
   layer?: string;
-}
-
-/** A rule the operator's side of a sandbox's policy allows: nest's defaults (`base`) or the operator's own layer. */
-export interface OperatorRule {
-  host: string;
-  ports: number[];
-  layer: "base" | "operator";
+  /** nest's `source` (docs/sandbox/networking/egress/policy/#sources); absent from an older control plane. */
+  source?: string;
 }
 
 /**
- * The operator's rules in a sandbox's effective policy, read-only on the page. nest labels its
- * defaults `base`; the operator's layer, the rules built from its repo allowlists, and the client's own
- * egress all `workstream` (the operator layer's wire name; `operator` taken too, should it be renamed);
- * temporary grants `sandbox`. So the operator's are the `workstream` rules less one per rule of the
- * client's own layer (`own`, from `GET …/client-policy`, compiled as nest does: no ports is 80 and 443),
- * and grants are left out.
+ * A rule the operator's side of a sandbox's policy allows, by its source: nest's defaults (`base`), the
+ * operator's layer (`operator`), or the rules nest builds from the repo allowlists (`repos`).
+ */
+export interface OperatorRule {
+  host: string;
+  ports: number[];
+  source: "base" | "operator" | "repos";
+}
+
+const OPERATOR_SOURCES: readonly string[] = ["base", "operator", "repos"];
+
+/**
+ * The operator's rules in a sandbox's effective policy, read-only on the page: those whose `source` is
+ * `base`, `operator` or `repos`. The app's own (`client`) are the role editors', and temporary grants
+ * (`grant`) are left out.
+ *
+ * Fallback, while a control plane answers no `source` (before nest's #sources; delete it once every
+ * one does): there `layer` is `base` for nest's defaults, `sandbox` for grants, and `workstream` for the
+ * rest, the client's own among them. So the operator's are those less one per rule of the client's own
+ * layer (`own`, from `GET …/client-policy`, compiled as nest does: no ports is 80 and 443), and the
+ * repo allowlists' can't be told from the operator's.
  */
 export function operatorRules(allow: readonly PolicyAllow[], own: readonly EgressRule[]): OperatorRule[] {
+  if (allow.some((r) => r.source !== undefined)) {
+    return allow
+      .filter((r) => r.source !== undefined && OPERATOR_SOURCES.includes(r.source))
+      .map((r) => ({ host: r.host, ports: [...(r.ports ?? WEB_PORTS)], source: r.source as OperatorRule["source"] }));
+  }
   const key = (host: string, ports: readonly number[] | undefined) => `${host} ${[...(ports ?? WEB_PORTS)].sort((a, b) => a - b).join(",")}`;
   const mine = new Map<string, number>();
   for (const r of own) mine.set(key(r.host, r.ports), (mine.get(key(r.host, r.ports)) ?? 0) + 1);
@@ -168,12 +183,12 @@ export function operatorRules(allow: readonly PolicyAllow[], own: readonly Egres
   for (const r of allow) {
     const ports = [...(r.ports ?? WEB_PORTS)];
     if (r.layer === "base") {
-      out.push({ host: r.host, ports, layer: "base" });
-    } else if (r.layer === "workstream" || r.layer === "operator") {
+      out.push({ host: r.host, ports, source: "base" });
+    } else if (r.layer === "workstream") {
       const k = key(r.host, r.ports);
       const n = mine.get(k) ?? 0;
       if (n > 0) mine.set(k, n - 1);
-      else out.push({ host: r.host, ports, layer: "operator" });
+      else out.push({ host: r.host, ports, source: "operator" });
     }
   }
   return out;

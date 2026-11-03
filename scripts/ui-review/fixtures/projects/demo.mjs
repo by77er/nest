@@ -107,8 +107,9 @@ export function data(variant = "demo", now = Date.now()) {
     ],
     egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org", "*.gadgets.example.com", "crates.io", "static.crates.io", "index.crates.io"],
     base: variant === "network-empty" ? null : [
-      ...["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "crates.io", "static.crates.io", "index.crates.io", "github.com", "*.githubusercontent.com", "deb.debian.org"].map((host) => ({ host, ports: [80, 443], layer: "base" })),
-      { host: "mirror.internal.example", ports: [8443], layer: "operator" },
+      ...["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "crates.io", "static.crates.io", "index.crates.io", "github.com", "*.githubusercontent.com", "deb.debian.org"].map((host) => ({ host, ports: [80, 443], source: "base" })),
+      { host: "mirror.internal.example", ports: [8443], source: "operator" },
+      ...["api.github.com", "codeload.github.com"].map((host) => ({ host, ports: [443], source: "repos" })),
     ],
   };
 

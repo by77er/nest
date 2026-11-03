@@ -77,18 +77,41 @@ describe("the network page's API", () => {
     expect(view.egress_hosts).toEqual(fake.egressHosts);
   });
 
-  it("shows the operator's rules from the manager's sandbox: nest's defaults and the operator's layer, not the app's own or grants", async () => {
+  it("shows the operator's rules from the manager's sandbox by nest's source: defaults, the operator's, the repo allowlists'; not the app's own or grants", async () => {
     const s = await setup();
-    // The manager's sandbox becomes known once its layer is first applied. Its own rule is labelled
-    // `workstream` too, and one the same as the operator's is still the operator's once.
+    // The manager's sandbox becomes known once its layer is first applied. A rule the same as the
+    // operator's is the operator's by its source, and the app's own as well.
     fake.operatorRules = [{ host: "mirror.internal.example", ports: [8443] }, { host: "nodejs.org" }];
     await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }, { host: "pypi.org", ports: [443] }] });
+    const before = fake.callsTo("GET", /\/client-policy$/).length;
     const view = (await api(token, "GET", `/api/projects/${s.id}/network`)).body;
     expect(view.base).toEqual([
-      { host: "github.com", ports: [443], layer: "base" },
-      { host: "mirror.internal.example", ports: [8443], layer: "operator" },
-      { host: "nodejs.org", ports: [80, 443], layer: "operator" },
+      { host: "github.com", ports: [443], source: "base" },
+      { host: "mirror.internal.example", ports: [8443], source: "operator" },
+      { host: "nodejs.org", ports: [80, 443], source: "operator" },
+      { host: "api.github.com", ports: [443], source: "repos" },
     ]);
+    // With `source`, the client's own layer isn't read to tell them apart.
+    expect(fake.callsTo("GET", /\/client-policy$/).length).toBe(before);
+  });
+
+  it("falls back, on a control plane without source, to the layers less the app's own rules", async () => {
+    const s = await setup();
+    fake.legacyPolicy = true;
+    try {
+      fake.operatorRules = [{ host: "mirror.internal.example", ports: [8443] }, { host: "nodejs.org" }];
+      await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }, { host: "pypi.org", ports: [443] }] });
+      const view = (await api(token, "GET", `/api/projects/${s.id}/network`)).body;
+      // There the repo allowlists' rules can't be told from the operator's, and one of two equal rules is the app's.
+      expect(view.base).toEqual([
+        { host: "github.com", ports: [443], source: "base" },
+        { host: "mirror.internal.example", ports: [8443], source: "operator" },
+        { host: "api.github.com", ports: [443], source: "operator" },
+        { host: "nodejs.org", ports: [80, 443], source: "operator" },
+      ]);
+    } finally {
+      fake.legacyPolicy = false;
+    }
   });
 });
 

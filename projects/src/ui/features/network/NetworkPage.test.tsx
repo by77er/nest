@@ -21,6 +21,7 @@ describe("the Network page", () => {
     expect(document.querySelector('[data-slot="base"]')).toHaveTextContent(/^github\.com$/);
     // A port shown only where it isn't the web's.
     expect(document.querySelector('[data-slot="operator"]')).toHaveTextContent(/^mirror\.internal\.example:8443$/);
+    expect(document.querySelector('[data-slot="repos"]')).toHaveTextContent(/^api\.github\.com$/);
     expect(within(role("worker")).getByText("registry.npmjs.org")).toBeInTheDocument();
     expect(within(role("worker")).getByText("ports 80, 443")).toBeInTheDocument();
     expect(within(role("manager")).getByText(/No hosts beyond the operator/)).toBeInTheDocument();
