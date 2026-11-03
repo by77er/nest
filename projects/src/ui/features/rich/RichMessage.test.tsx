@@ -169,6 +169,22 @@ describe("task references", () => {
     }
   });
 
+  it("while the board loads, a reference is a chip-sized placeholder, then the chip", async () => {
+    const t = task({ title: "Arrives later", state: "ready" });
+    const api = new FakeApi();
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `See task:${t.id}.`, delivered: true, error: null }];
+    let release!: () => void;
+    api.holds.push({ match: /^GET .*\/tasks$/, until: new Promise<void>((r) => (release = r)) });
+    api.tasks = [t];
+    renderApp("/projects/prj_one/manager", api);
+    const pending = await screen.findByText(`task:${t.id}`);
+    const chip = pending.closest("[data-ds=task-chip]")!;
+    expect(chip).toHaveAttribute("data-pending");
+    expect(chip.querySelector("a")).toBeNull();
+    release();
+    expect(await screen.findByRole("link", { name: "Task Arrives later" })).toBeInTheDocument();
+  });
+
   it("an id the board doesn't have is plain text: no chip, no card, no link", async () => {
     const t = task({ title: "Ours" });
     const { root } = await show("[theirs](task:tsk_notours) task:tsk_gone\n\n```tasks\ntsk_notours a note\n```", [t]);

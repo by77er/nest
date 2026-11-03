@@ -7,7 +7,7 @@ import { Badge, Text, Tooltip } from "@mantine/core";
 import { IconGitPullRequest, IconRobot } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import type { Task } from "../../api/types";
-import { MetaItem, MetaRow, Row, Stack } from "../../layout";
+import { MetaItem, MetaRow, Row, Stack, TouchTarget } from "../../layout";
 import { StateBadge } from "./StateBadge";
 
 export interface TaskCardBodyProps {
@@ -32,11 +32,13 @@ export function TaskCardBody({ task, title, pendingAsks, pr, end, note }: TaskCa
         <Row gap="xs">
           <StateBadge state={task.state} size="sm" />
           {task.blocked && (
-            <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
-              <Badge size="sm" color="warning" variant="filled" data-marker="blocked" tabIndex={0}>
-                Blocked
-              </Badge>
-            </Tooltip>
+            <TouchTarget>
+              <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
+                <Badge size="sm" color="warning" variant="filled" data-marker="blocked" tabIndex={0}>
+                  Blocked
+                </Badge>
+              </Tooltip>
+            </TouchTarget>
           )}
           {pendingAsks > 0 && (
             <Badge size="sm" color="warning" variant="filled" data-marker="ask">
@@ -44,11 +46,13 @@ export function TaskCardBody({ task, title, pendingAsks, pr, end, note }: TaskCa
             </Badge>
           )}
           {task.tainted && (
-            <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
-              <Badge size="sm" color="gray" variant="outline" data-marker="tainted" tabIndex={0}>
-                Tainted
-              </Badge>
-            </Tooltip>
+            <TouchTarget>
+              <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
+                <Badge size="sm" color="gray" variant="outline" data-marker="tainted" tabIndex={0}>
+                  Tainted
+                </Badge>
+              </Tooltip>
+            </TouchTarget>
           )}
         </Row>
         {end}

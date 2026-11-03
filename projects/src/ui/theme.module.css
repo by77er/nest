@@ -7,18 +7,21 @@
   }
 }
 
-/* A small inline trigger (a badge with a tooltip, focusable) keeps its box on touch, and a hit area
-   reaching the 44 px target around it. */
-.badge[tabindex] {
-  position: relative;
-  /* Mantine's badge clips its overflow; the hit area must reach past the box. */
-  overflow: visible;
-}
-
+/* The phone's menu button and a number input's steppers keep their look on touch, and take the 44 px
+   target as their own room (a hit area never reaches over a neighbour). */
 @media (pointer: coarse) {
-  .badge[tabindex]::before {
-    content: "";
-    position: absolute;
-    inset: calc((var(--nest-hit-touch) - 100%) / -2) 0;
+  .burger {
+    min-width: var(--nest-hit-touch);
+    min-height: var(--nest-hit-touch);
+  }
+
+  /* The input as tall as the target and its steppers' section as wide: each stepper is half of it. */
+  .numberInput {
+    --input-height: var(--nest-hit-touch);
+    --input-right-section-width: var(--nest-hit-touch);
+  }
+
+  .stepper {
+    min-width: var(--nest-hit-touch);
   }
 }

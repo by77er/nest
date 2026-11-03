@@ -50,6 +50,9 @@ export class FakeApi {
   /** Answers to give instead, by `METHOD path` pattern, once each. */
   readonly failures: { match: RegExp; status: number; error: string }[] = [];
 
+  /** Answers held until `until` settles, by `METHOD path` pattern (a slow board, say). */
+  readonly holds: { match: RegExp; until: Promise<unknown> }[] = [];
+
   fail(match: RegExp, status: number, error: string): void {
     this.failures.push({ match, status, error });
   }
@@ -60,6 +63,7 @@ export class FakeApi {
     const method = (init?.method ?? "GET").toUpperCase();
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     if (method !== "GET") this.writes.push({ method, path: url.pathname, body });
+    for (const h of this.holds) if (h.match.test(`${method} ${url.pathname}`)) await h.until;
     const f = this.failures.findIndex((x) => x.match.test(`${method} ${url.pathname}`));
     if (f >= 0) {
       const [x] = this.failures.splice(f, 1);

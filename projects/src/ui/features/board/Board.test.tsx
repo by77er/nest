@@ -22,6 +22,18 @@ const EXPECTED: Record<TaskState, { column: string; role: "gray" | "primary" | "
 const column = (name: string) => screen.getByRole("region", { name });
 
 describe("the board", () => {
+  it("a badge with a tooltip takes its touch room as layout around it, and its tooltip still opens", async () => {
+    const api = new FakeApi();
+    api.tasks = [task({ title: "Held up", state: "in_progress", blocked: { at_ms: 1, by: "agt_w", role: "worker", reason: "needs a key", question: null, tainted: false } })];
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const card = await screen.findByRole("article", { name: "Held up" });
+    const badge = card.querySelector("[data-marker=blocked]") as HTMLElement;
+    // The room is a wrapper around the Tooltip's trigger, so the Tooltip's own props never replace it.
+    expect(badge.parentElement).toHaveAttribute("data-ds", "touch-target");
+    await user.hover(badge);
+    expect(await screen.findByText("Blocked: needs a key")).toBeInTheDocument();
+  });
+
   it("a card's title is the label weight, 500: a weight by name renders, not dropped", async () => {
     const api = new FakeApi();
     api.tasks = [task({ title: "Weighed", state: "ready" })];
