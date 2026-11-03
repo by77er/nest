@@ -50,6 +50,18 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - a guest's write stalls during the pause.
 
   If a month-old 32 GiB disk's p99 clone exceeds 200 ms, M3′ comes first: an incremental shadow that clones only the ranges FIEMAP shows changed (`FICLONERANGE`). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
+- **Measured (2026-11-03, one `c8id.large` in us-east-1c, kernel 6.18.56, XFS `reflink=1` on the 118 GB instance store):** the gate fails, so M3′ comes first.
+
+  | 32 GiB disk | Extent records | `FICLONE`, 5 runs |
+  |---|---|---|
+  | fresh (`nest-base`, grown) | 44 | 13–14 ms |
+  | after 1 GiB of random 4 KiB churn over a cut | 157,649 | 1.6–2.9 s (median 2.4 s) |
+  | after 300 rounds of cut, 2,000 scattered writes, drop (a simulated month) | 818,954 | 8.0–11.0 s (median 8.1 s) |
+
+  - The clone costs about 10–15 µs per extent record. The records scattered writes add stay until the disk is rewritten, so on a disk in use a pause for a whole-file clone lasts seconds, not the milliseconds option 1 assumed.
+  - Reading a cut cold: 6.69 GB of data extents in 37.0 s, about 181 MB/s.
+  - Guest write stalls weren't measured: the test VM wasn't running when the pauses began. Twelve pause-clone-resume cycles on the month-aged disk took 5.06–5.14 s each. The harness now records whether the VM is up, and its console.
+  - Results: `dev/measure-cut/results-i-08370229efb01aa08.json`.
 - **Checked:** `verification/nestd/check` `sentinel` drives reads and cuts together (a cut recorded behind a newer one included), and fails for a cut recorded under the newest pass instead of its own. Tests:
   - host tests use a test cut (`disk_cut: locked_copy`): a copy under an exclusive `flock`, since the test filesystems have no reflink;
   - the e2e harness cuts that way during sustained writes, restores the generation from the store, and finds an exact prefix of the writes.

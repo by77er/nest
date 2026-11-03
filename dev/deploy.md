@@ -97,9 +97,9 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
   - a nestd of either release works with either state layout (`state_dir`, the kernel, images and jail paths are all in nestd.json);
   - a previous-release Worker ignores `cut_ms`;
   - an EBS-only host, or a previous-release nestd, pauses for whole reads as M1 does.
-- **Cost** (on-demand prices from third-party trackers, not AWS's price list: [c8id.large](https://calculator.holori.com/aws/ec2/c8id.large/us-east-1), [c8i-flex.large](https://calculator.holori.com/aws/ec2/c8i-flex.large), unverified):
-  - `c8id.large` is about $0.111 an hour against `c8i-flex.large`'s $0.089, about +$16 a month per always-on host;
-  - on spot, about $0.03 against $0.027–0.034 an hour, a few dollars a month per host.
+- **Cost** (us-east-1, Linux, from AWS's own APIs, verified 2026-11-02: the Price List API's `get-products` for [on demand](https://aws.amazon.com/ec2/pricing/on-demand/), `describe-spot-price-history` for [spot](https://aws.amazon.com/ec2/spot/pricing/)):
+  - On demand, `c8id.large` (1 × 118 GB NVMe instance store) is $0.11088 an hour, and `c8i-flex.large` (EBS only) $0.08902: +$0.02186 an hour, about +$16 a month per always-on host.
+  - On spot, `c8id.large` was $0.029–0.058 an hour and `c8i-flex.large` $0.026–0.043, by AZ (spot prices move). In the cell's AZs (1a, 1b, 1c), `c8id` was $0.029, $0.031 and $0.058 against flex's $0.032, $0.043 and $0.038. So on spot the difference is a few dollars a month per host either way, and `c8id` was the cheaper of the two in 1b and 1c.
 
   Hosts scale to zero when idle, so the delta follows sandbox hours. `maxHosts` (4) bounds it at about +$64 a month on demand.
 - **Compatibility one release back:**

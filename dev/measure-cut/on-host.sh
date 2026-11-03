@@ -5,6 +5,8 @@
 # JSON document to the serial console between NEST-MEASURE-BEGIN and NEST-MEASURE-END, then powers
 # off (the instance terminates on shutdown). Needs the host AMI: Firecracker, the guest kernel and
 # nest-base are baked in.
+# First of all: the instance powers off (and so terminates) by this deadline, whatever hangs below.
+shutdown -h +@DEADLINE_MIN@ || shutdown -P +@DEADLINE_MIN@
 set -uo pipefail
 exec > >(tee /dev/console) 2>&1
 J=/root/results.json
@@ -139,6 +141,8 @@ call PUT /boot-source '{"kernel_image_path": "/var/lib/nest/kernel/vmlinux", "bo
 call PUT /drives/rootfs "{\"drive_id\": \"rootfs\", \"path_on_host\": \"$M/disk.img\", \"is_root_device\": true, \"is_read_only\": false}"
 call PUT /actions '{"action_type": "InstanceStart"}'
 sleep 20
+# Whether the VM is up, and its console's tail either way (2026-11-03's run had no guest lines).
+if kill -0 $FC 2>/dev/null; then put vm_running true; else put vm_running false; fi
 PAUSES=()
 for k in $(seq 12); do
   sync -f $M/disk.img 2>/dev/null || sync
@@ -152,5 +156,6 @@ for k in $(seq 12); do
   sleep 5
 done
 kill $FC
+put vm_log "$(tail -c 4000 /root/vm.log | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 put cut_while_writing "{\"pauses_ms\": [$(IFS=,; echo "${PAUSES[*]}")], \"guest\": [$(grep -o 'NEST-STALL [0-9]* [0-9]* [0-9]*' /root/vm.log | awk '{printf "%s[%s, %s, %s]", (n++ ? "," : ""), $2, $3, $4}')]}"
 put done true

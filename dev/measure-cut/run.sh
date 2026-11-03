@@ -28,23 +28,71 @@ TIMEOUT_S=${MEASURE_TIMEOUT_S:-5400}
 DRY=()
 [ "${MEASURE_DRY_RUN:-0}" = 1 ] && DRY=(--dry-run)
 
+# Nothing may outlive the run. Four layers, each enough alone:
+# - the instance powers itself off (terminating it) when on-host.sh ends, and at the latest
+#   MEASURE_DEADLINE_MIN after boot, whatever hangs (on-host.sh's first line);
+# - this script terminates it by id on any exit (an error, a timeout, Ctrl-C, SIGTERM) and waits for
+#   `terminated`;
+# - a sweep by the run's tag (`nest-measure=<run id>`) afterwards terminates anything of the run
+#   still not terminated, and must find nothing;
+# - the id and tag are printed (and written to $HERE/last-run) the moment it launches, so a person
+#   can terminate it by hand if this script is killed outright.
+RUN_ID=${MEASURE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
 ID=""
+sweep() {
+  aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:nest-measure,Values=$RUN_ID" "Name=instance-state-name,Values=pending,running,shutting-down,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text
+}
 cleanup() {
+  trap - EXIT INT TERM HUP
+  [ -n "${DRY[*]}" ] && return
   if [ -n "$ID" ]; then
     echo "terminating $ID"
     aws ec2 terminate-instances --region "$REGION" --instance-ids "$ID" >/dev/null || echo "terminate $ID failed: terminate it by hand" >&2
+    aws ec2 wait instance-terminated --region "$REGION" --instance-ids "$ID" || echo "$ID not terminated yet: check it" >&2
   fi
+  local left
+  left=$(sweep)
+  if [ -n "$left" ]; then
+    echo "sweep: terminating $left (tag nest-measure=$RUN_ID)" >&2
+    # shellcheck disable=SC2086
+    aws ec2 terminate-instances --region "$REGION" --instance-ids $left >/dev/null
+    # shellcheck disable=SC2086
+    aws ec2 wait instance-terminated --region "$REGION" --instance-ids $left || true
+    left=$(sweep)
+  fi
+  echo "sweep (tag nest-measure=$RUN_ID, every state but terminated): ${left:-none}"
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 
-ID=$(aws ec2 run-instances --region "$REGION" "${DRY[@]}" \
+USER_DATA=$(mktemp)
+sed "s/@DEADLINE_MIN@/${MEASURE_DEADLINE_MIN:-90}/" "$HERE/on-host.sh" > "$USER_DATA"
+# The template names the cell's security group but no subnet: a subnet of that group's VPC, each AZ in
+# turn until one has the capacity (or MEASURE_SUBNET).
+SG=$(aws ec2 describe-launch-template-versions --region "$REGION" --launch-template-name "$TEMPLATE" --versions '$Default' \
+  --query 'LaunchTemplateVersions[0].LaunchTemplateData.SecurityGroupIds[0]' --output text)
+VPC=$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$SG" --query 'SecurityGroups[0].VpcId' --output text)
+SUBNETS=${MEASURE_SUBNET:-$(aws ec2 describe-subnets --region "$REGION" --filters "Name=vpc-id,Values=$VPC" --query 'Subnets[].SubnetId' --output text)}
+for SUBNET in $SUBNETS; do
+  if ID=$(aws ec2 run-instances --region "$REGION" "${DRY[@]}" \
   --launch-template "LaunchTemplateName=$TEMPLATE" \
-  --instance-type "$TYPE" \
-  --user-data "fileb://$HERE/on-host.sh" \
+  --instance-type "$TYPE" --subnet-id "$SUBNET" \
+  --user-data "fileb://$USER_DATA" \
   --instance-initiated-shutdown-behavior terminate \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=nest,Value=measurement},{Key=Name,Value=nest-$CELL-measure-cut}]" \
-  --query 'Instances[0].InstanceId' --output text)
-echo "launched $ID ($TYPE, from $TEMPLATE)"
+  --tag-specifications "ResourceType=instance,Tags=[{Key=nest,Value=measurement},{Key=nest-measure,Value=$RUN_ID},{Key=Name,Value=nest-$CELL-measure-cut}]" \
+    "ResourceType=volume,Tags=[{Key=nest,Value=measurement},{Key=nest-measure,Value=$RUN_ID}]" \
+  --query 'Instances[0].InstanceId' --output text); then break; fi
+  ID=""
+  [ -n "${DRY[*]}" ] && exit 1
+done
+[ -n "$ID" ] || { echo "no subnet of $VPC launched a $TYPE" >&2; exit 1; }
+echo "launched $ID ($TYPE, from $TEMPLATE), tag nest-measure=$RUN_ID: if this script dies, terminate it by hand"
+echo "$ID nest-measure=$RUN_ID $REGION" > "$HERE/last-run"
+# Every volume it has goes with it.
+aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
+  --query 'Reservations[0].Instances[0].BlockDeviceMappings[].[DeviceName,Ebs.VolumeId,Ebs.DeleteOnTermination]' --output text
 
 OUT=$(mktemp)
 deadline=$(( $(date +%s) + TIMEOUT_S ))
@@ -56,9 +104,23 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   echo "$(date -u +%H:%M:%S) $ID $state"
   [ "$state" = terminated ] && break
 done
+# EC2 posts the console in snapshots that can lag by many minutes (2026-11-03: the last one before the
+# power-off was 28 minutes old, and the one with the results came 9 minutes after it): keep reading
+# for up to 20 minutes after it terminates.
+if ! grep -q NEST-MEASURE-END "$OUT"; then
+  late=$(( $(date +%s) + 1200 ))
+  while [ "$(date +%s)" -lt "$late" ]; do
+    aws ec2 get-console-output --region "$REGION" --instance-id "$ID" --latest --output text --query Output > "$OUT" 2>/dev/null || true
+    grep -q NEST-MEASURE-END "$OUT" && break
+    echo "$(date -u +%H:%M:%S) waiting for the console snapshot with the results"
+    sleep 60
+  done
+fi
 grep '^measure:' "$OUT" || true
 RESULT="$HERE/results-$ID.json"
-if sed -n '/NEST-MEASURE-BEGIN/,/NEST-MEASURE-END/p' "$OUT" | sed '1d;$d' | python3 -I -m json.tool > "$RESULT"; then
+# The JSON is the first line starting `{"kernel"` (cloud-init echoes it again); the console can splice a
+# `[<timestamp>]` into a long line.
+if grep -m1 '^{"kernel"' "$OUT" | sed -E 's/\[[0-9]{4}-[0-9T:.-]+\]//g' | python3 -I -m json.tool > "$RESULT"; then
   echo "results: $RESULT"
 else
   echo "no results on the console (see $OUT)" >&2
