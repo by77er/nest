@@ -2068,16 +2068,23 @@ impl Inner {
         }
         // The guard against an unbounded pause (a disk fragmented, on purpose or not, until its
         // clone would outlast a read of it): counted while the VM runs.
-        let read_instead = match (storage::extent_count(&disk), std::fs::metadata(&disk)) {
-            (Ok(extents), Ok(meta)) => {
-                let allocated = std::os::unix::fs::MetadataExt::blocks(&meta) * 512;
+        let counted = {
+            let d = disk.clone();
+            tokio::task::spawn_blocking(move || Some((storage::extent_count(&d).ok()?, std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(&d).ok()?) * 512)))
+                .await
+                .ok()
+                .flatten()
+        };
+        let extents = counted.map(|c| c.0);
+        let read_instead = match counted {
+            Some((extents, allocated)) => {
                 let slower = storage::clone_slower_than_read(extents, allocated, self.cfg.cut_clone_ns_per_extent, self.cfg.cut_read_bytes_per_s);
                 if slower {
                     tracing::warn!(sandbox = %id, epoch = epoch.0, extents, allocated, "checkpoint: the disk's clone would outlast reading it: this cut reads it in the pause");
                 }
                 slower
             }
-            _ => false,
+            None => false,
         };
         let paused_at = Instant::now();
         if running {
@@ -2143,7 +2150,7 @@ impl Inner {
             }
         };
         let reused = matches!(source, CutSource::Read(_));
-        tracing::info!(sandbox = %id, epoch = epoch.0, reason = ?reason, cut = cut_id, paused_ms, reused, "checkpoint: disk cut");
+        tracing::info!(sandbox = %id, epoch = epoch.0, reason = ?reason, cut = cut_id, paused_ms, reused, extents, "checkpoint: disk cut");
         let (tx, rx) = oneshot::channel();
         drop_pending_cut(&mut s, "a newer cut replaces it");
         s.pending_cut = Some(PendingCut { id: cut_id, source, pass, stable, stamp, cut_ms, runs_at_cut, reason, keep_local, done: Some(tx) });
