@@ -72,6 +72,23 @@ pub struct Config {
     /// The cgroup v2 mount (tests point it elsewhere).
     #[serde(default = "default_cgroup_root")]
     pub cgroup_root: PathBuf,
+    /// How a checkpoint cuts a running sandbox's disk (`docs/sandbox/state/disk/`).
+    #[serde(default)]
+    pub disk_cut: DiskCut,
+}
+
+/// How a checkpoint takes a running sandbox's disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskCut {
+    /// A reflink cut where the sandboxes' filesystem has one (probed at start), else `read`.
+    #[default]
+    Auto,
+    /// Pause the VM while its disk is read (M1).
+    Read,
+    /// Tests and the e2e harness only: a cut taken by copying the disk under an exclusive `flock`
+    /// (`storage::locked_copy`), where the filesystem has no reflink.
+    LockedCopy,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
