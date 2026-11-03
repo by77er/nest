@@ -1,7 +1,6 @@
 # Control plane ↔ host
 
-> **Implemented contract.** It still has the one-release workstream compat fields (optional `ws_` values the control plane still sends) and the deprecated `agent_start.role` (optional, no longer sent) / `ToolDef.roles`; see [pending contract changes](../README.md#pending-contract-changes).
-
+> **Implemented contract.** Its one-release compat fields are listed under [pending contract changes](../README.md#pending-contract-changes).
 
 How hosts (nestd and the agent runner) talk to the Cloudflare control plane. Rust types: `nest_protocol::control` (messages) and `nest_protocol::model` (shared models). Fixtures: `protocol/fixtures/control/<type>/<variant>[.<case>].json`. The Rust tests round-trip every fixture and fail if any message variant lacks one; the control plane's TypeScript tests must do the same.
 

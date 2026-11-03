@@ -1,14 +1,15 @@
 // A task's card body, the one look a task has everywhere (similarity): the Board's cards, a message's
 // task cards and the Manager's context column. Its title (a link the caller gives), its badges in one
-// size (state, Blocked, Needs input, Tainted), who works on it and its PRs, its start error, and an
+// size (state, waiting on, Blocked, Needs input, Tainted), who works on it and its PRs, its start error, and an
 // optional note. The Board adds its grip; nothing else differs.
 
 import { Badge, Text, Tooltip } from "@mantine/core";
-import { IconGitPullRequest, IconRobot } from "@tabler/icons-react";
+import { IconGitPullRequest, IconHandStop, IconMessageQuestion, IconRobot } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import type { Task } from "../../api/types";
-import { MetaItem, MetaRow, Row, Stack, TriggerBadge } from "../../layout";
+import { icon, MetaItem, MetaRow, Row, Stack, TriggerBadge } from "../../layout";
 import { StateBadge } from "./StateBadge";
+import { WaitingBadge } from "./WaitingBadge";
 
 export interface TaskCardBodyProps {
   task: Task;
@@ -31,15 +32,16 @@ export function TaskCardBody({ task, title, pendingAsks, pr, end, note }: TaskCa
       <Row gap="xs" justify="space-between" align="flex-start">
         <Row gap="xs">
           <StateBadge state={task.state} size="sm" />
+          <WaitingBadge task={task} />
           {task.blocked && (
             <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
-              <TriggerBadge size="sm" color="warning" variant="filled" data-marker="blocked">
+              <TriggerBadge size="sm" color="warning" variant="filled" data-marker="blocked" leftSection={<IconHandStop size={icon.sm} aria-hidden />}>
                 Blocked
               </TriggerBadge>
             </Tooltip>
           )}
           {pendingAsks > 0 && (
-            <Badge size="sm" color="warning" variant="filled" data-marker="ask">
+            <Badge size="sm" color="warning" variant="filled" data-marker="ask" leftSection={<IconMessageQuestion size={icon.sm} aria-hidden />}>
               Needs input
             </Badge>
           )}
@@ -63,6 +65,7 @@ export function TaskCardBody({ task, title, pendingAsks, pr, end, note }: TaskCa
           {prs.map((n) => (
             <MetaItem key={n} icon={IconGitPullRequest}>
               {pr ? pr(n) : `#${n}`}
+              {task.prs.length > 1 ? ` +${task.prs.length - 1}` : ""}
             </MetaItem>
           ))}
         </MetaRow>

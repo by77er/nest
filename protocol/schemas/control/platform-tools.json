@@ -384,5 +384,63 @@
       "additionalProperties": false
     },
     "requires_approval": false
+  },
+  {
+    "name": "timer_set",
+    "description": "Set a named timer. When it fires you get an input `Message from timer: timer \"<name>\" fired: <note>`, as an inbox message: during a turn it arrives in that turn; otherwise it starts a turn (and wakes you). Setting a name again replaces its timer. To wait, set a timer and end your turn: whichever comes first, an inbox message or the timer, wakes you. At least 10 s and at most 30 days ahead; at most 32 timers.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "1-63 lowercase letters, digits, '_', '.' and '-'."
+        },
+        "after_s": {
+          "type": "integer",
+          "description": "Fire this many seconds from now (10 to 2592000). Give this or at_ms."
+        },
+        "at_ms": {
+          "type": "integer",
+          "description": "Fire at this time (Unix epoch milliseconds). Give this or after_s."
+        },
+        "note": {
+          "type": "string",
+          "description": "What to do when it fires (shown in the input), at most 1,000 characters."
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "requires_approval": false
+  },
+  {
+    "name": "timer_cancel",
+    "description": "Cancel a timer you set, by name.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The timer's name."
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "requires_approval": false
+  },
+  {
+    "name": "timer_list",
+    "description": "Your timers, soonest first: name, when it fires (at_ms) and its note.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "requires_approval": false
   }
 ]

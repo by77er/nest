@@ -28,7 +28,7 @@ All state is the app's. nest holds the agents, their sandboxes and their transcr
 Only the client interface. One client, `projects`, has this grant:
 - `cells`, and `credentials: [claude_oauth_token]`;
 - `repos` and `github.repos`: the attachable repos. Workers push to them; the manager and reviewers only read them, which `repos` covers (no `read_repos` needed);
-- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
+- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)), which also cover reading PRs to attach them (`pull_requests: read`; [below](#prs)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
 - `max_agents` and `max_sandboxes`.
 
@@ -73,8 +73,8 @@ Only the client interface. One client, `projects`, has this grant:
   2. The manager specs it (`ready`).
   3. It's assigned (`assigned`), by the owner from the board, by the manager, or automatically. Automatic assignment takes `ready` tasks in board order while the project's live workers are fewer than its `max_workers`.
   4. The app starts a worker labelled with the task (`in_progress`).
-  5. The worker pushes a branch `task/<task-id>` and opens a PR (`in_review`). The PR's branch maps it to the task.
-  6. The PR is merged (`done`), and the worker is ended.
+  5. The worker pushes a branch `task/<task-id>` and opens a PR (`in_review`). The PR's branch maps it to the task. The owner or the manager may attach more ([below](#prs)).
+  6. All its attached PRs merged (`done`), and the worker is ended.
   
   A worker that exits before opening a PR leaves the task `stalled`, shown on the board, to be reassigned. Cancelling a task stops its worker.
 - **Review:**
@@ -83,7 +83,7 @@ Only the client interface. One client, `projects`, has this grant:
   3. Each job creates a check run (`in_progress`) and starts a reviewer.
   4. The reviewer's verdict completes the check: `success` only if all three dimensions pass, else `failure`, with the summary as the check's output.
   5. A reviewer that exits without a verdict is started again, twice, then the check completes as `action_required`. Not `neutral`: a required check accepts `success`, `skipped` and `neutral` ([GitHub](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)), so `neutral` would let the PR merge unreviewed. A `check_run` `rerequested` queues the job again.
-- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR's task `done` and ends its worker; closed without merging, it's noted in the task's history and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
+- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR merged, and its task `done` once every attached PR has, ending its worker; closed without merging, the PR is detached, noted in the task's history, and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
 
 ## Not decided here
 
@@ -192,7 +192,7 @@ The owner's request (2026-11-02): "Agents might mark their tasks as blocked, whi
 
 The owner's request (2026-11-02): "Workers should be notified when their assigned task is modified."
 
-- **What's told:** a new title, body or spec, and its block cleared by the owner (answering it) or the manager. It doesn't matter whether the owner made the change (the API), the manager (`/mcp/board`) or the app.
+- **What's told:** a new title, body or spec, its block cleared by the owner (answering it) or the manager, PRs attached or detached ([PRs](#prs)), and its dependencies added, removed or done ([dependencies](#dependencies)). It doesn't matter whether the owner made the change (the API), the manager (`/mcp/board`) or the app.
   - The worker's own changes aren't told back, nor is a block it raised and the owner answered: that answer reached it already.
   - Cancelling stops the worker, as before.
   - A task with a live worker (`assigned`, `in_progress`, or `in_review` while its worker lives) may now be re-specced, so the spec can change under a worker (`spec` loops on those states in `src/tasks.ts`).
@@ -204,6 +204,35 @@ The owner's request (2026-11-02): "Workers should be notified when their assigne
   - A set is frozen on its first try and posted with the request id `<task>/changes/<last change>`, so a retry after a lost answer posts once. A change after that try is the next message.
   - A set with any change from a tainted session is posted as relayed text (`from: "projects/board"`), as the brief is.
   - Each set is recorded in the task's history (`worker_notified`, or `worker_not_notified` when the worker had gone or nest refused).
+
+## PRs
+
+The owner's request (2026-11-03): "PRs should be attachable to tasks."
+
+- **A relation, not one field.** A task has any number of PRs (ProjectDO's `task_prs`), and a PR belongs to one task at a time. The migration made each task's single `pr` its first attached PR, with its auto-merge. `Task.pr` (and the old column) is still the first attached; `Task.prs` lists them all.
+- **Attaching:**
+  - **the owner**, from the task's drawer: one of the repo's open PRs (`GET /api/projects/:id/prs/open`), or a number, `#n`, or the PR's URL (`POST /api/projects/:id/tasks/:task/prs`);
+  - **the manager**, with `attach_pr` on `/mcp/board`;
+  - **its worker's own PR** still attaches itself, by `report_pr` or by its branch `task/<id>`.
+
+  The owner's and the manager's are checked on GitHub with a `pull_requests: read` token: the PR is in the repo and open, and GitHub says whether it's from a fork. A task in progress goes to review; a task that's over takes no PR.
+- **One task per PR:** attaching a PR that's attached to another task is refused, naming that task: detach it there first. A branch `task/<id>` never moves a PR attached elsewhere; it's noted on the task it names. Moving it silently would take a PR from a task someone chose.
+- **Detaching** (`DELETE …/prs/<n>`, or `detach_pr`) works on an open PR only, since a merged one stays as the record. A detached PR's auto-merge is turned off.
+- **Done:** a task is done once at least one PR is attached and every attached one has merged (`prsDone` in `src/tasks.ts`). Merging one of several leaves it in review. A PR closed without merging is detached with a note, and the task is done if the rest have merged. `merged` now moves any task that isn't over, since a PR may be attached to a task with no worker.
+- **Review and auto-merge:** every PR is reviewed already. With auto-merge on, every attached PR gets it: the owner's, the manager's, the worker's or the branch's, but only once GitHub has said it's from the repo itself and given its node id. A fork's PR never gets it, and neither does one whose head repo GitHub no longer names.
+- **The live worker is told** when PRs are attached or detached ([task changes](#task-changes)).
+
+## Dependencies
+
+The owner's request (2026-11-03): "Tasks should be able to block other tasks."
+
+- **"Waiting on", a relation** (ProjectDO's `task_deps`): a task waits on others (`blocked_by`), and is waited on by others (`blocks`). This is distinct from "Blocked" ([above](#blocked)), the flag an agent raises for the owner, which is a "Needs you" item. A dependency is the board's own ordering, and nothing waits on the owner.
+- **Valid** (`dependencyError` in `src/tasks.ts`, pure): within the project only, never on itself, never on a task that's over, never twice, and never closing a cycle, which is refused with the cycle's path (`tsk_a → tsk_b → tsk_a`).
+- **Assignment:** a task waiting on any task not `done` can't be assigned, whether automatically, by the manager or by the owner. The refusal names the blockers and their states. **There is no override:** the owner removes the dependency instead, which says what changed and keeps the board's record honest.
+- **Becoming assignable:** when its last blocker is done, the task can be assigned, and auto-assign takes it. **A cancelled blocker still holds it:** the work it waited on won't happen, so whether to go on without it is the owner's or the manager's call, made by removing the dependency.
+- **Who:** the owner from the drawer (`POST /api/projects/:id/tasks/:task/dependencies {blocked_by}`, `DELETE …/dependencies/<task>`), and the manager with `add_dependency` and `remove_dependency`. A worker's `get_task` lists what its task waits on, with each one's state.
+- **A live worker** on a task whose dependencies change (added or removed mid-flight, or one done) is told ([task changes](#task-changes)).
+- **On the board:** a card says "Waiting on N", neutral (gray, outline), since it's no one's to act on now. Hovering or focusing it lists the blockers. The drawer has a Dependencies section: what it waits on, each removable, a task picker (the switcher) to add one, and what waits on it.
 
 ## The UI
 
@@ -224,15 +253,16 @@ The owner's request (2026-11-02): "Workers should be notified when their assigne
 
 **Built (2026-11-02):** an agent's turns as they happen, from nest's live trace ([API](../docs/control-plane/api/), "Live trace"). Code: `src/trace.ts` (the route) and `src/ui/features/trace/` (the viewer, self-contained). Tests: `test/trace.test.ts` (the route, against a WebSocket in the fake nest) and `src/ui/features/trace/trace.test.tsx`.
 - **The route:** `GET /api/agents/<id>/trace?after=<seq>`, behind Access like the rest of `/api/`. Only an agent DirectoryDO recorded for one of the app's projects (its manager, a worker, a reviewer); any other id is `404` before nest is asked. Then it opens the upgrade to nest with the client token (`fetch` with `Upgrade: websocket` and `Authorization`, nothing of the browser's forwarded) and returns nest's socket as its own `101`. Workers proxy a WebSocket that way ([Response](https://developers.cloudflare.com/workers/runtime-apis/response/): "This establishes a WebSocket connection proxied through a Worker"), so the app holds no state for it and the token never reaches the browser. nest's retryable `503` (minutes after its deploy) stays a `503`; its `404` is a `404`; any other refusal is a `502` with nest's message.
-- **The viewer** (`TraceView`, and one mount per place: `ManagerTrace`, `TaskTraces` for a task's worker in its drawer, `ReviewTrace` for a review job's reviewer):
-  - Turns are groups: the input's kind and when, then the assistant's text, each tool call with its result's status (Running, Done, Error) and its input and result a click away, asks and errors as notices, state changes as captions; the turn's badge says Working or Completed, with its tokens.
-  - The header shows the connection (Live, Connecting, Reconnecting, Ended) and the agent's last state.
-  - It follows the newest event only while scrolled to the bottom; above it, "Jump to live (n new)".
+- **The history route:** `GET /api/agents/<id>/trace/history?before=<cursor>&limit=<n>`, behind Access, for the same agents as the trace (404 before nest is asked otherwise), proxying nest's [trace history](../docs/control-plane/api/) (its stored transcript) with the client token. nest's `400` and its retryable `503` pass on; its `404` is a `404`; anything else a `502`.
+- **The viewer** (`TraceView`, and one mount per place: `ManagerTrace` on the Manager page's "Trace" tab, `TaskTraces` for a task's worker in its drawer, `ReviewTrace` for each review job's reviewer), a terminal transcript as Claude Code prints one (2026-11-02, the owner's):
+  - **The terminal** (the `Terminal`, `TermLine` and `TermRule` primitives): the `terminal` surface with a hairline, the mono family throughout, long lines wrapped (`pre-wrap`, breaking anywhere: no sideways scroll), code keeping its spacing, and every line text, so it selects and copies.
+  - **Its lines:** each turn under a quiet rule (its start time, its input's kind, how it ended, its tokens); the assistant's text after `●`; a tool call as `● Name(argument)` (an MCP tool by its own name, the main argument's first line), a disclosure whose region holds the full input; its result on the next line after `⎿`, the first 3 lines then `… +N lines (expand)`; a running call's `○`; states, asks, rate limits and exits as dim one-liners (`·`, `?`). An error is the danger role's text shade and `✗`, on the result and on the call's bullet. The glyphs are pinned by codepoint (U+25CF, U+25CB, U+23BF, U+2717, U+00B7): none has an emoji presentation, so none renders as an emoji (U+23FA would). `●`, `○`, `✗` and `⎿` are drawn in CSS at the font's stem weight (`Terminal.module.css`): JetBrains Mono's subsets lack all four (and DejaVu Sans Mono and Noto Sans Symbols 2 lack `⎿`), so the character stays in the text and the shape is what shows, the same on every system (unverified in the owner's browser). A finished call's `●` is in the success role, a failed one's in danger; a rate limit shows `!` in warning. The terminal has its own muted (`terminal-muted`) and warning shade, for AA on it, and its own hairline (`terminal-rule`, about 1.4:1) for its border and turn rules. Its rows that act (a call, `… +N lines`, "load earlier") are real buttons as wide as their row: text-line targets, the skill's exception to the 32 px rule.
+  - **Backfill:** when nest offers history (its `history` message: the ring starts after the agent did) or reports a gap with a cursor, the viewer loads the history page before it at once, then each older one as the reader scrolls to the top ("loading earlier…", then "the beginning of the trace"), keeping what was being read in place. History shows before the ring, its turns grouped by their starts (they have no ids). After a gap it drops what it held and backfills from the gap's cursor, so nothing shows twice or goes missing (nest's stitching rule).
+  - The header shows the connection (Live, Connecting, Reconnecting, Ended) and the agent's last state. It follows the newest line only while scrolled to the bottom; above it, "Jump to live (n new)".
   - **Reconnects** after a drop from the last seq received (`after`), 1 s doubling to 30 s, starting over once a connect's backlog is done; never after `ended`. A repeated seq is dropped. A `ping` every 25 s keeps the socket open without waking the agent's object.
-  - **Motion:** an event that arrives after nest's `live` marker fades in (`base`, 180 ms, the `FadeIn` primitive); the backlog and everything replayed on a reconnect don't. Reduced motion makes it instant.
-  - **The gap notice** names the events nest no longer holds. The app has no transcript view, so it links to none.
-  - At most 2,000 events are kept per view; older ones are dropped from it, and it says so.
-- **Where it's mounted:** the task drawer (the worker's). `ManagerTrace` is for the Manager page's "Trace" tab beside "Chat", and `ReviewTrace` for each job on the Reviews page; those pages come with the sidebar.
+  - **Motion:** a line that arrives after nest's `live` marker fades in (`base`, 180 ms, the `FadeIn` primitive); the backlog, history and everything replayed on a reconnect don't. Reduced motion makes it instant.
+  - At most 2,000 ring events are kept per view; older ones are dropped from it, and it says so.
+- **The task drawer** (2026-11-02, the owner's): a task that has or had a worker shows its trace beside its details. The sheet has one width whatever the task holds, so its title never moves: from `xl` on `--nest-sheet-wide` (72rem), with two columns that scroll on their own, the details in a third (`--nest-sheet-details`, 24rem) and the trace in the rest, filling its column with its header kept in view. The trace is the wider one because it's what's read at length (long log lines); the details are a side panel, which the skill holds to a third. Below `xl` (at 1200 px the wide sheet would cover the page) they're "Details" and "Trace" tabs, each the sheet's full height and kept mounted with `keepMountedMode="display-none"` (Mantine's default, React's `<Activity hidden>`, runs effect cleanups, which closed the trace's socket; the log's scroll is kept across the hide too), so switching keeps the trace's connection, scroll and what's expanded; the trace's status sits on the terminal's first line, with no second heading. A component test can't see the difference (Mantine renders without `<Activity>` in its test environment): `scripts/ui-review`'s `trace-tabs` check drives a real browser through the switch. At the wide width, a task without a worker shows "No worker yet" in the trace column. A task with no worker keeps the single column (at a form's measure in the wide sheet). Tabs are one style everywhere: a hit target's height, 44 px on touch (`global.css`).
 
 ### Rich messages
 
@@ -253,7 +283,7 @@ The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-de
 
 | Token | Values |
 |---|---|
-| Fonts | Inter Variable (UI), JetBrains Mono Variable (ids, code), from `@fontsource-variable/*`; no external request |
+| Fonts | Inter Variable (UI), JetBrains Mono Variable (ids, code, the trace), from `@fontsource-variable/*`; no external request |
 | Type | caption 12/16 (`xs`), small 13/20 (`sm`), body 14/20 (`md`), body-lg 16/24 (`lg`); h4 14/20, h3 16/24, h2 20/28, h1 24/32, all 600; weights `regular` 400, `medium` 500, `bold` 600 |
 | Spacing | `2xs` 2, `xs` 4, `sm` 8, `md` 12, `lg` 16, `xl` 24, `2xl` 32, `3xl` 48, `4xl` 64 (px) |
 | Radii | `sm` 4 (badges, inputs), `md` 8 (panels, buttons) |
@@ -263,7 +293,7 @@ The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-de
 | Motion | 120 / 180 / 240 ms, `cubic-bezier(0.2, 0, 0, 1)` in, `cubic-bezier(0.4, 0, 1, 1)` out; opacity and transform only; reduced motion honoured; a spinner only after 300 ms |
 | Layout | page max 1440 px; gutters `lg` / `xl` / `2xl` (phone / tablet / desktop); sidebar 264 px from 62em (a drawer below), collapsing in 180 ms; reading measure 42rem; board columns at least 8.5rem from 62em (16rem below), all six fitting beside the sidebar at 1280 px |
 
-**Primitives** (`src/ui/layout/`): `AppFrame` (the sidebar: the name small at its top, the places, a footer; a burger-toggled drawer below `md`; and the content), `NavRow`/`NavGroup`/`NavGroups` and `SwitcherTarget` (the sidebar's one row style, its groups, and the switcher's button), `Page` (the max width, gutters, `2xl` between blocks; `measure` `form` or `reading`, a column centred in the content area, its header included), `PageHeader` (the one h1 with its actions right on its row, wrapping when narrow, and a meta line; no breadcrumb), `Section` (a heading row of one height: title, count, actions right; `dense` for a board column), `Panel` (the bordered surface, `lg` padding, `md` when dense; never nested) and `Well` (the borderless subtle region that holds Panels), `Toolbar` (actions `sm` apart, wrapping; destructive ones last after a divider), `Stack` and `Row` (gaps from the scale), `FieldGroup` (fields `lg` apart, actions bottom right), `EmptyState`, `LoadingState`, `ErrorState` and `Notice`, `MetaRow`/`MetaItem` (caption lines), `TableFrame` (a dense table in a frame, scrolling in itself), `CardGrid` and `ColumnGrid` (the projects, the board), `SortablePanel` (a draggable card), `Sheet` (the task drawer), `Bubble`, `ChatColumn`, `ScrollSentinel`, `FooterPill` and `PinnedFooter` (the chat, its end, its pill and its composer), `ScrollLog` (a log of a fixed height: a trace), `FadeIn` (something that just arrived, once), `Prose`.
+**Primitives** (`src/ui/layout/`): `AppFrame` (the sidebar: the name small at its top, the places, a footer; a burger-toggled drawer below `md`; and the content), `NavRow`/`NavGroup`/`NavGroups` and `SwitcherTarget` (the sidebar's one row style, its groups, and the switcher's button), `Page` (the max width, gutters, `2xl` between blocks; `measure` `form` or `reading`, a column centred in the content area, its header included), `PageHeader` (the one h1 with its actions right on its row, wrapping when narrow, and a meta line; no breadcrumb), `Section` (a heading row of one height: title, count, actions right; `dense` for a board column), `Panel` (the bordered surface, `lg` padding, `md` when dense; never nested) and `Well` (the borderless subtle region that holds Panels), `Toolbar` (actions `sm` apart, wrapping; destructive ones last after a divider), `Stack` and `Row` (gaps from the scale), `FieldGroup` (fields `lg` apart, actions bottom right), `EmptyState`, `LoadingState`, `ErrorState` and `Notice`, `MetaRow`/`MetaItem` (caption lines), `TableFrame` (a dense table in a frame, scrolling in itself), `CardGrid` and `ColumnGrid` (the projects, the board), `SortablePanel` (a draggable card), `Sheet` (the task drawer; with `beside`, two columns from `lg` and tabs below), `Terminal`, `TermLine` and `TermRule` (a trace's terminal transcript), `Bubble`, `ChatColumn`, `ScrollSentinel`, `FooterPill` and `PinnedFooter` (the chat, its end, its pill and its composer), `ScrollLog` (a log of a fixed height, or with `fill` the rest of a column: a trace), `FadeIn` (something that just arrived, once), `Prose`.
 
 **Rules:**
 - **Placement:** a section's primary action at its top right, secondary ones to its left; destructive ones last, set apart, and confirmed. In forms and dialogs the actions are bottom right, the primary rightmost. A status badge right after the thing it's about; who and when on a caption line below.
@@ -275,6 +305,8 @@ The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-de
 npm run dev    # the page and the API in workerd; without NEST_CLIENT_TOKEN the API answers, but nothing reaches nest
 npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testing Library)
 ```
+
+**Spawning:** a worker may run Claude Code's own subagents (the `Agent` tool, through nest's `subagents` capability). They live in its brain and reach the same sandbox through its hands, with the same grant and taint. No role gets nest-level spawning (`spawn_agent`, `fork_sandbox`): the app starts every agent itself, one worker per task (`test/catalog-roles.test.ts`).
 
 ## Setup (the operator's)
 

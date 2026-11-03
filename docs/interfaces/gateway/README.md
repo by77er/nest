@@ -2,7 +2,7 @@
 
 How any client of a sandbox (the agent runner's hands client today; AgentDO's `api-loop` and the `nest` CLI later) talks to the [gateway](../../sandbox/gateway/) on the sandbox's host. The frames inside are the [host-guest](../host-guest/) ones, verbatim; this boundary adds only the transport, the binding and `resolve`. Rust types: `nest_protocol::gateway`; TypeScript mirrors: `control-plane/src/protocol/gateway.ts`, with the signer in `control-plane/src/lib/binding.ts`. Fixtures: `protocol/fixtures/gateway/`, round-tripped by both languages. Design: [sandbox gateway](../../sandbox/gateway/), [hands](../../agents/hands/).
 
-**Built:** the `/hands` route, in `crates/nest-gateway` (the server), `crates/nest-hands-client` (the client the runner uses) and the control plane (bindings, `resolve`). Also built, verified on AWS on 2026-10-23 and, with Access in front, on 2026-10-24 (spike item 13): the tunnel in front (the control plane creates it at enrollment and tells clients `wss://<host>-gw-nest.<zone>`; nestd runs cloudflared) and the Access credential in every target that points at a host's tunnel; the Access applications are created by hand ([gateway](../../sandbox/gateway/)). **Not built:** the `/pty` and `/ingress/<port>` routes (the gateway answers HTTP 501) and key rotation beyond accepting a list. The e2e harness speaks plain `ws://` on loopback with no tunnel.
+**Built:** the `/hands` route, in `crates/nest-gateway` (the server), `crates/nest-hands-client` (the client the runner uses) and the control plane (bindings, `resolve`); the tunnel in front (the control plane creates it at enrollment and tells clients `wss://<host>-gw-nest.<zone>`; nestd runs cloudflared) and the Access credential in every target that points at a host's tunnel, verified on AWS; the Access applications are in the edge stack (`deploy/lean/Edge/Stack.lean`). **Not built:** the `/pty` and `/ingress/<port>` routes (the gateway answers HTTP 501) and key rotation beyond accepting a list. The e2e harness speaks plain `ws://` on loopback with no tunnel.
 
 ## Transport
 
@@ -61,7 +61,7 @@ The gateway serves gateway protocol versions in `[min_supported, current]` (both
 
 ## Error codes
 
-Before `bound`, the gateway sends a text frame `error{error{code, message, retryable}, executed: false, retry_after_ms?, reason?}` and closes. `reason` (optional since 2026-11-02, an open enum, `GatewayRefusalReason` in `enums.json`) says why where a client acts on it: today only `paused`, on row 10's `busy`. A client treats an absent or unknown `reason` as none, so a gateway of the previous release gets the ordinary `busy` budget; it never reads the message. `executed` is always false here: the gateway never executes anything, and nothing has reached the guest. The checks run in this order, and the first refusal is the answer:
+Before `bound`, the gateway sends a text frame `error{error{code, message, retryable}, executed: false, retry_after_ms?, reason?}` and closes. `reason` (optional, an open enum, `GatewayRefusalReason` in `enums.json`) says why where a client acts on it: today only `paused`, on row 10's `busy`. A client treats an absent or unknown `reason` as none, so a gateway of the previous release gets the ordinary `busy` budget; it never reads the message. `executed` is always false here: the gateway never executes anything, and nothing has reached the guest. The checks run in this order, and the first refusal is the answer:
 
 | Order | Code | Meaning | Same binding again? |
 |---|---|---|---|
@@ -92,7 +92,7 @@ Set together (`nest_protocol::gateway`), so a slow or frozen guest reaches the c
 | Client: `busy` budget (the runner's `Budgets::busy`) | 30 s | the first `busy` or bind timeout of a call | the call's error, naming the last refusal's message |
 | Client: paused budget (`Budgets::paused`), instead, once a `busy` with reason `paused` came in the call | 120 s | the same | the same |
 
-The client's bind timer must exceed the gateway's guest timer by at least 5 s (`BIND_TIMEOUT_MARGIN_MS`: the edge, the tunnel and the token check), asserted at compile time. Before 2026-11-02 both were 5 s, the client's always fired first, and its timeout was final: a hands call during a checkpoint's 35 s pause failed at once with `bind timed out` (cell use1, 2026-11-02).
+The client's bind timer must exceed the gateway's guest timer by at least 5 s (`BIND_TIMEOUT_MARGIN_MS`: the edge, the tunnel and the token check), asserted at compile time: with equal timers the client's fires first, and a call meeting a paused guest fails instead of waiting.
 
 **A pause cuts nothing.** Connections bound before nestd pauses the VM stay open: their guest streams stall with the vCPUs and continue when it runs again. Only new binds get row 10's `busy`.
 

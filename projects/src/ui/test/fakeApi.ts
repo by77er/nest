@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { Ask, Attention, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
 
 export interface Write {
   method: string;
@@ -27,7 +27,8 @@ let seq = 0;
 export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
-    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, auto_merge: null, blocked: null,
+    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, blocked: null,
+    prs: [], blocked_by: [], blocks: [], waiting_on: [],
     created_ms: now - 3_600_000, updated_ms: now - 60_000, ...over,
   };
 }
@@ -45,6 +46,7 @@ export class FakeApi {
   asks: Ask[] = [];
   sync: SyncState | null = null;
   reviews: Job[] = [];
+  openPrs: OpenPr[] = [];
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
   /** Answers to give instead, by `METHOD path` pattern, once each. */
@@ -100,7 +102,7 @@ export class FakeApi {
     }
     const p = this.projects.find((x) => x.id === parts[1]);
     if (!p) return json({ error: "unknown project" }, 404);
-    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : s)).join("/")}`;
+    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
     const t = this.tasks.find((x) => x.id === parts[3]);
     switch (route) {
       case "GET ":
@@ -125,6 +127,8 @@ export class FakeApi {
         return json(p.settings);
       case "GET reviews":
         return json(this.reviews);
+      case "GET prs/open":
+        return json(this.openPrs);
       case "GET chat":
         return json(this.chat);
       case "POST chat": {
@@ -149,6 +153,28 @@ export class FakeApi {
         return json({ ...t, history: this.history.get(t.id) ?? [] });
       case "PATCH tasks/:task":
         Object.assign(t, body);
+        return json(t);
+      case "POST tasks/:task/prs": {
+        const n = typeof body.pr === "number" ? body.pr : Number(String(body.pr).replace(/^#/, "").replace(/^.*\/pull\//, ""));
+        if (!n) return json({ error: "pr: a PR number, #<n>, or its URL" }, 400);
+        t.prs = [...t.prs, { number: n, state: "open", title: null, fork: false, attached_by: "owner", attached_ms: now, auto_merge: null }];
+        t.pr = t.prs[0]!.number;
+        return json(t);
+      }
+      case "DELETE tasks/:task/prs/:n":
+        t.prs = t.prs.filter((p) => p.number !== Number(parts[5]));
+        t.pr = t.prs[0]?.number ?? null;
+        return json(t);
+      case "POST tasks/:task/dependencies": {
+        const b = this.tasks.find((x) => x.id === body.blocked_by);
+        if (!b) return json({ error: `unknown task ${body.blocked_by}` }, 404);
+        t.blocked_by = [...t.blocked_by, { id: b.id, title: b.title, state: b.state }];
+        t.waiting_on = t.blocked_by.filter((x) => x.state !== "done").map((x) => x.id);
+        return json(t);
+      }
+      case "DELETE tasks/:task/dependencies/:task":
+        t.blocked_by = t.blocked_by.filter((x) => x.id !== parts[5]);
+        t.waiting_on = t.blocked_by.filter((x) => x.state !== "done").map((x) => x.id);
         return json(t);
       case "POST tasks/:task/answer":
         if (!t.blocked) return json({ error: "the task isn't blocked" }, 409);

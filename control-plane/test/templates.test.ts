@@ -452,7 +452,7 @@ describe("the messaging tools' removal", () => {
       new CatalogDO(st, env as never);
       return sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'seed_version'").one().value;
     });
-    expect(rows).toBe("8");
+    expect(rows).toBe(String(SEED_VERSION));
     const caps = await rawRows(stub, "capabilities");
     expect(Object.keys(caps).sort()).toEqual([...Object.keys(SEED_CATALOG.capabilities), "mine"].sort());
     // Raw rows: the tools that left gone from each, every other field kept.

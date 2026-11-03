@@ -11,6 +11,15 @@
 import type { InjectionBinding, RequestGuard, RequestMatch } from "../../protocol/model";
 import { canonicalRepos, readOnlyRepos } from "../repos";
 import type { PolicyFragment } from "./fragment";
+import { z } from "zod";
+
+/**
+ * Opt-ins on a sandbox's GitHub push token (docs/control-plane/api/clients/#workflow-files): `workflows`
+ * adds `workflows: write`, without which GitHub refuses a push that adds or changes a file under
+ * `.github/workflows/`. Off by default; never on the read-only token.
+ */
+export const GithubPush = z.strictObject({ workflows: z.boolean().default(false) });
+export type GithubPush = z.output<typeof GithubPush>;
 
 /** The injection binding a sandbox's minted token goes out under. */
 export const GITHUB_BINDING = "github";

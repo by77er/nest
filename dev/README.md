@@ -6,7 +6,7 @@ How this repo is built, tested and shipped, and how nest's own agents will maint
 > - CI (`.github/workflows/ci.yml`), `.github/CODEOWNERS`, branch protection on `main` (`ci-ok`) and the `production` environment;
 > - the repo guards (`scripts/`);
 > - the agent skills (`.claude/skills/`);
-> - the first cut of the deploy (`deploy.yml`: infra, the Worker with a smoke check and rollback, the host release; `deploy-dashboard.yml`) and weekly fuzzing (`fuzz.yml`).
+> - the first cut of the deploy (`deploy.yml`: infra, the Worker with a smoke check and rollback, the host release; `deploy-dashboard.yml`, `deploy-projects.yml` and `deploy-projects-infra.yml`) and weekly fuzzing (`fuzz.yml`).
 >
 > The rest (the reviewer's `nest/review` check, the health window, `rollback.yml`, nest's own agents on this repo) is a plan.
 
@@ -57,14 +57,13 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 
 1. **CI, `CODEOWNERS`, guards and agent skills.** Done.
 2. **Me:** the GitHub and Cloudflare steps in [setup.md](setup.md), and stages 1–3 of the [platform setup](../docs/setup/) (a Claude token, the control plane on Cloudflare, cell hosts). Done, except `nest/review` as a required check, which waits for the hand-over.
-3. **Build the minimum platform slice,** in this order. Each step is a PR through the gates above, with me as reviewer until step 4:
-   1. ChannelDO with posts, reads, subscriptions and wakes. Built, then taken out of the platform (principle 9, [microkernel](../docs/README.md#principles)): coordination, GitHub webhooks included, is an external integration over MCP and the public API.
-   2. Grants (taint included). Spawn specs, templates and capabilities are built.
-   3. A coordination integration (messaging, GitHub events into inboxes), and `wake_at`.
-   4. BrokerDO's GitHub App minting and the `github.*` brokered actions.
-   5. A dev sandbox image: git, `gh`, Rust, Node, Python, nftables, with a warm build cache.
-   6. Metrics emitters, the `metrics` capability, and the rest of `deploy.yml` (the health window).
-4. **Hand over:** spawn the maintainer and the monitor. From then on, agents build the rest (Discord, versioned host rollout), and I review only `CODEOWNERS` paths.
+3. **Build the minimum platform slice.** Each step is a PR through the gates above, with me as reviewer until step 4:
+   1. Grants. Taint, spawn specs, templates and capabilities are built; grant attenuation isn't.
+   2. Coordination as an app on the [API clients](../docs/control-plane/api/clients/) interface: the [projects](../projects/README.md) task board (a manager, a worker per task, a reviewer per PR, auto-merge) is built. `wake_at` isn't.
+   3. BrokerDO's GitHub App minting and the `github.*` brokered actions. Built.
+   4. A dev sandbox image with git, `gh`, Rust, Node, Python and nftables, and a warm build cache. `nest-base` has git, `gh` and Python only.
+   5. Metrics emitters, the `metrics` capability, and the rest of `deploy.yml` (the health window).
+4. **Hand over:** spawn the maintainer and the monitor. From then on, agents build the rest (such as versioned host rollout), and I review only `CODEOWNERS` paths.
 
 Workspaces don't need the S3 store first: for a code repo, git is the durable copy, so a lost sandbox costs a re-clone.
 

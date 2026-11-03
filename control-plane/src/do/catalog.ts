@@ -33,6 +33,16 @@ export interface ClientScope {
   /** Its name: its namespace. */
   name: string;
   grant: Grant;
+  /**
+   * The grant's revision: higher for every later `setGrant` (absent in a record from before it: 0). A
+   * copy of the grant kept elsewhere (a sandbox's egress ceiling) is never replaced by an older one.
+   */
+  grant_rev?: number;
+  /**
+   * The identity the revision counts within: random, fixed for the record, and new whenever the record
+   * has no revision (it was lost, or never set), so a copy compares revisions only within one epoch.
+   */
+  grant_epoch?: string;
 }
 
 /** The entries `scope` sees (all of them for the operator, `undefined`). */
@@ -211,7 +221,8 @@ export class CatalogDO extends DurableObject<Env> {
     const r = checkTemplate(tpl, cat.capabilities);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${r.error}`);
     // Expanded as written (no overrides): what it gives must hold together, and a client's stay in its grant.
-    const spec = expandTemplate({ capabilities: cat.capabilities, templates: { [name]: tpl } }, PLATFORM_TOOL_NAMES, name);
+    const spec = expandTemplate({ capabilities: cat.capabilities, templates: { [name]: tpl } }, PLATFORM_TOOL_NAMES, name,
+      scope ? { [scope.name]: scope.client } : {});
     if (!spec.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, spec.error);
     if (scope) {
       const refusal = grantRefusal(scope.client, specOutsideGrant(spec.value, scope.grant));
@@ -234,7 +245,8 @@ export class CatalogDO extends DurableObject<Env> {
   private async namespaceClients(cat: Catalog, name: string, scope?: ClientScope): Promise<Record<string, string>> {
     const tpl = Object.hasOwn(cat.templates, name) ? cat.templates[name] : undefined;
     const out: Record<string, string> = scope ? { [scope.name]: scope.client } : {};
-    const wanted = new Set((tpl?.capabilities ?? []).filter((c) => cat.capabilities[c]?.mcp).map(namespaceOf).filter((ns): ns is string => ns !== null));
+    const wanted = new Set([...(tpl?.capabilities ?? []).filter((c) => cat.capabilities[c]?.mcp), ...(tpl?.inject?.length ? [name] : [])]
+      .map(namespaceOf).filter((ns): ns is string => ns !== null));
     for (const ns of wanted) {
       if (Object.hasOwn(out, ns)) continue;
       const id = await this.env.CLIENT.get(this.env.CLIENT.idFromName(CLIENT_DIRECTORY)).lookup(ns);

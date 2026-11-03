@@ -120,6 +120,8 @@ struct Sbx {
     slots: BTreeMap<AgentId, (u16, Option<u32>)>,
     /// agent → initial Bash cwd (`agent_attach.cwd`, default `/workspace`)
     slot_cwds: BTreeMap<AgentId, String>,
+    /// agent → its slot's environment (`agent_attach.env`)
+    slot_envs: BTreeMap<AgentId, BTreeMap<String, String>>,
     /// tcp exception rule (`host:port`) → (listener id, port)
     tcp_listeners: BTreeMap<String, (u32, u16)>,
     known_ports: BTreeSet<u16>,
@@ -135,6 +137,9 @@ struct Sbx {
     /// The last pass over the disk a later commit may reuse unread (`nestd_core::checkpoint`). In
     /// memory only: a restarted nestd reads every disk it salvages.
     scan_memo: ScanMemo<Manifest>,
+    /// How many times a VM has started or resumed on this disk: a commit marks the disk clean only
+    /// if none has since its read (a checkpoint's VM resumes right after the read).
+    runs: u64,
 }
 
 impl Sbx {
@@ -167,6 +172,7 @@ impl Sbx {
             next_listener: 1,
             slots: BTreeMap::new(),
             slot_cwds: BTreeMap::new(),
+            slot_envs: BTreeMap::new(),
             tcp_listeners: BTreeMap::new(),
             known_ports: BTreeSet::new(),
             exposed: BTreeMap::new(),
@@ -175,6 +181,7 @@ impl Sbx {
             guest_info: None,
             unanswered: None,
             scan_memo: ScanMemo::new(),
+            runs: 0,
         }
     }
 
@@ -203,7 +210,12 @@ impl Sbx {
 
     /// The attached agents' slots, as the guest's `configure` carries them.
     fn agent_slots(&self) -> Vec<AgentSlot> {
-        self.slots.iter().map(|(agent, (slot, _))| slot_for(agent, *slot, self.slot_cwds.get(agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into()))).collect()
+        self.slots
+            .iter()
+            .map(|(agent, (slot, _))| {
+                slot_for(agent, *slot, self.slot_cwds.get(agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into()), self.slot_envs.get(agent).cloned().unwrap_or_default())
+            })
+            .collect()
     }
 
     /// What `meta.json` records about this incarnation (see `recovery.rs`), with `inflight` as the
@@ -1483,7 +1495,7 @@ impl Inner {
             // Resolved on receipt (see `on_fleet_notice`).
             CommandBody::CommitResult { .. } | CommandBody::GuestCliResult { .. } => Ok(None),
             CommandBody::AgentStart(start) => self.agent_start(start).await,
-            CommandBody::AgentAttach { sandbox, epoch, agent, cwd } => self.agent_attach(&sandbox, epoch, &agent, cwd).await,
+            CommandBody::AgentAttach { sandbox, epoch, agent, cwd, env } => self.agent_attach(&sandbox, epoch, &agent, cwd, env).await,
             CommandBody::AgentDetach { sandbox, epoch, agent, kill_processes } => self.agent_detach(&sandbox, epoch, &agent, kill_processes).await,
             // A kill was applied on arrival; a graceful stop (or one from the previous release) goes in order.
             CommandBody::AgentStop { mode: Some(StopMode::Kill), .. } => Ok(None),
@@ -1654,6 +1666,7 @@ impl Inner {
         self.unless_fenced(s, "VM start")?;
         s.disk_clean = false;
         s.persist(None).context("write meta.json")?;
+        s.runs += 1;
         let vm = s.vm.as_mut().expect("created");
         vm.start().await.context("start VM")?;
         self.register_pauser(&s.id, s.epoch, vm.as_ref());
@@ -1700,6 +1713,7 @@ impl Inner {
     /// Run `s`'s VM again after [`Self::pause_vm`]. The gateway admits binds again only once the
     /// VM runs: a VM that fails to resume stays marked paused, which it is.
     async fn resume_vm(&self, s: &mut Sbx) -> std::io::Result<()> {
+        s.runs += 1;
         if let Some(vm) = s.vm.as_mut() {
             vm.resume().await?;
         }
@@ -1889,6 +1903,7 @@ impl Inner {
             s.disk_clean = false;
             s.persist(None).map_err(internal)?;
             self.ensure_not_fenced(id, epoch)?;
+            s.runs += 1;
             s.vm.as_mut().expect("checked").resume().await.map_err(internal)?;
             s.paused = false;
             if let Some(g) = &s.guest {
@@ -2094,7 +2109,7 @@ impl Inner {
 
     /// The sandbox side of `attach`: a slot (explicit proxy listener + guest `agent_attach`) for
     /// the agent, then the gateway learns the client. Idempotent: an existing slot keeps its port.
-    async fn agent_attach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, cwd: Option<String>) -> CmdResult {
+    async fn agent_attach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, cwd: Option<String>, env: BTreeMap<String, String>) -> CmdResult {
         let mut s = self.lock_live(sandbox, epoch).await?;
         let slot = match s.slots.get(agent) {
             Some((slot, _)) => *slot,
@@ -2118,12 +2133,13 @@ impl Inner {
         let cwd = cwd.unwrap_or_else(|| DEFAULT_CWD.into());
         let fresh = s.slots.insert(agent.clone(), (slot, listener_id)).is_none();
         s.slot_cwds.insert(agent.clone(), cwd.clone());
+        s.slot_envs.insert(agent.clone(), env.clone());
         self.gateway_sync(&s);
         // The guest round trip (up to 30 s) runs without the sandbox lock, so a fence, suspend or
         // checkpoint is never queued behind it.
         let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
         drop(s);
-        let attached = guest.attach(slot_for(agent, slot, cwd)).await;
+        let attached = guest.attach(slot_for(agent, slot, cwd, env)).await;
         // Fenced meanwhile: the slot is moot and the answer is `stale_epoch`, whatever the guest said.
         if let Err(e) = self.ensure_not_fenced(sandbox, epoch) {
             if fresh {
@@ -2148,6 +2164,7 @@ impl Inner {
             self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
         }
         s.slot_cwds.remove(agent);
+        s.slot_envs.remove(agent);
         if let Some(g) = &s.guest {
             g.forget_slot(agent);
         }
@@ -2166,6 +2183,7 @@ impl Inner {
             return Ok(Some(serde_json::json!({ "note": "not attached" })));
         };
         s.slot_cwds.remove(agent);
+        s.slot_envs.remove(agent);
         if let Some(id) = listener {
             self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
         }
@@ -2226,7 +2244,8 @@ impl Inner {
     /// this commit to go on (a salvage after another kind of request).
     async fn reask(self: &Arc<Self>, s: SbxGuard, reason: CommitReason, timeout: Duration) -> (SbxGuard, Result<Option<(SentCommit, Option<GenerationRecord>)>, ErrorBody>) {
         let Some(prev) = s.unanswered.clone() else { return (s, Ok(None)) };
-        let (s, r) = self.send_commit(s, prev.clone(), timeout).await;
+        // Never marks the disk clean: what it was read from is unknown here.
+        let (s, r) = self.send_commit(s, prev.clone(), timeout, None).await;
         match r {
             Ok(g) => (s, Ok(Some((prev, g)))),
             Err(e) if incarnation::reask_failure_ends_commit(reason == CommitReason::Salvage, prev.reason == CommitReason::Salvage, !e.retryable) => (s, Err(e)),
@@ -2247,6 +2266,7 @@ impl Inner {
         }
         // The memo is trusted only where a pause or stop really stops every write to the file.
         let stable = stable && self.driver.pause_quiesces_disk();
+        let runs = s.runs;
         // Begun, the memo is forgotten: a pass that fails anywhere below (the sentinel set over
         // content it doesn't describe included) leaves nothing a later commit could reuse.
         let reuse = s.scan_memo.begin(stable, disk_stamp(&disk).ok().as_ref());
@@ -2286,7 +2306,7 @@ impl Inner {
         if incarnation::nothing_to_salvage(reason == CommitReason::Salvage, s.head.as_ref().map(|h| &h.disk_manifest), &disk_scan.hash) {
             return Ok(None);
         }
-        Ok(Some(Prepared { disk: disk_scan, mem: mem_scan, reason }))
+        Ok(Some(Prepared { disk: disk_scan, mem: mem_scan, reason, runs_at_read: runs }))
     }
 
     /// Upload what [`Inner::scan`] held back and the manifests, then send the `commit_request`
@@ -2300,7 +2320,7 @@ impl Inner {
     ) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
         let store = self.store.clone();
         let started = Instant::now();
-        let Prepared { disk, mem, reason } = p;
+        let Prepared { disk, mem, reason, runs_at_read } = p;
         let published = tokio::task::spawn_blocking(move || -> std::io::Result<(ManifestHash, Option<ManifestHash>)> {
             storage::publish(store.as_ref(), &disk)?;
             if let Some(m) = &mem {
@@ -2323,12 +2343,14 @@ impl Inner {
         {
             return (s, Ok(g));
         }
-        self.send_commit(s, c, timeout).await
+        self.send_commit(s, c, timeout, Some(runs_at_read)).await
     }
 
     /// Send a `commit_request` and wait (unlocked) for its answer; a timeout keeps it as
     /// [`Sbx::unanswered`] for the next commit to ask again.
-    async fn send_commit(self: &Arc<Self>, s: SbxGuard, c: SentCommit, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
+    /// `read_at`: [`Sbx::runs`] when the committed disk was read (`None`: unknown, as for a request
+    /// asked about again): the disk is marked clean only if no VM has run since.
+    async fn send_commit(self: &Arc<Self>, s: SbxGuard, c: SentCommit, timeout: Duration, read_at: Option<u64>) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
         // Recorded before it goes out (or not sent): a restart asks again under this id.
         if let Err(e) = s.persist(Some(&c)) {
             return (s, Err(error(error_codes::INTERNAL, format!("recording commit {}: {e}", c.request), true)));
@@ -2361,7 +2383,7 @@ impl Inner {
                 if s.unanswered.as_ref().is_some_and(|u| u.request == c.request) {
                     s.unanswered = None;
                 }
-                self.apply_commit(&mut s, &id, o)
+                self.apply_commit(&mut s, &id, o, read_at)
             }
             Err(e) => {
                 s.unanswered = Some(c);
@@ -2372,13 +2394,15 @@ impl Inner {
         (s, r)
     }
 
-    fn apply_commit(self: &Arc<Self>, s: &mut Sbx, id: &SandboxId, outcome: CommitOutcome) -> Result<Option<GenerationRecord>, ErrorBody> {
+    fn apply_commit(self: &Arc<Self>, s: &mut Sbx, id: &SandboxId, outcome: CommitOutcome, read_at: Option<u64>) -> Result<Option<GenerationRecord>, ErrorBody> {
         match outcome {
             CommitOutcome::Committed { generation } => {
                 s.head = Some(generation.clone());
-                // Clean only while no VM runs on the disk (a suspend); `send_commit` persists it. A
-                // checkpoint's VM resumed before the answer: its disk stays dirty.
-                let still = s.vm.is_none() || s.paused;
+                // Clean only if no VM has run on the disk since it was read, and none runs now (a
+                // suspend); `send_commit` persists it. A checkpoint's VM resumed before the answer,
+                // and a fence may have stopped it while the answer was awaited: its disk stays
+                // dirty, so a retire salvages what it wrote.
+                let still = (s.vm.is_none() || s.paused) && read_at == Some(s.runs);
                 s.disk_clean = still;
                 self.with_row(id, s.epoch, |x| {
                     x.head = Some(generation.id.clone());
@@ -2419,6 +2443,8 @@ struct Prepared {
     disk: storage::Scanned,
     mem: Option<storage::Scanned>,
     reason: CommitReason,
+    /// [`Sbx::runs`] when the disk was read.
+    runs_at_read: u64,
 }
 
 /// Chunks a commit holds back in memory for upload after a checkpoint's VM resumes; past this it
@@ -2463,12 +2489,12 @@ fn is_request_denial(r: &EgressAuditRecord) -> bool {
     r.verdict == EgressVerdict::Deny && r.count.is_none() && r.port != 0
 }
 
-fn slot_for(agent: &AgentId, slot: u16, cwd: String) -> AgentSlot {
+fn slot_for(agent: &AgentId, slot: u16, cwd: String, env: BTreeMap<String, String>) -> AgentSlot {
     AgentSlot {
         agent_id: agent.clone(),
         proxy_port: EXPLICIT_BASE_PORT + slot,
         cwd,
-        env: Default::default(),
+        env,
         memory_max_bytes: None,
     }
 }

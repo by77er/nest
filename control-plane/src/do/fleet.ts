@@ -45,6 +45,9 @@ import { AGENTS_CURSOR, agentCursorOf, type AgentRead, classifyAgent, classifySa
 import { cellIdleTtlMs } from "../lib/lifetimes";
 import { labelWhere, type Labels } from "../lib/clients";
 
+/** A `secrets_update` entry whose reference resolved to nothing: removed before the batch goes out. */
+const DROPPED_SECRET = "\u0000nest:dropped";
+
 /** What an agent or sandbox registers beside its id: its API client and labels (fixed at creation). */
 export interface RegistryMeta {
   client: string | null;
@@ -946,7 +949,12 @@ export class FleetDO extends DurableObject<Env> {
       for (const s of slots) {
         const value = values.get(s.purpose)?.[s.ref];
         if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
-        s.set(value ?? "");
+        // A missing injection secret goes out as no secret at all, never an empty one: nest-proxy then
+        // refuses its binding's placeholder (`injection_unavailable`) instead of substituting "".
+        s.set(value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+      }
+      for (const c of (m.commands as Record<string, unknown>[] | undefined) ?? []) {
+        if (c.type === "secrets_update" && Array.isArray(c.secrets)) c.secrets = (c.secrets as { value?: unknown }[]).filter((x) => x.value !== DROPPED_SECRET);
       }
       this.send(ws, m as FleetToHost);
       ws.serializeAttachment({ host, helloed: true, sent: m.seq } satisfies Attachment);

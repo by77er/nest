@@ -6,7 +6,8 @@ import { IconAlertTriangle } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { icon, motion } from "../theme";
 
-export function LoadingState({ label }: { label: string }) {
+/** `terminal`: inside a trace's terminal, in its muted tone (AA on that surface, where `dimmed` isn't). */
+export function LoadingState({ label, terminal = false }: { label: string; terminal?: boolean }) {
   const [shown, setShown] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => setShown(true), motion.spinnerDelay);
@@ -17,7 +18,7 @@ export function LoadingState({ label }: { label: string }) {
       {shown && (
         <Center style={{ gap: "var(--mantine-spacing-sm)" }}>
           <Loader size="sm" color="gray" />
-          <Text c="dimmed" size="sm">
+          <Text c={terminal ? undefined : "dimmed"} size="sm" style={terminal ? { color: "var(--nest-term-muted)" } : undefined}>
             {label}
           </Text>
         </Center>

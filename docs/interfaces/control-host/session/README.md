@@ -1,7 +1,6 @@
 # Session channel (agent runner ↔ AgentDO)
 
-> **Implemented contract.** In the design, `segment_ack` follows the SQLite commit and there are no roles; see [pending contract changes](../../README.md#pending-contract-changes).
-
+> **Implemented contract.** In the design, `segment_ack` follows the SQLite commit; see [pending contract changes](../../README.md#pending-contract-changes).
 
 One WebSocket per **active** agent, opened by the agent runner after `agent_start`. It carries the native session file, canonical events, turn control, synchronous-hook caches and platform tool calls. The runner's hello carries the agent epoch AgentDO issued for this brain start (`agent_start.epoch`), for every agent; the sandbox epoch travels only inside the agent's binding ([gateway](../../gateway/)). A hello with epoch `0` (a runner that predates the agent epoch) is stale.
 
@@ -11,12 +10,12 @@ One WebSocket per **active** agent, opened by the agent runner after `agent_star
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello` | first frame | agent, host, `instance_id` (random per brain process), epoch (the agent epoch), `session?`, `local_bytes?`, `last_seq?`, `tools_changed?` (true: the runner acts on `tools_changed`; absent from older runners, which are never sent it) |
+| `hello` | first frame | agent, host, `instance_id` (random per brain process), epoch (the agent epoch), `session?`, `local_bytes?`, `last_seq?`, `tools_changed?` (true: the runner acts on `tools_changed`; absent from runners of the previous release, which are never sent it and list again only at their next start. A capability flag, kept until every runner sends it) |
 | `segment` | by offset | Raw JSONL bytes `[offset, offset+len)` of the native session file, base64. `base: true` means the file was rewritten (it shrank or its inode changed): discard earlier segments; this one starts at offset 0 |
 | `events` | seq | A batch of `model::AgentEvent` (each with its own per-agent `seq`), coalesced. Each event's `epoch` is the one this connection's hello presented; AgentDO drops any other |
 | `tool_call` | seq | A platform tool call relayed from nest-mcp: `call`, `turn?`, `name`, `arguments` |
 | `tools_list_request` | no | nest-mcp `tools/list` |
-| `cancel_call` | seq | `call`, `reason`. The runner abandoned a platform call (it timed out locally and the model was told `outcome_unknown`). An unacked `tool_call` is replaced in place by a `cancel_call` with the same seq, and a fresh one is always sent too. AgentDO marks the call done with `outcome_unknown` without running it (a later `tool_call` with that id gets that outcome), stops a pending `ask`'s sync wait (its answer then arrives as a turn), and sends no `tool_result`. Idempotent. |
+| `cancel_call` | seq | `call`, `reason`. The runner abandoned a platform call (it timed out locally and the model was told `outcome_unknown`). An unacked `tool_call` is replaced in place by a `cancel_call` with the same seq, and a fresh one is always sent too. AgentDO marks the call done with `outcome_unknown` without running it (a later `tool_call` with that id gets that outcome), withdraws a pending approval wait (the decision then arrives as a turn), and sends no `tool_result`. Idempotent. |
 | `hands_resolve` | no (`request`) | Ask for the sandbox's current gateway URL, a fresh binding and the guest's version: lazily before the first hands call after a brain start, and again after a refused connection, `moved`, `stale_epoch` or `unknown_key`. AgentDO calls SandboxDO's `resolve` and answers only the current runner's socket ([gateway](../../gateway/)) |
 | `ack` | — | Cumulative ack of reliable `AgentToRunner` messages |
 
@@ -61,7 +60,7 @@ runner                                      AgentDO                          R2
 ## Turns, inbox and caches
 
 - **One turn at a time.** AgentDO queues `run_turn`s and sends the next one after `turn_completed`.
-- **Inbox during a turn:** the runner hands it to the model at the next tool boundary, as `PostToolUse` `additionalContext` (the model sees it within the turn, verified on 2.1.316; a subagent's tool call hands it to the subagent instead, which is open: see [runner-hooks](../../host-internal/runner-hooks/)). When the turn ends, the `Stop` hook returns messages still pending as `decision: "block"`, up to `max_stop_continuations` times per stop chain. A message no hook handed out stays in the mirror and AgentDO queues it as the next turn. stdin carries only `run_turn` text, one message per turn.
+- **Inbox during a turn:** the runner hands it to the model at the next tool boundary, as `PostToolUse` `additionalContext` (the model sees it within the turn, verified on 2.1.316; a subagent's tool call hands out nothing, so the message waits for the main loop: [runner-hooks](../../host-internal/runner-hooks/)). When the turn ends, the `Stop` hook returns messages still pending as `decision: "block"`, up to `max_stop_continuations` times per stop chain. A message no hook handed out stays in the mirror and AgentDO queues it as the next turn. stdin carries only `run_turn` text, one message per turn.
 - **Interrupts:** `interrupt` or `inbox{interrupt: true}` sends the stream-json interrupt control message. If the process has been unresponsive for 10 s, the runner falls back to SIGINT, then `cgroup.kill`.
 - **`cache_update`** replaces the rules and inbox mirror used by `PreToolUse`, `PermissionRequest` and `Stop`. The first matching rule wins; no match means `ask`: the runner emits an `escalation{call, tool, input}` event and denies the call with "pending approval (request `call`)". AgentDO holds it as an ask the operator lists (`GET /v1/agents/<id>/asks`) and answers; the decision arrives as an `ask_answer` turn. Updates with a lower `version` are ignored.
 
@@ -71,5 +70,5 @@ nest-mcp (on the host) gets `tools/call`, and the runner sends `tool_call{seq, c
 
 - **Idempotency key:** `(agent, epoch, call)`. A redelivered `tool_call` returns the stored outcome.
 - **Call ids:** `call = cal_<turn>-<n>`, generated by the runner.
-- **Pending:** if a call needs a human or captain and doesn't resolve within about 2 minutes, AgentDO returns `pending{ask, message}`, and nest-mcp returns `message` as the tool's text. The model ends its turn, and the answer later arrives as `run_turn{input.kind: ask_answer}`.
+- **Pending:** if a call needs the operator's approval and doesn't resolve within about 2 minutes, AgentDO returns `pending{ask, message}`, and nest-mcp returns `message` as the tool's text. The model ends its turn, and the answer later arrives as `run_turn{input.kind: ask_answer}`.
 - **Timeouts:** nest-mcp gives up after 150 s and returns `error{rate_limited, retryable}`. A late `tool_result` is acknowledged and discarded.

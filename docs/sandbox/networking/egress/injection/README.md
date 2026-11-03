@@ -37,6 +37,10 @@ stripe-read:
 - **Reserved headers:** a `header{name}` location can't name `host`, `connection`, `content-length`, `transfer-encoding`, `te`, `trailer`, `upgrade`, `keep-alive`, `proxy-authorization`, `proxy-authenticate`, `proxy-connection`, `http2-settings`, or a [routing override](../inspection/). Substituting into them would change routing or framing after the proxy checked it. SPACE reserves the same standard headers ([net/common](https://github.com/perplexityai/space/blob/main/crates/libs/net/common/src/lib.rs)).
 - **Processors:** a binding's `where` covers bearer and basic credentials and named headers now. Request-signing processors (AWS SigV4, OAuth2 client credentials, HMAC) come later, as in Fly's [Tokenizer](https://github.com/superfly/tokenizer).
 
+## API clients' bindings
+
+**Built (2026-11-02):** an API client declares bindings naming its own write-only secrets, in its templates, its spawns' overrides (which only narrow) and its sandbox specs, on hosts within its grant's `inject_hosts`; nest assigns the placeholder (`nest-ph.<client>.<name>.`). On the wire each is an ordinary binding named `client:<name>`, so nest-proxy needs nothing new; BrokerDO serves its secret only under that client's id, and only for the sandbox's own client. Decisions: [API clients](../../../../control-plane/api/clients/#injection).
+
 ## On the wire
 
 - **No protocol upgrade after a substitution.** A request that had a placeholder substituted can't upgrade to WebSocket (h1 `Upgrade` or h2 extended CONNECT): 403, `injection_upgrade`. Masking follows HTTP responses, not frames.
@@ -48,6 +52,7 @@ stripe-read:
 ## Secrets in the proxy
 
 - **Static secrets are keyed by sandbox:** BrokerDO serves the most specific of `inject:<binding>:<sandbox>`, `inject:<binding>:<workstream>` (the sandbox's compat `ws_` value: still read in case secrets were stored under it before the sandbox key; nothing new is keyed by it) and `inject:<binding>`.
+- **An unresolved reference is refused, not substituted** (2026-11-02): a `secrets_update` entry whose reference resolves to nothing (a deleted or expired secret, the operator's static ones too) is left out of the push, so nest-proxy has no secret for that binding and refuses its placeholder (`injection_unavailable`), never sending an empty credential.
 - **They arrive separately today** (`secrets_set`, checked against the sandbox's epoch only). Designed, not built: each push carries the policy's version and sha256, and the proxy **refuses a secret whose binding isn't in the installed policy**, or that names another policy version or hash ([nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#policy-acknowledgement)).
 - **Fenced:** after the sandbox's lease or epoch expires, bindings stop substituting.
 - **Alerts carry the binding name** (`ProxyEvent::Alert.binding`) for `placeholder_wrong_host` and `injection_after_expiry`. Domain-fronting alerts have none.
@@ -55,6 +60,7 @@ stripe-read:
 ## GitHub
 
 - **GitHub uses a GitHub App (built).** A sandbox with a [push allowlist](../policy/#repo-allowlists) gets the binding `github` from the GitHub rule constructor; BrokerDO mints its installation token narrowed to exactly the allowed repos with `contents: write` (which includes the `contents: read` pull requests need) and `pull_requests: write`, valid for one hour, and SandboxDO pushes it again 15 minutes before it expires ([BrokerDO](../../../../control-plane/durable-objects/broker/#injection-minting)). An operator binding named `github` in the sandbox layer replaces the constructed one (and its static secret is used instead).
+- **`workflows: write` on the push token only when asked** (`github_push: {workflows: true}` in a template, a sandbox spec or the operator's layer, within an API client's grant): GitHub refuses a push that changes `.github/workflows/` without it. A pushed workflow runs with the repo's Actions secrets before review, so CI secrets belong in an approval-gated environment ([workflow files](../../../../control-plane/api/clients/#workflow-files)).
 - **Read-only repos get a token of their own** under the binding `github_read`, which can only read, and under `github_read_default` (the default placeholder) when the sandbox has no allowlist ([read-only repos](../policy/#read-only-repos)). An operator binding named `github_read` replaces that one the same way.
 - **The token doesn't decide where a push may go:** the [request guards](../policy/#github) do, whatever credential a request carries.
 - **Defaults in the image (built, `images/guest/`):**
