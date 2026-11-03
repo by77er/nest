@@ -278,6 +278,10 @@ export const MIGRATIONS = [
     // nest names minted for a value write and not yet recorded (each is used once), the grant as last
     // seen (a change owes every layer), and when the secrets' upkeep runs next.
     "CREATE TABLE minted (nest_name TEXT PRIMARY KEY, at_ms INTEGER NOT NULL)",
+    // Start attempts abandoned (the workflows setting turned off mid-start): what they may have made,
+    // found by their labels and destroyed, twice (the second after a create still in flight has landed).
+    `CREATE TABLE abandoned (task TEXT NOT NULL, start INTEGER NOT NULL, passes INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY (task, start))`,
     "ALTER TABLE settings ADD COLUMN grant_seen TEXT",
     "ALTER TABLE settings ADD COLUMN secrets_next_ms INTEGER",
   ],
@@ -352,17 +356,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
     if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
     if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
-    if (u.workers_edit_workflows === false && before.workers_edit_workflows) {
-      // Off for starts in flight too: their frozen specs lose it. A retry of a create whose answer was
-      // lost then differs from its first try, which nest refuses (409) for good: that start fails,
-      // rather than a worker starting with it after the owner turned it off.
-      for (const r of this.sql.exec<{ key: string; spec: string }>("SELECT key, spec FROM start_specs").toArray()) {
-        const spec = JSON.parse(r.spec) as StartSpec;
-        if (!spec.extras.github_push) continue;
-        delete spec.extras.github_push;
-        this.sql.exec("UPDATE start_specs SET spec = ? WHERE key = ?", JSON.stringify(spec), r.key);
-      }
-    }
+    if (u.workers_edit_workflows === false && before.workers_edit_workflows) this.abandonWorkflowStarts();
     if (u.auto_merge !== undefined && u.auto_merge !== before.auto_merge) this.setAutoMerge(u.auto_merge);
     this.autoAssign();
     await this.arm();
@@ -1634,6 +1628,46 @@ export class ProjectDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * The workflows setting turned off: each worker start in flight whose spec was frozen with it (no agent
+   * yet: its create may have been made, its answer lost) is abandoned for a new attempt, frozen afresh
+   * without it. Resending the old spec without it would be refused (its Idempotency-Key binds the
+   * request), and the task would stall. What the old attempt made is found by its labels and destroyed
+   * (`cleanAbandoned`); one still being made lands on a stale attempt, which stops it (`startWorker`).
+   */
+  private abandonWorkflowStarts(): void {
+    const s = this.settings()!;
+    for (const t of this.sql.exec<{ id: string; assignments: number }>("SELECT id, assignments FROM tasks WHERE state = 'assigned' AND assignee IS NULL").toArray()) {
+      const spec = this.frozenSpec(`${s.id}/${t.id}/${t.assignments}`);
+      if (!spec?.extras.github_push?.workflows) continue;
+      this.sql.exec("INSERT OR IGNORE INTO abandoned (task, start, next_ms) VALUES (?, ?, ?)", t.id, t.assignments, Date.now());
+      this.sql.exec("UPDATE tasks SET assignments = assignments + 1, start_next_ms = ?, start_attempts = 0, start_error = NULL WHERE id = ?", Date.now(), t.id);
+      this.record(t.id, { kind: "app", what: "assign" }, "start_abandoned", { start: t.assignments, reason: "workflows turned off" });
+    }
+  }
+
+  /** Destroy what an abandoned start attempt made: its agents (and their sandboxes), then any sandbox left, by labels. */
+  private async cleanAbandoned(nest: Nest, task: string, start: number): Promise<void> {
+    const s = this.settings()!;
+    const labels = { project: s.id, role: "worker", task, start: String(start) };
+    try {
+      for (const a of (await nest.listAgents(labels)).agents) if (a.agent) await nest.stopAgent(a.agent, { end: true, destroySandbox: true, reason: "start abandoned: workflows turned off" });
+      for (const x of (await nest.listSandboxes(labels)).sandboxes) {
+        if (!x.sandbox) continue;
+        await nest.destroySandbox(x.sandbox).catch((e) => {
+          if (!(e instanceof NestError && e.status === 404)) throw e;
+        });
+      }
+      const passes = this.sql.exec<{ passes: number }>("SELECT passes FROM abandoned WHERE task = ? AND start = ?", task, start).one().passes + 1;
+      // Again once a create still in flight can no longer land (nest's idempotency lease is 60 s).
+      if (passes >= 2) this.sql.exec("DELETE FROM abandoned WHERE task = ? AND start = ?", task, start);
+      else this.sql.exec("UPDATE abandoned SET passes = ?, attempts = 0, error = NULL, next_ms = ? WHERE task = ? AND start = ?", passes, Date.now() + ABANDON_RECHECK_MS, task, start);
+    } catch (e) {
+      const attempts = this.sql.exec<{ attempts: number }>("SELECT attempts FROM abandoned WHERE task = ? AND start = ?", task, start).one().attempts + 1;
+      this.sql.exec("UPDATE abandoned SET attempts = ?, error = ?, next_ms = ? WHERE task = ? AND start = ?", attempts, message(e), Date.now() + backoff(attempts), task, start);
+    }
+  }
+
   /** The secrets' upkeep is due soon: after a write, once the grace for retired names has passed. */
   private upkeepSoon(): void {
     const at = Date.now() + SWEEP_GRACE_MS;
@@ -1813,7 +1847,8 @@ export class ProjectDO extends DurableObject<Env> {
       min(`SELECT MIN(t) AS t FROM (
         SELECT deadline_ms AS t FROM waits WHERE resolved_ms IS NULL
         UNION ALL SELECT next_ms FROM layers WHERE next_ms IS NOT NULL
-        UNION ALL SELECT secrets_next_ms FROM settings WHERE secrets_next_ms IS NOT NULL)`),
+        UNION ALL SELECT secrets_next_ms FROM settings WHERE secrets_next_ms IS NOT NULL
+        UNION ALL SELECT next_ms FROM abandoned)`),
       // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
       // the repo allows it).
       min(`SELECT MIN(t) AS t FROM (
@@ -1867,6 +1902,7 @@ export class ProjectDO extends DurableObject<Env> {
     const now = Date.now();
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
     if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);
+    for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
     if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge(nest);
     if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge(nest);
     // A PR's auto-merge is enabled only once the repo allows it; disabling needn't wait.
@@ -2202,6 +2238,8 @@ function workerBrief(s: Settings, t: Task): string {
 type Grant = NonNullable<Awaited<ReturnType<Nest["self"]>>["grant"]>;
 /** How long a retired or orphaned nest secret is kept, so layers naming it have moved on first. */
 const SWEEP_GRACE_MS = 5 * 60_000;
+/** When an abandoned start attempt is looked for again: past nest's 60 s idempotency lease, with room. */
+const ABANDON_RECHECK_MS = 2 * 60_000;
 /** How often the secrets' upkeep (the grant read, the sweep) runs while the project has secrets. */
 const UPKEEP_EVERY_MS = 10 * 60_000;
 /** A minted name not used in this long is the Worker's write that never came back: no longer reserved. */

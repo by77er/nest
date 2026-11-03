@@ -455,23 +455,41 @@ describe("requesting a secret", () => {
 });
 
 describe("workers editing CI workflows", () => {
-  it("off: a start in flight loses it (its retry fails rather than start with it); live workers that have it are listed", async () => {
+  it("off mid-start: the attempt is abandoned for a new one without it, and what the old one made is destroyed", async () => {
     const p = await newProject();
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
     const live = await assignedWorker(p);
-    // A second start whose create was made but its answer lost: in flight, frozen with workflows.
+    // A start whose sandbox was made with workflows, its answer lost: in flight.
     fake.lost.push({ match: /^POST \/v1\/sandboxes$/, times: 1 });
     const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t2" })).body;
     await api(token, "PUT", `/api/projects/${p.id}/tasks/${t.id}/spec`, spec);
     await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
+    const made = [...fake.sandboxes.values()].filter((x) => x.labels.task === t.id);
+    expect(made).toHaveLength(1);
+    expect(made[0]!.github_push).toEqual({ workflows: true });
+    const first = made[0]!.labels.start;
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: false });
     await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE tasks SET start_next_ms = 0 WHERE start_next_ms IS NOT NULL"); });
     await drain(p);
-    const retries = fake.callsTo("POST", /^\/v1\/sandboxes$/).filter((c) => c.body.labels?.task === t.id);
-    expect(retries.length).toBeGreaterThan(1);
-    expect(retries.at(-1)!.body.github_push).toBeUndefined();
-    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body.state).not.toBe("in_progress");
+    // The old attempt's sandbox, found by its labels, is gone; a new attempt started without workflows.
+    expect(made[0]!.ended).toBe(true);
+    const fresh = [...fake.sandboxes.values()].filter((x) => x.labels.task === t.id && !x.ended);
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]!.labels.start).not.toBe(first);
+    expect(fresh[0]!.github_push).toBeNull();
+    const task = (await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body;
+    expect(task.state).toBe("in_progress");
+    expect(task.history.some((h: { action: string }) => h.action === "start_abandoned")).toBe(true);
+    // Nothing of the old attempt's was resent with its key: no 409.
+    expect(fake.calls.filter((c) => c.path === "/v1/sandboxes" && c.method === "POST" && c.body.labels?.task === t.id && c.body.labels?.start === first)).toHaveLength(1);
     expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.workflow_workers).toEqual([live.worker]);
+    // Looked for once more after the lease (a create still in flight may land late), then forgotten.
+    const late = { ...made[0]!, sandbox: "sbx_late1", ended: false };
+    fake.sandboxes.set(late.sandbox, late);
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE abandoned SET next_ms = 0"); });
+    await drain(p);
+    expect(fake.sandboxes.get("sbx_late1")!.ended).toBe(true);
+    expect(await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM abandoned").one().n)).toBe(0);
   });
 
   it("is off by default; on, it reaches worker sandboxes only; refused when the grant doesn't allow it", async () => {

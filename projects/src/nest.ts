@@ -151,6 +151,11 @@ export class Nest {
     return (await this.createAgent({ template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
   }
 
+  /** Destroy one of the app's sandboxes (`DELETE /v1/sandboxes/<id>`, owner auth). */
+  async destroySandbox(sandbox: string): Promise<void> {
+    await this.call("DELETE", `/v1/sandboxes/${encodeURIComponent(sandbox)}`);
+  }
+
   getAgent(agent: string): Promise<AgentView> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}`);
   }

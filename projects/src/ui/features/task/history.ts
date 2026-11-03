@@ -54,6 +54,8 @@ export function summarize(h: HistoryRow): string {
       return str(o.agent) ? `${str(o.agent)} started on it` : "Worker started";
     case "start_failed":
       return text ? `The worker couldn't start: ${clip(text)}` : "The worker couldn't start";
+    case "start_abandoned":
+      return "The worker's start began again, without workflow changes (the setting was turned off)";
     case "pr_opened":
       return typeof o.pr === "number" ? `PR #${o.pr} opened` : "PR opened";
     case "worker_exited": {
