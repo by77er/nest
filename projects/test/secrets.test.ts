@@ -455,6 +455,32 @@ describe("requesting a secret", () => {
 });
 
 describe("workers editing CI workflows", () => {
+  it("turned off while a start waits on the grant read: the start freezes without it", async () => {
+    const p = await newProject();
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
+    const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t" })).body;
+    await api(token, "PUT", `/api/projects/${p.id}/tasks/${t.id}/spec`, spec);
+    // The start's grant read is held; the owner turns the setting off meanwhile.
+    let release!: () => void;
+    const hold = { match: /^GET \/v1\/clients\/self$/, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    const assigning = api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
+    for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(hold.reached).toBe(true);
+    const turning = api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: false });
+    for (let i = 0; i < 400; i++) {
+      if ((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.workers_edit_workflows === false) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    release();
+    await Promise.all([assigning, turning]);
+    await drain(p);
+    const live = [...fake.sandboxes.values()].filter((x) => x.labels.task === t.id && !x.ended);
+    expect(live).toHaveLength(1);
+    expect(live[0]!.github_push).toBeNull();
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body.state).toBe("in_progress");
+  });
+
   it("off: a start in flight loses it (its retry fails rather than start with it); live workers that have it are listed", async () => {
     const p = await newProject();
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
