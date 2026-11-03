@@ -15,8 +15,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use nest_protocol::gateway::{
     BindingClaims, CLIENT_BIND_TIMEOUT_MS, ClientMessage, GatewayMessage, GuestInfo, HandsTarget,
-    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, ROUTE_HANDS, close_code, error_code,
-    parse_binding,
+    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, ROUTE_HANDS, RefusalReason, close_code,
+    error_code, parse_binding,
 };
 use nest_protocol::guest::frame::{self, Kind};
 use nest_protocol::model::{Epoch, ErrorBody};
@@ -104,6 +104,9 @@ pub struct Refusal {
     /// The wire's flag; [`Refusal::next`] decides by `code`, not by this.
     pub retryable: bool,
     pub retry_after_ms: Option<u64>,
+    /// The wire's `reason`, where the gateway gave one (`paused`); `None` from a gateway of the
+    /// previous release, or for any other refusal.
+    pub reason: Option<RefusalReason>,
 }
 
 /// The pause before trying the same target again after a `busy` that carried no
@@ -116,13 +119,25 @@ pub const NOT_READY_RETRY: Duration = Duration::from_secs(2);
 /// a call never spends a bind on a binding about to be refused as `unauthorized`.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
+/// Which of a caller's budgets a [`Next::RetrySame`] waits within.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// A `busy` of any other kind (a guest not configured or not answering its vsock, a resync,
+    /// an epoch not placed yet, a bind timeout, the guest's own `busy`): the short budget, so a
+    /// wedged guest fails a call promptly.
+    Busy,
+    /// The gateway's `busy` with reason `paused`: nestd has the VM paused for a commit, which
+    /// ends on its own; the long budget, which covers a checkpoint's pause.
+    Paused,
+}
+
 /// What a client does next about a refusal or a failed open: the one classification every
 /// client (the runner today, `api-loop` later) applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Next {
     /// The same target can succeed later: wait `after`, then open again (within the caller's
-    /// `busy` budget).
-    RetrySame { after: Duration },
+    /// budget for `wait`).
+    RetrySame { after: Duration, wait: Wait },
     /// The same target can never succeed, but a fresh one from `resolve` may: drop it, resolve
     /// again once, and retry once.
     Resolve,
@@ -131,7 +146,8 @@ pub enum Next {
 }
 
 impl Refusal {
-    /// `busy` → [`Next::RetrySame`] after `retry_after_ms` (else [`BUSY_RETRY`]);
+    /// `busy` → [`Next::RetrySame`] after `retry_after_ms` (else [`BUSY_RETRY`]), within the
+    /// [`Wait::Paused`] budget when its reason is `paused` and [`Wait::Busy`] otherwise;
     /// `stale_epoch`, `moved`, `unknown_key`, `unauthorized` (an expired or revoked binding)
     /// and `unsupported_version` (a target minted with a guest version that is no longer the
     /// guest's) → [`Next::Resolve`]; `bad_request` and unknown codes → [`Next::Final`].
@@ -142,6 +158,11 @@ impl Refusal {
                     .retry_after_ms
                     .map(Duration::from_millis)
                     .unwrap_or(BUSY_RETRY),
+                wait: if self.reason == Some(RefusalReason::Paused) {
+                    Wait::Paused
+                } else {
+                    Wait::Busy
+                },
             },
             RefusalCode::StaleEpoch
             | RefusalCode::Moved
@@ -158,7 +179,7 @@ impl Refusal {
 /// other guest error goes to the caller as it is.
 pub fn guest_error_next(error: &ErrorBody) -> Next {
     if error.code == nest_protocol::guest::error_code::BUSY {
-        Next::RetrySame { after: BUSY_RETRY }
+        Next::RetrySame { after: BUSY_RETRY, wait: Wait::Busy }
     } else {
         Next::Final
     }
@@ -298,7 +319,7 @@ impl OpenError {
     /// [`Refusal::next`] for a refusal; [`Next::Resolve`] when nothing usable answered where
     /// the target points ([`TransportError::is_unreachable`], or a connect that timed out: a
     /// host that accepts TCP and never completes the upgrade); [`Next::RetrySame`] after
-    /// [`BUSY_RETRY`] for a bind that timed out (the gateway upgraded and took the `bind`, so
+    /// [`BUSY_RETRY`], within the [`Wait::Busy`] budget, for a bind that timed out (the gateway upgraded and took the `bind`, so
     /// the target is live and nothing reached the guest: a guest slow or frozen past both
     /// timers, or a gateway of an older release whose timer was not shorter than ours);
     /// otherwise [`Next::Final`].
@@ -307,7 +328,7 @@ impl OpenError {
             OpenError::Refused(r) => r.next(),
             OpenError::Transport(t) if t.is_unreachable() => Next::Resolve,
             OpenError::Timeout(Phase::Connect) => Next::Resolve,
-            OpenError::Timeout(Phase::Bind) => Next::RetrySame { after: BUSY_RETRY },
+            OpenError::Timeout(Phase::Bind) => Next::RetrySame { after: BUSY_RETRY, wait: Wait::Busy },
             OpenError::Transport(_) | OpenError::Protocol(_) => Next::Final,
         }
     }
@@ -545,12 +566,14 @@ pub async fn open(target: &HandsTarget, opts: &OpenOptions) -> Result<HandsConn,
             Ok(GatewayMessage::Error {
                 error,
                 retry_after_ms,
+                reason,
                 ..
             }) => Err(OpenError::Refused(Refusal {
                 code: RefusalCode::parse(&error.code),
                 message: error.message,
                 retryable: error.retryable,
                 retry_after_ms,
+                reason: reason.filter(|r| *r != RefusalReason::Unknown),
             })),
             Err(e) => Err(OpenError::Protocol(format!(
                 "first message is not a gateway message: {e}"

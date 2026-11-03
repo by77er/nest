@@ -4,7 +4,8 @@
 import type { z } from "zod";
 import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
-import { nestFrom } from "./nest";
+import { type AgentRecord, type Lookup, managerStatus } from "./manager";
+import { NestError, nestFrom } from "./nest";
 import { Answer, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace } from "./trace";
@@ -59,7 +60,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   if (parts[0] === "agents" && parts.length === 3 && parts[2] === "trace") return proxyTrace(req, env, parts[1]!, url);
   if (parts[0] !== "projects") return err(404, "unknown route");
   if (parts.length === 1) {
-    if (m === "GET") return json({ projects: await directory(env).projects() });
+    // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).
+    if (m === "GET") {
+      const rows = await directory(env).projects();
+      return json({ projects: await Promise.all(rows.map(async (r) => ({ ...r, needs_you: await project(env, r.id).attentionCount() }))) });
+    }
     if (m !== "POST") return err(405, "GET or POST");
     const b = await body(req, CreateProject);
     if (!b.ok) return b.res;
@@ -70,7 +75,10 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     const synced = await sync(env);
     await review(env, p.id).init({ project: p.id, repo: p.repo }, { max_concurrent_reviews: b.value.max_concurrent_reviews });
     const stub = project(env, p.id);
-    await stub.init({ id: p.id, name: p.name, repo: p.repo, auto_assign: b.value.auto_assign, max_workers: b.value.max_workers });
+    await stub.init({
+      id: p.id, name: p.name, repo: p.repo, auto_assign: b.value.auto_assign, max_workers: b.value.max_workers,
+      auto_merge: b.value.auto_merge, merge_method: b.value.merge_method,
+    });
     // Attaches the repo, then starts the manager (README.md#flows).
     await stub.drain();
     const settings = await withReviews(env, p.id, await stub.getSettings());
@@ -89,6 +97,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
 
   switch (route) {
     case "GET ": {
+      // Looking at the project reads the repo's auto-merge setting again (at most once a minute).
+      await p.refreshRepoAutoMerge();
       const s = await withReviews(env, pid, await p.getSettings());
       if (!s.ok) return done(s);
       return json({ ...row, settings: s.value });
@@ -102,8 +112,28 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
       return done(await withReviews(env, pid, await p.updateSettings(rest)));
     }
+    case "POST auto-merge/retry":
+      return done(await withReviews(env, pid, await p.retryRepoAutoMerge()));
     case "POST attach":
       return done(await withReviews(env, pid, await p.retryAttach()));
+    case "GET manager": {
+      // The manager's status for its page: the project's record, then nest's agent record once it has one.
+      const s = await p.getSettings();
+      if (!s.ok) return done(s);
+      let lookup: Lookup | null = null;
+      if (s.value.attached && s.value.manager) {
+        const nest = nestFrom(env);
+        if (!nest) lookup = { failed: "NEST_CLIENT_TOKEN is not set" };
+        else {
+          try {
+            lookup = { record: (await nest.getAgent(s.value.manager)) as AgentRecord };
+          } catch (e) {
+            lookup = e instanceof NestError && e.status === 404 ? { gone: true } : { failed: e instanceof Error ? e.message : String(e) };
+          }
+        }
+      }
+      return json(managerStatus(s.value, lookup));
+    }
     case "GET reviews":
       return json(await review(env, pid).jobs());
     case "GET tasks":
@@ -137,6 +167,12 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "POST chat": {
       const b = await body(req, Chat);
       return b.ok ? done(await p.postChat(b.value.text), 201) : b.res;
+    }
+    case "GET attention":
+      return done(await p.attention());
+    case "POST tasks/:task/answer": {
+      const b = await body(req, Answer);
+      return b.ok ? done(await p.answerBlocked(task, b.value.answer)) : b.res;
     }
     case "GET asks":
       return done(await p.asks());

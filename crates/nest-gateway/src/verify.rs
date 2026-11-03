@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use nest_protocol::gateway::{
     BindingClaims, BindingParseError, BindingScope, GatewayMessage, GuestInfo, MIN_SUPPORTED_PROTOCOL_VERSION,
-    PAUSED_RETRY_AFTER_MS, PROTOCOL_VERSION, error_code, parse_binding,
+    PAUSED_RETRY_AFTER_MS, PROTOCOL_VERSION, RefusalReason, error_code, parse_binding,
 };
 use nest_protocol::model::ErrorBody;
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
@@ -19,21 +19,28 @@ pub struct Refusal {
     pub message: String,
     pub retryable: bool,
     pub retry_after_ms: Option<u64>,
+    /// Sent as the error's `reason`: only a paused VM's `busy` has one.
+    pub reason: Option<RefusalReason>,
 }
 
 impl Refusal {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Refusal { code, message: message.into(), retryable: false, retry_after_ms: None }
+        Refusal { code, message: message.into(), retryable: false, retry_after_ms: None, reason: None }
     }
 
     pub fn busy(message: impl Into<String>) -> Self {
-        Refusal { code: error_code::BUSY, message: message.into(), retryable: true, retry_after_ms: Some(500) }
+        Refusal { code: error_code::BUSY, message: message.into(), retryable: true, retry_after_ms: Some(500), reason: None }
     }
 
-    /// `busy` while nestd has the VM paused: the hint is [`PAUSED_RETRY_AFTER_MS`], and the
-    /// message names the pause's reason (a client shows it if its budget runs out).
-    pub fn paused(reason: &str) -> Self {
-        Refusal { retry_after_ms: Some(PAUSED_RETRY_AFTER_MS), ..Refusal::busy(format!("the sandbox is paused: {reason}")) }
+    /// `busy` while nestd has the VM paused: reason `paused` (a client waits it out within its
+    /// long budget), the hint [`PAUSED_RETRY_AFTER_MS`], and the message names what the pause is
+    /// for (a client shows it if its budget runs out).
+    pub fn paused(why: &str) -> Self {
+        Refusal {
+            retry_after_ms: Some(PAUSED_RETRY_AFTER_MS),
+            reason: Some(RefusalReason::Paused),
+            ..Refusal::busy(format!("the sandbox is paused: {why}"))
+        }
     }
 
     pub fn moved(message: impl Into<String>) -> Self {
@@ -45,6 +52,7 @@ impl Refusal {
             error: ErrorBody { code: self.code.to_string(), message: self.message.clone(), retryable: self.retryable },
             executed: false,
             retry_after_ms: self.retry_after_ms,
+            reason: self.reason,
         }
     }
 }
@@ -234,6 +242,7 @@ mod tests {
                                     let pause_row = TABLE.iter().position(|(_, holds)| holds(&c)) == Some(TABLE.len() - 1);
                                     assert_eq!(r.retry_after_ms == Some(PAUSED_RETRY_AFTER_MS), pause_row, "{c:?}: {r:?}");
                                     assert_eq!(r.message.contains("checkpoint (turn_end)"), pause_row, "{c:?}: {r:?}");
+                                    assert_eq!(r.reason == Some(RefusalReason::Paused), pause_row, "only the pause row says paused: {c:?}");
                                 }
                                 (got, want) => panic!("{c:?}: got {got:?}, the table says {want:?}"),
                             }

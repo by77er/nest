@@ -1456,8 +1456,20 @@ export class FleetDO extends DurableObject<Env> {
     if (row.type === "agent_attach" && row.sandbox && row.epoch !== null && row.agent) {
       await this.sandbox(row.sandbox).attachResult(host, row.epoch, row.agent, cmd, outcome);
     }
+    // A checkpoint's result, ok or not, lands it in SandboxDO (keyed by this command), even one that
+    // produced no new commit. A SandboxDO still on the previous code lacks the method for a few
+    // minutes after a deploy: logged, and its in-flight record then times out on its own.
+    if (row.type === "sandbox_checkpoint" && row.sandbox && row.epoch !== null) {
+      try {
+        await this.sandbox(row.sandbox).checkpointResult(host, row.epoch, cmd);
+      } catch (e) {
+        console.warn(`FleetDO: checkpoint result ${cmd} for ${row.sandbox} not delivered: ${e}`);
+      }
+    }
     if (outcome.status === "error") {
-      if (row.sandbox && row.epoch !== null) await this.sandbox(row.sandbox).commandFailed(host, row.type, row.epoch, outcome.error);
+      if (row.sandbox && row.epoch !== null && row.type !== "sandbox_checkpoint") {
+        await this.sandbox(row.sandbox).commandFailed(host, row.type, row.epoch, outcome.error);
+      }
       if (row.agent && row.type === "agent_start") {
         // Its index row stays: the start's own exit (owed by nestd until older brains there have
         // gone) or the host's loss removes it. AgentDO condemns the brain, never releases it here.

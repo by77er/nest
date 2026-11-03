@@ -33,7 +33,7 @@ export function AdminPage() {
   const sync = useSync();
 
   return (
-    <Page measure>
+    <Page measure="form">
       <PageHeader title="Admin" />
       <Panel>
         <Section

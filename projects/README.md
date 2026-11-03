@@ -2,7 +2,7 @@
 
 A task board for GitHub repos, run by agents on nest: an app with its own Worker and Durable Objects, built only on nest's [API clients](../docs/control-plane/api/clients/) interface. nest knows nothing of projects, tasks or reviews. A feature here that seems to need one of nest's internals means that interface is wrong: fix it there, generically, and build this on the result.
 
-**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), and attaching a repo and the review pipeline ([below](#built-the-review-pipeline)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
+**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), and auto-merge ([below](#auto-merge)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
 
 ## What it does
 
@@ -28,7 +28,7 @@ All state is the app's. nest holds the agents, their sandboxes and their transcr
 Only the client interface. One client, `projects`, has this grant:
 - `cells`, and `credentials: [claude_oauth_token]`;
 - `repos` and `github.repos`: the attachable repos. Workers push to them; the manager and reviewers only read them, which `repos` covers (no `read_repos` needed);
-- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch). The app reads nothing else on GitHub: a PR's number, head, base and title come in its webhook, and the reviewer reads the code in its sandbox;
+- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
 - `max_agents` and `max_sandboxes`.
 
@@ -37,7 +37,7 @@ Only the client interface. One client, `projects`, has this grant:
 | Templates for the three roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer}` and capabilities `projects/{board,task,review}` (the MCP URLs), synced from this directory at deploy |
 | Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides}`, each with an `Idempotency-Key`. `overrides` is `{repos: [<repo>]}` for a worker, whose sandbox pushes only to that repo, and `{read_repos: [<repo>]}` for the manager and a reviewer, whose sandboxes only read it ([read-only repos](../docs/sandbox/networking/egress/policy/#read-only-repos)). The agent clones it |
 | Talking to the manager | `POST /v1/agents/<id>/inbox`. Replies arrive as `agent.turn_completed` events |
-| Approvals | `agent.ask` events, shown on the board, answered by `POST /v1/agents/<id>/asks/…` |
+| Approvals | `agent.ask` events, shown in "Needs you" with blocked tasks ([below](#blocked)), answered by `POST /v1/agents/<id>/asks/…` |
 | Ending a worker or reviewer | `POST /v1/agents/<id>/stop {end: true, destroy_sandbox: true}` |
 | Knowing what agents did | Signed webhooks to `/hooks/nest`, deduplicated by event `id`. After a gap (the dropped count rises), it re-reads `GET /v1/agents?label=project=<id>` |
 | Check runs and branch protection | `POST /v1/clients/self/github-token {repo, permissions}`, then GitHub's API with that token |
@@ -56,7 +56,7 @@ Only the client interface. One client, `projects`, has this grant:
   - There is no bearer secret: the capabilities name no `auth`, so nest sends no `Authorization`, and the identity is the credential.
 - **Scope comes from the labels:**
   - The manager reads and writes the board of its `project`.
-  - A worker reads its `task`, posts progress on it, and says when its PR is open. It sees no other task.
+  - A worker reads its `task`, posts progress on it, marks it blocked or clears that, and says when its PR is open. It sees no other task.
   - A reviewer reads its `pr` at its `sha`, and submits one verdict per dimension (correctness, quality, architectural cohesiveness) with a summary.
 - **`tainted`** is recorded with each write and shown on the board. It gates nothing: a worker and a reviewer read repo content by design.
 
@@ -83,7 +83,7 @@ Only the client interface. One client, `projects`, has this grant:
   3. Each job creates a check run (`in_progress`) and starts a reviewer.
   4. The reviewer's verdict completes the check: `success` only if all three dimensions pass, else `failure`, with the summary as the check's output.
   5. A reviewer that exits without a verdict is started again, twice, then the check completes as `action_required`. Not `neutral`: a required check accepts `success`, `skipped` and `neutral` ([GitHub](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)), so `neutral` would let the PR merge unreviewed. A `check_run` `rerequested` queues the job again.
-- **Merging** is GitHub's, gated by the required check. A `pull_request` `closed` event with `merged: true` marks the PR's task `done` and ends its worker; closed without merging, it's noted in the task's history and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
+- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR's task `done` and ends its worker; closed without merging, it's noted in the task's history and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
 
 ## Not decided here
 
@@ -112,7 +112,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
   - **Retries:** ProjectDO owes nest its manager, workers, stops and chat messages, each retried from its alarm (5 s doubling to 5 min); a retryable 503 or 409 is also retried within the call. A worker nest refuses for good (a 4xx) stalls its task with the reason; the manager is retried until it starts.
 - **The board:**
-  - **States** (`src/tasks.ts`): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no PR and no live worker (`draft`, `ready`, `stalled`; a stalled task never has a PR, since one with a PR is `in_review`); a draft may be deleted, anything later is cancelled.
+  - **States** (`src/tasks.ts`; a task with a live worker may be re-specced, [below](#task-changes)): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no PR and no live worker (`draft`, `ready`, `stalled`; a stalled task never has a PR, since one with a PR is `in_review`); a draft may be deleted, anything later is cancelled.
   - **A spec** is a goal, acceptance criteria, the files it likely touches and a test plan.
   - **`max_workers`** caps auto-assign and the manager's `assign_task`; the owner's assign by hand isn't capped (nest's `max_agents` still is). A worker counts from its assignment until it exits or the app has stopped it.
   - **History:** every change records who (the owner, the app, or an agent), what, when, and whether the session was tainted.
@@ -147,18 +147,78 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - Rulesets aren't read or changed: a repo protected by rulesets alone gets branch protection besides.
 - **Tasks and PRs:** a `pull_request` from the repo's own branch `task/<id>` (not a fork's) links the PR to its task (`pr_opened`) if the worker hadn't reported it. Merged, the task is `done` (through `pr_opened` first if it was still `in_progress`) and its worker ended.
 
+## Auto-merge
+
+The owner's request (2026-11-02): "Auto-merge should be an option in the project, which writes back to the repo settings."
+
+- **The settings:** `auto_merge` (default off) and `merge_method` (`squash`, the default, `merge` or `rebase`), set at create or with `PATCH /api/projects/:id/settings`.
+- **The repo's "Allow auto-merge":**
+  - Turning `auto_merge` on writes `allow_auto_merge: true` to the repo; turning it off writes `false`. The write is `PATCH /repos/{o}/{r}`, from ProjectDO's alarm, retried from 5 s doubling to 5 min.
+  - A refusal that will repeat is shown (`repo_auto_merge.state: error`), with the setting kept as asked. `POST /api/projects/:id/auto-merge/retry` writes it again.
+  - Looking at the project (`GET /api/projects/:id`) reads the repo's value again, at most once a minute, from the alarm. A value that differs from the setting is shown as `drifted` (changed by hand on GitHub), and the same retry writes it back. A repo whose setting the app never wrote isn't watched.
+- **Per PR:**
+  - While `auto_merge` is on, a task's PR gets GitHub's auto-merge when it opens or reopens, with the project's merge method. The app uses GraphQL `enablePullRequestAutoMerge` with the PR's `node_id` from the webhook.
+  - Only a task's own PR counts: one from the repo's own branch `task/<id>`. Other PRs, and forks' branches with that name, are left alone.
+  - Turning `auto_merge` on enables it on the task PRs already open, and turning it off disables it on them (`disablePullRequestAutoMerge`).
+  - A PR's auto-merge waits until the repo allows it.
+  - The task records each change (`auto_merge_enabled`, `auto_merge_disabled`, `auto_merge_failed` with GitHub's reason) and shows it in its drawer. GitHub's GraphQL `errors` are refusals for good, except its rate limit.
+  - Changing `merge_method` applies to PRs opened after the change.
+- **Merging stays GitHub's,** gated by the required `nest-projects/review` check and the branch's other rules. GitHub's auto-merge merges "after all required reviews and status checks pass" ([GitHub](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request)). A PR that could merge at once has no auto-merge to enable; GitHub refuses it, and that's recorded.
+- **Each call's token:**
+
+| Call | Permissions | Source |
+|---|---|---|
+| `PATCH /repos/{o}/{r}` (`allow_auto_merge`) | `administration: write` | [Permissions required for GitHub Apps](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps) ("Administration": `PATCH /repos/{owner}/{repo}`, write) |
+| `GET /repos/{o}/{r}` (reading `allow_auto_merge`) | `metadata: read`, `contents: write` | the same page ("Metadata": `GET /repos/{owner}/{repo}`, read), and [Get a repository](https://docs.github.com/en/rest/repos/repos#get-a-repository): "To view merge-related settings, you must have the contents:read and contents:write permissions" |
+| GraphQL `enablePullRequestAutoMerge`, `disablePullRequestAutoMerge` | `pull_requests: write`, `contents: write` | GitHub's [GraphQL reference](https://docs.github.com/en/graphql/reference/pulls) names none (unverified). [Auto-merge](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request) needs "write permissions to a repository". The merge it arms is Contents: write (`PUT …/pulls/{n}/merge`, same permissions page), and it changes the PR |
+
+## Blocked
+
+The owner's request (2026-11-02): "Agents might mark their tasks as blocked, which should bubble up to me."
+
+- **A flag, not a state.** A blocked task keeps its state, its worker and its PR, and goes on from there once unblocked. A state would need a way back to wherever it was, and an `in_review` task blocked on a question still has its PR open and under review. The rules are pure, in `src/tasks.ts` (`canBlock`, `canUnblock`):
+  - the manager may block any task that isn't over (`block_task` on `/mcp/board`); a worker only its own, while its worker is live (`report_blocked` on `/mcp/task`, which takes no task id, and the task's assignee must be the caller);
+  - a blocked task isn't blocked again (clear it first). A task that ends (`done`, `cancelled`) drops its block, and auto-assign skips a blocked `ready` task.
+- **What it carries:** who blocked it, their role, when, the reason, an optional question for the owner, and whether the session was tainted.
+- **Unblocking:**
+  - **The owner answers** (`POST /api/projects/:id/tasks/:task/answer {answer}`). The answer goes to the blocking agent's inbox, and to the manager's too when a worker blocked it. Those messages carry the owner's words and the task's id only, nothing an agent wrote, so they're never relayed.
+  - **The manager** (`unblock_task`) **or the task's worker** (`clear_blocked`) clears it when it's resolved another way.
+- **The manager is told** when a worker blocks, with the reason and the question. That text is relayed (`from: "projects/board"`) when the worker's session was tainted, as a brief from a tainted spec is.
+- **Delivery:** messages to agents' inboxes are owed in ProjectDO's `messages` table, posted once each (a request id) from the alarm, retried from 5 s doubling to 5 min, and kept with the reason when nest refuses for good.
+- **"Needs you"** is one area at the top of the board: open asks and blocked tasks together, oldest first (`GET /api/projects/:id/attention`). Each shows who, why, how long ago, and its answer (approve or deny, or words). It replaces the asks banner, and is calm: the surface with a warning rule down its left edge and a warning icon by its title, not a tinted fill.
+- **The count:** `GET /api/projects` gives each project `needs_you`, its open asks plus blocked tasks, which the projects list badges (and a sidebar can).
+
+## Task changes
+
+The owner's request (2026-11-02): "Workers should be notified when their assigned task is modified."
+
+- **What's told:** a new title, body or spec, and its block cleared by the owner (answering it) or the manager. It doesn't matter whether the owner made the change (the API), the manager (`/mcp/board`) or the app.
+  - The worker's own changes aren't told back, nor is a block it raised and the owner answered: that answer reached it already.
+  - Cancelling stops the worker, as before.
+  - A task with a live worker (`assigned`, `in_progress`, or `in_review` while its worker lives) may now be re-specced, so the spec can change under a worker (`spec` loops on those states in `src/tasks.ts`).
+- **A reorder isn't told:** board order is priority among tasks not yet started, and a worker already on its task has nothing to do with that.
+- **To whom:** only a live worker (the task's assignee, still live). A task without one tells nobody, since a worker started later gets the task as it is in its brief.
+- **How:**
+  - Each change is noted in ProjectDO (`task_changes`) and told within 10 s (`NOTIFY_WINDOW_MS`) from the alarm. Changes in that window go out as one message.
+  - The message names the fields, gives each field's first before and last after (title and body clipped to 600 characters), the whole new spec, and asks the worker to re-read the task with `get_task`.
+  - A set is frozen on its first try and posted with the request id `<task>/changes/<last change>`, so a retry after a lost answer posts once. A change after that try is the next message.
+  - A set with any change from a tainted session is posted as relayed text (`from: "projects/board"`), as the brief is.
+  - Each set is recorded in the task's history (`worker_notified`, or `worker_not_notified` when the worker had gone or nest refused).
+
 ## The UI
 
-**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `asks`, `settings`, `admin`, `trace`), each component next to its test. `src/main.tsx` mounts it.
+**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`, `trace`), each component next to its test. `src/main.tsx` mounts it.
 
 - **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and one theme (`src/ui/theme.ts`); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons, Inter and JetBrains Mono self-hosted from npm.
 - **One API client** (`src/ui/api/client.ts`), same origin, so Access's cookie is the only credential: nothing secret is in the bundle. Its types are the Worker's own, imported by type only; the request bodies' zod schemas live in `src/requests.ts`, which both the Worker and the forms validate with.
-- **Live views poll while the tab is visible** (the trace is a WebSocket instead): the chat every 3 s, the board and the asks every 5 s, the project every 10 s. The board stops polling while a card is dragged. Nothing animates on a poll.
+- **Live views poll while the tab is visible** (the trace is a WebSocket instead): the chat every 3 s, the board and "Needs you" every 5 s, the project every 10 s. The board stops polling while a card is dragged. Nothing animates on a poll.
 - **Optimistic where safe:** reordering (one `ord` written, between the new neighbours'; put back if refused) and a chat message (shown as sending; its text back in the composer if refused). An answer to an ask isn't: the ask stays until nest has taken it.
 - **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling, deleting and marking done are confirmed, with the safe choice focused; "Mark done" shows only for a task with no PR and no live worker. A failed write is a notification (bottom right) with the Worker's reason.
-- **Routes:** `/` (projects), `/projects/<id>` (board, asks, chat, settings; `?task=<id>` opens the task's drawer), `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit; Mantine, React and the other libraries are chunks of their own too (vite.config.ts), cached across releases.
+- **The shell:** a persistent left sidebar (a burger-toggled drawer below `md`): the product's name, Projects, then each project as a group of its pages (Board, Manager, Reviews, Settings), the current one open and its page highlighted, with its "needs you" count as a warning badge (`features/shell/attention.ts`, from the projects list's `needs_you`), and Admin at its foot.
+- **Routes:** `/projects` (the list; `/` redirects there); `/projects/<id>/board` (the default for `/projects/<id>`; "Needs you" at the top, its oldest three shown and the rest behind "Show all (n)", then the board at full width, `?task=<id>` opening the task's drawer; an old `/projects/<id>?task=…` link redirects with its task), `/projects/<id>/manager` (the chat; `?view=trace` the manager's live trace), `/projects/<id>/reviews` (ReviewDO's jobs, read-only, each with its reviewer's live trace on demand), `/projects/<id>/settings`, and `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit; Mantine, React and the other libraries are chunks of their own too (vite.config.ts), cached across releases.
+- **The Manager page:** the conversation full width at a reading measure (42rem), the composer pinned to the viewport's bottom, and the manager's status in the header from `GET /api/projects/<id>/manager` (`src/manager.ts`): attaching, attach failed (with a retry, `POST …/attach`), starting, waiting for a host, running (and what it's doing), errored, ended, from the project's record and nest's agent record.
 - **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
-- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, and a "needs input" marker from the project's open asks.
+- **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, a "Blocked" badge (warning) while the task is blocked, and a "needs input" marker from the project's open asks.
 
 ### The live trace
 
@@ -190,9 +250,9 @@ The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-de
 | Neutrals (light / dark) | page `#fafafa` / `#121314`, surface `#ffffff` / `#1a1b1e`, subtle `#f1f3f5` / `#222327`, border `#e9ecef` / `#2c2e33`, text `#212529` / `#e9ecef`, muted `#666e76` / `#9aa0a6` |
 | Roles (filled, light / dark) | primary `#3b6fc0` / `#5a8ad6`, danger `#c2414c` / `#d9606a`, warning `#dca71c` / `#e3b341`, success `#2c8152` / `#3f9e6a`; label white (dark on warning) in light, `#121314` in dark |
 | Motion | 120 / 180 / 240 ms, `cubic-bezier(0.2, 0, 0, 1)` in, `cubic-bezier(0.4, 0, 1, 1)` out; opacity and transform only; reduced motion honoured; a spinner only after 300 ms |
-| Layout | page max 1440 px; gutters `lg` / `xl` / `2xl` (phone / tablet / desktop); side panel 320 px from 75em; board columns at least 8.5rem from 62em (16rem below) |
+| Layout | page max 1440 px; gutters `lg` / `xl` / `2xl` (phone / tablet / desktop); sidebar 264 px from 62em (a drawer below), collapsing in 180 ms; reading measure 42rem; board columns at least 8.5rem from 62em (16rem below), all six fitting beside the sidebar at 1280 px |
 
-**Primitives** (`src/ui/layout/`): `AppFrame` (header and content), `Page` (the max width, gutters, `2xl` between blocks; `measure` for a page of forms), `PageHeader` (breadcrumbs, the one h1 with its actions right on its row, wrapping when narrow, and a meta line), `Section` (a heading row of one height: title, count, actions right; `dense` for a board column), `Panel` (the bordered surface, `lg` padding, `md` when dense; never nested) and `Well` (the borderless subtle region that holds Panels), `Toolbar` (actions `sm` apart, wrapping; destructive ones last after a divider), `Stack` and `Row` (gaps from the scale), `FieldGroup` (fields `lg` apart, actions bottom right), `EmptyState`, `LoadingState`, `ErrorState` and `Notice`, `MetaRow`/`MetaItem` (caption lines), `CardGrid`, `ColumnGrid` and `SplitView` (the board and the chat beside it), `SortablePanel` (a draggable card), `Sheet` (the task drawer), `ScrollLog` and `Bubble` (the chat), `FadeIn` (something that just arrived, once), `Prose`.
+**Primitives** (`src/ui/layout/`): `AppFrame` (the sidebar: brand, places, a footer; a burger-toggled drawer below `md`; and the content), `Page` (the max width, gutters, `2xl` between blocks; `measure` `form` or `reading`, a column centred in the content area, its header included), `PageHeader` (breadcrumbs, the one h1 with its actions right on its row, wrapping when narrow, and a meta line), `Section` (a heading row of one height: title, count, actions right; `dense` for a board column), `Panel` (the bordered surface, `lg` padding, `md` when dense; never nested) and `Well` (the borderless subtle region that holds Panels), `Toolbar` (actions `sm` apart, wrapping; destructive ones last after a divider), `Stack` and `Row` (gaps from the scale), `FieldGroup` (fields `lg` apart, actions bottom right), `EmptyState`, `LoadingState`, `ErrorState` and `Notice`, `MetaRow`/`MetaItem` (caption lines), `TableFrame` (a dense table in a frame, scrolling in itself), `CardGrid` and `ColumnGrid` (the projects, the board), `SortablePanel` (a draggable card), `Sheet` (the task drawer), `Bubble` and `PinnedFooter` (the chat and its composer), `ScrollLog` (a log of a fixed height: a trace), `FadeIn` (something that just arrived, once), `Prose`.
 
 **Rules:**
 - **Placement:** a section's primary action at its top right, secondary ones to its left; destructive ones last, set apart, and confirmed. In forms and dialogs the actions are bottom right, the primary rightmost. A status badge right after the thing it's about; who and when on a caption line below.
@@ -211,4 +271,5 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 2. Cloudflare Access comes from the app's own inframe stack, [`deploy/`](deploy/) (not nest's `edge` stack): the owner's login on `projects-nest.bitcru.sh`, with `/hooks` and `/mcp` bypassed, since they are authenticated by signature and by identity instead. `.github/workflows/deploy-projects-infra.yml` applies it on a push to `main` that touches `deploy/`, with `CLOUDFLARE_ACCESS_API_TOKEN` (Access: Apps and Policies: Edit); or by hand, `inframe plan --stack projects` then `apply` ([deploy/README.md](deploy/README.md#use)). Set `PROJECTS_AUD` in `wrangler.jsonc` to its output `projects_aud`.
 3. The Worker deploys by `.github/workflows/deploy-projects.yml` on a push to `main` that touches `projects/` (outside `deploy/`), to `projects-nest.bitcru.sh`. It puts its secrets from the `production` environment's `PROJECTS_NEST_CLIENT_TOKEN`, `PROJECTS_NEST_WEBHOOK_SECRET` and `PROJECTS_GITHUB_WEBHOOK_SECRET` when they're set. Then `POST /api/admin/sync` writes the catalog.
 4. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
-5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events. The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo.
+5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events. The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo. For auto-merge, the App also needs Contents: read and write, and Pull requests: read and write.
+6. **Auto-merge's permissions (2026-11-02):** add `pull_requests: write` and `contents: write` to the live client's `github.permissions`. Use `PATCH /v1/admin/clients/<id>`, which takes the grant ([clients doc](../docs/control-plane/api/clients/)). Until then, turning auto-merge on writes the repo setting, but each PR's auto-merge fails with nest's 403, recorded on its task.

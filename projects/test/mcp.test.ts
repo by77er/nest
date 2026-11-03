@@ -163,12 +163,12 @@ describe("a worker", () => {
     const s = await setup();
     const t = await workerToken(s.p.id, s.mine.id, s.agent, { tainted: true });
     ok(await callTool("task", t, "report_progress", { text: "halfway" }));
-    ok(await callTool("task", t, "report_blocker", { text: "need a key" }));
+    ok(await callTool("task", t, "report_blocked", { reason: "need a key" }));
     expect(ok(await callTool("task", t, "report_pr", { number: 12 }))).toMatchObject({ state: "in_review", pr: 12 });
     const full = (await api(token, "GET", `/api/projects/${s.p.id}/tasks/${s.mine.id}`)).body;
     expect(full.pr).toBe(12);
     expect(full.history.slice(-3).map((h: { action: string; tainted: boolean; detail: string }) => [h.action, h.tainted])).toEqual([
-      ["progress", true], ["blocker", true], ["pr_opened", true],
+      ["progress", true], ["blocked", true], ["pr_opened", true],
     ]);
     expect((await api(token, "GET", `/api/projects/${s.p.id}/tasks/${s.other.id}`)).body.history).toHaveLength(1);
   });

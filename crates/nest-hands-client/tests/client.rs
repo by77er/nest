@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use nest_hands_client::{
     BUSY_RETRY, EDGE_CLIENT_ID_HEADER, EDGE_CLIENT_SECRET_HEADER, Next, OpenError, OpenOptions,
-    Phase, REFRESH_MARGIN, RecvError, Refusal, RefusalCode, TransportError, binding_exp_ms,
+    Phase, REFRESH_MARGIN, RecvError, Refusal, RefusalCode, TransportError, Wait, binding_exp_ms,
     guest_error_next, open, refresh_due,
 };
 use nest_protocol::model::ErrorBody;
@@ -354,6 +354,16 @@ async fn each_refusal_fixture_maps_to_refused_with_its_fields() {
             RefusalCode::Busy,
             Next::RetrySame {
                 after: Duration::from_millis(500),
+                wait: Wait::Busy,
+            },
+        ),
+        // A VM nestd has paused for a commit: the long budget, keyed on the reason, not the text.
+        (
+            "error.busy.paused.json",
+            RefusalCode::Busy,
+            Next::RetrySame {
+                after: Duration::from_millis(2000),
+                wait: Wait::Paused,
             },
         ),
         // An expired or revoked binding: a fresh one may cure it.
@@ -377,6 +387,7 @@ async fn each_refusal_fixture_maps_to_refused_with_its_fields() {
                     expected["error"]["retryable"].as_bool().unwrap()
                 );
                 assert_eq!(r.retry_after_ms, expected["retry_after_ms"].as_u64());
+                assert_eq!(r.reason.is_some(), expected.get("reason").is_some(), "{name}");
                 assert_eq!(r.next(), next, "{name}");
             }
             other => panic!("{name}: expected Refused, got {other:?}"),
@@ -395,6 +406,7 @@ fn one_classification_for_every_refusal_and_guest_error() {
         message: String::new(),
         retryable: false,
         retry_after_ms,
+        reason: None,
     };
     // A target minted with a guest version that is no longer the guest's: a fresh target
     // carries the current one.
@@ -408,10 +420,17 @@ fn one_classification_for_every_refusal_and_guest_error() {
         refusal(RefusalCode::Other("new".into()), None).next(),
         Next::Final
     );
+    // A `busy` whose message talks of a pause but has no `reason` (an older gateway, or a guest's
+    // free text) is an ordinary `busy`: the budget is keyed on the structured reason only.
+    let mut worded = refusal(RefusalCode::Busy, Some(2000));
+    worded.message = "the sandbox is paused: checkpoint (turn_end)".into();
+    assert_eq!(worded.next(), Next::RetrySame { after: Duration::from_millis(2000), wait: Wait::Busy });
+    let paused = Refusal { reason: Some(nest_protocol::gateway::RefusalReason::Paused), ..worded };
+    assert_eq!(paused.next(), Next::RetrySame { after: Duration::from_millis(2000), wait: Wait::Paused });
     // `busy` without a hint waits the one default; the decision is by code, not the flag.
     assert_eq!(
         refusal(RefusalCode::Busy, None).next(),
-        Next::RetrySame { after: BUSY_RETRY }
+        Next::RetrySame { after: BUSY_RETRY, wait: Wait::Busy }
     );
     assert_eq!(
         OpenError::Timeout(Phase::Connect).next(),
@@ -422,7 +441,7 @@ fn one_classification_for_every_refusal_and_guest_error() {
     // (a VM paused for a checkpoint, behind a gateway that can't tell) is waited out like `busy`.
     assert_eq!(
         OpenError::Timeout(Phase::Bind).next(),
-        Next::RetrySame { after: BUSY_RETRY }
+        Next::RetrySame { after: BUSY_RETRY, wait: Wait::Busy }
     );
     assert_eq!(
         OpenError::Transport(TransportError::Http(404)).next(),
@@ -440,7 +459,7 @@ fn one_classification_for_every_refusal_and_guest_error() {
     };
     assert_eq!(
         guest_error_next(&guest("busy")),
-        Next::RetrySame { after: BUSY_RETRY }
+        Next::RetrySame { after: BUSY_RETRY, wait: Wait::Busy }
     );
     assert_eq!(guest_error_next(&guest("stale_epoch")), Next::Final);
     assert_eq!(guest_error_next(&guest("not_found")), Next::Final);

@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { Ask, ChatMessage, HistoryRow, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { Ask, Attention, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
 
 export interface Write {
   method: string;
@@ -17,7 +17,8 @@ export function project(over: Partial<ProjectRow> = {}): Project {
   const row: ProjectRow = { id: "prj_one", name: "Widgets", repo: "owner/widgets", created_ms: now - 86_400_000, ...over };
   const settings: Settings = {
     id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null,
-    attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms }, created_ms: row.created_ms,
+    attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms },
+    auto_merge: false, merge_method: "squash", repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, created_ms: row.created_ms,
   };
   return { ...row, settings };
 }
@@ -26,7 +27,7 @@ let seq = 0;
 export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
-    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false,
+    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, auto_merge: null, blocked: null,
     created_ms: now - 3_600_000, updated_ms: now - 60_000, ...over,
   };
 }
@@ -43,6 +44,8 @@ export class FakeApi {
   chat: ChatMessage[] = [];
   asks: Ask[] = [];
   sync: SyncState | null = null;
+  reviews: Job[] = [];
+  manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
   /** Answers to give instead, by `METHOD path` pattern, once each. */
   readonly failures: { match: RegExp; status: number; error: string }[] = [];
@@ -65,6 +68,13 @@ export class FakeApi {
     return this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
   };
 
+  /** What the Worker's attention list answers: open asks and blocked tasks, oldest first. */
+  attention(): Attention[] {
+    const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
+    const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
+    return [...asks, ...blocked].sort((a, b) => a.at_ms - b.at_ms);
+  }
+
   private move(t: Task, event: TaskEvent): Response | null {
     const r = transition(t.state, event);
     if (!r.ok) return json({ error: r.error }, 409);
@@ -79,7 +89,7 @@ export class FakeApi {
       return json({ written: this.sync.written, repos: this.sync.repos });
     }
     if (parts.length === 1) {
-      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => row) });
+      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => ({ ...row, needs_you: row.id === "prj_one" ? this.attention().length : 0 })) });
       const p = project({ id: `prj_new${++seq}`, name: body.name, repo: body.repo.toLowerCase() });
       this.projects.push(p);
       return json({ ...p, catalog_synced: true }, 201);
@@ -94,6 +104,9 @@ export class FakeApi {
       case "PATCH settings":
         Object.assign(p.settings, body);
         return json(p.settings);
+      case "POST auto-merge/retry":
+        p.settings.repo_auto_merge = { state: "applied", want: p.settings.auto_merge, repo: p.settings.auto_merge, error: null, at_ms: now };
+        return json(p.settings);
       case "GET tasks":
         return json([...this.tasks].sort((a, b) => a.ord - b.ord));
       case "POST tasks": {
@@ -101,6 +114,13 @@ export class FakeApi {
         this.tasks.push(n);
         return json(n, 201);
       }
+      case "GET manager":
+        return json(this.manager);
+      case "POST attach":
+        this.manager = { ...this.manager, phase: "starting", error: null };
+        return json(p.settings);
+      case "GET reviews":
+        return json(this.reviews);
       case "GET chat":
         return json(this.chat);
       case "POST chat": {
@@ -110,6 +130,8 @@ export class FakeApi {
       }
       case "GET asks":
         return json(this.asks);
+      case "GET attention":
+        return json(this.attention());
       case "POST asks/:ask/answer": {
         const a = this.asks.find((x) => x.ask === parts[3]);
         if (!a) return json({ error: "unknown ask" }, 404);
@@ -123,6 +145,10 @@ export class FakeApi {
         return json({ ...t, history: this.history.get(t.id) ?? [] });
       case "PATCH tasks/:task":
         Object.assign(t, body);
+        return json(t);
+      case "POST tasks/:task/answer":
+        if (!t.blocked) return json({ error: "the task isn't blocked" }, 409);
+        t.blocked = null;
         return json(t);
       case "DELETE tasks/:task":
         if (t.state !== "draft") return json({ error: "only a draft is deleted; cancel it instead" }, 409);

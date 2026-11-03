@@ -3,7 +3,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { Ask, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
+import type { Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
 
 export const keys = {
   projects: ["projects"] as const,
@@ -12,15 +12,19 @@ export const keys = {
   task: (id: string, task: string) => ["projects", id, "task", task] as const,
   chat: (id: string) => ["projects", id, "chat"] as const,
   asks: (id: string) => ["projects", id, "asks"] as const,
+  manager: (id: string) => ["projects", id, "manager"] as const,
+  reviews: (id: string) => ["projects", id, "reviews"] as const,
+  attention: (id: string) => ["projects", id, "attention"] as const,
   syncState: ["admin", "sync-state"] as const,
 };
 
 /** How often each live view polls, in ms. */
-export const POLL = { board: 5_000, chat: 3_000, asks: 5_000, project: 10_000, task: 5_000 } as const;
+export const POLL = { board: 5_000, chat: 3_000, asks: 5_000, project: 10_000, task: 5_000, manager: 10_000, reviews: 15_000 } as const;
 
 // --- reads ------------------------------------------------------------------------------------------
 
-export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: api.projects });
+/** The projects, with each one's "needs you" count (the sidebar's badges): polled like a project. */
+export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: api.projects, refetchInterval: POLL.project });
 
 export const useProject = (id: string) => useQuery({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project });
 
@@ -40,6 +44,39 @@ export const useTask = (id: string, task: string | undefined) =>
 export const useChat = (id: string) => useQuery({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: POLL.chat });
 
 export const useAsks = (id: string) => useQuery({ queryKey: keys.asks(id), queryFn: () => api.asks(id), refetchInterval: POLL.asks });
+
+/** The manager's status for its page (nest's agent record, read through the app). */
+export const useManager = (id: string) => useQuery({ queryKey: keys.manager(id), queryFn: () => api.manager(id), refetchInterval: POLL.manager });
+
+export const useReviews = (id: string) => useQuery({ queryKey: keys.reviews(id), queryFn: () => api.reviews(id), refetchInterval: POLL.reviews });
+
+/** Attach the repo again after a failure: the manager starts once it's attached. */
+export function useRetryAttach(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.retryAttach(id),
+    meta: { failure: "The repo wasn't attached" },
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.manager(id) }), qc.invalidateQueries({ queryKey: keys.project(id), exact: true })]),
+  });
+}
+
+/** What waits on the owner: open asks and blocked tasks, oldest first (README.md#blocked). */
+export const useAttention = (id: string) => useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks });
+
+/** The owner answers a blocked task: its block clears, and the answer reaches the agents' inboxes. */
+export function useAnswerBlocked(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { task: string; answer: string }) => api.answerBlocked(id, v.task, { answer: v.answer }),
+    meta: { failure: "The answer wasn't sent" },
+    onSuccess: (t) => {
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "blocked" && x.task === t.id)));
+      qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? t : x)));
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
+      return qc.invalidateQueries({ queryKey: keys.attention(id) });
+    },
+  });
+}
 
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 
@@ -64,6 +101,16 @@ export function useUpdateSettings(id: string) {
       // Turning auto-assign on, or raising the cap, may assign tasks at once.
       return qc.invalidateQueries({ queryKey: keys.tasks(id) });
     },
+  });
+}
+
+/** Write the repo's "Allow auto-merge" again: after GitHub refused it, or to undo a change by hand. */
+export function useRetryRepoAutoMerge(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.retryRepoAutoMerge(id),
+    meta: { failure: "The repo's auto-merge setting wasn't written" },
+    onSuccess: () => qc.invalidateQueries({ queryKey: keys.project(id), exact: true }),
   });
 }
 
@@ -170,6 +217,9 @@ export function useAnswerAsk(id: string) {
     meta: { failure: "The answer wasn't sent" },
     onSuccess: (_d, v) => {
       qc.setQueryData<Ask[]>(keys.asks(id), (old) => old?.map((a) => (a.ask === v.ask ? { ...a, answered_ms: Date.now() } : a)));
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "ask" && x.ask === v.ask)));
+      void qc.invalidateQueries({ queryKey: keys.attention(id) });
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
       return qc.invalidateQueries({ queryKey: keys.asks(id) });
     },
   });

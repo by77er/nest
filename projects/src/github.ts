@@ -28,6 +28,17 @@ export const PERMISSIONS = {
   // `GET /repos/{o}/{r}` needs metadata, which GitHub gives every installation token; it's named anyway,
   // so the token doesn't depend on that implicit grant.
   attach: { administration: "write", metadata: "read" },
+  // `PATCH /repos/{o}/{r}` is Administration: write ("Permissions required for GitHub Apps",
+  // https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps).
+  repoSettings: { administration: "write" },
+  // "To view merge-related settings, you must have the contents:read and contents:write permissions"
+  // (https://docs.github.com/en/rest/repos/repos#get-a-repository); metadata for the repo itself.
+  repoRead: { metadata: "read", contents: "write" },
+  // Enabling auto-merge takes "write permissions to a repository"
+  // (https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request):
+  // the merge it arms is Contents: write (`PUT …/pulls/{n}/merge`) and it changes the PR (Pull
+  // requests: write). GitHub's GraphQL reference names no permission for the mutations (unverified).
+  autoMerge: { pull_requests: "write", contents: "write" },
 } as const satisfies Record<string, Record<string, "read" | "write">>;
 
 // --- the webhook's signature ---------------------------------------------------------------------------
@@ -136,6 +147,43 @@ export class GitHub {
     return this.call("POST", `/repos/${repo}/check-runs`, {
       name: CHECK_NAME, status: "in_progress", started_at: new Date().toISOString(), ...b,
     });
+  }
+
+  /** Set the repo's "Allow auto-merge"; answers the value GitHub reports after, when it does. */
+  async setAllowAutoMerge(repo: string, allow: boolean): Promise<boolean | null> {
+    const r = await this.call<{ allow_auto_merge?: unknown }>("PATCH", `/repos/${repo}`, { allow_auto_merge: allow });
+    return typeof r?.allow_auto_merge === "boolean" ? r.allow_auto_merge : null;
+  }
+
+  /** The repo's "Allow auto-merge"; null when GitHub doesn't show it to this token. */
+  async allowAutoMerge(repo: string): Promise<boolean | null> {
+    const r = await this.call<{ allow_auto_merge?: unknown }>("GET", `/repos/${repo}`);
+    return typeof r?.allow_auto_merge === "boolean" ? r.allow_auto_merge : null;
+  }
+
+  /**
+   * One GraphQL request (https://docs.github.com/en/graphql/guides/forming-calls-with-graphql). Its
+   * `errors` (a 200 all the same) are refusals for good, except GitHub's rate limit.
+   */
+  async graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+    const r = (await this.call<{ data?: T; errors?: { message?: unknown; type?: unknown }[] }>("POST", "/graphql", { query, variables }))!;
+    if (r.errors?.length) {
+      const limited = r.errors.some((e) => e.type === "RATE_LIMITED");
+      throw new GitHubError(limited ? 429 : 422, r.errors.map((e) => (typeof e.message === "string" ? e.message : "error")).join("; ").slice(0, 300), limited);
+    }
+    return r.data as T;
+  }
+
+  /** GitHub's auto-merge on a PR, by its node id (https://docs.github.com/en/graphql/reference/pulls). */
+  async enableAutoMerge(pullRequestId: string, mergeMethod: "SQUASH" | "MERGE" | "REBASE"): Promise<void> {
+    await this.graphql(
+      "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { pullRequest { id } } }",
+      { id: pullRequestId, method: mergeMethod },
+    );
+  }
+
+  async disableAutoMerge(pullRequestId: string): Promise<void> {
+    await this.graphql("mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { pullRequest { id } } }", { id: pullRequestId });
   }
 
   /** The app's check runs named CHECK_NAME at `sha`: to find one whose create answer was lost. */

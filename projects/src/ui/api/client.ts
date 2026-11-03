@@ -2,8 +2,8 @@
 // with every call and the page holds no credential of its own.
 
 import type {
-  AnswerBody, Ask, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
-  Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
+  AnswerBody, Ask, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
+  Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
 } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
@@ -45,10 +45,11 @@ const prj = (id: string) => `/projects/${encodeURIComponent(id)}`;
 const tsk = (id: string, task: string) => `${prj(id)}/tasks/${encodeURIComponent(task)}`;
 
 export const api = {
-  projects: () => call<{ projects: ProjectRow[] }>("GET", "/projects").then((r) => r.projects),
+  projects: () => call<{ projects: ListedProject[] }>("GET", "/projects").then((r) => r.projects),
   createProject: (b: CreateProjectBody) => call<CreatedProject>("POST", "/projects", b),
   project: (id: string) => call<Project>("GET", prj(id)),
   updateSettings: (id: string, b: SettingsBody) => call<Settings>("PATCH", `${prj(id)}/settings`, b),
+  retryRepoAutoMerge: (id: string) => call<Settings>("POST", `${prj(id)}/auto-merge/retry`),
 
   tasks: (id: string) => call<Task[]>("GET", `${prj(id)}/tasks`),
   task: (id: string, task: string) => call<TaskDetail>("GET", tsk(id, task)),
@@ -62,7 +63,13 @@ export const api = {
   chat: (id: string) => call<ChatMessage[]>("GET", `${prj(id)}/chat`),
   postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean }>("POST", `${prj(id)}/chat`, b),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
+  attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),
+  answerBlocked: (id: string, task: string, b: AnswerBody) => call<Task>("POST", `${tsk(id, task)}/answer`, b),
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),
+
+  manager: (id: string) => call<ManagerStatus>("GET", `${prj(id)}/manager`),
+  retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
+  reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
 
   syncState: () => call<SyncState | null>("GET", "/admin/sync-state"),
   sync: () => call<SyncResult>("POST", "/admin/sync"),

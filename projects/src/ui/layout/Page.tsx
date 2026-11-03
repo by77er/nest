@@ -4,10 +4,15 @@
 import { Box, Breadcrumbs, Group, Stack, Title } from "@mantine/core";
 import type { ReactNode } from "react";
 
-export function Page({ children, measure = false }: { children: ReactNode; /** Keep the content to a readable measure (forms, prose), on the page's left edge. */ measure?: boolean }) {
+/**
+ * `measure` keeps the content to a line length, centred in the content area (balance: no empty half):
+ * `form` (forms, prose: 45rem) or `reading` (a conversation: about 70 characters). The header is inside
+ * the column, so the breadcrumb, the h1 and the content share one left edge.
+ */
+export function Page({ children, measure }: { children: ReactNode; measure?: "form" | "reading" }) {
   return (
     <Box maw="var(--nest-page-max)" mx="auto" px={{ base: "lg", sm: "xl", md: "2xl" }} py={{ base: "lg", sm: "xl", md: "2xl" }} data-ds="page">
-      <Stack gap="2xl" maw={measure ? "var(--nest-measure)" : undefined}>
+      <Stack gap="2xl" maw={measure === "form" ? "var(--nest-measure)" : measure === "reading" ? "var(--nest-reading-measure)" : undefined} mx={measure ? "auto" : undefined} data-measure={measure}>
         {children}
       </Stack>
     </Box>

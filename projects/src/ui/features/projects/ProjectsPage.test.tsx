@@ -7,16 +7,16 @@ import { renderApp } from "../../test/render";
 
 describe("projects", () => {
   it("lists each project with a link to its page and its repo", async () => {
-    renderApp("/");
+    renderApp("/projects");
     const link = await screen.findByRole("link", { name: "Widgets" });
-    expect(link).toHaveAttribute("href", "/projects/prj_one");
+    expect(link).toHaveAttribute("href", "/projects/prj_one/board");
     expect(screen.getByRole("link", { name: "owner/widgets" })).toHaveAttribute("href", "https://github.com/owner/widgets");
   });
 
   it("creates one with its settings, refusing a malformed repo first, then opens it", async () => {
     const api = new FakeApi();
     api.projects = [];
-    const { user, router } = renderApp("/", api);
+    const { user, router } = renderApp("/projects", api);
 
     await user.click(await screen.findByRole("button", { name: "Create the first project" }));
     const d = screen.getByRole("dialog", { name: "New project" });
@@ -34,14 +34,15 @@ describe("projects", () => {
     await user.click(within(d).getByRole("button", { name: "Create project" }));
 
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Gadgets", repo: "Owner/Gadgets", auto_assign: true, max_workers: 3 } }]));
-    await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/projects\/prj_new/));
-    expect(await screen.findByRole("heading", { name: "Gadgets" })).toBeInTheDocument();
+    await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/projects\/prj_new[a-z0-9]+\/board$/));
+    expect(await screen.findByRole("heading", { level: 1, name: "Board" })).toBeInTheDocument();
+    expect(screen.getByRole("main")).toHaveTextContent("Gadgets");
   });
 
   it("says when the list can't be loaded", async () => {
     const api = new FakeApi();
     api.fail(/^GET \/api\/projects$/, 403, "a Cloudflare Access login for this app is required");
-    renderApp("/", api);
+    renderApp("/projects", api);
     expect(await screen.findByRole("alert")).toHaveTextContent("a Cloudflare Access login for this app is required");
   });
 });
