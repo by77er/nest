@@ -7,22 +7,21 @@
   }
 }
 
-/* The phone's menu button and a number input's steppers keep their look on touch, and take the 44 px
-   target as their own room (a hit area never reaches over a neighbour). */
+/* The phone's menu button keeps its look on touch and takes the 44 px target as its own room (a hit
+   area never reaches over a neighbour); a number input is the target's height. */
 @media (pointer: coarse) {
   .burger {
     min-width: var(--nest-hit-touch);
     min-height: var(--nest-hit-touch);
   }
 
-  /* The input as tall as the target and its steppers' section as wide: each stepper is half of it.
-     (Mantine sets these on the input's own wrapper, so they're set there, over its values.) */
+  /* A number input on touch: as tall as the target, and no steppers (two stacked 22 px halves mis-tap
+     the wrong way); the numeric keyboard does it. (Mantine sets the height on the input's own wrapper.) */
   .numberWrapper {
     --input-height: var(--nest-hit-touch) !important;
-    --input-right-section-width: var(--nest-hit-touch) !important;
   }
 
   .steppers {
-    max-width: none;
+    display: none;
   }
 }

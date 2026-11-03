@@ -71,16 +71,26 @@ export function ChatView({ projectId }: { projectId: string }) {
   const seenCount = useRef<number | null>(null);
   const count = chat.data?.length ?? 0;
 
-  const toEnd = useCallback(() => end.current?.scrollIntoView({ block: "end" }), []);
+  // To the end, only if it isn't already in view above the composer: a short chat that fits never
+  // scrolls (its header stays clear of the top bar).
+  const footerRef = useRef(0);
+  const toEnd = useCallback(() => {
+    const el = end.current;
+    if (el && el.getBoundingClientRect().bottom > window.innerHeight - footerRef.current) el.scrollIntoView({ block: "end" });
+  }, []);
 
   // The composer docks over the page's bottom: the newest message must clear it. Its height is measured,
   // and the end sentinel keeps that much room when scrolled to.
   useEffect(() => {
     const el = footer.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setFooterHeight(el.offsetHeight));
+    const measure = () => {
+      footerRef.current = el.offsetHeight;
+      setFooterHeight(el.offsetHeight);
+    };
+    const ro = new ResizeObserver(measure);
     ro.observe(el);
-    setFooterHeight(el.offsetHeight);
+    measure();
     return () => ro.disconnect();
   }, []);
 
@@ -101,13 +111,15 @@ export function ChatView({ projectId }: { projectId: string }) {
   }, [footerHeight, setFollowing]);
 
   // New messages: followed at the end, counted for the pill while reading back. On open, the end is
-  // scrolled to only if there's more than a line to scroll (else the header would just tuck under).
+  // scrolled to only if there's more to scroll than the page's header and a line: a short chat stays
+  // put with its header in view, never tucked under the top bar.
   useEffect(() => {
     if (!count || !footerHeight) return;
     const before = seenCount.current;
     seenCount.current = count;
     if (before === null) {
-      if (document.documentElement.scrollHeight - window.innerHeight > 48) toEnd();
+      const header = document.querySelector("[data-ds=page-header]")?.getBoundingClientRect().bottom ?? 0;
+      if (document.documentElement.scrollHeight - window.innerHeight > header + 48) toEnd();
       return;
     }
     if (count <= before) return;

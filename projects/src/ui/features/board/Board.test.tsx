@@ -1,7 +1,7 @@
 // The board, rendered from the API: every state in its column and its semantic color (the owner's
 // direction: blue in progress, yellow stalled, green done, red cancelled, neutral before work starts),
 // cancelled hidden until asked for, and the markers that need the owner's eye.
-import { screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { TaskState } from "../../api/types";
 import { ask, FakeApi, task } from "../../test/fakeApi";
@@ -22,15 +22,22 @@ const EXPECTED: Record<TaskState, { column: string; role: "gray" | "primary" | "
 const column = (name: string) => screen.getByRole("region", { name });
 
 describe("the board", () => {
-  it("a badge with a tooltip takes its touch room as layout around it, and its tooltip still opens", async () => {
+  it("a badge with details is its tooltip's target, focusable, and its tooltip opens on hover, focus or a tap", async () => {
     const api = new FakeApi();
     api.tasks = [task({ title: "Held up", state: "in_progress", blocked: { at_ms: 1, by: "agt_w", role: "worker", reason: "needs a key", question: null, tainted: false } })];
     const { user } = renderApp("/projects/prj_one/board", api);
     const card = await screen.findByRole("article", { name: "Held up" });
-    const badge = card.querySelector("[data-marker=blocked]") as HTMLElement;
-    // The room is a wrapper around the Tooltip's trigger, so the Tooltip's own props never replace it.
-    expect(badge.parentElement).toHaveAttribute("data-ds", "touch-target");
-    await user.hover(badge);
+    // The trigger wraps the badge and keeps the Tooltip's props: it's what's focused and what opens it.
+    const trigger = card.querySelector("[data-marker=blocked]") as HTMLElement;
+    expect(trigger).toHaveAttribute("data-ds", "trigger-badge");
+    expect(trigger).toHaveAttribute("tabindex", "0");
+    expect(trigger.querySelector(".mantine-Badge-root")).toHaveTextContent("Blocked");
+    await user.hover(trigger);
+    expect(await screen.findByText("Blocked: needs a key")).toBeInTheDocument();
+    await user.unhover(trigger);
+    await waitFor(() => expect(screen.queryByText("Blocked: needs a key")).toBeNull());
+    // Focus opens it (the keyboard, and a tap, which focuses the trigger); touch is on in the theme.
+    act(() => trigger.focus());
     expect(await screen.findByText("Blocked: needs a key")).toBeInTheDocument();
   });
 

@@ -5,7 +5,7 @@ export { AppFrame } from "./AppFrame";
 export { Bubble, PinnedFooter, ScrollLog } from "./Chat";
 export { FadeIn } from "./FadeIn";
 export { FieldGroup } from "./FieldGroup";
-export { CardGrid, ColumnGrid, TouchTarget } from "./Layouts";
+export { CardGrid, ColumnGrid, TriggerBadge } from "./Layouts";
 export { MetaItem, MetaRow } from "./Meta";
 export { NavGroup, NavGroups, NavRow, SwitcherTarget } from "./Nav";
 export { Switcher, type SwitcherItem } from "./Switcher";

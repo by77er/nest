@@ -44,14 +44,24 @@
   }
 }
 
-/* A small trigger's room: on touch, the 44 px target as layout space around its visual box. */
-.touchTarget {
+/* A badge that opens its details (TriggerBadge): the theme's focus ring, and on touch a 44 px target
+   that reserves its space around the badge, whose own box is unchanged. */
+.trigger {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  cursor: default;
+  border-radius: var(--mantine-radius-sm);
+}
+
+.trigger:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
 }
 
 @media (pointer: coarse) {
-  .touchTarget {
+  .trigger {
     min-height: var(--nest-hit-touch);
+    min-width: var(--nest-hit-touch);
   }
 }
