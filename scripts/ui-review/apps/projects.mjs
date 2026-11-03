@@ -334,7 +334,10 @@ export function inkChatFit() {
   const dock = document.querySelector("[data-ds=composer-dock]");
   const field = dock?.querySelector("textarea");
   if (!log || !dock || !field) return ["no chat log or composer on the page"];
-  const scroller = log.scrollHeight > log.clientHeight + 1 ? log : (log.closest("[data-ds=page]") ?? log);
+  // The log scrolls itself from `sm` up (overflow auto, even while it's short); on a phone the page's
+  // column does.
+  const ownScroll = /(auto|scroll)/.test(getComputedStyle(log).overflowY);
+  const scroller = ownScroll ? log : (log.closest("[data-ds=page]") ?? log);
   const was = scroller.scrollTop;
   const H = window.innerHeight;
   window.scrollTo(0, 1e6);
@@ -346,7 +349,7 @@ export function inkChatFit() {
     const d = dock.getBoundingClientRect();
     if (f.top < 0 || f.bottom > H + 0.5) out.push(`at the ${end}, the composer is off screen (${Math.round(f.top)}..${Math.round(f.bottom)} of ${H})`);
     // Pinned: flush on a phone (the page's column has no bottom padding), within the page's padding else.
-    const slack = scroller === log ? 64 : 4;
+    const slack = ownScroll ? 64 : 4;
     if (d.bottom < H - slack) out.push(`at the ${end}, the composer sits ${Math.round(H - d.bottom)} px above the viewport's bottom, not pinned there`);
     if (end === "end") {
       // The log's last line on screen: its own bottom when it scrolls itself, else its content's end.
