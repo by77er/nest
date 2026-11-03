@@ -4,10 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <script>
-      // The scheme follows the system: set before the first paint, so a dark system never flashes light.
-      document.documentElement.setAttribute("data-mantine-color-scheme", matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    </script>
+    <!-- The scheme, set before the first paint (public/scheme.js: not inline, for the CSP). -->
+    <script src="/scheme.js"></script>
     <title>nest projects</title>
   </head>
   <body>
