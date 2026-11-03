@@ -8,7 +8,7 @@ import { ActionIcon, Badge, Button, Select, Text, TextInput } from "@mantine/cor
 import { IconPlus, IconWorld, IconX } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
-import { NETWORK_PRESETS, NETWORK_ROLES, type NetworkRole, normalizeRules, rulesProblems } from "../../../network";
+import { NETWORK_PRESETS, NETWORK_ROLES, type NetworkRole, normalizeRules, type OperatorRule, rulesProblems } from "../../../network";
 import { useNetwork, useSetNetwork } from "../../api/queries";
 import type { EgressRule, LayerStatus, NetworkView, RoleRules } from "../../api/types";
 import { ago, exact } from "../../common/time";
@@ -197,6 +197,21 @@ function NetworkForm({ projectId, view }: { projectId: string; view: NetworkView
   );
 }
 
+/** One line of the operator's policy: its rules' hosts, a port shown only where it isn't the web's. */
+function PolicyLine({ label, slot, rules }: { label: string; slot: string; rules: OperatorRule[] }) {
+  const text = rules.map((r) => (r.ports.every((p) => p === 80 || p === 443) ? r.host : `${r.host}:${r.ports.join(",")}`)).join(", ");
+  return (
+    <Stack gap="2xs">
+      <Text fz="xs" fw="medium">
+        {label}
+      </Text>
+      <Text fz="sm" ff="monospace" data-slot={slot}>
+        {text || "None"}
+      </Text>
+    </Stack>
+  );
+}
+
 export function NetworkPage() {
   const { projectId } = useParams({ from: "/projects/$projectId/network" });
   const net = useNetwork(projectId);
@@ -233,13 +248,12 @@ export function NetworkPage() {
                   </Text>
                 ) : (
                   <Panel dense>
-                    <Stack gap="xs">
+                    <Stack gap="sm">
                       <Text fz="sm" c="dimmed">
-                        Always allowed, for every role, set by the operator.
+                        Always allowed, for every role.
                       </Text>
-                      <Text fz="sm" ff="monospace" data-slot="base">
-                        {net.data.base.map((r) => r.host).join(", ") || "No hosts"}
-                      </Text>
+                      <PolicyLine label="nest's defaults" slot="base" rules={net.data.base.filter((r) => r.layer === "base")} />
+                      <PolicyLine label="The operator's rules" slot="operator" rules={net.data.base.filter((r) => r.layer === "operator")} />
                     </Stack>
                   </Panel>
                 )}

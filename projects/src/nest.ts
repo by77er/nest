@@ -67,11 +67,8 @@ export interface SandboxExtras {
 }
 
 /** A sandbox's client layer (docs/control-plane/api/clients/#the-client-layer), as `GET …/client-policy` answers it. */
-export interface ClientPolicy {
-  egress: { allow: { host: string; ports?: number[] }[] };
-  inject: unknown[];
-  env: Record<string, string>;
-}
+import type { ClientLayer as ClientPolicy, HeldClientLayer } from "./network";
+export type { ClientPolicy, HeldClientLayer };
 
 /** The overrides a client may give a spawn (nest only narrows: `SpawnerOverrides`). */
 export interface SpawnOverrides {
@@ -186,7 +183,7 @@ export class Nest {
   }
 
   /** A sandbox's client layer: its own egress rules, bindings and env. */
-  getClientPolicy(sandbox: string): Promise<ClientPolicy> {
+  getClientPolicy(sandbox: string): Promise<HeldClientLayer> {
     return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/client-policy`);
   }
 

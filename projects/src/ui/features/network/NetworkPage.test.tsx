@@ -12,13 +12,15 @@ const role = (r: "worker" | "manager") => document.querySelector(`[data-role="${
 const picker = (el: HTMLElement) => within(el).getAllByLabelText("Add hosts").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden")!;
 
 describe("the Network page", () => {
-  it("shows the grant's ceiling, the operator's base rules, and each role's hosts", async () => {
+  it("shows the grant's ceiling, nest's defaults and the operator's rules apart, and each role's hosts", async () => {
     const api = new FakeApi();
     api.network.rules = { worker: [{ host: "registry.npmjs.org" }], manager: [] };
     renderApp("/projects/prj_one/network", api);
     await page();
     expect(screen.getByText(/This app may open registry\.npmjs\.org, nodejs\.org/)).toBeInTheDocument();
-    expect(document.querySelector('[data-slot="base"]')).toHaveTextContent("github.com");
+    expect(document.querySelector('[data-slot="base"]')).toHaveTextContent(/^github\.com$/);
+    // A port shown only where it isn't the web's.
+    expect(document.querySelector('[data-slot="operator"]')).toHaveTextContent(/^mirror\.internal\.example:8443$/);
     expect(within(role("worker")).getByText("registry.npmjs.org")).toBeInTheDocument();
     expect(within(role("worker")).getByText("ports 80, 443")).toBeInTheDocument();
     expect(within(role("manager")).getByText(/No hosts beyond the operator/)).toBeInTheDocument();

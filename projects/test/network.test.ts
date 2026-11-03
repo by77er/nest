@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { clientLayerFor, hostAllowed, NO_RULES, normalizeRules, rulesProblems } from "../src/network";
 import { env, runInDurableObject } from "cloudflare:test";
-import { AccessTeam, api, FakeNest, installFetch } from "./fake-nest";
+import { AccessTeam, api, CLIENT, FakeNest, installFetch } from "./fake-nest";
 
 describe("the rules (pure)", () => {
   it("refuses hosts outside the grant, saying the operator must widen it; and malformed rules", () => {
@@ -29,8 +29,10 @@ describe("the rules (pure)", () => {
 
   it("builds the whole layer: the role's rules, and each other part from its feed, else as the sandbox has it", () => {
     const rules = { worker: [{ host: "registry.npmjs.org" }], manager: [] };
-    const current = { egress: { allow: [{ host: "old.example.com" }] }, inject: [{ name: "npm_token" }], env: { NPM_TOKEN: "nest-ph.cli_app.npm_token." } };
-    expect(clientLayerFor(rules, "worker", {}, current)).toEqual({ egress: { allow: [{ host: "registry.npmjs.org" }] }, inject: current.inject, env: current.env });
+    // As `GET …/client-policy` answers a binding: held, with whose it is and its placeholder, which the PUT refuses.
+    const binding = { name: "npm_token", secret: "npm", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" as const }] };
+    const current = { egress: { allow: [{ host: "old.example.com" }] }, inject: [{ ...binding, client: "cli_app", placeholder: "nest-ph.cli_app.npm_token." }], env: { NPM_TOKEN: "nest-ph.cli_app.npm_token." } };
+    expect(clientLayerFor(rules, "worker", {}, current)).toEqual({ egress: { allow: [{ host: "registry.npmjs.org" }] }, inject: [binding], env: current.env });
     expect(clientLayerFor(rules, "manager", { inject: [], env: { A: "1" } }, current)).toEqual({ egress: { allow: [] }, inject: [], env: { A: "1" } });
     expect(clientLayerFor(NO_RULES, "worker", {}, null)).toEqual({ egress: { allow: [] }, inject: [], env: {} });
   });
@@ -75,12 +77,18 @@ describe("the network page's API", () => {
     expect(view.egress_hosts).toEqual(fake.egressHosts);
   });
 
-  it("shows the operator's base rules from the manager's sandbox, read-only", async () => {
+  it("shows the operator's rules from the manager's sandbox: nest's defaults and the operator's layer, not the app's own or grants", async () => {
     const s = await setup();
-    // The manager's sandbox becomes known once its layer is first applied.
-    await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] });
+    // The manager's sandbox becomes known once its layer is first applied. Its own rule is labelled
+    // `workstream` too, and one the same as the operator's is still the operator's once.
+    fake.operatorRules = [{ host: "mirror.internal.example", ports: [8443] }, { host: "nodejs.org" }];
+    await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }, { host: "pypi.org", ports: [443] }] });
     const view = (await api(token, "GET", `/api/projects/${s.id}/network`)).body;
-    expect(view.base).toEqual(fake.baseRules);
+    expect(view.base).toEqual([
+      { host: "github.com", ports: [443], layer: "base" },
+      { host: "mirror.internal.example", ports: [8443], layer: "operator" },
+      { host: "nodejs.org", ports: [80, 443], layer: "operator" },
+    ]);
   });
 });
 
@@ -101,7 +109,7 @@ describe("applying the rules", () => {
   it("live agents get them through their sandbox's client layer, which keeps its bindings and env", async () => {
     const s = await setup();
     const sb = sandboxOf(s.manager);
-    sb.layer = { egress: { allow: [] }, inject: [{ name: "npm_token", secret: "x", hosts: ["registry.npmjs.org"], locations: [] }], env: { NPM_TOKEN: "nest-ph.cli_app.npm_token." } };
+    sb.layer = { egress: { allow: [] }, inject: [{ name: "npm_token", secret: "x", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] }], env: { NPM_TOKEN: "nest-ph.cli_app.npm_token." } };
     const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] });
     expect(r.status).toBe(200);
     const put = fake.callsTo("PUT", /\/client-policy$/).at(-1)!;
@@ -113,6 +121,30 @@ describe("applying the rules", () => {
     const before = fake.callsTo("PUT", /\/client-policy$/).length;
     await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [{ host: "pypi.org" }], manager: [{ host: "nodejs.org" }] });
     expect(fake.callsTo("PUT", /\/client-policy$/).length).toBe(before);
+  });
+
+  it("a network change on a live sandbox keeps the Secrets page's bindings and env, change after change", async () => {
+    const s = await setup();
+    const t = (await api(token, "POST", `/api/projects/${s.id}/tasks`, { title: "t" })).body.id;
+    await api(token, "PUT", `/api/projects/${s.id}/tasks/${t}/spec`, spec);
+    const worker = (await api(token, "POST", `/api/projects/${s.id}/tasks/${t}/assign`)).body.assignee as string;
+    const sb = sandboxOf(worker);
+    // What the Secrets page (#133) puts in a worker's layer: bindings `{name, secret, hosts, locations}` (one
+    // a header, one `*.` with wildcard) and env carrying their placeholders, `nest-ph.<client>.<name>.`.
+    const bindings = [
+      { name: "npm_token", secret: "npm", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] },
+      { name: "pypi", secret: "pypi_upload", hosts: ["*.pythonhosted.org"], locations: [{ type: "header", name: "X-Upload-Token" }, { type: "authorization_basic_password" }], wildcard: true },
+    ];
+    const vars = { NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.`, PYPI_TOKEN: `nest-ph.${CLIENT}.pypi.`, CI: "1" };
+    sb.layer = { egress: { allow: [{ host: "registry.npmjs.org" }] }, inject: structuredClone(bindings), env: { ...vars } };
+    for (const worker_rules of [[{ host: "pypi.org" }], [{ host: "nodejs.org", ports: [443] }], []]) {
+      const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: worker_rules, manager: [] });
+      expect(r.status).toBe(200);
+      // Sent in the PUT's strict shape (nest refuses a held binding's `client` and `placeholder`), so it applied.
+      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars });
+      expect(sb.layer).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars });
+      expect(r.body.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: worker, state: "applied", error: null })]));
+    }
   });
 
   it("a refusal that will repeat shows as failed, not retried; a transient one stays pending and goes on", async () => {

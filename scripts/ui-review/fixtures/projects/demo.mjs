@@ -106,7 +106,10 @@ export function data(variant = "demo", now = Date.now()) {
       { agent: "agt_w1k7c2", role: "worker", sandbox: "sbx_w3", state: "failed", error: "nest 403 forbidden: egress host downloads.gadgets.example.com is outside the grant", rev: 2, at_ms: now - 900_000 },
     ],
     egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org", "*.gadgets.example.com", "crates.io", "static.crates.io", "index.crates.io"],
-    base: variant === "network-empty" ? null : [{ host: "github.com", ports: [443] }, { host: "api.github.com", ports: [443] }, { host: "codeload.github.com", ports: [443] }],
+    base: variant === "network-empty" ? null : [
+      ...["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "crates.io", "static.crates.io", "index.crates.io", "github.com", "*.githubusercontent.com", "deb.debian.org"].map((host) => ({ host, ports: [80, 443], layer: "base" })),
+      { host: "mirror.internal.example", ports: [8443], layer: "operator" },
+    ],
   };
 
   /** The answer to `GET|POST /api<path>`: [status, body]. */

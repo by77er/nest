@@ -74,11 +74,44 @@ export function normalizeRules(rules: readonly EgressRule[]): EgressRule[] {
   });
 }
 
+/** Where a binding's credential goes (nest's `ClientInjectionLocation`). */
+export type BindingLocation = { type: "authorization_bearer" } | { type: "authorization_basic_password" } | { type: "header"; name: string };
+
+/** A client's injection binding as `PUT …/client-policy` takes it (nest's `ClientInjection`, a strict object). */
+export interface Binding {
+  name: string;
+  secret: string;
+  hosts: string[];
+  locations: BindingLocation[];
+  wildcard?: boolean;
+}
+
+/**
+ * A binding as `GET …/client-policy` answers it (nest's `HeldInjection`): the PUT shape plus whose it is
+ * and the placeholder nest assigned (`nest-ph.<client>.<name>.`), which the PUT refuses.
+ */
+export interface HeldBinding extends Binding {
+  client?: string;
+  placeholder?: string;
+}
+
 /** A sandbox's client layer, nest's `PUT …/client-policy` body (every part present: an absent one is emptied). */
 export interface ClientLayer {
   egress: { allow: EgressRule[] };
-  inject: unknown[];
+  inject: Binding[];
   env: Record<string, string>;
+}
+
+/** A sandbox's client layer as `GET …/client-policy` answers it. */
+export interface HeldClientLayer {
+  egress: { allow: EgressRule[] };
+  inject: HeldBinding[];
+  env: Record<string, string>;
+}
+
+/** A held binding back in the PUT's shape: nest's strict schema refuses `client` and `placeholder`. */
+export function asBinding(b: HeldBinding): Binding {
+  return { name: b.name, secret: b.secret, hosts: [...b.hosts], locations: b.locations.map((l) => ({ ...l })), ...(b.wildcard !== undefined ? { wildcard: b.wildcard } : {}) };
 }
 
 /**
@@ -87,19 +120,61 @@ export interface ClientLayer {
  * role, so the layer keeps what the sandbox has now (its create's, or the last write's).
  */
 export interface LayerFeeds {
-  inject?: unknown[];
+  inject?: Binding[];
   env?: Record<string, string>;
 }
 
 /**
  * The one way the app builds a sandbox's whole client layer, since nest replaces it whole: the
  * network rules for its role, and each other part from its feed, else as the sandbox has it now. So a
- * network change never drops a secret's binding, and a secrets change never drops a host.
+ * network change never drops a secret's binding, and a secrets change never drops a host. A kept
+ * binding goes back in the PUT's shape, its placeholder (nest's, and unchanged) left for nest to assign.
  */
-export function clientLayerFor(rules: RoleRules, role: NetworkRole, feeds: LayerFeeds, current: ClientLayer | null): ClientLayer {
+export function clientLayerFor(rules: RoleRules, role: NetworkRole, feeds: LayerFeeds, current: HeldClientLayer | null): ClientLayer {
   return {
     egress: { allow: normalizeRules(rules[role]) },
-    inject: feeds.inject ?? current?.inject ?? [],
+    inject: (feeds.inject ?? current?.inject ?? []).map(asBinding),
     env: feeds.env ?? current?.env ?? {},
   };
+}
+
+/** One allow rule of a sandbox's effective policy (`GET /v1/sandboxes/<id>/policy`), with the layer it came from. */
+export interface PolicyAllow {
+  host: string;
+  ports?: number[];
+  layer?: string;
+}
+
+/** A rule the operator's side of a sandbox's policy allows: nest's defaults (`base`) or the operator's own layer. */
+export interface OperatorRule {
+  host: string;
+  ports: number[];
+  layer: "base" | "operator";
+}
+
+/**
+ * The operator's rules in a sandbox's effective policy, read-only on the page. nest labels its
+ * defaults `base`; the operator's layer, the rules built from its repo allowlists, and the client's own
+ * egress all `workstream` (the operator layer's wire name; `operator` taken too, should it be renamed);
+ * temporary grants `sandbox`. So the operator's are the `workstream` rules less one per rule of the
+ * client's own layer (`own`, from `GET …/client-policy`, compiled as nest does: no ports is 80 and 443),
+ * and grants are left out.
+ */
+export function operatorRules(allow: readonly PolicyAllow[], own: readonly EgressRule[]): OperatorRule[] {
+  const key = (host: string, ports: readonly number[] | undefined) => `${host} ${[...(ports ?? WEB_PORTS)].sort((a, b) => a - b).join(",")}`;
+  const mine = new Map<string, number>();
+  for (const r of own) mine.set(key(r.host, r.ports), (mine.get(key(r.host, r.ports)) ?? 0) + 1);
+  const out: OperatorRule[] = [];
+  for (const r of allow) {
+    const ports = [...(r.ports ?? WEB_PORTS)];
+    if (r.layer === "base") {
+      out.push({ host: r.host, ports, layer: "base" });
+    } else if (r.layer === "workstream" || r.layer === "operator") {
+      const k = key(r.host, r.ports);
+      const n = mine.get(k) ?? 0;
+      if (n > 0) mine.set(k, n - 1);
+      else out.push({ host: r.host, ports, layer: "operator" });
+    }
+  }
+  return out;
 }

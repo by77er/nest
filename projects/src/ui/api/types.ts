@@ -41,5 +41,5 @@ export interface NetworkView {
   rev: number;
   agents: import("../../do/project").LayerStatus[];
   egress_hosts: string[] | null;
-  base: import("../../network").EgressRule[] | null;
+  base: import("../../network").OperatorRule[] | null;
 }

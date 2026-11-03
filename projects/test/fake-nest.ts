@@ -59,8 +59,12 @@ export class FakeNest {
   readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; layer: { egress: { allow: unknown[] }; inject: unknown[]; env: Record<string, string> } }>();
   /** The grant's `egress_hosts` (docs/control-plane/api/clients/#egress), as `GET /v1/clients/self` answers it. */
   egressHosts: string[] = ["registry.npmjs.org", "nodejs.org", "*.pythonhosted.org", "pypi.org"];
-  /** The operator's base rules, as each sandbox's effective policy shows them. */
+  /** nest's defaults, as each sandbox's effective policy shows them (layer `base`). */
   baseRules: { host: string; ports: number[] }[] = [{ host: "github.com", ports: [443] }];
+  /** The operator's own layer, which the effective policy labels `workstream`, as it does the client's own rules. */
+  operatorRules: { host: string; ports?: number[] }[] = [{ host: "mirror.internal.example", ports: [8443] }];
+  /** Temporary grants (layer `sandbox`), in every sandbox's effective policy. */
+  grantRules: { host: string; ports: number[]; expires_ms: number }[] = [{ host: "approved.example.com", ports: [443], expires_ms: Date.now() + 3_600_000 }];
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
   readonly catalog = new Map<string, unknown>();
   readonly answers: { agent: string; ask: string; answer: string }[] = [];
@@ -170,11 +174,30 @@ export class FakeNest {
       if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
       if (sb.ended) return nestErr(409, "forbidden", "sandbox is destroyed");
       if (m[2] === "policy" && req.method === "GET") {
-        return json(200, { version: 1, allow: [...this.baseRules.map((b) => ({ ...b, layer: "base" })), ...(sb.layer.egress.allow as { host: string }[]).map((x) => ({ ...x, layer: "workstream" }))], passthrough: [] });
+        // As nest's effectivePolicy: its defaults `base`; the operator's layer and the client's own rules
+        // (no ports: 80 and 443) both `workstream`; grants `sandbox`.
+        const web = (r: { host: string; ports?: number[] }) => ({ host: r.host, ports: r.ports ?? [80, 443] });
+        return json(200, {
+          version: 1,
+          allow: [
+            ...this.baseRules.map((b) => ({ ...web(b), layer: "base" })),
+            ...this.operatorRules.map((b) => ({ ...web(b), layer: "workstream" })),
+            ...(sb.layer.egress.allow as { host: string; ports?: number[] }[]).map((x) => ({ ...web(x), layer: "workstream" })),
+            ...this.grantRules.map((g) => ({ ...g, layer: "sandbox" })),
+          ],
+          passthrough: [],
+        });
       }
-      if (req.method === "GET") return json(200, sb.layer);
+      // nest answers its bindings as held: whose they are and the placeholder it assigned (`HeldInjection`).
+      if (req.method === "GET") {
+        return json(200, { ...sb.layer, inject: (sb.layer.inject as { name: string }[]).map((b) => ({ ...b, client: CLIENT, placeholder: `nest-ph.${CLIENT}.${b.name}.` })) });
+      }
       if (req.method === "PUT") {
-        // nest's checks: the whole layer replaced, its egress within the grant's egress_hosts.
+        // nest's checks: the whole layer replaced, each binding a strict `ClientInjection`, its egress within
+        // the grant's egress_hosts.
+        const BINDING_KEYS = ["name", "secret", "hosts", "locations", "wildcard"];
+        const extra = ((call.body?.inject ?? []) as Record<string, unknown>[]).flatMap((b) => Object.keys(b).filter((k) => !BINDING_KEYS.includes(k)));
+        if (extra.length) return nestErr(400, "invalid_message", `inject: unrecognized key "${extra[0]}"`);
         const allow = (call.body?.egress?.allow ?? []) as { host: string }[];
         const outside = allow.filter((x) => !this.egressHosts.some((h) => h === x.host || (h.startsWith("*.") && x.host.endsWith(h.slice(1)))));
         if (outside.length) return nestErr(403, "forbidden", `egress host ${outside[0]!.host} is outside the grant`);

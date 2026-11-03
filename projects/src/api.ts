@@ -7,7 +7,7 @@ import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { NestError, nestFrom } from "./nest";
 import { Answer, Cancel, Chat, CreateProject, CreateTask, Network, Settings, Spec, UpdateTask } from "./requests";
-import { NETWORK_ROLES, normalizeRules, rulesProblems } from "./network";
+import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, rulesProblems } from "./network";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -219,19 +219,20 @@ async function egressHostsOf(env: Env): Promise<Result<string[]>> {
 
 /**
  * The Network page's view: the rules and each live agent's layer (ProjectDO's), the grant's ceiling,
- * and the operator's base rules as the manager's sandbox's effective policy shows them (a client may
- * read its own sandboxes' policy; null until the manager runs, or when nest can't be read).
+ * and the operator's rules (nest's defaults and the operator's layer, `operatorRules`) as the manager's
+ * sandbox's effective policy shows them (a client may read its own sandboxes' policy; null until the
+ * manager runs, or when nest can't be read).
  */
 async function networkView(env: Env, p: ReturnType<typeof project>, have?: Awaited<ReturnType<ReturnType<typeof project>["network"]>> extends Result<infer T> ? T : never): Promise<Response> {
   const mine = have ? { ok: true as const, value: have } : await p.network();
   if (!mine.ok) return err(mine.status, mine.error);
   const [grant, sandbox] = await Promise.all([egressHostsOf(env), p.managerSandbox()]);
-  let base: { host: string; ports?: number[] }[] | null = null;
+  let base: OperatorRule[] | null = null;
   const nest = nestFrom(env);
   if (nest && sandbox) {
     try {
-      const policy = await nest.sandboxPolicy(sandbox);
-      base = (policy.allow ?? []).filter((r) => r.layer === "base").map((r) => ({ host: r.host, ...(r.ports ? { ports: r.ports } : {}) }));
+      const [policy, own] = await Promise.all([nest.sandboxPolicy(sandbox), nest.getClientPolicy(sandbox)]);
+      base = operatorRules(policy.allow ?? [], own.egress?.allow ?? []);
     } catch {
       base = null;
     }

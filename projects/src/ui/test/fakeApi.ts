@@ -46,7 +46,7 @@ export class FakeApi {
   sync: SyncState | null = null;
   reviews: Job[] = [];
   waits: Waits = { pending: [], recent: [] };
-  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443] }] };
+  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], layer: "base" }, { host: "mirror.internal.example", ports: [8443], layer: "operator" }] };
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
   /** Answers to give instead, by `METHOD path` pattern, once each. */
