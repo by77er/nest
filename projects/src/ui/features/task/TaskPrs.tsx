@@ -11,7 +11,7 @@ import { prNumberOf } from "../../../prs";
 import { useAttachPr, useDetachPr, useOpenPrs, useReviews, useTasks } from "../../api/queries";
 import type { Job, Task, TaskPr } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { Grow, MetaItem, Picker, type PickerItem, Row, RowAction, Section, Stack, TriggerBadge, weight } from "../../layout";
+import { Grow, MetaItem, MetaRow, Picker, Row, RowAction, Section, Stack, TriggerBadge, type PickerItem, weight } from "../../layout";
 import { TERMINAL } from "../../../tasks";
 import { JobState } from "../reviews/ReviewsPage";
 
@@ -78,10 +78,13 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
             Fork
           </Badge>
         )}
+      </Row>
+      {/* Three lines: its number and title, its badges, who attached it. */}
+      <MetaRow>
         <MetaItem title={exact(pr.attached_ms)}>
           Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
         </MetaItem>
-      </Row>
+      </MetaRow>
     </Stack>
   );
 }

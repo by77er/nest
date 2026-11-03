@@ -36,7 +36,7 @@ body {
      are as with a mouse; it's lifted over the text it reaches into (its own result, its caption).
      `hit-overlap` guards it against reaching a neighbouring control. */
 @media (pointer: coarse) {
-  :is(button, [role="button"]):not(.mantine-Anchor-root, [data-ds="term-line"]),
+  :is(button, [role="button"]):not(.mantine-Anchor-root, [data-ds="term-line"], [data-ds="row-action"]),
   a[href]:is(.mantine-Button-root, [data-ds="nav-row"]) {
     min-height: var(--nest-hit-touch);
     min-width: var(--nest-hit-touch);
