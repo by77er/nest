@@ -16,7 +16,7 @@ export { Section } from "./Section";
 export { Sheet } from "./Sheet";
 export { SortablePanel } from "./Sortable";
 export { Prose, Row, Stack } from "./Stack";
-export { RichImage, RichProse, RichTableFrame, SvgFigure, TaskCards, TaskRefCard } from "./Rich";
+export { RichImage, RichProse, RichTableFrame, ScrollSentinel, SvgFigure, TaskCards, TaskCheck, TaskRefCard } from "./Rich";
 export { EmptyState, ErrorState, LoadingState } from "./States";
 export { Toolbar } from "./Toolbar";
 export { icon } from "../theme";

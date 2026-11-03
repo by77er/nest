@@ -2,12 +2,11 @@
 // grip at the right, then a caption line of who and which PR. The grip drags it, by pointer or keyboard
 // (space, arrows).
 
-import { Anchor, Badge, Text, Tooltip } from "@mantine/core";
-import { IconGitPullRequest, IconRobot } from "@tabler/icons-react";
+import { Anchor } from "@mantine/core";
 import type { Task } from "../../api/types";
 import { AnchorLink } from "../../common/links";
-import { MetaItem, MetaRow, Row, SortablePanel, Stack } from "../../layout";
-import { StateBadge } from "./StateBadge";
+import { SortablePanel } from "../../layout";
+import { TaskCardBody } from "./TaskCardBody";
 
 export interface TaskCardProps {
   task: Task;
@@ -23,57 +22,21 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
   return (
     <SortablePanel id={task.id} disabled={!sortable} gripLabel={`Move ${task.title}`} dense component="article" aria-label={task.title} data-task={task.id}>
       {(grip) => (
-        <Stack gap="sm">
-          <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: task.id }} c="bright" fw="medium" fz="sm">
-            {task.title}
-          </AnchorLink>
-          <Row gap="xs" justify="space-between" align="flex-start">
-            <Row gap="xs">
-              <StateBadge state={task.state} size="sm" />
-              {task.blocked && (
-                <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
-                  <Badge size="sm" color="warning" variant="filled" data-marker="blocked" tabIndex={0}>
-                    Blocked
-                  </Badge>
-                </Tooltip>
-              )}
-              {pendingAsks > 0 && (
-                <Badge size="sm" color="warning" variant="filled" data-marker="ask">
-                  Needs input
-                </Badge>
-              )}
-              {task.tainted && (
-                <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
-                  <Badge size="sm" color="gray" variant="outline" data-marker="tainted" tabIndex={0}>
-                    Tainted
-                  </Badge>
-                </Tooltip>
-              )}
-            </Row>
-            {grip}
-          </Row>
-          {(task.assignee || task.pr !== null) && (
-            <MetaRow>
-              {task.assignee && (
-                <MetaItem icon={IconRobot} mono>
-                  {task.assignee}
-                </MetaItem>
-              )}
-              {task.pr !== null && (
-                <MetaItem icon={IconGitPullRequest}>
-                  <Anchor href={`https://github.com/${repo}/pull/${task.pr}`} target="_blank" rel="noreferrer" inherit>
-                    #{task.pr}
-                  </Anchor>
-                </MetaItem>
-              )}
-            </MetaRow>
+        <TaskCardBody
+          task={task}
+          pendingAsks={pendingAsks}
+          end={grip}
+          title={
+            <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: task.id }} c="bright" fw="medium" fz="sm">
+              {task.title}
+            </AnchorLink>
+          }
+          pr={(n) => (
+            <Anchor href={`https://github.com/${repo}/pull/${n}`} target="_blank" rel="noreferrer" inherit>
+              #{n}
+            </Anchor>
           )}
-          {task.start_error && (
-            <Text size="xs" c="warning">
-              {task.start_error}
-            </Text>
-          )}
-        </Stack>
+        />
       )}
     </SortablePanel>
   );

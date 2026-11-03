@@ -8,16 +8,18 @@ import { createMemoryHistory, createRootRoute, createRoute, createRouter, Router
 import { describe, expect, it, vi } from "vitest";
 import { keys } from "../../api/queries";
 import { createQueryClient } from "../../api/queryClient";
-import { FakeApi, task } from "../../test/fakeApi";
+import type { Ask } from "../../api/types";
+import { ask, FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 import { cssVariablesResolver, theme } from "../../theme";
 import { sanitizeSvg, SVG_MAX_BYTES } from "../../rich/svg";
 import { RichMessage } from "./RichMessage";
 
 /** The message alone, over a board of `tasks`. */
-async function show(text: string, tasks = [task({ title: "Live title", state: "in_review", pr: 9 })]) {
+async function show(text: string, tasks = [task({ title: "Live title", state: "in_review", pr: 9 })], asks: Ask[] = []) {
   const api = new FakeApi();
   api.tasks = tasks;
+  api.asks = asks;
   vi.stubGlobal("fetch", api.fetch);
   const qc = createQueryClient();
   qc.setQueryData(keys.tasks("prj_one"), tasks);
@@ -53,11 +55,12 @@ describe("Markdown", () => {
         "[docs](https://example.com/docs)",
       ].join("\n\n"),
     );
-    expect(within(root).getByRole("heading", { level: 2, name: "Plan" })).toBeInTheDocument();
+    // Demoted by three: a message's headings sit under the page's own.
+    expect(within(root).getByRole("heading", { level: 5, name: "Plan" })).toBeInTheDocument();
     expect(within(root).getAllByRole("listitem").length).toBeGreaterThanOrEqual(4);
     const boxes = within(root).getAllByRole("checkbox");
-    expect(boxes.map((b) => (b as HTMLInputElement).checked)).toEqual([true, false]);
-    for (const b of boxes) expect(b).toBeDisabled();
+    expect(boxes.map((b) => b.getAttribute("aria-checked"))).toEqual(["true", "false"]);
+    for (const b of boxes) expect(b).not.toHaveAttribute("tabindex");
     expect(within(root).getByRole("table").closest("[data-ds=rich-table]")).not.toBeNull();
     expect(root.querySelector("blockquote")).toHaveTextContent("quoted");
     expect(root.querySelector("pre code")).toHaveTextContent("const x = 1;");
@@ -159,6 +162,10 @@ describe("task references", () => {
       expect(c).not.toHaveTextContent("an old name");
       expect(c.querySelector("[data-state=in_review]")).not.toBeNull();
       expect(c).toHaveAttribute("href", `/projects/prj_one/board?task=${t.id}`);
+      // The title reads first, then the state; the chip is phrasing content inside the paragraph.
+      expect(c.firstElementChild).toHaveTextContent("Live title");
+      expect(c.querySelector("div, p")).toBeNull();
+      expect(c.closest("p")).not.toBeNull();
     }
   });
 
@@ -168,14 +175,16 @@ describe("task references", () => {
     expect(root.querySelectorAll("[data-ds=task-chip], [data-ds=task-card], a")).toHaveLength(0);
     expect(root).toHaveTextContent("theirs");
     expect(root).toHaveTextContent("task:tsk_gone");
+    expect([...root.querySelectorAll("code[data-task-ref=unresolved]")].map((c) => c.textContent)).toEqual(["theirs", "task:tsk_gone"]);
     expect(root).toHaveTextContent("tsk_notours a note");
   });
 
-  it("a tasks block renders a card per task, with its state, assignee, PR, needs-you marker and the note", async () => {
+  it("a tasks block renders a card per task as the Board does: state, assignee, PR, Blocked, Needs input and the note", async () => {
     const a = task({ title: "First", state: "in_progress", assignee: "agt_w1", pr: 42 });
     const b = task({ title: "Second", state: "stalled", blocked: { at_ms: 1, by: "agt_w2", role: "worker", reason: "needs a key", question: null, tainted: false } });
     const fence = "```";
-    const { root } = await show(`Status:\n\n${fence}tasks\n${a.id} — PR is up\n${b.id}\n${fence}`, [a, b]);
+    const asks = [ask({ task: b.id, question: "Which key?" }), ask({ task: a.id, question: "Done already", answered_ms: 5 })];
+    const { root } = await show(`Status:\n\n${fence}tasks\n${a.id} — PR is up\n${b.id}\n${fence}`, [a, b], asks);
     const cards = [...root.querySelectorAll("[data-ds=task-card]")] as HTMLElement[];
     expect(cards.map((c) => c.getAttribute("data-task-ref"))).toEqual([a.id, b.id]);
     expect(cards[0]).toHaveTextContent("First");
@@ -183,8 +192,11 @@ describe("task references", () => {
     expect(cards[0]).toHaveTextContent("#42");
     expect(cards[0]).toHaveTextContent("PR is up");
     expect(cards[0]!.querySelector("[data-state=in_progress]")).not.toBeNull();
-    expect(cards[0]!.querySelector("[data-marker=needs-you]")).toBeNull();
-    expect(cards[1]!.querySelector("[data-marker=needs-you]")).not.toBeNull();
+    expect(cards[0]!.querySelector("[data-marker=blocked], [data-marker=ask]")).toBeNull();
+    expect(cards[1]!.querySelector("[data-marker=blocked]")).not.toBeNull();
+    // An open ask from its worker, as on the Board; an answered one is not.
+    await waitFor(() => expect(cards[1]!.querySelector("[data-marker=ask]")).not.toBeNull());
+    expect(cards[0]!.querySelector("[data-marker=ask]")).toBeNull();
     expect(within(cards[1]!).getByRole("link", { name: "Second" })).toHaveAttribute("href", `/projects/prj_one/board?task=${b.id}`);
   });
 

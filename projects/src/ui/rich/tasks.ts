@@ -64,3 +64,17 @@ export function remarkEscapeHtml() {
     walk(tree);
   };
 }
+
+/**
+ * A remark plugin: a message's headings are demoted by three (# is h4, down to h6), so user content
+ * never takes the page's h1–h3 and breaks its outline. They look the same (styled by weight).
+ */
+export function remarkDemoteHeadings() {
+  return (tree: MdNode & { depth?: number }) => {
+    const walk = (node: MdNode & { depth?: number }) => {
+      if (node.type === "heading" && typeof node.depth === "number") node.depth = Math.min(6, node.depth + 3);
+      for (const c of node.children ?? []) walk(c);
+    };
+    walk(tree);
+  };
+}
