@@ -150,6 +150,8 @@ interface InflightCheckpoint {
   sent_ms: number;
   /** Turn ends that arrived while it was in flight: they get one follow-up checkpoint once it lands. */
   waiting: number;
+  /** Its `sandbox_checkpoint` command, once FleetDO has queued it: only that command's result lands it. */
+  cmd?: string;
 }
 /** How many epochs `info().history` shows; the `epochs` table keeps them all. */
 const HISTORY_MAX = 50;
@@ -552,7 +554,10 @@ export class SandboxDO extends DurableObject<Env> {
     }
   }
 
-  /** A command failed on the lease holder: `sandbox_create` and `sandbox_checkpoint` failures matter here. */
+  /**
+   * A command failed on the lease holder: `sandbox_create` failures matter here, and `sandbox_checkpoint`
+   * ones from a FleetDO of the previous release (this one sends `checkpointResult` instead).
+   */
   async commandFailed(host: string, type: string, epoch: number, error: ErrorBody): Promise<void> {
     if (type === "sandbox_checkpoint" && this.tryInfo()) {
       await this.turnCheckpointLanded(epoch);
@@ -652,10 +657,12 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** Send one command to the current holder, stamped with the sandbox and the epoch read with the host. */
-  private async command(body: SandboxCommand): Promise<void> {
+  /** Send one command to the current holder, stamped with the sandbox and the epoch read with the host; its id. */
+  private async command(body: SandboxCommand): Promise<string | undefined> {
     const info = this.info_();
     if (!info.host) throw new NestError(ErrorCodes.NOT_BOUND, "sandbox is not placed on a host", 409, true);
-    await this.fleet(info.cell).issueCommands(info.host, [{ ...body, sandbox: info.sandbox, epoch: info.epoch } as CommandBody]);
+    const [cmd] = await this.fleet(info.cell).issueCommands(info.host, [{ ...body, sandbox: info.sandbox, epoch: info.epoch } as CommandBody]);
+    return cmd;
   }
 
   // --- generations ----------------------------------------------------------------------------------
@@ -1383,12 +1390,24 @@ export class SandboxDO extends DurableObject<Env> {
     // Recorded before the await: a turn that ends while the command is being queued waits for it too.
     this.put("turn_checkpoint_inflight", { epoch: info.epoch, sent_ms: now, waiting: 0 } satisfies InflightCheckpoint);
     try {
-      await this.command({ type: "sandbox_checkpoint", reason: "turn_end" });
+      const cmd = await this.command({ type: "sandbox_checkpoint", reason: "turn_end" });
+      const f = this.get<InflightCheckpoint>("turn_checkpoint_inflight");
+      if (cmd && f && f.epoch === info.epoch && f.sent_ms === now) this.put("turn_checkpoint_inflight", { ...f, cmd });
     } catch (e) {
       // Never queued: nothing is in flight, and a turn that ended meanwhile gets the follow-up.
       await this.turnCheckpointLanded(info.epoch);
       throw e;
     }
+  }
+
+  /**
+   * FleetDO's word that `cmd`, a `sandbox_checkpoint` for `epoch`, has its result (ok or not): it lands
+   * the checkpoint in flight if that is its command, including one that sent no new `turn_end` commit
+   * (nestd found nothing new to send after asking again for an unanswered one, or found no disk).
+   */
+  async checkpointResult(_host: string, epoch: number, cmd: string): Promise<void> {
+    if (!this.tryInfo()) return;
+    await this.turnCheckpointLanded(epoch, cmd);
   }
 
   /** The turn-end checkpoint in flight for `epoch`, unless it has been out longer than it can be. */
@@ -1403,9 +1422,12 @@ export class SandboxDO extends DurableObject<Env> {
    * and the turns that ended while it was in flight get their one follow-up when the interval is up
    * (replacing the deadline for its never landing, the only one armed meanwhile).
    */
-  private async turnCheckpointLanded(epoch: number): Promise<void> {
+  private async turnCheckpointLanded(epoch: number, cmd?: string): Promise<void> {
     const f = this.get<InflightCheckpoint>("turn_checkpoint_inflight");
     if (!f || f.epoch !== epoch) return;
+    // Another command's result (an older checkpoint's, late) never lands this one. Before its id is
+    // recorded (a result racing the queueing call's return), the epoch alone decides.
+    if (cmd !== undefined && f.cmd !== undefined && f.cmd !== cmd) return;
     const now = Date.now();
     this.del("turn_checkpoint_inflight");
     this.put("turn_checkpoint_ms", now);

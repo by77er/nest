@@ -67,6 +67,8 @@ struct FakeDriver {
     fail_next_start: Arc<AtomicBool>,
     /// The next VM starts, but its guest agent never comes up.
     mute_next_guest: Arc<AtomicBool>,
+    /// The next `pause` of a VM fails.
+    fail_next_pause: Arc<AtomicBool>,
     /// Sandboxes whose VM was stopped, in order.
     stopped: Arc<Mutex<Vec<String>>>,
     /// Lock-free pauses, as (sandbox, epoch).
@@ -91,6 +93,7 @@ impl Driver for FakeDriver {
             latch: self.latch.clone(),
             fail_next_start: self.fail_next_start.clone(),
             mute_next_guest: self.mute_next_guest.clone(),
+            fail_next_pause: self.fail_next_pause.clone(),
             stopped: self.stopped.clone(),
             live: self.live.clone(),
             resume_latch: self.resume_latch.clone(),
@@ -108,6 +111,7 @@ struct FakeVm {
     latch: Option<Arc<AttachLatch>>,
     fail_next_start: Arc<AtomicBool>,
     mute_next_guest: Arc<AtomicBool>,
+    fail_next_pause: Arc<AtomicBool>,
     stopped: Arc<Mutex<Vec<String>>>,
     live: Arc<AtomicUsize>,
     resume_latch: Arc<ResumeLatch>,
@@ -157,6 +161,9 @@ impl Vm for FakeVm {
         Ok(())
     }
     async fn pause(&mut self) -> std::io::Result<()> {
+        if self.fail_next_pause.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("fake VM failed to pause"));
+        }
         Ok(())
     }
     async fn resume(&mut self) -> std::io::Result<()> {
@@ -2482,4 +2489,30 @@ async fn a_commits_pause_is_marked_at_the_gateway_until_the_vm_runs_or_leaves() 
     let n = words.len();
     assert!(matches!(words[n - 1], GatewayCommand::SandboxRemove { .. }), "{words:?}");
     assert!(matches!(words[n - 2], GatewayCommand::SandboxUpsert { paused: Some(p), .. } if p.reason == "suspend"), "{words:?}");
+}
+
+/// A pause that fails lifts its mark: the VM still runs, so the gateway must admit binds again
+/// (a kept mark would answer every bind `busy` for the paused budget, then fail the calls).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_pause_lifts_its_mark() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    wait_until("the gateway has the running sandbox", || matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxUpsert { paused: None, .. }))).await;
+    let mark = h.gateway.got.lock().unwrap().len();
+    h.vm.fail_next_pause.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_ck").await), "the checkpoint fails with its pause");
+    wait_until("the mark is lifted", || {
+        let since: Vec<Option<String>> = h.gateway.got.lock().unwrap()[mark..]
+            .iter()
+            .filter_map(|c| match c {
+                GatewayCommand::SandboxUpsert { sandbox, paused, .. } if sandbox == &sbx => Some(paused.clone().map(|p| p.reason)),
+                _ => None,
+            })
+            .collect();
+        since == vec![Some("checkpoint (turn_end)".to_string()), None]
+    })
+    .await;
 }

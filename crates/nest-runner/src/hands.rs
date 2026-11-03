@@ -768,6 +768,35 @@ mod tests {
         assert_eq!(*resolves.lock().unwrap(), 1, "busy keeps the target");
     }
 
+    /// The long budget sticks: once a call has met a paused VM, a plain `busy` after it (the VM
+    /// running again, its guest not answering yet) keeps the paused budget, so the end of a pause
+    /// doesn't cut the call short. Scaled: paused 0.5 s, then a plain `busy` until 2.5 s, past the
+    /// 1 s busy budget and inside the 4 s paused one.
+    #[tokio::test]
+    async fn a_plain_busy_after_a_pause_keeps_the_paused_budget() {
+        let (gw, guest) = gateway_with_guest().await;
+        gw.set_paused(SBX, 4, &guest.path, &[AGENT], Some("checkpoint (turn_end)"));
+        let (agent, _) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
+        let (state, path) = (gw.state.clone(), guest.path.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Not paused any more, but no guest info yet: a plain `busy` ("not configured").
+            state.upsert_sandbox(
+                SandboxId(SBX.into()),
+                Epoch(4),
+                std::path::PathBuf::from(&path),
+                [AGENT.to_string()],
+                None,
+            );
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            TestGateway::configure(&state, SBX, 4, &path, &[AGENT]);
+        });
+        let started = Instant::now();
+        let r = call_with(&agent, "c1".into(), bash("echo hi"), &CancellationToken::new(), &split()).await;
+        assert!(!r.is_error, "{r:?}");
+        assert!(started.elapsed() >= Duration::from_millis(2500), "{:?}", started.elapsed());
+    }
+
     /// A pause past the paused budget ends the call with a message that says the sandbox was
     /// checkpointing, not "bind timed out", and only after the long budget; nothing reached the guest.
     #[tokio::test]

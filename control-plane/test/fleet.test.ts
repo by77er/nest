@@ -617,6 +617,10 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
       }]);
       await a.ws.next("ack", (m) => m.up_to >= seq);
     };
+    const ok = async (cmd: string) => {
+      const seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "command_result", cmd, outcome: { status: "ok" } }]);
+      await a.ws.next("ack", (m) => m.up_to >= seq);
+    };
     // The interval since the last checkpoint landed has passed.
     const intervalUp = () => runInDurableObject(stub, (_i, st) => {
       st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'turn_checkpoint_ms'", JSON.stringify(Date.now() - 11_000));
@@ -629,7 +633,7 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
       return at !== undefined && at > Date.now() && at <= Date.now() + 10_000;
     });
     const checkpoints = (ms = 300) => a.ws.none("commands", ms, (m) => (m.commands as any[]).some((c) => c.type === "sandbox_checkpoint"));
-    return { a, sbx, stub, turn, land, fail, intervalUp, armed, dueSoon, checkpoints };
+    return { a, sbx, stub, turn, land, fail, ok, intervalUp, armed, dueSoon, checkpoints };
   }
 
   it("commits the disk when a turn ends, and a turn ending within 10 s of the last landing gets its commit when the interval is up", async () => {
@@ -707,6 +711,20 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await runAlarm(t.stub, "turn_checkpoint");
     const [fifth] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
     expect(fifth).toMatchObject({ reason: "turn_end" });
+
+    // A checkpoint whose command succeeds with no new turn_end commit (nestd asked again for an
+    // unanswered commit of another reason and found nothing new, or found no disk): its ok lands it,
+    // and the turn that ended meanwhile gets its follow-up in 10 s, not 5 min. Only its own command's
+    // ok does: a late ok of an older checkpoint lands nothing.
+    await t.turn();
+    await t.ok(fourth.cmd);
+    expect(await t.dueSoon()).toBe(false);
+    await t.ok(fifth.cmd);
+    expect(await t.dueSoon()).toBe(true);
+    await t.intervalUp();
+    await runAlarm(t.stub, "turn_checkpoint");
+    const [sixth] = await nextCommands(t.a.ws, (c) => c.type === "sandbox_checkpoint");
+    expect(sixth).toMatchObject({ reason: "turn_end" });
   });
 
   it("a host retired with only suspended sandboxes evicts them; waking places them from head elsewhere", async () => {
