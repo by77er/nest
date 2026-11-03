@@ -24,12 +24,15 @@ async function sixColumns(page, { width }) {
 // acts like a reader (the wheel) and leaves what it measured for `check`.
 
 const bubbles = (p) => p.evaluate(() => [...document.querySelectorAll("[data-ds=bubble]")].map((b) => Math.round(b.getBoundingClientRect().top)));
-/** How far the newest message sits under the docked composer (0: clear of it). */
-const hidden = (p) => p.evaluate(() => {
+/** The room between the newest message and the docked composer (negative: under it). */
+const gapAbove = (p) => p.evaluate(() => {
   const last = [...document.querySelectorAll("[data-ds=bubble]")].at(-1)?.getBoundingClientRect();
   const f = document.querySelector("[data-ds=pinned-footer]")?.getBoundingClientRect();
-  return last && f ? Math.max(0, Math.round(last.bottom - f.top)) : null;
+  return last && f ? Math.round(f.top - last.bottom) : null;
 });
+/** While following, the newest message is clear of the composer by at least `md` (12 px), not touching it. */
+const MIN_GAP = 12;
+const endProblems = (gap, when) => (gap === null ? [`${when}: no message or composer`] : gap < MIN_GAP ? [`${when}, the newest message is ${gap} px from the composer (at least ${MIN_GAP})`] : []);
 /**
  * Scroll up like a reader, and the first message whose top is in view: its index and top. That's the line
  * the browser anchors on (the first visible in order), so growth above it mustn't move it; growth inside
@@ -91,7 +94,13 @@ const scroll = {
     const problems = [];
     const shift = (await bubbles(p))[r0.i] - r0.top;
     if (Math.abs(shift) > 2) problems.push(`reading back, a new reply moved the line ${shift} px`);
-    if (!(await p.getByRole("button", { name: /new message/i }).count())) problems.push("a reply arrived while reading back, with no cue");
+    const pill = p.getByRole("button", { name: /new message/i });
+    if (!(await pill.count())) problems.push("a reply arrived while reading back, with no cue");
+    else {
+      await pill.first().click();
+      await p.waitForTimeout(600);
+      problems.push(...endProblems(await gapAbove(p), "after the pill"));
+    }
     await stash(p, problems);
   },
   /** Sending while reading back: the page goes to the end, your message clear of the composer. */
@@ -101,19 +110,19 @@ const scroll = {
     await p.getByPlaceholder("Write a message").fill("Sent while reading back");
     await p.keyboard.press("Control+Enter");
     await p.waitForTimeout(1_000);
-    const h = await hidden(p);
     const last = await p.evaluate(() => [...document.querySelectorAll("[data-ds=bubble]")].at(-1)?.textContent ?? "");
     const problems = [];
     if (!last.includes("Sent while reading back")) problems.push("the sent message isn't the last one shown");
-    if (h === null || h > 0) problems.push(`after sending, the newest message is ${h} px under the composer`);
+    problems.push(...endProblems(await gapAbove(p), "after sending"));
     await stash(p, problems);
   },
-  /** At the end while content grows (chips re-wrapping on a poll): the newest message stays clear. */
+  /** On open and while content grows (chips re-wrapping on a poll): the newest message stays clear. */
   followGrowth: (fixture) => async (p) => {
+    const problems = endProblems(await gapAbove(p), "on open");
     await longerTitles(p, fixture);
     await p.waitForTimeout(6_000);
-    const h = await hidden(p);
-    await stash(p, h === null || h > 0 ? [`following, the newest message ended ${h} px under the composer`] : []);
+    problems.push(...endProblems(await gapAbove(p), "after growth"));
+    await stash(p, problems);
   },
 };
 

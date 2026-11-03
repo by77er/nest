@@ -37,7 +37,7 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 | `measure` | a `form` or `reading` measure doesn't start on the frame's left edge |
 | `page-error` | an uncaught error, a console error, the app's error page, or a capture that failed |
 | `content` | in user content (`selectors.content`: a manager's message), a heading is above the level it's demoted to or smaller than the text; or a figure's ground is dark or it's inverted, not on a fixed light canvas |
-| `chat-scroll` (projects) | acted out with the wheel: reading back, the line moves more than 2 px as content above grows or a reply arrives; a reply while reading back shows no cue; after sending, or while following as content grows, the newest message isn't clear of the composer |
+| `chat-scroll` (projects) | acted out with the wheel: reading back, the line moves more than 2 px as content above grows or a reply arrives; a reply while reading back shows no cue; while following (on open, after growth, after the pill, after sending), the newest message isn't at least `md` (12 px) above the composer |
 | `board-columns` (projects) | at 1280 px and up, the board's six columns don't fit without scrolling |
 
 The apps' own `npm test` covers the code side (no inline styles, raw values or off-palette colors; tokens equal the skill's). Judgement (hierarchy, balance, placement) stays the reviewer's.
