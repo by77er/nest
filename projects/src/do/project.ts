@@ -275,6 +275,11 @@ export const MIGRATIONS = [
       at_ms INTEGER NOT NULL)`,
     "CREATE TABLE start_specs (key TEXT PRIMARY KEY, spec TEXT NOT NULL, at_ms INTEGER NOT NULL)",
     "ALTER TABLE settings ADD COLUMN workers_edit_workflows INTEGER NOT NULL DEFAULT 0",
+    // nest names minted for a value write and not yet recorded (each is used once), the grant as last
+    // seen (a change owes every layer), and when the secrets' upkeep runs next.
+    "CREATE TABLE minted (nest_name TEXT PRIMARY KEY, at_ms INTEGER NOT NULL)",
+    "ALTER TABLE settings ADD COLUMN grant_seen TEXT",
+    "ALTER TABLE settings ADD COLUMN secrets_next_ms INTEGER",
   ],
 ] as const;
 
@@ -905,18 +910,26 @@ export class ProjectDO extends DurableObject<Env> {
     }));
   }
 
-  /** A role's secrets as its sandboxes' bindings and variables, inside the grant's `inject_hosts` (README.md#secrets). */
-  private secretFeeds(role: SecretRole, injectHosts: readonly string[]): ReturnType<typeof secretFeeds> {
+  /**
+   * A role's secrets as its sandboxes' bindings and variables, inside the grant's `inject_hosts`
+   * (README.md#secrets); `null`, the grant unknown: all of them (only ever the target a removal is cut from).
+   */
+  private secretFeeds(role: SecretRole, injectHosts: readonly string[] | null): ReturnType<typeof secretFeeds> {
     return secretFeeds(this.clientId(), this.secretRows().filter((m) => m.roles.includes(role)), injectHosts);
   }
 
   /**
-   * The nest name a secret's value goes under: its own, or a new generation's for a new one (the
-   * Worker stores the value first, then `saveSecretMeta` records the name).
+   * The nest name a secret's value goes under: its own (a replacement takes no new place in the grant's
+   * `max_count`), or for a new secret a new generation, minted here and usable once (`saveSecretMeta`
+   * takes it). So a write racing a delete can't record the deleted generation's name again: the row it
+   * expected is gone, and that name was never minted for a new one.
    */
-  async nestNameFor(name: string): Promise<string> {
-    const had = this.secretRows().find((x) => x.name === name);
-    return had?.nest_name || nestSecretName(this.settings()!.id, name, randomId().slice(0, 6).toLowerCase());
+  async nestNameFor(name: string, value: boolean): Promise<string | null> {
+    const had = this.secretRows().find((x) => x.name === name)?.nest_name;
+    if (had || !value) return had ?? null;
+    const minted = nestSecretName(this.settings()!.id, name, randomId().slice(0, 6).toLowerCase());
+    this.sql.exec("INSERT INTO minted (nest_name, at_ms) VALUES (?, ?)", minted, Date.now());
+    return minted;
   }
 
   private clientId(): string {
@@ -944,8 +957,14 @@ export class ProjectDO extends DurableObject<Env> {
     if (!this.settings()) return fail(404, "unknown project");
     const before = this.secretRows().find((x) => x.name === m.name);
     if (!before && size === null) return fail(400, "a new secret needs a value");
-    // Deleted and made again while the value was on its way: it went under a name the row doesn't have.
-    if (before && before.nest_name !== m.nest_name) return fail(409, `${m.name} changed meanwhile: save it again`);
+    if (before) {
+      // Its own name, as read when the write began; deleted (and perhaps made again) since: refused.
+      if (before.nest_name !== m.nest_name) return fail(409, `${m.name} changed meanwhile: save it again`);
+    } else {
+      // A new one: under a name minted for it and not used yet, never a retired generation's.
+      const fresh = this.sql.exec("DELETE FROM minted WHERE nest_name = ? RETURNING nest_name", m.nest_name).toArray().length;
+      if (!fresh) return fail(409, `${m.name} changed meanwhile: save it again`);
+    }
     const clash = this.secretRows().find((x) => x.name !== m.name && x.env === m.env);
     if (clash) return fail(409, `${clash.name} uses ${m.env} already`);
     const now = Date.now();
@@ -964,6 +983,7 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL AND kind = 'injected' AND name = ?", m.name).toArray()) {
       this.finishRequest(r);
     }
+    this.upkeepSoon();
     await this.arm();
     return ok({ ...after, holders: this.holdersOf(m.name) });
   }
@@ -975,6 +995,7 @@ export class ProjectDO extends DurableObject<Env> {
     const gone = this.sql.exec<{ roles: string }>("DELETE FROM secrets WHERE name = ? RETURNING roles", name).toArray()[0];
     if (!gone) return fail(404, `no secret ${name}`);
     const roles = JSON.parse(gone.roles) as SecretRole[];
+    this.upkeepSoon();
     await this.oweLayers(LAYER_ROLES.filter((r) => roles.includes(r)));
     return ok({ deleted: name, holders });
   }
@@ -1523,6 +1544,12 @@ export class ProjectDO extends DurableObject<Env> {
     let sandbox = (row.sandbox as string | null) ?? null;
     let current: Awaited<ReturnType<Nest["getClientPolicy"]>> | null = null;
     let desired: ClientLayer | null = null;
+    // The layer for a grant: inside it; for none (unread), everything, as the target a removal is cut from.
+    const build = (g: Grant | null) => {
+      const feeds = this.secretFeeds(role, g ? (g.inject_hosts ?? []) : null);
+      const layer = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env }, current), g ? (g.egress_hosts ?? null) : null);
+      return { layer, names: feeds.secrets.map((m) => m.name) };
+    };
     try {
       if (!sandbox) {
         const view = await nest.getAgent(agent);
@@ -1531,12 +1558,22 @@ export class ProjectDO extends DurableObject<Env> {
         this.sql.exec("UPDATE layers SET sandbox = ? WHERE agent = ?", sandbox, agent);
       }
       current = await nest.getClientPolicy(sandbox);
-      const grant = await nest.self().then((x) => x.grant ?? {}, () => null);
-      const feeds = this.secretFeeds(role, grant?.inject_hosts ?? []);
-      desired = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env }, current), grant?.egress_hosts ?? null);
+      let grant = await this.readGrant(nest);
+      let built = build(grant);
+      desired = built.layer;
       if (grant === null) throw new NestError(503, "grant_unread", "the grant couldn't be read: removals applied, the rest retried", false);
-      await nest.putClientPolicy(sandbox, desired);
-      this.recordHolder(agent, role, feeds.secrets.map((m) => m.name));
+      try {
+        await nest.putClientPolicy(sandbox, desired);
+      } catch (e) {
+        // Refused: perhaps the grant narrowed since it was read. Read it again and rebuild, once.
+        if (!(e instanceof NestError && e.status === 403)) throw e;
+        grant = await this.readGrant(nest);
+        if (grant === null) throw e;
+        built = build(grant);
+        desired = built.layer;
+        await nest.putClientPolicy(sandbox, desired);
+      }
+      this.recordHolder(agent, role, built.names);
       // Applied as of `want`; a newer change meanwhile stays owed.
       this.sql.exec(
         "UPDATE layers SET rev = ?, attempts = 0, error = NULL, at_ms = ?, next_ms = CASE WHEN want_rev = ? THEN NULL ELSE ? END WHERE agent = ?",
@@ -1568,6 +1605,70 @@ export class ProjectDO extends DurableObject<Env> {
       this.sql.exec("UPDATE layers SET attempts = ?, error = ?, next_ms = ? WHERE agent = ? AND want_rev = ?",
         attempts, message(e) + note, permanent ? null : Date.now() + backoff(attempts), agent, want);
     }
+  }
+
+  /** The grant, or null when it can't be read; a change from the one last seen owes every live layer. */
+  private async readGrant(nest: Nest): Promise<Grant | null> {
+    const g = await nest.self().then((x) => x.grant ?? {}, () => null);
+    if (g) await this.grantSeen(g);
+    return g;
+  }
+
+  /**
+   * The grant as read (here, or by the Worker): when its hosts changed since last seen, every live layer
+   * is owed again, so a secret left out for a narrowed grant comes back once it's widened, and goes
+   * once it's narrowed, without anyone saving anything.
+   */
+  async grantSeen(g: Grant): Promise<void> {
+    const seen = JSON.stringify({ inject: [...(g.inject_hosts ?? [])].sort(), egress: g.egress_hosts ? [...g.egress_hosts].sort() : null });
+    const before = this.settingsRow()?.grant_seen as string | null | undefined;
+    if (before === undefined || before === seen) return;
+    this.sql.exec("UPDATE settings SET grant_seen = ?", seen);
+    if (before !== null) {
+      await this.oweLayers(LAYER_ROLES);
+      // Applied in this drain, not the next alarm's.
+      if (this.draining) this.again = true;
+    }
+  }
+
+  /** The secrets' upkeep is due soon: after a write, once the grace for retired names has passed. */
+  private upkeepSoon(): void {
+    const at = Date.now() + SWEEP_GRACE_MS;
+    this.sql.exec("UPDATE settings SET secrets_next_ms = MIN(COALESCE(secrets_next_ms, ?), ?)", at, at);
+  }
+
+  /**
+   * The secrets' upkeep, every few minutes while the project has secrets: the grant read (a change owes
+   * every layer, `grantSeen`), and the sweep. A nest secret of this project's that no row names, and no
+   * write in flight is about to (`minted`, recent), is an orphan (a retired generation, or a write that
+   * failed before its cleanup): it's never injected, but counts against the grant's `max_count`. Deleted
+   * once older than the grace, so a layer still naming a retired one has moved on first.
+   */
+  private async secretsUpkeep(nest: Nest): Promise<void> {
+    const s = this.settings()!;
+    const now = Date.now();
+    this.sql.exec("DELETE FROM minted WHERE at_ms < ?", now - MINTED_TTL_MS);
+    try {
+      await this.readGrant(nest);
+      const named = new Set([
+        ...this.secretRows().map((m) => m.nest_name),
+        ...this.sql.exec<{ nest_name: string }>("SELECT nest_name FROM minted").toArray().map((r) => r.nest_name),
+      ]);
+      for (const x of await nest.listSecrets()) {
+        if (!x.name.startsWith(`${s.id}-`) || named.has(x.name)) continue;
+        const at = x.updated_ms ?? x.created_ms ?? 0;
+        if (now - at < SWEEP_GRACE_MS) continue;
+        try {
+          await nest.deleteSecret(x.name);
+        } catch (e) {
+          if (!(e instanceof NestError && e.status === 404)) console.error(`secrets sweep: ${x.name} wasn't deleted: ${message(e)}`);
+        }
+      }
+    } catch (e) {
+      console.error(`secrets upkeep: ${message(e)}`);
+    }
+    const more = this.secretRows().length > 0 || this.sql.exec("SELECT 1 FROM minted").toArray().length > 0;
+    this.sql.exec("UPDATE settings SET secrets_next_ms = ?", more ? now + UPKEEP_EVERY_MS : null);
   }
 
   // --- the MCP tools ---------------------------------------------------------------------------------
@@ -1707,7 +1808,8 @@ export class ProjectDO extends DurableObject<Env> {
       // The manager's waits' deadlines, and client layers owed to live sandboxes.
       min(`SELECT MIN(t) AS t FROM (
         SELECT deadline_ms AS t FROM waits WHERE resolved_ms IS NULL
-        UNION ALL SELECT next_ms FROM layers WHERE next_ms IS NOT NULL)`),
+        UNION ALL SELECT next_ms FROM layers WHERE next_ms IS NOT NULL
+        UNION ALL SELECT secrets_next_ms FROM settings WHERE secrets_next_ms IS NOT NULL)`),
       // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
       // the repo allows it).
       min(`SELECT MIN(t) AS t FROM (
@@ -1759,6 +1861,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (!nest) return;
     const now = Date.now();
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
+    if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);
     if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge(nest);
     if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge(nest);
     // A PR's auto-merge is enabled only once the repo allows it; disabling needn't wait.
@@ -2089,6 +2192,15 @@ function workerBrief(s: Settings, t: Task): string {
     ] : []),
   ].join("\n");
 }
+
+/** The client's grant, as `GET /v1/clients/self` answers it. */
+type Grant = NonNullable<Awaited<ReturnType<Nest["self"]>>["grant"]>;
+/** How long a retired or orphaned nest secret is kept, so layers naming it have moved on first. */
+const SWEEP_GRACE_MS = 5 * 60_000;
+/** How often the secrets' upkeep (the grant read, the sweep) runs while the project has secrets. */
+const UPKEEP_EVERY_MS = 10 * 60_000;
+/** A minted name not used in this long is the Worker's write that never came back: no longer reserved. */
+const MINTED_TTL_MS = 15 * 60_000;
 
 /** A start attempt's sandbox spec, frozen at its first try, with the layer revision it was built at. */
 export interface StartSpec {

@@ -171,7 +171,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const nest = nestFrom(env);
       if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
       let size: number | null = null;
-      const nestName = await p.nestNameFor(name);
+      const nestName = await p.nestNameFor(name, value !== undefined);
+      if (nestName === null) return err(400, "a new secret needs a value");
       if (value !== undefined) {
         // Straight to nest, write-only: the value never reaches the app's objects, logs or answers.
         try {
@@ -183,7 +184,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const saved = await p.saveSecretMeta({ name, ...meta, nest_name: nestName }, size);
       // Not recorded (a new one refused, or the name made again meanwhile): its value mustn't stay in nest unnamed.
       if (!saved.ok && value !== undefined && !(await secretRows(p)).some((x) => x.nest_name === nestName)) {
-        await nest.deleteSecret(nestName).catch(() => {});
+        // Failing that, ProjectDO's sweep deletes it once the grace has passed (it counts against max_count).
+        await nest.deleteSecret(nestName).catch((e) => console.error(`secret ${nestName} not recorded and not deleted (the sweep retries): ${String(e).slice(0, 200)}`));
       }
       return done(saved);
     }

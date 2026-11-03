@@ -192,7 +192,7 @@ describe("applying the rules", () => {
       fake.egressHosts = grant;
     }
     // Accepted by the app, refused by nest (the fake's grant narrowed only for the write).
-    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403);
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403, { times: 2 });
     let r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] });
     expect(r.body.agents).toEqual([expect.objectContaining({ agent: s.manager, state: "failed", error: expect.stringContaining("403") })]);
     // A transient failure: pending, then applied on the next try.

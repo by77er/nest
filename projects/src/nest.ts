@@ -232,8 +232,8 @@ export class Nest {
     await this.call("DELETE", `/v1/clients/self/secrets/${encodeURIComponent(name)}`);
   }
 
-  async listSecrets(): Promise<{ name: string; size: number; last_injected_ms: number | null }[]> {
-    return (await this.call<{ secrets?: { name: string; size: number; last_injected_ms: number | null }[] }>("GET", "/v1/clients/self/secrets")).secrets ?? [];
+  async listSecrets(): Promise<{ name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[]> {
+    return (await this.call<{ secrets?: { name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[] }>("GET", "/v1/clients/self/secrets")).secrets ?? [];
   }
 
   /**

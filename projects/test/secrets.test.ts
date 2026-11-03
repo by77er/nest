@@ -199,7 +199,7 @@ describe("live agents", () => {
 
   it("a layer nest refuses shows as failed on the Secrets page; a retry after a transient one applies it", async () => {
     const p = await newProject();
-    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403);
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403, { times: 2 });
     await put(p, "cf_token", cf(valueOf("f")));
     await drain(p);
     let agents = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents;
@@ -246,7 +246,7 @@ describe("live agents", () => {
     await put(p, "npm_token", npm(valueOf("b"), ["manager"]));
     await drain(p);
     // Refused for good, once: the full layer. The removal alone goes out after it.
-    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403);
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403, { times: 2 });
     await api(token, "DELETE", `/api/projects/${p.id}/secrets/npm_token`);
     await drain(p);
     expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
@@ -256,22 +256,97 @@ describe("live agents", () => {
     expect(view.secrets.find((x: { name: string }) => x.name === "cf_token").holders).toEqual([{ agent: p.manager, role: "manager" }]);
   });
 
-  it("without the grant: a save is refused (503), and a removal still applies", async () => {
+  it("without the grant: a save is refused (503), and a removal still applies, and only it", async () => {
     const p = await newProject();
+    await put(p, "cf_token", cf(valueOf("a")));
     await put(p, "npm_token", npm(valueOf("b"), ["manager"]));
     await drain(p);
     fake.fail(/GET \/v1\/clients\/self/, 503, { times: 10 });
     try {
-      const r = await put(p, "cf_token", cf(valueOf("c")));
+      const r = await put(p, "late_token", { ...cf(valueOf("c")), env: "LATE_TOKEN" });
       expect(r.status).toBe(503);
-      expect(nestKey(p, "cf_token")).toBeUndefined();
+      expect(nestKey(p, "late_token")).toBeUndefined();
       await api(token, "DELETE", `/api/projects/${p.id}/secrets/npm_token`);
       await drain(p);
-      expect(sandboxOf(p.manager).layer).toMatchObject({ inject: [], env: {} });
+      // npm_token went; cf_token, unchanged, stays (an unknown grant isn't an empty one).
+      expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
+      expect(Object.keys(sandboxOf(p.manager).layer.env)).toEqual(["CLOUDFLARE_API_TOKEN"]);
       expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.agents[0]).toMatchObject({ state: "pending", error: expect.stringContaining("grant couldn't be read") });
     } finally {
       fake.failures = fake.failures.filter((f) => !f.match.test("GET /v1/clients/self"));
     }
+  });
+
+  it("a refusal is tried once more against the grant read again (it may have narrowed meanwhile)", async () => {
+    const p = await newProject();
+    await put(p, "cf_token", cf(valueOf("a")));
+    await drain(p);
+    const before = layerPuts(p.manager).length;
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403);
+    await put(p, "npm_token", npm(valueOf("b"), ["manager"]));
+    await drain(p);
+    expect(layerPuts(p.manager).length).toBe(before + 2);
+    expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name).sort()).toEqual(["cf_token", "npm_token"]);
+    expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents[0]).toMatchObject({ state: "applied", error: null });
+  });
+
+  it("a grant widened again brings a left-out secret back by itself, at the next upkeep", async () => {
+    const p = await newProject();
+    await put(p, "cf_token", cf(valueOf("a")));
+    await drain(p);
+    const upkeep = () => runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0");
+    }).then(() => drain(p));
+    await upkeep();
+    const saved = [...fake.grant.inject_hosts];
+    try {
+      fake.grant.inject_hosts = saved.filter((h) => h !== "api.cloudflare.com");
+      await upkeep();
+      expect(sandboxOf(p.manager).layer.inject).toEqual([]);
+      fake.grant.inject_hosts = saved;
+      await upkeep();
+      expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
+    } finally {
+      fake.grant.inject_hosts = saved;
+    }
+  });
+
+  it("a value write racing a delete can't record the deleted generation's name again", async () => {
+    const p = await newProject();
+    await put(p, "cf_token", cf(valueOf("a")));
+    const stub = env.PROJECT.get(env.PROJECT.idFromName(p.id));
+    // The Worker read the name for a new value; the secret is deleted before the write is recorded.
+    const old = (await stub.nestNameFor("cf_token", true))!;
+    expect(old).toBe(nestKey(p, "cf_token"));
+    await api(token, "DELETE", `/api/projects/${p.id}/secrets/cf_token`);
+    const r = await stub.saveSecretMeta({ name: "cf_token", description: "", hosts: ["api.cloudflare.com"], locations: [{ type: "authorization_bearer" }], roles: ["manager"], env: "CLOUDFLARE_API_TOKEN", nest_name: old }, 10);
+    expect(r).toMatchObject({ ok: false, status: 409 });
+    // A new one gets a new generation, used once.
+    const fresh = (await stub.nestNameFor("cf_token", true))!;
+    expect(fresh).not.toBe(old);
+    const meta = { name: "cf_token", description: "", hosts: ["api.cloudflare.com"], locations: [{ type: "authorization_bearer" as const }], roles: ["manager" as const], env: "CLOUDFLARE_API_TOKEN", nest_name: fresh };
+    expect((await stub.saveSecretMeta(meta, 10)).ok).toBe(true);
+    await stub.deleteSecretMeta("cf_token");
+    expect(await stub.saveSecretMeta(meta, 10)).toMatchObject({ ok: false, status: 409 });
+  });
+
+  it("the sweep deletes this project's nest secrets no row names, once past the grace", async () => {
+    const p = await newProject();
+    const other = await newProject();
+    await put(p, "cf_token", cf(valueOf("a")));
+    const long = Date.now() - 3_600_000;
+    const ghost = { value: "x", description: null, created_ms: long, updated_ms: long, last_injected_ms: null };
+    fake.secrets.set(`${p.id}-ghost-aaaaaa`, ghost);
+    fake.secrets.set(`${p.id}-young-aaaaaa`, { ...ghost, created_ms: Date.now(), updated_ms: Date.now() });
+    fake.secrets.set(`${other.id}-ghost-aaaaaa`, ghost);
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0");
+    });
+    await drain(p);
+    expect(fake.secrets.has(`${p.id}-ghost-aaaaaa`)).toBe(false);
+    expect(fake.secrets.has(`${p.id}-young-aaaaaa`)).toBe(true);
+    expect(fake.secrets.has(`${other.id}-ghost-aaaaaa`)).toBe(true);
+    expect(nestKey(p, "cf_token")).toBeDefined();
   });
 
   it("reviewers' layers follow too; a name made again is a new nest secret, which no old binding reaches", async () => {
