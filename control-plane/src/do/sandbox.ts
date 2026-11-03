@@ -27,6 +27,8 @@ import type { Labels } from "../lib/clients";
 import { ClientOutbox } from "../lib/client-events";
 import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, GithubPush, readBindings } from "../lib/rules/github";
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
+import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
+import { slotEnv } from "../lib/sandbox-env";
 import type { MintedInjection } from "./broker";
 import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
@@ -136,6 +138,10 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
 export interface AgentAccess {
   inject?: HeldInjection[];
   workflows?: boolean;
+  /** Its egress rules (`AgentSpec.egress`). */
+  egress?: EgressRule[];
+  /** Its processes' environment (`AgentSpec.env`). */
+  env?: Record<string, string>;
 }
 
 export interface CreateSandbox {
@@ -155,7 +161,22 @@ export interface CreateSandbox {
   inject?: HeldInjection[];
   /** Its push token also carries `workflows: write`. */
   github_push?: { workflows: true };
+  /** Its own egress rules (docs/control-plane/api/clients/#egress), checked against its client's grant by the caller. */
+  egress?: EgressRule[];
+  /** Its own environment (docs/control-plane/api/clients/#environment), checked by the caller. */
+  env?: Record<string, string>;
 }
+
+/** The sandbox's own egress rules (its create's, or `PUT …/client-policy`). */
+const OWN_EGRESS = "client_egress";
+/** Each attached agent's egress rules, by agent (removed at detach). */
+const AGENT_EGRESS = "agent_egress";
+/** Its own environment (its create's, or its client layer's), for every attached agent's slot. */
+const OWN_ENV = "client_env";
+/** Each attached agent's environment, by agent (removed at detach). */
+const AGENT_ENV = "agent_env";
+/** Its client's grant's `egress_hosts`, as last read: the ceiling its rules are applied within (absent: none). */
+const EGRESS_CEILING = "client_egress_hosts";
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
 const PLACE_RETRY_MS = 30_000;
@@ -395,6 +416,10 @@ export class SandboxDO extends DurableObject<Env> {
     const own = (req.inject ?? []).filter((b) => b.client === req.client);
     if (own.length) this.put(OWN_INJECT, own);
     if (req.github_push?.workflows) this.put(OWN_PUSH, { workflows: true });
+    if (req.egress?.length) this.put(OWN_EGRESS, req.egress);
+    if (req.env && Object.keys(req.env).length) this.put(OWN_ENV, req.env);
+    // A client's sandbox applies client rules within its grant's `egress_hosts`, read now and at each change.
+    if (req.client) await this.readEgressCeiling();
     try {
       await this.placeCurrentEpoch();
     } catch (e) {
@@ -901,6 +926,9 @@ export class SandboxDO extends DurableObject<Env> {
     const allow: AllowRule[] = [
       ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
       ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER })),
+      // Its own and its agents' egress rules (docs/control-plane/api/clients/#egress): allow rules only, so the
+      // guards and the hard deny still apply to what they open.
+      ...compileEgress(this.clientEgress()),
       ...this.sql
         .exec<{ host: string; ports: string; expires_ms: number }>("SELECT host, ports, expires_ms FROM grants WHERE expires_ms > ? ORDER BY expires_ms", now)
         .toArray()
@@ -1108,12 +1136,11 @@ export class SandboxDO extends DurableObject<Env> {
     // grant's `inject_hosts` (narrowing it takes the value away at the next push), and only that client's.
     if (clientBindings.length && before.client) {
       try {
-        const scope = await this.env.CLIENT.get(this.env.CLIENT.idFromName(before.client)).scope();
-        const within = clientBindings.filter((b) => !injectionsOutsideGrant([b], scope.grant.inject_hosts ?? []).length);
-        // Each binding's secret is looked up under the client that declared it, never the sandbox's alone:
-        // a binding that reached another client's sandbox can't name that client's secret.
-        for (const client of new Set(within.map((b) => b.client))) {
-          const mine = within.filter((b) => b.client === client);
+        // Each binding is held to the grant of the client that declared it, and its secret looked up under
+        // that client: a binding that reached another client's sandbox can't name that client's secret.
+        for (const client of new Set(clientBindings.map((b) => b.client))) {
+          const scope = await this.env.CLIENT.get(this.env.CLIENT.idFromName(client)).scope();
+          const mine = clientBindings.filter((b) => b.client === client && !injectionsOutsideGrant([b], scope.grant.inject_hosts ?? []).length);
           secrets.push(...await broker.clientInjectionRefs(client, before.sandbox,
             mine.map((b) => ({ binding: injectionWireName(b.name), secret: b.secret, hosts: b.hosts })), "SandboxDO"));
         }
@@ -1147,7 +1174,9 @@ export class SandboxDO extends DurableObject<Env> {
   async attach(agent: string, cwd?: string, repos?: string[], readRepos?: string[], extra: AgentAccess = {}): Promise<SandboxInfo> {
     const cur = this.info_();
     if (lease.gone(cur.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${cur.state}`, 409);
-    // What its client bindings and push opt-ins count is the attached agents': compared across the attach itself.
+    // Its client's grant's `egress_hosts`, read before the agent's rules count.
+    if (extra.egress?.length && cur.client) await this.readEgressCeiling();
+    // What its client bindings, push opt-ins and egress rules count is the attached agents': compared across the attach itself.
     const extrasBefore = this.extrasKey();
     this.setAgentExtras(agent, extra);
     const repoChanged = this.setAgentRepos(agent, repos ?? [], readRepos ?? []);
@@ -1312,7 +1341,7 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * Record an attached agent's client bindings (only those of the sandbox's own client: an agent's
-   * spec names whose they are) and whether it asks for `workflows`.
+   * spec names whose they are) whether it asks for `workflows`, and its egress rules.
    */
   private setAgentExtras(agent: string, extra: AgentAccess): void {
     const client = this.info_().client;
@@ -1330,11 +1359,25 @@ export class SandboxDO extends DurableObject<Env> {
       else delete all[agent];
       this.put(AGENT_PUSH, all);
     }
+    const env = extra.env ?? {};
+    if (Object.keys(env).length || this.get(AGENT_ENV)) {
+      const all = { ...(this.get<Record<string, Record<string, string>>>(AGENT_ENV) ?? {}) };
+      if (Object.keys(env).length) all[agent] = env;
+      else delete all[agent];
+      this.put(AGENT_ENV, all);
+    }
+    const egress = extra.egress ?? [];
+    if (egress.length || this.get(AGENT_EGRESS)) {
+      const all = { ...(this.get<Record<string, EgressRule[]>>(AGENT_EGRESS) ?? {}) };
+      if (egress.length) all[agent] = egress;
+      else delete all[agent];
+      this.put(AGENT_EGRESS, all);
+    }
   }
 
-  /** The push opt-ins and client bindings the attached agents give, compared as one. */
+  /** The push opt-ins, client bindings and egress rules the attached agents give, compared as one. */
   private extrasKey(): string {
-    return accessKey({ ...this.pushAccess(), inject: this.clientInjections() });
+    return `${accessKey({ ...this.pushAccess(), inject: this.clientInjections() })}|${JSON.stringify(this.clientEgress())}`;
   }
 
   /**
@@ -1357,6 +1400,80 @@ export class SandboxDO extends DurableObject<Env> {
   /** Its client's bindings the policy carries: none whose wire name another binding (`taken`) has. */
   private appliedClientInjections(taken: readonly string[]): HeldInjection[] {
     return this.clientInjections().filter((b) => !taken.includes(injectionWireName(b.name)));
+
+  }
+
+  // --- client egress rules (docs/control-plane/api/clients/#egress) ------------------------------------
+
+  /**
+   * Its own egress rules and each attached agent's, a host once (the first: its own, then by agent id).
+   * In a client's sandbox only those within its grant's `egress_hosts` as last read: a narrowed grant
+   * takes the rest away at its next policy.
+   */
+  clientEgress(): EgressRule[] {
+    const info = this.tryInfo();
+    if (!info) return [];
+    // Only agents attached now, as for client bindings.
+    const attached = new Set(info.attached);
+    const agents = this.get<Record<string, EgressRule[]>>(AGENT_EGRESS) ?? {};
+    const all = [...(this.get<EgressRule[]>(OWN_EGRESS) ?? []), ...Object.keys(agents).filter((a) => attached.has(a)).sort().flatMap((a) => agents[a]!)];
+    const seen = new Set<string>();
+    const once = all.filter((r) => !seen.has(r.host) && seen.add(r.host));
+    return info.client ? egressWithin(once, this.get<string[]>(EGRESS_CEILING) ?? []) : once;
+  }
+
+  /** Read its client's `egress_hosts` (a deleted client's: none). */
+  private async readEgressCeiling(): Promise<void> {
+    const client = this.info_().client;
+    if (!client) return;
+    let hosts: string[];
+    try {
+      hosts = (await this.env.CLIENT.get(this.env.CLIENT.idFromName(client)).scope()).grant.egress_hosts ?? [];
+    } catch (e) {
+      // A deleted client (403) has nothing; anything else leaves the ceiling as it was.
+      if (asNestError(e)?.code !== ErrorCodes.FORBIDDEN) throw e;
+      hosts = [];
+    }
+    this.put(EGRESS_CEILING, hosts);
+  }
+
+  /**
+   * Replace its own client layer (`PUT /v1/sandboxes/<id>/client-policy`; the caller checked it against
+   * the client's grant): egress rules, injection bindings (whose they are must be its client) and
+   * environment, each replaced whole. The policy and its secrets go out as a new version through the
+   * usual path, and the attached agents' slots get the new environment. Answers the effective policy.
+   */
+  async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string> }): Promise<EgressPolicy> {
+    const info = this.info_();
+    if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
+    if (info.client) await this.readEgressCeiling();
+    const now = this.info_();
+    const put = (key: string, v: unknown, has: boolean) => (has ? this.put(key, v) : this.del(key));
+    const envBefore = JSON.stringify(this.get(OWN_ENV) ?? {});
+    put(OWN_EGRESS, layer.egress, layer.egress.length > 0);
+    const inject = layer.inject.filter((b) => b.client === now.client);
+    put(OWN_INJECT, inject, inject.length > 0);
+    put(OWN_ENV, layer.env, Object.keys(layer.env).length > 0);
+    const policy = await this.policyChanged(true);
+    if (JSON.stringify(layer.env) !== envBefore && now.attached.length) await this.issueAttachCommands(now.attached);
+    return policy;
+  }
+
+  /** Its own client layer, as `PUT …/client-policy` set it (never a secret: bindings name theirs). */
+  async clientLayer(): Promise<{ egress: { allow: EgressRule[] }; inject: HeldInjection[]; env: Record<string, string> }> {
+    this.info_();
+    return { egress: { allow: this.get<EgressRule[]>(OWN_EGRESS) ?? [] }, inject: this.get<HeldInjection[]>(OWN_INJECT) ?? [], env: this.get<Record<string, string>>(OWN_ENV) ?? {} };
+  }
+
+  /** Its client's grant changed: read `egress_hosts` again, and send a new policy if what applies changed. */
+  async clientGrantChanged(): Promise<boolean> {
+    const info = this.tryInfo();
+    if (!info?.client || lease.gone(info.state)) return false;
+    const before = JSON.stringify(this.clientEgress());
+    await this.readEgressCeiling();
+    if (JSON.stringify(this.clientEgress()) === before) return false;
+    await this.policyChanged(false);
+    return true;
   }
 
   /** The push allowlist: the operator's layer and every attached agent's spec (docs/sandbox/networking/egress/policy/#repo-allowlists). */
@@ -1393,7 +1510,9 @@ export class SandboxDO extends DurableObject<Env> {
     if (!info.host || !agents.length) return;
     const bodies = agents.map((agent): CommandBody => {
       const cwd = info.attach_cwd[agent];
-      return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}) };
+      // Its slot's environment: the sandbox's, then the agent's (a nestd of the previous release ignores it).
+      const env = slotEnv(this.get<Record<string, string>>(OWN_ENV) ?? {}, this.get<Record<string, Record<string, string>>>(AGENT_ENV)?.[agent]);
+      return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}), ...(Object.keys(env).length ? { env } : {}) };
     });
     const cmds = await this.fleet(info.cell).issueCommands(info.host, bodies);
     this.update((i) => {

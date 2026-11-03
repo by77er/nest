@@ -747,10 +747,15 @@ async fn host_lifecycle_commit_and_self_fence() {
     assert!(!seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. })), "a brain start configures no guest slot");
 
     // 2a. attach: the guest slot (explicit proxy port 3128, the cwd), and the gateway's client set.
-    let attach = |id: &str, epoch: u64, cwd: Option<&str>| cmd(id, CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(epoch), agent: AgentId("agt_w".into()), cwd: cwd.map(Into::into) });
+    let attach = |id: &str, epoch: u64, cwd: Option<&str>| {
+        // The control plane's `env` (a sandbox's and its agent's) becomes the slot's environment.
+        let env = std::collections::BTreeMap::from([("API_TOKEN".to_string(), "nest-ph.cli_x.api.".to_string())]);
+        cmd(id, CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(epoch), agent: AgentId("agt_w".into()), cwd: cwd.map(Into::into), env })
+    };
     fleet.commands.send(vec![attach("cmd_attach", 1, Some("/workspace/app"))]).unwrap();
     assert!(matches!(fleet.result("cmd_attach").await, CommandOutcome::Ok { .. }));
-    assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { slot } if slot.proxy_port == 3128 && slot.cwd == "/workspace/app")));
+    assert!(seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { slot }
+        if slot.proxy_port == 3128 && slot.cwd == "/workspace/app" && slot.env.get("API_TOKEN").map(String::as_str) == Some("nest-ph.cli_x.api."))));
     wait_until("gateway learns the client", || matches!(upserts(&gateway.lock().unwrap()).last(), Some(GatewayCommand::SandboxUpsert { clients, .. }) if clients == &vec!["agt_w".to_string()])).await;
     // Idempotent: a second attach keeps the slot's port; a stale epoch is refused.
     fleet.commands.send(vec![attach("cmd_attach2", 1, None), attach("cmd_attach_stale", 7, None)]).unwrap();
@@ -1230,7 +1235,7 @@ async fn fence_during_attach_answers_stale_epoch_and_never_re_adds_the_sandbox()
 
     // The guest holds the attach reply; the fence lands meanwhile; then the reply is released.
     latch.held.store(true, Ordering::SeqCst);
-    fleet.commands.send(vec![cmd("cmd_attach", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None })]).unwrap();
+    fleet.commands.send(vec![cmd("cmd_attach", CommandBody::AgentAttach { sandbox: sbx.clone(), epoch: Epoch(1), agent: AgentId("agt_w".into()), cwd: None, env: Default::default() })]).unwrap();
     wait_until("guest holds the attach", || seen.lock().unwrap().iter().any(|b| matches!(b, ControlBody::AgentAttach { .. }))).await;
     fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
     fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
@@ -1438,7 +1443,7 @@ fn nestd_now_ms() -> i64 {
 // ---------------------------------------------------------------------------------------------
 
 fn attach_cmd(id: &str, sandbox: &str, agent: &str) -> Command {
-    cmd(id, CommandBody::AgentAttach { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), agent: AgentId(agent.into()), cwd: None })
+    cmd(id, CommandBody::AgentAttach { sandbox: SandboxId(sandbox.into()), epoch: Epoch(1), agent: AgentId(agent.into()), cwd: None, env: Default::default() })
 }
 
 fn is_ok(o: &CommandOutcome) -> bool {

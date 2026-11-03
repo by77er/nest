@@ -52,6 +52,7 @@ stripe-read:
 ## Secrets in the proxy
 
 - **Static secrets are keyed by sandbox:** BrokerDO serves the most specific of `inject:<binding>:<sandbox>`, `inject:<binding>:<workstream>` (the sandbox's compat `ws_` value: still read in case secrets were stored under it before the sandbox key; nothing new is keyed by it) and `inject:<binding>`.
+- **An unresolved reference is refused, not substituted** (2026-11-02): a `secrets_update` entry whose reference resolves to nothing (a deleted or expired secret, the operator's static ones too) is left out of the push, so nest-proxy has no secret for that binding and refuses its placeholder (`injection_unavailable`), never sending an empty credential.
 - **They arrive separately today** (`secrets_set`, checked against the sandbox's epoch only). Designed, not built: each push carries the policy's version and sha256, and the proxy **refuses a secret whose binding isn't in the installed policy**, or that names another policy version or hash ([nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#policy-acknowledgement)).
 - **Fenced:** after the sandbox's lease or epoch expires, bindings stop substituting.
 - **Alerts carry the binding name** (`ProxyEvent::Alert.binding`) for `placeholder_wrong_host` and `injection_after_expiry`. Domain-fronting alerts have none.

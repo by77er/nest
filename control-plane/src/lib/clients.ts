@@ -4,6 +4,7 @@
 import { z } from "zod";
 import { GithubRepoPermissions, levelWithin } from "./github";
 import { InjectHost, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT } from "./client-secrets";
+import { EgressHost, egressOutsideGrant } from "./client-egress";
 import { canonicalRepos, Repo } from "./repos";
 import type { AgentSpec, Capability } from "./spec";
 import { hex, sha256 } from "./util";
@@ -74,6 +75,11 @@ export const Grant = z.strictObject({
    * `workflows: true` lets its specs ask for `workflows: write`. Absent (as in every grant stored before it): nothing more.
    */
   github_push: z.strictObject({ workflows: z.boolean().default(false) }).optional(),
+  /**
+   * The hosts its own egress rules may allow (docs/control-plane/api/clients/#egress): exact names, or
+   * `*.` suffixes of two or more labels. A grant stored before this field reads as none.
+   */
+  egress_hosts: z.array(EgressHost).max(64).default([]),
   /** Live (not ended, not destroyed) at once, across its whole subtree. */
   max_agents: z.number().int().min(0).max(100_000).default(0),
   max_sandboxes: z.number().int().min(0).max(100_000).default(0),
@@ -110,7 +116,7 @@ function brokeredOutside(action: string, repos: readonly string[] | null, capabi
  * Everything an expanded spec reaches outside the grant: its credential, each mcp server and the
  * secrets it authenticates with, its push allowlist, its read-only repos and its brokered actions. Empty: within it.
  */
-export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "brokered" | "repos" | "read_repos" | "inject" | "github_push">, grant: Grant): string[] {
+export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "brokered" | "repos" | "read_repos" | "inject" | "github_push" | "egress">, grant: Grant): string[] {
   const out: string[] = [];
   const creds = new Set(grant.credentials);
   if (!creds.has(spec.credential)) out.push(`credential ${spec.credential}`);
@@ -133,6 +139,7 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
   }
   out.push(...injectionsOutsideGrant(spec.inject ?? [], grant.inject_hosts ?? []));
   if (spec.github_push?.workflows && !grant.github_push?.workflows) out.push("github_push.workflows");
+  out.push(...egressOutsideGrant(spec.egress?.allow ?? [], grant.egress_hosts ?? []));
   return out;
 }
 

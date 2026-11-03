@@ -32,7 +32,10 @@ export type TraceBody =
   | { type: "state"; state: AgentState }
   | { type: "ask"; ask: string; question: string }
   | { type: "ask_answered"; ask: string }
-  | { type: "ended"; reason: string };
+  | { type: "ended"; reason: string }
+  | { type: "timer_set"; name: string; at_ms: number; note: string }
+  | { type: "timer_fired"; name: string; note: string }
+  | { type: "timer_cancelled"; name: string; by: string };
 export type TraceUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number };
 export type TraceEvent = { seq: number; ts_ms: number; turn?: string } & TraceBody;
 /**

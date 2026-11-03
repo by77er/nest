@@ -31,6 +31,7 @@
   | `rate_limited` | `retry_after_ms?`, `detail` | the runner |
   | `error` | `code`, `message` | the runner (a failed Claude Code result) |
   | `task_exited` | `task_id`, `status`, `exit_code?` | the runner (a background hands task) |
+  | `timer_set`, `timer_fired`, `timer_cancelled` | `name`, and `at_ms` and `note`, `note`, or `by` | AgentDO ([timers](../../agents/capabilities/timers/)) |
   | `state` | `state` (as `GET /v1/agents/<id>` shows it) | AgentDO, at each change |
   | `ask` | `ask`, `question` | AgentDO (an approval or a tool rule in `ask` mode) |
   | `ask_answered` | `ask` | AgentDO |

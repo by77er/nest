@@ -126,7 +126,9 @@ client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a G
 `GET /v1/clients/self/secrets` (names and metadata, never a value; the operator's `GET /v1/admin/clients/<cli>/secrets`),
 within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
 hosts within `inject_hosts`) are injected by nest-proxy; `github_push: {workflows: true}` (within `github_push`) adds
-`workflows: write` to a sandbox's push token.
+`workflows: write` to a sandbox's push token. Egress rules within `egress_hosts` (`egress {allow: [{host, ports?}]}` in its templates, overrides and
+`POST /v1/sandboxes`), env (`env {NAME: value}`), and the live sandbox's client layer, `GET|PUT /v1/sandboxes/<id>/client-policy {egress?, inject?, env?}`
+(`src/lib/client-egress.ts`, `src/lib/sandbox-env.ts`). An agent's timers (`src/lib/timers.ts`): `GET /v1/agents/<id>/timers`, `DELETE /v1/agents/<id>/timers/<name>`.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
 its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
 retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.
