@@ -83,7 +83,8 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 |---|---|
 | `AppFrame` | The sidebar (the product name small at its top, the places, a footer apart by a hairline; a burger-toggled drawer on a phone) and the content area |
 | `NavRow` / `NavGroup` | One row style for every place (icon column, height, padding, left edge; the quiet active state), rows `xs` apart, groups `xl` apart ([Navigation](#navigation)) |
-| `Page` | Max content width 1440 px, centred. Gutters: `2xl` on desktop, `xl` on tablet, `lg` on phone. Vertical rhythm `2xl` between page-level blocks |
+| `Page` | Max content width 1440 px, centred. Gutters: `2xl` on desktop, `xl` on tablet, `lg` on phone. Vertical rhythm `2xl` between page-level blocks | The frame never moves: every view of a section uses the same `Page`; narrow content goes in a left-aligned `Measure` |
+| `WithContext` / `SectionGrid` | A narrow view's content on the frame's left edge with a sticky context column beside it (a disclosure above it below `lg`); sections as Panels in a responsive two-column grid |
 | `PageHeader` | The h1 (the thing the page is about) and a meta line; no breadcrumb. Actions go right-aligned on the title's baseline and wrap below it on narrow screens |
 | `Section` | A heading row (h3, optional count, actions right) over content, `lg` below the heading. Sections are `2xl` apart |
 | `Panel` | The bordered surface (`md` radius, `lg` padding; `md` when dense). Cards, side panels, banners and table frames are all Panels |
@@ -108,6 +109,7 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
   - don't fill every pixel, and leave room around the focal element;
   - side panels take at most a third of the width;
   - dense data (tables) gets dense spacing (`xs`/`sm` rows), but its frame keeps the page's outer space.
+- **Continuity:** within a section of an app, switching views never moves the header or the page edges. A view whose content is narrow left-aligns it to the frame and uses the remaining width for related context, not empty margins.
 - **Balance:** the visual weight is spread so no edge is crowded and none is empty. When a layout looks heavy on one side, fix the grid, not individual margins.
 
 ## Navigation

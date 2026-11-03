@@ -117,3 +117,8 @@ export function TaskBlock({ projectId, lines }: { projectId: string; lines: stri
     </TaskCards>
   );
 }
+
+/** Cards for these tasks (ids the board has), in order; nothing when there are none. */
+export function TaskCardList({ projectId, ids }: { projectId: string; ids: string[] }) {
+  return <TaskBlock projectId={projectId} lines={ids} />;
+}

@@ -6,7 +6,7 @@ import { IconRefresh } from "@tabler/icons-react";
 import { useSync, useSyncState } from "../../api/queries";
 import type { SyncState } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { ErrorState, icon, LoadingState, Notice, Page, PageHeader, Panel, Section, Stack } from "../../layout";
+import { ErrorState, icon, LoadingState, Measure, Notice, Page, PageHeader, Panel, Section, Stack } from "../../layout";
 
 function Written({ s }: { s: Pick<SyncState, "written" | "repos"> }) {
   return (
@@ -33,8 +33,9 @@ export function AdminPage() {
   const sync = useSync();
 
   return (
-    <Page measure="form">
+    <Page>
       <PageHeader title="Admin" />
+      <Measure type="form">
       <Panel>
         <Section
           title="Catalog sync"
@@ -84,6 +85,7 @@ export function AdminPage() {
           </Stack>
         </Section>
       </Panel>
+      </Measure>
     </Page>
   );
 }

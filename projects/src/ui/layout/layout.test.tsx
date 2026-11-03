@@ -7,7 +7,7 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { cssVariablesResolver, motion, theme } from "../theme";
-import { AppFrame, ErrorState, FieldGroup, LoadingState, NavGroup, NavGroups, NavRow, Page, PageHeader, Panel, PinnedFooter, Section, Toolbar } from ".";
+import { AppFrame, ErrorState, FieldGroup, LoadingState, Measure, NavGroup, NavGroups, NavRow, Page, PageHeader, Panel, PinnedFooter, Section, SectionGrid, Toolbar, WithContext } from ".";
 
 const wrap = (ui: ReactNode) => render(<MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">{ui}</MantineProvider>);
 /** Whether `a` comes before `b` in the document. */
@@ -157,21 +157,53 @@ describe("AppFrame", () => {
   });
 });
 
-describe("Page and PinnedFooter", () => {
-  it("a reading page keeps its content to the reading measure, centred; a pinned footer sticks to the bottom", () => {
+describe("Page, Measure and PinnedFooter", () => {
+  it("the page has one frame, no measure of its own; a Measure is left-aligned in it; a pinned footer sticks", () => {
     wrap(
-      <Page measure="reading">
-        <PinnedFooter>
-          <button>Send</button>
-        </PinnedFooter>
+      <Page>
+        <Measure type="reading">
+          <PinnedFooter>
+            <button>Send</button>
+          </PinnedFooter>
+        </Measure>
       </Page>,
     );
+    const content = document.querySelector("[data-ds=page-content]")!;
+    expect(style(content)).not.toMatch(/max-width/);
+    const measure = document.querySelector("[data-ds=measure]")!;
+    expect(style(measure)).toContain("var(--nest-reading-measure)");
+    // On the frame's left edge: never centred, so switching views never moves an edge.
+    expect(style(measure)).not.toMatch(/margin-(inline|left|right):\s*auto/);
     const footer = screen.getByRole("button", { name: "Send" }).closest("[data-ds=pinned-footer]")!;
     expect(style(footer)).toMatch(/position:\s*sticky/);
     expect(style(footer)).toMatch(/bottom:\s*0/);
-    expect(style(footer.parentElement!)).toContain("var(--nest-reading-measure)");
-    // Centred in the content area, and the header inside the same column.
-    expect(style(footer.parentElement!)).toMatch(/margin-inline:\s*auto|margin-left:\s*auto/);
+  });
+});
+
+describe("WithContext and SectionGrid", () => {
+  it("puts the content first and the context beside it, or above it in a disclosure when narrow", async () => {
+    wrap(
+      <WithContext contextLabel="About it" context={<p>context</p>}>
+        <p>content</p>
+      </WithContext>,
+    );
+    // jsdom matches no media query: the narrow layout, its context behind a disclosure above the content.
+    const toggle = await screen.findByRole("button", { name: "About it" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(before(toggle, screen.getByText("content"))).toBe(true);
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("lays sections out in one column, two from lg", () => {
+    wrap(
+      <SectionGrid>
+        <p>a</p>
+        <p>b</p>
+      </SectionGrid>,
+    );
+    const grid = document.querySelector("[data-ds=section-grid]")!;
+    expect(grid.className).toMatch(/SimpleGrid/);
   });
 });
 

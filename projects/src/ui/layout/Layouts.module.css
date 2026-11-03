@@ -43,3 +43,28 @@
     min-height: var(--nest-hit-touch);
   }
 }
+
+/* Content and its context: the main column on the frame's left edge, the context column (a token's
+   width, sticky) at its right; below lg, the context is a disclosure above the content. */
+.withContext {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--mantine-spacing-xl);
+  align-items: start;
+}
+
+@media (min-width: 75em) {
+  .withContext {
+    grid-template-columns: minmax(0, 1fr) var(--nest-context-column);
+    gap: var(--mantine-spacing-2xl);
+  }
+
+  .context {
+    position: sticky;
+    top: var(--mantine-spacing-xl);
+  }
+}
+
+.contextInner {
+  padding-top: var(--mantine-spacing-md);
+}
