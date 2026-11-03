@@ -6,6 +6,7 @@
 
 import { verifyAccessJwt } from "./access";
 import { handleApi } from "./api";
+import { withSecurityHeaders } from "./csp";
 import { directory, type Env, project, review } from "./env";
 import { githubHook } from "./github-hook";
 import { handleMcp, isServer } from "./mcp";
@@ -99,6 +100,8 @@ export default {
 
     if (!(await admitted(request, env))) return json({ error: "a Cloudflare Access login for this app is required" }, 403);
     if (path.startsWith("/api/")) return handleApi(request, env, url);
-    return env.ASSETS.fetch(request);
+    const asset = await env.ASSETS.fetch(request);
+    // `vite build` replaces the flag with `false`: the deployed Worker always sends them.
+    return import.meta.env.DEV ? asset : withSecurityHeaders(asset);
   },
 } satisfies ExportedHandler<Env>;
