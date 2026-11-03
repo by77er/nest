@@ -4,6 +4,7 @@ import { z } from "zod";
 import { num, type Env } from "./env";
 import { CmsRsaIdentityVerifier, type InstanceIdentity } from "./lib/aws-identity";
 import { bearer, type HostClaims, verifyBlobUrl, verifyHostToken } from "./lib/tokens";
+import { clientSender, OPERATOR_SENDER } from "./lib/senders";
 import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } from "./lib/util";
 import { checkHealth, healthProbes } from "./lib/health";
 import { CONFIG_DIGEST } from "./lib/build";
@@ -845,8 +846,9 @@ export const ROUTES: Route[] = [
     // The caller speaking as itself (`user` for the operator, its id for a client) is trusted; text it relays
     // under another name may not be (it taints).
     run: async (c) => {
-      const self = c.caller.kind === "client" ? c.caller.client : "user";
-      const from = c.body.from ?? self;
+      // A client names a label of its own, shown with its id; never one of nest's senders (docs/control-plane/api/clients/#inbox-senders).
+      const self = c.caller.kind === "client" ? c.caller.client : OPERATOR_SENDER;
+      const from = c.caller.kind === "client" ? clientSender(c.body.from, c.caller.client) : c.body.from ?? self;
       const a = await ownAgent(c, c.p.agent);
       return { message: await a.postInbox(from, c.body.text, c.body.interrupt, requestId(c.req, c.body.request_id), from !== self) };
     },

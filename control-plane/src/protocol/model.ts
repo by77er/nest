@@ -357,6 +357,8 @@ export const GenerationRecord = z.object({
   mem_manifest: ManifestHash.optional(),
   reason: CommitReason,
   created_ms: TimestampMs,
+  /** When its disk was cut, from the commit request; absent for a disk read in place. */
+  cut_ms: TimestampMs.optional(),
 });
 export type GenerationRecord = z.output<typeof GenerationRecord>;
 

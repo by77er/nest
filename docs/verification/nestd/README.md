@@ -237,15 +237,20 @@ Time is abstract: 5 s steps, 70 s explored. Frames are delayed any number of ste
   - A watchdog that ignores `CLOCK_BOOTTIME` fails in 7 steps, across a suspend.
 - **Assumed:** clock rates agree; the watchdog's 250 ms poll is far inside the 10 s margin.
 
-### Unchanged disk (M1)
+### Unchanged disk (M1, M2)
 
-[`verification/nestd/check/src/sentinel.rs`](../../../verification/nestd/check/src/sentinel.rs) drives the real `ScanMemo` as `host.rs` `Inner::scan` does. A disk has two one-bit chunks and a modification time that every write moves to a clock tick. The VM runs, is paused, or is gone (a nestd restart, which also empties the memo). A commit, made only with the VM paused or gone, takes the memo (`begin`) and reuses or reads; then, as separate steps, sets the sentinel and records the pass, and may fail after either without recording ([disk](../../sandbox/state/disk/#m1-pause-only-to-read-and-never-read-an-unchanged-disk)).
+[`verification/nestd/check/src/sentinel.rs`](../../../verification/nestd/check/src/sentinel.rs) drives the real `ScanMemo` as `host.rs` does, with both kinds of commit. A disk has two one-bit chunks and a modification time that every write moves to a clock tick. The VM runs, is paused, or is gone (a nestd restart, which also empties the memo and drops every cut).
+- **A read** (`Inner::scan`), made only with the VM paused or gone: take the memo (`begin`), reuse or read, then as separate steps set the sentinel and record the pass. It may fail after either without recording.
+- **A cut** (`Inner::cut_checkpoint`, M2), in one pause: take the memo, reuse or clone, set the sentinel. It is recorded later in the background (`Inner::commit_cut`), after the guest may have written and newer cuts may have been taken. Cuts queue one deep behind the one in flight, a newer one replacing the queued one; a read drops the queued cut ([disk](../../sandbox/state/disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)).
 
-- **`a_reused_manifest_is_the_disk` (always):** a reused manifest is the disk's content. **Holds** (5 writes, 5 commits, 1 restart: 2,032 states, about a millisecond; 3,825 at 6, 6 and 2). `a_commit_reused_a_manifest` (sometimes) shows the reuse is reached.
-- **It holds by the shell's three rules, and the check pins each:**
-  - a write that lands after its time moved, as Firecracker's `Async` io_engine allows across a pause, fails in 7 steps (`Write, Pause, Commit, Land, Sentinel, Record, Commit`);
+- **`a_reused_manifest_is_the_disk` (always):** a reused manifest is the disk's content. **Holds** (4 writes, 4 commits, 1 restart: 12,277 states in 19 ms; 32,002 at 5, 5 and 2).
+  - `a_commit_reused_a_manifest` (sometimes) shows the reuse is reached;
+  - `a_cut_was_recorded_behind_a_newer_one` (sometimes) shows the overlap passes exist for is reached.
+- **It holds by the shell's four rules, and the check pins each:**
+  - a write that lands after its time moved, as Firecracker's `Async` io_engine allows across a pause, fails in 6 steps (`Write, Pause, Cut, Land, RecordCut, Cut`). That is why a cut while the VM runs, which needs `Async`, would have to turn the memo off;
   - a shell that calls a running VM's disk stable fails in 5;
-  - a shell that peeks at the memo (`unchanged`) instead of taking it (`begin`) fails in 11: a pass that fails after its sentinel leaves the previous memo, whose stamp the sentinel matches again (`… Pause, Commit, Sentinel, Fail, Commit`). A memory suspend whose snapshot couldn't be read reached exactly that state (found in review of #122), so the memo is taken when a pass begins and the sentinel is the pass's last step (`a_failed_pass_leaves_nothing_to_reuse` in `crates/nestd/tests/host.rs`).
+  - a read that peeks at the memo (`unchanged`) instead of taking it (`begin`) fails in 10: a pass that fails after its sentinel leaves an older memo, whose stamp the sentinel matches again. A memory suspend whose snapshot couldn't be read reached exactly that state (found in review of #122), so the memo is taken when a pass begins and the sentinel is the pass's last step (`a_failed_pass_leaves_nothing_to_reuse` in `crates/nestd/tests/host.rs`);
+  - a cut recorded under the newest pass instead of its own fails in 8 (`Pause, Cut, Resume, Write, Pause, Cut, RecordCut, Read`): the older cut's manifest lands over the sentinel a newer cut set. So the memo hands out passes, and only the newest begun records.
 - **Assumed:** every write moves the modification time before its data lands, and only nestd sets the sentinel (the kernel's write path; unverified on a host beyond the tests in `crates/nestd`).
 
 ### Residuals
@@ -275,7 +280,7 @@ Functions of one expression have table tests and no harness of their own; the to
 | `the_tombstone_map_refuses_a_fenced_epoch_until_a_destroy_or_newer_run_reaches_it` | `TombstoneMap` as `Tombstones` drives it. After a fence of `k@e` and any 4 calls (fence, destroy or run of either sandbox, at any epoch), `k@e` stays refused until a destroy at or above `e` or a run above `e`. A fence keeps the higher epoch; a destroy keeps exactly a tombstone above it, and a run exactly one that refuses it. Other sandboxes are untouched, and `refuses` and `len` agree with the map | 2 sandboxes, 5 calls | 19 s | 0.3 GB |
 | `a_deleting_entry_is_always_removed` | a name ending `.del` is a deletion whatever its type; only a directory is an incarnation | names ≤ 6 ASCII bytes | 46 s | 1.0 GB |
 | `the_retire_backoff_grows_to_the_max_and_stays` | from any wait in [1 s, 300 s]: never shrinks or passes 300 s, doubles unless capped, reaches 300 s within 9 steps | any ns in range | 4 s | 0.2 GB |
-| `reuse_only_of_a_stable_sentinel_pass_with_the_same_stamp` | after any 3 calls (a pass recorded, stable or not, with any or no stamp; a forget; or a pass begun and never recorded, which leaves nothing), a reused manifest is the newest recorded, from a stable pass, with exactly the stamp seen now, which is the sentinel, and the disk is stable now; `begin` reuses exactly what `unchanged` would and leaves nothing behind | stamps of 2 values per field | 1 s | — |
+| `reuse_only_of_the_newest_stable_sentinel_pass_with_the_same_stamp` | after any 4 calls (a pass begun; a pass recorded, the newest or an older one, stable or not, with any or no stamp; a forget), a reused manifest is the one the newest pass begun recorded, from a stable pass, with exactly the stamp seen now, which is the sentinel, and the disk is stable now; `begin` reuses exactly what `unchanged` would and leaves nothing behind | stamps of 2 values per field, 2 passes | 3 s | — |
 | `a_stable_sentinel_pass_is_reused` | right after a stable sentinel pass, the same stamp reuses it (the first isn't vacuous) | any stamp with the sentinel time | 1 s | — |
 | `the_cache_is_bounded_and_keeps_recent_outcomes` | after every insert: size ≤ cap; map and order hold the same keys once; a never-inserted key has no value; a value is the latest for its key; a key stays while fewer than cap other keys entered since | cap 1-3, 6 inserts, keys 0-3 | 60 s | 1.5 GB |
 
@@ -284,7 +289,7 @@ Functions of one expression have table tests and no harness of their own; the to
 - a fence that overwrites the tombstone instead of keeping the higher epoch;
 - `refuses` with `<` instead of `<=`;
 - the cache evicting at `len >= cap`;
-- the memo recording an unstable pass, and recording a pass without the sentinel.
+- the memo recording an unstable pass, recording a pass without the sentinel, and recording a pass that is no longer the newest.
 
 **Limits.**
 - **The map stand-ins:** Kani doesn't finish over `BTreeMap` and `VecDeque` (a popped `VecDeque` value stalls CBMC; the tombstone harness over the real `BTreeMap` had no verdict after 900 s at 3.2 GB). So `ResultCache` and `TombstoneMap` are generic over their map (and queue), and the proofs run their own code over fixed-array stand-ins. The standard map and FIFO are trusted, not proved.
