@@ -1439,10 +1439,11 @@ async fn retryable_fleet_error_resends_the_failed_batch() {
         let (sent, logged) = (failed.iter().filter(|f| *f == e).count(), log.events.iter().filter(|f| *f == e).count());
         assert_eq!(logged, sent, "resent exactly once: {e:#?}");
     }
-    // One result, plus one per redelivery of cmd_a's batch: a reconnect before the host reported it
-    // done (on a loaded machine) resends it, and the host answers it again from its result cache.
+    // One result, and at most one more per redelivery of cmd_a's batch: a reconnect before the host
+    // reported it done (on a loaded machine) resends it, and a host that had already finished it
+    // answers it again from its result cache (one still running it doesn't forward it twice).
     let results: Vec<&CommandOutcome> = log.events.iter().filter_map(|e| match &e.body { HostEventBody::CommandResult { cmd, outcome } if cmd.0 == "cmd_a" => Some(outcome), _ => None }).collect();
-    assert_eq!(results.len(), 1 + log.redelivered.len(), "redelivered: {:?}", log.redelivered);
+    assert!((1..=1 + log.redelivered.len()).contains(&results.len()), "{} results, redelivered: {:?}", results.len(), log.redelivered);
     assert!(results.windows(2).all(|w| w[0] == w[1]), "a redelivered command is answered with its first outcome: {results:?}");
 }
 
