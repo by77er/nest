@@ -273,10 +273,13 @@ export function measure(sel) {
     }
   }
 
-  // --- hit-size (touch widths): a tap anywhere in a 44 px square on a control lands on it ---
-  // Taps across the square centred on each control: at least 90% must reach it. A link inside running
-  // text (a block with text of its own around it) is the inline exception (WCAG 2.5.8): it keeps the
-  // text's line, which must be at least 24 px.
+  // --- hit-size (touch widths): a tap anywhere in a control's target square lands on it ---
+  // The square is 44 px, or, where another control's centre is nearer, that distance (each keeps its
+  // own share, never less than 24 px: WCAG 2.5.8's spacing); at least 90% of 25 taps across it must
+  // reach the control. A link inside running text (a block with text of its own around it) is the
+  // inline exception: it keeps the text's line, which must be at least 24 px. A whole-card link (its
+  // ::after stretched over the card) is that card: at least half of it must land on the link, the rest
+  // being the card's own controls.
   if (sel.touch) {
     const CONTROL = 'a[href], button, [role="button"], [role="tab"], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"])';
     const modals = [...document.querySelectorAll('[aria-modal="true"]')].filter(visible);
@@ -289,6 +292,8 @@ export function measure(sel) {
       return (block.textContent ?? "").replace(el.textContent ?? "", "").trim().length > 0;
     };
     const label = (el) => `<${el.tagName.toLowerCase()}> "${short(el.getAttribute("aria-label") ?? el.textContent)}"`;
+    /** What's open over the page for a moment: a tooltip, a dialog or drawer, a menu, a picker's list. */
+    const LAYER = '[role="tooltip"], [aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .mantine-Popover-dropdown, .mantine-Combobox-dropdown, .mantine-Menu-dropdown';
     /** The hit is in a fixed or sticky layer that doesn't hold the control (it scrolled under it). */
     const pinned = (hit, el) => {
       for (let e = hit; e && e !== document.body; e = e.parentElement) {
@@ -297,14 +302,30 @@ export function measure(sel) {
       }
       return false;
     };
-    for (const el of layer.querySelectorAll(CONTROL)) {
-      if (!visible(el) || el.closest('[aria-hidden="true"], [inert]') || el.matches(":disabled")) continue;
+    /** A link stretched over its card by an absolutely positioned ::after (or ::before): that box. */
+    const stretched = (el) => {
       const r = el.getBoundingClientRect();
-      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      for (const pe of ["::after", "::before"]) {
+        const cs = getComputedStyle(el, pe);
+        if (cs.content === "none" || cs.content === "normal" || cs.position !== "absolute") continue;
+        const w = parseFloat(cs.width), h = parseFloat(cs.height);
+        if (w > r.width + 8 || h > r.height + 8) {
+          let box = el.offsetParent?.getBoundingClientRect();
+          if (box) return box;
+        }
+      }
+      return null;
+    };
+    const controls = [...layer.querySelectorAll(CONTROL)].filter((el) => visible(el) && !el.closest('[aria-hidden="true"], [inert]') && !el.matches(":disabled"));
+    const centre = (el) => {
+      const r = el.getBoundingClientRect();
+      return [r.left + r.width / 2, r.top + r.height / 2];
+    };
+    for (const el of controls) {
+      const r = el.getBoundingClientRect();
+      const [cx, cy] = centre(el);
       if (cx < 0 || cy < 0 || cx >= W || cy >= H) continue;
-      // Only what the reader can reach: not under another layer at its centre, and not cut by a scroller
-      // it sits in (a table scrolled sideways, a drawer's body): scrolled to, it's whole.
-      if (!own(el, document.elementFromPoint(cx, cy))) continue;
+      // Not cut by a scroller it sits in (a table scrolled sideways, a drawer's body): scrolled to, it's whole.
       let cut = false;
       for (let e = el.parentElement; e && e !== document.body; e = e.parentElement) {
         const cs = getComputedStyle(e);
@@ -313,27 +334,61 @@ export function measure(sel) {
         if (r.left < c.left - 0.5 || r.right > c.right + 0.5 || r.top < c.top - 0.5 || r.bottom > c.bottom + 0.5) cut = true;
       }
       if (cut) continue;
+      // Covered at its centre: by a pinned bar it scrolled under or a layer over the page (a tooltip, a
+      // drawer, a menu), it's out of reach for now; by anything else, it can't be tapped at all.
+      const top = document.elementFromPoint(cx, cy);
+      if (!own(el, top)) {
+        const passing = !top || pinned(top, el) || top.closest(LAYER);
+        if (!passing) problems["hit-size"].push(`${label(el)}: covered at its centre by <${top.tagName.toLowerCase()}>${top.getAttribute("data-ds") ? ` (${top.getAttribute("data-ds")})` : ""}`);
+        continue;
+      }
       if (inline(el)) {
         const cs = getComputedStyle(el);
         const lh = cs.lineHeight === "normal" ? parseFloat(cs.fontSize) * 1.2 : parseFloat(cs.lineHeight);
         if (lh < 23.5) problems["hit-size"].push(`${label(el)}: an inline link on a ${Math.round(lh)} px line (at least 24)`);
         continue;
       }
-      const size = 44;
-      let n = 0, hits = 0;
-      for (const fx of [-0.4, -0.2, 0, 0.2, 0.4]) {
-        for (const fy of [-0.4, -0.2, 0, 0.2, 0.4]) {
-          const x = cx + fx * size, y = cy + fy * size;
-          if (x < 0 || y < 0 || x >= W || y >= H) continue;
-          const hit = document.elementFromPoint(x, y);
-          // A tooltip open over it, or a fixed bar it has scrolled under (the app's header), is passing,
-          // not a neighbour: those taps don't count either way.
-          if (hit?.closest('[role="tooltip"]') || pinned(hit, el)) continue;
-          n++;
-          if (own(el, hit)) hits++;
+      const sample = (x0, y0, w, h, need, what) => {
+        let n = 0, hits = 0;
+        for (const fx of [-0.4, -0.2, 0, 0.2, 0.4]) {
+          for (const fy of [-0.4, -0.2, 0, 0.2, 0.4]) {
+            const x = x0 + fx * w, y = y0 + fy * h;
+            if (x < 0 || y < 0 || x >= W || y >= H) continue;
+            const hit = document.elementFromPoint(x, y);
+            // A layer open over it (a tooltip, a picker's list), or a fixed bar it has scrolled under (the
+            // app's header), is passing, not a neighbour: those taps don't count either way.
+            if ((hit && !el.contains(hit) && hit.closest(LAYER)) || pinned(hit, el)) continue;
+            n++;
+            if (own(el, hit)) hits++;
+          }
         }
+        if (n && hits / n < need) problems["hit-size"].push(`${label(el)}: ${hits} of ${n} taps in ${what} land on it (${Math.round(r.width)}×${Math.round(r.height)} px)`);
+      };
+      const card = stretched(el);
+      if (card) {
+        sample(card.left + card.width / 2, card.top + card.height / 2, card.width, card.height, 0.5, "its card");
+        continue;
       }
-      if (n && hits / n < 0.9) problems["hit-size"].push(`${label(el)}: ${hits} of ${n} taps in its ${size} px square land on it (${Math.round(r.width)}×${Math.round(r.height)} px)`);
+      // Its share: the nearest other control's centre (one beside it, not inside it or around it).
+      let near = Infinity, who = null;
+      const layerOf = (x) => x.closest(LAYER);
+      for (const o of controls) {
+        // A neighbour the reader can reach: one under a floating control (a "Jump to live" pill over
+        // the rows) is covered, not beside it.
+        const [ox0, oy0] = centre(o);
+        if (!own(o, document.elementFromPoint(ox0, oy0))) continue;
+        // A neighbour shares its layer: a list open over the page has its own.
+        if (o === el || o.contains(el) || el.contains(o) || stretched(o) || layerOf(o) !== layerOf(el)) continue;
+        const [ox, oy] = centre(o);
+        const d = Math.max(Math.abs(ox - cx), Math.abs(oy - cy));
+        if (d < near) [near, who] = [d, o];
+      }
+      if (near < 23.5) {
+        problems["hit-size"].push(`${label(el)}: ${Math.round(near)} px from ${label(who)}, closer than 24`);
+        continue;
+      }
+      const size = Math.min(44, near);
+      sample(cx, cy, size, size, 0.9, `its ${Math.round(size)} px square`);
     }
   }
 

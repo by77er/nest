@@ -44,7 +44,8 @@ export function ProjectsPage() {
         <CardGrid>
           {projects.data.map((p) => (
             <Panel key={p.id} component="article" aria-label={p.name}>
-              <Stack gap="sm">
+              {/* Two rows of controls (the title and its badge, the repo): a touch pitch apart. */}
+              <Stack gap="sm" data-touch-pitch>
                 <Row gap="sm" justify="space-between" wrap="nowrap">
                   <AnchorLink to="/projects/$projectId/manager" params={{ projectId: p.id }} search={{}} c="bright" fw={weight.bold} fz="lg">
                     {p.name}

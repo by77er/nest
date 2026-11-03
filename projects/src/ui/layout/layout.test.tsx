@@ -257,7 +257,9 @@ describe("TriggerBadge", () => {
     // The class's rules: the theme's 2 px primary ring, and on touch a reserved 44 px height (no
     // pseudo-element reaching over a neighbour).
     expect(css).toMatch(/\.trigger:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--mantine-primary-color-filled\)/);
-    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{\s*\.trigger\s*\{\s*min-height:\s*var\(--nest-hit-touch\)/);
+    // On touch its hit box is the 44 px target around the badge, without growing the line: padding with
+    // an equal negative margin.
+    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{[^}]*\.trigger\s*\{[^}]*--nest-hit-pad:\s*calc\(\(var\(--nest-hit-touch\)[^}]*padding-block:\s*var\(--nest-hit-pad\);\s*margin-block:\s*calc\(var\(--nest-hit-pad\) \* -1\)/);
     expect(css).not.toMatch(/\.trigger::(before|after)/);
     // It's the tooltip's target: focus opens it.
     await user.tab();

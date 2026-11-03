@@ -149,16 +149,76 @@ const longerTitles = (p, fixture) =>
     const tasks = fixed(fixture, "/projects/prj_demo/tasks").map((t) => ({ ...t, title: `${t.title}, now with a much longer title that wraps onto another line` }));
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(tasks) });
   });
+/**
+ * Touch doesn't change the rhythm: the same page at the same width, without touch, lays out the same.
+ * A touch target grows its hit box, never its line, so these blocks' heights (and so proximity: a call
+ * and its result, a title and its meta) match within a few px.
+ */
+const rhythm = (fixture, blocks, after) => async (p, { width }) => {
+  if (width >= 600) return [];
+  // A block is a selector (its height; a terminal's, its transcript's) or [from, to] (the gap from one's
+  // bottom to the other's top: a title and its meta line).
+  const measure = (pg) => pg.evaluate((specs) => specs.map((s) => {
+    if (Array.isArray(s)) {
+      const [a, b] = s.map((x) => document.querySelector(x)?.getBoundingClientRect());
+      return a && b ? Math.round(b.top - a.bottom) : null;
+    }
+    const el = document.querySelector(s);
+    return el ? Math.round(s.includes("terminal") ? el.querySelector(".mantine-ScrollArea-viewport")?.scrollHeight ?? el.scrollHeight : el.getBoundingClientRect().height) : null;
+  }), blocks);
+  const touch = await measure(p);
+  const ctx = await p.context().browser().newContext({ viewport: p.viewportSize(), reducedMotion: "reduce" });
+  const mouse = await ctx.newPage();
+  await app.serve(mouse, { fixture });
+  await mouse.goto(p.url(), { waitUntil: "networkidle" });
+  await mouse.locator("h1").first().waitFor();
+  await mouse.waitForTimeout(800);
+  if (after) {
+    await after(mouse);
+    await mouse.waitForTimeout(800);
+  }
+  const m = await measure(mouse);
+  await ctx.close();
+  const name = (b) => (Array.isArray(b) ? `the gap from ${b[0]} to ${b[1]}` : b);
+  return blocks.flatMap((b, i) => (touch[i] === null || m[i] === null ? [`${name(b)}: not on the page`] : Math.abs(touch[i] - m[i]) > 4 ? [`${name(b)} is ${touch[i]} px on touch, ${m[i]} px with a mouse: touch targets grew its lines`] : []));
+};
+
+/**
+ * A transcript on touch keeps its proximity: within a tool call (its row, its result) the gap is at most
+ * half the gap to the next call, measured on the text, not the rows' grown hit boxes.
+ */
+async function traceProximity(p, { width }) {
+  if (width >= 600) return [];
+  return p.evaluate(() => {
+    const out = [];
+    const text = (row) => (row.querySelector("[data-slot=text]") ?? row).getBoundingClientRect();
+    const groups = [...document.querySelectorAll("[data-ds=terminal] [data-kind=tool]")].filter((g) => g.getBoundingClientRect().height > 0);
+    for (let i = 0; i + 1 < groups.length; i++) {
+      const rows = [...groups[i].querySelectorAll("[data-ds=term-line]")].filter((r) => r.getBoundingClientRect().height > 0);
+      const result = groups[i].querySelector("[data-kind=tool_result]");
+      const next = groups[i + 1].querySelector("[data-ds=term-line]");
+      if (!result || !next || groups[i].nextElementSibling !== groups[i + 1]) continue;
+      const within = Math.round(text(result).top - text(rows[0]).bottom);
+      const between = Math.round(text(next).top - text(rows.at(-1)).bottom);
+      if (within > between / 2) out.push(`"${rows[0].textContent.slice(0, 30)}": ${within} px to its result, ${between} px to the next call (within a group at most half)`);
+    }
+    return out;
+  });
+}
+
 /** A task card's PR link opens the PR (a new tab on GitHub), not the task the whole card links to. */
-async function cardPrLink(p) {
+const cardPrLink = (p) => prLinkIn(p, "[data-slot=manager-context] [data-ds=task-card]", "a context card");
+const chatCardPrLink = (p) => prLinkIn(p, "[data-ds=rich] [data-ds=task-card]", "a chat card");
+async function prLinkIn(p, cards, where) {
   await p.context().route(/^https:\/\/github\.com\//, (r) => r.fulfill({ status: 200, contentType: "text/html", body: "<title>PR</title>" }));
-  const card = p.locator("[data-slot=manager-context] [data-ds=task-card]", { hasText: "#118" }).first();
+  const card = p.locator(cards, { hasText: "#118" }).first();
+  await card.scrollIntoViewIfNeeded();
   const link = card.getByRole("link", { name: "#118" });
   const before = p.url();
   const [tab] = await Promise.all([p.context().waitForEvent("page", { timeout: 5_000 }).catch(() => null), link.click()]);
   const problems = [];
-  if (!tab || !/github\.com\/[^/]+\/[^/]+\/pull\/118/.test(tab.url())) problems.push(`clicking "#118" in a context card didn't open the PR (${tab?.url() ?? "no new tab"})`);
-  if (p.url() !== before) problems.push(`clicking "#118" in a context card navigated the page to ${p.url()}`);
+  if (!tab || !/github\.com\/[^/]+\/[^/]+\/pull\/118/.test(tab.url())) problems.push(`clicking "#118" in ${where} didn't open the PR (${tab?.url() ?? "no new tab"})`);
+  if (p.url() !== before) problems.push(`clicking "#118" in ${where} navigated the page to ${p.url()}`);
   await tab?.close();
   return problems;
 }
@@ -219,7 +279,7 @@ const scroll = {
   },
 };
 
-export default {
+const app = {
   dir: "projects",
   ready: "/projects",
   errorText: "This page hit an error",
@@ -302,6 +362,13 @@ export default {
     { name: "manager-context-open", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click() },
     { name: "svg-modal", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false, widths: DESKTOP, after: (p) => p.getByRole("button", { name: /Search pipeline: open larger/ }).click() },
     { name: "card-pr-link", section: "project", path: "/projects/prj_demo/manager", full: false, widths: DESKTOP, check: cardPrLink, checkName: "card-links" },
+    { name: "card-pr-link-chat", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false, widths: DESKTOP, check: chatCardPrLink, checkName: "card-links" },
+    // Touch keeps the rhythm (checks: `rhythm`): text beside a control lays out as with a mouse (the
+    // header's meta under its h1, the Manager's context), and the trace keeps its proximity. (Rows of
+    // controls, like a project card's title and repo, take a 44 px pitch instead: data-touch-pitch.)
+    { name: "rhythm-header", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: rhythm("demo", [["[data-ds=page-header] h1", "[data-ds=page-header] [data-slot=meta]"]]), checkName: "rhythm" },
+    { name: "rhythm-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: traceProximity, checkName: "rhythm" },
+    { name: "rhythm-context", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click(), check: rhythm("demo", ["[data-slot=manager-context]"], (p) => p.getByRole("button", { name: "About the manager" }).click()), checkName: "rhythm" },
     // The chat's scrolling, acted out (checks: `chat-scroll`).
     { name: "chat-readback-growth", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, widths: [1440, 390], after: scroll.readbackGrowth("chat-long"), check: stashed, checkName: "chat-scroll" },
     { name: "chat-readback-new", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, widths: [1440, 390], after: scroll.readbackNew("chat-long"), check: stashed, checkName: "chat-scroll" },
@@ -318,3 +385,4 @@ export default {
     { name: "sidebar-drawer-switcher", section: "project", path: "/projects/prj_demo/board", full: false, widths: PHONE, after: async (p) => { await menu(p); await p.getByRole("button", { name: /Switch project/ }).click(); } },
   ],
 };
+export default app;
